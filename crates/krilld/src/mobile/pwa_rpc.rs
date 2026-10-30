@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 mod command_catalog;
 mod composer;
+mod composer_status;
 pub(super) mod feed;
 mod mention_files;
 mod requests;
@@ -257,12 +258,21 @@ enum Action {
         session: u64,
         query: String,
     },
+    ChatComposer {
+        session: u64,
+    },
     ComposerModels {
         session: u64,
     },
     SetModel {
         session: u64,
         model: String,
+        #[serde(default)]
+        effort: Option<String>,
+    },
+    SetEffort {
+        session: u64,
+        effort: String,
     },
 }
 #[derive(Debug, Deserialize)]
@@ -700,8 +710,14 @@ impl Backend {
             Action::MentionFiles { session, query } => {
                 mention_files::load(&self.cwd(session)?, &query)
             }
+            Action::ChatComposer { session } => self.composer_status(session),
             Action::ComposerModels { session } => self.composer_models(session),
-            Action::SetModel { session, model } => self.set_composer_model(session, &model),
+            Action::SetModel {
+                session,
+                model,
+                effort,
+            } => self.set_composer_model(session, &model, effort.as_deref()),
+            Action::SetEffort { session, effort } => self.set_composer_effort(session, &effort),
         }
     }
     fn session_bracketed_paste(&self, session: u64) -> bool {
@@ -1193,7 +1209,7 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"model_set":cfg!(unix),"change_feed":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )

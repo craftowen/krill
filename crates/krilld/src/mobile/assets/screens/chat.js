@@ -214,6 +214,8 @@
         if (!active()) return;
         if (failedEarlier) requestLatest();
         earlierEpoch++;
+        prefetchedEarlier = null;
+        fillPages = 0;
         earlierQueued = false;
         failedEarlier = false;
         autoBlocked = null;
@@ -290,7 +292,9 @@
     let earlierEpoch = 0,
       earlierQueued = false,
       autoBlocked = null,
-      failedEarlier = false;
+      failedEarlier = false,
+      prefetchedEarlier = null,
+      fillPages = 0;
     let resetHistory = !!entry.latestRecovery,
       refreshLatest =
         resetHistory ||
@@ -317,7 +321,8 @@
       if (gap <= 1) following = true;
       else if (upward) following = false;
       else if (gap < 60) following = true;
-      if (top > 120) {
+      const threshold = historyThreshold();
+      if (top > threshold) {
         autoBlocked = null;
         earlierQueued = false;
       } else if (upward && !following && !earlierPending) {
@@ -325,6 +330,16 @@
         drainEarlier();
       }
     });
+    let touchStartY = null, touchHistory = false, wheelAt = -Infinity;
+    function earlierGesture() {
+      if (!capability("chat_tail") || !canReadEarlier() || feed.scrollHeight > feed.clientHeight + 1) return;
+      following = false; fillPages = 0; autoBlocked = null; earlierQueued = true; drainEarlier();
+    }
+    feed.addEventListener("touchstart", e => {touchStartY = e.touches?.[0]?.clientY ?? null; touchHistory = false;}, {passive:true});
+    feed.addEventListener("touchmove", e => {if (touchStartY !== null && !touchHistory && (e.touches?.[0]?.clientY ?? touchStartY) - touchStartY > 12) {touchHistory = true; earlierGesture();}}, {passive:true});
+    feed.addEventListener("touchend", () => touchStartY = null, {passive:true});
+    feed.addEventListener("touchcancel", () => touchStartY = null, {passive:true});
+    feed.addEventListener("wheel", e => {const now = Date.now(), continuing = now - wheelAt < 250; wheelAt = now; if (e.deltaY < 0 && !continuing) earlierGesture();}, {passive:true});
     function pinLatest() {
       if (visible && following && !entry.live)
         feed.scrollTop = feed.scrollHeight || 0;
@@ -381,7 +396,14 @@
     sendBtn.setAttribute("aria-label", t("Send"));
     if (ctx.icon) sendBtn.append(ctx.icon("arrowUp"));
     else sendBtn.textContent = t("Send");
-    const modelBtn = button(t("Model"), () => chooseModel(), "composer-pill");
+    const modelBtn = button(t("Model"), () => chooseModel(), "composer-pill"),
+      modelName = el("span", undefined, "composer-model-name"),
+      modelEffort = el("span", undefined, "composer-model-effort"),
+      contextMeter = el("span", undefined, "composer-context"),
+      contextRing = el("span", undefined, "composer-context-ring"),
+      contextText = el("span", "?");
+    contextMeter.setAttribute("role", "img");
+    contextMeter.append(contextRing, contextText);
     const suggestions = el("div", undefined, "chat-composer-suggestions"),
       choiceList = el("div", undefined, "chat-composer-options");
     choiceList.id = `chat-composer-options-${sessionId}`;
@@ -417,7 +439,12 @@
       quick.replaceChildren(svg);
       bar.append(quick);
     }
-    bar.append(modelBtn, el("span", undefined, "composer-spacer"), sendBtn);
+    const statusRow = el("div", undefined, "chat-composer-status"),
+      actionsRow = el("div", undefined, "chat-composer-actions");
+    actionsRow.append(...Array.from(bar.children));
+    statusRow.append(modelBtn, contextMeter);
+    actionsRow.append(el("span", undefined, "composer-spacer"), sendBtn);
+    bar.replaceChildren(statusRow, actionsRow);
     box.append(suggestions, input, bar);
     composer.append(receipt, attachment, box);
     globalThis.MkKeyboard?.keepFocus(composer, ctx.signal);
@@ -506,6 +533,9 @@
         entry.composerScope = key;
         entry.composerEpoch = (entry.composerEpoch || 0) + 1;
         entry.model = null;
+        entry.composerStatus = null;
+        entry.composerStatusAt = 0;
+        statusFlight = null;
         discovery.clear();
         discovering.clear();
         closeSuggestions();
@@ -552,7 +582,9 @@
         el(
           "span",
           t(
-            picker?.kind === "models"
+            picker?.kind === "efforts"
+              ? "Effort"
+              : picker?.kind === "models"
               ? "Model"
               : picker?.kind === "files"
                 ? "Workspace files"
@@ -738,9 +770,15 @@
         closeSuggestions();
         return;
       }
+      if (token.kind === "efforts") {
+        applyModel(token.model, choice.id); return;
+      }
       if (token.kind === "models") {
-        applyModel(choice);
-        return;
+        if (choice.efforts?.length) {
+          picker = {kind:"efforts", scope:token.scope, model:choice.effortOnly ? null : choice};
+          paintChoices(choice.efforts.map(effort => ({id:effort,label:effort}))); return;
+        }
+        applyModel(choice); return;
       }
       const current = trigger();
       if (
@@ -822,6 +860,7 @@
       paintChoices([], t("Loading models…"));
       input.focus?.();
       try {
+        await refreshStatus(true);
         const data = await discover("composer_models");
         if (!active() || version !== suggestVersion || scope() !== context)
           return;
@@ -837,15 +876,21 @@
               scope: context,
               id: current.id,
               label: current.label || current.name || current.id,
+              statusBefore: entry.composerStatus?.model,
             }
           : null;
         syncAgent();
-        paintChoices(
-          models.map((item) => ({
+        const status = entry.composerStatus;
+        const modelChoices = models.map((item) => ({
             id: item.id,
             label: item.label || item.name || item.id,
             detail: item.id === data.current ? t("Current model") : undefined,
-          })),
+            efforts: status?.effort_supported ? status.models?.find(model => model.id === item.id)?.efforts || [] : [],
+          }));
+        const efforts = status?.models?.find(model => model.id === status.model)?.efforts || status?.efforts || [];
+        if (status?.effort_supported && efforts.length) modelChoices.push({id:"effort", label:t("Effort"), effortOnly:true, efforts});
+        paintChoices(
+          modelChoices,
           models.length
             ? data.note
               ? t(data.note)
@@ -863,7 +908,7 @@
           );
       }
     }
-    async function applyModel(choice) {
+    async function applyModel(choice, effort) {
       if (
         entry.modelPending ||
         entry.sending ||
@@ -879,9 +924,10 @@
       updateComposer();
       try {
         const result = await ctx.rpc({
-          action: "set_model",
+          action: choice ? "set_model" : "set_effort",
           session: sessionId,
-          model: choice.id,
+          ...(choice ? {model:choice.id} : {}),
+          ...(effort ? {effort} : {}),
         });
         if (
           !ownsEntry() ||
@@ -892,13 +938,16 @@
         discovery.clear();
         if (result?.applied === true) {
           const id =
-            typeof result.model === "string" ? result.model : choice.id;
-          entry.model = {
+            typeof result.model === "string" ? result.model : choice?.id;
+          if (id) entry.model = {
             agent: chatAgent(),
             scope: context,
             id,
-            label: id === choice.id ? choice.label : id,
+            label: id === choice?.id ? choice.label : id,
+            statusBefore: entry.composerStatus?.model,
           };
+          entry.composerStatusAt = 0;
+          if (result.effort && entry.composerStatus) entry.composerStatus.effort = result.effort;
           if (active() && version === suggestVersion) closeSuggestions();
         } else if (active() && version === suggestVersion)
           paintChoices(
@@ -920,17 +969,50 @@
         }
       }
     }
+    let statusFlight = null;
+    async function refreshStatus(force = false) {
+      if (!active() || !capability("chat_composer") || state.cached || state.connection?.phase !== "ready") return;
+      const binding = scope(), generation = entry.generation, owner = ctx.transport, linkEpoch = state.connection?.generation;
+      if (statusFlight?.binding === binding) return statusFlight.promise;
+      if (!force && (!isVisible() || Date.now() - (entry.composerStatusAt || 0) < 15000)) return;
+      const flight = {binding};
+      const current = () => statusFlight === flight && active() && scope() === binding && entry.generation === generation && owner === ctx.transport && linkEpoch === state.connection?.generation;
+      flight.promise = Promise.resolve().then(async () => {
+        try {
+          const data = await ctx.rpc({action:"chat_composer", session:sessionId});
+          if (!current() || data?.agent !== chatAgent() || data.generation && data.generation !== generation) return;
+          if (entry.model && data.model && data.model !== entry.model.statusBefore && !matchesModel(chatAgent(), entry.model.id, data.model)) entry.model = null;
+          entry.composerStatus = data; entry.composerStatusAt = Date.now(); syncAgent();
+        } catch (error) {
+          if (current()) {entry.composerStatus = null; entry.composerStatusAt = Date.now(); syncAgent(); if (force) throw error;}
+        } finally {if (statusFlight === flight) statusFlight = null; if (active() && scope() === binding && entry.generation !== generation) refreshStatus();}
+      });
+      statusFlight = flight; return flight.promise;
+    }
+    function matchesModel(agent, selected, observed) {
+      return selected === observed || agent === "claude" && ["opus","sonnet","haiku","fable"].includes(selected) && String(observed || "").startsWith(`claude-${selected}-`);
+    }
     function syncAgent() {
       const context = scope(),
         agent = chatAgent(),
-        label =
-          entry.model?.agent === agent && entry.model.scope === context
-            ? entry.model.label
-            : t("Model");
-      if (modelBtn.textContent !== label) {
-        modelBtn.textContent = label;
-        modelBtn.setAttribute("aria-label", label);
-      }
+        status = entry.composerStatus?.agent === agent ? entry.composerStatus : null,
+        currentModel = entry.model?.agent === agent && entry.model.scope === context ? entry.model.label : null,
+        label = capability("chat_composer") ? `${currentModel || status?.model || t("Model unknown")} · ${status?.effort || t("Effort unknown")}` : currentModel || t("Model");
+      shell.dataset.composerStatus = String(capability("chat_composer"));
+      if ((modelBtn.getAttribute ? modelBtn.getAttribute("aria-label") : modelBtn.attrs?.["aria-label"]) !== label) modelBtn.setAttribute("aria-label", label);
+      if (capability("chat_composer")) {
+        modelName.textContent = currentModel || status?.model || t("Model unknown");
+        modelEffort.textContent = `· ${status?.effort || t("Effort unknown")}`;
+        if (modelName.parentElement !== modelBtn) modelBtn.replaceChildren(modelName, modelEffort);
+      } else if (modelBtn.textContent !== label) modelBtn.textContent = label;
+      modelBtn.title = label;
+      contextMeter.hidden = !capability("chat_composer");
+      const percent = !entry.model || matchesModel(agent, entry.model.id, status?.model) ? status?.context?.percent : undefined, known = typeof percent === "number" && Number.isFinite(percent), usage = known ? Math.round(Math.max(0,Math.min(100,percent))) : null;
+      contextMeter.dataset.known = String(known);
+      contextText.textContent = known ? `${usage}%` : "?";
+      contextRing.style.background = known ? `conic-gradient(var(--foreground) ${usage}%, var(--border) 0)` : "var(--border)";
+      const description = known ? t("Context used {0}%", usage) : t("Context usage unknown");
+      contextMeter.title = description; contextMeter.setAttribute("aria-label",description);
       modelBtn.hidden = !agent || !capability("composer_models");
       modelBtn.disabled =
         !!entry.modelPending ||
@@ -2023,6 +2105,8 @@
       }));
     }
     function clearTranscript() {
+      prefetchedEarlier = null; fillPages = 0;
+      entry.composerStatus = null; entry.composerStatusAt = 0; statusFlight = null;
       entry.items = [];
       entry.retainedBytes = 0;
       entry.disclosures?.clear();
@@ -2276,6 +2360,7 @@
         updateStrip();
         restoreReader(anchor);
         pruneCache(state);
+        refreshStatus();
       } catch (error) {
         if (!current()) return;
         if (
@@ -2296,6 +2381,8 @@
       } finally {
         inFlight = false;
         if (earlierQueued) drainEarlier();
+        prefetchEarlier();
+        fillHistory();
         if (retryWithoutTail) {
           retryWithoutTail = false;
           pollNow(initial);
@@ -2329,17 +2416,35 @@
             key: `${entry.generation}:${start}:${end}:${first.id}`,
           };
     }
+    function historyThreshold() {return capability("chat_tail") ? Math.max(600, feed.clientHeight * 1.5) : 120;}
+    function prefetchEarlier() {
+      if (!capability("chat_tail") || !canReadEarlier() || earlierPending) return null;
+      const page = earlierPage();
+      if (!page) {prefetchedEarlier = null; return null;}
+      if (autoBlocked === page.key) return null;
+      if (prefetchedEarlier?.key === page.key) return prefetchedEarlier;
+      if (prefetchedEarlier && !prefetchedEarlier.settled) return null;
+      const prepared = {key:page.key, promise:Promise.resolve().then(() => ctx.rpc({action:"chat_poll",session:sessionId,offset:page.start??0,end_offset:page.end,...page.start===undefined?{latest:true}:{}}))};
+      prepared.promise.then(() => prepared.settled = true, () => prepared.settled = true);
+      prefetchedEarlier = prepared; return prepared;
+    }
+    function fillHistory() {
+      if (!capability("chat_tail") || !canReadEarlier() || inFlight || earlierPending || !earlierPage() || autoBlocked) return;
+      if (feed.scrollHeight <= feed.clientHeight + 1 && fillPages < 4) {earlierQueued = true; drainEarlier();}
+    }
     function drainEarlier() {
       if (!earlierQueued || inFlight) return;
       earlierQueued = false;
-      if (canReadEarlier() && !following && feed.scrollTop <= 120)
-        loadEarlier(true);
+      const short = capability("chat_tail") && feed.scrollHeight <= feed.clientHeight + 1;
+      if (canReadEarlier() && (!following || short && fillPages < 4) && feed.scrollTop <= historyThreshold())
+        loadEarlier(true, short && following);
     }
-    async function loadEarlier(automatic = false) {
+    async function loadEarlier(automatic = false, filling = false) {
       if (!canReadEarlier() || earlierPending || inFlight) return;
       const page = earlierPage();
       if (!page || (automatic && autoBlocked === page.key)) return;
       const { first, end } = page;
+      const prepared = prefetchedEarlier?.key === page.key ? prefetchedEarlier : prefetchEarlier();
       let { start } = page;
       const epoch = ++earlierEpoch,
         generation = entry.generation,
@@ -2353,16 +2458,18 @@
       earlierQueued = false;
       earlierPending = true;
       failedEarlier = false;
-      following = false;
+      if (!filling) following = false;
+      if (feed.scrollHeight <= feed.clientHeight + 1) fillPages++;
       renderItems();
+      let loaded = false;
       try {
-        const res = await ctx.rpc({
+        const res = await (prepared?.key === page.key ? prepared.promise : ctx.rpc({
           action: "chat_poll",
           session: sessionId,
           offset: start ?? 0,
           end_offset: end,
           ...(start === undefined ? { latest: true } : {}),
-        });
+        }));
         if (!current()) return;
         const responseStart = res?.page_start ?? start;
         if (
@@ -2379,7 +2486,7 @@
         )
           throw new Error(t("Transcript changed. Return to latest and retry."));
         // Capture the viewport after any scrolling during the RPC, before changing chrome/items.
-        following = false;
+        if (!filling) following = false;
         const anchor = readerAnchor();
         start = responseStart;
         rememberPage(start, res.next_offset);
@@ -2388,7 +2495,7 @@
         const prefix = index >= 0 ? items.slice(0, index) : items;
         const previous = entry.items,
           live = entry.live;
-        if (!live)
+        if (!filling && !live)
           entry.live = { items: previous.slice(), offset: entry.offset };
         const seen = new Set(previous.map((item) => item.id));
         entry.items = [
@@ -2399,7 +2506,7 @@
           }),
           ...previous,
         ];
-        trimItems(false);
+        trimItems(filling);
         const anchorKey =
           anchor?.node.dataset.chatId ||
           [...toolRuns].find(
@@ -2415,7 +2522,9 @@
           trimItems(false);
           return;
         }
-        if (first._clipped) delete first._clipped;
+        if (first._clipped && entry.items[0] !== first) delete first._clipped;
+        loaded = entry.items[0] !== first;
+        if (filling && !loaded) fillPages = 4;
         failures = 0;
         pollStatus.hidden = true;
         autoBlocked = null;
@@ -2424,13 +2533,14 @@
       } catch (error) {
         if (current()) {
           autoBlocked = page.key;
-          failedEarlier = true;
-          showPollError(error);
+          if (!filling) {failedEarlier = true; showPollError(error);}
         }
       } finally {
         earlierPending = false;
+        if (epoch === earlierEpoch && (loaded || !filling)) prefetchedEarlier = null;
         if (active()) {
           renderItems();
+          if (epoch === earlierEpoch && loaded) {prefetchEarlier(); fillHistory();}
           if (epoch !== earlierEpoch && canReadEarlier() && !entry.live)
             pollNow();
         }
@@ -2455,6 +2565,7 @@
     function visibilityChanged() {
       if (!isVisible()) {
         earlierEpoch++;
+        prefetchedEarlier = null;
         earlierQueued = false;
       }
       schedule();
@@ -2462,6 +2573,7 @@
         if (Date.now() - lastSuccess > 3000) refreshLatest = true;
         pinLatest();
         pollNow();
+        prefetchEarlier(); refreshStatus();
       }
     }
     globalThis.document?.addEventListener?.(
@@ -2474,6 +2586,7 @@
     updateStrip();
     updateComposer();
     pollNow(true);
+    refreshStatus();
     schedule();
     return {
       insertText,
@@ -2493,7 +2606,7 @@
         if (picker && picker.scope !== scope()) closeSuggestions();
         updateStrip();
         updateComposer();
-        pollNow();
+        pollNow(); refreshStatus();
       },
       unmount() {
         if (disposed) return;

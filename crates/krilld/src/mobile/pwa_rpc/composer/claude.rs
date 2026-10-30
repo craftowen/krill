@@ -12,11 +12,11 @@ const ALIASES: &[(&str, &str)] = &[
 ];
 
 fn verified(screen: &Screen) -> bool {
-    screen
-        .rows
-        .iter()
-        .enumerate()
-        .any(|(y, _)| native::row(screen, y).ends_with("Claude Code v2.1.311"))
+    screen.rows.iter().enumerate().any(|(y, _)| {
+        ["Claude Code v2.1.311", "Claude Code v2.1.314"]
+            .iter()
+            .any(|version| native::row(screen, y).ends_with(version))
+    })
 }
 
 fn border(screen: &Screen, y: usize) -> bool {
@@ -97,7 +97,7 @@ pub(super) fn models(context: &Context, tap: &Tap) -> io::Result<Value> {
     let (screen, _, _) = tap.capture();
     if !verified(&screen) || !composer(&screen, None) {
         return Err(io::Error::other(
-            "Wait for an idle Claude Code 2.1.311 chat with an empty native composer",
+            "Wait for an idle Claude Code 2.1.311 or 2.1.314 chat with an empty native composer",
         ));
     }
     Ok(
@@ -116,7 +116,7 @@ pub(super) fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Va
     let (before, revision, seq) = tap.capture();
     if !verified(&before) || !composer(&before, None) {
         return Err(io::Error::other(
-            "Wait for an idle Claude Code 2.1.311 chat with an empty native composer",
+            "Wait for an idle Claude Code 2.1.311 or 2.1.314 chat with an empty native composer",
         ));
     }
     let command = format!("/model {id}");
@@ -137,6 +137,40 @@ pub(super) fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Va
     }
     Ok(
         json!({"applied":false,"supported":true,"reason":"Claude received the model command, but its native confirmation was not recognized. It will not be resent."}),
+    )
+}
+
+fn effort_version(screen: &Screen) -> bool {
+    screen
+        .rows
+        .iter()
+        .enumerate()
+        .any(|(y, _)| native::row(screen, y).ends_with("Claude Code v2.1.314"))
+}
+
+pub(super) fn effort_available(screen: &Screen) -> bool {
+    effort_version(screen) && composer(screen, None)
+}
+
+pub(super) fn set_effort(tap: &Tap, effort: &str) -> io::Result<Value> {
+    if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Effort is not a verified Claude effort level",
+        ));
+    }
+    let (before, revision, _) = tap.capture();
+    if !effort_available(&before) {
+        return Err(io::Error::other(
+            "Wait for an idle Claude Code chat with an empty native composer",
+        ));
+    }
+    let command = format!("/effort {effort}");
+    tap.guarded_command(revision.0, command.as_bytes(), |screen, pasted| {
+        effort_version(screen) && composer(screen, pasted.then_some(command.as_str()))
+    })?;
+    Ok(
+        json!({"applied":false,"requested":true,"supported":true,"effort":effort,"reason":"Claude received the effort command. Its current effort has not been observed; the command will not be resent."}),
     )
 }
 

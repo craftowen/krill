@@ -178,3 +178,28 @@ fn model_discovery_uses_account_and_never_claims_config_is_current_or_applied() 
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn reasoning_choices_are_model_scoped_and_reject_command_text() {
+    let catalog = json!({"items":[{"id":"observed-model","efforts":["low","high"],"default_effort":"low"},{"id":"other-model","efforts":["max"],"default_effort":"max"}]});
+    assert!(validate_effort(&catalog, "observed-model", Some("high")).is_ok());
+    assert!(validate_effort(&catalog, "observed-model", None).is_ok());
+    for effort in ["max", "high\n/model", "--speed=fast", "", "ultra"] {
+        assert!(validate_effort(&catalog, "observed-model", Some(effort)).is_err());
+    }
+    assert!(validate_effort(&catalog, "other-model", Some("max")).is_ok());
+    assert!(codex_version("0.164.0"));
+    assert!(codex_version("0.165.0"));
+    assert!(!codex_version("0.166.0"));
+}
+
+#[test]
+fn live_model_switch_does_not_reuse_the_previous_context_window() {
+    let mut metadata = json!({"model":"before-model","effort":"high","context":{"percent":80}});
+    observe_live_model(&mut metadata, "before-model");
+    assert_eq!(metadata["context"]["percent"], 80);
+    observe_live_model(&mut metadata, "after-model");
+    assert_eq!(metadata["model"], "after-model");
+    assert!(metadata["context"].is_null());
+    assert!(metadata["effort"].is_null());
+}
