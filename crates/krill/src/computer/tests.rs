@@ -615,7 +615,7 @@ fn observation_and_action_scripts_share_one_identity_prefix() {
     assert!(LIVE_ACTION_JXA_SCRIPT.starts_with(observe));
     assert!(observe.contains("function validateTree"));
     assert!(observe.contains("fresh.value!==target.value"));
-    assert!(observe.contains("refs.length && truncated"));
+    assert!(observe.contains("after.slice(0,-1).some(n=>cutNodes.has(n))"));
     assert!(observe.contains("sameObservedWindow(proc,focused,win)"));
     assert!(!observe.contains("equal(rect(focused),req.winBounds)"));
 }
