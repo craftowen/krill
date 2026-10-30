@@ -83,6 +83,7 @@ impl SshHost {
             "BatchMode=yes".to_owned(),
             "-o".to_owned(),
             "StrictHostKeyChecking=accept-new".to_owned(),
+            "--".to_owned(),
             self.destination.clone(),
             "uname -sr && ([ -x \"$HOME/.local/bin/krill\" ] || command -v krill >/dev/null 2>&1) && echo 'krill: ready' || echo 'krill: not installed'".to_owned(),
         ]);
@@ -102,6 +103,7 @@ impl SshHost {
             "-N".to_owned(),
             "-L".to_owned(),
             forward,
+            "--".to_owned(),
             self.destination.clone(),
         ]);
         args
@@ -114,6 +116,7 @@ impl SshHost {
         args.extend([
             "-o".to_owned(),
             "BatchMode=yes".to_owned(),
+            "--".to_owned(),
             self.destination.clone(),
             krill_hosts::ssh::remote_query(),
         ]);
@@ -343,8 +346,15 @@ pub fn add_host(
     } else {
         label.trim()
     };
-    let id = format!("ssh-{}", slugify(clean_label));
     let mut hosts = load_hosts(state_dir);
+    // 한글·기호 라벨은 같은 slug가 되고 같은 라벨도 주소가 다를 수 있으므로, 다른 주소의 호스트와 id가 겹치면 번호를 붙인다.
+    let base = format!("ssh-{}", slugify(clean_label));
+    let mut id = base.clone();
+    let mut n = 2;
+    while hosts.iter().any(|h| h.id == id && h.destination != dest) {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
     let entry = SshHost {
         id: id.clone(),
         label: clean_label.to_owned(),
@@ -893,6 +903,7 @@ pub fn build_connect_command(host: &SshHost) -> String {
         parts.push("-i".to_owned());
         parts.push(shell_quote(id_file.trim()));
     }
+    parts.push("--".to_owned());
     parts.push(shell_quote(&host.destination));
     format!("{}\n", parts.join(" "))
 }
@@ -1077,7 +1088,10 @@ Host dev-box
         .unwrap();
         assert_eq!(list.len(), 1);
         let cmd = build_connect_command(&list[0]);
-        assert_eq!(cmd, "ssh -t -p 2200 -i '~/.ssh/office_key' owen@10.0.0.8\n");
+        assert_eq!(
+            cmd,
+            "ssh -t -p 2200 -i '~/.ssh/office_key' -- owen@10.0.0.8\n"
+        );
 
         let copy_cmd = build_connect_command(&list[0].clone().with_copy_id());
         assert_eq!(
@@ -1087,6 +1101,36 @@ Host dev-box
 
         let after = remove_host(Some(&dir), &list[0].id).unwrap();
         assert!(after.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_ascii_labels_do_not_overwrite_other_hosts_and_ssh_ends_options() {
+        let dir = std::env::temp_dir().join(format!("mk-ko-labels-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        add_host(Some(&dir), "집 맥미니", "owen@10.0.0.5", None, None).unwrap();
+        let list = add_host(Some(&dir), "회사 서버", "owen@10.0.0.6", None, None).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_ne!(list[0].id, list[1].id);
+        let args = list[0].test_args();
+        let at = args.iter().position(|a| a == "owen@10.0.0.5").unwrap();
+        assert_eq!(args[at - 1], "--");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_label_different_destination_keeps_both_hosts() {
+        let dir = std::env::temp_dir().join(format!("mk-same-label-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        add_host(Some(&dir), "집", "owen@10.0.0.5", None, None).unwrap();
+        let list = add_host(Some(&dir), "집", "owen@10.0.0.6", None, None).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_ne!(list[0].id, list[1].id);
+        let list = add_host(Some(&dir), "집", "owen@10.0.0.6", Some(2200), None).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].port, Some(2200));
         std::fs::remove_dir_all(&dir).ok();
     }
 

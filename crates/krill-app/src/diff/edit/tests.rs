@@ -354,6 +354,26 @@ fn click(selector: &'static str, cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
+fn hunk_and_line_discard_ask_before_applying(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (panel, cx) = cx.add_window_view(|_, cx| {
+        let mut p = Panel::unconnected("/repo-that-does-not-exist".into(), cx);
+        p.visible = false;
+        p.raw_patch = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n".into();
+        p
+    });
+    panel.update_in(cx, |p, window, cx| p.discard_hunk(0, window, cx));
+    assert!(cx.pending_prompt().is_some());
+    panel.read_with(cx, |p, _| assert!(p.editing.busy));
+    cx.simulate_prompt_answer(text::CANCEL.get());
+    cx.run_until_parked();
+    panel.read_with(cx, |p, _| {
+        assert!(!p.editing.busy);
+        assert!(p.editing.note.is_empty());
+    });
+}
+
+#[gpui::test]
 fn repository_switch_cancels_pending_discard_confirmation(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let fake = Arc::new(Fake::default());
@@ -1161,4 +1181,23 @@ fn unknown_remote_blocks_sync_until_background_probe_and_repo_reset(cx: &mut Tes
     });
     cx.run_until_parked();
     assert!(fake.edits.lock().unwrap().is_empty());
+}
+
+#[test]
+fn hunk_and_line_patches_refuse_lossy_text() {
+    let head = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n";
+    assert!(build_hunk_patch(&format!("{head}-a\n+b\n"), 0).is_some());
+    let raw = format!("{head}-a\n+\u{FFFD}\n");
+    assert!(build_hunk_patch(&raw, 0).is_none());
+    assert!(build_line_patch(&raw, false, 1, 1, true).is_none());
+}
+
+#[test]
+fn lossy_hunk_does_not_block_clean_hunks_of_the_same_file() {
+    let head = "diff --git a/f b/f\n--- a/f\n+++ b/f\n";
+    let raw = format!("{head}@@ -1 +1 @@\n-a\n+\u{FFFD}\n@@ -10 +10 @@\n-c\n+d\n");
+    assert!(build_hunk_patch(&raw, 0).is_none());
+    assert!(build_hunk_patch(&raw, 1).is_some());
+    assert!(build_line_patch(&raw, false, 10, 10, true).is_some());
+    assert!(build_line_patch(&raw, false, 1, 1, true).is_none());
 }

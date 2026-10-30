@@ -185,7 +185,10 @@ fn read_rest_bounded(
         }
         let chunk = read_chunk(target, path, offset, want)?;
         if chunk.bytes.is_empty() {
-            break;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "remote file ended before its reported end",
+            ));
         }
         bytes.extend_from_slice(&chunk.bytes);
         eof = chunk.eof;
@@ -914,6 +917,57 @@ mod tests {
         assert!(
             released,
             "expected forwarded local port to auto-release after idle timeout"
+        );
+    }
+
+    #[test]
+    fn remote_open_rejects_a_truncated_read() {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let sock_dir = std::env::temp_dir().join(format!(
+            "krill-rfs-trunc-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("d.sock");
+        let ipc_listener = UnixListener::bind(&sock_path).unwrap();
+        let stat = WireStat {
+            exists: true,
+            is_file: true,
+            is_dir: false,
+            is_symlink: false,
+            stamp: Some(WireStamp {
+                modified_unix_ns: Some(1),
+                len: 100,
+            }),
+        };
+        let daemon_thread = thread::spawn(move || {
+            for step in 0..2 {
+                let (mut stream, _) = ipc_listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                accept_test_handshake(&mut stream, &mut writer);
+                ipc::read_frame(&mut stream).unwrap().unwrap();
+                let bytes = if step == 0 {
+                    b"hello\n".to_vec()
+                } else {
+                    Vec::new()
+                };
+                let reply = Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
+                    stat,
+                    bytes,
+                    eof: false,
+                })));
+                stream.write_all(&reply.encode().unwrap()).unwrap();
+            }
+        });
+        let host = HostId::Remote("box".into());
+        let target = HostTarget::remote("box", sock_path);
+        let got = open(&target, &host, Path::new("/remote/note.txt"));
+        daemon_thread.join().unwrap();
+        fs::remove_dir_all(&sock_dir).ok();
+        assert!(
+            got.is_err(),
+            "a short read must not open as a complete file"
         );
     }
 

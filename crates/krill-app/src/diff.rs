@@ -2091,8 +2091,8 @@ impl Panel {
                         .xsmall()
                         .ghost()
                         .label(text::DISCARD_HUNK.get())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.discard_hunk(active_hunk, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.discard_hunk(active_hunk, window, cx);
                         })),
                 )
                 .when(has_selected_lines, |d| {
@@ -2112,8 +2112,8 @@ impl Panel {
                             .xsmall()
                             .ghost()
                             .label(text::DISCARD_LINE.get())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.discard_selected_lines(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.discard_selected_lines(window, cx);
                             })),
                     )
                 })

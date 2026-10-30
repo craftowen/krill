@@ -384,6 +384,19 @@ fn open_default_does_not_execute_executables() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `.command`·`.app`은 실행 비트가 없어도 `open`이 실행한다.
+#[cfg(target_os = "macos")]
+#[test]
+fn open_default_reveals_runnable_bundles_without_exec_bit() {
+    let dir = std::env::temp_dir().join(format!("mk-open-bundle-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("X.app")).unwrap();
+    std::fs::write(dir.join("go.command"), b"echo hi").unwrap();
+    let revealed = |p: &Path| open_default_command(p).get_args().any(|a| a == "-R");
+    assert!(revealed(&dir.join("X.app")));
+    assert!(revealed(&dir.join("go.command")));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 proptest::proptest! {
     #[test]
     fn parsers_never_panic(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048), cut in 0u64..4096) {
@@ -552,4 +565,36 @@ fn fit_image_stays_inside_the_pane(cx: &mut gpui::TestAppContext) {
         "fit image {image:?} must stay inside {pane:?}"
     );
     assert!(image.right() <= pane.right());
+}
+
+/// 심볼릭 링크는 이름이 아니라 대상으로 판정한다(`link.txt -> a.command`는 `open`이 실행한다).
+#[cfg(target_os = "macos")]
+#[test]
+fn open_default_judges_symlinks_by_target() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let dir = std::env::temp_dir().join(format!("mk-open-link-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(dir.join("X.APP")).unwrap();
+    std::fs::write(dir.join("a.command"), b"echo hi").unwrap();
+    std::fs::write(dir.join("tool"), b"\xcf\xfa\xed\xfe\0").unwrap();
+    std::fs::set_permissions(dir.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("a.pdf"), b"%PDF").unwrap();
+    for (name, target) in [
+        ("link.txt", "a.command"),
+        ("lnk.txt", "X.APP"),
+        ("exe.txt", "tool"),
+        ("doc.txt", "a.pdf"),
+    ] {
+        symlink(dir.join(target), dir.join(name)).unwrap();
+    }
+    let revealed = |n: &str| {
+        open_default_command(&dir.join(n))
+            .get_args()
+            .any(|a| a == "-R")
+    };
+    assert!(revealed("link.txt"));
+    assert!(revealed("lnk.txt"));
+    assert!(revealed("exe.txt"));
+    assert!(!revealed("doc.txt"));
+    std::fs::remove_dir_all(&dir).ok();
 }

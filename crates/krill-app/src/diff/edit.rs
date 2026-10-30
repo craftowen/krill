@@ -487,6 +487,13 @@ fn push_patch_line(buf: &mut String, line: &str) {
     }
 }
 
+/// `raw_patch`는 UTF-8 손실 변환 문자열이다. U+FFFD가 있으면 다시 만든 패치가 파일 바이트와 달라져
+/// 엉뚱한 내용을 적용할 수 있으므로 그 조각을 거부한다. 판정은 쓰이는 조각(헤더+선택 헝크)별이라
+/// 같은 파일의 깨끗한 헝크는 막지 않는다. 정상 UTF-8 `�`와 손실 변환은 문자열만으로 구별되지 않아 둘 다 거부한다.
+fn patch_roundtrips(raw_patch: &str) -> bool {
+    !raw_patch.contains('\u{FFFD}')
+}
+
 pub fn extract_patch_header_and_hunks(raw_patch: &str) -> (String, Vec<String>) {
     let mut header = String::new();
     let mut hunks = Vec::new();
@@ -518,6 +525,9 @@ pub fn build_hunk_patch(raw_patch: &str, hunk_index: usize) -> Option<String> {
         return None;
     }
     let hunk = hunks.get(hunk_index)?;
+    if !patch_roundtrips(&header) || !patch_roundtrips(hunk) {
+        return None;
+    }
     let mut out = header;
     out.push_str(hunk);
     if !out.ends_with('\n') {
@@ -559,7 +569,7 @@ pub fn build_line_patch(
         (end_line, start_line)
     };
     let (header, hunks) = extract_patch_header_and_hunks(raw_patch);
-    if header.trim().is_empty() || hunks.is_empty() {
+    if header.trim().is_empty() || hunks.is_empty() || !patch_roundtrips(&header) {
         return None;
     }
     let mut out_hunks = Vec::new();
@@ -686,6 +696,9 @@ pub fn build_line_patch(
         );
         if !changed {
             continue;
+        }
+        if !patch_roundtrips(hunk) {
+            return None;
         }
         let old_count = body_lines
             .iter()
@@ -1058,6 +1071,7 @@ impl Panel {
             return;
         }
         let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.submit_patch_apply(patch_text, true, false, cx);
@@ -1068,19 +1082,21 @@ impl Panel {
             return;
         }
         let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.submit_patch_apply(patch_text, true, true, cx);
     }
 
-    pub fn discard_hunk(&mut self, hunk_index: usize, cx: &mut Context<Self>) {
+    pub fn discard_hunk(&mut self, hunk_index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing.busy || self.comparison != Comparison::Worktree {
             return;
         }
         let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
+            self.reject_unsafe_patch(cx);
             return;
         };
-        self.submit_patch_apply(patch_text, false, true, cx);
+        self.confirm_discard_patch(text::CONFIRM_DISCARD_HUNK.get(), patch_text, window, cx);
     }
 
     pub fn stage_selected_lines(&mut self, cx: &mut Context<Self>) {
@@ -1094,6 +1110,7 @@ impl Panel {
         let Some(patch_text) =
             build_line_patch(&self.raw_patch, false, range.start(), range.end(), use_new)
         else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.submit_patch_apply(patch_text, true, false, cx);
@@ -1110,12 +1127,13 @@ impl Panel {
         let Some(patch_text) =
             build_line_patch(&self.raw_patch, true, range.start(), range.end(), use_new)
         else {
+            self.reject_unsafe_patch(cx);
             return;
         };
         self.submit_patch_apply(patch_text, true, true, cx);
     }
 
-    pub fn discard_selected_lines(&mut self, cx: &mut Context<Self>) {
+    pub fn discard_selected_lines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing.busy || self.comparison != Comparison::Worktree {
             return;
         }
@@ -1126,9 +1144,53 @@ impl Panel {
         let Some(patch_text) =
             build_line_patch(&self.raw_patch, true, range.start(), range.end(), use_new)
         else {
+            self.reject_unsafe_patch(cx);
             return;
         };
-        self.submit_patch_apply(patch_text, false, true, cx);
+        self.confirm_discard_patch(text::CONFIRM_DISCARD_LINES.get(), patch_text, window, cx);
+    }
+
+    fn reject_unsafe_patch(&mut self, cx: &mut Context<Self>) {
+        if !patch_roundtrips(&self.raw_patch) {
+            self.editing.note = text::PATCH_UNSAFE.get().into();
+            cx.notify();
+        }
+    }
+
+    fn confirm_discard_patch(
+        &mut self,
+        title: &str,
+        patch_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote_host() {
+            self.editing.note = text::REMOTE_UNSUPPORTED.get().into();
+            cx.notify();
+            return;
+        }
+        self.editing.busy = true;
+        let detail = self.repo.display().to_string();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            title,
+            Some(&detail),
+            &[text::DISCARD.get(), text::CANCEL.get()],
+            cx,
+        );
+        self.editing.task = Some(cx.spawn(async move |this, cx| {
+            let confirmed = answer.await == Ok(0);
+            this.update(cx, |this, cx| {
+                if confirmed {
+                    this.submit_patch_apply(patch_text, false, true, cx);
+                } else {
+                    this.editing.busy = false;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn submit_patch_apply(

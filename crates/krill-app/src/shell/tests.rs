@@ -4086,7 +4086,7 @@ fn account_switch_updates_state_without_auto_switch_notification(cx: &mut TestAp
     });
     let (k, b) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
     let sent = String::from_utf8(Input::decode(k, &b).unwrap().bytes).unwrap();
-    assert_eq!(sent, "ssh -t -p 2222 owen@10.0.0.42\n");
+    assert_eq!(sent, "ssh -t -p 2222 -- owen@10.0.0.42\n");
 
     // Verify queue_terminal_command triggers Shell::on_config_changed -> run_terminal_command,
     // and preserves FIFO order when multiple commands are queued in the same update cycle.
