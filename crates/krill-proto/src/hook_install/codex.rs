@@ -437,6 +437,8 @@ mod windows_tests {
 
     #[test]
     fn rpc_matches_canonical_account_home_to_native_config_layer() {
+        use base64::Engine as _;
+
         let root = std::env::temp_dir().join(format!("krill config 한글 {}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let bin = root.join("npm bin");
@@ -458,10 +460,29 @@ mod windows_tests {
             assert!(text.is_ascii());
             assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *value);
         }
+        // cmd's set /p drops extra lines from a single pipe read.
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             $null=[Console]::ReadLine(); \
+             [Console]::WriteLine('{{\"id\":0,\"result\":{{}}}}'); \
+             $null=[Console]::ReadLine(); \
+             $null=[Console]::ReadLine(); \
+             [Console]::WriteLine('{}'); \
+             $null=[Console]::ReadLine(); \
+             [Console]::WriteLine('{}')",
+            reply_text.replace('\'', "''"),
+            second_text.replace('\'', "''"),
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
         std::fs::write(
             bin.join("codex.cmd"),
             format!(
-                "@echo off\r\nset /p krill_request=\r\necho {{\"id\":0,\"result\":{{}}}}\r\nset /p krill_notice=\r\nset /p krill_read=\r\necho {reply_text}\r\nset /p krill_again=\r\necho {second_text}\r\nset /p krill_done=\r\n"
+                "@echo off\r\n\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -EncodedCommand {encoded}\r\n"
             ),
         )
         .unwrap();
