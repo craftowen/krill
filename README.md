@@ -227,7 +227,7 @@ The installer verifies the ZIP's SHA-256, installs under `%LOCALAPPDATA%\Program
 
 ## First Successful Session
 
-1. Open Krill and use **Open folder…** to select a local Git repository. If the interface is Korean, select **설정 → 모양 → 언어 → English** (Settings → General & Appearance → Language).
+1. Open Krill and use **Open folder…** to select a local Git repository. If the interface is Korean, select **설정 → 모양 → 언어 → English** (Settings → Appearance → Language).
 2. Open the **New session** (`+`) menu and choose **Terminal**, or choose an installed, authenticated agent such as Claude Code or Codex. Ask the agent to inspect the repository.
 3. Use **New worktree** in the sidebar, enter a unique name, and choose **Create**. Review any setup script before approving it, or choose **Skip setup**. Start a second agent there to work independently.
 4. Record the session IDs with `krill ls`. Quit and reopen the app while leaving the session tabs intact; check that the running sessions reconnect with the same IDs. Closing a session tab/pane explicitly terminates that session.

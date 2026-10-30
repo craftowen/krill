@@ -6,7 +6,7 @@
 //! - 미리보기: `krill import orca --dry-run --json --from <orca-dir>`
 //! - 실행: `krill import orca --json [--only <domains_csv>] --from <orca-dir>`
 //! - 완료 즉시 앱 재시작 없이 `settings::reload` + `settings::notify_external_change`를 통해
-//!   사이드바 프로젝트/워크트리 트리, `Settings > Accounts`, `Settings > Ssh`, 상태바를 갱신한다.
+//!   사이드바 프로젝트/워크트리 트리, `Settings > Accounts`, `Settings > Devices`, 상태바를 갱신한다.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -490,7 +490,7 @@ enum DiscoveryPhase {
     Ready,
 }
 
-/// 앱 전역 Orca 마이그레이션 상태(온보딩 마법사 및 `Settings > General` / `Accounts` 공유).
+/// 앱 전역 Orca 마이그레이션 상태(온보딩 마법사 및 `Settings > System` / `Accounts` 공유).
 #[derive(Debug, Clone)]
 pub struct OrcaImportState {
     pub orca_dir_override: Option<PathBuf>,
@@ -1156,7 +1156,7 @@ pub fn import_selected(cx: &mut App) {
     .detach();
 }
 
-/// 온보딩 마법사 및 `Settings > General` / `Settings > Accounts` 상단에 삽입되는 자동 감지 카드.
+/// 온보딩 마법사 및 `Settings > System` / `Settings > Accounts` 상단에 삽입되는 자동 감지 카드.
 #[must_use]
 pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>> {
     let _orca_dir = detect_orca_dir(cx)?;

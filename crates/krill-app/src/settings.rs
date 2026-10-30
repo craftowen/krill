@@ -184,7 +184,7 @@ pub struct Settings {
     /// false면 라이트 모드에서도 다크 모드 테마를 쓴다.
     #[serde(default = "default_true")]
     pub terminal_use_separate_light_theme: bool,
-    /// 사이드바 자동화 진입점 표시. Workflows 설정에서 다시 켤 수 있다.
+    /// 사이드바 자동화 진입점 표시. 명령 팔레트의 '자동화 열기'가 다시 켠다.
     #[serde(default = "default_true")]
     pub show_automations_button: bool,
     /// 가져온 사용자 터미널 테마(Ghostty·Warp, OWE-956).
@@ -365,6 +365,17 @@ impl Settings {
                 })
                 .map_or(name, |theme| theme.name.as_str())
         })
+    }
+
+    /// 모드의 터미널 테마를 가져온 테마 같은 임의 선택값으로 바꾼다.
+    pub fn select_terminal_theme(&mut self, mode: ThemeMode, selection: String) {
+        match mode {
+            ThemeMode::Dark => self.terminal_theme_dark = selection,
+            ThemeMode::Light => {
+                self.terminal_use_separate_light_theme = true;
+                self.terminal_theme_light = selection;
+            }
+        }
     }
 
     /// 모드의 터미널 테마를 앱 테마의 짝으로 되돌린다.
@@ -1757,6 +1768,28 @@ fn persist_settings_edit(
     Ok((settings, modified(&path)))
 }
 
+/// 테마 드롭다운 끝에 가져온 터미널 테마를 붙인다.
+fn imported_theme_items(
+    mut menu: gpui_component::menu::PopupMenu,
+    themes: &[(String, String)],
+    mode: ThemeMode,
+) -> gpui_component::menu::PopupMenu {
+    use gpui_component::menu::PopupMenuItem;
+    if themes.is_empty() {
+        return menu;
+    }
+    menu = menu.separator().label(text::IMPORTED_TERMINAL_THEMES.get());
+    for (name, selection) in themes.iter().cloned() {
+        menu = menu.item(PopupMenuItem::new(name).on_click(move |_, _, cx| {
+            let selection = selection.clone();
+            edit(cx, move |s| {
+                s.select_terminal_theme(mode, selection.clone());
+            });
+        }));
+    }
+    menu
+}
+
 /// Ghostty·Warp 터미널 테마를 settings.toml로 가져오고 결과 문구를 돌려준다.
 pub fn import_terminal_themes(cx: &mut App) -> gpui::Task<String> {
     let revision = cx.try_global::<Config>().map(|config| config.revision);
@@ -2049,7 +2082,7 @@ fn close_settings_page_for(view: Option<gpui::EntityId>, window: &mut Window, cx
 }
 
 pub fn open_window(cx: &mut App) {
-    // OWE-860: ⌘, 재입력 시 이미 열린 설정 창은 현재 탭을 유지한 채 앞으로만 가져온다(일반 탭 강제 초기화 없음).
+    // OWE-860: ⌘, 재입력 시 이미 열린 설정 창은 현재 탭을 유지한 채 앞으로만 가져온다(모양 탭 강제 초기화 없음).
     if let Some(handle) = cx
         .windows()
         .into_iter()
@@ -2147,7 +2180,7 @@ pub enum AdminTab {
     Mobile,
     Shortcuts,
     System,
-    /// 내비에 없는 하위 페이지. 프로젝트 메뉴에서 연다.
+    /// 내비에 없는 하위 페이지. 프로젝트 메뉴·에이전트 탭에서 연다.
     Project,
     /// 내비에 없는 하위 페이지. 에이전트 탭·명령 팔레트·빠른 명령 메뉴에서 연다.
     QuickCommands,
@@ -2894,7 +2927,7 @@ pub struct SettingsView {
     )>,
     /// 단축키 탭 기록기·충돌 확인(OWE-660).
     shortcuts: shortcuts::Recorder,
-    /// 워크플로 탭의 저장소별 심볼릭 링크·훅 입력 폼(MK-174).
+    /// 프로젝트 페이지의 저장소별 심볼릭 링크·훅 입력 폼(MK-174).
     workflow_form: Option<WorkflowRepoForm>,
     /// 워크스페이스 디스크 용량 분석(Space) 및 워크트리 일괄 클린업 패널(MK-175·OWE-729).
     space: space::Panel,
@@ -3131,7 +3164,7 @@ struct SshForm {
     _subs: Vec<Subscription>,
 }
 
-/// 워크플로 탭의 저장소별 공유 심볼릭 링크·setup/archive 훅·빠른 명령·완료 웹훅 입력 폼(MK-174·OWE-801).
+/// 프로젝트·빠른 명령 페이지의 저장소별 공유 심볼릭 링크·setup/archive 훅·빠른 명령 입력 폼(MK-174·OWE-801).
 struct WorkflowRepoForm {
     repo_path: gpui::Entity<gpui_component::input::InputState>,
     symlink_path: gpui::Entity<gpui_component::input::InputState>,
@@ -3316,7 +3349,7 @@ impl SettingsView {
             }
         }));
         view.refresh_accounts_async(cx);
-        // 점검 스냅샷이 바뀌면 일반 탭 요약도 다시 그린다(구독은 앱 수명 동안 둔다).
+        // 점검 스냅샷이 바뀌면 시스템 탭 요약도 다시 그린다(구독은 앱 수명 동안 둔다).
         cx.observe_global::<crate::onboarding::ChecksSnapshot>(|_, cx| cx.notify())
             .detach();
         cx.observe_global::<crate::star_nag::StarNag>(|_, cx| cx.notify())
@@ -6003,6 +6036,12 @@ impl SettingsView {
                     edit(cx, move |s| s.theme = choice);
                 })
         };
+        let imported: Vec<(String, String)> = s
+            .terminal_custom_themes
+            .iter()
+            .map(|theme| (theme.name.clone(), theme.selection_value()))
+            .collect();
+        let (dark_imported, light_imported) = (imported.clone(), imported);
         let selected_dark = s.ui_theme_dark;
         let dark_themes = layout::secondary("ui-theme-dark", selected_dark.label())
             .dropdown_caret(true)
@@ -6017,7 +6056,7 @@ impl SettingsView {
                             }),
                     );
                 }
-                menu
+                imported_theme_items(menu, &dark_imported, ThemeMode::Dark)
             });
         let selected_light = s.ui_theme_light;
         let light_themes = layout::secondary("ui-theme-light", selected_light.label())
@@ -6033,7 +6072,7 @@ impl SettingsView {
                             }),
                     );
                 }
-                menu
+                imported_theme_items(menu, &light_imported, ThemeMode::Light)
             });
         // 터미널 테마가 앱 테마의 짝이 아니면 드롭다운만 바꿔도 터미널 색이 그대로라 맞추는 버튼을 둔다.
         let terminal_theme_match = |mode: ThemeMode| {
@@ -6454,7 +6493,7 @@ impl SettingsView {
                 ),
         ]
     }
-    /// 터미널 탭(OWE-658, OWE-798): 글꼴·크기.
+    /// 모양 탭의 터미널 글꼴·크기(OWE-658, OWE-798).
     fn render_terminal_tab(&mut self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         let search_focus = self.search_focus.clone();
@@ -8865,7 +8904,41 @@ impl SettingsView {
             .child(default_view_mode_row)
             .child(yolo_row)
             .child(hooks_row)
-            .child(auto_setup_row);
+            .child(auto_setup_row)
+            .child(
+                layout::row(p)
+                    .child(layout::label(
+                        p,
+                        text::TAB_QUICK_COMMANDS.get(),
+                        Some(text::TAB_QUICK_COMMANDS_DESC.get()),
+                    ))
+                    .child(
+                        layout::controls().child(
+                            layout::secondary("open-quick-commands", text::DISK_OPEN.get())
+                                .debug_selector(|| "open-quick-commands".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_tab(AdminTab::QuickCommands, cx);
+                                })),
+                        ),
+                    ),
+            )
+            .child(
+                layout::row(p)
+                    .child(layout::label(
+                        p,
+                        text::TAB_PROJECT.get(),
+                        Some(text::TAB_PROJECT_DESC.get()),
+                    ))
+                    .child(
+                        layout::controls().child(
+                            layout::secondary("open-project-settings", text::DISK_OPEN.get())
+                                .debug_selector(|| "open-project-settings".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_tab(AdminTab::Project, cx);
+                                })),
+                        ),
+                    ),
+            );
 
         let builtin_agents = krill_proto::agent::Agents::load(None).unwrap_or_default();
         let dir = state_dir(cx);
@@ -10456,7 +10529,7 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// 워크플로 탭의 프로젝트 선택 후보. 심볼릭 링크·훅·코멘트·워크트리 부모에 등록된 저장소 중
+    /// 프로젝트 페이지의 프로젝트 선택 후보. 심볼릭 링크·훅·코멘트·워크트리 부모에 등록된 저장소 중
     /// 실제 절대 경로만 남긴다(`내 드라이브::workspace:…` 같은 내부 키는 프로젝트가 아니다).
     fn workflow_repo_candidates(
         store: &krill_proto::orchestration::WorktreeStore,
@@ -11662,7 +11735,7 @@ impl Render for SettingsView {
                                 .filter(|_| !query.trim().is_empty())
                             {
                                 cx.stop_propagation();
-                                this.set_tab(tab, cx);
+                                this.set_tab(search::search_target(&query, tab), cx);
                             }
                         }),
                     )
@@ -11738,7 +11811,8 @@ impl Render for SettingsView {
                         .hover(|d| d.bg(p.sidebar_accent).text_color(p.foreground))
                         .active(|d| d.bg(p.accent).text_color(p.foreground))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_tab(tab, cx);
+                            let query = this.search_query(cx);
+                            this.set_tab(search::search_target(&query, tab), cx);
                         }))
                         .child(tab.icon_element().small())
                         .child(div().flex_1().min_w_0().truncate().child(tab.label())),

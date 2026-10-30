@@ -1264,7 +1264,12 @@ impl Shell {
             resources,
             _resources_open: resources_open,
             status_menus_open: 0,
-            security: krill_app::security::State::default(),
+            security: {
+                let mut security = krill_app::security::State::default();
+                security
+                    .set_secure_keyboard(krill_app::settings::current(cx).secure_keyboard_entry);
+                security
+            },
             paste_queue: security::PasteQueue::default(),
             character_input_keys: BTreeSet::new(),
             files: files::Files::default(),
@@ -2361,7 +2366,11 @@ impl Shell {
             jump::ActionKind::OpenDisk => {
                 self.open_settings(krill_app::settings::AdminTab::Disk, Some(window), cx);
             }
-            jump::ActionKind::OpenAutomations => self.open_automations(Some(window), cx),
+            jump::ActionKind::OpenAutomations => {
+                // 사이드바에서 숨긴 자동화를 되돌리는 경로이기도 하다.
+                krill_app::settings::edit(cx, |s| s.show_automations_button = true);
+                self.open_automations(Some(window), cx);
+            }
             jump::ActionKind::EditQuickCommands => {
                 self.open_settings(
                     krill_app::settings::AdminTab::QuickCommands,

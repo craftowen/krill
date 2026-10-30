@@ -256,7 +256,7 @@ pub fn listen(sidebar: &WeakEntity<Sidebar>, cx: &mut App) {
 }
 
 /// 사이드바가 폴링한 최신 세션 스냅샷을 반영해 알림·Dock 배지·`IOPMAssertion`을 갱신한다.
-/// 활성 창의 포커스 칸만 알림을 생략한다. 창이 없거나 비활성이면 알림을 보낸다(메뉴바 상주).
+/// 활성 창이 있으면 모든 알림을 생략한다. 창이 없거나 비활성이면 알림을 보낸다(메뉴바 상주).
 pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
     ensure_state(cx);
     let cfg = effective_settings(cx);
@@ -460,7 +460,7 @@ fn play_notification_sound(cx: &mut App) {
 }
 
 /// 터미널 벨 알림(OWE-659). 이벤트 토글이 꺼져 있으면 조용하고, 이미 게시된
-/// 알림이 있거나 보고 있는 칸의 벨이면 생략한다.
+/// 알림이 이미 있거나 활성 창이 있으면 생략한다.
 pub fn notify_bell(id: SessionId, label: &str, cx: &mut App) {
     ensure_state(cx);
     let cfg = effective_settings(cx);

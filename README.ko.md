@@ -135,7 +135,7 @@
 <td width="50%" valign="top">
 
 ### 5. 종단간 암호화 모바일 웹 앱 (PWA)
-Mac 앱의 **설정 → 기기 → 모바일**에서 QR 코드를 스캔하면, 폰 브라우저나 홈 화면 앱(PWA)에서 에이전트 상태를 확인하고 터미널에 접속합니다. Relay·Tailscale 경로와 **ChaCha20-Poly1305**(`HKDF-SHA256`) 종단간 암호화로 보호됩니다.
+Mac 앱의 **설정 → 기기 → 모바일 원격 제어**에서 QR 코드를 스캔하면, 폰 브라우저나 홈 화면 앱(PWA)에서 에이전트 상태를 확인하고 터미널에 접속합니다. Relay·Tailscale 경로와 **ChaCha20-Poly1305**(`HKDF-SHA256`) 종단간 암호화로 보호됩니다.
 
 PC에서 릴레이 연결을 선택하면 Google 로그인으로 이어집니다. 모바일 PWA는 로그인 없이 열리고 QR 페어링 또는 저장된 기기 키로 인증합니다.
 
@@ -218,7 +218,7 @@ ZIP SHA-256 검사 뒤 `%LOCALAPPDATA%\Programs\Krill`에 설치하고 시작 �
 |---|---|---|
 | **macOS Apple Silicon (`arm64`)** | 주 데스크톱 플랫폼 | 릴리스 앱·CLI 또는 소스 빌드 |
 | **Windows `x64`** | 네이티브 데스크톱 프리뷰. Windows Server VM 기록 외에 데스크톱 GUI·대화형 로그온·절전·재부팅 검증이 더 필요 | 릴리스 ZIP·PowerShell 설치기 |
-| **모바일 (iOS / Android)** | QR 코드로 페어링하는 모바일 웹 앱(PWA, Relay·Tailscale + ChaCha20-Poly1305 종단간 암호화) | Mac 앱 **설정 → 기기 → 모바일**에서 QR 스캔(앱 스토어 앱 아님) |
+| **모바일 (iOS / Android)** | QR 코드로 페어링하는 모바일 웹 앱(PWA, Relay·Tailscale + ChaCha20-Poly1305 종단간 암호화) | Mac 앱 **설정 → 기기 → 모바일 원격 제어**에서 QR 스캔(앱 스토어 앱 아님) |
 | **Intel Mac (`x86_64`)** | 이번 공개 프리뷰에서 미지원 | 지원 번들·소스 설치를 약속하지 않음 |
 | **Linux** | 이번 공개 프리뷰에서 미지원 | 데스크톱·원격 호스트 다운로드를 약속하지 않음 |
 | **Windows ARM64·32비트** | 미지원 | 릴리스 패키지 없음 |

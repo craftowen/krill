@@ -1450,6 +1450,7 @@ catalog! {
         TAB_DISK => ("디스크 용량", "Disk usage"),
         TAB_DISK_DESC => ("워크트리가 쓰는 디스크 용량을 확인하고 정리합니다.", "Review and clean up disk space used by worktrees."),
         DISK_OPEN => ("열기", "Open"),
+        IMPORTED_TERMINAL_THEMES => ("가져온 터미널 테마", "Imported terminal themes"),
         SKILLS_TITLE => ("내장 에이전트 스킬 레지스트리 (Claude · Codex · Antigravity · OpenCode · Cursor)", "Built-in Agent Skills Registry (Claude · Codex · Antigravity · OpenCode · Cursor)"),
         SKILLS_INSTALL => ("스킬 설치", "Install Skill"),
         SKILLS_INSTALL_ALL => ("스킬 전체 설치", "Install All Skills"),
@@ -1522,7 +1523,7 @@ catalog! {
         TERMINAL_FONT => ("글꼴", "Font family"),
         TERMINAL_FONT_DESC => ("터미널 글꼴입니다. 목록에는 고정폭 글꼴만 나옵니다.", "Terminal font. Only monospace fonts are listed."),
         TERMINAL_FONT_FALLBACK => ("“{requested}”은(는) 고정폭으로 쓸 수 없어 “{effective}”(으)로 표시합니다.", "“{requested}” is not a usable monospace font, so the terminal shows “{effective}” instead."),
-        NOTIFICATIONS_DESC => ("에이전트 입력 대기·완료 알림과 Dock 배지를 보냅니다.", "Notify and badge the Dock when an agent waits for input or finishes."),
+        NOTIFICATIONS_DESC => ("Krill 창을 보고 있지 않을 때 에이전트 입력 대기·완료를 알리고, Dock 배지는 항상 표시합니다.", "Notify when an agent waits for input or finishes while Krill is not the active window. The Dock badge always shows."),
         ALERT_SOUND_DESC => ("알림을 보낼 때 소리를 함께 냅니다.", "Play a sound with notifications."),
         KEEP_AWAKE_DESC => ("Mac이 유휴 잠자기에 들어가지 않게 합니다.", "Prevent the Mac from idle sleep."),
         FILES_TITLE => ("설정 파일", "Settings files"),
@@ -2636,7 +2637,7 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
     (
         crate::settings::AdminTab::System,
         catalog::settings::RESOURCES_TITLE,
-        &["메모리", "보안", "memory", "security"],
+        &["개인정보", "privacy"],
     ),
     (
         crate::settings::AdminTab::System,
@@ -2656,7 +2657,7 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         ],
     ),
     (
-        crate::settings::AdminTab::System,
+        crate::settings::AdminTab::Disk,
         catalog::settings::SPACE_TITLE,
         &[
             "용량",

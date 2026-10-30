@@ -3195,6 +3195,7 @@ impl Sidebar {
         let wt_text = crate::i18n::catalog::worktree::PROMPT_TITLE.format(&[("source", &source)]);
         let (enable_dir, enable_key, enable_script) =
             (state_dir.clone(), repo_key.clone(), script.clone());
+        let settings_key = repo_key.clone();
         let (dismiss_dir, dismiss_key) = (state_dir, repo_key);
         Some(
             div()
@@ -3266,9 +3267,9 @@ impl Sidebar {
                                 .xsmall()
                                 .label(crate::i18n::catalog::worktree::PROMPT_SETTINGS.get())
                                 .debug_selector(|| "setup-prompt-settings".into())
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    crate::settings::open_window_at_tab(
-                                        crate::settings::AdminTab::Project,
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    crate::settings::open_project_settings(
+                                        std::path::Path::new(&settings_key),
                                         cx,
                                     );
                                 })),

@@ -65,10 +65,49 @@ mod tests {
     }
 
     #[test]
+    fn search_reaches_segments_and_subpages() {
+        assert_eq!(search_target("qr", AdminTab::Ssh), AdminTab::RemoteKrill);
+        assert_eq!(search_target("초대", AdminTab::Ssh), AdminTab::RemoteKrill);
+        assert_eq!(search_target("스마트폰", AdminTab::Ssh), AdminTab::Mobile);
+        assert_eq!(search_target("ssh", AdminTab::Ssh), AdminTab::Ssh);
+        assert_eq!(
+            search_target("빠른 명령", AdminTab::Agents),
+            AdminTab::QuickCommands
+        );
+        assert_eq!(search_target("심링크", AdminTab::Agents), AdminTab::Project);
+        assert_eq!(search_target("디스크", AdminTab::System), AdminTab::Disk);
+        assert_eq!(search_target("", AdminTab::System), AdminTab::System);
+    }
+
+    #[test]
     fn empty_query_keeps_every_tab() {
         assert_eq!(search_tabs(""), AdminTab::ALL);
         assert_eq!(search_tabs("   "), AdminTab::ALL);
     }
+}
+
+/// 내비 탭에서 검색어가 가리키는 실제 페이지. 세그먼트·하위 페이지 항목이면 그 페이지로 간다.
+pub(super) fn search_target(query: &str, tab: AdminTab) -> AdminTab {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return tab;
+    }
+    let hit = |s: &str| s.to_lowercase().contains(&query);
+    let both = |m: Message| [Language::Ko, Language::En].map(|l| m.in_language(l));
+    INDEX
+        .iter()
+        .find(|(t, title, words)| {
+            t.page() == tab && (both(*title).into_iter().any(hit) || words.iter().copied().any(hit))
+        })
+        .map(|(t, ..)| *t)
+        .or_else(|| {
+            AdminTab::SUBPAGES.into_iter().find(|sub| {
+                sub.page() == tab
+                    && (both(sub.title_message()).into_iter().any(hit)
+                        || both(sub.subtitle_message()).into_iter().any(hit))
+            })
+        })
+        .unwrap_or(tab)
 }
 
 /// 탭 제목보다 실제 설정 제목·키워드가 일치하는 행을 우선한다.
@@ -79,7 +118,7 @@ pub(super) fn first_setting(query: &str, tab: AdminTab) -> Option<Message> {
     }
     INDEX
         .iter()
-        .filter(|(t, ..)| t.page() == tab.page())
+        .filter(|(t, ..)| *t == tab)
         .find_map(|(_, title, words)| {
             ([Language::Ko, Language::En]
                 .iter()
