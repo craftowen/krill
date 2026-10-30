@@ -84,6 +84,8 @@ const B_ENABLED: usize = 6;
 const B_FOCUSED: usize = 7;
 const B_POSITION: usize = 8;
 const B_SIZE: usize = 9;
+/// 지문에 들어가는 속성 비트. 활성·포커스는 지문이 아니다.
+const IDENTITY_BITS: u16 = !(1 << B_ENABLED | 1 << B_FOCUSED);
 
 #[derive(Debug)]
 struct Attrs {
@@ -162,6 +164,33 @@ struct Semantic {
     identifier: Option<String>,
     value: SemanticValue,
     frame: Option<(ffi::CgPoint, ffi::CgSize)>,
+    /// 읽기 오류가 난 속성(`B_*` 비트). 값 없음과 다르다. 0이 아니면 입력 대상·조상이 될 수 없고,
+    /// 유일성 판정에서는 그 속성이 어느 값과도 같을 수 있는 후보로 센다.
+    unreadable: u16,
+}
+
+/// 배치 결과를 값과 읽기 오류 비트로 나눈다. 위치·크기는 한쪽만 실패해도 둘 다 실패로 본다.
+fn split_batch(batch: Vec<Result<Option<Cf>, AxError>>) -> (Vec<Option<Cf>>, u16) {
+    let mut failed = 0u16;
+    let mut values: Vec<Option<Cf>> = batch
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.unwrap_or_else(|_| {
+                failed |= 1 << index;
+                None
+            })
+        })
+        .collect();
+    if failed & (1 << B_POSITION | 1 << B_SIZE) != 0 {
+        failed |= 1 << B_POSITION | 1 << B_SIZE;
+        for index in [B_POSITION, B_SIZE] {
+            if let Some(value) = values.get_mut(index) {
+                *value = None;
+            }
+        }
+    }
+    (values, failed)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,7 +250,19 @@ impl Semantic {
             identifier: text(B_IDENTIFIER)?,
             value,
             frame,
+            unreadable: 0,
         })
+    }
+
+    /// 실제 앱(macOS 툴바 버튼의 `AXSubrole` → `kAXErrorFailure`)에서 속성 하나만 읽기 오류가 나는 일이 관찰됐다.
+    /// 역할을 못 읽으면 지문이 없다.
+    fn from_batch(values: &[Option<Cf>], failed: u16) -> Option<Self> {
+        if failed & 1 << B_ROLE != 0 {
+            return None;
+        }
+        let mut identity = Self::from_values(values)?;
+        identity.unreadable = failed & IDENTITY_BITS;
+        Some(identity)
     }
 
     fn bytes(&self) -> usize {
@@ -252,19 +293,24 @@ impl Semantic {
     }
 
     fn matches(&self, other: &Self, compare_value: bool) -> bool {
-        self.stable_matches(other) && (!compare_value || self.value == other.value)
+        self.unreadable == 0
+            && other.unreadable == 0
+            && self.stable_matches(other)
+            && (!compare_value || self.value == other.value)
     }
 
     /// 유일성 판정에서 위치는 제외한다. 같은 라벨 두 개를 좌표로 억지 구별하지 않는다.
+    /// `other`의 읽지 못한 속성은 같다고 본다(후보를 줄이지 않는다).
     fn same_candidate(&self, other: &Self, compare_value: bool) -> bool {
+        let same = |bit: usize, equal: bool| equal || other.unreadable & 1 << bit != 0;
         if let Some(identifier) = &self.identifier {
-            return other.identifier.as_ref() == Some(identifier);
+            return same(B_IDENTIFIER, other.identifier.as_ref() == Some(identifier));
         }
         self.role == other.role
-            && self.subrole == other.subrole
-            && self.title == other.title
-            && self.description == other.description
-            && (!compare_value || self.value == other.value)
+            && same(B_SUBROLE, self.subrole == other.subrole)
+            && same(B_TITLE, self.title == other.title)
+            && same(B_DESCRIPTION, self.description == other.description)
+            && (!compare_value || same(B_VALUE, self.value == other.value))
     }
 
     fn has_identity(&self) -> bool {
@@ -297,6 +343,12 @@ fn validate_observed_graph(
         .identity
         .as_ref()
         .ok_or_else(|| Refusal::new("identity_incomplete", "observed identity is unreadable"))?;
+    if expected.unreadable != 0 {
+        return Err(Refusal::new(
+            "identity_incomplete",
+            "target identity is partially unreadable",
+        ));
+    }
     if !snapshot.complete
         || !expected.has_identity()
         || (!compare_target_value
@@ -752,8 +804,8 @@ impl MacBackend {
                 continue;
             }
             self.budget(deadline)?;
-            let values = match ffi::copy_multiple(&element, &attrs.batch) {
-                Ok(values) => values,
+            let (values, failed) = match ffi::copy_multiple(&element, &attrs.batch) {
+                Ok(values) => split_batch(values),
                 Err(error) => {
                     if depth == 0 {
                         root_error = Some(error);
@@ -861,8 +913,8 @@ impl MacBackend {
                     }
                 }
             }
-            let identity = Semantic::from_values(&values);
-            if identity.is_none() {
+            let identity = Semantic::from_batch(&values, failed);
+            if identity.as_ref().is_none_or(|id| id.unreadable != 0) {
                 node["inputRefusal"] = json!("identity_incomplete");
             }
             bytes += serde_json::to_vec(&node).map_or(0, |b| b.len())
@@ -992,9 +1044,10 @@ impl MacBackend {
                     "element process identity changed",
                 ));
             }
-            let values = ffi::copy_multiple(&current.element, &attrs.batch)
+            let (values, failed) = ffi::copy_multiple(&current.element, &attrs.batch)
+                .map(split_batch)
                 .map_err(|error| ax_refusal(error, "identity"))?;
-            let identity = Semantic::from_values(&values).ok_or_else(|| {
+            let identity = Semantic::from_batch(&values, failed).ok_or_else(|| {
                 Refusal::new(
                     "identity_incomplete",
                     "current identity cannot be read in full",
