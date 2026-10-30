@@ -107,6 +107,10 @@ pub fn remove_with_state(
             } else {
                 return Err(e);
             }
+        } else if !req.force && is_dirty(q, repo, &path, &config.worktree.symlinks) != Ok(false) {
+            return Err(
+                "archive hook left files in the worktree; use --force to discard them".to_owned(),
+            );
         }
     }
     reject_nested_worktrees(&entries(q, repo)?, &path)?;

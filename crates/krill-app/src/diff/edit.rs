@@ -489,7 +489,7 @@ fn push_patch_line(buf: &mut String, line: &str) {
 
 /// `raw_patch`는 UTF-8 손실 변환 문자열이다. U+FFFD가 있으면 다시 만든 패치가 파일 바이트와 달라져
 /// 엉뚱한 내용을 적용할 수 있으므로 그 조각을 거부한다. 판정은 쓰이는 조각(헤더+선택 헝크)별이라
-/// 같은 파일의 깨끗한 헝크는 막지 않는다. 정상 UTF-8 `�`와 손실 변환은 문자열만으로 구별되지 않아 둘 다 거부한다.
+/// 같은 파일의 깨끗한 헝크는 막지 않는다. 정상 UTF-8 U+FFFD와 손실 변환은 문자열만으로 구별되지 않아 둘 다 거부한다.
 fn patch_roundtrips(raw_patch: &str) -> bool {
     !raw_patch.contains('\u{FFFD}')
 }

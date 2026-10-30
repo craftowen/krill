@@ -2996,6 +2996,18 @@ mod tests {
     use super::*;
     use krill_proto::orchestration::DispatchStatus;
 
+    #[test]
+    fn reset_rejects_a_run_flag_without_a_value() {
+        let dir = std::env::temp_dir().join(format!("mk-orch-reset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        for bad in [&["--run"][..], &["--run", "--json"][..]] {
+            let err = cmd_reset(&dir, &args(bad)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|arg| (*arg).to_owned()).collect()
     }

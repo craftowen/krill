@@ -130,7 +130,8 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
         #[cfg(windows)]
         let foreground = foreground.or_else(|| crate::sys::session_agent_process(root));
         if let Some(pid) = foreground {
-            // 셸 복귀 래퍼 아래 자식은 이름과 상관없이 실행한 에이전트다.
+            // 래퍼 그룹의 유일한 자식은 에이전트라는 보장이 없다. 래퍼 로그인 셸의 rc(`$(brew shellenv)` 등)도
+            // 같은 그룹에 짧은 자식을 띄우고, 그 종료를 에이전트 종료로 보면 시작 중인 세션이 Exited가 된다.
             let wrapped = raw == Some(root)
                 && pid != root
                 && *t.launched.get_or_insert_with(|| reg.wrapped(id));
@@ -150,15 +151,15 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
                 name
             };
             let name = name.to_ascii_lowercase();
-            let agent = matches!(
-                name.as_str(),
-                "claude" | "codex" | "opencode" | "cursor-agent" | "agy" | "antigravity" | "pi"
-            ) || wrapped
-                || (pid != root
+            let agent = !wrapped
+                && (matches!(
+                    name.as_str(),
+                    "claude" | "codex" | "opencode" | "cursor-agent" | "agy" | "antigravity" | "pi"
+                ) || (pid != root
                     && (matches!(name.as_str(), "node" | "bun") && !status.agent.is_empty()
                         || evidence
                             .is_some_and(|e| e.source == krill_proto::control::Source::Title)
-                            && status.source != Some(krill_proto::control::Source::Process)));
+                            && status.source != Some(krill_proto::control::Source::Process))));
             if agent
                 && let Some(start) = identity
                 && t.process != Some((pid, start))
@@ -184,7 +185,7 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
             }
         }
         // 셸 복귀 래퍼가 로그인 셸로 바뀌었으면(인자에서 `mk-agent`가 사라짐) 에이전트가 끝났다.
-        // 폴링 사이에 끝나 감시에 붙지 못한 에이전트(시작 직후 실패 등)도 여기서 잡는다.
+        // 래퍼 그룹 안의 에이전트는 자식 종료가 아니라 이 전환이나 루트 종료로만 끝난다.
         #[cfg(unix)]
         if raw == Some(root)
             && foreground == raw

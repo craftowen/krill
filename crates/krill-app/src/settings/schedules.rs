@@ -159,9 +159,22 @@ enum Quote {
     Double,
 }
 
-/// 명령 인자 배열을 공백·따옴표가 보존되는 셸 문자열로 직렬화한다.
+/// 명령 인자 배열을 직렬화한다. Windows의 경로·이스케이프 문자는 JSON으로 보존한다.
 #[must_use]
 pub fn format_command_args(args: &[String]) -> String {
+    if cfg!(windows)
+        && args
+            .iter()
+            .any(|arg| arg.contains(['\\', '\'', '"', '\n', '\r', '\t']))
+    {
+        return serde_json::Value::Array(
+            args.iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        )
+        .to_string();
+    }
     args.iter()
         .enumerate()
         .map(|(idx, arg)| {
@@ -200,8 +213,12 @@ pub fn format_command_args(args: &[String]) -> String {
         .join(" ")
 }
 
-/// 셸 따옴표(`'...'`, `"..."`, `\`) 또는 JSON 문자열 배열(`["bash", "-c", "..."]`)을 파싱한다.
+/// 셸 따옴표 또는 JSON 문자열 배열을 파싱한다. Windows에서는 `\`를 경로 문자로 보존한다.
 pub fn parse_command_args(raw: &str) -> Result<Vec<String>, String> {
+    parse_command_args_for(raw, cfg!(windows))
+}
+
+fn parse_command_args_for(raw: &str, windows: bool) -> Result<Vec<String>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(text::SCHEDULE_ERR_COMMAND_EMPTY.get().to_owned());
@@ -224,12 +241,17 @@ pub fn parse_command_args(raw: &str) -> Result<Vec<String>, String> {
     let mut cur = String::new();
     let mut in_token = false;
     let mut quote: Option<Quote> = None;
-    let mut chars = trimmed.chars();
+    let mut chars = trimmed.chars().peekable();
     while let Some(ch) = chars.next() {
         match quote {
             Some(Quote::Single) => {
                 if ch == '\'' {
-                    quote = None;
+                    if windows && chars.peek() == Some(&'\'') {
+                        chars.next();
+                        cur.push('\'');
+                    } else {
+                        quote = None;
+                    }
                 } else {
                     cur.push(ch);
                 }
@@ -237,7 +259,7 @@ pub fn parse_command_args(raw: &str) -> Result<Vec<String>, String> {
             Some(Quote::Double) => {
                 if ch == '"' {
                     quote = None;
-                } else if ch == '\\' {
+                } else if ch == '\\' && !windows {
                     let Some(next) = chars.next() else {
                         return Err(text::SCHEDULE_ERR_COMMAND_ESCAPE.get().to_owned());
                     };
@@ -267,7 +289,7 @@ pub fn parse_command_args(raw: &str) -> Result<Vec<String>, String> {
                 } else if ch == '"' {
                     in_token = true;
                     quote = Some(Quote::Double);
-                } else if ch == '\\' {
+                } else if ch == '\\' && !windows {
                     let Some(next) = chars.next() else {
                         return Err(text::SCHEDULE_ERR_COMMAND_ESCAPE.get().to_owned());
                     };
@@ -1360,5 +1382,66 @@ fn parse_optional_number<T: std::str::FromStr>(raw: &str) -> Result<Option<T>, T
         Ok(None)
     } else {
         raw.trim().parse().map(Some)
+    }
+}
+
+#[cfg(test)]
+mod command_path_tests {
+    use super::*;
+
+    #[test]
+    fn windows_command_paths_keep_backslashes_and_apostrophes() {
+        for raw in [
+            r"C:\tools\runner.exe --flag",
+            r#""C:\tools\runner.exe" --flag"#,
+        ] {
+            assert_eq!(
+                parse_command_args_for(raw, true).unwrap(),
+                [r"C:\tools\runner.exe", "--flag"]
+            );
+        }
+        assert_eq!(
+            parse_command_args_for(r#""\\server\share\tool.exe" "C:\temp\new\report""#, true)
+                .unwrap(),
+            [r"\\server\share\tool.exe", r"C:\temp\new\report"]
+        );
+        assert_eq!(
+            parse_command_args_for("powershell -Command 'it''s literal'", true).unwrap(),
+            ["powershell", "-Command", "it's literal"]
+        );
+    }
+
+    #[test]
+    fn posix_command_and_json_argv_still_preserve_arguments() {
+        assert_eq!(
+            parse_command_args_for(r"echo hello\ world", false).unwrap(),
+            ["echo", "hello world"]
+        );
+        let args = vec![
+            r"C:\tools\runner.exe".to_owned(),
+            "a\nb\t'quoted'".to_owned(),
+        ];
+        let json = serde_json::to_string(&args).unwrap();
+        assert_eq!(parse_command_args_for(&json, true).unwrap(), args);
+        assert_eq!(parse_command_args_for(&json, false).unwrap(), args);
+        assert_eq!(
+            parse_command_args(&format_command_args(&args)).unwrap(),
+            args
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_command_formatter_roundtrips_paths() {
+        let args = vec![
+            r"C:\Program Files\Krill\runner.exe".to_owned(),
+            r"\\server\share\O'Brien\report.txt".to_owned(),
+            "say \"hello\"".to_owned(),
+            String::new(),
+        ];
+        assert_eq!(
+            parse_command_args(&format_command_args(&args)).unwrap(),
+            args
+        );
     }
 }

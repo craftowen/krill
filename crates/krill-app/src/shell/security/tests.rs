@@ -1369,6 +1369,56 @@ fn hidden_confirming_paste_and_following_keys_survive_other_tab_attach(cx: &mut 
     assert!(view.read_with(cx, |shell, _| !shell.paste_queue.has_pending_for(original)));
 }
 
+/// 숨긴 탭의 Live를 버리면 소켓이 닫혀 ACK를 기다리는 입력의 결과를 잃는다. ACK가 정리될 때까지 연결을 유지한다.
+#[gpui::test]
+fn hidden_pane_keeps_its_connection_until_sent_input_is_acknowledged(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("hidden-pending-input"));
+    let original = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    view.update(cx, |shell, cx| {
+        shell.attach_test(original, krill_proto::SessionId(42), ours, cx);
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.send(&typed(b"echo hi\r"), Some(window), cx);
+            shell.new_tab_on_launch_host(cx);
+            shell.sync(cx);
+            assert!(
+                shell.live.contains_key(&original),
+                "a hidden pane awaiting an input ACK keeps its connection"
+            );
+        });
+    });
+    let id = loop {
+        let (kind, body) = krill_proto::ipc::read_frame(&mut peer).unwrap().unwrap();
+        if kind != Input::KIND {
+            continue;
+        }
+        let input = Input::decode(kind, &body).unwrap();
+        if input.bytes == b"echo hi\r" {
+            break input.id;
+        }
+    };
+    let encoded = krill_proto::input::InputAck {
+        id,
+        result: krill_proto::input::InputResult::Applied,
+    }
+    .encode()
+    .unwrap();
+    let (ack_kind, body) = krill_proto::ipc::read_frame(&mut encoded.as_slice())
+        .unwrap()
+        .unwrap();
+    view.update(cx, |shell, cx| {
+        assert!(shell.on_frame(original, ack_kind, &body, cx));
+        shell.sync(cx);
+        assert!(
+            !shell.live.contains_key(&original),
+            "after the ACK the hidden pane releases its connection"
+        );
+    });
+}
+
 #[gpui::test]
 fn cold_read_only_pane_never_accepts_clipboard_confirmation(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("cold-clipboard-guard"));

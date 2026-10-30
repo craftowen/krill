@@ -250,7 +250,7 @@ pub(super) fn no_daemon_supported_with(exe: &Path) -> bool {
     String::from_utf8_lossy(&raw).contains("--no-daemon")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn set_checking_for_test(home: &Path, done_command: Option<&str>) {
     let mut checked = crate::session::lock(&CHECKED);
     let state = match done_command {

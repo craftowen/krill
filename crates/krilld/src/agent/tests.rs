@@ -1380,10 +1380,10 @@ fn pre_trust_all_agents_preserves_existing_configs_and_skips_broad_paths() {
         "[projects.\"{ws_canon_str}\"]\ntrust_level = \"trusted\""
     )));
 
-    // 기존 섹션의 untrusted 값을 trusted로 갱신하는지 확인.
+    // 사용자가 명시한 untrusted 값은 뒤집지 않는다.
     let (updated, changed) = super::upsert_codex_project_trust(&toml_text, "/other");
-    assert!(changed);
-    assert!(updated.contains("[projects.\"/other\"]\ntrust_level = \"trusted\""));
+    assert!(!changed);
+    assert_eq!(updated, toml_text);
 
     // 4. Cursor & Antigravity 통합 호출(pre_trust_all_agents_in) 검증.
     let ws2 = dir.join("worktrees/repo/feat-two");

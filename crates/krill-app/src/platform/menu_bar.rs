@@ -165,6 +165,9 @@ fn icon(cx: &App) -> Option<Retained<AnyObject>> {
         renderer.parse_svg(&bytes).ok()?
     };
     let edge = crate::ui::MENU_BAR_ICON_SIZE;
+    let bitmap_edge = isize::try_from(edge).ok()?;
+    let row_bytes = bitmap_edge.checked_mul(4)?;
+    let byte_len = usize::try_from(row_bytes.checked_mul(bitmap_edge)?).ok()?;
     let image = renderer
         .render_parsed(
             &svg,
@@ -172,27 +175,39 @@ fn icon(cx: &App) -> Option<Retained<AnyObject>> {
         )
         .ok()?;
     let pixels = image.as_bytes(0)?;
+    if pixels.len() != byte_len {
+        return None;
+    }
     let bitmap_class = AnyClass::get(c"NSBitmapImageRep")?;
     let color = super::macos::cf_string("NSDeviceRGBColorSpace")?;
     // SAFETY: alloc이 init까지 소유할 NSBitmapImageRep를 반환한다.
     let bitmap: *mut AnyObject = unsafe { msg_send![bitmap_class, alloc] };
-    // SAFETY: planes=nil이면 AppKit이 edge*edge*4 RGBA 영역을 할당한다. 크기는 고정 UI 토큰이다.
+    // bytesPerRow=0은 AppKit이 행을 패딩하므로 조밀한 gpui 버퍼와 같은 행 간격을 명시한다.
+    // SAFETY: planes=nil이면 AppKit이 지정한 행 간격과 높이의 4채널 비트맵 영역을 할당한다.
     let bitmap: *mut AnyObject = unsafe {
         msg_send![bitmap, initWithBitmapDataPlanes: std::ptr::null_mut::<*mut u8>(),
-            pixelsWide: isize::try_from(edge).ok()?, pixelsHigh: isize::try_from(edge).ok()?,
+            pixelsWide: bitmap_edge, pixelsHigh: bitmap_edge,
             bitsPerSample: 8_isize, samplesPerPixel: 4_isize, hasAlpha: true,
             isPlanar: false, colorSpaceName: color.cast::<AnyObject>(),
-            bytesPerRow: 0_isize, bitsPerPixel: 32_isize]
+            bytesPerRow: row_bytes, bitsPerPixel: 32_isize]
     };
     super::macos::cf_release(color);
     // SAFETY: init 계열이 반환한 +1 소유권을 RAII로 옮긴다.
     let bitmap = unsafe { Retained::from_raw(bitmap) }?;
-    // SAFETY: 비 planar bitmapData가 위에서 할당한 연속 RGBA 영역을 반환한다.
+    // SAFETY: bitmap은 위에서 생성한 살아 있는 NSBitmapImageRep다.
+    let stride: isize = unsafe { msg_send![&*bitmap, bytesPerRow] };
+    // SAFETY: 비 planar bitmap의 bytesPerPlane은 할당된 단일 평면의 바이트 수다.
+    let capacity: isize = unsafe { msg_send![&*bitmap, bytesPerPlane] };
+    if stride != row_bytes || usize::try_from(capacity).ok()? < byte_len {
+        return None;
+    }
+    // SAFETY: 비 planar bitmapData가 위에서 할당한 연속 4채널 영역을 반환한다.
     let data: *mut u8 = unsafe { msg_send![&*bitmap, bitmapData] };
     if data.is_null() {
         return None;
     }
-    // SAFETY: edge*edge*4 바이트가 할당돼 gpui의 같은 크기 이미지와 길이가 일치한다. 영역이 겹치지 않는다.
+    // gpui의 검정 모노 BGRA는 RGB가 0이어서 AppKit RGBA에서도 같은 알파 마스크다.
+    // SAFETY: 입력 길이·행 간격·할당 크기를 확인했다. 별도 할당된 두 영역은 겹치지 않는다.
     unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), data, pixels.len()) };
     // SAFETY: 유효한 bitmap의 TIFFRepresentation은 이 스코프에서 유효한 NSData다.
     let tiff: *mut AnyObject = unsafe { msg_send![&*bitmap, TIFFRepresentation] };
@@ -207,3 +222,6 @@ fn icon(cx: &App) -> Option<Retained<AnyObject>> {
     let (): () = unsafe { msg_send![&*image, setTemplate: true] };
     Some(image)
 }
+
+#[cfg(test)]
+mod tests;

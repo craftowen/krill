@@ -1577,17 +1577,11 @@ pub(crate) fn upsert_codex_project_trust(existing: &str, project_path: &str) -> 
         if let Some(slice) = lines.get_mut((start + 1)..end) {
             for line in slice {
                 let without_comment = line.split('#').next().unwrap_or("").trim();
-                if let Some((key, val)) = without_comment.split_once('=')
+                if let Some((key, _)) = without_comment.split_once('=')
                     && key.trim() == "trust_level"
                 {
-                    let val = val.trim();
-                    if val == "\"trusted\"" || val == "'trusted'" {
-                        return (existing.to_owned(), false);
-                    }
-                    trust_line.clone_into(line);
-                    let mut out = lines.join("\n");
-                    out.push('\n');
-                    return (out, true);
+                    // "untrusted" 같은 기존 값은 사용자의 명시적 선택이라 뒤집지 않는다.
+                    return (existing.to_owned(), false);
                 }
             }
         }

@@ -18,6 +18,7 @@ impl Shell {
         item: &ChatItem,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let key = (self.layout.host(pane).clone(), session);
         let palette = ui::palette(cx);
         let border = palette.border;
         let fg = palette.foreground;
@@ -31,7 +32,7 @@ impl Shell {
         let expanded = self
             .chat
             .logs
-            .get(&session)
+            .get(&key)
             .is_some_and(|log| log.expanded.contains(&abs_idx));
         let role_label = match item.kind {
             ChatItemKind::User => ctext::YOU.get(),
@@ -168,7 +169,11 @@ impl Shell {
                         .ghost()
                         .xsmall()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(log) = this.chat.logs.get_mut(&session) {
+                            if let Some(log) = this
+                                .chat
+                                .logs
+                                .get_mut(&(this.layout.host(pane).clone(), session))
+                            {
                                 if !log.expanded.remove(&abs_idx) {
                                     log.expanded.insert(abs_idx);
                                 }
@@ -216,7 +221,7 @@ impl Shell {
                                         SharedString::from(format!(
                                             "chat-markdown-{}-{}-{abs_idx}-{code_idx}-{:x}",
                                             pane.get(),
-                                            self.chat.logs.get(&session).map_or(0, |log| log.epoch),
+                                            self.chat.logs.get(&key).map_or(0, |log| log.epoch),
                                             hash.finish()
                                         ))
                                     },
@@ -308,12 +313,12 @@ impl Shell {
         let submission = self
             .chat
             .logs
-            .get(&session)
+            .get(&key)
             .and_then(|log| log.submissions.get(&answer_key));
         let current = self.chat_request_is_current(&request, cx);
         let disabled = !current
             || submission.is_some_and(Submission::blocks_input)
-            || self.chat.prompt_tasks.contains_key(&session);
+            || self.chat.prompt_tasks.contains_key(&key);
         if matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission) {
             let status = if !current
                 && !matches!(
@@ -341,7 +346,7 @@ impl Shell {
             let selected_set = self
                 .chat
                 .logs
-                .get(&session)
+                .get(&key)
                 .and_then(|l| l.multi_selected.get(&answer_key))
                 .cloned()
                 .unwrap_or_default();
@@ -536,8 +541,9 @@ impl Shell {
             return None;
         }
         let session = self.layout.session(pane)?;
+        let key = (self.layout.host(pane).clone(), session);
         if self.layout.focused() == Some(pane)
-            && matches!(self.chat.focus_pending, Some(ChatFocus::Terminal(id)) if id == session)
+            && matches!(&self.chat.focus_pending, Some(ChatFocus::Terminal(id)) if *id == key)
         {
             window.focus(&self.focus, cx);
             self.chat.focus_pending = None;
@@ -546,15 +552,15 @@ impl Shell {
             return None;
         }
         self.ensure_chat_poll_timer(cx);
-        if !self.chat.logs.contains_key(&session)
-            && !self.chat.poll_failed.contains(&session)
+        if !self.chat.logs.contains_key(&key)
+            && !self.chat.poll_failed.contains(&key)
             && self.target_for_host(self.layout.host(pane)).is_some()
         {
             self.poll_session_chat(pane, session, cx);
         }
-        let input_state = self.ensure_chat_input(session, window, cx);
+        let input_state = self.ensure_chat_input(key.clone(), window, cx);
         if self.layout.focused() == Some(pane)
-            && matches!(self.chat.focus_pending, Some(ChatFocus::Composer(id)) if id == session)
+            && matches!(&self.chat.focus_pending, Some(ChatFocus::Composer(id)) if *id == key)
         {
             input_state.update(cx, |state, cx| state.focus(window, cx));
             self.chat.focus_pending = None;
@@ -565,7 +571,7 @@ impl Shell {
         let border = palette.border;
         let muted_fg = palette.muted_foreground;
 
-        let log = self.chat.logs.get(&session);
+        let log = self.chat.logs.get(&key);
         let agent_label = log
             .and_then(|l| (!l.agent.is_empty()).then_some(l.agent.as_str()))
             .unwrap_or("agent")
@@ -688,7 +694,7 @@ impl Shell {
             }
         }
 
-        let composer = self.render_chat_composer(pane, session, &input_state, cx);
+        let composer = self.render_chat_composer(pane, key.clone(), &input_state, cx);
 
         let live_line = self.pane_live_status_line(pane);
         let strip_label = match live_line {
@@ -778,7 +784,7 @@ impl Shell {
                 .flex_col()
                 .bg(bg)
                 .child(feed)
-                .children(self.render_chat_prompt_notices(session, cx))
+                .children(self.render_chat_prompt_notices(&key, cx))
                 .child(composer)
                 .child(strip)
                 .into_any_element(),

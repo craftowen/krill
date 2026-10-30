@@ -502,7 +502,7 @@ fn file_created_by_archive_hook_is_not_force_deleted() {
     )
     .unwrap();
     let err = f.remove(&w, false).unwrap_err();
-    assert!(err.contains("untracked"), "{err}");
+    assert!(err.contains("archive hook left files"), "{err}");
     assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late");
     assert!(
         fs::symlink_metadata(wt.join("link"))
@@ -511,6 +511,25 @@ fn file_created_by_archive_hook_is_not_force_deleted() {
             .is_symlink(),
         "failed removal must keep configured symlinks"
     );
+}
+
+#[test]
+fn ignored_file_created_by_archive_hook_is_not_deleted() {
+    let script = "printf late > .env";
+    let f = Fixture::new(
+        "rm-late-ignored",
+        &format!("[worktree]\narchive = '{script}'\n"),
+    );
+    let w = f.created("late-ignored", Setup::Skip).0;
+    let wt = path(&w);
+    remember(
+        &f.trust,
+        &digest(&fs::canonicalize(&f.repo).unwrap(), script),
+    )
+    .unwrap();
+    let err = f.remove(&w, false).unwrap_err();
+    assert!(err.contains("archive hook left files"), "{err}");
+    assert_eq!(fs::read_to_string(wt.join(".env")).unwrap(), "late");
 }
 
 fn committed_symlink_fixture(tag: &str, archive: Option<&str>) -> Fixture {
@@ -549,7 +568,7 @@ fn committed_symlink_does_not_let_late_files_be_force_deleted() {
     let w = f.created("committed-link-late", Setup::Skip).0;
     let wt = path(&w);
     let err = f.remove(&w, false).unwrap_err();
-    assert!(err.contains("untracked"), "{err}");
+    assert!(err.contains("archive hook left files"), "{err}");
     assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late");
     assert_eq!(
         fs::read_link(wt.join("CLAUDE.md")).unwrap(),

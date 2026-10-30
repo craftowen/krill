@@ -267,13 +267,7 @@ fn split_active_sessions(
         return Ok((Vec::new(), Vec::new()));
     }
     let cwds = crate::session::running_session_cwds()?;
-    let (idle, busy): (Vec<_>, Vec<_>) = matched.iter().cloned().partition(|c| {
-        let wt = std::fs::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
-        !cwds.iter().any(|cwd| {
-            let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone());
-            cwd.starts_with(&wt)
-        })
-    });
+    let (idle, busy) = split_active_session_cwds(matched, &cwds);
     let skipped = busy
         .into_iter()
         .map(|item| CleanupItemOutcome {
@@ -287,6 +281,19 @@ fn split_active_sessions(
         })
         .collect();
     Ok((idle, skipped))
+}
+
+fn split_active_session_cwds(
+    matched: &[WorktreeCleanupCandidate],
+    cwds: &[PathBuf],
+) -> (Vec<WorktreeCleanupCandidate>, Vec<WorktreeCleanupCandidate>) {
+    matched.iter().cloned().partition(|c| {
+        let wt = std::fs::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
+        !cwds.iter().any(|cwd| {
+            let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone());
+            cwd.starts_with(&wt)
+        })
+    })
 }
 
 fn resolve_repos(
@@ -449,6 +456,45 @@ mod tests {
     use std::process::Command;
 
     use krill_proto::worktree_space::{CleanupPrState, SECS_PER_DAY};
+
+    #[test]
+    fn worktrees_holding_a_running_session_are_split_off() {
+        let root = std::env::temp_dir().join(format!("mk-cleanup-busy-{}", std::process::id()));
+        let (busy, idle) = (root.join("busy"), root.join("idle"));
+        fs::create_dir_all(busy.join("sub")).unwrap();
+        fs::create_dir_all(&idle).unwrap();
+        let candidate = |path: &Path| super::WorktreeCleanupCandidate {
+            repo: root.clone(),
+            repo_name: String::new(),
+            path: path.to_path_buf(),
+            name: String::new(),
+            branch: None,
+            is_main: false,
+            locked: false,
+            dirty: false,
+            dirty_count: 0,
+            merged_into_main: true,
+            pr_state: CleanupPrState::Merged,
+            pr_number: None,
+            last_active_secs: 0,
+            idle_days: 0,
+            disk_bytes: 0,
+            artifact_bytes: 0,
+        };
+        let (keep, skip) = super::split_active_session_cwds(
+            &[candidate(&busy), candidate(&idle)],
+            &[busy.join("sub"), root.join("elsewhere")],
+        );
+        assert_eq!(
+            keep.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+            [idle]
+        );
+        assert_eq!(
+            skip.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+            [busy]
+        );
+        fs::remove_dir_all(&root).ok();
+    }
 
     use super::super::space::record_worktree_metadata;
 

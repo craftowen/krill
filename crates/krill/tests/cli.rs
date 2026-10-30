@@ -1257,6 +1257,28 @@ launch = ["/bin/sh", "-c", "exit 3"]
     assert!(!ls_has_session(&d.ok(&["ls"]), &sid));
 }
 
+/// 셸 복귀 래퍼의 로그인 셸 rc는 래퍼와 같은 그룹에 짧은 자식(`$(...)`, `path_helper`)을 띄운다.
+/// 그 자식이 끝나도 에이전트는 끝나지 않았다. 래퍼가 로그인 셸로 넘어갈 때만 Exited다.
+#[test]
+fn wrapper_startup_children_do_not_end_the_agent() {
+    let d = Daemon::new("wrapper-startup");
+    // 래퍼 argv 모양(`-c` 스크립트 다음 `mk-agent`)이라 krilld가 래퍼 세션으로 본다.
+    let script = "i=0; while [ $i -lt 10 ]; do /bin/sleep 0.05; i=$((i + 1)); done; \
+                  stty -echo; printf 'wrapper-ready\\n'; IFS= read -r line; exec /bin/sh";
+    let id = d.ok(&[
+        "new", "--", "/bin/sh", "-u", "-f", "-c", script, "mk-agent", "hint",
+    ]);
+    let id = id.trim();
+    d.wait_text(id, "wrapper-ready");
+    let early = d.run(&["wait", id, "--for", "exited", "--timeout", "1"]);
+    assert!(
+        String::from_utf8_lossy(&early.stderr).contains("wait timed out"),
+        "startup children must not mark the agent exited: {early:?}"
+    );
+    d.ok(&["send", id, "--enter", "--", "done"]);
+    d.ok(&["wait", id, "--for", "exited", "--timeout", "5"]);
+}
+
 /// 세션이 먼저 사라져도 `worker-stop`/`worker-release`는 '이미 종료됨'으로 정산한다(C1).
 /// 예전에는 capture 실패 지점에서 매번 실패해 고스트 Active dispatch가 영구히 남았다.
 #[test]

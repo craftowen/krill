@@ -1113,6 +1113,8 @@ Host dev-box
         let list = add_host(Some(&dir), "회사 서버", "owen@10.0.0.6", None, None).unwrap();
         assert_eq!(list.len(), 2);
         assert_ne!(list[0].id, list[1].id);
+        let list = add_host(Some(&dir), "회사 서버", "owen@10.0.0.6", None, None).unwrap();
+        assert_eq!(list.len(), 2, "re-adding the same address updates in place");
         let args = list[0].test_args();
         let at = args.iter().position(|a| a == "owen@10.0.0.5").unwrap();
         assert_eq!(args[at - 1], "--");
