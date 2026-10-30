@@ -2220,6 +2220,10 @@ impl Shell {
             (Kind::ToggleSidebar, jtext::ACT_TOGGLE_SIDEBAR.get()),
             (Kind::ToggleExplorer, jtext::ACT_TOGGLE_EXPLORER.get()),
             (Kind::ToggleSearch, jtext::ACT_TOGGLE_SEARCH.get()),
+            (
+                Kind::ImportTerminalThemes,
+                jtext::ACT_IMPORT_TERMINAL_THEMES.get(),
+            ),
         ]
         .into_iter()
         .map(|(kind, label)| jump::ActionEntry::new(kind, label.to_owned()))
@@ -2346,6 +2350,18 @@ impl Shell {
             jump::ActionKind::ToggleSidebar => self.toggle_sidebar(cx),
             jump::ActionKind::ToggleExplorer => self.toggle_explorer(window, cx),
             jump::ActionKind::ToggleSearch => self.toggle_workspace_search(window, cx),
+            jump::ActionKind::ImportTerminalThemes => {
+                let imported = krill_app::settings::import_terminal_themes(cx);
+                cx.spawn(async move |this, cx| {
+                    let message = imported.await;
+                    this.update(cx, |this, cx| {
+                        this.notice = Some(message);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             jump::ActionKind::QuickCommand(index) => {
                 if let Some(command) = krill_app::settings::current(cx)
                     .quick_commands

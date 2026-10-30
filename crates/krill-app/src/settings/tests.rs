@@ -8368,91 +8368,48 @@ fn terminal_themes_toml_roundtrip_and_mode_resolution() {
     assert!(reparsed_cleared.terminal_custom_themes.is_empty());
 }
 
-/// OWE-956: 터미널 탭에서 테마 목록·모드 전환·미리보기·삭제가 동작한다.
+/// 터미널 테마가 앱 테마의 짝이 아니면 맞추기 버튼이 나오고, 저장값은 사용자가 누를 때만 바뀐다.
 #[gpui::test]
-fn terminal_tab_renders_themes_preview_and_selects_theme(cx: &mut TestAppContext) {
-    let d = dir("owe956-terminal-themes-ui");
+fn general_tab_offers_matching_an_unpaired_terminal_theme(cx: &mut TestAppContext) {
+    let d = dir("theme-match");
     init(cx, &d);
-    let custom = crate::ui::parse_warp_theme_yaml(
-        "name: My Warp Dark\nbackground: '#101418'\nforeground: '#e0e4e8'\nterminal_colors:\n  normal:\n    green: '#22cc66'\n",
-        "my-warp.yaml",
-    )
-    .unwrap();
-    cx.update(|cx| {
-        edit(cx, move |s| {
-            s.terminal_custom_themes.push(custom.clone());
-        });
-    });
-    let (view, vcx) = cx.add_window_view(|_, cx| {
-        let mut v = SettingsView::new(cx);
-        v.tab = AdminTab::Terminal;
-        v.terminal_theme_target = Some(ThemeMode::Dark);
-        v
-    });
-    vcx.simulate_resize(size(px(1280.), px(4000.)));
+    let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(2400.)));
     vcx.run_until_parked();
+    assert!(vcx.debug_bounds("ui-theme-dark-match").is_none());
+    assert!(vcx.debug_bounds("ui-theme-light-match").is_none());
 
-    for sel in [
-        "terminal-section-themes",
-        "terminal-theme-picker-card",
-        "terminal-theme-preview-card",
-        "terminal-theme-custom-0",
-        "terminal-theme-builtin-0",
-    ] {
-        assert!(vcx.debug_bounds(sel).is_some(), "missing {sel}");
-    }
-
-    let click_sel = |vcx: &mut gpui::VisualTestContext, sel: &'static str| {
-        let b = vcx
-            .debug_bounds(sel)
-            .unwrap_or_else(|| panic!("missing selector {sel}"));
-        vcx.simulate_click(b.center(), gpui::Modifiers::default());
-        vcx.run_until_parked();
-    };
-
-    // 다크 모드에서 가져온 테마를 고른다.
-    click_sel(vcx, "terminal-theme-custom-0");
-    vcx.update(|_, cx| {
-        assert_eq!(current(cx).terminal_theme_dark, "custom:warp:my-warp-dark");
+    vcx.update(|window, cx| {
+        edit(cx, |s| {
+            s.terminal_theme_dark = "custom:warp:cyber-neon".into();
+            s.terminal_use_separate_light_theme = false;
+        });
+        window.draw(cx).clear(cx);
     });
-
-    // 삭제하면 다크 테마가 기본값으로 돌아간다.
-    click_sel(vcx, "terminal-theme-delete-0");
+    vcx.run_until_parked();
     vcx.update(|_, cx| {
-        assert!(current(cx).terminal_custom_themes.is_empty());
+        let s = current(cx);
         assert_eq!(
-            current(cx).terminal_theme_dark,
-            crate::ui::DEFAULT_TERMINAL_THEME_DARK
+            s.unpaired_terminal_theme(ThemeMode::Dark),
+            Some("custom:warp:cyber-neon")
         );
+        assert!(s.unpaired_terminal_theme(ThemeMode::Light).is_some());
     });
-
-    // 라이트로 바꾸면 "다크 모드와 동일하게" 행이 나온다(기본은 분리 = 꺼짐).
-    click_sel(vcx, "terminal-theme-mode-light");
-    assert!(vcx.debug_bounds("terminal-theme-match-dark-row").is_some());
-    vcx.update(|_, cx| {
-        assert_eq!(view.read(cx).terminal_theme_target, Some(ThemeMode::Light));
-        assert!(current(cx).terminal_use_separate_light_theme);
-    });
-
-    click_sel(vcx, "terminal-theme-match-dark-toggle");
-    vcx.update(|_, cx| {
-        assert!(!current(cx).terminal_use_separate_light_theme);
-    });
-
-    // 라이트 내장 테마를 고르면 분리가 다시 켜지고 그 테마가 저장된다.
-    let (light_idx, light) = crate::ui::BUILTIN_TERMINAL_THEMES
-        .iter()
-        .enumerate()
-        .find(|(_, t)| !t.is_dark && t.name != crate::ui::DEFAULT_TERMINAL_THEME_LIGHT)
-        .unwrap();
-    let light_sel: &'static str = format!("terminal-theme-builtin-{light_idx}").leak();
-    click_sel(vcx, light_sel);
+    let at = vcx.debug_bounds("ui-theme-light-match").unwrap().center();
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
     vcx.update(|_, cx| {
         let s = current(cx);
         assert!(s.terminal_use_separate_light_theme);
-        assert_eq!(s.terminal_theme_light, light.name);
+        assert_eq!(s.unpaired_terminal_theme(ThemeMode::Light), None);
+        assert_eq!(s.terminal_theme_dark, "custom:warp:cyber-neon");
     });
-
+    let at = vcx.debug_bounds("ui-theme-dark-match").unwrap().center();
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).unpaired_terminal_theme(ThemeMode::Dark), None);
+    });
     fs::remove_dir_all(d).ok();
 }
 
@@ -9128,51 +9085,6 @@ fn indexed_duplicate_labels_match_existing_identity_and_host_preference() {
 }
 
 #[gpui::test]
-fn custom_theme_swatch_cache_updates_same_id_and_discards_removed_entries(cx: &mut TestAppContext) {
-    let d = dir("theme-swatch-cache");
-    init(cx, &d);
-    let custom = crate::ui::parse_warp_theme_yaml(
-        "name: Cache Fixture\nbackground: '#101418'\nforeground: '#e0e4e8'\nterminal_colors:\n  normal:\n    black: '#000000'\n",
-        "cache.yaml",
-    )
-    .unwrap();
-    cx.update(|cx| {
-        edit(cx, move |settings| {
-            settings.terminal_custom_themes = vec![custom.clone()];
-        });
-    });
-    let (view, vcx) = cx.add_window_view(|_, cx| {
-        let mut view = SettingsView::new(cx);
-        view.tab = AdminTab::Terminal;
-        view.terminal_theme_target = Some(ThemeMode::Dark);
-        view
-    });
-    vcx.run_until_parked();
-    vcx.update(|_, cx| assert_eq!(view.read(cx).terminal_theme_swatches.len(), 1));
-    vcx.update(|_, cx| {
-        edit(cx, |settings| {
-            settings.terminal_custom_themes[0].background = "#112233".into();
-        });
-    });
-    vcx.run_until_parked();
-    vcx.update(|_, cx| {
-        assert_eq!(
-            view.read(cx)
-                .terminal_theme_swatches
-                .get(&0)
-                .unwrap()
-                .0
-                .background,
-            "#112233"
-        );
-    });
-    vcx.update(|_, cx| edit(cx, |settings| settings.terminal_custom_themes.clear()));
-    vcx.run_until_parked();
-    vcx.update(|_, cx| assert!(view.read(cx).terminal_theme_swatches.is_empty()));
-    fs::remove_dir_all(d).ok();
-}
-
-#[gpui::test]
 fn external_workflow_reload_preserves_unsaved_hooks_and_symlink(cx: &mut TestAppContext) {
     let d = dir("workflow-draft-revalidate");
     init(cx, &d);
@@ -9451,25 +9363,6 @@ fn ui_audit_settings_rename_focus_and_escape_preserve_account(cx: &mut TestAppCo
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
     vcx.update(|_, cx| assert!(view.read(cx).rename.is_none()));
-    fs::remove_dir_all(d).ok();
-}
-
-#[gpui::test]
-fn ui_audit_settings_theme_picker_stacks_in_narrow_content(cx: &mut TestAppContext) {
-    let d = dir("ui-audit-theme");
-    init(cx, &d);
-    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
-    vcx.simulate_resize(size(px(800.), px(700.)));
-    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Terminal, cx)));
-    vcx.run_until_parked();
-    let picker = vcx
-        .debug_bounds("terminal-theme-picker-card")
-        .expect("picker");
-    let preview = vcx
-        .debug_bounds("terminal-theme-preview-card")
-        .expect("preview");
-    assert!(preview.origin.x >= picker.origin.x && preview.right() <= picker.right());
-    assert!(preview.size.width <= picker.size.width);
     fs::remove_dir_all(d).ok();
 }
 
