@@ -71,40 +71,31 @@ pub fn run_cleanup(args: &[OsString]) -> ExitCode {
     let all_candidates = discover_cleanup_candidates(&repos, state_dir.as_deref(), now_unix_secs());
     let matched = select_candidates(&all_candidates, &parsed);
 
+    let (idle, skipped) = match split_active_sessions(&matched) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!(
+                "worktree cleanup: cannot check for running sessions ({e}); nothing was removed"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     let preview = parsed.preview();
-    let summary = if preview || matched.is_empty() {
+    let mut summary = if preview || idle.is_empty() {
         CleanupSummary::default()
     } else {
         let paths = Paths::dev().ok();
-        let (idle, busy) = match split_active_sessions(&matched) {
-            Ok(split) => split,
-            Err(e) => {
-                eprintln!(
-                    "worktree cleanup: cannot check for running sessions ({e}); nothing was removed"
-                );
-                return ExitCode::FAILURE;
-            }
-        };
-        let mut summary = run_cleanup_engine(
+        run_cleanup_engine(
             &idle,
             !parsed.filter.exclude_dirty,
             paths.as_ref(),
             state_dir.as_deref(),
-        );
-        for item in busy {
-            summary.failed_count = summary.failed_count.saturating_add(1);
-            summary.items.push(CleanupItemOutcome {
-                path: item.path.clone(),
-                branch: item.branch.clone(),
-                removed: false,
-                branch_deleted: false,
-                freed_bytes: 0,
-                warnings: Vec::new(),
-                error: Some("worktree has a running session; close it first".to_owned()),
-            });
-        }
-        summary
+        )
     };
+    if !preview {
+        summary.failed_count = summary.failed_count.saturating_add(skipped.len());
+    }
+    summary.items.extend(skipped);
 
     if parsed.json {
         let out = CleanupReport {
@@ -135,13 +126,21 @@ pub fn run_cleanup(args: &[OsString]) -> ExitCode {
     if preview {
         println!("dry-run: {} worktree(s) matched", matched.len());
         for c in &matched {
+            let skipped = summary
+                .items
+                .iter()
+                .find(|item| item.path == c.path)
+                .and_then(|item| item.error.as_deref());
             println!(
-                "  {} (branch: {}, pr: {}, idle: {}d, size: {})",
+                "  {} (branch: {}, pr: {}, idle: {}d, size: {}){}",
                 c.path.display(),
                 c.branch.as_deref().unwrap_or("detached"),
                 c.pr_state.as_str(),
                 c.idle_days,
                 format_bytes(c.disk_bytes),
+                skipped
+                    .map(|e| format!(" skipped: {e}"))
+                    .unwrap_or_default(),
             );
         }
         if !parsed.dry_run {
@@ -259,19 +258,35 @@ fn select_candidates(
     matched
 }
 
-/// 실행 중인 세션의 cwd가 안에 있는 워크트리는 지우지 않는다. 데몬이 있는데 세션을 답하지 못하면 오류다
-/// (빈 목록으로 보면 가드가 꺼진다).
+/// 실행 중인 세션의 cwd가 안에 있는 워크트리를 건너뛸 항목(사유 포함)으로 가른다. 미리보기와 실행이 같이 쓴다.
+/// 데몬이 있는데 세션을 답하지 못하면 오류다(빈 목록으로 보면 가드가 꺼진다).
 fn split_active_sessions(
     matched: &[WorktreeCleanupCandidate],
-) -> Result<(Vec<WorktreeCleanupCandidate>, Vec<WorktreeCleanupCandidate>), String> {
+) -> Result<(Vec<WorktreeCleanupCandidate>, Vec<CleanupItemOutcome>), String> {
+    if matched.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let cwds = crate::session::running_session_cwds()?;
-    Ok(matched.iter().cloned().partition(|c| {
+    let (idle, busy): (Vec<_>, Vec<_>) = matched.iter().cloned().partition(|c| {
         let wt = std::fs::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
         !cwds.iter().any(|cwd| {
             let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone());
             cwd.starts_with(&wt)
         })
-    }))
+    });
+    let skipped = busy
+        .into_iter()
+        .map(|item| CleanupItemOutcome {
+            path: item.path,
+            branch: item.branch,
+            removed: false,
+            branch_deleted: false,
+            freed_bytes: 0,
+            warnings: Vec::new(),
+            error: Some("worktree has a running session; close it first".to_owned()),
+        })
+        .collect();
+    Ok((idle, skipped))
 }
 
 fn resolve_repos(

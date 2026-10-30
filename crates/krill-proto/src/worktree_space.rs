@@ -349,6 +349,6 @@ pub struct CleanupReport {
     pub dry_run: bool,
     /// 필터(와 `--worktree` 지정 시 그 경로 집합)에 일치한 후보.
     pub candidates: Vec<WorktreeCleanupCandidate>,
-    /// 실행 결과(`dry_run`이면 비어 있다).
+    /// 실행 결과(`dry_run`이면 실행 중인 세션 때문에 건너뛸 항목만 사유와 함께 담고 개수는 0이다).
     pub summary: CleanupSummary,
 }
