@@ -1631,12 +1631,13 @@ fn check_and_stage_with(
         reason = "Escaped path representations keep distinct update-flight keys unambiguous"
     )]
     let key = format!(
-        "{:?}|{:?}|{}|{}|{}",
+        "{:?}|{:?}|{}|{}|{}|{}",
         bundle,
         state_dir,
         cfg.url,
         cfg.channel.as_str(),
-        cfg.public_key
+        cfg.public_key,
+        skip_rolled_back
     );
     single_flight(&key, || {
         let manifest = fetch_manifest(&cfg.url)?;
