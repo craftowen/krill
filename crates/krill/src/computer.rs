@@ -64,6 +64,13 @@ pub(super) struct CommonWindowOpts {
 }
 
 pub fn run(raw: &[OsString]) -> ExitCode {
+    let started = std::time::Instant::now();
+    let result = run_inner(raw);
+    engine::emit_timing(started);
+    result
+}
+
+fn run_inner(raw: &[OsString]) -> ExitCode {
     let Ok(args) = raw
         .iter()
         .cloned()
@@ -428,11 +435,13 @@ fn cmd_get_app_state(args: &[String]) -> Result<(), CliError> {
         )
         .map_err(CliError::Runtime)?
     };
-    if common.json {
-        return print_json(&snapshot_json(&snapshot, &common)?);
-    }
-    print_snapshot_human(&snapshot);
-    Ok(())
+    engine::timed("output", || {
+        if common.json {
+            return print_json(&snapshot_json(&snapshot, &common)?);
+        }
+        print_snapshot_human(&snapshot);
+        Ok(())
+    })
 }
 
 pub(super) fn print_snapshot_human(snap: &AppStateSnapshot) {
@@ -449,6 +458,11 @@ pub(super) fn print_snapshot_human(snap: &AppStateSnapshot) {
         );
     }
     println!("snapshot   {}", snap.snapshot_id);
+    match (&snap.path, &snap.fallback_reason) {
+        (Some(path), Some(reason)) => println!("path       {path} (fallback: {reason})"),
+        (Some(path), None) => println!("path       {path}"),
+        _ => {}
+    }
     println!(
         "elements   {} interactive / {} total (focused: {:?})",
         snap.interactive_count, snap.element_count, snap.focused_element_id
@@ -506,7 +520,7 @@ pub(super) fn ensure_current_snapshot(
     if engine::is_native_snapshot(&before) {
         if common.restore_window {
             return Err(CliError::Runtime(
-                "native snapshots cannot restore windows; observe without KRILL_COMPUTER_ENGINE=native"
+                "native snapshots cannot restore windows; observe with get-app-state --restore-window first"
                     .to_owned(),
             ));
         }
@@ -526,7 +540,10 @@ pub(super) fn ensure_current_snapshot(
     .map_err(CliError::Runtime)?;
     engine::validate_snapshot_identity(&before, &fresh).map_err(CliError::Runtime)?;
     if let (Some(original), Some(current)) = (&before.root, &fresh.root) {
-        engine::validate_structure(original, current).map_err(CliError::Runtime)?;
+        engine::timed("identityJxa", || {
+            engine::validate_structure(original, current)
+        })
+        .map_err(CliError::Runtime)?;
     } else {
         return Err(CliError::Runtime("AX observation unavailable".to_owned()));
     }
@@ -584,9 +601,14 @@ pub(super) fn observe_after_action(
 }
 
 pub(super) fn print_action_result(res: &ActionResultPayload, json: bool) -> Result<(), CliError> {
+    let path = engine::action_path();
     if json {
         let mut value = serde_json::to_value(res).map_err(|e| CliError::Runtime(e.to_string()))?;
         value["contract"] = serde_json::json!("computer/2");
+        if let Some((path, reason)) = &path {
+            value["path"] = serde_json::json!(path);
+            value["fallbackReason"] = serde_json::json!(reason);
+        }
         if let Some(snapshot) = &res.app_state {
             value["appState"] = snapshot_json(snapshot, &CommonWindowOpts::default())?;
         }
@@ -599,6 +621,12 @@ pub(super) fn print_action_result(res: &ActionResultPayload, json: bool) -> Resu
         if res.ok { "ok" } else { "failed" },
         res.verification.status
     );
+    if let Some((path, reason)) = &path {
+        match reason {
+            Some(reason) => println!("path       {path} (fallback: {reason})"),
+            None => println!("path       {path}"),
+        }
+    }
     if let Some(id) = res.target_reference_id {
         println!("element    #{id}");
     }

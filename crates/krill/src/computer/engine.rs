@@ -43,7 +43,9 @@ fn unique_token() -> String {
 /// Scope is derived from the actual parent process, never --session or environment claims.
 pub fn caller_scope() -> String {
     static SCOPE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SCOPE.get_or_init(compute_caller_scope).clone()
+    SCOPE
+        .get_or_init(|| timed("callerScope", compute_caller_scope))
+        .clone()
 }
 
 fn compute_caller_scope() -> String {
@@ -83,9 +85,9 @@ fn write_private_new(path: &std::path::Path, body: &[u8]) -> Result<(), String> 
     let mut file = options
         .open(path)
         .map_err(|e| format!("create {}: {e}", path.display()))?;
-    file.write_all(body)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| e.to_string())
+    // No fsync: on macOS `sync_all` is F_FULLFSYNC (measured about 4 ms per file). These are a private
+    // cache and an operation hand-off; a file lost to a crash only forces a new observation.
+    file.write_all(body).map_err(|e| e.to_string())
 }
 
 pub fn load_mock_env() -> Result<Option<MockEnvironment>, String> {
@@ -113,6 +115,10 @@ pub fn save_mock_env(env: &MockEnvironment) -> Result<(), String> {
 }
 
 pub fn save_cached_snapshot(snapshot: &AppStateSnapshot) -> Result<(), String> {
+    timed("saveSnapshot", || save_snapshot_files(snapshot))
+}
+
+fn save_snapshot_files(snapshot: &AppStateSnapshot) -> Result<(), String> {
     let Some(dir) = snapshot_dir() else {
         return Err("cannot resolve snapshot cache".to_owned());
     };
@@ -137,6 +143,10 @@ pub fn save_cached_snapshot(snapshot: &AppStateSnapshot) -> Result<(), String> {
 }
 
 pub fn load_snapshot(id: Option<&str>) -> Result<Option<AppStateSnapshot>, String> {
+    timed("loadSnapshot", || load_snapshot_file(id))
+}
+
+fn load_snapshot_file(id: Option<&str>) -> Result<Option<AppStateSnapshot>, String> {
     let path = if let Some(id) = id {
         if !id.starts_with("snap-") || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
             return Err("invalid snapshot token".to_owned());
@@ -256,7 +266,9 @@ pub fn query_permissions() -> Result<(bool, bool), String> {
     if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
         return Ok((true, true));
     }
-    let out = run_jxa(PERMISSION_PROBE_JXA_SCRIPT, &[])?;
+    let out = timed("permissionsJxa", || {
+        run_jxa(PERMISSION_PROBE_JXA_SCRIPT, &[])
+    })?;
     parse_permission_probe_json(&out)
 }
 
@@ -290,7 +302,8 @@ pub fn capabilities_payload() -> Result<CapabilitiesPayload, String> {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
     Ok(CapabilitiesPayload {
-        contract: "computer/2".to_owned(), backend: "jxa".to_owned(),
+        contract: "computer/2".to_owned(),
+        backend: if native::unavailable().is_none() { "native" } else { "jxa" }.to_owned(),
         guide_hash: format!("fnv1a64:{hash:016x}"), batch_supported: false,
         request_dedup_supported: false, status_supported: false, cancel_supported: false,
         platform: if supported {
@@ -318,6 +331,7 @@ pub fn capabilities_payload() -> Result<CapabilitiesPayload, String> {
             "Prefer semantic element references (--element <N>) from get-app-state before falling back to coordinates.".to_owned(),
             "References are immutable: pass --snapshot <snapshotId>; input never retries an uncertain mutation.".to_owned(),
             "Paste refuses when full clipboard preservation or receiver confirmation is unavailable.".to_owned(),
+            "The native krill-app worker observes and runs element click, secondary action and set-value; other actions fall back to JXA per action (result path/fallbackReason). KRILL_COMPUTER_ENGINE=jxa forces JXA.".to_owned(),
             "Experimental persistent MCP: krill computer serve --experimental (MCP 2025-11-25); native features are reported by computer_session, not these JXA flags.".to_owned(),
             format!("Completed captures are immutable private artifacts, pruned to {} files / {} bytes / {} seconds; an evicted image must be captured again.", retention::MAX_IMAGES, retention::MAX_BYTES, retention::MAX_AGE.as_secs()),
         ],
@@ -362,7 +376,7 @@ for (let i = 0; i < apps.length; i++) {
 }
 JSON.stringify(rows);
 "#;
-    let out = run_jxa(script, &[])?;
+    let out = timed("listAppsJxa", || run_jxa(script, &[]))?;
     serde_json::from_str(&out).map_err(|e| format!("parse list-apps output: {e}"))
 }
 
@@ -405,7 +419,10 @@ pub fn list_windows(app_selector: &str) -> Result<Vec<WindowSummary>, String> {
 }
 
 pub fn resolve_live_app(app_selector: &str) -> Result<AppSummary, String> {
-    let apps = list_apps()?;
+    pick_app(list_apps()?, app_selector)
+}
+
+fn pick_app(apps: Vec<AppSummary>, app_selector: &str) -> Result<AppSummary, String> {
     let mut matches = apps
         .into_iter()
         .filter(|app| matches_app_selector(app, app_selector));
@@ -467,15 +484,17 @@ function run(argv) {
   return JSON.stringify(rows);
 }
 "#;
-    let out = run_jxa(
-        script,
-        &[
-            &app.pid.to_string(),
-            &app.name,
-            app.bundle_id.as_deref().unwrap_or(""),
-            if include_offscreen { "all" } else { "onscreen" },
-        ],
-    )?;
+    let out = timed("listWindowsJxa", || {
+        run_jxa(
+            script,
+            &[
+                &app.pid.to_string(),
+                &app.name,
+                app.bundle_id.as_deref().unwrap_or(""),
+                if include_offscreen { "all" } else { "onscreen" },
+            ],
+        )
+    })?;
     serde_json::from_str(&out).map_err(|e| format!("parse list-windows output: {e}"))
 }
 
@@ -614,6 +633,8 @@ pub fn observe_app_state(
         let snapshot = AppStateSnapshot {
             snapshot_id: format!("snap-{}", unique_token()),
             process_start: format!("mock:{}", app_summary.pid),
+            path: None,
+            fallback_reason: None,
             caller_scope: caller_scope(),
             captured_at_ms: now_ms(),
             coverage_truncated: false,
@@ -634,54 +655,57 @@ pub fn observe_app_state(
         return Ok(snapshot);
     }
 
-    let (ax, sc) = query_permissions()?;
-    if !ax {
-        return Err(format!(
-            "accessibility permission denied; enable in System Settings ({ACCESSIBILITY_SETTINGS_URL})"
-        ));
-    }
-    let app = resolve_live_app(app_selector)?;
-    // The native worker has no window restore or capture geometry; those requests stay on JXA.
-    let use_native = native::enabled()
-        && window_index.is_none()
-        && !restore_window
-        && (no_screenshot || !sc)
-        && window_id.is_none_or(native::is_native_window);
-    let (selected_window, observation, ax_observation_timing) = if use_native {
+    // The native worker has no window restore, screenshot capture or CG window order; those stay on JXA.
+    let mut fallback_reason = native::unavailable()
+        .or_else(|| restore_window.then(|| "--restore-window needs the JXA executor".to_owned()))
+        .or_else(|| (!no_screenshot).then(|| "screenshots need the JXA capture path".to_owned()))
+        .or_else(|| {
+            window_index
+                .is_some()
+                .then(|| "--window-index uses the JXA window order".to_owned())
+        })
+        .or_else(|| {
+            window_id
+                .filter(|id| !native::is_native_window(id))
+                .map(|_| "CG window ids belong to JXA snapshots".to_owned())
+        });
+    let mut native_observed = None;
+    if fallback_reason.is_none() {
         let ax_started = capture::clock();
-        let (window, observation) = native::observe(&app, window_id)?;
-        (Some(window), observation, Some(capture::timing(ax_started)))
-    } else {
-        let windows = list_windows_for_app(&app, restore_window)?;
-        let selected_window = if let Some(id) = window_id {
-            Some(
-                windows
-                    .into_iter()
-                    .find(|w| w.id == id)
-                    .ok_or_else(|| format!("window id not found: {id}"))?,
-            )
-        } else if let Some(idx) = window_index {
-            Some(
-                windows
-                    .into_iter()
-                    .find(|w| w.index == idx)
-                    .ok_or_else(|| format!("window index out of range: {idx}"))?,
-            )
-        } else {
-            windows.into_iter().next()
-        };
-
-        if restore_window {
-            verify_target_app(&app)?;
+        match native::observe(app_selector, window_id) {
+            Ok((app, window, observation)) => {
+                native_observed =
+                    Some((app, Some(window), observation, capture::timing(ax_started)));
+            }
+            // A native window id has no JXA counterpart.
+            Err(error) if window_id.is_some() => return Err(error),
+            Err(error) => fallback_reason = Some(format!("native observation failed: {error}")),
         }
-        let ax_started = capture::clock();
-        let observation =
-            query_live_window_ax_tree(&app, selected_window.as_ref(), restore_window)?;
-        (
-            selected_window,
-            observation,
-            Some(capture::timing(ax_started)),
-        )
+    }
+    let (sc, app, selected_window, observation, ax_observation_timing) = if let Some((
+        app,
+        window,
+        observation,
+        timing,
+    )) = native_observed
+    {
+        (false, app, window, observation, Some(timing))
+    } else {
+        let (ax, sc) = query_permissions()?;
+        if !ax {
+            return Err(format!(
+                "accessibility permission denied; enable in System Settings ({ACCESSIBILITY_SETTINGS_URL})"
+            ));
+        }
+        let app = resolve_live_app(app_selector)?;
+        let (window, observation, timing) =
+            observe_jxa_window(&app, window_id, window_index, restore_window)?;
+        (sc, app, window, observation, timing)
+    };
+    let path = if fallback_reason.is_none() {
+        "native"
+    } else {
+        "jxa"
     };
     let LiveObservation {
         mut root,
@@ -690,7 +714,8 @@ pub fn observe_app_state(
         geometry,
         geometry_error,
     } = observation;
-    let (flat, focused_id, total_count, tree_text) = index_and_render_tree(&mut root);
+    let (flat, focused_id, total_count, tree_text) =
+        timed("indexTree", || index_and_render_tree(&mut root));
     let mut notes = Vec::new();
     if coverage_truncated {
         notes.push(
@@ -724,6 +749,8 @@ pub fn observe_app_state(
     let snapshot = AppStateSnapshot {
         snapshot_id: format!("snap-{}", unique_token()),
         process_start,
+        path: Some(path.to_owned()),
+        fallback_reason,
         caller_scope: caller_scope(),
         captured_at_ms: now_ms(),
         coverage_truncated,
@@ -742,6 +769,48 @@ pub fn observe_app_state(
         notes,
     };
     Ok(snapshot)
+}
+
+type JxaWindowObservation = (
+    Option<WindowSummary>,
+    LiveObservation,
+    Option<ObservationTiming>,
+);
+
+fn observe_jxa_window(
+    app: &AppSummary,
+    window_id: Option<&str>,
+    window_index: Option<usize>,
+    restore_window: bool,
+) -> Result<JxaWindowObservation, String> {
+    let windows = list_windows_for_app(app, restore_window)?;
+    let selected_window = if let Some(id) = window_id {
+        Some(
+            windows
+                .into_iter()
+                .find(|w| w.id == id)
+                .ok_or_else(|| format!("window id not found: {id}"))?,
+        )
+    } else if let Some(idx) = window_index {
+        Some(
+            windows
+                .into_iter()
+                .find(|w| w.index == idx)
+                .ok_or_else(|| format!("window index out of range: {idx}"))?,
+        )
+    } else {
+        windows.into_iter().next()
+    };
+    if restore_window {
+        verify_target_app(app)?;
+    }
+    let ax_started = capture::clock();
+    let observation = query_live_window_ax_tree(app, selected_window.as_ref(), restore_window)?;
+    Ok((
+        selected_window,
+        observation,
+        Some(capture::timing(ax_started)),
+    ))
 }
 
 /// Read-only unless `restore` is set; then restore is a leased, postcondition-checked mutation.
@@ -767,7 +836,9 @@ fn query_live_window_ax_tree(
     let win = win.ok_or("application has no observed window")?;
     let payload = serde_json::json!({"pid":app.pid,"bundleId":app.bundle_id,"winId":win.id,
         "winTitle":win.title,"winBounds":win.bounds,"restore":restore_window});
-    let raw = run_jxa(LIVE_WINDOW_AX_JXA_SCRIPT, &[&payload.to_string()])?;
+    let raw = timed("axTreeJxa", || {
+        run_jxa(LIVE_WINDOW_AX_JXA_SCRIPT, &[&payload.to_string()])
+    })?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse AX observation: {e}"))?;
     let node: ElementNode = serde_json::from_value(
@@ -1092,26 +1163,63 @@ pub fn execute_live_action(
     };
     verify_target_app(app)?;
     let base = action_snapshot().ok_or("no immutable action snapshot")?;
-    if native::is_native_snapshot(&base) {
-        // The worker takes this same session lock around its own dispatch and cannot inherit our
-        // lease (its stdin is the protocol pipe). Nothing on this path issues input from the CLI.
-        EXECUTION.with_borrow_mut(|slot| {
-            if let Some(execution) = slot {
-                execution.lease = None;
+    let rebased;
+    let (process_start, root, receiver, win, action) = if native::is_native_snapshot(&base) {
+        if let Some((target, op)) = native::worker_op(action) {
+            set_action_path("native", None);
+            // The worker takes this same session lock around its own dispatch and cannot inherit our
+            // lease (its stdin is the protocol pipe). Nothing on this path issues input from the CLI.
+            EXECUTION.with_borrow_mut(|slot| {
+                if let Some(execution) = slot {
+                    execution.lease = None;
+                }
+            });
+            return Ok(native::execute(&base, app, target, op));
+        }
+        // Per-action fallback under the lease this call already holds.
+        let reason = native::fallback_reason(action);
+        set_action_path("jxa", Some(reason.clone()));
+        rebased = match timed("jxaRebase", || jxa_rebase(&base, app, action)) {
+            Ok(rebased) => rebased,
+            Err(error) => {
+                return Ok(native::not_dispatched(format!(
+                    "{reason}; JXA fallback refused before input: {error}"
+                )));
             }
-        });
-        return Ok(native::execute(&base, app, action));
-    }
+        };
+        (
+            rebased.process_start.as_str(),
+            rebased.root.as_ref(),
+            // JXA's bounded tree often ends above the focused element; the script compares this
+            // observed receiver with the live focus before every key either way.
+            base.root.as_ref().and_then(native::observed_receiver),
+            Some(&rebased.window),
+            &rebased.action,
+        )
+    } else {
+        set_action_path("jxa", None);
+        let root = base.root.as_ref();
+        (
+            base.process_start.as_str(),
+            root,
+            root.and_then(focused_receiver),
+            win,
+            action,
+        )
+    };
     let mut payload = build_live_action_payload(app, win, action);
-    payload["processStart"] = serde_json::json!(base.process_start);
-    payload["receiver"] = serde_json::json!(base.root.as_ref().and_then(focused_receiver));
-    payload["baseRoot"] = serde_json::json!(base.root);
+    payload["processStart"] = serde_json::json!(process_start);
+    payload["receiver"] = serde_json::json!(receiver);
+    payload["baseRoot"] = serde_json::json!(root);
     payload["winBounds"] = serde_json::json!(win.map(|w| w.bounds));
+    payload["noTree"] = serde_json::json!(root.is_none());
     if let LiveAction::PasteText { text, .. } = action {
         payload["text"] = serde_json::json!(text);
     }
     let payload_str = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
-    let raw = match run_private_action(LIVE_ACTION_JXA_SCRIPT, &payload_str) {
+    let raw = match timed("actionJxa", || {
+        run_private_action(LIVE_ACTION_JXA_SCRIPT, &payload_str)
+    }) {
         Ok(raw) => raw,
         Err(error) => return Ok(LiveActionOutcome::unknown(error)),
     };
@@ -1136,6 +1244,69 @@ pub fn execute_live_action(
         outcome.reason = Some("dispatch is not a verified business predicate".to_owned());
     }
     Ok(outcome)
+}
+
+struct JxaRebase {
+    window: WindowSummary,
+    process_start: String,
+    /// `None` when the action has no element target: JXA then skips its tree (see `noTree` in `action.js`).
+    root: Option<ElementNode>,
+    action: LiveAction,
+}
+
+/// The JXA window matching a native snapshot, and for element targets JXA's own observation of it with
+/// the action's references rewritten into it ([`native::jxa_counterpart`]). The JXA action script then
+/// validates against that observation exactly as it does for a JXA snapshot.
+fn jxa_rebase(
+    base: &AppStateSnapshot,
+    app: &AppSummary,
+    action: &LiveAction,
+) -> Result<JxaRebase, String> {
+    let native_root = base.root.as_ref().ok_or("native AX root unavailable")?;
+    let bounds = base
+        .window
+        .as_ref()
+        .ok_or("native snapshot has no window")?
+        .bounds;
+    let mut windows = list_windows_for_app(app, false)?
+        .into_iter()
+        .filter(|window| window.bounds == bounds);
+    let window = windows
+        .next()
+        .ok_or("no on-screen window has the observed frame")?;
+    if windows.next().is_some() {
+        return Err("several on-screen windows have the observed frame".to_owned());
+    }
+    if !native::has_element_target(action) {
+        // CG reports no title without Screen Recording; the script's focus check still holds the window.
+        if !window.title.is_empty() && Some(&window.title) != native_root.title.as_ref() {
+            return Err("the window with the observed frame has another title".to_owned());
+        }
+        return Ok(JxaRebase {
+            window,
+            process_start: native::start_seconds(&base.process_start)
+                .ok_or("native process witness unavailable")?
+                .to_owned(),
+            root: None,
+            action: action.clone(),
+        });
+    }
+    let mut observation = query_live_window_ax_tree(app, Some(&window), false)?;
+    if !native::same_process_start(&base.process_start, &observation.process_start) {
+        return Err("process instance changed; observe again".to_owned());
+    }
+    if observation.root.title != native_root.title || observation.root.bounds != native_root.bounds
+    {
+        return Err("JXA observed another window; observe again".to_owned());
+    }
+    index_and_render_tree(&mut observation.root);
+    let action = native::jxa_counterpart(native_root, &observation.root, action)?;
+    Ok(JxaRebase {
+        window,
+        process_start: observation.process_start,
+        root: Some(observation.root),
+        action,
+    })
 }
 
 /// Input text and private AX values never appear in child argv, even for *-stdin flags.
@@ -1212,6 +1383,51 @@ struct Execution {
 thread_local! {
     static EXECUTION: std::cell::RefCell<Option<Execution>> = const { std::cell::RefCell::new(None) };
     static ACTION_SNAPSHOT: std::cell::RefCell<Option<AppStateSnapshot>> = const { std::cell::RefCell::new(None) };
+    static PHASES: std::cell::RefCell<Vec<(&'static str, f64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static ACTION_PATH: std::cell::RefCell<Option<(&'static str, Option<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn set_action_path(path: &'static str, fallback_reason: Option<String>) {
+    ACTION_PATH.set(Some((path, fallback_reason)));
+}
+
+/// Engine that ran this call's live action (`native` or `jxa`) and why it fell back, if it did.
+pub fn action_path() -> Option<(&'static str, Option<String>)> {
+    ACTION_PATH.with_borrow(Clone::clone)
+}
+
+/// Charges the duration of `f` to latency phase `label` (see [`emit_timing`]).
+pub fn timed<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let value = f();
+    record_phase(label, started.elapsed().as_secs_f64() * 1000.0);
+    value
+}
+
+pub(super) fn record_phase(label: &'static str, ms: f64) {
+    PHASES.with_borrow_mut(|phases| phases.push((label, ms)));
+}
+
+/// With `KRILL_COMPUTER_TIMING` set, one stderr line `krill-computer-timing {json}` lists the
+/// in-process phases in milliseconds. Process launch and exit are outside `inProcessMs`.
+pub fn emit_timing(started: std::time::Instant) {
+    if std::env::var_os("KRILL_COMPUTER_TIMING").is_none() {
+        return;
+    }
+    let round = |ms: f64| (ms * 10.0).round() / 10.0;
+    let phases: Vec<_> = PHASES.with_borrow(|phases| {
+        phases
+            .iter()
+            .map(|(label, ms)| serde_json::json!([label, round(*ms)]))
+            .collect()
+    });
+    let total = started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "krill-computer-timing {}",
+        serde_json::json!({"inProcessMs": round(total), "phases": phases})
+    );
 }
 
 pub(super) fn with_execution(
@@ -1231,6 +1447,8 @@ pub(super) fn with_execution(
     };
     EXECUTION.with_borrow_mut(|slot| *slot = Some(Execution { lease, deadline }));
     let result = f();
+    native::release();
+    ACTION_PATH.set(None);
     ACTION_SNAPSHOT.with_borrow_mut(|slot| *slot = None);
     EXECUTION.with_borrow_mut(|slot| *slot = None);
     result

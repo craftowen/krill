@@ -421,6 +421,8 @@ fn snapshot_fixture() -> super::engine::AppStateSnapshot {
     super::engine::AppStateSnapshot {
         snapshot_id: "snap-fixture-1".to_owned(),
         process_start: "1792848000.123456".to_owned(),
+        path: None,
+        fallback_reason: None,
         caller_scope: "caller-fixture".to_owned(),
         captured_at_ms: 123,
         coverage_truncated: false,
