@@ -2929,7 +2929,6 @@ pub struct SettingsView {
 struct ServiceCache {
     worktree_locations: std::collections::BTreeMap<String, String>,
     worktrees: std::sync::Arc<krill_proto::orchestration::WorktreeStore>,
-    orchestration: std::sync::Arc<krill_proto::orchestration::OrchestrationStore>,
     aliases: std::collections::BTreeMap<String, String>,
     schedules: Vec<krill_proto::schedule::Schedule>,
     runs: Vec<krill_proto::schedule::ScheduleRun>,
@@ -2997,7 +2996,6 @@ fn account_stamps(dir: Option<&Path>) -> Vec<Option<AdminFileStamp>> {
 fn service_stamps(dir: &Path) -> Vec<Option<AdminFileStamp>> {
     [
         krill_proto::orchestration::COMMENTS_FILE,
-        krill_proto::orchestration::ORCH_FILE,
         krill_proto::schedule::FILE,
         krill_proto::schedule::RUNS,
         krill_proto::schedule::PREVIOUS_RUNS,
@@ -3144,8 +3142,6 @@ struct WorkflowRepoForm {
     qc_name: gpui::Entity<gpui_component::input::InputState>,
     qc_text: gpui::Entity<gpui_component::input::InputState>,
     qc_editing: Option<usize>,
-    webhook_url: gpui::Entity<gpui_component::input::InputState>,
-    webhook_error: Option<SharedString>,
     pending_repo_path: Option<String>,
     loaded_repo: Option<String>,
     loaded_setup: String,
@@ -3156,17 +3152,6 @@ struct WorkflowRepoForm {
     refresh_hooks: bool,
     status: Option<(SharedString, bool)>,
     _subs: Vec<Subscription>,
-}
-
-/// 완료 웹훅 종류의 표시 이름(OWE-883). URL에는 비밀 토큰이 들어갈 수 있어
-/// 종류만 보이고 원문·`{:?}`는 노출하지 않는다.
-#[must_use]
-pub fn webhook_kind_label(ep: &crate::webhook::Endpoint) -> &'static str {
-    match ep {
-        crate::webhook::Endpoint::Ntfy { .. } => text::WEBHOOK_KIND_NTFY.get(),
-        crate::webhook::Endpoint::Telegram { .. } => text::WEBHOOK_KIND_TELEGRAM.get(),
-        crate::webhook::Endpoint::Discord { .. } => text::WEBHOOK_KIND_DISCORD.get(),
-    }
 }
 
 /// 오케스트레이션 작업 상태의 표시 이름(OWE-883). 내부 영문(`ready` 등)을 그대로 보이지 않는다.
@@ -3457,11 +3442,7 @@ impl SettingsView {
                 this.file_jobs.remove(key);
                 if matches!(
                     key,
-                    "worktree-edit"
-                        | "worktree-location-edit"
-                        | "schedule-edit"
-                        | "schedule-run"
-                        | "orchestration-reset"
+                    "worktree-edit" | "worktree-location-edit" | "schedule-edit" | "schedule-run"
                 ) {
                     this.services_checked = None;
                 }
@@ -3516,10 +3497,6 @@ impl SettingsView {
                                 ),
                             worktrees: std::sync::Arc::new(
                                 krill_proto::orchestration::WorktreeStore::load(&dir)
-                                    .unwrap_or_default(),
-                            ),
-                            orchestration: std::sync::Arc::new(
-                                krill_proto::orchestration::OrchestrationStore::load(&dir)
                                     .unwrap_or_default(),
                             ),
                             aliases: repo
@@ -10319,10 +10296,6 @@ impl SettingsView {
             gpui_component::input::InputState::new(window, cx)
                 .placeholder(text::QC_TEXT_PLACEHOLDER.get())
         });
-        let webhook_url = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx)
-                .placeholder(text::WEBHOOK_URL_PLACEHOLDER.get())
-        });
         let repo_obs = cx.observe_in(&repo_path, window, |this, _, window, cx| {
             this.sync_workflow_repo_hooks(window, cx);
         });
@@ -10345,8 +10318,6 @@ impl SettingsView {
             qc_name,
             qc_text,
             qc_editing: None,
-            webhook_url,
-            webhook_error: None,
             pending_repo_path: None,
             loaded_repo,
             loaded_setup,
@@ -10747,45 +10718,6 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub fn add_webhook_url(
-        &mut self,
-        raw_url: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<crate::webhook::Endpoint, String> {
-        if let Ok(ep) = crate::webhook::Endpoint::from_url_input(raw_url) {
-            let ep_clone = ep.clone();
-            edit(cx, move |s| {
-                if !s.webhooks.contains(&ep_clone) {
-                    s.webhooks.push(ep_clone.clone());
-                }
-            });
-            if let Some(form) = &mut self.workflow_form {
-                form.webhook_error = None;
-            }
-            cx.notify();
-            Ok(ep)
-        } else {
-            let msg = text::WEBHOOK_INVALID_URL.get().to_owned();
-            if let Some(form) = &mut self.workflow_form {
-                form.webhook_error = Some(msg.clone().into());
-            }
-            cx.notify();
-            Err(msg)
-        }
-    }
-
-    pub fn submit_webhook_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ensure_workflow_form(window, cx);
-        let Some(form) = &self.workflow_form else {
-            return;
-        };
-        let raw = form.webhook_url.read(cx).value().to_string();
-        let url_inp = form.webhook_url.clone();
-        if self.add_webhook_url(&raw, cx).is_ok() {
-            url_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
-        }
-    }
-
     fn render_workflows_tab(
         &mut self,
         s: &Settings,
@@ -10798,96 +10730,7 @@ impl SettingsView {
         let p = crate::ui::palette(cx);
         let qc_count =
             text::QUICK_COMMANDS_COUNT.format(&[("count", &s.quick_commands.len().to_string())]);
-        let wh_count = text::WEBHOOKS_COUNT.format(&[("count", &s.webhooks.len().to_string())]);
         self.refresh_service_cache(cx);
-        let orch = self.services.orchestration.clone();
-        let pending_gates = orch
-            .gates
-            .iter()
-            .filter(|g| g.status == krill_proto::orchestration::GateStatus::Pending)
-            .count();
-        let orch_summary = text::ORCH_SUMMARY.format(&[
-            ("runs", &orch.runs.len().to_string()),
-            ("tasks", &orch.tasks.len().to_string()),
-            ("workers", &orch.dispatches.len().to_string()),
-            ("gates", &pending_gates.to_string()),
-        ]);
-        let reset = self.confirm_button(
-            "admin-orch-reset",
-            text::ORCH_RESET.get(),
-            cx,
-            |this, cx| {
-                if let Some(dir) = state_dir(cx) {
-                    this.file_job(
-                        "orchestration-reset",
-                        move || {
-                            krill_proto::orchestration::OrchestrationStore::reset_via_daemon_or_disk(&dir, None)
-                            .map_err(|error| error.to_string())
-                        },
-                        |this, result, cx| {
-                            if let Err(error) = result {
-                                this.doctor_status = Some(error.into());
-                            }
-                            cx.defer(notify_external_change);
-                        },
-                        cx,
-                    );
-                }
-            },
-        );
-        let mut orch_card = layout::card(p).flex().flex_col().gap_2().child(
-            div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(
-                    layout::label(p, text::ORCH_TITLE.get(), Some(text::ORCH_DESC.get())).child(
-                        div()
-                            .text_size(crate::ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(orch_summary),
-                    ),
-                )
-                .child(layout::controls().child(reset)),
-        );
-        for task in orch.tasks.iter().take(6) {
-            let line = orchestration_task_line(
-                &task.run_id,
-                &task.id,
-                &task.title,
-                task.status,
-                &task.deps,
-            );
-            orch_card = orch_card.child(div().text_size(crate::ui::TEXT_SM).child(line));
-        }
-        let lines_btns = [50u16, 100, 250, 500].into_iter().map(|lines| {
-            let id = format!("admin-context-lines-{lines}");
-            let label = lines.to_string();
-            let active = s.copy_context_lines == lines;
-            layout::segment(p, gpui::ElementId::Name(id.clone().into()), label, active)
-                .debug_selector(move || id.clone())
-                .on_click(move |_, _, cx| {
-                    edit(cx, move |s| s.copy_context_lines = lines);
-                })
-        });
-        let lines_row = layout::row(p)
-            .child(layout::label(
-                p,
-                text::CONTEXT_LINES.get(),
-                Some(text::CONTEXT_LINES_DESC.get()),
-            ))
-            .child(
-                layout::controls().child(
-                    layout::segmented_control(p, lines_btns)
-                        .id("admin-context-lines-control")
-                        .debug_selector(|| "admin-context-lines-control".into()),
-                ),
-            );
-
         let mut qc_card = layout::card(p)
             .id("admin-qc-card")
             .debug_selector(|| "admin-qc-card".into())
@@ -11030,165 +10873,6 @@ impl SettingsView {
             }
         }
 
-        let clear = self.confirm_button(
-            "admin-webhook-clear",
-            text::WEBHOOK_CLEAR.get(),
-            cx,
-            |_, cx| edit(cx, move |s| s.webhooks.clear()),
-        );
-        let mut wh_card = layout::card(p)
-            .id("admin-webhooks-card")
-            .debug_selector(|| "admin-webhooks-card".into())
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(layout::label(p, wh_count, Some(text::WEBHOOK_DESC.get())))
-                    .child(
-                        layout::controls()
-                            .child(
-                                layout::secondary(
-                                    "admin-webhook-add-local",
-                                    text::WEBHOOK_ADD_LOCAL.get(),
-                                )
-                                .debug_selector(|| "admin-webhook-add-local".into())
-                                .on_click(|_, _, cx| {
-                                    edit(cx, move |s| {
-                                        let n = s.webhooks.len().saturating_add(1);
-                                        s.webhooks.push(crate::webhook::Endpoint::Ntfy {
-                                            url: format!("http://127.0.0.1:8080/krill-hook-{n}"),
-                                        });
-                                    });
-                                }),
-                            )
-                            .child(clear),
-                    ),
-            );
-        if let Some(form) = &self.workflow_form {
-            let webhook_url_input = form.webhook_url.clone();
-            let webhook_err = form.webhook_error.clone();
-            wh_card = wh_card.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("admin-webhook-url-input")
-                            .debug_selector(|| "admin-webhook-url-input".into())
-                            .flex_1()
-                            .min_w_0()
-                            .child(gpui_component::input::Input::new(&webhook_url_input).small()),
-                    )
-                    .child(
-                        layout::controls().child(
-                            layout::primary("admin-webhook-add", text::WEBHOOK_ADD.get())
-                                .debug_selector(|| "admin-webhook-add".into())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.submit_webhook_url(window, cx);
-                                })),
-                        ),
-                    ),
-            );
-            if let Some(err) = webhook_err {
-                wh_card = wh_card.child(
-                    crate::ui::error_banner(p, err)
-                        .id("admin-webhook-error")
-                        .debug_selector(|| "admin-webhook-error".into()),
-                );
-            }
-        }
-        if s.webhooks.is_empty() {
-            wh_card = wh_card.child(
-                div()
-                    .id("admin-webhooks-empty")
-                    .debug_selector(|| "admin-webhooks-empty".into())
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::WEBHOOK_EMPTY.get()),
-            );
-        } else {
-            for (idx, ep) in s.webhooks.iter().enumerate() {
-                let row_id = format!("admin-webhook-row-{idx}");
-                let badge_id = format!("admin-webhook-badge-{idx}");
-                let url_id = format!("admin-webhook-url-{idx}");
-                let rm_id = format!("admin-webhook-remove-{idx}");
-                let provider_label = ep.provider_badge();
-                // OWE-883: URL 원문(비밀 토큰 포함 가능) 대신 종류 표시 이름만 보인다.
-                let kind_label = text::WEBHOOK_LABEL.format(&[
-                    ("n", &(idx + 1).to_string()),
-                    ("kind", webhook_kind_label(ep)),
-                ]);
-                wh_card = wh_card.child(
-                    div()
-                        .id(gpui::ElementId::Name(row_id.clone().into()))
-                        .debug_selector(move || row_id.clone())
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .p_2()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .bg(p.background)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    crate::ui::badge(
-                                        p,
-                                        crate::ui::BadgeTone::Accent,
-                                        provider_label,
-                                    )
-                                    .id(SharedString::from(badge_id.clone()))
-                                    .debug_selector(move || badge_id.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(url_id.clone()))
-                                        .debug_selector(move || url_id.clone())
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(crate::ui::TEXT_SM)
-                                        .child(kind_label),
-                                ),
-                        )
-                        .child(
-                            layout::controls().child(
-                                layout::secondary(
-                                    gpui::ElementId::Name(rm_id.clone().into()),
-                                    text::ACCOUNT_REMOVE.get(),
-                                )
-                                .debug_selector(move || rm_id.clone())
-                                .on_click(move |_, _, cx| {
-                                    edit(cx, move |s| {
-                                        if idx < s.webhooks.len() {
-                                            s.webhooks.remove(idx);
-                                        }
-                                    });
-                                }),
-                            ),
-                        ),
-                );
-            }
-        }
         let wt_store = self.services.worktrees.clone();
 
         let active_repo = self
@@ -11657,19 +11341,11 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_3()
-            .child(orch_card)
             .child(self.render_schedules_section(cx))
             .child(repo_context_card)
             .child(symlinks_card)
             .child(hooks_card)
-            .child(layout::section_title(
-                p,
-                "admin-section-workflows",
-                text::WORKFLOWS_TITLE.get(),
-            ))
-            .child(lines_row)
             .child(qc_card)
-            .child(wh_card)
     }
 
     fn render_resources_tab(&self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {

@@ -335,36 +335,6 @@ fn owe883_user_facing_lines_hide_debug_and_english_internals() {
         assert_ne!(orchestration_task_status_label(status), raw);
     }
 
-    // 웹훅 행: 종류만 보이고 URL·비밀은 노출하지 않는다.
-    for (ep, kind) in [
-        (
-            crate::webhook::Endpoint::Ntfy {
-                url: "http://127.0.0.1:9/hook?token=SECRET".into(),
-            },
-            "Ntfy",
-        ),
-        (
-            crate::webhook::Endpoint::Telegram {
-                url: "https://api.telegram.org/botSECRET/send".into(),
-                chat_id: "PRIVATE".into(),
-            },
-            "Telegram",
-        ),
-        (
-            crate::webhook::Endpoint::Discord {
-                url: "https://discord.com/api/SECRET".into(),
-            },
-            "Discord",
-        ),
-    ] {
-        let label = webhook_kind_label(&ep);
-        assert_eq!(label, kind);
-        let row = text::WEBHOOK_LABEL.format(&[("n", "1"), ("kind", label)]);
-        assert!(!row.contains("SECRET"), "{row}");
-        assert!(!row.contains("PRIVATE"), "{row}");
-        assert!(!row.contains('{'), "{row}");
-    }
-
     // 스케줄 실행 시각: epoch 분 대신 날짜·시각(UTC).
     assert_eq!(schedules::format_run_minute(0), "1970-01-01 00:00 (UTC)");
     assert_eq!(
@@ -2057,10 +2027,7 @@ fn admin_tabs_hide_developer_sample_buttons(cx: &mut TestAppContext) {
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(6000.)));
-    for (tab, kept) in [
-        (AdminTab::Ssh, "admin-ssh-import"),
-        (AdminTab::Workflows, "admin-orch-reset"),
-    ] {
+    for (tab, kept) in [(AdminTab::Ssh, "admin-ssh-import")] {
         vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(tab, cx)));
         vcx.run_until_parked();
         assert!(vcx.debug_bounds(kept).is_some(), "missing {kept}");
@@ -2073,43 +2040,6 @@ fn admin_tabs_hide_developer_sample_buttons(cx: &mut TestAppContext) {
             assert!(vcx.debug_bounds(gone).is_none(), "{gone} still rendered");
         }
     }
-    fs::remove_dir_all(d).ok();
-}
-
-/// OWE-651 2번: 웹훅 비우기는 위험 버튼이며 두 번째 클릭에만 실행된다. 탭을 바꾸면 확인 상태가 풀린다.
-#[gpui::test]
-fn webhook_clear_requires_confirmation(cx: &mut TestAppContext) {
-    let d = dir("webhook-clear-confirm");
-    init(cx, &d);
-    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
-    vcx.simulate_resize(size(px(1400.), px(3000.)));
-    vcx.update(|_, cx| {
-        edit(cx, |s| {
-            s.webhooks.push(crate::webhook::Endpoint::Ntfy {
-                url: "http://127.0.0.1:9/hook".into(),
-            });
-        });
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
-    });
-    vcx.run_until_parked();
-    let click = |vcx: &mut gpui::VisualTestContext| {
-        let b = vcx
-            .debug_bounds("admin-webhook-clear")
-            .expect("missing admin-webhook-clear");
-        vcx.simulate_click(b.center(), gpui::Modifiers::default());
-        vcx.run_until_parked();
-    };
-    click(vcx);
-    vcx.update(|_, cx| {
-        assert_eq!(current(cx).webhooks.len(), 1);
-        assert_eq!(view.read(cx).armed.as_deref(), Some("admin-webhook-clear"));
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
-        assert_eq!(view.read(cx).armed, None);
-    });
-    vcx.run_until_parked();
-    click(vcx);
-    click(vcx);
-    vcx.update(|_, cx| assert!(current(cx).webhooks.is_empty()));
     fs::remove_dir_all(d).ok();
 }
 
@@ -2138,14 +2068,9 @@ fn section_titles_render_as_headers(cx: &mut TestAppContext) {
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(3000.)));
-    for (tab, id) in [
-        (AdminTab::Resources, "admin-section-resources"),
-        (AdminTab::Workflows, "admin-section-workflows"),
-    ] {
-        vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(tab, cx)));
-        vcx.run_until_parked();
-        assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
-    }
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-section-resources").is_some());
     fs::remove_dir_all(d).ok();
 }
 
@@ -4747,26 +4672,21 @@ fn other_confirm_buttons_keep_width_and_disarm_on_outside_click(cx: &mut TestApp
             });
         });
     });
-    for (tab, id) in [
-        (AdminTab::Workflows, "admin-webhook-clear"),
-        (AdminTab::Workflows, "admin-orch-reset"),
-        (AdminTab::Resources, "admin-history-clear"),
-    ] {
-        vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(tab, cx)));
-        vcx.run_until_parked();
-        let before = vcx
-            .debug_bounds(id)
-            .unwrap_or_else(|| panic!("missing {id}"));
-        vcx.simulate_click(before.center(), gpui::Modifiers::default());
-        vcx.run_until_parked();
-        vcx.update(|_, cx| assert_eq!(view.read(cx).armed.as_deref(), Some(id)));
-        assert_eq!(vcx.debug_bounds(id), Some(before), "{id} grew when armed");
-        // 버튼 왼쪽 위 바깥(빈 곳) 클릭.
-        let outside = gpui::point(px(2.), before.origin.y + before.size.height / 2.);
-        vcx.simulate_click(outside, gpui::Modifiers::default());
-        vcx.run_until_parked();
-        vcx.update(|_, cx| assert_eq!(view.read(cx).armed, None, "{id} stayed armed"));
-    }
+    let id = "admin-history-clear";
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx)));
+    vcx.run_until_parked();
+    let before = vcx
+        .debug_bounds(id)
+        .unwrap_or_else(|| panic!("missing {id}"));
+    vcx.simulate_click(before.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).armed.as_deref(), Some(id)));
+    assert_eq!(vcx.debug_bounds(id), Some(before), "{id} grew when armed");
+    // 버튼 왼쪽 위 바깥(빈 곳) 클릭.
+    let outside = gpui::point(px(2.), before.origin.y + before.size.height / 2.);
+    vcx.simulate_click(outside, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).armed, None, "{id} stayed armed"));
     vcx.update(|_, cx| assert_eq!(current(cx).webhooks.len(), 1));
     fs::remove_dir_all(d).ok();
 }
@@ -7993,7 +7913,7 @@ fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut Test
 /// 심볼릭 링크 등폭 칩 추가/제거, 빠른 명령 추가/수정/삭제, 완료 웹훅 배지+URL 표시 및 추가/삭제,
 /// 예약 작업 활성/일시정지 `Switch` 및 820px 좁은 창 경계 준수를 검증한다.
 #[gpui::test]
-fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_schedule_switch(
+fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switch(
     cx: &mut TestAppContext,
 ) {
     use krill_proto::schedule::Schedules;
@@ -8031,17 +7951,6 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_sched
         vcx.run_until_parked();
         vcx.update(|window, cx| window.draw(cx).clear(cx));
     };
-
-    // 1) 컨텍스트 줄 수 SegmentedControl (50/100/250/500)
-    assert!(vcx.debug_bounds("admin-context-lines-control").is_some());
-    click_sel(vcx, "admin-context-lines-100");
-    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 100));
-    click_sel(vcx, "admin-context-lines-250");
-    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 250));
-    click_sel(vcx, "admin-context-lines-500");
-    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 500));
-    click_sel(vcx, "admin-context-lines-50");
-    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 50));
 
     // 2) 저장소 선택 컨텍스트 통합 및 심볼릭 링크 등폭 칩 추가/제거
     assert!(vcx.debug_bounds("admin-workflow-repo-card").is_some());
@@ -8155,46 +8064,6 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_sched
     assert!(vcx.debug_bounds("admin-qc-empty").is_some());
     vcx.update(|_, cx| assert!(current(cx).quick_commands.is_empty()));
 
-    // 4) 완료 웹훅 배지+URL 표시 및 추가·검증·삭제 ({:?} [redacted] 노출 금지)
-    assert!(vcx.debug_bounds("admin-webhooks-card").is_some());
-    assert!(vcx.debug_bounds("admin-webhooks-empty").is_some());
-    vcx.update(|window, cx| {
-        let url_inp = view
-            .read(cx)
-            .workflow_form
-            .as_ref()
-            .unwrap()
-            .webhook_url
-            .clone();
-        url_inp.update(cx, |inp, cx| inp.set_value("invalid-url", window, cx));
-    });
-    click_sel(vcx, "admin-webhook-add");
-    assert!(vcx.debug_bounds("admin-webhook-error").is_some());
-
-    let discord_url = "https://discord.com/api/webhooks/12345/token-abc";
-    vcx.update(|window, cx| {
-        let url_inp = view
-            .read(cx)
-            .workflow_form
-            .as_ref()
-            .unwrap()
-            .webhook_url
-            .clone();
-        url_inp.update(cx, |inp, cx| inp.set_value(discord_url, window, cx));
-    });
-    click_sel(vcx, "admin-webhook-add");
-    assert!(vcx.debug_bounds("admin-webhook-error").is_none());
-    assert!(vcx.debug_bounds("admin-webhook-row-0").is_some());
-    assert!(vcx.debug_bounds("admin-webhook-badge-0").is_some());
-    assert!(vcx.debug_bounds("admin-webhook-url-0").is_some());
-    vcx.update(|_, cx| {
-        let hooks = &current(cx).webhooks;
-        assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0].provider_badge(), "Discord");
-        assert_eq!(hooks[0].url(), discord_url);
-        assert!(!hooks[0].url().contains("[redacted]"));
-    });
-
     // 5) 예약 작업 활성/일시정지 Switch 및 좁은 창(820px) 경계 검증
     click_sel(vcx, "admin-schedule-add");
     vcx.update(|window, cx| {
@@ -8244,7 +8113,6 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_sched
         "admin-repo-hooks-card",
         "admin-schedules-card",
         "admin-qc-card",
-        "admin-webhooks-card",
     ] {
         let cb = vcx.debug_bounds(card_sel).unwrap();
         assert!(
@@ -8267,9 +8135,6 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_sched
             "schedule control {ctrl_sel} ({b:?}) overflowed row ({sched_row_b:?})"
         );
     }
-
-    click_sel(vcx, "admin-webhook-remove-0");
-    assert!(vcx.debug_bounds("admin-webhooks-empty").is_some());
 
     fs::remove_dir_all(d).ok();
 }
