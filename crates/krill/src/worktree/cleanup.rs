@@ -76,7 +76,15 @@ pub fn run_cleanup(args: &[OsString]) -> ExitCode {
         CleanupSummary::default()
     } else {
         let paths = Paths::dev().ok();
-        let (idle, busy) = split_active_sessions(&matched);
+        let (idle, busy) = match split_active_sessions(&matched) {
+            Ok(split) => split,
+            Err(e) => {
+                eprintln!(
+                    "worktree cleanup: cannot check for running sessions ({e}); nothing was removed"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
         let mut summary = run_cleanup_engine(
             &idle,
             !parsed.filter.exclude_dirty,
@@ -251,18 +259,19 @@ fn select_candidates(
     matched
 }
 
-/// 실행 중인 세션의 cwd가 안에 있는 워크트리는 지우지 않는다. 데몬이 없거나 조회에 실패하면 막지 않는다.
+/// 실행 중인 세션의 cwd가 안에 있는 워크트리는 지우지 않는다. 데몬이 있는데 세션을 답하지 못하면 오류다
+/// (빈 목록으로 보면 가드가 꺼진다).
 fn split_active_sessions(
     matched: &[WorktreeCleanupCandidate],
-) -> (Vec<WorktreeCleanupCandidate>, Vec<WorktreeCleanupCandidate>) {
-    let cwds = crate::session::running_session_cwds().unwrap_or_default();
-    matched.iter().cloned().partition(|c| {
+) -> Result<(Vec<WorktreeCleanupCandidate>, Vec<WorktreeCleanupCandidate>), String> {
+    let cwds = crate::session::running_session_cwds()?;
+    Ok(matched.iter().cloned().partition(|c| {
         let wt = std::fs::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
         !cwds.iter().any(|cwd| {
             let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone());
             cwd.starts_with(&wt)
         })
-    })
+    }))
 }
 
 fn resolve_repos(

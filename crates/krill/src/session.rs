@@ -984,34 +984,41 @@ pub(crate) fn observe_sessions_on_target(target: &Target) -> Option<Vec<Observed
     )
 }
 
-/// 실행 중(`exit` 없는) 세션의 cwd 목록. 데몬을 새로 띄우지 않으며 연결·조회 실패는 `None`.
-pub(crate) fn running_session_cwds() -> Option<Vec<std::path::PathBuf>> {
-    let target = Target::establish(None).ok()?;
-    let mut c = target
-        .dial(&daemon::client_hello(ClientRole::Cli, "krill"), IO_TIMEOUT)
-        .ok()?;
+/// 실행 중(`exit` 없는) 세션의 cwd 목록. 데몬을 새로 띄우지 않는다.
+/// 데몬이 없으면(소켓 없음·연결 거부) 세션도 없으니 빈 목록이고, 데몬이 있는데 답하지 못하면 오류다.
+pub(crate) fn running_session_cwds() -> std::result::Result<Vec<std::path::PathBuf>, String> {
+    let target = Target::establish(None).map_err(|e| e.to_string())?;
+    let mut c = match target.dial(&daemon::client_hello(ClientRole::Cli, "krill"), IO_TIMEOUT) {
+        Ok(c) => c,
+        Err(e) if daemon::is_absent(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
     if c.negotiated.features & (FEAT_CONTROL | FEAT_SIDEBAR) != FEAT_CONTROL | FEAT_SIDEBAR {
-        return None;
+        return Err("krilld cannot list session directories; update the daemon".to_owned());
     }
-    c.stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
-    c.stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
-    let Reply::Sessions(sessions) = request(&mut c.stream, &Request::List).ok()? else {
-        return None;
+    c.stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    c.stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    let Reply::Sessions(sessions) = request(&mut c.stream, &Request::List).map_err(|e| e.text)?
+    else {
+        return Err("unexpected session list reply".to_owned());
     };
-    let Reply::Sidebar(sb) = request(&mut c.stream, &Request::Sidebar).ok()? else {
-        return None;
+    let Reply::Sidebar(sb) = request(&mut c.stream, &Request::Sidebar).map_err(|e| e.text)? else {
+        return Err("unexpected sidebar reply".to_owned());
     };
-    Some(
-        sb.sessions
-            .iter()
-            .filter(|e| {
-                sessions
-                    .iter()
-                    .any(|s| s.session == e.session && s.status.is_none())
-            })
-            .map(|e| std::path::PathBuf::from(String::from_utf8_lossy(&e.cwd).into_owned()))
-            .collect(),
-    )
+    Ok(sb
+        .sessions
+        .iter()
+        .filter(|e| {
+            sessions
+                .iter()
+                .any(|s| s.session == e.session && s.status.is_none())
+        })
+        .map(|e| std::path::PathBuf::from(String::from_utf8_lossy(&e.cwd).into_owned()))
+        .collect())
 }
 
 pub(crate) fn list_session_ids() -> std::result::Result<Vec<u64>, String> {
