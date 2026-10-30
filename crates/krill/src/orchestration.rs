@@ -819,6 +819,35 @@ struct WorkerStartArgs {
     worktree_options: Vec<OsString>,
 }
 
+/// `parse_worker_start`가 받는 플래그. `--prompt` 값이 이 중 하나면 값이 빠진 것으로 본다.
+const WORKER_START_FLAGS: &[&str] = &[
+    "--spec",
+    "--run",
+    "--task",
+    "--worker",
+    "--name",
+    "--base",
+    "--setup",
+    "--trust-setup",
+    "--agent",
+    "--account",
+    "--session",
+    "--terminal",
+    "--cwd",
+    "--worktree",
+    "--model",
+    "--effort",
+    "--retry-of",
+    "--retry-request",
+    "--prompt",
+    "--depth",
+    "--max-depth",
+    "--preamble",
+    "--no-preamble",
+    "--no-spawn",
+    "--json",
+];
+
 fn parse_worker_start(args: &[String], remote: bool) -> io::Result<WorkerStartArgs> {
     let mut spec = WorkerStartSpec::default();
     let mut new_child = false;
@@ -925,11 +954,11 @@ fn parse_worker_start(args: &[String], remote: bool) -> io::Result<WorkerStartAr
                 spec.retry_request = Some(take_opt(&mut it, "--retry-request")?.clone());
             }
             "--prompt" => {
-                // 프롬프트는 `--`로 시작할 수 있지만, 공백 없는 `--json` 같은 토큰은 다음 플래그다.
-                let v = it.next().ok_or_else(|| bad_arg("missing --prompt"))?;
-                if v.starts_with("--") && !v.contains(char::is_whitespace) {
-                    return Err(bad_arg("missing --prompt"));
-                }
+                // 프롬프트는 `--`로 시작할 수 있다. 이 명령의 플래그 이름일 때만 값이 빠진 것이다.
+                let v = it
+                    .next()
+                    .filter(|v| !WORKER_START_FLAGS.contains(&v.as_str()))
+                    .ok_or_else(|| bad_arg("missing --prompt"))?;
                 spec.prompt = Some(v.clone());
             }
             "--depth" => {
