@@ -311,7 +311,9 @@ pub fn connect_client(
     let status = lines.next().ok_or_else(invalid)?;
     if !status.starts_with("HTTP/1.1 101") {
         return Err(io::Error::new(
-            if status.starts_with("HTTP/1.1 401") || status.starts_with("HTTP/1.1 403") {
+            // Only 401 means the sign-in is invalid. The relay answers 403 for an origin, account or
+            // host-key mismatch, and a proxy can answer 403 for a temporary block.
+            if status.starts_with("HTTP/1.1 401") {
                 io::ErrorKind::PermissionDenied
             } else {
                 io::ErrorKind::ConnectionRefused

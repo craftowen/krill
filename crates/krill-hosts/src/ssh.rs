@@ -444,7 +444,7 @@ pub fn resolve_remote_endpoint_with_program(
 /// `KRILL_REMOTE_SOCK` 또는 `hosts.toml`의 `remote_socket`으로 명시한 원격 소켓.
 fn explicit_remote_socket(opts: &SshOptions) -> io::Result<Option<PathBuf>> {
     if let Some(sock) = std::env::var_os("KRILL_REMOTE_SOCK") {
-        let Some(s) = sock.to_str().filter(|s| !s.is_empty()) else {
+        let Some(s) = sock.to_str().map(str::trim).filter(|s| !s.is_empty()) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "KRILL_REMOTE_SOCK is empty or non-UTF-8",

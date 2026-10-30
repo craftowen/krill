@@ -2428,3 +2428,155 @@ fn secure_tailscale_notification_uses_the_same_hosted_storage_origin() {
         )
     );
 }
+
+fn read_http_head(socket: &mut TcpStream) -> String {
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        head.extend(byte);
+    }
+    String::from_utf8(head).unwrap()
+}
+
+fn accept_within(listener: &TcpListener, wait: Duration) -> Option<TcpStream> {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        if let Ok((socket, _)) = listener.accept() {
+            socket.set_nonblocking(false).unwrap();
+            return Some(socket);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+/// Signs the gateway into a fake relay origin. The fake serves the PWA manifest, then
+/// answers the host upgrade with `status`. Returns the upgraded host socket for `101`, or the
+/// relay's next connection attempt for a rejection.
+fn relay_with_upgrade_status(
+    status: &'static str,
+) -> (Arc<Registry>, Arc<Gateway>, Option<TcpStream>) {
+    fn must_not_start_tunnel(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
+        panic!("relay tests must not start cloudflared")
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (registry, gateway) = start();
+    {
+        let mut state = lock(&gateway.shared.state);
+        state.publication.origin = format!("http://{}", listener.local_addr().unwrap());
+        state.account.session = Some(super::super::relay_auth::Session {
+            token: "test-session".into(),
+            expires_at_ms: u64::MAX,
+            email: "test@example.test".into(),
+            origin: state.publication.origin.clone(),
+        });
+        state.relay_enabled = true;
+        state.tunnel_start = Some(must_not_start_tunnel);
+    }
+    let server = thread::spawn(move || {
+        let (mut manifest, _) = listener.accept().unwrap();
+        read_http_head(&mut manifest);
+        manifest
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+        drop(manifest);
+        let (mut host_ws, _) = listener.accept().unwrap();
+        let head = read_http_head(&mut host_ws);
+        if status == "101" {
+            let key = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+                .unwrap()
+                .trim();
+            let accept = ws::base64(
+                digest::digest(
+                    &digest::SHA1_FOR_LEGACY_USE_ONLY,
+                    format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
+                )
+                .as_ref(),
+                false,
+            );
+            write!(
+                host_ws,
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .unwrap();
+            return Some(host_ws);
+        }
+        write!(
+            host_ws,
+            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        drop(host_ws);
+        // The relay retries only after it has handled the rejected upgrade.
+        accept_within(&listener, Duration::from_secs(5))
+    });
+    gateway.request(MobileRequest::MintPairingTicket {
+        mode: ConnectMode::Tunnel,
+        custom_address: None,
+        rotate: true,
+    });
+    let socket = server.join().unwrap();
+    (registry, gateway, socket)
+}
+
+#[test]
+fn relay_forbidden_upgrade_keeps_the_sign_in_and_unauthorized_clears_it() {
+    for (status, kept) in [("403 Forbidden", true), ("401 Unauthorized", false)] {
+        let (_registry, gateway, retry) = relay_with_upgrade_status(status);
+        if kept {
+            assert!(retry.is_some(), "{status}: relay must retry");
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !kept
+            && lock(&gateway.shared.state).account.session.is_some()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            lock(&gateway.shared.state).account.session.is_some(),
+            kept,
+            "{status}"
+        );
+    }
+}
+
+#[test]
+fn relay_capacity_close_is_not_the_auth_cooldown_code() {
+    use super::super::relay::{MUX_CLOSE, MUX_OPEN, MUX_TEXT, decode_mux, encode_mux};
+    fn open(host_ws: &mut TcpStream, cid: u32) -> (u8, Vec<u8>) {
+        ws::write(host_ws, ws::BINARY, &encode_mux(MUX_OPEN, cid, &[])).unwrap();
+        loop {
+            let (op, body) = ws::read(host_ws).unwrap();
+            assert_eq!(op, ws::BINARY);
+            let (kind, from, payload) = decode_mux(&body).unwrap();
+            if from == cid {
+                return (kind, payload.to_vec());
+            }
+        }
+    }
+    let (_registry, _gateway, host_ws) = relay_with_upgrade_status("101");
+    let mut host_ws = host_ws.unwrap();
+    for cid in 1..=u32::try_from(MAX_PENDING).unwrap() {
+        assert_eq!(
+            open(&mut host_ws, cid).0,
+            MUX_TEXT,
+            "conn {cid} gets a challenge"
+        );
+    }
+    let (kind, payload) = open(&mut host_ws, 99);
+    assert_eq!(kind, MUX_CLOSE);
+    let code = u16::from_be_bytes(payload.try_into().unwrap());
+    // client.js reads 1013 as an auth cooldown and 1008/4009 as a rejection that stops retrying.
+    assert!(
+        !matches!(code, 1008 | 1013 | 4009),
+        "a full relay must close with a retryable code, got {code}"
+    );
+}
