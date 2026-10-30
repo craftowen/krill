@@ -4168,6 +4168,37 @@ fn as12_settings_save_preserves_future_fields_and_source() {
     fs::remove_dir_all(d).unwrap();
 }
 
+/// 화면에서 뺀 옵션과 스키마에서 지운 키는 어떤 저장을 거쳐도 파일에 그대로 남아야 한다.
+#[test]
+fn settings_save_preserves_file_only_and_retired_keys() {
+    let d = dir("retired-keys");
+    let path = d.join(SETTINGS_FILE);
+    let raw = "ui_zoom = 1.0\nterminal_opacity_pct = 80\nterminal_cursor_blink = false\noption_as_meta = true\ncopy_on_select = true\nconfirm_running_close = false\neditor_font_size = 16\ncopy_context_lines = 42\nhibernation_enabled = true\nnotify_on_bell = true\nnotify_only_inactive = true\nprompt_cache_timer_enabled = true\nprompt_cache_ttl_secs = 3600\n";
+    fs::write(&path, raw).unwrap();
+    let mut settings = Settings::parse(raw).unwrap();
+    settings.zoom = 1.2;
+    save_settings(&path, &settings, Some(raw)).unwrap();
+    let body = fs::read_to_string(&path).unwrap();
+    for key in [
+        "terminal_opacity_pct = 80",
+        "terminal_cursor_blink = false",
+        "option_as_meta = true",
+        "copy_on_select = true",
+        "confirm_running_close = false",
+        "editor_font_size = 16",
+        "copy_context_lines = 42",
+        "hibernation_enabled = true",
+        "notify_on_bell = true",
+        "notify_only_inactive = true",
+        "prompt_cache_timer_enabled = true",
+        "prompt_cache_ttl_secs = 3600",
+    ] {
+        assert!(body.contains(key), "{key} was lost from {body}");
+    }
+    assert_eq!(Settings::parse(&body).unwrap(), settings);
+    fs::remove_dir_all(d).unwrap();
+}
+
 #[test]
 fn as12_keys_edit_preserves_future_fields_in_complex_toml() {
     let d = dir("as12-keys");
@@ -5574,15 +5605,12 @@ fn project_worktree_location_saves_switches_and_resets(cx: &mut TestAppContext) 
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-737: 에이전트 탭의 '첫 프롬프트로 브랜치·세션 이름 자동 변경'·'프롬프트 캐시 카운트다운'·'캐시 유지 시간(5분/1시간)'·
+/// OWE-737: 에이전트 탭의 '첫 프롬프트로 브랜치·세션 이름 자동 변경'·
 /// '워크스페이스 신뢰 프리셋 자동 등록(기본 꺼짐·동의 확인 후 켜기)' 컨트롤이 `settings.toml` 및 플래그 파일에 동기화된다.
 #[gpui::test]
-fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
-    cx: &mut TestAppContext,
-) {
+fn owe737_agent_settings_toggle_auto_rename_and_sync_flag_file(cx: &mut TestAppContext) {
     let d = dir("owe737-agent-settings");
     init(cx, &d);
-    cx.update(|cx| edit(cx, |s| s.prompt_cache_timer_enabled = true));
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(6000.)));
     vcx.update(|_, cx| {
@@ -5590,17 +5618,11 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
     });
     vcx.run_until_parked();
 
-    for id in [
-        "auto-rename-branch-toggle",
-        "prompt-cache-timer-toggle",
-        "prompt-cache-ttl-5m",
-        "prompt-cache-ttl-1h",
-        "workspace-trust-preset-toggle",
-    ] {
+    for id in ["auto-rename-branch-toggle", "workspace-trust-preset-toggle"] {
         assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
     }
 
-    // 기본값: 자동 이름 변경·캐시 타이머·워크스페이스 신뢰 프리셋 모두 기본 켜짐.
+    // 기본값: 자동 이름 변경·워크스페이스 신뢰 프리셋 모두 기본 켜짐.
     assert!(krill_proto::git::is_auto_rename_enabled(Some(&d)));
     assert!(krill_proto::git::is_workspace_trust_preset_enabled(Some(
         &d
@@ -5609,8 +5631,6 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
     vcx.update(|_, cx| {
         let s = current(cx);
         assert!(s.auto_rename_branch_from_work);
-        assert!(s.prompt_cache_timer_enabled);
-        assert_eq!(s.prompt_cache_ttl_secs, 300);
         assert!(s.workspace_trust_preset_enabled);
     });
 
@@ -5666,7 +5686,7 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
         &d
     )));
 
-    // 자동 이름 변경 토글과 '1시간' 클릭 시 settings.toml 및 플래그 파일 반영 확인.
+    // 자동 이름 변경 토글 클릭 시 settings.toml 및 플래그 파일 반영 확인.
     let off_at = vcx
         .debug_bounds("auto-rename-branch-toggle")
         .unwrap()
@@ -5675,13 +5695,8 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
     vcx.run_until_parked();
     assert!(!krill_proto::git::is_auto_rename_enabled(Some(&d)));
 
-    let ttl_1h_at = vcx.debug_bounds("prompt-cache-ttl-1h").unwrap().center();
-    vcx.simulate_click(ttl_1h_at, gpui::Modifiers::default());
-    vcx.run_until_parked();
-
     let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
     assert!(!saved.auto_rename_branch_from_work);
-    assert_eq!(saved.prompt_cache_ttl_secs, 3_600);
     assert!(saved.workspace_trust_preset_enabled);
 
     fs::remove_dir_all(d).ok();
@@ -7002,7 +7017,6 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
 ) {
     let d = dir("owe793-layout-primitives");
     init(cx, &d);
-    cx.update(|cx| edit(cx, |s| s.prompt_cache_timer_enabled = true));
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
 
     // 좁은 창(820px)에서도 모든 카드·행 내부 우측 컨트롤이 부모 우측 경계 안에 들어와야 한다.
@@ -7088,9 +7102,6 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
         "admin-yolo-toggle",
         "hib-toggle",
         "auto-rename-branch-toggle",
-        "prompt-cache-timer-toggle",
-        "prompt-cache-ttl-5m",
-        "prompt-cache-ttl-1h",
         "workspace-trust-preset-toggle",
     ] {
         let b = bounds(vcx, sel);
@@ -7149,12 +7160,11 @@ fn owe806_account_detail_does_not_repeat_org_name_when_auto_label_matches_org(
 }
 
 /// OWE-796: 에이전트 탭의 알약형 기본 에이전트 선택기(체크 아이콘), Yolo/수동 세그먼트,
-/// 조건부 프롬프트 캐시 TTL 하위 행, 단일 `agents.toml 열기` 헤더와 접이식 에이전트 카탈로그 행을 검증한다.
+/// 단일 `agents.toml 열기` 헤더와 접이식 에이전트 카탈로그 행을 검증한다.
 #[gpui::test]
-fn owe796_agents_tab_collapsible_catalog_pill_default_and_cache_ttl(cx: &mut TestAppContext) {
+fn owe796_agents_tab_collapsible_catalog_and_pill_default(cx: &mut TestAppContext) {
     let d = dir("owe796-agents-tab");
     init(cx, &d);
-    cx.update(|cx| edit(cx, |s| s.prompt_cache_timer_enabled = true));
 
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(820.), px(5000.)));
@@ -7219,29 +7229,7 @@ fn owe796_agents_tab_collapsible_catalog_pill_default_and_cache_ttl(cx: &mut Tes
         );
     });
 
-    // 3) 프롬프트 캐시 TTL: 타이머가 켜진 동안에만 하위 행으로 보이고, 끄면 숨겨진다.
-    assert!(vcx.debug_bounds("prompt-cache-ttl-row").is_some());
-    let cache_toggle = bounds(vcx, "prompt-cache-timer-toggle");
-    vcx.simulate_click(cache_toggle.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    vcx.update(|window, cx| {
-        assert!(!current(cx).prompt_cache_timer_enabled);
-        window.draw(cx).clear(cx);
-    });
-    assert!(
-        vcx.debug_bounds("prompt-cache-ttl-row").is_none(),
-        "타이머가 꺼지면 캐시 TTL 하위 행은 숨겨져야 한다"
-    );
-    let cache_toggle = bounds(vcx, "prompt-cache-timer-toggle");
-    vcx.simulate_click(cache_toggle.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    vcx.update(|window, cx| {
-        assert!(current(cx).prompt_cache_timer_enabled);
-        window.draw(cx).clear(cx);
-    });
-    assert!(vcx.debug_bounds("prompt-cache-ttl-row").is_some());
-
-    // 4) 에이전트 카탈로그 카드: 헤더 우측에 `agents.toml 열기`가 한 번만 배치되고,
+    // 3) 에이전트 카탈로그 카드: 헤더 우측에 `agents.toml 열기`가 한 번만 배치되고,
     //    5개 에이전트 행은 기본적으로 모두 접혀 있으며 요약·배지가 표시된다.
     let catalog_card = bounds(vcx, "admin-agents-catalog-card");
     let open_toml = bounds(vcx, "admin-agents-open-toml");

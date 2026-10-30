@@ -1244,19 +1244,6 @@ impl Sidebar {
                     .session_account_error(&account_host, id)
                     .map(str::to_owned);
                 let current_account = session.account.as_ref().map(|a| a.account_id.clone());
-                let app_settings = crate::settings::current(cx);
-                let session_cache_secs = app_settings
-                    .prompt_cache_timer_enabled
-                    .then(|| {
-                        status::session_cache_remaining_secs(
-                            &session.status.agent,
-                            session.status.state,
-                            session.status.since_unix_ns,
-                            self.now_unix_ns(),
-                            app_settings.prompt_cache_ttl_secs,
-                        )
-                    })
-                    .flatten();
                 let inside_card = self.session_card_index(index).is_some();
                 let session_highlighted = selected || self.is_session_focused(index, id);
                 // 프로젝트 기준 보기에서 카드 밖 원격 세션(폴더·작업 폴더 모르는 세션)은 PC 배지로 구분한다.
@@ -1428,22 +1415,6 @@ impl Sidebar {
                             .flatten()
                             .map(|ob| super::external::session_orch_element(&ob, p)),
                     )
-                    .children(session_cache_secs.map(|secs| {
-                        let tip = text::CACHE_TIMER_TOOLTIP.get().to_owned();
-                        div()
-                            .id(("session-cache-timer", index))
-                            .aria_label(format!(
-                                "{}: {}",
-                                tip,
-                                status::format_cache_countdown(secs)
-                            ))
-                            .debug_selector(move || format!("session-cache-timer-{index}"))
-                            .flex_none()
-                            .child(status::cache_timer_chip(secs, cx))
-                            .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                            })
-                    }))
                     .children(
                         (account_label.is_some()
                             || !account_choices.is_empty()
@@ -2170,36 +2141,6 @@ impl Sidebar {
                     .child(badge)
             });
 
-        let app_settings = crate::settings::current(cx);
-        let worktree_cache_badge = app_settings
-            .prompt_cache_timer_enabled
-            .then(|| {
-                status::worktree_most_urgent_cache_remaining_secs(
-                    tree_sessions.iter().map(|s| {
-                        (
-                            s.status.agent.as_str(),
-                            s.status.state,
-                            s.status.since_unix_ns,
-                        )
-                    }),
-                    self.now_unix_ns(),
-                    app_settings.prompt_cache_ttl_secs,
-                )
-            })
-            .flatten()
-            .map(|secs| {
-                let tip = text::CACHE_TIMER_TOOLTIP.get().to_owned();
-                div()
-                    .id(("worktree-cache-timer", index))
-                    .aria_label(format!("{}: {}", tip, status::format_cache_countdown(secs)))
-                    .debug_selector(move || format!("worktree-cache-timer-{index}"))
-                    .flex_none()
-                    .child(status::cache_timer_chip(secs, cx))
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                    })
-            });
-
         let issue_text = props.issue.then(|| self.issue_for(path)).flatten();
         let has_issue_badge = issue_text.is_some();
         let issue_badge = issue_text.map(|iss| {
@@ -2449,7 +2390,6 @@ impl Sidebar {
             .is_some_and(|parts| parts.label(has_issue_badge).is_some() || parts.unread);
         // 미커밋 수(`±N`)는 1행 오른쪽 수치 열로 옮겼으므로 배지 줄에서 뺀다.
         let has_badges = checkpoint_visible
-            || worktree_cache_badge.is_some()
             || host_badge.is_some()
             || issue_badge.is_some()
             || ports_badge.is_some()
@@ -2603,7 +2543,6 @@ impl Sidebar {
                         .items_center()
                         .gap_1()
                         .children(checkpoint_pill)
-                        .children(worktree_cache_badge)
                         .children(host_badge)
                         .children(issue_badge)
                         .children(ports_badge)

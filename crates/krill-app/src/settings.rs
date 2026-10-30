@@ -167,12 +167,6 @@ pub struct Settings {
     /// 새 버전 스테이징 완료 시 자동으로 앱을 재시작해 적용(기본 false, MK-156).
     #[serde(default)]
     pub auto_restart_update: bool,
-    /// Claude 프롬프트 캐시 카운트다운 표시 켜기/끄기(기본 false).
-    #[serde(default)]
-    pub prompt_cache_timer_enabled: bool,
-    /// Claude 프롬프트 캐시 TTL(초, 기본 300초 = 5분, OWE-737).
-    #[serde(default = "default_prompt_cache_ttl_secs")]
-    pub prompt_cache_ttl_secs: u32,
     /// 첫 프롬프트 기반 브랜치·세션 이름 자동 변경 켜기/끄기(기본 true, OWE-737).
     #[serde(default = "default_true")]
     pub auto_rename_branch_from_work: bool,
@@ -224,12 +218,6 @@ const fn default_terminal_opacity_pct() -> u8 {
 
 const fn default_true() -> bool {
     true
-}
-
-pub const DEFAULT_PROMPT_CACHE_TTL_SECS: u32 = 300;
-
-const fn default_prompt_cache_ttl_secs() -> u32 {
-    DEFAULT_PROMPT_CACHE_TTL_SECS
 }
 
 fn default_terminal_font_family() -> String {
@@ -314,8 +302,6 @@ impl Default for Settings {
             recording_paused: false,
             secure_keyboard_entry: false,
             auto_restart_update: false,
-            prompt_cache_timer_enabled: false,
-            prompt_cache_ttl_secs: DEFAULT_PROMPT_CACHE_TTL_SECS,
             auto_rename_branch_from_work: true,
             confirm_running_close: true,
             workspace_trust_preset_enabled: true,
@@ -370,7 +356,6 @@ impl Settings {
             .editor_font_size
             .clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
         parsed.terminal_opacity_pct = parsed.terminal_opacity_pct.clamp(50, 100);
-        parsed.prompt_cache_ttl_secs = parsed.prompt_cache_ttl_secs.clamp(60, 86_400);
         if parsed.terminal_theme_dark.trim().is_empty() {
             parsed.terminal_theme_dark = default_terminal_theme_dark();
         }
@@ -505,11 +490,6 @@ impl Settings {
     /// 자른 터미널 배경 불투명도(`50..=100`).
     pub fn terminal_opacity_pct(&self) -> u8 {
         self.terminal_opacity_pct.clamp(50, 100)
-    }
-
-    /// 자른 프롬프트 캐시 TTL(초, `60..=86400`).
-    pub fn prompt_cache_ttl_secs(&self) -> u32 {
-        self.prompt_cache_ttl_secs.clamp(60, 86_400)
     }
 
     /// 해당 프로바이더를 하단 상태바에 표시할지 여부(기본 true).
@@ -10026,73 +10006,6 @@ impl SettingsView {
                 ),
             );
 
-        let is_1h = s.prompt_cache_ttl_secs >= 3_600;
-        let ttl_5m = layout::segment(p, "prompt-cache-ttl-5m", text::CACHE_TTL_5M.get(), !is_1h)
-            .debug_selector(|| "prompt-cache-ttl-5m".into())
-            .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 300));
-        let ttl_1h = layout::segment(p, "prompt-cache-ttl-1h", text::CACHE_TTL_1H.get(), is_1h)
-            .debug_selector(|| "prompt-cache-ttl-1h".into())
-            .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 3_600));
-        let cache_timer_card = layout::card(p)
-            .debug_selector(|| "prompt-cache-timer-card".into())
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(self.search_focus.label(
-                        p,
-                        text::PROMPT_CACHE_TIMER.get(),
-                        Some(text::PROMPT_CACHE_TIMER_DESC.get()),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "prompt-cache-timer-toggle",
-                                s.prompt_cache_timer_enabled,
-                                false,
-                                |next, _, cx| {
-                                    edit(cx, move |s| s.prompt_cache_timer_enabled = next);
-                                },
-                            )
-                            .aria_label(text::PROMPT_CACHE_TIMER.get()),
-                        ),
-                    ),
-            )
-            .when(s.prompt_cache_timer_enabled, |d| {
-                d.child(
-                    div()
-                        .id("prompt-cache-ttl-row")
-                        .debug_selector(|| "prompt-cache-ttl-row".into())
-                        .w_full()
-                        .min_w_0()
-                        .pl_6()
-                        .pt_2()
-                        .border_t_1()
-                        .border_color(p.border)
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(self.search_focus.label(
-                            p,
-                            text::PROMPT_CACHE_TTL.get(),
-                            Some(text::PROMPT_CACHE_TTL_DESC.get()),
-                        ))
-                        .child(
-                            layout::controls()
-                                .child(layout::segmented_control(p, [ttl_5m, ttl_1h])),
-                        ),
-                )
-            });
-
         let view = cx.entity();
         let mut workspace_trust_section = div().w_full().min_w_0().flex().flex_col().gap_2().child(
             layout::row(p)
@@ -10185,7 +10098,7 @@ impl SettingsView {
                     ),
             );
         }
-        vec![auto_rename_row, cache_timer_card, workspace_trust_section]
+        vec![auto_rename_row, workspace_trust_section]
     }
 
     #[inline(never)]
