@@ -323,3 +323,35 @@ fn chain_output_is_kept_when_a_background_child_holds_stdout_open() {
         started.elapsed()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn chain_timeout_also_kills_the_shells_children() {
+    use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+
+    let dir = temp_root("chain-group");
+    let pid_file = dir.join("child.pid");
+    let command = format!(
+        "echo partial; /bin/sh -c 'echo $$ > \"$1\"; exec sleep 30' _ '{}'",
+        pid_file.display()
+    );
+    let out = run_chain_within(OsStr::new(&command), b"{}", Duration::from_millis(500));
+    assert!(out.is_empty(), "timeout means empty output");
+    let raw: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let pid = Pid::from_raw(raw).unwrap();
+    // 고아가 된 자식은 init이 거둔다. 거두기 전 좀비도 살아 있는 것으로 보이니 잠깐 기다린다.
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while test_kill_process(pid).is_ok() && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let alive = test_kill_process(pid).is_ok();
+    if alive {
+        kill_process(pid, Signal::KILL).ok();
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(!alive, "the chain's child outlived the timeout");
+}
