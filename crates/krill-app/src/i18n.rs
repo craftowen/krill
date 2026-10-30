@@ -2032,6 +2032,7 @@ catalog! {
         UPDATE_ERR_DOWNGRADE => ("낮은 버전으로는 업데이트할 수 없습니다(현재 {current}, 제공 {offered})", "Downgrade refused (current {current}, offered {offered})"),
         UPDATE_ERR_PROTOCOL => ("v{version} 업데이트에는 데몬 프로토콜 {required} 이상이 필요합니다(현재 {supported})", "Update v{version} requires daemon protocol {required} or newer (current {supported})"),
         UPDATE_ERR_ROLLOUT => ("순차 배포 대상이 아닙니다(rollout {pct}%)", "Not in the rollout cohort (rollout {pct}%)"),
+        UPDATE_SKIP_ROLLED_BACK => ("v{version}은 시작 확인에 실패해 롤백되어 자동 업데이트에서 건너뜁니다. 업데이트 확인을 누르면 다시 시도합니다", "v{version} rolled back after a failed launch check, so automatic updates skip it. Check for updates to try again"),
         UPDATE_ERR_SIGNATURE => ("업데이트 서명 검증에 실패했습니다", "Update signature verification failed"),
         UPDATE_ERR_SHA256 => ("업데이트 파일 검증에 실패했습니다(무결성 불일치)", "Update file integrity check failed (sha256 mismatch)"),
         UPDATE_ERR_CODESIGN => ("업데이트 코드서명 검증에 실패했습니다: {detail}", "Update code signature verification failed: {detail}"),

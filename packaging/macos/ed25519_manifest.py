@@ -209,6 +209,11 @@ def load_or_create_seed(key_file: Path, create_if_missing: bool) -> bytes:
     finally:
         os.close(fd)
     os.chmod(key_file, stat.S_IRUSR | stat.S_IWUSR)
+    sys.stderr.write(
+        f"warning: created a NEW Ed25519 update signing key at {key_file}. "
+        "Apps built with another key reject updates signed by this key; "
+        "if a release key already exists, restore it or set KRILL_UPDATE_KEY_FILE instead.\n"
+    )
     return seed
 
 
