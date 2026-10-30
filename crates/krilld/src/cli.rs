@@ -155,6 +155,56 @@ mod tests {
         }
     }
 
+    /// 알려진 차이로 대조에서 뺀다. (1) DCS 안 8비트 ST 0x9c는 vte만 문자열을 끝낸다.
+    /// (2) 잘못된 UTF-8 선두(`f0 80` 등)는 vte가 곧바로 ground로 돌아가고 Boundary는 다음 비연속 바이트까지
+    /// Utf8에 머문다(유한 오차). 알파벳은 0x9c와 잘못된 UTF-8 선두를 만들지 않는다.
+    fn vte_is_ground_after(bytes: &[u8]) -> bool {
+        let mut parser = alacritty_terminal::vte::Parser::new();
+        parser.advance(&mut Sink, bytes);
+        parser.mk_is_ground()
+    }
+    struct Sink;
+    impl alacritty_terminal::vte::Perform for Sink {}
+
+    #[test]
+    fn escape_intermediate_does_not_swallow_following_text() {
+        for input in [
+            b"\x1b [".as_slice(),
+            b"\xe9\x1b ]".as_slice(),
+            b"\x80\x1b/X".as_slice(),
+        ] {
+            let mut boundary = Boundary::default();
+            let mut tail = input.to_vec();
+            tail.extend(b"plain\n".repeat(1000));
+            boundary.advance(&tail);
+            assert_eq!(boundary.pending, 0, "input={input:?}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(30000))]
+        #[test]
+        fn boundary_ground_matches_vte_bytewise(
+            bytes in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    0x1b_u8, 0x20, 0x2f, b']', b'P', b'X', b'^', b'_', b'[', b'\\', 0x07, 0x18, 0x1a,
+                    b'A', b'0', b'~', 0x7f, b'\n', 0x80, 0xe9, 0x9f, 0x93,
+                ]),
+                1..40,
+            )
+        ) {
+            let mut boundary = Boundary::default();
+            for (i, &byte) in bytes.iter().enumerate() {
+                boundary.advance(&[byte]);
+                proptest::prop_assert_eq!(
+                    boundary.pending == 0,
+                    vte_is_ground_after(&bytes[..=i]),
+                    "input={:02x?} at {}", bytes, i
+                );
+            }
+        }
+    }
+
     #[test]
     fn ascii_chunks_preserve_pending_escape_strings_and_utf8() {
         for prefix in [
