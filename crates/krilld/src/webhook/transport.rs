@@ -182,3 +182,75 @@ fn post(config: &str) -> io::Result<()> {
         Err(io::Error::other("webhook POST failed"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn native_curl_posts_completion_to_loopback_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut peer = loop {
+                match listener.accept() {
+                    Ok((peer, _)) => break peer,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "webhook did not connect");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("webhook accept failed: {error}"),
+                }
+            };
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                peer.read_exact(&mut byte).unwrap();
+                request.extend_from_slice(&byte);
+                assert!(request.len() < 8192);
+            }
+            let headers = String::from_utf8(request).unwrap();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            assert!(length < 8192);
+            let mut body = vec![0; length];
+            peer.read_exact(&mut body).unwrap();
+            peer.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            (headers, body)
+        });
+        let result = deliver_transition(
+            &Endpoint::Discord {
+                url: format!("http://{address}/completion"),
+            },
+            SessionId(42),
+            AgentState::Done,
+            None,
+        );
+        let (headers, body) = server.join().unwrap();
+        result.unwrap();
+        assert!(headers.starts_with("POST /completion HTTP/1.1\r\n"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "content": "Krill: session #42 completed.",
+                "allowed_mentions": {"parse": []},
+            })
+        );
+    }
+}
