@@ -863,6 +863,24 @@ impl Shell {
                     }
                 });
             }
+            if let Some(settings) = &this.settings {
+                let identities = sidebar.read(cx).machine_identities();
+                let statuses = sidebar
+                    .read(cx)
+                    .remote_hosts()
+                    .iter()
+                    .map(|host| {
+                        (
+                            krill_app::hosts::HostId::Remote(host.id.clone()),
+                            host.status,
+                        )
+                    })
+                    .collect();
+                settings.update(cx, |view, cx| {
+                    view.sync_machine_observations(identities, cx);
+                    view.sync_machine_remote_statuses(statuses, cx);
+                });
+            }
             // Orca `activeWorktreeId` 패리티: 워크스페이스 선택이 바뀌면 다음 Cmd+T·새 에이전트의
             // 실행 위치도 그 호스트를 따른다. 메뉴에서 직접 고른 실행 위치는 선택이 다시 바뀔 때까지 둔다.
             if let Some(selected) = sidebar.read(cx).selected_workspace()
@@ -2802,6 +2820,14 @@ impl Shell {
         }
     }
 
+    fn machine_local_status(&self) -> krill_app::hosts::HostStatus {
+        match self.link {
+            Link::Up => krill_app::hosts::HostStatus::Connected,
+            Link::Connecting | Link::Down => krill_app::hosts::HostStatus::Connecting,
+            Link::Failed(_) => krill_app::hosts::HostStatus::Disconnected,
+        }
+    }
+
     pub(super) fn sync_settings_account_hosts(&self, cx: &mut Context<Self>) {
         let Some(settings) = &self.settings else {
             return;
@@ -2836,7 +2862,25 @@ impl Shell {
             snapshots.insert(host.clone(), (**snap).clone());
         }
         let settings = settings.clone();
-        settings.update(cx, |v, cx| v.sync_account_hosts(hosts, snapshots, cx));
+        let identities = self.sidebar.read(cx).machine_identities();
+        let statuses = self
+            .sidebar
+            .read(cx)
+            .remote_hosts()
+            .iter()
+            .map(|host| {
+                (
+                    krill_app::hosts::HostId::Remote(host.id.clone()),
+                    host.status,
+                )
+            })
+            .collect();
+        settings.update(cx, |v, cx| {
+            v.sync_account_hosts(hosts, snapshots, cx);
+            v.sync_machine_observations(identities, cx);
+            v.sync_machine_local_status(self.machine_local_status(), cx);
+            v.sync_machine_remote_statuses(statuses, cx);
+        });
     }
 
     pub(super) fn remote_target_for_pane(
@@ -3151,6 +3195,11 @@ impl Shell {
             }
         }
         self.link = link;
+        if let Some(settings) = &self.settings {
+            settings.update(cx, |view, cx| {
+                view.sync_machine_local_status(self.machine_local_status(), cx);
+            });
+        }
         krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
         if self.link == Link::Up {

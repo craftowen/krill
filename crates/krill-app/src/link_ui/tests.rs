@@ -786,13 +786,33 @@ fn remote_disconnect_failure_keeps_the_row_and_allows_retry(cx: &mut TestAppCont
     let backend = Arc::new(RealLinkBackend::new(dir.clone(), "unused-link".into()));
     let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend, cx));
     vcx.simulate_resize(size(px(1000.), px(1600.)));
+    vcx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            p.page = PairingPage::Details {
+                local: false,
+                routes: vec!["studio".into()],
+            };
+            cx.notify();
+        });
+    });
     vcx.run_until_parked();
+    click(vcx, "link-remote-disconnect-studio");
+    assert!(panel.read_with(vcx, |p, _| p.confirm_disconnect.is_some()));
+    vcx.update(|window, cx| {
+        let focus = panel.read(cx).focus.clone();
+        window.focus(&focus, cx);
+    });
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(panel.read_with(vcx, |p, _| p.confirm_disconnect.is_none()));
     // 손상된 저장 파일에서는 메모리 목록만 지워 성공처럼 보이지 않는다.
     std::fs::write(dir.join("link/hosts.toml"), "invalid = [").unwrap();
     click(vcx, "link-remote-disconnect-studio");
     click(vcx, "link-remote-disconnect-studio");
     assert!(vcx.debug_bounds("link-remote-host-studio").is_some());
     assert!(panel.read_with(vcx, |p, _| p.error.is_some()));
+    assert!(vcx.debug_bounds("link-server-error").is_some());
+    assert!(vcx.debug_bounds("link-server-toggle").is_none());
     krill_link::save_hosts(&dir, &[host]).unwrap();
     click(vcx, "link-remote-disconnect-studio");
     click(vcx, "link-remote-disconnect-studio");

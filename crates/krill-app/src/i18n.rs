@@ -1286,6 +1286,17 @@ catalog! {
         OPENCODE_APIKEY_EMPTY => ("API 키를 입력해 주세요", "Enter an API key"),
         TAB_AGENTS => ("에이전트", "Agents"),
         TAB_INSTALL => ("설치", "Install"),
+        TAB_MACHINES => ("머신", "Machines"),
+        TAB_MACHINES_DESC => ("이 컴퓨터와 원격 머신, 연결 방법과 접속 권한을 관리합니다.", "Manage this computer, remote machines, connection methods, and incoming access."),
+        MACHINES_ADD => ("머신 추가", "Add machine"),
+        MACHINES_THIS_COMPUTER => ("이 컴퓨터", "This computer"),
+        MACHINES_BACK => ("머신 목록", "All machines"),
+        MACHINES_INVITE => ("초대 링크", "Invitation link"),
+        MACHINES_SSH => ("SSH", "SSH"),
+        MACHINES_METHODS => ("연결 방법", "Connection methods"),
+        MACHINES_LOCAL_DESC => ("다른 기기의 접속 허용과 연결된 기기를 관리합니다.", "Manage incoming access and authorized devices."),
+        MACHINES_ADD_DESC => ("머신에 연결할 방법을 선택하세요.", "Choose how to connect to the machine."),
+        MACHINES_UNKNOWN => ("연결하면 머신을 확인합니다", "Machine identity is checked when connected"),
         TAB_SSH => ("SSH 호스트", "SSH Hosts"),
         TAB_REMOTE_KRILL => ("원격 Krill", "Remote Krill"),
         TAB_WORKFLOWS => ("오케스트레이션 · 워크플로", "Orchestration & Workflows"),
@@ -2777,7 +2788,7 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         &["훅", "상태 감지", "hook", "status"],
     ),
     (
-        crate::settings::AdminTab::RemoteKrill,
+        crate::settings::AdminTab::Machines,
         catalog::settings::TAB_REMOTE_KRILL,
         &[
             "초대",
@@ -2795,7 +2806,7 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         ],
     ),
     (
-        crate::settings::AdminTab::Ssh,
+        crate::settings::AdminTab::Machines,
         catalog::settings::SSH_TITLE,
         &[
             "원격",

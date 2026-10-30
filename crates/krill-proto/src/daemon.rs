@@ -527,6 +527,8 @@ fn find_exe(bin: &Path, apps: &[PathBuf], name: &str) -> PathBuf {
 pub struct Connection {
     pub stream: UnixStream,
     pub server: ServerHello,
+    pub daemon_identity: Option<ipc::DaemonIdentity>,
+    pub machine_identity: Option<ipc::MachineIdentity>,
     pub negotiated: Negotiated,
     /// 이 호출이 holder를 띄웠다.
     pub launched: bool,
@@ -1019,7 +1021,8 @@ fn handshake_stream(
     });
     configured?;
     let (kind, body) = ipc::read_frame(&mut stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
-    let server = ServerHello::decode(kind, &body)?;
+    let (server, daemon_identity, machine_identity) =
+        ServerHello::decode_with_identities(kind, &body)?;
     stream.write_all(&hello.encode()?)?;
     let negotiated = ipc::negotiate(&server, hello).ok_or(ipc::Error::Incompatible)?;
     let holder_status = if is_watch(hello.features) && negotiated.features & FEAT_HOLDER_WATCH != 0
@@ -1036,6 +1039,8 @@ fn handshake_stream(
     Ok(Connection {
         stream,
         server,
+        daemon_identity,
+        machine_identity,
         negotiated,
         launched: false,
         holder_status,

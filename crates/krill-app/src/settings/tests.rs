@@ -972,7 +972,7 @@ fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext)
     // Add, connect, and remove SSH host in SSH tab, and verify window reuse via open_window_at_tab.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
-            v.set_tab(AdminTab::Ssh, cx);
+            v.set_tab(AdminTab::Machines, cx);
             v.ssh_hosts = crate::ssh_hosts::add_host(
                 Some(&d),
                 "mac-node-1",
@@ -1017,10 +1017,13 @@ fn owe897_managed_remote_card_shows_probe_and_confirmed_remove(cx: &mut TestAppC
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
-            v.set_tab(AdminTab::Ssh, cx);
+            v.set_tab(AdminTab::Machines, cx);
             v.ssh_hosts =
                 crate::ssh_hosts::add_host(Some(&d), "Studio", "owen@studio.local", None, None)
                     .unwrap();
+            v.machine_page = crate::machines::MachinePage::Details(crate::hosts::HostId::Remote(
+                v.ssh_hosts[0].id.clone(),
+            ));
         });
         window.draw(cx).clear(cx);
     });
@@ -1307,13 +1310,13 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("cmd-f");
     vcx.simulate_input("ssh");
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-tab-ssh").is_some());
+    assert!(vcx.debug_bounds("admin-tab-machines").is_some());
     assert!(vcx.debug_bounds("admin-tab-general").is_none());
     assert!(vcx.debug_bounds("admin-tab-agents").is_none());
-    let ssh = vcx.debug_bounds("admin-tab-ssh").unwrap();
+    let ssh = vcx.debug_bounds("admin-tab-machines").unwrap();
     vcx.simulate_click(ssh.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Ssh));
+    vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Machines));
     vcx.simulate_keystrokes("cmd-f");
     vcx.simulate_input("zzz-no-such-setting");
     vcx.run_until_parked();
@@ -2053,7 +2056,7 @@ fn admin_tabs_hide_developer_sample_buttons(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(6000.)));
     for (tab, kept) in [
-        (AdminTab::Ssh, "admin-ssh-import"),
+        (AdminTab::Machines, "admin-machines-add"),
         (AdminTab::Workflows, "admin-orch-reset"),
     ] {
         vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(tab, cx)));
@@ -2120,9 +2123,9 @@ fn shortcuts_and_sidebar_use_readable_labels() {
         }
     }
     assert!(matches!(AdminTab::Shortcuts.icon(), IconName::Keyboard));
-    assert!(matches!(AdminTab::Ssh.icon(), IconName::Server));
+    assert!(matches!(AdminTab::Machines.icon(), IconName::Monitor));
     assert_eq!(AdminTab::Accounts.badge(), None);
-    assert_eq!(AdminTab::Ssh.badge(), None);
+    assert_eq!(AdminTab::Machines.badge(), None);
     assert_ne!(text::GROUP_SETUP.in_language(Language::Ko), "설정 시작");
 }
 
@@ -2214,7 +2217,7 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-search-clear").is_some());
     assert!(vcx.debug_bounds("admin-search-hint").is_none());
-    assert!(vcx.debug_bounds("admin-tab-ssh").is_some());
+    assert!(vcx.debug_bounds("admin-tab-machines").is_some());
     assert!(vcx.debug_bounds("admin-tab-general").is_none());
 
     let clear_btn = vcx
@@ -3438,7 +3441,9 @@ fn owe668_ssh_tab_form_tailscale_and_onboarding_flow(cx: &mut TestAppContext) {
     };
 
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Ssh, cx));
+        view.update(cx, |v, cx| {
+            v.show_machine_add(crate::machines::AddMethod::Ssh, cx);
+        });
         window.draw(cx).clear(cx);
     });
 
@@ -3490,6 +3495,7 @@ fn owe668_ssh_tab_form_tailscale_and_onboarding_flow(cx: &mut TestAppContext) {
     // Tailscale 발견 기기 주입 후 한 번 눌러 추가.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
+            v.show_machine_add(crate::machines::AddMethod::Ssh, cx);
             v.set_tailscale_peers(
                 vec![crate::ssh_hosts::TailscalePeer {
                     hostname: "Owen Studio".into(),
@@ -3588,7 +3594,9 @@ fn owe800_ssh_tab_host_card_status_dot_edit_disconnect_and_two_column_form(
     };
 
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Ssh, cx));
+        view.update(cx, |v, cx| {
+            v.show_machine_add(crate::machines::AddMethod::Ssh, cx);
+        });
         window.draw(cx).clear(cx);
     });
 
@@ -3777,7 +3785,9 @@ fn owe884_ssh_form_enter_test_pending_remove_confirm_and_copy_id_notice(cx: &mut
         vcx.run_until_parked();
     };
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Ssh, cx));
+        view.update(cx, |v, cx| {
+            v.show_machine_add(crate::machines::AddMethod::Ssh, cx);
+        });
         window.draw(cx).clear(cx);
     });
     assert!(vcx.debug_bounds("admin-ssh-form").is_some());
@@ -8646,14 +8656,14 @@ fn mobile_pairing_keeps_path_selection_and_other_tabs_available(cx: &mut TestApp
     fs::remove_dir_all(d).ok();
 }
 
-/// SSH 입력과 초대 링크 기반 Krill 연결은 서로 다른 설정 페이지에만 표시된다.
 #[gpui::test]
-fn ssh_and_remote_krill_have_separate_pages(cx: &mut TestAppContext) {
-    let d = dir("remote-krill-separate");
+fn machines_page_owns_add_methods_and_this_computer_access(cx: &mut TestAppContext) {
+    use crate::machines::{AddMethod, MachinePage};
+    let d = dir("machines-navigation");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
-    vcx.simulate_resize(size(px(1400.), px(1200.)));
-    vcx.update(|window, cx| {
+    vcx.simulate_resize(size(px(1400.), px(1600.)));
+    let pairing = vcx.update(|window, cx| {
         let pairing = cx.new(|cx| {
             crate::link_ui::PairingView::new(
                 std::sync::Arc::new(crate::link_ui::MockLinkBackend::new()),
@@ -8662,33 +8672,54 @@ fn ssh_and_remote_krill_have_separate_pages(cx: &mut TestAppContext) {
             )
         });
         view.update(cx, |v, cx| {
-            v.remote_krill = Some(pairing);
-            v.set_tab(AdminTab::Ssh, cx);
+            v.remote_krill = Some(pairing.clone());
+            v.set_tab(AdminTab::Machines, cx);
         });
+        pairing
     });
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-tab-ssh").is_some());
-    assert!(vcx.debug_bounds("admin-tab-remote-krill").is_some());
-    assert!(vcx.debug_bounds("admin-ssh-import").is_some());
+    assert!(vcx.debug_bounds("admin-tab-machines").is_some());
+    assert!(vcx.debug_bounds("admin-tab-ssh").is_none());
+    assert!(vcx.debug_bounds("admin-tab-remote-krill").is_none());
+    assert!(vcx.debug_bounds("admin-machines-list").is_some());
     assert!(vcx.debug_bounds("link-server-panel").is_none());
-    assert!(vcx.debug_bounds("admin-link-pairing").is_none());
-    let tab = vcx.debug_bounds("admin-tab-remote-krill").unwrap();
-    vcx.simulate_click(tab.center(), gpui::Modifiers::default());
+    assert!(vcx.debug_bounds("admin-ssh-form").is_none());
+    let add = vcx.debug_bounds("admin-machines-add").unwrap();
+    vcx.simulate_click(add.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("link-server-panel").is_some());
     assert!(vcx.debug_bounds("link-client-input-link").is_some());
-    assert!(vcx.debug_bounds("admin-ssh-import").is_none());
-    assert!(vcx.debug_bounds("link-pairing-modal").is_none());
-    // 탭을 왕복해도 입력 중인 링크·페어링 상태를 가진 뷰는 유지된다.
-    let pairing = vcx.update(|_, cx| view.read(cx).remote_krill.clone().unwrap());
+    assert!(vcx.debug_bounds("link-server-panel").is_none());
+    vcx.simulate_input("krill://pair?invite=draft");
+    vcx.update(|_, cx| {
+        assert_eq!(
+            pairing.read(cx).client.read(cx).link_value(cx),
+            "krill://pair?invite=draft"
+        );
+    });
+    let ssh = vcx.debug_bounds("admin-machines-ssh").unwrap();
+    vcx.simulate_click(ssh.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-ssh-form").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-import").is_some());
+    assert!(vcx.debug_bounds("link-client-input-link").is_none());
+    vcx.update(|window, cx| {
+        let input = view.read(cx).ssh_form.as_ref().unwrap().label.clone();
+        assert!(input.read(cx).focus_handle(cx).is_focused(window));
+    });
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
-            v.set_tab(AdminTab::Ssh, cx);
-            v.set_tab(AdminTab::RemoteKrill, cx);
+            v.machine_page = MachinePage::ThisComputer;
+            cx.notify();
         });
     });
     vcx.run_until_parked();
-    vcx.update(|_, cx| assert_eq!(view.read(cx).remote_krill.as_ref(), Some(&pairing)));
+    assert!(vcx.debug_bounds("link-server-panel").is_some());
+    assert!(vcx.debug_bounds("link-client-input-link").is_none());
+    assert!(vcx.debug_bounds("admin-ssh-form").is_none());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.show_machine_add(AddMethod::Invite, cx));
+        assert_eq!(view.read(cx).remote_krill.as_ref(), Some(&pairing));
+    });
     fs::remove_dir_all(d).ok();
 }
 
@@ -10352,6 +10383,235 @@ fn settings_search_enter_scrolls_and_focuses_matching_row(cx: &mut TestAppContex
         assert!(
             view.search_focus.scroll.offset().y < px(0.),
             "matching font row must scroll past theme previews"
+        );
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[derive(Debug)]
+struct MachinesBackend(crate::link_ui::MockLinkBackend);
+
+impl crate::link_ui::LinkBackend for MachinesBackend {
+    fn enable_server(&self) -> Result<crate::link_ui::ServerStatus, String> {
+        self.0.enable_server()
+    }
+    fn disable_server(&self) -> Result<crate::link_ui::ServerStatus, String> {
+        self.0.disable_server()
+    }
+    fn server_status(&self) -> Result<crate::link_ui::ServerStatus, String> {
+        self.0.server_status()
+    }
+    fn create_invite(&self) -> Result<crate::link_ui::Invite, String> {
+        self.0.create_invite()
+    }
+    fn pair(&self, link: &str, device: &str, host: &str) -> crate::link_ui::PairOutcome {
+        self.0.pair(link, device, host)
+    }
+    fn devices(&self) -> Result<Vec<crate::link_ui::PairedDevice>, String> {
+        self.0.devices()
+    }
+    fn revoke(&self, id: &str) -> Result<Vec<crate::link_ui::PairedDevice>, String> {
+        self.0.revoke(id)
+    }
+    fn nearby(&self) -> Result<Vec<crate::link_ui::NearbyMac>, String> {
+        self.0.nearby()
+    }
+    fn remote_hosts(&self) -> Result<Vec<crate::link_ui::PairedHost>, String> {
+        Ok(vec![crate::link_ui::PairedHost {
+            id: "studio-peer".into(),
+            name: "Studio".into(),
+            status: crate::hosts::HostStatus::Connected,
+            version: None,
+        }])
+    }
+}
+
+#[gpui::test]
+fn machines_group_verified_ssh_and_invite_routes_without_losing_controls(cx: &mut TestAppContext) {
+    use crate::hosts::HostId;
+    use crate::machines::MachinePage;
+    use krill_proto::ipc::MachineIdentity;
+    let d = dir("machines-grouped-controls");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(1600.)));
+    vcx.update(|window, cx| {
+        let pairing = cx.new(|cx| {
+            crate::link_ui::PairingView::new(
+                std::sync::Arc::new(MachinesBackend(crate::link_ui::MockLinkBackend::new())),
+                window,
+                cx,
+            )
+        });
+        view.update(cx, |v, cx| {
+            v.remote_krill = Some(pairing);
+            v.ssh_hosts =
+                crate::ssh_hosts::add_host(Some(&d), "Studio SSH", "user@studio", None, None)
+                    .unwrap();
+            v.set_tab(AdminTab::Machines, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            let ssh = HostId::Remote(v.ssh_hosts[0].id.clone());
+            v.sync_machine_observations(
+                std::collections::BTreeMap::from([
+                    (ssh.clone(), MachineIdentity([7; 16])),
+                    (
+                        HostId::Remote("iroh:studio-peer".into()),
+                        MachineIdentity([7; 16]),
+                    ),
+                ]),
+                cx,
+            );
+            let machines = v.machine_catalog(cx);
+            assert_eq!(machines.len(), 2, "one local and one remote machine");
+            assert_eq!(
+                machines
+                    .iter()
+                    .find(|m| !m.is_local())
+                    .unwrap()
+                    .routes
+                    .len(),
+                2
+            );
+            v.machine_page = MachinePage::Details(ssh);
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-ssh-card-ssh-studio-ssh").is_some());
+    assert!(vcx.debug_bounds("link-remote-host-studio-peer").is_some());
+    assert!(vcx.debug_bounds("link-remote-rename-studio-peer").is_some());
+    assert!(vcx.debug_bounds("link-server-toggle").is_none());
+    assert!(vcx.debug_bounds("link-client-input-link").is_none());
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn machine_details_keep_selected_route_when_identity_arrives(cx: &mut TestAppContext) {
+    use crate::hosts::HostId;
+    use crate::machines::MachinePage;
+    use krill_proto::ipc::MachineIdentity;
+    let d = dir("machines-late-identity");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(1200.)));
+    let selected = vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.ssh_hosts =
+                crate::ssh_hosts::add_host(Some(&d), "Studio", "user@studio", None, None).unwrap();
+            let host = HostId::Remote(v.ssh_hosts[0].id.clone());
+            v.machine_page = MachinePage::Details(host.clone());
+            v.set_tab(AdminTab::Machines, cx);
+            host
+        })
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-ssh-card-ssh-studio").is_some());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.sync_machine_observations(
+                std::collections::BTreeMap::from([(selected.clone(), MachineIdentity([1; 16]))]),
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-ssh-card-ssh-studio").is_some());
+    vcx.update(|_, cx| assert_eq!(view.read(cx).machine_page, MachinePage::Details(selected)));
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn machines_local_status_follows_link_without_requiring_identity_support(cx: &mut TestAppContext) {
+    use crate::hosts::HostStatus;
+    let d = dir("machines-local-status");
+    init(cx, &d);
+    let view = cx.new(SettingsView::new);
+    view.update(cx, |v, cx| {
+        assert_eq!(v.machine_catalog(cx)[0].status(), HostStatus::Connecting);
+        v.sync_machine_local_status(HostStatus::Connected, cx);
+        assert_eq!(v.machine_catalog(cx)[0].status(), HostStatus::Connected);
+        assert!(
+            v.machine_catalog(cx)[0].routes[0].identity.is_none(),
+            "legacy daemon can still be connected"
+        );
+        v.sync_machine_local_status(HostStatus::Disconnected, cx);
+        assert_eq!(v.machine_catalog(cx)[0].status(), HostStatus::Disconnected);
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn machines_ssh_overview_waits_for_observed_connection_success(cx: &mut TestAppContext) {
+    use crate::hosts::{HostId, HostStatus};
+    let d = dir("machines-observed-ssh-status");
+    init(cx, &d);
+    let view = cx.new(SettingsView::new);
+    view.update(cx, |v, cx| {
+        v.ssh_hosts =
+            crate::ssh_hosts::add_host(Some(&d), "Studio", "unreachable.example", None, None)
+                .unwrap();
+        let host = v.ssh_hosts[0].clone();
+        let route = HostId::Remote(host.id.clone());
+        v.connect_ssh_host(host, cx);
+        assert_eq!(
+            v.ssh_host_status(route.remote_id().unwrap()),
+            SshHostCardStatus::Connected
+        );
+        let status = |v: &SettingsView, cx: &App| {
+            v.machine_catalog(cx)
+                .into_iter()
+                .find(|m| !m.is_local())
+                .unwrap()
+                .status()
+        };
+        assert_eq!(
+            status(v, cx),
+            HostStatus::Disconnected,
+            "a queued connection is not a successful observation"
+        );
+        v.sync_machine_remote_statuses(
+            std::collections::BTreeMap::from([(route.clone(), HostStatus::Connecting)]),
+            cx,
+        );
+        assert_eq!(status(v, cx), HostStatus::Connecting);
+        v.sync_machine_remote_statuses(
+            std::collections::BTreeMap::from([(route, HostStatus::Connected)]),
+            cx,
+        );
+        assert_eq!(status(v, cx), HostStatus::Connected);
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn machines_add_same_label_opens_the_submitted_destination(cx: &mut TestAppContext) {
+    use crate::machines::{AddMethod, MachinePage};
+    let d = dir("machines-duplicate-label");
+    init(cx, &d);
+    let first = crate::ssh_hosts::add_host(Some(&d), "Studio", "user@first", None, None).unwrap();
+    let first_id = first[0].id.clone();
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    view.update(vcx, |v, cx| {
+        v.show_machine_add(AddMethod::Ssh, cx);
+        v.submit_ssh_host("Studio", "user@second", "", "", cx)
+            .unwrap();
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let new = v
+            .ssh_hosts
+            .iter()
+            .find(|host| host.destination == "user@second")
+            .unwrap();
+        assert_ne!(new.id, first_id);
+        assert_eq!(
+            v.machine_page,
+            MachinePage::Details(crate::hosts::HostId::Remote(new.id.clone()))
         );
     });
     fs::remove_dir_all(d).ok();

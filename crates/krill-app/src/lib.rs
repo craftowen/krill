@@ -24,6 +24,7 @@ pub mod keys;
 pub mod layout;
 pub mod link;
 pub mod link_ui;
+pub mod machines;
 pub mod menu_bar;
 pub mod onboarding;
 pub mod open_in;

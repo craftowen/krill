@@ -54,6 +54,7 @@ pub enum LinkUiEvent {
 
 /// "이 Mac에 다른 기기 접속 허용" 서버 패널.
 pub struct ServerPanel {
+    page: PairingPage,
     backend: Arc<dyn LinkBackend>,
     qr_source: Option<Arc<dyn QrMatrixSource>>,
     status: ServerStatus,
@@ -104,10 +105,15 @@ impl std::fmt::Debug for ServerPanel {
 }
 
 impl ServerPanel {
+    pub fn remote_hosts(&self) -> &[PairedHost] {
+        &self.remote_hosts
+    }
+
     /// 백엔드를 연결해 서버 패널을 만들고 초기 상태(`server_status`, `devices`)를 백그라운드에서 조회한다.
     pub fn new(backend: Arc<dyn LinkBackend>, cx: &mut Context<Self>) -> Self {
         let mut panel = Self {
             backend,
+            page: PairingPage::All,
             qr_source: None,
             status: ServerStatus::default(),
             invite: None,
@@ -820,6 +826,7 @@ impl ServerPanel {
     fn render_remote_hosts(
         &self,
         p: &crate::ui::Palette,
+        selected: Option<&[String]>,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         use crate::i18n::catalog::sidebar as labels;
@@ -843,7 +850,11 @@ impl ServerPanel {
                     .child(text::REMOTE_HOSTS_EMPTY.get()),
             );
         }
-        for host in &self.remote_hosts {
+        for host in self
+            .remote_hosts
+            .iter()
+            .filter(|host| selected.is_none_or(|ids| ids.contains(&host.id)))
+        {
             let (color, label) = match host.status {
                 krill_hosts::HostStatus::Connected => (p.success, labels::HOST_CONNECTED.get()),
                 krill_hosts::HostStatus::Connecting => (p.warning, labels::HOST_CONNECTING.get()),
@@ -1150,6 +1161,7 @@ impl ServerPanel {
 impl Render for ServerPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = crate::ui::palette(cx);
+        let local_content = !matches!(self.page, PairingPage::Details { local: false, .. });
         let enabled = self.status.enabled;
         let desc = if enabled {
             text::SERVER_DESC_ON.get()
@@ -1196,44 +1208,46 @@ impl Render for ServerPanel {
             .flex_col()
             .gap_3()
             .text_color(p.card_foreground)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(text::SERVER_TITLE.get()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(desc),
-                            ),
-                    )
-                    .child(
-                        crate::ui::controls()
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(toggle_label),
-                            )
-                            .child(toggle),
-                    ),
-            )
-            .when(!enabled, |d| {
+            .when(local_content, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::TEXT_SM)
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(text::SERVER_TITLE.get()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_color(p.muted_foreground)
+                                        .child(desc),
+                                ),
+                        )
+                        .child(
+                            crate::ui::controls()
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_color(p.muted_foreground)
+                                        .child(toggle_label),
+                                )
+                                .child(toggle),
+                        ),
+                )
+            })
+            .when(local_content && !enabled, |d| {
                 d.child(
                     div()
                         .id("link-server-off-notice")
@@ -1253,9 +1267,22 @@ impl Render for ServerPanel {
                         .debug_selector(|| "link-server-error".into()),
                 )
             })
-            .when(enabled, |d| d.child(self.render_invite_section(p, cx)))
-            .child(self.render_devices_section(p, cx))
-            .child(self.render_remote_hosts(p, cx))
+            .when(local_content && enabled, |d| {
+                d.child(self.render_invite_section(p, cx))
+            })
+            .when(local_content, |d| {
+                d.child(self.render_devices_section(p, cx))
+            })
+            .when(self.page == PairingPage::All, |d| {
+                d.child(self.render_remote_hosts(p, None, cx))
+            })
+            .when_some(
+                match &self.page {
+                    PairingPage::Details { routes, .. } if !routes.is_empty() => Some(routes),
+                    _ => None,
+                },
+                |d, routes| d.child(self.render_remote_hosts(p, Some(routes), cx)),
+            )
     }
 }
 
@@ -1366,6 +1393,11 @@ impl ClientDialog {
     #[must_use]
     pub const fn phase(&self) -> &ClientPhase {
         &self.phase
+    }
+
+    pub fn focus_link(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_input
+            .update(cx, |input, cx| input.focus(window, cx));
     }
 
     #[must_use]
@@ -1904,12 +1936,40 @@ impl Render for ClientDialog {
 /// 한 화면에 묶어 보여주는 통합 뷰.
 #[derive(Debug)]
 pub struct PairingView {
+    page: PairingPage,
     pub server: Entity<ServerPanel>,
     pub client: Entity<ClientDialog>,
     _events: Vec<Subscription>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PairingPage {
+    #[default]
+    All,
+    Add,
+    Details {
+        local: bool,
+        routes: Vec<String>,
+    },
+}
+
 impl PairingView {
+    pub fn show(&mut self, page: PairingPage, cx: &mut Context<Self>) {
+        if self.page != page {
+            self.server.update(cx, |server, cx| {
+                server.page = page.clone();
+                server.confirm_disconnect = None;
+                server.confirm_revoke = None;
+                server.confirmation_deadline = None;
+                server.renaming = None;
+                server.rename_return_focus = None;
+                cx.notify();
+            });
+            self.page = page;
+            cx.notify();
+        }
+    }
+
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.server
             .update(cx, |server, cx| server.set_visible(visible, cx));
@@ -1930,6 +1990,7 @@ impl PairingView {
             }),
         ];
         Self {
+            page: PairingPage::All,
             server,
             client,
             _events: events,
@@ -1947,8 +2008,13 @@ impl Render for PairingView {
             .flex()
             .flex_col()
             .gap_4()
-            .child(self.server.clone())
-            .child(self.client.clone())
+            .when(self.page != PairingPage::Add, |d| {
+                d.child(self.server.clone())
+            })
+            .when(
+                matches!(self.page, PairingPage::All | PairingPage::Add),
+                |d| d.child(self.client.clone()),
+            )
     }
 }
 

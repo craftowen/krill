@@ -104,6 +104,11 @@ fn re_pairing_the_same_host_replaces_the_sidebar_source_without_an_empty_poll(
     view.update(vcx, |s, cx| s.sync_remote_hosts(&manager, cx));
     vcx.run_until_parked();
     let old = view.read_with(vcx, |s, _| s.remote_hosts[0].source.clone().unwrap());
+    let host = HostId::Remote("iroh:studio".into());
+    let identity = krill_proto::ipc::MachineIdentity([6; 16]);
+    view.update(vcx, |s, _| {
+        s.observe_machine(host.clone(), Some(identity));
+    });
     // 같은 세대의 주기 갱신은 연결과 GitWatch 캐시를 유지한다.
     manager.sync_external_hosts(vec![registration(key, current.clone())]);
     view.update(vcx, |s, cx| s.sync_remote_hosts(&manager, cx));
@@ -112,6 +117,10 @@ fn re_pairing_the_same_host_replaces_the_sidebar_source_without_an_empty_poll(
         &old,
         s.remote_hosts[0].source.as_ref().unwrap()
     )));
+    assert_eq!(
+        view.read_with(vcx, |s, _| s.machine_identities().get(&host).copied()),
+        Some(identity)
+    );
     current.store(false, Ordering::Release);
     manager.sync_external_hosts(vec![registration(
         Arc::new(()),
@@ -124,6 +133,7 @@ fn re_pairing_the_same_host_replaces_the_sidebar_source_without_an_empty_poll(
         assert!(!Arc::ptr_eq(&old, new));
         assert!(!old.target().unwrap().is_current());
         assert!(new.target().unwrap().is_current());
+        assert!(!s.machine_identities().contains_key(&host));
     });
 }
 
@@ -1397,13 +1407,14 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
 
     // 원격 폴링 경로(`poll_snapshot`)는 호스트 전용 스레드에서 기존 연결을 재사용하고,
     // 결과도 fetch + meta와 같다.
-    let (snap, meta) = tokio::runtime::Builder::new_current_thread()
+    let PolledSnapshot { observed, meta } = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
         .block_on(sidebar_sock.poll_snapshot())
         .unwrap();
     // 레지스트리는 실행 환경의 다른 저장소도 보여 주고 그 변경 수는 git 감시가 비동기로 채운다. 그래서 두 번 읽은
     // 값을 통째로 비교하지 않고 저장소 목록과 브랜치만 비교한다.
+    let snap = observed.snapshot;
     let again = sidebar_sock.meta(&snap.trees);
     let shape = |m: &BTreeMap<PathBuf, _>| {
         m.iter()
@@ -7195,5 +7206,74 @@ fn transient_poll_errors_keep_diagnostics_without_warning_card(cx: &mut TestAppC
         assert!(sidebar.poll_error_notice().is_some());
         sidebar.apply(Ok((Snapshot::default(), Meta::new())), BTreeMap::new(), cx);
         assert!(sidebar.poll_error.is_none());
+    });
+}
+
+#[gpui::test]
+fn machine_observations_follow_accepted_remote_snapshots(cx: &mut TestAppContext) {
+    struct Observed {
+        identity: krill_proto::ipc::MachineIdentity,
+        snapshot: Arc<Snapshot>,
+        gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+    impl Source for Observed {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok((*self.snapshot).clone())
+        }
+        fn poll_snapshot(&self) -> PollSnapshot {
+            let observed = IdentifiedSnapshot {
+                snapshot: self.snapshot.clone(),
+                daemon_identity: None,
+                machine_identity: Some(self.identity),
+            };
+            let gate = self.gate.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.await.ok();
+                }
+                Ok(PolledSnapshot {
+                    observed,
+                    meta: Meta::new(),
+                })
+            })
+        }
+    }
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let make = |byte, gate| {
+        Arc::new(Observed {
+            identity: krill_proto::ipc::MachineIdentity([byte; 16]),
+            snapshot: Arc::new(Snapshot {
+                sessions: vec![session(u64::from(byte), AgentState::Waiting, None)],
+                ..Snapshot::default()
+            }),
+            gate: std::sync::Mutex::new(gate),
+        })
+    };
+    view.update(vcx, |s, cx| {
+        s.set_remote_host_source(
+            "route",
+            "Old",
+            HostStatus::Connecting,
+            make(1, Some(gate)),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert!(view.read_with(vcx, |s, _| s.machine_identities().is_empty()));
+    view.update(vcx, |s, cx| {
+        s.set_remote_host_source("route", "New", HostStatus::Connecting, make(2, None), cx);
+    });
+    vcx.run_until_parked();
+    release.send(()).ok();
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert_eq!(
+            s.machine_identities().get(&HostId::Remote("route".into())),
+            Some(&krill_proto::ipc::MachineIdentity([2; 16]))
+        );
+        assert_eq!(s.remote_hosts[0].snapshot.sessions[0].id, SessionId(2));
+        assert_eq!(s.remote_hosts[0].status, HostStatus::Connected);
     });
 }

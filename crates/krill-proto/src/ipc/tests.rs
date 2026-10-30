@@ -537,3 +537,119 @@ fn resume_history_hello_fixtures_and_n_minus_1_negotiation() {
         0
     );
 }
+
+#[test]
+fn daemon_identity_tail_preserves_frozen_hello_in_both_directions() {
+    let identity = DaemonIdentity(std::array::from_fn(|i| u8::try_from(i).unwrap()));
+    let legacy = unhex(SERVER_HELLO_V1);
+    let (kind, body) = frame(&legacy);
+    assert_eq!(
+        ServerHello::decode_with_identity(kind, &body).unwrap(),
+        (server_hello(), None)
+    );
+    let extended = server_hello().encode_with_identity(identity).unwrap();
+    assert_eq!(
+        hex(&extended),
+        "270000000101010005302e312e30888e98a8c0e08081014b444931000102030405060708090a0b0c0d0e0f"
+    );
+    let (kind, body) = frame(&extended);
+    assert_eq!(ServerHello::decode(kind, &body).unwrap(), server_hello());
+    assert_eq!(
+        ServerHello::decode_with_identity(kind, &body).unwrap(),
+        (server_hello(), Some(identity))
+    );
+    assert_eq!(server_hello().encode().unwrap(), legacy);
+    assert!(ServerHello::decode_with_identity(kind, &body[..body.len() - 1]).is_err());
+    let mut unknown = frame(&legacy).1;
+    unknown.extend_from_slice(b"future-extension");
+    assert_eq!(
+        ServerHello::decode_with_identity(kind, &unknown).unwrap().1,
+        None
+    );
+}
+
+#[test]
+fn machine_identity_tail_preserves_legacy_decoders_and_epoch() {
+    let epoch = DaemonIdentity([3; 16]);
+    let machine = MachineIdentity([7; 16]);
+    let extended = server_hello()
+        .encode_with_identities(epoch, Some(machine))
+        .unwrap();
+    let (kind, body) = frame(&extended);
+    assert_eq!(ServerHello::decode(kind, &body).unwrap(), server_hello());
+    assert_eq!(
+        ServerHello::decode_with_identity(kind, &body).unwrap(),
+        (server_hello(), Some(epoch))
+    );
+    assert_eq!(
+        ServerHello::decode_with_identities(kind, &body).unwrap(),
+        (server_hello(), Some(epoch), Some(machine))
+    );
+    let base_body = postcard::to_stdvec(&server_hello()).unwrap();
+    let mut frozen = base_body;
+    frozen.extend_from_slice(b"KDI1");
+    frozen.extend_from_slice(&[3; 16]);
+    frozen.extend_from_slice(b"KMI1");
+    frozen.extend_from_slice(&[7; 16]);
+    assert_eq!(body, frozen);
+    for missing in 1..=16 {
+        assert!(ServerHello::decode_with_identities(kind, &body[..body.len() - missing]).is_err());
+    }
+    let old = server_hello().encode_with_identity(epoch).unwrap();
+    let (kind, body) = frame(&old);
+    assert_eq!(
+        ServerHello::decode_with_identities(kind, &body).unwrap(),
+        (server_hello(), Some(epoch), None)
+    );
+    let old = server_hello().encode().unwrap();
+    let (kind, body) = frame(&old);
+    assert_eq!(
+        ServerHello::decode_with_identities(kind, &body).unwrap(),
+        (server_hello(), None, None)
+    );
+}
+
+#[test]
+fn unknown_machine_identity_extension_does_not_guess_an_identity() {
+    let epoch = DaemonIdentity([3; 16]);
+    let old = server_hello().encode_with_identity(epoch).unwrap();
+    let (kind, mut body) = frame(&old);
+    body.extend_from_slice(b"KMI2unknown");
+    assert_eq!(
+        ServerHello::decode_with_identities(kind, &body).unwrap(),
+        (server_hello(), Some(epoch), None)
+    );
+}
+
+#[test]
+fn identity_decoder_rejects_wrong_kind_and_preserves_unknown_tails() {
+    let body = postcard::to_stdvec(&server_hello()).unwrap();
+    assert!(ServerHello::decode_with_identities(kind::CLIENT_HELLO, &body).is_err());
+    assert!(ServerHello::decode_with_identity(kind::CLIENT_HELLO, &body).is_err());
+    let mut unknown = body;
+    unknown.extend_from_slice(b"KDI2future");
+    assert_eq!(
+        ServerHello::decode_with_identities(kind::SERVER_HELLO, &unknown).unwrap(),
+        (server_hello(), None, None)
+    );
+}
+
+proptest::proptest! {
+    #[test]
+    fn arbitrary_identity_bytes_roundtrip(
+        daemon in proptest::prelude::any::<[u8; 16]>(),
+        machine in proptest::prelude::any::<[u8; 16]>(),
+        malformed in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+    ) {
+        let daemon = DaemonIdentity(daemon);
+        let machine = MachineIdentity(machine);
+        let encoded = server_hello().encode_with_identities(daemon, Some(machine)).unwrap();
+        let (kind, body) = frame(&encoded);
+        proptest::prop_assert_eq!(
+            ServerHello::decode_with_identities(kind, &body).unwrap(),
+            (server_hello(), Some(daemon), Some(machine))
+        );
+        drop(ServerHello::decode_with_identities(kind, &malformed));
+        drop(ServerHello::decode_with_identity(kind, &malformed));
+    }
+}

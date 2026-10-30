@@ -34,7 +34,12 @@ impl super::Shell {
                 link_ui::HostCommand::Open => {}
             }
             Some(entity.update(cx, |this, cx| {
-                this.open_settings(krill_app::settings::AdminTab::RemoteKrill, None, cx);
+                this.open_settings(krill_app::settings::AdminTab::Machines, None, cx);
+                if let Some(settings) = &this.settings {
+                    settings.update(cx, |view, cx| {
+                        view.show_machine_add(krill_app::machines::AddMethod::Invite, cx);
+                    });
+                }
                 this.activate_host_window(cx);
                 true
             }))

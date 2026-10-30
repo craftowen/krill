@@ -6737,7 +6737,7 @@ fn multi_window_settings_close_targets_matching_shell_host(cx: &mut TestAppConte
             s
         });
         floating.update(cx, |s, cx| {
-            s.open_settings(krill_app::settings::AdminTab::Ssh, None, cx);
+            s.open_settings(krill_app::settings::AdminTab::Machines, None, cx);
         });
         assert!(
             floating.read(cx).settings.is_none(),
@@ -8634,9 +8634,9 @@ fn file_tab_context_menu_copies_paths(cx: &mut TestAppContext) {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// 앱 메뉴의 연결 진입점은 원격 Krill 설정으로 이동하며 터미널 칸을 보존한다.
+/// 앱 메뉴의 연결 진입점은 머신 추가 화면으로 이동하며 터미널 칸을 보존한다.
 #[gpui::test]
-fn pairing_opens_remote_krill_settings_page(cx: &mut TestAppContext) {
+fn pairing_opens_machines_invite_page(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("remote-krill-settings"));
     let panes = layout_of(&view, cx).visible();
     cx.run_until_parked();
@@ -8645,12 +8645,13 @@ fn pairing_opens_remote_krill_settings_page(cx: &mut TestAppContext) {
     assert_eq!(cx.windows().len(), 1);
     assert!(cx.debug_bounds("admin-center").is_some());
     assert!(cx.debug_bounds("link-pairing-modal").is_none());
-    assert!(cx.debug_bounds("link-server-panel").is_some());
+    assert!(cx.debug_bounds("link-client-input-link").is_some());
+    assert!(cx.debug_bounds("link-server-panel").is_none());
     cx.update(|_, cx| {
         let settings = view.read(cx).settings.as_ref().unwrap();
         assert_eq!(
             settings.read(cx).tab(),
-            krill_app::settings::AdminTab::RemoteKrill
+            krill_app::settings::AdminTab::Machines
         );
     });
     cx.update(|_, cx| krill_app::link_ui::open_pairing(cx));

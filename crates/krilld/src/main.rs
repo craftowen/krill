@@ -297,6 +297,7 @@ fn main() -> ExitCode {
             })
             .ok();
     }
+    krilld::ipc::initialize_machine_identity(&path);
     tracing::info!(linked, reused, "daemon accepting clients");
     let hello = ServerHello {
         proto_min: PROTO_MIN,

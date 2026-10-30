@@ -114,6 +114,14 @@ pub mod kind {
     pub const CLIENT_HELLO: u8 = 0x02;
 }
 
+/// 같은 데몬 프로세스로 연결되는 서로 다른 전송 경로를 식별하는 난수.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DaemonIdentity(pub [u8; 16]);
+
+/// 재시작 뒤에도 유지하는 데몬 설치 단위 식별자. 전송 인증이나 세션 세대가 아니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct MachineIdentity(pub [u8; 16]);
+
 /// krilld가 accept 직후 보내는 첫 프레임([`kind::SERVER_HELLO`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerHello {
@@ -122,7 +130,7 @@ pub struct ServerHello {
     pub features: u64,
     /// krilld 빌드 문자열(진단용).
     pub build: String,
-    /// krilld 세대 식별자. 재기동하면 바뀐다.
+    /// krilld PID(진단용). 다른 호스트의 데몬 식별에 쓰지 않는다.
     pub instance_id: u64,
 }
 
@@ -206,6 +214,71 @@ impl ServerHello {
 
     pub fn decode(kind: u8, body: &[u8]) -> Result<Self, Error> {
         decode(kind::SERVER_HELLO, kind, body)
+    }
+
+    /// 기존 Hello 뒤에 프로세스 난수를 붙인다. 구 디코더는 이 꼬리를 무시한다.
+    pub fn encode_with_identity(&self, identity: DaemonIdentity) -> Result<Vec<u8>, Error> {
+        self.encode_with_identities(identity, None)
+    }
+
+    pub fn encode_with_identities(
+        &self,
+        daemon: DaemonIdentity,
+        machine: Option<MachineIdentity>,
+    ) -> Result<Vec<u8>, Error> {
+        let mut body = postcard::to_stdvec(self).map_err(Error::Codec)?;
+        body.extend_from_slice(b"KDI1");
+        body.extend(postcard::to_stdvec(&daemon).map_err(Error::Codec)?);
+        if let Some(machine) = machine {
+            body.extend_from_slice(b"KMI1");
+            body.extend(postcard::to_stdvec(&machine).map_err(Error::Codec)?);
+        }
+        encode_frame(kind::SERVER_HELLO, &body)
+    }
+
+    pub fn decode_with_identity(
+        kind: u8,
+        body: &[u8],
+    ) -> Result<(Self, Option<DaemonIdentity>), Error> {
+        if kind != kind::SERVER_HELLO {
+            return Err(Error::UnexpectedKind {
+                want: kind::SERVER_HELLO,
+                got: kind,
+            });
+        }
+        let (hello, tail) = postcard::take_from_bytes(body).map_err(Error::Codec)?;
+        let identity = match tail.strip_prefix(b"KDI1") {
+            Some(tail) => Some(
+                postcard::take_from_bytes::<DaemonIdentity>(tail)
+                    .map_err(Error::Codec)?
+                    .0,
+            ),
+            None => None,
+        };
+        Ok((hello, identity))
+    }
+
+    pub fn decode_with_identities(
+        kind: u8,
+        body: &[u8],
+    ) -> Result<(Self, Option<DaemonIdentity>, Option<MachineIdentity>), Error> {
+        if kind != kind::SERVER_HELLO {
+            return Err(Error::UnexpectedKind {
+                want: kind::SERVER_HELLO,
+                got: kind,
+            });
+        }
+        let (hello, tail) = postcard::take_from_bytes(body).map_err(Error::Codec)?;
+        let Some(tail) = tail.strip_prefix(b"KDI1") else {
+            return Ok((hello, None, None));
+        };
+        let (daemon, tail) = postcard::take_from_bytes(tail).map_err(Error::Codec)?;
+        let machine = tail
+            .strip_prefix(b"KMI1")
+            .map(|tail| postcard::take_from_bytes::<MachineIdentity>(tail).map(|(id, _)| id))
+            .transpose()
+            .map_err(Error::Codec)?;
+        Ok((hello, Some(daemon), machine))
     }
 }
 

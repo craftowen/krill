@@ -160,10 +160,22 @@ pub type Meta = BTreeMap<PathBuf, Tree>;
 
 pub type PromptHistories = BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>;
 
-/// IPC boundary: gpui tests supply snapshots without waiting for external IO.
+#[derive(Debug, Clone)]
+pub struct IdentifiedSnapshot {
+    pub snapshot: Arc<Snapshot>,
+    pub daemon_identity: Option<krill_proto::ipc::DaemonIdentity>,
+    pub machine_identity: Option<krill_proto::ipc::MachineIdentity>,
+}
+
+#[derive(Debug)]
+pub struct PolledSnapshot {
+    pub observed: IdentifiedSnapshot,
+    pub meta: Meta,
+}
+
 /// [`Source::poll_snapshot`]의 결과를 기다리는 future.
 pub type PollSnapshot =
-    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<(Snapshot, Meta)>> + Send>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<PolledSnapshot>> + Send>>;
 
 pub trait Source: Send + Sync {
     fn fetch(&self) -> io::Result<Snapshot>;
@@ -173,6 +185,13 @@ pub trait Source: Send + Sync {
     }
     fn fetch_shared(&self) -> io::Result<Arc<Snapshot>> {
         self.fetch().map(Arc::new)
+    }
+    fn fetch_identified(&self) -> io::Result<IdentifiedSnapshot> {
+        self.fetch_shared().map(|snapshot| IdentifiedSnapshot {
+            snapshot,
+            daemon_identity: None,
+            machine_identity: None,
+        })
     }
     /// 마지막으로 읽은 호스트 스냅샷의 프롬프트 기록.
     fn prompt_histories(&self) -> PromptHistories {
@@ -185,9 +204,9 @@ pub trait Source: Send + Sync {
     /// 폴링 한 번: `fetch` 뒤 그 트리로 `meta`. 기본은 호출한 스레드에서 바로 돈다.
     /// 소켓 소스는 호스트 전용 스레드에서 돌려 원격 ssh·IPC 대기가 공유 실행기 스레드를 붙잡지 않게 한다.
     fn poll_snapshot(&self) -> PollSnapshot {
-        let polled = self.fetch().map(|snap| {
-            let meta = self.meta(&snap.trees);
-            (snap, meta)
+        let polled = self.fetch_identified().map(|observed| {
+            let meta = self.meta(&observed.snapshot.trees);
+            PolledSnapshot { observed, meta }
         });
         Box::pin(std::future::ready(polled))
     }
@@ -884,6 +903,7 @@ pub struct Sidebar {
     local_status: HostStatus,
     relink: Relink,
     remote_hosts: Vec<RemoteHost>,
+    machine_identities: BTreeMap<HostId, krill_proto::ipc::MachineIdentity>,
     remote_task: Option<Task<()>>,
     remote_manager: Option<HostManager>,
     remote_info: BTreeMap<String, krill_hosts::HostConnectionInfo>,
@@ -1278,6 +1298,7 @@ impl Sidebar {
             local_status: HostStatus::Connected,
             relink: Relink::Steady,
             remote_hosts: Vec::new(),
+            machine_identities: BTreeMap::new(),
             remote_task: None,
             remote_manager: None,
             remote_info: BTreeMap::new(),
@@ -1886,6 +1907,12 @@ impl Sidebar {
                                 .zip(next.as_ref().and_then(|s| s.target()))
                                 .is_some_and(|(old, next)| old != next)
                         });
+                        if replaced {
+                            changed |= s
+                                .machine_identities
+                                .remove(&HostId::Remote(spec.id.clone()))
+                                .is_some();
+                        }
                         if (entry.source.is_none() || replaced) && s.visible {
                             entry.source = next;
                             new_source |= entry.source.is_some();
@@ -1893,6 +1920,12 @@ impl Sidebar {
                         entry
                     })
                     .collect();
+                s.machine_identities.retain(|host, _| {
+                    *host == HostId::Local
+                        || s.remote_hosts
+                            .iter()
+                            .any(|entry| *host == HostId::Remote(entry.id.clone()))
+                });
                 if changed {
                     s.rebuild(cx);
                 }
@@ -1916,6 +1949,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let id = id.into();
+        self.machine_identities.remove(&HostId::Remote(id.clone()));
         let label = label.into();
         if let Some(existing) = self.remote_hosts.iter_mut().find(|r| r.id == id) {
             existing.label = label;
@@ -1935,6 +1969,23 @@ impl Sidebar {
         self.rebuild(cx);
         self.remote_task = None;
         self.start_remote_polling(cx);
+    }
+
+    #[must_use]
+    pub fn machine_identities(&self) -> BTreeMap<HostId, krill_proto::ipc::MachineIdentity> {
+        self.machine_identities.clone()
+    }
+
+    fn observe_machine(
+        &mut self,
+        host: HostId,
+        identity: Option<krill_proto::ipc::MachineIdentity>,
+    ) -> bool {
+        if let Some(identity) = identity {
+            self.machine_identities.insert(host, identity) != Some(identity)
+        } else {
+            self.machine_identities.remove(&host).is_some()
+        }
     }
 
     /// 원격 호스트 상태를 직접 갱신한다(마지막 스냅샷은 그대로 유지).
@@ -2021,7 +2072,15 @@ impl Sidebar {
                             }
                             let mut changed = false;
                             let mut probe_repos = Vec::new();
-                            if let Ok((snap, mut meta)) = res {
+                            if let Ok(PolledSnapshot { observed, mut meta }) = res {
+                                let snap = (*observed.snapshot).clone();
+                                let host = HostId::Remote(id.clone());
+                                if let Some(identity) = observed.machine_identity {
+                                    changed |= s.machine_identities.insert(host, identity)
+                                        != Some(identity);
+                                } else {
+                                    changed |= s.machine_identities.remove(&host).is_some();
+                                }
                                 for path in snap.trees.values().flatten() {
                                     if let Some(prev_branch) =
                                         entry.meta.get(path).and_then(|m| m.branch.clone())
@@ -3434,7 +3493,8 @@ impl Sidebar {
                             .and_then(Path::parent)
                             .filter(|p| !p.as_os_str().is_empty())
                             .map(Path::to_path_buf);
-                        let result = source.fetch().map(|mut snapshot| {
+                        let result = source.fetch_identified().map(|observed| {
+                            let mut snapshot = (*observed.snapshot).clone();
                             external::include_claude_worktrees(&mut snapshot.trees);
                             let mut imported_meta = Meta::default();
                             if let Some(ref dir) = state_dir {
@@ -3454,7 +3514,7 @@ impl Sidebar {
                                     entry.dirty = value.dirty;
                                 }
                             }
-                            (snapshot, meta)
+                            (snapshot, meta, observed.machine_identity)
                         });
                         // 데몬이 응답하지 않아도 등록된 로컬 프로젝트는 목록에 남긴다.
                         let fallback = if result.is_err()
@@ -3486,6 +3546,12 @@ impl Sidebar {
                         s.meta.extend(meta);
                         s.rebuild(cx);
                     }
+                    let result = result.map(|(snapshot, meta, identity)| {
+                        if s.observe_machine(HostId::Local, identity) {
+                            cx.notify();
+                        }
+                        (snapshot, meta)
+                    });
                     s.apply_with_auto_titles(result, comments, auto_titles, prompt_histories, cx);
                     s.is_visible().then(|| s.poll_interval())
                 });

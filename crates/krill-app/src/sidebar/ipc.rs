@@ -19,7 +19,7 @@ use krill_proto::screen::Msg as _;
 
 use crate::hosts::{HostId, HostTarget};
 
-use super::{Meta, Session, Snapshot, Source, Tree};
+use super::{IdentifiedSnapshot, Meta, PolledSnapshot, Session, Snapshot, Source, Tree};
 
 /// krilld `git::watch::Hub`의 최대 감시 슬롯 수(8)를 넘기지 않는다.
 const MAX_WATCHES: usize = 8;
@@ -129,6 +129,14 @@ fn watch_exchange(stream: &mut UnixStream, req: GitWatchRequest) -> io::Result<G
 struct Conn {
     stream: UnixStream,
     features: u64,
+    daemon_identity: Option<krill_proto::ipc::DaemonIdentity>,
+    machine_identity: Option<krill_proto::ipc::MachineIdentity>,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectionIdentities {
+    daemon: Option<krill_proto::ipc::DaemonIdentity>,
+    machine: Option<krill_proto::ipc::MachineIdentity>,
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -136,7 +144,14 @@ type Job = Box<dyn FnOnce() + Send>;
 /// 이보다 오래 걸린 호스트 폴링은 운영 로그에 남긴다.
 const SLOW_POLL: Duration = Duration::from_secs(1);
 
-type SharedSnapshot = Mutex<Option<(Instant, Arc<Snapshot>, super::PromptHistories)>>;
+struct CachedSnapshot {
+    at: Instant,
+    observed: IdentifiedSnapshot,
+    histories: super::PromptHistories,
+    target: HostTarget,
+}
+
+type SharedSnapshot = Mutex<Option<CachedSnapshot>>;
 type SnapshotRegistry = Mutex<Vec<(SnapshotSource, Weak<SharedSnapshot>)>>;
 
 // A registry key must not retain RemoteConnector or its transport resources.
@@ -260,6 +275,16 @@ impl Shared {
         read: Duration,
         f: impl FnOnce(&mut UnixStream) -> io::Result<T>,
     ) -> io::Result<T> {
+        self.with_identified_conn(required, read, f)
+            .map(|(value, _)| value)
+    }
+
+    fn with_identified_conn<T>(
+        &self,
+        required: u64,
+        read: Duration,
+        f: impl FnOnce(&mut UnixStream) -> io::Result<T>,
+    ) -> io::Result<(T, ConnectionIdentities)> {
         let mut guard = self
             .conn
             .lock()
@@ -281,6 +306,10 @@ impl Shared {
             *guard = None;
             return Err(e);
         }
+        let identity = ConnectionIdentities {
+            daemon: conn.daemon_identity,
+            machine: conn.machine_identity,
+        };
         let res = f(&mut conn.stream);
         if !self.target.is_current() {
             *guard = None;
@@ -293,7 +322,7 @@ impl Shared {
                 self.target.record_outcome(false, Some(e));
             }
         }
-        res
+        res.map(|value| (value, identity))
     }
 
     /// 워크트리별 미커밋 파일 수(`Request::GitWatch` 재사용). 실패한 워크트리는 빠진다(UI는 수를 숨긴다).
@@ -361,6 +390,10 @@ impl Shared {
     }
 
     fn fetch_shared(&self) -> io::Result<Arc<Snapshot>> {
+        self.fetch_identified().map(|observed| observed.snapshot)
+    }
+
+    fn fetch_identified(&self) -> io::Result<IdentifiedSnapshot> {
         if !self.target.is_current() {
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -368,10 +401,11 @@ impl Shared {
             .snapshot
             .lock()
             .map_err(|_| io::Error::other("sidebar snapshot mutex poisoned"))?;
-        if let Some((at, snapshot, _)) = cached.as_ref()
-            && at.elapsed() < Duration::from_millis(450)
+        if let Some(snapshot) = cached.as_ref()
+            && snapshot.target == self.target
+            && snapshot.at.elapsed() < Duration::from_millis(450)
         {
-            return Ok(snapshot.clone());
+            return Ok(snapshot.observed.clone());
         }
         let is_local = self.target.allow_local_launch();
         // 외부 에이전트 상태는 로컬 호스트에서만 TTL 캐시에서 읽는다. 실패해도 krilld 스냅샷은 그대로 돌려준다.
@@ -383,18 +417,27 @@ impl Shared {
         } else {
             BTreeMap::new()
         };
-        let result = self.with_conn(
+        let result = self.with_identified_conn(
             FEAT_CONTROL | FEAT_HOOK | FEAT_SIDEBAR,
             Duration::from_secs(5),
             |stream| fetch_from(stream, &external, is_local),
         );
         match result {
-            Ok((snapshot, branches, histories)) => {
+            Ok(((snapshot, branches, histories), identities)) => {
                 if let Ok(mut guard) = self.branches.lock() {
                     *guard = branches;
                 }
-                let snapshot = Arc::new(snapshot);
-                *cached = Some((Instant::now(), snapshot.clone(), histories));
+                let snapshot = IdentifiedSnapshot {
+                    snapshot: Arc::new(snapshot),
+                    daemon_identity: identities.daemon,
+                    machine_identity: identities.machine,
+                };
+                *cached = Some(CachedSnapshot {
+                    at: Instant::now(),
+                    observed: snapshot.clone(),
+                    histories,
+                    target: self.target.clone(),
+                });
                 Ok(snapshot)
             }
             Err(error) => {
@@ -424,10 +467,10 @@ impl Shared {
             .collect()
     }
 
-    fn poll(&self) -> io::Result<(Snapshot, Meta)> {
-        self.fetch().map(|snap| {
-            let meta = self.meta(&snap.trees);
-            (snap, meta)
+    fn poll(&self) -> io::Result<PolledSnapshot> {
+        self.fetch_identified().map(|observed| {
+            let meta = self.meta(&observed.snapshot.trees);
+            PolledSnapshot { observed, meta }
         })
     }
 
@@ -463,12 +506,16 @@ impl Source for Socket {
         self.shared.fetch_shared()
     }
 
+    fn fetch_identified(&self) -> io::Result<IdentifiedSnapshot> {
+        self.shared.fetch_identified()
+    }
+
     fn prompt_histories(&self) -> super::PromptHistories {
         self.shared
             .snapshot
             .lock()
             .ok()
-            .and_then(|cached| cached.as_ref().map(|(_, _, histories)| histories.clone()))
+            .and_then(|cached| cached.as_ref().map(|cached| cached.histories.clone()))
             .unwrap_or_default()
     }
 
@@ -625,7 +672,8 @@ fn connect(target: &HostTarget, required: u64, read: Duration) -> io::Result<Con
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let (kind, body) = ipc::read_frame(&mut stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
-        let server = ipc::ServerHello::decode(kind, &body)?;
+        let (server, daemon_identity, machine_identity) =
+            ipc::ServerHello::decode_with_identities(kind, &body)?;
         let negotiated = ipc::negotiate(&server, &hello).ok_or(io::ErrorKind::Unsupported)?;
         if negotiated.features & required != required {
             return Err(io::ErrorKind::Unsupported.into());
@@ -635,6 +683,8 @@ fn connect(target: &HostTarget, required: u64, read: Duration) -> io::Result<Con
         Ok(Conn {
             stream,
             features: negotiated.features,
+            daemon_identity,
+            machine_identity,
         })
     } else {
         let c = target.connect(&hello).map_err(|e| match e {
@@ -649,6 +699,8 @@ fn connect(target: &HostTarget, required: u64, read: Duration) -> io::Result<Con
         Ok(Conn {
             stream: c.stream,
             features: c.negotiated.features,
+            daemon_identity: c.daemon_identity,
+            machine_identity: c.machine_identity,
         })
     }
 }
@@ -921,8 +973,27 @@ mod tests {
         let second = Socket::new(&paths);
         assert!(Arc::ptr_eq(&first.shared.snapshot, &second.shared.snapshot));
         let snapshot = Arc::new(Snapshot::default());
-        *first.shared.snapshot.lock().unwrap() =
-            Some((Instant::now(), snapshot.clone(), BTreeMap::new()));
+        let identity = Some(krill_proto::ipc::DaemonIdentity([7; 16]));
+        *first.shared.snapshot.lock().unwrap() = Some(CachedSnapshot {
+            at: Instant::now(),
+            observed: IdentifiedSnapshot {
+                snapshot: snapshot.clone(),
+                daemon_identity: identity,
+                machine_identity: Some(krill_proto::ipc::MachineIdentity([8; 16])),
+            },
+            histories: BTreeMap::new(),
+            target: first.shared.target.clone(),
+        });
+        assert_eq!(first.fetch_identified().unwrap().daemon_identity, identity);
+        assert_eq!(second.fetch_identified().unwrap().daemon_identity, identity);
+        assert_eq!(
+            second.fetch_identified().unwrap().machine_identity,
+            Some(krill_proto::ipc::MachineIdentity([8; 16]))
+        );
+        assert!(
+            second.shared.conn.lock().unwrap().is_none(),
+            "cache hit carries identity without opening another stream"
+        );
         assert!(Arc::ptr_eq(&first.fetch_shared().unwrap(), &snapshot));
         assert!(Arc::ptr_eq(&second.fetch_shared().unwrap(), &snapshot));
         first
@@ -1204,5 +1275,109 @@ mod tests {
         );
         fs::remove_dir_all(&dir).ok();
         Ok(())
+    }
+    #[test]
+    fn replaced_registration_does_not_reuse_previous_identity_from_shared_cache() {
+        use krill_hosts::RemoteConnector;
+        let target = |key| {
+            HostTarget::remote_with_connector(
+                "iroh:replaced",
+                "/unused/replaced-identity.sock".into(),
+                RemoteConnector::new(|| Err(io::ErrorKind::NotConnected.into()), |_, _| {})
+                    .with_lifetime(key, || true),
+            )
+        };
+        let old = Socket::new(target(Arc::new(())));
+        let new = Socket::new(target(Arc::new(())));
+        assert!(Arc::ptr_eq(&old.shared.snapshot, &new.shared.snapshot));
+        *old.shared.snapshot.lock().unwrap() = Some(CachedSnapshot {
+            at: Instant::now(),
+            observed: IdentifiedSnapshot {
+                snapshot: Arc::new(Snapshot::default()),
+                daemon_identity: Some(krill_proto::ipc::DaemonIdentity([1; 16])),
+                machine_identity: Some(krill_proto::ipc::MachineIdentity([8; 16])),
+            },
+            histories: BTreeMap::new(),
+            target: old.shared.target.clone(),
+        });
+        assert!(
+            new.fetch_identified().is_err(),
+            "a new registration must handshake before reporting an identity"
+        );
+    }
+    #[test]
+    fn metadata_reconnect_cannot_change_the_identity_of_a_cached_snapshot() {
+        use krill_proto::ipc::{self as wire, DaemonIdentity, ServerHello};
+        use std::os::unix::net::UnixListener;
+        let root = PathBuf::from(format!("/tmp/krill-di-meta-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = ServerHello {
+                proto_min: wire::PROTO_MIN,
+                proto_max: wire::PROTO_MAX,
+                features: wire::FEATURES,
+                build: "fixture".into(),
+                instance_id: 1,
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(&hello.encode_with_identity(DaemonIdentity([2; 16])).unwrap())
+                .unwrap();
+            wire::read_frame(&mut stream).unwrap().unwrap();
+            let (kind, body) = wire::read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::GitWatch(_)
+            ));
+            stream
+                .write_all(
+                    &Reply::GitWatch(GitWatchReply::Unchanged { pending: false })
+                        .encode()
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+        let socket = Socket::new(HostTarget::remote("metadata", path));
+        *socket.shared.snapshot.lock().unwrap() = Some(CachedSnapshot {
+            at: Instant::now(),
+            observed: IdentifiedSnapshot {
+                snapshot: Arc::new(Snapshot {
+                    trees: BTreeMap::from([("/repo".into(), vec!["/repo".into()])]),
+                    ..Snapshot::default()
+                }),
+                daemon_identity: Some(DaemonIdentity([1; 16])),
+                machine_identity: Some(krill_proto::ipc::MachineIdentity([8; 16])),
+            },
+            histories: BTreeMap::new(),
+            target: socket.shared.target.clone(),
+        });
+        let polled = socket.shared.poll().unwrap();
+        assert_eq!(
+            polled.observed.machine_identity,
+            Some(krill_proto::ipc::MachineIdentity([8; 16]))
+        );
+        assert_eq!(
+            polled.observed.daemon_identity,
+            Some(DaemonIdentity([1; 16]))
+        );
+        assert_eq!(
+            socket
+                .shared
+                .conn
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .daemon_identity,
+            Some(DaemonIdentity([2; 16]))
+        );
+        worker.join().unwrap();
+        drop(socket);
+        fs::remove_dir_all(root).unwrap();
     }
 }

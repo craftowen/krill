@@ -1601,10 +1601,22 @@ impl Shell {
                     move |_, window, cx| {
                         open_settings_from_menu(
                             &open_weak,
-                            krill_app::settings::AdminTab::Ssh,
+                            krill_app::settings::AdminTab::Machines,
                             window,
                             cx,
                         );
+                        open_weak
+                            .update(cx, |shell, cx| {
+                                if let Some(settings) = &shell.settings {
+                                    settings.update(cx, |view, cx| {
+                                        view.show_machine_add(
+                                            krill_app::machines::AddMethod::Ssh,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            })
+                            .ok();
                     },
                 ))
         })
