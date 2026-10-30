@@ -123,7 +123,7 @@ pub fn remove_with_state(
         }
     }
     reject_nested_worktrees(&entries(q, repo)?, &path)?;
-    let unlinked = unlink_symlinks(&path, &config.worktree.symlinks);
+    let unlinked = unlink_symlinks(q, repo, &path, &config.worktree.symlinks);
     let removal = (|| -> Result<(), String> {
         if target.is_none() {
             remove_orphan(q, repo, &path)?;
@@ -489,29 +489,50 @@ fn is_dirty_ignoring_symlinks(stdout: &[u8], wt_real: &Path, symlinks: &[String]
     false
 }
 
-fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) -> Vec<(PathBuf, PathBuf)> {
+/// Krill이 만든(추적되지 않는) 심링크만 끊는다. 커밋된 심링크를 지우면 Git이 삭제된 파일로 보고
+/// 정상 삭제를 막는다. 추적 여부를 모르면 아무것도 끊지 않는다(삭제는 dirty 재검사에서 멈춘다).
+fn unlink_symlinks(
+    q: &GitQueue,
+    repo: &Path,
+    wt_real: &Path,
+    symlinks: &[String],
+) -> Vec<(PathBuf, PathBuf)> {
+    let links: Vec<&str> = symlinks
+        .iter()
+        .map(|raw| raw.trim().trim_end_matches('/'))
+        .filter(|rel| is_valid_worktree_symlink(wt_real, rel))
+        .collect();
+    if links.is_empty() {
+        return Vec::new();
+    }
+    let mut args: Vec<OsString> = vec!["--literal-pathspecs".into(), "-C".into()];
+    args.push(wt_real.as_os_str().to_owned());
+    args.extend(["ls-files", "-z", "--"].map(OsString::from));
+    args.extend(links.iter().map(OsString::from));
+    let Ok(tracked) = git(q, repo, args).and_then(|out| text(out, "cannot list tracked symlinks"))
+    else {
+        return Vec::new();
+    };
+    let tracked: Vec<&str> = tracked.split('\0').collect();
     let mut removed = Vec::new();
-    for raw in symlinks {
-        if is_valid_worktree_symlink(wt_real, raw) {
-            let trimmed = raw.trim().trim_end_matches('/');
-            let rel = Path::new(trimmed);
-            let link = wt_real.join(rel);
-            let target = fs::read_link(&link).ok();
-            if fs::remove_file(&link).is_ok()
-                && let Some(target) = target
-            {
-                removed.push((link, target));
+    for trimmed in links.into_iter().filter(|rel| !tracked.contains(rel)) {
+        let rel = Path::new(trimmed);
+        let link = wt_real.join(rel);
+        let target = fs::read_link(&link).ok();
+        if fs::remove_file(&link).is_ok()
+            && let Some(target) = target
+        {
+            removed.push((link, target));
+        }
+        let mut parent = rel.parent();
+        while let Some(p) = parent {
+            if p.as_os_str().is_empty() {
+                break;
             }
-            let mut parent = rel.parent();
-            while let Some(p) = parent {
-                if p.as_os_str().is_empty() {
-                    break;
-                }
-                if fs::remove_dir(wt_real.join(p)).is_err() {
-                    break;
-                }
-                parent = p.parent();
+            if fs::remove_dir(wt_real.join(p)).is_err() {
+                break;
             }
+            parent = p.parent();
         }
     }
     removed
