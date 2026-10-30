@@ -2042,3 +2042,25 @@ mod orchestration_frame_bound {
         }
     }
 }
+
+#[test]
+fn statusline_stays_within_its_budget_when_stdin_never_closes() {
+    let dir = std::env::temp_dir().join(format!("mk-statusline-budget-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let started = Instant::now();
+    let mut child = Command::new(MK)
+        .args(["statusline", "--chain", "exec sleep 30"])
+        .env("CLAUDE_CONFIG_DIR", &dir)
+        .env_remove(krill_proto::statusline::DEPTH_ENV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _stdin_left_open = child.stdin.take();
+    let status = child.wait().unwrap();
+    let elapsed = started.elapsed();
+    fs::remove_dir_all(&dir).ok();
+    assert!(status.success(), "{status:?}");
+    assert!(elapsed < Duration::from_secs(12), "{elapsed:?}");
+}

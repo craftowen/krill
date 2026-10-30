@@ -105,10 +105,10 @@ fn record_skips_without_rate_limits_and_missing_dir() {
 fn chain_passthrough_returns_user_output_verbatim() {
     // 사용자 명령(`cat`)이 stdin을 그대로 돌려준다.
     let input = payload(10, 20);
-    let output = run_chain(OsStr::new("cat"), &input);
+    let output = run_chain_within(OsStr::new("cat"), &input, CHAIN_WAIT);
     assert_eq!(output, input);
     // 없는 명령은 빈 출력이다(표시만 비고 0으로 끝난다 — 호출자가 보장).
-    assert!(run_chain(OsStr::new("/no/such/command-owe701"), &input).is_empty());
+    assert!(run_chain_within(OsStr::new("/no/such/command-owe701"), &input, CHAIN_WAIT).is_empty());
 }
 
 #[test]
@@ -290,4 +290,68 @@ fn help_flag_returns_zero() {
     use std::ffi::OsString;
     assert_eq!(super::run(&[OsString::from("--help")]), ExitCode::SUCCESS);
     assert_eq!(super::run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+}
+
+#[test]
+fn chain_that_never_exits_is_killed_at_the_deadline() {
+    let started = std::time::Instant::now();
+    let out = run_chain_within(
+        OsStr::new("printf partial; exec sleep 30"),
+        b"{}",
+        Duration::from_millis(300),
+    );
+    assert!(out.is_empty(), "timeout means empty output");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn chain_output_is_kept_when_a_background_child_holds_stdout_open() {
+    let started = std::time::Instant::now();
+    let out = run_chain_within(
+        OsStr::new("echo hi; sleep 3 2>/dev/null &"),
+        b"{}",
+        Duration::from_secs(1),
+    );
+    assert_eq!(String::from_utf8_lossy(&out), "hi\n");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn chain_timeout_also_kills_the_shells_children() {
+    use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+
+    let dir = temp_root("chain-group");
+    let pid_file = dir.join("child.pid");
+    let command = format!(
+        "echo partial; /bin/sh -c 'echo $$ > \"$1\"; exec sleep 30' _ '{}'",
+        pid_file.display()
+    );
+    let out = run_chain_within(OsStr::new(&command), b"{}", Duration::from_millis(500));
+    assert!(out.is_empty(), "timeout means empty output");
+    let raw: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let pid = Pid::from_raw(raw).unwrap();
+    // 고아가 된 자식은 init이 거둔다. 거두기 전 좀비도 살아 있는 것으로 보이니 잠깐 기다린다.
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while test_kill_process(pid).is_ok() && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let alive = test_kill_process(pid).is_ok();
+    if alive {
+        kill_process(pid, Signal::KILL).ok();
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(!alive, "the chain's child outlived the timeout");
 }

@@ -2,7 +2,7 @@
 //!
 //! - `krill worktree space [--repo <path>] [--json]`:
 //!   워크트리별 전체 디스크 사용량 및 주요 빌드 아티팩트(`target`, `node_modules`, `.next` 등) 용량 집계.
-//! - `krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <N>] [--exclude-dirty|--include-dirty|--force] [--worktree <path>]... [--dry-run] [--yes] [--json]`:
+//! - `krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <N>] [--exclude-dirty|--include-dirty|--force] [--worktree <path>]... [--dry-run] [--yes] [--json] (--yes 없이는 미리보기만)`:
 //!   조건별(PR Merged/Closed, 경과 일수 7/14/30일 이상, dirty 안전 제외) 워크트리 일괄 삭제 및 병합된 로컬 브랜치 정리.
 //!   `--worktree <path>`(반복 가능)를 주면 필터 일치 후보 중 그 경로만 대상으로 한다(앱 클린업 모달의 선택 실행).
 //!
@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use krill_proto::daemon::{self, Paths};
 use krill_proto::worktree_space::{
-    CleanupFilter, CleanupPrFilter, CleanupReport, CleanupSummary, SpaceReport,
+    CleanupFilter, CleanupItemOutcome, CleanupPrFilter, CleanupReport, CleanupSummary, SpaceReport,
     WorktreeCleanupCandidate, filter_cleanup_candidates, format_bytes,
 };
 
@@ -34,7 +34,15 @@ struct CleanupArgs {
     /// 비어 있지 않으면 필터 일치 후보 중 이 경로들만 남긴다.
     worktrees: Vec<PathBuf>,
     dry_run: bool,
+    yes: bool,
     json: bool,
+}
+
+impl CleanupArgs {
+    /// `--yes` 없이는 아무것도 지우지 않는다(USAGE의 확인 단계를 미리보기로 대신한다).
+    fn preview(&self) -> bool {
+        self.dry_run || !self.yes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -63,22 +71,36 @@ pub fn run_cleanup(args: &[OsString]) -> ExitCode {
     let all_candidates = discover_cleanup_candidates(&repos, state_dir.as_deref(), now_unix_secs());
     let matched = select_candidates(&all_candidates, &parsed);
 
-    let summary = if parsed.dry_run || matched.is_empty() {
+    let (idle, skipped) = match split_active_sessions(&matched) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!(
+                "worktree cleanup: cannot check for running sessions ({e}); nothing was removed"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let preview = parsed.preview();
+    let mut summary = if preview || idle.is_empty() {
         CleanupSummary::default()
     } else {
         let paths = Paths::dev().ok();
         run_cleanup_engine(
-            &matched,
+            &idle,
             !parsed.filter.exclude_dirty,
             paths.as_ref(),
             state_dir.as_deref(),
         )
     };
+    if !preview {
+        summary.failed_count = summary.failed_count.saturating_add(skipped.len());
+    }
+    summary.items.extend(skipped);
 
     if parsed.json {
         let out = CleanupReport {
             filter: parsed.filter,
-            dry_run: parsed.dry_run,
+            dry_run: preview,
             candidates: matched,
             summary,
         };
@@ -101,17 +123,28 @@ pub fn run_cleanup(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if parsed.dry_run {
+    if preview {
         println!("dry-run: {} worktree(s) matched", matched.len());
         for c in &matched {
+            let skipped = summary
+                .items
+                .iter()
+                .find(|item| item.path == c.path)
+                .and_then(|item| item.error.as_deref());
             println!(
-                "  {} (branch: {}, pr: {}, idle: {}d, size: {})",
+                "  {} (branch: {}, pr: {}, idle: {}d, size: {}){}",
                 c.path.display(),
                 c.branch.as_deref().unwrap_or("detached"),
                 c.pr_state.as_str(),
                 c.idle_days,
                 format_bytes(c.disk_bytes),
+                skipped
+                    .map(|e| format!(" skipped: {e}"))
+                    .unwrap_or_default(),
             );
+        }
+        if !parsed.dry_run {
+            println!("nothing was removed; re-run with --yes to delete these worktrees");
         }
         return ExitCode::SUCCESS;
     }
@@ -225,6 +258,37 @@ fn select_candidates(
     matched
 }
 
+/// 실행 중인 세션의 cwd가 안에 있는 워크트리를 건너뛸 항목(사유 포함)으로 가른다. 미리보기와 실행이 같이 쓴다.
+/// 데몬이 있는데 세션을 답하지 못하면 오류다(빈 목록으로 보면 가드가 꺼진다).
+fn split_active_sessions(
+    matched: &[WorktreeCleanupCandidate],
+) -> Result<(Vec<WorktreeCleanupCandidate>, Vec<CleanupItemOutcome>), String> {
+    if matched.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let cwds = crate::session::running_session_cwds()?;
+    let (idle, busy): (Vec<_>, Vec<_>) = matched.iter().cloned().partition(|c| {
+        let wt = std::fs::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
+        !cwds.iter().any(|cwd| {
+            let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone());
+            cwd.starts_with(&wt)
+        })
+    });
+    let skipped = busy
+        .into_iter()
+        .map(|item| CleanupItemOutcome {
+            path: item.path,
+            branch: item.branch,
+            removed: false,
+            branch_deleted: false,
+            freed_bytes: 0,
+            warnings: Vec::new(),
+            error: Some("worktree has a running session; close it first".to_owned()),
+        })
+        .collect();
+    Ok((idle, skipped))
+}
+
 fn resolve_repos(
     explicit: &[PathBuf],
     state_dir: Option<&std::path::Path>,
@@ -254,6 +318,7 @@ fn parse_cleanup_args(args: &[OsString]) -> Result<CleanupArgs, String> {
         filter: CleanupFilter::default(),
         worktrees: Vec::new(),
         dry_run: false,
+        yes: false,
         json: false,
     };
 
@@ -294,7 +359,7 @@ fn parse_cleanup_args(args: &[OsString]) -> Result<CleanupArgs, String> {
                 "--exclude-dirty" => out.filter.exclude_dirty = true,
                 "--include-dirty" | "--force" => out.filter.exclude_dirty = false,
                 "--dry-run" | "-n" => out.dry_run = true,
-                "--yes" | "-y" => {}
+                "--yes" | "-y" => out.yes = true,
                 "--json" => out.json = true,
                 _ => return Err(format!("unexpected argument {arg:?}")),
             }
@@ -346,7 +411,7 @@ fn execute_cleanup_with_state(
     let repos = resolve_repos(&parsed.repos, state_dir)?;
     let all_candidates = discover_cleanup_candidates(&repos, state_dir, now_unix_secs());
     let matched = select_candidates(&all_candidates, &parsed);
-    let summary = if parsed.dry_run || matched.is_empty() {
+    let summary = if parsed.preview() || matched.is_empty() {
         CleanupSummary::default()
     } else {
         let paths = use_daemon.then(|| Paths::dev().ok()).flatten();
@@ -359,7 +424,7 @@ fn execute_cleanup_with_state(
     };
     let out = CleanupReport {
         filter: parsed.filter.clone(),
-        dry_run: parsed.dry_run,
+        dry_run: parsed.preview(),
         candidates: matched,
         summary,
     };
@@ -415,6 +480,45 @@ mod tests {
         assert_eq!(parsed2.filter.pr_filter, CleanupPrFilter::Closed);
         assert_eq!(parsed2.filter.min_idle_days, 30);
         assert!(!parsed2.filter.exclude_dirty);
+    }
+
+    #[test]
+    fn cleanup_without_yes_only_previews() {
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        let root =
+            std::env::temp_dir().join(format!("mk-cli-cleanup-noyes-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("README.md"), "r").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let wt = root.join("wt-merged");
+        git(
+            &repo,
+            &["worktree", "add", "-b", "feat", wt.to_str().unwrap()],
+        );
+
+        let args = ["--repo", repo.to_str().unwrap(), "--json"].map(OsString::from);
+        let (_, out) = execute_cleanup_with_state(&args, Some(&state), false).unwrap();
+        assert_eq!(out.candidates.len(), 1);
+        assert!(out.dry_run, "without --yes the run must be a preview");
+        assert!(wt.exists(), "cleanup without --yes must not delete");
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -551,6 +655,7 @@ mod tests {
             "closed",
             "--idle-days",
             "30",
+            "--yes",
             "--json",
         ]
         .map(OsString::from);
@@ -585,6 +690,7 @@ mod tests {
             "merged",
             "--idle-days",
             "7",
+            "--yes",
             "--json",
         ]
         .map(OsString::from);

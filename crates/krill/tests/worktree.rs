@@ -712,3 +712,180 @@ fn worktree_symlink_and_hooks_cli_end_to_end() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn worktree_local_only_subcommands_reject_host() {
+    let state = PathBuf::from(format!("/tmp/mkwt-host-{}", std::process::id()));
+    fs::create_dir_all(&state).unwrap();
+    for sub in [
+        "list", "show", "current", "cleanup", "space", "set", "symlink", "hooks",
+    ] {
+        let out = Command::new(MK)
+            .env("KRILL_STATE_DIR", &state)
+            .args(["worktree", sub, "--host", "nobody@invalid.invalid"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{sub}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--host"),
+            "{sub}: {out:?}"
+        );
+    }
+    fs::remove_dir_all(&state).ok();
+}
+
+#[test]
+fn account_daemon_failure_is_not_a_usage_error() {
+    for args in [
+        &["account", "policy", "predict", "on"][..],
+        &["account", "rule", "claude", "work", "on"],
+        &["account", "auto-switch", "on", "80"],
+    ] {
+        let out = Command::new(MK)
+            .env("KRILL_STATE_DIR", "/dev/null/no-such-state")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+    }
+}
+
+#[test]
+fn account_invalid_arguments_are_usage_errors_even_without_a_daemon() {
+    for args in [
+        &["account", "policy", "a", "b"][..],
+        &["account", "rule", "x", "y"],
+        &["account", "rule", "claude", "work", "maybe"],
+        &["account", "auto-switch", "on", "z"],
+    ] {
+        let out = Command::new(MK)
+            .env("KRILL_STATE_DIR", "/dev/null/no-such-state")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    }
+}
+
+fn krill_in(state: &Path, args: &[&str]) -> Output {
+    Command::new(MK)
+        .args(args)
+        .env("KRILL_STATE_DIR", state)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// `busy`에는 실행 중인 세션을 두고 `idle`은 비워 둔다. 세션 ID를 돌려준다.
+fn busy_and_idle_worktrees(f: &Fixture) -> (PathBuf, PathBuf, String) {
+    let busy = f.dir.join("wt-busy");
+    let idle = f.dir.join("wt-idle");
+    for (wt, branch) in [(&busy, "busy"), (&idle, "idle")] {
+        Fixture::git(
+            &f.repo,
+            &["worktree", "add", "-q", "-b", branch, wt.to_str().unwrap()],
+        );
+    }
+    let created = krill_in(
+        &f.state,
+        &[
+            "new",
+            "--cwd",
+            busy.to_str().unwrap(),
+            "--",
+            "/bin/sleep",
+            "600",
+        ],
+    );
+    assert!(created.status.success(), "{created:?}");
+    let session = String::from_utf8(created.stdout).unwrap().trim().to_owned();
+    (busy, idle, session)
+}
+
+#[test]
+fn cleanup_removes_nothing_when_the_daemon_cannot_report_sessions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new("cleanup-guard");
+    let (busy, idle, session) = busy_and_idle_worktrees(&f);
+    let repo = f.repo.to_str().unwrap();
+    let cleanup = [
+        "worktree", "cleanup", "--repo", repo, "--pr", "any", "--yes",
+    ];
+
+    let socket = f.state.join("run/krilld.sock");
+    let mode = fs::metadata(&socket).unwrap().permissions().mode();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
+    let blind = krill_in(&f.state, &cleanup);
+    fs::set_permissions(&socket, fs::Permissions::from_mode(mode)).unwrap();
+    assert!(
+        busy.exists() && idle.exists(),
+        "nothing may be removed while running sessions cannot be checked: {blind:?}"
+    );
+    assert_eq!(blind.status.code(), Some(1), "{blind:?}");
+
+    let guarded = krill_in(&f.state, &cleanup);
+    assert_eq!(guarded.status.code(), Some(1), "{guarded:?}");
+    assert!(
+        String::from_utf8_lossy(&guarded.stderr).contains("running session"),
+        "{guarded:?}"
+    );
+    assert!(busy.exists(), "{guarded:?}");
+    assert!(!idle.exists(), "{guarded:?}");
+
+    let killed = krill_in(&f.state, &["kill", &session]);
+    assert!(killed.status.success(), "{killed:?}");
+    let no_daemon = krill_in(&f.dir.join("state-without-daemon"), &cleanup);
+    assert!(no_daemon.status.success(), "{no_daemon:?}");
+    assert!(!busy.exists(), "{no_daemon:?}");
+}
+
+#[test]
+fn cleanup_preview_shows_worktrees_with_running_sessions_as_skipped() {
+    let f = Fixture::new("cleanup-preview");
+    let (busy, idle, session) = busy_and_idle_worktrees(&f);
+    let repo = f.repo.to_str().unwrap();
+
+    let preview = krill_in(
+        &f.state,
+        &["worktree", "cleanup", "--repo", repo, "--pr", "any"],
+    );
+    assert!(preview.status.success(), "{preview:?}");
+    let stdout = String::from_utf8_lossy(&preview.stdout);
+    let line = |name: &str| {
+        stdout
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("{name} missing from preview:\n{stdout}"))
+    };
+    assert!(line("wt-busy").contains("running session"), "{stdout}");
+    assert!(!line("wt-idle").contains("skipped"), "{stdout}");
+
+    let json = krill_in(
+        &f.state,
+        &[
+            "worktree", "cleanup", "--repo", repo, "--pr", "any", "--json",
+        ],
+    );
+    assert!(json.status.success(), "{json:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let skipped: Vec<&str> = report["summary"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| {
+            i["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("running session"))
+        })
+        .filter_map(|i| i["path"].as_str())
+        .collect();
+    assert!(
+        skipped.len() == 1 && skipped[0].ends_with("wt-busy"),
+        "{report}"
+    );
+    assert!(busy.exists() && idle.exists(), "a preview removes nothing");
+
+    let killed = krill_in(&f.state, &["kill", &session]);
+    assert!(killed.status.success(), "{killed:?}");
+}

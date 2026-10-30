@@ -54,7 +54,7 @@ usage: krill [--host <user@host>] orchestration <subcommand> [options]
   worker-retain <worker-or-dispatch> [--json]
   worker-release <worker-or-dispatch> [--json]
   worker-abandon <worker-or-dispatch> [--json]
-  reset [--run <run-id>] [--json]";
+  reset (--run <run-id> | --yes) [--json]   (--yes는 모든 run 초기화)";
 
 enum TargetRef<'a> {
     Borrowed(&'a Target),
@@ -819,6 +819,35 @@ struct WorkerStartArgs {
     worktree_options: Vec<OsString>,
 }
 
+/// `parse_worker_start`가 받는 플래그. `--prompt` 값이 이 중 하나면 값이 빠진 것으로 본다.
+const WORKER_START_FLAGS: &[&str] = &[
+    "--spec",
+    "--run",
+    "--task",
+    "--worker",
+    "--name",
+    "--base",
+    "--setup",
+    "--trust-setup",
+    "--agent",
+    "--account",
+    "--session",
+    "--terminal",
+    "--cwd",
+    "--worktree",
+    "--model",
+    "--effort",
+    "--retry-of",
+    "--retry-request",
+    "--prompt",
+    "--depth",
+    "--max-depth",
+    "--preamble",
+    "--no-preamble",
+    "--no-spawn",
+    "--json",
+];
+
 fn parse_worker_start(args: &[String], remote: bool) -> io::Result<WorkerStartArgs> {
     let mut spec = WorkerStartSpec::default();
     let mut new_child = false;
@@ -888,9 +917,9 @@ fn parse_worker_start(args: &[String], remote: bool) -> io::Result<WorkerStartAr
                     auto_create_task = true;
                 }
             }
-            "--run" => spec.run_id = it.next().cloned(),
-            "--task" => spec.task_id = it.next().cloned(),
-            "--worker" => spec.worker = it.next().cloned(),
+            "--run" => spec.run_id = Some(take_opt(&mut it, "--run")?.clone()),
+            "--task" => spec.task_id = Some(take_opt(&mut it, "--task")?.clone()),
+            "--worker" => spec.worker = Some(take_opt(&mut it, "--worker")?.clone()),
             "--name" => {
                 let name = take_opt(&mut it, "--name")?.clone();
                 spec.worker = Some(name.clone());
@@ -924,7 +953,14 @@ fn parse_worker_start(args: &[String], remote: bool) -> io::Result<WorkerStartAr
             "--retry-request" => {
                 spec.retry_request = Some(take_opt(&mut it, "--retry-request")?.clone());
             }
-            "--prompt" => spec.prompt = it.next().cloned(),
+            "--prompt" => {
+                // 프롬프트는 `--`로 시작할 수 있다. 이 명령의 플래그 이름일 때만 값이 빠진 것이다.
+                let v = it
+                    .next()
+                    .filter(|v| !WORKER_START_FLAGS.contains(&v.as_str()))
+                    .ok_or_else(|| bad_arg("missing --prompt"))?;
+                spec.prompt = Some(v.clone());
+            }
             "--depth" => {
                 let v = it.next().ok_or_else(|| bad_arg("missing --depth"))?;
                 explicit_depth = Some(v.parse::<u32>().map_err(|_| bad_arg("invalid --depth"))?);
@@ -2898,13 +2934,20 @@ fn cmd_reset(state_dir: &Path, args: &[String]) -> io::Result<()> {
 fn cmd_reset_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut run_id = None;
     let mut json = false;
+    let mut yes = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--run" => run_id = it.next().cloned(),
+            "--run" => run_id = Some(take_opt(&mut it, "--run")?.clone()),
             "--json" => json = true,
+            "--yes" | "-y" => yes = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
+    }
+    if run_id.is_none() && !yes {
+        return Err(bad_arg(
+            "reset without --run clears every run; pass --run <run-id> or --yes",
+        ));
     }
     if ctx
         .try_ipc(
@@ -3205,13 +3248,38 @@ mod tests {
             OrchestrationStore::default()
         );
         let next_seq = store.next_seq;
-        cmd_reset(&dir, &args(&["--json"]))?;
+        assert!(
+            cmd_reset(&dir, &args(&["--json"])).is_err(),
+            "bare reset must be refused"
+        );
+        assert_eq!(OrchestrationStore::load(&dir)?.next_seq, next_seq);
+        cmd_reset(&dir, &args(&["--yes", "--json"]))?;
         let reset = OrchestrationStore::load(&dir)?;
         assert!(reset.messages.is_empty());
         assert!(reset.gates.is_empty());
         assert_eq!(reset.next_seq, next_seq);
         std::fs::remove_dir_all(dir)
     }
+    #[test]
+    fn value_flags_do_not_swallow_the_next_flag() {
+        for flag in ["--prompt", "--run", "--task", "--worker"] {
+            let err = parse_worker_start(&args(&[flag, "--json"]), false).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{flag}");
+        }
+        let ok = parse_worker_start(&args(&["--prompt", "-- keep going"]), false).unwrap();
+        assert_eq!(ok.spec.prompt.as_deref(), Some("-- keep going"));
+    }
+
+    #[test]
+    fn prompt_may_be_any_dash_text_that_is_not_a_worker_start_flag() {
+        for prompt in ["--foo", "--", "--foo=bar", "---"] {
+            let parsed = parse_worker_start(&args(&["--prompt", prompt, "--json"]), false)
+                .unwrap_or_else(|e| panic!("{prompt:?}: {e}"));
+            assert_eq!(parsed.spec.prompt.as_deref(), Some(prompt));
+            assert!(parsed.json, "{prompt:?}");
+        }
+    }
+
     #[test]
     fn launch_preferences_parse_and_reject_invalid_effort() -> io::Result<()> {
         let parsed = parse_worker_start(

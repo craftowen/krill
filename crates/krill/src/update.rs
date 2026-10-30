@@ -17,6 +17,8 @@ const USAGE: &str = "usage: krill update [--check] [--app <path>] [--state-dir <
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     let mut app_bundle: Option<PathBuf> = None;
+    let mut check = false;
+    let mut json = false;
     let mut idx = 0;
     while idx < raw.len() {
         let arg = raw[idx].to_string_lossy();
@@ -26,6 +28,11 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--check" | "--json" => {
+                if arg == "--check" {
+                    check = true;
+                } else {
+                    json = true;
+                }
                 idx += 1;
             }
             "--app" => {
@@ -53,14 +60,35 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
         let _ = app_bundle;
-        upgrade_daemon()
+        upgrade_daemon(check, json)
     }
     #[cfg(not(target_os = "linux"))]
-    delegate_to_app(raw, app_bundle.as_deref())
+    {
+        let _ = (check, json);
+        delegate_to_app(raw, app_bundle.as_deref())
+    }
+}
+
+/// `--check` 결과: 실행 중인 krilld가 이 빌드보다 오래됐는지만 보고한다(교체하지 않는다).
+#[cfg(any(target_os = "linux", test))]
+fn daemon_check_report(current: &str, running: &str, json: bool) -> String {
+    let available = krill_proto::control::is_newer(current, running) == Some(true);
+    if json {
+        serde_json::json!({
+            "installed": current,
+            "running": running,
+            "update_available": available,
+        })
+        .to_string()
+    } else if available {
+        format!("daemon {running} can be upgraded to {current}")
+    } else {
+        format!("daemon is up to date ({running})")
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn upgrade_daemon() -> ExitCode {
+fn upgrade_daemon(check: bool, json: bool) -> ExitCode {
     use krill_proto::daemon;
     let paths = match daemon::Paths::dev() {
         Ok(p) => p,
@@ -70,6 +98,21 @@ fn upgrade_daemon() -> ExitCode {
         }
     };
     let hello = daemon::client_hello(krill_proto::ipc::ClientRole::Cli, "krill-update");
+    if check {
+        return match daemon::handshake(&paths.socket, &hello, std::time::Duration::from_secs(5)) {
+            Ok(c) => {
+                println!(
+                    "{}",
+                    daemon_check_report(krill_proto::BUILD, &c.server.build, json)
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("krill update: cannot reach the daemon: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match daemon::upgrade(&paths, &hello) {
         Ok(Some(server)) => println!("daemon upgraded to {}", server.build),
         Ok(None) => println!("daemon is up to date ({})", krill_proto::BUILD),
@@ -143,6 +186,16 @@ mod tests {
         assert_eq!(run(&[OsString::from("--unknown")]), ExitCode::from(2));
         assert_eq!(run(&[OsString::from("--app")]), ExitCode::from(2));
         assert_eq!(run(&[OsString::from("--state-dir")]), ExitCode::from(2));
+    }
+
+    #[test]
+    fn check_report_never_upgrades_and_honors_json() {
+        let json: serde_json::Value =
+            serde_json::from_str(&daemon_check_report("0.2.10", "0.2.9", true)).unwrap();
+        assert_eq!(json["update_available"], true);
+        assert_eq!(json["running"], "0.2.9");
+        assert!(daemon_check_report("0.2.9", "0.2.9", false).contains("up to date"));
+        assert!(daemon_check_report("0.2.10", "0.2.9", false).contains("can be upgraded"));
     }
 
     #[cfg(not(target_os = "linux"))]

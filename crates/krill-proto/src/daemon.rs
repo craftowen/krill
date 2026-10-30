@@ -940,7 +940,7 @@ fn default_hello_timeout(role: ClientRole) -> Duration {
 }
 
 /// 소켓 파일이 없거나(처음) 죽은 소켓만 남았다(krilld가 죽음).
-fn is_absent(e: &io::Error) -> bool {
+pub fn is_absent(e: &io::Error) -> bool {
     // Windows AF_UNIX reports a missing socket as WSAENETDOWN (OWE-828).
     if cfg!(windows) && e.raw_os_error() == Some(10050) {
         return true;

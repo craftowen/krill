@@ -26,8 +26,12 @@ const RECEIPT_FILE: &str = "hooks/statusline-claude.json";
 const STDIN_MAX: u64 = 1024 * 1024;
 /// stdin EOF 대기. 넘으면 가진 만큼으로 진행한다(틱 pile-up 방지).
 const STDIN_WAIT: Duration = Duration::from_secs(5);
-/// 사용자 체인 명령 실행 제한. 넘으면 죽이고 빈 출력으로 둔다.
+/// 틱 전체(stdin 대기 + 체인 실행) 제한. 넘으면 체인을 죽이고 빈 출력으로 둔다.
 const CHAIN_WAIT: Duration = Duration::from_secs(10);
+/// 체인 셸 종료 확인 간격.
+const CHAIN_POLL: Duration = Duration::from_millis(10);
+/// 체인 셸이 끝난 뒤 이미 파이프에 있는 출력을 거두는 유예.
+const CHAIN_EXIT_GRACE: Duration = Duration::from_millis(50);
 /// `claude --version` 프로브 제한.
 const PROBE_WAIT: Duration = Duration::from_secs(10);
 
@@ -49,6 +53,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
 
 /// 실행 모드. 어떤 실패도 statusline 표시를 깨지 않게 항상 0으로 끝난다.
 fn run_mode(args: &[OsString]) -> ExitCode {
+    let deadline = std::time::Instant::now() + CHAIN_WAIT;
     let parsed = parse_run_args(args);
     let payload = read_stdin(STDIN_WAIT, STDIN_MAX);
     let dir = config_dir();
@@ -61,7 +66,11 @@ fn run_mode(args: &[OsString]) -> ExitCode {
         std::env::var_os(DEPTH_ENV).is_some(),
         &exe_string(),
     ) {
-        Some(command) => run_chain(&command, &payload),
+        Some(command) => run_chain_within(
+            &command,
+            &payload,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ),
         None => Vec::new(),
     };
     io::stdout().write_all(&output).ok();
@@ -198,15 +207,19 @@ fn chain_shell() -> PathBuf {
 
 /// 사용자 명령을 [`chain_shell`]`-c`로 실행하고 stdout을 그대로 돌려준다.
 /// 실패·타임아웃은 빈 출력이다(표시 우선).
-fn run_chain(command: &OsStr, input: &[u8]) -> Vec<u8> {
-    let mut child = match std::process::Command::new(chain_shell())
+fn run_chain_within(command: &OsStr, input: &[u8], wait: Duration) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + wait;
+    let mut shell = std::process::Command::new(chain_shell());
+    shell
         .arg("-c")
         .arg(command)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .env(DEPTH_ENV, "1")
-        .spawn()
-    {
+        .env(DEPTH_ENV, "1");
+    // 마감에 셸만 죽이면 셸이 기다리던 자식이 고아로 남는다. 자기 그룹으로 띄워 그룹째 정리한다.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut shell, 0);
+    let mut child = match shell.spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!("krill statusline: chain spawn skipped: {e}");
@@ -215,39 +228,79 @@ fn run_chain(command: &OsStr, input: &[u8]) -> Vec<u8> {
     };
     let mut stdin = child.stdin.take();
     let input = input.to_vec();
-    let writer = std::thread::Builder::new()
+    // 기다리지 않는다: 셸이 끝난 뒤에도 자식이 stdin을 쥐고 있으면 쓰기가 끝나지 않는다.
+    std::thread::Builder::new()
         .name("statusline-chain-stdin".into())
         .spawn(move || {
             if let Some(mut stdin) = stdin.take() {
                 stdin.write_all(&input).ok();
             }
-        });
-    let mut output = Vec::new();
+        })
+        .ok();
+    // stdout을 별도 스레드에서 읽어야 출력을 닫지 않는 명령도 마감 시각에 kill에 닿는다.
+    let (tx, rx) = std::sync::mpsc::channel();
     if let Some(mut stdout) = child.stdout.take() {
-        stdout.read_to_end(&mut output).ok();
-    }
-    let steps = CHAIN_WAIT.as_millis().div_ceil(10);
-    let mut waited = false;
-    for _ in 0..steps {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                waited = true;
-                break;
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx
+                            .send(chunk.get(..n).unwrap_or_default().to_vec())
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => break,
+        });
+    }
+    if let Some(output) = collect_until_exit(&mut child, &rx, deadline) {
+        return output;
+    }
+    // 거두기 전에 보낸다: 거두지 않은 리더가 그룹 ID를 붙잡아 재사용되지 않는다.
+    #[cfg(unix)]
+    if let Some(pid) = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).ok();
+    }
+    child.kill().ok();
+    child.wait().ok();
+    Vec::new()
+}
+
+/// 셸이 끝날 때까지 stdout 조각을 모은다. 셸이 끝나면 EOF를 기다리지 않는다: 백그라운드 자식이 stdout을
+/// 쥐고 있어도 그때까지 받은 출력으로 끝낸다. 마감까지 셸이 안 끝나면 `None`.
+fn collect_until_exit(
+    child: &mut std::process::Child,
+    chunks: &std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: std::time::Instant,
+) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    loop {
+        let exited = child.try_wait().ok()?.is_some();
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return exited.then_some(output);
+        }
+        // ponytail: 셸이 끝난 뒤 파이프에 남은 꼬리는 읽기 스레드가 CHAIN_EXIT_GRACE 안에 넘긴다고 본다.
+        // EOF가 오면 바로 끝나므로 이 유예는 백그라운드 자식이 stdout을 쥔 경우에만 쓰인다.
+        let wait = if exited { CHAIN_EXIT_GRACE } else { CHAIN_POLL };
+        match chunks.recv_timeout(wait.min(left)) {
+            Ok(chunk) => output.extend(chunk),
+            Err(_) if exited => return Some(output),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(CHAIN_POLL.min(left));
+            }
         }
     }
-    if !waited {
-        child.kill().ok();
-        child.wait().ok();
-        return Vec::new();
-    }
-    if let Ok(writer) = writer {
-        writer.join().ok();
-    }
-    child.wait().ok();
-    output
 }
 
 fn usage_error(message: impl std::fmt::Display) -> io::Error {
