@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use krill_proto::daemon::{self, Paths};
 use krill_proto::worktree_space::{
-    CleanupFilter, CleanupPrFilter, CleanupReport, CleanupSummary, SpaceReport,
+    CleanupFilter, CleanupItemOutcome, CleanupPrFilter, CleanupReport, CleanupSummary, SpaceReport,
     WorktreeCleanupCandidate, filter_cleanup_candidates, format_bytes,
 };
 
@@ -66,13 +66,36 @@ pub fn run_cleanup(args: &[OsString]) -> ExitCode {
     let summary = if parsed.dry_run || matched.is_empty() {
         CleanupSummary::default()
     } else {
+        let cwds = match crate::session::running_session_cwds() {
+            Ok(cwds) => cwds,
+            Err(e) => {
+                eprintln!(
+                    "worktree cleanup: cannot check for running sessions ({e}); nothing was removed"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let (idle, busy) = split_active_sessions(&matched, &cwds);
         let paths = Paths::dev().ok();
-        run_cleanup_engine(
-            &matched,
+        let mut summary = run_cleanup_engine(
+            &idle,
             !parsed.filter.exclude_dirty,
             paths.as_ref(),
             state_dir.as_deref(),
-        )
+        );
+        for item in busy {
+            summary.failed_count = summary.failed_count.saturating_add(1);
+            summary.items.push(CleanupItemOutcome {
+                path: item.path,
+                branch: item.branch,
+                removed: false,
+                branch_deleted: false,
+                freed_bytes: 0,
+                warnings: Vec::new(),
+                error: Some("worktree has a running session; close it first".to_owned()),
+            });
+        }
+        summary
     };
 
     if parsed.json {
@@ -223,6 +246,21 @@ fn select_candidates(
         matched.retain(|c| wanted.contains(&c.path) || parsed.worktrees.contains(&c.path));
     }
     matched
+}
+
+/// 실행 중인 세션의 cwd가 안에 있는 워크트리를 따로 나눈다. 지우면 그 세션의 상대 경로 쓰기가 실패한다.
+fn split_active_sessions(
+    matched: &[WorktreeCleanupCandidate],
+    cwds: &[PathBuf],
+) -> (Vec<WorktreeCleanupCandidate>, Vec<WorktreeCleanupCandidate>) {
+    let cwds: Vec<PathBuf> = cwds
+        .iter()
+        .map(|cwd| std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone()))
+        .collect();
+    matched.iter().cloned().partition(|c| {
+        let wt = std::fs::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
+        !cwds.iter().any(|cwd| cwd.starts_with(&wt))
+    })
 }
 
 fn resolve_repos(
@@ -384,6 +422,45 @@ mod tests {
     use std::process::Command;
 
     use krill_proto::worktree_space::{CleanupPrState, SECS_PER_DAY};
+
+    #[test]
+    fn worktrees_holding_a_running_session_are_split_off() {
+        let root = std::env::temp_dir().join(format!("mk-cleanup-busy-{}", std::process::id()));
+        let (busy, idle) = (root.join("busy"), root.join("idle"));
+        fs::create_dir_all(busy.join("sub")).unwrap();
+        fs::create_dir_all(&idle).unwrap();
+        let candidate = |path: &Path| super::WorktreeCleanupCandidate {
+            repo: root.clone(),
+            repo_name: String::new(),
+            path: path.to_path_buf(),
+            name: String::new(),
+            branch: None,
+            is_main: false,
+            locked: false,
+            dirty: false,
+            dirty_count: 0,
+            merged_into_main: true,
+            pr_state: CleanupPrState::Merged,
+            pr_number: None,
+            last_active_secs: 0,
+            idle_days: 0,
+            disk_bytes: 0,
+            artifact_bytes: 0,
+        };
+        let (keep, skip) = super::split_active_sessions(
+            &[candidate(&busy), candidate(&idle)],
+            &[busy.join("sub"), root.join("elsewhere")],
+        );
+        assert_eq!(
+            keep.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+            [idle]
+        );
+        assert_eq!(
+            skip.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+            [busy]
+        );
+        fs::remove_dir_all(&root).ok();
+    }
 
     use super::super::space::record_worktree_metadata;
 
