@@ -72,27 +72,27 @@ $cFail     = if ($krillColor) { "$esc[38;2;255;101;104m" } else { '' }
 $cMuted    = if ($krillColor) { "$esc[38;2;154;163;181m" } else { '' }
 $cReset    = if ($krillColor) { "$esc[0m" } else { '' }
 
-$gTop   = Convert-KrillUnicode '\u250C' # ┌
-$gPipe  = Convert-KrillUnicode '\u2502' # │
-$gStep  = Convert-KrillUnicode '\u25C7' # ◇
-$gBot   = Convert-KrillUnicode '\u2514' # └
-$gCross = Convert-KrillUnicode '\u00D7' # ×
-$gDot   = Convert-KrillUnicode '\u00B7' # ·
-$gArrow = Convert-KrillUnicode '\u2192' # →
+$gTop   = Convert-KrillUnicode '\u250C'
+$gPipe  = Convert-KrillUnicode '\u2502'
+$gStep  = Convert-KrillUnicode '\u25C7'
+$gBot   = Convert-KrillUnicode '\u2514'
+$gCross = Convert-KrillUnicode '\u00D7'
+$gDot   = Convert-KrillUnicode '\u00B7'
+$gArrow = Convert-KrillUnicode '\u2192'
 $gArcs  = @(
-    (Convert-KrillUnicode '\u25DC'), # ◜
-    (Convert-KrillUnicode '\u25E0'), # ◠
-    (Convert-KrillUnicode '\u25DD'), # ◝
-    (Convert-KrillUnicode '\u25DF'), # ◞
-    (Convert-KrillUnicode '\u25E1'), # ◡
-    (Convert-KrillUnicode '\u25DE')  # ◟
+    (Convert-KrillUnicode '\u25DC'),
+    (Convert-KrillUnicode '\u25E0'),
+    (Convert-KrillUnicode '\u25DD'),
+    (Convert-KrillUnicode '\u25DF'),
+    (Convert-KrillUnicode '\u25E1'),
+    (Convert-KrillUnicode '\u25DE')
 )
 
-$kWork  = Convert-KrillUnicode '\uC791\uC5C5' # 작업
-$kFail  = Convert-KrillUnicode '\uC2E4\uD328' # 실패
-$kAbort = Convert-KrillUnicode '\uC124\uCE58\uB97C \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4' # 설치를 중단했습니다
-$kDone  = Convert-KrillUnicode '\uC124\uCE58\uD588\uC2B5\uB2C8\uB2E4' # 설치했습니다
-$kStart = Convert-KrillUnicode '\uC2DC\uC791' # 시작
+$kWork  = Convert-KrillUnicode '\uC791\uC5C5'
+$kFail  = Convert-KrillUnicode '\uC2E4\uD328'
+$kAbort = Convert-KrillUnicode '\uC124\uCE58\uB97C \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4'
+$kDone  = Convert-KrillUnicode '\uC124\uCE58\uD588\uC2B5\uB2C8\uB2E4'
+$kStart = Convert-KrillUnicode '\uC2DC\uC791'
 
 $installTimer = [Diagnostics.Stopwatch]::StartNew()
 $stepTimer = [Diagnostics.Stopwatch]::New()
@@ -160,7 +160,7 @@ if (-not $alreadyInstalled) {
     New-Item -ItemType Directory $tmp | Out-Null
     try {
         if ($download) {
-            # [01/06] 릴리스 확인
+
             Start-KrillStep '01' (Convert-KrillUnicode '\uB9B4\uB9AC\uC2A4 \uD655\uC778 \uC911') 0
             # Windows PowerShell 5.1 may otherwise negotiate an obsolete TLS version.
             [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -175,7 +175,7 @@ if (-not $alreadyInstalled) {
             if ($checksums.Count -ne 1) { throw 'The Windows package SHA-256 file is missing.' }
             Complete-KrillStep '01' (Convert-KrillUnicode '\uD655\uC778') ((Convert-KrillUnicode '\uB9B4\uB9AC\uC2A4 \uB2E4\uC6B4\uB85C\uB4DC \uACBD\uB85C \uD655\uC778 (') + $asset.name + ')')
 
-            # [02/06] 번들 다운로드
+
             Start-KrillStep '02' ((Convert-KrillUnicode '\uBC88\uB4E4 \uB2E4\uC6B4\uB85C\uB4DC \uC911 (') + $asset.name + ')') 1
             $Zip = Join-Path $tmp $asset.name
             $checksumFile = Join-Path $tmp 'package.sha256'
@@ -197,7 +197,7 @@ if (-not $alreadyInstalled) {
             $zipMib = ('{0:0.0} MiB' -f ($zipBytes / 1048576.0))
             Complete-KrillStep '02' (Convert-KrillUnicode '\uC218\uC2E0') ((Convert-KrillUnicode '\uBC88\uB4E4 \uB2E4\uC6B4\uB85C\uB4DC \uC644\uB8CC (') + $zipMib + ')')
 
-            # [03/06] SHA-256 비교
+
             Start-KrillStep '03' (Convert-KrillUnicode 'SHA-256 \uBE44\uAD50 \uC911') 2
             $checksum = (Get-Content -LiteralPath $checksumFile -Raw).Trim()
             if ($checksum -notmatch '^([0-9a-fA-F]{64})(?:\s+\*?([^\r\n]+))?$') { throw 'Invalid SHA-256 file.' }
@@ -216,7 +216,7 @@ if (-not $alreadyInstalled) {
             Complete-KrillStep '03' (Convert-KrillUnicode '\uC0DD\uB7B5') (Convert-KrillUnicode '\uC624\uD504\uB77C\uC778 \uD328\uD0A4\uC9C0 (\uC678\uBD80 \uCCB4\uD06C\uC12C \uC0DD\uB7B5)')
         }
 
-        # [04/06] 번들 해제·실행 파일 검사
+
         Start-KrillStep '04' (Convert-KrillUnicode '\uBC88\uB4E4 \uD574\uC81C\u00B7\uAD6C\uC131 \uD30C\uC77C \uAC80\uC0AC \uC911') 3
         $unpacked = Join-Path $tmp 'unpacked'
         $savedProgress2 = $ProgressPreference
@@ -233,7 +233,7 @@ if (-not $alreadyInstalled) {
         }
         Complete-KrillStep '04' (Convert-KrillUnicode '\uAC80\uC99D') (Convert-KrillUnicode '\uBC88\uB4E4 \uD574\uC81C \u00B7 \uD544\uC218 \uAD6C\uC131 \uD30C\uC77C 5\uC885 \uD655\uC778')
 
-        # [05/06] 앱 파일 설치
+
         Start-KrillStep '05' ((Convert-KrillUnicode '\uC571 \uD30C\uC77C \uC124\uCE58 \uC911 (') + $Dest + ')') 4
         New-Item -ItemType Directory -Force (Split-Path -Parent $Dest) | Out-Null
         Move-Item -LiteralPath (Join-Path $unpacked 'Krill') -Destination $Dest
@@ -246,14 +246,14 @@ if (-not $alreadyInstalled) {
     }
 }
 
-# [06/06] 바로가기·PATH 연결·앱 열기 요청
+
 Start-KrillStep '06' (Convert-KrillUnicode 'CLI PATH \u00B7 \uBC14\uB85C\uAC00\uAE30 \u00B7 \uC571 \uC5F4\uAE30 \uAD6C\uC131 \uC911') 5
 try {
     if (-not $NoShortcut) {
         $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Krill.lnk'
         $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
         $s.TargetPath = Join-Path $Dest 'krill-app.exe'
-        # 작업 디렉터리를 설치 폴더로 두지 않는다(실행 중 프로세스의 cwd가 설치 폴더면 교체가 어려워진다).
+
         $s.WorkingDirectory = $env:USERPROFILE
         $s.Save()
     }
