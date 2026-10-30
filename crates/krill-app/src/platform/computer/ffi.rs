@@ -638,7 +638,8 @@ pub fn running_apps(max: usize) -> Vec<RunningApp> {
             }
             // SAFETY: `app`은 NSRunningApplication이다.
             let policy: isize = unsafe { msg_send![app, activationPolicy] };
-            if policy != 0 {
+            // Regular(0)와 accessory(1, 메뉴 막대 앱의 설정 창 등). CLI `list-apps`와 같은 범위다.
+            if policy != 0 && policy != 1 {
                 continue;
             }
             // SAFETY: `app`은 NSRunningApplication이다.

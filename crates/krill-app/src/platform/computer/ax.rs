@@ -19,7 +19,8 @@ use crate::platform::permissions;
 mod input;
 
 const MAX_SNAPSHOTS: usize = 4;
-const MAX_DEPTH: usize = 24;
+/// `MAX_ANCESTRY`보다 얕아야 대상의 조상 검사가 창까지 닿는다. Electron 앱(Slack)은 깊이 24를 넘어 census가 잘렸다.
+const MAX_DEPTH: usize = 63;
 const MAX_CHILDREN: usize = 200;
 const MAX_WINDOWS: usize = 64;
 const MAX_ACTIONS: usize = 24;
@@ -84,8 +85,10 @@ const B_ENABLED: usize = 6;
 const B_FOCUSED: usize = 7;
 const B_POSITION: usize = 8;
 const B_SIZE: usize = 9;
-/// 지문에 들어가는 속성 비트. 활성·포커스는 지문이 아니다.
-const IDENTITY_BITS: u16 = !(1 << B_ENABLED | 1 << B_FOCUSED);
+/// 관찰 순회(`Attrs::walk`)에서만 같이 읽는다. 노드마다 개수·목록 두 번의 AX 왕복을 없앤다.
+const B_CHILDREN: usize = 10;
+/// 지문에 들어가는 속성 비트. 활성·포커스·자식 목록은 지문이 아니다.
+const IDENTITY_BITS: u16 = !(1 << B_ENABLED | 1 << B_FOCUSED | 1 << B_CHILDREN);
 
 #[derive(Debug)]
 struct Attrs {
@@ -102,6 +105,7 @@ struct Attrs {
     sheets: Cf,
     modal: Cf,
     batch: AttrBatch,
+    walk: AttrBatch,
 }
 
 impl Attrs {
@@ -117,7 +121,8 @@ impl Attrs {
         let focused = s("AXFocused")?;
         let position = s("AXPosition")?;
         let size = s("AXSize")?;
-        let batch = AttrBatch::new(&[
+        let children = s("AXChildren")?;
+        let identity = [
             &role,
             &subrole,
             &title,
@@ -128,13 +133,17 @@ impl Attrs {
             &focused,
             &position,
             &size,
-        ])?;
+        ];
+        let batch = AttrBatch::new(&identity)?;
+        let mut walk = identity.to_vec();
+        walk.push(&children);
+        let walk = AttrBatch::new(&walk)?;
         Some(Self {
             role,
             value,
             position,
             size,
-            children: s("AXChildren")?,
+            children,
             windows: s("AXWindows")?,
             focused_window: s("AXFocusedWindow")?,
             focused_element: s("AXFocusedUIElement")?,
@@ -143,6 +152,7 @@ impl Attrs {
             sheets: s("AXSheets")?,
             modal: s("AXModal")?,
             batch,
+            walk,
         })
     }
 }
@@ -560,6 +570,11 @@ impl MacBackend {
 
     /// 실행기·부모(제어 프로세스)·지정 PID·Krill 번들은 대상이 될 수 없다.
     fn guard(&self, pid: i32) -> Result<(), Refusal> {
+        self.guard_known(pid, ffi::bundle_id_of(pid).as_deref())
+    }
+
+    /// [`Self::guard`]에서 번들 ID를 이미 읽은 경우(앱 목록).
+    fn guard_known(&self, pid: i32, bundle_id: Option<&str>) -> Result<(), Refusal> {
         let me = i32::try_from(std::process::id()).unwrap_or(-1);
         let parent = rustix::process::Pid::as_raw(rustix::process::getppid());
         if pid == me || pid == parent || self.protected.contains(&pid) {
@@ -568,7 +583,7 @@ impl MacBackend {
                 "refusing to drive the executor or its controller",
             ));
         }
-        if ffi::bundle_id_of(pid).is_some_and(|id| {
+        if bundle_id.is_some_and(|id| {
             id == krill_proto::daemon::BUNDLE_ID || id.starts_with(SELF_BUNDLE_PREFIX)
         }) {
             return Err(Refusal::new(
@@ -683,7 +698,7 @@ impl MacBackend {
                     "bundleId": app.bundle_id,
                     "active": app.active,
                     "hidden": app.hidden,
-                    "protected": self.guard(app.pid).is_err(),
+                    "protected": self.guard_known(app.pid, app.bundle_id.as_deref()).is_err(),
                     "startWitness": ffi::process_start(app.pid).map(|(s, us)| format!("{s}.{us:06}")),
                 })
             })
@@ -735,7 +750,7 @@ impl MacBackend {
             (windows.iter().position(|w| *w == focused), focused)
         };
         let limit = limit.unwrap_or(DEFAULT_OBSERVE_NODES);
-        let (nodes, elements, coverage) = self.walk(&root, limit, deadline)?;
+        let (nodes, elements, coverage) = self.walk(&root, limit, false, deadline)?;
         let generation = self.next_generation;
         self.next_generation += 1;
         let id = format!(
@@ -772,10 +787,12 @@ impl MacBackend {
     }
 
     /// 창에서 시작하는 전위 순회. 노드·깊이·자식·바이트·시간 상한과 방문 집합(`CFEqual`)으로 순환을 끊는다.
+    /// `census`는 지문과 부모만 쓰는 재검증용이다. 표시용 동작 목록·값 쓰기 가능 여부 왕복을 건너뛴다.
     fn walk(
         &self,
         root: &Cf,
         limit: usize,
+        census: bool,
         deadline: Instant,
     ) -> Result<(Vec<Node>, Vec<Value>, Coverage), Refusal> {
         let (attrs, _) = self.ax()?;
@@ -804,7 +821,7 @@ impl MacBackend {
                 continue;
             }
             self.budget(deadline)?;
-            let (values, failed) = match ffi::copy_multiple(&element, &attrs.batch) {
+            let (values, failed) = match ffi::copy_multiple(&element, &attrs.walk) {
                 Ok(values) => split_batch(values),
                 Err(error) => {
                     if depth == 0 {
@@ -857,9 +874,11 @@ impl MacBackend {
                 } else if let Some(flag) = ffi::bool_value(value) {
                     node["value"] = json!(flag);
                 }
-                self.budget(deadline)?;
-                if let Ok(settable) = ffi::is_settable(&element, &attrs.value) {
-                    node["valueSettable"] = json!(settable);
+                if !census {
+                    self.budget(deadline)?;
+                    if let Ok(settable) = ffi::is_settable(&element, &attrs.value) {
+                        node["valueSettable"] = json!(settable);
+                    }
                 }
             }
             for (field, index) in [("enabled", B_ENABLED), ("focused", B_FOCUSED)] {
@@ -875,42 +894,36 @@ impl MacBackend {
                     "x": origin.x, "y": origin.y, "width": size.width, "height": size.height,
                 });
             }
-            self.budget(deadline)?;
-            if let Ok(actions) = ffi::action_names(&element, MAX_ACTIONS)
-                && !actions.is_empty()
-            {
-                node["actions"] = json!(actions);
+            if !census {
+                self.budget(deadline)?;
+                if let Ok(actions) = ffi::action_names(&element, MAX_ACTIONS)
+                    && !actions.is_empty()
+                {
+                    node["actions"] = json!(actions);
+                }
             }
             if depth >= MAX_DEPTH {
                 node["unexpanded"] = json!(true);
                 coverage.truncate("depth");
-            } else {
-                self.budget(deadline)?;
-                match ffi::attribute_count(&element, &attrs.children) {
-                    Ok(0) | Err(ax::NO_VALUE | ax::ATTRIBUTE_UNSUPPORTED) => {}
-                    Ok(count) => {
-                        let take = count.min(MAX_CHILDREN);
-                        self.budget(deadline)?;
-                        if let Ok(children) =
-                            ffi::copy_attribute_values(&element, &attrs.children, take)
-                        {
-                            node["childCount"] = json!(count);
-                            if count > take {
-                                node["childrenTruncated"] = json!(true);
-                                coverage.truncate("children");
-                            }
-                            for child in children.into_iter().rev() {
-                                stack.push((child, Some(key), depth + 1));
-                            }
-                        } else {
-                            node["unexpanded"] = json!(true);
-                            coverage.truncate("ax_error");
-                        }
+            } else if failed & 1 << B_CHILDREN != 0 {
+                node["unexpanded"] = json!(true);
+                coverage.truncate("ax_error");
+            } else if let Some(list) = get(B_CHILDREN) {
+                if let Some(children) = ffi::array_items(list) {
+                    let count = children.len();
+                    if count > 0 {
+                        node["childCount"] = json!(count);
                     }
-                    Err(_) => {
-                        node["unexpanded"] = json!(true);
-                        coverage.truncate("ax_error");
+                    if count > MAX_CHILDREN {
+                        node["childrenTruncated"] = json!(true);
+                        coverage.truncate("children");
                     }
+                    for child in children.into_iter().take(MAX_CHILDREN).rev() {
+                        stack.push((child, Some(key), depth + 1));
+                    }
+                } else {
+                    node["unexpanded"] = json!(true);
+                    coverage.truncate("ax_error");
                 }
             }
             let identity = Semantic::from_batch(&values, failed);
@@ -995,7 +1008,8 @@ impl MacBackend {
         compare_value: bool,
         deadline: Instant,
     ) -> Result<(), Refusal> {
-        let (current, _, coverage) = self.walk(&snapshot.window, MAX_OBSERVE_NODES, deadline)?;
+        let (current, _, coverage) =
+            self.walk(&snapshot.window, MAX_OBSERVE_NODES, true, deadline)?;
         if coverage.truncated {
             return Err(Refusal::new(
                 "identity_incomplete",
