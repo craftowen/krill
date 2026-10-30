@@ -26,7 +26,7 @@ const RECEIPT_FILE: &str = "hooks/statusline-claude.json";
 const STDIN_MAX: u64 = 1024 * 1024;
 /// stdin EOF 대기. 넘으면 가진 만큼으로 진행한다(틱 pile-up 방지).
 const STDIN_WAIT: Duration = Duration::from_secs(5);
-/// 사용자 체인 명령 실행 제한. 넘으면 죽이고 빈 출력으로 둔다.
+/// 틱 전체(stdin 대기 + 체인 실행) 제한. 넘으면 체인을 죽이고 빈 출력으로 둔다.
 const CHAIN_WAIT: Duration = Duration::from_secs(10);
 /// 체인 셸 종료 확인 간격.
 const CHAIN_POLL: Duration = Duration::from_millis(10);
@@ -53,6 +53,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
 
 /// 실행 모드. 어떤 실패도 statusline 표시를 깨지 않게 항상 0으로 끝난다.
 fn run_mode(args: &[OsString]) -> ExitCode {
+    let deadline = std::time::Instant::now() + CHAIN_WAIT;
     let parsed = parse_run_args(args);
     let payload = read_stdin(STDIN_WAIT, STDIN_MAX);
     let dir = config_dir();
@@ -65,7 +66,11 @@ fn run_mode(args: &[OsString]) -> ExitCode {
         std::env::var_os(DEPTH_ENV).is_some(),
         &exe_string(),
     ) {
-        Some(command) => run_chain(&command, &payload),
+        Some(command) => run_chain_within(
+            &command,
+            &payload,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ),
         None => Vec::new(),
     };
     io::stdout().write_all(&output).ok();
@@ -202,10 +207,6 @@ fn chain_shell() -> PathBuf {
 
 /// 사용자 명령을 [`chain_shell`]`-c`로 실행하고 stdout을 그대로 돌려준다.
 /// 실패·타임아웃은 빈 출력이다(표시 우선).
-fn run_chain(command: &OsStr, input: &[u8]) -> Vec<u8> {
-    run_chain_within(command, input, CHAIN_WAIT)
-}
-
 fn run_chain_within(command: &OsStr, input: &[u8], wait: Duration) -> Vec<u8> {
     let deadline = std::time::Instant::now() + wait;
     let mut shell = std::process::Command::new(chain_shell());

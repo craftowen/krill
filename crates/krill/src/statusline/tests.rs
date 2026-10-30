@@ -105,10 +105,10 @@ fn record_skips_without_rate_limits_and_missing_dir() {
 fn chain_passthrough_returns_user_output_verbatim() {
     // 사용자 명령(`cat`)이 stdin을 그대로 돌려준다.
     let input = payload(10, 20);
-    let output = run_chain(OsStr::new("cat"), &input);
+    let output = run_chain_within(OsStr::new("cat"), &input, CHAIN_WAIT);
     assert_eq!(output, input);
     // 없는 명령은 빈 출력이다(표시만 비고 0으로 끝난다 — 호출자가 보장).
-    assert!(run_chain(OsStr::new("/no/such/command-owe701"), &input).is_empty());
+    assert!(run_chain_within(OsStr::new("/no/such/command-owe701"), &input, CHAIN_WAIT).is_empty());
 }
 
 #[test]
