@@ -310,7 +310,7 @@ fn channel_mismatch_surfaces_configured_and_offered_without_staging() {
     };
     let d = TempGuard(temp_dir("channel-mismatch"));
     let app = d.0.join("Krill.app");
-    let status = decide_and_stage(&cfg, &m, &app, &d.0).unwrap();
+    let status = decide_and_stage(&cfg, &m, &app, &d.0, true).unwrap();
     assert!(matches!(
         status,
         CheckStatus::ChannelMismatch {
@@ -341,7 +341,8 @@ fn newer_release_skipped_by_rollout_or_protocol_never_reports_up_to_date() {
         rollout_pct: 0,
     };
     sign_manifest(&mut manifest, &sk);
-    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0).unwrap() else {
+    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0, true).unwrap()
+    else {
         panic!("a newer release outside rollout must not appear up to date");
     };
     assert_eq!(
@@ -351,7 +352,8 @@ fn newer_release_skipped_by_rollout_or_protocol_never_reports_up_to_date() {
     manifest.rollout_pct = 100;
     manifest.min_daemon_protocol = PROTO_MAX.checked_add(1).unwrap();
     sign_manifest(&mut manifest, &sk);
-    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0).unwrap() else {
+    let CheckStatus::Error(message) = decide_and_stage(&cfg, &manifest, &app, &d.0, true).unwrap()
+    else {
         panic!("a newer incompatible release must not appear up to date");
     };
     assert!(message.contains("0.2.7"));
@@ -1029,6 +1031,105 @@ fn stage_update_manifest_downloads_and_stages_from_local_http() {
     assert_eq!(staged, Some((state.clone(), "0.2.0".to_owned())));
     assert_eq!(bundle_version(&staging_path(&app)), "0.2.0");
     assert_eq!(bundle_version(&app), "0.1.0");
+
+    fetch_bytes(&format!("{base_url}/stop"), 64).ok();
+    server.join().ok();
+}
+
+/// v0.2.29 실기: 시작 확인에 실패해 롤백된 버전을 자동 점검이 곧바로 다시 받아 자동 재시작하면서
+/// 재시작·롤백이 47분 동안 되풀이됐다.
+#[test]
+fn automatic_poll_does_not_restage_a_rolled_back_version() {
+    let d = TempGuard(temp_dir("rolled-back-poll"));
+    let state = d.0.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let (kp, pk) = fresh_key();
+    fs::write(
+        state.join(CONFIG_FILE),
+        format!("public_key = \"{}\"\n", encode_hex(&pk)),
+    )
+    .unwrap();
+
+    let app = d.0.join("Krill.app");
+    build_test_app_bundle(&app, "0.1.0", "exit 0", true);
+    let broken = d.0.join("src-0.2.0/Krill.app");
+    build_test_app_bundle(&broken, "0.2.0", "exit 42", true);
+    let zip = zip_bundle(&broken, &d.0.join("v2.zip"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let mut m = Manifest {
+        version: "0.2.0".to_owned(),
+        url: format!("{base_url}/Krill-0.2.0.zip"),
+        sha256: sha256_hex(&zip),
+        ed25519_sig: String::new(),
+        min_daemon_protocol: 1,
+        channel: Channel::Stable,
+        rollout_pct: 100,
+    };
+    sign_manifest_with(&kp, &mut m);
+    let m_json = serde_json::to_vec(&m).unwrap();
+    let server = thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let body: &[u8] = match path {
+                "/latest.json" => &m_json,
+                "/Krill-0.2.0.zip" => &zip,
+                "/stop" => break,
+                _ => b"not found",
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).ok();
+            stream.write_all(body).ok();
+        }
+    });
+
+    let url = format!("{base_url}/latest.json");
+    let exe = std::env::current_exe().unwrap();
+    let bundle = app.to_string_lossy().into_owned();
+    let staged = poll_update_with(Some(&url), Some(&bundle), false, &exe, &state)
+        .unwrap()
+        .expect("first automatic poll stages 0.2.0");
+    let outcome = relaunch_and_verify(
+        &app,
+        &state,
+        &staged.from_version,
+        &staged.to_version,
+        None,
+        Duration::from_secs(5),
+        &CodesignVerifier::adhoc(),
+    )
+    .unwrap();
+    let RelaunchOutcome::RolledBack { mut restored, .. } = outcome else {
+        panic!("broken 0.2.0 must roll back");
+    };
+    restored.wait().unwrap();
+    assert_eq!(bundle_version(&app), "0.1.0");
+
+    assert_eq!(
+        poll_update_with(Some(&url), Some(&bundle), false, &exe, &state).unwrap(),
+        None,
+        "automatic poll must not restage the version that just rolled back"
+    );
+    assert!(!staging_path(&app).exists());
+    assert!(
+        matches!(
+            check_and_stage_with(Some(&url), &app, &state, false).unwrap(),
+            CheckStatus::Ready(_)
+        ),
+        "an explicit check still retries the rolled-back version"
+    );
 
     fetch_bytes(&format!("{base_url}/stop"), 64).ok();
     server.join().ok();
