@@ -155,6 +155,68 @@ mod tests {
         }
     }
 
+    /// 알려진 차이로 대조에서 뺀다. DCS 안 8비트 ST 0x9c는 vte만 문자열을 끝낸다. 알파벳은 0x9c를 만들지 않는다.
+    fn vte_is_ground_after(bytes: &[u8]) -> bool {
+        let mut parser = alacritty_terminal::vte::Parser::new();
+        parser.advance(&mut Sink, bytes);
+        parser.mk_is_ground()
+    }
+    struct Sink;
+    impl alacritty_terminal::vte::Perform for Sink {}
+
+    #[test]
+    fn escape_intermediate_does_not_swallow_following_text() {
+        for input in [
+            b"\x1b [".as_slice(),
+            b"\xe9\x1b ]".as_slice(),
+            b"\x80\x1b/X".as_slice(),
+        ] {
+            let mut boundary = Boundary::default();
+            let mut tail = input.to_vec();
+            tail.extend(b"plain\n".repeat(1000));
+            boundary.advance(&tail);
+            assert_eq!(boundary.pending, 0, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_lead_returns_to_ground_like_vte() {
+        for input in [
+            b"\xf0\x80".as_slice(),
+            b"\xe0\x80",
+            b"\xed\xa0",
+            b"\xf4\x90",
+        ] {
+            let mut boundary = Boundary::default();
+            boundary.advance(input);
+            assert_eq!(boundary.pending, 0, "input={input:02x?}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(30000))]
+        #[test]
+        fn boundary_ground_matches_vte_bytewise(
+            bytes in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    0x1b_u8, 0x20, 0x2f, b']', b'P', b'X', b'^', b'_', b'[', b'\\', 0x07, 0x18, 0x1a,
+                    b'A', b'0', b'~', 0x7f, b'\n', 0x80, 0xe9, 0x9f, 0x93, 0xf0, 0xe0, 0xed, 0xf4, 0x90, 0xa0, 0xbf, 0xc2, 0xc0, 0xf5,
+                ]),
+                1..40,
+            )
+        ) {
+            let mut boundary = Boundary::default();
+            for (i, &byte) in bytes.iter().enumerate() {
+                boundary.advance(&[byte]);
+                proptest::prop_assert_eq!(
+                    boundary.pending == 0,
+                    vte_is_ground_after(&bytes[..=i]),
+                    "input={:02x?} at {}", bytes, i
+                );
+            }
+        }
+    }
+
     #[test]
     fn ascii_chunks_preserve_pending_escape_strings_and_utf8() {
         for prefix in [
@@ -175,7 +237,6 @@ mod tests {
                     bytewise.advance(std::slice::from_ref(byte));
                 }
                 assert_eq!(chunked.pending, bytewise.pending, "prefix={prefix:?}");
-                assert_eq!(chunked.escaped, bytewise.escaped, "prefix={prefix:?}");
                 assert_eq!(
                     std::mem::discriminant(&chunked.state),
                     std::mem::discriminant(&bytewise.state),
@@ -193,6 +254,8 @@ mod tests {
             (b"before \x1b[31", b"mred"),
             (b"before \xe9\x9f", b"\x93"),
             (b"before \x1b]2;part", b"ial\x07after"),
+            (b"before \x1b]2;cut\x1b[31mred", b"more"),
+            (b"before \x1bXsos\x1b[31mred", b"more"),
             (b"before \x1b[?2026hbuffer", b"ed\x1b[?2026l"),
             (b"\x1b[31mred", b"more"),
         ];
@@ -222,18 +285,26 @@ mod tests {
 pub(crate) struct Boundary {
     state: BoundaryState,
     pub pending: usize,
-    escaped: bool,
 }
 #[derive(Default)]
 enum BoundaryState {
     #[default]
     Ground,
     Escape,
+    EscapeIntermediate,
     Csi,
     String {
         osc: bool,
     },
-    Utf8(u8),
+    /// 남은 연속 바이트 수와 다음 바이트가 가질 수 있는 범위(선두 바이트별 잘못된 인코딩 거절).
+    Utf8 {
+        left: u8,
+        lo: u8,
+        hi: u8,
+    },
+}
+const fn utf8(left: u8, lo: u8, hi: u8) -> BoundaryState {
+    BoundaryState::Utf8 { left, lo, hi }
 }
 impl Boundary {
     pub fn advance(&mut self, bytes: &[u8]) {
@@ -247,20 +318,35 @@ impl Boundary {
             self.pending = self.pending.saturating_add(1);
             match self.state {
                 BoundaryState::Ground => self.start(byte),
-                BoundaryState::Utf8(left) => {
-                    if byte & 0xc0 != 0x80 {
-                        self.start(byte);
+                BoundaryState::Utf8 { left, lo, hi } => {
+                    if !(lo..=hi).contains(&byte) {
+                        if byte & 0xc0 == 0x80 {
+                            self.clear();
+                        } else {
+                            self.start(byte);
+                        }
                     } else if left == 1 {
                         self.clear();
                     } else {
-                        self.state = BoundaryState::Utf8(left - 1);
+                        self.state = BoundaryState::Utf8 {
+                            left: left - 1,
+                            lo: 0x80,
+                            hi: 0xbf,
+                        };
                     }
                 }
                 BoundaryState::Escape => match byte {
                     b'[' => self.state = BoundaryState::Csi,
-                    b']' | b'P' | b'_' | b'^' => {
+                    b']' | b'P' | b'X' | b'_' | b'^' => {
                         self.state = BoundaryState::String { osc: byte == b']' }
                     }
+                    0x1b => self.start(byte),
+                    0x20..=0x2f => self.state = BoundaryState::EscapeIntermediate,
+                    0x30..=0x7e | 0x18 | 0x1a => self.clear(),
+                    _ => {}
+                },
+                // vte처럼 중간 바이트 뒤에는 `[ ] P X ^ _`도 최종 바이트라 문자열을 열지 않는다.
+                BoundaryState::EscapeIntermediate => match byte {
                     0x1b => self.start(byte),
                     0x30..=0x7e | 0x18 | 0x1a => self.clear(),
                     _ => {}
@@ -270,31 +356,31 @@ impl Boundary {
                     0x1b => self.start(byte),
                     _ => {}
                 },
-                BoundaryState::String { osc } => {
-                    if (osc && byte == 7)
-                        || (self.escaped && byte == b'\\')
-                        || byte == 0x18
-                        || byte == 0x1a
-                    {
-                        self.clear();
-                    }
-                    self.escaped = byte == 0x1b;
-                }
+                // vte처럼 ESC는 문자열을 끝내고 새 이스케이프를 연다. ST(ESC 0x5c)는 Escape 상태에서 끝난다.
+                BoundaryState::String { osc } => match byte {
+                    0x1b => self.start(byte),
+                    0x18 | 0x1a => self.clear(),
+                    7 if osc => self.clear(),
+                    _ => {}
+                },
             }
         }
     }
     fn clear(&mut self) {
         self.pending = 0;
         self.state = BoundaryState::Ground;
-        self.escaped = false;
     }
     fn start(&mut self, byte: u8) {
         self.pending = 1;
         self.state = match byte {
             0x1b => BoundaryState::Escape,
-            0xc2..=0xdf => BoundaryState::Utf8(1),
-            0xe0..=0xef => BoundaryState::Utf8(2),
-            0xf0..=0xf4 => BoundaryState::Utf8(3),
+            0xc2..=0xdf => utf8(1, 0x80, 0xbf),
+            0xe0 => utf8(2, 0xa0, 0xbf),
+            0xed => utf8(2, 0x80, 0x9f),
+            0xe1..=0xef => utf8(2, 0x80, 0xbf),
+            0xf0 => utf8(3, 0x90, 0xbf),
+            0xf4 => utf8(3, 0x80, 0x8f),
+            0xf1..=0xf3 => utf8(3, 0x80, 0xbf),
             _ => {
                 self.clear();
                 return;
