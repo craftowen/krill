@@ -555,6 +555,20 @@ fn truncated_upload_fails_and_keeps_the_installed_binary() {
 }
 
 #[test]
+fn upload_into_a_directory_target_fails_at_upload_and_leaves_no_temp_file() {
+    let fake = FakeSsh::new("dirtarget");
+    fake.set_uname("Darwin", "arm64");
+    fake.set_launchctl(0);
+    let target = fake.home.join(".krill/bin/krilld");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let err = install_with_holder(&fake, &fake.home.display().to_string(), b"holder").unwrap_err();
+
+    assert_eq!(err.step, "upload");
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+}
+
+#[test]
 fn install_fails_when_the_version_file_cannot_be_written() {
     let fake = FakeSsh::new("versionfail");
     fake.set_uname("Darwin", "arm64");
