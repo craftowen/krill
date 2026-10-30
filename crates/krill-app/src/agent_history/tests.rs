@@ -683,3 +683,42 @@ fn server_search_hits_survive_incomplete_snippets_and_remote_path_spelling() {
     });
     assert_eq!(panel.visible_hits(), vec![hit]);
 }
+
+#[gpui::test]
+fn resumed_reply_is_not_dropped_when_a_search_is_pending(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let call: Call = Arc::new(|r| {
+        Ok(Reply::AgentHistory(match r {
+            Request::AgentHistory(Action::Scan) => Response::Scanned(Snapshot {
+                entries: vec![sample()],
+                truncated: false,
+                skipped: false,
+            }),
+            Request::AgentHistory(Action::Search(_)) => Response::Searched(SearchSnapshot {
+                hits: Vec::new(),
+                truncated: false,
+                skipped: false,
+            }),
+            _ => Response::Resumed {
+                session: SessionId(5),
+            },
+        }))
+    });
+    let (panel, cx) = cx.add_window_view(|_, _| Panel::new(call));
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let events = opened.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&panel, move |_, event: &Open, _| {
+            events.lock().unwrap().push(event.session);
+        })
+        .detach();
+    });
+    panel.update(cx, Panel::toggle);
+    cx.run_until_parked();
+    panel.update(cx, |p, cx| {
+        p.resume(sample(), cx);
+        p.set_query("typed while resuming", cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(*opened.lock().unwrap(), [SessionId(5)]);
+}
