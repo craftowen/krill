@@ -60,16 +60,10 @@ impl Drop for Daemon {
 
 /// 붙어서 Hello를 주고받는다. 소켓이 아직 없거나 죽은 소켓이면 `None`.
 fn connect(sock: &Path) -> Option<(UnixStream, ServerHello)> {
-    let mut s = UnixStream::connect(sock).ok()?;
-    s.set_read_timeout(Some(WAIT)).unwrap();
-    let (k, b) = ipc::read_frame(&mut s).ok()??;
-    let hello = ServerHello::decode(k, &b).unwrap();
-    std::io::Write::write_all(
-        &mut s,
-        &client_hello(ClientRole::Cli, "it").encode().unwrap(),
-    )
-    .unwrap();
-    Some((s, hello))
+    let connection =
+        krill_proto::daemon::handshake(sock, &client_hello(ClientRole::Cli, "it"), WAIT).ok()?;
+    connection.stream.set_read_timeout(Some(WAIT)).ok()?;
+    Some((connection.stream, connection.server))
 }
 
 /// `instance_id`가 `not`이 아닌 krilld가 게시될 때까지 기다린다.
