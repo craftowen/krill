@@ -1162,3 +1162,18 @@ fn unknown_remote_blocks_sync_until_background_probe_and_repo_reset(cx: &mut Tes
     cx.run_until_parked();
     assert!(fake.edits.lock().unwrap().is_empty());
 }
+
+#[test]
+fn hunk_and_line_patches_refuse_lossy_text() {
+    let head = "diff --git a/f b/f\n--- a/f\n+++ b/f\n";
+    let clean = "@@ -1 +1 @@\n-a\n+b\n";
+    let lossy = "@@ -5 +5 @@\n-c\n+\u{FFFD}\n";
+    assert!(build_hunk_patch(&format!("{head}{clean}"), 0).is_some());
+    let raw = format!("{head}{clean}{lossy}");
+    assert!(
+        build_hunk_patch(&raw, 0).is_some(),
+        "a clean hunk in the same file stays editable"
+    );
+    assert!(build_hunk_patch(&raw, 1).is_none());
+    assert!(build_line_patch(&raw, false, 5, 5, true).is_none());
+}
