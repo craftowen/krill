@@ -2700,32 +2700,16 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
         vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
         vcx.run_until_parked();
     };
-    // 글꼴 크기·투명도는 터미널 탭(OWE-658), 사운드는 일반 탭.
+    // 글꼴 크기는 터미널 탭(OWE-658), 사운드는 일반 탭.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| v.set_tab(AdminTab::Terminal, cx));
         window.draw(cx).clear(cx);
     });
-    for selector in [
-        "font-dec",
-        "font-inc",
-        "font-reset",
-        "editor-font-dec",
-        "editor-font-inc",
-        "editor-font-reset",
-        "opacity-dec",
-        "opacity-inc",
-        "opacity-reset",
-    ] {
+    for selector in ["font-dec", "font-inc", "font-reset"] {
         assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
     }
     assert_eq!(text::RESET.in_language(Language::Ko), "기본값");
-    assert_eq!(
-        vcx.debug_bounds("font-reset").unwrap().size,
-        vcx.debug_bounds("opacity-reset").unwrap().size,
-        "font-reset must render the same '기본값' label as opacity-reset"
-    );
     click(vcx, "font-inc");
-    click(vcx, "opacity-dec");
     vcx.update(|_, cx| {
         assert_eq!(
             current(cx).terminal_font_size(),
@@ -2734,11 +2718,6 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
     });
     click(vcx, "font-reset");
     vcx.update(|_, cx| assert_eq!(current(cx).terminal_font_size(), DEFAULT_TERMINAL_FONT_SIZE));
-    // OWE-843: 에디터 글꼴 행도 같은 탭에서 조절·영속된다.
-    click(vcx, "editor-font-inc");
-    vcx.update(|_, cx| assert_eq!(current(cx).editor_font_size(), 13));
-    click(vcx, "editor-font-reset");
-    vcx.update(|_, cx| assert_eq!(current(cx).editor_font_size(), 12));
     assert_eq!(
         Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap())
             .unwrap()
@@ -2757,22 +2736,8 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
             current(cx).terminal_font_size(),
             DEFAULT_TERMINAL_FONT_SIZE + 1
         );
-        assert_eq!(current(cx).terminal_opacity_pct(), 95);
         assert!(!current(cx).notification_sound);
     });
-    vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
-        window.draw(cx).clear(cx);
-    });
-    assert!(vcx.debug_bounds("hib-toggle").is_some());
-    vcx.update(|_, cx| assert!(!current(cx).hibernation_enabled));
-    assert!(!d.join(HIBERNATION_FLAG).exists());
-    click(vcx, "hib-toggle");
-    vcx.update(|_, cx| assert!(current(cx).hibernation_enabled));
-    assert!(d.join(HIBERNATION_FLAG).is_file());
-    click(vcx, "hib-toggle");
-    vcx.update(|_, cx| assert!(!current(cx).hibernation_enabled));
-    assert!(!d.join(HIBERNATION_FLAG).exists());
     fs::remove_dir_all(d).ok();
 }
 
@@ -3376,30 +3341,11 @@ fn owe658_terminal_tab_controls_toggle_and_persist(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("admin-tab-terminal").is_some());
     click(vcx, "admin-tab-terminal");
     vcx.update(|window, cx| window.draw(cx).clear(cx));
-    for selector in [
-        "terminal-font-family",
-        "cursor-block",
-        "cursor-bar",
-        "cursor-underline",
-        "cursor-blink-toggle",
-        "option-meta-toggle",
-        "copy-select-toggle",
-    ] {
+    for selector in ["terminal-font-family", "font-dec"] {
         assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
     }
     // 대체가 없으면 경고 행이 없다(OWE-899).
     assert!(vcx.debug_bounds("terminal-font-fallback").is_none());
-    click(vcx, "cursor-bar");
-    click(vcx, "cursor-blink-toggle");
-    click(vcx, "option-meta-toggle");
-    click(vcx, "copy-select-toggle");
-    vcx.update(|_, cx| {
-        let s = current(cx);
-        assert_eq!(s.terminal_cursor_shape, TerminalCursorShape::Bar);
-        assert!(!s.terminal_cursor_blink && s.option_as_meta && s.copy_on_select);
-    });
-    click(vcx, "option-meta-toggle");
-    vcx.update(|_, cx| assert!(!current(cx).option_as_meta));
     fs::remove_dir_all(d).ok();
 }
 
@@ -5605,10 +5551,15 @@ fn project_worktree_location_saves_switches_and_resets(cx: &mut TestAppContext) 
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-737: 에이전트 탭의 '첫 프롬프트로 브랜치·세션 이름 자동 변경'·
+fn cx_edit_auto_rename(vcx: &mut gpui::VisualTestContext) {
+    vcx.update(|_, cx| edit(cx, |s| s.auto_rename_branch_from_work = false));
+    vcx.run_until_parked();
+}
+
+/// OWE-737: 첫 프롬프트 자동 이름 변경은 파일 전용이고, 에이전트 탭의
 /// '워크스페이스 신뢰 프리셋 자동 등록(기본 꺼짐·동의 확인 후 켜기)' 컨트롤이 `settings.toml` 및 플래그 파일에 동기화된다.
 #[gpui::test]
-fn owe737_agent_settings_toggle_auto_rename_and_sync_flag_file(cx: &mut TestAppContext) {
+fn owe737_agent_settings_sync_auto_rename_and_trust_flag_files(cx: &mut TestAppContext) {
     let d = dir("owe737-agent-settings");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
@@ -5618,9 +5569,10 @@ fn owe737_agent_settings_toggle_auto_rename_and_sync_flag_file(cx: &mut TestAppC
     });
     vcx.run_until_parked();
 
-    for id in ["auto-rename-branch-toggle", "workspace-trust-preset-toggle"] {
-        assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
-    }
+    assert!(
+        vcx.debug_bounds("workspace-trust-preset-toggle").is_some(),
+        "missing workspace-trust-preset-toggle"
+    );
 
     // 기본값: 자동 이름 변경·워크스페이스 신뢰 프리셋 모두 기본 켜짐.
     assert!(krill_proto::git::is_auto_rename_enabled(Some(&d)));
@@ -5686,13 +5638,8 @@ fn owe737_agent_settings_toggle_auto_rename_and_sync_flag_file(cx: &mut TestAppC
         &d
     )));
 
-    // 자동 이름 변경 토글 클릭 시 settings.toml 및 플래그 파일 반영 확인.
-    let off_at = vcx
-        .debug_bounds("auto-rename-branch-toggle")
-        .unwrap()
-        .center();
-    vcx.simulate_click(off_at, gpui::Modifiers::default());
-    vcx.run_until_parked();
+    // 자동 이름 변경은 settings.toml 편집만으로 플래그 파일에 반영된다.
+    cx_edit_auto_rename(vcx);
     assert!(!krill_proto::git::is_auto_rename_enabled(Some(&d)));
 
     let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
@@ -7094,12 +7041,7 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
         );
     }
 
-    for sel in [
-        "admin-yolo-toggle",
-        "hib-toggle",
-        "auto-rename-branch-toggle",
-        "workspace-trust-preset-toggle",
-    ] {
+    for sel in ["admin-yolo-toggle", "workspace-trust-preset-toggle"] {
         let b = bounds(vcx, sel);
         assert!(
             b.right() <= column.right() + px(0.5),
@@ -7444,55 +7386,17 @@ fn general_terminal_controls_in_language(cx: &mut TestAppContext, language: Lang
     vcx.run_until_parked();
     vcx.update(|window, cx| window.draw(cx).clear(cx));
 
-    let term_app = bounds(vcx, "terminal-section-appearance");
-    let term_cur = bounds(vcx, "terminal-section-cursor");
-    let term_kbd = bounds(vcx, "terminal-section-keyboard");
-    assert!(term_app.origin.y < term_cur.origin.y);
-    assert!(term_cur.origin.y < term_kbd.origin.y);
-
-    assert!(bounds(vcx, "cursor-block").origin.x < bounds(vcx, "cursor-bar").origin.x);
-    assert!(bounds(vcx, "cursor-bar").origin.x < bounds(vcx, "cursor-underline").origin.x);
-
-    let opacity_val_before = bounds(vcx, "opacity-value");
-    let opacity_inc_before = bounds(vcx, "opacity-inc");
-    // 기본 불투명도 100%(최댓값)에서 '+' 클릭은 무효, '-' 클릭 시 95%로 감소하되 버튼 위치 고정
-    click(vcx, "opacity-inc");
-    vcx.update(|_, cx| assert_eq!(current(cx).terminal_opacity_pct(), 100));
-    click(vcx, "opacity-dec");
-    vcx.update(|_, cx| assert_eq!(current(cx).terminal_opacity_pct(), 95));
-    assert_eq!(
-        bounds(vcx, "opacity-value").size.width,
-        opacity_val_before.size.width,
-        "opacity-value width must remain fixed across 100% -> 95%"
-    );
-    assert_eq!(
-        bounds(vcx, "opacity-inc").origin.x,
-        opacity_inc_before.origin.x,
-        "opacity-inc button must not shift horizontally across 100% -> 95%"
-    );
-    click(vcx, "opacity-reset");
-    vcx.update(|_, cx| assert_eq!(current(cx).terminal_opacity_pct(), 100));
-
-    // 글꼴 크기 최솟값(10pt)·최댓값(24pt) 및 불투명도 최솟값(50%) 경계 검증
+    // 글꼴 크기 최솟값(10pt) 경계 검증
     vcx.update(|window, cx| {
-        edit(cx, |s| {
-            s.terminal_font_size = 10;
-            s.terminal_opacity_pct = 50;
-        });
+        edit(cx, |s| s.terminal_font_size = 10);
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
     click(vcx, "font-dec");
-    click(vcx, "opacity-dec");
-    vcx.update(|_, cx| {
-        assert_eq!(current(cx).terminal_font_size(), 10);
-        assert_eq!(current(cx).terminal_opacity_pct(), 50);
-    });
+    vcx.update(|_, cx| assert_eq!(current(cx).terminal_font_size(), 10));
     click(vcx, "font-reset");
-    click(vcx, "opacity-reset");
     vcx.update(|_, cx| {
         assert_eq!(current(cx).terminal_font_size(), DEFAULT_TERMINAL_FONT_SIZE);
-        assert_eq!(current(cx).terminal_opacity_pct(), 100);
     });
 
     // 좁은 창(820px)에서 Terminal 탭의 모든 컨트롤이 본문 열 우측 경계를 넘지 않는다.
@@ -7502,16 +7406,6 @@ fn general_terminal_controls_in_language(cx: &mut TestAppContext, language: Lang
         "font-size-value",
         "font-inc",
         "font-reset",
-        "opacity-dec",
-        "opacity-value",
-        "opacity-inc",
-        "opacity-reset",
-        "cursor-block",
-        "cursor-bar",
-        "cursor-underline",
-        "cursor-blink-toggle",
-        "option-meta-toggle",
-        "copy-select-toggle",
     ] {
         let b = bounds(vcx, sel);
         assert!(

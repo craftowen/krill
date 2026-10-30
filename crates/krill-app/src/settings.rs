@@ -7160,9 +7160,6 @@ impl SettingsView {
             |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
         let font_size = s.terminal_font_size();
         let font_pt = format!("{font_size}pt");
-        let editor_font_pt = format!("{}pt", s.editor_font_size());
-        let opacity_val = s.terminal_opacity_pct();
-        let opacity_pct = format!("{opacity_val}%");
         self.refresh_font_names(cx);
         let font_names = self.font_names.clone();
         let family = s.terminal_font_family.clone();
@@ -7182,11 +7179,6 @@ impl SettingsView {
                 }
                 menu
             });
-        let cursor_button = |id: &'static str, title: &'static str, shape: TerminalCursorShape| {
-            layout::segment(p, id, title, s.terminal_cursor_shape == shape)
-                .debug_selector(move || id.into())
-                .on_click(move |_, _, cx| edit(cx, move |s| s.terminal_cursor_shape = shape))
-        };
         div()
             .flex()
             .flex_col()
@@ -7271,272 +7263,6 @@ impl SettingsView {
                                         });
                                     }),
                             ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::EDITOR_FONT_SIZE.get(),
-                        text::EDITOR_FONT_SIZE_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls()
-                            .child(
-                                Button::new("editor-font-dec")
-                                    .accessibility_label(
-                                        text::STEP_DEC
-                                            .format(&[("name", text::EDITOR_FONT_SIZE.get())]),
-                                    )
-                                    .label("−")
-                                    .disabled(s.editor_font_size_step(-1) == s.editor_font_size)
-                                    .debug_selector(|| "editor-font-dec".into())
-                                    .ghost()
-                                    .small()
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.editor_font_size = s.editor_font_size_step(-1);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .w_12()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .child(editor_font_pt),
-                            )
-                            .child(
-                                Button::new("editor-font-inc")
-                                    .accessibility_label(
-                                        text::STEP_INC
-                                            .format(&[("name", text::EDITOR_FONT_SIZE.get())]),
-                                    )
-                                    .label("+")
-                                    .disabled(s.editor_font_size_step(1) == s.editor_font_size)
-                                    .debug_selector(|| "editor-font-inc".into())
-                                    .ghost()
-                                    .small()
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.editor_font_size = s.editor_font_size_step(1);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                Button::new("editor-font-reset")
-                                    .label(text::RESET.get())
-                                    .tooltip(text::EDITOR_FONT_RESET.get())
-                                    .disabled(s.editor_font_size == default_editor_font_size())
-                                    .debug_selector(|| "editor-font-reset".into())
-                                    .ghost()
-                                    .small()
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.editor_font_size = default_editor_font_size();
-                                        });
-                                    }),
-                            ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(text::OPACITY.get(), text::OPACITY_DESC.get()))
-                    .child(
-                        layout::controls()
-                            .child(
-                                layout::secondary("opacity-dec", "−")
-                                    .accessibility_label(
-                                        text::STEP_DEC.format(&[("name", text::OPACITY.get())]),
-                                    )
-                                    .disabled(opacity_val <= 50)
-                                    .debug_selector(|| "opacity-dec".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.terminal_opacity_pct =
-                                                s.terminal_opacity_pct().saturating_sub(5).max(50);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id("opacity-value")
-                                    .debug_selector(|| "opacity-value".into())
-                                    .w(px(48.))
-                                    .text_center()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .child(opacity_pct),
-                            )
-                            .child(
-                                layout::secondary("opacity-inc", "+")
-                                    .accessibility_label(
-                                        text::STEP_INC.format(&[("name", text::OPACITY.get())]),
-                                    )
-                                    .disabled(opacity_val >= 100)
-                                    .debug_selector(|| "opacity-inc".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.terminal_opacity_pct =
-                                                s.terminal_opacity_pct().saturating_add(5).min(100);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                layout::ghost("opacity-reset", text::RESET.get())
-                                    .disabled(opacity_val == default_terminal_opacity_pct())
-                                    .debug_selector(|| "opacity-reset".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| s.terminal_opacity_pct = 100);
-                                    }),
-                            ),
-                    ),
-            )
-            .child(layout::section_title(
-                p,
-                "terminal-section-cursor",
-                text::SECTION_TERMINAL_CURSOR.get(),
-            ))
-            .child(
-                row()
-                    .child(label(
-                        text::CURSOR_SHAPE.get(),
-                        text::CURSOR_SHAPE_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(layout::segmented_control(
-                            p,
-                            [
-                                (
-                                    "cursor-block",
-                                    text::CURSOR_BLOCK.get(),
-                                    TerminalCursorShape::Block,
-                                ),
-                                (
-                                    "cursor-bar",
-                                    text::CURSOR_BAR.get(),
-                                    TerminalCursorShape::Bar,
-                                ),
-                                (
-                                    "cursor-underline",
-                                    text::CURSOR_UNDERLINE.get(),
-                                    TerminalCursorShape::Underline,
-                                ),
-                            ]
-                            .into_iter()
-                            .map(|(id, l, shape)| cursor_button(id, l, shape)),
-                        )),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::CURSOR_BLINK.get(),
-                        text::CURSOR_BLINK_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "cursor-blink-toggle",
-                                s.terminal_cursor_blink,
-                                false,
-                                |next, _, cx| edit(cx, move |s| s.terminal_cursor_blink = next),
-                            )
-                            .aria_label(text::CURSOR_BLINK.get()),
-                        ),
-                    ),
-            )
-            .child(layout::section_title(
-                p,
-                "terminal-section-keyboard",
-                text::SECTION_TERMINAL_KEYBOARD.get(),
-            ))
-            .child(
-                row()
-                    .child(label(
-                        text::OPTION_AS_META.get(),
-                        text::OPTION_AS_META_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "option-meta-toggle",
-                                s.option_as_meta,
-                                false,
-                                |next, _, cx| {
-                                    edit(cx, move |s| {
-                                        s.option_as_meta = next;
-                                        s.option_as_meta_auto = false;
-                                    });
-                                },
-                            )
-                            .aria_label(text::OPTION_AS_META.get()),
-                        ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::OPTION_META_AUTO.get(),
-                        text::OPTION_META_AUTO_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "option-meta-auto",
-                                s.option_as_meta_auto,
-                                false,
-                                |next, _, cx| {
-                                    edit(cx, move |s| {
-                                        s.option_as_meta_auto = next;
-                                        if next {
-                                            s.option_as_meta = false;
-                                        }
-                                    });
-                                },
-                            )
-                            .aria_label(text::OPTION_META_AUTO.get()),
-                        ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::COPY_ON_SELECT.get(),
-                        text::COPY_ON_SELECT_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "copy-select-toggle",
-                                s.copy_on_select,
-                                false,
-                                |next, _, cx| edit(cx, move |s| s.copy_on_select = next),
-                            )
-                            .aria_label(text::COPY_ON_SELECT.get()),
-                        ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::CONFIRM_RUNNING_CLOSE.get(),
-                        text::CONFIRM_RUNNING_CLOSE_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "confirm-running-close-toggle",
-                                s.confirm_running_close,
-                                false,
-                                |next, _, cx| edit(cx, move |s| s.confirm_running_close = next),
-                            )
-                            .aria_label(text::CONFIRM_RUNNING_CLOSE.get()),
-                        ),
                     ),
             )
     }
@@ -9739,26 +9465,6 @@ impl SettingsView {
 
         // 유휴 동면은 `settings.toml` + 상태 디렉터리의 `hibernation.enabled` 표식으로 데몬에
         // 전달한다(OWE-655). 표식 동기화는 `edit`·`reload`가 맡는다.
-        let hib_row = layout::row(p)
-            .child(self.search_focus.label(
-                p,
-                text::HIBERNATION_TITLE.get(),
-                Some(text::HIBERNATION_DESC.get()),
-            ))
-            .child(
-                layout::controls().child(
-                    layout::switch(
-                        p,
-                        "hib-toggle",
-                        s.hibernation_enabled,
-                        false,
-                        |next, _, cx| edit(cx, move |s| s.hibernation_enabled = next),
-                    )
-                    .aria_label(text::HIBERNATION_TITLE.get()),
-                ),
-            );
-
-        // 끄면 Krill이 설치한 훅을 되돌리고, 다시 켜면 설치된 에이전트에 바로 설치한다.
         let hooks_row = layout::row(p)
             .child(self.search_focus.label(
                 p,
@@ -9855,7 +9561,6 @@ impl SettingsView {
             .child(default_agent_row)
             .child(default_view_mode_row)
             .child(yolo_row)
-            .child(hib_row)
             .child(hooks_row)
             .child(auto_setup_row);
 
@@ -9885,25 +9590,6 @@ impl SettingsView {
     #[inline(never)]
     fn render_agent_extra_rows(&mut self, s: &Settings, cx: &mut Context<Self>) -> Vec<gpui::Div> {
         let p = crate::ui::palette(cx);
-        let auto_rename_row = layout::row(p)
-            .child(self.search_focus.label(
-                p,
-                text::AUTO_RENAME_BRANCH.get(),
-                Some(text::AUTO_RENAME_BRANCH_DESC.get()),
-            ))
-            .child(
-                layout::controls().child(
-                    layout::switch(
-                        p,
-                        "auto-rename-branch-toggle",
-                        s.auto_rename_branch_from_work,
-                        false,
-                        |next, _, cx| edit(cx, move |s| s.auto_rename_branch_from_work = next),
-                    )
-                    .aria_label(text::AUTO_RENAME_BRANCH.get()),
-                ),
-            );
-
         let view = cx.entity();
         let mut workspace_trust_section = div().w_full().min_w_0().flex().flex_col().gap_2().child(
             layout::row(p)
@@ -9996,7 +9682,7 @@ impl SettingsView {
                     ),
             );
         }
-        vec![auto_rename_row, workspace_trust_section]
+        vec![workspace_trust_section]
     }
 
     #[inline(never)]

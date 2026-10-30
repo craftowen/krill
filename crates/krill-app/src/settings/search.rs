@@ -53,16 +53,16 @@ mod tests {
         assert_eq!(search_tabs("글꼴"), [AdminTab::Terminal]);
         assert_eq!(search_tabs("font"), [AdminTab::Terminal]);
         assert_eq!(search_tabs("  FONT "), [AdminTab::Terminal]);
-        // 터미널 탭(OWE-658) 키워드: 커서·Option·Meta·복사(한·영).
+        // 파일 전용 옵션은 설정 파일 행으로 안내한다.
         for q in ["커서", "cursor", "옵션", "meta", "복사", "copy", "blink"] {
-            assert!(search_tabs(q).contains(&AdminTab::Terminal), "{q}");
+            assert!(search_tabs(q).contains(&AdminTab::General), "{q}");
         }
         assert_eq!(search_tabs("ssh"), [AdminTab::Ssh]);
         for q in ["원격 Krill", "remote krill", "초대", "invite", "p2p"] {
             assert_eq!(search_tabs(q), [AdminTab::RemoteKrill], "{q}");
         }
         assert!(search_tabs("페어링").contains(&AdminTab::RemoteKrill));
-        assert_eq!(search_tabs("동면"), [AdminTab::Agents]);
+        assert_eq!(search_tabs("동면"), [AdminTab::General]);
         assert!(search_tabs("webhook").contains(&AdminTab::Workflows));
         // 알림 이벤트(OWE-659)는 알림 항목에서 찾는다.
         for q in ["벨", "bell", "입력", "input", "승인", "완료", "done"] {
