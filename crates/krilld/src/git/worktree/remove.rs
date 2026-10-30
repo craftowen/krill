@@ -76,31 +76,18 @@ pub fn remove_with_state(
         verify_git_link(q, repo, &path)?;
     }
     let config = super::compat::read_config_with_state(repo, state_dir)?;
-    let status = git(
-        q,
-        repo,
-        [
-            OsString::from("-C"),
-            path.as_os_str().to_owned(),
-            OsString::from("status"),
-            OsString::from("--porcelain"),
-            OsString::from("-z"),
-            OsString::from("--untracked-files=all"),
-            OsString::from("--ignored=matching"),
-        ],
-    )?;
-    let dirty = is_dirty_ignoring_symlinks(&status.stdout, &path, &config.worktree.symlinks);
     // Missing metadata makes status unknowable. Only explicit --force can discard
     // files in an ownership-verified orphan; a normal removal stays fail-closed.
-    if !req.force || target.is_some() {
-        text(status, "cannot check worktree status").map_err(|e| {
-            format!(
+    match is_dirty(q, repo, &path, &config.worktree.symlinks) {
+        Err(e) if !req.force || target.is_some() => {
+            return Err(format!(
                 "cannot check worktree status: {e}; use --force only to discard an orphan's files"
-            )
-        })?;
-    }
-    if !req.force && dirty {
-        return Err("worktree is dirty; use --force to discard its files".to_owned());
+            ));
+        }
+        Ok(true) if !req.force => {
+            return Err("worktree is dirty; use --force to discard its files".to_owned());
+        }
+        _ => {}
     }
     let mut warnings = Vec::new();
     if let Some(script) = config.worktree.archive.as_deref() {
@@ -120,50 +107,66 @@ pub fn remove_with_state(
             } else {
                 return Err(e);
             }
+        } else if !req.force && is_dirty(q, repo, &path, &config.worktree.symlinks) != Ok(false) {
+            // The hook runs after the dirty check; a plain `git worktree remove` would
+            // still delete ignored files it wrote.
+            return Err(
+                "archive hook left files in the worktree; use --force to discard them".to_owned(),
+            );
         }
     }
     reject_nested_worktrees(&entries(q, repo)?, &path)?;
-    unlink_symlinks(&path, &config.worktree.symlinks);
-    if target.is_none() {
-        remove_orphan(q, repo, &path)?;
-    } else {
-        let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
-        if req.force {
-            args.push("--force".into());
-        }
-        args.push("--".into());
-        args.push(path.as_os_str().to_owned());
-        if let Err(first_err) =
-            git(q, repo, args).and_then(|out| text(out, "git worktree remove failed"))
-        {
-            if registered(q, repo, &path)? {
-                // A clean tree with initialized submodules needs a single --force.
-                if req.force {
-                    return Err(first_err);
-                }
-                let retry_args = [
-                    OsString::from("worktree"),
-                    OsString::from("remove"),
-                    OsString::from("--force"),
-                    OsString::from("--"),
-                    path.as_os_str().to_owned(),
-                ];
-                if let Err(retry_err) =
-                    git(q, repo, retry_args).and_then(|out| text(out, &first_err))
-                {
-                    if registered(q, repo, &path)? {
-                        return Err(retry_err);
+    let unlinked = unlink_symlinks(&path, &config.worktree.symlinks);
+    let removal = (|| -> Result<(), String> {
+        if target.is_none() {
+            remove_orphan(q, repo, &path)?;
+        } else {
+            let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
+            if req.force {
+                args.push("--force".into());
+            }
+            args.push("--".into());
+            args.push(path.as_os_str().to_owned());
+            if let Err(first_err) =
+                git(q, repo, args).and_then(|out| text(out, "git worktree remove failed"))
+            {
+                if registered(q, repo, &path)? {
+                    // A clean tree with initialized submodules needs a single --force.
+                    // Files created after the dirty check (e.g. by the archive hook) must
+                    // not be discarded by the retry, so look again before forcing.
+                    if req.force || is_dirty(q, repo, &path, &config.worktree.symlinks) != Ok(false)
+                    {
+                        return Err(first_err);
                     }
+                    let retry_args = [
+                        OsString::from("worktree"),
+                        OsString::from("remove"),
+                        OsString::from("--force"),
+                        OsString::from("--"),
+                        path.as_os_str().to_owned(),
+                    ];
+                    if let Err(retry_err) =
+                        git(q, repo, retry_args).and_then(|out| text(out, &first_err))
+                    {
+                        if registered(q, repo, &path)? {
+                            return Err(retry_err);
+                        }
+                        remove_orphan(q, repo, &path)?;
+                    }
+                } else {
                     remove_orphan(q, repo, &path)?;
                 }
-            } else {
+            }
+            // Even a successful Git exit is insufficient if a directory survived.
+            if !directory_absent(&path)? {
                 remove_orphan(q, repo, &path)?;
             }
         }
-        // Even a successful Git exit is insufficient if a directory survived.
-        if !directory_absent(&path)? {
-            remove_orphan(q, repo, &path)?;
-        }
+        Ok(())
+    })();
+    if let Err(e) = removal {
+        restore_symlinks(&path, &unlinked);
+        return Err(e);
     }
     if !directory_absent(&path)? {
         return Err(
@@ -480,12 +483,19 @@ fn is_dirty_ignoring_symlinks(stdout: &[u8], wt_real: &Path, symlinks: &[String]
     false
 }
 
-fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) {
+fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) -> Vec<(PathBuf, PathBuf)> {
+    let mut removed = Vec::new();
     for raw in symlinks {
         if is_valid_worktree_symlink(wt_real, raw) {
             let trimmed = raw.trim().trim_end_matches('/');
             let rel = Path::new(trimmed);
-            fs::remove_file(wt_real.join(rel)).ok();
+            let link = wt_real.join(rel);
+            let target = fs::read_link(&link).ok();
+            if fs::remove_file(&link).is_ok()
+                && let Some(target) = target
+            {
+                removed.push((link, target));
+            }
             let mut parent = rel.parent();
             while let Some(p) = parent {
                 if p.as_os_str().is_empty() {
@@ -497,6 +507,91 @@ fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) {
                 parent = p.parent();
             }
         }
+    }
+    removed
+}
+
+/// 삭제가 실패해 워크트리가 남으면 끊어 둔 심링크를 되살린다.
+fn restore_symlinks(wt_real: &Path, removed: &[(PathBuf, PathBuf)]) {
+    if !wt_real.is_dir() {
+        return;
+    }
+    for (link, target) in removed {
+        if let Some(parent) = link.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).ok();
+        #[cfg(windows)]
+        {
+            if target.is_dir() {
+                std::os::windows::fs::symlink_dir(target, link).ok();
+            } else {
+                std::os::windows::fs::symlink_file(target, link).ok();
+            }
+        }
+    }
+}
+
+/// 삭제하면 사라질 파일이 있는지. Krill이 만든 심링크는 세지 않는다. `.gitmodules`의 `ignore`
+/// 설정을 따르지 않고, 상위 status가 보지 않는 하위 모듈 안의 무시된 파일까지 센다.
+fn is_dirty(q: &GitQueue, repo: &Path, wt: &Path, symlinks: &[String]) -> Result<bool, String> {
+    let git_in = |command: &[&str]| {
+        let mut args = vec![OsString::from("-C"), wt.as_os_str().to_owned()];
+        args.extend(command.iter().map(OsString::from));
+        git(q, repo, args)
+    };
+    let status = git_in(&[
+        "status",
+        "--porcelain",
+        "-z",
+        "--untracked-files=all",
+        "--ignored=matching",
+        "--ignore-submodules=none",
+    ])?;
+    if is_dirty_ignoring_symlinks(
+        &stdout(status, "cannot check worktree status")?,
+        wt,
+        symlinks,
+    ) {
+        return Ok(true);
+    }
+    // `git submodule` is a shell script that cannot enter paths with newlines; read .gitmodules.
+    let listed = git_in(&[
+        "config",
+        "-z",
+        "--file",
+        ".gitmodules",
+        "--get-regexp",
+        r"^submodule\..*\.path$",
+    ])?;
+    if listed.status.code() == Some(1) {
+        return Ok(false);
+    }
+    for entry in stdout(listed, "cannot list submodules")?.split(|b| *b == 0) {
+        let Some(rel) = entry.splitn(2, |b| *b == b'\n').nth(1) else {
+            continue;
+        };
+        let rel = Path::new(OsStr::from_bytes(rel));
+        if rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+            && super::safe_parent(wt, rel, false).is_ok()
+            && wt.join(rel).join(".git").exists()
+            && is_dirty(q, repo, &wt.join(rel), &[])?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 성공한 git의 stdout. 실패면 `text`와 같은 오류.
+fn stdout(out: Output, what: &str) -> Result<Vec<u8>, String> {
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        text(out, what).map(String::into_bytes)
     }
 }
 
