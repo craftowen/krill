@@ -76,31 +76,18 @@ pub fn remove_with_state(
         verify_git_link(q, repo, &path)?;
     }
     let config = super::compat::read_config_with_state(repo, state_dir)?;
-    let status = git(
-        q,
-        repo,
-        [
-            OsString::from("-C"),
-            path.as_os_str().to_owned(),
-            OsString::from("status"),
-            OsString::from("--porcelain"),
-            OsString::from("-z"),
-            OsString::from("--untracked-files=all"),
-            OsString::from("--ignored=matching"),
-        ],
-    )?;
-    let dirty = is_dirty_ignoring_symlinks(&status.stdout, &path, &config.worktree.symlinks);
     // Missing metadata makes status unknowable. Only explicit --force can discard
     // files in an ownership-verified orphan; a normal removal stays fail-closed.
-    if !req.force || target.is_some() {
-        text(status, "cannot check worktree status").map_err(|e| {
-            format!(
+    match is_dirty(q, repo, &path, &config.worktree.symlinks) {
+        Err(e) if !req.force || target.is_some() => {
+            return Err(format!(
                 "cannot check worktree status: {e}; use --force only to discard an orphan's files"
-            )
-        })?;
-    }
-    if !req.force && dirty {
-        return Err("worktree is dirty; use --force to discard its files".to_owned());
+            ));
+        }
+        Ok(true) if !req.force => {
+            return Err("worktree is dirty; use --force to discard its files".to_owned());
+        }
+        _ => {}
     }
     let mut warnings = Vec::new();
     if let Some(script) = config.worktree.archive.as_deref() {
@@ -141,7 +128,8 @@ pub fn remove_with_state(
                     // A clean tree with initialized submodules needs a single --force.
                     // Files created after the dirty check (e.g. by the archive hook) must
                     // not be discarded by the retry, so look again before forcing.
-                    if req.force || !worktree_is_clean(q, repo, &path) {
+                    if req.force || is_dirty(q, repo, &path, &config.worktree.symlinks) != Ok(false)
+                    {
                         return Err(first_err);
                     }
                     let retry_args = [
@@ -560,21 +548,66 @@ fn restore_symlinks(wt_real: &Path, removed: &[(PathBuf, PathBuf)]) {
     }
 }
 
-fn worktree_is_clean(q: &GitQueue, repo: &Path, wt: &Path) -> bool {
-    git(
-        q,
-        repo,
-        [
-            OsString::from("-C"),
-            wt.as_os_str().to_owned(),
-            OsString::from("status"),
-            OsString::from("--porcelain"),
-            OsString::from("-z"),
-            OsString::from("--untracked-files=all"),
-            OsString::from("--ignored=matching"),
-        ],
-    )
-    .is_ok_and(|out| out.status.success() && out.stdout.is_empty())
+/// 삭제하면 사라질 파일이 있는지. Krill이 만든 심링크는 세지 않는다. `.gitmodules`의 `ignore`
+/// 설정을 따르지 않고, 상위 status가 보지 않는 하위 모듈 안의 무시된 파일까지 센다.
+fn is_dirty(q: &GitQueue, repo: &Path, wt: &Path, symlinks: &[String]) -> Result<bool, String> {
+    let git_in = |command: &[&str]| {
+        let mut args = vec![OsString::from("-C"), wt.as_os_str().to_owned()];
+        args.extend(command.iter().map(OsString::from));
+        git(q, repo, args)
+    };
+    let status = git_in(&[
+        "status",
+        "--porcelain",
+        "-z",
+        "--untracked-files=all",
+        "--ignored=matching",
+        "--ignore-submodules=none",
+    ])?;
+    if is_dirty_ignoring_symlinks(
+        &stdout(status, "cannot check worktree status")?,
+        wt,
+        symlinks,
+    ) {
+        return Ok(true);
+    }
+    // `git submodule` is a shell script that cannot enter paths with newlines; read .gitmodules.
+    let listed = git_in(&[
+        "config",
+        "-z",
+        "--file",
+        ".gitmodules",
+        "--get-regexp",
+        r"^submodule\..*\.path$",
+    ])?;
+    if listed.status.code() == Some(1) {
+        return Ok(false);
+    }
+    for entry in stdout(listed, "cannot list submodules")?.split(|b| *b == 0) {
+        let Some(rel) = entry.splitn(2, |b| *b == b'\n').nth(1) else {
+            continue;
+        };
+        let rel = Path::new(OsStr::from_bytes(rel));
+        if rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+            && super::safe_parent(wt, rel, false).is_ok()
+            && wt.join(rel).join(".git").exists()
+            && is_dirty(q, repo, &wt.join(rel), &[])?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 성공한 git의 stdout. 실패면 `text`와 같은 오류.
+fn stdout(out: Output, what: &str) -> Result<Vec<u8>, String> {
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        text(out, what).map(String::into_bytes)
+    }
 }
 
 fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String> {
