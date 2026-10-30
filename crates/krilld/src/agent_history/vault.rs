@@ -3070,4 +3070,59 @@ mod cache_budget_tests {
         assert!(lookup_cached_doc(b, 1, 1).is_some());
         assert_eq!(VAULT_CACHE_BYTES.load(Ordering::Relaxed), 600);
     }
+
+    /// 검색이 캐시에 남긴 실제 힙(jemalloc 스레드 카운터)이 예산 안이고, 회계가 그 힙을 따라간다.
+    #[cfg(not(windows))]
+    #[test]
+    fn cache_budget_bounds_the_heap_it_retains() {
+        use tikv_jemalloc_ctl::thread::{allocatedp, deallocatedp};
+        let (allocated, deallocated) = (allocatedp::read().unwrap(), deallocatedp::read().unwrap());
+        let heap = || i128::from(allocated.get()) - i128::from(deallocated.get());
+        let root = std::env::temp_dir().join(format!("vault-cache-heap-{}", std::process::id()));
+        // 42바이트 줄(한 글자 메시지)과 437바이트 줄 대화. 둘 다 캐시 예산보다 크다.
+        for (content, files) in [(1, 16), (396, 20)] {
+            fs::remove_dir_all(&root).ok();
+            let dir = root.join("claude/projects/-tmp-heap");
+            fs::create_dir_all(&dir).unwrap();
+            let line = format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+                "x".repeat(content)
+            );
+            for i in 0..files {
+                let id = format!("{i:08x}-2222-4333-8444-555555555555");
+                let mut body = format!("{{\"sessionId\":\"{id}\",\"cwd\":\"/tmp/heap\"}}\n");
+                while body.len() + line.len() <= 500 * 1024 {
+                    body.push_str(&line);
+                }
+                fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
+            }
+            let roots = VaultRoots {
+                claude: vec![root.join("claude")],
+                ..VaultRoots::default()
+            };
+            let clear = || {
+                VAULT_CACHE.lock().unwrap().clear();
+                VAULT_CACHE_BYTES.store(0, Ordering::Relaxed);
+            };
+            // 첫 검색은 지연 초기화되는 전역까지 할당하므로 비우고 다시 잰다.
+            drop(search_in(&roots, &SearchQuery::default()));
+            clear();
+            let before = heap();
+            let snapshot = search_in(&roots, &SearchQuery::default());
+            assert!(
+                !snapshot.truncated,
+                "{content}: scan budget must not cut the corpus"
+            );
+            drop(snapshot);
+            let retained = heap() - before;
+            let counted = i128::try_from(VAULT_CACHE_BYTES.load(Ordering::Relaxed)).unwrap();
+            let budget = i128::try_from(MAX_CACHE_BYTES).unwrap();
+            assert!(
+                retained <= budget && (retained - counted).abs() <= counted / 10,
+                "{content}-byte messages: retained {retained} B, counted {counted} B, budget {budget} B"
+            );
+            clear();
+        }
+        fs::remove_dir_all(&root).ok();
+    }
 }

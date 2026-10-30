@@ -1,6 +1,11 @@
 #![deny(clippy::indexing_slicing, clippy::print_stdout, clippy::print_stderr)]
 //! krilld: 세션 데몬. 세션마다 Term(핫 1,000행)과 PTY 리더 스레드를 둔다(ARCHITECTURE §4). 클라이언트는 UDS 하나로 붙는다([`ipc`]).
 
+// 단위 테스트도 데몬과 같은 할당기에서 돌아, 힙 계측 테스트가 실제 크기 등급을 본다.
+#[cfg(all(test, not(windows)))]
+#[global_allocator]
+static TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 pub mod agent;
 mod agent_history;
 pub mod alloc;
