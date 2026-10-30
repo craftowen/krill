@@ -6,6 +6,12 @@ use std::io;
 
 use gpui::{AnyWindowHandle, App, Window};
 
+/// Wait for the exact process opened before replacement, with a bounded kernel wait.
+#[cfg(windows)]
+pub fn wait_process_exit(pid: u32, timeout: std::time::Duration) -> io::Result<()> {
+    win::wait_process_exit(pid, timeout)
+}
+
 #[cfg(windows)]
 mod shell;
 
@@ -151,6 +157,69 @@ mod win {
     };
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_OK, SW_SHOWNORMAL};
+
+    pub(super) fn wait_process_exit(pid: u32, timeout: std::time::Duration) -> io::Result<()> {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+        use windows_sys::Win32::Foundation::{
+            ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+        if pid == 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // SAFETY: opens a synchronization-only handle to the supplied PID; no inheritance.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if raw.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER.cast_signed()) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: OpenProcess returned a new exclusively owned handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        // Never pass INFINITE even if a caller supplies an enormous duration.
+        let millis = u32::try_from(timeout.as_millis())
+            .unwrap_or(u32::MAX - 1)
+            .min(u32::MAX - 1);
+        // SAFETY: handle remains owned throughout the bounded wait.
+        match unsafe { WaitForSingleObject(handle.as_raw_handle(), millis) } {
+            WAIT_OBJECT_0 => Ok(()),
+            WAIT_TIMEOUT => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "old app did not exit; replacement aborted",
+            )),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn process_wait_distinguishes_exit_timeout_and_invalid_pid() {
+        use std::time::Duration;
+        assert_eq!(
+            wait_process_exit(0, Duration::ZERO).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            wait_process_exit(std::process::id(), Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        let command = std::env::var_os("SystemRoot").unwrap();
+        let mut child = crate::platform::background_command(
+            std::path::Path::new(&command).join("System32/cmd.exe"),
+        )
+        .args(["/D", "/C", "exit /b 0"])
+        .spawn()
+        .unwrap();
+        wait_process_exit(child.id(), Duration::from_secs(3)).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
 
     pub(super) fn preferred_locale() -> Option<String> {
         use windows_sys::Win32::Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};

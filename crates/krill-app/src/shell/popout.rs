@@ -1031,6 +1031,35 @@ fn open_settings_from_menu(
 pub(super) const ACCOUNTS_POLL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Shell {
+    /// 현재 실행 중인 호스트·세션에 속하는 캐시 URL만 메뉴에 표시한다.
+    pub(super) fn detected_ports(
+        &self,
+    ) -> Vec<(
+        krill_app::hosts::HostId,
+        krill_app::layout::PaneId,
+        krill_proto::orchestration::PortEntry,
+    )> {
+        let mut detected_ports = Vec::new();
+        for ((host, sid), cache) in self.ports_cache.borrow().iter() {
+            let Some((&pane, _)) = self.live.iter().find(|(pane, live)| {
+                self.layout.host(**pane) == host
+                    && live.pane.session().is_some_and(|session| session.0 == *sid)
+                    && cache.matches(&live.pane.shown())
+            }) else {
+                continue;
+            };
+            for entry in cache.entries() {
+                detected_ports.push((host.clone(), pane, entry.clone()));
+            }
+        }
+        detected_ports.sort_by(|a, b| {
+            (&a.0, a.2.session_id, &a.2.url).cmp(&(&b.0, b.2.session_id, &b.2.url))
+        });
+        detected_ports
+            .dedup_by(|a, b| a.0 == b.0 && a.2.session_id == b.2.session_id && a.2.url == b.2.url);
+        detected_ports
+    }
+
     /// OWE-702: 데몬 연결 중에만 [`ACCOUNTS_POLL`]마다 `ListAccounts`를 다시 받는다. 링크가 끊기면 끝난다.
     /// 데몬에만 묻고(로컬 폴백 없음) 일시 오류는 배너 없이 다음 바퀴에 다시 시도한다.
     pub(super) fn poll_accounts(cx: &mut Context<Self>) -> gpui::Task<()> {
@@ -1843,23 +1872,8 @@ impl Shell {
                 }
             })
             .on_open_change(track_menu_open(cx.weak_entity()));
-        let mut detected_ports = Vec::new();
-        for (sid, cache) in self.ports_cache.borrow().iter() {
-            if !self.live.values().any(|live| {
-                live.pane.session().is_some_and(|session| session.0 == *sid)
-                    && cache.matches(&live.pane.shown())
-            }) {
-                continue;
-            }
-            for entry in cache.entries() {
-                if !detected_ports
-                    .iter()
-                    .any(|e: &krill_proto::orchestration::PortEntry| e.url == entry.url)
-                {
-                    detected_ports.push(entry.clone());
-                }
-            }
-        }
+        let detected_ports = self.detected_ports();
+        let ports_weak = cx.weak_entity();
         let ports_count_label = detected_ports.len().to_string();
         let ports_full_label = text::PORTS_MENU_BTN.format(&[("count", &ports_count_label)]);
         let ports_tooltip = format!("{} — {ports_full_label}", text::PORTS_MENU_TITLE.get());
@@ -1886,13 +1900,26 @@ impl Shell {
             if detected_ports.is_empty() {
                 menu = menu.item(PopupMenuItem::new(text::PORTS_EMPTY.get()).disabled(true));
             } else {
-                for entry in &detected_ports {
-                    let label = format!("s{} · :{} → {}", entry.session_id, entry.port, entry.url);
+                for (host, pane, entry) in &detected_ports {
+                    let label = format!(
+                        "{host} · s{} · :{} → {}",
+                        entry.session_id, entry.port, entry.url
+                    );
                     let url = entry.url.clone();
+                    let (host, pane, session, weak) =
+                        (host.clone(), *pane, entry.session_id, ports_weak.clone());
                     menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                        // AS-23: 자식 프로세스로 `open`을 띄우면 회수하지 않아 좀비가 쌓인다.
-                        // 같은 동작(기본 브라우저로 URL 열기)을 플랫폼에 맡긴다.
-                        cx.open_url(&url);
+                        weak.update(cx, |this, cx| {
+                            // 메뉴가 열린 뒤 다른 소유자로 재사용된 칸으로 URL을 열지 않는다.
+                            if this.layout.host(pane) == &host
+                                && this.live.get(&pane).is_some_and(|live| {
+                                    live.pane.session().is_some_and(|sid| sid.0 == session)
+                                })
+                            {
+                                this.open_terminal_url(pane, &url, cx);
+                            }
+                        })
+                        .ok();
                     }));
                 }
             }

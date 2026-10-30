@@ -49,6 +49,16 @@ pub(crate) fn all_pids() -> io::Result<Vec<u32>> {
         .collect())
 }
 
+/// `pid`의 직계 자식 PID(`/proc/<pid>/task/<pid>/children`).
+pub(crate) fn child_pids(pid: u32) -> io::Result<Vec<u32>> {
+    Ok(
+        std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))?
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect(),
+    )
+}
+
 /// UDS 피어의 유효 UID(`SO_PEERCRED`).
 pub fn peer_uid(sock: BorrowedFd<'_>) -> io::Result<u32> {
     Ok(rustix::net::sockopt::socket_peercred(sock)?.uid.as_raw())
@@ -96,6 +106,17 @@ pub(crate) fn open_vnode_paths(pid: u32) -> Vec<PathBuf> {
         .take(512)
         .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
         .collect()
+}
+
+/// 프로세스 argv(`/proc/<pid>/cmdline`).
+pub(crate) fn process_args(pid: u32) -> io::Result<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    Ok(raw
+        .strip_suffix(&[0])
+        .unwrap_or(&raw)
+        .split(|&b| b == 0)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
 }
 
 /// 프로세스 이름. 명령줄을 읽지 않고 커널의 짧은 실행 이름(`/proc/<pid>/comm`)만 사용한다.
@@ -214,6 +235,8 @@ pub(crate) fn exclude_from_backup(_dir: BorrowedFd<'_>) -> io::Result<()> {
 pub(crate) fn clone_file(_src: &std::path::Path, _dst: &std::path::Path) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
+
+pub(crate) fn release_malloc_cache() {}
 
 #[cfg(test)]
 mod tests {

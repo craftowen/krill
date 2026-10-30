@@ -501,3 +501,15 @@ fn wake_after_account_switch_keeps_launch_profile() {
     drop((holder_end, reg));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn idle_roster_allows_only_the_wrapped_agent_without_children() {
+    // 루트 10, 에이전트 11.
+    assert!(idle_roster(10, &[]));
+    assert!(idle_roster(10, &[(11, 10)]));
+    assert!(
+        !idle_roster(10, &[(11, 10), (12, 11)]),
+        "에이전트가 도구를 돌리는 중"
+    );
+    assert!(!idle_roster(10, &[(11, 10), (12, 10)]), "루트 아래 자식 둘");
+}

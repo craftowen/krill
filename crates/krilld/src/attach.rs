@@ -84,8 +84,19 @@ impl Conn {
         lock(&self.out).write_all(frame)
     }
 
-    fn update(&self, revision: Revision, seq: Seq, ops: Vec<Op>) -> io::Result<()> {
-        let frames = krill_proto::screen::encode_update(revision, seq, ops)?;
+    fn update(
+        &self,
+        revision: Revision,
+        seq: Seq,
+        ops: Vec<Op>,
+        cursor_explicit: bool,
+    ) -> io::Result<()> {
+        let frames = krill_proto::screen::encode_update_with_cursor(
+            revision,
+            seq,
+            ops,
+            Some(cursor_explicit),
+        )?;
         let mut out = lock(&self.out);
         frames.iter().try_for_each(|f| out.write_all(f))
     }
@@ -223,6 +234,7 @@ pub(crate) fn run_as(
     )?;
     let writer = thread::Builder::new()
         .name(format!("attach-{}", attach.session.0))
+        .stack_size(128 * 1024)
         .spawn({
             let (tap, conn) = (tap.clone(), Arc::clone(&conn));
             move || {
@@ -250,6 +262,7 @@ pub(crate) fn run_as(
         .join()
         .unwrap_or_else(|_| Err(io::Error::other("attach writer panicked")));
     tap.finish_input();
+    crate::alloc::purge();
     r.and(w)
 }
 
@@ -460,14 +473,14 @@ fn sync_client(
     conn: &Conn,
     clock: &mut CaptureClock,
     rev: Revision,
-    seq: Seq,
+    position: (Seq, bool),
     ops: Vec<Op>,
     now: Instant,
 ) -> io::Result<bool> {
     if ops.is_empty() {
         return Ok(false);
     }
-    conn.update(rev, seq, ops)?;
+    conn.update(rev, position.0, ops, position.1)?;
     conn.echo.store(false, Ordering::Release);
     clock.mark(now);
     Ok(true)
@@ -506,7 +519,7 @@ fn screen_loop(
             revision: rev,
         })
     {
-        conn.update(rev, seq, keep(snapshot(&sent)))?;
+        conn.update(rev, seq, keep(snapshot(&sent)), sent.cursor_explicit)?;
         clock.mark(Instant::now());
     }
     let mut closed_sent = false;
@@ -537,7 +550,14 @@ fn screen_loop(
         } else {
             diff(&sent, &next)
         });
-        sync_client(conn, &mut clock, rev, seq, ops, Instant::now())?;
+        sync_client(
+            conn,
+            &mut clock,
+            rev,
+            (seq, next.cursor_explicit),
+            ops,
+            Instant::now(),
+        )?;
         sent = next;
         seen = rev.0;
         if p.closed && !closed_sent {
@@ -650,7 +670,7 @@ fn diff(prev: &Screen, next: &Screen) -> Vec<Op> {
     if prev.bells != next.bells {
         ops.push(Op::Bell); // 프레임 사이 여러 번 울려도 한 번
     }
-    if prev.cursor_style != next.cursor_style {
+    if prev.cursor_style != next.cursor_style || prev.cursor_explicit != next.cursor_explicit {
         ops.push(Op::CursorStyle(next.cursor_style));
     }
     // 커서·제목·링크만 바뀌었으면 전행 해시와 O(행²) 스크롤 탐색이 필요 없다.

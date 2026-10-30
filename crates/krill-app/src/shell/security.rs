@@ -8,8 +8,9 @@ use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use krill_app::keys;
 use krill_app::layout::PaneId;
-use krill_app::security::{LinkMenu, PastePlan, plan_paste, text as sec_text};
+use krill_app::security::{LinkMenu, PastePlan, PendingPaste, plan_paste, text as sec_text};
 use krill_proto::input::Now;
+use krill_term::paste::{DropPolicy, ShellFamily};
 
 use super::Shell;
 
@@ -32,7 +33,8 @@ const REMOTE_PASTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duratio
 pub(crate) struct RemoteUploadTarget {
     pub ssh_host: Option<krill_app::ssh_hosts::SshHost>,
     pub host_target: Option<krill_app::hosts::HostTarget>,
-    pub prefer_target_ipc: bool,
+    /// Remote daemon runs on Windows: no `/bin/sh`, so stage via PowerShell + `RemoteFs`.
+    pub windows: bool,
 }
 
 #[derive(Default)]
@@ -44,16 +46,50 @@ impl PasteQueue {
     pub(super) fn has_pending_for(&self, pane: PaneId) -> bool {
         self.entries.iter().any(|entry| entry.pane == pane)
     }
+
+    pub(super) fn pending_panes(&self) -> std::collections::BTreeSet<PaneId> {
+        self.entries.iter().map(|entry| entry.pane).collect()
+    }
+
+    /// 칸이 첫 세션을 배정받으면 그 전에 들어온 `session == None` 항목을 모두 그 첫 세션에 묶는다(APP-RUNTIME-003).
+    pub(super) fn bind_first_session(&mut self, pane: PaneId, session: krill_proto::SessionId) {
+        for entry in &mut self.entries {
+            if entry.pane == pane && entry.session.is_none() {
+                entry.session = Some(session);
+            }
+        }
+    }
 }
 
 struct QueuedInput {
     pane: PaneId,
-    session: krill_proto::SessionId,
+    host: krill_app::hosts::HostId,
+    creation: std::sync::Arc<std::sync::Mutex<super::close::Creation>>,
+    /// 큐에 넣을 때 칸이 붙어 있던 세션. 첫 세션에 붙기 전이면 `None`이고 그 칸의 첫 세션에 전달된다(APP-RUNTIME-003).
+    session: Option<krill_proto::SessionId>,
     kind: QueuedKind,
+    attachment: bool,
+    files: bool,
+    drop_policy: Option<DropPolicy>,
+}
+impl QueuedInput {
+    fn targets(&self, shell: &Shell) -> bool {
+        shell.layout.pane_exists(self.pane)
+            && shell.layout.host(self.pane) == &self.host
+            && shell.live.get(&self.pane).is_some_and(|live| {
+                !live.pane.is_cold()
+                    && std::sync::Arc::ptr_eq(&self.creation, &live.creation)
+                    && self
+                        .session
+                        .is_none_or(|session| live.pane.session() == Some(session))
+            })
+    }
 }
 enum PreparedPaste {
     Pending,
     Ready(Option<Vec<u8>>),
+    /// 여러 줄 붙여넣기 경고에 걸려 사용자 확인을 기다린다. 큐 머리에 남아 그 칸의 뒤 입력을 막는다(APP-RUNTIME-002).
+    Confirming(PendingPaste),
 }
 enum QueuedKind {
     Paste(u64, PreparedPaste),
@@ -61,6 +97,177 @@ enum QueuedKind {
 }
 
 impl Shell {
+    fn mark_file_paste(&mut self, id: u64) {
+        for entry in &mut self.paste_queue.entries {
+            if matches!(entry.kind, QueuedKind::Paste(request, _) if request == id) {
+                entry.files = true;
+            }
+        }
+    }
+
+    fn drop_policy_for(&self, pane: PaneId, cx: &App) -> DropPolicy {
+        use krill_proto::control::Program;
+        let family = |name: &str| {
+            let name = name
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(name)
+                .to_ascii_lowercase();
+            match name.trim_end_matches(".exe") {
+                "cmd" => Some(ShellFamily::Cmd),
+                "pwsh" | "powershell" => Some(ShellFamily::PowerShell),
+                "sh" | "bash" | "zsh" | "fish" => Some(ShellFamily::Posix),
+                _ => None,
+            }
+        };
+        let launch = self.layout.launch(pane).map(|launch| &launch.program);
+        let custom_shell = match launch {
+            Some(Program::Custom { program, .. }) => {
+                std::str::from_utf8(program).ok().and_then(family)
+            }
+            _ => None,
+        };
+        let status = self.layout.session(pane).and_then(|session| {
+            self.sidebar
+                .read(cx)
+                .session_on(self.layout.host(pane), session)
+        });
+        let foreground = status.and_then(|session| session.status.foreground.as_deref());
+        let observed = status.and_then(|session| session.status.root_shell.as_deref());
+        let shell = foreground
+            .and_then(family)
+            .or_else(|| observed.and_then(|root| family(&root.program)))
+            .or(custom_shell)
+            .unwrap_or_else(|| {
+                if let Some(root) = observed {
+                    match root.os {
+                        krill_proto::control::ShellOs::Windows => ShellFamily::WindowsUnknown,
+                        krill_proto::control::ShellOs::Unix => ShellFamily::Unknown,
+                    }
+                } else if self.layout.host(pane).is_remote() {
+                    ShellFamily::Unknown
+                } else if cfg!(windows) {
+                    ShellFamily::WindowsUnknown
+                } else {
+                    ShellFamily::Posix
+                }
+            });
+        let attachment_agent =
+            |id: &str| matches!(krill_proto::agent::executable_id(id), "claude" | "codex");
+        let image_attachments = if foreground.and_then(family).is_some() {
+            // An interactive tool shell owns the input while the provider waits.
+            false
+        } else {
+            match launch {
+                Some(Program::Agent { id }) => krill_proto::agent::decode_agent_program_id(id)
+                    .is_ok_and(|(id, _)| attachment_agent(id)),
+                _ => foreground.is_some_and(attachment_agent),
+            }
+        };
+        DropPolicy {
+            shell,
+            image_attachments,
+            windows_images: observed.map_or(
+                cfg!(windows) && !self.layout.host(pane).is_remote(),
+                |root| {
+                    root.os == krill_proto::control::ShellOs::Windows
+                        && !matches!(
+                            krill_proto::agent::executable_id(&root.program)
+                                .to_ascii_lowercase()
+                                .as_str(),
+                            "wsl" | "wslhost" | "ssh"
+                        )
+                },
+            ),
+        }
+    }
+
+    pub(super) fn input_policy_for(
+        &self,
+        pane: PaneId,
+        cx: &App,
+    ) -> krill_term::paste::InputPolicy {
+        use krill_proto::control::Program;
+        use krill_term::paste::InputPolicy;
+        let status = self.layout.session(pane).and_then(|session| {
+            self.sidebar
+                .read(cx)
+                .session_on(self.layout.host(pane), session)
+        });
+        let windows = status
+            .and_then(|session| session.status.root_shell.as_deref())
+            .map_or(
+                cfg!(windows) && !self.layout.host(pane).is_remote(),
+                |root| root.os == krill_proto::control::ShellOs::Windows,
+            );
+        if !windows {
+            return InputPolicy::ByteStream;
+        }
+        if status
+            .and_then(|session| session.status.root_shell.as_deref())
+            .is_some_and(|root| {
+                matches!(
+                    krill_proto::agent::executable_id(&root.program)
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "wsl" | "wslhost" | "ssh"
+                )
+            })
+        {
+            // The daemon's OS does not describe the consumer behind a nested
+            // WSL/SSH byte stream. Never apply native console input-record rules.
+            return InputPolicy::ByteStream;
+        }
+        let policy = |name: &str| {
+            let name = krill_proto::agent::executable_id(name).to_ascii_lowercase();
+            match name.as_str() {
+                "codex" => InputPolicy::WindowsCodex,
+                "pi" => InputPolicy::WindowsPi,
+                _ => InputPolicy::ByteStream,
+            }
+        };
+        if let Some(foreground) = status.and_then(|session| session.status.foreground.as_deref()) {
+            let detected = policy(foreground);
+            if detected != InputPolicy::ByteStream {
+                return detected;
+            }
+            if matches!(
+                krill_proto::agent::executable_id(foreground)
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "cmd" | "pwsh" | "powershell" | "bash" | "zsh" | "sh" | "fish" | "wsl" | "ssh"
+            ) {
+                return InputPolicy::ByteStream;
+            }
+        }
+        match self.layout.launch(pane).map(|launch| &launch.program) {
+            Some(Program::Agent { id }) => {
+                let id = krill_proto::agent::decode_agent_program_id(id)
+                    .map_or(id.as_str(), |(id, _)| id);
+                policy(id)
+            }
+            Some(Program::Custom { program, .. }) => {
+                std::str::from_utf8(program).map_or(InputPolicy::ByteStream, policy)
+            }
+            _ => InputPolicy::ByteStream,
+        }
+    }
+
+    pub(super) fn plan_terminal_paste(
+        &self,
+        pane: PaneId,
+        bytes: &[u8],
+        modes: krill_proto::term_modes::Modes,
+        cx: &App,
+    ) -> PastePlan {
+        let policy = self.input_policy_for(pane, cx);
+        if policy == krill_term::paste::InputPolicy::WindowsCodex {
+            PastePlan::Immediate(krill_term::paste::paste_with_policy(bytes, modes, policy))
+        } else {
+            plan_paste(pane, bytes, modes)
+        }
+    }
+
     pub(crate) fn on_toggle_secure_input(
         &mut self,
         _: &ToggleSecureInput,
@@ -108,7 +315,15 @@ impl Shell {
 
     fn begin_clipboard_paste(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<u64> {
         let pane = self.layout.focused()?;
-        let session = self.live.get(&pane)?.pane.session()?;
+        // Preserve first-attach buffering and bind every queue entry to the original Live and host.
+        let host = self.layout.host(pane).clone();
+        let drop_policy = self.drop_policy_for(pane, cx);
+        let live = self.ensure_input_live(pane)?;
+        if live.pane.is_cold() {
+            return None;
+        }
+        let session = live.pane.session();
+        let creation = std::sync::Arc::clone(&live.creation);
         let timeout = if self.layout.host(pane).is_remote() {
             REMOTE_PASTE_PREPARATION_TIMEOUT
         } else {
@@ -121,8 +336,13 @@ impl Shell {
         let id = self.paste_queue.next;
         self.paste_queue.entries.push_back(QueuedInput {
             pane,
+            host,
+            creation,
             session,
             kind: QueuedKind::Paste(id, PreparedPaste::Pending),
+            attachment: false,
+            files: false,
+            drop_policy: Some(drop_policy),
         });
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
@@ -219,10 +439,20 @@ impl Shell {
                 if ssh_host.is_none() && host_target.is_none() {
                     return None;
                 }
+                let windows = self
+                    .layout
+                    .session(pane)
+                    .and_then(|session| {
+                        self.sidebar
+                            .read(cx)
+                            .session_on(self.layout.host(pane), session)
+                    })
+                    .and_then(|session| session.status.root_shell.as_deref())
+                    .is_some_and(|root| root.os == krill_proto::control::ShellOs::Windows);
                 Some(RemoteUploadTarget {
                     ssh_host,
                     host_target,
-                    prefer_target_ipc: id.starts_with("iroh:"),
+                    windows,
                 })
             }
             krill_app::hosts::HostId::Local => None,
@@ -233,6 +463,10 @@ impl Shell {
         let Some(id) = self.begin_clipboard_paste(window, cx) else {
             return;
         };
+        let policy = self
+            .layout
+            .focused()
+            .map_or_else(DropPolicy::default, |pane| self.drop_policy_for(pane, cx));
         // 원격 칸이면 로컬 경로를 그대로 보내지 않고 SSH 또는 원격 제어 소켓으로 파일을 올려
         // 원격 경로를 붙여넣는다. 앱(맥북)이 가진 클립보드를 원격 데몬(맥미니) PTY가 읽을 수 있게 한다.
         let remote_pane = self
@@ -249,6 +483,12 @@ impl Shell {
             let item = read.await.ok().flatten();
             #[cfg(not(test))]
             let item = augment_clipboard_item_from_pasteboard(item);
+            if item.as_ref().is_some_and(clipboard_has_files) {
+                this.update(cx, |this, _| this.mark_file_paste(id)).ok();
+            }
+            let attachment = item
+                .as_ref()
+                .is_some_and(|item| clipboard_is_attachment(item, policy));
             let payload = cx
                 .background_executor()
                 .spawn(async move {
@@ -256,7 +496,11 @@ impl Shell {
                         if remote_pane && remote_target.is_none() {
                             remote_text_without_upload(item)
                         } else {
-                            clipboard_paste_payload_for_target(item, remote_target.as_ref())
+                            clipboard_paste_payload_for_target_with_policy(
+                                item,
+                                remote_target.as_ref(),
+                                policy,
+                            )
                         }
                     })
                 })
@@ -264,7 +508,7 @@ impl Shell {
             handle
                 .update(cx, |_, window, cx| {
                     this.update(cx, |this, cx| {
-                        this.complete_clipboard_paste(id, payload, window, cx);
+                        this.complete_attachment_paste(id, payload, attachment, window, cx);
                     })
                     .ok();
                 })
@@ -284,10 +528,25 @@ impl Shell {
             .layout
             .focused()
             .is_some_and(|pane| self.layout.host(pane).is_remote());
+        let policy = self
+            .layout
+            .focused()
+            .map_or_else(DropPolicy::default, |pane| self.drop_policy_for(pane, cx));
         if !remote_pane {
-            let text =
-                krill_term::paste::dropped(paths.paths().iter().map(|p| p.as_os_str().as_bytes()));
-            self.paste_bytes(&text, window, cx);
+            let attachment = policy.image_attachments
+                && !paths.paths().is_empty()
+                && paths
+                    .paths()
+                    .iter()
+                    .all(|path| krill_term::paste::is_image_path(path.as_os_str().as_bytes()));
+            let text = krill_term::paste::dropped_with_policy(
+                paths.paths().iter().map(|p| p.as_os_str().as_bytes()),
+                policy,
+            );
+            if let Some(id) = self.begin_clipboard_paste(window, cx) {
+                self.mark_file_paste(id);
+                self.complete_attachment_paste(id, text, attachment, window, cx);
+            }
             return;
         }
         let Some(id) = self.begin_clipboard_paste(window, cx) else {
@@ -300,22 +559,28 @@ impl Shell {
         let item = gpui::ClipboardItem {
             entries: vec![gpui::ClipboardEntry::ExternalPaths(paths.clone())],
         };
+        self.mark_file_paste(id);
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
+            let attachment = clipboard_is_attachment(&item, policy);
             let payload = cx
                 .background_executor()
                 .spawn(async move {
                     if remote_target.is_none() {
                         remote_text_without_upload(&item)
                     } else {
-                        clipboard_paste_payload_for_target(&item, remote_target.as_ref())
+                        clipboard_paste_payload_for_target_with_policy(
+                            &item,
+                            remote_target.as_ref(),
+                            policy,
+                        )
                     }
                 })
                 .await;
             handle
                 .update(cx, |_, window, cx| {
                     this.update(cx, |this, cx| {
-                        this.complete_clipboard_paste(id, payload, window, cx);
+                        this.complete_attachment_paste(id, payload, attachment, window, cx);
                     })
                     .ok();
                 })
@@ -342,23 +607,35 @@ impl Shell {
             .layout
             .focused()
             .and_then(|pane| self.remote_upload_target_for_pane(pane, cx));
+        let policy = self
+            .layout
+            .focused()
+            .map_or_else(DropPolicy::default, |pane| self.drop_policy_for(pane, cx));
         let item = item.clone();
+        if clipboard_has_files(&item) {
+            self.mark_file_paste(id);
+        }
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
+            let attachment = clipboard_is_attachment(&item, policy);
             let payload = cx
                 .background_executor()
                 .spawn(async move {
                     if remote_pane && remote_target.is_none() {
                         remote_text_without_upload(&item)
                     } else {
-                        clipboard_paste_payload_for_target(&item, remote_target.as_ref())
+                        clipboard_paste_payload_for_target_with_policy(
+                            &item,
+                            remote_target.as_ref(),
+                            policy,
+                        )
                     }
                 })
                 .await;
             handle
                 .update(cx, |_, window, cx| {
                     this.update(cx, |this, cx| {
-                        this.complete_clipboard_paste(id, payload, window, cx);
+                        this.complete_attachment_paste(id, payload, attachment, window, cx);
                     })
                     .ok();
                 })
@@ -372,40 +649,96 @@ impl Shell {
             .paste_queue
             .entries
             .iter()
-            .any(|entry| entry.pane == pane)
+            .any(|entry| entry.pane == pane && entry.targets(self))
         {
             return false;
         }
-        let Some(session) = self.live.get(&pane).and_then(|l| l.pane.session()) else {
+        let host = self.layout.host(pane).clone();
+        let Some(live) = self.ensure_input_live(pane) else {
             return false;
         };
+        let session = live.pane.session();
+        let creation = std::sync::Arc::clone(&live.creation);
         self.paste_queue.entries.push_back(QueuedInput {
             pane,
+            host,
+            creation,
             session,
             kind: QueuedKind::Bytes(bytes.to_vec()),
+            attachment: false,
+            files: false,
+            drop_policy: None,
         });
         true
     }
 
     pub(super) fn cancel_pending_paste_for(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let exists = self.layout.pane_exists(pane);
+        // 확인을 기다리는 붙여넣기(배너)는 사용자가 결정할 때까지 남고, 그 뒤에 친 키는 순서를 지키려 큐에 남는다.
+        let confirming = exists
+            && self.paste_queue.entries.iter().any(|entry| {
+                entry.pane == pane
+                    && matches!(
+                        entry.kind,
+                        QueuedKind::Paste(_, PreparedPaste::Confirming(_))
+                    )
+            });
         let pending = std::mem::take(&mut self.paste_queue.entries);
         for entry in pending {
+            if !entry.targets(self) {
+                continue;
+            }
             if entry.pane != pane {
+                self.paste_queue.entries.push_back(entry);
+                continue;
+            }
+            let keep = match &entry.kind {
+                QueuedKind::Paste(_, PreparedPaste::Confirming(_)) => exists,
+                QueuedKind::Bytes(_) => confirming,
+                QueuedKind::Paste(..) => false,
+            };
+            if keep {
                 self.paste_queue.entries.push_back(entry);
                 continue;
             }
             // A focus change cancels clipboard navigation intent. Keystrokes
             // already submitted to the still-existing session keep their order.
-            if self.layout.pane_exists(pane)
+            if exists
                 && let QueuedKind::Bytes(bytes) = entry.kind
                 && let Some(live) = self
                     .live
                     .get_mut(&pane)
-                    .filter(|live| live.pane.session() == Some(entry.session))
+                    .filter(|live| entry.session.is_none_or(|s| live.pane.session() == Some(s)))
             {
                 let notice = live.pane.input(&bytes, Now::get());
                 self.show(notice.as_ref(), cx);
             }
+        }
+        self.refresh_pending_paste_banner(cx);
+    }
+
+    /// 경고 배너(단일 슬롯)는 큐의 투영이다: 보이는 칸에서 그 칸의 첫 항목이 확인 대기인 것 중 가장 앞의 것.
+    /// 앞 붙여넣기가 확인되기 전에는 다음 경고를 띄우지 않으므로 페이로드가 덮어써지지 않는다.
+    pub(super) fn refresh_pending_paste_banner(&mut self, cx: &mut Context<Self>) {
+        let visible = self.layout.visible();
+        let mut seen = std::collections::BTreeSet::new();
+        let next = self.paste_queue.entries.iter().find_map(|entry| {
+            if !entry.targets(self) {
+                return None;
+            }
+            let first = seen.insert(entry.pane);
+            match &entry.kind {
+                QueuedKind::Paste(_, PreparedPaste::Confirming(pending))
+                    if first && visible.contains(&entry.pane) =>
+                {
+                    Some(pending.clone())
+                }
+                _ => None,
+            }
+        });
+        if self.security.pending_paste() != next.as_ref() {
+            self.security.set_pending_paste(next);
+            cx.notify();
         }
     }
 
@@ -422,6 +755,50 @@ impl Shell {
         }
     }
 
+    /// 칸이 첫 세션(`session`)에 닿았을 때 아직 세션이 없던 붙여넣기 큐 항목을 그 세션으로 고정한다.
+    pub(super) fn bind_paste_queue_first_session(
+        &mut self,
+        pane: PaneId,
+        had_session: bool,
+        session: krill_proto::SessionId,
+    ) {
+        if !had_session {
+            self.paste_queue.bind_first_session(pane, session);
+        }
+    }
+
+    /// 재시작·세션 교체로 칸의 이전 세션이 끝났을 때, 새 세션(`keep`)과 맞지 않는 붙여넣기 큐와 경고 배너를 정리한다.
+    pub(super) fn drop_stale_pastes_for_pane(
+        &mut self,
+        pane: PaneId,
+        keep: Option<krill_proto::SessionId>,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.paste_queue.entries.len();
+        self.paste_queue
+            .entries
+            .retain(|entry| entry.pane != pane || keep.is_some() && entry.session == keep);
+        if self.paste_queue.entries.len() != before {
+            self.refresh_pending_paste_banner(cx);
+        }
+    }
+
+    fn complete_attachment_paste(
+        &mut self,
+        id: u64,
+        payload: Option<Vec<u8>>,
+        attachment: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        for entry in &mut self.paste_queue.entries {
+            if matches!(entry.kind, QueuedKind::Paste(request, _) if request == id) {
+                entry.attachment = attachment;
+            }
+        }
+        self.complete_clipboard_paste(id, payload, window, cx);
+    }
+
     fn complete_clipboard_paste(
         &mut self,
         id: u64,
@@ -429,74 +806,118 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let mut found = false;
-        for entry in &mut self.paste_queue.entries {
-            if let QueuedKind::Paste(request, ready) = &mut entry.kind
-                && *request == id
-            {
-                *ready = PreparedPaste::Ready(payload);
-                found = true;
-                break;
-            }
-        }
         // Expired/cancelled requests cannot reinsert payloads into the stream.
-        if !found {
+        let Some(index) = self.paste_queue.entries.iter().position(|entry| {
+            matches!(entry.kind, QueuedKind::Paste(request, PreparedPaste::Pending) if request == id)
+        }) else {
             return;
+        };
+        let entry = &self.paste_queue.entries[index];
+        if payload.is_none()
+            && entry.files
+            && entry.targets(self)
+            && self.layout.focused() == Some(entry.pane)
+        {
+            self.notice = Some(sec_text::FILE_PASTE_FAILED.get().to_owned());
+            cx.notify();
         }
+        self.paste_queue.entries[index].kind = QueuedKind::Paste(id, PreparedPaste::Ready(payload));
+        self.drain_paste_queue(cx);
+        let _ = window;
+    }
+
+    /// 큐를 머리부터 비운다. 칸마다 준비 중(`Pending`)·확인 대기(`Confirming`) 항목 뒤는 보류한다.
+    /// 클립보드 결과는 포커스 칸일 때만 보내고(포커스 이동은 붙여넣기 의도 취소), 이미 제출한 키 입력은 포커스와
+    /// 무관하게 순서대로 보낸다. 닫힌 칸·다른 세션으로 바뀐 칸의 항목은 버린다.
+    pub(super) fn drain_paste_queue(&mut self, cx: &mut Context<Self>) {
         let pending = std::mem::take(&mut self.paste_queue.entries);
         let mut blocked = std::collections::BTreeSet::new();
-        for entry in pending {
-            if !self.layout.pane_exists(entry.pane)
-                || self
-                    .live
-                    .get(&entry.pane)
-                    .is_none_or(|live| live.pane.session() != Some(entry.session))
-            {
+        for mut entry in pending {
+            if !entry.targets(self) {
                 continue;
             }
+            entry.session = entry
+                .session
+                .or_else(|| self.live.get(&entry.pane)?.pane.session());
+            let Some(modes) = self
+                .live
+                .get(&entry.pane)
+                .filter(|_| self.layout.pane_exists(entry.pane))
+                .filter(|live| entry.session.is_none_or(|s| live.pane.session() == Some(s)))
+                .map(|live| live.pane.modes())
+            else {
+                continue;
+            };
             if blocked.contains(&entry.pane)
-                || matches!(entry.kind, QueuedKind::Paste(_, PreparedPaste::Pending))
+                || matches!(
+                    entry.kind,
+                    QueuedKind::Paste(_, PreparedPaste::Pending | PreparedPaste::Confirming(_))
+                )
             {
                 blocked.insert(entry.pane);
                 self.paste_queue.entries.push_back(entry);
                 continue;
             }
-            if self.page_open()
-                || self.dashboard.is_some()
-                || self.layout.focused() != Some(entry.pane)
-            {
-                continue;
-            }
-            let Some(live) = self
-                .live
-                .get_mut(&entry.pane)
-                .filter(|live| live.pane.session() == Some(entry.session))
-            else {
-                continue;
-            };
             let bytes = match entry.kind {
                 QueuedKind::Bytes(bytes) => bytes,
-                QueuedKind::Paste(_, PreparedPaste::Ready(Some(bytes))) => {
-                    match plan_paste(entry.pane, &bytes, live.pane.modes()) {
+                QueuedKind::Paste(id, PreparedPaste::Ready(Some(bytes))) => {
+                    if self.page_open()
+                        || self.dashboard.is_some()
+                        || self.layout.focused() != Some(entry.pane)
+                    {
+                        continue;
+                    }
+                    if entry
+                        .drop_policy
+                        .is_some_and(|policy| policy != self.drop_policy_for(entry.pane, cx))
+                    {
+                        if entry.files {
+                            self.notice = Some(sec_text::FILE_PASTE_FAILED.get().to_owned());
+                            cx.notify();
+                        }
+                        continue;
+                    }
+                    let mut modes = modes;
+                    if entry.attachment {
+                        modes.flags |= krill_proto::term_modes::Modes::BRACKETED_PASTE;
+                    }
+                    match self.plan_terminal_paste(entry.pane, &bytes, modes, cx) {
                         PastePlan::Immediate(bytes) => bytes,
                         PastePlan::Warn(pending) => {
-                            self.security.set_pending_paste(Some(pending));
-                            cx.notify();
+                            // 확인될 때까지 머리에 남아 뒤 입력을 막는다(APP-RUNTIME-002).
+                            entry.kind = QueuedKind::Paste(id, PreparedPaste::Confirming(pending));
+                            blocked.insert(entry.pane);
+                            self.paste_queue.entries.push_back(entry);
                             continue;
                         }
                     }
                 }
-                QueuedKind::Paste(_, PreparedPaste::Pending | PreparedPaste::Ready(None)) => {
-                    continue;
-                }
+                QueuedKind::Paste(
+                    _,
+                    PreparedPaste::Ready(None)
+                    | PreparedPaste::Pending
+                    | PreparedPaste::Confirming(_),
+                ) => continue,
             };
-            live.clear_selection();
-            live.echo.key_sent(std::time::Instant::now());
-            let notice = live.pane.input(&bytes, Now::get());
-            self.show(notice.as_ref(), cx);
-            cx.notify();
+            self.deliver_queued(entry.pane, &bytes, cx);
         }
-        let _ = window;
+        self.refresh_pending_paste_banner(cx);
+    }
+
+    // Preserve the initial-attach flush contract introduced on main.
+    pub(super) fn flush_clipboard_pastes(&mut self, cx: &mut Context<Self>) {
+        self.drain_paste_queue(cx);
+    }
+
+    fn deliver_queued(&mut self, pane: PaneId, bytes: &[u8], cx: &mut Context<Self>) {
+        let Some(live) = self.live.get_mut(&pane) else {
+            return;
+        };
+        live.clear_selection();
+        live.echo.key_sent(std::time::Instant::now());
+        let notice = live.pane.input(bytes, Now::get());
+        self.show(notice.as_ref(), cx);
+        cx.notify();
     }
 
     /// 포커스 칸에 텍스트를 붙여넣는다(MK-033·MK-076).
@@ -505,11 +926,20 @@ impl Shell {
         let Some(pane) = self.layout.focused() else {
             return;
         };
+        let host = self.layout.host(pane).clone();
+        let drop_policy = self.drop_policy_for(pane, cx);
+        let Some(l) = self.ensure_input_live(pane) else {
+            return;
+        };
+        if l.pane.is_cold() {
+            return;
+        }
+        let modes = l.pane.modes();
+        let plan = self.plan_terminal_paste(pane, text, modes, cx);
         let Some(l) = self.live.get_mut(&pane) else {
             return;
         };
-        let modes = l.pane.modes();
-        match plan_paste(pane, text, modes) {
+        match plan {
             PastePlan::Immediate(bytes) => {
                 let mut out = l.ime.commit();
                 out.pty = keys::tui::text(&out.pty, modes);
@@ -517,38 +947,56 @@ impl Shell {
                 self.send(&out, Some(window), cx);
             }
             PastePlan::Warn(pending) => {
-                self.security.set_pending_paste(Some(pending));
+                // 확인 대기 항목을 큐 뒤에 둬 그 뒤에 친 키가 앞지르지 않게 한다(APP-RUNTIME-002).
+                let session = l.pane.session();
+                let creation = std::sync::Arc::clone(&l.creation);
+                self.paste_queue.next = self.paste_queue.next.wrapping_add(1);
+                let id = self.paste_queue.next;
+                self.paste_queue.entries.push_back(QueuedInput {
+                    pane,
+                    host,
+                    creation,
+                    session,
+                    kind: QueuedKind::Paste(id, PreparedPaste::Confirming(pending)),
+                    attachment: false,
+                    files: false,
+                    drop_policy: Some(drop_policy),
+                });
+                self.refresh_pending_paste_banner(cx);
                 cx.notify();
             }
         }
     }
 
+    /// 배너의 붙여넣기를 보낸다. 페이로드 → 그 뒤 큐에 쌓인 키 → 지금 조합 중인 IME 글자 순서(제출 순서)로 간다.
     pub(super) fn confirm_pending_paste(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.security.take_pending_paste() else {
+        let Some(pending) = self.take_confirming(cx) else {
+            self.drain_paste_queue(cx);
             return;
         };
+        self.deliver_queued(pending.pane, &pending.payload, cx);
         if self.layout.focused() == Some(pending.pane) {
-            let Some(l) = self.live.get_mut(&pending.pane) else {
-                cx.notify();
-                return;
-            };
-            let modes = l.pane.modes();
-            let mut out = l.ime.commit();
-            out.pty = keys::tui::text(&out.pty, modes);
-            out.pty.extend(pending.payload);
-            self.send(&out, Some(window), cx);
-        } else if let Some(l) = self.live.get_mut(&pending.pane) {
-            let n = l.pane.input(&pending.payload, Now::get());
-            self.show(n.as_ref(), cx);
-            cx.notify();
-        } else {
-            cx.notify();
+            self.commit_ime(pending.pane, Some(window), cx);
         }
+        self.drain_paste_queue(cx);
     }
 
+    /// 배너의 붙여넣기를 버린다. 그 뒤에 친 키는 순서대로 보낸다.
     pub(super) fn cancel_pending_paste(&mut self, cx: &mut Context<Self>) {
-        self.security.set_pending_paste(None);
+        let _ = self.take_confirming(cx);
+        self.drain_paste_queue(cx);
+    }
+
+    /// 배너에 보이는 확인 대기 항목을 큐에서 뺀다.
+    fn take_confirming(&mut self, cx: &mut Context<Self>) -> Option<PendingPaste> {
+        let shown = self.security.take_pending_paste()?;
         cx.notify();
+        let index = self.paste_queue.entries.iter().position(|entry| {
+            matches!(&entry.kind, QueuedKind::Paste(_, PreparedPaste::Confirming(p)) if *p == shown)
+        })?;
+        let entry = self.paste_queue.entries.remove(index)?;
+        // 배너를 띄운 뒤 같은 칸이 새 세션에 붙을 수 있다. 큐의 원래 세션과 일치할 때만 확인을 보낸다.
+        entry.targets(self).then_some(shown)
     }
 
     /// 맨 클릭한 링크의 팝오버를 클릭한 자리에 연다.
@@ -846,6 +1294,44 @@ impl Shell {
     }
 }
 
+fn clipboard_has_files(item: &gpui::ClipboardItem) -> bool {
+    item.entries().iter().any(|entry| match entry {
+        gpui::ClipboardEntry::ExternalPaths(paths) => !paths.paths().is_empty(),
+        gpui::ClipboardEntry::Image(image) => !image.bytes.is_empty(),
+        gpui::ClipboardEntry::String(_) => false,
+    })
+}
+
+fn clipboard_is_attachment(item: &gpui::ClipboardItem, policy: DropPolicy) -> bool {
+    use krill_proto::os::ffi::OsStrExt as _;
+    if !policy.image_attachments {
+        return false;
+    }
+    let has_image = item.entries().iter().any(|entry| matches!(entry, gpui::ClipboardEntry::Image(img) if !img.bytes.is_empty() && img.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES));
+    let mut skipped_dead = false;
+    for entry in item.entries() {
+        if let gpui::ClipboardEntry::ExternalPaths(paths) = entry
+            && !paths.paths().is_empty()
+        {
+            let existing: Vec<_> = paths
+                .paths()
+                .iter()
+                .filter(|path| !has_image || path.exists())
+                .collect();
+            if !existing.is_empty() {
+                return existing
+                    .iter()
+                    .all(|path| krill_term::paste::is_image_path(path.as_os_str().as_bytes()));
+            }
+            skipped_dead = true;
+        }
+    }
+    if !skipped_dead && item.text().is_some_and(|text| !text.trim().is_empty()) {
+        return false;
+    }
+    has_image
+}
+
 const MAX_CLIPBOARD_PREPARATIONS: usize = 2;
 static CLIPBOARD_PREPARATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -904,7 +1390,15 @@ pub(crate) fn sniff_clipboard_image_extension(
 /// - 비어 있지 않은 문자열 항목이 있으면 텍스트를 그대로 반환한다(이미지가 함께 있을 때는 공백만 있는 문자열은 건너뛴다).
 /// - 이미지 항목(`ClipboardEntry::Image`)이 있으면 `$TMPDIR/krill-paste/` 아래에 `0600` 파일로 저장하고
 ///   셸 이스케이프된 파일 경로를 반환한다.
+#[cfg(all(test, unix))]
 pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<u8>> {
+    clipboard_paste_payload_with_policy(item, DropPolicy::default())
+}
+
+fn clipboard_paste_payload_with_policy(
+    item: &gpui::ClipboardItem,
+    policy: DropPolicy,
+) -> Option<Vec<u8>> {
     use krill_proto::os::ffi::OsStrExt as _;
     // Admission is held until native conversion/filesystem work really returns,
     // independently of a UI deadline or the originating window's lifetime.
@@ -927,15 +1421,17 @@ pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<
                 let existing: Vec<&std::path::PathBuf> =
                     paths.paths().iter().filter(|p| p.exists()).collect();
                 if !existing.is_empty() {
-                    return Some(krill_term::paste::dropped(
+                    return krill_term::paste::dropped_with_policy(
                         existing.into_iter().map(|p| p.as_os_str().as_bytes()),
-                    ));
+                        policy,
+                    );
                 }
                 skipped_dead_external_paths = true;
             } else {
-                return Some(krill_term::paste::dropped(
+                return krill_term::paste::dropped_with_policy(
                     paths.paths().iter().map(|p| p.as_os_str().as_bytes()),
-                ));
+                    policy,
+                );
             }
         }
     }
@@ -965,7 +1461,7 @@ pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<
             && img.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES
             && let Ok(path) = save_clipboard_image(img)
         {
-            return Some(krill_term::paste::dropped([path.as_os_str().as_bytes()]));
+            return krill_term::paste::dropped_with_policy([path.as_os_str().as_bytes()], policy);
         }
     }
 
@@ -1032,29 +1528,42 @@ pub(crate) fn clipboard_paste_payload_for_host(
     let target = remote.cloned().map(|h| RemoteUploadTarget {
         ssh_host: Some(h),
         host_target: None,
-        prefer_target_ipc: false,
+        windows: false,
     });
     clipboard_paste_payload_for_target(item, target.as_ref())
 }
 
+#[cfg(all(test, unix))]
 pub(crate) fn clipboard_paste_payload_for_target(
     item: &gpui::ClipboardItem,
     remote: Option<&RemoteUploadTarget>,
 ) -> Option<Vec<u8>> {
+    clipboard_paste_payload_for_target_with_policy(item, remote, DropPolicy::default())
+}
+
+fn clipboard_paste_payload_for_target_with_policy(
+    item: &gpui::ClipboardItem,
+    remote: Option<&RemoteUploadTarget>,
+    policy: DropPolicy,
+) -> Option<Vec<u8>> {
     let Some(target) = remote else {
-        return clipboard_paste_payload(item);
+        return clipboard_paste_payload_with_policy(item, policy);
     };
     let has_valid_image = item.entries().iter().any(|entry| {
         matches!(entry, gpui::ClipboardEntry::Image(img) if !img.bytes.is_empty() && img.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES)
     });
-    let _permit = PreparationPermit::acquire(&CLIPBOARD_PREPARATIONS)?;
-    remote_payload_inner(item, target, has_valid_image)
+    let Some(_permit) = PreparationPermit::acquire(&CLIPBOARD_PREPARATIONS) else {
+        tracing::warn!("remote clipboard preparation busy");
+        return None;
+    };
+    remote_payload_inner(item, target, has_valid_image, policy)
 }
 
 fn remote_payload_inner(
     item: &gpui::ClipboardItem,
     target: &RemoteUploadTarget,
     has_valid_image: bool,
+    policy: DropPolicy,
 ) -> Option<Vec<u8>> {
     let mut skipped_dead = false;
     for entry in item.entries() {
@@ -1071,7 +1580,7 @@ fn remote_payload_inner(
                 }
                 return None;
             }
-            return upload_local_paths(target, &existing);
+            return upload_local_paths(target, &existing, policy);
         }
     }
     if !skipped_dead {
@@ -1097,7 +1606,7 @@ fn remote_payload_inner(
             if img.bytes.is_empty() || img.bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
                 continue;
             }
-            if let Some(payload) = upload_clipboard_image(target, img) {
+            if let Some(payload) = upload_clipboard_image(target, img, policy) {
                 return Some(payload);
             }
         }
@@ -1132,28 +1641,36 @@ fn upload_bytes_to_remote_target(
     filename: &str,
     bytes: &[u8],
 ) -> Option<String> {
-    if target.prefer_target_ipc {
-        if let Some(ht) = &target.host_target
-            && let Some(path) =
-                upload_bytes_via_target(ht, filename, bytes, Duration::from_secs(15))
-        {
-            return Some(path);
-        }
-        if let Some(host) = &target.ssh_host {
-            return upload_bytes_to_remote(host, filename, bytes);
-        }
-        None
-    } else {
-        if let Some(host) = &target.ssh_host
-            && let Some(path) = upload_bytes_to_remote(host, filename, bytes)
-        {
-            return Some(path);
-        }
-        if let Some(ht) = &target.host_target {
-            return upload_bytes_via_target(ht, filename, bytes, Duration::from_secs(15));
-        }
-        None
+    if target
+        .host_target
+        .as_ref()
+        .is_some_and(|host| host.host().is_local())
+    {
+        tracing::warn!("refused local destination for remote clipboard upload");
+        return None;
     }
+    if target.windows {
+        // SSH upload relies on a POSIX shell (`mktemp`/`cat`); only the daemon RPC works here.
+        return upload_bytes_via_windows_target(target.host_target.as_ref()?, filename, bytes);
+    }
+    // The connected daemon identifies the actual session host. Reuse its SSH/iroh tunnel
+    // before opening a separate SSH connection (which may not share the tunnel's auth).
+    if let Some(ht) = &target.host_target {
+        let started = std::time::Instant::now();
+        let path = upload_bytes_via_target(ht, filename, bytes, Duration::from_secs(15));
+        if path.is_none() {
+            tracing::warn!(
+                bytes = bytes.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "remote clipboard upload failed on connected host"
+            );
+        }
+        return path;
+    }
+    target
+        .ssh_host
+        .as_ref()
+        .and_then(|host| upload_bytes_to_remote(host, filename, bytes))
 }
 
 fn upload_bytes_to_remote(
@@ -1170,7 +1687,7 @@ fn upload_bytes_to_remote(
     )
 }
 
-fn base64_encode(input: &[u8]) -> Vec<u8> {
+pub(super) fn base64_encode(input: &[u8]) -> Vec<u8> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(input.len().div_ceil(3).saturating_mul(4));
     for chunk in input.chunks(3) {
@@ -1200,30 +1717,27 @@ fn base64_encode(input: &[u8]) -> Vec<u8> {
 
 fn run_custom_and_wait_marker(
     stream: &mut krill_proto::os::net::UnixStream,
+    program: &[u8],
+    cwd: &[u8],
     args: Vec<Vec<u8>>,
-    marker_prefix: &str,
-    marker_suffix: &str,
-    error_marker: &str,
+    // Script prints `<marker>_OK:<value>:END` on success, `<marker>_ERR` on failure.
+    marker: &str,
     deadline: std::time::Instant,
 ) -> Option<String> {
     use krill_proto::control::{CaptureFormat, Create, Program, Reply, Request};
-    use krill_proto::ipc;
-    use krill_proto::screen::Msg as _;
-    use std::io::Write as _;
 
     let create = Request::Create(Create {
         account: None,
         program: Program::Custom {
-            program: b"/bin/sh".to_vec(),
+            program: program.to_vec(),
             args,
         },
-        cwd: b"/tmp".to_vec(),
+        cwd: cwd.to_vec(),
         cols: 1024,
         rows: 24,
     });
-    stream.write_all(&create.encode().ok()?).ok()?;
-    let (kind, body) = ipc::read_frame(stream).ok()??;
-    let Reply::Created { session, .. } = Reply::decode(kind, &body).ok()? else {
+    let Reply::Created { session, .. } = clipboard_request_until(stream, &create, deadline)? else {
+        tracing::warn!("remote clipboard destination helper could not start");
         return None;
     };
 
@@ -1233,40 +1747,31 @@ fn run_custom_and_wait_marker(
             session,
             format: CaptureFormat::Plain,
         };
-        if stream
-            .write_all(&cap_req.encode().unwrap_or_default())
-            .is_err()
-        {
-            break;
-        }
-        let Ok(Some((k, b))) = ipc::read_frame(stream) else {
-            break;
-        };
-        match Reply::decode(k, &b) {
-            Ok(Reply::Captured { bytes: cap, .. }) => {
+        match clipboard_request_until(stream, &cap_req, deadline) {
+            Some(Reply::Captured { bytes: cap, .. }) => {
                 let text = String::from_utf8_lossy(&cap);
                 let flat: String = text.chars().filter(|&c| c != '\n' && c != '\r').collect();
-                if flat.contains(error_marker) {
+                if flat.contains(&format!("{marker}_ERR")) {
                     break;
                 }
-                if let Some((_, after)) = flat.split_once(marker_prefix)
-                    && let Some((inner, _)) = after.split_once(marker_suffix)
+                if let Some((_, after)) = flat.split_once(&format!("{marker}_OK:"))
+                    && let Some((inner, _)) = after.split_once(":END")
                 {
                     result = Some(inner.trim().to_owned());
                     break;
                 }
             }
-            Ok(Reply::Failed(_)) | Err(_) => break,
-            Ok(_) => {}
+            Some(Reply::Failed(_)) | None => break,
+            Some(_) => {}
         }
         std::thread::sleep(Duration::from_millis(15));
     }
 
-    if let Ok(close_bytes) = (Request::Close { session }).encode()
-        && stream.write_all(&close_bytes).is_ok()
-    {
-        ipc::read_frame(stream).ok();
-    }
+    // Cleanup still needs to be sent when preparation has exhausted its budget.
+    // Its short, separate grace period never makes a late paste eligible for delivery.
+    let cleanup_deadline = deadline.max(std::time::Instant::now() + Duration::from_millis(100));
+    clipboard_request_until(stream, &(Request::Close { session }), cleanup_deadline);
+
     result
 }
 
@@ -1280,17 +1785,17 @@ pub(crate) fn upload_bytes_via_target(
     use krill_proto::ipc::{self, ClientRole};
     use std::io::Write as _;
 
-    // 96 KiB is a multiple of 3 (so each Base64 chunk is 128 KiB with no mid-stream '=' padding)
-    // and stays well below ARG_MAX (1 MiB) and ipc::MAX_FRAME (1 MiB).
-    const RAW_CHUNK_BYTES: usize = 96 * 1024;
+    // Keep encoded argv below Linux's 128 KiB MAX_ARG_STRLEN, including its NUL.
+    const RAW_CHUNK_BYTES: usize = 48 * 1024;
 
     if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
         return None;
     }
+    let deadline = std::time::Instant::now() + timeout;
     let filename = sanitize_remote_filename(filename);
     let required = FEAT_CONTROL | FEAT_CLI;
     let hello = krill_proto::daemon::client_hello(ClientRole::App, "krill-app-clipboard");
-    let mut stream = if target.allow_local_launch() {
+    let (mut stream, features) = if target.allow_local_launch() {
         let mut s = krill_proto::os::net::UnixStream::connect(target.socket()).ok()?;
         s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
         s.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
@@ -1301,7 +1806,7 @@ pub(crate) fn upload_bytes_via_target(
             return None;
         }
         s.write_all(&hello.encode().ok()?).ok()?;
-        s
+        (s, negotiated.features)
     } else {
         let c = target.connect(&hello).ok()?;
         if c.negotiated.features & required != required {
@@ -1313,10 +1818,12 @@ pub(crate) fn upload_bytes_via_target(
         c.stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .ok()?;
-        c.stream
+        (c.stream, c.negotiated.features)
     };
 
-    let deadline = std::time::Instant::now() + timeout;
+    if features & krill_proto::control::FEAT_REMOTE_FS != 0 {
+        return upload_bytes_via_remote_fs(&mut stream, &filename, bytes, deadline);
+    }
     let mut chunks = bytes.chunks(RAW_CHUNK_BYTES);
     let first_chunk = chunks.next()?;
     let first_b64 = base64_encode(first_chunk);
@@ -1333,15 +1840,15 @@ pub(crate) fn upload_bytes_via_target(
     );
     let remote_path = run_custom_and_wait_marker(
         &mut stream,
+        b"/bin/sh",
+        b"/tmp",
         vec![
             b"-c".to_vec(),
             create_script.into_bytes(),
             b"sh".to_vec(),
             first_b64,
         ],
-        "KRILL_PASTE_OK:",
-        ":END",
-        "KRILL_PASTE_ERR",
+        "KRILL_PASTE",
         deadline,
     )?;
     if !remote_path.starts_with('/') || remote_path.contains(['\n', '\r', '\0']) {
@@ -1361,6 +1868,8 @@ pub(crate) fn upload_bytes_via_target(
         let chunk_b64 = base64_encode(chunk);
         run_custom_and_wait_marker(
             &mut stream,
+            b"/bin/sh",
+            b"/tmp",
             vec![
                 b"-c".to_vec(),
                 append_script.clone(),
@@ -1368,14 +1877,182 @@ pub(crate) fn upload_bytes_via_target(
                 remote_path.as_bytes().to_vec(),
                 chunk_b64,
             ],
-            "KRILL_APPEND_OK:",
-            ":END",
-            "KRILL_APPEND_ERR",
+            "KRILL_APPEND",
             deadline,
         )?;
     }
 
     Some(remote_path)
+}
+
+/// Reuse the existing bounded binary file protocol. Only the private destination allocation
+/// needs a helper PTY; image bytes never pass through argv, Base64, or terminal capture.
+fn upload_bytes_via_remote_fs(
+    stream: &mut krill_proto::os::net::UnixStream,
+    filename: &str,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> Option<String> {
+    use krill_proto::control::{Reply, Request};
+    use krill_proto::remote_fs::{
+        MAX_REMOTE_CHUNK, RemoteFsReply, RemoteFsRequest, WireWriteOutcome,
+    };
+
+    let script = format!(
+        "umask 077; \
+         d=$(mktemp -d \"${{TMPDIR:-/tmp}}/krill-paste.XXXXXXXX\" 2>/dev/null || mktemp -d /tmp/krill-paste.XXXXXXXX) || exit 1; \
+         f=\"$d/{filename}\"; \
+         if : > \"$f\"; then printf 'KRILL_PASTE_OK:%s:END\\n' \"$f\"; \
+         else rm -rf \"$d\"; printf 'KRILL_PASTE_ERR\\n'; fi; sleep 3"
+    );
+    let path = run_custom_and_wait_marker(
+        stream,
+        b"/bin/sh",
+        b"/tmp",
+        vec![b"-c".to_vec(), script.into_bytes()],
+        "KRILL_PASTE",
+        deadline,
+    )?;
+    if !path.starts_with('/') || path.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    let mut offset = 0_u64;
+    for chunk in bytes.chunks(MAX_REMOTE_CHUNK) {
+        let commit = offset + chunk.len() as u64 == bytes.len() as u64;
+        let request = Request::RemoteFs(RemoteFsRequest::WriteAtomic {
+            path: path.as_bytes().to_vec(),
+            bytes: chunk.to_vec(),
+            expected: None,
+            stage_id: 1, // The destination has its own unique private directory.
+            offset,
+            commit,
+        });
+        let reply = clipboard_request_until(stream, &request, deadline);
+        let accepted = match reply {
+            Some(Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::StageAck))) => !commit,
+            Some(Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(stamp)))) => {
+                commit && stamp.len == bytes.len() as u64
+            }
+            _ => false,
+        };
+        if !accepted {
+            tracing::warn!(
+                offset,
+                total = bytes.len(),
+                "remote clipboard file write failed"
+            );
+            // No path is delivered unless the final atomic commit is acknowledged. Dropping
+            // a failed stream avoids replaying an ambiguous write on another connection.
+            return None;
+        }
+        offset += chunk.len() as u64;
+    }
+    Some(path)
+}
+
+/// Refresh the remaining timeout on every syscall, including partial frame reads.
+struct ClipboardIo<'a> {
+    stream: &'a mut krill_proto::os::net::UnixStream,
+    deadline: std::time::Instant,
+}
+impl ClipboardIo<'_> {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| std::io::ErrorKind::TimedOut.into())
+    }
+}
+impl std::io::Read for ClipboardIo<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        std::io::Read::read(self.stream, bytes)
+    }
+}
+impl std::io::Write for ClipboardIo<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        std::io::Write::write(self.stream, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(self.stream)
+    }
+}
+
+fn clipboard_request_until(
+    stream: &mut krill_proto::os::net::UnixStream,
+    request: &krill_proto::control::Request,
+    deadline: std::time::Instant,
+) -> Option<krill_proto::control::Reply> {
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+    let mut io = ClipboardIo { stream, deadline };
+    io.write_all(&request.encode().ok()?).ok()?;
+    let (kind, body) = krill_proto::ipc::read_frame(&mut io).ok()??;
+    io.remaining().ok()?;
+    krill_proto::control::Reply::decode(kind, &body).ok()
+}
+
+/// Windows daemon: PowerShell creates a private temp folder, then the bytes go through the
+/// OS-neutral `RemoteFs` atomic write (chunked), avoiding command-line length limits.
+fn upload_bytes_via_windows_target(
+    target: &krill_app::hosts::HostTarget,
+    filename: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    use krill_proto::control::{FEAT_CLI, FEAT_CONTROL};
+    use krill_proto::ipc::ClientRole;
+
+    if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return None;
+    }
+    let filename = sanitize_remote_filename(filename);
+    let hello = krill_proto::daemon::client_hello(ClientRole::App, "krill-app-clipboard");
+    let conn = target.connect(&hello).ok()?;
+    let required = FEAT_CONTROL | FEAT_CLI;
+    if conn.negotiated.features & required != required {
+        return None;
+    }
+    let mut stream = conn.stream;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+    let dir = run_custom_and_wait_marker(
+        &mut stream,
+        b"powershell.exe",
+        b"",
+        windows_temp_dir_args(),
+        "KRILL_PASTE",
+        std::time::Instant::now() + Duration::from_secs(15),
+    )?;
+    let dir = dir.trim_end_matches(['\\', '/']);
+    if dir.is_empty() || dir.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    let path = format!("{dir}\\{filename}");
+    krill_app::remote_fs::save_atomic_bytes(target, std::path::Path::new(&path), bytes, None)
+        .ok()?;
+    Some(path)
+}
+
+/// `-EncodedCommand` (UTF-16LE Base64) sidesteps Windows command-line quoting entirely.
+fn windows_temp_dir_args() -> Vec<Vec<u8>> {
+    const SCRIPT: &str = "try { \
+        $d = Join-Path ([IO.Path]::GetTempPath()) ('krill-paste-' + [guid]::NewGuid().ToString('N').Substring(0, 12)); \
+        [void](New-Item -ItemType Directory -Path $d -ErrorAction Stop); \
+        [Console]::Out.Write('KRILL_PASTE_OK:' + $d + ':END') \
+    } catch { [Console]::Out.Write('KRILL_PASTE_ERR') }; Start-Sleep -Seconds 3";
+    let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    vec![
+        b"-NoProfile".to_vec(),
+        b"-NonInteractive".to_vec(),
+        b"-ExecutionPolicy".to_vec(),
+        b"Bypass".to_vec(),
+        b"-EncodedCommand".to_vec(),
+        base64_encode(&utf16),
+    ]
 }
 
 fn upload_bytes_with_program(
@@ -1463,6 +2140,7 @@ fn upload_bytes_with_program(
 fn upload_local_paths(
     target: &RemoteUploadTarget,
     paths: &[&std::path::PathBuf],
+    policy: DropPolicy,
 ) -> Option<Vec<u8>> {
     let mut remote_paths: Vec<String> = Vec::new();
     for path in paths {
@@ -1488,12 +2166,14 @@ fn upload_local_paths(
     if remote_paths.is_empty() {
         return None;
     }
-    Some(krill_term::paste::dropped(
-        remote_paths.iter().map(String::as_bytes),
-    ))
+    krill_term::paste::dropped_with_policy(remote_paths.iter().map(String::as_bytes), policy)
 }
 
-fn upload_clipboard_image(target: &RemoteUploadTarget, img: &gpui::Image) -> Option<Vec<u8>> {
+fn upload_clipboard_image(
+    target: &RemoteUploadTarget,
+    img: &gpui::Image,
+    policy: DropPolicy,
+) -> Option<Vec<u8>> {
     if img.bytes.is_empty() || img.bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
         return None;
     }
@@ -1510,7 +2190,7 @@ fn upload_clipboard_image(target: &RemoteUploadTarget, img: &gpui::Image) -> Opt
         };
     let filename = format!("clipboard-{:016x}.{}", img.id, ext);
     let remote_path = upload_bytes_to_remote_target(target, &filename, &payload)?;
-    Some(krill_term::paste::dropped([remote_path.as_bytes()]))
+    krill_term::paste::dropped_with_policy([remote_path.as_bytes()], policy)
 }
 
 pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::path::PathBuf> {

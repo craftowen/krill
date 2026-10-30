@@ -44,7 +44,7 @@ impl log::Log for Forward {
         let second = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs() & 0xffff_ffff);
-        if !self.enabled(record.metadata()) || !self.admit(second) {
+        if !self.enabled(record.metadata()) || expected_font_skip(record) || !self.admit(second) {
             return;
         }
         let source = record.target();
@@ -57,6 +57,17 @@ impl log::Log for Forward {
     }
 
     fn flush(&self) {}
+}
+
+/// gpui가 글꼴 패밀리를 읽다 'm' 글리프가 없는 얼굴(Apple Braille·Al Bayan 등 시스템 글꼴)을 건너뛸 때 내는
+/// 경고. 설정 화면이 고정폭 목록을 만들려고 모든 패밀리를 해석할 때마다 20여 줄씩 나오는 정상 건너뜀이다.
+/// 사용자가 지정한 터미널 글꼴을 못 쓰는 경우는 krill-app이 따로 경고한다(`settings::terminal_font_family`).
+fn expected_font_skip(record: &log::Record) -> bool {
+    record.target() == "gpui_apple::text_system"
+        && record
+            .args()
+            .to_string()
+            .ends_with("has no 'm' character and was not loaded")
 }
 
 /// `log` 크레이트의 경고·오류를 `tracing`(운영 로그)으로 넘긴다. 이미 다른 로거가 있으면 아무것도 하지 않는다.
@@ -78,6 +89,34 @@ mod tests {
         assert!((0..PER_SECOND).all(|_| forward.admit(7)));
         assert!(!forward.admit(7), "a flood within one second is capped");
         assert!(forward.admit(8), "the next second starts a fresh budget");
+    }
+
+    #[test]
+    fn font_enumeration_skips_are_dropped_but_other_text_warnings_pass() {
+        fn record(target: &str, args: std::fmt::Arguments<'_>) -> bool {
+            expected_font_skip(
+                &log::Record::builder()
+                    .level(log::Level::Warn)
+                    .target(target)
+                    .args(args)
+                    .build(),
+            )
+        }
+        assert!(record(
+            "gpui_apple::text_system",
+            format_args!(
+                "font '{}' has no 'm' character and was not loaded",
+                "Apple Braille"
+            ),
+        ));
+        assert!(!record(
+            "gpui_apple::text_system",
+            format_args!("Failed to read traits for font \"X\""),
+        ));
+        assert!(!record(
+            "gpui_macos::window",
+            format_args!("font 'X' has no 'm' character and was not loaded"),
+        ));
     }
 
     #[test]

@@ -13,6 +13,161 @@ pub(super) fn sample() -> Entry {
 }
 
 #[gpui::test]
+fn switching_history_hosts_clears_results_and_never_uses_local_call(cx: &mut TestAppContext) {
+    let calls = Arc::new(Mutex::new(0));
+    let seen = calls.clone();
+    let panel = cx.new(|_| {
+        Panel::new(Arc::new(move |_| {
+            *seen.lock().unwrap() += 1;
+            Ok(Reply::AgentHistory(Response::Scanned(Snapshot {
+                entries: vec![sample()],
+                truncated: false,
+                skipped: false,
+            })))
+        }))
+    });
+    panel.update(cx, Panel::scan);
+    cx.run_until_parked();
+    assert_eq!(panel.read_with(cx, |p, _| p.loaded_hits().len()), 1);
+    panel.update(cx, |p, cx| {
+        p.set_host(HostId::Remote("studio".into()), None, cx);
+        assert!(p.loaded_hits().is_empty());
+        assert!(p.list_hits.is_empty());
+    });
+    cx.run_until_parked();
+    assert_eq!(*calls.lock().unwrap(), 1, "no local fallback");
+    panel.read_with(cx, |p, _| {
+        assert!(p.error.is_some());
+        assert!(!p.has_loaded());
+    });
+}
+
+#[gpui::test]
+fn remote_history_resume_preserves_host_and_switch_discards_pending_reply(cx: &mut TestAppContext) {
+    let panel = cx.new(|_| Panel::new(Arc::new(|_| unreachable!())));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let seen = events.clone();
+    cx.update(|cx| {
+        cx.subscribe(&panel, move |_, event: &Open, _| {
+            seen.lock()
+                .unwrap()
+                .push((event.host.clone(), event.session));
+        })
+        .detach();
+    });
+    let host = HostId::Remote("studio".into());
+    let call: Call = Arc::new(|_| {
+        Ok(Reply::AgentHistory(Response::Resumed {
+            session: SessionId(91),
+        }))
+    });
+    panel.update(cx, |p, cx| {
+        p.set_host(host.clone(), None, cx);
+        p.set_call(call.clone());
+        p.resume_vault(VaultHit::from(&sample()).target(), cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(*events.lock().unwrap(), [(host, SessionId(91))]);
+
+    // A request from the old host must not publish into the new host's view.
+    panel.update(cx, |p, cx| {
+        p.resume(sample(), cx);
+        p.set_host(HostId::Local, None, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(events.lock().unwrap().len(), 1);
+}
+
+#[gpui::test]
+fn history_target_reconnect_invalidates_same_host_cache(cx: &mut TestAppContext) {
+    let panel = cx.new(|_| Panel::new(Arc::new(|_| unreachable!())));
+    let target = HostTarget::remote("studio", "/tmp/history-old.sock".into());
+    panel.update(cx, |p, cx| {
+        p.set_host(target.host().clone(), Some(target.clone()), cx);
+        p.data = Some(Snapshot {
+            entries: vec![sample()],
+            truncated: false,
+            skipped: false,
+        });
+        let generation = p.generation;
+        p.set_host(target.host().clone(), Some(target), cx);
+        assert_eq!(p.generation, generation);
+        assert_eq!(p.loaded_hits().len(), 1);
+        let replacement = HostTarget::remote("studio", "/tmp/history-new.sock".into());
+        p.set_host(replacement.host().clone(), Some(replacement), cx);
+        assert!(p.loaded_hits().is_empty());
+        assert_ne!(p.generation, generation);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_history_transport_sends_scan_search_and_resume_to_forwarded_socket() {
+    use krill_proto::ipc::{ClientHello, ServerHello};
+    use krill_proto::os::net::UnixListener;
+
+    let dir = std::env::temp_dir().join(format!("krill-history-wire-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("remote.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let requests = [
+        Request::AgentHistory(Action::Scan),
+        Request::AgentHistory(Action::Search(SearchQuery {
+            query: "원격 검색".into(),
+            paths: vec![sample().cwd],
+            ..SearchQuery::default()
+        })),
+        Request::AgentHistory(Action::ResumeVault(VaultHit::from(&sample()).target())),
+    ];
+    let expected = requests.clone();
+    let server = std::thread::spawn(move || {
+        for request in expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(
+                    &ServerHello {
+                        proto_min: ipc::PROTO_MIN,
+                        proto_max: ipc::PROTO_MAX,
+                        features: FEAT_CONTROL | FEAT_AGENT_HISTORY | FEAT_AI_VAULT,
+                        build: "remote-history-test".into(),
+                        instance_id: 1,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+            ClientHello::decode(kind, &body).unwrap();
+            let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+            assert_eq!(Request::decode(kind, &body).unwrap(), request);
+            stream
+                .write_all(
+                    &Reply::AgentHistory(Response::Resumed {
+                        session: SessionId(91),
+                    })
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let call = daemon_call_for(Some(HostTarget::remote("studio", socket)));
+    for request in requests {
+        assert_eq!(
+            call(&request).unwrap(),
+            Reply::AgentHistory(Response::Resumed {
+                session: SessionId(91)
+            })
+        );
+    }
+    server.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[gpui::test]
 fn on_demand_scan_refresh_and_resume_emit_new_session(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -34,8 +189,8 @@ fn on_demand_scan_refresh_and_resume_emit_new_session(cx: &mut TestAppContext) {
     let opened = Arc::new(Mutex::new(Vec::new()));
     let events = opened.clone();
     cx.update(|_, cx| {
-        cx.subscribe(&panel, move |_, &Open(id), _| {
-            events.lock().unwrap().push(id);
+        cx.subscribe(&panel, move |_, event: &Open, _| {
+            events.lock().unwrap().push(event.session);
         })
         .detach();
     });
@@ -207,8 +362,15 @@ fn vault_panel_filters_by_scope_and_agent_and_one_click_resumes(cx: &mut TestApp
                 truncated: false,
                 skipped: false,
             }),
-            Request::AgentHistory(Action::Search(_)) => Response::Searched(SearchSnapshot {
-                hits: hits_for_call.clone(),
+            Request::AgentHistory(Action::Search(q)) => Response::Searched(SearchSnapshot {
+                hits: hits_for_call
+                    .iter()
+                    .filter(|hit| {
+                        (q.agents.is_empty() || q.agents.contains(&hit.agent))
+                            && path_matches_scope(&hit.cwd, &q.paths)
+                    })
+                    .cloned()
+                    .collect(),
                 truncated: false,
                 skipped: false,
             }),
@@ -224,8 +386,8 @@ fn vault_panel_filters_by_scope_and_agent_and_one_click_resumes(cx: &mut TestApp
     let opened = Arc::new(Mutex::new(Vec::new()));
     let events = opened.clone();
     cx.update(|_, cx| {
-        cx.subscribe(&panel, move |_, &Open(id), _| {
-            events.lock().unwrap().push(id);
+        cx.subscribe(&panel, move |_, event: &Open, _| {
+            events.lock().unwrap().push(event.session);
         })
         .detach();
     });
@@ -504,4 +666,59 @@ fn history_rows_are_virtualized_and_same_count_replacements_refresh(cx: &mut gpu
     });
     cx.run_until_parked();
     panel.read_with(cx, |panel, _| assert_eq!(panel.list_hits[0].id, "replaced"));
+}
+
+#[test]
+fn server_search_hits_survive_incomplete_snippets_and_remote_path_spelling() {
+    let mut panel = Panel::new(Arc::new(|_| unreachable!()));
+    panel.query = "alpha beta".into();
+    panel.scope = VaultScope::Workspace;
+    panel.workspace_path = Some(r"C:\Repo".into());
+    let mut hit = VaultHit::from(&sample());
+    hit.cwd = "c:/repo/sub".into();
+    hit.snippet = "alpha".into();
+    panel.vault = Some(SearchSnapshot {
+        hits: vec![hit.clone()],
+        ..Default::default()
+    });
+    assert_eq!(panel.visible_hits(), vec![hit]);
+}
+
+#[gpui::test]
+fn resumed_reply_is_not_dropped_when_a_search_is_pending(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let call: Call = Arc::new(|r| {
+        Ok(Reply::AgentHistory(match r {
+            Request::AgentHistory(Action::Scan) => Response::Scanned(Snapshot {
+                entries: vec![sample()],
+                truncated: false,
+                skipped: false,
+            }),
+            Request::AgentHistory(Action::Search(_)) => Response::Searched(SearchSnapshot {
+                hits: Vec::new(),
+                truncated: false,
+                skipped: false,
+            }),
+            _ => Response::Resumed {
+                session: SessionId(5),
+            },
+        }))
+    });
+    let (panel, cx) = cx.add_window_view(|_, _| Panel::new(call));
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let events = opened.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&panel, move |_, event: &Open, _| {
+            events.lock().unwrap().push(event.session);
+        })
+        .detach();
+    });
+    panel.update(cx, Panel::toggle);
+    cx.run_until_parked();
+    panel.update(cx, |p, cx| {
+        p.resume(sample(), cx);
+        p.set_query("typed while resuming", cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(*opened.lock().unwrap(), [SessionId(5)]);
 }

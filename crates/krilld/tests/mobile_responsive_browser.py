@@ -1,6 +1,6 @@
 """Chromium responsive matrix against the isolated mobile_pwa.cjs loopback fixture.
 
-Run with CARGO_TARGET_DIR pointing at the actual Cargo target directory.
+Run with KRILL_BIN and KRILLD_BIN pointing at the built binaries.
 --phase before records problems without failing; after enforces the contract.
 Screenshots and measured geometry are kept for every viewport/state pair.
 """
@@ -27,7 +27,7 @@ MEASURE = """(()=>{
  const rect=n=>{const r=n.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height,right:r.right,bottom:r.bottom};};
  const visible=n=>!!n.getClientRects().length&&getComputedStyle(n).visibility!=='hidden';
  const dialog=document.querySelector('dialog[open]'),scope=dialog||document.querySelector('.scanner')||document.querySelector('#route-root');
- const controls=[...scope.querySelectorAll('button,summary,.key-label')].filter(visible).map(n=>({name:n.getAttribute('aria-label')||n.textContent.trim(),compact:!!n.closest('.session.screen>.page-header,.session-tabs,.command-dock,.quick-commands-list')||n.classList.contains('quick-command-add'),...rect(n)}));
+ const controls=[...scope.querySelectorAll('button,summary,.key-label')].filter(visible).map(n=>({name:n.getAttribute('aria-label')||n.textContent.trim(),compact:!!n.closest('.session.screen>.page-header,.session-tabs,.command-dock,.quick-actions-manager,.quick-actions-list')||n.classList.contains('quick-command-add'),...rect(n)}));
  const reading=[...document.querySelectorAll('.home-list,.workspace-list,.settings-list,.detail-list,.connection-log')].filter(visible).map(n=>({name:n.className,...rect(n)}));
  const overflow=[...document.querySelectorAll('#route-root,.screen,.home-list,.workspace-list,.settings-list,.detail-list,.connection-log,.chat-view,.chat-feed,.command-dock')].filter(visible).filter(n=>n.scrollWidth>n.clientWidth+1).map(n=>({name:n.className||n.id,scroll:n.scrollWidth,client:n.clientWidth}));
  const dock=document.querySelector('.terminal-mount:not([hidden]) .command-dock');
@@ -71,12 +71,16 @@ def problems(m):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--address', required=True)
+    parser.add_argument('--address', default='127.0.0.1:0')
     parser.add_argument('--phase', choices=['before', 'after'], default='after')
     parser.add_argument('--screenshots')
     args = parser.parse_args()
+    if ':' not in args.address:
+        args.address += ':0'
     root = Path(__file__).resolve().parents[3]
-    target = Path(os.environ['CARGO_TARGET_DIR'])
+    target = Path(os.environ.get('CARGO_TARGET_DIR', root / 'target'))
+    krilld = Path(os.environ.get('KRILLD_BIN', str(target / 'debug/krilld')))
+    krill = Path(os.environ.get('KRILL_BIN', str(krilld.with_name('krill'))))
     shots = Path(args.screenshots or f'/tmp/krill-responsive/{args.phase}').resolve()
     shots.mkdir(parents=True, exist_ok=True)
     session = f'mobile-responsive-{os.getpid()}'
@@ -87,7 +91,7 @@ def main():
                    M9_BROWSER_METADATA=str(metadata))
         with (shots / 'fixture.log').open('w+') as log:
             fixture = subprocess.Popen(['node', str(Path(__file__).with_name('mobile_pwa.cjs')),
-                                        str(target / 'debug/krilld'), '--keep'],
+                                        str(krilld), '--keep'],
                                        env=env, stdout=log, stderr=log)
             try:
                 until(metadata.exists, 90)
@@ -186,15 +190,15 @@ def main():
                     evaluate('KrillMobile.activeTerminal.setInputMode("direct");true')
                     settle()
                     capture('session-direct', width, height)
-                    named('Quick Commands')
-                    wait('!!document.querySelector(".quick-commands-list")')
+                    named('Quick actions')
+                    wait('!!document.querySelector(".quick-actions-list")')
                     capture('quick-commands', width, height)
-                    named('Add Quick Command')
-                    wait('document.querySelectorAll(".quick-command-result").length>=3')
+                    named('Find installed skills')
+                    wait('document.querySelectorAll(".quick-action-card").length>=3')
                     capture('quick-command-catalog', width, height)
-                    browser('fill', '.quick-command-search', 'mobile-review')
-                    wait('document.querySelectorAll(".quick-command-result").length===1')
-                    assert evaluate('document.querySelector(".quick-command-result").textContent.includes("/mobile-review")')
+                    browser('fill', '.quick-catalog-search', 'mobile-review')
+                    wait('document.querySelectorAll(".quick-action-card").length===1')
+                    assert evaluate('document.querySelector(".quick-action-card").textContent.includes("/mobile-review")')
                     capture('quick-command-search', width, height)
                     close()
                     named('Terminal actions')
@@ -284,7 +288,7 @@ def main():
                 history_text = '\n'.join(f'fold-history-{i:03d}' for i in range(120)) + '\n'
                 evaluate(f'(async()=>{{await KrillMobile.app.transport.rpc({{action:"prompt",session:{fold_sid},text:{json.dumps(history_text)}}});return true;}})()')
                 def history_ready():
-                    output = subprocess.check_output([str(target / 'debug/krill'), 'read', str(fold_sid)],
+                    output = subprocess.check_output([str(krill), 'read', str(fold_sid)],
                                                      env=dict(os.environ, KRILL_STATE_DIR=cfg['dir']), text=True)
                     return 'fold-history-119' in output
                 until(history_ready)
@@ -322,7 +326,7 @@ def main():
                 print('PASS rapid fold x12: live grid, draft, terminal identity, history and scroll anchor', flush=True)
                 # Tablet shell, independent terminal panes and real daemon lifetime.
                 def cli(*command):
-                    return subprocess.check_output([str(target / 'debug/krill'), *command],
+                    return subprocess.check_output([str(krill), *command],
                         env=dict(os.environ, KRILL_STATE_DIR=cfg['dir']), text=True)
 
                 def pane_ready():

@@ -19,7 +19,7 @@ use krill_proto::schedule::{
     tokenize_command_line, truncate_output,
 };
 
-use crate::child::{kill_and_reap as kill_precheck, nonblocking as set_nonblocking};
+use crate::child::{PipeReader, own_group, spawn};
 
 use super::{Create, Peer, Program, Registry, Reply, Scope, lock};
 
@@ -42,70 +42,112 @@ pub struct PrecheckResult {
     pub timed_out: bool,
 }
 
-/// Runs `/bin/sh -c <command>` in `cwd` as a precheck gate (MK-186).
+/// Runs `sh -c <command>` in `cwd` as a precheck gate (MK-186): Unix `/bin/sh`, Windows the Git for
+/// Windows `sh.exe` (`git var GIT_SHELL_PATH`, daemon-03).
 /// Exit code `0` passes; any non-zero exit, timeout, or spawn error marks the run as skipped.
 #[must_use]
 pub fn run_precheck(cwd: &Path, command: &str, timeout_override: Option<u64>) -> PrecheckResult {
     run_precheck_with_timeout(cwd, command, precheck_timeout(timeout_override))
 }
 
+/// The shell that runs precheck commands. Windows needs Git for Windows (`sh.exe`); `cmd.exe` would give the
+/// same command text different semantics, so a missing Git fails the precheck explicitly instead.
+#[cfg_attr(
+    unix,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Windows resolves the Git shell and can fail"
+    )
+)]
+fn precheck_shell() -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        Ok(PathBuf::from("/bin/sh"))
+    }
+    #[cfg(windows)]
+    {
+        let mut git = Command::new("git");
+        {
+            use std::os::windows::process::CommandExt as _;
+            git.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let out = git
+            .args(["var", "GIT_SHELL_PATH"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("precheck requires Git for Windows sh: {e}"),
+                )
+            })?;
+        let mut path = out.stdout;
+        while path.last().is_some_and(|b| matches!(b, b'\n' | b'\r')) {
+            path.pop();
+        }
+        if !out.status.success() || path.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "precheck requires Git for Windows sh (git var GIT_SHELL_PATH)",
+            ));
+        }
+        Ok(PathBuf::from(String::from_utf8_lossy(&path).into_owned()))
+    }
+}
+
 #[must_use]
 pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -> PrecheckResult {
     let started = Instant::now();
-    let mut child = match crate::child::own_group(&mut Command::new("/bin/sh"))
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            return PrecheckResult {
-                duration_ms: elapsed_ms(started),
-                timed_out: false,
-                passed: false,
-                status: None,
-                output: None,
-                error: Some(format!("precheck failed: {e}")),
-            };
-        }
+    let failed = |error: String| PrecheckResult {
+        duration_ms: elapsed_ms(started),
+        timed_out: false,
+        passed: false,
+        status: None,
+        output: None,
+        error: Some(error),
     };
-    let Some(mut stdout) = child.stdout.take() else {
-        kill_precheck(&mut child);
-        return PrecheckResult {
-            duration_ms: elapsed_ms(started),
-            timed_out: false,
-            passed: false,
-            status: None,
-            output: None,
-            error: Some("precheck failed: missing stdout pipe".into()),
-        };
+    let shell = match precheck_shell() {
+        Ok(shell) => shell,
+        Err(e) => return failed(format!("precheck failed: {e}")),
     };
-    let Some(mut stderr) = child.stderr.take() else {
-        kill_precheck(&mut child);
-        return PrecheckResult {
-            duration_ms: elapsed_ms(started),
-            timed_out: false,
-            passed: false,
-            status: None,
-            output: None,
-            error: Some("precheck failed: missing stderr pipe".into()),
+    let mut process = Command::new(&shell);
+    #[cfg(windows)]
+    if let Some(bin) = shell.parent() {
+        // Git's `cmd` PATH entry does not expose sh utilities such as sleep and grep.
+        let mut paths = vec![bin.to_owned()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = match std::env::join_paths(paths) {
+            Ok(path) => path,
+            Err(e) => return failed(format!("precheck PATH failed: {e}")),
         };
-    };
-    if let Err(e) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
-        kill_precheck(&mut child);
-        return PrecheckResult {
-            duration_ms: elapsed_ms(started),
-            timed_out: false,
-            passed: false,
-            status: None,
-            output: None,
-            error: Some(format!("precheck failed: {e}")),
-        };
+        process.env("PATH", path);
     }
+    // `spawn` kills descendants on drop (Unix process group, Windows Job) on every exit path below.
+    let mut child = match spawn(
+        own_group(&mut process)
+            .arg("-c")
+            .arg(command)
+            .current_dir(krill_proto::os::shell_path(cwd))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    ) {
+        Ok(child) => child,
+        Err(e) => return failed(format!("precheck failed: {e}")),
+    };
+    // `PipeReader` gives both platforms `WouldBlock` reads (Unix O_NONBLOCK, Windows PeekNamedPipe).
+    let pipes = child
+        .stdout
+        .take()
+        .zip(child.stderr.take())
+        .ok_or_else(|| io::Error::other("missing stdout/stderr pipe"))
+        .and_then(|(out, err)| Ok((PipeReader::new(out)?, PipeReader::new(err)?)));
+    let (mut stdout, mut stderr) = match pipes {
+        Ok(pipes) => pipes,
+        Err(e) => return failed(format!("precheck failed: {e}")),
+    };
 
     let mut out_bytes = Vec::new();
     let mut err_bytes = Vec::new();
@@ -114,7 +156,6 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
         if let Err(e) = drain_pipe(&mut stdout, &mut out_bytes, PRECHECK_STREAM_LIMIT, deadline)
             .and_then(|()| drain_pipe(&mut stderr, &mut err_bytes, PRECHECK_STREAM_LIMIT, deadline))
         {
-            kill_precheck(&mut child);
             return PrecheckResult {
                 duration_ms: elapsed_ms(started),
                 timed_out: false,
@@ -141,7 +182,6 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
                     post_deadline,
                 )
                 .ok();
-                kill_precheck(&mut child);
                 let code = status.code();
                 let passed = status.success();
                 return PrecheckResult {
@@ -156,7 +196,6 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
             }
             Ok(None) => {}
             Err(e) => {
-                kill_precheck(&mut child);
                 return PrecheckResult {
                     duration_ms: elapsed_ms(started),
                     timed_out: false,
@@ -168,7 +207,6 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
             }
         }
         if Instant::now() >= deadline {
-            kill_precheck(&mut child);
             return PrecheckResult {
                 duration_ms: elapsed_ms(started),
                 timed_out: true,
@@ -751,3 +789,6 @@ impl<'a> Journal<'a> {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+#[cfg(all(test, windows))]
+#[path = "schedule/windows_tests.rs"]
+mod windows_tests;

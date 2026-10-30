@@ -761,11 +761,16 @@ fn ssh_failed(opts: &SshOptions, step: &'static str, out: &std::process::Output)
 fn mkdir_remote_command(spec: &InstallSpec) -> String {
     let launch_agents = format!("{}/Library/LaunchAgents", spec.home);
     format!(
-        "/bin/sh -c 'mkdir -p {} {}/tmp {}'",
+        "/bin/sh -c 'mkdir -p -- \"$1\" \"$2\" \"$3\"' sh {} {} {}",
         shell_quote(&spec.bin_dir()),
         shell_quote(&format!("{}/.krill/tmp", spec.home)),
         shell_quote(&launch_agents),
     )
+}
+
+/// 표준 입력을 원격 파일 하나로 기록하는 명령.
+fn upload_remote_command(remote_path: &str) -> String {
+    format!("/bin/sh -c 'cat > \"$1\"' sh {}", shell_quote(remote_path))
 }
 
 /// 관리형 설치 전체 수행(디렉터리 준비 → 바이너리·plist 전송 → 설정 스크립트).
@@ -874,7 +879,7 @@ fn install_remote_with_program(
     for blob in payload.blobs {
         let remote_path = format!("{}/{}", spec.bin_dir(), blob.name);
         let out = run(
-            &format!("/bin/sh -c 'cat > {}'", shell_quote(&remote_path)),
+            &upload_remote_command(&remote_path),
             Some(blob.bytes),
             "upload",
         )?;
@@ -883,7 +888,7 @@ fn install_remote_with_program(
         }
     }
     let plist_out = run(
-        &format!("/bin/sh -c 'cat > {}'", shell_quote(&spec.plist_path())),
+        &upload_remote_command(&spec.plist_path()),
         Some(payload.plist_xml.as_bytes()),
         "upload-plist",
     )?;

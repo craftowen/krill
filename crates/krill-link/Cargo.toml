@@ -30,6 +30,9 @@ zeroize = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+krill-holder = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 

@@ -12,17 +12,18 @@ use krill_proto::os::net::UnixStream;
 
 #[test]
 fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_old() {
-    for (fail, cancel, unconfirmed, close_fail, process_bound, late_hook) in [
-        (false, false, false, false, false, false),
-        (true, false, false, false, false, false),
-        (false, true, false, false, false, false),
-        (false, false, true, false, false, false),
-        (false, false, false, true, false, false),
-        (false, false, false, false, true, false),
-        (false, false, false, false, false, true),
+    for (fail, cancel, unconfirmed, close_fail, process_bound, late_hook, streaming) in [
+        (false, false, false, false, false, false, false),
+        (true, false, false, false, false, false, false),
+        (false, true, false, false, false, false, false),
+        (false, false, true, false, false, false, false),
+        (false, false, false, true, false, false, false),
+        (false, false, false, false, true, false, false),
+        (false, false, false, false, false, true, false),
+        (false, false, false, false, false, false, true),
     ] {
         let root = Path::new("/tmp").join(format!(
-            "kas-{}-{fail}-{cancel}-{unconfirmed}-{close_fail}-{process_bound}-{late_hook}",
+            "kas-{}-{fail}-{cancel}-{unconfirmed}-{close_fail}-{process_bound}-{late_hook}-{streaming}",
             std::process::id()
         ));
         fs::remove_dir_all(&root).ok();
@@ -109,6 +110,8 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             .join(transcript.file_name().unwrap());
         let reselect = cancel.then(|| Arc::clone(&reg));
         let hook_reg = Arc::clone(&reg);
+        let stop_output = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output_stop = Arc::clone(&stop_output);
         let mock = std::thread::spawn(move || {
             let packet = holder_link.recv().unwrap().unwrap();
             let ToHolder::Spawn {
@@ -148,6 +151,17 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 )
                 .unwrap();
             process.write_all(b"resumed selected account\r\n").unwrap();
+            let output_worker = streaming.then(|| {
+                let mut stream = process.try_clone().unwrap();
+                std::thread::spawn(move || {
+                    while !output_stop.load(std::sync::atomic::Ordering::Acquire) {
+                        if stream.write_all(b"continuing output\r\n").is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                })
+            });
             if !unconfirmed && !process_bound {
                 hook_reg.agents.record_hook_session(
                     id,
@@ -204,7 +218,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                     .unwrap();
             }
             // Keep the new PTY open until the parent has committed its handoff.
-            Some((id, process, replacement_process))
+            Some((id, process, replacement_process, output_worker))
         });
         reg.queue_account_switch(ProviderKind::Codex, &target);
         reg.queue_account_switch(ProviderKind::Codex, "codex-old");
@@ -225,6 +239,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             })
         });
         reg.process_account_work_in(&home);
+        stop_output.store(true, std::sync::atomic::Ordering::Release);
         if let Some(binding) = late_binding {
             binding.join().unwrap();
         }
@@ -254,7 +269,12 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             fs::read_to_string(to.join("auth.json")).unwrap(),
             "selected fixture credentials"
         );
-        drop(mock.join().unwrap());
+        if let Some((_, process, replacement, output_worker)) = mock.join().unwrap() {
+            if let Some(worker) = output_worker {
+                worker.join().unwrap();
+            }
+            drop((process, replacement));
+        }
         reader_worker.join().unwrap();
         drop(source_process);
         drop(reg);
@@ -344,7 +364,7 @@ fn switch_without_verified_identity_or_transcript_preserves_original_session() {
         }
         let (master, mut old_process) = UnixStream::pair().unwrap();
         let (holder, _link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
-        let reg = Registry::new(
+        let reg = Arc::new(Registry::new(
             Some((
                 holder,
                 vec![Kept {
@@ -355,7 +375,7 @@ fn switch_without_verified_identity_or_transcript_preserves_original_session() {
                 }],
             )),
             Some(&state),
-        );
+        ));
         reg.agents
             .remember_session(
                 SessionId(9),
@@ -510,7 +530,7 @@ fn completion_snapshot_waits_for_durable_handoff_and_failed_writes_restore_pendi
     clippy::unwrap_used,
     reason = "test fixture setup requires valid local sockets and files"
 )]
-fn kept_fixture(root: &Path, id: SessionId) -> (Registry, UnixStream) {
+fn kept_fixture(root: &Path, id: SessionId) -> (Arc<Registry>, UnixStream) {
     fs::create_dir_all(root).unwrap();
     let (daemon_end, holder_end) = UnixStream::pair().unwrap();
     let link = Link::new(OwnedFd::from(holder_end));
@@ -526,7 +546,7 @@ fn kept_fixture(root: &Path, id: SessionId) -> (Registry, UnixStream) {
     }
     let (master, process) = UnixStream::pair().unwrap();
     let (holder, _reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
-    let reg = Registry::new(
+    let reg = Arc::new(Registry::new(
         Some((
             holder,
             vec![Kept {
@@ -537,7 +557,7 @@ fn kept_fixture(root: &Path, id: SessionId) -> (Registry, UnixStream) {
             }],
         )),
         Some(root),
-    );
+    ));
     (reg, process)
 }
 
@@ -1062,6 +1082,187 @@ fn switch_auto_continues_working_or_rate_limited_session_after_retirement() {
 }
 
 #[test]
+fn unconfirmed_replacement_preserves_original_and_allows_a_verified_retry() {
+    use std::io::Read as _;
+
+    let root = Path::new("/tmp").join(format!("kas-unconfirmed-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let from = root.join("from");
+    let to = root.join("to");
+    let back = root.join("back");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(from.join("sessions/2026/10/28")).unwrap();
+    let mut target_ids = Vec::new();
+    for (dir, label) in [(&to, "Selected"), (&back, "Back")] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("auth.json"), "fixture credentials").unwrap();
+        let snap = accounts::add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            label,
+            None,
+            dir.to_str().unwrap(),
+        )
+        .unwrap();
+        target_ids.push(
+            snap.accounts
+                .iter()
+                .find(|a| a.label == label)
+                .unwrap()
+                .id
+                .clone(),
+        );
+    }
+    let sid = "cccccccc-dddd-eeee-ffff-000000000000";
+    fs::write(
+        from.join(format!("sessions/2026/10/28/rollout-date-{sid}.jsonl")),
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
+    )
+    .unwrap();
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (master, _old_process) = UnixStream::pair().unwrap();
+    let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Arc::new(Registry::new(
+        Some((
+            holder,
+            vec![Kept {
+                id: SessionId(31),
+                pid: 731,
+                status: None,
+                master: OwnedFd::from(master),
+            }],
+        )),
+        Some(&state),
+    ));
+    reg.agents
+        .remember_session(
+            SessionId(31),
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Yolo,
+            },
+            Some(sid.into()),
+            root.as_os_str().as_encoded_bytes().to_vec(),
+            Some(LaunchAccount {
+                id: "codex-old".into(),
+                env_key: "CODEX_HOME".into(),
+                dir: from.display().to_string(),
+            }),
+        )
+        .unwrap();
+    // A rate-limited original would normally be told to continue after the switch.
+    reg.agents.mark_rate_limited(SessionId(31));
+    let reader = Arc::clone(&reg);
+    let reader_worker =
+        std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+    let hook_reg = Arc::clone(&reg);
+    let mock = std::thread::spawn(move || {
+        let mut replacements = Vec::new();
+        let mut processes = Vec::new();
+        for round in [0, 1] {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, argv, .. } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!("expected replacement spawn");
+            };
+            assert!(argv.iter().any(|arg| arg == sid.as_bytes()));
+            let (master, mut process) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned {
+                        req,
+                        id,
+                        pid: 831 + round,
+                    }
+                    .encode()
+                    .unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            // Like a login screen: output, but no hook and no open conversation.
+            process.write_all(b"Sign in with ChatGPT").unwrap();
+            if round == 1 {
+                hook_reg.agents.record_hook_session(
+                    id,
+                    format!("{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{sid}\"}}")
+                        .as_bytes(),
+                );
+            }
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!(
+                    "expected rollback of an unconfirmed replacement or retirement after confirmation"
+                );
+            };
+            let expected = if round == 0 { id } else { SessionId(31) };
+            assert_eq!(old, expected);
+            holder_link
+                .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                .unwrap();
+            lock(&hook_reg.state).exited.insert(old, 0);
+            replacements.push(id);
+            if round == 0 {
+                process
+                    .set_read_timeout(Some(Duration::from_millis(1500)))
+                    .unwrap();
+                let mut byte = [0_u8; 1];
+                assert!(
+                    !matches!(process.read(&mut byte), Ok(1..)),
+                    "an unconfirmed replacement must not receive the continuation prompt"
+                );
+            }
+            processes.push(process);
+        }
+        (replacements, processes)
+    });
+
+    reg.queue_account_switch(ProviderKind::Codex, &target_ids[0]);
+    reg.process_account_work_in(&home);
+    let failed = load(Some(&state))
+        .get(&SessionId(31))
+        .cloned()
+        .expect("failure must preserve the original's recovery record");
+    assert!(failed.to.is_none() && failed.error.is_some());
+    assert!(
+        reg.agents.stored(SessionId(31)).unwrap().is_some(),
+        "original conversation remains switchable"
+    );
+    let snapshot = accounts::refresh_accounts_with(&home, Some(&state), false);
+    reg.queue_session_account_switch(
+        SessionId(31),
+        ProviderKind::Codex,
+        &target_ids[1],
+        &snapshot,
+    )
+    .unwrap();
+    reg.process_account_work_in(&home);
+    let (replacements, _processes) = mock.join().unwrap();
+    assert_ne!(replacements[0], replacements[1]);
+    assert_eq!(
+        load(Some(&state)).get(&SessionId(31)).and_then(|h| h.to),
+        Some(replacements[1])
+    );
+    reader_worker.join().unwrap();
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unmanaged_shell_skips_unidentifiable_daemon_agent_and_switches_open_transcript_agent() {
     use krill_proto::hook::{EventId, HookEvent, Input};
 
@@ -1319,7 +1520,7 @@ fn unbound_session_skips_auto_switch_and_cancelled_opt_out_until_bound_and_prune
     let (master_51, _proc_51) = UnixStream::pair().unwrap();
     let (master_52, _proc_52) = UnixStream::pair().unwrap();
     let (holder, _link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
-    let reg = Registry::new(
+    let reg = Arc::new(Registry::new(
         Some((
             holder,
             vec![
@@ -1338,7 +1539,7 @@ fn unbound_session_skips_auto_switch_and_cancelled_opt_out_until_bound_and_prune
             ],
         )),
         Some(&state),
-    );
+    ));
     reg.agents
         .remember_session(
             SessionId(51),
@@ -1650,17 +1851,37 @@ fn stale_provider_handoff_is_cancelled_and_rejected_before_reading_transcripts()
     assert!(!load(Some(&state)).contains_key(&session));
     assert!(!lock(&reg.state).closing.contains(&session));
     original.write_all(b"original still running\r\n").unwrap();
+    // Wait for the capture so the store does not write a segment while the fixture is removed.
+    let tap = lock(&reg.state)
+        .sessions
+        .get(&session)
+        .unwrap()
+        .session
+        .tap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while tap.pulse().end < 24 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!tap.pulse().closed);
+    assert!(tap.pulse().end >= 24, "original PTY keeps capturing output");
     assert!(
         fs::read_dir(&to)
             .unwrap()
             .all(|entry| entry.unwrap().file_name() == "auth.json")
     );
     drop(reg);
-    fs::remove_dir_all(root).unwrap();
+    // 취소된 인계의 백그라운드 정리가 끝나기 전에 지우면 DirectoryNotEmpty가 난다(8회 반복 중 2회 재현).
+    for attempt in 0..50 {
+        match fs::remove_dir_all(&root) {
+            Ok(()) => break,
+            Err(error) if attempt == 49 => panic!("{error}"),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
 #[expect(clippy::unwrap_used, reason = "deterministic account fixture setup")]
-fn kept_sessions_fixture(root: &Path, ids: &[SessionId]) -> (Registry, Vec<UnixStream>) {
+fn kept_sessions_fixture(root: &Path, ids: &[SessionId]) -> (Arc<Registry>, Vec<UnixStream>) {
     fs::create_dir_all(root).unwrap();
     let (daemon_end, holder_end) = UnixStream::pair().unwrap();
     let link = Link::new(OwnedFd::from(holder_end));
@@ -1689,7 +1910,7 @@ fn kept_sessions_fixture(root: &Path, ids: &[SessionId]) -> (Registry, Vec<UnixS
         })
         .collect();
     let (holder, _reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
-    let reg = Registry::new(Some((holder, sessions)), Some(root));
+    let reg = Arc::new(Registry::new(Some((holder, sessions)), Some(root)));
     (reg, processes)
 }
 
@@ -1932,7 +2153,7 @@ fn replacement_journals_are_independent_and_legacy_record_is_preserved() {
     let root = Path::new("/tmp").join(format!("kas-journals-{}", std::process::id()));
     fs::remove_dir_all(&root).ok();
     fs::create_dir_all(&root).unwrap();
-    let reg = Registry::new(None, Some(&root));
+    let reg = Arc::new(Registry::new(None, Some(&root)));
     for id in [SessionId(8), SessionId(9)] {
         accounts::write_atomic_0600(&replacement_journal(&root, id), b"fixture").unwrap();
     }

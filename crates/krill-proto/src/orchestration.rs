@@ -17,11 +17,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+mod offline;
+pub use offline::offline_archive_configured;
+
 pub const ORCH_FILE: &str = "orchestration.json";
 pub const ORCH_LOCK: &str = "orchestration.lock";
 pub const COMMENTS_FILE: &str = "worktree-comments.toml";
 pub const COMMENTS_LOCK: &str = "worktree-comments.lock";
 pub const MAX_ORCH_BYTES: u64 = 2 * 1024 * 1024;
+/// 바이트 압박 때 방치된 `Active` Run을 정리 대상으로 보는 무갱신 기간(24시간).
+const STALE_RUN_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_COMMENTS_BYTES: u64 = 256 * 1024;
 /// [`OrchestrationStore::prune_messages`]가 남기는 확인済み 일시 메시지(하트비트·상태) 상한.
 /// 근거: 본문 300B 하트비트 3,395건 ≈ 2MiB 실측(PH-02). 500건이면 본문만 ~150KiB라 상한에 여유가 있고,
@@ -94,6 +99,74 @@ pub const MAX_STORE_BYTES: u64 = MAX_ORCH_BYTES;
 
 /// Retain action/status extension; older peers receive the preserved-session stopped state.
 pub const FEAT_ORCH_RETAIN: u64 = 1 << 19;
+/// 페이지 스냅샷([`OrchAction::SnapshotPage`]/[`OrchResponse::SnapshotPage`]): 단일 프레임
+/// `SnapshotV2`가 [`crate::ipc::MAX_FRAME`]을 넘는 유효 저장소(≤[`MAX_ORCH_BYTES`])를 무손실로
+/// 읽는다(foundation-02, 지휘자 배정 2026-10-27). 미협상 피어에는 요청하지 않는다.
+pub const FEAT_ORCH_SNAPSHOT_PAGE: u64 = 1 << 35;
+/// 페이지 하나의 바이트. 프레임 상한의 절반이라 응답 봉투를 더해도 한 프레임에 든다.
+pub const SNAPSHOT_PAGE_BYTES: usize = 512 * 1024;
+/// 클라이언트가 조립을 허용하는 페이지 스냅샷 총량. ≤2MiB JSON 저장소의 postcard는 이보다 작다.
+pub const MAX_SNAPSHOT_PAGED_BYTES: usize = 4 * 1024 * 1024;
+/// 페이지 조립 중 저장소가 바뀌어 처음부터 다시 읽는 횟수 상한.
+pub const MAX_SNAPSHOT_PAGE_RETRIES: u32 = 3;
+/// `check` 응답 하나에 싣는 메시지 바이트(postcard) 예산. ACK는 이 예산 안에 든 메시지만 확정한다
+/// (응답이 프레임에 들어가는지 확인한 뒤에야 확인 처리한다).
+pub const MAX_DELIVERY_BYTES: usize = 512 * 1024;
+/// 메시지 하나의 `summary + body` 상한(정책값, 측정치 아님). 새 메시지는 모두 한 배달 응답에 들어간다.
+pub const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+/// 예산 도입 전에 저장된 메시지가 홀로 한 프레임에 들어가는 postcard 길이 상한(`MAX_FRAME` − 4KiB 봉투 여유).
+/// 이보다 큰 메시지는 `check`가 확인 처리 없이 명시 오류를 내고, 페이지 스냅샷(`inbox`)으로만 읽는다.
+pub const MAX_SINGLE_DELIVERY_BYTES: usize = 1_044_480;
+const _: () = assert!(MAX_SINGLE_DELIVERY_BYTES < crate::ipc::MAX_FRAME);
+/// 응답 본문이 프레임에 들어가는지 확인할 때 두는 봉투(Reply 태그·kind) 여유.
+const RESPONSE_ENVELOPE_BYTES: usize = 64;
+/// 데몬이 [`crate::ipc::MAX_FRAME`]을 넘는 응답 대신 보내는 [`OrchResponse::Error`] 문구의 접두어.
+pub const FRAME_LIMIT_ERROR: &str = "response exceeds IPC frame limit";
+/// 페이지 조립 도중 저장소가 바뀌었을 때의 [`OrchResponse::Error`] 문구. 클라이언트는 처음부터 다시 읽는다.
+pub const SNAPSHOT_CHANGED_ERROR: &str = "snapshot changed during paging";
+
+/// [`FRAME_LIMIT_ERROR`] 문구. `bytes`는 넘친 본문 길이다.
+pub fn frame_limit_error(bytes: u64) -> String {
+    format!(
+        "{FRAME_LIMIT_ERROR} ({bytes} bytes > {} bytes)",
+        crate::ipc::MAX_FRAME
+    )
+}
+
+/// 직렬화된 스냅샷 바이트의 세대. 같은 바이트면 같은 값이라 페이지들이 한 직렬화에서 왔는지 검사한다.
+pub fn snapshot_generation(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 직렬화된 스냅샷 응답(`postcard(OrchResponse)`) `bytes`에서 [`OrchAction::SnapshotPage`] 한 페이지.
+/// `generation`이 있고 현재 바이트의 세대와 다르면 [`SNAPSHOT_CHANGED_ERROR`].
+pub fn snapshot_page(bytes: &[u8], generation: Option<u64>, offset: u32) -> OrchResponse {
+    let current = snapshot_generation(bytes);
+    if generation.is_some_and(|g| g != current) {
+        return OrchResponse::Error(SNAPSHOT_CHANGED_ERROR.to_owned());
+    }
+    let Ok(total) = u32::try_from(bytes.len()) else {
+        return OrchResponse::Error(format!(
+            "snapshot too large to page ({} bytes)",
+            bytes.len()
+        ));
+    };
+    let Some(rest) = usize::try_from(offset).ok().and_then(|o| bytes.get(o..)) else {
+        return OrchResponse::Error(format!("snapshot page offset {offset} out of range"));
+    };
+    let page = rest
+        .get(..SNAPSHOT_PAGE_BYTES.min(rest.len()))
+        .unwrap_or(rest);
+    OrchResponse::SnapshotPage {
+        generation: current,
+        total,
+        offset,
+        bytes: page.to_vec(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -520,6 +593,12 @@ pub enum OrchAction {
         operation: WorkerOperation,
         archived_output: Option<String>,
     },
+    /// `FEAT_ORCH_SNAPSHOT_PAGE` 필요. `generation: None`은 현재 저장소의 첫 페이지(`offset` 0),
+    /// 이후는 받은 세대와 다음 offset으로 잇는다. 응답은 [`OrchResponse::SnapshotPage`].
+    SnapshotPage {
+        generation: Option<u64>,
+        offset: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,6 +624,7 @@ impl OrchAction {
                 | Self::LaunchWorker { .. }
                 | Self::WorkerStartFailed { .. }
                 | Self::ManageWorker { .. }
+                | Self::SnapshotPage { .. }
         )
     }
 }
@@ -570,6 +650,14 @@ pub enum OrchResponse {
     },
     SnapshotV2(OrchestrationStore),
     DispatchV2(Box<Dispatch>),
+    /// `FEAT_ORCH_SNAPSHOT_PAGE` 필요. `bytes`는 `postcard(OrchResponse::SnapshotV2(..))`의
+    /// `[offset, offset + len)` 구간이고 `total`이 전체 길이다. 모든 페이지의 `generation`이 같아야 한다.
+    SnapshotPage {
+        generation: u64,
+        total: u32,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
 }
 
 // Frozen N-1 payloads: serde defaults do not extend postcard structs safely.
@@ -719,6 +807,12 @@ enum WireOrchResponse {
     },
     SnapshotV2(OrchestrationStore),
     DispatchV2(Box<Dispatch>),
+    SnapshotPage {
+        generation: u64,
+        total: u32,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
 }
 
 impl From<OrchResponse> for WireOrchResponse {
@@ -738,6 +832,17 @@ impl From<OrchResponse> for WireOrchResponse {
             OrchResponse::Delivery { delivery, messages } => Self::Delivery { delivery, messages },
             OrchResponse::SnapshotV2(v) => Self::SnapshotV2(v),
             OrchResponse::DispatchV2(v) => Self::DispatchV2(v),
+            OrchResponse::SnapshotPage {
+                generation,
+                total,
+                offset,
+                bytes,
+            } => Self::SnapshotPage {
+                generation,
+                total,
+                offset,
+                bytes,
+            },
         }
     }
 }
@@ -761,6 +866,17 @@ impl From<WireOrchResponse> for OrchResponse {
             }
             WireOrchResponse::SnapshotV2(v) => Self::SnapshotV2(v),
             WireOrchResponse::DispatchV2(v) => Self::DispatchV2(v),
+            WireOrchResponse::SnapshotPage {
+                generation,
+                total,
+                offset,
+                bytes,
+            } => Self::SnapshotPage {
+                generation,
+                total,
+                offset,
+                bytes,
+            },
         }
     }
 }
@@ -849,7 +965,25 @@ impl OrchestrationStore {
         fs::create_dir_all(state_dir)?;
         let body = crate::config_document::save_json(&state_dir.join(ORCH_FILE), self)?;
         if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_ORCH_BYTES {
-            return Err(invalid("orchestration.json exceeds size limit"));
+            let unread: usize = self
+                .messages
+                .iter()
+                .filter(|m| !m.acked)
+                .map(|m| m.summary.len().saturating_add(m.body.len()))
+                .sum();
+            let outputs: usize = self
+                .dispatches
+                .iter()
+                .map(|d| d.archived_output.as_deref().map_or(0, str::len))
+                .sum();
+            return Err(invalid(format!(
+                "orchestration.json exceeds size limit and nothing safe to prune is left \
+                 (unread mail ~{unread}B, archived worker output ~{outputs}B, {} runs). \
+                 Read and ack mail with `krill orchestration check --to <name> --ack`, or discard a \
+                 finished/abandoned Run with `krill orchestration reset --run <run-id>` \
+                 (see `krill orchestration runs`)",
+                self.runs.len()
+            )));
         }
         atomic_write(&state_dir.join(ORCH_FILE), body.as_bytes())
     }
@@ -883,7 +1017,7 @@ impl OrchestrationStore {
         use crate::ipc::ClientRole;
         use crate::screen::Msg as _;
 
-        let socket = state_dir.join("run/krilld.sock");
+        let socket = crate::daemon::socket_path(state_dir)?;
         let hello = crate::daemon::client_hello(ClientRole::Cli, "krill-orch");
         let Ok(mut conn) = crate::daemon::handshake(&socket, &hello, Duration::from_secs(2)) else {
             return Ok(None);
@@ -928,6 +1062,80 @@ impl OrchestrationStore {
             Reply::Failed(Failure::BadRequest) => Ok(None),
             Reply::Failed(f) => Err(io::Error::other(f.to_string())),
             _ => Err(invalid("unexpected orchestration response")),
+        }
+    }
+
+    /// [`FEAT_ORCH_SNAPSHOT_PAGE`] 데몬에서 스냅샷을 페이지로 받아 조립한다. `request`는
+    /// `(generation, offset)` 요청의 응답이다(데몬의 오류 응답은 `Ok(OrchResponse::Error)`든 그 문구를
+    /// 담은 `Err`든 된다). 조립 중 저장소가 바뀌면 [`MAX_SNAPSHOT_PAGE_RETRIES`]회까지 처음부터 다시 읽고,
+    /// 그래도 안 되면 명시 오류다. 어떤 페이지도 잘라 쓰지 않는다(무손실).
+    pub fn fetch_paged(
+        mut request: impl FnMut(Option<u64>, u32) -> io::Result<OrchResponse>,
+    ) -> io::Result<Self> {
+        for _ in 0..MAX_SNAPSHOT_PAGE_RETRIES {
+            if let Some(store) = Self::fetch_pages_once(&mut request)? {
+                return Ok(store);
+            }
+        }
+        Err(io::Error::other(
+            "orchestration snapshot kept changing while paging; retry",
+        ))
+    }
+
+    /// 한 세대를 끝까지 읽는다. 도중에 세대가 바뀌었으면 `Ok(None)`.
+    fn fetch_pages_once(
+        request: &mut impl FnMut(Option<u64>, u32) -> io::Result<OrchResponse>,
+    ) -> io::Result<Option<Self>> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut generation = None;
+        let mut expected_total = None;
+        loop {
+            let offset =
+                u32::try_from(buf.len()).map_err(|_| invalid("snapshot page offset overflow"))?;
+            let response = match request(generation, offset) {
+                Ok(response) => response,
+                Err(e) if e.to_string().contains(SNAPSHOT_CHANGED_ERROR) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let (page_generation, total, page_offset, bytes) = match response {
+                OrchResponse::SnapshotPage {
+                    generation,
+                    total,
+                    offset,
+                    bytes,
+                } => (generation, total, offset, bytes),
+                OrchResponse::Error(msg) if msg.contains(SNAPSHOT_CHANGED_ERROR) => {
+                    return Ok(None);
+                }
+                OrchResponse::Error(msg) => return Err(invalid(msg)),
+                _ => return Err(invalid("unexpected snapshot page reply")),
+            };
+            let total =
+                usize::try_from(total).map_err(|_| invalid("snapshot page total overflow"))?;
+            if total > MAX_SNAPSHOT_PAGED_BYTES {
+                return Err(invalid(format!(
+                    "paged snapshot {total} bytes exceeds {MAX_SNAPSHOT_PAGED_BYTES} bytes"
+                )));
+            }
+            if page_offset != offset
+                || generation.is_some_and(|g| g != page_generation)
+                || expected_total.is_some_and(|t| t != total)
+                || bytes.len() > SNAPSHOT_PAGE_BYTES
+                || buf.len().saturating_add(bytes.len()) > total
+                || (bytes.is_empty() && buf.len() < total)
+            {
+                return Err(invalid("inconsistent snapshot page"));
+            }
+            generation = Some(page_generation);
+            expected_total = Some(total);
+            buf.extend_from_slice(&bytes);
+            if buf.len() >= total {
+                break;
+            }
+        }
+        match postcard::from_bytes::<OrchResponse>(&buf).map_err(invalid)? {
+            OrchResponse::Snapshot(store) | OrchResponse::SnapshotV2(store) => Ok(Some(store)),
+            _ => Err(invalid("paged snapshot is not a snapshot")),
         }
     }
 
@@ -1621,7 +1829,7 @@ impl OrchestrationStore {
                 .find(|m| !m.acked && matches(m) && !reserved.contains(&m.id));
             let batch_to = first.map(|m| m.to.clone()).unwrap_or_default();
             let batch_run = first.and_then(|m| m.run_id.clone());
-            let ids: Vec<_> = self
+            let candidates: Vec<_> = self
                 .messages
                 .iter()
                 .filter(|m| {
@@ -1632,8 +1840,14 @@ impl OrchestrationStore {
                         && !reserved.contains(&m.id)
                 })
                 .take(50)
-                .map(|m| m.id.clone())
                 .collect();
+            let fit = fits_in_delivery(candidates.iter().copied());
+            if fit == 0
+                && let Some(first) = candidates.first()
+            {
+                return Err(oversized_message_error(first));
+            }
+            let ids: Vec<_> = candidates.iter().take(fit).map(|m| m.id.clone()).collect();
             if ids.is_empty() {
                 None
             } else {
@@ -1650,28 +1864,83 @@ impl OrchestrationStore {
             }
         };
         let Some(mut delivery) = delivery else {
-            let history = if unread_only {
+            let mut history: Vec<OrchMessage> = if unread_only {
                 Vec::new()
             } else {
-                self.messages
+                // 확인済み 이력도 응답 하나가 프레임에 드는 만큼만 돌려준다(건수 50 + 바이트 예산). 홀로도
+                // 안 드는 레거시 메시지는 본문을 자르지 않고 건너뛴다(페이지 스냅샷으로 읽는다).
+                let acked: Vec<&OrchMessage> = self
+                    .messages
                     .iter()
-                    .filter(|m| m.acked && matches(m))
+                    .filter(|m| m.acked && matches(m) && wire_len(m) <= MAX_SINGLE_DELIVERY_BYTES)
                     .take(50)
-                    .cloned()
-                    .collect()
+                    .collect();
+                let fit = fits_in_delivery(acked.iter().copied());
+                acked.iter().take(fit).map(|m| (*m).clone()).collect()
             };
+            // 메타데이터를 포함한 최종 응답 검사: 안 들어가면 뒤쪽 메시지를 빼지, 본문을 자르지 않는다.
+            while !history.is_empty()
+                && !response_fits_frame(&OrchResponse::Delivery {
+                    delivery: None,
+                    messages: history.clone(),
+                })
+            {
+                history.pop();
+            }
             return Ok((None, history));
         };
-        let mut messages = Vec::new();
-        for id in &delivery.message_ids {
-            if let Some(message) = self.messages.iter_mut().find(|m| &m.id == id) {
-                if ack {
-                    message.acked = true;
-                }
-                messages.push(message.clone());
+        // 응답이 한 프레임에 들어가는 앞머리만 전달·확인한다. 넘치는 나머지(바이트 예산 도입 전의
+        // 배치)는 새 미확인 배치로 떼어 다음 조회에서 이어 받는다 — ACK보다 먼저, 유실 없이.
+        let fit = fits_in_delivery(
+            delivery
+                .message_ids
+                .iter()
+                .filter_map(|id| self.messages.iter().find(|m| &m.id == id)),
+        );
+        if fit == 0
+            && let Some(first) = delivery
+                .message_ids
+                .iter()
+                .find_map(|id| self.messages.iter().find(|m| &m.id == id))
+        {
+            return Err(oversized_message_error(first));
+        }
+        if fit < delivery.message_ids.len() {
+            let rest = delivery.message_ids.split_off(fit);
+            let carried = OrchestrationDelivery {
+                id: self.alloc_id("delivery"),
+                to: delivery.to.clone(),
+                run_id: delivery.run_id.clone(),
+                message_ids: rest,
+                created_at_ms: now_ms(),
+                acked: false,
+            };
+            if let Some(stored) = self.deliveries.iter_mut().find(|d| d.id == delivery.id) {
+                stored.message_ids.clone_from(&delivery.message_ids);
             }
+            self.deliveries.push(carried);
+        }
+        let mut messages: Vec<OrchMessage> = delivery
+            .message_ids
+            .iter()
+            .filter_map(|id| self.messages.iter().find(|m| &m.id == id).cloned())
+            .collect();
+        // 메타데이터까지 포함한 최종 응답이 프레임에 드는지 확인한 뒤에야 확인 처리한다.
+        if !response_fits_frame(&OrchResponse::Delivery {
+            delivery: Some(delivery.clone()),
+            messages: messages.clone(),
+        }) {
+            return Err(invalid(
+                "delivery response exceeds the IPC frame limit; retry to receive a smaller batch",
+            ));
         }
         if ack {
+            for message in &mut messages {
+                message.acked = true;
+                if let Some(stored) = self.messages.iter_mut().find(|m| m.id == message.id) {
+                    stored.acked = true;
+                }
+            }
             delivery.acked = true;
             if let Some(stored) = self.deliveries.iter_mut().find(|d| d.id == delivery.id) {
                 stored.acked = true;
@@ -1680,8 +1949,14 @@ impl OrchestrationStore {
         Ok((Some(delivery), messages))
     }
 
-    /// Compact before the atomic size gate, preserving every outstanding delivery and
-    /// the selected Run. Completed older Runs can be discarded under byte pressure.
+    /// Compact before the atomic size gate. Under byte pressure the store MUST get back under the
+    /// threshold, otherwise every later mutate→save fails (T6: 2MiB wedge). Order, oldest first:
+    /// 1. acked deliveries/messages; 2. finished (Completed/Archived) Runs, even with unconfirmed
+    ///    deliveries — nobody is coming back for a finished Run's mail; 3. abandoned Runs (still
+    ///    `Active` but untouched for [`STALE_RUN_MS`]).
+    ///
+    /// Never dropped: the current Run, a Run with an active dispatch, an unanswered `question`
+    /// or a pending decision gate.
     pub fn prune_if_needed(&mut self) -> io::Result<()> {
         self.prune_messages();
         let unread: BTreeSet<_> = self
@@ -1709,31 +1984,93 @@ impl OrchestrationStore {
             .iter()
             .flat_map(|d| d.message_ids.iter().cloned())
             .collect();
-        self.messages.retain(|m| !m.acked || pinned.contains(&m.id));
-        let mut completed: Vec<_> = self
-            .runs
-            .iter()
-            .filter(|r| {
-                r.status == RunStatus::Completed
-                    && self.current_run_id.as_deref() != Some(r.id.as_str())
-                    && !self
-                        .dispatches
-                        .iter()
-                        .any(|d| d.run_id == r.id && d.status == DispatchStatus::Active)
-                    && !self.messages.iter().any(|m| {
-                        m.run_id.as_deref() == Some(r.id.as_str()) && pinned.contains(&m.id)
-                    })
-            })
-            .map(|r| (r.updated_at_ms, r.id.clone()))
-            .collect();
-        completed.sort();
-        for (_, id) in completed {
-            if bytes(self)? < threshold {
-                break;
+        let unanswered = self.unanswered_questions();
+        self.messages
+            .retain(|m| !m.acked || pinned.contains(&m.id) || unanswered.contains(&m.id));
+        let now = now_ms();
+        for stale_only in [false, true] {
+            let mut victims: Vec<_> = self
+                .runs
+                .iter()
+                .filter(|r| self.run_is_discardable(r, now, stale_only))
+                .map(|r| (self.run_last_activity_ms(r), r.id.clone()))
+                .collect();
+            victims.sort();
+            for (_, id) in victims {
+                if bytes(self)? < threshold {
+                    return Ok(());
+                }
+                self.reset(Some(&id));
             }
-            self.reset(Some(&id));
         }
         Ok(())
+    }
+
+    /// 답이 없는 question(ACK 여부 무관 — `reply_message`는 질문을 먼저 ACK한다)의 메시지 ID.
+    fn unanswered_questions(&self) -> BTreeSet<String> {
+        let answered: BTreeSet<_> = self
+            .messages
+            .iter()
+            .filter_map(|m| m.reply_to.as_deref())
+            .collect();
+        self.messages
+            .iter()
+            .filter(|m| m.msg_type == MessageType::Question && !answered.contains(m.id.as_str()))
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
+    fn run_last_activity_ms(&self, run: &Run) -> u64 {
+        let id = Some(run.id.as_str());
+        let tasks = self
+            .tasks
+            .iter()
+            .filter(|t| t.run_id == run.id)
+            .map(|t| t.updated_at_ms);
+        let dispatches = self
+            .dispatches
+            .iter()
+            .filter(|d| d.run_id == run.id)
+            .map(|d| d.ended_at_ms.unwrap_or(d.started_at_ms));
+        let messages = self
+            .messages
+            .iter()
+            .filter(|m| m.run_id.as_deref() == id)
+            .map(|m| m.created_at_ms);
+        tasks
+            .chain(dispatches)
+            .chain(messages)
+            .fold(run.updated_at_ms, u64::max)
+    }
+
+    /// `stale_only=false`: finished Runs. `true`: abandoned `Active` Runs idle for [`STALE_RUN_MS`].
+    fn run_is_discardable(&self, run: &Run, now: u64, stale_only: bool) -> bool {
+        let id = Some(run.id.as_str());
+        let eligible = if stale_only {
+            run.status == RunStatus::Active
+                && now.saturating_sub(self.run_last_activity_ms(run)) >= STALE_RUN_MS
+        } else {
+            run.status != RunStatus::Active
+        };
+        let unanswered = self.unanswered_questions();
+        eligible
+            && self.current_run_id.as_deref() != id
+            // 코디네이터 세션에 묶인 Active Run은 바인딩이 사라지지 않게 남긴다(세션 생존 여부는 모른다).
+            && !(stale_only
+                && (run.coordinator_session_id.is_some()
+                    || self.session_runs.values().any(|r| r == &run.id)))
+            && !self
+                .dispatches
+                .iter()
+                .any(|d| d.run_id == run.id && d.status == DispatchStatus::Active)
+            && !self
+                .gates
+                .iter()
+                .any(|g| g.run_id.as_deref() == id && g.status == GateStatus::Pending)
+            && !self
+                .messages
+                .iter()
+                .any(|m| m.run_id.as_deref() == id && unanswered.contains(&m.id))
     }
 
     pub fn resolve_recipients(&self, to: &str, run_id: Option<&str>) -> Vec<String> {
@@ -1787,6 +2124,12 @@ impl OrchestrationStore {
         if summary.is_empty() {
             return Err(invalid("message summary must not be empty"));
         }
+        // 저장된 어떤 메시지든 한 배달 응답(1MiB 프레임)에 들어가야 ACK 전 바이트 예산이 성립한다.
+        if summary.len().saturating_add(params.body.len()) > MAX_MESSAGE_BYTES {
+            return Err(invalid(format!(
+                "message exceeds {MAX_MESSAGE_BYTES} byte limit (summary + body); put the detail in a file and send its path"
+            )));
+        }
 
         let now = now_ms();
         let mut resolved_task_id = params.task_id.clone();
@@ -1825,6 +2168,20 @@ impl OrchestrationStore {
                     )));
                 }
                 if let Some(active_disp) = matching.first() {
+                    // An older process with this name may still report after fencing.
+                    // Name-only inference cannot distinguish that report from its retry.
+                    if self.dispatches.iter().any(|d| {
+                        d.id != active_disp.id
+                            && d.worker_name == from
+                            && resolved_run_id.as_ref().is_none_or(|rid| &d.run_id == rid)
+                            && resolved_task_id
+                                .as_ref()
+                                .is_none_or(|tid| d.task_id.as_ref() == Some(tid))
+                    }) {
+                        return Err(invalid(format!(
+                            "worker '{from}' has prior dispatches in this scope; specify --dispatch explicitly"
+                        )));
+                    }
                     resolved_dispatch_id = Some(active_disp.id.clone());
                     if resolved_task_id.is_none() {
                         resolved_task_id.clone_from(&active_disp.task_id);
@@ -1961,9 +2318,16 @@ impl OrchestrationStore {
                 acked: false,
                 created_at_ms: now,
             };
-            self.messages.push(msg.clone());
             created.push(msg);
         }
+        // 수신자 fan-out(`@all` 등)을 합친 응답도 한 프레임에 들어가야 저장한다. 안 들어가면 아무것도 남기지 않는다.
+        if !response_fits_frame(&OrchResponse::Messages(created.clone())) {
+            return Err(invalid(format!(
+                "message to {} recipients exceeds the IPC frame limit; send to fewer recipients or a shorter body",
+                created.len()
+            )));
+        }
+        self.messages.extend(created.iter().cloned());
         self.prune_messages();
         Ok(created)
     }
@@ -2017,29 +2381,31 @@ impl OrchestrationStore {
         unread_only: bool,
         ack: bool,
     ) -> Vec<OrchMessage> {
-        let mut out = Vec::new();
-        for msg in &mut self.messages {
-            if let Some(rcpt) = recipient
-                && msg.to != rcpt
-                && msg.to != "@all"
-            {
-                continue;
+        let selected: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, msg)| {
+                recipient.is_none_or(|rcpt| msg.to == rcpt || msg.to == "@all")
+                    && run_id.is_none_or(|rid| msg.run_id.as_deref() == Some(rid))
+                    && !(unread_only && msg.acked)
+                    && (types.is_empty() || types.contains(&msg.msg_type))
+                    // 구 opcode에는 오류 채널이 없다: 홀로도 프레임에 안 드는(예산 도입 전) 메시지는
+                    // 확인 처리 없이 건너뛰고 페이지 스냅샷으로 읽게 둔다.
+                    && wire_len(msg) <= MAX_SINGLE_DELIVERY_BYTES
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // 응답이 한 프레임에 드는 앞머리만 돌려주고 그만큼만 확인 처리한다. 나머지는 다음 조회가 받는다.
+        let fit = fits_in_delivery(selected.iter().filter_map(|&i| self.messages.get(i)));
+        let mut out = Vec::with_capacity(fit);
+        for &i in selected.iter().take(fit) {
+            if let Some(msg) = self.messages.get_mut(i) {
+                if ack {
+                    msg.acked = true;
+                }
+                out.push(msg.clone());
             }
-            if let Some(rid) = run_id
-                && msg.run_id.as_deref() != Some(rid)
-            {
-                continue;
-            }
-            if unread_only && msg.acked {
-                continue;
-            }
-            if !types.is_empty() && !types.contains(&msg.msg_type) {
-                continue;
-            }
-            if ack {
-                msg.acked = true;
-            }
-            out.push(msg.clone());
         }
         out
     }
@@ -2099,11 +2465,31 @@ impl OrchestrationStore {
             matched_indices.push(idx);
         }
 
-        let mut out = Vec::with_capacity(matched_indices.len());
-        for idx in matched_indices {
-            if let Some(msg) = self.messages.get_mut(idx) {
-                msg.acked = true;
-                out.push(msg.clone());
+        let mut out: Vec<OrchMessage> = matched_indices
+            .iter()
+            .filter_map(|&idx| self.messages.get(idx).cloned())
+            .collect();
+        // 명시 ACK는 사용자가 고른 ID라 확정하되, 확인 응답(echo)이 프레임에 들어가야 한다. 안 들어가면
+        // echo의 본문만 명시 표식으로 대체한다 — 저장소의 본문은 그대로다(`inbox --all`로 읽는다).
+        if !response_fits_frame(&OrchResponse::Messages(out.clone())) {
+            for message in &mut out {
+                message.body = format!(
+                    "[body elided from this acknowledgment echo: {} bytes exceed the IPC frame; \
+                     the stored message is intact, read it with `inbox --all --json`]",
+                    message.body.len()
+                );
+            }
+            if !response_fits_frame(&OrchResponse::Messages(out.clone())) {
+                return Err(invalid(format!(
+                    "acknowledging {} messages at once exceeds the IPC frame limit; pass fewer --ack-ids per call",
+                    out.len()
+                )));
+            }
+        }
+        for (message, idx) in out.iter_mut().zip(matched_indices) {
+            message.acked = true;
+            if let Some(stored) = self.messages.get_mut(idx) {
+                stored.acked = true;
             }
         }
         Ok(out)
@@ -2549,12 +2935,17 @@ pub fn worker_preamble(dispatch: &Dispatch) -> String {
         "[KRILL ORCHESTRATION PREAMBLE]\n\
          Run: {run} | Dispatch: {disp} | Worker: {worker}{task_line}\n\
          Task Prompt: {prompt}\n\
-         First read the Krill worker contract: krill skills get orchestration --reference references/worker-contract.md. If KRILL_CLI is set, use that absolute executable instead of bare krill; quote it for your shell. This is the krill-orchestration skill, not Orca orchestration.\n\
-         IMPORTANT: Always use the `krill orchestration` CLI via your shell/command tool to report status or ask questions; do NOT use built-in subagent tools (like `send_message`, `Task`, or `spawn_agent`).\n\
-         When finished, report completion with:\n  \
+         Use KRILL_CLI if set (quote for your shell), else krill; never native subagent tools. Read:\n\
+         krill skills get orchestration --reference references/worker-contract.md\n\
+         At checkpoints/before completion:\n\
+         krill orchestration check --to {worker} --run {run} --unread --json\n\
+         Process, then ACK delivery.id with --ack <id>; read again (ACK returns the old batch).\n\
+         Finish once:\n\
          krill orchestration send --from {worker} --to coordinator --type worker_done --run {run}{task_flag} --dispatch {disp} --outcome succeeded --summary \"<result>\"\n\
-         If blocked or need clarification (blocks until answered):\n  \
-         krill orchestration ask --from {worker} --to coordinator --run {run} --wait --summary \"<question>\"",
+         Use --outcome failed if incomplete. Then idle; stop edits if ownership ends.\n\
+         Blocked:\n\
+         krill orchestration ask --from {worker} --to coordinator --run {run} --wait --timeout-ms 10000 --summary \"<question>\" --json\n\
+         Timeout stays pending; resume: krill orchestration ask --question-id <id> --wait --timeout-ms 10000 --json",
         run = dispatch.run_id,
         disp = dispatch.id,
         worker = dispatch.worker_name,
@@ -3503,6 +3894,50 @@ fn invalid(msg: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg.to_string())
 }
 
+fn wire_len(message: &OrchMessage) -> usize {
+    postcard::to_stdvec(message).map_or(usize::MAX, |b| b.len())
+}
+
+/// `messages`의 앞머리 중 postcard 길이 합이 [`MAX_DELIVERY_BYTES`] 안에 드는 건수. 첫 메시지는 예산을
+/// 넘어도 홀로 프레임에 들어가면([`MAX_SINGLE_DELIVERY_BYTES`]) 1건으로 세고, 그것조차 안 되면 0이다
+/// — 0이면 호출자는 확인 처리 없이 명시 오류를 낸다. 배달 응답이 프레임에 들어가는지 ACK보다 먼저
+/// 확정하는 기준이다.
+fn fits_in_delivery<'a>(messages: impl Iterator<Item = &'a OrchMessage>) -> usize {
+    let mut used = 0_usize;
+    let mut count = 0_usize;
+    for message in messages {
+        let len = wire_len(message);
+        if count == 0 && len > MAX_SINGLE_DELIVERY_BYTES {
+            break;
+        }
+        if count > 0 && used.saturating_add(len) > MAX_DELIVERY_BYTES {
+            break;
+        }
+        used = used.saturating_add(len);
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+/// 메타데이터를 포함한 응답 전체가 한 [`crate::ipc::MAX_FRAME`] 프레임에 들어가는가. 확인 처리·저장 같은
+/// 변경은 이 검사가 참일 때만 확정한다(인코딩 실패 뒤의 ACK 금지).
+pub fn response_fits_frame(response: &OrchResponse) -> bool {
+    postcard::to_stdvec(response).is_ok_and(|body| {
+        body.len().saturating_add(RESPONSE_ENVELOPE_BYTES) <= crate::ipc::MAX_FRAME
+    })
+}
+
+/// 예산 도입 전에 저장된, 홀로도 프레임에 들어가지 않는 메시지. 확인 처리하지 않고 읽는 길을 알려 준다.
+fn oversized_message_error(message: &OrchMessage) -> io::Error {
+    invalid(format!(
+        "message {} ({} bytes) exceeds the IPC frame limit and cannot be delivered by check; read it with \
+         `inbox --all --json` and acknowledge it explicitly with `check --ack-ids {}`",
+        message.id,
+        wire_len(message),
+        message.id
+    ))
+}
+
 /// 정리 대상 일시 메시지: 확인済み 하트비트·상태. 미확인 메시지와 진행 기록은
 /// [`OrchestrationStore::prune_messages`]가 버리지 않는다.
 fn is_ephemeral(m: &OrchMessage) -> bool {
@@ -4051,6 +4486,112 @@ mod tests {
     }
 
     #[test]
+    fn reused_worker_name_cannot_settle_replacement_without_dispatch_id() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("retry fencing", None)?;
+        let task = store.create_task(&run.id, "work", "", Vec::new())?;
+        let first = store.start_worker(
+            &run.id,
+            Some(&task.id),
+            "reused",
+            "codex",
+            None,
+            "/tmp",
+            "first",
+        )?;
+        store.abandon_worker(&first.id)?;
+        let replacement = store.start_worker(
+            &run.id,
+            Some(&task.id),
+            "reused",
+            "codex",
+            None,
+            "/tmp",
+            "replacement",
+        )?;
+        let snapshot = store.clone();
+        let mut late = SendParams {
+            from: "reused".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "late completion without attempt identity".into(),
+            body: String::new(),
+            run_id: Some(run.id),
+            task_id: Some(task.id),
+            dispatch_id: None,
+            outcome: Some("succeeded".into()),
+            reply_to: None,
+        };
+        for (omit_run, omit_task) in [(false, false), (true, false), (false, true), (true, true)] {
+            let scoped = SendParams {
+                run_id: if omit_run { None } else { late.run_id.clone() },
+                task_id: if omit_task {
+                    None
+                } else {
+                    late.task_id.clone()
+                },
+                ..late.clone()
+            };
+            assert!(store.send_message(&scoped).is_err());
+            assert_eq!(store, snapshot);
+        }
+        late.dispatch_id = Some(first.id);
+        assert!(store.send_message(&late).is_err());
+        assert_eq!(store, snapshot);
+        late.dispatch_id = Some(replacement.id.clone());
+        store.send_message(&late)?;
+        assert_eq!(
+            store
+                .dispatches
+                .iter()
+                .find(|d| d.id == replacement.id)
+                .unwrap()
+                .status,
+            DispatchStatus::Succeeded,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_completion_preserves_distinct_run_and_task_scopes() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let first_run = store.create_run("first", None)?;
+        let second_run = store.create_run("second", None)?;
+        let first_task = store.create_task(&first_run.id, "first", "", Vec::new())?;
+        let second_task = store.create_task(&first_run.id, "second", "", Vec::new())?;
+        for (run, task) in [
+            (&first_run.id, Some(first_task.id)),
+            (&first_run.id, Some(second_task.id)),
+            (&second_run.id, None),
+        ] {
+            let dispatch =
+                store.start_worker(run, task.as_deref(), "shared", "codex", None, "/tmp", "p")?;
+            store.send_message(&SendParams {
+                from: "shared".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                summary: "done".into(),
+                body: String::new(),
+                run_id: Some(run.clone()),
+                task_id: task,
+                dispatch_id: None,
+                outcome: Some("succeeded".into()),
+                reply_to: None,
+            })?;
+            assert_eq!(
+                store
+                    .dispatches
+                    .iter()
+                    .find(|d| d.id == dispatch.id)
+                    .unwrap()
+                    .status,
+                DispatchStatus::Succeeded
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn invalid_worker_outcomes_leave_dispatch_task_and_messages_unchanged() {
         let mut store = OrchestrationStore::default();
         let run = store.create_run("outcome validation", None).unwrap();
@@ -4475,8 +5016,12 @@ mod tests {
         for i in 0..4000u32 {
             store.send_message(&beat(i))?;
             if i % 1000 == 999 {
-                // 코디네이터가 주기적으로 읽어 확인済みに 했다고 가정한다.
-                store.check_messages(Some("coordinator"), &[MessageType::Heartbeat], false, true);
+                // 코디네이터가 주기적으로 미확인분을 읽어 확인済みに 했다고 가정한다(응답은 배달 바이트
+                // 예산 안의 앞머리라 빌 때까지 되풀이한다).
+                while !store
+                    .check_messages(Some("coordinator"), &[MessageType::Heartbeat], true, true)
+                    .is_empty()
+                {}
             }
         }
         // 진행 기록(worker_done 전 dispatch 메시지와 settlement)은 살아 있어야 한다.
@@ -5282,20 +5827,204 @@ mod mailbox_and_worker_safety_tests {
         fs::remove_dir_all(dir)
     }
 
+    /// Run에 `bytes`짜리 미확인 메시지를 `n`건 쌓는다.
+    fn fill_run(store: &mut OrchestrationStore, run: &str, n: usize, bytes: usize) {
+        for _ in 0..n {
+            store
+                .send_message(&mail(Some(run), "coordinator", &"x".repeat(bytes)))
+                .unwrap();
+        }
+    }
+
+    /// Run과 그 메시지의 마지막 활동 시각을 `ms`로 되돌린다.
+    fn age_run(store: &mut OrchestrationStore, run: &str, ms: u64) {
+        for r in store.runs.iter_mut().filter(|r| r.id == run) {
+            r.updated_at_ms = ms;
+        }
+        for m in store
+            .messages
+            .iter_mut()
+            .filter(|m| m.run_id.as_deref() == Some(run))
+        {
+            m.created_at_ms = ms;
+        }
+    }
+
+    fn store_len(store: &OrchestrationStore) -> u64 {
+        u64::try_from(serde_json::to_vec_pretty(store).unwrap().len()).unwrap()
+    }
+
     #[test]
-    fn pruning_preserves_outstanding_delivery_even_for_completed_runs() -> io::Result<()> {
+    fn pruning_preserves_outstanding_delivery_of_current_run() -> io::Result<()> {
         let mut store = OrchestrationStore::default();
-        let old = store.create_run("old", None)?;
-        store.runs.first_mut().unwrap().status = RunStatus::Completed;
-        store.send_message(&mail(Some(&old.id), "coordinator", &"x".repeat(1_900_000)))?;
+        let cur = store.create_run("current", None)?;
+        // 메시지 하나는 MAX_MESSAGE_BYTES 이하라, 여러 건으로 정리 임계(1.75MiB)를 넘긴다.
+        fill_run(&mut store, &cur.id, 8, 250_000);
         let batch =
-            store.check_delivery(Some("coordinator"), &[], true, false, Some(&old.id), None)?;
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&cur.id), None)?;
+        store.prune_if_needed()?;
+        assert!(store.runs.iter().any(|r| r.id == cur.id));
+        assert_eq!(
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&cur.id), None)?,
+            batch
+        );
+        Ok(())
+    }
+
+    /// T6 재현: 완료 Run마다 미확인 delivery가 남고 나머지는 방치된 Active Run — 예전엔 아무것도
+    /// 못 지워 저장소가 한도에 고정됐다.
+    #[test]
+    fn byte_pressure_discards_completed_runs_with_unconfirmed_delivery_and_stale_active_runs()
+    -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let day = 24 * 60 * 60 * 1000;
+        let now = now_ms();
+        for i in 0..12u64 {
+            let run = store.create_run("done", None)?;
+            fill_run(&mut store, &run.id, 1, 110_000);
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&run.id), None)?;
+            store
+                .runs
+                .iter_mut()
+                .find(|r| r.id == run.id)
+                .unwrap()
+                .status = RunStatus::Completed;
+            age_run(&mut store, &run.id, now - i * 1000);
+        }
+        for i in 0..26u64 {
+            let run = store.create_run("abandoned", None)?;
+            fill_run(&mut store, &run.id, 1, 25_000);
+            age_run(&mut store, &run.id, now - 2 * day - i * 1000);
+        }
+        let live = store.create_run("live", None)?;
+        fill_run(&mut store, &live.id, 1, 25_000);
+        assert!(store_len(&store) >= MAX_STORE_BYTES - 256 * 1024);
+
+        store.prune_if_needed()?;
+
+        assert!(store_len(&store) + 256 * 1024 <= MAX_STORE_BYTES);
+        assert_eq!(store.current_run_id.as_deref(), Some(live.id.as_str()));
+        assert!(store.runs.iter().any(|r| r.id == live.id));
+        assert!(
+            store
+                .messages
+                .iter()
+                .any(|m| m.run_id.as_deref() == Some(live.id.as_str()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn byte_pressure_keeps_active_dispatch_pending_question_and_fresh_runs() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let day = 24 * 60 * 60 * 1000;
+        let old = now_ms() - 3 * day;
+        let mk = |store: &mut OrchestrationStore, title: &str| -> io::Result<String> {
+            let run = store.create_run(title, None)?;
+            fill_run(store, &run.id, 2, 250_000);
+            age_run(store, &run.id, old);
+            Ok(run.id)
+        };
+        let with_dispatch = mk(&mut store, "dispatch")?;
+        let with_question = mk(&mut store, "question")?;
+        let with_gate = mk(&mut store, "gate")?;
+        let fresh = mk(&mut store, "fresh")?;
+        let victim = mk(&mut store, "victim")?;
+        store.create_run("current", None)?;
+        store.start_worker(&with_dispatch, None, "w", "claude", None, "/tmp", "p")?;
+        store.send_message(&SendParams {
+            msg_type: MessageType::Question,
+            ..mail(Some(&with_question), "coordinator", "q?")
+        })?;
+        store.create_gate("w", "pick", vec![], Some(with_gate.clone()), None)?;
+        age_run(&mut store, &with_question, old);
+        age_run(&mut store, &with_gate, old);
+        age_run(&mut store, &with_dispatch, old);
+        age_run(&mut store, &fresh, now_ms());
+        // 압박이 풀리는 즉시 멈추므로, 보호 대상 + 최신 Run이 임계 안에 들어올 때까지 victim이 먼저 지워진다.
+        store.prune_if_needed()?;
+        let ids: Vec<_> = store.runs.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&with_dispatch.as_str()));
+        assert!(ids.contains(&with_question.as_str()));
+        assert!(ids.contains(&with_gate.as_str()));
+        assert!(ids.contains(&fresh.as_str()));
+        assert!(!ids.contains(&victim.as_str()));
+        Ok(())
+    }
+
+    fn pad_message(store: &mut OrchestrationStore, run: &str, t: MessageType, acked: bool) {
+        let mut m = store
+            .send_message(&mail(Some(run), "coordinator", &"x".repeat(200_000)))
+            .unwrap()
+            .remove(0);
+        m.msg_type = t;
+        m.acked = acked;
+        let stored = store.messages.iter_mut().find(|s| s.id == m.id).unwrap();
+        *stored = m;
+    }
+
+    #[test]
+    fn byte_pressure_keeps_acked_but_unanswered_question() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let day = 24 * 60 * 60 * 1000;
+        let old = now_ms() - 3 * day;
+        let waiting = store.create_run("waiting", None)?;
+        pad_message(&mut store, &waiting.id, MessageType::Question, true);
+        store
+            .runs
+            .iter_mut()
+            .find(|r| r.id == waiting.id)
+            .unwrap()
+            .status = RunStatus::Completed;
+        for _ in 0..9 {
+            let r = store.create_run("junk", None)?;
+            fill_run(&mut store, &r.id, 1, 200_000);
+            age_run(&mut store, &r.id, old);
+        }
         store.create_run("current", None)?;
         store.prune_if_needed()?;
-        assert!(store.runs.iter().any(|r| r.id == old.id));
-        assert_eq!(
-            store.check_delivery(Some("coordinator"), &[], true, false, Some(&old.id), None)?,
-            batch
+        assert!(store.runs.iter().any(|r| r.id == waiting.id));
+        assert!(
+            store
+                .messages
+                .iter()
+                .any(|m| m.run_id.as_deref() == Some(waiting.id.as_str()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn byte_pressure_keeps_stale_run_bound_to_coordinator_session() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let old = now_ms() - 3 * 24 * 60 * 60 * 1000;
+        let bound = store.create_run("bound", Some(7))?;
+        fill_run(&mut store, &bound.id, 1, 200_000);
+        age_run(&mut store, &bound.id, old);
+        for _ in 0..9 {
+            let r = store.create_run("junk", None)?;
+            fill_run(&mut store, &r.id, 1, 200_000);
+            age_run(&mut store, &r.id, old);
+        }
+        store.create_run("current", None)?;
+        store.prune_if_needed()?;
+        assert!(store.runs.iter().any(|r| r.id == bound.id));
+        assert!(store.session_runs.values().any(|id| id == &bound.id));
+        Ok(())
+    }
+
+    #[test]
+    fn size_limit_error_says_what_to_do() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let cur = store.create_run("current", None)?;
+        for _ in 0..11 {
+            pad_message(&mut store, &cur.id, MessageType::Status, false);
+        }
+        let dir = std::env::temp_dir().join(format!("mk-sizeerr-{}", std::process::id()));
+        let err = store.save(&dir).unwrap_err().to_string();
+        fs::remove_dir_all(&dir).ok();
+        assert!(
+            err.contains("unread mail") && err.contains("orchestration check"),
+            "{err}"
         );
         Ok(())
     }
@@ -5500,5 +6229,455 @@ mod orchestration_old_peer_tests {
         server.join().unwrap();
         assert_eq!(fs::read(dir.join(ORCH_FILE))?, before);
         fs::remove_dir_all(dir)
+    }
+}
+
+#[cfg(test)]
+mod frame_bound_tests {
+    //! foundation-02: 저장 상한(2MiB)과 프레임 상한(1MiB) 사이의 유효 상태를 무손실로 읽고, 배달 ACK보다
+    //! 먼저 응답이 한 프레임에 드는지 확정한다.
+    use super::*;
+    use crate::control::Reply;
+    use crate::ipc::MAX_FRAME;
+    use crate::screen::Msg as _;
+
+    /// 검증자 재현과 같은 저장소: 활성 task 12개 × 100,000B 설명(정리할 데이터가 없는 1.2MB JSON).
+    fn twelve_active_tasks() -> OrchestrationStore {
+        let mut store = OrchestrationStore::default();
+        let run = store
+            .create_run("verify_core independent synthetic snapshot", None)
+            .unwrap();
+        for i in 0..12_u8 {
+            let letter = b'A'.checked_add(i).unwrap();
+            let description = String::from_utf8(vec![letter; 100_000]).unwrap();
+            store
+                .create_task(&run.id, &format!("fixture-{i}"), &description, vec![])
+                .unwrap();
+        }
+        store
+    }
+
+    fn message(i: usize, body_len: usize) -> SendParams {
+        SendParams {
+            from: "worker".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Status,
+            summary: format!("status {i}"),
+            body: "x".repeat(body_len),
+            run_id: None,
+            task_id: None,
+            dispatch_id: None,
+            outcome: None,
+            reply_to: None,
+        }
+    }
+
+    fn unacked(count: usize, body_len: usize) -> OrchestrationStore {
+        let mut store = OrchestrationStore::default();
+        for i in 0..count {
+            store.send_message(&message(i, body_len)).unwrap();
+        }
+        store
+    }
+
+    fn snapshot_bytes(store: &OrchestrationStore) -> Vec<u8> {
+        postcard::to_stdvec(&OrchResponse::SnapshotV2(store.clone())).unwrap()
+    }
+
+    fn drain(store: &mut OrchestrationStore) -> (usize, BTreeSet<String>) {
+        let mut seen = BTreeSet::new();
+        let mut batches = 0_usize;
+        loop {
+            let (delivery, messages) = store
+                .check_delivery(Some("coordinator"), &[], true, true, None, None)
+                .unwrap();
+            if messages.is_empty() {
+                assert!(delivery.is_none());
+                break;
+            }
+            batches = batches.saturating_add(1);
+            let delivery = delivery.unwrap();
+            assert!(delivery.acked && messages.iter().all(|m| m.acked));
+            assert!(messages.len() <= 50);
+            let acked_bytes: usize = messages
+                .iter()
+                .map(|m| postcard::to_stdvec(m).unwrap().len())
+                .sum();
+            assert!(acked_bytes <= MAX_DELIVERY_BYTES, "{acked_bytes}");
+            let reply = Reply::Orchestration(OrchResponse::Delivery {
+                delivery: Some(delivery),
+                messages: messages.clone(),
+            });
+            assert!(reply.encode().unwrap().len() <= MAX_FRAME.saturating_add(4));
+            for m in messages {
+                assert!(seen.insert(m.id));
+            }
+        }
+        (batches, seen)
+    }
+
+    #[test]
+    fn twelve_active_tasks_fit_the_store_but_not_one_frame() {
+        let store = twelve_active_tasks();
+        let json = serde_json::to_vec_pretty(&store).unwrap();
+        assert!(u64::try_from(json.len()).unwrap() <= MAX_ORCH_BYTES);
+        assert!(json.len() > MAX_FRAME, "{} bytes", json.len());
+        assert!(matches!(
+            Reply::Orchestration(OrchResponse::SnapshotV2(store)).encode(),
+            Err(crate::ipc::Error::BadLength(_))
+        ));
+    }
+
+    #[test]
+    fn paged_snapshot_reassembles_twelve_active_tasks_byte_identically() {
+        let store = twelve_active_tasks();
+        let bytes = snapshot_bytes(&store);
+        let mut pages = 0_usize;
+        let fetched = OrchestrationStore::fetch_paged(|generation, offset| {
+            let page = snapshot_page(&bytes, generation, offset);
+            let frame = Reply::Orchestration(page.clone()).encode().unwrap();
+            assert!(frame.len() <= MAX_FRAME.saturating_add(4));
+            pages = pages.saturating_add(1);
+            Ok(page)
+        })
+        .unwrap();
+        assert_eq!(fetched, store);
+        assert_eq!(pages, bytes.len().div_ceil(SNAPSHOT_PAGE_BYTES));
+        assert!(pages >= 3, "{pages}");
+        for (i, task) in (0..12_u8).zip(&fetched.tasks) {
+            let letter = b'A'.checked_add(i).unwrap();
+            assert_eq!(task.description.len(), 100_000);
+            assert!(task.description.bytes().all(|b| b == letter));
+        }
+    }
+
+    #[test]
+    fn paged_snapshot_restarts_after_a_change_and_gives_up_when_it_keeps_changing() {
+        let before = snapshot_bytes(&twelve_active_tasks());
+        let mut changed = twelve_active_tasks();
+        changed.create_run("appended while paging", None).unwrap();
+        let after = snapshot_bytes(&changed);
+        assert_ne!(snapshot_generation(&before), snapshot_generation(&after));
+        // 첫 페이지 뒤에 저장소가 바뀌면 세대 불일치 → 처음부터 다시 읽어 바뀐 저장소를 온전히 받는다.
+        let mut calls = 0_usize;
+        let fetched = OrchestrationStore::fetch_paged(|generation, offset| {
+            calls = calls.saturating_add(1);
+            let source = if calls == 1 { &before } else { &after };
+            Ok(snapshot_page(source, generation, offset))
+        })
+        .unwrap();
+        assert_eq!(fetched, changed);
+        // 매번 바뀌면 상한 뒤 명시 오류(조각을 섞은 부분 조립 금지).
+        let mut flips = 0_usize;
+        let error = OrchestrationStore::fetch_paged(|generation, offset| {
+            flips = flips.saturating_add(1);
+            let source = if flips.is_multiple_of(2) {
+                &before
+            } else {
+                &after
+            };
+            Ok(snapshot_page(source, generation, offset))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("kept changing"), "{error}");
+        let retries = usize::try_from(MAX_SNAPSHOT_PAGE_RETRIES).unwrap();
+        assert_eq!(flips, retries.saturating_mul(2));
+    }
+
+    #[test]
+    fn fetch_paged_rejects_oversized_totals_and_inconsistent_pages() {
+        let too_big = u32::try_from(MAX_SNAPSHOT_PAGED_BYTES)
+            .unwrap()
+            .saturating_add(1);
+        let page = |total, offset, len| OrchResponse::SnapshotPage {
+            generation: 1,
+            total,
+            offset,
+            bytes: vec![0; len],
+        };
+        for (response, needle) in [
+            (page(too_big, 0, 10), "exceeds"),
+            (page(10, 5, 5), "inconsistent"),
+            (page(10, 0, 0), "inconsistent"),
+            (page(10, 0, 11), "inconsistent"),
+            (OrchResponse::Reset, "unexpected"),
+        ] {
+            let error = OrchestrationStore::fetch_paged(|_, _| Ok(response.clone())).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(needle), "{error}");
+        }
+    }
+
+    #[test]
+    fn check_delivery_batches_fit_one_frame_before_acknowledging() {
+        let mut store = unacked(40, 32 * 1024);
+        let json = serde_json::to_vec_pretty(&store).unwrap();
+        assert!(u64::try_from(json.len()).unwrap() <= MAX_ORCH_BYTES);
+        assert!(json.len() > MAX_FRAME, "{} bytes", json.len());
+        let (batches, seen) = drain(&mut store);
+        assert_eq!(seen.len(), 40);
+        assert!(batches >= 3, "{batches}");
+        assert!(store.messages.iter().all(|m| m.acked));
+    }
+
+    #[test]
+    fn acknowledged_history_reply_is_byte_bounded_and_keeps_durable_bodies() {
+        let mut store = unacked(40, 32 * 1024);
+        let (_, seen) = drain(&mut store);
+        assert_eq!(seen.len(), 40);
+        // 예산 도입 전에 확인된 1.1MB 레거시 메시지: 이력에서 건너뛰고 본문은 그대로 둔다.
+        store.messages.push(OrchMessage {
+            id: "msg-big-acked".into(),
+            run_id: None,
+            task_id: None,
+            dispatch_id: None,
+            from: "worker".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Status,
+            summary: "big".into(),
+            body: "y".repeat(1_100_000),
+            reply_to: None,
+            acked: true,
+            created_at_ms: 1,
+        });
+        let before = store.clone();
+        // 기본 `check`(미확인 전용 아님)는 확인済み 이력을 돌려주며, 한 프레임에 들어가야 한다.
+        let (delivery, history) = store
+            .check_delivery(Some("coordinator"), &[], false, false, None, None)
+            .unwrap();
+        assert!(delivery.is_none());
+        assert!(
+            !history.is_empty() && history.len() < 40,
+            "{}",
+            history.len()
+        );
+        assert!(history.iter().all(|m| m.acked && m.id != "msg-big-acked"));
+        let reply = Reply::Orchestration(OrchResponse::Delivery {
+            delivery: None,
+            messages: history,
+        });
+        assert!(reply.encode().unwrap().len() <= MAX_FRAME.saturating_add(4));
+        assert_eq!(
+            store, before,
+            "history reads never mutate or truncate durable bodies"
+        );
+    }
+
+    #[test]
+    fn oversized_legacy_delivery_is_split_before_acknowledging() {
+        let mut store = unacked(40, 32 * 1024);
+        let ids: Vec<String> = store.messages.iter().map(|m| m.id.clone()).collect();
+        // 바이트 예산 도입 전에 만들어진 40건(1.3MB)짜리 배치.
+        store.deliveries.push(OrchestrationDelivery {
+            id: "delivery-legacy".into(),
+            to: "coordinator".into(),
+            run_id: None,
+            message_ids: ids.clone(),
+            created_at_ms: 1,
+            acked: false,
+        });
+        let (delivery, messages) = store
+            .check_delivery(
+                Some("coordinator"),
+                &[],
+                true,
+                true,
+                None,
+                Some("delivery-legacy"),
+            )
+            .unwrap();
+        let delivery = delivery.unwrap();
+        assert!(!delivery.message_ids.is_empty() && delivery.message_ids.len() < 40);
+        let delivered: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(delivered, delivery.message_ids);
+        let reply = Reply::Orchestration(OrchResponse::Delivery {
+            delivery: Some(delivery.clone()),
+            messages,
+        });
+        assert!(reply.encode().is_ok());
+        let acked: BTreeSet<String> = store
+            .messages
+            .iter()
+            .filter(|m| m.acked)
+            .map(|m| m.id.clone())
+            .collect();
+        let expected: BTreeSet<String> = delivery.message_ids.iter().cloned().collect();
+        assert_eq!(acked, expected);
+        // 나머지는 새 미확인 배치로 남아 다음 조회가 이어 받는다(유실 없음).
+        let carried = store
+            .deliveries
+            .iter()
+            .find(|d| d.id != "delivery-legacy")
+            .unwrap();
+        assert!(!carried.acked);
+        assert_eq!(
+            carried.message_ids,
+            ids.get(delivery.message_ids.len()..).unwrap()
+        );
+        let (_, rest) = drain(&mut store);
+        assert_eq!(rest.len(), 40_usize.saturating_sub(acked.len()));
+        assert!(rest.is_disjoint(&acked));
+    }
+
+    #[test]
+    fn single_oversized_legacy_message_is_reported_before_any_acknowledgment() {
+        let mut store = unacked(2, 16);
+        // 예산 도입 전에 오프라인으로 저장된 1.1MB 메시지: 홀로도 한 프레임에 들어가지 않는다.
+        let big = OrchMessage {
+            id: "msg-big".into(),
+            run_id: None,
+            task_id: None,
+            dispatch_id: None,
+            from: "worker".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Status,
+            summary: "big".into(),
+            body: "y".repeat(1_100_000),
+            reply_to: None,
+            acked: false,
+            created_at_ms: 1,
+        };
+        store.messages.insert(0, big);
+        let before = store.clone();
+        let error = store
+            .check_delivery(Some("coordinator"), &[], true, true, None, None)
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("msg-big") && text.contains("--ack-ids"),
+            "{text}"
+        );
+        assert_eq!(store, before, "no delivery, no ack, no mutation");
+        // 저장된 본문은 페이지 스냅샷으로 그대로 읽힌다.
+        let bytes = snapshot_bytes(&store);
+        let fetched =
+            OrchestrationStore::fetch_paged(|g, o| Ok(snapshot_page(&bytes, g, o))).unwrap();
+        assert_eq!(fetched.messages.first().unwrap().body.len(), 1_100_000);
+        // 명시 ACK는 확정되고, 확인 echo만 본문을 명시 표식으로 대체해 프레임에 들어간다.
+        let acked = store
+            .ack_message_ids(Some("coordinator"), None, &[], true, &["msg-big".into()])
+            .unwrap();
+        assert_eq!(acked.len(), 1);
+        assert!(acked.first().unwrap().body.contains("elided"));
+        assert!(
+            Reply::Orchestration(OrchResponse::Messages(acked))
+                .encode()
+                .is_ok()
+        );
+        let stored = store.messages.first().unwrap();
+        assert!(
+            stored.acked && stored.body.len() == 1_100_000,
+            "durable body intact"
+        );
+        // 큰 메시지를 치운 뒤 작은 메시지들이 배달된다.
+        let (_, rest) = store
+            .check_delivery(Some("coordinator"), &[], true, true, None, None)
+            .unwrap();
+        assert_eq!(rest.len(), 2);
+    }
+
+    #[test]
+    fn legacy_filtered_check_is_byte_bounded_and_skips_unfit_messages() {
+        let mut store = unacked(40, 32 * 1024);
+        store.messages.first_mut().unwrap().body = "z".repeat(1_100_000);
+        let mut seen = BTreeSet::new();
+        loop {
+            let batch = store.check_messages_filtered(Some("coordinator"), None, &[], true, true);
+            if batch.is_empty() {
+                break;
+            }
+            let reply = Reply::Orchestration(OrchResponse::Messages(batch.clone()));
+            assert!(reply.encode().is_ok());
+            for m in batch {
+                assert!(seen.insert(m.id));
+            }
+        }
+        assert_eq!(seen.len(), 39);
+        let unfit = store.messages.first().unwrap();
+        assert!(!unfit.acked && !seen.contains(&unfit.id));
+    }
+
+    #[test]
+    fn send_message_caps_each_message() {
+        let mut store = OrchestrationStore::default();
+        let error = store
+            .send_message(&message(0, MAX_MESSAGE_BYTES))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("exceeds"), "{error}");
+        assert!(store.messages.is_empty());
+        store
+            .send_message(&message(0, MAX_MESSAGE_BYTES.saturating_sub(64)))
+            .unwrap();
+        assert_eq!(store.messages.len(), 1);
+    }
+
+    #[test]
+    fn send_message_fan_out_must_fit_one_frame_before_storing() {
+        let mut store = OrchestrationStore::default();
+        for i in 0..5_u8 {
+            let dispatch: Dispatch = serde_json::from_value(serde_json::json!({
+                "id": format!("d{i}"), "run_id": "r", "worker_name": format!("w{i}"),
+                "agent": "claude", "cwd": "/", "prompt": "p", "status": "active",
+                "started_at_ms": 1,
+            }))
+            .unwrap();
+            store.dispatches.push(dispatch);
+        }
+        let mut params = message(0, 250 * 1024);
+        params.to = "@all".into();
+        // 5 × 250KiB는 한 프레임을 넘는다: 아무것도 저장하지 않고 명시 오류.
+        let error = store.send_message(&params).unwrap_err();
+        assert!(error.to_string().contains("recipients"), "{error}");
+        assert!(store.messages.is_empty());
+        store.dispatches.truncate(3);
+        assert_eq!(store.send_message(&params).unwrap().len(), 3);
+        assert!(response_fits_frame(&OrchResponse::Messages(
+            store.messages.clone()
+        )));
+    }
+
+    #[test]
+    fn snapshot_page_wire_fixtures_and_feature_gating() {
+        let first = OrchAction::SnapshotPage {
+            generation: None,
+            offset: 0,
+        };
+        assert_eq!(postcard::to_stdvec(&first).unwrap(), [25, 0, 0]);
+        let next = OrchAction::SnapshotPage {
+            generation: Some(1),
+            offset: 2,
+        };
+        assert_eq!(postcard::to_stdvec(&next).unwrap(), [25, 1, 1, 2]);
+        assert_eq!(
+            postcard::from_bytes::<OrchAction>(&[25, 1, 1, 2]).unwrap(),
+            next
+        );
+        assert!(first.requires_v2());
+        let page = OrchResponse::SnapshotPage {
+            generation: 1,
+            total: 3,
+            offset: 0,
+            bytes: vec![7, 8, 9],
+        };
+        let frozen = [14, 1, 3, 0, 3, 7, 8, 9];
+        assert_eq!(postcard::to_stdvec(&page).unwrap(), frozen);
+        assert_eq!(postcard::from_bytes::<OrchResponse>(&frozen).unwrap(), page);
+        assert_eq!(page.clone().for_features(0), page);
+        assert_eq!(FEAT_ORCH_SNAPSHOT_PAGE.trailing_zeros(), 35);
+        assert_ne!(crate::ipc::FEATURES & FEAT_ORCH_SNAPSHOT_PAGE, 0);
+        assert!(frame_limit_error(5).contains(FRAME_LIMIT_ERROR));
+        assert!(matches!(
+            snapshot_page(b"abc", Some(0), 0),
+            OrchResponse::Error(msg) if msg == SNAPSHOT_CHANGED_ERROR
+        ));
+        assert!(matches!(
+            snapshot_page(b"abc", None, 4),
+            OrchResponse::Error(_)
+        ));
+        assert!(matches!(
+            snapshot_page(b"abc", None, 0),
+            OrchResponse::SnapshotPage { total: 3, offset: 0, bytes, .. } if bytes == b"abc"
+        ));
     }
 }

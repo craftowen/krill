@@ -20,6 +20,14 @@ mod locale;
 pub(crate) use locale::preferred_locale;
 
 pub mod computer;
+#[cfg_attr(
+    windows,
+    expect(
+        unsafe_code,
+        reason = "Handle-relative Win32 filesystem boundary (CONVENTIONS U1)"
+    )
+)]
+pub(crate) mod explorer_transfer;
 pub mod permissions;
 
 /// 실행 비트(`0o111`)가 하나라도 있는지. Windows는 실행 비트가 없어 늘 `true`다(파일 여부는 호출자가 본다).

@@ -1,7 +1,7 @@
 //! Krill이 만든 계정 프로필 폴더(OWE-704). krilld와 앱의 로컬 경로가 같은 규칙을 쓴다.
 //!
 //! 지우는 대신 휴지통(`~/.Trash`)으로 옮긴다. 로그인 정보·대화 기록이 든 사용자 데이터라
-//! 실수해도 Finder에서 되돌릴 수 있어야 한다. 관리 루트(`~/.config/krill/profiles/<provider>/<이름>`)
+//! macOS에서는 Finder로 되돌리고, Windows에서는 이 사설 보관 경로에서 원래 위치로 옮겨 복원한다. 관리 루트(`~/.config/krill/profiles/<provider>/<이름>`)
 //! 밖의 폴더(사용자가 직접 지정한 `~/.claude` 등)는 절대 옮기지 않는다. 파일 탐색기의 휴지통 이동은
 //! 워크트리 안으로 범위를 좁힌 별도 함수 [`move_path_to_trash`]를 쓴다.
 
@@ -82,30 +82,321 @@ pub fn migrate_long_codex_profile_if_needed(
     slug: &str,
     current_dir: &Path,
 ) -> PathBuf {
+    // Read-only callers keep the original, working home when migration fails. Startup
+    // and registration use the fallible variant and report the error to their caller.
+    try_migrate_long_codex_profile(home, slug, current_dir)
+        .unwrap_or_else(|_| current_dir.to_path_buf())
+}
+
+/// Preserve all legacy content and publish the short home only after a verified copy.
+/// The original is never renamed or deleted. Existing unrelated targets are rejected.
+pub fn try_migrate_long_codex_profile(
+    home: &Path,
+    slug: &str,
+    current_dir: &Path,
+) -> io::Result<PathBuf> {
     let legacy_codex_root = managed_root(home).join(ProviderKind::Codex.as_str());
-    if current_dir.as_os_str().len() <= MAX_CODEX_HOME_BYTES
+    if !cfg!(unix)
+        || current_dir.as_os_str().len() <= MAX_CODEX_HOME_BYTES
         || !current_dir.starts_with(&legacy_codex_root)
     {
-        return current_dir.to_path_buf();
+        return Ok(current_dir.to_path_buf());
     }
+    if !is_managed(home, current_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid legacy Codex home",
+        ));
+    }
+    let source = current_dir.canonicalize()?;
     let target = short_codex_profile_dir(home, slug);
-    if current_dir.is_dir() && std::fs::create_dir_all(&target).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).ok();
+    let marker_name = ".krill-legacy-source";
+    if source.join(marker_name).symlink_metadata().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "legacy Codex home contains a reserved migration marker",
+        ));
+    }
+    let marker = target.join(marker_name);
+    if target.symlink_metadata().is_ok() {
+        let conflict = || {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Codex migration source or target changed; stop both agents, compare the legacy and short homes, then reconcile or register the intended home explicitly (both homes preserved)",
+            )
+        };
+        if !target.symlink_metadata()?.is_dir() {
+            return Err(conflict());
         }
-        if let Ok(entries) = std::fs::read_dir(current_dir) {
-            for entry in entries.flatten() {
-                let src = entry.path();
-                let dst = target.join(entry.file_name());
-                if src.is_file() && !dst.exists() {
-                    std::fs::copy(&src, &dst).ok();
+        let marker_meta = marker.symlink_metadata().map_err(|_| conflict())?;
+        if !marker_meta.is_file() || marker_meta.len() > 16 * 1024 {
+            return Err(conflict());
+        }
+        let provenance: CodexMigrationProvenance =
+            serde_json::from_slice(&std::fs::read(&marker).map_err(|_| conflict())?)
+                .map_err(|_| conflict())?;
+        let before = codex_tree_stamp(&source, 0)?;
+        if provenance.version != 1
+            || provenance.source != source.as_os_str().as_encoded_bytes()
+            || provenance.digest != codex_content_digest(&source, None)?
+            || provenance.digest != codex_content_digest(&target, Some(marker_name))?
+            || before != codex_tree_stamp(&source, 0)?
+            || provenance.digest != codex_content_digest(&source, None)?
+        {
+            return Err(conflict());
+        }
+        return Ok(target);
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::other("missing Codex parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let migration_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(target.with_extension("migration-lock"))?;
+    migration_lock.try_lock().map_err(io::Error::other)?;
+    // Another participating process may have completed before this lock was acquired.
+    if target.symlink_metadata().is_ok() {
+        return try_migrate_long_codex_profile(home, slug, current_dir);
+    }
+    // create_dir deliberately rejects stale staging directories, so retries cannot silently
+    // reuse a partial copy. The user's original home stays usable on every failure.
+    let staging = target.with_extension(format!("migrating-{}", std::process::id()));
+    std::fs::create_dir(&staging)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let result = (|| {
+        let before = codex_tree_stamp(&source, 0)?;
+        let digest = codex_content_digest(&source, None)?;
+        copy_codex_tree(&source, &staging, &source, 0)?;
+        if before != codex_tree_stamp(&source, 0)?
+            || digest != codex_content_digest(&source, None)?
+            || digest != codex_content_digest(&staging, None)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Codex home changed during migration; retry after the agent stops",
+            ));
+        }
+        std::fs::write(
+            staging.join(marker_name),
+            serde_json::to_vec(&CodexMigrationProvenance {
+                version: 1,
+                source: source.as_os_str().as_encoded_bytes().to_vec(),
+                digest,
+            })
+            .map_err(io::Error::other)?,
+        )?;
+        // A concurrently created target must never be replaced, including an empty directory.
+        if target.symlink_metadata().is_ok() {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        std::fs::rename(&staging, &target)?;
+        Ok(target)
+    })();
+    if result.is_err() {
+        std::fs::remove_dir_all(&staging).ok();
+    }
+    result
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CodexMigrationProvenance {
+    version: u8,
+    source: Vec<u8>,
+    digest: Vec<u8>,
+}
+
+// A content manifest survives a crash between publication and account registration.
+// Relative names, entry kinds and streamed file hashes bind both trees to that snapshot.
+fn codex_content_digest(root: &Path, marker: Option<&str>) -> io::Result<Vec<u8>> {
+    use ring::digest::{Context, SHA256};
+    use std::io::Read as _;
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        depth: usize,
+        count: &mut usize,
+        marker: Option<&str>,
+        hash: &mut Context,
+    ) -> io::Result<()> {
+        if depth > 64 {
+            return Err(io::Error::other("Codex home nesting too deep"));
+        }
+        let mut entries = std::fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            if dir == root && marker.is_some_and(|name| entry.file_name() == name) {
+                continue;
+            }
+            *count = count.saturating_add(1);
+            if *count > 100_000 {
+                return Err(io::Error::other("Codex migration entry budget exceeded"));
+            }
+            let path = entry.path();
+            let rel = path.strip_prefix(root).map_err(io::Error::other)?;
+            let name = rel.as_os_str().as_encoded_bytes();
+            hash.update(
+                &u64::try_from(name.len())
+                    .map_err(io::Error::other)?
+                    .to_le_bytes(),
+            );
+            hash.update(name);
+            let meta = path.symlink_metadata()?;
+            if meta.is_dir() {
+                hash.update(b"dir");
+                visit(root, &path, depth.saturating_add(1), count, marker, hash)?;
+            } else if meta.is_file() {
+                hash.update(b"file");
+                let mut content = Context::new(&SHA256);
+                let mut file = std::fs::File::open(&path)?;
+                let mut buf = [0; 8192];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    content.update(
+                        buf.get(..n)
+                            .ok_or_else(|| io::Error::other("invalid read size"))?,
+                    );
                 }
+                hash.update(content.finish().as_ref());
+            } else if meta.file_type().is_symlink() {
+                hash.update(b"link");
+                let link = path.canonicalize()?;
+                let name = link.as_os_str().as_encoded_bytes();
+                hash.update(
+                    &u64::try_from(name.len())
+                        .map_err(io::Error::other)?
+                        .to_le_bytes(),
+                );
+                hash.update(name);
+            } else {
+                return Err(io::Error::other("unsupported Codex home entry"));
             }
         }
+        Ok(())
     }
-    target
+    let mut hash = Context::new(&SHA256);
+    visit(root, root, 0, &mut 0, marker, &mut hash)?;
+    Ok(hash.finish().as_ref().to_vec())
+}
+
+type CodexTreeStamp = Vec<(PathBuf, u64, std::time::SystemTime)>;
+
+fn codex_tree_stamp(source: &Path, depth: usize) -> io::Result<CodexTreeStamp> {
+    if depth > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex home nesting too deep",
+        ));
+    }
+    let mut entries = vec![(
+        source.to_path_buf(),
+        0,
+        source.symlink_metadata()?.modified()?,
+    )];
+    for entry in std::fs::read_dir(source)? {
+        let path = entry?.path();
+        let meta = path.symlink_metadata()?;
+        if meta.is_dir() {
+            entries.extend(codex_tree_stamp(&path, depth.saturating_add(1))?);
+        } else {
+            entries.push((path, meta.len(), meta.modified()?));
+        }
+        if entries.len() > 100_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Codex migration entry budget exceeded",
+            ));
+        }
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+fn copy_codex_tree(source: &Path, target: &Path, original: &Path, depth: usize) -> io::Result<()> {
+    if depth > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex home nesting too deep",
+        ));
+    }
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = target.join(entry.file_name());
+        let meta = src.symlink_metadata()?;
+        if meta.is_dir() {
+            std::fs::create_dir(&dst)?;
+            copy_codex_tree(&src, &dst, original, depth.saturating_add(1))?;
+            std::fs::set_permissions(&dst, meta.permissions())?;
+        } else if meta.is_file() {
+            std::fs::copy(&src, &dst)?;
+            if !same_file_contents(&src, &dst)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Codex source changed during copy",
+                ));
+            }
+        } else if meta.file_type().is_symlink() {
+            // External shared stores keep their identity. Internal absolute links would
+            // depend on an orphaned legacy home, so leave that migration to the user.
+            let link = std::fs::read_link(&src)?;
+            let resolved = if link.is_absolute() {
+                link.clone()
+            } else {
+                src.parent()
+                    .ok_or_else(|| io::Error::other("invalid Codex link"))?
+                    .join(&link)
+            }
+            .canonicalize()?;
+            if resolved.starts_with(original) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy Codex home has an internal absolute link",
+                ));
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(resolved, dst)?;
+            #[cfg(not(unix))]
+            return Err(io::ErrorKind::Unsupported.into());
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported Codex home entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn same_file_contents(source: &Path, target: &Path) -> io::Result<bool> {
+    use std::io::Read as _;
+    let mut a = std::fs::File::open(source)?;
+    let mut b = std::fs::File::open(target)?;
+    let mut left = [0u8; 8192];
+    let mut right = [0u8; 8192];
+    loop {
+        let n = a.read(&mut left)?;
+        b.read_exact(
+            right
+                .get_mut(..n)
+                .ok_or_else(|| io::Error::other("invalid copy size"))?,
+        )?;
+        if left.get(..n) != right.get(..n) {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(b.read(&mut right)? == 0);
+        }
+    }
 }
 
 /// `dir`이 관리 루트 바로 아래 `<provider>/<이름>` 폴더인가. `..`·심볼릭 링크는 아니다.
@@ -173,7 +464,8 @@ pub fn move_to_trash(home: &Path, dir: &Path) -> io::Result<PathBuf> {
     rename_into_trash(home, dir, &format!("krill-{provider}-{name}"))
 }
 
-/// 파일 탐색기 전용: 워크트리 `root` 안의 파일·폴더를 `~/.Trash/<이름>`(겹치면 ` 2`, ` 3` …)으로 옮긴다.
+/// 파일 탐색기 전용: macOS는 `~/.Trash/<이름>`, Windows는 시스템 Recycle Bin으로 옮긴다.
+/// Windows 성공 반환값은 복구 UI 위치인 `shell:RecycleBinFolder`다. UNC/reparse point는 거부한다.
 /// 루트 자체, 루트 밖(`..`·심볼릭 링크 부모로 빠져나가는 경로 포함)은 `InvalidInput`으로 거부한다.
 /// 계정 프로필 폴더는 [`move_to_trash`]만 쓴다.
 pub fn move_path_to_trash(home: &Path, root: &Path, path: &Path) -> io::Result<PathBuf> {
@@ -193,7 +485,79 @@ pub fn move_path_to_trash(home: &Path, root: &Path, path: &Path) -> io::Result<P
     }
     path.symlink_metadata()?;
     let name = path.file_name().ok_or_else(invalid)?.to_string_lossy();
+    #[cfg(windows)]
+    {
+        let _ = (home, name);
+        recycle_windows_path(path)
+    }
+    #[cfg(not(windows))]
     rename_into_trash(home, path, &name)
+}
+
+/// File explorer deletion uses the OS recovery surface on Windows. Account data is
+/// deliberately retained in the private ~/.Trash archive by `move_to_trash` instead.
+#[cfg(windows)]
+fn recycle_windows_path(path: &Path) -> io::Result<PathBuf> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let system_root =
+        std::env::var_os("SystemRoot").ok_or_else(|| io::Error::other("SystemRoot is not set"))?;
+    let powershell =
+        PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let script = r"$ErrorActionPreference='Stop'
+try {
+  Add-Type -AssemblyName Microsoft.VisualBasic
+  $p=$env:KRILL_RECYCLE_PATH
+  if ($p.StartsWith('\\') -or ([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint)) {
+    throw 'Recycle Bin is not available for network paths or reparse points'
+  }
+  if ([IO.Directory]::Exists($p)) {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+  } else {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+  }
+  exit 0
+} catch { exit 1 }
+";
+    let mut child = crate::os::background_command(powershell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .env("KRILL_RECYCLE_PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() || path.symlink_metadata().is_ok() {
+                    return Err(io::Error::other(
+                        "Windows Recycle Bin operation failed; no permanent-delete fallback",
+                    ));
+                }
+                return Ok(PathBuf::from("shell:RecycleBinFolder"));
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(15) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(result.err().unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Windows Recycle Bin operation timed out",
+                    )
+                }));
+            }
+        }
+    }
 }
 
 fn rename_into_trash(home: &Path, src: &Path, base: &str) -> io::Result<PathBuf> {
@@ -361,6 +725,7 @@ mod tests {
         std::fs::remove_dir_all(h).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_short_profile_dir_stays_within_socket_budget_and_migrates() {
         let realistic_home = Path::new("/Users/alexanderhamilton");
@@ -398,5 +763,91 @@ mod tests {
                 .any(|o| o.dir == migrated.display().to_string())
         );
         std::fs::remove_dir_all(h).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod migration_tests;
+
+#[cfg(all(test, unix))]
+mod independent_verifier {
+    use super::*;
+    #[test]
+    fn independent_interrupted_registration_retry_must_not_switch_to_stale_copy() {
+        let home = std::env::temp_dir().join(format!(
+            "independent-migration-retry-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&home).ok();
+        let source = managed_root(&home).join("codex/legacy-with-a-long-source-profile-directory");
+        std::fs::create_dir_all(source.join("sessions")).unwrap();
+        std::fs::write(source.join("auth.json"), "old auth").unwrap();
+        let target = try_migrate_long_codex_profile(&home, "retry", &source).unwrap();
+        // Simulate crash/save failure after target publication but before accounts.toml switches.
+        std::fs::write(source.join("auth.json"), "new auth").unwrap();
+        std::fs::write(
+            source.join("sessions/new.jsonl"),
+            "new session after failed registration",
+        )
+        .unwrap();
+        let retry = try_migrate_long_codex_profile(&home, "retry", &source);
+        let safe = retry.as_ref().map_or(true, |p| {
+            std::fs::read(p.join("auth.json")).unwrap() == b"new auth"
+                && p.join("sessions/new.jsonl").exists()
+        });
+        assert!(source.join("sessions/new.jsonl").exists());
+        let actual = std::fs::read(target.join("auth.json")).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+        assert!(
+            safe,
+            "stale target accepted after source changed: {actual:?}"
+        );
+    }
+
+    #[test]
+    fn independent_simultaneous_source_write_fails_and_keeps_original() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let home =
+            std::env::temp_dir().join(format!("independent-migration-live-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        let source = managed_root(&home).join("codex/legacy-with-a-long-source-profile-directory");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("auth.json"), vec![0u8; 16 * 1024 * 1024]).unwrap();
+        for n in 0..1000 {
+            std::fs::write(source.join(format!("file-{n}")), b"data").unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let src = source.clone();
+        let writer = std::thread::spawn(move || {
+            use std::io::{Seek, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(src.join("auth.json"))
+                .unwrap();
+            let mut n = 0u8;
+            while !stopped.load(Ordering::Acquire) {
+                f.rewind().unwrap();
+                f.write_all(&[n]).unwrap();
+                n = n.wrapping_add(1);
+            }
+        });
+        let result = try_migrate_long_codex_profile(&home, "live", &source);
+        stop.store(true, Ordering::Release);
+        writer.join().unwrap();
+        let source_ok = source.join("auth.json").is_file();
+        let target_exists = short_codex_profile_dir(&home, "live").exists();
+        let leftovers = std::fs::read_dir(short_codex_profile_dir(&home, "live").parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains("migrating-"));
+        std::fs::remove_dir_all(home).unwrap();
+        assert!(
+            result.is_err() && source_ok && !target_exists && !leftovers,
+            "live source published or rollback failed: {result:?}"
+        );
     }
 }

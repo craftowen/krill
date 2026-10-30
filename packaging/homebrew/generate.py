@@ -100,12 +100,12 @@ class Krill < Formula
     system "bash", "packaging/bundle.sh"
     libexec.install "packaging/dist/Krill.app"
     bin.install_symlink libexec/"Krill.app/Contents/MacOS/krill"
-    bin.install_symlink libexec/"Krill.app/Contents/MacOS/krill-app" => "krill"
+    bin.install_symlink libexec/"Krill.app/Contents/MacOS/krill-app"
   end
 
   def caveats
     <<~EOS
-      Launch the source-built UI with krill. The CLI is krill.
+      Launch the source-built UI with krill-app. The CLI is krill.
       The app bundle is in #{{libexec}}/Krill.app and is built locally, not notarized.
       Do not install the krill cask alongside this formula.
       Uninstall keeps sessions, history and agent settings; see the release guide

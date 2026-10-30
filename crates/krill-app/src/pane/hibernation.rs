@@ -17,8 +17,9 @@ pub(super) fn wake(
         create: create.clone(),
     })? {
         Reply::Hibernation { session } => Ok(session),
-        Reply::Failed(f) => Err(io::Error::other(f.to_string())),
-        _ => Err(io::ErrorKind::InvalidData.into()),
+        // 확정 거부(NoSession 등)는 Resume과 같은 종류로 남겨 요청 전 실패와 구분한다.
+        Reply::Failed(f) => Err(super::failure_to_io_error(f)),
+        _ => Err(super::unexpected_reply()),
     }
 }
 

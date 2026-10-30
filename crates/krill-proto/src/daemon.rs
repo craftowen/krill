@@ -18,6 +18,8 @@
 //! 앱은 붙은 krilld의 `ServerHello.build`가 자기 빌드보다 오래됐으면 [`upgrade`]로 교체를 요청한다. krilld는 holder를
 //! 새 바이너리로 exec 핸드오프하고 다음 krilld 경로를 바꾼 뒤 끝난다. holder가 새 krilld를 바로 띄워 세션을 넘긴다
 //! (세대 공존 없음 → 고아 데몬 0). 새 빌드의 krilld에 구 앱(N-1)이 붙으면 아무것도 요청하지 않는다(다운그레이드 금지).
+//! Windows는 활성 세션의 holder를 유지하고 krilld만 교체한다. 이를 보장하지 않는 구 데몬에는
+//! Upgrade를 보내지 않는다. 구 런타임은 OS 재시작 등으로 자연 종료된 뒤 새 바이너리로 기동된다.
 //!
 //! # 끊김과 재연결 (MK-026)
 //!
@@ -39,7 +41,9 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::control::{FEAT_UPGRADE, Reply, Request, Upgrade, Upgraded, is_newer};
+use crate::control::{
+    FEAT_UPGRADE, FEAT_WINDOWS_UPGRADE, Reply, Request, Upgrade, Upgraded, is_newer,
+};
 use crate::ipc::{self, ClientHello, ClientRole, Negotiated, ServerHello};
 use crate::screen::Msg as _;
 
@@ -58,6 +62,8 @@ pub const PING: u8 = 0x43;
 pub const PONG: u8 = 0x63;
 /// 정상 응답 뒤 다음 ping까지의 간격. 세션 수와 무관하게 앱당 감시 연결 하나다.
 pub const INTERVAL: Duration = Duration::from_secs(2);
+/// PONG를 이만큼 연속으로 놓치면 데몬이 멈춘 것으로 본다(멈춘 데몬 감지는 `MISSES × PROBE` 안에 끝난다).
+const MISSES: u32 = 2;
 
 /// 감시 연결용 Hello에 ping/pong 지원을 더한다. 구 Hello fixture는 유지한다.
 pub fn heartbeat_hello(role: ClientRole, name: &str) -> ClientHello {
@@ -107,6 +113,7 @@ fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io
     let mut nonce = 0u64;
     stream.write_all(&ping(nonce)?)?;
     let mut pending = true;
+    let mut missed = 0u32;
     let mut deadline = Instant::now()
         .checked_add(probe)
         .ok_or(io::ErrorKind::TimedOut)?;
@@ -130,8 +137,21 @@ fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io
                     return Err(io::ErrorKind::InvalidData.into());
                 }
                 pending = false;
+                missed = 0;
                 deadline = Instant::now()
                     .checked_add(interval)
+                    .ok_or(io::ErrorKind::TimedOut)?;
+            }
+            // 부하가 큰 PC에서는 멀쩡한 데몬의 PONG도 한 번쯤 늦는다. 한 번 놓친 것으로 연결을 끊으면 사이드바가
+            // 재연결로 깜빡이고 알림·계정 폴링이 끊기므로, 연속 `MISSES`번 놓칠 때만 멈춘 것으로 본다.
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut
+                    && pending
+                    && missed.saturating_add(1) < MISSES =>
+            {
+                missed = missed.saturating_add(1);
+                deadline = Instant::now()
+                    .checked_add(probe)
                     .ok_or(io::ErrorKind::TimedOut)?;
             }
             Err(e) if e.kind() == io::ErrorKind::TimedOut && !pending && consumed == 0 => {
@@ -277,6 +297,58 @@ pub fn default_state_dir() -> Option<PathBuf> {
     Some(state_dir_in(Path::new(&base)))
 }
 
+/// Windows users with long profiles may select a short, private socket directory
+/// using `KRILL_SOCKET_DIR`. Persistent state remains in `LOCALAPPDATA/Krill`.
+#[cfg_attr(
+    not(windows),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Windows validates the socket directory override"
+    )
+)]
+pub fn socket_path(state: &Path) -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        socket_path_in(state, std::env::var_os("KRILL_SOCKET_DIR").as_deref())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(state.join("run/krilld.sock"))
+    }
+}
+
+#[cfg(windows)]
+fn socket_path_in(state: &Path, root: Option<&std::ffi::OsStr>) -> io::Result<PathBuf> {
+    let Some(root) = root else {
+        return Ok(state.join("run/krilld.sock"));
+    };
+    let root = Path::new(root);
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KRILL_SOCKET_DIR must be an absolute, private directory",
+        ));
+    }
+    // Scope the endpoint to the state directory even when one override serves
+    // multiple installations. Do not expose the profile path in the filename.
+    let state = std::path::absolute(state)?;
+    let hash = ring::digest::digest(&ring::digest::SHA256, state.as_os_str().as_encoded_bytes());
+    let mut name = String::from("krilld-");
+    for byte in hash.as_ref().iter().take(12) {
+        use std::fmt::Write as _;
+        write!(name, "{byte:02x}").map_err(io::Error::other)?;
+    }
+    name.push_str(".sock");
+    let path = root.join(name);
+    if path.as_os_str().as_encoded_bytes().len().saturating_add(4) >= SUN_PATH_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KRILL_SOCKET_DIR is too long; choose a shorter private directory",
+        ));
+    }
+    Ok(path)
+}
+
 /// 데몬 기동에 필요한 경로.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -309,7 +381,7 @@ impl Paths {
         let exe = executable_path(&exe);
         let bin = exe.parent().ok_or(io::ErrorKind::NotFound)?;
         Ok(Self {
-            socket: state.join("run/krilld.sock"),
+            socket: socket_path(state)?,
             holder: find_exe(bin, apps, "krill-holder"),
             krilld: find_exe(bin, apps, "krilld"),
         })
@@ -320,7 +392,7 @@ impl Paths {
 /// launchers and shell integrations, without a lossy Unicode round trip. Other
 /// device namespaces stay verbatim (stripping them would change their meaning).
 #[cfg(windows)]
-pub(crate) fn executable_path(path: &Path) -> PathBuf {
+pub fn executable_path(path: &Path) -> PathBuf {
     use std::path::{Component, Prefix};
     let mut components = path.components();
     let base = match components.next() {
@@ -486,7 +558,7 @@ impl fmt::Display for Error {
         match self {
             Self::PathTooLong(p) => write!(
                 f,
-                "socket path too long (must be under {} bytes): {}",
+                "socket path too long (must be under {} bytes): {}; choose a short KRILL_STATE_DIR or, on Windows, a private KRILL_SOCKET_DIR",
                 SUN_PATH_MAX.saturating_sub(4),
                 p.display()
             ),
@@ -609,6 +681,7 @@ pub fn preflight(path: &Path) -> io::Result<()> {
 /// 붙은 krilld가 이 빌드(`crate::BUILD`)보다 오래됐으면 `paths`의 holder·krilld로 교체를 요청하고 새 krilld가
 /// 클라이언트를 받을 때까지 기다린다(MK-062). 교체했으면 새 krilld의 `ServerHello`. krilld가 업그레이드를 모르거나
 /// (`FEAT_UPGRADE` 없음) 같거나 새 빌드면(다운그레이드 금지) 아무것도 하지 않고 `None`.
+/// Windows 구 데몬이 holder 보존을 지원하지 않으면 런타임 교체를 보류한다(`None`).
 ///
 /// # Errors
 /// 연결·협상 실패, krilld의 거절(`Failed`, 범위 밖·holder 없음·실행 파일 없음), 새 krilld가 제때 뜨지 않음.
@@ -625,9 +698,39 @@ pub fn upgrade_as(
     hello: &ClientHello,
     build: &str,
 ) -> io::Result<Option<ServerHello>> {
+    let platform = if cfg!(windows) {
+        UpgradePlatform::Windows
+    } else {
+        UpgradePlatform::Other
+    };
+    upgrade_as_on(paths, hello, build, platform)
+}
+
+#[derive(Clone, Copy)]
+enum UpgradePlatform {
+    Windows,
+    Other,
+}
+
+fn upgrade_as_on(
+    paths: &Paths,
+    hello: &ClientHello,
+    build: &str,
+    platform: UpgradePlatform,
+) -> io::Result<Option<ServerHello>> {
     let control = client_hello(hello.role, &hello.name);
     let mut c = handshake(&paths.socket, &control, HELLO_TIMEOUT)?;
     if c.negotiated.features & FEAT_UPGRADE == 0 || is_newer(build, &c.server.build) != Some(true) {
+        return Ok(None);
+    }
+    c.stream.set_read_timeout(Some(UPGRADE_TIMEOUT))?;
+    // The running daemon/holder still contains the OLD implementation during
+    // the first fixed app update. Do not ask it to hand off live ConPTYs.
+    // A List snapshot cannot fence a concurrent Spawn in an old daemon. Leave
+    // that runtime intact until its next natural cold start, even if idle now.
+    if matches!(platform, UpgradePlatform::Windows)
+        && c.negotiated.features & FEAT_WINDOWS_UPGRADE == 0
+    {
         return Ok(None);
     }
     let request = Request::Upgrade(Upgrade {
@@ -635,7 +738,6 @@ pub fn upgrade_as(
         holder: paths.holder.as_os_str().as_encoded_bytes().to_vec(),
         krilld: paths.krilld.as_os_str().as_encoded_bytes().to_vec(),
     });
-    c.stream.set_read_timeout(Some(UPGRADE_TIMEOUT))?;
     c.stream.write_all(&request.encode()?)?;
     let (kind, body) = ipc::read_frame(&mut c.stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
     match Reply::decode(kind, &body)? {

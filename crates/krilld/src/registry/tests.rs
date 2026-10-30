@@ -43,8 +43,13 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
                 session,
                 pid: 0,
                 cwd,
+                wrapped: false,
             },
         );
+        let dir = reg.state_dir().unwrap();
+        krill_proto::git::record_session_prompt(&dir, id, "Visible scoped prompt", 1).unwrap();
+        krill_proto::git::record_session_prompt(&dir, SessionId(9999), "Private other session", 1)
+            .unwrap();
         writer
     };
     let check = |reg: &Registry, expected: &[u8]| {
@@ -52,11 +57,18 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
             panic!("expected sidebar reply");
         };
         assert_eq!(data.sessions.len(), 1);
+        assert_eq!(data.prompt_histories.len(), 1);
+        assert_eq!(data.prompt_histories[0].0, id);
+        assert_eq!(data.prompt_histories[0].1.total_turns, 1);
         assert_eq!(data.sessions[0].session, id);
         assert_eq!(data.sessions[0].cwd, expected);
+        // 세션 피어는 전체 권한이라 등록된 프로젝트도 함께 받는다. 이 세션의 저장소만 확인한다.
         if !expected.is_empty() {
-            assert_eq!(data.repositories.len(), 1);
-            assert_eq!(data.repositories[0].worktrees, [expected]);
+            assert!(
+                data.repositories
+                    .iter()
+                    .any(|repo| repo.worktrees == [expected])
+            );
         }
     };
     let reg = Registry::new(None, Some(&dir));
@@ -107,7 +119,9 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
 fn agent_settings_and_metadata_obey_peer_scope() {
     let reg = Registry::new(None, None);
     let mut clients = HashMap::new();
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer { pid: None, scope };
         for permission in [None, Some(Permission::Yolo)] {
             assert_eq!(
@@ -128,7 +142,7 @@ fn agent_settings_and_metadata_obey_peer_scope() {
     }
     let full = Peer {
         pid: None,
-        scope: Scope::Full,
+        scope: Scope::Session(SessionId(7)),
     };
     assert!(matches!(
         reg.handle(
@@ -374,7 +388,9 @@ fn restart_daemon_needs_full_scope_and_holder() {
     let reg = Registry::new(None, None);
     let mut clients = HashMap::new();
     let restart = Request::Resources(Action::RestartDaemon);
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer { pid: None, scope };
         assert_eq!(
             reg.handle(&peer, restart.clone(), &mut clients),
@@ -383,7 +399,7 @@ fn restart_daemon_needs_full_scope_and_holder() {
     }
     let full = Peer {
         pid: None,
-        scope: Scope::Full,
+        scope: Scope::Session(SessionId(7)),
     };
     assert_eq!(
         reg.handle(&full, restart.clone(), &mut clients),
@@ -411,7 +427,9 @@ fn worktree_requests_obey_peer_scope_and_write_audit() {
     std::fs::create_dir_all(&dir).unwrap();
     let reg = Registry::new(None, Some(&dir));
     let mut clients = HashMap::new();
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer {
             pid: Some(42),
             scope,
@@ -457,30 +475,10 @@ fn worktree_requests_obey_peer_scope_and_write_audit() {
     }
     let audit = std::fs::read_to_string(dir.join("audit.log")).unwrap();
     assert!(audit.contains("deny op=worktree-new target=0 peer_pid=42 scope=restricted\n"));
-    assert!(audit.contains("deny op=worktree-new target=0 peer_pid=42 scope=session:7\n"));
     assert!(audit.contains("deny op=worktree-rm target=0 peer_pid=42 scope=restricted\n"));
-    assert!(audit.contains("deny op=worktree-rm target=0 peer_pid=42 scope=session:7\n"));
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// OWE-612: 기동 시 `live`에 없는 자식 ID는 `session-creators`에서 정리된다.
-#[test]
-fn new_prunes_creators_of_dead_sessions() {
-    let dir = std::env::temp_dir().join(format!("mk612-reg-prune-{}", std::process::id()));
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::create_dir_all(&dir).unwrap();
-    let stale = vec![(SessionId(2), SessionId(1)), (SessionId(3), SessionId(2))];
-    std::fs::write(
-        dir.join("session-creators"),
-        serde_json::to_vec(&stale).unwrap(),
-    )
-    .unwrap();
-    let _reg = Registry::new(None, Some(&dir));
-    let rows: Vec<(SessionId, SessionId)> =
-        serde_json::from_slice(&std::fs::read(dir.join("session-creators")).unwrap()).unwrap();
     assert!(
-        rows.is_empty(),
-        "dead creator entries must be pruned: {rows:?}"
+        !audit.contains("scope=session:"),
+        "session peers are not denied: {audit}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -518,6 +516,7 @@ fn theme_ipc_updates_queries_and_survives_reconnect_and_restart() {
             session,
             pid: 0,
             cwd: dir.clone(),
+            wrapped: false,
         },
     );
     let mut light = DEFAULT;
@@ -828,6 +827,33 @@ fn telemetry_publisher_defaults_on_and_respects_opt_out_and_environment_vetoes()
 }
 
 #[test]
+fn daemon_startup_collects_expired_orphan_launch_metadata() {
+    let dir = std::env::temp_dir().join(format!("startup-launch-gc-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let agents = crate::agent::control::Control::new(Some(&dir));
+    let id = SessionId(42);
+    agents
+        .remember(
+            id,
+            &control::AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+        )
+        .unwrap();
+    let old = SystemTime::now() - Duration::from_hours(8 * 24);
+    fs::File::options()
+        .write(true)
+        .open(dir.join("agent-launches/42.json"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    assert!(!reg.agents.has(id));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn monitor_tick_collects_history_on_interval_without_restart() {
     let dir = std::env::temp_dir().join(format!("mk587-gc-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
@@ -848,7 +874,9 @@ fn monitor_tick_collects_history_on_interval_without_restart() {
 #[test]
 fn git_mutations_reject_scoped_peers_and_are_never_read_only() {
     let reg = Registry::new(None, None);
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer { pid: None, scope };
         for edit in [
             krill_proto::git::Edit::Stage {
@@ -1017,11 +1045,43 @@ fn session_accounts_returns_launch_account_with_label() {
         pid: None,
         scope: Scope::Session(SessionId(8)),
     };
+    // 세션 피어도 전체 권한이라 다른 세션의 계정 배지를 본다.
     assert_eq!(
         reg.handle(&peer8, Request::SessionAccounts, &mut HashMap::new()),
-        Reply::SessionAccounts(vec![])
+        reg.handle(&peer7, Request::SessionAccounts, &mut HashMap::new())
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+/// 구버전 앱이 끄기 요청을 보내도 자동 수집을 멈추거나 설정 파일을 덮어쓰지 않는다.
+#[test]
+fn legacy_direct_usage_request_cannot_disable_collection() {
+    use krill_proto::usage::{UsageReply, UsageRequest};
+
+    let root = std::env::temp_dir().join(format!("auto-usage-dispatch-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("accounts.toml");
+    let raw = "direct_usage = false\n[auto_switch]\nenabled = false\n";
+    fs::write(&path, raw).unwrap();
+    let reg = Registry::new(None, Some(&root));
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    for enabled in [false, true] {
+        let reply = reg.on_usage(
+            &peer,
+            Role::Interactive,
+            UsageRequest::SetDirectUsage(enabled),
+        );
+        let UsageReply::Accounts(snapshot) = reply else {
+            panic!("expected accounts snapshot, got {reply:?}");
+        };
+        assert!(snapshot.connections.direct_usage);
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+    }
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
 }
 
 /// OWE-722: 실제 usage 분기에서 저장·조회·권한·협상 거부를 확인한다.
@@ -1058,7 +1118,9 @@ fn provisioning_usage_dispatch_and_access_control() {
         reg.on_usage(&full, Role::Observer, UsageRequest::SetProvisioning(true)),
         UsageReply::Failed(Failure::Denied)
     );
-    for scope in [Scope::Restricted, Scope::Session(SessionId(1))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         let peer = Peer { pid: None, scope };
         for request in [
             UsageRequest::GetProvisioning,
@@ -1385,11 +1447,25 @@ fn owe755_concurrent_hook_auto_rename_preserves_all_session_titles() {
                     r#"{{"hook_event_name":"UserPromptSubmit","prompt":"Fix hook bug {i}"}}"#
                 );
                 b.wait();
-                r.maybe_rename_from_hook(SessionId(i), payload.as_bytes());
+                r.maybe_rename_from_hook(
+                    SessionId(i),
+                    payload.as_bytes(),
+                    hook::EventId {
+                        pid: 1,
+                        unix_ns: status::now_ns(),
+                    },
+                );
                 // 같은 세션에 두 번째 프롬프트 훅이 와도 첫 제목이 유지되어야 한다.
                 let second =
                     r#"{"hook_event_name":"UserPromptSubmit","prompt":"Second prompt ignored"}"#;
-                r.maybe_rename_from_hook(SessionId(i), second.as_bytes());
+                r.maybe_rename_from_hook(
+                    SessionId(i),
+                    second.as_bytes(),
+                    hook::EventId {
+                        pid: 1,
+                        unix_ns: status::now_ns(),
+                    },
+                );
             })
         })
         .collect();
@@ -1560,6 +1636,7 @@ fn states_resolve_launched_pi_without_hooks_and_preserve_hook_identity() {
             session,
             pid: 0,
             cwd: dir.clone(),
+            wrapped: false,
         },
     );
     reg.agents
@@ -1629,6 +1706,7 @@ fn states_resolve_launched_pi_without_hooks_and_preserve_hook_identity() {
             session: agy_session,
             pid: 0,
             cwd: dir.clone(),
+            wrapped: false,
         },
     );
     reg.agents
@@ -1691,10 +1769,6 @@ fn first_hook_waits_for_spawn_registration_on_socket_and_spool() {
         let spawning = std::thread::spawn(move || {
             spawn_reg
                 .spawn_holder(
-                    &Peer {
-                        pid: None,
-                        scope: Scope::Full,
-                    },
                     spawn_reg.holder.as_ref().unwrap(),
                     id,
                     vec![b"/bin/sh".to_vec()],
@@ -1825,6 +1899,7 @@ fn late_hook_cannot_resurrect_a_deleted_session_or_launch_metadata() {
             session,
             pid: 0,
             cwd: dir.clone(),
+            wrapped: false,
         },
     );
     reg.agents
@@ -1931,7 +2006,9 @@ fn negotiated_remote_fs_enforces_scope_and_observer_permissions() {
         commit: true,
     };
     let reg = Registry::new(None, None);
-    for scope in [Scope::Restricted, Scope::Session(SessionId(7))] {
+    {
+        // 세션 피어는 전체 권한이므로 계보를 확인하지 못한 피어만 거부된다.
+        let scope = Scope::Restricted;
         for request in [stat.clone(), write.clone()] {
             assert_eq!(
                 reg.handle(
@@ -2075,11 +2152,26 @@ fn explicit_close_marks_session_closed_and_blocks_cold_or_resume_resurrection() 
                 session,
                 pid: 1234,
                 cwd: dir.clone(),
+                wrapped: false,
             },
         );
         st.exited.insert(id, 0);
     }
 
+    reg.agents
+        .remember(
+            id,
+            &control::AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+        )
+        .unwrap();
+    reg.on_exited(id, 0);
+    assert!(
+        reg.agents.has(id),
+        "natural exit must preserve resume metadata"
+    );
     let full = Peer {
         pid: None,
         scope: Scope::Full,
@@ -2089,6 +2181,10 @@ fn explicit_close_marks_session_closed_and_blocks_cold_or_resume_resurrection() 
         Reply::Closed
     );
     assert!(dir.join("sessions/42.noindex/closed").is_file());
+    assert!(
+        !reg.agents.has(id),
+        "explicit close must forget launch metadata"
+    );
     assert_eq!(
         reg.handle(&full, Request::Cold { session: id }, &mut HashMap::new()),
         Reply::Failed(Failure::NoSession)
@@ -2483,14 +2579,23 @@ fn maybe_rename_from_hook_records_every_prompt_turn_while_preserving_first_title
     reg.maybe_rename_from_hook(
         id,
         br#"{"hook_event_name":"UserPromptSubmit","prompt":"Fix auth token expiry bug"}"#,
+        hook::EventId {
+            pid: 1,
+            unix_ns: status::now_ns(),
+        },
     );
     reg.maybe_rename_from_hook(
         id,
         br#"{"hook_event_name":"UserPromptSubmit","prompt":"Add regression test for expired cookie"}"#,
+        hook::EventId { pid: 1, unix_ns: status::now_ns() },
     );
     reg.maybe_rename_from_hook(
         id,
         br#"{"hook_event_name":"UserPromptSubmit","prompt":"ok proceed"}"#,
+        hook::EventId {
+            pid: 1,
+            unix_ns: status::now_ns(),
+        },
     );
 
     let titles = krill_proto::git::load_session_auto_titles(&dir);
@@ -2514,4 +2619,274 @@ fn maybe_rename_from_hook_records_every_prompt_turn_while_preserving_first_title
     );
 
     fs::remove_dir_all(&dir).ok();
+}
+
+/// foundation-02: 1MiB 프레임을 넘는 스냅샷(활성 task 12개 × 100KB)은 EOF가 아니라 명시 오류로 답하고
+/// 연결은 살아 있으며, 페이지 스냅샷은 같은 연결에서 디스크와 같은 저장소를 무손실로 돌려준다. 기능을
+/// 협상하지 않은(N-1) 피어의 페이지 요청은 `BadRequest`다.
+#[test]
+fn oversized_orchestration_snapshot_answers_explicitly_and_pages_losslessly() {
+    use krill_proto::orchestration::{
+        FEAT_ORCH_SNAPSHOT_PAGE, FRAME_LIMIT_ERROR, OrchAction, OrchResponse, OrchestrationStore,
+    };
+    let dir = std::env::temp_dir().join(format!("krill-orch-paged-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let mut store = OrchestrationStore::default();
+    let run = store
+        .create_run("verify_core independent synthetic snapshot", None)
+        .unwrap();
+    for i in 0..12_u8 {
+        let description = String::from_utf8(vec![b'A' + i; 100_000]).unwrap();
+        store
+            .create_task(&run.id, &format!("fixture-{i}"), &description, vec![])
+            .unwrap();
+    }
+    store.save(&dir).unwrap();
+    assert!(fs::metadata(dir.join("orchestration.json")).unwrap().len() > 1 << 20);
+    let serve = |features: u64| {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let dir = dir.clone();
+        let thread = std::thread::spawn(move || {
+            let hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            };
+            Registry::new(None, Some(&dir))
+                .serve(server, &hello)
+                .unwrap();
+        });
+        let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+        ServerHello::decode(kind, &body).unwrap();
+        let mut hello = krill_proto::daemon::client_hello(ipc::ClientRole::Cli, "test");
+        hello.features = features;
+        client.write_all(&hello.encode().unwrap()).unwrap();
+        (client, thread)
+    };
+    let request = |client: &mut UnixStream, action: OrchAction| -> Reply {
+        client
+            .write_all(&Request::Orchestration(action).encode().unwrap())
+            .unwrap();
+        let (kind, body) = ipc::read_frame(client)
+            .unwrap()
+            .expect("daemon closed the stream instead of replying");
+        Reply::decode(kind, &body).unwrap()
+    };
+
+    let (mut client, thread) = serve(ipc::FEATURES);
+    // 구 CLI 경로: 단일 프레임 SnapshotV2는 EOF 대신 명시 오류이고 연결은 살아 있다.
+    match request(&mut client, OrchAction::SnapshotV2) {
+        Reply::Orchestration(OrchResponse::Error(msg)) => {
+            assert!(msg.contains(FRAME_LIMIT_ERROR), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // 새 CLI 경로: 같은 연결에서 페이지로 읽어 디스크와 같다.
+    let fetched = OrchestrationStore::fetch_paged(|generation, offset| {
+        match request(&mut client, OrchAction::SnapshotPage { generation, offset }) {
+            Reply::Orchestration(response) => Ok(response),
+            other => Err(io::Error::other(format!("{other:?}"))),
+        }
+    })
+    .unwrap();
+    assert_eq!(fetched, OrchestrationStore::load(&dir).unwrap());
+    assert_eq!(fetched.tasks.len(), 12);
+    assert!(fetched.tasks.iter().all(|t| t.description.len() == 100_000));
+    let check = OrchAction::CheckMessages {
+        recipient: Some("nobody".into()),
+        types: vec![],
+        unread_only: true,
+        ack: false,
+        wait_ms: 0,
+        run_id: None,
+        delivery_id: None,
+    };
+    assert!(matches!(
+        request(&mut client, check),
+        Reply::Orchestration(OrchResponse::Delivery { delivery: None, messages }) if messages.is_empty()
+    ));
+    drop(client);
+    thread.join().unwrap();
+
+    let (mut old, thread) = serve(ipc::FEATURES & !FEAT_ORCH_SNAPSHOT_PAGE);
+    let page = OrchAction::SnapshotPage {
+        generation: None,
+        offset: 0,
+    };
+    assert_eq!(request(&mut old, page), Reply::Failed(Failure::BadRequest));
+    drop(old);
+    thread.join().unwrap();
+    fs::remove_dir_all(dir).ok();
+}
+
+#[cfg(windows)]
+#[test]
+fn spawn_cwd_uses_shell_compatible_paths_without_requiring_them_to_exist() {
+    for (input, expected) in [
+        (r"\\?\C:\Users\한글 QA\project", r"C:\Users\한글 QA\project"),
+        (r"\\?\UNC\server\share\project", r"\\server\share\project"),
+        (r"C:\Users\한글 QA\project", r"C:\Users\한글 QA\project"),
+        (r"\\?\C:\special.\project", r"\\?\C:\special.\project"),
+        (r"\\?\C:\special \project", r"\\?\C:\special \project"),
+        (r"\\?\C:\CON\project", r"\\?\C:\CON\project"),
+        (r"\\.\pipe\krill", r"\\.\pipe\krill"),
+        (
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+        ),
+    ] {
+        let mut cwd = input.as_bytes().to_vec();
+        sanitize_spawn_cwd(&mut cwd);
+        assert_eq!(cwd, expected.as_bytes(), "{input}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn spawn_cwd_preserves_long_verbatim_paths() {
+    let path = format!(r"\\?\C:\{}", "long-directory\\".repeat(30));
+    let mut cwd = path.as_bytes().to_vec();
+    sanitize_spawn_cwd(&mut cwd);
+    assert_eq!(cwd, path.as_bytes());
+}
+
+#[test]
+fn worktree_refs_are_read_only_but_enforce_scope_and_negotiation() {
+    let request = Request::WorktreeRefs {
+        repo: b"/reserved".to_vec(),
+    };
+    assert!(read_only(&request));
+    let registry = Registry::new(None, None);
+    assert_eq!(
+        registry.handle(
+            &Peer {
+                pid: None,
+                scope: Scope::Restricted
+            },
+            request.clone(),
+            &mut HashMap::new()
+        ),
+        Reply::Failed(Failure::Denied)
+    );
+    // Verified session peers share the same owner permissions as external shells.
+    assert!(matches!(
+        registry.handle(
+            &Peer {
+                pid: None,
+                scope: Scope::Session(SessionId(999))
+            },
+            request.clone(),
+            &mut HashMap::new()
+        ),
+        Reply::WorktreeFailed(_)
+    ));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    let thread = std::thread::spawn(move || {
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        Registry::new(None, None).serve(server, &hello).unwrap();
+    });
+    ipc::read_frame(&mut client).unwrap().unwrap();
+    let mut hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "test");
+    hello.features = FEAT_CONTROL;
+    client.write_all(&hello.encode().unwrap()).unwrap();
+    client.write_all(&request.encode().unwrap()).unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(
+        Reply::decode(kind, &body).unwrap(),
+        Reply::Failed(Failure::BadRequest)
+    );
+    // Legacy clients remain usable on the same connection after the feature-gated rejection.
+    client.write_all(&Request::List.encode().unwrap()).unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(Reply::decode(kind, &body).unwrap(), Reply::Sessions(vec![]));
+    drop(client);
+    thread.join().unwrap();
+}
+
+#[test]
+fn negotiated_worktree_refs_allow_observers_and_preserve_sessions() {
+    use krill_proto::os::ffi::OsStrExt as _;
+    let dir = PathBuf::from("/tmp").join(format!("registry-refs-observer-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+        .unwrap();
+    let thread = std::thread::spawn(move || {
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        Registry::new(None, None)
+            .serve_mobile(server, &hello)
+            .unwrap();
+    });
+    ipc::read_frame(&mut client).unwrap().unwrap();
+    let mut hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "test");
+    hello.features = FEAT_CONTROL | control::FEAT_WORKTREE_REFS | FEAT_ROLES;
+    client.write_all(&hello.encode().unwrap()).unwrap();
+    client
+        .write_all(&roles::Request::Set(Role::Observer).encode().unwrap())
+        .unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(Ack::decode(kind, &body).unwrap(), Ack::Applied);
+    client
+        .write_all(
+            &Request::WorktreeRefs {
+                repo: dir.as_os_str().as_bytes().to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(
+        Reply::decode(kind, &body).unwrap(),
+        Reply::WorktreeRefs(vec![])
+    );
+    client.write_all(&Request::List.encode().unwrap()).unwrap();
+    let (kind, body) = ipc::read_frame(&mut client).unwrap().unwrap();
+    assert_eq!(Reply::decode(kind, &body).unwrap(), Reply::Sessions(vec![]));
+    drop(client);
+    thread.join().unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_argv_is_recognized_only_for_agent_launches() {
+    let agent = [
+        "/bin/zsh", "-l", "-i", "-c", "script", "mk-agent", "hint", "claude",
+    ];
+    assert!(is_wrapper_argv(&agent));
+    assert!(!is_wrapper_argv(&["/bin/zsh", "-l"]));
+    assert!(!is_wrapper_argv(&[
+        "/bin/sh", "-c", "x", "y", "z", "mk-agent"
+    ]));
 }

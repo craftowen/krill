@@ -241,7 +241,11 @@ fn vault_search_indexes_claude_codex_agy_opencode_titles_summaries_and_bodies() 
         &roots,
         &SearchQuery {
             query: "VaultScope".into(),
-            paths: vec!["/tmp/repo-beta".into()],
+            paths: vec![if cfg!(target_os = "macos") {
+                "/tmp/repo-beta".into()
+            } else {
+                "/private/tmp/repo-beta".into()
+            }],
             ..SearchQuery::default()
         },
     );
@@ -376,6 +380,10 @@ fn vault_large_jsonl_head_tail_and_incremental_cache() {
         "{{\"type\":\"assistant\",\"sessionId\":\"{sess_id}\",\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}}}}\n",
         "x".repeat(1024)
     );
+    while content.len() < 320 * 1024 {
+        content.push_str(&filler_line);
+    }
+    content.push_str("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"MiddleOnlyUnseenToken\"}}\n");
     while content.len() < 640 * 1024 {
         content.push_str(&filler_line);
     }
@@ -401,6 +409,10 @@ fn vault_large_jsonl_head_tail_and_incremental_cache() {
             ..SearchQuery::default()
         },
     );
+    assert!(
+        snap_tail.truncated,
+        "head/tail search must disclose omitted middle records"
+    );
     assert_eq!(snap_tail.hits.len(), 1);
     assert_eq!(snap_tail.hits[0].agent, VaultAgent::Claude);
     assert_eq!(snap_tail.hits[0].id, sess_id);
@@ -416,11 +428,24 @@ fn vault_large_jsonl_head_tail_and_incremental_cache() {
             ..SearchQuery::default()
         },
     );
+    assert!(
+        snap_cached.truncated,
+        "cached partial documents remain partial"
+    );
     assert_eq!(snap_cached.hits.len(), 1);
     assert!(
         vault_cache_hits_for_test() > hits_after_first,
         "expected incremental vault cache hit on unchanged file (before={hits_before}, after_first={hits_after_first})"
     );
+
+    let middle = search_in(
+        &roots,
+        &SearchQuery {
+            query: "MiddleOnlyUnseenToken".into(),
+            ..Default::default()
+        },
+    );
+    assert!(middle.hits.is_empty() && middle.truncated);
 
     // 3. Modifying the file (size/mtime change) invalidates the cache and indexes new content.
     content.push_str(

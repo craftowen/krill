@@ -2,6 +2,8 @@ use std::process::Command;
 
 use super::*;
 
+mod upgrade;
+
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("mk025-{}-{name}", std::process::id()));
     std::fs::remove_dir_all(&d).ok();
@@ -532,6 +534,45 @@ fn stopped_daemon_is_detected_without_eof() {
     assert!(result.is_err_and(|e| e.kind() == io::ErrorKind::TimedOut));
 }
 
+/// 한 번 늦은 PONG은 허용한다(부하 PC에서 연결이 깜빡이지 않게). 첫 지연 뒤에도 정상 응답하는 동안은 버티고, 그 뒤
+/// 연속으로 놓치면 그때서야 멈춘 데몬으로 판정한다. 서버는 끝까지 소켓을 닫지 않는다(macOS는 닫힌 피어에 EINVAL을 준다).
+#[test]
+fn one_late_pong_does_not_declare_the_daemon_stopped() {
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let probe = Duration::from_millis(400);
+    let answer = std::thread::spawn(move || {
+        let (kind, body) = ipc::read_frame(&mut server).unwrap().unwrap();
+        let nonce = ping_nonce(kind, &body).unwrap();
+        std::thread::sleep(Duration::from_millis(550)); // probe보다 늦다: 한 번 놓친다(두 번째 마감 800ms 안)
+        server.write_all(&pong(nonce).unwrap()).unwrap();
+        let until = std::time::Instant::now() + Duration::from_millis(600);
+        server
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        while std::time::Instant::now() < until {
+            if let Ok(Some((kind, body))) = ipc::read_frame(&mut server) {
+                let nonce = ping_nonce(kind, &body).unwrap();
+                server.write_all(&pong(nonce).unwrap()).unwrap();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1500)); // 이후 침묵(소켓은 연다)
+        drop(server);
+    });
+    let started = std::time::Instant::now();
+    let result = watch_for(&mut client, Duration::from_millis(50), probe);
+    let elapsed = started.elapsed();
+    assert!(
+        result.is_err_and(|e| e.kind() == io::ErrorKind::TimedOut),
+        "a silent daemon is still detected"
+    );
+    // 수정 전에는 첫 놓침(약 400ms)에 바로 끊었다. 지금은 지연 응답(550ms)과 정상 응답 구간(600ms)을 지나서야 끊는다.
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "gave up on the first late PONG: {elapsed:?}"
+    );
+    answer.join().unwrap();
+}
+
 /// 멈춘 데몬 감지 번호는 고정이다(ARCHITECTURE §4.3). 바뀌면 N-1 호환 위반이다.
 #[test]
 fn heartbeat_numbers_are_frozen() {
@@ -670,4 +711,25 @@ fn windows_paths_choose_flat_then_exact_version_holder() {
     std::fs::remove_file(&current).unwrap();
     assert_eq!(exe_near(&root, "krill-holder"), holder);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn short_socket_override_keeps_long_state_and_isolates_installations() {
+    let a = PathBuf::from(format!(
+        r"C:\Users\{}\AppData\Local\Krill",
+        "한글".repeat(50)
+    ));
+    let root = std::ffi::OsStr::new(r"C:\ks\private-user");
+    let socket = socket_path_in(&a, Some(root)).unwrap();
+    assert!(socket.starts_with(root));
+    assert!(socket.as_os_str().as_encoded_bytes().len() + 4 < SUN_PATH_MAX);
+    assert_eq!(socket_path_in(&a, Some(root)).unwrap(), socket);
+    assert_ne!(
+        socket_path_in(&a.join("another"), Some(root)).unwrap(),
+        socket
+    );
+    assert_eq!(socket_path_in(&a, None).unwrap(), a.join("run/krilld.sock"));
+    assert!(socket_path_in(&a, Some("relative".as_ref())).is_err());
+    assert!(socket_path_in(&a, Some(format!(r"C:\{}", "long".repeat(30)).as_ref())).is_err());
 }

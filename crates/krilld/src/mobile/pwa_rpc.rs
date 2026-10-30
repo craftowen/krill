@@ -30,6 +30,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 mod command_catalog;
+mod composer;
+pub(super) mod feed;
+mod mention_files;
 mod requests;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -99,6 +102,8 @@ pub(super) struct Backend {
     git_inflight: Arc<Mutex<HashSet<PathBuf>>>,
     git_revision: Arc<AtomicU64>,
     snapshot_cache: Mutex<Option<DashboardSnapshot>>,
+    /// 스냅샷을 새로 만들 때마다 늘어난다. 늦게 도착한 옛 스냅샷이 새 것을 덮지 않게 한다.
+    snapshot_rev: AtomicU64,
     catalog_cache: Mutex<Option<CatalogSnapshot>>,
     settings_lock: Mutex<()>,
 }
@@ -112,6 +117,7 @@ struct DashboardSnapshot {
     at: Instant,
     data: Value,
     etag: String,
+    rev: u64,
 }
 
 struct CatalogSnapshot {
@@ -143,6 +149,9 @@ enum Action {
     Snapshot {
         #[serde(default)]
         since: Option<String>,
+        /// 변경 피드 간격(ms, 0=일시정지). `capabilities.change_feed`를 본 클라이언트만 보낸다.
+        #[serde(default)]
+        feed: Option<u64>,
     },
     #[serde(alias = "set_quick_commands")]
     SaveQuickCommands {
@@ -244,6 +253,17 @@ enum Action {
     CommandCatalog {
         session: u64,
     },
+    MentionFiles {
+        session: u64,
+        query: String,
+    },
+    ComposerModels {
+        session: u64,
+    },
+    SetModel {
+        session: u64,
+        model: String,
+    },
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,6 +319,7 @@ impl Backend {
             git_inflight: Arc::default(),
             git_revision: Arc::default(),
             snapshot_cache: Mutex::default(),
+            snapshot_rev: AtomicU64::default(),
             catalog_cache: Mutex::default(),
             settings_lock: Mutex::default(),
         }
@@ -315,14 +336,29 @@ impl Backend {
             Ok(data) => json!({"ok":true,"data":data}),
             Err(e) => json!({"ok":false,"error":e.to_string()}),
         };
-        serde_json::to_string(&value)
+        let out = serde_json::to_string(&value)
             .ok()
             .filter(|text| text.len() < ipc::MAX_FRAME.saturating_sub(32))
-            .unwrap_or_else(|| "{\"ok\":false,\"error\":\"response unavailable\"}".into())
+            .unwrap_or_else(|| "{\"ok\":false,\"error\":\"response unavailable\"}".into());
+        crate::alloc::purge();
+        out
     }
     fn handle(&self, action: Action) -> io::Result<Value> {
         match action {
-            Action::Snapshot { since } => self.snapshot_since(since.as_deref()),
+            Action::Snapshot { since, feed } => {
+                let (mut value, rev) = self.snapshot_versioned(since.as_deref())?;
+                // 응답은 언제나 피드에 반영한다. rev·현재 간격은 feed를 보낸(새) 클라이언트에만 덧붙여
+                // 옛 클라이언트의 응답은 그대로 둔다(etag 밖이라 본문 동일성에도 영향 없음).
+                if let Some(etag) = value.get("etag").and_then(Value::as_str).map(str::to_owned)
+                    && let Some(armed) = feed::observe(feed, &etag, rev)
+                    && feed.is_some()
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.insert("rev".into(), rev.into());
+                    object.insert("feed".into(), armed.into());
+                }
+                Ok(value)
+            }
             Action::SaveQuickCommands { commands } => self.save_quick_commands(commands),
             Action::CreateTerminal {
                 cwd_session,
@@ -652,78 +688,21 @@ impl Backend {
                 serde_json::from_slice(&output).map_err(io::Error::other)
             }
             Action::Git { session, path } => self.git(session, path.as_deref()),
-            Action::CommandCatalog { session } => self.command_catalog(session),
+            Action::CommandCatalog { session } => {
+                let context = self.composer_context(session)?;
+                Ok(command_catalog::load(
+                    &context.home,
+                    &context.cwd,
+                    &context.agent,
+                    context.config.as_deref(),
+                ))
+            }
+            Action::MentionFiles { session, query } => {
+                mention_files::load(&self.cwd(session)?, &query)
+            }
+            Action::ComposerModels { session } => self.composer_models(session),
+            Action::SetModel { session, model } => self.set_composer_model(session, &model),
         }
-    }
-    fn command_catalog(&self, session: u64) -> io::Result<Value> {
-        let cwd = self.cwd(session)?;
-        let stored =
-            crate::agent::control::Control::new(self.dir.as_deref()).stored(SessionId(session))?;
-        let status = match self.control(&Request::States)? {
-            Reply::States(states) => states.into_iter().find(|s| s.session.0 == session),
-            _ => None,
-        };
-        let observed = status.as_ref().map(|s| &s.status);
-        let agent = observed
-            .map(|s| s.agent.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| stored.as_ref().map(|s| s.profile.as_str()))
-            .or_else(|| observed.and_then(|s| s.foreground.as_deref()))
-            .unwrap_or_default();
-        let raw = self
-            .dir
-            .as_ref()
-            .and_then(|dir| fs::read_to_string(dir.join(krill_proto::agent::FILE_NAME)).ok());
-        let agents = krill_proto::agent::Agents::load(raw.as_deref()).map_err(io::Error::other)?;
-        let profile = agents.resolve(agent).map(|(_, profile)| profile);
-        let program = profile
-            .and_then(krill_proto::agent::Profile::program)
-            .unwrap_or(agent);
-        let program = Path::new(program)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(agent);
-        let canonical = krill_proto::agent::canonical_id(agent);
-        let provider = if matches!(
-            canonical,
-            "claude" | "codex" | "agy" | "cursor" | "opencode" | "pi"
-        ) {
-            canonical
-        } else {
-            krill_proto::agent::canonical_id(program)
-        };
-        let key = match provider {
-            "claude" => "CLAUDE_CONFIG_DIR",
-            "codex" => "CODEX_HOME",
-            "opencode" => "OPENCODE_CONFIG_DIR",
-            "pi" => "PI_CODING_AGENT_DIR",
-            _ => "",
-        };
-        let config = stored
-            .as_ref()
-            .and_then(|s| s.account.as_ref())
-            .filter(|a| a.env_key == key && !a.dir.is_empty())
-            .map(|a| PathBuf::from(&a.dir))
-            .or_else(|| {
-                profile
-                    .and_then(|p| p.env.get(key))
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-            })
-            .or_else(|| {
-                std::env::var_os(key)
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-            });
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(invalid)?;
-        Ok(command_catalog::load(
-            &home,
-            &cwd,
-            provider,
-            config.as_deref(),
-        ))
     }
     fn session_bracketed_paste(&self, session: u64) -> bool {
         self.registry
@@ -757,10 +736,12 @@ impl Backend {
         socket.set_write_timeout(Some(Duration::from_secs(5)))?;
         let worker = thread::Builder::new()
             .name("mobile-rpc".into())
-            .stack_size(super::gateway::RPC_STACK)
+            .stack_size(128 * 1024)
             .spawn(move || {
                 crate::alloc::mobile_thread().ok();
-                registry.serve_mobile(server, &hello).ok()
+                let out = registry.serve_mobile(server, &hello).ok();
+                crate::alloc::purge();
+                out
             })?;
         let mut wire = Wire {
             socket: socket.try_clone()?,
@@ -916,7 +897,12 @@ impl Backend {
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 
+    #[cfg(test)]
     fn snapshot_since(&self, since: Option<&str>) -> io::Result<Value> {
+        self.snapshot_versioned(since).map(|(value, _)| value)
+    }
+
+    fn snapshot_versioned(&self, since: Option<&str>) -> io::Result<(Value, u64)> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
         // This mutex is a snapshot-only singleflight, independent of registry/session IO.
         let mut cached = crate::session::lock(&self.snapshot_cache);
@@ -926,11 +912,11 @@ impl Backend {
             && snapshot.at.elapsed() < GIT_TTL
             && snapshot.stamps == file_stamps(&snapshot.paths)
         {
-            return if since == Some(snapshot.etag.as_str()) {
-                Ok(json!({"unchanged":true,"etag":snapshot.etag}))
+            return Ok(if since == Some(snapshot.etag.as_str()) {
+                (json!({"unchanged":true,"etag":snapshot.etag}), snapshot.rev)
             } else {
-                Ok(snapshot.data.clone())
-            };
+                (snapshot.data.clone(), snapshot.rev)
+            });
         }
         // Drop stale terminal bodies before rebuilding (including a viewport clear).
         *cached = None;
@@ -938,11 +924,13 @@ impl Backend {
         let before = file_stamps(&base_paths);
         let mut catalog_used = None;
         let mut data = self.snapshot(&mut catalog_used)?;
+        let rev = self.snapshot_rev.fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = serde_json::to_vec(&data).map_err(io::Error::other)?;
         let etag: String = hex(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref())
             .chars()
             .take(16)
             .collect();
+        drop(bytes);
         if let Some(object) = data.as_object_mut() {
             object.insert("etag".into(), etag.clone().into());
         }
@@ -958,13 +946,14 @@ impl Backend {
                 at: Instant::now(),
                 data: data.clone(),
                 etag: etag.clone(),
+                rev,
             });
         }
-        if since == Some(etag.as_str()) {
-            Ok(json!({"unchanged":true,"etag":etag}))
+        Ok(if since == Some(etag.as_str()) {
+            (json!({"unchanged":true,"etag":etag}), rev)
         } else {
-            Ok(data)
-        }
+            (data, rev)
+        })
     }
 
     fn snapshot_dependencies(
@@ -1082,6 +1071,7 @@ impl Backend {
                 sessions: Vec::new(),
                 repositories: Vec::new(),
                 branches: Vec::new(),
+                prompt_histories: Vec::new(),
             },
         };
         let catalog = self.catalog(&sidebar.repositories);
@@ -1106,6 +1096,8 @@ impl Backend {
         );
         let mut cards = Vec::new();
         let mut workspace_titles = std::collections::BTreeMap::new();
+        let launch_metadata = crate::agent::control::Control::new(self.dir.as_deref());
+        let agent_profiles = launch_metadata.agents().unwrap_or_default();
         // 데스크톱 스마트 정렬과 같은 워크트리 순위(승인대기 0 → 작업 중 2 → 완료 3 → 유휴 4).
         let mut ranks: std::collections::BTreeMap<PathBuf, u8> = std::collections::BTreeMap::new();
         // 데스크톱 "잠든 작업 공간 숨기기"의 깨어 있음 판정: 작업 중·대기·완료이거나 에이전트가 살아 있는 세션.
@@ -1149,6 +1141,7 @@ impl Backend {
             .map(krill_proto::git::load_session_auto_titles)
             .unwrap_or_default();
         for (info, cwd_bytes, group) in rows {
+            let stored_launch = launch_metadata.stored(info.session).ok().flatten();
             if let Some(title) = auto_titles.get(&info.session)
                 && let Some(path) = &group.path
             {
@@ -1189,6 +1182,9 @@ impl Backend {
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
             cards.push(json!({"id":info.session.0,"state":state.state,"agent":agent,"title":title,"foreground":state.foreground,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+                "profile_id":stored_launch.as_ref().map(|s|s.profile.as_str()),
+                "account_id":stored_launch.as_ref().and_then(|s|s.account.as_ref()).map(|a|a.id.as_str()),
+                "command_context":composer::command_context(stored_launch.as_ref(), &agent_profiles, &agent),
                 "repo_key":group.repo_key,"worktree_key":group.worktree_key,
                 "group_label":group.label,"group_path":group.path,
                 "state_source":state.source,"state_confidence":state.confidence,
@@ -1197,7 +1193,7 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"model_set":cfg!(unix),"change_feed":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
@@ -1293,7 +1289,9 @@ impl Backend {
             scheduled.extend(stale.iter().cloned());
             let spawned = thread::Builder::new()
                 .name("mobile-git-swr".into())
+                .stack_size(128 * 1024)
                 .spawn(move || {
+                    crate::alloc::mobile_thread().ok();
                     let queue = crate::git::queue().ok();
                     let mut pending = deferred;
                     pending.extend(stale.into_iter().map(|cwd| {
@@ -1318,6 +1316,7 @@ impl Backend {
                         crate::session::lock(&inflight).remove(&cwd);
                         revision.fetch_add(1, Ordering::Relaxed);
                     }
+                    crate::alloc::purge();
                 });
             if spawned.is_err() {
                 let mut inflight = crate::session::lock(&self.git_inflight);
@@ -1613,7 +1612,7 @@ fn cache_git_summary(
 fn mobile_git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command
-        .current_dir(cwd)
+        .current_dir(krill_proto::os::shell_path(cwd))
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
     for key in [
@@ -1638,6 +1637,8 @@ fn git_root(cwd: &Path) -> io::Result<PathBuf> {
     .map_err(|_| io::Error::other("Not a Git repository"))?;
     // Git terminates this path with a newline; spaces in a repository name are significant.
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    #[cfg(windows)]
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     fs::canonicalize(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
 }
 
@@ -1690,7 +1691,13 @@ fn git_relative_path(root: &Path, cwd: &Path, raw: &str, files: &[String]) -> Op
     if relative.as_os_str().is_empty() {
         return None;
     }
-    relative.to_str().map(str::to_owned)
+    relative.to_str().map(|path| {
+        if cfg!(windows) {
+            path.replace('\\', "/")
+        } else {
+            path.to_owned()
+        }
+    })
 }
 
 fn read_patch(cwd: &Path, path: &str) -> io::Result<String> {
@@ -1793,14 +1800,14 @@ fn untracked_patch(root: &Path, path: &str) -> io::Result<String> {
     Ok(patch)
 }
 fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Vec<u8>> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = crate::child::spawn(
+        crate::child::own_group(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )?;
     let result = (|| {
-        let mut pipe = child.stdout.take().ok_or_else(invalid)?;
-        crate::child::nonblocking(&pipe)?;
+        let mut pipe = crate::child::PipeReader::new(child.stdout.take().ok_or_else(invalid)?)?;
         let deadline = Instant::now() + timeout;
         let mut out = Vec::new();
         let mut buffer = [0; 8192];
@@ -1836,8 +1843,7 @@ fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io
             thread::sleep(Duration::from_millis(5));
         }
     })();
-    child.kill().ok();
-    child.wait().ok();
+    drop(child); // Process owns the child group/Job, including descendants on timeout.
     result
 }
 
@@ -3035,6 +3041,33 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_subprocess_output_and_time_are_bounded() {
+        use std::os::windows::process::CommandExt as _;
+
+        let command = |script: &str| {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/C"]).raw_arg(script);
+            command
+        };
+        assert_eq!(
+            bounded_command(&mut command("echo hello"), Duration::from_secs(5), 7).unwrap(),
+            b"hello\r\n"
+        );
+        assert!(bounded_command(&mut command("echo hello"), Duration::from_secs(5), 6).is_err());
+        assert_eq!(
+            bounded_command(
+                &mut command("for /L %i in (0,0,1) do @rem waiting"),
+                Duration::from_millis(30),
+                10
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
     proptest::proptest! {
         #[test]
         fn photo_decoder_never_panics(text in ".{0,2048}") {
@@ -3080,7 +3113,7 @@ mod revision_tests {
             let sessions: Vec<_> = (1..=64).map(|id| json!({"id":id,"title":"fixture","state":"Working","lines":["one","two","three"]})).collect();
             let data = json!({"sessions":sessions,"padding":"x".repeat(ipc::MAX_FRAME - 20_000),"etag":"stack"});
             *crate::session::lock(&backend.snapshot_cache) = Some(DashboardSnapshot {
-                revision: backend.effective_revision(&registry), paths: Vec::new(), stamps: Vec::new(), at: Instant::now(), data, etag: "stack".into(),
+                revision: backend.effective_revision(&registry), paths: Vec::new(), stamps: Vec::new(), at: Instant::now(), data, etag: "stack".into(), rev: 1,
             });
             let reply = backend.request("{\"action\":\"snapshot\"}");
             assert!(reply.len() > ipc::MAX_FRAME - 20_000);
@@ -3122,6 +3155,7 @@ mod revision_tests {
             at: Instant::now(),
             data: json!({"sessions":[],"etag":"same"}),
             etag: "same".into(),
+            rev: 1,
         });
         assert_eq!(
             backend.snapshot_since(Some("same")).unwrap(),

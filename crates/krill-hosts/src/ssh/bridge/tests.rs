@@ -94,3 +94,80 @@ fn control_path_leaves_room_for_ssh_temporary_suffix() {
     let long_dir = format!("/{}/fwd-x.sock", "d".repeat(daemon::SUN_PATH_MAX - 20));
     assert!(control_path(std::path::Path::new(&long_dir)).is_none());
 }
+
+#[cfg(unix)]
+fn write_fake_bridge_ssh(dir: &std::path::Path, relay_body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(dir).unwrap();
+    let script = dir.join("fake-ssh");
+    let contents = format!(
+        "#!/bin/sh\nlast=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\ncase \"$last\" in\n  *--probe)\n    printf 'krill-os=windows\\nkrill-arch=x86_64\\nkrill-version=0.2.9\\nkrill-bridge=ok\\n'\n    exec cat >/dev/null\n    ;;\n  *)\n    {relay_body}\n    ;;\nesac\n"
+    );
+    std::fs::write(&script, contents).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn bridge_teardown_cancels_wedged_local_writer() {
+    let dir = PathBuf::from(format!("/tmp/mk-br-wedge-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let ssh_bin = write_fake_bridge_ssh(
+        &dir,
+        "chunk='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'\n    while :; do printf '%s%s%s%s' \"$chunk\" \"$chunk\" \"$chunk\" \"$chunk\" || exit 0; done",
+    );
+    let sock = dir.join("fwd.sock");
+    let opts = SshOptions::new("user@win-pc");
+    let tunnel =
+        crate::ssh::Tunnel::start_bridge_with_program(&opts, sock, ssh_bin.as_os_str()).unwrap();
+    let mut client = UnixStream::connect(tunnel.socket()).unwrap();
+    let mut initial = [0_u8; 4096];
+    client.read_exact(&mut initial).unwrap();
+    assert!(initial.iter().all(u8::is_ascii_hexdigit));
+    // 로컬 소비자가 읽기를 멈춰 커널 송수신 버퍼를 가득 채운다.
+    thread::sleep(Duration::from_millis(200));
+
+    let (tx, rx) = mpsc::channel();
+    let started = std::time::Instant::now();
+    thread::spawn(move || {
+        drop(tunnel);
+        tx.send(started.elapsed()).ok();
+    });
+    let elapsed = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Tunnel::drop hung on blocked local UDS write");
+    assert!(elapsed < Duration::from_secs(2), "elapsed={elapsed:?}");
+    drop(client);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn bridge_normal_remote_eof_delivers_complete_payload() {
+    let dir = PathBuf::from(format!("/tmp/mk-br-eof-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let ssh_bin = write_fake_bridge_ssh(
+        &dir,
+        "line='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'\n    i=0\n    while [ $i -lt 2048 ]; do printf '%s' \"$line\"; i=$((i + 1)); done",
+    );
+    let sock = dir.join("fwd.sock");
+    let opts = SshOptions::new("user@win-pc");
+    let tunnel =
+        crate::ssh::Tunnel::start_bridge_with_program(&opts, sock, ssh_bin.as_os_str()).unwrap();
+    let mut client = UnixStream::connect(tunnel.socket()).unwrap();
+    // 원격 프로세스가 먼저 종료된 뒤에도 파이프에 남은 바이트를 끝까지 전달해야 한다.
+    thread::sleep(Duration::from_millis(120));
+    let mut received = Vec::new();
+    client.read_to_end(&mut received).unwrap();
+    assert_eq!(received.len(), 2048 * 64);
+    assert!(
+        received
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .all(|c| c == b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    );
+    drop(tunnel);
+    std::fs::remove_dir_all(&dir).ok();
+}

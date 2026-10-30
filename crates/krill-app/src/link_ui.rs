@@ -65,6 +65,8 @@ pub struct ServerPanel {
     renaming: Option<HostRename>,
     confirm_revoke: Option<PairedDevice>,
     confirm_disconnect: Option<PairedHost>,
+    /// 업데이트를 요청한 원격 호스트 id. 상대가 새 버전으로 다시 붙으면 목록에서 빠진다.
+    updating_hosts: std::collections::BTreeSet<String>,
     confirmation_deadline: Option<std::time::Instant>,
     rename_return_focus: Option<gpui::FocusHandle>,
     focus: gpui::FocusHandle,
@@ -116,6 +118,7 @@ impl ServerPanel {
             renaming: None,
             confirm_revoke: None,
             confirm_disconnect: None,
+            updating_hosts: std::collections::BTreeSet::new(),
             confirmation_deadline: None,
             rename_return_focus: None,
             focus: cx.focus_handle(),
@@ -567,6 +570,39 @@ impl ServerPanel {
         }));
     }
 
+    fn update_host(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.error = None;
+        let backend = self.backend.clone();
+        cx.notify();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let call_id = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { backend.update_host(&call_id) })
+                .await;
+            this.update(cx, |panel, cx| {
+                if panel.generation != generation {
+                    return;
+                }
+                panel.busy = false;
+                match result {
+                    Ok(()) => {
+                        panel.updating_hosts.insert(id);
+                    }
+                    Err(err) => panel.error = Some(err.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn request_disconnect(&mut self, host: PairedHost, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -815,6 +851,12 @@ impl ServerPanel {
                     (p.muted_foreground, labels::HOST_DISCONNECTED.get())
                 }
             };
+            let outdated = host.status == krill_hosts::HostStatus::Connected
+                && host
+                    .version
+                    .as_deref()
+                    .and_then(|v| krill_proto::control::is_newer(krill_proto::BUILD, v))
+                    == Some(true);
             let selector = format!("link-remote-host-{}", host.id);
             let button_id = format!("link-remote-disconnect-{}", host.id);
             let button_selector = button_id.clone();
@@ -904,12 +946,46 @@ impl ServerPanel {
                             .gap_2()
                             .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))
                             .child(name)
+                            .children(host.version.as_ref().map(|v| {
+                                div()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(v.clone())
+                            }))
                             .child(
                                 div()
                                     .text_size(crate::ui::TEXT_XS)
                                     .text_color(color)
                                     .child(label),
                             )
+                            .when(outdated && editing.is_none(), |d| {
+                                if self.updating_hosts.contains(&host.id) {
+                                    return d.child(
+                                        div()
+                                            .text_size(crate::ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(text::UPDATE_HOST_STARTED.get()),
+                                    );
+                                }
+                                let update_id = format!("link-remote-update-{}", host.id);
+                                let update_selector = update_id.clone();
+                                let target_id = host.id.clone();
+                                d.child(
+                                    crate::ui::controls().child(
+                                        crate::ui::primary(
+                                            SharedString::from(update_id),
+                                            text::UPDATE_HOST_BUTTON.get(),
+                                        )
+                                        .disabled(self.busy)
+                                        .debug_selector(move || update_selector.clone())
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.update_host(target_id.clone(), cx);
+                                            }),
+                                        ),
+                                    ),
+                                )
+                            })
                             .child(actions)
                             .when(editing.is_none(), |d| {
                                 d.child(

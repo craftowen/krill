@@ -33,6 +33,7 @@ pub struct AccountConnection {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionsSnapshot {
     pub supported: bool,
+    /// 구버전 호환용 필드. 새 데몬은 항상 true를 보낸다.
     pub direct_usage: bool,
     pub accounts: Vec<AccountConnection>,
 }

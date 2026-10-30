@@ -86,12 +86,17 @@ impl Shell {
         let (Some(doc), Body::Text { state, .. }) = (&tab.doc, &tab.body) else {
             return;
         };
+        let Ok(remote) = self.file_host_for_pane(pane).transport() else {
+            // 전송이 없는 원격: 같은 경로의 로컬 파일을 '디스크 내용'으로 보이지 않는다.
+            self.mark_remote_unavailable(pane, cx);
+            return;
+        };
+        let host = self.layout.host(pane).clone();
         let before = doc.clone();
         let path = doc.path().to_owned();
         let revision = tab.revision;
         let state_id = state.entity_id();
         let draft = state.read(cx).text().clone();
-        let remote = self.remote_target_for_pane(pane);
         self.files.next_request = self.files.next_request.wrapping_add(1);
         let generation = self.files.next_request;
         self.files.loading.insert(pane, (generation, path.clone()));
@@ -128,6 +133,7 @@ impl Shell {
                     || state.entity_id() != state_id
                     || tab.doc.as_ref() != Some(&before)
                     || this.layout.file(pane) != Some(path.as_path())
+                    || *this.layout.host(pane) != host
                 {
                     return;
                 }

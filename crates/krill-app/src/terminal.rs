@@ -108,10 +108,10 @@ fn text_run(family: &SharedString, len: usize, bold: bool, italic: bool) -> Text
 }
 
 /// 프로그램이 DECSCUSR로 커서를 지정하지 않았으면(기본값 그대로) 설정 기본 커서를 쓴다(OWE-658).
-// ponytail: 화면은 "미지정"과 "DECSCUSR 2(깜박이지 않는 블록)"를 구분하지 못해 둘 다 설정값을 따른다.
-// 구분이 필요하면 krill-proto `CursorStyle`에 지정 여부를 싣는다(와이어 변경).
-pub fn effective_cursor(program: CursorStyle, default: CursorStyle) -> CursorStyle {
-    if program == CursorStyle::default() {
+/// The explicit marker distinguishes a requested steady block from an implicit
+/// default. A legacy daemon has no marker; retain its non-default style fallback.
+pub fn effective_cursor(program: CursorStyle, explicit: bool, default: CursorStyle) -> CursorStyle {
+    if !explicit && program == CursorStyle::default() {
         default
     } else {
         program
@@ -157,6 +157,7 @@ impl Render for Terminal {
         element.opacity = crate::settings::terminal_opacity_alpha(cx);
         element.cursor = effective_cursor(
             self.screen.cursor_style,
+            self.screen.cursor_explicit,
             crate::settings::terminal_cursor(cx),
         );
         element
@@ -223,10 +224,12 @@ pub fn file_link_target(
     if !uri.starts_with("file://") {
         return None;
     }
-    let path = gpui::http_client::Url::parse(uri)
-        .ok()?
-        .to_file_path()
-        .ok()?;
+    let url = gpui::http_client::Url::parse(uri).ok()?;
+    // Windows converts remote file:// hosts to UNC paths; reveal only local files.
+    if url.host_str().is_some_and(|host| host != "localhost") {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
     if uri
         .chars()
         .chain(path.to_string_lossy().chars())
@@ -583,13 +586,30 @@ impl Element for TerminalElement {
                             * f32::from(u16::try_from(run.origin.line).unwrap_or(u16::MAX)),
                 );
                 window.paint_quad(fill(
-                    Bounds::new(row, size(cols(run.columns), cell.height)),
+                    Bounds::new(
+                        row,
+                        size(
+                            cols(run.columns.min(
+                                usize::from(self.screen.cols).saturating_sub(run.origin.column),
+                            )),
+                            cell.height,
+                        ),
+                    ),
                     background,
                 ));
                 for (offset, text, group_cols) in run.groups() {
                     // 확정 셀과 같은 강제 폭(2칸 글자는 2칸, 아니면 1칸)으로 같은 자리에 그린다.
                     let force = cell.width
                         * f32::from(u16::try_from(group_cols.max(1)).unwrap_or(u16::MAX));
+                    if run
+                        .origin
+                        .column
+                        .saturating_add(offset)
+                        .saturating_add(group_cols)
+                        > usize::from(self.screen.cols)
+                    {
+                        continue;
+                    }
                     let x =
                         row.x + cell.width * f32::from(u16::try_from(offset).unwrap_or(u16::MAX));
                     let layout = window.text_system().layout_line(
@@ -635,7 +655,11 @@ impl Element for TerminalElement {
             }
             // 마지막 글자 끝(조합 중이면 preedit 끝, 아니면 확정 대기 끝)에 그리드와 같은 모양 커서.
             let (caret_column, caret_line) = match (&self.preedit, &self.pending) {
-                (Some(p), _) | (None, Some(p)) => (p.origin.column + p.columns, p.origin.line),
+                (Some(p), _) | (None, Some(p)) => (
+                    (p.origin.column + p.columns)
+                        .min(usize::from(self.screen.cols).saturating_sub(1)),
+                    p.origin.line,
+                ),
                 (None, None) => return,
             };
             let caret = |v: usize| f32::from(u16::try_from(v).unwrap_or(u16::MAX));

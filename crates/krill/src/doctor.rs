@@ -449,29 +449,53 @@ fn login_path() -> Option<OsString> {
     let shell = std::env::var_os("SHELL")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| OsString::from("/bin/zsh"));
+    login_path_with(&shell, SHELL_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn login_path_with(shell: &std::ffi::OsStr, timeout: Duration) -> Option<OsString> {
+    use std::os::unix::process::CommandExt as _;
+
     let script = format!("printf '\\n{PATH_MARK}%s\\n' \"$PATH\"");
-    let mut child = Command::new(&shell)
+    let mut child = Command::new(shell)
         .args(["-l", "-i", "-c", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        stop_login_shell(&mut child);
+        return None;
+    };
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut text = String::new();
         stdout.read_to_string(&mut text).ok();
         tx.send(text).ok();
     });
-    let out = rx.recv_timeout(SHELL_TIMEOUT).ok()?;
-    child.kill().ok();
-    child.wait().ok();
+    let out = rx.recv_timeout(timeout).ok();
+    stop_login_shell(&mut child);
+    let out = out?;
     out.lines()
         .rev()
         .find_map(|l| l.strip_prefix(PATH_MARK))
         .filter(|p| !p.is_empty())
         .map(OsString::from)
+}
+
+#[cfg(unix)]
+fn stop_login_shell(child: &mut std::process::Child) {
+    // Reap only after signalling: the unreaped leader keeps its process-group ID reserved.
+    if let Some(pid) = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).ok();
+    }
+    child.kill().ok();
+    child.wait().ok();
 }
 
 /// 내장 프로필·PATH에서 에이전트를 찾는다(앱 온보딩 `survey`와 같은 범위).
@@ -621,7 +645,7 @@ fn executable(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn login_path() -> Option<OsString> {
-    std::env::var_os("PATH")
+    krill_proto::os::augment_windows_path(std::env::var_os("PATH").as_deref())
 }
 
 /// 상태 디렉터리·`run/`에 실제로 써 본다. Unix 소유자(uid) 검사는 Windows ACL에 대응하는 것이 없어 건너뛴다

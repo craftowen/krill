@@ -25,10 +25,74 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use super::crypto::{Key, SALT_LEN, Stream};
 use krill_proto::SessionId;
 use krill_proto::holder::WinSize;
+use zstd::stream::raw::Operation as _;
+
+fn decompress_stream(
+    decoder: &mut zstd::stream::raw::Decoder<'static>,
+    mut input: &[u8],
+    out: &mut Vec<u8>,
+) -> bool {
+    if decoder.reinit().is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 8 * 1024];
+    let mut remaining = usize::try_from(MAX_RAW).unwrap_or(usize::MAX);
+    let mut finished_frame = false;
+    loop {
+        let cap = buf.len().min(remaining);
+        if cap == 0 {
+            return false;
+        }
+        let Some(dst) = buf.get_mut(..cap) else {
+            return false;
+        };
+        let Ok(status) = decoder.run_on_buffers(input, dst) else {
+            return false;
+        };
+        let Some(rest) = input.get(status.bytes_read..) else {
+            return false;
+        };
+        input = rest;
+        let Some(written) = buf.get(..status.bytes_written) else {
+            return false;
+        };
+        out.extend_from_slice(written);
+        remaining = remaining.saturating_sub(status.bytes_written);
+        if status.remaining == 0 {
+            finished_frame = true;
+            if input.is_empty() {
+                return true;
+            }
+        }
+        if status.bytes_read == 0 && status.bytes_written == 0 {
+            return finished_frame && input.is_empty();
+        }
+    }
+}
+
+fn shared_decoder() -> &'static Mutex<Option<zstd::stream::raw::Decoder<'static>>> {
+    static DECODER: OnceLock<Mutex<Option<zstd::stream::raw::Decoder<'static>>>> = OnceLock::new();
+    DECODER.get_or_init(|| {
+        let mut decoder = zstd::stream::raw::Decoder::new().ok();
+        if let Some(d) = decoder.as_mut()
+            && let Ok(sample) = zstd::encode_all(b"krill".as_slice(), 1)
+        {
+            let mut sink = Vec::with_capacity(8);
+            decompress_stream(d, &sample, &mut sink);
+            d.reinit().ok();
+        }
+        Mutex::new(decoder)
+    })
+}
+
+pub(super) fn warm_decoder() {
+    let _ = shared_decoder();
+}
 
 pub(crate) const MAGIC: [u8; 4] = *b"MKSG";
 pub(crate) const VERSION: u16 = 1;
@@ -281,12 +345,25 @@ fn decode_mut(bytes: &mut [u8], key: Option<&Key>) -> io::Result<Option<Segment>
         valid_len += CHUNK_HEAD + len;
         content = rest;
     }
+    drop(crypto);
     let mut raw = Vec::new();
+    let mut guard = crate::session::lock(shared_decoder());
+    if guard.is_none() {
+        *guard = Some(zstd::stream::raw::Decoder::new()?);
+    }
     // 프레임이 끝나지 않았으면(봉인 전 크래시) 풀 수 있는 데까지 담고 오류를 낸다.
-    let finished = zstd::stream::read::Decoder::with_buffer(stream.as_slice())
-        .and_then(|d| d.take(MAX_RAW).read_to_end(&mut raw))
-        .is_ok();
+    let finished = guard
+        .as_mut()
+        .is_some_and(|d| decompress_stream(d, &stream, &mut raw));
+    if let Some(d) = guard.as_mut() {
+        d.reinit().ok();
+    }
+    drop(guard);
+    let sealed = finished && !stream.is_empty();
+    drop(stream);
+    crate::sys::release_malloc_cache();
     let mut records = decode_records(&raw);
+    drop(raw);
     let keyframe_bytes =
         if keyframe == KEYFRAME_V1 && matches!(records.first(), Some(Record::Keyframe(_))) {
             match records.remove(0) {
@@ -301,7 +378,7 @@ fn decode_mut(bytes: &mut [u8], key: Option<&Key>) -> io::Result<Option<Segment>
         keyframe_bytes,
         records,
         valid_len: valid_len as u64,
-        sealed: finished && !stream.is_empty(),
+        sealed,
     }))
 }
 

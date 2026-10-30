@@ -112,6 +112,25 @@ pub struct User {
     pub shell: Vec<u8>,
 }
 
+/// 에이전트 셸 복귀 래퍼(`agent::PREFLIGHT`, `set +m`)는 에이전트를 루트와 같은 프로세스 그룹에 둔다.
+/// `root` 그룹에 속한 직계 자식이 하나뿐이면 그 PID. 작업 제어가 켜진 셸의 작업은 그룹이 달라 빠진다.
+#[cfg(unix)]
+pub(crate) fn wrapped_child(root: u32) -> Option<u32> {
+    let group = |pid: u32| {
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)?;
+        rustix::process::getpgid(Some(pid)).ok()
+    };
+    let leader = group(root)?;
+    let mut same = child_pids(root)
+        .ok()?
+        .into_iter()
+        .filter(|&pid| group(pid) == Some(leader));
+    match (same.next(), same.next()) {
+        (Some(child), None) => Some(child),
+        _ => None,
+    }
+}
+
 /// `getpwuid_r(getuid())`. 버퍼가 모자라면(ERANGE) 1MiB까지 늘려 다시 묻는다.
 #[cfg(unix)]
 pub fn user() -> io::Result<User> {
@@ -208,4 +227,19 @@ pub(crate) fn tcgetpgrp(fd: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
     // SAFETY: `fd`는 호출 동안 살아 있는 유효한 파일 디스크립터다.
     let pgrp = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
     (pgrp > 0).then(|| u32::try_from(pgrp).ok()).flatten()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn process_args_reads_a_childs_argv() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let args = super::process_args(child.id());
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(args.unwrap(), ["sleep", "30"]);
+    }
 }

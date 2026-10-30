@@ -1,7 +1,13 @@
-//! Multiline input uses the existing terminal paste contract, then a separate Enter.
-use super::{Context, Duration, SessionId, Shell, TextareaState, Window};
+//! Paste submission waits for PTY receipts, then for the provider's user turn.
+use super::{Context, SessionId, Shell, TextareaState, Window};
+use krill_proto::input::{Delivery, Receipt};
+use std::time::Duration;
 
-pub(super) struct MultilinePrompt {
+const POLL: Duration = Duration::from_millis(20);
+const RECEIPT_POLLS: usize = 500;
+const TURN_POLLS: usize = 750;
+
+pub(super) struct ChatPrompt {
     pub pane: super::super::PaneId,
     pub session: SessionId,
     pub input: gpui::Entity<TextareaState>,
@@ -9,55 +15,214 @@ pub(super) struct MultilinePrompt {
     pub bytes: Vec<u8>,
 }
 
+struct Origin {
+    pane: super::super::PaneId,
+    session: SessionId,
+    host: krill_app::hosts::HostId,
+    target: Option<krill_app::hosts::HostTarget>,
+    epoch: u64,
+    item: usize,
+}
+
 impl Shell {
-    pub(super) fn start_multiline_chat_prompt(
+    fn chat_prompt_current(&self, origin: &Origin, cx: &Context<Self>) -> bool {
+        let Origin {
+            pane,
+            session,
+            host,
+            target,
+            epoch,
+            ..
+        } = origin;
+        self.is_pane_chat_view(*pane, cx)
+            && self.layout.host(*pane) == host
+            && self.layout.session(*pane) == Some(*session)
+            && self.chat.logs.get(session).map_or(0, |log| log.epoch) == *epoch
+            && self.live.get(pane).is_some_and(|live| {
+                &live.target == target
+                    && live.pane.session() == Some(*session)
+                    && live.pane.is_linked()
+                    && !live.pane.is_closed()
+                    && !live.pane.is_cold()
+                    && !live.pane.account_switching()
+                    && !live.suspended
+            })
+            && target
+                .as_ref()
+                .is_some_and(krill_app::hosts::HostTarget::is_current)
+    }
+
+    fn chat_prompt_delivery(
+        &self,
+        origin: &Origin,
+        receipt: Receipt,
+        cx: &Context<Self>,
+    ) -> Delivery {
+        if !self.chat_prompt_current(origin, cx) {
+            return Delivery::Uncertain;
+        }
+        #[cfg(test)]
+        if self.chat.send_input.is_some() {
+            return self.chat.prompt_delivery.unwrap_or(Delivery::Applied);
+        }
+        self.live
+            .get(&origin.pane)
+            .map_or(Delivery::Uncertain, |live| {
+                live.pane.input_delivery(receipt)
+            })
+    }
+
+    fn chat_prompt_confirmed(&self, origin: &Origin, text: &str) -> bool {
+        #[cfg(test)]
+        if self.chat.send_input.is_some() {
+            return self.chat.prompt_confirmed.unwrap_or(true);
+        }
+        self.chat.logs.get(&origin.session).is_some_and(|log| {
+            log.bound
+                && log.epoch == origin.epoch
+                && log.items.iter().enumerate().any(|(i, item)| {
+                    log.base_index.saturating_add(i) >= origin.item
+                        && item.kind == krill_proto::agent_history::ChatItemKind::User
+                        && super::normalized(&item.text) == super::normalized(text)
+                })
+        })
+    }
+
+    fn finish_chat_prompt(&mut self, session: SessionId, confirmed: bool, cx: &mut Context<Self>) {
+        self.chat.prompt_tasks.remove(&session);
+        if confirmed {
+            self.chat.prompt_failed.remove(&session);
+        } else {
+            self.chat.prompt_review.insert(session);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn start_chat_prompt(
         &mut self,
-        prompt: MultilinePrompt,
+        prompt: ChatPrompt,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let MultilinePrompt {
+        let ChatPrompt {
             pane,
             session,
             input,
             text,
             bytes,
         } = prompt;
-        let host = self.layout.host(pane).clone();
-        let target = self.live.get(&pane).and_then(|live| live.target.clone());
-        let epoch = self.chat.logs.get(&session).map_or(0, |log| log.epoch);
+        let origin = Origin {
+            pane,
+            session,
+            host: self.layout.host(pane).clone(),
+            target: self.live.get(&pane).and_then(|live| live.target.clone()),
+            epoch: self.chat.logs.get(&session).map_or(0, |log| log.epoch),
+            item: self
+                .chat
+                .logs
+                .get(&session)
+                .map_or(0, |log| log.base_index.saturating_add(log.items.len())),
+        };
         if !self.send_to_chat_pane(pane, session, &bytes, cx) {
             self.chat.prompt_failed.insert(session);
             cx.notify();
             return;
         }
+        let Some(receipt) = self.live.get(&pane).map(|live| live.pane.input_receipt()) else {
+            return;
+        };
         self.chat.prompt_failed.remove(&session);
         let task = cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(60))
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                this.chat.prompt_tasks.remove(&session);
-                let same_origin = this.is_session_chat_view(session, cx)
-                    && this.layout.host(pane) == &host
-                    && this.layout.session(pane) == Some(session)
-                    && this.chat.logs.get(&session).map_or(0, |log| log.epoch) == epoch
-                    && this
-                        .live
-                        .get(&pane)
-                        .is_some_and(|live| live.target == target)
-                    && target
-                        .as_ref()
-                        .is_some_and(krill_app::hosts::HostTarget::is_current);
-                if same_origin && this.send_to_chat_pane(pane, session, b"\r", cx) {
-                    Self::clear_sent_chat_draft(&input, &text, window, cx);
-                    this.chat.prompt_failed.remove(&session);
-                } else {
-                    // A paste may already be visible in the TUI: never automatically
-                    // replay it into a replacement pane or blindly offer a retry.
-                    this.chat.prompt_review.insert(session);
+            // Queue acceptance can precede the actual Windows pipe write by an
+            // arbitrary interval. Start settling only after the Applied ACK.
+            let mut applied = false;
+            for _ in 0..RECEIPT_POLLS {
+                let Ok(delivery) = this.update_in(cx, |this, _, cx| {
+                    this.chat_prompt_delivery(&origin, receipt, cx)
+                }) else {
+                    return;
+                };
+                match delivery {
+                    Delivery::Applied => {
+                        applied = true;
+                        break;
+                    }
+                    Delivery::Uncertain => break,
+                    Delivery::Pending => cx.background_executor().timer(POLL).await,
                 }
-                cx.notify();
+            }
+            if !applied {
+                this.update_in(cx, |this, _, cx| {
+                    this.finish_chat_prompt(session, false, cx);
+                })
+                .ok();
+                return;
+            }
+            cx.background_executor()
+                .timer(krill_proto::input::PASTE_SUBMIT_DELAY)
+                .await;
+            let enter = this
+                .update_in(cx, |this, _, cx| {
+                    if this.chat_prompt_delivery(&origin, receipt, cx) != Delivery::Applied
+                        || !this.send_chat_prompt_input(pane, session, b"\r", cx)
+                    {
+                        return None;
+                    }
+                    this.live.get(&pane).map(|live| live.pane.input_receipt())
+                })
+                .ok()
+                .flatten();
+            let Some(enter) = enter else {
+                this.update_in(cx, |this, _, cx| {
+                    this.finish_chat_prompt(session, false, cx);
+                })
+                .ok();
+                return;
+            };
+            let mut applied = false;
+            for _ in 0..RECEIPT_POLLS {
+                let Ok(delivery) = this.update_in(cx, |this, _, cx| {
+                    this.chat_prompt_delivery(&origin, enter, cx)
+                }) else {
+                    return;
+                };
+                match delivery {
+                    Delivery::Applied => {
+                        applied = true;
+                        break;
+                    }
+                    Delivery::Uncertain => break,
+                    Delivery::Pending => cx.background_executor().timer(POLL).await,
+                }
+            }
+            if applied {
+                for _ in 0..TURN_POLLS {
+                    let Ok((current, confirmed)) = this.update_in(cx, |this, _, cx| {
+                        (
+                            this.chat_prompt_current(&origin, cx),
+                            this.chat_prompt_confirmed(&origin, &text),
+                        )
+                    }) else {
+                        return;
+                    };
+                    if !current {
+                        break;
+                    }
+                    if confirmed {
+                        this.update_in(cx, |this, window, cx| {
+                            Self::clear_sent_chat_draft(&input, &text, window, cx);
+                            this.finish_chat_prompt(session, true, cx);
+                        })
+                        .ok();
+                        return;
+                    }
+                    cx.background_executor().timer(POLL).await;
+                }
+            }
+            // Applied only proves a PTY write, never provider consumption. Keep
+            // the draft and require review rather than replaying or adding Enter.
+            this.update_in(cx, |this, _, cx| {
+                this.finish_chat_prompt(session, false, cx);
             })
             .ok();
         });

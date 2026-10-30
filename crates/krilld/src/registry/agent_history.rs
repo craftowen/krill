@@ -1,11 +1,11 @@
 //! MK-082의 외부 transcript → MK-052 재개 경계.
 //! 잠정 결정 의존: OWE-417의 `agent::resume_in`. 거부 시 이 모듈의 재개 분기만 제거한다.
-use super::{Failure, Launch, Path, Peer, Registry, Reply, Scope, control, os};
+use super::{Failure, Launch, Path, Peer, Registry, Reply, control, os};
 use krill_proto::agent_history::{Action, Response, VaultAgent, VaultTarget};
 
 impl Registry {
     pub(super) fn agent_history(&self, peer: &Peer, action: Action) -> Result<Reply, Failure> {
-        if peer.scope != Scope::Full {
+        if !peer.scope.full() {
             peer.deny("agent-history", &self.audit);
             return Err(Failure::Denied);
         }
@@ -45,12 +45,10 @@ impl Registry {
         let id = target.agent.profile();
         let profile = agents.profiles.get(id).ok_or(Failure::UnknownAgent)?;
         // 기본 프로필이 다른 프로그램이면 그 프로그램에 대화 ID를 넘기지 않는다.
-        if profile.program().is_none_or(|p| {
-            Path::new(p)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_none_or(|n| krill_proto::agent::canonical_id(n) != id)
-        }) {
+        if profile
+            .program()
+            .is_none_or(|p| krill_proto::agent::executable_id(p) != id)
+        {
             return Err(Failure::UnknownAgent);
         }
         let session = self.next_id();
@@ -112,8 +110,7 @@ impl Registry {
                 self.discard_settings(session);
                 os(&e)
             })?;
-        let (session, _) =
-            self.spawn_holder(peer, holder, session, argv, env, cwd_bytes, 80, 24)?;
+        let (session, _) = self.spawn_holder(holder, session, argv, env, cwd_bytes, 80, 24)?;
         Ok(Reply::AgentHistory(Response::Resumed { session }))
     }
 }
@@ -122,6 +119,7 @@ impl Registry {
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use crate::scope::Scope;
     use krill_proto::agent_history::{Agent, Entry, SearchQuery};
     use krill_proto::control::{FEAT_CONTROL, Request};
     use krill_proto::os::net::UnixStream;
@@ -143,10 +141,13 @@ mod tests {
     }
 
     #[test]
-    fn history_is_global_only_and_scan_is_the_only_read_only_action() {
+    fn history_denies_unverified_peers_and_scan_is_the_only_read_only_action() {
         let reg = Registry::new(None, None);
-        for scope in [Scope::Restricted, Scope::Session(SessionId(1))] {
-            let peer = Peer { pid: None, scope };
+        {
+            let peer = Peer {
+                pid: None,
+                scope: Scope::Restricted,
+            };
             for action in [
                 Action::Scan,
                 Action::Search(SearchQuery::default()),
@@ -451,6 +452,7 @@ mod chat_process_tests {
                         session,
                         pid: child.0.id(),
                         cwd: "/same/project".into(),
+                        wrapped: false,
                     },
                 );
                 let snap = reg.chat_poll(id, 0);

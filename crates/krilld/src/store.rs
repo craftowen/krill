@@ -52,9 +52,9 @@ const RESUME: u64 = 256 << 10;
 /// 원본 n바이트를 쓸 때 압축·청크·헤더·Gap 레코드에 더 드는 최대 바이트(zstd 블록 헤더는 128KiB당 3B).
 const OVERHEAD: u64 = 256;
 /// zstd 레벨(ARCHITECTURE §3 zstd 하나, T2 D8 zstd-3).
-const LEVEL: i32 = 3;
+const LEVEL: i32 = 1;
 /// zstd 창 1MiB = 봉인 크기. 더 크게 잡아도 한 세그먼트 안에서만 참조하니 이득이 없다.
-const WINDOW_LOG: u32 = 20;
+const WINDOW_LOG: u32 = 17;
 /// 재생 때 스크롤백을 거두는 간격. 이 안에서 [`HOT_LINES`](crate::HOT_LINES)행 넘게 밀려나면 넘친 행은 페이지에서 빠진다.
 // ponytail: 256B로 1,000행을 넘기려면 `CSI n S` 반복 같은 병적 입력뿐이다. 실제로 잘리면 간격을 줄이거나 재생 Term 상한을 키운다.
 pub(crate) type CheckpointFn<'a> = &'a mut dyn FnMut(usize, usize, &Engine);
@@ -789,48 +789,49 @@ impl History {
     /// Lazy screen history: retain only the requested rows, even for a large segment.
     /// Two bounded replays determine the total first, then harvest the requested range.
     pub fn rows(&self, i: usize, skip: usize, count: usize) -> io::Result<(usize, Vec<Vec<Cell>>)> {
+        let _permit = replay_gate::acquire(&|| false).ok_or(io::ErrorKind::Interrupted)?;
         let raw_i = self.raw_index(i)?;
         let seg = self.read_raw(raw_i)?;
         let look = no_theme();
         let mut total = 0usize;
-        {
+        let mut rows = Vec::new();
+        let warmed = {
             let mut engine = self.warm(raw_i, &seg, &look);
-            engine.take_history();
-            replay_harvest(
+            engine.clear_history();
+            let warmed = engine.clone_ground();
+            replay_window(
                 &mut engine,
                 &seg,
                 &look,
-                Some(&mut |batch: Vec<Vec<Cell>>| {
-                    total = total.saturating_add(batch.len());
-                }),
-                None,
+                &mut total,
+                0,
+                0,
+                &mut rows,
                 self.cleared_seq,
             );
-        }
+            warmed
+        };
         let end = total.saturating_sub(skip);
         let start =
             end.saturating_sub(count.min(usize::from(krill_proto::screen::MAX_HISTORY_ROWS)));
-        let mut rows = Vec::new();
         if start < end {
-            let mut engine = self.warm(raw_i, &seg, &look);
-            engine.take_history();
+            rows.reserve(end - start);
+            let mut engine = warmed.unwrap_or_else(|| self.warm(raw_i, &seg, &look));
+            engine.clear_history();
             let mut at = 0usize;
-            replay_harvest(
+            replay_window(
                 &mut engine,
                 &seg,
                 &look,
-                Some(&mut |batch: Vec<Vec<Cell>>| {
-                    for row in batch {
-                        if (start..end).contains(&at) {
-                            rows.push(row);
-                        }
-                        at = at.saturating_add(1);
-                    }
-                }),
-                None,
+                &mut at,
+                start,
+                end,
+                &mut rows,
                 self.cleared_seq,
             );
         }
+        drop(seg);
+        crate::alloc::purge();
         Ok((total, rows))
     }
 
@@ -1113,7 +1114,7 @@ impl History {
             }
         }
         // 남은 원본이 우선이다. 앞 원본이 GC된 가장 이른 세그먼트에서만 시작 키프레임을 쓴다.
-        let initial = self.read_raw(first).ok();
+        let mut initial = self.read_raw(first).ok();
         let mut engine = initial
             .as_ref()
             .and_then(|s| {
@@ -1128,7 +1129,12 @@ impl History {
             if cancelled() {
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            if let Ok(previous) = self.read_raw(p) {
+            let next_seg = if p == first {
+                initial.take()
+            } else {
+                self.read_raw(p).ok()
+            };
+            if let Some(previous) = next_seg {
                 engine.resize(previous.header.size);
                 if previous.header.start_seq < self.cleared_seq {
                     engine.clear_history();
@@ -1212,6 +1218,72 @@ fn replay_harvest(
     replay_harvest_cancelled(engine, seg, look, harvest, limit_seq, cleared_seq, &|| {
         false
     })
+}
+
+#[expect(clippy::too_many_arguments, reason = "내부 콜드 재생 범위 헬퍼")]
+fn replay_window(
+    engine: &mut Engine,
+    seg: &Segment,
+    look: &Appearance,
+    at: &mut usize,
+    start: usize,
+    end: usize,
+    out: &mut Vec<Vec<Cell>>,
+    cleared_seq: u64,
+) {
+    let mut seq = seg.header.start_seq;
+    let mut size = seg.header.size;
+    if seq <= cleared_seq {
+        engine.clear_history();
+    }
+    for rec in &seg.records {
+        match rec {
+            Record::Data(d) => {
+                let pre = usize::try_from(cleared_seq.saturating_sub(seq))
+                    .unwrap_or(usize::MAX)
+                    .min(d.len());
+                for part in d.get(..pre).unwrap_or_default().chunks(REPLAY_STEP) {
+                    if panic::catch_unwind(AssertUnwindSafe(|| {
+                        engine.feed(part, Feed::Replay, look);
+                    }))
+                    .is_err()
+                    {
+                        *engine = Engine::new(size);
+                    }
+                    engine.clear_history();
+                }
+                for part in d.get(pre..).unwrap_or_default().chunks(REPLAY_STEP) {
+                    if panic::catch_unwind(AssertUnwindSafe(|| {
+                        engine.feed(part, Feed::Replay, look);
+                    }))
+                    .is_err()
+                    {
+                        *engine = Engine::new(size);
+                    }
+                    if engine.has_history() {
+                        engine.take_history_window(at, start, end, out);
+                    }
+                }
+                seq = seq.saturating_add(u64::try_from(d.len()).unwrap_or(u64::MAX));
+                continue;
+            }
+            Record::Keyframe(_) => {}
+            Record::Resize(s) => {
+                size = *s;
+                engine.resize(size);
+                if seq < cleared_seq {
+                    engine.clear_history();
+                } else if engine.has_history() {
+                    engine.take_history_window(at, start, end, out);
+                }
+            }
+            Record::Gap(n) => {
+                seq = seq.saturating_add(*n);
+                continue;
+            }
+        }
+        seq = seq.saturating_add(rec.seq_len());
+    }
 }
 
 fn replay_harvest_cancelled(

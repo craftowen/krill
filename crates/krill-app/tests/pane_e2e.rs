@@ -290,6 +290,8 @@ fn spawn(phase: &str, state: &Path) -> (Child, Receiver<String>) {
         .args(["child", "--exact", "--nocapture", "--test-threads=1"])
         .env(PHASE, phase)
         .env("KRILL_STATE_DIR", state)
+        // `release_check.py`는 이 바이너리를 cargo·nextest 없이 직접 돌린다 — 자식 앱·holder·krilld에 테스트 표식이 없다.
+        .env("KRILL_LOG_DIR", state.join("logs"))
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();

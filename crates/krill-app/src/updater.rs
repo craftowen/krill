@@ -408,6 +408,7 @@ pub enum Error {
     Http(String),
     Unpack(String),
     NoBackup(PathBuf),
+    NoJournal,
     Io(io::Error),
 }
 
@@ -433,6 +434,7 @@ impl Clone for Error {
             Self::Http(v) => Self::Http(v.clone()),
             Self::Unpack(v) => Self::Unpack(v.clone()),
             Self::NoBackup(v) => Self::NoBackup(v.clone()),
+            Self::NoJournal => Self::NoJournal,
             Self::Io(v) => Self::Io(io::Error::new(v.kind(), v.to_string())),
         }
     }
@@ -467,6 +469,10 @@ impl fmt::Display for Error {
             Self::Http(m) => write!(f, "http transfer failed: {m}"),
             Self::Unpack(m) => write!(f, "archive unpack failed: {m}"),
             Self::NoBackup(p) => write!(f, "backup bundle not found for rollback: {}", p.display()),
+            Self::NoJournal => write!(
+                f,
+                "update journal not found; backup completeness unknown, rollback refused"
+            ),
             Self::Io(e) => write!(f, "updater I/O error: {e}"),
         }
     }
@@ -493,6 +499,7 @@ impl Error {
             Self::Http(m) => utext::UPDATE_ERR_NETWORK.format(&[("detail", m)]),
             Self::Unpack(m) => utext::UPDATE_ERR_UNPACK.format(&[("detail", m)]),
             Self::NoBackup(_) => utext::UPDATE_ERR_BACKUP.get().to_owned(),
+            Self::NoJournal => utext::UPDATE_ERR_JOURNAL.get().to_owned(),
             Self::Io(e) => utext::UPDATE_ERR_IO.format(&[("detail", &e.to_string())]),
         }
     }
@@ -701,8 +708,8 @@ pub fn validate_bundle_layout(app_bundle: &Path) -> Result<Vec<PathBuf>, Error> 
     Ok(binaries)
 }
 
-/// Windows 설치 폴더의 필수 구조(`Krill.json`, 실행 파일 4개)를 확인하고 실행 파일 목록을 돌려준다.
-/// `krill-link.exe`·`conpty.dll`·`x64\OpenConsole.exe`는 선택이다(없으면 holder는 kernel32 축소 모드).
+/// Windows 설치 폴더의 필수 구조(`Krill.json`, 실행 파일 4개, 번들 ConPTY)를 확인하고 실행 파일 목록을 돌려준다.
+/// `krill-link.exe`는 선택이다. 새 세션은 고정된 번들 `ConPTY` ABI를 요구한다.
 pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut binaries = Vec::new();
     for name in [
@@ -726,7 +733,43 @@ pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
             dir.display()
         )));
     }
+    for name in ["conpty.dll", "x64/OpenConsole.exe"] {
+        if !dir.join(name).is_file() {
+            return Err(Error::BundleStructure(format!(
+                "missing {name} in {}",
+                dir.display()
+            )));
+        }
+    }
     Ok(binaries)
+}
+
+#[cfg(test)]
+#[test]
+fn windows_install_layout_requires_both_conpty_components() {
+    let dir = std::env::temp_dir().join(format!("krill-conpty-layout-{}", std::process::id()));
+    fs::create_dir_all(dir.join("x64")).unwrap();
+    for name in [
+        "Krill.json",
+        "krill-holder.exe",
+        "krilld.exe",
+        "krill.exe",
+        "krill-app.exe",
+        "conpty.dll",
+        "x64/OpenConsole.exe",
+    ] {
+        fs::write(dir.join(name), b"fixture").unwrap();
+    }
+    assert_eq!(validate_install_layout(&dir).unwrap().len(), 4);
+    for name in ["conpty.dll", "x64/OpenConsole.exe"] {
+        fs::remove_file(dir.join(name)).unwrap();
+        assert!(matches!(
+            validate_install_layout(&dir),
+            Err(Error::BundleStructure(_))
+        ));
+        fs::write(dir.join(name), b"fixture").unwrap();
+    }
+    fs::remove_dir_all(dir).unwrap();
 }
 
 impl CodeVerifier for CodesignVerifier {
@@ -1381,11 +1424,14 @@ pub fn download_and_stage(
 
 /// 매니페스트 판정까지만 보고 설치 가능할 때만 스테이징한다.
 /// 채널 불일치는 `None`에 묻히지 않고 [`CheckStatus::ChannelMismatch`]로 돌려준다.
+/// `skip_rolled_back`이면 시작 확인에 실패해 롤백된 버전을 다시 받지 않는다. 자동 점검이 그 버전을
+/// 곧바로 다시 스테이징해 자동 재시작·롤백을 되풀이했다(v0.2.29). 사용자가 직접 점검하면 다시 시도한다.
 fn decide_and_stage(
     cfg: &Config,
     manifest: &Manifest,
     app_bundle: &Path,
     state_dir: &Path,
+    skip_rolled_back: bool,
 ) -> Result<CheckStatus, Error> {
     let pk = cfg.public_key_bytes()?;
     let from_version = effective_version(Some(app_bundle));
@@ -1421,6 +1467,18 @@ fn decide_and_stage(
             ));
         }
         Decision::Available => {}
+    }
+    if skip_rolled_back
+        && matches!(
+            Journal::load(state_dir),
+            Ok(Some(journal)) if same_version(&journal.to_version, &manifest.version)
+                && matches!(journal.stage, Stage::RolledBack { .. } | Stage::Acknowledged)
+        )
+    {
+        return Ok(CheckStatus::Error(
+            crate::i18n::catalog::updater_relaunch::UPDATE_SKIP_ROLLED_BACK
+                .format(&[("version", &manifest.version)]),
+        ));
     }
     let verifier = CodesignVerifier::from_config(cfg);
     let staged = download_and_stage(
@@ -1554,6 +1612,7 @@ fn check_and_stage_with(
     manifest_url: Option<&str>,
     app_bundle: &Path,
     state_dir: &Path,
+    skip_rolled_back: bool,
 ) -> Result<CheckStatus, Error> {
     if append_ext(app_bundle, "stage-publish").exists() {
         let _lock = staging_lock(app_bundle)?;
@@ -1572,25 +1631,27 @@ fn check_and_stage_with(
         reason = "Escaped path representations keep distinct update-flight keys unambiguous"
     )]
     let key = format!(
-        "{:?}|{:?}|{}|{}|{}",
+        "{:?}|{:?}|{}|{}|{}|{}",
         bundle,
         state_dir,
         cfg.url,
         cfg.channel.as_str(),
-        cfg.public_key
+        cfg.public_key,
+        skip_rolled_back
     );
     single_flight(&key, || {
         let manifest = fetch_manifest(&cfg.url)?;
-        decide_and_stage(&cfg, &manifest, app_bundle, state_dir)
+        decide_and_stage(&cfg, &manifest, app_bundle, state_dir, skip_rolled_back)
     })
 }
 
+/// 자동 점검 경로. 시작 확인에 실패해 롤백된 버전은 다시 받지 않는다([`decide_and_stage`]).
 pub fn stage_update_for_bundle(
     manifest_url: Option<&str>,
     app_bundle: &Path,
     state_dir: &Path,
 ) -> Result<Option<StagedUpdate>, Error> {
-    match check_and_stage_with(manifest_url, app_bundle, state_dir)? {
+    match check_and_stage_with(manifest_url, app_bundle, state_dir, true)? {
         CheckStatus::Ready(staged) => Ok(Some(staged)),
         _ => Ok(None),
     }
@@ -1643,7 +1704,7 @@ pub fn check_and_stage_current_app(state_dir: &Path) -> Result<CheckStatus, Erro
 /// 지정한 `.app` 번들의 업데이트를 점검하고 새 버전이 있으면 스테이징까지 완료한다.
 pub fn check_and_stage_bundle(app_bundle: &Path, state_dir: &Path) -> Result<CheckStatus, Error> {
     let manifest_env = std::env::var("KRILL_UPDATE_MANIFEST_URL").ok();
-    check_and_stage_with(manifest_env.as_deref(), app_bundle, state_dir)
+    check_and_stage_with(manifest_env.as_deref(), app_bundle, state_dir, false)
 }
 
 /// 환경 변수(`KRILL_UPDATE_*`) 또는 번들 `Info.plist`/`updater.toml` 설정으로 업데이트를 내려받아 스테이징하고,
@@ -1877,7 +1938,7 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
         }
         // 교체 뒤 구 holder·krilld에 새 실행 파일로 업그레이드를 요청한다(기존 IPC). Windows inbox 축소 모드는
         // 세션이 있으면 holder가 거절(EBUSY)해 구 holder가 다음 기동까지 남는다(OWE-832).
-        let socket = state_dir.join("run/krilld.sock");
+        let socket = krill_proto::daemon::socket_path(&state_dir)?;
         let helpers = if cfg!(windows) {
             app_bundle.clone()
         } else {

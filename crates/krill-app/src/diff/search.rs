@@ -112,12 +112,6 @@ const MIN_MATCH_PREVIEW_COLS: usize = 12;
 /// 앞 문맥 생략 시 뒤 문맥(`after`) 노출을 위해 예약할 최대 열 수.
 const AFTER_CONTEXT_RESERVE_COLS: usize = 6;
 
-/// 단일 시작 위치에서 허용하는 정규식 백트래킹 최대 스텝 수.
-const MAX_REGEX_STEPS_PER_MATCH: usize = 4_096;
-
-/// 한 줄 전체에서 허용하는 정규식 백트래킹 최대 스텝 수.
-const MAX_REGEX_STEPS_PER_LINE: usize = 100_000;
-
 /// 가상 리스트 행 높이(px).
 const ROW_HEIGHT: f32 = 24.0;
 
@@ -200,6 +194,8 @@ pub enum SearchRow {
 /// 우측 패널 내 워크스페이스 검색 상태.
 pub struct WorkspaceSearch {
     pub(crate) repo: PathBuf,
+    /// 원격 호스트 작업공간이면 `true`: 로컬 `rg`·디렉터리 워크를 돌리지 않는다(APP-F05).
+    pub(crate) remote: bool,
     pub(crate) options: SearchOptions,
     pub(crate) result: SearchResult,
     pub(crate) collapsed_files: BTreeSet<String>,
@@ -238,6 +234,7 @@ impl WorkspaceSearch {
     pub fn new(repo: PathBuf) -> Self {
         Self {
             repo,
+            remote: false,
             options: SearchOptions::default(),
             result: SearchResult::default(),
             collapsed_files: BTreeSet::new(),
@@ -265,13 +262,26 @@ impl WorkspaceSearch {
             return;
         }
         self.repo = repo;
+        self.reset_results(active);
+    }
+
+    /// 같은 경로라도 호스트가 바뀌면 다른 저장소다. 이전 호스트의 결과를 버린다.
+    pub(crate) fn set_remote(&mut self, remote: bool, active: bool) {
+        if self.remote == remote {
+            return;
+        }
+        self.remote = remote;
+        self.reset_results(active);
+    }
+
+    fn reset_results(&mut self, active: bool) {
         self.collapsed_files.clear();
         self.selected_row = None;
         self.error = None;
         self.generation = self.generation.wrapping_add(1);
         self.cancel = None;
         self.search_task = None;
-        self.searching = active && !self.options.query.trim().is_empty();
+        self.searching = active && !self.remote && !self.options.query.trim().is_empty();
         self.result = SearchResult::default();
         self.rows.clear();
     }
@@ -281,7 +291,7 @@ impl WorkspaceSearch {
         self.cancel = None;
         self.search_task = None;
         self.searching = false;
-        if self.options.query.is_empty() {
+        if self.options.query.is_empty() || self.remote {
             self.result = SearchResult::default();
             self.collapsed_files.clear();
             self.rows.clear();
@@ -452,69 +462,34 @@ pub fn search_worktree_fallback(
     ))
 }
 
-enum LineMatcher {
-    Literal {
-        query: Vec<char>,
-        case_sensitive: bool,
-        whole_word: bool,
-    },
-    Regex {
-        pieces: Vec<RegexPiece>,
-        case_sensitive: bool,
-        whole_word: bool,
-    },
-}
+/// 폴백 검색의 줄 매처. `rg`의 기본 엔진과 같은 Rust `regex` 문법으로 컴파일해 `rg` 유무와 무관하게
+/// 같은 의미로 매칭한다(APP-F06: `(?i)`·`|`·`{m,n}`·그룹 반복). 선형 시간 엔진이라 줄 길이에 비례한
+/// 시간만 쓰고, 컴파일 크기 상한으로 메모리를 묶는다.
+struct LineMatcher(regex::Regex);
 
-#[derive(Clone)]
-struct RegexPiece {
-    atom: RegexAtom,
-    quant: Quantifier,
-}
-
-#[derive(Clone)]
-enum RegexAtom {
-    Literal(char),
-    Dot,
-    Shorthand(char),
-    WordBoundary,
-    Start,
-    End,
-    Class {
-        negated: bool,
-        items: Vec<ClassItem>,
-    },
-}
-
-#[derive(Clone)]
-enum ClassItem {
-    Single(char),
-    Range(char, char),
-    Shorthand(char),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Quantifier {
-    Once,
-    ZeroOrMore,
-    OneOrMore,
-    ZeroOrOne,
-}
+/// 컴파일된 정규식·DFA 캐시 상한(바이트). 넘는 패턴은 컴파일 오류로 거부한다.
+const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
 
 impl LineMatcher {
     fn compile(options: &SearchOptions) -> Result<Self, String> {
-        if !options.use_regex {
-            return Ok(Self::Literal {
-                query: options.query.chars().collect(),
-                case_sensitive: options.case_sensitive,
-                whole_word: options.whole_word,
-            });
+        let mut pattern = if options.use_regex {
+            options.query.clone()
+        } else {
+            regex::escape(&options.query)
+        };
+        if options.whole_word {
+            // `rg -w`와 같은 반쪽 단어 경계: 매치 앞 글자가 단어 문자가 아니고(또는 줄 시작) 뒤 글자가 단어
+            // 문자가 아니면(또는 줄 끝) 된다. `\b`는 패턴이 비단어 문자로 시작·끝나면(`foo()`·`--flag`·`$VAR`)
+            // 거꾸로 단어 문자를 요구해 rg와 어긋났다(APP-F06). 교대(`foo|foobar`)는 엔진이 경계까지 맞춰 고른다.
+            pattern = format!(r"\b{{start-half}}(?:{pattern})\b{{end-half}}");
         }
-        let pieces = parse_regex_pieces(&options.query)?;
-        Ok(Self::Regex {
-            pieces,
-            case_sensitive: options.case_sensitive,
-            whole_word: options.whole_word,
-        })
+        regex::RegexBuilder::new(&pattern)
+            .case_insensitive(!options.case_sensitive)
+            .size_limit(MAX_REGEX_COMPILED_BYTES)
+            .dfa_size_limit(MAX_REGEX_COMPILED_BYTES)
+            .build()
+            .map(Self)
+            .map_err(|e| e.to_string())
     }
 
     fn find_spans(
@@ -523,424 +498,19 @@ impl LineMatcher {
         budget: &mut SearchBudget,
         limit: usize,
     ) -> Vec<(usize, usize)> {
-        let line_chars: Vec<(usize, char)> = raw_line.char_indices().collect();
-        let n = line_chars.len();
         let mut out = Vec::new();
-        let mut i = 0usize;
-        let mut line_steps = 0usize;
-
-        while i < n && out.len() < limit {
-            if i.is_multiple_of(64) && budget.stopped() {
+        if budget.stopped() {
+            return out;
+        }
+        for (i, m) in self.0.find_iter(raw_line).enumerate() {
+            if out.len() >= limit || (i.is_multiple_of(64) && budget.stopped()) {
                 break;
             }
-            if line_steps >= MAX_REGEX_STEPS_PER_LINE {
-                budget.truncated = true;
-                break;
-            }
-            let matched_end = match self {
-                Self::Literal {
-                    query,
-                    case_sensitive,
-                    whole_word,
-                } => match_literal_at(&line_chars, i, query, *case_sensitive, *whole_word),
-                Self::Regex {
-                    pieces,
-                    case_sensitive,
-                    whole_word,
-                } => {
-                    let mut steps = 0usize;
-                    let matched = match_regex_at(
-                        &line_chars,
-                        i,
-                        pieces,
-                        *case_sensitive,
-                        *whole_word,
-                        &mut steps,
-                    );
-                    line_steps = line_steps.saturating_add(steps);
-                    matched
-                }
-            };
-            if let Some(end_idx) = matched_end
-                && end_idx > i
-            {
-                let byte_start = line_chars.get(i).map_or(0, |&(b, _)| b);
-                let byte_end = line_chars.get(end_idx).map_or(raw_line.len(), |&(b, _)| b);
-                out.push((byte_start, byte_end));
-                i = end_idx;
-            } else {
-                i = i.saturating_add(1);
+            if m.start() < m.end() {
+                out.push((m.start(), m.end()));
             }
         }
         out
-    }
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-fn chars_eq(a: char, b: char, case_sensitive: bool) -> bool {
-    if case_sensitive {
-        a == b
-    } else {
-        a.to_lowercase().eq(b.to_lowercase())
-    }
-}
-
-fn is_word_boundary_at(line_chars: &[(usize, char)], idx: usize) -> bool {
-    let prev = idx
-        .checked_sub(1)
-        .and_then(|p| line_chars.get(p))
-        .is_some_and(|&(_, c)| is_word_char(c));
-    let next = line_chars.get(idx).is_some_and(|&(_, c)| is_word_char(c));
-    prev != next
-}
-
-fn match_literal_at(
-    line_chars: &[(usize, char)],
-    start: usize,
-    query: &[char],
-    case_sensitive: bool,
-    whole_word: bool,
-) -> Option<usize> {
-    if query.is_empty() || start.saturating_add(query.len()) > line_chars.len() {
-        return None;
-    }
-    for (offset, &qc) in query.iter().enumerate() {
-        let &(_, lc) = line_chars.get(start.saturating_add(offset))?;
-        if !chars_eq(lc, qc, case_sensitive) {
-            return None;
-        }
-    }
-    let end = start.saturating_add(query.len());
-    if whole_word
-        && (!is_word_boundary_at(line_chars, start) || !is_word_boundary_at(line_chars, end))
-    {
-        return None;
-    }
-    Some(end)
-}
-
-fn parse_regex_pieces(pattern: &str) -> Result<Vec<RegexPiece>, String> {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut i = 0usize;
-    let mut pieces: Vec<RegexPiece> = Vec::new();
-    let mut group_starts: Vec<usize> = Vec::new();
-
-    while let Some(&ch) = chars.get(i) {
-        match ch {
-            '(' => {
-                group_starts.push(pieces.len());
-                i = i.saturating_add(1);
-                if chars.get(i) == Some(&'?') && chars.get(i.saturating_add(1)) == Some(&':') {
-                    i = i.saturating_add(2);
-                }
-            }
-            ')' => {
-                let Some(group_start) = group_starts.pop() else {
-                    return Err("unmatched closing parenthesis in regular expression".to_owned());
-                };
-                i = i.saturating_add(1);
-                let (quant, next_i) = consume_quantifier(&chars, i);
-                i = next_i;
-                if quant != Quantifier::Once {
-                    let group_slice = pieces.get(group_start..).unwrap_or(&[]).to_vec();
-                    if group_slice.len() == 1
-                        && let Some(last) = pieces.last_mut()
-                        && last.quant == Quantifier::Once
-                    {
-                        last.quant = quant;
-                    } else if !group_slice.is_empty() {
-                        for mut gp in group_slice {
-                            if gp.quant == Quantifier::OneOrMore || gp.quant == Quantifier::Once {
-                                gp.quant = Quantifier::ZeroOrMore;
-                            }
-                            pieces.push(gp);
-                        }
-                    }
-                }
-            }
-            '^' => {
-                pieces.push(RegexPiece {
-                    atom: RegexAtom::Start,
-                    quant: Quantifier::Once,
-                });
-                i = i.saturating_add(1);
-            }
-            '$' => {
-                pieces.push(RegexPiece {
-                    atom: RegexAtom::End,
-                    quant: Quantifier::Once,
-                });
-                i = i.saturating_add(1);
-            }
-            '.' => {
-                i = i.saturating_add(1);
-                let (quant, next_i) = consume_quantifier(&chars, i);
-                i = next_i;
-                pieces.push(RegexPiece {
-                    atom: RegexAtom::Dot,
-                    quant,
-                });
-            }
-            '\\' => {
-                let Some(&esc) = chars.get(i.saturating_add(1)) else {
-                    return Err("trailing backslash in regular expression".to_owned());
-                };
-                i = i.saturating_add(2);
-                if esc == 'b' {
-                    pieces.push(RegexPiece {
-                        atom: RegexAtom::WordBoundary,
-                        quant: Quantifier::Once,
-                    });
-                } else {
-                    let atom = match esc {
-                        'w' | 'W' | 'd' | 'D' | 's' | 'S' => RegexAtom::Shorthand(esc),
-                        'n' => RegexAtom::Literal('\n'),
-                        'r' => RegexAtom::Literal('\r'),
-                        't' => RegexAtom::Literal('\t'),
-                        other => RegexAtom::Literal(other),
-                    };
-                    let (quant, next_i) = consume_quantifier(&chars, i);
-                    i = next_i;
-                    pieces.push(RegexPiece { atom, quant });
-                }
-            }
-            '[' => {
-                i = i.saturating_add(1);
-                let negated = if chars.get(i) == Some(&'^') {
-                    i = i.saturating_add(1);
-                    true
-                } else {
-                    false
-                };
-                let mut items = Vec::new();
-                let mut closed = false;
-                while let Some(&c) = chars.get(i) {
-                    if c == ']' && !items.is_empty() {
-                        closed = true;
-                        i = i.saturating_add(1);
-                        break;
-                    }
-                    if c == '\\' {
-                        let Some(&esc) = chars.get(i.saturating_add(1)) else {
-                            return Err("unclosed character class in regular expression".to_owned());
-                        };
-                        i = i.saturating_add(2);
-                        items.push(match esc {
-                            'w' | 'W' | 'd' | 'D' | 's' | 'S' => ClassItem::Shorthand(esc),
-                            other => ClassItem::Single(other),
-                        });
-                    } else if chars.get(i.saturating_add(1)) == Some(&'-')
-                        && let Some(&end_c) = chars.get(i.saturating_add(2))
-                        && end_c != ']'
-                    {
-                        items.push(ClassItem::Range(c, end_c));
-                        i = i.saturating_add(3);
-                    } else {
-                        items.push(ClassItem::Single(c));
-                        i = i.saturating_add(1);
-                    }
-                }
-                if !closed {
-                    return Err("unclosed character class in regular expression".to_owned());
-                }
-                let (quant, next_i) = consume_quantifier(&chars, i);
-                i = next_i;
-                pieces.push(RegexPiece {
-                    atom: RegexAtom::Class { negated, items },
-                    quant,
-                });
-            }
-            '*' | '+' | '?' => {
-                return Err("quantifier without preceding token in regular expression".to_owned());
-            }
-            lit => {
-                i = i.saturating_add(1);
-                let (quant, next_i) = consume_quantifier(&chars, i);
-                i = next_i;
-                pieces.push(RegexPiece {
-                    atom: RegexAtom::Literal(lit),
-                    quant,
-                });
-            }
-        }
-    }
-    if !group_starts.is_empty() {
-        return Err("unclosed group in regular expression".to_owned());
-    }
-    Ok(pieces)
-}
-
-fn consume_quantifier(chars: &[char], idx: usize) -> (Quantifier, usize) {
-    match chars.get(idx) {
-        Some('*') => (Quantifier::ZeroOrMore, idx.saturating_add(1)),
-        Some('+') => (Quantifier::OneOrMore, idx.saturating_add(1)),
-        Some('?') => (Quantifier::ZeroOrOne, idx.saturating_add(1)),
-        _ => (Quantifier::Once, idx),
-    }
-}
-
-fn match_regex_at(
-    line_chars: &[(usize, char)],
-    start: usize,
-    pieces: &[RegexPiece],
-    case_sensitive: bool,
-    whole_word: bool,
-    steps: &mut usize,
-) -> Option<usize> {
-    let end = match_regex_pieces(line_chars, start, pieces, case_sensitive, steps)?;
-    if whole_word
-        && (!is_word_boundary_at(line_chars, start) || !is_word_boundary_at(line_chars, end))
-    {
-        return None;
-    }
-    Some(end)
-}
-
-fn match_regex_pieces(
-    line_chars: &[(usize, char)],
-    pos: usize,
-    pieces: &[RegexPiece],
-    case_sensitive: bool,
-    steps: &mut usize,
-) -> Option<usize> {
-    if *steps >= MAX_REGEX_STEPS_PER_MATCH {
-        return None;
-    }
-    *steps = steps.saturating_add(1);
-
-    let Some(piece) = pieces.first() else {
-        return Some(pos);
-    };
-    let rest = pieces.get(1..).unwrap_or(&[]);
-
-    match &piece.atom {
-        RegexAtom::Start => {
-            if pos == 0 {
-                match_regex_pieces(line_chars, pos, rest, case_sensitive, steps)
-            } else {
-                None
-            }
-        }
-        RegexAtom::End => {
-            if pos == line_chars.len() {
-                match_regex_pieces(line_chars, pos, rest, case_sensitive, steps)
-            } else {
-                None
-            }
-        }
-        RegexAtom::WordBoundary => {
-            if is_word_boundary_at(line_chars, pos) {
-                match_regex_pieces(line_chars, pos, rest, case_sensitive, steps)
-            } else {
-                None
-            }
-        }
-        atom => match piece.quant {
-            Quantifier::Once => {
-                if atom_matches_char(atom, line_chars, pos, case_sensitive) {
-                    match_regex_pieces(
-                        line_chars,
-                        pos.saturating_add(1),
-                        rest,
-                        case_sensitive,
-                        steps,
-                    )
-                } else {
-                    None
-                }
-            }
-            Quantifier::ZeroOrOne => {
-                if atom_matches_char(atom, line_chars, pos, case_sensitive)
-                    && let Some(end) = match_regex_pieces(
-                        line_chars,
-                        pos.saturating_add(1),
-                        rest,
-                        case_sensitive,
-                        steps,
-                    )
-                {
-                    return Some(end);
-                }
-                match_regex_pieces(line_chars, pos, rest, case_sensitive, steps)
-            }
-            Quantifier::ZeroOrMore | Quantifier::OneOrMore => {
-                let min_count = usize::from(piece.quant == Quantifier::OneOrMore);
-                let mut max_count = 0usize;
-                while atom_matches_char(
-                    atom,
-                    line_chars,
-                    pos.saturating_add(max_count),
-                    case_sensitive,
-                ) {
-                    max_count = max_count.saturating_add(1);
-                }
-                if max_count < min_count {
-                    return None;
-                }
-                for count in (min_count..=max_count).rev() {
-                    if *steps >= MAX_REGEX_STEPS_PER_MATCH {
-                        return None;
-                    }
-                    if let Some(end) = match_regex_pieces(
-                        line_chars,
-                        pos.saturating_add(count),
-                        rest,
-                        case_sensitive,
-                        steps,
-                    ) {
-                        return Some(end);
-                    }
-                }
-                None
-            }
-        },
-    }
-}
-
-fn atom_matches_char(
-    atom: &RegexAtom,
-    line_chars: &[(usize, char)],
-    pos: usize,
-    case_sensitive: bool,
-) -> bool {
-    let Some(&(_, ch)) = line_chars.get(pos) else {
-        return false;
-    };
-    match atom {
-        RegexAtom::Literal(expected) => chars_eq(ch, *expected, case_sensitive),
-        RegexAtom::Dot => ch != '\n' && ch != '\r',
-        RegexAtom::Shorthand(kind) => shorthand_matches(*kind, ch),
-        RegexAtom::Class { negated, items } => {
-            let matched = items.iter().any(|item| match *item {
-                ClassItem::Single(c) => chars_eq(ch, c, case_sensitive),
-                ClassItem::Range(lo, hi) => {
-                    if case_sensitive {
-                        ch >= lo && ch <= hi
-                    } else {
-                        let cl = ch.to_ascii_lowercase();
-                        cl >= lo.to_ascii_lowercase() && cl <= hi.to_ascii_lowercase()
-                    }
-                }
-                ClassItem::Shorthand(k) => shorthand_matches(k, ch),
-            });
-            if *negated { !matched } else { matched }
-        }
-        RegexAtom::Start | RegexAtom::End | RegexAtom::WordBoundary => false,
-    }
-}
-
-fn shorthand_matches(kind: char, ch: char) -> bool {
-    match kind {
-        'w' => is_word_char(ch),
-        'W' => !is_word_char(ch),
-        'd' => ch.is_ascii_digit(),
-        'D' => !ch.is_ascii_digit(),
-        's' => ch.is_whitespace(),
-        'S' => !ch.is_whitespace(),
-        _ => ch == kind,
     }
 }
 
@@ -951,26 +521,123 @@ pub(crate) enum RgError {
 }
 
 fn find_rg_binary() -> Option<PathBuf> {
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("rg");
-            if candidate.is_file() {
-                return Some(candidate);
+    find_rg_binary_in(
+        std::env::var_os("PATH").as_deref(),
+        if cfg!(windows) {
+            &[]
+        } else {
+            &[
+                "/opt/homebrew/bin/rg",
+                "/usr/local/bin/rg",
+                "/usr/bin/rg",
+                "/opt/local/bin/rg",
+            ]
+        },
+    )
+}
+
+// Windows는 PATHEXT의 셸 래퍼 대신 네이티브 실행파일을 직접 실행한다.
+// 환경을 인자로 받아 테스트가 프로세스 전역 환경을 바꾸지 않게 한다.
+fn find_rg_binary_in(path: Option<&std::ffi::OsStr>, fallbacks: &[&str]) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "rg.exe" } else { "rg" };
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(name))
+        .chain(fallbacks.iter().map(PathBuf::from))
+        .find(|candidate| rg_executable(candidate))
+}
+
+fn rg_executable(path: &Path) -> bool {
+    path.metadata().is_ok_and(|metadata| {
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
+}
+
+#[cfg(test)]
+mod rg_discovery_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "krill-rg-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+        fn binary(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, b"fixture").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
             }
+            path
         }
     }
-    for fixed in [
-        "/opt/homebrew/bin/rg",
-        "/usr/local/bin/rg",
-        "/usr/bin/rg",
-        "/opt/local/bin/rg",
-    ] {
-        let candidate = PathBuf::from(fixed);
-        if candidate.is_file() {
-            return Some(candidate);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
         }
     }
-    None
+
+    #[test]
+    fn rg_discovery_native_name_and_path_precedence() {
+        let first = Fixture::new();
+        let second = Fixture::new();
+        let native = if cfg!(windows) { "rg.exe" } else { "rg" };
+        first.binary(if cfg!(windows) { "rg" } else { "rg.exe" });
+        first.binary("rg.cmd");
+        let selected = second.binary(native);
+        let path = std::env::join_paths([&first.0, &second.0]).unwrap();
+        assert_eq!(find_rg_binary_in(Some(&path), &[]), Some(selected));
+        let preferred = first.binary(native);
+        assert_eq!(find_rg_binary_in(Some(&path), &[]), Some(preferred));
+    }
+
+    #[test]
+    fn rg_discovery_missing_directory_and_explicit_fallback() {
+        let fixture = Fixture::new();
+        let native = if cfg!(windows) { "rg.exe" } else { "rg" };
+        fs::create_dir(fixture.0.join(native)).unwrap();
+        let path = std::env::join_paths([&fixture.0]).unwrap();
+        assert_eq!(find_rg_binary_in(Some(&path), &[]), None);
+        assert_eq!(find_rg_binary_in(None, &[]), None);
+        let fallback = fixture.binary("fallback-rg");
+        assert_eq!(
+            find_rg_binary_in(Some(&path), &[fallback.to_str().unwrap()]),
+            Some(fallback)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rg_discovery_skips_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new();
+        let binary = fixture.binary("rg");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([&fixture.0]).unwrap();
+        assert_eq!(find_rg_binary_in(Some(&path), &[]), None);
+    }
 }
 
 #[expect(
@@ -1991,7 +1658,8 @@ impl Panel {
         self.search.cancel = None;
         self.search.generation = self.search.generation.wrapping_add(1);
         let generation = self.search.generation;
-        if self.search.options.query.is_empty() {
+        // 원격 작업공간은 로컬 `rg`·디렉터리 워크로 검색할 수 없다. 로컬을 뒤지지 않고 미지원 상태만 보여 준다.
+        if self.search.options.query.is_empty() || self.search.remote {
             self.search.searching = false;
             self.search.search_task = None;
             self.search.result = SearchResult::default();
@@ -2339,7 +2007,16 @@ impl Panel {
                 .child(ui::error_banner(p, msg.clone()))
         });
 
-        let body = if !has_query {
+        let body = if self.search.remote {
+            Self::render_empty_state(
+                "search-remote-unsupported",
+                IconName::Search,
+                text::SEARCH_REMOTE_UNSUPPORTED.get(),
+                "",
+                cx,
+            )
+            .into_any_element()
+        } else if !has_query {
             Self::render_empty_state(
                 "search-empty-idle",
                 IconName::Search,

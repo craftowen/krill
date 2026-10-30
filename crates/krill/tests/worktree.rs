@@ -228,12 +228,17 @@ fn cli_new_worktree_starts_session_in_the_created_path() {
             1,
             "stdout must contain only the session ID"
         );
-        let waited = run(cwd, &["wait", id.trim(), "--timeout", "5"]);
+        let name = if index == 0 { "feat-x" } else { "feat-x-2" };
+        let path = fs::canonicalize(f.dir.join("worktrees/레포").join(name)).unwrap();
+        let condition = format!("pattern:{}", path.display());
+        // Agent programs retain a login shell after printing; wait for their output.
+        let waited = run(
+            cwd,
+            &["wait", id.trim(), "--for", &condition, "--timeout", "5"],
+        );
         assert!(waited.status.success(), "{waited:?}");
         let output = run(cwd, &["read", id.trim()]);
         assert!(output.status.success(), "{output:?}");
-        let name = if index == 0 { "feat-x" } else { "feat-x-2" };
-        let path = fs::canonicalize(f.dir.join("worktrees/레포").join(name)).unwrap();
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(path.to_str().unwrap()),
             "{output:?}"
@@ -416,32 +421,27 @@ fn cli_removal_refuses_dirty_and_locked_and_preserves_unmerged_branch() {
     }
     assert!(!pending.exists());
 
-    // 세션 범위 피어: 자기 cwd에서 worktree new는 허용되지만 다른 경로 생성·삭제는 거부되고 감사 로그에 남는다.
-    let target_wt = output_path(&f.krill(&["protected-wt", "--setup", "skip"]));
-    let deny_rm = f.dir.join("deny-rm");
-    let deny_new = f.dir.join("deny-new");
-    let allow_new = f.dir.join("allow-new");
+    // 세션 안 피어도 전체 권한이라 자기 cwd 밖의 worktree도 지우고 만든다(Orca 소유자 모델).
+    let target_wt = output_path(&f.krill(&["other-wt", "--setup", "skip"]));
+    let other_rm = f.dir.join("other-rm");
+    let outside_new = f.dir.join("outside-new");
     let script = format!(
-        "KRILL_STATE_DIR='{state}' '{krill}' worktree rm '{wt}' --repo '{repo}' --force >'{drm}' 2>&1; \
-         printf '%s' $? >'{drm}.rc'; \
-         KRILL_STATE_DIR='{state}' '{krill}' worktree new denied-wt --repo '{other}' --setup skip >'{dnew}' 2>&1; \
-         printf '%s' $? >'{dnew}.rc'; \
-         KRILL_STATE_DIR='{state}' '{krill}' worktree new allowed-wt --setup skip >'{anew}' 2>&1; \
-         printf '%s' $? >'{anew}.rc'",
+        "KRILL_STATE_DIR='{state}' '{krill}' worktree rm '{wt}' --repo '{repo}' --force >'{orm}' 2>&1; \
+         printf '%s' $? >'{orm}.rc'; \
+         KRILL_STATE_DIR='{state}' '{krill}' worktree new outside-wt --repo '{repo}' --setup skip >'{onew}' 2>&1; \
+         printf '%s' $? >'{onew}.rc'",
         state = f.state.display(),
         krill = MK,
         wt = target_wt.display(),
         repo = f.repo.display(),
-        other = f.dir.display(),
-        drm = deny_rm.display(),
-        dnew = deny_new.display(),
-        anew = allow_new.display(),
+        orm = other_rm.display(),
+        onew = outside_new.display(),
     );
     let sid = Command::new(MK)
         .args([
             "new",
             "--cwd",
-            f.repo.to_str().unwrap(),
+            f.dir.to_str().unwrap(),
             "--",
             "/bin/sh",
             "-c",
@@ -459,44 +459,19 @@ fn cli_removal_refuses_dirty_and_locked_and_preserves_unmerged_branch() {
         .unwrap();
     assert!(waited.status.success(), "{waited:?}");
     assert_eq!(
-        fs::read_to_string(deny_rm.with_extension("rc")).unwrap(),
-        "1"
-    );
-    assert!(
-        fs::read_to_string(&deny_rm)
-            .unwrap()
-            .contains("not allowed from inside another session")
-    );
-    assert!(
-        target_wt.exists(),
-        "session must not remove another worktree"
-    );
-    assert_eq!(
-        fs::read_to_string(deny_new.with_extension("rc")).unwrap(),
-        "1"
-    );
-    assert!(
-        fs::read_to_string(&deny_new)
-            .unwrap()
-            .contains("not allowed from inside another session")
-    );
-    assert_eq!(
-        fs::read_to_string(allow_new.with_extension("rc")).unwrap(),
+        fs::read_to_string(other_rm.with_extension("rc")).unwrap(),
         "0",
         "{}",
-        fs::read_to_string(&allow_new).unwrap_or_default()
+        fs::read_to_string(&other_rm).unwrap_or_default()
     );
-    let audit = fs::read_to_string(f.state.join("audit.log")).unwrap();
-    assert!(
-        audit.contains("deny op=worktree-rm target=0")
-            && audit.contains(&format!("scope=session:{}", sid.trim())),
-        "{audit}"
+    assert!(!target_wt.exists(), "session peer removes another worktree");
+    assert_eq!(
+        fs::read_to_string(outside_new.with_extension("rc")).unwrap(),
+        "0",
+        "{}",
+        fs::read_to_string(&outside_new).unwrap_or_default()
     );
-    assert!(
-        audit.contains("deny op=worktree-new target=0")
-            && audit.contains(&format!("scope=session:{}", sid.trim())),
-        "{audit}"
-    );
+    assert!(!f.state.join("audit.log").exists());
 }
 
 #[test]

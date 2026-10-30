@@ -55,6 +55,24 @@ const MAX_PENDING_FRAMES: usize = 1_024;
 pub const GRACE: Duration = Duration::from_mins(5);
 /// 보낸 입력의 ack를 이만큼 못 받으면 krilld가 멈춘 것으로 본다. 설계값(perf-first #13 "입력 후 2초").
 pub const PROBE: Duration = Duration::from_secs(2);
+/// Settle after an Applied receipt, before sending a separate submit.
+/// This is not proof that the application has consumed the paste.
+pub const PASTE_SUBMIT_DELAY: Duration = Duration::from_millis(250);
+
+/// Local journal checkpoint; never serialized or accepted across a reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Receipt {
+    id: u64,
+    generation: u64,
+    journal: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    Pending,
+    Applied,
+    Uncertain,
+}
 
 /// 이 모듈의 kind. 값은 영구다.
 pub mod kind {
@@ -165,15 +183,37 @@ struct Entry {
 
 /// 세션 하나(칸 하나)의 입력 장부. 연결 상태에 따라 보낼 [`Input`]을 내주고, 버리거나 결과를 모르는 입력을
 /// [`Notice`]로 돌려준다. IO는 하지 않는다. 처음에는 끊긴 상태다([`Journal::relink`]로 붙는다).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Journal {
+    instance: u64,
     last: u64,
+    typing_last: u64,
+    applied: u64,
+    generation: u64,
     linked: bool,
     /// 보냈고 ack를 기다리는 입력.
     sent: VecDeque<Entry>,
     /// 끊긴 동안 친 입력.
     held: VecDeque<Entry>,
     held_bytes: usize,
+}
+
+impl Default for Journal {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self {
+            instance: NEXT.fetch_add(1, Ordering::Relaxed),
+            last: 0,
+            typing_last: 0,
+            applied: 0,
+            generation: 0,
+            linked: false,
+            sent: VecDeque::new(),
+            held: VecDeque::new(),
+            held_bytes: 0,
+        }
+    }
 }
 
 impl Journal {
@@ -194,8 +234,32 @@ impl Journal {
         self.held_bytes > 0 || !self.sent.is_empty()
     }
 
+    pub fn receipt(&self) -> Receipt {
+        Receipt {
+            id: self.typing_last,
+            generation: self.generation,
+            journal: self.instance,
+        }
+    }
+
+    pub fn delivery(&self, receipt: Receipt) -> Delivery {
+        if !self.linked
+            || receipt.journal != self.instance
+            || receipt.generation != self.generation
+            || receipt.id == 0
+            || receipt.id != self.typing_last
+        {
+            Delivery::Uncertain
+        } else if self.applied >= receipt.id {
+            Delivery::Applied
+        } else {
+            Delivery::Pending
+        }
+    }
+
     /// Hold new input while an account replacement starts; existing acknowledgements still apply.
     pub fn pause(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.linked = false;
     }
 
@@ -250,6 +314,7 @@ impl Journal {
 
     fn send(&mut self, bytes: Vec<u8>, now: Now) -> Input {
         self.last = self.last.saturating_add(1);
+        self.typing_last = self.last;
         let id = InputId(self.last);
         self.sent.push_back(Entry {
             id,
@@ -279,8 +344,12 @@ impl Journal {
         let fate = match ack.result {
             InputResult::Closed => Fate::SessionClosed,
             InputResult::Denied => Fate::Unsupported,
-            InputResult::Applied => return None,
+            InputResult::Applied => {
+                self.applied = self.applied.max(ack.id.0);
+                return None;
+            }
         };
+        self.generation = self.generation.wrapping_add(1);
         Some(Notice {
             fate,
             bytes: acked.bytes.clone(),
@@ -289,6 +358,7 @@ impl Journal {
 
     /// 연결이 끊겼다. ack를 못 받은 입력은 결과를 모른다([`Fate::Uncertain`], 다시 보내지 않음).
     pub fn unlink(&mut self) -> Option<Notice> {
+        self.generation = self.generation.wrapping_add(1);
         self.linked = false;
         notice(Fate::Uncertain, self.sent.drain(..))
     }
@@ -300,6 +370,7 @@ impl Journal {
         self.held_bytes = 0;
         let held: Vec<Entry> = self.held.drain(..).collect();
         if session == Incarnation::Changed {
+            self.generation = self.generation.wrapping_add(1);
             return (
                 Vec::new(),
                 notice(Fate::NewSession, held).into_iter().collect(),

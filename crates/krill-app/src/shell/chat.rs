@@ -111,8 +111,6 @@ enum ChatFocus {
 
 #[derive(Default)]
 pub(crate) struct ChatState {
-    pub active_sessions: BTreeSet<SessionId>,
-    pub overrides: BTreeMap<SessionId, bool>,
     poll_timer: Option<Task<()>>,
     poll_failed: BTreeSet<SessionId>,
     lists: BTreeMap<(PaneId, SessionId), ChatList>,
@@ -133,15 +131,16 @@ pub(crate) struct ChatState {
     multiline_blocked: BTreeSet<SessionId>,
     #[cfg(test)]
     send_input: Option<Box<dyn FnMut(Vec<u8>) -> bool>>,
+    #[cfg(test)]
+    prompt_delivery: Option<krill_proto::input::Delivery>,
+    #[cfg(test)]
+    prompt_confirmed: Option<bool>,
 }
 
 impl ChatState {
-    pub(crate) fn set_session_chat_view(&mut self, session: SessionId, chat: bool) {
-        self.overrides.insert(session, chat);
-        if chat {
-            self.active_sessions.insert(session);
-        } else {
-            self.active_sessions.remove(&session);
+    pub(super) fn review_pending_prompt(&mut self, session: SessionId) {
+        if self.prompt_tasks.contains_key(&session) {
+            self.prompt_review.insert(session);
         }
     }
 }
@@ -274,15 +273,21 @@ use body::{ChatBodySegment, parse_chat_segments};
 
 impl Shell {
     pub(super) fn is_session_chat_view(&self, session: SessionId, cx: &gpui::App) -> bool {
-        self.chat
-            .overrides
-            .get(&session)
-            .copied()
-            .unwrap_or_else(|| {
-                self.chat.active_sessions.contains(&session)
-                    || krill_app::settings::default_view_mode(cx)
-                        == krill_app::settings::DefaultViewMode::Chat
-            })
+        let pane = self
+            .layout
+            .focused()
+            .filter(|pane| self.layout.session(*pane) == Some(session));
+        pane.is_some_and(|pane| self.is_pane_chat_view(pane, cx))
+    }
+
+    fn is_pane_chat_view(&self, pane: PaneId, cx: &gpui::App) -> bool {
+        if self.layout.session(pane).is_none() {
+            return false;
+        }
+        if let Some(chat) = self.layout.chat_view(pane) {
+            return chat;
+        }
+        krill_app::settings::default_view_mode(cx) == krill_app::settings::DefaultViewMode::Chat
     }
 
     pub(super) fn is_active_chat_view_in(&self, cx: &gpui::App) -> bool {
@@ -293,10 +298,10 @@ impl Shell {
     /// 현재 포커스된 칸의 세션이 명시적 Chat 뷰 모드인지 반환한다(테스트/내부 호환용).
     #[cfg(test)]
     pub(super) fn is_active_chat_view(&self) -> bool {
-        self.active_session_id().is_some_and(|id| {
-            self.chat.active_sessions.contains(&id)
-                || self.chat.overrides.get(&id).copied().unwrap_or(false)
-        })
+        self.layout
+            .focused()
+            .and_then(|pane| self.layout.chat_view(pane))
+            .unwrap_or(false)
     }
 
     pub(super) fn active_session_id(&self) -> Option<SessionId> {
@@ -319,6 +324,15 @@ impl Shell {
         });
     }
 
+    fn set_pane_chat_view(&mut self, pane: PaneId, chat: bool, cx: &mut Context<Self>) {
+        if self.layout.session(pane).is_none() {
+            return;
+        }
+        self.layout.set_chat_view(pane, chat);
+        self.save();
+        cx.notify();
+    }
+
     /// `[Chat | Term]` 모드를 토글한다(OWE-946 / MK-243).
     pub(super) fn toggle_chat_view(&mut self, cx: &mut Context<Self>) {
         self.diff
@@ -327,7 +341,9 @@ impl Shell {
             return;
         };
         let chat = !self.is_session_chat_view(session, cx);
-        self.chat.set_session_chat_view(session, chat);
+        if let Some(pane) = self.layout.focused() {
+            self.set_pane_chat_view(pane, chat, cx);
+        }
         self.chat.focus_pending = Some(if chat {
             ChatFocus::Composer(session)
         } else {
@@ -421,7 +437,7 @@ impl Shell {
         session: SessionId,
         cx: &mut Context<Self>,
     ) {
-        if self.chat.task.is_some() || !self.is_session_chat_view(session, cx) {
+        if self.chat.task.is_some() || !self.is_pane_chat_view(pane, cx) {
             return;
         }
         self.ensure_chat_poll_timer(cx);
@@ -459,7 +475,7 @@ impl Shell {
                 this.chat.task = None;
                 if this.layout.host(pane) == &host
                     && this.layout.session(pane) == Some(session)
-                    && this.is_session_chat_view(session, cx)
+                    && this.is_pane_chat_view(pane, cx)
                     && this.chat.logs.get(&session).map_or(0, |log| log.offset) == offset
                 {
                     if let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply {
@@ -509,14 +525,6 @@ impl Shell {
             log.agent = snap.agent;
         }
         log.bound = snap.bound;
-        if reset
-            || snap
-                .items
-                .iter()
-                .any(|item| matches!(item.kind, ChatItemKind::User | ChatItemKind::Assistant))
-        {
-            self.chat.prompt_review.remove(&session);
-        }
         if reset || !snap.items.is_empty() {
             log.revision = log.revision.wrapping_add(1);
         }
@@ -597,10 +605,22 @@ impl Shell {
         bytes: &[u8],
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.chat.prompt_tasks.contains_key(&session) {
+            return false;
+        }
+        self.send_chat_prompt_input(pane, session, bytes, cx)
+    }
+
+    fn send_chat_prompt_input(
+        &mut self,
+        pane: super::PaneId,
+        session: SessionId,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) -> bool {
         // Pane::input also returns None when disconnected: preflight the exact
         // pane before interpreting its queue result. This is not an agent ACK.
         if self.paste_queue.has_pending_for(pane)
-            || self.chat.prompt_tasks.contains_key(&session)
             || self.layout.file(pane).is_some()
             || self.layout.session(pane) != Some(session)
             || self.live.get(&pane).is_none_or(|live| {
@@ -710,20 +730,21 @@ impl Shell {
             .live
             .get(&pane)
             .map_or_else(Default::default, |live| live.pane.modes());
-        // Use the same paste plan as terminal handoff: newlines belong inside
-        // a bracketed paste, with a single submit after the closing marker.
-        // Refuse multiline on an unbracketed terminal and preserve the draft.
+        // Use the terminal consumer's paste plan, then submit separately.
+        // Unknown unbracketed consumers retain the multiline draft for review.
         let krill_app::security::PastePlan::Immediate(mut bytes) =
-            krill_app::security::plan_paste(pane, text.as_bytes(), modes)
+            self.plan_terminal_paste(pane, text.as_bytes(), modes, cx)
         else {
             self.chat.multiline_blocked.insert(session);
             cx.notify();
             return;
         };
         self.chat.multiline_blocked.remove(&session);
-        if text.contains(['\n', '\r']) {
-            self.start_multiline_chat_prompt(
-                prompt::MultilinePrompt {
+        if modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
+            || text.contains(['\n', '\r'])
+        {
+            self.start_chat_prompt(
+                prompt::ChatPrompt {
                     pane,
                     session,
                     input,

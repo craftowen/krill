@@ -343,8 +343,15 @@ pub fn add_host(
     } else {
         label.trim()
     };
-    let id = format!("ssh-{}", slugify(clean_label));
     let mut hosts = load_hosts(state_dir);
+    // 한글·기호 라벨은 같은 slug가 되고 같은 라벨도 주소가 다를 수 있으므로, 다른 주소의 호스트와 id가 겹치면 번호를 붙인다.
+    let base = format!("ssh-{}", slugify(clean_label));
+    let mut id = base.clone();
+    let mut n = 2;
+    while hosts.iter().any(|h| h.id == id && h.destination != dest) {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
     let entry = SshHost {
         id: id.clone(),
         label: clean_label.to_owned(),
@@ -1087,6 +1094,20 @@ Host dev-box
 
         let after = remove_host(Some(&dir), &list[0].id).unwrap();
         assert!(after.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_ascii_labels_do_not_overwrite_other_hosts() {
+        let dir = std::env::temp_dir().join(format!("mk-ko-labels-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        add_host(Some(&dir), "집 맥미니", "owen@10.0.0.5", None, None).unwrap();
+        let list = add_host(Some(&dir), "회사 서버", "owen@10.0.0.6", None, None).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_ne!(list[0].id, list[1].id);
+        let list = add_host(Some(&dir), "회사 서버", "owen@10.0.0.6", None, None).unwrap();
+        assert_eq!(list.len(), 2, "re-adding the same address updates in place");
         std::fs::remove_dir_all(&dir).ok();
     }
 

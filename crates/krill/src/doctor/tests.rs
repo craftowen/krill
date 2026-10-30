@@ -5,6 +5,59 @@ use std::path::PathBuf;
 use super::checks::{Agent, CliPath, Daemon, Facts, Helpers, History, State};
 use krill_proto::doctor::Status;
 
+#[test]
+#[cfg(unix)]
+fn timed_out_login_probe_reaps_shell_and_stops_descendants() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::env::temp_dir().join(format!("doctor-timeout-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let shell = root.join("probe.sh");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\necho $$ > '{}/parent'\nsleep 60 &\necho $! > '{}/child'\nwait\n",
+            root.display(),
+            root.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        super::login_path_with(shell.as_os_str(), std::time::Duration::from_millis(500)).is_none()
+    );
+    let pids: Vec<_> = ["parent", "child"]
+        .iter()
+        .map(|name| {
+            let raw = std::fs::read_to_string(root.join(name))
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            rustix::process::Pid::from_raw(raw).unwrap()
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while pids
+        .iter()
+        .any(|pid| rustix::process::test_kill_process(*pid).is_ok())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let alive: Vec<_> = pids
+        .into_iter()
+        .filter(|pid| rustix::process::test_kill_process(*pid).is_ok())
+        .collect();
+    for pid in &alive {
+        rustix::process::kill_process(*pid, rustix::process::Signal::KILL).ok();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        alive.is_empty(),
+        "probe processes survived timeout: {alive:?}"
+    );
+}
+
 fn ok_facts() -> Facts {
     Facts {
         helpers: Helpers {
@@ -225,7 +278,14 @@ fn missing_git_is_warn_with_copy_fix() {
     let checks = super::checks::decide(&f);
     let c = checks.iter().find(|c| c.id == "git").unwrap();
     assert_eq!(c.status, Status::Warn);
-    assert_eq!(c.fix.value, "xcode-select --install");
+    assert_eq!(
+        c.fix.value,
+        if cfg!(windows) {
+            "winget install --id Git.Git -e"
+        } else {
+            "xcode-select --install"
+        }
+    );
 }
 
 #[test]

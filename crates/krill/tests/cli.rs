@@ -194,7 +194,7 @@ impl Drop for Daemon {
 }
 
 #[test]
-fn commands_work_without_app_and_enforce_session_scope() {
+fn commands_work_without_app_and_reach_other_sessions() {
     let d = Daemon::new("commands");
     assert!(d.ok(&["doctor"]).contains("daemon     ok"));
     let id = d.ok(&[
@@ -220,11 +220,21 @@ fn commands_work_without_app_and_enforce_session_scope() {
             .contains("unknown")
     );
 
-    let rejected = d.dir.join("rejected");
+    // 다른 세션 안에서 실행한 `krill`도 무관한 세션에 입력을 보낼 수 있다(Orca 소유자 모델).
+    let unrelated = d.ok(&[
+        "new",
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty -echo; printf 'unrelated-ready\\n'; IFS= read -r line; printf 'unrelated-got:%s\\n' \"$line\"; sleep 30",
+    ]);
+    let unrelated = unrelated.trim();
+    d.wait_text(unrelated, "unrelated-ready");
+    let sent = d.dir.join("sent");
     let child_out = d.dir.join("child-out");
     let attack = format!(
-        "KRILL_STATE_DIR='{dir}' '{krill}' send {id} --enter hijack >'{rej}' 2>&1; \
-         printf '%s' $? >'{rej}.status'; \
+        "KRILL_STATE_DIR='{dir}' '{krill}' send {unrelated} --enter from-other >'{sent}' 2>&1; \
+         printf '%s' $? >'{sent}.status'; \
          cid=$(KRILL_STATE_DIR='{dir}' '{krill}' new -- /bin/sh -c 'stty -echo; printf child-ready\\\\n; IFS= read -r l; printf child-got:%s\\\\n \"$l\"') && \
          KRILL_STATE_DIR='{dir}' '{krill}' wait \"$cid\" --for pattern:child-ready --timeout 5 && \
          KRILL_STATE_DIR='{dir}' '{krill}' send \"$cid\" --enter -- from-creator && \
@@ -233,22 +243,18 @@ fn commands_work_without_app_and_enforce_session_scope() {
          printf '%s' $? >'{cout}.status'",
         dir = d.dir.display(),
         krill = MK,
-        id = id,
-        rej = rejected.display(),
+        sent = sent.display(),
         cout = child_out.display(),
     );
     let attacker = d.ok(&["new", "--", "/bin/sh", "-c", &attack]);
     d.ok(&["wait", attacker.trim(), "--timeout", "10"]);
     assert_eq!(
-        fs::read_to_string(rejected.with_extension("status")).unwrap(),
-        "1"
+        fs::read_to_string(sent.with_extension("status")).unwrap(),
+        "0",
+        "{}",
+        fs::read_to_string(&sent).unwrap_or_default()
     );
-    assert!(
-        fs::read_to_string(&rejected)
-            .unwrap()
-            .contains("no such session")
-    );
-    assert!(!d.ok(&["read", id]).contains("hijack"));
+    d.wait_text(unrelated, "unrelated-got:from-other");
     assert_eq!(
         fs::read_to_string(child_out.with_extension("status")).unwrap(),
         "0",
@@ -399,18 +405,17 @@ fn history_clear_preserves_live_session_and_restarts_recording() {
     d.ok(&["send", id, "--enter", "go"]);
     d.wait_text(id, "new-output");
     assert!(ls_has_session(&d.ok(&["ls"]), id));
-    // A session descendant cannot erase all sessions' history.
-    let report = d.dir.join("denied.status");
+    // A session descendant holds full rights like an external shell (Orca owner model).
+    let report = d.dir.join("inside.status");
     let script = format!(
         "KRILL_STATE_DIR='{}' '{}' history clear; printf '%s' $? > '{}'",
         d.dir.display(),
         MK,
         report.display()
     );
-    let attacker = d.ok(&["new", "--", "/bin/sh", "-c", &script]);
-    d.ok(&["wait", attacker.trim(), "--timeout", "5"]);
-    assert_eq!(fs::read_to_string(report).unwrap(), "1");
-    assert!(session.exists());
+    let inside = d.ok(&["new", "--", "/bin/sh", "-c", &script]);
+    d.ok(&["wait", inside.trim(), "--timeout", "5"]);
+    assert_eq!(fs::read_to_string(report).unwrap(), "0");
     assert_eq!(d.run(&["history"]).status.code(), Some(2));
     d.ok(&["history", "clear"]);
     assert!(!d.dir.join("sessions").exists());
@@ -458,8 +463,13 @@ launch = ["/bin/sh", "-c", "printf 'folder-agent-ready\\n'; /bin/pwd -P; IFS= re
     };
     assert!(text.contains(expected.to_str().unwrap()), "{text}");
     d.ok(&["send", id, "--enter", "folder-input"]);
-    d.ok(&["wait", id, "--timeout", "5"]);
     d.wait_text(id, "agent-received:folder-input");
+    // 에이전트 종료는 Exited로 잡히고, 세션은 로그인 셸로 남는다.
+    d.ok(&["wait", id, "--for", "exited", "--timeout", "5"]);
+    assert!(
+        ls_has_session(&d.ok(&["ls"]), id),
+        "agent exit must retain its login shell"
+    );
     assert!(!folder.join(".git").exists());
 }
 
@@ -1011,6 +1021,7 @@ fn worker_start_validates_run_and_task_before_spawn_and_reports_delivery_errors(
         "missing-preflight-agent",
         "--prompt",
         "Work",
+        "--json",
     ]);
     assert_eq!(spawn.status.code(), Some(2));
     assert!(
@@ -1023,6 +1034,14 @@ fn worker_start_validates_run_and_task_before_spawn_and_reports_delivery_errors(
         serde_json::from_str(&d.ok(&["orchestration", "worker-show", "spawn-failure", "--json"]))
             .unwrap();
     assert_eq!(failed["status"], "failed");
+    let receipt: serde_json::Value = serde_json::from_slice(&spawn.stdout).unwrap();
+    assert_eq!(receipt["id"], failed["id"]);
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(receipt["summary"], failed["summary"]);
+    let request = receipt["request_id"].as_str().unwrap();
+    let lookup: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "request-show", request, "--json"])).unwrap();
+    assert_eq!(lookup, receipt);
     assert!(
         failed["summary"]
             .as_str()
@@ -1061,6 +1080,104 @@ fn worker_start_validates_run_and_task_before_spawn_and_reports_delivery_errors(
         fs::read(d.dir.join("orchestration.json")).unwrap(),
         after_failed_start
     );
+}
+
+/// 시작 실패 영수증은 저장 상태와 일치하고 재시도 상한 직전에도 조회 가능해야 한다.
+#[test]
+fn orchestration_failed_start_receipts_preserve_retry_limit() {
+    let d = Daemon::new("orch-failed-receipt");
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "failed receipts",
+        "--json",
+    ]))
+    .unwrap();
+    let run_id = run["id"].as_str().unwrap();
+    let task: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "task-create",
+        "--run",
+        run_id,
+        "--title",
+        "work",
+        "--json",
+    ]))
+    .unwrap();
+    let task_id = task["id"].as_str().unwrap();
+    let mut previous = None::<String>;
+    for attempt in 1..=3 {
+        let worker = format!("failed-{attempt}");
+        let mut args = vec![
+            "orchestration",
+            "worker-start",
+            "--run",
+            run_id,
+            "--task",
+            task_id,
+            "--worker",
+            &worker,
+            "--agent",
+            "missing-fixture-profile",
+            "--prompt",
+            "work",
+            "--json",
+        ];
+        if let Some(id) = previous.as_deref() {
+            args.extend(["--retry-of", id]);
+        }
+        let out = d.run(&args);
+        assert!(!out.status.success());
+        assert_eq!(out.status.code(), Some(if attempt == 3 { 1 } else { 2 }));
+        let receipt: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["retry_of"].as_str(), previous.as_deref());
+        let lookup: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "request-show",
+            receipt["request_id"].as_str().unwrap(),
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(lookup, receipt);
+        if attempt == 3 {
+            assert!(
+                receipt["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("circuit breaker")
+            );
+        }
+        previous = Some(receipt["id"].as_str().unwrap().to_owned());
+    }
+    let before = fs::read(d.dir.join("orchestration.json")).unwrap();
+    let blocked = d.run(&[
+        "orchestration",
+        "worker-start",
+        "--retry-of",
+        previous.as_deref().unwrap(),
+        "--json",
+    ]);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("circuit breaker"));
+    assert!(blocked.stdout.is_empty());
+    assert_eq!(fs::read(d.dir.join("orchestration.json")).unwrap(), before);
+    let plain = d.run(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run_id,
+        "--worker",
+        "plain-failure",
+        "--agent",
+        "missing-fixture-profile",
+        "--prompt",
+        "work",
+    ]);
+    assert!(!plain.status.success());
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("\tfailed\t"));
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("dispatch disp-"));
 }
 
 /// `worker-start`는 TUI가 프롬프트를 띄운 뒤에 지시문을 넣고, 부팅 중 죽은 에이전트는 실패로 알린다.
@@ -1116,8 +1233,20 @@ launch = ["/bin/sh", "-c", "exit 3"]
         cwd,
         "--prompt",
         "do it",
+        "--json",
     ]);
     assert!(!broken.status.success());
+    let receipt: serde_json::Value = serde_json::from_slice(&broken.stdout).unwrap();
+    assert_eq!(receipt["status"], "failed");
+    assert!(receipt["session_id"].is_number());
+    let recorded: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "request-show",
+        receipt["request_id"].as_str().unwrap(),
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(recorded, receipt);
     assert!(
         String::from_utf8_lossy(&broken.stderr).contains("exited during startup"),
         "{}",
@@ -1228,6 +1357,63 @@ fn orchestration_borrowed_session_survives_stop_rejection_and_abandon() {
     assert!(ls_has_session(&d.ok(&["ls"]), sid));
     d.ok(&["orchestration", "worker-abandon", "borrowed"]);
     assert!(ls_has_session(&d.ok(&["ls"]), sid));
+    for outcome in ["succeeded", "failed"] {
+        let worker = format!("borrowed-{outcome}");
+        let dispatch: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run["id"].as_str().unwrap(),
+            "--worker",
+            &worker,
+            "--session",
+            sid,
+            "--no-preamble",
+            "--prompt",
+            "inspect",
+            "--json",
+        ]))
+        .unwrap();
+        let id = dispatch["id"].as_str().unwrap();
+        d.ok(&[
+            "orchestration",
+            "send",
+            "--from",
+            &worker,
+            "--to",
+            "coordinator",
+            "--type",
+            "worker_done",
+            "--run",
+            run["id"].as_str().unwrap(),
+            "--dispatch",
+            id,
+            "--outcome",
+            outcome,
+            "--summary",
+            "inspection result",
+        ]);
+        let rejected = d.run(&["orchestration", "worker-stop", id]);
+        assert!(!rejected.status.success());
+        let advice = String::from_utf8_lossy(&rejected.stderr);
+        assert!(advice.contains("worker-retain"), "{advice}");
+        assert!(!advice.contains("worker-abandon"), "{advice}");
+        let report: serde_json::Value =
+            serde_json::from_str(&d.ok(&["orchestration", "worker-show", id, "--json"])).unwrap();
+        assert_eq!(report["next_action"]["action"], "retain");
+        let command = report["next_action"]["command"].as_str().unwrap();
+        let retained: serde_json::Value = serde_json::from_str(
+            &d.ok(&command
+                .split_whitespace()
+                .skip(1)
+                .chain(["--json"])
+                .collect::<Vec<_>>()),
+        )
+        .unwrap();
+        assert_eq!(retained["status"], outcome);
+        assert_eq!(retained["release_state"], "retained");
+        assert!(ls_has_session(&d.ok(&["ls"]), sid));
+    }
     d.ok(&["kill", sid]);
 }
 
@@ -1682,4 +1868,177 @@ fn search_literal_help_queries_an_isolated_daemon() {
     let out = d.ok(&["search", "help", "--json"]);
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(report["hits"], serde_json::json!([]));
+}
+
+/// foundation-02: 1MiB 프레임을 넘는 유효 orchestration 상태의 온라인 읽기(페이지 스냅샷·N-1 fallback).
+mod orchestration_frame_bound {
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use krill_proto::control::{Reply, Request};
+    use krill_proto::ipc::{ClientHello, FEATURES, PROTO_MAX, PROTO_MIN, ServerHello, read_frame};
+    use krill_proto::orchestration::{
+        FEAT_ORCH_SNAPSHOT_PAGE, OrchAction, OrchResponse, OrchestrationStore, frame_limit_error,
+    };
+
+    /// 검증자 재현과 같은 fixture: 활성 task 12개 × 100,000B 설명(1.2MB JSON, 1MiB 프레임 초과)을
+    /// 실제 holder/krilld 아래의 온라인 CLI가 디스크와 바이트 동일하게 읽는다.
+    #[test]
+    fn oversized_orchestration_state_lists_online_identically_to_disk() {
+        let d = Daemon::new("orch-paged");
+        let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "run-create",
+            "--title",
+            "verify_core independent synthetic snapshot",
+            "--json",
+        ]))
+        .unwrap();
+        let run = run["id"].as_str().unwrap();
+        let descriptions: Vec<String> = (0..12_u8)
+            .map(|i| String::from_utf8(vec![b'A' + i; 100_000]).unwrap())
+            .collect();
+        for (i, description) in descriptions.iter().enumerate() {
+            d.ok(&[
+                "orchestration",
+                "task-create",
+                "--run",
+                run,
+                "--title",
+                &format!("fixture-{i}"),
+                "--desc",
+                description,
+            ]);
+        }
+        let state = fs::metadata(d.dir.join("orchestration.json"))
+            .unwrap()
+            .len();
+        assert!(state > 1 << 20 && state <= 2 << 20, "{state} bytes");
+        let online: Vec<serde_json::Value> =
+            serde_json::from_str(&d.ok(&["orchestration", "task-list", "--run", run, "--json"]))
+                .unwrap();
+        let disk = OrchestrationStore::load(&d.dir).unwrap();
+        assert_eq!(online.len(), 12);
+        assert_eq!(disk.tasks.len(), 12);
+        for ((task, expected), stored) in online.iter().zip(&descriptions).zip(&disk.tasks) {
+            assert_eq!(task["description"].as_str().unwrap(), expected);
+            assert_eq!(&stored.description, expected);
+        }
+        assert_eq!(
+            serde_json::to_value(&disk.tasks).unwrap(),
+            serde_json::Value::Array(online)
+        );
+        d.ok(&["orchestration", "run-list", "--json"]);
+        d.ok(&["orchestration", "worker-list", "--json"]);
+        let inbox: Vec<serde_json::Value> =
+            serde_json::from_str(&d.ok(&["orchestration", "inbox", "--all", "--json"])).unwrap();
+        assert!(inbox.is_empty());
+    }
+
+    /// 페이지 스냅샷을 모르는 구(N-1) 로컬 데몬이 단일 프레임을 못 보내면(이전 빌드: EOF, 현재 빌드:
+    /// 프레임 상한 명시 오류) 로컬 CLI는 데몬이 읽는 바로 그 orchestration.json을 읽기 전용으로 읽는다.
+    #[test]
+    fn prior_local_daemon_snapshot_overflow_falls_back_to_disk_read_only() {
+        for explicit in [false, true] {
+            let tag = if explicit {
+                "orch-n1-error"
+            } else {
+                "orch-n1-eof"
+            };
+            let dir = std::env::temp_dir().join(format!("mk045-{}-{tag}", std::process::id()));
+            fs::remove_dir_all(&dir).ok();
+            fs::create_dir_all(dir.join("run")).unwrap();
+            let mut store = OrchestrationStore::default();
+            let run = store.create_run("prior daemon", None).unwrap();
+            store
+                .create_task(&run.id, "visible-from-disk", "", vec![])
+                .unwrap();
+            store.save(&dir).unwrap();
+            let before = fs::read(dir.join("orchestration.json")).unwrap();
+            let (listener, stop, server) = prior_daemon(&dir, explicit);
+            let out = Command::new(MK)
+                .args(["orchestration", "task-list", "--json"])
+                .env("KRILL_STATE_DIR", &dir)
+                .output()
+                .unwrap();
+            stop.store(true, Ordering::Release);
+            server.join().unwrap();
+            drop(listener);
+            assert!(
+                out.status.success(),
+                "{tag}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(tasks.len(), 1, "{tag}");
+            assert_eq!(tasks[0]["title"], "visible-from-disk");
+            assert_eq!(
+                fs::read(dir.join("orchestration.json")).unwrap(),
+                before,
+                "{tag}: fallback must be read-only"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// `FEAT_ORCH_SNAPSHOT_PAGE`를 모르는 데몬 흉내. 연결마다 Hello를 마친 뒤 첫 요청(`SnapshotV2`)에
+    /// EOF(이전 빌드) 또는 프레임 상한 명시 오류(현재 빌드)로 답한다.
+    fn prior_daemon(
+        dir: &Path,
+        explicit: bool,
+    ) -> (Arc<UnixListener>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = Arc::new(UnixListener::bind(dir.join("run/krilld.sock")).unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let listener = Arc::clone(&listener);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((socket, _)) => {
+                            thread::spawn(move || serve_prior(socket, explicit));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        (listener, stop, server)
+    }
+
+    fn serve_prior(mut socket: UnixStream, explicit: bool) {
+        socket.set_nonblocking(false).ok();
+        socket.set_read_timeout(Some(WAIT)).ok();
+        let hello = ServerHello {
+            proto_min: PROTO_MIN,
+            proto_max: PROTO_MAX,
+            features: FEATURES & !FEAT_ORCH_SNAPSHOT_PAGE,
+            build: "prior-daemon-fixture".into(),
+            instance_id: 7,
+        };
+        if socket.write_all(&hello.encode().unwrap()).is_err() {
+            return;
+        }
+        let Ok(Some((kind, body))) = read_frame(&mut socket) else {
+            return;
+        };
+        ClientHello::decode(kind, &body).unwrap();
+        while let Ok(Some((kind, body))) = read_frame(&mut socket) {
+            assert!(matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::Orchestration(OrchAction::SnapshotV2)
+            ));
+            if !explicit {
+                return; // 이전 빌드: 인코딩 실패로 응답 없이 스트림을 닫는다.
+            }
+            let reply = Reply::Orchestration(OrchResponse::Error(frame_limit_error(1_204_357)));
+            socket.write_all(&reply.encode().unwrap()).unwrap();
+        }
+    }
 }

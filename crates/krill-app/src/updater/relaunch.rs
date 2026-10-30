@@ -25,6 +25,15 @@ const RELAUNCHER_BIN: &str = "relauncher";
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WAIT_PID_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[cfg(test)]
+thread_local! {
+    /// 테스트 전용 고장 주입: 백업(`.prev`)이 끝나 `MovingStagingToTarget`을 기록한 직후, 교체를 시작하기
+    /// 전에 한 번 호출된다. 교체 도중 `.prev`가 외부에서 사라지는 상황을 실제 [`swap_with`] 흐름 안에서
+    /// 재현한다(APP-F03). 스레드 로컬이라 병렬 테스트끼리 섞이지 않는다.
+    pub(super) static AFTER_BACKUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(super) use crate::i18n::catalog::updater_relaunch as text;
 
 /// 롤백 사유 영문을 사용자용 문구로 바꾼다(OWE-883). 모르는 사유는 그대로 둔다.
@@ -187,6 +196,10 @@ pub(super) fn swap_with(
         }
         journal.stage = Stage::MovingStagingToTarget;
         journal.save(state_dir)?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_BACKUP.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
         match mode {
             Mode::InPlace => sync_bundle_in_place(&staging, app_bundle)?,
             Mode::Rename => rename::move_tree(&staging, app_bundle, &trash)?,
@@ -196,13 +209,22 @@ pub(super) fn swap_with(
         journal.save(state_dir)
     })();
     if let Err(error) = replaced {
-        // 어느 단계가 실패해도 원래 번들을 복원한 후에만 RolledBack을 기록한다.
+        // 원래 번들이 실제로 온전한 뒤에만 RolledBack을 기록한다(APP-F03).
+        // - 백업 단계(`MovingToPrev`) 실패: 번들은 손대지 않았다. 불완전할 수 있는 `.prev`를 버리거나
+        //   (Rename) 옮긴 파일을 되돌린다. `.prev`가 아직 없어도 번들은 그대로다.
+        // - 교체 단계 실패: 완결된 `.prev`로 되돌린다. 그 `.prev`가 없으면 신·구 파일이 섞였을 수 있는
+        //   번들을 복원했다고 기록하지 않는다 — 저널은 `MovingStagingToTarget`으로, 스테이징은 그대로 남겨
+        //   다음 시작([`recover_with`])이 [`Error::NoBackup`]으로 알리게 하고 오류를 그대로 돌려준다.
+        // 디스크 저널을 다시 읽지 않고 이 프로세스가 아는 단계로 백업 상태를 판정한다.
+        let backup = Backup::of(&journal.stage);
         if prev.exists() {
             if app_bundle.exists() {
-                rollback_with(mode, app_bundle, state_dir, &error.to_string())?;
+                rollback_from(mode, app_bundle, state_dir, &error.to_string(), backup)?;
             } else {
                 fs::rename(&prev, app_bundle)?;
             }
+        } else if backup == Backup::Complete {
+            return Err(error);
         }
         journal.stage = Stage::RolledBack {
             reason: error.to_string(),
@@ -286,8 +308,12 @@ fn prune_extraneous_entries(src: &Path, dst: &Path) -> io::Result<()> {
 /// - 번들이 없고 백업이 있으면 복원하고 `RolledBack`을 기록한다(진짜 롤백).
 /// - 번들이 있고 스테이징이 없으면 교체가 끝난 것이다. 성공한 교체를
 ///   `RolledBack`으로 오표기하지 않고(AS-09) 검증 단계로 이어간다.
-/// - 번들·스테이징이 둘 다 멀쩡하면 교체 전에 죽은 것이다. 복원할 게 없으니
+/// - 백업 단계(`MovingToPrev`)에서 죽었으면 번들은 그대로다. 불완전할 수 있는 `.prev`를 지우고
 ///   거짓 롤백 대화상자를 남기지 않고 저널을 버린다.
+/// - 교체 단계(`MovingStagingToTarget`)에서 스테이징이 남아 있으면 파일 일부만 바뀌었을 수 있다.
+///   완결된 `.prev`로 되돌리고 `RolledBack`을 기록한다(혼합 번들을 정상 설치로 오판하지 않는다).
+///   `.prev`가 없으면 복원할 수 없으므로 저널·스테이징을 그대로 두고 [`Error::NoBackup`]을 돌려준다
+///   (복원했다고 기록하지 않는다).
 ///
 /// Windows([`Mode::Rename`])는 설치 폴더가 사라지지 않으므로 단계로 판정한다. 옮기기 전(`MovingToPrev`)에
 /// 멈췄으면 `.prev`의 파일을 되돌리고 저널을 버린다. 새 파일을 놓다가(`MovingStagingToTarget`) 멈췄으면
@@ -331,26 +357,64 @@ pub(super) fn recover_with(mode: Mode, state_dir: &Path) -> Result<Option<Journa
             journal.save(state_dir)?;
             return Ok(Some(journal));
         }
+        if journal.stage == Stage::MovingToPrev {
+            // 백업을 만들다 죽었다: 번들은 아직 손대지 않았고 `.prev`는 불완전할 수 있다.
+            // 불완전한 백업이 나중에 복원 원천으로 쓰이지 않도록 지우고 저널을 버린다.
+            if prev.exists() {
+                fs::remove_dir_all(&prev)?;
+            }
+            fs::remove_file(journal_path(state_dir)).ok();
+            return Ok(None);
+        }
+        // `MovingStagingToTarget`: `.prev`는 완결된 백업이다(백업이 끝난 뒤에만 이 단계를 저장한다).
         if journal.bundle.exists() && !staging.exists() {
             journal.stage = Stage::VerifyingLaunch;
             journal.save(state_dir)?;
             return Ok(Some(journal));
         }
-        if journal.bundle.exists() && staging.exists() {
-            fs::remove_file(journal_path(state_dir)).ok();
-            return Ok(None);
+        if journal.bundle.exists() && prev.exists() {
+            // 파일 단위 교체 도중 죽어 신·구 파일이 섞였을 수 있다. 완결된 백업으로 되돌린다.
+            rollback_from(
+                mode,
+                &journal.bundle,
+                state_dir,
+                "interrupted during bundle replacement",
+                Backup::of(&journal.stage),
+            )?;
+            return Journal::load(state_dir);
         }
-        journal.stage = Stage::RolledBack {
-            reason: "interrupted during bundle replacement".to_owned(),
-        };
-        journal.save(state_dir)?;
+        // 백업이 없어 복원할 수 없다. 저널·스테이징을 그대로 두고(다음 시작·업데이트 재시도에서 다시 본다)
+        // 복원했다고 기록하지 않는다.
+        return Err(Error::NoBackup(prev));
     }
     Ok(Some(journal))
 }
 
 /// `<app_bundle>.prev` 백업으로 `<app_bundle>`을 롤백하고 저널을 `Stage::RolledBack`으로 갱신한다.
+///
+/// 저널이 없으면 [`Error::NoJournal`]로 거부하고 번들·`.prev`를 건드리지 않는다. `.prev`가 완결된
+/// 백업이라는 유일한 증거가 저널 단계이기 때문이다(APP-F02). 저널 없이 손으로 되돌리려면
+/// `.prev`가 완결됐는지 직접 확인한 뒤 번들을 교체해야 한다.
 pub fn rollback(app_bundle: &Path, state_dir: &Path, reason: &str) -> Result<(), Error> {
     rollback_with(MODE, app_bundle, state_dir, reason)
+}
+
+/// 호출자가 아는 `.prev` 백업 상태. 백업 단계(`MovingToPrev`)에서 멈췄으면 `.prev`는 불완전할 수
+/// 있고 번들은 아직 손대지 않았다. 모르는 상태를 완결된 백업으로 가정하지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backup {
+    Complete,
+    Partial,
+}
+
+impl Backup {
+    fn of(stage: &Stage) -> Self {
+        if *stage == Stage::MovingToPrev {
+            Self::Partial
+        } else {
+            Self::Complete
+        }
+    }
 }
 
 pub(super) fn rollback_with(
@@ -359,21 +423,44 @@ pub(super) fn rollback_with(
     state_dir: &Path,
     reason: &str,
 ) -> Result<(), Error> {
+    // `.prev`가 완결된 백업이라는 증거는 저널 단계뿐이다(`MovingStagingToTarget` 이후 단계는 백업이 끝난
+    // 뒤에만 저장된다). 저널이 없거나 읽을 수 없으면 백업 상태를 추정하지 않고 번들·`.prev`를 건드리지
+    // 않는다. 없음을 완결로 보면 중단된 백업의 불완전한 `.prev`가 아직 복사되지 않은 원본을 지운다(APP-F02).
+    let journal = Journal::load(state_dir)?.ok_or(Error::NoJournal)?;
+    rollback_from(
+        mode,
+        app_bundle,
+        state_dir,
+        reason,
+        Backup::of(&journal.stage),
+    )
+}
+
+fn rollback_from(
+    mode: Mode,
+    app_bundle: &Path,
+    state_dir: &Path,
+    reason: &str,
+    backup: Backup,
+) -> Result<(), Error> {
     let prev = prev_path(app_bundle);
     if !prev.exists() {
         return Err(Error::NoBackup(prev));
     }
+    let partial = backup == Backup::Partial;
     if mode == Mode::Rename {
-        // 옮기는 도중(`MovingToPrev`) 실패면 설치 폴더에 남은 것은 아직 안 옮긴 구 파일이라 지우지 않는다.
+        // 설치 폴더에 남은 것은 아직 안 옮긴 구 파일이라 지우지 않는다.
         // 그 뒤 단계면 설치 폴더의 파일은 새 버전이므로 치우고 구 파일을 되돌린다.
         let trash = trash_path(app_bundle);
-        let partial =
-            matches!(Journal::load(state_dir), Ok(Some(j)) if j.stage == Stage::MovingToPrev);
         if !partial {
             rename::clear(app_bundle, &trash)?;
         }
         rename::move_tree(&prev, app_bundle, &trash)?;
         fs::remove_dir_all(&prev).ok();
+    } else if partial && app_bundle.exists() {
+        // 불완전한 `.prev`를 번들에 동기화하면 아직 백업되지 않은 원본 파일이 prune으로 지워진다.
+        // 번들은 그대로 두고 백업만 버린다.
+        fs::remove_dir_all(&prev)?;
     } else if app_bundle.exists() {
         sync_bundle_in_place(&prev, app_bundle)?;
         fs::remove_dir_all(&prev)?;
@@ -468,7 +555,8 @@ pub fn relaunch_and_verify(
 
     child.kill().ok();
     child.wait().ok();
-    rollback(app_bundle, state_dir, &fail_reason)?;
+    // `swap_bundles`가 성공했으므로 `.prev`는 완결된 백업이다. 저널 읽기에 기대지 않는다.
+    rollback_from(MODE, app_bundle, state_dir, &fail_reason, Backup::Complete)?;
     let restored = spawn_bundle_app(app_bundle, state_dir, None)?;
     Ok(RelaunchOutcome::RolledBack {
         reason: fail_reason,
@@ -537,34 +625,10 @@ fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
     }
 }
 
-/// Windows: `tasklist`로 PID가 사라질 때까지 기다린다(unsafe FFI는 platform 모듈 밖에 두지 않는다, AGENTS 5).
-// ponytail: tasklist 한 번에 수십 ms. 대기는 업데이트 때 한 번뿐이라 OpenProcess+WaitForSingleObject로 바꾸지 않는다.
+/// Wait on a process handle: tool failures cannot masquerade as process exit.
 #[cfg(windows)]
 fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let filter = format!("PID eq {raw_pid}");
-    let needle = format!("\"{raw_pid}\"");
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
-    loop {
-        let out = crate::platform::background_command("tasklist")
-            .args(["/FI", &filter, "/NH", "/FO", "CSV"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .output()?;
-        if !String::from_utf8_lossy(&out.stdout).contains(&needle) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "old app did not exit; replacement aborted",
-            ));
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
+    crate::platform::wait_process_exit(raw_pid, timeout)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -713,8 +777,8 @@ fn load_rollback(state_dir: PathBuf, recover: bool, window: &Window, cx: &mut Ap
     let handle = window.window_handle();
     let work_dir = state_dir.clone();
     let work = cx.background_spawn(async move {
-        if recover {
-            recover_journal(&work_dir).ok();
+        if recover && let Err(error) = recover_journal(&work_dir) {
+            tracing::warn!(%error, "update journal recovery failed");
         }
         Journal::load(&work_dir).ok().flatten()
     });

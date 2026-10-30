@@ -17,6 +17,9 @@ use serde::Deserialize;
 
 use super::Sidebar;
 
+mod location;
+pub use location::{project_worktree_locations, save_project_worktree_location};
+
 pub const COMMENTS_FILE: &str = krill_proto::orchestration::COMMENTS_FILE;
 
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -644,6 +647,10 @@ fn slugify_project_id(name: &str) -> String {
 
 fn write_projects_file(path: &Path, value: &toml::Value) -> io::Result<()> {
     let body = toml::to_string(value).map_err(io::Error::other)?;
+    write_projects_body(path, &body)
+}
+
+fn write_projects_body(path: &Path, body: &str) -> io::Result<()> {
     if u64::try_from(body.len()).map_or(true, |n| n > MAX_PROJECTS_BYTES) {
         return Err(io::Error::new(
             io::ErrorKind::QuotaExceeded,
@@ -717,6 +724,8 @@ struct ImportedProject {
     kind: Option<String>,
     #[serde(default)]
     host_id: Option<String>,
+    #[serde(default)]
+    worktree_base_path: Option<String>,
     #[serde(default)]
     pinned: bool,
     #[serde(default)]
@@ -3463,7 +3472,10 @@ fn linked_worktree_registers_and_groups_under_main_repo() {
     // v0.1.8이 남긴 잘못된 항목(linked 워크트리 경로)도 주 저장소 그룹으로 합친다.
     fs::write(
         state.join(PROJECTS_FILE),
-        format!("[[projects]]\npath = \"{}\"\n", canon(&wt).display()),
+        format!(
+            "[[projects]]\npath = \"{}\"\n",
+            canon(&wt).display().to_string().replace('\\', "\\\\")
+        ),
     )
     .unwrap();
     let mut trees = BTreeMap::new();
@@ -3590,9 +3602,9 @@ display_name = "구글드라이브"
 badge_color = "#ef4444"
 kind = "folder"
 "##,
-            repo_local_icon.display(),
-            repo_github.display(),
-            folder_drive.display(),
+            repo_local_icon.display().to_string().replace('\\', "\\\\"),
+            repo_github.display().to_string().replace('\\', "\\\\"),
+            folder_drive.display().to_string().replace('\\', "\\\\"),
         ),
     )
     .unwrap();
@@ -3666,9 +3678,9 @@ display_name = "가상 세션"
 repo_id = "gdrive"
 display_name = "지워진 워크트리"
 "#,
-            drive = drive_canon.display(),
-            polluted = polluted,
-            deleted = deleted_wt.display(),
+            drive = drive_canon.display().to_string().replace('\\', "\\\\"),
+            polluted = polluted.replace('\\', "\\\\"),
+            deleted = deleted_wt.display().to_string().replace('\\', "\\\\"),
         ),
     )
     .unwrap();

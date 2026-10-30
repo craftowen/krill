@@ -129,6 +129,77 @@ pub fn capture_ui_stall(process: Process, elapsed: Duration, file: &str, line: u
     }
 }
 
+/// 테스트 프로세스가 실제 사용자(기본) 상태 폴더의 오류 보고를 건드리지 못하게 한다(2026-10-28: krill-app updater
+/// 단위 테스트가 실제 대기열에 `update_failed`를 남겼다). 모든 기록·실행 표식·native 수집·전송은 동의 확인
+/// ([`consent::read`])을 거치므로 거기서 동의를 없는 것으로 보고, 동의·철회는 거절한다. Krill 세션 안 셸은
+/// `KRILL_STATE_DIR`에 기본 경로를 그대로 물려받으므로 오버라이드 여부가 아니라 실제 디렉터리로 가른다.
+pub(crate) fn shielded(state: &Path) -> bool {
+    is_test_process() && crate::daemon::default_state_dir().is_some_and(|d| same_dir(state, &d))
+}
+
+/// 같은 디렉터리인가(`..`·심볼릭 링크 별칭 포함). 아직 없는 폴더도 별칭으로 동의를 만들 수 있으니 글자 비교로
+/// 물러서지 않고 [`resolve`]로 비교한다.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    resolve(a) == resolve(b)
+}
+
+/// 존재하는 가장 깊은 조상을 `canonicalize`하고, 없는 나머지 구성 요소는 글자 그대로 붙이며 `.`·`..`만 접는다.
+fn resolve(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut rest = Vec::new();
+    let mut base = path;
+    let mut out = loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            break real;
+        }
+        match (base.parent(), base.components().next_back()) {
+            (Some(parent), Some(last)) => {
+                rest.push(last);
+                base = parent;
+            }
+            _ => break PathBuf::new(),
+        }
+    };
+    for part in rest.into_iter().rev() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// 테스트 하네스가 띄운 프로세스(와 그 자식)인가 — `krill_log::is_test_process`와 같은 판정이다(이 크레이트는
+/// krill-log에 의존하지 않는다). `NEXTEST`, `cargo test`가 런타임에 두는 `CARGO_BIN_EXE_<이름>`, libtest
+/// 실행 파일(`…/deps/<이름>-<해시>`). 일반 `cargo run`·설치본은 아니다. 프로세스 수명 동안 바뀌지 않아 한 번만 본다.
+fn is_test_process() -> bool {
+    static TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TEST.get_or_init(|| {
+        is_test_process_in(
+            std::env::vars_os().map(|(key, _)| key),
+            std::env::current_exe().ok().as_deref(),
+        )
+    })
+}
+
+fn is_test_process_in(
+    keys: impl IntoIterator<Item = std::ffi::OsString>,
+    exe: Option<&Path>,
+) -> bool {
+    keys.into_iter().any(|key| {
+        key == "NEXTEST"
+            || key
+                .to_str()
+                .is_some_and(|key| key.starts_with("CARGO_BIN_EXE_"))
+    }) || exe
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|dir| dir == "deps")
+}
+
 /// 동의·거부를 먼저 보고(꺼져 있으면 이벤트를 만들지 않는다) 종류별 필수 필드를 채워 기록한다.
 fn capture_with(
     state: &Path,

@@ -14,12 +14,36 @@ use krill_proto::usage::ProviderKind;
 
 use crate::shell::Launch;
 
-pub(super) fn wrap(login: Launch, hint: &str, args: Vec<String>) -> Launch {
+/// Batch files need Rust's `Command` batch quoting rather than the holder's CRT argv encoding.
+pub(crate) fn wrap_shell(mut login: Launch) -> Launch {
+    let batch = login.argv.first().is_some_and(|program| {
+        std::path::Path::new(OsStr::from_bytes(program))
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+    });
+    if !batch {
+        return login;
+    }
+    let args = std::mem::take(&mut login.argv);
+    let mut launch = wrap(login, "command not found", Vec::new(), false);
+    launch.argv.extend(args);
+    launch
+}
+
+/// `then_shell`: 에이전트가 끝나면 같은 `ConPTY`에서 로그인 셸을 띄운다(Unix `PREFLIGHT`와 같은 약속).
+/// 사용자 지정 배치 셸([`wrap_shell`])은 그 자체가 셸이라 끄고 쓴다.
+pub(super) fn wrap(login: Launch, hint: &str, args: Vec<String>, then_shell: bool) -> Launch {
     // The running daemon is also the helper, so upgrades cannot select a different installation.
     let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("krilld.exe"));
+    let flag: &[u8] = if then_shell {
+        AGENT_THEN_SHELL
+    } else {
+        b"--agent-exec"
+    };
     let mut argv = vec![
         executable.into_os_string().as_encoded_bytes().to_vec(),
-        b"--agent-exec".to_vec(),
+        flag.to_vec(),
         hint.as_bytes().to_vec(),
     ];
     argv.extend(args.into_iter().map(String::into_bytes));
@@ -29,10 +53,14 @@ pub(super) fn wrap(login: Launch, hint: &str, args: Vec<String>) -> Launch {
     }
 }
 
+/// [`wrap`]의 `then_shell` 진입 플래그. 인자 모양은 `--agent-exec`와 같다.
+pub const AGENT_THEN_SHELL: &[u8] = b"--agent-exec-then-shell";
+
 /// Internal `krilld --agent-exec <hint> <program> [args...]` entry point.
 /// Inherit terminal handles and the holder's Job; never open another console or daemon socket.
+/// `then_shell`이면 에이전트가 끝난 뒤(설치 안 됨 127은 제외) 로그인 셸을 띄우고 그 종료 코드를 돌려준다.
 #[cfg(windows)]
-pub fn run(mut args: impl Iterator<Item = OsString>) -> ExitCode {
+pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCode {
     let Some(hint) = args.next() else {
         return ExitCode::from(2);
     };
@@ -58,14 +86,35 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> ExitCode {
     {
         command.env("SSH_CONNECTION", "krill");
     }
+    crate::sys::console_utf8();
     if let Err(error) = crate::sys::protect_agent_launcher() {
         writeln!(io::stderr().lock(), "agent console setup failed: {error}").ok();
         return ExitCode::FAILURE;
     }
-    match command.args(args).status() {
+    let code = match command.args(args).status() {
         Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1)),
         Err(error) => {
             writeln!(io::stderr().lock(), "agent launch failed: {error}").ok();
+            ExitCode::FAILURE
+        }
+    };
+    if !then_shell {
+        return code;
+    }
+    // 셸은 에이전트 계정 env 없이, 세션 env(`MK_PANE_ID` 등)는 그대로 받는다.
+    let login = crate::shell::Shell::Login.launch();
+    let Some((program, shell_args)) = login.argv.split_first() else {
+        return code;
+    };
+    let mut shell = Command::new(OsStr::from_bytes(program));
+    shell
+        .args(shell_args.iter().map(|a| OsStr::from_bytes(a)))
+        .env_remove("KRILL_ACCOUNT_PROVIDER")
+        .env_remove("KRILL_ACCOUNT_DIR");
+    match shell.status() {
+        Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1)),
+        Err(error) => {
+            writeln!(io::stderr().lock(), "shell launch failed: {error}").ok();
             ExitCode::FAILURE
         }
     }

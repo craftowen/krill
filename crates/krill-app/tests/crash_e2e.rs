@@ -23,7 +23,8 @@ fn forced_panic_leaves_crash_log() {
     assert!(text.contains("process: krill-app"), "{text}");
     assert!(text.contains("message: MK-067 crash test"), "{text}");
     assert!(
-        text.contains("location: crates/krill-app/src/main.rs"),
+        text.replace('\\', "/")
+            .contains("location: crates/krill-app/src/main.rs"),
         "{text}"
     );
     fs::remove_dir_all(&state).ok();

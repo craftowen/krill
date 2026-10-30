@@ -93,14 +93,13 @@ impl Target {
     /// `ShellExecuteW`에 넘길 대상. 탐색기는 경로 그대로, 에디터는 각자 등록한 URL 처리기(`<scheme>://file/<경로>`)다.
     #[cfg(windows)]
     fn windows_target(self, path: &Path) -> String {
+        let path = krill_proto::daemon::executable_path(path);
         let path = path.to_string_lossy();
-        // `canonicalize`가 붙이는 `\\?\` 접두사는 탐색기·에디터가 읽지 못한다.
-        let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
         match self {
-            Self::VsCode => editor_url("vscode", path),
-            Self::Cursor => editor_url("cursor", path),
-            Self::Zed => editor_url("zed", path),
-            Self::Finder => path.to_owned(),
+            Self::VsCode => editor_url("vscode", &path),
+            Self::Cursor => editor_url("cursor", &path),
+            Self::Zed => editor_url("zed", &path),
+            Self::Finder => path.into_owned(),
         }
     }
 }
@@ -153,6 +152,28 @@ mod tests {
             editor_url("vscode", r"C:\Users\오웬\my proj#1"),
             "vscode://file/C:/Users/%EC%98%A4%EC%9B%AC/my%20proj%231"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_targets_preserve_unc_share_roots() {
+        for (verbatim, ordinary) in [
+            (
+                r"\\?\UNC\server\share\한글 folder",
+                r"\\server\share\한글 folder",
+            ),
+            (
+                r"\\?\UNC\wsl.localhost\Ubuntu\home\owen",
+                r"\\wsl.localhost\Ubuntu\home\owen",
+            ),
+            (r"\\?\C:\Users\owen", r"C:\Users\owen"),
+        ] {
+            assert_eq!(Target::Finder.windows_target(Path::new(verbatim)), ordinary);
+            assert_eq!(
+                Target::VsCode.windows_target(Path::new(verbatim)),
+                editor_url("vscode", ordinary)
+            );
+        }
     }
 
     #[test]

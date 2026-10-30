@@ -32,8 +32,29 @@ impl Fixture {
         Self { dir, child: None }
     }
 
+    #[cfg_attr(
+        not(windows),
+        expect(
+            clippy::unused_self,
+            reason = "Windows copies each fixture's server out of Cargo's shared output"
+        )
+    )]
+    fn program(&self) -> PathBuf {
+        #[cfg(windows)]
+        {
+            // A resident server must not lock Cargo's output during other builds.
+            let program = self.dir.join("krill-link.exe");
+            if !program.is_file() {
+                fs::copy(env!("CARGO_BIN_EXE_krill-link"), &program).unwrap();
+            }
+            program
+        }
+        #[cfg(not(windows))]
+        PathBuf::from(env!("CARGO_BIN_EXE_krill-link"))
+    }
+
     fn disable(&self) {
-        let result = Command::new(env!("CARGO_BIN_EXE_krill-link"))
+        let result = Command::new(self.program())
             .args(["disable", "--state-dir"])
             .arg(&self.dir)
             .env("KRILL_LINK_SKIP_LAUNCHCTL", "1")
@@ -46,7 +67,7 @@ impl Fixture {
     fn start(&mut self) {
         #[cfg(windows)]
         {
-            let output = Command::new(env!("CARGO_BIN_EXE_krill-link"))
+            let output = Command::new(self.program())
                 .args(["enable", "--state-dir"])
                 .arg(&self.dir)
                 .output()
@@ -56,7 +77,7 @@ impl Fixture {
         #[cfg(not(windows))]
         {
             self.child = Some(
-                Command::new(env!("CARGO_BIN_EXE_krill-link"))
+                Command::new(self.program())
                     .args(["serve", "--state-dir"])
                     .arg(&self.dir)
                     .stdin(Stdio::null())
@@ -106,7 +127,7 @@ fn disabling_exits_serve_process_and_keeps_local_socket_alive() {
     let local_path = fixture.dir.join("run/krilld.sock");
     fs::create_dir_all(local_path.parent().unwrap()).unwrap();
     let local = krill_proto::os::net::UnixListener::bind(&local_path).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_krill-link"))
+    let child = Command::new(fixture.program())
         .args(["serve", "--state-dir"])
         .arg(&fixture.dir)
         .stdin(Stdio::null())
@@ -198,7 +219,8 @@ fn incoming_server_pairs_and_forwards_to_local_socket() {
 #[test]
 fn windows_default_server_starts_reuses_and_remembers_off() {
     let fixture = Fixture::new("default");
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_krill-link"));
+    let program = fixture.program();
+    let executable = program.as_path();
     assert!(krill_link::service::incoming_enabled(&fixture.dir).unwrap());
     krill_link::service::ensure_default_server(executable, &fixture.dir).unwrap();
     assert!(is_serve_running(&fixture.dir));

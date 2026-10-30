@@ -160,6 +160,9 @@ pub(super) struct State {
     custom: Option<String>,
     /// QR 선택과 독립적으로 유지하는 Tailscale 백업 주소.
     tailscale_address: Option<String>,
+    host_id: String,
+    tailscale_enabled: bool,
+    tailscale_serve: Option<super::tailscale_serve::Serve>,
     interfaces: Vec<NetworkInterface>,
     network_checked: Instant,
     selected: Option<SocketAddrV4>,
@@ -197,6 +200,10 @@ struct Intent {
     #[serde(default)]
     rid: String,
     #[serde(default)]
+    host_id: String,
+    #[serde(default)]
+    tailscale_enabled: bool,
+    #[serde(default)]
     key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relay_owner: Option<String>,
@@ -225,6 +232,8 @@ impl Intent {
                 custom: None,
                 tailscale_address: None,
                 rid: String::new(),
+                host_id: String::new(),
+                tailscale_enabled: false,
                 key: String::new(),
                 relay_owner: None,
                 port: None,
@@ -251,6 +260,9 @@ impl Intent {
             intent.rid = hex(&random()?.into_iter().take(16).collect::<Vec<_>>());
             intent.key = hex(&random()?);
         }
+        if decode_hex::<16>(&intent.host_id).is_err() {
+            intent.host_id.clone_from(&intent.rid);
+        }
         if let Some(dir) = dir {
             intent.save(dir)?;
         }
@@ -272,6 +284,8 @@ fn save_intent(s: &State) -> io::Result<()> {
         custom: s.custom.clone(),
         tailscale_address: s.tailscale_address.clone(),
         rid: s.publication.rid.clone(),
+        host_id: s.host_id.clone(),
+        tailscale_enabled: s.tailscale_enabled,
         key: s.publication.key.clone(),
         relay_owner: s.relay_owner.clone(),
         port: s.saved_port,
@@ -357,6 +371,51 @@ pub struct AuthProof {
 pub struct Authenticated {
     pub device_id: String,
     pub credential: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<DesktopRoutes>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DesktopRoutes {
+    pub host_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayRoute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tailscale: Option<DirectRoute>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RelayRoute {
+    pub origin: String,
+    pub rid: String,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DirectRoute {
+    pub origin: String,
+}
+pub(super) fn authenticated_reply(
+    s: &State,
+    device_id: String,
+    credential: Option<String>,
+) -> Authenticated {
+    Authenticated {
+        device_id,
+        credential,
+        desktop: Some(DesktopRoutes {
+            host_id: s.host_id.clone(),
+            relay: s
+                .relay
+                .as_ref()
+                .filter(|relay| relay.connected())
+                .map(|_| RelayRoute {
+                    origin: s.publication.origin.clone(),
+                    rid: s.publication.rid.clone(),
+                }),
+            tailscale: s
+                .tailscale_serve
+                .as_ref()
+                .and_then(super::tailscale_serve::Serve::ready)
+                .map(|origin| DirectRoute { origin }),
+        }),
+    }
 }
 impl std::fmt::Debug for Authenticated {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -395,6 +454,9 @@ impl Gateway {
                 mode: intent.mode,
                 custom: intent.custom,
                 tailscale_address: intent.tailscale_address,
+                host_id: intent.host_id,
+                tailscale_enabled: intent.tailscale_enabled,
+                tailscale_serve: None,
                 interfaces: net::detect()?,
                 network_checked: Instant::now(),
                 selected: None,
@@ -463,16 +525,10 @@ impl Gateway {
             } else {
                 return None;
             }
+        } else if state.mode == ConnectMode::Tailscale {
+            state.tailscale_serve.as_ref()?.ready()?;
+            fixed_base(&state)
         } else {
-            if state.mode == ConnectMode::Tailscale
-                && (!net::tailscale(*address.ip())
-                    || !state
-                        .listeners
-                        .iter()
-                        .any(|listener| listener.local_addr().ok() == Some(address.into())))
-            {
-                return None;
-            }
             format!("http://{address}")
         };
         Some(format!("{base}/?session={}", session.0))
@@ -492,6 +548,9 @@ impl Gateway {
             return MobileReply::Workflow(reply.to_string());
         }
         self.request(request)
+    }
+    pub(super) fn backend(&self) -> &super::pwa_rpc::Backend {
+        &self.backend
     }
     pub fn request(&self, request: MobileRequest) -> MobileReply {
         if let MobileRequest::Workflow(json) = request {
@@ -563,10 +622,13 @@ impl Gateway {
                     ));
                 }
                 configure(&mut state, mode, custom_address, now)?;
+                if mode == ConnectMode::Tailscale {
+                    request_tailscale(&mut state, true)?;
+                }
                 let ticket = state.devices.mint(now, rotate)?;
                 state.tunnel_retry_at = None;
                 reconcile(&mut state, now)?;
-                if mode == ConnectMode::Tunnel {
+                if matches!(mode, ConnectMode::Tunnel | ConnectMode::Tailscale) {
                     // 설치·터널 준비·고정 출처 판정을 모두 락 밖에서 기다린다.
                     drop(state);
                     self.shared.wake();
@@ -584,6 +646,36 @@ impl Gateway {
                             return Err(io::Error::other(
                                 "페어링 요청이 취소되었거나 만료되었습니다",
                             ));
+                        }
+                        if mode == ConnectMode::Tailscale {
+                            if state
+                                .tailscale_serve
+                                .as_ref()
+                                .and_then(super::tailscale_serve::Serve::ready)
+                                .is_some()
+                            {
+                                return pairing_offer(&state, now_ms());
+                            }
+                            if let Some(error) = state
+                                .tailscale_serve
+                                .as_ref()
+                                .and_then(super::tailscale_serve::Serve::error)
+                            {
+                                return Err(io::Error::other(error));
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "Tailscale HTTPS is still preparing. Check Tailscale, then create a new QR code.",
+                                ));
+                            }
+                            drop(
+                                self.shared
+                                    .changed
+                                    .wait_timeout(state, Duration::from_millis(50))
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            );
+                            continue;
                         }
                         // 릴레이가 연결되면 퀵 터널의 DNS/엣지 정착을 기다리지 않는다.
                         if relay_pairing(&state) {
@@ -652,6 +744,9 @@ impl Gateway {
                     ));
                 }
                 configure(&mut state, mode, custom_address, now)?;
+                if mode == ConnectMode::Tailscale {
+                    request_tailscale(&mut state, true)?;
+                }
                 reconcile(&mut state, now)?;
                 status(&state, now)
             }
@@ -873,16 +968,35 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
                 url.to_owned()
             }
         }
+    } else if state.mode == ConnectMode::Tailscale {
+        fixed_base(state)
     } else {
         format!("http://{host}:{port}")
     };
-    let mut url = format!(
-        "{base}/#pair={}&key={}",
-        hex(&ticket.token),
-        ws::base64(&ticket.secret, true)
-    );
+    let url = pairing_url(state, ticket, &base)?;
+    Ok(MobileReply::PairingOffer {
+        url,
+        host,
+        port,
+        expires_at_ms: ticket.expires_at_ms,
+        mode: state.mode,
+        interfaces: state.interfaces.clone(),
+    })
+}
+
+fn pairing_url(
+    state: &State,
+    ticket: &krill_proto::mobile::PairingTicket,
+    base: &str,
+) -> io::Result<String> {
+    let pairing = if state.mode == ConnectMode::Tailscale {
+        format!("p={}", ws::base64(&ticket.token, true))
+    } else {
+        format!("pair={}", hex(&ticket.token))
+    };
+    let mut url = format!("{base}/#{pairing}&key={}", ws::base64(&ticket.secret, true));
     if state.mode == ConnectMode::Tunnel {
-        if relay_only {
+        if relay_pairing(state) {
             write!(url, "&r={}", state.publication.rid).map_err(io::Error::other)?;
         } else if let Some(tunnel) = state.tunnel.as_ref().filter(|t| t.fixed()) {
             let host = tunnel
@@ -892,14 +1006,29 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
             write!(url, "&t={host}&r={}", state.publication.rid).map_err(io::Error::other)?;
         }
     }
-    Ok(MobileReply::PairingOffer {
-        url,
-        host,
-        port,
-        expires_at_ms: ticket.expires_at_ms,
-        mode: state.mode,
-        interfaces: state.interfaces.clone(),
-    })
+    if state.mode == ConnectMode::Tailscale {
+        let direct = state
+            .tailscale_serve
+            .as_ref()
+            .and_then(super::tailscale_serve::Serve::ready)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Tailscale HTTPS is preparing. Create a new QR code after setup completes.",
+                )
+            })?;
+        let authority = direct.strip_prefix("https://").ok_or_else(invalid)?;
+        write!(url, "&r={}&d={authority}", state.host_id).map_err(io::Error::other)?;
+    }
+    if state.mode != ConnectMode::Tailscale && state.host_id != state.publication.rid {
+        write!(url, "&h={}", state.host_id).map_err(io::Error::other)?;
+    }
+    if state.mode == ConnectMode::Tailscale && url.len() > 271 {
+        return Err(io::Error::other(
+            "The Tailscale HTTPS name is too long for this QR code. Use a shorter machine name in Tailscale, then create a new QR code.",
+        ));
+    }
+    Ok(url)
 }
 
 fn relay_pairing(state: &State) -> bool {
@@ -953,6 +1082,7 @@ fn status(s: &State, now: u64) -> MobileReply {
     }
 }
 fn close(s: &mut State) {
+    s.tailscale_serve = None;
     if let Some(mut tunnel) = s.tunnel.take() {
         tunnel.terminate();
     } else if let Some(pid) = s.saved_tunnel_pid.take() {
@@ -1000,6 +1130,7 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
     if !s.listeners.is_empty() {
         sync_direct_listener(s);
         supervise_tunnel(s);
+        request_tailscale(s, false)?;
         return Ok(());
     }
     let selected = match s.selected {
@@ -1037,6 +1168,42 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
     save_intent(s)?;
     sync_direct_listener(s);
     supervise_tunnel(s);
+    request_tailscale(s, false)?;
+    Ok(())
+}
+fn request_tailscale(s: &mut State, explicit: bool) -> io::Result<()> {
+    if explicit && !s.tailscale_enabled {
+        s.tailscale_enabled = true;
+        save_intent(s)?;
+    }
+    if !s.tailscale_enabled || s.listeners.is_empty() {
+        return Ok(());
+    }
+    if s.tailscale_serve
+        .as_ref()
+        .is_some_and(|serve| (explicit && serve.error().is_some()) || serve.retry_due())
+    {
+        s.tailscale_serve = None;
+    }
+    let port = s
+        .listeners
+        .first()
+        .ok_or_else(invalid)?
+        .local_addr()?
+        .port();
+    if s.tailscale_serve
+        .as_ref()
+        .is_some_and(|serve| !serve.matches_port(port))
+    {
+        s.tailscale_serve = None;
+    }
+    if s.tailscale_serve.is_none() {
+        s.tailscale_serve = Some(super::tailscale_serve::Serve::start(
+            port,
+            s.publication.origin.clone(),
+            s.dir.clone(),
+        )?);
+    }
     Ok(())
 }
 /// Keep the tailnet endpoint warm even while relay is preferred. Bind failure
@@ -1364,6 +1531,7 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
                     tracing::debug!(kind=?error.kind(), "mobile connection ended");
                 }
                 drop(guard);
+                crate::alloc::purge();
             })
             .is_err()
         {
@@ -1553,10 +1721,7 @@ fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Re
             };
             let conn = s.connections.get_mut(&id).ok_or_else(invalid)?;
             conn.device = Some(device_id.clone());
-            Authenticated {
-                device_id,
-                credential,
-            }
+            authenticated_reply(&s, device_id, credential)
         };
         let payload =
             channel.seal(&serde_json::to_vec(&authenticated).map_err(io::Error::other)?)?;
@@ -1585,6 +1750,23 @@ fn bridge(
     let output = Arc::new(Mutex::new(socket.try_clone()?));
     let cipher = Arc::new(Mutex::new(channel));
     let (c, w) = (Arc::clone(&cipher), Arc::clone(&output));
+    // 응답과 변경 피드 푸시가 같은 순서로 봉인·전송되도록 출력 잠금을 봉인까지 쥔다(nonce 순서 = 전송 순서).
+    // 쓰기 실패(부분 쓰기 포함)는 WS 프레이밍을 깨므로 소켓을 닫아 연결을 끝낸다. WouldBlock도 예외가 아니다.
+    // 봉인 잠금은 봉인 직후 놓는다(네트워크 쓰기 동안 수신 복호화를 막지 않게). 순서는 출력 잠금이 지킨다.
+    let send = Arc::new(move |frame: &[u8]| -> io::Result<()> {
+        let mut out = lock(&w);
+        let sealed = lock(&c).seal(frame);
+        let result = sealed.and_then(|sealed| ws::write(&mut *out, ws::BINARY, &sealed));
+        if result.is_err() {
+            out.shutdown(Shutdown::Both).ok();
+        }
+        result
+    });
+    let feed = super::pwa_rpc::feed::Feed::new(Arc::downgrade(&registry), {
+        let send = Arc::clone(&send);
+        move |frame: &[u8]| send(frame)
+    });
+    let w = Arc::clone(&output);
     let reader = thread::Builder::new()
         .name("mobile-out".into())
         .stack_size(STACK)
@@ -1592,15 +1774,22 @@ fn bridge(
             crate::alloc::mobile_thread().ok();
             let result = (|| -> io::Result<()> {
                 while let Some((kind, body)) = ipc::read_frame(&mut outgoing)? {
+                    let large = body.len() > 8 * 1024;
                     let frame = ipc::encode_frame(kind, &body)?;
-                    let sealed = lock(&c).seal(&frame)?;
-                    ws::write(&mut *lock(&w), ws::BINARY, &sealed)?;
+                    drop(body);
+                    send(&frame)?;
+                    drop(frame);
+                    if large {
+                        crate::alloc::purge();
+                    }
                 }
                 Ok(())
             })();
+            crate::alloc::purge();
             lock(&w).shutdown(Shutdown::Both).ok();
             result
         })?;
+    let installed = Arc::clone(&feed);
     let worker = thread::Builder::new()
         .name("mobile-ipc".into())
         .stack_size(RPC_STACK)
@@ -1609,10 +1798,12 @@ fn bridge(
             // server_stop 복제가 fd를 붙잡고 있어 serve가 끝나도 local 쪽에 EOF가 오지 않는다.
             // 레지스트리가 먼저 끝내면(첫 요청 기한 초과·세션 종료) 여기서 닫아 WS도 닫히게 한다.
             let done = server.try_clone();
+            installed.install();
             let result = registry.serve_mobile(server, &hello);
             if let Ok(done) = done {
                 done.shutdown(Shutdown::Both).ok();
             }
+            crate::alloc::purge();
             result
         });
     let result = if worker.is_ok() {
@@ -1662,6 +1853,7 @@ fn bridge(
     local.shutdown(Shutdown::Both).ok();
     server_stop.shutdown(Shutdown::Both).ok();
     socket.shutdown(Shutdown::Both).ok();
+    feed.stop();
     reader.join().ok();
     if let Ok(worker) = worker {
         worker.join().ok();

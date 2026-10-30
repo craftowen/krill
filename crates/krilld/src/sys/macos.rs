@@ -65,6 +65,22 @@ pub(crate) fn all_pids() -> io::Result<Vec<u32>> {
     }
 }
 
+/// `pid`의 직계 자식 PID(`proc_listchildpids`).
+pub(crate) fn child_pids(pid: u32) -> io::Result<Vec<u32>> {
+    let ppid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+    let mut pids: Vec<libc::pid_t> = vec![0; 64];
+    let bytes = c_int::try_from(pids.len().saturating_mul(size_of::<libc::pid_t>()))
+        .map_err(io::Error::other)?;
+    // SAFETY: pids는 bytes 바이트의 쓰기 가능한 버퍼다.
+    let n = unsafe { libc::proc_listchildpids(ppid, pids.as_mut_ptr().cast(), bytes) };
+    let n = usize::try_from(n).map_err(|_| io::Error::last_os_error())?;
+    pids.truncate(n);
+    Ok(pids
+        .into_iter()
+        .filter_map(|p| u32::try_from(p).ok())
+        .collect())
+}
+
 /// UDS 피어의 유효 UID(`getpeereid`).
 pub fn peer_uid(sock: BorrowedFd<'_>) -> io::Result<u32> {
     let mut uid: libc::uid_t = 0;
@@ -239,6 +255,59 @@ pub(crate) fn current_directory(pid: u32) -> io::Result<PathBuf> {
         return Err(io::ErrorKind::NotFound.into());
     }
     Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+/// 프로세스 argv(`KERN_PROCARGS2`). 같은 UID 프로세스만 조회된다.
+pub(crate) fn process_args(pid: u32) -> io::Result<Vec<String>> {
+    let pid = c_int::try_from(pid).map_err(io::Error::other)?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    // SAFETY: 출력 버퍼가 null이면 커널은 필요한 크기만 `size`에 쓴다.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            ptr::null_mut(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buf = vec![0_u8; size];
+    // SAFETY: `buf`는 `size` 바이트짜리 쓰기 가능한 버퍼다.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast::<c_void>(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(size);
+    parse_procargs2(&buf)
+}
+
+/// `KERN_PROCARGS2` 버퍼: `argc`(i32) · 실행 경로\0 · \0 패딩 · argv\0 × argc · 환경변수.
+fn parse_procargs2(buf: &[u8]) -> io::Result<Vec<String>> {
+    let (argc, rest) = buf
+        .split_first_chunk::<4>()
+        .ok_or(io::ErrorKind::InvalidData)?;
+    let argc = usize::try_from(i32::from_ne_bytes(*argc)).map_err(io::Error::other)?;
+    Ok(rest
+        .split(|&b| b == 0)
+        .skip(1)
+        .skip_while(|s| s.is_empty())
+        .take(argc)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
 }
 
 /// 프로세스 이름. 명령줄을 읽지 않고 커널의 짧은 실행 이름만 사용한다.
@@ -485,6 +554,17 @@ pub(crate) fn exclude_from_backup(dir: BorrowedFd<'_>) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// C 라이브러리(libzstd 등)가 시스템 malloc zone에 남긴 빈 캐시 페이지를 OS에 돌려준다.
+pub(crate) fn release_malloc_cache() {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
+    }
+    // SAFETY: zone이 NULL이면 모든 기본 malloc zone에서 goal(0 = 가능한 만큼)만큼 빈 캐시 페이지를 비운다.
+    unsafe {
+        malloc_zone_pressure_relief(ptr::null_mut(), 0);
     }
 }
 

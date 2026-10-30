@@ -96,3 +96,68 @@ mod tests {
         assert_eq!(search_tabs("   "), AdminTab::ALL);
     }
 }
+
+/// 탭 제목보다 실제 설정 제목·키워드가 일치하는 행을 우선한다.
+pub(super) fn first_setting(query: &str, tab: AdminTab) -> Option<Message> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    INDEX
+        .iter()
+        .filter(|(t, ..)| *t == tab)
+        .find_map(|(_, title, words)| {
+            ([Language::Ko, Language::En]
+                .iter()
+                .any(|lang| title.in_language(*lang).to_lowercase().contains(&query))
+                || words
+                    .iter()
+                    .any(|word| word.to_lowercase().contains(&query)))
+            .then_some(*title)
+        })
+}
+
+/// 일치하는 라벨에 네이티브 포커스와 중첩 스크롤 앵커를 연결한다.
+#[derive(Clone)]
+pub(super) struct SearchFocus {
+    pub title: Option<Message>,
+    pub scroll: gpui::ScrollHandle,
+    pub anchor: gpui::ScrollAnchor,
+    pub focus: gpui::FocusHandle,
+    pub rendered: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl SearchFocus {
+    pub fn new(cx: &gpui::App) -> Self {
+        let scroll = gpui::ScrollHandle::default();
+        Self {
+            title: None,
+            anchor: gpui::ScrollAnchor::for_handle(scroll.clone()),
+            scroll,
+            focus: cx.focus_handle(),
+            rendered: std::rc::Rc::default(),
+        }
+    }
+
+    pub fn label(
+        &self,
+        p: &crate::ui::Palette,
+        title: &'static str,
+        desc: impl crate::ui::primitives::LabelDesc,
+    ) -> gpui::Stateful<gpui::Div> {
+        use gpui::prelude::FluentBuilder as _;
+        use gpui::{InteractiveElement as _, StatefulInteractiveElement as _, Styled as _};
+        let matched = self.title.is_some_and(|target| target.get() == title);
+        if matched {
+            self.rendered.set(true);
+        }
+        super::layout::label(p, title, desc)
+            .id(gpui::SharedString::from(format!("settings-label-{title}")))
+            .when(matched, |d| {
+                d.track_focus(&self.focus)
+                    .tab_index(0)
+                    .anchor_scroll(Some(self.anchor.clone()))
+                    .focus_visible(|d| d.bg(p.accent).rounded(crate::ui::RADIUS_SM))
+            })
+    }
+}

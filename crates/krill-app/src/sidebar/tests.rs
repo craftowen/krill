@@ -2258,33 +2258,45 @@ fn orca_card_expansion_agent_counts_and_reveal_focused(cx: &mut TestAppContext) 
         });
     });
     cx.run_until_parked();
-    // 기본 상태에서는 카드 요약 바만 보이고 하위 세션 행은 접혀 있다(렌더 행 2개: 저장소 + 워크트리 카드).
+    // 이미지 디코드가 재렌더를 일으킬 수 있으므로 누적 렌더 호출 수 대신
+    // 현재 목록의 항목 수와 실제 세션 행의 표시 여부를 검사한다.
+    // 기본 상태는 저장소 + 워크트리 카드 2개다.
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).rendered_rows),
+        cx.update(|_, cx| view.read(cx).card_list.state.item_count()),
         2,
         "collapsed card should hide nested session rows by default"
     );
+    for selector in ["sidebar-session-2", "sidebar-session-3"] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "{selector}: collapsed card should hide nested session rows by default"
+        );
+    }
 
     // 카드 요약 바 토글 시 하위 세션 행 2개가 펼쳐진다(렌더 행 4개).
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.rendered_rows = 0;
             s.toggle_card_sessions(Path::new("/repo/a"), cx);
             assert!(s.expanded_cards.contains(Path::new("/repo/a")));
         });
     });
     cx.run_until_parked();
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).rendered_rows),
+        cx.update(|_, cx| view.read(cx).card_list.state.item_count()),
         4,
         "expanded card should render nested session rows"
     );
+    for selector in ["sidebar-session-2", "sidebar-session-3"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector}: expanded card should render nested session rows"
+        );
+    }
 
     // 하위 세션에 커서가 있을 때 다시 토글하면 커서를 워크트리 행으로 되돌리고 하위 세션 행을 실제로 접는다.
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.cursor = Some(2);
-            s.rendered_rows = 0;
             s.toggle_card_sessions(Path::new("/repo/a"), cx);
             assert!(!s.expanded_cards.contains(Path::new("/repo/a")));
             assert_eq!(s.cursor, Some(1));
@@ -2292,10 +2304,16 @@ fn orca_card_expansion_agent_counts_and_reveal_focused(cx: &mut TestAppContext) 
     });
     cx.run_until_parked();
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).rendered_rows),
+        cx.update(|_, cx| view.read(cx).card_list.state.item_count()),
         2,
         "re-collapsing card while cursor was on nested session must hide session rows"
     );
+    for selector in ["sidebar-session-2", "sidebar-session-3"] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "{selector}: re-collapsing card while cursor was on nested session must hide session rows"
+        );
+    }
 
     // 숨겨진 `.claude/worktrees` 안의 세션에 포커스가 있을 때 reveal_focused가 숨김을 풀고 워크트리를 가리킨다.
     cx.update(|_, cx| {
@@ -2948,6 +2966,48 @@ fn workspace_filters_card_properties_compact_layout_and_persistence(cx: &mut Tes
     assert!(restored.options().filters.hide_automation);
 
     fs::remove_dir_all(dir).ok();
+}
+
+/// 재부팅 복원(2026-10-28): 데몬이 아직 새 세션을 목록에 올리지 않아 살아 있는 세션이 없어도, 자동 재개한 칸의
+/// 워크트리는 수면 숨김(`hide_sleeping`)에서 보인다. 정상 종료 세션만 있어 재개되지 않은 워크트리와 사용자가 재운
+/// 워크트리는 계속 숨는다.
+#[gpui::test]
+fn restored_worktree_stays_visible_while_hiding_sleeping(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let repo = PathBuf::from("/reboot-repo");
+    let restored = repo.join("restored");
+    let closed_only = repo.join("closed-only");
+    let slept = repo.join("slept");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: Vec::new(),
+                trees: BTreeMap::from([(
+                    repo.clone(),
+                    vec![
+                        repo.clone(),
+                        restored.clone(),
+                        closed_only.clone(),
+                        slept.clone(),
+                    ],
+                )]),
+            };
+            s.shown_external.insert(repo.clone());
+            s.toggle_hide_sleeping(cx);
+            s.sleep_worktree(slept.clone(), cx);
+            s.reveal_restored_worktree(restored.clone(), cx);
+            s.reveal_restored_worktree(slept.clone(), cx);
+        });
+    });
+    let rows = cx.update(|_, cx| view.read(cx).rows.clone());
+    let has = |target: &Path| {
+        rows.iter()
+            .any(|r| matches!(r, Row::Worktree(p) if p == target))
+    };
+    assert!(has(&restored), "restored worktree must stay visible");
+    assert!(!has(&closed_only), "closed-only worktree must stay hidden");
+    assert!(!has(&slept), "user-slept worktree must stay hidden");
 }
 
 #[gpui::test]
@@ -5358,6 +5418,68 @@ fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
     }
 }
 
+#[test]
+fn orchestration_session_labels_preserve_provenance_across_title_changes() {
+    use krill_proto::orchestration::{DispatchSessionOrigin, DispatchStatus, OrchestrationStore};
+
+    let mut sidebar = Sidebar::new_loaded(None);
+    let mut worker = session(21, AgentState::Working, Some("/repo"));
+    worker.status.agent = "codex".into();
+    worker.status.title = Some("조사 신고리스트".into());
+    assert_eq!(sidebar.session_label(&worker).0, "조사 신고리스트");
+
+    let store = &mut sidebar.disk.orchestration;
+    let run = store.create_run("Title provenance", None).unwrap();
+    store
+        .start_worker(&run.id, None, "worker", "codex", Some(21), "/repo", "p")
+        .unwrap();
+    // Persisted dispatches also identify workers created before an app restart.
+    sidebar.disk.orchestration =
+        serde_json::from_slice(&serde_json::to_vec(&sidebar.disk.orchestration).unwrap()).unwrap();
+    assert_eq!(
+        sidebar.session_label(&worker).0,
+        "[orchestration] 조사 신고리스트"
+    );
+    assert_eq!(
+        sidebar
+            .session_label_on_with_title(&HostId::Local, &worker, Some("⠂ 새 터미널 제목"))
+            .0,
+        "[orchestration] 새 터미널 제목"
+    );
+    sidebar
+        .custom_titles
+        .insert(worker.id, "직접 정한 제목".into());
+    assert_eq!(
+        sidebar.session_label(&worker).0,
+        "[orchestration] 직접 정한 제목"
+    );
+    sidebar
+        .custom_titles
+        .insert(worker.id, "[orchestration] 기존 접두사".into());
+    assert_eq!(
+        sidebar.session_label(&worker).0,
+        "[orchestration] 기존 접두사"
+    );
+
+    sidebar.disk.orchestration.dispatches[0].status = DispatchStatus::Succeeded;
+    sidebar.custom_titles.clear();
+    worker.status.title = None;
+    sidebar.auto_titles.insert(worker.id, "첫 프롬프트".into());
+    assert_eq!(
+        sidebar.session_label(&worker).0,
+        "[orchestration] 첫 프롬프트"
+    );
+    sidebar.auto_titles.clear();
+    assert_eq!(sidebar.session_label(&worker).0, "[orchestration] codex");
+
+    let remote = HostId::Remote("other-host".into());
+    assert_eq!(sidebar.session_label_on(&remote, &worker).0, "codex");
+    sidebar.disk.orchestration.dispatches[0].session_origin = DispatchSessionOrigin::Borrowed;
+    assert_eq!(sidebar.session_label(&worker).0, "codex");
+    sidebar.disk.orchestration = OrchestrationStore::default();
+    assert_eq!(sidebar.session_label(&worker).0, "codex");
+}
+
 /// 칸이 열리지 않은 세션도 krilld가 보낸 터미널 제목으로 이름을 보이고, 칸 제목의 상태 글리프는 떼며,
 /// 에이전트 기본 제목(`Claude Code`)은 첫 프롬프트 자동 제목에 양보한다.
 #[gpui::test]
@@ -6403,6 +6525,62 @@ fn remote_host_worktree_creation_and_child_lineage(cx: &mut TestAppContext) {
     assert_eq!(del_sent.len(), 1);
     assert_eq!(del_sent[0].repo, b"/remote/repo".to_vec());
     assert_eq!(del_sent[0].path, b"/remote/repo/child-wt".to_vec());
+}
+
+#[gpui::test]
+fn missing_daemon_sessions_leave_sidebar_and_local_caches(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| Sidebar::new_loaded(None));
+    sidebar.update(cx, |sidebar, cx| {
+        let mut done = session(203, AgentState::Done, None);
+        done.cwd = Some("/tmp/probe".into());
+        done.status.agent = "claude".into();
+        sidebar.apply(
+            Ok((
+                Snapshot {
+                    sessions: vec![done.clone()],
+                    ..Snapshot::default()
+                },
+                Meta::new(),
+            )),
+            BTreeMap::new(),
+            cx,
+        );
+        assert!(
+            sidebar
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Session(s, _) if s.id == done.id))
+        );
+        sidebar.titles.insert(done.id, "screen title".into());
+        sidebar.auto_titles.insert(done.id, "prompt title".into());
+        sidebar.unread.insert(done.id);
+        sidebar.set_remote_snapshot_for_test(
+            "remote",
+            HostStatus::Connected,
+            Snapshot {
+                sessions: vec![done.clone()],
+                ..Snapshot::default()
+            },
+            cx,
+        );
+        sidebar.apply(Ok((Snapshot::default(), Meta::new())), BTreeMap::new(), cx);
+        assert!(sidebar.snapshot.sessions.is_empty());
+        assert!(!sidebar.titles.contains_key(&done.id));
+        assert!(!sidebar.auto_titles.contains_key(&done.id));
+        assert!(!sidebar.unread.contains(&done.id));
+        assert_eq!(
+            sidebar.dashboard_sessions().len(),
+            1,
+            "the other host matching ID must survive"
+        );
+        assert!(
+            sidebar
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Session(s, _) if s.id == done.id))
+        );
+    });
 }
 
 #[gpui::test]

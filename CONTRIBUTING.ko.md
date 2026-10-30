@@ -2,7 +2,7 @@
 
 [English](CONTRIBUTING.md)
 
-[README](README.ko.md)·[첫 실행](docs/GETTING_STARTED.ko.md)에 이어 [AGENTS.md](AGENTS.md), [아키텍처](docs/ARCHITECTURE.md), [로드맵](docs/ROADMAP.md), [코드 규칙](docs/CONVENTIONS.md), [디자인 시스템](docs/STYLEGUIDE.md)을 읽습니다. ARCHITECTURE·ROADMAP·CONVENTIONS·STYLEGUIDE가 규범이며 조사 기록과 다르면 규범을 따릅니다.
+[README](README.ko.md)·[첫 실행](GETTING_STARTED.ko.md)에 이어 [AGENTS.md](AGENTS.md), [아키텍처](docs/ARCHITECTURE.md), [로드맵](docs/ROADMAP.md), [코드 규칙](docs/CONVENTIONS.md), [디자인 시스템](docs/STYLEGUIDE.md)을 읽습니다. ARCHITECTURE·ROADMAP·CONVENTIONS·STYLEGUIDE가 규범이며 조사 기록과 다르면 규범을 따릅니다.
 
 ## 작업 흐름
 
@@ -32,7 +32,7 @@ IPC·공유 프로토콜·PTY/FFI·세션 생존 계약을 바꾸면 해당 경�
 
 ## 소스 빌드 환경
 
-[소스 빌드 가이드](docs/GETTING_STARTED.ko.md#macos-소스-빌드)를 따릅니다. MSRV는 Rust 1.98이며 1.99 전용 기능에 기대지 않습니다. 로컬 기준 툴체인은 Homebrew Rust이고 rustup은 필요하지 않습니다. 공용 메인테이너 작업 환경의 Cargo 산출물은 `CARGO_TARGET_DIR`를 덮어쓸 때도 `/Volumes/krill-build/targets/<이름>` 아래에만 둡니다. 내장 SSD에 target 디렉터리를 만들지 않습니다.
+[소스 빌드 가이드](GETTING_STARTED.ko.md#macos-소스-빌드)를 따릅니다. MSRV는 Rust 1.98이며 1.99 전용 기능에 기대지 않습니다. 로컬 기준 툴체인은 Homebrew Rust이고 rustup은 필요하지 않습니다. 공용 메인테이너 작업 환경의 Cargo 산출물은 `CARGO_TARGET_DIR`를 덮어쓸 때도 `/Volumes/krill-build/targets/<이름>` 아래에만 둡니다. 내장 SSD에 target 디렉터리를 만들지 않습니다.
 
 ## 코드·리뷰 규칙
 

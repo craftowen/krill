@@ -27,6 +27,7 @@ rustix = { workspace = true }
 rustix-openpty = { workspace = true }
 
 [dev-dependencies]
+same-file = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

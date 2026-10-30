@@ -104,11 +104,11 @@ pub(crate) fn migrate(home: &Path, state: Option<&Path>) -> io::Result<()> {
             continue;
         }
         let target = if source.starts_with(profiles::managed_root(home).join("codex")) {
-            profiles::migrate_long_codex_profile_if_needed(
+            profiles::try_migrate_long_codex_profile(
                 home,
                 account.id.strip_prefix("codex-").unwrap_or(&account.id),
                 source,
-            )
+            )?
         } else {
             prepare(home, source)?
         };
@@ -160,5 +160,53 @@ mod tests {
             source.join("sessions").canonicalize().unwrap()
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod registration_regressions {
+    use super::*;
+    use crate::usage::accounts::{AccountsFile, StoredAccount, config_path, load_file_result};
+
+    #[test]
+    fn failed_legacy_copy_keeps_registration_and_success_switches_only_after_verification() {
+        let home =
+            std::env::temp_dir().join(format!("krill-codex-registration-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        let source =
+            profiles::managed_root(&home).join("codex/legacy-with-a-long-profile-home-directory");
+        std::fs::create_dir_all(source.join("rules")).unwrap();
+        std::fs::write(source.join("rules/private.md"), "private rules").unwrap();
+        let mut file = AccountsFile::default();
+        file.accounts.push(StoredAccount {
+            id: "codex-legacy".into(),
+            provider: "codex".into(),
+            label: "Legacy".into(),
+            email: None,
+            profile_dir: source.display().to_string(),
+        });
+        let path = config_path(&home, None);
+        std::fs::write(&path, toml::to_string(&file).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let target = profiles::short_codex_profile_dir(&home, "legacy");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(migrate(&home, None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir(&target).unwrap();
+        migrate(&home, None).unwrap();
+        let saved = load_file_result(&home, None).unwrap();
+        assert_eq!(
+            saved.accounts.first().unwrap().profile_dir,
+            target.display().to_string()
+        );
+        assert_eq!(
+            std::fs::read(target.join("rules/private.md")).unwrap(),
+            b"private rules"
+        );
+        assert_eq!(
+            std::fs::read(source.join("rules/private.md")).unwrap(),
+            b"private rules"
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

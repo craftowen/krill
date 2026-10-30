@@ -217,6 +217,34 @@ impl Default for ScreenRules {
     }
 }
 
+/// Codex의 비동기 질문은 작업 중에도 footer에 남는다. 본문 문구나 일반 후속 입력은
+/// 제외하고, 인접한 제목·양수 질문 수·응답 키 안내를 모두 확인한다.
+#[must_use]
+pub fn has_pending_question(screen: &str) -> bool {
+    let lines: Vec<_> = screen.lines().rev().take(12).map(str::trim).collect();
+    lines.windows(3).any(|lines| {
+        let mut lines = lines.iter();
+        let Some(answer) = lines
+            .next()
+            .and_then(|line| line.strip_suffix(" to answer"))
+        else {
+            return false;
+        };
+        if answer.is_empty() {
+            return false;
+        }
+        let Some(question) = lines.next().and_then(|line| line.strip_prefix("? ")) else {
+            return false;
+        };
+        let Some((count, label)) = question.split_once(' ') else {
+            return false;
+        };
+        count.parse::<u32>().is_ok_and(|count| count > 0)
+            && matches!(label, "question" | "questions")
+            && lines.next() == Some(&"• Queued follow-up inputs")
+    })
+}
+
 impl ScreenRules {
     /// 메뉴 선택 항목이 있고 멈춤·대기 문구가 있으면 판정한다. 설명 문장 한 줄만으로는
     /// 상태를 바꾸지 않는다(MK-049와 같은 규칙).

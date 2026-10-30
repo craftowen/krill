@@ -366,6 +366,7 @@ mod tests {
         assert!(CALLS.load(Ordering::SeqCst) >= 4);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn carbon_secure_event_input_roundtrip() {
         assert!(!platform::is_secure_event_input_engaged());

@@ -882,6 +882,7 @@ fn remote_rename_all_closures_restore_initiating_focus(cx: &mut TestAppContext) 
         id: "focus-fixture".into(),
         name: "Fixture Mac".into(),
         status: krill_hosts::HostStatus::Disconnected,
+        version: None,
     };
     let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(mock.clone(), cx));
     vcx.run_until_parked();

@@ -85,11 +85,38 @@ pub fn shell_quote(text: &str) -> String {
 /// Fixed command: pane identity stays in the environment so Codex trust hashes stay stable.
 pub fn command(exe: &Path, agent: Agent) -> Option<String> {
     let exe = exe.to_str()?;
+    #[cfg(windows)]
+    if agent == Agent::Codex {
+        use base64::Engine as _;
+        // Codex invokes hooks through cmd.exe. Encode the fixed PowerShell script
+        // so %, $, quotes and shell metacharacters in the executable stay literal.
+        // The native hook already returns {} outside a Krill pane.
+        let script = format!(
+            "& '{}' hook codex; exit $LASTEXITCODE",
+            exe.replace('\'', "''")
+        );
+        let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        return Some(format!(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}"
+        ));
+    }
     Some(format!(
         "if [ -n \"${{MK_PANE_ID:-}}\" ]; then exec {} hook {}; else printf '{{}}\\n'; fi",
         shell_quote(exe),
         agent.id()
     ))
+}
+
+/// Event from Codex's synthetic session layer key. Keep the original key when
+/// persisting trust: Windows uses C:\\<session-flags> while Unix uses /<session-flags>.
+pub fn codex_session_event(key: &str) -> Option<&str> {
+    let tail = key
+        .strip_prefix("/<session-flags>/config.toml:")
+        .or_else(|| key.strip_prefix(r"C:\<session-flags>\config.toml:"))
+        .or_else(|| key.strip_prefix("C:/<session-flags>/config.toml:"))?;
+    let (event, slot) = tail.split_once(':')?;
+    (!event.is_empty() && slot == "0:0").then_some(event)
 }
 
 /// Wrap an Antigravity (`agy`) hook command in `/bin/sh -c` with event propagation and
@@ -334,6 +361,25 @@ pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_session_keys_accept_native_roots_without_trusting_other_sources() {
+        for key in [
+            "/<session-flags>/config.toml:session_start:0:0",
+            r"C:\<session-flags>\config.toml:session_start:0:0",
+            "C:/<session-flags>/config.toml:session_start:0:0",
+        ] {
+            assert_eq!(codex_session_event(key), Some("session_start"));
+        }
+        for key in [
+            r"C:\project\<session-flags>\config.toml:stop:0:0",
+            "/project/config.toml:stop:0:0",
+            "/<session-flags>/config.toml:stop:1:0",
+            "/<session-flags>/config.toml:",
+        ] {
+            assert_eq!(codex_session_event(key), None);
+        }
+    }
 
     #[test]
     fn pi_hook_extension_is_observational_and_uses_direct_spawn() {

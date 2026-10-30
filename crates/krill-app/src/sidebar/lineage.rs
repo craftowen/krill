@@ -731,15 +731,13 @@ impl Sidebar {
         self.creating_dialog_id = dialog_id;
 
         let meta = self.meta_for(&target_host);
-        // OWE-853: 호출한 워크트리(부모 우선, 없으면 레포)의 현재 브랜치를 기본값으로 쓴다.
+        // 부모에서 만들 때는 그 브랜치를 명시하고, 프로젝트 생성은 데몬의 설정된 기본 ref를 따른다.
         let parent_branch = parent
             .as_ref()
             .and_then(|p| meta.get(p).and_then(|t| t.branch.clone()));
         let repo_branch = meta.get(&target_repo).and_then(|t| t.branch.clone());
-        // OWE-853: 로컬 git refs를 읽어 후보를 풍부하게 한다(새 IPC 없이, 실패 시 폴백만).
+        // 실제 관측한 브랜치로 시작하고 선택한 호스트의 refs는 Dialog의 세대별 작업으로 보강한다.
         let git_refs = Vec::new();
-        let refs_repo = target_repo.clone();
-        let refs_host = target_host.clone();
         let (default_base, initial_candidates) = worktree::branch_suggestions(
             parent_branch.as_deref(),
             repo_branch.as_deref(),
@@ -750,42 +748,17 @@ impl Sidebar {
                 target_repo,
                 parent,
                 default_base.as_deref(),
-                initial_candidates.clone(),
+                initial_candidates,
                 source,
                 window,
                 cx,
             );
             dialog.set_host_options(target_host, host_options, cx);
-            dialog.set_branch_candidates(initial_candidates, cx);
-            if let Some(ref base) = default_base {
-                dialog.set_base_default(Some(base.clone()), window, cx);
-            }
             dialog
         });
-        if refs_host.is_local() {
-            let weak_dialog = dialog.downgrade();
-            let check_repo = refs_repo.clone();
-            cx.spawn_in(window, async move |_, cx| {
-                let refs = cx
-                    .background_executor()
-                    .spawn(async move { worktree::list_git_refs(&refs_repo) })
-                    .await;
-                let (base, candidates) = worktree::branch_suggestions(
-                    parent_branch.as_deref(),
-                    repo_branch.as_deref(),
-                    &refs,
-                );
-                weak_dialog
-                    .update_in(cx, |dialog, window, cx| {
-                        if dialog.host().is_local() && dialog.repo() == check_repo.as_path() {
-                            dialog.set_branch_candidates(candidates, cx);
-                            dialog.set_base_default(base, window, cx);
-                        }
-                    })
-                    .ok();
-            })
-            .detach();
-        }
+        dialog.update(cx, |dialog, cx| {
+            dialog.load_branches(parent_branch, repo_branch, cx);
+        });
         let events = cx.subscribe_in(
             &dialog,
             window,
@@ -1019,6 +992,14 @@ impl Sidebar {
         }
         if self.sleeping_worktrees.remove(path) || !self.disk.initialized {
             self.persist(cx);
+        }
+    }
+
+    /// 재부팅 뒤 자동 재개한 칸의 워크트리를 새로 만든 워크트리처럼 수면 숨김 필터에서도 보이게 한다.
+    /// 재개 직후엔 에이전트 상태가 아직 없어 라이브 세션만으로는 깨어 있다고 보지 않는다. 사용자가 재운 워크트리는 그대로 둔다.
+    pub fn reveal_restored_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.recently_created_worktrees.insert(path) {
+            self.rebuild(cx);
         }
     }
 

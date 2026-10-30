@@ -39,10 +39,10 @@ fn cursor_blink_stops_when_hidden_or_inactive_and_restarts_visible(cx: &mut Test
             s.on_window_active_changed(true, cx);
             assert!(s.cursor_blink.as_ref().is_some_and(|(_, hidden)| !hidden));
 
-            s.chat.active_sessions.insert(krill_proto::SessionId(41));
+            s.layout.set_chat_view(pane, true);
             s.sync_cursor_blink(true, cx);
             assert!(s.cursor_blink.is_none());
-            s.chat.active_sessions.clear();
+            s.layout.set_chat_view(pane, false);
             s.sync_cursor_blink(true, cx);
             assert!(s.cursor_blink.is_some());
 
@@ -832,11 +832,18 @@ fn tui_modes_keys_ime_mouse_and_cmd_link(cx: &mut TestAppContext) {
     cx.simulate_mouse_down(at, MouseButton::Left, cmd);
     cx.simulate_mouse_up(at, MouseButton::Left, cmd);
     assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/문서"));
+    // 우클릭은 프로그램으로, ⇧+우클릭은 Krill 메뉴 몫이라 보내지 않는다.
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+    assert_eq!(input(), b"\x1b[<2;1;1M");
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    assert_eq!(input(), b"\x1b[<2;1;1m");
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::shift());
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::shift());
     theirs.set_nonblocking(true).unwrap();
     let mut extra = [0; 1];
     assert!(
         std::io::Read::read(&mut theirs, &mut extra).is_err(),
-        "Cmd+click and preedit send no input"
+        "Cmd+click, Shift+right-click and preedit send no input"
     );
 }
 
@@ -912,7 +919,12 @@ fn folder_tab_and_agent_use_selected_directory(cx: &mut TestAppContext) {
         let old = this.layout.tabs()[0].focused;
         assert_eq!(this.folder(), folder);
         assert_eq!(this.layout.session(old), Some(krill_proto::SessionId(420)));
-        this.new_folder_tab(&this.folder(), Program::Agent { id: "codex".into() }, cx);
+        this.new_folder_tab_on(
+            this.launch_host.clone(),
+            &this.folder(),
+            Program::Agent { id: "codex".into() },
+            cx,
+        );
         let launch = this.launch_for(this.layout.active_tab().focused);
         assert_eq!(launch.program, Program::Agent { id: "codex".into() });
         assert_eq!(launch.cwd, folder.as_os_str().as_bytes());
@@ -1039,6 +1051,50 @@ fn detached_session_reopens_in_new_tab(cx: &mut TestAppContext) {
 
 /// OWE-506: 세션을 만든 뒤 붙기만 실패하면 그 세션을 레이아웃에 적는다. 안 적으면 다시 시도할 때 `want`가 비어 세션을
 /// 또 만든다.
+#[gpui::test]
+fn hiding_first_attach_keeps_creation_until_session_is_recorded(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("hidden-first-attach"));
+    view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        let live = Live::new(Task::ready(()));
+        let creation = Arc::clone(&live.creation);
+        assert!(close::Creation::publish(&creation, SessionId(108)));
+        s.live.insert(pane, live);
+        s.creations.insert(pane, Arc::clone(&creation));
+        s.layout.new_tab();
+        s.sync(cx);
+        assert!(
+            s.live.contains_key(&pane),
+            "hiding must not cancel the pending Create/Attach continuation"
+        );
+        s.layout.activate(0);
+        s.sync(cx);
+        assert!(
+            Arc::ptr_eq(&s.live[&pane].creation, &creation),
+            "showing must reuse the same pending creation"
+        );
+        s.layout.activate(1);
+        let next = s.settled(
+            pane,
+            Ok(Got::Live {
+                session: SessionId(108),
+                linked: Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "attach delayed",
+                )),
+                prior_cold: None,
+            }),
+            cx,
+        );
+        assert!(matches!(next, Next::Gone));
+        assert_eq!(s.layout.session(pane), Some(SessionId(108)));
+        assert!(
+            !s.live.contains_key(&pane),
+            "settled hidden panes must release their screen connection"
+        );
+    });
+}
+
 #[gpui::test]
 fn attach_failure_after_create_keeps_session(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("attach-fail"));
@@ -1325,7 +1381,12 @@ fn sidebar_selection_sets_folder_for_open_in_and_new_agent(cx: &mut TestAppConte
                 this.layout.session(this.layout.active_tab().focused),
                 Some(krill_proto::SessionId(id))
             );
-            this.new_folder_tab(&this.folder(), Program::Agent { id: "codex".into() }, cx);
+            this.new_folder_tab_on(
+                this.launch_host.clone(),
+                &this.folder(),
+                Program::Agent { id: "codex".into() },
+                cx,
+            );
             assert_eq!(this.folder(), PathBuf::from(folder));
         });
     }
@@ -1335,9 +1396,9 @@ fn sidebar_selection_sets_folder_for_open_in_and_new_agent(cx: &mut TestAppConte
 #[gpui::test]
 fn new_session_buttons_are_a_named_group(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("a11y-agents"));
-    let (role, label) = cx.update(|_, cx| {
+    let (role, label) = cx.update(|window, cx| {
         view.update(cx, |s, cx| {
-            let group = s.render_agents(cx);
+            let group = s.render_agents(window, cx);
             let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
             gpui::Element::write_a11y_info(&group, &mut node);
             (
@@ -2790,6 +2851,28 @@ fn update_ready_waits_for_successful_link(cx: &mut TestAppContext) {
     std::fs::remove_dir_all(state).unwrap();
 }
 
+/// 복원 칸이 전부 krilld에 영구 거절돼도(이미 이어졌거나 닫힌 세션) ready를 보낸다. 안 보내면 업데이트 health 확인이
+/// 30초 뒤 롤백되고 앱이 34초마다 재시작되는 루프에 빠졌다(2026-10-29 v0.2.28).
+#[gpui::test]
+fn update_ready_is_sent_when_every_restored_pane_is_permanently_refused(cx: &mut TestAppContext) {
+    let state = std::env::temp_dir().join(format!("mk-shell-ready-refused-{}", std::process::id()));
+    std::fs::remove_dir_all(&state).ok();
+    let (view, cx) = open(cx, state_path("update-ready-refused"));
+    let ready = krill_app::updater::ready_path(&state, env!("CARGO_PKG_VERSION"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.arm_update_ready(state.clone());
+            let pane = s.layout.active_tab().focused;
+            s.live.insert(pane, Live::new(Task::ready(())));
+            s.settled(pane, Err(std::io::ErrorKind::InvalidInput.into()), cx);
+            assert!(s.update_ready.is_none());
+        });
+    });
+    cx.run_until_parked();
+    assert!(ready.exists());
+    std::fs::remove_dir_all(state).unwrap();
+}
+
 /// 설 실기(v0.1.11): 보이는 칸이 원격뿐이면(호스트 꺼짐) 원격 연결을 기다리지 않고 바로 ready를 보낸다.
 /// 기다리면 30초 health 기한을 넘겨 업데이트가 롤백된다.
 #[gpui::test]
@@ -2956,6 +3039,41 @@ fn restart_keeps_session_until_resumed_and_stops_on_permanent_failure(cx: &mut T
     cx.run_until_parked();
     assert!(cx.debug_bounds("session-ended").is_some());
     assert!(cx.debug_bounds("pane-error").is_some());
+}
+
+/// 데몬이 닫힘·이미 재개됨(`NoSession`)으로 확정한 세션의 칸은 "no such session" 빈 화면으로 남지 않고
+/// 그 칸만 거둔다. 같은 오류라도 다른 영구 실패(예: 에이전트 프로필 없음)·형제 칸은 그대로 둔다.
+#[gpui::test]
+fn no_such_session_pane_is_removed_but_other_failures_and_siblings_stay(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("no-such-session-removed"));
+    let keep = layout_of(&view, cx).active_tab().focused;
+    cx.simulate_keystrokes("cmd-t");
+    let stale = layout_of(&view, cx).active_tab().focused;
+    let (keep_id, stale_id) = (krill_proto::SessionId(801), krill_proto::SessionId(802));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.layout.set_session(keep, keep_id);
+            s.layout.set_session(stale, stale_id);
+            s.live.insert(keep, Live::new(Task::ready(())));
+            s.live.insert(stale, Live::new(Task::ready(())));
+            // 다른 영구 실패는 칸을 남긴다(기존 동작).
+            let other = std::io::Error::new(std::io::ErrorKind::NotFound, "unknown agent profile");
+            assert!(matches!(s.settled(stale, Err(other), cx), Next::Gone));
+            assert!(
+                s.layout.pane_exists(stale),
+                "non-NoSession failure keeps the pane"
+            );
+            // 데몬이 NoSession으로 확정하면 그 칸만 거둔다.
+            let gone = pane::failure_to_io_error(krill_proto::control::Failure::NoSession);
+            assert!(matches!(s.settled(stale, Err(gone), cx), Next::Gone));
+            assert!(
+                !s.layout.pane_exists(stale),
+                "dead session pane must be removed"
+            );
+            assert!(s.layout.pane_exists(keep), "sibling pane must stay");
+            assert_eq!(s.layout.session(keep), Some(keep_id));
+        });
+    });
 }
 
 /// OWE-615 원인 1: 연속 음절 입력에서 `insertText` 직후 프레임이 와도 이전 확정 글자가 사라지지 않고
@@ -3366,9 +3484,9 @@ fn stale_selection_clears_on_new_output(cx: &mut TestAppContext) {
     let frame = |ops: Vec<Op>| encode_update(Revision(1), Seq(0), ops).unwrap()[0].clone();
     let select_all_first_line = |s: &mut Shell, cx: &mut gpui::Context<Shell>| {
         let l = s.live.get_mut(&pane).unwrap();
-        l.selection = Some(Selection {
-            anchor: select::Point { line: 0, column: 0 },
-            head: select::Point { line: 0, column: 4 },
+        l.selection = Some(Anchored {
+            anchor: (0, 0),
+            head: (0, 4),
             block: false,
         });
         l.selecting = true;
@@ -3451,7 +3569,10 @@ fn history_resume_opens_new_tab_without_replacing_existing_session(cx: &mut Test
     });
     let panel = view.read_with(cx, |shell, _| shell.history.clone());
     panel.update(cx, |_, cx| {
-        cx.emit(krill_app::agent_history::Open(krill_proto::SessionId(99)));
+        cx.emit(krill_app::agent_history::Open {
+            host: krill_app::hosts::HostId::Local,
+            session: krill_proto::SessionId(99),
+        });
     });
     cx.run_until_parked();
     let layout = layout_of(&view, cx);
@@ -4567,6 +4688,60 @@ fn tab_titles_share_sidebar_rule_and_number_duplicates(cx: &mut TestAppContext) 
     }
 }
 
+#[gpui::test]
+fn daemon_title_change_replaces_hidden_tab_screen_cache(cx: &mut TestAppContext) {
+    use krill_proto::control::AgentStatus;
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let (view, cx) = open(cx, state_path("tab-title-refresh"));
+    let snapshot = |title: &str| sidebar::Snapshot {
+        sessions: vec![sidebar::Session {
+            id: SessionId(51),
+            status: AgentStatus {
+                title: Some(title.into()),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: Some("/repo".into()),
+            account: None,
+        }],
+        ..Default::default()
+    };
+    let pane = view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, SessionId(51));
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(Arc::new(Memory(snapshot("First task"))), cx);
+        });
+        pane
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.titles.insert(pane, "First screen title".into());
+        s.sidebar.update(cx, |sb, cx| {
+            sb.set_title(SessionId(51), "First screen title", cx);
+        });
+        assert_eq!(s.pane_label(pane, cx), "First screen title");
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(Arc::new(Memory(snapshot("Second task"))), cx);
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        assert_eq!(
+            s.titles[&pane], "First screen title",
+            "hidden pane has no new frames"
+        );
+        assert_eq!(s.pane_label(pane, cx), "Second task");
+        s.layout.set_tab_title(s.layout.active(), Some("My title"));
+        assert_eq!(s.tab_display_label(s.layout.active(), cx), "My title");
+    });
+}
+
 /// OSC 제목이 없는 agy 탭도 데몬의 대화 제목·첫 프롬프트 제목을 표시한다.
 #[gpui::test]
 fn agy_tab_titles_use_sidebar_titles_without_osc(cx: &mut TestAppContext) {
@@ -4652,8 +4827,14 @@ fn agy_tab_titles_use_sidebar_titles_without_osc(cx: &mut TestAppContext) {
             assert_eq!(s.pane_label(pane, cx), "첫 요청에서 만든 제목", "{raw}");
         }
         s.titles.insert(pane, "⠂ 실제 터미널 제목".into());
+        s.sidebar.update(cx, |sb, cx| {
+            sb.set_title(SessionId(82), "⠂ 실제 터미널 제목", cx);
+        });
         assert_eq!(s.pane_label(pane, cx), "실제 터미널 제목");
         s.titles.insert(pane, "작업 powershell.exe review".into());
+        s.sidebar.update(cx, |sb, cx| {
+            sb.set_title(SessionId(82), "작업 powershell.exe review", cx);
+        });
         assert_eq!(s.pane_label(pane, cx), "작업 powershell.exe review");
         s.layout.set_tab_title(1, Some("사용자가 지정한 제목"));
         assert_eq!(s.tab_display_label(1, cx), "사용자가 지정한 제목");
@@ -6874,7 +7055,8 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
     // 탭 1 (a): 명시적 비-git 폴더 탭 (`/tmp/plain-folder`)
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.new_folder_tab(
+            s.new_folder_tab_on(
+                s.launch_host.clone(),
                 std::path::Path::new("/tmp/plain-folder"),
                 Program::Login,
                 cx,
@@ -6892,7 +7074,8 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
     // 탭 2 (b): 워크트리 하위 디렉터리에서 열린 탭 (`/repo/main/crates/sub`)
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.new_folder_tab(
+            s.new_folder_tab_on(
+                s.launch_host.clone(),
                 std::path::Path::new("/repo/main/crates/sub"),
                 Program::Login,
                 cx,
@@ -6948,7 +7131,12 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
     // 탭 5: 워크트리 루트 탭 (`/repo/feature`)
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.new_folder_tab(std::path::Path::new("/repo/feature"), Program::Login, cx);
+            s.new_folder_tab_on(
+                s.launch_host.clone(),
+                std::path::Path::new("/repo/feature"),
+                Program::Login,
+                cx,
+            );
         });
     });
     cx.run_until_parked();
@@ -7323,8 +7511,8 @@ fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
             );
             assert!(s.select_end(pane, cx));
             let sel = s.live[&pane].selection.expect("shift selection");
-            assert_eq!(sel.anchor, select::Point { line: 1, column: 0 });
-            assert_eq!(sel.head, select::Point { line: 1, column: 5 });
+            assert_eq!(sel.anchor, (1, 0));
+            assert_eq!(sel.head, (1, 5));
         });
     });
     assert_eq!(text_of(&view, cx).as_deref(), Some("second"));
@@ -7630,7 +7818,7 @@ fn owe_842_full_workspace_restoration_scenarios_a_and_b(cx: &mut TestAppContext)
                 sb.select_worktree(Some(wt_b.clone()), cx);
             });
             let sb_snap = s.sidebar.read(cx);
-            s.sync_live_cwds(sb_snap);
+            assert!(s.sync_live_cwds(sb_snap).is_empty());
             // 폴더는 설정된 cwd 그대로(워크트리 루트 유지), 최신 라이브 cwd는 재스폰 보관으로 분리.
             assert_eq!(
                 s.layout.launch(p0a).map(|l| l.cwd.as_slice()),
@@ -8146,7 +8334,7 @@ fn jump_and_quick_open_are_mutually_exclusive(cx: &mut TestAppContext) {
     fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
     let (view, cx) = open(cx, state_path("palette-mutex"));
     view.update(cx, |s, cx| {
-        s.new_folder_tab(&dir, Program::Login, cx);
+        s.new_folder_tab_on(s.launch_host.clone(), &dir, Program::Login, cx);
     });
     cx.run_until_parked();
 
@@ -8232,6 +8420,106 @@ fn scrolled_terminal_shows_scrollbar_and_bottom_badge(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("scrollbar").is_none());
     let offset = cx.update(|_, cx| view.read(cx).live.get(&pane).unwrap().pane.scroll_offset());
     assert_eq!(offset, 0);
+}
+
+/// 액터진 제보: 끌어 선택하다 휠로 위로 올려도 선택이 풀리지 않고, 화면 밖 스크롤백까지
+/// 이어 복사한다(Orca/xterm.js처럼 버퍼 기준 줄).
+#[gpui::test]
+fn wheel_scroll_keeps_drag_selection_across_scrollback(cx: &mut TestAppContext) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+    use krill_proto::control::Cold;
+    use krill_proto::screen::{Cell, Op};
+    use std::os::unix::net::UnixStream;
+
+    fn row(text: &str) -> Vec<Cell> {
+        text.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    }
+
+    let (view, cx) = open(cx, state_path("selection-wheel"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(3), ours, cx);
+            s.live
+                .get_mut(&pane)
+                .unwrap()
+                .pane
+                .show_cold(
+                    krill_proto::SessionId(3),
+                    Cold {
+                        screen: vec![
+                            Op::Reset { cols: 10, lines: 2 },
+                            Op::Line {
+                                line: 0,
+                                cells: row("top"),
+                            },
+                            Op::Line {
+                                line: 1,
+                                cells: row("end"),
+                            },
+                        ],
+                        history: vec![row("old"), row("mid")],
+                    },
+                )
+                .unwrap();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    let at = |col: f32, line: f32| {
+        point(
+            bounds.origin.x + cell.width * (col + 0.5),
+            bounds.origin.y + cell.height * (line + 0.5),
+        )
+    };
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at(2., 1.), MouseButton::Left, none);
+    cx.simulate_mouse_move(at(0., 0.), MouseButton::Left, none);
+    // 끄는 중에 휠로 2행 올린다.
+    cx.simulate_event(ScrollWheelEvent {
+        position: at(0., 0.),
+        delta: ScrollDelta::Lines(point(0., 2.)),
+        modifiers: none,
+        touch_phase: TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let live = &view.read(cx).live[&pane];
+        assert_eq!(live.pane.scroll_offset(), 2);
+        assert!(live.selection.is_some(), "휠 스크롤은 선택을 지우지 않는다");
+    });
+    // 올라간 화면 맨 위 "old"의 1열까지 끌고 놓는다.
+    cx.simulate_mouse_move(at(1., 0.), MouseButton::Left, none);
+    cx.simulate_mouse_up(at(1., 0.), MouseButton::Left, none);
+    cx.simulate_keystrokes("cmd-c");
+    let clip = |cx: &mut VisualTestContext| cx.read_from_clipboard().and_then(|c| c.text());
+    assert_eq!(clip(cx).as_deref(), Some("ld\nmid\ntop\nend"));
+
+    // 바닥으로 내려와도 선택은 남고, 보이는 부분만 칠한다.
+    cx.simulate_event(ScrollWheelEvent {
+        position: at(0., 0.),
+        delta: ScrollDelta::Lines(point(0., -2.)),
+        modifiers: none,
+        touch_phase: TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let live = &view.read(cx).live[&pane];
+        assert_eq!(live.pane.scroll_offset(), 0);
+        let shown = live.shown_selection().expect("visible part");
+        assert_eq!(shown.anchor, select::Point { line: 0, column: 0 });
+        assert_eq!(shown.head, select::Point { line: 1, column: 2 });
+    });
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(String::new()));
+    cx.simulate_keystrokes("cmd-c");
+    assert_eq!(clip(cx).as_deref(), Some("ld\nmid\ntop\nend"));
 }
 
 /// OWE-874-5: 파일 탭 우클릭 메뉴에 절대·상대 경로 복사, Finder 보기가 있고 세션 탭에는 없다.
@@ -9880,6 +10168,7 @@ fn run_pane_against(
     cx: &mut VisualTestContext,
     dir: &std::path::Path,
     rounds: usize,
+    ready: impl Fn(&Shell) -> bool,
 ) {
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
@@ -9891,6 +10180,35 @@ fn run_pane_against(
             s.sync(cx);
         });
     });
+    // Socket workers use real time, while retry timers use the simulated clock.
+    // Observe completion before testing repeated disconnects: eight simulated
+    // ticks are not evidence that a real handshake has finished on a CI host.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        cx.run_until_parked();
+        if view.read_with(cx, |shell, _| ready(shell)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pane fixture did not settle: {:?}",
+            view.read_with(cx, |shell, _| (
+                shell.layout_loading,
+                shell
+                    .layout
+                    .focused()
+                    .and_then(|pane| shell.layout.session(pane)),
+                shell
+                    .live
+                    .values()
+                    .filter_map(|live| live.error.clone())
+                    .collect::<Vec<_>>()
+            ))
+        );
+        // Pump both clocks without pretending the socket worker has completed.
+        std::thread::sleep(Duration::from_millis(10));
+        cx.executor().advance_clock(Duration::from_millis(50));
+    }
     for _ in 0..rounds {
         // The daemon uses real socket threads. Give them this retry interval before
         // advancing the simulated clock; otherwise eight ticks can finish before
@@ -9918,7 +10236,13 @@ fn pane_recovers_after_transient_daemon_eof_with_one_session(cx: &mut TestAppCon
     let requests = transient_daemon(&dir.join("k.sock"), 3, false);
     let (view, cx) = open(cx, layout);
     let pane = layout_of(&view, cx).active_tab().focused;
-    run_pane_against(&view, cx, &dir, 8);
+    run_pane_against(&view, cx, &dir, 8, |shell| {
+        shell.layout.session(pane) == Some(SessionId(41))
+            && shell
+                .live
+                .get(&pane)
+                .is_some_and(|live| live.error.is_none())
+    });
     assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
     assert_eq!(creates(&requests), 1);
     cx.update(|_, cx| {
@@ -9938,7 +10262,9 @@ fn lost_create_reply_is_not_replayed(cx: &mut TestAppContext) {
     let requests = transient_daemon(&dir.join("k.sock"), 0, true);
     let (view, cx) = open(cx, layout);
     let pane = layout_of(&view, cx).active_tab().focused;
-    run_pane_against(&view, cx, &dir, 8);
+    run_pane_against(&view, cx, &dir, 8, |shell| {
+        shell.outcome_unknown.contains_key(&pane)
+    });
     let unconfirmed = Some(text::START_UNCONFIRMED.get());
     let error = |cx: &mut VisualTestContext| {
         cx.update(|_, cx| view.read(cx).live.get(&pane).and_then(|l| l.error.clone()))
@@ -10291,4 +10617,816 @@ fn sticky_last_prompt_bar_and_tab_hover_card_render_and_toggle_timeline(cx: &mut
         cx.debug_bounds(pop_sel).is_none(),
         "clicking close button must dismiss timeline popover"
     );
+}
+
+/// APP-RUNTIME-004: 저장된 레이아웃을 백그라운드에서 읽는 동안 사용자가 새 탭을 열면, 복원이 끝난 뒤 초기 칸들의
+/// `PaneId`는 그대로 유지된 채 저장된 탭 뒤에 붙고, 저장된 탭·분할·세션·호스트 매핑·사용자 제목은 충돌 없는 새
+/// `PaneId`로 옮겨 메모리와 디스크 모두 그대로 보존된다(ARCHITECTURE §4.1).
+#[gpui::test]
+fn new_tab_during_startup_restore_keeps_saved_tabs(cx: &mut TestAppContext) {
+    let path = state_path("startup-edit-merge");
+    let mut saved = Layout::default();
+    let first_pane = saved.focused().unwrap();
+    saved.set_session(first_pane, SessionId(7));
+    saved.new_tab();
+    saved.split(Axis::Horizontal);
+    let remote_pane = saved.focused().unwrap();
+    saved.set_host(remote_pane, krill_app::hosts::HostId::Remote("box".into()));
+    saved.set_tab_title(1, Some("work"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    saved.save(&path).unwrap();
+
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        bind_keys(cx);
+        krill_app::settings::init_at(state_dir, cx);
+    });
+    let mut early_panes = Vec::new();
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut shell = Shell::new(Some(path.clone()), cx);
+        // 복원 작업이 실행되기 전(같은 프레임)에 Cmd+T와 같은 경로로 새 탭을 연다.
+        assert!(shell.layout_loading);
+        shell.new_tab_on_launch_host(cx);
+        shell.split_active(Axis::Vertical, cx);
+        assert_eq!(shell.layout.tabs().len(), 2);
+        early_panes = shell.layout.tab_panes(1);
+        shell
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, _| s.flush_layout());
+    assert!(!cx.update(|_, cx| view.read(cx).layout_loading));
+    let layout = layout_of(&view, cx);
+    assert_eq!(
+        layout.tabs().len(),
+        3,
+        "saved tabs + the tab opened while loading"
+    );
+    let restored_tab0 = layout.tab_panes(0);
+    assert_eq!(restored_tab0.len(), 1);
+    assert_eq!(layout.session(restored_tab0[0]), Some(SessionId(7)));
+
+    let restored_tab1 = layout.tab_panes(1);
+    assert_eq!(restored_tab1.len(), 2);
+    assert_eq!(layout.tabs()[1].focused, restored_tab1[1]);
+    assert_eq!(
+        layout.host(restored_tab1[1]),
+        &krill_app::hosts::HostId::Remote("box".into())
+    );
+    assert_eq!(layout.tab_title(1), Some("work"));
+    assert_eq!(layout.active(), 2, "the tab the user opened stays active");
+    let new_panes = layout.tab_panes(2);
+    assert_eq!(
+        new_panes, early_panes,
+        "early panes keep their exact PaneId identity and split"
+    );
+    assert!(
+        new_panes
+            .iter()
+            .all(|p| !restored_tab0.contains(p) && !restored_tab1.contains(p)),
+        "restored saved panes and kept early panes must have disjoint PaneIds"
+    );
+    let new_pane = layout.active_tab().focused;
+    assert!(new_panes.contains(&new_pane));
+    assert!(layout.launch(new_pane).is_some());
+    assert_eq!(Layout::load(&path).unwrap(), layout);
+}
+
+/// APP-RUNTIME-001: Create는 끝났는데(ID 발행) attach를 기다리는 사이 탭을 숨기면 `settled`가 취소돼 레이아웃에
+/// ID가 남지 않는다. 다시 보인 칸은 발행된 ID로 같은 세션에 붙어야 하며 두 번째 Create를 보내면 안 된다.
+#[gpui::test]
+fn reshown_pane_reattaches_published_session_instead_of_creating_again(cx: &mut TestAppContext) {
+    let layout = state_path("published-creation-recovery");
+    let dir = layout.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    let requests = transient_daemon(&dir.join("k.sock"), 0, false);
+    let (view, cx) = open(cx, layout);
+    let pane = layout_of(&view, cx).active_tab().focused;
+    run_pane_against(&view, cx, &dir, 4, |shell| {
+        shell
+            .live
+            .get(&pane)
+            .is_some_and(|live| live.pane.session() == Some(SessionId(41)))
+    });
+    assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
+    assert_eq!(creates(&requests), 1);
+
+    // 숨긴 뒤 다시 보이는 상태를 재현: Live(와 그 foreground Task)는 사라졌고, 레이아웃에는 ID가 없으며,
+    // 백그라운드 Create가 발행한 ID만 Creation에 남아 있다.
+    let creation = Arc::new(std::sync::Mutex::new(close::Creation::default()));
+    assert!(close::Creation::publish(&creation, SessionId(41)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.live.remove(&pane);
+            s.layout.clear_session(pane);
+            s.creations.insert(pane, Arc::clone(&creation));
+            s.sync(cx);
+            assert_eq!(
+                s.layout.session(pane),
+                Some(SessionId(41)),
+                "sync must recover the published ID before attaching"
+            );
+        });
+    });
+    run_pane_against(&view, cx, &dir, 4, |shell| {
+        shell
+            .live
+            .get(&pane)
+            .is_some_and(|live| live.pane.session() == Some(SessionId(41)))
+    });
+    assert_eq!(
+        creates(&requests),
+        1,
+        "the re-shown pane must attach to the published session, not create another PTY"
+    );
+    assert_eq!(layout_of(&view, cx).session(pane), Some(SessionId(41)));
+    assert_eq!(close::Creation::published(&creation), Some(SessionId(41)));
+}
+
+/// APP-F01·F05: 포커스된 탭이 원격 호스트인데 그 호스트의 전송이 없으면(시작 중·호스트 제거) Changes 패널은
+/// 같은 절대 경로의 로컬 저장소에 붙지 않는다. 전송이 생겨도 원격 모드를 지키고, 로컬 탭으로 돌아오면
+/// 이 Mac의 저장소에 붙는다.
+#[gpui::test]
+fn remote_tab_without_host_target_keeps_diff_panel_off_local_repo(cx: &mut TestAppContext) {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::sync::Arc;
+
+    let repo = std::env::temp_dir().join(format!("mk-shell-remote-diff-{}", std::process::id()));
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+
+    let (view, cx) = open(cx, state_path("remote-diff-guard"));
+    let host = krill_app::hosts::HostId::Remote("studio".into());
+    let repo_cwd = repo.as_os_str().as_bytes().to_vec();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let pane = s.layout.active_tab().focused;
+            s.layout.set_host(pane, host.clone());
+            let mut launch = s.launch_for(pane);
+            launch.cwd = repo_cwd.clone();
+            s.layout.set_launch(pane, launch);
+            assert!(s.target_for_host(&host).is_none());
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    let remote =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| view.read(cx).diff.read(cx).remote_host());
+    assert!(
+        remote(cx),
+        "remote tab without transport must not fall back to the local repo"
+    );
+    assert!(cx.debug_bounds("diff-tab-changes").is_some());
+    assert!(cx.debug_bounds("diff-empty-error").is_some());
+    assert!(cx.debug_bounds("changed-file-0").is_none());
+
+    // 데몬이 늦게 붙어도(시작 레이스) 원격 작업공간을 로컬 저장소로 바꾸지 않는다.
+    // holder·krilld 경로가 파일이 아니면 `daemon::connect`가 기동 없이 바로 실패한다.
+    let paths = krill_proto::daemon::Paths {
+        socket: repo.join("krilld.sock"),
+        holder: PathBuf::new(),
+        krilld: PathBuf::new(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            // `connect_daemon_with_paths`는 활성 작업공간이 로컬일 때만 Changes 패널을 로컬에 붙인다.
+            assert_eq!(s.active_workspace(cx).host, host);
+            s.paths = Some(paths);
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(remote(cx));
+
+    // 전송이 생기면(실패하는 커넥터라도) 원격 타깃으로 잇되 원격 모드는 유지한다.
+    let target = krill_hosts::HostTarget::remote_with_connector(
+        "studio",
+        PathBuf::from("/unused"),
+        krill_hosts::RemoteConnector::new(
+            || Err(std::io::ErrorKind::NotConnected.into()),
+            |_, _| {},
+        )
+        .with_lifetime(Arc::new(()), || true),
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.host_targets.insert(host.clone(), target);
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(remote(cx));
+    assert!(cx.debug_bounds("changed-file-0").is_none());
+
+    // 호스트가 제거되면 다시 전송 없는 원격: 여전히 로컬에 붙지 않는다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.host_targets.clear();
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(remote(cx));
+    assert!(cx.debug_bounds("diff-empty-error").is_some());
+
+    // 로컬 탭으로 돌아오면 이 Mac의 저장소에 붙는다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let pane = s.layout.active_tab().focused;
+            s.layout.set_host(pane, krill_app::hosts::HostId::Local);
+            s.sync_diff_workspace(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(!remote(cx));
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// APP-RUNTIME-004: `layout_loading` 중 시작한 탭 이름 변경(`tab_rename`), 고정 탭 닫기 확인(`confirm_close_tab`),
+/// 우클릭 메뉴(`tab_context_menu`), 실행 중 탭 닫기 확인(`pending_running_close`)이 `restore_layout` 뒤에도
+/// 복원된 저장본 탭(0, 1)을 잘못 건드리지 않고 원래 초기 탭으로 정확히 이어진다.
+#[gpui::test]
+fn startup_tab_rename_and_close_dialogs_target_kept_early_tabs_after_restore(
+    cx: &mut TestAppContext,
+) {
+    let path = state_path("startup-tab-ui-remap");
+    let mut saved = Layout::default();
+    let s0 = saved.focused().unwrap();
+    saved.set_session(s0, SessionId(7));
+    saved.set_tab_title(0, Some("saved-zero"));
+    saved.new_tab();
+    let s1 = saved.focused().unwrap();
+    saved.set_session(s1, SessionId(8));
+    saved.set_tab_title(1, Some("saved-one"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    saved.save(&path).unwrap();
+
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        bind_keys(cx);
+        krill_app::settings::init_at(state_dir, cx);
+    });
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
+        let shell = Shell::new_with_restore_gate(Some(path.clone()), gate, cx);
+        assert!(shell.layout_loading);
+        shell
+    });
+
+    let (pane_pinned, pane_renamed, pane_running) = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            assert!(shell.layout_loading);
+            shell.new_tab_on_launch_host(cx); // index 1
+            let p1 = shell.layout.focused().unwrap();
+            assert!(shell.layout.toggle_pin_tab(1));
+
+            shell.new_tab_on_launch_host(cx); // index 2
+            let p2 = shell.layout.focused().unwrap();
+
+            shell.new_tab_on_launch_host(cx); // index 3
+            let p3 = shell.layout.focused().unwrap();
+
+            shell.request_close_tab(1, cx);
+            assert_eq!(shell.confirm_close_tab, Some(1));
+
+            shell.begin_tab_rename(2, window, cx);
+            shell
+                .tab_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| {
+                    input.set_value("early-renamed", window, cx);
+                });
+            shell.open_tab_context_menu(1, point(px(12.), px(16.)), cx);
+            shell.pending_running_close = Some((PendingRunningClose::Tab(3), false));
+            (p1, p2, p3)
+        })
+    });
+    cx.run_until_parked();
+
+    // 이제 저장된 2개 탭(0, 1)이 복원되며 초기 탭 [1, 2, 3]은 [2, 3, 4]로 배치된다.
+    release.send(()).unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.layout_loading);
+        assert_eq!(shell.layout.tabs().len(), 5);
+        assert_eq!(shell.confirm_close_tab, Some(2));
+        assert_eq!(shell.tab_context_menu, Some((2, point(px(12.), px(16.)))));
+        assert!(matches!(
+            shell.pending_running_close,
+            Some((PendingRunningClose::Tab(4), false))
+        ));
+        assert_eq!(
+            shell.tab_rename.as_ref().map(|r| r.pane),
+            Some(pane_renamed)
+        );
+    });
+
+    // 실행 중 닫기 확인(index 4 = pane_running)과 고정 탭 닫기 확인(index 2 = pane_pinned)을 차례로 실행하고,
+    // 모달 포커스 복원이 끝난 뒤 탭 이름 인라인 입력에 포커스를 두고 Enter로 확정한다.
+    view.update(cx, |shell, cx| {
+        shell.tab_context_menu = None;
+        shell.confirm_running_close(cx);
+        shell.confirm_close_pinned_tab(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell
+                .tab_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| input.focus(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let final_layout = layout_of(&view, cx);
+    assert_eq!(final_layout.tabs().len(), 3);
+    assert_eq!(final_layout.tab_title(0), Some("saved-zero"));
+    assert_eq!(final_layout.tab_title(1), Some("saved-one"));
+    assert_eq!(final_layout.tab_title(2), Some("early-renamed"));
+    assert!(final_layout.pane_exists(pane_renamed));
+    assert!(!final_layout.pane_exists(pane_pinned));
+    assert!(!final_layout.pane_exists(pane_running));
+    assert_eq!(
+        final_layout.session(final_layout.tab_panes(0)[0]),
+        Some(SessionId(7))
+    );
+    assert_eq!(
+        final_layout.session(final_layout.tab_panes(1)[0]),
+        Some(SessionId(8))
+    );
+}
+
+#[gpui::test]
+fn input_policy_altgr_prefers_text_and_does_not_leak_kitty_release(cx: &mut TestAppContext) {
+    use krill_proto::screen::Msg as _;
+    use krill_proto::term_modes::{Modes, TERM_MODES};
+    use std::io::Read as _;
+    let (view, cx) = open(cx, state_path("input-policy-altgr"));
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).focused().unwrap();
+    cx.update(|_, cx| {
+        cx.bind_keys([KeyBinding::new("ctrl-alt-t", NewTab, Some(KEY_CONTEXT))]);
+        view.update(cx, |shell, cx| {
+            shell.attach_test(pane, SessionId(678), ours, cx);
+        });
+    });
+    for kitty in [0, 31] {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                TERM_MODES,
+                &postcard::to_stdvec(&Modes { kitty, flags: 0 }).unwrap(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let before = layout_of(&view, cx).tabs().len();
+        let mut keystroke = gpui::Keystroke::parse("ctrl-alt-t").unwrap();
+        keystroke.key_char = Some("þ".into());
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: true,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        cx.run_until_parked();
+        assert_eq!(
+            layout_of(&view, cx).tabs().len(),
+            before,
+            "AltGr text must bypass the app binding"
+        );
+        peer.set_nonblocking(true).unwrap();
+        assert!(
+            peer.read(&mut [0; 64]).is_err(),
+            "AltGr must not leak Ctrl+Alt or release bytes"
+        );
+        cx.simulate_input("þ");
+        cx.run_until_parked();
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (kind, body) = ipc::read_frame(&mut peer).unwrap().unwrap();
+        let input = krill_proto::input::Input::decode(kind, &body).unwrap();
+        assert_eq!(
+            input.bytes,
+            keys::tui::text("þ".as_bytes(), Modes { kitty, flags: 0 })
+        );
+    }
+    let before = layout_of(&view, cx).tabs().len();
+    cx.simulate_event(gpui::KeyDownEvent {
+        keystroke: gpui::Keystroke::parse("ctrl-alt-t").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        layout_of(&view, cx).tabs().len(),
+        before + 1,
+        "a real Ctrl+Alt shortcut remains available"
+    );
+}
+
+#[gpui::test]
+fn input_policy_tab_workspace_indices_and_effective_menu_hints(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("input-policy-hints"));
+    cx.update(|window, cx| {
+        let bindings = cx.key_bindings();
+        let bindings = bindings.borrow();
+        for index in 1..=9 {
+            let workspace = if cfg!(target_os = "macos") {
+                format!("cmd-{index}")
+            } else {
+                format!("ctrl-{index}")
+            };
+            let workspace = gpui::Keystroke::parse(&workspace).unwrap();
+            let tab = gpui::Keystroke::parse(&keys::tab_index_key(index)).unwrap();
+            assert_ne!(workspace, tab);
+            let index_bindings: Vec<_> = bindings
+                .bindings()
+                .filter(|binding| {
+                    binding.match_keystrokes(std::slice::from_ref(&workspace)) == Some(false)
+                })
+                .collect();
+            assert!(
+                index_bindings
+                    .iter()
+                    .any(|b| b.action().name().contains("ActivateWorkspace"))
+            );
+            assert!(
+                !index_bindings
+                    .iter()
+                    .any(|b| b.action().name().contains("ActivateTab"))
+            );
+        }
+        assert!(keys::shortcut_label(window, &CloseTab).is_some());
+        assert!(keys::shortcut_label(window, &Jump).is_some());
+    });
+    cx.update(|_, cx| {
+        cx.clear_key_bindings();
+        cx.bind_keys([
+            KeyBinding::new("ctrl-f8", CloseTab, Some(KEY_CONTEXT)),
+            KeyBinding::new("ctrl-f9", Jump, Some(KEY_CONTEXT)),
+        ]);
+        view.update(cx, |_, cx| cx.notify());
+    });
+    cx.run_until_parked();
+    cx.update(|window, _| {
+        let format = |key| gpui::Keystroke::parse(key).unwrap().to_string();
+        assert_eq!(
+            keys::shortcut_label(window, &CloseTab).unwrap(),
+            format("ctrl-f8")
+        );
+        assert_eq!(
+            keys::shortcut_label(window, &Jump).unwrap(),
+            format("ctrl-f9")
+        );
+    });
+    cx.update(|_, cx| {
+        cx.clear_key_bindings();
+        view.update(cx, |_, cx| cx.notify());
+    });
+    cx.run_until_parked();
+    cx.update(|window, _| {
+        assert!(keys::shortcut_label(window, &CloseTab).is_none());
+        assert!(keys::shortcut_label(window, &Jump).is_none());
+    });
+}
+
+#[gpui::test]
+fn input_policy_link_modifier_drives_tui_hover_modifiers_and_direct_click(cx: &mut TestAppContext) {
+    use krill_proto::screen::{Link as ScreenLink, Op, Revision, Seq, encode_update};
+    use krill_proto::term_modes::{Modes, TERM_MODES};
+    let (view, cx) = open(cx, state_path("input-link-modifier"));
+    let pane = layout_of(&view, cx).focused().unwrap();
+    let (ours, _peer) = UnixStream::pair().unwrap();
+    view.update(cx, |shell, cx| {
+        shell.attach_test(pane, SessionId(911), ours, cx);
+        shell.on_frame(
+            pane,
+            TERM_MODES,
+            &postcard::to_stdvec(&Modes {
+                kitty: 0,
+                flags: Modes::MOUSE_CLICK | Modes::SGR_MOUSE,
+            })
+            .unwrap(),
+            cx,
+        );
+        for frame in encode_update(
+            Revision(1),
+            Seq(0),
+            vec![
+                Op::Reset { cols: 20, lines: 4 },
+                Op::Links {
+                    line: 0,
+                    links: vec![ScreenLink {
+                        column: 0,
+                        cols: 4,
+                        uri: "https://example.test/input".into(),
+                    }],
+                },
+            ],
+        )
+        .unwrap()
+        {
+            let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+            shell.on_frame(pane, kind, &body, cx);
+        }
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = view.read_with(cx, |shell, _| shell.live[&pane].painted.get());
+    let position = point(
+        bounds.origin.x + cell.width / 2.,
+        bounds.origin.y + cell.height / 2.,
+    );
+    let hover =
+        |cx: &mut VisualTestContext| view.read_with(cx, |shell, _| shell.files.hover.is_some());
+    let modifier = if cfg!(target_os = "macos") {
+        Modifiers {
+            platform: true,
+            ..Default::default()
+        }
+    } else {
+        Modifiers {
+            control: true,
+            ..Default::default()
+        }
+    };
+    let wrong = if cfg!(target_os = "macos") {
+        Modifiers {
+            control: true,
+            ..Default::default()
+        }
+    } else {
+        Modifiers {
+            platform: true,
+            ..Default::default()
+        }
+    };
+    cx.simulate_mouse_move(position, None, wrong);
+    cx.run_until_parked();
+    assert!(!hover(cx));
+    cx.simulate_mouse_move(position, None, modifier);
+    cx.run_until_parked();
+    assert!(hover(cx), "mouse-move must use the platform link modifier");
+    cx.simulate_modifiers_change(Modifiers::default());
+    cx.run_until_parked();
+    assert!(!hover(cx));
+    cx.simulate_modifiers_change(modifier);
+    cx.run_until_parked();
+    assert!(hover(cx), "modifier changes must use the same gesture");
+    assert_eq!(cx.opened_url(), None);
+    cx.simulate_click(position, modifier);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.test/input")
+    );
+}
+
+#[gpui::test]
+fn tab_menu_keyboard_down_enter_activates_first_item(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-menu-keyboard"));
+    cx.run_until_parked();
+    let tab = cx.debug_bounds("session-tab-0").unwrap().center();
+    cx.simulate_mouse_down(tab, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-context-menu").is_some());
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(
+            !view.read(cx).tab_menu_focus.is_focused(window),
+            "Down must leave the container and focus a menu item"
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).is_tab_pinned(0));
+    assert!(cx.debug_bounds("tab-context-menu").is_none());
+}
+
+#[gpui::test]
+fn ports_keep_same_session_and_url_on_different_hosts(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("ports-host-identity"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        let panes = s
+            .layout
+            .tabs()
+            .iter()
+            .map(|tab| tab.focused)
+            .collect::<Vec<_>>();
+        assert_eq!(panes.len(), 2);
+        for (index, pane) in panes.iter().enumerate() {
+            let host = krill_app::hosts::HostId::Remote(format!("host-{index}"));
+            s.layout.set_host(*pane, host.clone());
+            let sid = 42;
+            let (ours, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let mut live = Live::new(Task::ready(()));
+            live.pane.link(
+                krill_proto::SessionId(sid),
+                1,
+                pane::Writer::spawn(ours).unwrap(),
+                krill_proto::input::FEAT_INPUT,
+                Now::get(),
+            );
+            s.live.insert(*pane, live);
+            let screen = s.live[pane].pane.shown();
+            let entries =
+                krill_proto::orchestration::extract_local_urls(sid, "http://localhost:3000", false);
+            s.ports_cache.borrow_mut().insert(
+                (host, sid),
+                super::popout::PortCache::from_result(&screen, String::new(), entries),
+            );
+        }
+        let detected = s.detected_ports();
+        assert_eq!(
+            detected.len(),
+            2,
+            "same URL on two owners must produce two menu items"
+        );
+        assert_ne!(detected[0].0, detected[1].0);
+        // Disconnecting a host must not fall through to opening a local loopback URL.
+        s.open_terminal_url(panes[0], "http://localhost:3000", cx);
+        assert!(s.notice.is_some());
+        s.layout.set_host(panes[0], krill_app::hosts::HostId::Local);
+        assert_eq!(s.detected_ports().len(), 1, "stale host cache is excluded");
+    });
+}
+
+#[gpui::test]
+fn tab_menu_home_end_arrows_space_escape_skip_disabled(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-menu-boundaries"));
+    cx.run_until_parked();
+    let tab = cx.debug_bounds("session-tab-0").unwrap().center();
+    cx.simulate_mouse_down(tab, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    let first = cx.update(|w, cx| w.focused(cx).unwrap());
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    let second = cx.update(|w, cx| w.focused(cx).unwrap());
+    assert_ne!(first, second);
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(first, cx.update(|w, cx| w.focused(cx).unwrap()));
+    cx.simulate_keystrokes("end");
+    cx.run_until_parked();
+    let last = cx.update(|w, cx| {
+        assert!(view.read(cx).tab_menu_focus.contains_focused(w, cx));
+        w.focused(cx).unwrap()
+    });
+    assert_ne!(first, last);
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(first, cx.update(|w, cx| w.focused(cx).unwrap()));
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(last, cx.update(|w, cx| w.focused(cx).unwrap()));
+    // A sole unpinned session has exactly pin, rename, close and the color
+    // swatches. Close-other/right/left/editors are visible but disabled.
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    let mut stops = vec![cx.update(|w, cx| w.focused(cx).unwrap())];
+    loop {
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        let handle = cx.update(|w, cx| {
+            assert!(view.read(cx).tab_menu_focus.contains_focused(w, cx));
+            w.focused(cx).unwrap()
+        });
+        if handle == first {
+            break;
+        }
+        assert!(!stops.contains(&handle));
+        stops.push(handle);
+        assert!(stops.len() < 30);
+    }
+    assert_eq!(stops.len(), 4 + krill_app::layout::TabColor::ALL.len());
+    cx.simulate_keystrokes("space");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("space").unwrap(),
+    });
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).is_tab_pinned(0));
+    assert!(cx.debug_bounds("tab-context-menu").is_none());
+    cx.simulate_mouse_down(tab, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab shift-tab escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-context-menu").is_none());
+    cx.update(|w, cx| assert!(!view.read(cx).tab_menu_focus.is_focused(w)));
+}
+
+#[gpui::test]
+fn sticky_prompt_bar_uses_polled_remote_history_with_colliding_session_id(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostStatus};
+    use krill_app::sidebar::{PromptHistories, Source};
+    struct RemotePrompts;
+    impl Source for RemotePrompts {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(sidebar::Snapshot {
+                sessions: vec![sidebar::Session {
+                    id: SessionId(501),
+                    status: krill_proto::control::AgentStatus::UNKNOWN,
+                    worktree: None,
+                    cwd: None,
+                    account: None,
+                }],
+                trees: std::collections::BTreeMap::new(),
+            })
+        }
+        fn prompt_histories(&self) -> PromptHistories {
+            let mut history = krill_proto::git::SessionPromptHistory::default();
+            history.record_turn("Remote host user request", 10_000_000_000);
+            [(SessionId(501), history)].into()
+        }
+    }
+    let (view, cx) = open(cx, state_path("remote-sticky-prompts"));
+    let pane = cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let pane = s.layout.focused().unwrap();
+            s.layout.set_host(pane, HostId::Remote("studio".into()));
+            s.layout.set_session(pane, SessionId(501));
+            s.sidebar.update(cx, |sb, cx| {
+                sb.record_local_prompt(SessionId(501), "Unrelated local user request", cx);
+                sb.set_remote_host_source(
+                    "studio",
+                    "Studio",
+                    HostStatus::Connected,
+                    std::sync::Arc::new(RemotePrompts),
+                    cx,
+                );
+            });
+            cx.notify();
+            pane
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|_, cx| {
+        let sb = view.read(cx).sidebar.read(cx);
+        assert_eq!(
+            sb.session_prompt_history_on(&HostId::Remote("studio".into()), SessionId(501))
+                .unwrap()
+                .single_line_summary()
+                .as_deref(),
+            Some("Remote host user request")
+        );
+        assert_eq!(
+            sb.session_prompt_history_on(&HostId::Local, SessionId(501))
+                .unwrap()
+                .single_line_summary()
+                .as_deref(),
+            Some("Unrelated local user request")
+        );
+    });
+    let bar: &'static str = format!("sticky-prompt-bar-{}", pane.get()).leak();
+    let copy: &'static str = format!("sticky-prompt-copy-{}", pane.get()).leak();
+    let item: &'static str = format!("sticky-prompt-turn-item-{}-0", pane.get()).leak();
+    let copy_bounds = cx.debug_bounds(copy).expect("remote prompt copy button");
+    cx.simulate_click(copy_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("Remote host user request".into())
+    );
+    let bar_bounds = cx.debug_bounds(bar).expect("remote prompt bar");
+    cx.simulate_click(bar_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds(item).is_some(), "remote timeline must open");
 }

@@ -2,7 +2,7 @@
 //!
 //! - 상태·취소는 리더 스레드가 장부만 보고 답하므로 실행기가 AX 호출에 막혀도 응답한다.
 //! - 변경 동작은 전역 입력 잠금 → 대상 재검증 → `begin_dispatch` → 발행 순서다. 잠금 대기·재검증 중
-//!   취소·기한 초과는 미실행이다. 발행 뒤 결과 불명(`unknown`)이면 실행기는
+//!   취소·기한 초과·출력 전송로 실패는 미실행이다(결과를 알릴 수 없는 입력은 내지 않는다). 발행 뒤 결과 불명(`unknown`)이면 실행기는
 //!   잠금을 쥔 채 정지(quiescing)하고 이후 변경 요청을 받지 않는다. 잠금은 프로세스 종료로만 풀린다.
 //!   정리 미완료(`cleanup: incomplete`)도 같다.
 //! - `batch`는 잠금 하나를 모든 단계 동안 쥐고, 단계마다 기한·멈춤 요청 확인 → 재검증 → 발행 순서다. 첫 단계만
@@ -529,17 +529,19 @@ impl<B: Backend> Executor<B> {
             );
         }
         let input = match lock::acquire(&self.lock_path, job.deadline, || {
-            state() == RequestState::Queued
+            state() == RequestState::Queued && shared.outbox.alive()
         }) {
             Ok(input) => input,
+            Err(lock::LockError::Abandoned) if !shared.outbox.alive() => {
+                let refusal = transport_failed();
+                return Outcome::not_dispatched(seq, refusal.code, refusal.message);
+            }
             Err(error) => return Outcome::not_dispatched(seq, error.code(), error.message()),
         };
         if let Op::Batch { steps } = op {
             return self.batch(seq, steps, job.deadline, input, shared);
         }
-        let dispatched = match self.step(op, job.deadline, || {
-            guard(&shared.ledger).begin_dispatch(seq)
-        }) {
+        let dispatched = match self.step(op, job.deadline, || dispatch_gate(shared, seq)) {
             Ok(dispatched) => dispatched,
             Err(refusal) => return Outcome::not_dispatched(seq, refusal.code, refusal.message),
         };
@@ -564,7 +566,7 @@ impl<B: Backend> Executor<B> {
         &mut self,
         op: &Op,
         deadline: Instant,
-        gate: impl FnOnce() -> bool,
+        gate: impl FnOnce() -> Result<(), Refusal>,
     ) -> Result<Dispatched, Refusal> {
         let late = || {
             Refusal::new(
@@ -579,12 +581,7 @@ impl<B: Backend> Executor<B> {
         if Instant::now() >= deadline {
             return Err(late());
         }
-        if !gate() {
-            return Err(Refusal::new(
-                "cancelled",
-                "request was cancelled before dispatch",
-            ));
-        }
+        gate()?;
         Ok(self.backend.dispatch(prepared, deadline))
     }
 
@@ -618,9 +615,9 @@ impl<B: Backend> Executor<B> {
             } else {
                 self.step(op, deadline, || {
                     if index == 0 {
-                        guard(&shared.ledger).begin_dispatch(seq)
+                        dispatch_gate(shared, seq)
                     } else {
-                        !guard(&shared.ledger).stop_requested(seq)
+                        continue_gate(shared, seq)
                     }
                 })
             };
@@ -818,6 +815,45 @@ fn deadline_exceeded(seq: u64) -> Outcome {
         "deadline_exceeded",
         "request deadline passed before dispatch",
     )
+}
+
+/// 출력 전송로가 죽었다: 결과를 알릴 수 없는 입력은 내지 않는다(APP-RUNTIME-005).
+fn transport_failed() -> Refusal {
+    Refusal::new(
+        "transport_failed",
+        "output transport failed before dispatch; the result could not be delivered",
+    )
+}
+
+/// 첫 발행 직전 문: 전송로가 살아 있고 요청이 아직 `Queued`일 때만 `begin_dispatch`한다. 잠금 대기·재검증(`prepare`)
+/// 중에 호출자가 사라지거나 쓰기가 정체돼도 새 부작용을 시작하지 않는다.
+fn dispatch_gate(shared: &Shared, seq: u64) -> Result<(), Refusal> {
+    if !shared.outbox.alive() {
+        return Err(transport_failed());
+    }
+    if guard(&shared.ledger).begin_dispatch(seq) {
+        Ok(())
+    } else {
+        Err(Refusal::new(
+            "cancelled",
+            "request was cancelled before dispatch",
+        ))
+    }
+}
+
+/// 묶음의 둘째 단계부터: 전송로가 살아 있고 멈춤 요청이 없어야 한다.
+fn continue_gate(shared: &Shared, seq: u64) -> Result<(), Refusal> {
+    if !shared.outbox.alive() {
+        return Err(transport_failed());
+    }
+    if guard(&shared.ledger).stop_requested(seq) {
+        Err(Refusal::new(
+            "cancelled",
+            "request was cancelled before this step",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

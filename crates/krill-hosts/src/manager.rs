@@ -67,6 +67,15 @@ impl std::fmt::Debug for ExternalHost {
 }
 
 impl ExternalHost {
+    /// 이 등록으로 데몬에 붙는 호스트 타깃(연결 세대 추적 포함).
+    pub fn target(&self) -> HostTarget {
+        HostTarget::remote_with_connector(
+            self.spec.id.clone(),
+            self.socket.clone(),
+            (self.factory)(),
+        )
+    }
+
     pub fn new(
         spec: RemoteHostSpec,
         socket: PathBuf,
@@ -324,6 +333,14 @@ impl HostManager {
         self.slot(id)
             .and_then(|slot| slot.lock().ok().map(|s| s.tunnel_starts))
             .unwrap_or(0)
+    }
+
+    /// 원격 중계(`krill __bridge`, Windows 원격)로 붙은 호스트가 보고한 OS 이름(`windows` 등).
+    /// 소켓 포워딩(POSIX 원격)이거나 터널이 없으면 `None`. 대상 OS에 맞는 명령을 고를 때 쓴다.
+    pub fn remote_os(&self, id: &str) -> Option<String> {
+        let slot = self.slot(id)?;
+        let s = slot.lock().ok()?;
+        s.tunnel.as_ref()?.remote_os().map(str::to_owned)
     }
 
     /// 현재 살아 있는 터널의 자식 PID(테스트에서 터널 강제 종료 검증용).

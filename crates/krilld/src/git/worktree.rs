@@ -133,11 +133,20 @@ fn finish(
         Err(e) => return Reply::WorktreeFailed(e),
     };
     if let Some(script) = setup {
+        let shell = match setup_shell(Path::new(OsStr::from_bytes(&worktree.path))) {
+            Ok(shell) => shell,
+            Err(error) => {
+                worktree
+                    .warnings
+                    .push(format!("setup did not start: {error}"));
+                return Reply::WorktreeCreated(worktree);
+            }
+        };
         let size = size.unwrap_or(DEFAULT_SETUP_SIZE);
         let c = Create {
             account: None,
             program: Program::Custom {
-                program: b"/bin/sh".to_vec(),
+                program: shell.into_os_string().into_vec(),
                 args: vec![b"-c".to_vec(), script.into_bytes()],
             },
             cwd: worktree.path.clone(),
@@ -153,7 +162,43 @@ fn finish(
     Reply::WorktreeCreated(worktree)
 }
 
-/// `req.repo`에 워크트리를 `<root>/<레포 이름>/<이름>`으로 만든다. `trust`는 setup 신뢰 파일.
+/// Setup and archive hooks use Git's POSIX shell on Windows, not a Unix-only path.
+#[cfg_attr(
+    unix,
+    expect(clippy::unnecessary_wraps, reason = "Windows must resolve Git's shell")
+)]
+fn script_shell(q: &GitQueue, wt: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        output_path(
+            git(q, wt, ["var", "GIT_SHELL_PATH"])?,
+            "cannot find Git shell",
+        )
+    }
+    #[cfg(unix)]
+    {
+        let _ = (q, wt);
+        Ok(PathBuf::from("/bin/sh"))
+    }
+}
+
+#[cfg_attr(
+    unix,
+    expect(clippy::unnecessary_wraps, reason = "Windows shell discovery may fail")
+)]
+fn setup_shell(wt: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        script_shell(queue()?, wt)
+    }
+    #[cfg(unix)]
+    {
+        let _ = wt;
+        Ok(PathBuf::from("/bin/sh"))
+    }
+}
+
+/// 프로젝트에 지정한 위치 또는 `<root>/<레포 이름>/<이름>`에 만든다. `trust`는 setup 신뢰 파일.
 ///
 /// # Errors
 /// 사람이 읽을 이유(git 실패는 git의 stderr).
@@ -244,7 +289,8 @@ pub fn create_with_pool(
     )?;
 
     let repo_name = top.file_name().ok_or("repository has no name")?;
-    let dir = root.join(repo_name);
+    let dir =
+        compat::project_destination(&top, trust.parent())?.unwrap_or_else(|| root.join(repo_name));
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     // git이 기록하는 경로와 비교하려고 실제 경로로(`/tmp` → `/private/tmp`).
     let dir = fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;

@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::session::lock;
 
 mod claude;
+pub(super) mod codex_reset;
 
 type Key = (PathBuf, ProviderKind, PathBuf);
 static CACHE: Mutex<BTreeMap<Key, (Instant, AccountMeters)>> = Mutex::new(BTreeMap::new());
@@ -30,10 +31,6 @@ pub(super) fn has_cached(home: &Path, provider: ProviderKind, dir: &Path) -> boo
     lock(&CACHE)
         .get(&(home.into(), provider, dir.into()))
         .is_some_and(|(at, _)| at.elapsed() < CACHE_TTL)
-}
-
-pub(super) fn evict(home: &Path) {
-    lock(&CACHE).retain(|(h, _, _), _| h != home);
 }
 
 pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
@@ -98,7 +95,7 @@ fn read_local(home: &Path, account: &AccountInfo) -> AccountMeters {
         }
     }
     if account.provider == ProviderKind::Codex
-        && let Some(path) = super::latest_rollout(&dir.join("sessions"))
+        && let Some(path) = super::own_rollout(&dir.join("sessions"))
         && let Ok(file) = std::fs::File::open(path)
     {
         use std::io::{Read as _, Seek as _, SeekFrom};
@@ -206,30 +203,8 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                     value_meter(&mut out, "credits", "Credits", format!("{balance}"));
                 }
             }
-            if let Some(count) = json
-                .pointer("/rate_limit_reset_credits/available_count")
-                .and_then(Value::as_u64)
-            {
-                value_meter(
-                    &mut out,
-                    krill_proto::usage::RESET_CREDITS_METER_KEY,
-                    krill_proto::usage::RESET_CREDITS_METER_LABEL,
-                    count.to_string(),
-                );
-                if count > 0 {
-                    let expiry = json
-                        .get("rate_limit_reset_credits")
-                        .and_then(|credits| {
-                            credits.get("expires_at").or_else(|| credits.get("ends_at"))
-                        })
-                        .and_then(super::resets)
-                        .and_then(|at| krill_proto::time::parse_reset_epoch(&at))
-                        .filter(|at| *at > 0);
-                    out.meters
-                        .push(krill_proto::usage::reset_credit_expiry_meter(
-                            0, count, expiry,
-                        ));
-                }
+            if let Some(credits) = json.get("rate_limit_reset_credits") {
+                codex_reset::read(&mut out, credits);
             }
             if let Some(review) = json.get("code_review_rate_limit") {
                 for key in ["primary_window", "secondary_window"] {

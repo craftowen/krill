@@ -262,6 +262,11 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ("FEAT_AGENTS", crate::control::FEAT_AGENTS, 31),
         ("FEAT_SESSION_FORK", crate::control::FEAT_SESSION_FORK, 34),
         ("FEAT_UPGRADE", crate::control::FEAT_UPGRADE, 36),
+        (
+            "FEAT_WINDOWS_UPGRADE",
+            crate::control::FEAT_WINDOWS_UPGRADE,
+            29,
+        ),
         ("FEAT_COLD", crate::control::FEAT_COLD, 18),
         ("FEAT_HOLDER_WATCH", crate::daemon::FEAT_HOLDER_WATCH, 7),
         ("FEAT_HISTORY", crate::history::FEAT_HISTORY, 16),
@@ -354,6 +359,12 @@ fn feature_registry_matches_architecture_and_frozen_values() {
             52,
         ),
         ("FEAT_REMOTE_FS", crate::control::FEAT_REMOTE_FS, 27),
+        (
+            "FEAT_ORCH_SNAPSHOT_PAGE",
+            crate::orchestration::FEAT_ORCH_SNAPSHOT_PAGE,
+            35,
+        ),
+        ("FEAT_WORKTREE_REFS", crate::control::FEAT_WORKTREE_REFS, 37),
     ];
     // 새 상수를 표·fixture 양쪽에서 빠뜨리는 것도 잡는다.
     let declared: std::collections::BTreeSet<_> =

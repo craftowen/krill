@@ -3,6 +3,7 @@
 //! - 리더는 절대 잠들어 모으지 않는다. 직전 read가 PTY 한 번 분량(1,024B)으로 꽉 찼을 때만 최대
 //!   [`SPIN`] 동안 다시 읽어 묶는다(ARCHITECTURE §4.2, perf-first #1).
 //! - DEC 2026 sync는 vte가 알려 주는 마감 시각을 `poll` 타임아웃으로 한 번만 건다. 폴링 없음(perf-first #7).
+//!   강등된 세션의 grid 캐시 정리 시각(OWE-1114)도 같은 타임아웃에 함께 건다.
 //! - 엔진 호출은 세션 단위 `catch_unwind`로 감싼다(CONVENTIONS P4). panic한 묶음은 Gap으로 기록하고 엔진을
 //!   새로 만든 뒤 계속 읽는다. 다른 세션 스레드와 PTY는 영향이 없다.
 //! - 질의 응답은 krilld만 한다(AGENTS 3, MK-020). 엔진이 만든 응답을 리더가 엔진 잠금 안에서 바로 PTY에 쓴다.
@@ -11,16 +12,19 @@
 //! - 화면 전송(MK-023): 엔진이 바뀔 때마다 화면 revision을 올리고, 원본은 디스크에 넘긴 뒤 메모리 링([`RING`])에
 //!   넣고 구독자를 깨운다([`Tap`]). 깨우기만 하고 기다리지 않는다. 디스크에 먼저 쓰므로 링에서 밀려난 원본은
 //!   (기록했다면) 디스크에 있다.
-//! - krilld 간 인계([`crate::rejoin`]): [`halt`]가 이 프로세스의 리더를 모두 읽기 경계에서 멈추고 세그먼트를 봉인한다.
+//! - krilld 간 인계([`crate::rejoin`]): [`Handoff`]가 읽기 경계에서 세그먼트를 봉인하고 리더를 주차한다. 실패하면 같은 엔진으로 재개한다.
 //!   멈춘 리더는 세션을 닫힌 것으로 알리지 않는다(세션은 다음 krilld가 이어 읽는다).
 //! - 숨긴 세션 강등(MK-035): 화면 구독자([`Viewer`])가 없는 채로 [`PARK_GRACE`]가 지나면 엔진의 핫 스크롤백·파서
 //!   버퍼를 돌려준다(화면·모드는 유지). 구독자가 생기면 바로 다시 쌓는다. 버린 행은 세그먼트 콜드 페이지로 읽으므로
 //!   디스크에 기록하지 않는 세션은 강등하지 않는다.
 
 mod capture_since;
+mod handoff;
 mod history_view;
+pub(crate) use handoff::Handoff;
 mod input;
 mod park;
+pub(crate) use park::purge_soon;
 mod recovery;
 #[cfg(windows)]
 mod windows;
@@ -68,7 +72,7 @@ pub(crate) const RING: usize = 256 * 1_024;
 /// 화면 구독자가 모두 떠난 뒤 강등까지 기다리는 시간. 탭을 오가는 동안 강등·복원이 반복되지 않게 한다.
 pub const PARK_GRACE: Duration = Duration::from_secs(10);
 
-/// [`halt`] 이후 리더는 읽지 않고 끝난다.
+/// Handoff preparation parks readers until it commits or rolls back.
 static HALTED: AtomicBool = AtomicBool::new(false);
 /// 리더가 master와 함께 poll하는 파이프(읽는 쪽, 쓰는 쪽). [`halt`]가 한 바이트를 쓰고 아무도 읽지 않아 모든 리더의
 /// poll이 깨어 있는 채로 남는다. 프로세스에 하나.
@@ -95,7 +99,9 @@ pub(crate) mod pty {
 
     pub(super) fn halt_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         let (r, w) = io::pipe()?;
-        Ok((r.into(), w.into()))
+        let reader = OwnedFd::from(r);
+        nonblocking(&reader)?;
+        Ok((reader, w.into()))
     }
 
     pub(super) fn nonblocking(master: &OwnedFd) -> io::Result<()> {
@@ -125,8 +131,8 @@ pub(crate) mod pty {
     }
 }
 
-/// 이 프로세스의 PTY 리더를 모두 멈춘다(krilld 간 인계). 리더는 읽은 묶음을 기록까지 마친 뒤 세그먼트를 봉인하고
-/// 끝난다. 되돌릴 수 없다. 끝났는지는 [`Session::is_closed`]로 본다.
+/// Prepare readers to park after recording queued bytes and sealing their segments.
+/// The scoped [`Handoff`] resumes them on failure; commit leaves them parked until process exit.
 #[cfg_attr(
     windows,
     expect(
@@ -141,9 +147,14 @@ pub(crate) fn halt() -> io::Result<()> {
         let (_, w) = halt_pipe()?;
         write(w, &[0])?;
     }
+    wake_halt();
+    Ok(())
+}
+
+/// Repeat cancellation to cover a worker entering `ReadFile` after the first cancellation.
+pub(crate) fn wake_halt() {
     #[cfg(windows)]
     windows::halt();
-    Ok(())
 }
 
 /// 엔진이 panic해서 화면에 반영하지 못한 원본 바이트 구간(`start`는 세션 시작부터 읽은 바이트 수).
@@ -214,9 +225,14 @@ struct Shared {
     master: Master,
     #[cfg(windows)]
     holder: Option<Arc<crate::holder::Holder>>,
+    /// PTY 입력 쓰기 스레드(daemon-02). 질의 응답은 큐에 넣기만 하고, 입력은 완료·취소를 기다린다.
+    #[cfg(windows)]
+    writer: windows::Writer,
+    reader: Mutex<Option<JoinHandle<io::Result<()>>>>,
     look: Arc<Appearance>,
     out: Mutex<Out>,
     changed: Condvar,
+    paused: AtomicBool,
     /// 링 밖 원본을 읽을 디스크 저장소(기록하지 않는 세션은 `None`).
     store: Option<Arc<Store>>,
 }
@@ -254,6 +270,8 @@ impl Shared {
         *lock(&self.capture) = None;
         if live.update_engine(demote).is_some() {
             live.parked = true;
+            drop(live);
+            crate::alloc::purge();
         } else {
             let revision = live.revision;
             drop(live);
@@ -291,7 +309,6 @@ impl Drop for Viewer {
 pub struct Session {
     id: SessionId,
     shared: Arc<Shared>,
-    reader: JoinHandle<io::Result<()>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -318,6 +335,8 @@ impl Session {
         let halt = halt_pipe()?.0.as_fd();
         #[cfg(windows)]
         let pipe = windows::Reader::start(&master)?;
+        #[cfg(windows)]
+        let writer = windows::Writer::start(&master)?;
         // krilld가 재기동했으면 seq는 디스크 마지막 세그먼트 끝에서 이어진다.
         let seq = rec.as_ref().map_or(0, Recorder::seq);
         let shared = Arc::new(Shared {
@@ -345,6 +364,9 @@ impl Session {
             master,
             #[cfg(windows)]
             holder,
+            #[cfg(windows)]
+            writer,
+            reader: Mutex::new(None),
             look,
             out: Mutex::new(Out {
                 ring: VecDeque::new(),
@@ -354,6 +376,7 @@ impl Session {
                 generation: 0,
             }),
             changed: Condvar::new(),
+            paused: AtomicBool::new(false),
             store: rec
                 .as_ref()
                 .filter(|r| r.store().recording())
@@ -361,6 +384,7 @@ impl Session {
         });
         let reader = thread::Builder::new()
             .name(format!("pty-{}", id.0))
+            .stack_size(256 * 1024)
             .spawn({
                 let shared = Arc::clone(&shared);
                 move || {
@@ -371,22 +395,29 @@ impl Session {
                     #[cfg(unix)]
                     let source = halt;
                     #[cfg(windows)]
-                    let source = pipe;
+                    let mut source = pipe;
+                    #[cfg(unix)]
                     let r = read_loop(&shared, source, rec);
-                    if !HALTED.load(Ordering::SeqCst)
-                        && panic::catch_unwind(AssertUnwindSafe(|| {
-                            shared.publish(&[], 0, true);
-                        }))
-                        .is_err()
+                    #[cfg(windows)]
+                    let r = read_loop(&shared, &mut source, rec);
+                    #[cfg(test)]
+                    pause_tests::before_close(shared.id);
+                    // Handoff parks inside read_loop instead of returning. Reaching
+                    // this point is real EOF, even if a concurrent pause just began.
+                    if panic::catch_unwind(AssertUnwindSafe(|| {
+                        shared.publish(&[], 0, true);
+                    }))
+                    .is_err()
                     {
                         tracing::warn!("pty close publish panicked");
                     }
                     r
                 }
             })?;
+        *lock(&shared.reader) = Some(reader);
         // 아무도 붙지 않은 채 시작한 세션(CLI 생성·krilld 재기동)도 같은 규칙으로 강등한다.
         park_later(&shared, 0);
-        Ok(Self { id, shared, reader })
+        Ok(Self { id, shared })
     }
 
     pub fn id(&self) -> SessionId {
@@ -408,7 +439,7 @@ impl Session {
         let theme = self.shared.look.theme();
         let live = self.shared.live();
         if let Some(notice) = live.engine.scheme_notice(&theme) {
-            write_reply(&self.shared.master, notice.as_bytes());
+            write_reply(&self.shared, notice.as_bytes());
         }
     }
 
@@ -427,16 +458,25 @@ impl Session {
         lock(&self.shared.gaps).clone()
     }
 
-    /// PTY가 닫혀(EOF) 리더가 끝났는지.
+    /// 리더가 EOF 또는 오류로 끝났는지. 인계 중 주차된 리더는 닫힌 것이 아니다.
     pub fn is_closed(&self) -> bool {
-        self.reader.is_finished()
+        lock(&self.shared.reader)
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.shared.paused.load(Ordering::SeqCst)
     }
 
     /// 리더가 끝날 때까지 기다리고 끝난 이유를 돌려준다.
     pub fn wait(self) -> io::Result<()> {
-        self.reader
-            .join()
-            .unwrap_or_else(|_| Err(io::Error::other("pty reader panicked outside catch_unwind")))
+        let reader = lock(&self.shared.reader).take();
+        reader.map_or(Ok(()), |reader| {
+            reader.join().unwrap_or_else(|_| {
+                Err(io::Error::other("pty reader panicked outside catch_unwind"))
+            })
+        })
     }
 }
 
@@ -835,6 +875,15 @@ impl Tap {
         input::write_input(self, bytes, peer)
     }
 
+    pub(crate) fn guarded_command(
+        &self,
+        revision: u64,
+        command: &[u8],
+        accepts: impl Fn(&Screen, bool) -> bool,
+    ) -> io::Result<()> {
+        input::guarded_command(self, revision, command, accepts)
+    }
+
     /// 입력 연결이 프레임 사이에서 닫혀도 열린 붙여넣기의 종료 표지를 보충한다.
     pub(crate) fn finish_input(&self) {
         input::finish_input(self);
@@ -880,7 +929,7 @@ fn guarded(
         resized = live.resized.take();
     }
     let ok = if let Some(reply) = live.update_engine(f) {
-        write_reply(&shared.master, reply.as_bytes());
+        write_reply(shared, reply.as_bytes());
         true
     } else {
         // 복구 엔진은 현재 크기·강등 여부로 생성하며 원본은 기존 Gap 경로로 남긴다.
@@ -927,16 +976,10 @@ fn rebuild(shared: &Shared, rec: &Recorder, size: WinSize) {
 
 #[cfg(unix)]
 type Source<'a> = BorrowedFd<'a>;
+/// 리더 스레드가 소유하고 되돌리기 경합 때 새 워커로 바꾼다(`read_loop`가 끝나면 취소·join).
 #[cfg(windows)]
-type Source<'a> = windows::Reader;
+type Source<'a> = &'a mut windows::Reader;
 
-#[cfg_attr(
-    windows,
-    expect(
-        clippy::needless_pass_by_value,
-        reason = "Own Reader so every loop exit cancels and joins the pipe worker"
-    )
-)]
 fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> io::Result<()> {
     let look = &*shared.look;
     let mut buf = vec![0u8; BATCH];
@@ -947,17 +990,25 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
         // through EOF after cancellation before sealing, or handover loses bytes.
         #[cfg(unix)]
         if HALTED.load(Ordering::SeqCst) {
-            if let Some(r) = &mut rec {
-                seal(shared, r);
-            }
-            return Ok(());
+            handoff::wait(shared, &mut rec);
+            continue;
         }
-        let deadline = shared.live().engine.sync_deadline();
-        if deadline.is_some_and(|at| at <= Instant::now()) {
+        let (sync_at, trim_at) = {
+            let live = shared.live();
+            (live.engine.sync_deadline(), live.engine.trim_deadline())
+        };
+        let now = Instant::now();
+        if sync_at.is_some_and(|at| at <= now) {
             let (_, rev, _) = guarded(shared, 0, |e| e.end_sync(Feed::Live, look));
             shared.publish(&[], rev, false);
             continue;
         }
+        if trim_at.is_some_and(|at| at <= now) {
+            // 화면은 그대로라 발행하지 않는다.
+            shared.live().update_engine(Engine::trim);
+            continue;
+        }
+        let deadline = sync_at.into_iter().chain(trim_at).min();
         let timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
         #[cfg(unix)]
         let ready = read_ready(&shared.master, source, &mut buf, timeout);
@@ -973,10 +1024,25 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
                 continue;
             }
         }) else {
+            #[cfg(windows)]
+            if source.cancelled() {
+                // The queue is drained. Even if preparation already rolled back,
+                // this canceled worker is not terminal EOF and must be replaced.
+                handoff::wait(shared, &mut rec);
+                match windows::Reader::start(&shared.master) {
+                    Ok(reader) => *source = reader,
+                    Err(error) => {
+                        errors = errors.saturating_add(1);
+                        tracing::warn!(kind = ?error.kind(), "pty reader resume failed; retrying");
+                        thread::sleep(backoff(errors));
+                    }
+                }
+                continue;
+            }
             if let Some(r) = &mut rec {
                 seal(shared, r);
             }
-            return Ok(()); // EOF
+            return Ok(());
         };
         errors = 0;
         let Some(bytes) = buf.get(..n) else { continue };
@@ -1149,9 +1215,9 @@ fn read_batch(master: &OwnedFd, buf: &mut [u8]) -> io::Result<Option<usize>> {
 
 /// 질의 응답을 PTY 입력으로 쓴다. 리더를 멈추지 않으려고 기다리지 않는다.
 #[cfg(unix)]
-fn write_reply(master: &OwnedFd, mut bytes: &[u8]) {
+fn write_reply(shared: &Shared, mut bytes: &[u8]) {
     while !bytes.is_empty() {
-        match write(master, bytes) {
+        match write(&shared.master, bytes) {
             Ok(n) if n > 0 => bytes = bytes.get(n..).unwrap_or_default(),
             Err(Errno::INTR) => {}
             // ponytail: 입력 큐가 가득하면(에이전트가 stdin을 안 읽음, EAGAIN) 남은 응답을 버린다. 응답은 질의당 수십
@@ -1161,18 +1227,17 @@ fn write_reply(master: &OwnedFd, mut bytes: &[u8]) {
     }
 }
 
+/// 질의 응답을 writer 스레드 큐에 넣는다. 엔진 잠금 안에서 파이프를 기다리지 않는다(daemon-02); 큐가 차면
+/// Unix의 EAGAIN 정책처럼 응답을 버린다.
 #[cfg(windows)]
-fn write_reply(master: &Master, bytes: &[u8]) {
-    use std::io::Write as _;
-    if !bytes.is_empty() {
-        // A borrowed handle becomes a File only through an owned duplicate.
-        if let Ok(handle) = master.input.try_clone() {
-            std::fs::File::from(handle).write_all(bytes).ok();
-        }
-    }
+fn write_reply(shared: &Shared, bytes: &[u8]) {
+    shared.writer.reply(bytes);
 }
 
 #[cfg(test)]
 #[cfg(unix)]
 #[path = "session/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod pause_tests;

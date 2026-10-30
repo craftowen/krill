@@ -112,21 +112,16 @@ fn start(executable: &Path, state_dir: &Path) -> Result<(), Error> {
         }
     }
     #[cfg(windows)]
-    let mut child = {
-        use std::os::windows::process::CommandExt as _;
-        use std::process::{Command, Stdio};
-        Command::new(executable)
-            .arg("serve")
-            .arg("--state-dir")
-            .arg(state_dir)
-            // 콘솔 없이 앱과 독립된 프로세스로 실행한다.
-            .creation_flags(0x0000_0008 | 0x0000_0200)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(Error::Io)?
-    };
+    let child = krill_holder::spawn_detached(
+        executable.as_os_str(),
+        &[
+            "serve".into(),
+            "--state-dir".into(),
+            state_dir.as_os_str().to_owned(),
+        ],
+        false,
+    )
+    .map_err(Error::Io)?;
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = executable;
@@ -137,7 +132,7 @@ fn start(executable: &Path, state_dir: &Path) -> Result<(), Error> {
         let deadline = Instant::now() + START_TIMEOUT;
         while !is_serve_running(state_dir) {
             #[cfg(windows)]
-            if let Some(status) = child.try_wait().map_err(Error::Io)? {
+            if let Some(status) = child.status().map_err(Error::Io)? {
                 return Err(Error::Transport(format!(
                     "incoming server exited: {status}"
                 )));
@@ -145,8 +140,7 @@ fn start(executable: &Path, state_dir: &Path) -> Result<(), Error> {
             if Instant::now() >= deadline {
                 #[cfg(windows)]
                 {
-                    child.kill().ok();
-                    child.wait().ok();
+                    child.terminate().ok();
                 }
                 return Err(Error::Timeout("incoming server startup"));
             }

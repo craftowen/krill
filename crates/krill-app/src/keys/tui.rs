@@ -20,6 +20,17 @@ pub fn is_shell_shortcut(ks: &Keystroke) -> bool {
     if m.shift && !m.control && !m.alt && matches!(ks.key.as_str(), "pageup" | "pagedown") {
         return true;
     }
+    if !cfg!(target_os = "macos")
+        && m.alt
+        && !m.control
+        && !m.shift
+        && matches!(
+            ks.key.as_str(),
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+        )
+    {
+        return true;
+    }
     if m.control && !m.alt {
         match ks.key.as_str() {
             "tab" => return true,
@@ -59,6 +70,7 @@ fn shortcut_bytes(ks: &Keystroke, modes: Modes) -> Option<&'static [u8]> {
             "c" => Some(b"\x03"),
             "backspace" => Some(b"\x17"),
             "enter" if cfg!(target_os = "macos") || modes.kitty != 0 => Some(b"\x1b[13;5u"),
+            "enter" => Some(b"\r"),
             _ => None,
         };
     }
@@ -75,6 +87,26 @@ fn shortcut_bytes(ks: &Keystroke, modes: Modes) -> Option<&'static [u8]> {
         }
     }
     None
+}
+
+/// A Windows Pi pane keeps CSI-u Shift+Enter even if a tool reset Kitty mode.
+pub fn key_with_policy(
+    ks: &Keystroke,
+    modes: Modes,
+    event: Event,
+    policy: krill_term::paste::InputPolicy,
+) -> Option<Vec<u8>> {
+    if policy == krill_term::paste::InputPolicy::WindowsPi
+        && modes.kitty == 0
+        && ks.key == "enter"
+        && ks.modifiers.shift
+        && !ks.modifiers.control
+        && !ks.modifiers.alt
+        && !ks.modifiers.platform
+    {
+        return (event != Event::Release).then(|| b"\x1b[13;2u".to_vec());
+    }
+    key(ks, modes, event)
 }
 
 /// 문자 입력은 IME로, 모호한 키·기능 키는 협상한 형식으로 보낸다.
@@ -220,7 +252,7 @@ pub fn key(ks: &Keystroke, modes: Modes, event: Event) -> Option<Vec<u8>> {
 // ponytail: Shift는 영문자만 대문자로 바꾼다(Option+Shift+1 → ESC 1). 기호까지 필요하면 자판 배열 조회를 붙인다.
 pub fn meta(ks: &Keystroke, option_as_meta: bool) -> Option<Vec<u8>> {
     let m = ks.modifiers;
-    if !m.alt || m.control || m.platform || m.function {
+    if is_shell_shortcut(ks) || !m.alt || m.control || m.platform || m.function {
         return None;
     }
     let mut chars = ks.key.chars();
@@ -326,6 +358,56 @@ mod tests {
             },
             event,
         )
+    }
+
+    #[test]
+    fn native_windows_enter_and_pi_mode_reset_policy() {
+        use krill_term::paste::InputPolicy;
+        let ks = Keystroke::parse("ctrl-enter").unwrap();
+        assert_eq!(
+            key(&ks, Modes::default(), Event::Press).unwrap(),
+            if cfg!(target_os = "macos") {
+                b"\x1b[13;5u".as_slice()
+            } else {
+                b"\r"
+            }
+        );
+        assert_eq!(key(&ks, Modes::default(), Event::Release), None);
+        let ks = Keystroke::parse("shift-enter").unwrap();
+        assert_eq!(
+            key_with_policy(&ks, Modes::default(), Event::Press, InputPolicy::WindowsPi).unwrap(),
+            b"\x1b[13;2u"
+        );
+        assert_eq!(
+            key_with_policy(
+                &ks,
+                Modes::default(),
+                Event::Release,
+                InputPolicy::WindowsPi
+            ),
+            None
+        );
+        assert_eq!(
+            key_with_policy(&ks, Modes::default(), Event::Press, InputPolicy::ByteStream).unwrap(),
+            b"\x1b\r"
+        );
+        if !cfg!(target_os = "macos") {
+            let ks = Keystroke::parse("alt-2").unwrap();
+            for event in [Event::Press, Event::Repeat, Event::Release] {
+                assert_eq!(
+                    key(
+                        &ks,
+                        Modes {
+                            kitty: 31,
+                            flags: 0
+                        },
+                        event
+                    ),
+                    None
+                );
+            }
+            assert_eq!(meta(&ks, true), None);
+        }
     }
 
     #[test]
