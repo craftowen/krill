@@ -24,6 +24,8 @@ use crate::agent::hooks::shell_quote;
 use crate::config_document::edit_json;
 use crate::time::parse_reset_epoch;
 
+pub mod context;
+
 /// statusline이 쓰는 프로필별 사용량 캐시 파일 이름. 데몬 읽기 경로가 이미 아는 이름이다.
 pub const CACHE_FILE: &str = "usage_cache.json";
 /// 같은 값을 다시 쓰지 않는 최소 간격(초). Orca 클라이언트 하한(15초) 참조.
@@ -141,6 +143,10 @@ pub fn render_cache(
 /// 캐시 파일을 원자·0600으로 쓴다. 디렉터리가 없으면 만들지 않고 `Ok(false)`(기록 건너뜀).
 /// 같은 디렉터리의 숨김 임시 파일에 0600으로 쓰고 fsync 뒤 rename한다.
 pub fn write_cache_file(dir: &Path, text: &str) -> io::Result<bool> {
+    write_named_cache_file(dir, CACHE_FILE, text)
+}
+
+fn write_named_cache_file(dir: &Path, name: &str, text: &str) -> io::Result<bool> {
     use crate::os::fs::OpenOptionsExt as _;
     use std::fs::OpenOptions;
     use std::io::Write as _;
@@ -148,8 +154,8 @@ pub fn write_cache_file(dir: &Path, text: &str) -> io::Result<bool> {
         return Ok(false);
     }
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp = dir.join(format!(".{CACHE_FILE}.tmp-{}-{seq}", std::process::id()));
-    let target = cache_path(dir);
+    let temp = dir.join(format!(".{name}.tmp-{}-{seq}", std::process::id()));
+    let target = dir.join(name);
     let written = (|| {
         let mut file = OpenOptions::new()
             .write(true)

@@ -52,6 +52,12 @@ fn run_mode(args: &[OsString]) -> ExitCode {
     let parsed = parse_run_args(args);
     let payload = read_stdin(STDIN_WAIT, STDIN_MAX);
     let dir = config_dir();
+    if let Some(state) = daemon::state_dir()
+        && let Some(profile) = dir.as_deref()
+        && let Ok(data) = serde_json::from_slice(&payload)
+    {
+        statusline::context::record(&state, profile, &data).ok();
+    }
     if let Some(dir) = &dir {
         record(dir, &payload, now_epoch());
     }

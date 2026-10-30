@@ -49,7 +49,7 @@ impl Backend {
                             set(&mut models, "current", current.into());
                         }
                     } else {
-                        set(&mut models, "reason", "Wait for an idle Codex chat with an empty native composer. Direct model control is verified for Codex 0.164.0.".into());
+                        set(&mut models, "reason", "Wait for an idle Codex chat with an empty native composer. Direct model control is verified for Codex 0.164.0 and 0.165.0.".into());
                     }
                 }
                 Err(error) => set(&mut models, "reason", error.to_string().into()),
@@ -70,9 +70,20 @@ impl Backend {
         Ok(models)
     }
 
-    pub(super) fn set_composer_model(&self, session: u64, model: &str) -> io::Result<Value> {
+    pub(super) fn set_composer_model(
+        &self,
+        session: u64,
+        model: &str,
+        effort: Option<&str>,
+    ) -> io::Result<Value> {
         let context = self.composer_context(session)?;
         if context.agent == "claude" {
+            if effort.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Choose Claude effort separately from the model",
+                ));
+            }
             let tap = self
                 .registry
                 .upgrade()
@@ -82,6 +93,7 @@ impl Backend {
         }
         let catalog = context.models();
         let fallback = context.validate_model(&catalog, model)?;
+        validate_effort(&catalog, model, effort)?;
         if context.agent != "codex" {
             return Ok(fallback);
         }
@@ -95,15 +107,20 @@ impl Backend {
             || !native::composer(&before, None)
         {
             return Err(io::Error::other(
-                "Wait for an idle Codex 0.164.0 chat with an empty native composer",
+                "Wait for an idle Codex 0.164.0 or 0.165.0 chat with an empty native composer",
             ));
         }
-        if observed_model(&catalog, &before).as_deref() == Some(model) {
+        if observed_model(&catalog, &before).as_deref() == Some(model)
+            && effort.is_none_or(|effort| native::effort(&before).as_deref() == Some(effort))
+        {
             return Ok(
-                json!({"applied":true,"supported":true,"model":model,"already_selected":true}),
+                json!({"applied":true,"supported":true,"model":model,"effort":effort,"already_selected":true}),
             );
         }
-        let command = format!("/model {model}");
+        let command = effort.map_or_else(
+            || format!("/model {model}"),
+            |effort| format!("/model {model} --reasoning={effort}"),
+        );
         tap.guarded_command(revision.0, command.as_bytes(), |screen, pasted| {
             (context.verified_codex || native::verified(screen))
                 && native::composer(screen, pasted.then_some(command.as_str()))
@@ -117,13 +134,88 @@ impl Backend {
                 && observed_model(&catalog, &screen).as_deref() == Some(model)
                 && native::latest_confirmation(&screen, model)
                 && native::fresh_confirmation(&tap, seq.0, model)
+                && effort.is_none_or(|effort| native::effort(&screen).as_deref() == Some(effort))
             {
-                return Ok(json!({"applied":true,"supported":true,"model":model}));
+                return Ok(json!({"applied":true,"supported":true,"model":model,"effort":effort}));
             }
         }
         Ok(
             json!({"applied":false,"supported":true,"reason":"Codex received the model command, but its session-only change was not confirmed. Check the chat; the command will not be resent."}),
         )
+    }
+
+    pub(super) fn composer_status(&self, session: u64) -> io::Result<Value> {
+        let context = self.composer_context(session)?;
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let snapshot = registry.chat_poll(SessionId(session), u64::MAX);
+        let mut value = super::composer_status::read(&snapshot, &context, self.dir.as_deref())?;
+        let catalog = self.composer_models(session)?;
+        set(
+            &mut value,
+            "models",
+            catalog.get("items").cloned().unwrap_or_else(|| json!([])),
+        );
+        let supported = catalog
+            .get("supported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        set(&mut value, "supported", supported.into());
+        let effort_supported = supported
+            && if context.agent == "claude" {
+                registry
+                    .mobile_composer_tap(SessionId(session))
+                    .is_ok_and(|tap| claude::effort_available(&tap.capture().0))
+            } else {
+                context.agent == "codex"
+            };
+        set(&mut value, "effort_supported", effort_supported.into());
+        if context.agent == "claude" && effort_supported {
+            set(
+                &mut value,
+                "efforts",
+                json!(["low", "medium", "high", "xhigh", "max"]),
+            );
+        }
+        if context.agent == "codex"
+            && let Ok(tap) = registry.mobile_composer_tap(SessionId(session))
+        {
+            let (screen, _, _) = tap.capture();
+            if (context.verified_codex || native::verified(&screen))
+                && native::composer(&screen, None)
+            {
+                if let Some(model) = observed_model(&catalog, &screen) {
+                    observe_live_model(&mut value, &model);
+                }
+                if let Some(effort) = native::effort(&screen) {
+                    set(&mut value, "effort", effort.into());
+                }
+            }
+        }
+        let identity = crate::agent_history::chat::generation(&snapshot);
+        let generation =
+            super::hex(ring::digest::digest(&ring::digest::SHA256, identity.as_bytes()).as_ref());
+        set(&mut value, "generation", generation.into());
+        Ok(value)
+    }
+
+    pub(super) fn set_composer_effort(&self, session: u64, effort: &str) -> io::Result<Value> {
+        let context = self.composer_context(session)?;
+        if context.agent == "claude" {
+            let tap = self
+                .registry
+                .upgrade()
+                .ok_or_else(invalid)?
+                .mobile_composer_tap(SessionId(session))?;
+            return claude::set_effort(&tap, effort);
+        }
+        let catalog = self.composer_models(session)?;
+        let model = catalog
+            .get("current")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                io::Error::other("Wait for an idle chat with an observed current model")
+            })?;
+        self.set_composer_model(session, model, Some(effort))
     }
 
     pub(super) fn composer_context(&self, session: u64) -> io::Result<Context> {
@@ -181,6 +273,47 @@ fn set(value: &mut Value, key: &str, item: Value) {
     if let Some(fields) = value.as_object_mut() {
         fields.insert(key.into(), item);
     }
+}
+
+fn observe_live_model(value: &mut Value, model: &str) {
+    if value.get("model").and_then(Value::as_str) != Some(model) {
+        set(value, "context", Value::Null);
+        set(value, "effort", Value::Null);
+    }
+    set(value, "model", model.into());
+}
+
+fn valid_effort(effort: &str) -> bool {
+    matches!(
+        effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    )
+}
+
+fn validate_effort(catalog: &Value, model: &str, effort: Option<&str>) -> io::Result<()> {
+    let Some(effort) = effort else {
+        return Ok(());
+    };
+    let supported = valid_effort(effort)
+        && catalog
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(model))
+            .is_some_and(|item| {
+                item.get("efforts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|levels| levels.iter().any(|value| value.as_str() == Some(effort)))
+                    || item.get("default_effort").and_then(Value::as_str) == Some(effort)
+            });
+    if !supported {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Effort is not in this session model's discovered catalog",
+        ));
+    }
+    Ok(())
 }
 
 fn provider(agent: &str, profile: Option<&Profile>) -> String {
@@ -262,6 +395,10 @@ fn resolve(
     }
 }
 
+fn codex_version(version: &str) -> bool {
+    matches!(version, "0.164.0" | "0.165.0")
+}
+
 fn verified_codex_transcript(stored: &StoredLaunch) -> bool {
     let Some(path) = stored
         .transcript_path
@@ -288,7 +425,10 @@ fn verified_codex_transcript(stored: &StoredLaunch) -> bool {
     };
     meta.get("type").and_then(Value::as_str) == Some("session_meta")
         && meta.pointer("/payload/id").and_then(Value::as_str) == Some(id)
-        && meta.pointer("/payload/cli_version").and_then(Value::as_str) == Some("0.164.0")
+        && meta
+            .pointer("/payload/cli_version")
+            .and_then(Value::as_str)
+            .is_some_and(codex_version)
 }
 
 fn read(path: &Path) -> Option<String> {
@@ -315,9 +455,9 @@ fn valid_id(id: &str) -> bool {
 impl Context {
     pub(super) fn models(&self) -> Value {
         let mut items = BTreeMap::new();
-        let mut add = |id: &str, label: &str| {
+        let mut add = |id: &str, label: &str, metadata: Option<&Value>| {
             if valid_id(id) && items.len() < 128 {
-                items.entry(id.to_owned()).or_insert_with(|| json!({"id":id,"label":label.chars().filter(|c| !c.is_control()).take(160).collect::<String>()}));
+                items.entry(id.to_owned()).or_insert_with(|| json!({"id":id,"label":label.chars().filter(|c| !c.is_control()).take(160).collect::<String>(),"efforts":metadata.and_then(|m|m.get("supported_reasoning_levels")).and_then(Value::as_array).into_iter().flatten().filter_map(|e|e.get("effort").and_then(Value::as_str)).filter(|e|valid_effort(e)).take(16).collect::<Vec<_>>(),"default_effort":metadata.and_then(|m|m.get("default_reasoning_level")).and_then(Value::as_str).filter(|e|valid_effort(e))}));
             }
         };
         match self.agent.as_str() {
@@ -350,6 +490,7 @@ impl Context {
                                     .get("display_name")
                                     .and_then(Value::as_str)
                                     .unwrap_or(id),
+                                Some(model),
                             );
                         }
                     }
@@ -358,7 +499,7 @@ impl Context {
                     .and_then(|s| toml::from_str::<toml::Table>(&s).ok())
                 {
                     if let Some(id) = config.get("model").and_then(toml::Value::as_str) {
-                        add(id, id);
+                        add(id, id, None);
                     }
                     for profile in config
                         .get("profiles")
@@ -368,7 +509,7 @@ impl Context {
                         .take(128)
                     {
                         if let Some(id) = profile.get("model").and_then(toml::Value::as_str) {
-                            add(id, id);
+                            add(id, id, None);
                         }
                     }
                 }
@@ -387,7 +528,7 @@ impl Context {
                         read(&path).and_then(|s| serde_json::from_str::<Value>(&s).ok())
                     {
                         if let Some(id) = settings.get("model").and_then(Value::as_str) {
-                            add(id, id);
+                            add(id, id, None);
                         }
                         for id in settings
                             .get("availableModels")
@@ -397,7 +538,7 @@ impl Context {
                             .filter_map(Value::as_str)
                             .take(128)
                         {
-                            add(id, id);
+                            add(id, id, None);
                         }
                     }
                 }
@@ -405,7 +546,7 @@ impl Context {
                     if key == "ANTHROPIC_MODEL"
                         || key.starts_with("ANTHROPIC_DEFAULT_") && key.ends_with("_MODEL")
                     {
-                        add(id, id);
+                        add(id, id, None);
                     }
                 }
             }
