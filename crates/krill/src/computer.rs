@@ -503,6 +503,17 @@ pub(super) fn ensure_current_snapshot(
             "target does not match original snapshot; observe the intended window first".to_owned(),
         ));
     }
+    if engine::is_native_snapshot(&before) {
+        if common.restore_window {
+            return Err(CliError::Runtime(
+                "native snapshots cannot restore windows; observe without KRILL_COMPUTER_ENGINE=native"
+                    .to_owned(),
+            ));
+        }
+        // The native action re-observes in its own worker and checks the target path there.
+        engine::set_action_snapshot(before.clone());
+        return Ok(before);
+    }
     // Restore is a mutation and is guarded and leased before this observation.
     let fresh = engine::observe_app_state(
         &format!("pid:{}", before.app.pid),

@@ -14,6 +14,7 @@ use krill_proto::daemon;
 pub use super::model::*;
 
 mod capture;
+mod native;
 mod retention;
 
 const MOCK_FILE_NAME: &str = "computer-mock.json";
@@ -640,31 +641,48 @@ pub fn observe_app_state(
         ));
     }
     let app = resolve_live_app(app_selector)?;
-    let windows = list_windows_for_app(&app, restore_window)?;
-    let selected_window = if let Some(id) = window_id {
-        Some(
-            windows
-                .into_iter()
-                .find(|w| w.id == id)
-                .ok_or_else(|| format!("window id not found: {id}"))?,
-        )
-    } else if let Some(idx) = window_index {
-        Some(
-            windows
-                .into_iter()
-                .find(|w| w.index == idx)
-                .ok_or_else(|| format!("window index out of range: {idx}"))?,
-        )
+    // The native worker has no window restore or capture geometry; those requests stay on JXA.
+    let use_native = native::enabled()
+        && window_index.is_none()
+        && !restore_window
+        && (no_screenshot || !sc)
+        && window_id.is_none_or(native::is_native_window);
+    let (selected_window, observation, ax_observation_timing) = if use_native {
+        let ax_started = capture::clock();
+        let (window, observation) = native::observe(&app, window_id)?;
+        (Some(window), observation, Some(capture::timing(ax_started)))
     } else {
-        windows.into_iter().next()
-    };
+        let windows = list_windows_for_app(&app, restore_window)?;
+        let selected_window = if let Some(id) = window_id {
+            Some(
+                windows
+                    .into_iter()
+                    .find(|w| w.id == id)
+                    .ok_or_else(|| format!("window id not found: {id}"))?,
+            )
+        } else if let Some(idx) = window_index {
+            Some(
+                windows
+                    .into_iter()
+                    .find(|w| w.index == idx)
+                    .ok_or_else(|| format!("window index out of range: {idx}"))?,
+            )
+        } else {
+            windows.into_iter().next()
+        };
 
-    if restore_window {
-        verify_target_app(&app)?;
-    }
-    let ax_started = capture::clock();
-    let observation = query_live_window_ax_tree(&app, selected_window.as_ref(), restore_window)?;
-    let ax_observation_timing = Some(capture::timing(ax_started));
+        if restore_window {
+            verify_target_app(&app)?;
+        }
+        let ax_started = capture::clock();
+        let observation =
+            query_live_window_ax_tree(&app, selected_window.as_ref(), restore_window)?;
+        (
+            selected_window,
+            observation,
+            Some(capture::timing(ax_started)),
+        )
+    };
     let LiveObservation {
         mut root,
         process_start,
@@ -1074,6 +1092,16 @@ pub fn execute_live_action(
     };
     verify_target_app(app)?;
     let base = action_snapshot().ok_or("no immutable action snapshot")?;
+    if native::is_native_snapshot(&base) {
+        // The worker takes this same session lock around its own dispatch and cannot inherit our
+        // lease (its stdin is the protocol pipe). Nothing on this path issues input from the CLI.
+        EXECUTION.with_borrow_mut(|slot| {
+            if let Some(execution) = slot {
+                execution.lease = None;
+            }
+        });
+        return Ok(native::execute(&base, app, action));
+    }
     let mut payload = build_live_action_payload(app, win, action);
     payload["processStart"] = serde_json::json!(base.process_start);
     payload["receiver"] = serde_json::json!(base.root.as_ref().and_then(focused_receiver));
@@ -1226,6 +1254,10 @@ fn run_managed(cmd: Command) -> Result<super::lifecycle::Finished, String> {
         };
         lifecycle::run(cmd, &opts).map_err(|e| format!("not_dispatched: {e}"))
     })
+}
+
+pub fn is_native_snapshot(snapshot: &AppStateSnapshot) -> bool {
+    native::is_native_snapshot(snapshot)
 }
 
 pub fn set_action_snapshot(snapshot: AppStateSnapshot) {
