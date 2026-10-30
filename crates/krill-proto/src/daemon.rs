@@ -990,9 +990,34 @@ fn launch_lock(socket: &Path, timeout: Duration) -> Result<std::fs::File, Error>
 /// [`SIGNED_HELLO_TIMEOUT`]으로 이 함수를 부른다. 소켓 파일이 없으면 `NotFound`,
 /// krilld가 죽었으면 `ConnectionRefused`.
 pub fn handshake(socket: &Path, hello: &ClientHello, timeout: Duration) -> io::Result<Connection> {
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    handshake_stream(UnixStream::connect(socket)?, hello, timeout)
+}
+
+fn handshake_stream(
+    mut stream: UnixStream,
+    hello: &ClientHello,
+    timeout: Duration,
+) -> io::Result<Connection> {
+    let configured = stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)));
+    #[cfg(target_os = "macos")]
+    let configured = configured.map_err(|error| {
+        // macOS rejects setsockopt with EINVAL after a peer closes. Confirm EOF
+        // without blocking, before any hello or request was sent. Other invalid
+        // arguments (including a zero timeout) retain their original error.
+        if !timeout.is_zero()
+            && error.raw_os_error() == Some(22)
+            && stream.set_nonblocking(true).is_ok()
+        {
+            use std::io::Read as _;
+            if matches!(stream.read(&mut [0]), Ok(0)) {
+                return io::ErrorKind::UnexpectedEof.into();
+            }
+        }
+        error
+    });
+    configured?;
     let (kind, body) = ipc::read_frame(&mut stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
     let server = ServerHello::decode(kind, &body)?;
     stream.write_all(&hello.encode()?)?;

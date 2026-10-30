@@ -22,6 +22,28 @@ fn hello() -> ClientHello {
     client_hello(ClientRole::Cli, "test")
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn closed_prehello_peer_is_a_handshake_transition() {
+    let (stream, peer) = UnixStream::pair().unwrap();
+    drop(peer);
+    let error = handshake_stream(stream, &hello(), HELLO_TIMEOUT).unwrap_err();
+    assert!(is_transition(&error), "closed pre-Hello peer: {error:?}");
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn zero_handshake_timeout_remains_invalid_with_open_or_closed_peer() {
+    for closed in [false, true] {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let _peer = (!closed).then_some(peer);
+        let error = handshake_stream(stream, &hello(), Duration::ZERO).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!is_transition(&error));
+    }
+    assert!(!is_transition(&io::ErrorKind::InvalidInput.into()));
+}
+
 /// 명시한 handshake 기한은 그대로 존중한다. 서버가 2초 늦어도 0.2초로 부르면
 /// 0.2초 근처에서 끝난다. `krill wait --timeout 0.2`가 30초 붙잡히던 회귀 방지.
 #[test]
@@ -159,13 +181,11 @@ fn transient_close_before_hello_waits_for_successor_without_launch() {
     std::fs::write(&holder, b"not an executable").unwrap();
     let listener = crate::os::net::UnixListener::bind(&socket).unwrap();
     let worker = thread::spawn(move || {
-        // 쓰기 쪽만 닫아 Hello 전 EOF를 만든다. 읽기 쪽은 유지해 macOS의 닫힌 피어 setsockopt(EINVAL)
-        // 경합을 피하고, 이 테스트가 확인하는 핸드셰이크 EOF에 도달하게 한다.
-        let mut retired = Vec::new();
+        // Retired daemons close the whole connection. On macOS this can race
+        // with the client's initial timeout configuration, before its first read.
         for _ in 0..3 {
             let (stream, _) = listener.accept().unwrap();
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
-            retired.push(stream);
+            drop(stream);
         }
         // 감시 handshake 한 번 + 실제 handshake 한 번.
         for _ in 0..2 {
