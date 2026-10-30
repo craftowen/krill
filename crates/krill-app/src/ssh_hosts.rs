@@ -347,14 +347,11 @@ pub fn add_host(
         label.trim()
     };
     let mut hosts = load_hosts(state_dir);
-    // 한글·기호 라벨은 모두 같은 slug가 되므로, 라벨이 다른 호스트와 id가 겹치면 번호를 붙인다.
+    // 한글·기호 라벨은 같은 slug가 되고 같은 라벨도 주소가 다를 수 있으므로, 다른 주소의 호스트와 id가 겹치면 번호를 붙인다.
     let base = format!("ssh-{}", slugify(clean_label));
     let mut id = base.clone();
     let mut n = 2;
-    while hosts
-        .iter()
-        .any(|h| h.id == id && h.label != clean_label && h.destination != dest)
-    {
+    while hosts.iter().any(|h| h.id == id && h.destination != dest) {
         id = format!("{base}-{n}");
         n += 1;
     }
