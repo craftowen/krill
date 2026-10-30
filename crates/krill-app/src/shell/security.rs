@@ -1255,7 +1255,7 @@ impl Shell {
                             .debug_selector(|| "sidebar-settings".into())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_settings(
-                                    krill_app::settings::AdminTab::General,
+                                    krill_app::settings::AdminTab::Appearance,
                                     Some(window),
                                     cx,
                                 );

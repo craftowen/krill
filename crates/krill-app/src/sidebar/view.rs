@@ -441,6 +441,16 @@ fn row_menu(
                     }),
             );
         }
+        if header.repo && host.is_local() {
+            let settings_repo = header.path.clone();
+            menu = menu.item(
+                PopupMenuItem::new(text::PROJECT_SETTINGS.get())
+                    .icon(IconName::Settings)
+                    .on_click(move |_, _, cx| {
+                        crate::settings::open_project_settings(&settings_repo, cx);
+                    }),
+            );
+        }
         if host.is_local() {
             let (remove_this, remove_path) = (this.clone(), header.path.clone());
             menu = menu.item(
@@ -3258,7 +3268,7 @@ impl Sidebar {
                                 .debug_selector(|| "setup-prompt-settings".into())
                                 .on_click(cx.listener(|_, _, _, cx| {
                                     crate::settings::open_window_at_tab(
-                                        crate::settings::AdminTab::Workflows,
+                                        crate::settings::AdminTab::Project,
                                         cx,
                                     );
                                 })),

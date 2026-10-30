@@ -46,7 +46,7 @@ fn cursor_blink_stops_when_hidden_or_inactive_and_restarts_visible(cx: &mut Test
             s.sync_cursor_blink(true, cx);
             assert!(s.cursor_blink.is_some());
 
-            s.open_settings(krill_app::settings::AdminTab::General, None, cx);
+            s.open_settings(krill_app::settings::AdminTab::Appearance, None, cx);
             s.sync_cursor_blink(true, cx);
             assert!(s.cursor_blink.is_none());
             s.close_settings(None, cx);
@@ -5898,7 +5898,7 @@ fn owe855_main_window_title_restored_after_settings(cx: &mut TestAppContext) {
     );
     cx.update(|window, cx| {
         view.update(cx, |s, cx| {
-            s.open_settings(krill_app::settings::AdminTab::General, Some(window), cx);
+            s.open_settings(krill_app::settings::AdminTab::Appearance, Some(window), cx);
         });
     });
     cx.run_until_parked();
@@ -6381,7 +6381,7 @@ fn settings_page_keeps_hidden_terminal_completion_unread(cx: &mut TestAppContext
     cx.run_until_parked();
     cx.update(|window, cx| {
         view.update(cx, |s, cx| {
-            s.open_settings(krill_app::settings::AdminTab::General, Some(window), cx);
+            s.open_settings(krill_app::settings::AdminTab::Appearance, Some(window), cx);
         });
     });
     cx.run_until_parked();
@@ -6510,7 +6510,7 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     // 모바일 단독 페이지에서 일반 설정으로 이동한 뒤 navigate_back 시 mobile_page()가 true로 복원된다.
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.open_settings(krill_app::settings::AdminTab::General, None, cx);
+            s.open_settings(krill_app::settings::AdminTab::Appearance, None, cx);
             assert!(!s.mobile_page_open(cx));
             assert!(s.navigate_back(None, cx));
             assert!(s.mobile_page_open(cx));
@@ -6573,7 +6573,7 @@ fn artifacts_open_the_library_by_default_and_back_preserves_the_workspace(cx: &m
     cx.update(|window, cx| {
         view.update(cx, |s, cx| {
             s.open_artifacts(Some(window), cx);
-            s.open_settings(krill_app::settings::AdminTab::General, None, cx);
+            s.open_settings(krill_app::settings::AdminTab::Appearance, None, cx);
             assert!(s.artifacts.is_none());
             s.navigate_back(None, cx);
             assert!(s.artifacts.is_some());
@@ -6693,11 +6693,11 @@ fn multi_window_settings_close_targets_matching_shell_host(cx: &mut TestAppConte
     //    swallowed by view_b (another window) or an unrendered Shell host (this.window == None).
     let unrendered = cx.update(|window, cx| {
         view_a.update(cx, |s, cx| {
-            s.open_settings(krill_app::settings::AdminTab::General, Some(window), cx);
+            s.open_settings(krill_app::settings::AdminTab::Appearance, Some(window), cx);
         });
         let unrendered = cx.new(|cx| Shell::new(None, cx));
         unrendered.update(cx, |s, cx| {
-            s.open_settings(krill_app::settings::AdminTab::Terminal, None, cx);
+            s.open_settings(krill_app::settings::AdminTab::Appearance, None, cx);
         });
         unrendered
     });

@@ -944,7 +944,7 @@ fn dashboard_card_click_closes_settings_unzooms_pane_and_routes_remote_host(
                     cx,
                 );
             });
-            shell.open_settings(krill_app::settings::AdminTab::General, None, cx);
+            shell.open_settings(krill_app::settings::AdminTab::Appearance, None, cx);
         });
     });
     cx.run_until_parked();

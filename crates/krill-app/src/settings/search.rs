@@ -2,7 +2,6 @@
 //! UI 언어와 상관없이 한글·영어 검색어가 모두 맞는다(Orca `settings-search.ts`와 같은 방식).
 
 use super::AdminTab;
-use super::text;
 use crate::i18n::{Language, Message, SETTINGS_SEARCH_INDEX as INDEX};
 
 /// 검색어와 맞는 탭([`AdminTab::ALL`] 순). 빈 검색어면 전부. 대소문자는 가리지 않는다.
@@ -16,32 +15,22 @@ pub(super) fn search_tabs(query: &str) -> Vec<AdminTab> {
     AdminTab::ALL
         .into_iter()
         .filter(|&tab| {
-            both(tab_title(tab)).into_iter().any(hit)
-                || both(tab.subtitle_message()).into_iter().any(hit)
+            AdminTab::SUBPAGES
+                .into_iter()
+                .chain([tab])
+                .filter(|sub| sub.page() == tab)
+                .any(|sub| {
+                    both(sub.title_message()).into_iter().any(hit)
+                        || both(sub.subtitle_message()).into_iter().any(hit)
+                })
                 || INDEX
                     .iter()
-                    .filter(|(t, ..)| *t == tab)
+                    .filter(|(t, ..)| t.page() == tab)
                     .any(|(_, title, words)| {
                         both(*title).into_iter().any(hit) || words.iter().copied().any(hit)
                     })
         })
         .collect()
-}
-
-fn tab_title(tab: AdminTab) -> Message {
-    match tab {
-        AdminTab::General => text::TAB_GENERAL,
-        AdminTab::Terminal => text::TAB_TERMINAL,
-        AdminTab::Accounts => text::TAB_ACCOUNTS,
-        AdminTab::Agents => text::TAB_AGENTS,
-        AdminTab::Install => text::TAB_INSTALL,
-        AdminTab::Ssh => text::TAB_SSH,
-        AdminTab::RemoteKrill => text::TAB_REMOTE_KRILL,
-        AdminTab::Workflows => text::TAB_WORKFLOWS,
-        AdminTab::Shortcuts => text::TAB_SHORTCUTS,
-        AdminTab::Resources => text::TAB_RESOURCES,
-        AdminTab::Mobile => crate::i18n::catalog::mobile::TAB,
-    }
 }
 
 #[cfg(test)]
@@ -50,28 +39,28 @@ mod tests {
 
     #[test]
     fn korean_and_english_queries_filter_tabs() {
-        assert_eq!(search_tabs("글꼴"), [AdminTab::Terminal]);
-        assert_eq!(search_tabs("font"), [AdminTab::Terminal]);
-        assert_eq!(search_tabs("  FONT "), [AdminTab::Terminal]);
+        assert_eq!(search_tabs("글꼴"), [AdminTab::Appearance]);
+        assert_eq!(search_tabs("font"), [AdminTab::Appearance]);
+        assert_eq!(search_tabs("  FONT "), [AdminTab::Appearance]);
         // 파일 전용 옵션은 설정 파일 행으로 안내한다.
         for q in ["커서", "cursor", "옵션", "meta", "복사", "copy", "blink"] {
-            assert!(search_tabs(q).contains(&AdminTab::General), "{q}");
+            assert!(search_tabs(q).contains(&AdminTab::System), "{q}");
         }
         assert_eq!(search_tabs("ssh"), [AdminTab::Ssh]);
         for q in ["원격 Krill", "remote krill", "초대", "invite", "p2p"] {
-            assert_eq!(search_tabs(q), [AdminTab::RemoteKrill], "{q}");
+            assert_eq!(search_tabs(q), [AdminTab::Ssh], "{q}");
         }
-        assert!(search_tabs("페어링").contains(&AdminTab::RemoteKrill));
-        assert_eq!(search_tabs("동면"), [AdminTab::General]);
-        assert!(search_tabs("webhook").contains(&AdminTab::General));
+        assert!(search_tabs("페어링").contains(&AdminTab::Ssh));
+        assert_eq!(search_tabs("동면"), [AdminTab::System]);
+        assert!(search_tabs("webhook").contains(&AdminTab::System));
         // 알림 이벤트(OWE-659)는 알림 항목에서 찾는다.
         for q in ["벨", "bell", "입력", "input", "승인", "완료", "done"] {
-            assert!(search_tabs(q).contains(&AdminTab::General), "{q}");
+            assert!(search_tabs(q).contains(&AdminTab::System), "{q}");
         }
         // 탭 이름·부제(한·영 모두)도 맞는다(OWE-795).
         assert!(search_tabs("shortcuts").contains(&AdminTab::Shortcuts));
-        assert_eq!(search_tabs("스마트폰"), [AdminTab::Mobile]);
-        assert_eq!(search_tabs("qr"), [AdminTab::RemoteKrill, AdminTab::Mobile]);
+        assert_eq!(search_tabs("스마트폰"), [AdminTab::Ssh]);
+        assert_eq!(search_tabs("qr"), [AdminTab::Ssh]);
         assert!(search_tabs("zzz-no-such-setting").is_empty());
     }
 
@@ -90,7 +79,7 @@ pub(super) fn first_setting(query: &str, tab: AdminTab) -> Option<Message> {
     }
     INDEX
         .iter()
-        .filter(|(t, ..)| *t == tab)
+        .filter(|(t, ..)| t.page() == tab.page())
         .find_map(|(_, title, words)| {
             ([Language::Ko, Language::En]
                 .iter()

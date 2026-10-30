@@ -346,15 +346,6 @@ fn owe883_user_facing_lines_hide_debug_and_english_internals() {
         "2026-10-18 09:30 (UTC)"
     );
 
-    // 자가 진단: 내부 키-값이 아니라 카탈로그 문구.
-    let report = run_doctor_check(None);
-    assert!(!report.contains("state="), "{report}");
-    assert!(!report.contains("bins="), "{report}");
-    assert!(!report.contains("crashes="), "{report}");
-    assert!(!report.contains("recording="), "{report}");
-    assert!(!report.contains("missing-bins"), "{report}");
-    assert!(report.contains(text::DOCTOR_MISSING.get()), "{report}");
-
     // 업데이터 오류: 영문 Display 원문이 아니라 사용자용 문구.
     for err in [
         crate::updater::Error::BadSignature,
@@ -1282,10 +1273,10 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("cmd-f");
     vcx.simulate_input("ssh");
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-tab-ssh").is_some());
-    assert!(vcx.debug_bounds("admin-tab-general").is_none());
+    assert!(vcx.debug_bounds("admin-tab-devices").is_some());
+    assert!(vcx.debug_bounds("admin-tab-appearance").is_none());
     assert!(vcx.debug_bounds("admin-tab-agents").is_none());
-    let ssh = vcx.debug_bounds("admin-tab-ssh").unwrap();
+    let ssh = vcx.debug_bounds("admin-tab-devices").unwrap();
     vcx.simulate_click(ssh.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Ssh));
@@ -1295,7 +1286,7 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("admin-search-empty").is_some());
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-tab-general").is_some());
+    assert!(vcx.debug_bounds("admin-tab-appearance").is_some());
     assert!(vcx.debug_bounds("admin-search-empty").is_none());
 
     fs::remove_dir_all(d).ok();
@@ -1651,8 +1642,9 @@ fn resources_tab_history_clear_reports_unavailable_in_test_dir(cx: &mut TestAppC
     let d = dir("history-clear");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
     });
     vcx.run_until_parked();
     let clear = vcx
@@ -1691,8 +1683,9 @@ fn resources_tab_recording_toggle_reverts_without_daemon(cx: &mut TestAppContext
     let d = dir("recording-pause");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
     });
     vcx.run_until_parked();
     let paused = vcx
@@ -1721,7 +1714,7 @@ fn resources_error_reporting_toggle_persists_separate_consent_and_revokes(cx: &m
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.update(|_, cx| {
-        view.update(cx, |view, cx| view.set_tab(AdminTab::Resources, cx));
+        view.update(cx, |view, cx| view.set_tab(AdminTab::System, cx));
     });
     vcx.run_until_parked();
     assert!(!error_reporting::status(&d).unwrap().consented);
@@ -1771,10 +1764,10 @@ fn resources_error_reporting_repeated_tab_does_not_invalidate_pending_read(
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.set_tab(AdminTab::Resources, cx);
+            view.set_tab(AdminTab::System, cx);
             assert!(view.file_jobs.contains_key("error-reporting-read"));
             let revision = view.error_reporting.revision;
-            view.set_tab(AdminTab::Resources, cx);
+            view.set_tab(AdminTab::System, cx);
             assert_eq!(view.error_reporting.revision, revision);
         });
     });
@@ -2056,9 +2049,82 @@ fn shortcuts_and_sidebar_use_readable_labels() {
     }
     assert!(matches!(AdminTab::Shortcuts.icon(), IconName::Keyboard));
     assert!(matches!(AdminTab::Ssh.icon(), IconName::Server));
-    assert_eq!(AdminTab::Accounts.badge(), None);
-    assert_eq!(AdminTab::Ssh.badge(), None);
-    assert_ne!(text::GROUP_SETUP.in_language(Language::Ko), "설정 시작");
+}
+
+/// 내비는 6개 탭이고, 세그먼트와 하위 페이지는 부모 탭을 강조한다.
+#[gpui::test]
+fn settings_nav_shows_six_tabs_and_subpages_keep_their_parent(cx: &mut TestAppContext) {
+    let d = dir("six-tabs");
+    init(cx, &d);
+    assert_eq!(AdminTab::ALL.len(), 6);
+    assert!(
+        AdminTab::SUBPAGES
+            .iter()
+            .all(|sub| { !AdminTab::ALL.contains(sub) && AdminTab::ALL.contains(&sub.page()) })
+    );
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-tab-ssh").is_none());
+    for selector in [
+        "admin-tab-appearance",
+        "admin-tab-agents",
+        "admin-tab-accounts",
+        "admin-tab-devices",
+        "admin-tab-shortcuts",
+        "admin-tab-system",
+    ] {
+        assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let at = vcx.debug_bounds(selector).unwrap().center();
+        vcx.simulate_click(at, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    click(vcx, "admin-tab-devices");
+    assert!(vcx.debug_bounds("admin-tab-ssh").is_some());
+    vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Ssh));
+    click(vcx, "admin-tab-remote-krill");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::RemoteKrill));
+    assert!(vcx.debug_bounds("admin-tab-devices").is_some());
+
+    click(vcx, "admin-tab-system");
+    click(vcx, "open-disk");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Disk));
+    fs::remove_dir_all(d).ok();
+}
+
+/// 프로젝트 메뉴에서 연 저장소가 프로젝트 페이지의 대상이 된다.
+#[gpui::test]
+fn project_settings_open_with_the_chosen_repository(cx: &mut TestAppContext) {
+    let d = dir("project-page");
+    let repo = d.join("repo-alpha");
+    fs::create_dir_all(&repo).unwrap();
+    let repo = fs::canonicalize(repo).unwrap();
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
+    vcx.update(|_, cx| open_project_settings(&repo, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).tab(), AdminTab::Project);
+        assert_eq!(
+            view.read(cx)
+                .workflow_form
+                .as_ref()
+                .unwrap()
+                .repo_path
+                .read(cx)
+                .value()
+                .as_str(),
+            repo.display().to_string()
+        );
+    });
+    fs::remove_dir_all(d).ok();
 }
 
 /// OWE-651 7번: 섹션 제목은 카드 행이 아니라 별도 머리글로 그린다.
@@ -2068,7 +2134,7 @@ fn section_titles_render_as_headers(cx: &mut TestAppContext) {
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(3000.)));
-    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx)));
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-section-resources").is_some());
     fs::remove_dir_all(d).ok();
@@ -2119,11 +2185,6 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
         assert!(vcx.debug_bounds("admin-page-title").is_some());
         assert!(vcx.debug_bounds("admin-page-subtitle").is_some());
         assert!(vcx.debug_bounds("admin-page-header-actions").is_some());
-        assert_eq!(
-            vcx.debug_bounds("admin-page-badge").is_some(),
-            tab.badge().is_some(),
-            "badge mismatch on {tab:?}"
-        );
         let col = vcx
             .debug_bounds("admin-content-column")
             .expect("missing admin-content-column");
@@ -2144,8 +2205,8 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-search-clear").is_some());
     assert!(vcx.debug_bounds("admin-search-hint").is_none());
-    assert!(vcx.debug_bounds("admin-tab-ssh").is_some());
-    assert!(vcx.debug_bounds("admin-tab-general").is_none());
+    assert!(vcx.debug_bounds("admin-tab-devices").is_some());
+    assert!(vcx.debug_bounds("admin-tab-appearance").is_none());
 
     let clear_btn = vcx
         .debug_bounds("admin-search-clear")
@@ -2154,7 +2215,7 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-search-clear").is_none());
     assert!(vcx.debug_bounds("admin-search-hint").is_some());
-    assert!(vcx.debug_bounds("admin-tab-general").is_some());
+    assert!(vcx.debug_bounds("admin-tab-appearance").is_some());
 
     // 검색 결과가 0건이면 우측 본문 영역에 빈 상태 카드가 표시되고 기존 탭 본문 헤더는 숨겨진다.
     vcx.simulate_keystrokes("cmd-f");
@@ -2172,7 +2233,7 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-content-search-empty").is_none());
     assert!(vcx.debug_bounds("admin-page-header").is_some());
-    assert!(vcx.debug_bounds("admin-tab-general").is_some());
+    assert!(vcx.debug_bounds("admin-tab-appearance").is_some());
 
     fs::remove_dir_all(d).ok();
 }
@@ -2211,7 +2272,7 @@ fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &m
     );
 
     // 다른 탭으로 갔다가 돌아와도 본문 높이는 계속 창 안에 머문다.
-    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::General, cx)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Appearance, cx)));
     vcx.run_until_parked();
     vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx)));
     vcx.run_until_parked();
@@ -2627,7 +2688,7 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
     };
     // 글꼴 크기는 터미널 탭(OWE-658), 사운드는 일반 탭.
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Terminal, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Appearance, cx));
         window.draw(cx).clear(cx);
     });
     for selector in ["font-dec", "font-inc", "font-reset"] {
@@ -2651,7 +2712,7 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
     );
     click(vcx, "font-inc");
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::General, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
         window.draw(cx).clear(cx);
     });
     assert!(vcx.debug_bounds("sound-toggle").is_some());
@@ -3241,30 +3302,11 @@ fn owe658_terminal_tab_controls_toggle_and_persist(cx: &mut TestAppContext) {
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1100.), px(2400.)));
-    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
-        let bounds = vcx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("missing {selector}"));
-        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
-        vcx.run_until_parked();
-    };
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::General, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Appearance, cx));
         window.draw(cx).clear(cx);
     });
-    assert!(vcx.debug_bounds("font-inc").is_none());
-    assert!(vcx.debug_bounds("general-view-mode-terminal").is_some());
-    assert!(vcx.debug_bounds("general-view-mode-chat").is_some());
-    click(vcx, "general-view-mode-chat");
-    vcx.update(|_, cx| {
-        assert_eq!(default_view_mode(cx), DefaultViewMode::Chat);
-    });
-    click(vcx, "general-view-mode-terminal");
-    vcx.update(|_, cx| {
-        assert_eq!(default_view_mode(cx), DefaultViewMode::Terminal);
-    });
-    assert!(vcx.debug_bounds("admin-tab-terminal").is_some());
-    click(vcx, "admin-tab-terminal");
+    assert!(vcx.debug_bounds("general-view-mode-chat").is_none());
     vcx.update(|window, cx| window.draw(cx).clear(cx));
     for selector in ["terminal-font-family", "font-dec"] {
         assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
@@ -3790,8 +3832,9 @@ fn as01_history_clear_runs_off_ui_thread_with_pending(cx: &mut TestAppContext) {
     let d = dir("as01-clear-bg");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
     });
     vcx.run_until_parked();
     let clear = vcx
@@ -4537,12 +4580,17 @@ fn account_remove_needs_confirm_and_rename_keeps_id(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).unwrap();
 }
 
-/// MK-162: 일반 탭에 설정 점검 섹션(요약 + 점검 열기 버튼)이 있다.
+/// MK-162: 시스템 탭에 설정 점검 섹션(요약 + 점검 열기 버튼)이 있다.
 #[gpui::test]
 fn general_tab_shows_checks_section(cx: &mut TestAppContext) {
     let d = dir("checks-section");
     init(cx, &d);
-    let (_, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
+        window.draw(cx).clear(cx);
+    });
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("checks-summary").is_some());
     assert!(vcx.debug_bounds("open-checks").is_some());
@@ -4673,7 +4721,7 @@ fn other_confirm_buttons_keep_width_and_disarm_on_outside_click(cx: &mut TestApp
         });
     });
     let id = "admin-history-clear";
-    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx)));
     vcx.run_until_parked();
     let before = vcx
         .debug_bounds(id)
@@ -4923,6 +4971,11 @@ fn general_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppCont
     let d = dir("mk156-general-updates");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
     vcx.simulate_resize(size(px(1400.), px(6000.)));
     vcx.run_until_parked();
 
@@ -5091,7 +5144,6 @@ fn mobile_eighth_tab_qr_and_mode_invalidation(cx: &mut TestAppContext) {
                     _ => MobileReply::Devices(Vec::new()),
                 })
             }));
-            assert!(AdminTab::ALL.contains(&AdminTab::Mobile));
             v.set_tab(AdminTab::Mobile, cx);
             // OWE-880: 탭 진입 시 상태 자동 조회가 시작된다.
             assert!(v.mobile.pending, "entering the tab auto-fetches status");
@@ -5309,7 +5361,7 @@ fn owe728_workflows_tab_worktree_symlinks_and_repo_hooks(cx: &mut TestAppContext
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1200.), px(2800.)));
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
         window.draw(cx).clear(cx);
     });
     assert!(vcx.debug_bounds("admin-worktree-symlinks-card").is_some());
@@ -5398,7 +5450,7 @@ fn project_worktree_location_saves_switches_and_resets(cx: &mut TestAppContext) 
     };
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
-            v.set_tab(AdminTab::Workflows, cx);
+            v.set_tab(AdminTab::Project, cx);
             v.load_repo_hooks_for(&repo_a, window, cx);
         });
     });
@@ -5651,8 +5703,8 @@ fn owe729_resources_space_scan_and_artifact_breakdown(cx: &mut TestAppContext) {
 
     for q in ["클린업", "용량", "node_modules", "worktree cleanup"] {
         assert!(
-            search::search_tabs(q).contains(&AdminTab::Resources),
-            "search query {q} should match AdminTab::Resources"
+            search::search_tabs(q).contains(&AdminTab::System),
+            "search query {q} should match AdminTab::System"
         );
     }
 
@@ -5708,7 +5760,7 @@ fn owe729_resources_space_scan_and_artifact_breakdown(cx: &mut TestAppContext) {
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.set_space_repos(vec![repo.clone()], Some(run), cx);
-            v.set_tab(AdminTab::Resources, cx);
+            v.set_tab(AdminTab::Disk, cx);
         });
         window.draw(cx).clear(cx);
     });
@@ -5814,7 +5866,7 @@ fn owe729_cleanup_modal_filters_and_bulk_delete_with_branch_safety(cx: &mut Test
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.set_space_repos(vec![repo.clone()], Some(run), cx);
-            v.set_tab(AdminTab::Resources, cx);
+            v.set_tab(AdminTab::Disk, cx);
         });
         window.draw(cx).clear(cx);
     });
@@ -5977,7 +6029,7 @@ fn workflows_schedule_modal_precheck_isolated_worktree_and_log_viewer(cx: &mut T
     vcx.simulate_resize(size(px(1400.), px(4000.)));
 
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
     });
     vcx.run_until_parked();
 
@@ -6421,7 +6473,7 @@ fn owe760_schedule_modal_validates_fields_and_preserves_quoted_command_args(
     vcx.simulate_resize(size(px(1400.), px(4000.)));
 
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
     });
     vcx.run_until_parked();
 
@@ -6634,7 +6686,7 @@ fn owe761_workflow_repo_path_change_syncs_hooks_without_clobbering_other_repo(
 
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
-            v.set_tab(AdminTab::Workflows, cx);
+            v.set_tab(AdminTab::Project, cx);
             v.save_repo_hooks_for(
                 &repo_a,
                 Some("pnpm install"),
@@ -6771,7 +6823,7 @@ fn owe776_schedule_modal_allows_empty_optional_prompt_and_localizes_validation_e
     vcx.simulate_resize(size(px(1400.), px(4000.)));
 
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
     });
     vcx.run_until_parked();
 
@@ -6895,18 +6947,18 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
             .unwrap_or_else(|| panic!("missing selector {s}"))
     };
 
-    // 1) General 탭: 사이드바·본문 폭 토큰 및 스위치·세그먼트 컨트롤 경계 검증
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    // 1) 시스템 탭: 사이드바·본문 폭 토큰 및 스위치·세그먼트 컨트롤 경계 검증
     let sidebar = bounds(vcx, "admin-sidebar");
     let column = bounds(vcx, "admin-content-column");
     assert_eq!(sidebar.size.width, crate::ui::SETTINGS_NAV_WIDTH);
     assert!(column.size.width <= crate::ui::SETTINGS_CONTENT_MAX_WIDTH);
 
     for sel in [
-        "theme-dark",
-        "theme-light",
-        "theme-system",
-        "language-ko",
-        "language-en",
         "notif-toggle",
         "notif-toggle-thumb",
         "sound-toggle",
@@ -7224,23 +7276,36 @@ fn general_terminal_controls_in_language(cx: &mut TestAppContext, language: Lang
         vcx.run_until_parked();
     };
 
-    // 1. General 탭 섹션 머리글 존재 및 위→아래 순서 검증
+    // 1. 모양 탭의 터미널 글꼴은 테마 아래에 놓이고, 나머지 섹션은 시스템 탭으로 옮겨 간다.
     let column = bounds(vcx, "admin-content-column");
-    let sec_appearance = bounds(vcx, "general-section-appearance");
-    let sec_notif = bounds(vcx, "general-section-notifications");
-    let sec_power = bounds(vcx, "general-section-power");
-    let sec_files = bounds(vcx, "general-section-files");
-    assert!(sec_appearance.origin.y < sec_notif.origin.y);
-    assert!(sec_notif.origin.y < sec_power.origin.y);
-    assert!(sec_power.origin.y < sec_files.origin.y);
+    assert!(
+        bounds(vcx, "general-section-appearance").origin.y
+            < bounds(vcx, "terminal-section-appearance").origin.y
+    );
+    assert!(vcx.debug_bounds("general-section-notifications").is_none());
 
     // 2. 세그먼트 선택지 좌→우 순서 검증 (한국어/English, 다크/라이트/시스템, 끄기/작업 중/항상)
     assert!(bounds(vcx, "language-ko").origin.x < bounds(vcx, "language-en").origin.x);
     assert!(bounds(vcx, "theme-dark").origin.x < bounds(vcx, "theme-light").origin.x);
     assert!(bounds(vcx, "theme-light").origin.x < bounds(vcx, "theme-system").origin.x);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    let sec_notif = bounds(vcx, "general-section-notifications");
+    let sec_power = bounds(vcx, "general-section-power");
+    let sec_files = bounds(vcx, "general-section-files");
+    assert!(sec_notif.origin.y < sec_power.origin.y);
+    assert!(sec_power.origin.y < sec_files.origin.y);
     assert!(bounds(vcx, "awake-off").origin.x < bounds(vcx, "awake-agent").origin.x);
     assert!(bounds(vcx, "awake-agent").origin.x < bounds(vcx, "awake-on").origin.x);
 
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Appearance, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
     // 3. UI 줌 스테퍼 고정폭 및 경계값 비활성화·초기화 검증
     let zoom_val_before = bounds(vcx, "zoom-value");
     assert_eq!(zoom_val_before.size.width, px(48.));
@@ -7273,6 +7338,11 @@ fn general_terminal_controls_in_language(cx: &mut TestAppContext, language: Lang
     click(vcx, "zoom-reset");
     vcx.update(|_, cx| assert!((current(cx).zoom() - 1.0).abs() < 1e-4));
 
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
     // 4. 마스터 알림(notif-toggle) OFF 시 하위 알림 행·컨트롤 비활성화 검증
     vcx.update(|_, cx| {
         let s = current(cx);
@@ -7300,7 +7370,7 @@ fn general_terminal_controls_in_language(cx: &mut TestAppContext, language: Lang
 
     // 5. Terminal 탭 섹션 머리글·세그먼트 순서·스테퍼 고정폭 및 경계값 검증
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Terminal, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Appearance, cx));
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
@@ -7559,13 +7629,17 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
     // 2) Resources 탭: 스위치·진단 버튼 및 좁은 창(720px / 820px)·넓은 창(1200px)에서
     //    디스크 용량 카드 헤더 버튼(`admin-worktree-cleanup-open`) 우측 잘림 없음 검증
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
 
     for width in [720., 820., 1200.] {
         vcx.simulate_resize(size(px(width), px(5000.)));
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
+            window.draw(cx).clear(cx);
+        });
         vcx.run_until_parked();
         vcx.update(|window, cx| window.draw(cx).clear(cx));
 
@@ -7573,9 +7647,6 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
         for sel in [
             "admin-recording-paused",
             "admin-recording-paused-thumb",
-            "admin-secure-kb-toggle",
-            "admin-secure-kb-toggle-thumb",
-            "admin-run-doctor",
             "admin-history-clear",
         ] {
             let b = bounds(vcx, sel);
@@ -7585,6 +7656,13 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
             );
         }
 
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_tab(AdminTab::Disk, cx));
+            window.draw(cx).clear(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        let column = bounds(vcx, "admin-content-column");
         let space_card = bounds(vcx, "admin-space-section");
         let header_row = bounds(vcx, "admin-space-header-row");
         let scan_btn = bounds(vcx, "admin-space-scan");
@@ -7937,7 +8015,7 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
     vcx.simulate_resize(size(px(1200.), px(6000.)));
 
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
@@ -8022,7 +8100,13 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
     let store = krill_proto::orchestration::WorktreeStore::load(&d).unwrap();
     assert_eq!(store.symlinks_for(&repo_a), vec!["node_modules".to_owned()]);
 
-    // 3) 빠른 명령(Quick Commands) 추가·수정·삭제
+    // 3) 빠른 명령(Quick Commands) 추가·수정·삭제: 전용 페이지에서 편집한다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::QuickCommands, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("admin-qc-card").is_some());
     assert!(vcx.debug_bounds("admin-qc-empty").is_some());
     vcx.update(|window, cx| {
@@ -8065,6 +8149,12 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
     vcx.update(|_, cx| assert!(current(cx).quick_commands.is_empty()));
 
     // 5) 예약 작업 활성/일시정지 Switch 및 좁은 창(820px) 경계 검증
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     click_sel(vcx, "admin-schedule-add");
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
@@ -8112,7 +8202,6 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
         "admin-worktree-symlinks-card",
         "admin-repo-hooks-card",
         "admin-schedules-card",
-        "admin-qc-card",
     ] {
         let cb = vcx.debug_bounds(card_sel).unwrap();
         assert!(
@@ -8318,8 +8407,8 @@ fn mobile_pairing_keeps_path_selection_and_other_tabs_available(cx: &mut TestApp
         view.update(cx, |v, cx| {
             v.mobile_pair(ConnectMode::Tailscale, None, cx);
             assert_eq!(v.mobile.mode, ConnectMode::Tailscale);
-            v.set_tab(AdminTab::General, cx);
-            assert_eq!(v.tab, AdminTab::General);
+            v.set_tab(AdminTab::Appearance, cx);
+            assert_eq!(v.tab, AdminTab::Appearance);
         });
         window.draw(cx).clear(cx);
     });
@@ -8419,8 +8508,8 @@ fn mobile_pairing_path_selection_does_not_block_settings(cx: &mut TestAppContext
         view.update(cx, |v, cx| {
             v.mobile_pair(ConnectMode::Tailscale, None, cx);
             assert_eq!(v.mobile.mode, ConnectMode::Tailscale);
-            v.set_tab(AdminTab::General, cx);
-            assert_eq!(v.tab, AdminTab::General);
+            v.set_tab(AdminTab::Appearance, cx);
+            assert_eq!(v.tab, AdminTab::Appearance);
         });
         window.draw(cx).clear(cx);
     });
@@ -8875,7 +8964,7 @@ fn unrelated_settings_edits_do_not_invalidate_workflow_cache(cx: &mut TestAppCon
     vcx.run_until_parked();
     vcx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.set_tab(AdminTab::Workflows, cx);
+            view.set_tab(AdminTab::Project, cx);
         });
     });
     vcx.run_until_parked();
@@ -8956,7 +9045,7 @@ fn external_workflow_reload_preserves_unsaved_hooks_and_symlink(cx: &mut TestApp
     let repo = d.display().to_string();
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let mut view = SettingsView::new(cx);
-        view.tab = AdminTab::Workflows;
+        view.tab = AdminTab::Project;
         view.load_repo_hooks_for(&repo, window, cx);
         view
     });
@@ -9057,7 +9146,7 @@ fn unresolved_workflow_alias_cannot_save_empty_hooks_over_existing_root(cx: &mut
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let mut view = SettingsView::new(cx);
-        view.tab = AdminTab::Workflows;
+        view.tab = AdminTab::Project;
         view.load_repo_hooks_for(&root, window, cx);
         view
     });
@@ -9538,7 +9627,7 @@ fn automations_page_templates_editor_roundtrip_and_navigation(cx: &mut TestAppCo
     vcx.simulate_resize(size(px(1600.), px(1600.)));
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
-            v.set_tab(AdminTab::Workflows, cx);
+            v.set_tab(AdminTab::Project, cx);
             v.set_automations_page(true, cx);
         });
     });
@@ -9937,7 +10026,7 @@ fn settings_search_enter_scrolls_and_focuses_matching_row(cx: &mut TestAppContex
     vcx.run_until_parked();
     vcx.update(|window, cx| {
         let view = view.read(cx);
-        assert_eq!(view.tab, AdminTab::Terminal);
+        assert_eq!(view.tab, AdminTab::Appearance);
         assert_eq!(view.search_focus.title, Some(text::TERMINAL_FONT));
         assert!(view.search_focus.rendered.get());
         assert!(view.search_focus.focus.is_focused(window));

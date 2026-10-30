@@ -2062,7 +2062,18 @@ pub fn open_window(cx: &mut App) {
         });
         return;
     }
-    open_window_at_tab(AdminTab::General, cx);
+    open_window_at_tab(AdminTab::Appearance, cx);
+}
+
+/// 프로젝트 메뉴가 고른 저장소. 프로젝트 페이지가 처음 그려질 때 가져간다.
+struct PendingProject(Option<String>);
+
+impl gpui::Global for PendingProject {}
+
+/// 프로젝트 설정 페이지를 해당 저장소로 연다.
+pub fn open_project_settings(repo: &Path, cx: &mut App) {
+    cx.set_global(PendingProject(Some(repo.display().to_string())));
+    open_window_at_tab(AdminTab::Project, cx);
 }
 
 pub fn open_window_at_tab(tab: AdminTab, cx: &mut App) {
@@ -2127,23 +2138,30 @@ fn window_options(cx: &App) -> WindowOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AdminTab {
     #[default]
-    General,
-    /// 터미널 글꼴·커서·키보드·선택(OWE-658).
-    Terminal,
-    Accounts,
+    Appearance,
     Agents,
-    /// 프론티어 CLI·개발 도구 원클릭 설치 및 에일리어스 설정.
-    Install,
+    Accounts,
+    /// 내비의 '기기'. SSH·원격 Krill·모바일을 세그먼트로 나눈다.
     Ssh,
     RemoteKrill,
-    Workflows,
-    Shortcuts,
-    Resources,
     Mobile,
+    Shortcuts,
+    System,
+    /// 내비에 없는 하위 페이지. 프로젝트 메뉴에서 연다.
+    Project,
+    /// 내비에 없는 하위 페이지. 에이전트 탭·명령 팔레트·빠른 명령 메뉴에서 연다.
+    QuickCommands,
+    /// 내비에 없는 하위 페이지. 시스템 탭에서 연다.
+    Install,
+    /// 내비에 없는 하위 페이지. 시스템 탭·명령 팔레트에서 연다.
+    Disk,
 }
 
 // 기본 번들 밖 탭 아이콘. 지정한 SVG만 바이너리에 싣는다.
-gpui_kit_assets::icon_assets!(TabIcons, [Keyboard, Server, Smartphone, Monitor, Package]);
+gpui_kit_assets::icon_assets!(
+    TabIcons,
+    [Keyboard, Server, Smartphone, Monitor, Package, Palette]
+);
 
 fn settings_nav_tab(tab: AdminTab, selected: bool) -> gpui::Stateful<gpui::Div> {
     let selector = tab.selector();
@@ -2157,64 +2175,87 @@ fn settings_nav_tab(tab: AdminTab, selected: bool) -> gpui::Stateful<gpui::Div> 
 }
 
 impl AdminTab {
-    pub const ALL: [Self; 11] = [
-        Self::General,
-        Self::Terminal,
-        Self::Accounts,
+    pub const ALL: [Self; 6] = [
+        Self::Appearance,
         Self::Agents,
-        Self::Install,
+        Self::Accounts,
         Self::Ssh,
-        Self::RemoteKrill,
-        Self::Workflows,
         Self::Shortcuts,
-        Self::Mobile,
-        Self::Resources,
+        Self::System,
     ];
+
+    /// 내비에 없고 부모 탭 안에서 여는 페이지.
+    pub const SUBPAGES: [Self; 6] = [
+        Self::RemoteKrill,
+        Self::Mobile,
+        Self::Project,
+        Self::QuickCommands,
+        Self::Install,
+        Self::Disk,
+    ];
+
+    /// 내비에서 강조할 탭. 세그먼트와 하위 페이지는 부모 탭에 속한다.
+    #[must_use]
+    pub const fn page(self) -> Self {
+        match self {
+            Self::RemoteKrill | Self::Mobile => Self::Ssh,
+            Self::Project | Self::QuickCommands => Self::Agents,
+            Self::Install | Self::Disk => Self::System,
+            tab => tab,
+        }
+    }
 
     pub fn selector(self) -> &'static str {
         match self {
-            Self::General => "admin-tab-general",
-            Self::Terminal => "admin-tab-terminal",
+            Self::Appearance => "admin-tab-appearance",
             Self::Accounts => "admin-tab-accounts",
             Self::Agents => "admin-tab-agents",
             Self::Install => "admin-tab-install",
-            Self::Ssh => "admin-tab-ssh",
+            Self::Ssh => "admin-tab-devices",
             Self::RemoteKrill => "admin-tab-remote-krill",
-            Self::Workflows => "admin-tab-workflows",
+            Self::Project => "admin-tab-project",
+            Self::QuickCommands => "admin-tab-quick-commands",
             Self::Shortcuts => "admin-tab-shortcuts",
-            Self::Resources => "admin-tab-resources",
+            Self::System => "admin-tab-system",
+            Self::Disk => "admin-tab-disk",
             Self::Mobile => "admin-tab-mobile",
         }
     }
 
     pub fn label(self) -> &'static str {
+        self.title_message().get()
+    }
+
+    pub fn title_message(self) -> crate::i18n::Message {
         match self {
-            Self::General => text::TAB_GENERAL.get(),
-            Self::Terminal => text::TAB_TERMINAL.get(),
-            Self::Accounts => text::TAB_ACCOUNTS.get(),
-            Self::Agents => text::TAB_AGENTS.get(),
-            Self::Install => text::TAB_INSTALL.get(),
-            Self::Ssh => text::TAB_SSH.get(),
-            Self::RemoteKrill => text::TAB_REMOTE_KRILL.get(),
-            Self::Workflows => text::TAB_WORKFLOWS.get(),
-            Self::Shortcuts => text::TAB_SHORTCUTS.get(),
-            Self::Resources => text::TAB_RESOURCES.get(),
-            Self::Mobile => crate::i18n::catalog::mobile::TAB.get(),
+            Self::Appearance => text::TAB_APPEARANCE,
+            Self::Accounts => text::TAB_ACCOUNTS,
+            Self::Agents => text::TAB_AGENTS,
+            Self::Install => text::TAB_INSTALL,
+            Self::Ssh => text::TAB_DEVICES,
+            Self::RemoteKrill => text::TAB_REMOTE_KRILL,
+            Self::Project => text::TAB_PROJECT,
+            Self::QuickCommands => text::TAB_QUICK_COMMANDS,
+            Self::Shortcuts => text::TAB_SHORTCUTS,
+            Self::System => text::TAB_SYSTEM,
+            Self::Disk => text::TAB_DISK,
+            Self::Mobile => crate::i18n::catalog::mobile::TAB,
         }
     }
 
     pub fn subtitle_message(self) -> crate::i18n::Message {
         match self {
-            Self::General => text::TAB_GENERAL_DESC,
-            Self::Terminal => text::TAB_TERMINAL_DESC,
+            Self::Appearance => text::TAB_APPEARANCE_DESC,
             Self::Accounts => text::TAB_ACCOUNTS_DESC,
             Self::Agents => text::AGENTS_DESC,
             Self::Install => text::TAB_INSTALL_DESC,
-            Self::Ssh => text::TAB_SSH_DESC,
+            Self::Ssh => text::TAB_DEVICES_DESC,
             Self::RemoteKrill => text::TAB_REMOTE_KRILL_DESC,
-            Self::Workflows => text::TAB_WORKFLOWS_DESC,
+            Self::Project => text::TAB_PROJECT_DESC,
+            Self::QuickCommands => text::TAB_QUICK_COMMANDS_DESC,
             Self::Shortcuts => text::SHORTCUTS_DESC,
-            Self::Resources => text::TAB_RESOURCES_DESC,
+            Self::System => text::TAB_SYSTEM_DESC,
+            Self::Disk => text::TAB_DISK_DESC,
             Self::Mobile => text::TAB_MOBILE_DESC,
         }
     }
@@ -2227,16 +2268,16 @@ impl AdminTab {
     pub fn icon(self) -> gpui_kit_assets::IconName {
         use gpui_kit_assets::IconName;
         match self {
-            Self::General => IconName::Settings,
-            Self::Terminal => IconName::SquareTerminal,
+            Self::Appearance => IconName::Palette,
             Self::Accounts => IconName::User,
             Self::Agents => IconName::Bot,
             Self::Install => IconName::Package,
             Self::Ssh => IconName::Server,
             Self::RemoteKrill => IconName::Monitor,
-            Self::Workflows => IconName::Cpu,
+            Self::Project | Self::QuickCommands => IconName::Cpu,
             Self::Shortcuts => IconName::Keyboard,
-            Self::Resources => IconName::CircleCheck,
+            Self::System => IconName::Settings,
+            Self::Disk => IconName::CircleCheck,
             Self::Mobile => IconName::Smartphone,
         }
     }
@@ -2249,13 +2290,6 @@ impl AdminTab {
         match TabIcons.load(&name.path()) {
             Ok(Some(svg)) => gpui_component::Icon::default().data(&svg),
             _ => gpui_component::Icon::new(name),
-        }
-    }
-
-    pub fn badge(self) -> Option<&'static str> {
-        match self {
-            Self::Workflows => Some(text::BADGE_BETA.get()),
-            _ => None,
         }
     }
 }
@@ -2644,41 +2678,6 @@ fn canonical_hook_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(result)
 }
 
-/// `krill doctor` 핵심 항목(상태 디렉터리·데몬 바이너리·미보고 크래시·세그먼트 기록 상태)을 자가 진단한다.
-/// 내부 키-값이 아니라 카탈로그 문구로 보인다(OWE-883).
-pub fn run_doctor_check(state: Option<&Path>) -> String {
-    let state_status = match state {
-        Some(d) if d.exists() => text::DOCTOR_OK.get(),
-        Some(_) => text::DOCTOR_NEEDS_INIT.get(),
-        None => text::DOCTOR_MISSING.get(),
-    };
-    let bins_status = match krill_proto::daemon::Paths::dev() {
-        Ok(p) if p.holder.exists() && p.krilld.exists() => text::DOCTOR_OK.get(),
-        Ok(_) => text::DOCTOR_MISSING_BINS.get(),
-        Err(_) => text::DOCTOR_UNAVAILABLE.get(),
-    };
-    let crashes = state.map_or(0, |d| krill_proto::diag::pending(d).len());
-    let rec_warns = state.map_or(0, |d| krill_proto::diag::record_warnings(d).len());
-    let rec_flag = state.is_some_and(|d| {
-        d.join(krill_proto::history::RECORDING_WARNING_FILE)
-            .exists()
-    });
-    let rec_status = if rec_flag || rec_warns > 0 {
-        text::DOCTOR_WARN.format(&[("n", &rec_warns.to_string())])
-    } else {
-        text::DOCTOR_OK.get().to_owned()
-    };
-    text::DOCTOR_REPORT.format(&[
-        ("state", state_status),
-        ("bins", bins_status),
-        (
-            "crashes",
-            &text::DOCTOR_CRASHES.format(&[("n", &crashes.to_string())]),
-        ),
-        ("recording", &rec_status),
-    ])
-}
-
 /// 디스크 기록(zstd 세그먼트) 즉시 삭제(MK-075). 데몬(`krilld`)에 `HistoryRequest::Clear`를
 /// 보내며, PTY·화면·상태·설정은 유지된다. 로컬 폴백은 없다 — 데몬이 살아 있을 수 있어 직접
 /// 지우면 세대 가드(`Store::clear`)를 우회한다.
@@ -2844,7 +2843,6 @@ pub struct SettingsView {
     ssh_auth_failed_host: Option<crate::ssh_hosts::SshHost>,
     ssh_keygen_confirm_host: Option<crate::ssh_hosts::SshHost>,
     skill_status: Option<SharedString>,
-    doctor_status: Option<SharedString>,
     error_reporting: crate::errors::Panel,
     history_status: Option<SharedString>,
     /// 기록 즉시 삭제 IPC 진행 중. UI 스레드를 막지 않고 백그라운드에서 돌린다(AS-01).
@@ -3214,7 +3212,7 @@ impl SettingsView {
                 this.refresh_accounts_if_changed(cx);
                 cx.notify();
             }),
-            tab: AdminTab::General,
+            tab: AdminTab::Appearance,
             visible: true,
             account_probe_pending: false,
             account_file_stamp: Vec::new(),
@@ -3253,7 +3251,6 @@ impl SettingsView {
             ssh_auth_failed_host: None,
             ssh_keygen_confirm_host: None,
             skill_status: None,
-            doctor_status: None,
             error_reporting: crate::errors::Panel::default(),
             history_status: None,
             history_clear_pending: false,
@@ -3308,7 +3305,7 @@ impl SettingsView {
                 cx.background_executor().timer(POLL).await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.visible && this.tab == AdminTab::Workflows {
+                        if this.visible && this.tab == AdminTab::Project {
                             this.refresh_service_cache(cx);
                         }
                     })
@@ -3640,7 +3637,7 @@ impl SettingsView {
             if self.tab == AdminTab::Mobile {
                 self.mobile_enter(cx);
             }
-            if self.tab == AdminTab::Workflows {
+            if self.tab == AdminTab::Project {
                 self.refresh_service_cache(cx);
             }
         }
@@ -3660,7 +3657,7 @@ impl SettingsView {
         if tab == AdminTab::Ssh && !self.tailscale_loaded {
             self.refresh_tailscale_peers(cx);
         }
-        if tab == AdminTab::Workflows {
+        if tab == AdminTab::Project {
             self.services_checked = None;
             self.refresh_service_cache(cx);
         }
@@ -3668,10 +3665,10 @@ impl SettingsView {
             // 진입 시 기기 목록·활성 오퍼를 자동 조회한다(수동 새로고침 전 빈 화면 방지, OWE-880).
             self.mobile_enter(cx);
         }
-        if tab == AdminTab::Resources && self.space.report.is_none() && !self.space.scanning {
+        if tab == AdminTab::Disk && self.space.report.is_none() && !self.space.scanning {
             self.scan_workspace_space(cx);
         }
-        if tab == AdminTab::Resources {
+        if tab == AdminTab::System {
             self.refresh_error_reporting(cx);
         }
         cx.notify();
@@ -5814,18 +5811,6 @@ impl SettingsView {
         }
     }
 
-    pub fn run_doctor(&mut self, cx: &mut Context<Self>) {
-        let dir = state_dir(cx);
-        self.file_job(
-            "doctor",
-            move || run_doctor_check(dir.as_deref()),
-            |this, report, _| {
-                this.doctor_status = Some(report.into());
-            },
-            cx,
-        );
-    }
-
     fn refresh_error_reporting(&mut self, cx: &mut Context<Self>) {
         if self.error_reporting.pending || self.file_jobs.contains_key("error-reporting-read") {
             return;
@@ -6063,13 +6048,6 @@ impl SettingsView {
                     .on_click(move |_, _, cx| edit(cx, move |s| s.match_terminal_theme(mode)))
             })
         };
-        let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
-            layout::segment(p, id, label, s.keep_awake == mode)
-                .debug_selector(move || id.into())
-                .on_click(move |_, _, cx| {
-                    edit(cx, move |s| s.keep_awake = mode);
-                })
-        };
         let language_button = |id: &'static str, label: &'static str, language: Language| {
             layout::segment(p, id, label, s.language == language)
                 .debug_selector(move || id.into())
@@ -6082,21 +6060,13 @@ impl SettingsView {
         let zoom_at_min = zoom_val <= ZOOM_MIN + f32::EPSILON;
         let zoom_at_max = zoom_val >= ZOOM_MAX - f32::EPSILON;
         let zoom_at_default = (zoom_val - 1.0).abs() < f32::EPSILON;
-        let notif_disabled = !s.notifications;
         let row = || layout::row(p);
-        let sub_notif_row = |id: &'static str| {
-            layout::row(p)
-                .id(id)
-                .debug_selector(move || id.into())
-                .when(notif_disabled, |d| d.opacity(0.5))
-        };
         let label =
             |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .children(crate::orca_import::render_banner("settings-general", cx))
             .child(layout::section_title(
                 p,
                 "general-section-appearance",
@@ -6197,48 +6167,34 @@ impl SettingsView {
                             ),
                     ),
             )
-            .child(
-                row()
-                    .child(label(
-                        text::DEFAULT_VIEW_MODE_TITLE.get(),
-                        text::DEFAULT_VIEW_MODE_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::segmented_control(
-                                p,
-                                [
-                                    layout::segment(
-                                        p,
-                                        "general-view-mode-terminal",
-                                        text::DEFAULT_VIEW_MODE_TERMINAL.get(),
-                                        s.default_view_mode == DefaultViewMode::Terminal,
-                                    )
-                                    .debug_selector(|| "general-view-mode-terminal".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.default_view_mode = DefaultViewMode::Terminal;
-                                        });
-                                    }),
-                                    layout::segment(
-                                        p,
-                                        "general-view-mode-chat",
-                                        text::DEFAULT_VIEW_MODE_CHAT.get(),
-                                        s.default_view_mode == DefaultViewMode::Chat,
-                                    )
-                                    .debug_selector(|| "general-view-mode-chat".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.default_view_mode = DefaultViewMode::Chat;
-                                        });
-                                    }),
-                                ],
-                            )
-                            .id("general-default-view-mode")
-                            .debug_selector(|| "general-default-view-mode".into()),
-                        ),
-                    ),
-            )
+    }
+
+    /// 시스템 탭 윗부분: 가져오기 배너·알림·전원·설정 파일·업데이트.
+    fn render_system_rows(&self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
+        let search_focus = self.search_focus.clone();
+        let p = crate::ui::palette(cx);
+        let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
+            layout::segment(p, id, label, s.keep_awake == mode)
+                .debug_selector(move || id.into())
+                .on_click(move |_, _, cx| {
+                    edit(cx, move |s| s.keep_awake = mode);
+                })
+        };
+        let notif_disabled = !s.notifications;
+        let row = || layout::row(p);
+        let sub_notif_row = |id: &'static str| {
+            layout::row(p)
+                .id(id)
+                .debug_selector(move || id.into())
+                .when(notif_disabled, |d| d.opacity(0.5))
+        };
+        let label =
+            |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .children(crate::orca_import::render_banner("settings-general", cx))
             .child(layout::section_title(
                 p,
                 "general-section-notifications",
@@ -6354,7 +6310,25 @@ impl SettingsView {
                                     .on_click(|_, _, cx| {
                                         crate::onboarding::open_checks_current(cx);
                                     }),
+                            )
+                            .child(
+                                layout::secondary("open-install", text::TAB_INSTALL.get())
+                                    .debug_selector(|| "open-install".into())
+                                    .on_click(|_, _, cx| {
+                                        open_window_at_tab(AdminTab::Install, cx);
+                                    }),
                             ),
+                    ),
+            )
+            .child(
+                row()
+                    .child(label(text::TAB_DISK.get(), text::TAB_DISK_DESC.get()))
+                    .child(
+                        layout::controls().child(
+                            layout::secondary("open-disk", text::DISK_OPEN.get())
+                                .debug_selector(|| "open-disk".into())
+                                .on_click(|_, _, cx| open_window_at_tab(AdminTab::Disk, cx)),
+                        ),
                     ),
             )
             // 자체 업데이터는 macOS 번들 전용이라 다른 OS에서는 숨긴다(규칙 10).
@@ -10718,19 +10692,18 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn render_workflows_tab(
+    /// 빠른 명령 편집 페이지. 메뉴·팔레트에서 바로 온다.
+    fn render_quick_commands_page(
         &mut self,
         s: &Settings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         use gpui_component::Sizable as _;
-        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         self.ensure_workflow_form(window, cx);
         let p = crate::ui::palette(cx);
         let qc_count =
             text::QUICK_COMMANDS_COUNT.format(&[("count", &s.quick_commands.len().to_string())]);
-        self.refresh_service_cache(cx);
         let mut qc_card = layout::card(p)
             .id("admin-qc-card")
             .debug_selector(|| "admin-qc-card".into())
@@ -10873,6 +10846,23 @@ impl SettingsView {
             }
         }
 
+        div().child(qc_card)
+    }
+
+    /// 프로젝트별 설정 페이지. 프로젝트 메뉴가 고른 저장소가 있으면 먼저 불러온다.
+    fn render_project_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        use gpui_component::Sizable as _;
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+        if let Some(repo) = cx
+            .try_global::<PendingProject>()
+            .and_then(|pending| pending.0.clone())
+        {
+            cx.set_global(PendingProject(None));
+            self.load_repo_hooks_for(&repo, window, cx);
+        }
+        self.ensure_workflow_form(window, cx);
+        let p = crate::ui::palette(cx);
+        self.refresh_service_cache(cx);
         let wt_store = self.services.worktrees.clone();
 
         let active_repo = self
@@ -11345,7 +11335,6 @@ impl SettingsView {
             .child(repo_context_card)
             .child(symlinks_card)
             .child(hooks_card)
-            .child(qc_card)
     }
 
     fn render_resources_tab(&self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
@@ -11450,62 +11439,7 @@ impl SettingsView {
                         text::RECORDING_DELETE_DESC.get(),
                     ))
                     .child(layout::controls().child(clear)),
-            )
-            // Secure Keyboard Entry는 macOS 전용이라 다른 OS에서는 숨긴다(규칙 10).
-            .when(cfg!(target_os = "macos"), |el| {
-                el.child(
-                    row()
-                        .child(label(
-                            crate::security::text::SECURE_KEYBOARD_MENU.get(),
-                            text::SECURE_KB_DESC.get(),
-                        ))
-                        .child(
-                            layout::controls().child(
-                                layout::switch(
-                                    p,
-                                    "admin-secure-kb-toggle",
-                                    s.secure_keyboard_entry,
-                                    false,
-                                    |next, _, cx| {
-                                        edit(cx, move |s| s.secure_keyboard_entry = next);
-                                        crate::platform::set_secure_event_input(next);
-                                    },
-                                )
-                                .aria_label(crate::security::text::SECURE_KEYBOARD_MENU.get()),
-                            ),
-                        ),
-                )
-            })
-            .child(
-                row()
-                    .child(label(text::DOCTOR_TITLE.get(), text::DOCTOR_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary("admin-run-doctor", text::DOCTOR_RUN.get())
-                                .debug_selector(|| "admin-run-doctor".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_doctor(cx);
-                                })),
-                        ),
-                    ),
             );
-        if let Some(status) = &self.doctor_status {
-            root = root.child(
-                div()
-                    .id("admin-doctor-status")
-                    .debug_selector(|| "admin-doctor-status".into())
-                    .w_full()
-                    .min_w_0()
-                    .p_2()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.card)
-                    .border_1()
-                    .border_color(p.border)
-                    .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_SM)
-                    .child(status.clone()),
-            );
-        }
         if let Some(status) = &self.history_status {
             root = root.child(
                 div()
@@ -11538,7 +11472,6 @@ impl SettingsView {
                     .child(status.clone()),
             );
         }
-        root = root.child(self.render_space_section(cx));
         root
     }
 }
@@ -11595,12 +11528,7 @@ impl SettingsView {
                                     .text_size(crate::ui::TEXT_LG)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(tab.label()),
-                            )
-                            .children(tab.badge().map(|badge_text| {
-                                crate::ui::badge(p, crate::ui::BadgeTone::Muted, badge_text)
-                                    .id("admin-page-badge")
-                                    .debug_selector(|| "admin-page-badge".into())
-                            })),
+                            ),
                     )
                     .child(
                         div()
@@ -11660,11 +11588,11 @@ impl Render for SettingsView {
                 (
                     if matches!(
                         self.tab,
-                        AdminTab::General
-                            | AdminTab::Terminal
+                        AdminTab::Appearance
                             | AdminTab::Agents
-                            | AdminTab::Workflows
-                            | AdminTab::Resources
+                            | AdminTab::Project
+                            | AdminTab::QuickCommands
+                            | AdminTab::System
                     ) {
                         c.settings.clone()
                     } else {
@@ -11681,28 +11609,6 @@ impl Render for SettingsView {
         let search_value = search_input.read(cx).value().to_string();
         let has_search_query = !search_value.is_empty();
         let matches = search::search_tabs(&search_value);
-        let groups: &[(&'static str, &[AdminTab])] = &[
-            (
-                text::GROUP_AI.get(),
-                &[AdminTab::Agents, AdminTab::Accounts],
-            ),
-            (
-                text::GROUP_SETUP.get(),
-                &[
-                    AdminTab::General,
-                    AdminTab::Terminal,
-                    AdminTab::Install,
-                    AdminTab::Shortcuts,
-                    AdminTab::Ssh,
-                    AdminTab::RemoteKrill,
-                ],
-            ),
-            (
-                text::GROUP_WORKFLOW.get(),
-                &[AdminTab::Workflows, AdminTab::Mobile, AdminTab::Resources],
-            ),
-        ];
-
         let mut nav = div()
             .id("admin-sidebar")
             .debug_selector(|| "admin-sidebar".into())
@@ -11804,26 +11710,10 @@ impl Render for SettingsView {
             );
         }
 
-        for &(group_label, tabs) in groups {
-            let tabs: Vec<AdminTab> = tabs
-                .iter()
-                .copied()
-                .filter(|t| matches.contains(t))
-                .collect();
-            if tabs.is_empty() {
-                continue;
-            }
-            let mut group_col = div().flex_none().flex().flex_col().gap_1().child(
-                div()
-                    .px_2()
-                    .pt_1()
-                    .text_size(crate::ui::TEXT_XS)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(p.muted_foreground)
-                    .child(group_label),
-            );
-            for tab in tabs {
-                let selected = tab == current_tab;
+        {
+            let mut group_col = div().flex_none().flex().flex_col().gap_1();
+            for tab in matches.iter().copied() {
+                let selected = tab == current_tab.page();
                 group_col = group_col.child(
                     settings_nav_tab(tab, selected)
                         .focus_visible(|style| style.border_color(p.ring))
@@ -11851,21 +11741,7 @@ impl Render for SettingsView {
                             this.set_tab(tab, cx);
                         }))
                         .child(tab.icon_element().small())
-                        .child(div().flex_1().min_w_0().truncate().child(tab.label()))
-                        .children(tab.badge().map(|badge_text| {
-                            div()
-                                .flex_none()
-                                .px_1p5()
-                                .py(px(1.))
-                                .rounded(crate::ui::RADIUS_XS)
-                                .bg(p.muted)
-                                .border_1()
-                                .border_color(p.border)
-                                .text_size(crate::ui::TEXT_2XS)
-                                .font_weight(gpui::FontWeight::NORMAL)
-                                .text_color(p.muted_foreground)
-                                .child(badge_text)
-                        })),
+                        .child(div().flex_1().min_w_0().truncate().child(tab.label())),
                 );
             }
             nav = nav.child(group_col);
@@ -11948,27 +11824,64 @@ impl Render for SettingsView {
                 )
         } else {
             let page_header = Self::render_page_header(current_tab, None, cx);
-            let body = match current_tab {
-                AdminTab::General => self.render_general_tab(&s, cx),
-                AdminTab::Terminal => self.render_terminal_tab(&s, cx),
+            let content = match current_tab {
+                AdminTab::Appearance => self
+                    .render_general_tab(&s, cx)
+                    .child(self.render_terminal_tab(&s, cx)),
                 AdminTab::Accounts => self.render_accounts_tab(window, cx),
                 AdminTab::Agents => self.render_agents_tab(&s, window, cx),
                 AdminTab::Install => self.render_install_tab(window, cx),
                 AdminTab::Ssh => self.render_ssh_tab(window, cx),
                 AdminTab::RemoteKrill => self.render_remote_krill_tab(window, cx),
-                AdminTab::Workflows => self.render_workflows_tab(&s, window, cx),
+                AdminTab::Project => self.render_project_page(window, cx),
+                AdminTab::QuickCommands => self.render_quick_commands_page(&s, window, cx),
                 // OWE-799: 단축키 탭은 카테고리 그룹·로컬 검색·인라인 기록을 위해 window를 받는다.
                 AdminTab::Shortcuts => self.render_shortcuts_tab(window, cx),
-                AdminTab::Resources => self.render_resources_tab(&s, cx),
+                AdminTab::System => div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(self.render_system_rows(&s, cx))
+                    .child(self.render_resources_tab(&s, cx)),
+                AdminTab::Disk => div().child(self.render_space_section(cx)),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
-            }
-            .w_full()
-            .min_w_0()
-            .id("admin-tab-body")
-            .when(
-                !self.search_focus.rendered.get() && self.search_pending,
-                |body| body.anchor_scroll(Some(self.search_focus.anchor.clone())),
-            );
+            };
+            let device_tabs = (current_tab.page() == AdminTab::Ssh).then(|| {
+                let segment = |id: &'static str, label: &'static str, tab: AdminTab| {
+                    layout::segment(p, id, label, current_tab == tab)
+                        .debug_selector(move || id.into())
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
+                };
+                layout::segmented_control(
+                    p,
+                    vec![
+                        segment("admin-tab-ssh", text::TAB_SSH.get(), AdminTab::Ssh),
+                        segment(
+                            "admin-tab-remote-krill",
+                            text::TAB_REMOTE_KRILL.get(),
+                            AdminTab::RemoteKrill,
+                        ),
+                        segment(
+                            "admin-tab-mobile",
+                            crate::i18n::catalog::mobile::TAB.get(),
+                            AdminTab::Mobile,
+                        ),
+                    ],
+                )
+            });
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .children(device_tabs)
+                .child(content)
+                .w_full()
+                .min_w_0()
+                .id("admin-tab-body")
+                .when(
+                    !self.search_focus.rendered.get() && self.search_pending,
+                    |body| body.anchor_scroll(Some(self.search_focus.anchor.clone())),
+                );
 
             div()
                 .id("admin-content-column")

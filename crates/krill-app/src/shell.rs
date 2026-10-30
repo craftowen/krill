@@ -2224,6 +2224,13 @@ impl Shell {
                 Kind::ImportTerminalThemes,
                 jtext::ACT_IMPORT_TERMINAL_THEMES.get(),
             ),
+            (Kind::OpenChecks, jtext::ACT_OPEN_CHECKS.get()),
+            (Kind::OpenDisk, jtext::ACT_OPEN_DISK.get()),
+            (Kind::OpenAutomations, jtext::ACT_OPEN_AUTOMATIONS.get()),
+            (
+                Kind::EditQuickCommands,
+                jtext::ACT_EDIT_QUICK_COMMANDS.get(),
+            ),
         ]
         .into_iter()
         .map(|(kind, label)| jump::ActionEntry::new(kind, label.to_owned()))
@@ -2345,11 +2352,23 @@ impl Shell {
             jump::ActionKind::SplitRight => self.split_active(Axis::Horizontal, cx),
             jump::ActionKind::SplitDown => self.split_active(Axis::Vertical, cx),
             jump::ActionKind::OpenSettings => {
-                self.open_settings(krill_app::settings::AdminTab::General, Some(window), cx);
+                self.open_settings(krill_app::settings::AdminTab::Appearance, Some(window), cx);
             }
             jump::ActionKind::ToggleSidebar => self.toggle_sidebar(cx),
             jump::ActionKind::ToggleExplorer => self.toggle_explorer(window, cx),
             jump::ActionKind::ToggleSearch => self.toggle_workspace_search(window, cx),
+            jump::ActionKind::OpenChecks => krill_app::onboarding::open_checks_current(cx),
+            jump::ActionKind::OpenDisk => {
+                self.open_settings(krill_app::settings::AdminTab::Disk, Some(window), cx);
+            }
+            jump::ActionKind::OpenAutomations => self.open_automations(Some(window), cx),
+            jump::ActionKind::EditQuickCommands => {
+                self.open_settings(
+                    krill_app::settings::AdminTab::QuickCommands,
+                    Some(window),
+                    cx,
+                );
+            }
             jump::ActionKind::ImportTerminalThemes => {
                 let imported = krill_app::settings::import_terminal_themes(cx);
                 cx.spawn(async move |this, cx| {
@@ -7506,7 +7525,7 @@ impl Render for Shell {
                         this.close_settings(Some(&mut *window), cx);
                     } else {
                         this.open_settings(
-                            krill_app::settings::AdminTab::General,
+                            krill_app::settings::AdminTab::Appearance,
                             Some(window),
                             cx,
                         );

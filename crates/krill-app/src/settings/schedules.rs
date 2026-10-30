@@ -908,59 +908,28 @@ impl SettingsView {
                     open_file(FILE, "# [[schedule]]\n", cx);
                 });
 
-        let mut card =
-            layout::card(p)
-                .id("admin-schedules-card")
-                .debug_selector(|| "admin-schedules-card".into())
-                .child(
-                    layout::row(p)
-                        .child(layout::label(
-                            p,
-                            text::AUTOMATIONS_SHOW_BTN_TITLE.get(),
-                            Some(text::AUTOMATIONS_SHOW_BTN_DESC.get()),
-                        ))
-                        .child(
-                            layout::controls()
-                                .child(layout::switch(
-                                    p,
-                                    "admin-show-automations-button",
-                                    super::current(cx).show_automations_button,
-                                    false,
-                                    |on, _, cx| {
-                                        super::edit(cx, move |s| s.show_automations_button = on);
-                                    },
-                                ))
-                                .child(
-                                    layout::secondary(
-                                        "admin-open-automations-page",
-                                        text::AUTOMATIONS_OPEN.get(),
-                                    )
-                                    .debug_selector(|| "admin-open-automations-page".into())
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| this.set_automations_page(true, cx),
-                                    )),
-                                ),
-                        ),
-                )
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(layout::label(
-                            p,
-                            text::SCHEDULES_TITLE.get(),
-                            Some(text::SCHEDULES_DESC.get()),
-                        ))
-                        .child(layout::controls().child(open_toml_btn).child(add_btn)),
-                );
+        let mut card = layout::card(p)
+            .id("admin-schedules-card")
+            .debug_selector(|| "admin-schedules-card".into())
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(layout::label(
+                        p,
+                        text::SCHEDULES_TITLE.get(),
+                        Some(text::SCHEDULES_DESC.get()),
+                    ))
+                    .child(layout::controls().child(open_toml_btn).child(add_btn)),
+            );
 
         if let Some(err) = &self.schedule_error {
             card = card.child(
