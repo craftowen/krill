@@ -64,10 +64,11 @@ fn launch(sock: &Path) -> Kids {
 }
 
 /// 게시된 소켓이 살아남은 krilld 것인지 `ServerHello::instance_id`(pid)로 확인한다.
-fn served_by(sock: &Path) -> u64 {
+fn served_by(sock: &Path) -> (u64, ipc::MachineIdentity) {
     let mut c = UnixStream::connect(sock).unwrap();
     let (kind, body) = ipc::read_frame(&mut c).unwrap().unwrap();
-    ServerHello::decode(kind, &body).unwrap().instance_id
+    let (hello, _, machine) = ServerHello::decode_with_identities(kind, &body).unwrap();
+    (hello.instance_id, machine.unwrap())
 }
 
 fn names(dir: &Path) -> Vec<String> {
@@ -86,14 +87,33 @@ fn hundred_concurrent_starts_leave_one_daemon() {
     let sock = dir.join("k.sock");
 
     let d = launch(&sock);
-    assert_eq!(served_by(&sock), u64::from(d.0[0].id()));
-    assert_eq!(names(&dir), ["k.sock", "k.sock.lock"]);
+    let (pid, machine) = served_by(&sock);
+    assert_eq!(pid, u64::from(d.0[0].id()));
+    assert_eq!(
+        names(&dir),
+        [
+            "k.sock",
+            "k.sock.lock",
+            "k.sock.machine-id",
+            "k.sock.machine-id.lock"
+        ]
+    );
 
     drop(d); // SIGKILL: 죽은 소켓이 남는다. 여기에 bind와 rename 사이에 죽은 흔적(.tmp)을 더한다.
     fs::write(dir.join("k.sock.tmp"), b"").unwrap();
     let d = launch(&sock);
-    assert_eq!(served_by(&sock), u64::from(d.0[0].id()));
-    assert_eq!(names(&dir), ["k.sock", "k.sock.lock"]);
+    let (pid, restarted_machine) = served_by(&sock);
+    assert_eq!(pid, u64::from(d.0[0].id()));
+    assert_eq!(restarted_machine, machine);
+    assert_eq!(
+        names(&dir),
+        [
+            "k.sock",
+            "k.sock.lock",
+            "k.sock.machine-id",
+            "k.sock.machine-id.lock"
+        ]
+    );
 
     drop(d);
     fs::remove_dir_all(&dir).ok();
