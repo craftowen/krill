@@ -279,6 +279,7 @@ enum BoundaryState {
     #[default]
     Ground,
     Escape,
+    EscapeIntermediate,
     Csi,
     String {
         osc: bool,
@@ -311,6 +312,13 @@ impl Boundary {
                     b']' | b'P' | b'X' | b'_' | b'^' => {
                         self.state = BoundaryState::String { osc: byte == b']' }
                     }
+                    0x1b => self.start(byte),
+                    0x20..=0x2f => self.state = BoundaryState::EscapeIntermediate,
+                    0x30..=0x7e | 0x18 | 0x1a => self.clear(),
+                    _ => {}
+                },
+                // vte처럼 중간 바이트 뒤에는 `[ ] P X ^ _`도 최종 바이트라 문자열을 열지 않는다.
+                BoundaryState::EscapeIntermediate => match byte {
                     0x1b => self.start(byte),
                     0x30..=0x7e | 0x18 | 0x1a => self.clear(),
                     _ => {}
