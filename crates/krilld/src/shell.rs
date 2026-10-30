@@ -168,18 +168,40 @@ impl std::fmt::Debug for Launch {
     }
 }
 
-/// 로그인 셸(`-l -i -c`)이 만든 `PATH`의 성공값만 캐시한다. 실패·타임아웃이면 이번 호출만 기본값을 쓰고 재시도한다.
+/// 실패한 PATH 탐색을 다시 시도하기까지의 대기. 그동안은 기본값을 즉시 쓴다.
+const PATH_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 로그인 셸(`-l -i -c`)이 만든 `PATH`의 성공값만 캐시한다. 실패·타임아웃이면 기본값을 쓰고
+/// [`PATH_RETRY`] 뒤에 다시 시도한다(git 호출마다 최대 5초씩 재탐색하지 않는다).
 pub(crate) fn login_path() -> &'static [u8] {
     static PATH: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    cached_path(&PATH, || Shell::Login.launch())
+    static FAILED_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    cached_path(&PATH, &FAILED_AT, PATH_RETRY, || Shell::Login.launch())
 }
 
-fn cached_path(cache: &std::sync::OnceLock<Vec<u8>>, login: impl FnOnce() -> Launch) -> &[u8] {
+fn cached_path<'a>(
+    cache: &'a std::sync::OnceLock<Vec<u8>>,
+    failed_at: &std::sync::Mutex<Option<std::time::Instant>>,
+    retry_after: std::time::Duration,
+    login: impl FnOnce() -> Launch,
+) -> &'a [u8] {
     if let Some(path) = cache.get() {
         return path;
     }
-    if let Some(path) = probe_path(&login()) {
-        cache.set(path).ok();
+    // 락을 잡은 채 탐색해 동시 호출이 각자 5초씩 탐색하지 않고 한 번의 결과를 공유한다.
+    let mut failed = failed_at
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(path) = cache.get() {
+        return path;
+    }
+    if failed.is_none_or(|at| at.elapsed() >= retry_after) {
+        match probe_path(&login()) {
+            Some(path) => {
+                cache.set(path).ok();
+            }
+            None => *failed = Some(std::time::Instant::now()),
+        }
     }
     cache.get().map_or(LAUNCHD_PATH, Vec::as_slice)
 }

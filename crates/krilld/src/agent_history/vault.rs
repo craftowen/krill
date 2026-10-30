@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(all(test, unix))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -78,16 +77,65 @@ fn lookup_cached_doc(path: &Path, mtime_ns: u128, size: u64) -> Option<CachedVau
     }
 }
 
+/// 캐시가 붙드는 힙 총량 상한(데몬 메모리 예산 보호). 항목 수 상한과 별개로 바이트로 막는다.
+const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+static VAULT_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// jemalloc이 `bytes` 요청에 실제로 잡는 크기. 크기 등급은 2배 구간마다 4단계이고, 간격은 16바이트에서
+/// 16KiB 페이지까지다(aarch64 macOS 실측: 585,120B 요청은 589,824B).
+fn allocation(bytes: usize) -> usize {
+    match bytes {
+        0 => 0,
+        1..=8 => 8,
+        _ => bytes.next_multiple_of((bytes.next_power_of_two() / 8).clamp(16, 16 * 1024)),
+    }
+}
+
+impl CachedVaultDoc {
+    /// 맵 슬롯·경로 키·문자열·메시지 버퍼를 할당 크기로 센 항목의 힙. 짧은 메시지는 본문보다 구조가 크다.
+    fn heap_bytes(&self, key: &Path) -> usize {
+        let string = |s: &String| allocation(s.capacity());
+        let doc = &self.doc;
+        size_of::<(PathBuf, Self)>()
+            + allocation(key.as_os_str().len())
+            + string(&doc.id)
+            + string(&doc.cwd)
+            + string(&doc.title)
+            + string(&doc.summary)
+            + allocation(doc.messages.capacity() * size_of::<(String, String)>())
+            + doc
+                .messages
+                .iter()
+                .map(|(role, text)| string(role) + string(text))
+                .sum::<usize>()
+    }
+}
+
 fn store_cached_doc(path: &Path, entry: CachedVaultDoc) {
+    store_cached_doc_capped(path, entry, MAX_CACHE_BYTES);
+}
+
+fn store_cached_doc_capped(path: &Path, entry: CachedVaultDoc, max_bytes: usize) {
     let mut guard = VAULT_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.len() >= MAX_CACHE_ENTRIES
-        && !guard.contains_key(path)
+    // 락을 잡은 채로만 합계를 바꾼다.
+    if let Some(old) = guard.remove(path) {
+        VAULT_CACHE_BYTES.fetch_sub(old.heap_bytes(path), Ordering::Relaxed);
+    }
+    let bytes = entry.heap_bytes(path);
+    if bytes > max_bytes {
+        return;
+    }
+    while (guard.len() >= MAX_CACHE_ENTRIES
+        || VAULT_CACHE_BYTES.load(Ordering::Relaxed) + bytes > max_bytes)
         && let Some(first_key) = guard.keys().next().cloned()
     {
-        guard.remove(&first_key);
+        if let Some(evicted) = guard.remove(&first_key) {
+            VAULT_CACHE_BYTES.fetch_sub(evicted.heap_bytes(&first_key), Ordering::Relaxed);
+        }
     }
+    VAULT_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     guard.insert(path.to_path_buf(), entry);
 }
 
@@ -2997,5 +3045,105 @@ mod path_scope_regressions {
             }
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cache_budget_tests {
+    use super::*;
+
+    fn entry(bytes: usize) -> CachedVaultDoc {
+        CachedVaultDoc {
+            mtime_ns: 1,
+            size: 1,
+            doc: VaultDoc {
+                agent: VaultAgent::Claude,
+                id: String::new(),
+                cwd: String::new(),
+                modified: 0,
+                title: String::new(),
+                summary: String::new(),
+                messages: vec![(String::new(), "x".repeat(bytes))],
+            },
+            has_primary_title: true,
+            partial: false,
+            skipped: false,
+        }
+    }
+
+    #[test]
+    fn cache_is_bounded_by_bytes() {
+        let (a, b, c) = (Path::new("/a"), Path::new("/b"), Path::new("/c"));
+        store_cached_doc_capped(a, entry(600), 1000);
+        let one = VAULT_CACHE_BYTES.load(Ordering::Relaxed);
+        store_cached_doc_capped(b, entry(600), 1000);
+        assert!(lookup_cached_doc(a, 1, 1).is_none(), "oldest entry evicted");
+        assert!(lookup_cached_doc(b, 1, 1).is_some());
+        store_cached_doc_capped(c, entry(2000), 1000);
+        assert!(
+            lookup_cached_doc(c, 1, 1).is_none(),
+            "oversized doc not retained"
+        );
+        assert!(lookup_cached_doc(b, 1, 1).is_some());
+        assert_eq!(
+            VAULT_CACHE_BYTES.load(Ordering::Relaxed),
+            one,
+            "evicted entries give back exactly what they counted"
+        );
+    }
+
+    /// 검색이 캐시에 남긴 실제 힙(jemalloc 스레드 카운터)이 예산 안이고, 회계가 그 힙을 따라간다.
+    #[cfg(not(windows))]
+    #[test]
+    fn cache_budget_bounds_the_heap_it_retains() {
+        use tikv_jemalloc_ctl::thread::{allocatedp, deallocatedp};
+        let (allocated, deallocated) = (allocatedp::read().unwrap(), deallocatedp::read().unwrap());
+        let heap = || i128::from(allocated.get()) - i128::from(deallocated.get());
+        let root = std::env::temp_dir().join(format!("vault-cache-heap-{}", std::process::id()));
+        // 42바이트 줄(한 글자 메시지)과 437바이트 줄 대화. 둘 다 캐시 예산보다 크다.
+        for (content, files) in [(1, 16), (396, 20)] {
+            fs::remove_dir_all(&root).ok();
+            let dir = root.join("claude/projects/-tmp-heap");
+            fs::create_dir_all(&dir).unwrap();
+            let line = format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+                "x".repeat(content)
+            );
+            for i in 0..files {
+                let id = format!("{i:08x}-2222-4333-8444-555555555555");
+                let mut body = format!("{{\"sessionId\":\"{id}\",\"cwd\":\"/tmp/heap\"}}\n");
+                while body.len() + line.len() <= 500 * 1024 {
+                    body.push_str(&line);
+                }
+                fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
+            }
+            let roots = VaultRoots {
+                claude: vec![root.join("claude")],
+                ..VaultRoots::default()
+            };
+            let clear = || {
+                VAULT_CACHE.lock().unwrap().clear();
+                VAULT_CACHE_BYTES.store(0, Ordering::Relaxed);
+            };
+            // 첫 검색은 지연 초기화되는 전역까지 할당하므로 비우고 다시 잰다.
+            drop(search_in(&roots, &SearchQuery::default()));
+            clear();
+            let before = heap();
+            let snapshot = search_in(&roots, &SearchQuery::default());
+            assert!(
+                !snapshot.truncated,
+                "{content}: scan budget must not cut the corpus"
+            );
+            drop(snapshot);
+            let retained = heap() - before;
+            let counted = i128::try_from(VAULT_CACHE_BYTES.load(Ordering::Relaxed)).unwrap();
+            let budget = i128::try_from(MAX_CACHE_BYTES).unwrap();
+            assert!(
+                retained <= budget && (retained - counted).abs() <= counted / 50,
+                "{content}-byte messages: retained {retained} B, counted {counted} B, budget {budget} B"
+            );
+            clear();
+        }
+        fs::remove_dir_all(&root).ok();
     }
 }

@@ -487,6 +487,82 @@ fn remove_clean_worktree_and_merged_branch() {
 }
 
 #[test]
+fn file_created_by_archive_hook_is_not_force_deleted() {
+    let script = "printf late > late.txt";
+    let f = Fixture::new(
+        "rm-late-file",
+        &format!("[worktree]\narchive = '{script}'\nsymlinks = [\"link\"]\n"),
+    );
+    let w = f.created("late", Setup::Skip).0;
+    let wt = path(&w);
+    symlink(&f.dir, wt.join("link")).unwrap();
+    remember(
+        &f.trust,
+        &digest(&fs::canonicalize(&f.repo).unwrap(), script),
+    )
+    .unwrap();
+    let err = f.remove(&w, false).unwrap_err();
+    assert!(err.contains("untracked"), "{err}");
+    assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late");
+    assert!(
+        fs::symlink_metadata(wt.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "failed removal must keep configured symlinks"
+    );
+}
+
+fn committed_symlink_fixture(tag: &str, archive: Option<&str>) -> Fixture {
+    let hook = archive.map_or(String::new(), |s| format!("archive = '{s}'\n"));
+    let f = Fixture::new(
+        tag,
+        &format!("[worktree]\n{hook}symlinks = [\"CLAUDE.md\"]\n"),
+    );
+    fs::write(f.repo.join("AGENTS.md"), "agents\n").unwrap();
+    symlink("AGENTS.md", f.repo.join("CLAUDE.md")).unwrap();
+    f.git(&["add", "AGENTS.md", "CLAUDE.md"]);
+    f.git(&["commit", "-q", "-m", "committed symlink"]);
+    if let Some(script) = archive {
+        remember(
+            &f.trust,
+            &digest(&fs::canonicalize(&f.repo).unwrap(), script),
+        )
+        .unwrap();
+    }
+    f
+}
+
+#[test]
+fn committed_symlink_listed_in_symlinks_removes_without_force() {
+    let f = committed_symlink_fixture("rm-committed-link", None);
+    let w = f.created("committed-link", Setup::Skip).0;
+    let result = f.remove(&w, false).unwrap();
+    assert!(result.branch_deleted, "{result:?}");
+    assert!(!path(&w).exists());
+}
+
+#[test]
+fn committed_symlink_does_not_let_late_files_be_force_deleted() {
+    let script = "printf late > late.txt";
+    let f = committed_symlink_fixture("rm-committed-link-late", Some(script));
+    let w = f.created("committed-link-late", Setup::Skip).0;
+    let wt = path(&w);
+    let err = f.remove(&w, false).unwrap_err();
+    assert!(err.contains("untracked"), "{err}");
+    assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late");
+    assert_eq!(
+        fs::read_link(wt.join("CLAUDE.md")).unwrap(),
+        Path::new("AGENTS.md")
+    );
+    assert_eq!(
+        f.git_in(&wt, &["status", "--porcelain"]),
+        "?? late.txt\n",
+        "only the hook's file differs from the commit"
+    );
+}
+
+#[test]
 fn removal_even_forced_preserves_unmerged_branch() {
     let f = Fixture::new("rm-unmerged", "");
     for force in [false, true] {
@@ -828,50 +904,106 @@ fn rename_branch_from_prompt_renames_default_and_handles_collisions_and_guards()
     );
 }
 
-#[test]
-fn clean_worktree_with_initialized_submodule_removes_without_force() {
-    let f = Fixture::new("submodule-rm", "");
+/// `vendor/sub` 하위 모듈(`*.log` 무시)을 초기화한 워크트리. `ignore`는 `.gitmodules`의 `submodule.*.ignore`.
+fn submodule_worktree(f: &Fixture, ignore: Option<&str>) -> Worktree {
     let sub_src = f.dir.join("sub-src");
     fs::create_dir_all(&sub_src).unwrap();
-    f.git_in(&sub_src, &["init", "-b", "main"]);
-    f.git_in(&sub_src, &["config", "user.email", "t@example.com"]);
-    f.git_in(&sub_src, &["config", "user.name", "t"]);
+    f.git_in(&sub_src, &["init", "-q", "-b", "main"]);
     fs::write(sub_src.join("lib.txt"), "v1\n").unwrap();
-    f.git_in(&sub_src, &["add", "lib.txt"]);
-    f.git_in(&sub_src, &["commit", "-m", "init sub"]);
-
-    let sub_src_str = sub_src.to_str().unwrap();
+    fs::write(sub_src.join(".gitignore"), "*.log\n").unwrap();
+    f.git_in(&sub_src, &["add", "."]);
+    f.git_in(&sub_src, &["commit", "-q", "-m", "init sub"]);
     f.git(&[
         "-c",
         "protocol.file.allow=always",
         "submodule",
         "add",
-        sub_src_str,
+        sub_src.to_str().unwrap(),
         "vendor/sub",
     ]);
-    f.git(&["commit", "-m", "add submodule"]);
-
-    let (wt, _) = f.created("with-sub", Setup::Skip);
-    let wt_path = path(&wt);
+    if let Some(ignore) = ignore {
+        f.git(&[
+            "config",
+            "-f",
+            ".gitmodules",
+            "submodule.vendor/sub.ignore",
+            ignore,
+        ]);
+        f.git(&["add", ".gitmodules"]);
+    }
+    f.git(&["commit", "-q", "-m", "add submodule"]);
+    let w = f.created("with-sub", Setup::Skip).0;
     f.git_in(
-        &wt_path,
+        &path(&w),
         &[
             "-c",
             "protocol.file.allow=always",
             "submodule",
             "update",
             "--init",
+            "-q",
         ],
     );
-    assert!(wt_path.join("vendor/sub/lib.txt").is_file());
+    assert!(path(&w).join("vendor/sub/lib.txt").is_file());
+    w
+}
 
-    // Without dirty files, removing the worktree with force=false must succeed even though
-    // the submodule is initialized.
+#[test]
+fn clean_worktree_with_initialized_submodule_removes_without_force() {
+    let f = Fixture::new("submodule-rm", "");
+    let wt = submodule_worktree(&f, None);
     let removed = f
         .remove(&wt, false)
         .expect("clean submodule worktree must remove");
     assert!(removed.branch_deleted);
-    assert!(!wt_path.exists());
+    assert!(!path(&wt).exists());
+}
+
+#[test]
+fn submodule_files_hidden_by_gitmodules_ignore_are_not_force_deleted() {
+    for ignore in ["untracked", "dirty", "all"] {
+        let f = Fixture::new(&format!("submodule-ignore-{ignore}"), "");
+        let wt = submodule_worktree(&f, Some(ignore));
+        let file = path(&wt).join("vendor/sub/precious.txt");
+        fs::write(&file, "keep").unwrap();
+        let err = f.remove(&wt, false).unwrap_err();
+        assert!(err.contains("dirty"), "{ignore}: {err}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "keep", "{ignore}");
+        fs::remove_file(&file).unwrap();
+        assert!(f.remove(&wt, false).is_ok(), "{ignore}: clean tree removes");
+        assert!(!path(&wt).exists());
+    }
+}
+
+#[test]
+fn ignored_file_inside_submodule_is_not_force_deleted() {
+    let f = Fixture::new("submodule-ignored-file", "");
+    let wt = submodule_worktree(&f, None);
+    let file = path(&wt).join("vendor/sub/build.log");
+    fs::write(&file, "keep").unwrap();
+    let err = f.remove(&wt, false).unwrap_err();
+    assert!(err.contains("dirty"), "{err}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "keep");
+}
+
+#[test]
+fn archive_hook_file_inside_ignored_submodule_is_not_force_deleted() {
+    let script = "printf late > vendor/sub/late.txt";
+    let f = Fixture::new(
+        "submodule-late",
+        &format!("[worktree]\narchive = '{script}'\n"),
+    );
+    remember(
+        &f.trust,
+        &digest(&fs::canonicalize(&f.repo).unwrap(), script),
+    )
+    .unwrap();
+    let wt = submodule_worktree(&f, Some("untracked"));
+    assert!(f.remove(&wt, false).is_err());
+    assert_eq!(
+        fs::read_to_string(path(&wt).join("vendor/sub/late.txt")).unwrap(),
+        "late"
+    );
 }
 
 #[test]
