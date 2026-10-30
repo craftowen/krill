@@ -1,6 +1,6 @@
-//! GitHub 별 요청 카드·랜딩 알약 버튼·일반 설정 지원 섹션(OWE-905).
+//! GitHub 별 요청 카드·랜딩 알약 버튼(OWE-905).
 //! 앱에서 에이전트 세션을 시작한 횟수가 문턱을 넘거나 버전당 첫 에이전트 작업 완료(Value Moment)에 도달하면
-//! 메인 창 우하단에 카드를 띄우고, 빈 워크스페이스 하단과 설정 > 일반 하단에서도 직접 별을 줄 수 있게 한다.
+//! 메인 창 우하단에 카드를 띄우고, 빈 워크스페이스 하단에서도 직접 별을 줄 수 있게 한다.
 //! 텔레메트리 없음 — 상태는 `star-nag.toml` 하나다.
 //!
 //! Logic and UI adapted from Orca (`src/main/star-nag/*`, `src/main/github/client/fetch/orca-star.ts`,
@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{AnyElement, App, Global, MouseButton, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+use gpui_component::{Icon, IconName, Sizable as _};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::catalog::star_nag as text;
@@ -106,7 +106,7 @@ pub enum Mode {
     Web,
 }
 
-/// 빈 워크스페이스(랜딩)와 설정 > 일반 'Krill 지원' 섹션이 공유하는 별 상태.
+/// 빈 워크스페이스(랜딩) 알약이 쓰는 별 상태.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RepoStar {
     #[default]
@@ -372,7 +372,7 @@ fn show_card(cx: &mut App) {
     }
 }
 
-/// 랜딩 화면이나 설정 > 일반이 열릴 때 한 번만 백그라운드에서 GitHub 별 상태를 확인한다.
+/// 랜딩 화면이 열릴 때 한 번만 백그라운드에서 GitHub 별 상태를 확인한다.
 pub fn ensure_checked(cx: &mut App) {
     if !cx.has_global::<StarNag>() {
         return;
@@ -567,7 +567,7 @@ pub fn star(cx: &mut App) {
     .detach();
 }
 
-/// 빈 워크스페이스(랜딩) 알약 버튼 또는 설정 > 일반 'Krill 지원' 섹션에서 별 주기 클릭.
+/// 빈 워크스페이스(랜딩) 알약 버튼에서 별 주기 클릭.
 pub fn star_from_surface(cx: &mut App) {
     if !cx.has_global::<StarNag>() {
         cx.open_url(REPO_URL);
@@ -926,50 +926,6 @@ pub fn landing_star_pill(has_projects: bool, cx: &App) -> Option<AnyElement> {
             )
             .into_any_element(),
     )
-}
-
-/// 설정 > 일반 > 'Krill 지원' 행 우측 컨트롤(Orca `GeneralSupportSection.tsx` 패리티).
-pub fn settings_support_control(cx: &App) -> AnyElement {
-    let p = crate::ui::palette(cx);
-    let (repo_star, starring) = cx
-        .try_global::<StarNag>()
-        .map_or((RepoStar::WebFallback, false), |nag| {
-            (nag.repo_star, nag.repo_star_starring)
-        });
-    match repo_star {
-        RepoStar::Starred => div()
-            .id("settings-star-thanks")
-            .debug_selector(|| "settings-star-thanks".into())
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .text_size(crate::ui::TEXT_SM)
-            .text_color(p.muted_foreground)
-            .child(Icon::new(IconName::Star).small().text_color(p.warning))
-            .child(text::SUPPORT_THANKS.get())
-            .into_any_element(),
-        RepoStar::WebFallback => Button::new("settings-star-github")
-            .label(text::OPEN_GITHUB.get())
-            .icon(IconName::ExternalLink)
-            .small()
-            .outline()
-            .debug_selector(|| "settings-star-github".into())
-            .on_click(|_, _, cx| star_from_surface(cx))
-            .into_any_element(),
-        RepoStar::Loading | RepoStar::NotStarred => crate::ui::button_with_reserved_label(
-            "settings-star-github",
-            text::STAR_SHORT.get(),
-            text::STARRING.get(),
-            starring,
-        )
-        .icon(Icon::new(IconName::Star).text_color(p.warning))
-        .small()
-        .outline()
-        .disabled(repo_star == RepoStar::Loading || starring)
-        .debug_selector(|| "settings-star-github".into())
-        .on_click(|_, _, cx| star_from_surface(cx))
-        .into_any_element(),
-    }
 }
 
 #[cfg(test)]

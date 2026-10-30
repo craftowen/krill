@@ -131,9 +131,6 @@ pub struct Settings {
     /// 알림 사운드 켜기/끄기(기본 true).
     #[serde(default = "default_true")]
     pub notification_sound: bool,
-    /// 창이 비활성 상태일 때만 알림 보내기(기본 false).
-    #[serde(default)]
-    pub notify_only_inactive: bool,
     /// 입력·승인 대기 알림(기본 켬, OWE-659). 마스터 `notifications`가 꺼지면 함께 꺼진다.
     #[serde(default = "default_true")]
     pub notify_on_input: bool,
@@ -290,7 +287,6 @@ impl Default for Settings {
             option_as_meta_auto: true,
             copy_on_select: false,
             notification_sound: true,
-            notify_only_inactive: false,
             notify_on_input: true,
             notify_on_done: true,
             notify_on_bell: false,
@@ -3158,7 +3154,6 @@ impl SettingsView {
     /// 계정·호스트는 UI 스레드에서 읽지 않는다(AS-06·OWE-697). 첫 스냅샷은 백그라운드 갱신이 채운다.
     pub fn new(cx: &mut Context<Self>) -> Self {
         crate::orca_import::ensure_scanned(cx);
-        crate::star_nag::ensure_checked(cx);
         let mut view = Self {
             _observe: cx.observe_global::<Config>(|this, cx| {
                 this.refresh_accounts_if_changed(cx);
@@ -6208,57 +6203,6 @@ impl SettingsView {
                     ),
             )
             .child(
-                sub_notif_row("notify-input-row")
-                    .child(label(
-                        text::NOTIFY_INPUT.get(),
-                        text::NOTIFY_INPUT_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "notify-input-toggle",
-                                s.notify_on_input,
-                                notif_disabled,
-                                |next, _, cx| edit(cx, move |s| s.notify_on_input = next),
-                            )
-                            .aria_label(text::NOTIFY_INPUT.get()),
-                        ),
-                    ),
-            )
-            .child(
-                sub_notif_row("notify-done-row")
-                    .child(label(text::NOTIFY_DONE.get(), text::NOTIFY_DONE_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "notify-done-toggle",
-                                s.notify_on_done,
-                                notif_disabled,
-                                |next, _, cx| edit(cx, move |s| s.notify_on_done = next),
-                            )
-                            .aria_label(text::NOTIFY_DONE.get()),
-                        ),
-                    ),
-            )
-            .child(
-                sub_notif_row("notify-bell-row")
-                    .child(label(text::NOTIFY_BELL.get(), text::NOTIFY_BELL_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "notify-bell-toggle",
-                                s.notify_on_bell,
-                                notif_disabled,
-                                |next, _, cx| edit(cx, move |s| s.notify_on_bell = next),
-                            )
-                            .aria_label(text::NOTIFY_BELL.get()),
-                        ),
-                    ),
-            )
-            .child(
                 sub_notif_row("notify-sound-row")
                     .child(label(text::ALERT_SOUND.get(), text::ALERT_SOUND_DESC.get()))
                     .child(
@@ -6271,37 +6215,6 @@ impl SettingsView {
                                 |next, _, cx| edit(cx, move |s| s.notification_sound = next),
                             )
                             .aria_label(text::ALERT_SOUND.get()),
-                        ),
-                    ),
-            )
-            .child(
-                sub_notif_row("notify-inactive-row")
-                    .child(label(
-                        text::INACTIVE_ONLY.get(),
-                        text::INACTIVE_ONLY_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "notify-inactive-toggle",
-                                s.notify_only_inactive,
-                                notif_disabled,
-                                |next, _, cx| edit(cx, move |s| s.notify_only_inactive = next),
-                            )
-                            .aria_label(text::INACTIVE_ONLY.get()),
-                        ),
-                    ),
-            )
-            .child(
-                sub_notif_row("notify-test-row")
-                    .child(label(text::TEST_NOTIFY.get(), text::TEST_NOTIFY_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary("send-test-notification", text::TEST_NOTIFY.get())
-                                .disabled(notif_disabled)
-                                .debug_selector(|| "send-test-notification".into())
-                                .on_click(|_, _, cx| crate::alert::send_test_notification(cx)),
                         ),
                     ),
             )
@@ -6385,21 +6298,6 @@ impl SettingsView {
             .when(cfg!(target_os = "macos"), |el| {
                 el.children(Self::render_update_rows(s, cx))
             })
-            .child(layout::section_title(
-                p,
-                "general-section-support",
-                text::SECTION_SUPPORT.get(),
-            ))
-            .child(
-                row()
-                    .id("settings-support-star-row")
-                    .debug_selector(|| "settings-support-star-row".into())
-                    .child(label(
-                        text::SUPPORT_STAR_TITLE.get(),
-                        text::SUPPORT_STAR_DESC.get(),
-                    ))
-                    .child(layout::controls().child(crate::star_nag::settings_support_control(cx))),
-            )
     }
 
     fn render_update_rows(s: &Settings, cx: &mut Context<Self>) -> [gpui::Div; 2] {
@@ -12774,12 +12672,6 @@ impl SettingsView {
                 Self::clear_history,
             )
             .disabled(self.history_clear_pending);
-        let info = |body: &'static str| {
-            layout::card(p)
-                .text_size(crate::ui::TEXT_XS)
-                .text_color(p.muted_foreground)
-                .child(body)
-        };
         let mut root = div()
             .flex()
             .flex_col()
@@ -12789,8 +12681,6 @@ impl SettingsView {
                 "admin-section-resources",
                 text::RESOURCES_TITLE.get(),
             ))
-            .child(info(text::RESOURCES_BUDGET.get()))
-            .child(info(text::RESOURCES_SECURITY.get()))
             .child(
                 row()
                     .child(label(

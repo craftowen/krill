@@ -7042,11 +7042,7 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
         "language-en",
         "notif-toggle",
         "notif-toggle-thumb",
-        "notify-input-toggle",
-        "notify-done-toggle",
-        "notify-bell-toggle",
         "sound-toggle",
-        "notify-inactive-toggle",
         "update-auto-restart-toggle",
         "settings-update-check",
     ] {
@@ -7419,44 +7415,26 @@ fn general_terminal_controls_in_language(cx: &mut TestAppContext, language: Lang
     vcx.update(|_, cx| {
         let s = current(cx);
         assert!(s.notifications);
-        assert!(s.notify_on_input);
-        assert!(s.notify_on_done);
-        assert!(!s.notify_on_bell);
         assert!(s.notification_sound);
-        assert!(!s.notify_only_inactive);
     });
     click(vcx, "notif-toggle");
     vcx.update(|_, cx| assert!(!current(cx).notifications));
 
-    for sub_sel in [
-        "notify-input-toggle",
-        "notify-done-toggle",
-        "notify-bell-toggle",
-        "sound-toggle",
-        "notify-inactive-toggle",
-        "send-test-notification",
-    ] {
-        click(vcx, sub_sel);
-    }
+    click(vcx, "sound-toggle");
     vcx.update(|_, cx| {
-        let s = current(cx);
         assert!(
-            s.notify_on_input
-                && s.notify_on_done
-                && !s.notify_on_bell
-                && s.notification_sound
-                && !s.notify_only_inactive,
-            "subordinate notification toggles must be disabled while master notifications is false"
+            current(cx).notification_sound,
+            "the sound toggle must be disabled while master notifications is false"
         );
     });
 
     // 다시 마스터 알림을 켜면 하위 스위치가 정상 동작한다.
     click(vcx, "notif-toggle");
     vcx.update(|_, cx| assert!(current(cx).notifications));
-    click(vcx, "notify-input-toggle");
-    vcx.update(|_, cx| assert!(!current(cx).notify_on_input));
-    click(vcx, "notify-input-toggle");
-    vcx.update(|_, cx| assert!(current(cx).notify_on_input));
+    click(vcx, "sound-toggle");
+    vcx.update(|_, cx| assert!(!current(cx).notification_sound));
+    click(vcx, "sound-toggle");
+    vcx.update(|_, cx| assert!(current(cx).notification_sound));
 
     // 5. Terminal 탭 섹션 머리글·세그먼트 순서·스테퍼 고정폭 및 경계값 검증
     vcx.update(|window, cx| {
