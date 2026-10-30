@@ -3242,6 +3242,16 @@ mod tests {
     }
 
     #[test]
+    fn prompt_may_be_any_dash_text_that_is_not_a_worker_start_flag() {
+        for prompt in ["--foo", "--", "--foo=bar", "---"] {
+            let parsed = parse_worker_start(&args(&["--prompt", prompt, "--json"]), false)
+                .unwrap_or_else(|e| panic!("{prompt:?}: {e}"));
+            assert_eq!(parsed.spec.prompt.as_deref(), Some(prompt));
+            assert!(parsed.json, "{prompt:?}");
+        }
+    }
+
+    #[test]
     fn launch_preferences_parse_and_reject_invalid_effort() -> io::Result<()> {
         let parsed = parse_worker_start(
             &args(&[
