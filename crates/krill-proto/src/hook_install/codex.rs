@@ -398,6 +398,19 @@ fn same_config_path(left: &Path, right: &Path) -> bool {
 mod windows_tests {
     use super::*;
 
+    fn ascii_json(value: &Value) -> Result<String, std::fmt::Error> {
+        use std::fmt::Write as _;
+
+        let mut output = String::new();
+        for unit in value.to_string().encode_utf16() {
+            match u8::try_from(unit) {
+                Ok(byte) if byte.is_ascii() => output.push(char::from(byte)),
+                _ => write!(&mut output, r"\u{unit:04x}")?,
+            }
+        }
+        Ok(output)
+    }
+
     #[test]
     fn rpc_starts_npm_batch_shim_from_the_selected_path() {
         let root = std::env::temp_dir().join(format!("krill hook 한글 {}", std::process::id()));
@@ -436,10 +449,19 @@ mod windows_tests {
         assert_ne!(config, canonical);
         let reply = json!({"id":1,"result":{"layers":[{"name":{"type":"user","file":config},"version":"native-version"}]}});
         let second_reply = json!({"id":2,"result":reply["result"]});
+        // cmd.exe may use a non-UTF-8 codepage; the RPC fixture still sends UTF-8 JSON.
+        let (reply_text, second_text) = (
+            ascii_json(&reply).unwrap(),
+            ascii_json(&second_reply).unwrap(),
+        );
+        for (text, value) in [(&reply_text, &reply), (&second_text, &second_reply)] {
+            assert!(text.is_ascii());
+            assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *value);
+        }
         std::fs::write(
             bin.join("codex.cmd"),
             format!(
-                "@echo off\r\nset /p krill_request=\r\necho {{\"id\":0,\"result\":{{}}}}\r\nset /p krill_notice=\r\nset /p krill_read=\r\necho {reply}\r\nset /p krill_again=\r\necho {second_reply}\r\nset /p krill_done=\r\n"
+                "@echo off\r\nset /p krill_request=\r\necho {{\"id\":0,\"result\":{{}}}}\r\nset /p krill_notice=\r\nset /p krill_read=\r\necho {reply_text}\r\nset /p krill_again=\r\necho {second_text}\r\nset /p krill_done=\r\n"
             ),
         )
         .unwrap();
