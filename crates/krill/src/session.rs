@@ -964,6 +964,29 @@ pub(crate) fn observe_sessions_on_target(target: &Target) -> Option<Vec<Observed
     )
 }
 
+/// 실행 중(`exit` 없는) 세션의 cwd 목록. 답을 받지 못하면 오류다(빈 목록으로 보면 정리 가드가 꺼진다).
+pub(crate) fn running_session_cwds() -> std::result::Result<Vec<std::path::PathBuf>, String> {
+    let target = Target::establish(None).map_err(|e| e.to_string())?;
+    let mut c = connect(&target, FEAT_CONTROL | FEAT_SIDEBAR).map_err(|e| e.text)?;
+    let Reply::Sessions(sessions) = request(&mut c.stream, &Request::List).map_err(|e| e.text)?
+    else {
+        return Err("unexpected session list reply".to_owned());
+    };
+    let Reply::Sidebar(sb) = request(&mut c.stream, &Request::Sidebar).map_err(|e| e.text)? else {
+        return Err("unexpected sidebar reply".to_owned());
+    };
+    Ok(sb
+        .sessions
+        .iter()
+        .filter(|e| {
+            sessions
+                .iter()
+                .any(|s| s.session == e.session && s.status.is_none())
+        })
+        .map(|e| std::path::PathBuf::from(String::from_utf8_lossy(&e.cwd).into_owned()))
+        .collect())
+}
+
 pub(crate) fn list_session_ids() -> std::result::Result<Vec<u64>, String> {
     let target = Target::establish(None).map_err(|e| e.to_string())?;
     list_session_ids_on_target(&target)
