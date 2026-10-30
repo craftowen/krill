@@ -77,20 +77,36 @@ fn lookup_cached_doc(path: &Path, mtime_ns: u128, size: u64) -> Option<CachedVau
     }
 }
 
-/// 캐시가 붙드는 문서 텍스트 총량 상한(데몬 메모리 예산 보호). 항목 수 상한과 별개로 바이트로 막는다.
+/// 캐시가 붙드는 힙 총량 상한(데몬 메모리 예산 보호). 항목 수 상한과 별개로 바이트로 막는다.
 const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 static VAULT_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-impl VaultDoc {
-    fn text_bytes(&self) -> usize {
-        self.id.len()
-            + self.cwd.len()
-            + self.title.len()
-            + self.summary.len()
-            + self
+/// jemalloc이 `bytes` 요청에 실제로 잡는 크기. 크기 등급은 2배 구간마다 4단계이고, 간격은 16바이트에서
+/// 16KiB 페이지까지다(aarch64 macOS 실측: 585,120B 요청은 589,824B).
+fn allocation(bytes: usize) -> usize {
+    match bytes {
+        0 => 0,
+        1..=8 => 8,
+        _ => bytes.next_multiple_of((bytes.next_power_of_two() / 8).clamp(16, 16 * 1024)),
+    }
+}
+
+impl CachedVaultDoc {
+    /// 맵 슬롯·경로 키·문자열·메시지 버퍼를 할당 크기로 센 항목의 힙. 짧은 메시지는 본문보다 구조가 크다.
+    fn heap_bytes(&self, key: &Path) -> usize {
+        let string = |s: &String| allocation(s.capacity());
+        let doc = &self.doc;
+        size_of::<(PathBuf, Self)>()
+            + allocation(key.as_os_str().len())
+            + string(&doc.id)
+            + string(&doc.cwd)
+            + string(&doc.title)
+            + string(&doc.summary)
+            + allocation(doc.messages.capacity() * size_of::<(String, String)>())
+            + doc
                 .messages
                 .iter()
-                .map(|(role, text)| role.len() + text.len())
+                .map(|(role, text)| string(role) + string(text))
                 .sum::<usize>()
     }
 }
@@ -105,9 +121,9 @@ fn store_cached_doc_capped(path: &Path, entry: CachedVaultDoc, max_bytes: usize)
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // 락을 잡은 채로만 합계를 바꾼다.
     if let Some(old) = guard.remove(path) {
-        VAULT_CACHE_BYTES.fetch_sub(old.doc.text_bytes(), Ordering::Relaxed);
+        VAULT_CACHE_BYTES.fetch_sub(old.heap_bytes(path), Ordering::Relaxed);
     }
-    let bytes = entry.doc.text_bytes();
+    let bytes = entry.heap_bytes(path);
     if bytes > max_bytes {
         return;
     }
@@ -116,7 +132,7 @@ fn store_cached_doc_capped(path: &Path, entry: CachedVaultDoc, max_bytes: usize)
         && let Some(first_key) = guard.keys().next().cloned()
     {
         if let Some(evicted) = guard.remove(&first_key) {
-            VAULT_CACHE_BYTES.fetch_sub(evicted.doc.text_bytes(), Ordering::Relaxed);
+            VAULT_CACHE_BYTES.fetch_sub(evicted.heap_bytes(&first_key), Ordering::Relaxed);
         }
     }
     VAULT_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed);
@@ -3059,6 +3075,7 @@ mod cache_budget_tests {
     fn cache_is_bounded_by_bytes() {
         let (a, b, c) = (Path::new("/a"), Path::new("/b"), Path::new("/c"));
         store_cached_doc_capped(a, entry(600), 1000);
+        let one = VAULT_CACHE_BYTES.load(Ordering::Relaxed);
         store_cached_doc_capped(b, entry(600), 1000);
         assert!(lookup_cached_doc(a, 1, 1).is_none(), "oldest entry evicted");
         assert!(lookup_cached_doc(b, 1, 1).is_some());
@@ -3068,7 +3085,11 @@ mod cache_budget_tests {
             "oversized doc not retained"
         );
         assert!(lookup_cached_doc(b, 1, 1).is_some());
-        assert_eq!(VAULT_CACHE_BYTES.load(Ordering::Relaxed), 600);
+        assert_eq!(
+            VAULT_CACHE_BYTES.load(Ordering::Relaxed),
+            one,
+            "evicted entries give back exactly what they counted"
+        );
     }
 
     /// 검색이 캐시에 남긴 실제 힙(jemalloc 스레드 카운터)이 예산 안이고, 회계가 그 힙을 따라간다.
@@ -3118,7 +3139,7 @@ mod cache_budget_tests {
             let counted = i128::try_from(VAULT_CACHE_BYTES.load(Ordering::Relaxed)).unwrap();
             let budget = i128::try_from(MAX_CACHE_BYTES).unwrap();
             assert!(
-                retained <= budget && (retained - counted).abs() <= counted / 10,
+                retained <= budget && (retained - counted).abs() <= counted / 50,
                 "{content}-byte messages: retained {retained} B, counted {counted} B, budget {budget} B"
             );
             clear();
