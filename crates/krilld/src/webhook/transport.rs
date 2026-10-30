@@ -208,6 +208,7 @@ mod tests {
                     Err(error) => panic!("webhook accept failed: {error}"),
                 }
             };
+            peer.set_nonblocking(false).unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut request = Vec::new();
             let mut byte = [0];
