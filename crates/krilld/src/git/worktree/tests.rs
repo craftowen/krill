@@ -513,6 +513,55 @@ fn file_created_by_archive_hook_is_not_force_deleted() {
     );
 }
 
+fn committed_symlink_fixture(tag: &str, archive: Option<&str>) -> Fixture {
+    let hook = archive.map_or(String::new(), |s| format!("archive = '{s}'\n"));
+    let f = Fixture::new(
+        tag,
+        &format!("[worktree]\n{hook}symlinks = [\"CLAUDE.md\"]\n"),
+    );
+    fs::write(f.repo.join("AGENTS.md"), "agents\n").unwrap();
+    symlink("AGENTS.md", f.repo.join("CLAUDE.md")).unwrap();
+    f.git(&["add", "AGENTS.md", "CLAUDE.md"]);
+    f.git(&["commit", "-q", "-m", "committed symlink"]);
+    if let Some(script) = archive {
+        remember(
+            &f.trust,
+            &digest(&fs::canonicalize(&f.repo).unwrap(), script),
+        )
+        .unwrap();
+    }
+    f
+}
+
+#[test]
+fn committed_symlink_listed_in_symlinks_removes_without_force() {
+    let f = committed_symlink_fixture("rm-committed-link", None);
+    let w = f.created("committed-link", Setup::Skip).0;
+    let result = f.remove(&w, false).unwrap();
+    assert!(result.branch_deleted, "{result:?}");
+    assert!(!path(&w).exists());
+}
+
+#[test]
+fn committed_symlink_does_not_let_late_files_be_force_deleted() {
+    let script = "printf late > late.txt";
+    let f = committed_symlink_fixture("rm-committed-link-late", Some(script));
+    let w = f.created("committed-link-late", Setup::Skip).0;
+    let wt = path(&w);
+    let err = f.remove(&w, false).unwrap_err();
+    assert!(err.contains("untracked"), "{err}");
+    assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late");
+    assert_eq!(
+        fs::read_link(wt.join("CLAUDE.md")).unwrap(),
+        Path::new("AGENTS.md")
+    );
+    assert_eq!(
+        f.git_in(&wt, &["status", "--porcelain"]),
+        "?? late.txt\n",
+        "only the hook's file differs from the commit"
+    );
+}
+
 #[test]
 fn removal_even_forced_preserves_unmerged_branch() {
     let f = Fixture::new("rm-unmerged", "");
