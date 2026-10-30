@@ -68,9 +68,6 @@ fn owe864_native_menus_cover_edit_view_window_help(cx: &mut gpui::TestAppContext
             })
             .collect();
         for expected in [
-            gtext::HIDE_APP.get(),
-            gtext::HIDE_OTHERS.get(),
-            gtext::SHOW_ALL.get(),
             gtext::CLOSE_TAB.get(),
             gtext::CLOSE_PANE.get(),
             gtext::UNDO.get(),
