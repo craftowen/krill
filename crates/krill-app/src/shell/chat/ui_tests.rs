@@ -249,7 +249,7 @@ fn chat_empty_state_send_is_disabled_and_drafts_survive_term_switch(cx: &mut Tes
     assert!(cx.debug_bounds("chat-prompt-error").is_none());
     let input = cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| state.set_value("draft\n한글", window, cx));
             input
         })
@@ -499,6 +499,22 @@ fn chat_reader_anchor_survives_term_and_tab_remount_until_explicit_latest(cx: &m
     });
     cx.run_until_parked();
     shell.update(cx, |shell, cx| {
+        assert!(
+            !shell.chat.lists.contains_key(&(replacement, SESSION)),
+            "the previous host's list and log do not carry over"
+        );
+        shell.apply_chat_poll(
+            SESSION,
+            snapshot(vec![ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "replacement host".into(),
+                ..Default::default()
+            }]),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    shell.update(cx, |shell, cx| {
         let list = &shell.chat.lists[&(replacement, SESSION)];
         assert_eq!(
             list.host,
@@ -536,5 +552,44 @@ fn chat_reader_anchor_survives_term_and_tab_remount_until_explicit_latest(cx: &m
             shell.chat.lists.is_empty(),
             "reassigned panes must be pruned"
         );
+    });
+}
+
+/// 세션 ID는 데몬마다 따로 세므로 로컬과 원격의 같은 번호가 로그, 초안, 전송 칸을 공유하면 안 된다.
+#[gpui::test]
+fn same_session_number_on_two_hosts_keeps_logs_drafts_and_target_apart(cx: &mut TestAppContext) {
+    let (shell, cx) = open(cx, state_path("chat-two-hosts"));
+    let remote_host = krill_app::hosts::HostId::Remote("windows-pc".into());
+    let remote_key = (remote_host.clone(), SESSION);
+    let item = |text: &str| ChatItem {
+        kind: ChatItemKind::Assistant,
+        text: text.into(),
+        ..Default::default()
+    };
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let local = shell.layout.focused().unwrap();
+            shell.layout.set_session(local, SESSION);
+            shell.layout.split(krill_app::layout::Axis::Horizontal);
+            let remote = shell.layout.focused().unwrap();
+            shell.layout.set_host(remote, remote_host.clone());
+            shell.layout.set_session(remote, SESSION);
+
+            let local_host = krill_app::hosts::HostId::Local;
+            shell.apply_chat_poll_for_host(SESSION, local_host, snapshot(vec![item("local")]));
+            shell.apply_chat_poll_for_host(SESSION, remote_host, snapshot(vec![item("remote")]));
+            let local_log = &shell.chat.logs[&local_key(SESSION)];
+            assert_eq!(local_log.items.len(), 1);
+            assert_eq!(local_log.items[0].text, "local");
+            assert_eq!(shell.chat.logs[&remote_key].items[0].text, "remote");
+
+            let local_input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            let remote_input = shell.ensure_chat_input(remote_key.clone(), window, cx);
+            assert_ne!(local_input.entity_id(), remote_input.entity_id());
+
+            shell.layout.focus(local);
+            assert_eq!(shell.chat_pane(&remote_key), Some(remote));
+            assert_eq!(shell.chat_pane(&local_key(SESSION)), Some(local));
+        });
     });
 }

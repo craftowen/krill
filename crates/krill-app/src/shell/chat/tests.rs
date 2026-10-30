@@ -53,7 +53,7 @@ fn desktop_hybrid_chat_toggle_and_incremental_poll_render(cx: &mut TestAppContex
 
     shell.update(cx, |this, cx| {
         assert!(this.is_active_chat_view());
-        assert_eq!(this.chat.logs[&SessionId(9)].items.len(), 2);
+        assert_eq!(this.chat.logs[&local_key(SessionId(9))].items.len(), 2);
         this.toggle_chat_view(cx);
     });
     cx.run_until_parked();
@@ -84,10 +84,10 @@ fn long_chat_renders_viewport_rows_and_shares_message_text(cx: &mut TestAppConte
                 ..ChatPollSnapshot::default()
             },
         );
-        let messages = shell.chat.logs[&SessionId(444)].items.clone();
+        let messages = shell.chat.logs[&local_key(SessionId(444))].items.clone();
         assert!(Arc::ptr_eq(
             &messages[0],
-            &shell.chat.logs[&SessionId(444)].items[0]
+            &shell.chat.logs[&local_key(SessionId(444))].items[0]
         ));
         cx.notify();
         pane
@@ -197,7 +197,7 @@ fn slow_chat_poll_is_coalesced_and_rejects_changed_host(cx: &mut gpui::TestAppCo
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     view.read_with(cx, |shell, _| {
         assert!(shell.chat.task.is_none());
-        assert!(!shell.chat.logs.contains_key(&SessionId(321)));
+        assert!(!shell.chat.logs.contains_key(&local_key(SessionId(321))));
     });
 }
 
@@ -292,7 +292,7 @@ fn desktop_chat_choice_survives_update_restart(cx: &mut TestAppContext) {
     );
     shell.update(cx, |this, cx| {
         assert_eq!(
-            this.chat.logs[&SessionId(9241)].items[0].text,
+            this.chat.logs[&local_key(SessionId(9241))].items[0].text,
             "existing conversation"
         );
         this.toggle_chat_view(cx);

@@ -62,7 +62,7 @@ fn chat_retries_without_terminal_output_and_recovers_from_poll_failure(
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert!(cx.debug_bounds("chat-poll-error").is_none());
     view.read_with(cx, |shell, _| {
-        let log = &shell.chat.logs[&SessionId(992)];
+        let log = &shell.chat.logs[&local_key(SessionId(992))];
         assert!(log.bound);
         assert_eq!(log.offset, 64);
         assert_eq!(log.items[0].text, "Loaded after flush");
@@ -93,7 +93,7 @@ fn chat_switch_moves_focus_and_feed_click_keeps_input_out_of_terminal(
         view.read_with(cx, |shell, cx| {
             assert!(shell.is_active_chat_view());
             assert!(
-                shell.chat.inputs[&SessionId(994)]
+                shell.chat.inputs[&local_key(SessionId(994))]
                     .0
                     .read(cx)
                     .focus_handle(cx)
@@ -108,7 +108,7 @@ fn chat_switch_moves_focus_and_feed_click_keeps_input_out_of_terminal(
     cx.run_until_parked();
     view.read_with(cx, |shell, cx| {
         assert_eq!(
-            shell.chat.inputs[&SessionId(994)]
+            shell.chat.inputs[&local_key(SessionId(994))]
                 .0
                 .read(cx)
                 .value()
@@ -130,7 +130,7 @@ fn chat_switch_moves_focus_and_feed_click_keeps_input_out_of_terminal(
     cx.simulate_keystrokes("space a g a i n");
     view.read_with(cx, |shell, cx| {
         assert_eq!(
-            shell.chat.inputs[&SessionId(994)]
+            shell.chat.inputs[&local_key(SessionId(994))]
                 .0
                 .read(cx)
                 .value()
