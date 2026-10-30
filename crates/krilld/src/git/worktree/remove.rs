@@ -107,6 +107,12 @@ pub fn remove_with_state(
             } else {
                 return Err(e);
             }
+        } else if !req.force && is_dirty(q, repo, &path, &config.worktree.symlinks) != Ok(false) {
+            // The hook runs after the dirty check; a plain `git worktree remove` would
+            // still delete ignored files it wrote.
+            return Err(
+                "archive hook left files in the worktree; use --force to discard them".to_owned(),
+            );
         }
     }
     reject_nested_worktrees(&entries(q, repo)?, &path)?;
