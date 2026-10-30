@@ -361,7 +361,7 @@ fn execute(action: &str, yes: bool, dry_run: bool, out: &mut impl Write) -> io::
         .to_str()
         .ok_or_else(|| io::Error::other("krill executable path is not UTF-8"))?;
     let paths = InstallPaths {
-        settings: config_dir.join("settings.json"),
+        settings: krill_proto::hook_install::claude_settings_path(&config_dir, &home),
         receipt: state.join(RECEIPT_FILE),
         lock_dir: state.join("hooks"),
     };

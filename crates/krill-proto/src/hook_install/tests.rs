@@ -253,3 +253,39 @@ fn existing_opencode_plugin_is_an_already_exists_conflict_and_untouched() {
     assert_eq!(fs::read_to_string(&plugin).unwrap(), "user plugin");
     assert!(!home.state().exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn claude_settings_path_follows_only_the_shared_account_link() {
+    let root = std::env::temp_dir().join(format!("krill-shared-settings-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let host = root.join(".claude");
+    std::fs::create_dir_all(&host).unwrap();
+    let root = root.canonicalize().unwrap();
+    let host = root.join(".claude");
+    std::fs::write(host.join("settings.json"), "{}").unwrap();
+    let shared = root.join("shared");
+    let private = root.join("private");
+    let custom = root.join("custom");
+    for dir in [&shared, &private, &custom] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    std::os::unix::fs::symlink(host.join("settings.json"), shared.join("settings.json")).unwrap();
+    std::fs::write(private.join("settings.json"), "{}").unwrap();
+    std::fs::write(root.join("dotfile.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(root.join("dotfile.json"), custom.join("settings.json")).unwrap();
+    assert_eq!(
+        claude_settings_path(&shared, &root),
+        host.join("settings.json")
+    );
+    assert_eq!(
+        claude_settings_path(&private, &root),
+        private.join("settings.json")
+    );
+    assert_eq!(
+        claude_settings_path(&custom, &root),
+        custom.join("settings.json"),
+        "사용자가 만든 다른 링크는 기존처럼 저장소가 거부한다"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

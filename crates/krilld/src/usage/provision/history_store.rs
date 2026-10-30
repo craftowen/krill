@@ -1,8 +1,11 @@
 //! 프로바이더 기록을 기본 저장소로 모은다. 파일은 삭제하지 않고 원본 트리와 충돌 정본을 보존한다.
 //! 프로세스 전역 잠금은 `provision::LOCK`, 데몬 간 잠금은 `File::try_lock`으로 직렬화한다.
+//! `live` 저장소는 세션이 쓰는 중에도 옮긴다. 파일을 하드 링크로 게시한 뒤 경로만 원자 교체하므로
+//! 열린 fd와 경로 쓰기가 같은 inode에 남고, 교체 전에 생긴 파일은 교체 뒤 한 번 더 모은다.
 
-use std::fs::{self, Metadata, OpenOptions};
-use std::io;
+use std::collections::HashSet;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{self, Write as _};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +27,8 @@ pub(super) struct Store<'a> {
     pub files: &'static [&'static str],
     pub backup_name: &'static str,
     pub foreign_links: ForeignLinks,
+    /// 사용 중인 프로필도 기다리지 않고 원자 교체로 옮긴다.
+    pub live: bool,
 }
 
 impl Store<'_> {
@@ -66,20 +71,11 @@ impl Store<'_> {
         real_dir(host)?;
         let archive = archive_root(host, profile, self.backup_name);
         let _lock = if self.needs_merge() {
-            if !idle() {
+            if !self.live && !idle() {
                 report.conflicts.extend(self.names());
                 return Ok(());
             }
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(host.join(".krill-history-migration.lock"))?;
-            lock.try_lock().map_err(io::Error::other)?;
-            Some(lock)
+            Some(migration_lock(host)?)
         } else {
             None
         };
@@ -110,9 +106,13 @@ impl Store<'_> {
             let backup = archive.join(name);
             let original = backup.join("original");
             let private = source.symlink_metadata().is_ok();
-            if private || original.symlink_metadata().is_ok() {
+            if private && self.live {
+                validate_tree(&source, 0)?;
+                make_archive(host, &backup)?;
+                share_live(&source, &target, &backup, merge_tree)?;
+            } else if private || original.symlink_metadata().is_ok() {
                 // 검사 후 생긴 프로세스도 디렉터리를 옮기기 직전에 다시 확인한다.
-                if !idle() {
+                if !self.live && !idle() {
                     report.conflicts.push(name);
                     continue;
                 }
@@ -177,6 +177,108 @@ impl Store<'_> {
         }
         Ok(())
     }
+}
+
+/// 공용 저장소로 먼저 게시하고 경로를 교체한 뒤, 그사이 생긴 파일까지 다시 모은다.
+fn share_live(
+    source: &Path,
+    target: &Path,
+    backup: &Path,
+    merge_tree: &dyn Fn(&Path, &Path, &Path, usize) -> io::Result<()>,
+) -> io::Result<()> {
+    let displaced = backup.join("displaced");
+    if source.symlink_metadata()?.is_file() {
+        append_missing_lines(source, target)?;
+    }
+    merge_tree(source, target, &displaced, 0)?;
+    let original = unused_path(&backup.join("original"));
+    replace_with_link(target, source, &original)?;
+    merge_tree(&original, target, &displaced, 0)
+}
+
+/// 프롬프트 기록은 크기로 고르지 않고 없는 줄만 덧붙인다. 한 번의 append라 동시 기록과 섞이지 않는다.
+fn append_missing_lines(source: &Path, target: &Path) -> io::Result<()> {
+    let current = match fs::read(target) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let incoming = fs::read(source)?;
+    let seen: HashSet<&[u8]> = current.split(|byte| *byte == b'\n').collect();
+    let mut missing = Vec::new();
+    for line in incoming.split(|byte| *byte == b'\n') {
+        if !line.is_empty() && !seen.contains(line) {
+            missing.extend_from_slice(line);
+            missing.push(b'\n');
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if current.last().is_some_and(|byte| *byte != b'\n') {
+        missing.insert(0, b'\n');
+    }
+    OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(target)?
+        .write_all(&missing)
+}
+
+pub(super) fn migration_lock(host: &Path) -> io::Result<File> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(host.join(".krill-history-migration.lock"))?;
+    lock.try_lock().map_err(io::Error::other)?;
+    Ok(lock)
+}
+
+/// `source`를 `target` 링크로 원자 교체하고 이전 항목을 `parked`로 옮긴다.
+pub(super) fn replace_with_link(target: &Path, source: &Path, parked: &Path) -> io::Result<()> {
+    let name = source.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+    let staged = unused_path(&source.with_file_name(format!(
+        ".krill-link-{}-{}",
+        std::process::id(),
+        name.to_string_lossy()
+    )));
+    std::os::unix::fs::symlink(target, &staged)?;
+    match exchange(&staged, source) {
+        Ok(()) => fs::rename(&staged, parked),
+        // 교체를 지원하지 않는 파일시스템은 잠깐의 공백을 감수하고 되돌릴 수 있게 옮긴다.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            fs::remove_file(&staged)?;
+            fs::rename(source, parked)?;
+            std::os::unix::fs::symlink(target, source).or_else(|error| {
+                fs::rename(parked, source)?;
+                Err(error)
+            })
+        }
+        Err(error) => {
+            fs::remove_file(&staged).ok();
+            Err(error)
+        }
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn exchange(first: &Path, second: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, first, CWD, second, RenameFlags::EXCHANGE).map_err(io::Error::from)
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn exchange(_first: &Path, _second: &Path) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 fn ensure_target(target: &Path, name: &str, files: &[&str]) -> io::Result<()> {

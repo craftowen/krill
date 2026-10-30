@@ -24,6 +24,7 @@ fn store<'a>(host: &'a Path, profile: &'a Path) -> Store<'a> {
         files: &[],
         backup_name: "history-merged-backup",
         foreign_links: ForeignLinks::Preserve,
+        live: false,
     }
 }
 

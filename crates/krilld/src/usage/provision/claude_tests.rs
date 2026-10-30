@@ -2,10 +2,6 @@ use super::*;
 use std::path::PathBuf;
 
 // 프로세스 조회는 별도로 검증하고 파일 이행 테스트는 임시 HOME의 유휴 상태를 주입한다.
-fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
-    super::provision_claude_inner(home, profile, &|| true)
-}
-
 fn root(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("owe699-{tag}-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
@@ -37,7 +33,10 @@ fn host_fixture(home: &Path) -> PathBuf {
     let host = home.join(".claude");
     std::fs::create_dir_all(host.join("projects").join("-tmp-work")).unwrap();
     std::fs::write(host.join("projects/-tmp-work/s1.jsonl"), "{}\n").unwrap();
-    for name in LINKED {
+    for name in HISTORY
+        .iter()
+        .chain(&["skills", "commands", "agents", "plugins", "rules"])
+    {
         std::fs::create_dir_all(host.join(name)).unwrap();
     }
     std::fs::write(host.join("history.jsonl"), "prompt history\n").unwrap();
@@ -246,51 +245,74 @@ fn atomic_mcp_publication_preserves_newer_state_and_removes_staging_file() {
 }
 
 #[test]
-fn disabled_registered_profile_never_writes_any_file() {
-    let home = root("mcp-disabled");
-    host_fixture(&home);
+fn legacy_disabled_flag_still_shares_claude_but_keeps_other_providers_off() {
+    let home = root("legacy-disabled");
+    let host = host_fixture(&home);
+    let claude = home.join("claude");
+    let codex = home.join("codex");
+    std::fs::create_dir(&claude).unwrap();
+    std::fs::create_dir(&codex).unwrap();
+    let state = home.join("state");
+    std::fs::create_dir(&state).unwrap();
     std::fs::write(
-        home.join(".claude.json"),
-        r#"{"mcpServers":{"local":{"command":"example"}}}"#,
+        state.join("accounts.toml"),
+        format!(
+            "provisioning = false\n\
+             [[accounts]]\nid = \"a\"\nprovider = \"claude\"\nlabel = \"a\"\nprofile_dir = \"{}\"\n\
+             [[accounts]]\nid = \"b\"\nprovider = \"codex\"\nlabel = \"b\"\nprofile_dir = \"{}\"\n",
+            claude.display(),
+            codex.display()
+        ),
     )
     .unwrap();
-    let profile = home.join("profile");
-    std::fs::create_dir(&profile).unwrap();
+    provision_if_enabled(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        claude.to_str().unwrap(),
+    );
+    assert_eq!(
+        std::fs::read_link(claude.join("plugins")).unwrap(),
+        host.join("plugins")
+    );
+    assert_eq!(
+        std::fs::read_link(claude.join("settings.json")).unwrap(),
+        host.join("settings.json")
+    );
+    provision_if_enabled(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        codex.to_str().unwrap(),
+    );
+    assert_eq!(std::fs::read_dir(&codex).unwrap().count(), 0);
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn orca_managed_profile_is_left_to_orca() {
+    let home = root("orca-managed");
+    host_fixture(&home);
+    let profile = home.join("claude-profiles/dae9286b-d011-4443-9ddb-7ada705db2c1/home");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("settings.json"), "{\"orca\":1}").unwrap();
     let state = home.join("state");
     std::fs::create_dir(&state).unwrap();
     let dir = profile.to_str().unwrap();
-    std::fs::write(state.join("accounts.toml"), format!(
-        "provisioning = false\n[[accounts]]\nid = \"a\"\nprovider = \"claude\"\nlabel = \"a\"\nprofile_dir = \"{dir}\"\n"
-    )).unwrap();
-    let before = snapshot(&home);
-    // 바이트가 같은 재쓰기·임시 파일 생성 후 삭제도 inode/mtime/ctime으로 잡는다.
-    let metadata = || {
-        use std::os::unix::fs::MetadataExt as _;
-        std::iter::once(home.clone())
-            .chain(before.iter().map(|(path, _)| path.clone()))
-            .map(|path| {
-                let m = std::fs::symlink_metadata(&path).unwrap();
-                (
-                    path,
-                    m.ino(),
-                    m.mtime(),
-                    m.mtime_nsec(),
-                    m.ctime(),
-                    m.ctime_nsec(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    let before_metadata = metadata();
+    std::fs::write(
+        state.join("accounts.toml"),
+        format!("[[accounts]]\nid = \"a\"\nprovider = \"claude\"\nlabel = \"a\"\nprofile_dir = \"{dir}\"\n"),
+    )
+    .unwrap();
     provision_if_enabled(&home, Some(&state), ProviderKind::Claude, dir);
-    assert_eq!(metadata(), before_metadata);
-    assert_eq!(snapshot(&home), before);
+    assert!(!profile.join("settings.json").is_symlink());
+    assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 1);
     std::fs::remove_dir_all(home).ok();
 }
 
 #[test]
 fn lists_never_overlap() {
-    for name in LINKED.iter().chain(COPIED) {
+    for name in HISTORY {
         assert!(!EXCLUDED.contains(name), "{name}");
     }
 }
@@ -337,10 +359,11 @@ fn provisions_idempotently_without_touching_host() {
     let first = provision_claude(&home, &profile).unwrap();
     assert_eq!(
         first.changed,
-        LINKED
-            .iter()
-            .copied()
-            .chain(["history.jsonl", "settings.json", "CLAUDE.md"])
+        ["skills", "commands", "agents", "plugins", "rules"]
+            .into_iter()
+            .chain(["settings.json", "CLAUDE.md"])
+            .chain(HISTORY.iter().copied())
+            .chain(["history.jsonl"])
             .collect::<Vec<_>>()
     );
     assert!(first.conflicts.is_empty());
@@ -374,12 +397,11 @@ fn provisions_idempotently_without_touching_host() {
 }
 
 #[test]
-fn migrates_empty_dirs_and_keeps_profile_data() {
+fn migrates_existing_profile_to_reference_the_host_and_archives_its_copy() {
     let home = root("migrate");
     let host = host_fixture(&home);
     let before = snapshot(&host);
     let profile = home.join("profile");
-    // 기존 프로필: 빈 projects(이전 대상), 내용 있는 skills·자체 settings.json·CLAUDE.md(보존).
     std::fs::create_dir_all(profile.join("projects")).unwrap();
     std::fs::create_dir_all(profile.join("skills/mine")).unwrap();
     std::fs::write(profile.join("settings.json"), "{\"mine\":1}").unwrap();
@@ -389,21 +411,30 @@ fn migrates_empty_dirs_and_keeps_profile_data() {
     assert!(report.changed.contains(&"projects"));
     assert!(report.changed.contains(&"skills"));
     assert!(report.conflicts.is_empty());
-    assert!(
-        profile
-            .join("projects")
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert!(profile.join("skills/mine").is_dir());
+    assert!(profile.join("projects").is_symlink());
     assert_eq!(
-        std::fs::read_to_string(profile.join("settings.json")).unwrap(),
-        "{\"mine\":1}"
+        std::fs::read_link(profile.join("skills")).unwrap(),
+        host.join("skills")
+    );
+    assert!(
+        host.join("skills/mine").is_dir(),
+        "프로필 전용 스킬도 기본 폴더로 옮긴다"
+    );
+    assert_eq!(
+        std::fs::read_link(profile.join("settings.json")).unwrap(),
+        host.join("settings.json")
     );
     assert_eq!(
         std::fs::read_to_string(profile.join("CLAUDE.md")).unwrap(),
+        MEMORY_IMPORT
+    );
+    let archive = history_store::archive_root(&host, &profile, "projects-merged-backup");
+    assert_eq!(
+        std::fs::read_to_string(archive.join("settings.json/original")).unwrap(),
+        "{\"mine\":1}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(archive.join("CLAUDE.md/original")).unwrap(),
         "내 메모\n"
     );
     for (path, bytes) in before {
@@ -470,4 +501,21 @@ fn registered_only_and_trashing_profile_keeps_host_history() {
     std::fs::remove_dir_all(&profile).unwrap();
     assert_eq!(snapshot(&host), before);
     std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn real_home_is_never_provisioned_from_a_test_process() {
+    let home = krill_proto::os::home_dir().unwrap();
+    let state = root("real-home-guard");
+    let profile = state.join("profile");
+    std::fs::create_dir(&profile).unwrap();
+    let dir = profile.to_str().unwrap();
+    std::fs::write(
+        state.join("accounts.toml"),
+        format!("[[accounts]]\nid = \"a\"\nprovider = \"claude\"\nlabel = \"a\"\nprofile_dir = \"{dir}\"\n"),
+    )
+    .unwrap();
+    provision_if_enabled(&home, Some(&state), ProviderKind::Claude, dir);
+    assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 0);
+    std::fs::remove_dir_all(state).ok();
 }

@@ -643,7 +643,7 @@ fn orca_detected_id(idx: usize, row: &AccountUsage) -> String {
 /// Orca 프로필 경로에서 계정 uuid를 뽑는다(OWE-896).
 /// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`.
 /// uuid 형태가 아니면 `None`(사용자 임의 경로와 오인 병합 방지).
-fn orca_uuid_from_profile_dir(dir: &str) -> Option<&str> {
+pub(super) fn orca_uuid_from_profile_dir(dir: &str) -> Option<&str> {
     let mut parts = dir.split('/');
     let leaf = parts.next_back()?;
     let uuid = parts.next_back()?;

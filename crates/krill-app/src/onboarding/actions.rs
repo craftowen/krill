@@ -457,9 +457,10 @@ fn hook_config_path(agent: TargetAgent, env: &Env) -> Result<PathBuf, String> {
         std::env::var_os(key).map_or(default, PathBuf::from)
     };
     let path = match agent {
-        TargetAgent::Claude => {
-            directory("CLAUDE_CONFIG_DIR", env.home.join(".claude")).join("settings.json")
-        }
+        TargetAgent::Claude => krill_proto::hook_install::claude_settings_path(
+            &directory("CLAUDE_CONFIG_DIR", env.home.join(".claude")),
+            &env.home,
+        ),
         TargetAgent::Other(Agent::Codex) => {
             directory("CODEX_HOME", env.home.join(".codex")).join("config.toml")
         }

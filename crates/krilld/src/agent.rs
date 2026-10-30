@@ -670,11 +670,16 @@ pub(crate) fn resume_account_in(
     } else {
         dir.into_os_string().into_string().ok()?
     };
-    Some(LaunchAccount {
-        id: account_id_in(home, &file, provider, &dir),
-        env_key: key.to_owned(),
-        dir,
-    })
+    Some(keep_active_when_shared(
+        home,
+        state,
+        provider,
+        LaunchAccount {
+            id: account_id_in(home, &file, provider, &dir),
+            env_key: key.to_owned(),
+            dir,
+        },
+    ))
 }
 
 /// 저장된 실행 기록(`account` → `transcript_path` → `session_id` 볼트 탐색)에서 세션이 속한 계정을 찾는다.
@@ -734,11 +739,16 @@ pub(crate) fn account_for_stored_in(
                     })
             });
             if transcript.starts_with(&resolved) || transcript.starts_with(cfg) || canon_match {
-                return Some(LaunchAccount {
-                    id: a.id.clone(),
-                    env_key: provider.env_var().to_owned(),
-                    dir: resolved.to_string_lossy().into_owned(),
-                });
+                return Some(keep_active_when_shared(
+                    home,
+                    state,
+                    provider,
+                    LaunchAccount {
+                        id: a.id.clone(),
+                        env_key: provider.env_var().to_owned(),
+                        dir: resolved.to_string_lossy().into_owned(),
+                    },
+                ));
             }
         }
         let host = accounts::host_default_dir(home, provider);
@@ -751,11 +761,16 @@ pub(crate) fn account_for_stored_in(
                 })
         });
         if !host.as_os_str().is_empty() && (transcript.starts_with(&host) || host_canon_match) {
-            return Some(LaunchAccount {
-                id: accounts::host_default_id(provider),
-                env_key: provider.env_var().to_owned(),
-                dir: String::new(),
-            });
+            return Some(keep_active_when_shared(
+                home,
+                state,
+                provider,
+                LaunchAccount {
+                    id: accounts::host_default_id(provider),
+                    env_key: provider.env_var().to_owned(),
+                    dir: String::new(),
+                },
+            ));
         }
     }
     resume_account_in(
@@ -767,11 +782,42 @@ pub(crate) fn account_for_stored_in(
     )
 }
 
+/// 대화 저장소를 공유하는 Claude 계정은 어느 쪽으로든 재개된다. 사용자가 고른 활성 계정을 유지한다.
+fn keep_active_when_shared(
+    home: &Path,
+    state: Option<&Path>,
+    provider: ProviderKind,
+    found: LaunchAccount,
+) -> LaunchAccount {
+    if provider != ProviderKind::Claude {
+        return found;
+    }
+    let history = |dir: &str| {
+        let root = if dir.is_empty() {
+            accounts::host_default_dir(home, provider)
+        } else {
+            PathBuf::from(dir)
+        };
+        root.join("projects").canonicalize().ok()
+    };
+    match active_account_in(home, state, provider.as_str()) {
+        Some(active)
+            if history(&active.dir).is_some() && history(&active.dir) == history(&found.dir) =>
+        {
+            active
+        }
+        _ => found,
+    }
+}
+
 /// 지금 활성 계정. 호스트 기본이면 `dir`이 빈 기록이라 이후 계정을 바꿔도 재개는 기본 프로필로 간다.
 fn active_account(state: Option<&Path>, program: &str) -> Option<LaunchAccount> {
+    active_account_in(&accounts::default_home(), state, program)
+}
+
+fn active_account_in(home: &Path, state: Option<&Path>, program: &str) -> Option<LaunchAccount> {
     let provider = ProviderKind::parse(program)?;
-    let home = accounts::default_home();
-    let (id, dir) = match accounts::active_account_info(&home, state, program) {
+    let (id, dir) = match accounts::active_account_info(home, state, program) {
         Some((_, active)) => (active.id, active.profile_dir),
         None => (accounts::host_default_id(provider), String::new()),
     };
@@ -2326,6 +2372,54 @@ mod independent_state_verifier {
             assert_eq!(actual.env_key, "CODEX_HOME");
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_keeps_the_active_account_when_history_is_shared() {
+        let root = std::env::temp_dir().join(format!("krill-shared-resume-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        let host = home.join(".claude");
+        let session = "11111111-2222-4333-8444-555555555555";
+        std::fs::create_dir_all(host.join("projects/repo")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(host.join(format!("projects/repo/{session}.jsonl")), "{}\n").unwrap();
+        let profile_dir = |name: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::os::unix::fs::symlink(host.join("projects"), dir.join("projects")).unwrap();
+            dir.display().to_string()
+        };
+        let stored = |name: &str, dir: String| accounts::StoredAccount {
+            id: format!("claude-{name}"),
+            provider: "claude".into(),
+            label: name.into(),
+            email: None,
+            profile_dir: dir,
+        };
+        let first = profile_dir("first");
+        let active = profile_dir("active");
+        let mut file = accounts::AccountsFile {
+            accounts: vec![stored("first", first), stored("active", active.clone())],
+            ..Default::default()
+        };
+        file.active.insert("claude".into(), "claude-active".into());
+        std::fs::write(
+            accounts::config_path(&home, Some(&state)),
+            toml::to_string(&file).unwrap(),
+        )
+        .unwrap();
+        let profile = krill_proto::agent::Agents::load(None)
+            .unwrap()
+            .profiles
+            .get("claude")
+            .unwrap()
+            .clone();
+        let actual = resume_account_in(&home, &profile, Some(&state), None, Some(session)).unwrap();
+        assert_eq!(actual.id, "claude-active");
+        assert_eq!(actual.dir, active);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

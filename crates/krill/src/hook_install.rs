@@ -158,9 +158,10 @@ fn directory_override(variable: &str, default: PathBuf) -> io::Result<PathBuf> {
 
 fn config_path(agent: TargetAgent, home: &Path) -> io::Result<PathBuf> {
     Ok(match agent {
-        TargetAgent::Claude => {
-            directory_override("CLAUDE_CONFIG_DIR", home.join(".claude"))?.join("settings.json")
-        }
+        TargetAgent::Claude => krill_proto::hook_install::claude_settings_path(
+            &directory_override("CLAUDE_CONFIG_DIR", home.join(".claude"))?,
+            home,
+        ),
         TargetAgent::Other(Agent::Cursor) => home.join(".cursor/hooks.json"),
         TargetAgent::Other(Agent::Agy) => home.join(".gemini/config/hooks.json"),
         TargetAgent::Other(Agent::OpenCode) => {

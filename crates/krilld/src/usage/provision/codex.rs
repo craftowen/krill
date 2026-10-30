@@ -26,6 +26,7 @@ fn store<'a>(host: &'a Path, profile: &'a Path) -> super::history_store::Store<'
         files: FILES,
         backup_name: "history-merged-backup",
         foreign_links: super::history_store::ForeignLinks::Copy,
+        live: false,
     }
 }
 

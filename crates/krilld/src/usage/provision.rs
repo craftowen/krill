@@ -1,9 +1,10 @@
-//! 계정 프로필 프로비저닝(OWE-699, MK-139). `accounts.toml`의 `provisioning`이 켜졌을 때만 동작한다(키가 없으면 켜짐).
+//! 계정 프로필 프로비저닝(OWE-699, MK-139). Claude 프로필은 Orca처럼 항상 `~/.claude`를 참조한다.
+//! 다른 프로바이더는 `accounts.toml`의 `provisioning`이 켜졌을 때만 동작한다(키가 없으면 켜짐).
 //!
 //! 구조는 Orca `claude-profile-provisioning.ts`·`claude-profile-history.ts`(MIT)를 참고했다(코드 복사 없음).
 //! 참고 출처: Orca, Copyright (c) 2026 Lovecast Inc. (MIT), `.ref/orca/src/main/claude-accounts/`.
 //! Claude 기록은 `~/.claude`로 모은다. 기존 프로필 기록과 충돌 사본은 백업에 보존한다.
-//! 로그인 정보는 프로필에 남기고 MCP의 없는 서버 정의만 병합한다.
+//! 설정·확장은 `claude_config`가 링크로 공유한다. 로그인 정보는 프로필에 남기고 MCP의 없는 서버 정의만 병합한다.
 //! 멱등이라 계정 추가 때와 실행 전마다 다시 불러도 된다.
 
 use std::io;
@@ -12,6 +13,8 @@ use std::path::Path;
 use krill_proto::usage::ProviderKind;
 
 mod agy;
+#[cfg(unix)]
+mod claude_config;
 #[cfg(unix)]
 mod claude_history;
 mod codex;
@@ -22,12 +25,11 @@ mod history_probe;
 #[cfg(unix)]
 mod history_store;
 
-// 오웬 승인(OWE-720): 대화 기록 공유, settings.json 최초 한 번 복사, 프로필 기존 내용 보존.
 // Orca CLAUDE_PROFILE_HISTORY_DIRS와의 항목별 비교: 비공개 OWE-720 프로비저닝 비교 기록.
 
-/// 프로필에 `~/.claude/<이름>`을 가리키는 심볼릭 링크로 공유하는 폴더(대화 기록 + 사용자 확장).
+/// 프로필에 `~/.claude/<이름>`을 가리키는 심볼릭 링크로 공유하는 대화 기록 폴더.
 /// Unix에서는 원본이 없어도 만들어 첫 실행부터 기록 위치가 갈라지지 않게 한다.
-pub const LINKED: &[&str] = &[
+pub const HISTORY: &[&str] = &[
     "projects",        // 세션 JSONL: --resume/-c 대상 대화.
     "session-env",     // 세션별 환경 복원 자료(Orca 기록 공유 목록).
     "file-history",    // 세션 파일 변경 이력.
@@ -37,14 +39,15 @@ pub const LINKED: &[&str] = &[
     "tasks",           // 세션 작업 목록·진행 상태.
     "plans",           // 대화가 참조하는 계획 파일.
     "transcripts",     // 대화 전사 자료(Orca 기록 공유 목록).
-    "skills",
-    "commands",
-    "agents",
-    "plugins",
 ];
-/// 프로필에 없을 때만 한 번 복사하는 파일. 복사 뒤 프로필 쪽 수정은 보존된다(덮어쓰지 않음).
+/// Unix 외 환경에서 링크로 공유하는 사용자 확장 폴더. Unix는 `claude_config`가 기본 폴더를 훑는다.
+#[cfg(not(unix))]
+const EXTENSIONS: &[&str] = &["skills", "commands", "agents", "plugins"];
+/// Unix 외 환경의 최초 설정 복사 목록. 복사 뒤 프로필 쪽 수정은 보존된다(덮어쓰지 않음).
+#[cfg(not(unix))]
 pub const COPIED: &[&str] = &["settings.json"];
-/// 링크·통째 복사를 금지하는 로그인·런타임 상태. 위 두 목록과 겹치면 안 된다.
+/// 계정마다 따로 두는 로그인·런타임 상태. 기본 폴더의 나머지는 공유한다.
+/// 목록은 Orca `CLAUDE_RUNTIME_STATE_ENTRIES`를 따르고 Krill 전용 항목을 더했다.
 /// `.claude.json`은 `merge_claude_mcp`의 mcpServers 허용 목록 병합만 예외다.
 pub const EXCLUDED: &[&str] = &[
     ".credentials.json",
@@ -56,6 +59,40 @@ pub const EXCLUDED: &[&str] = &[
     "cache",
     "debug",
     "usage_cache.json",
+    "api-dumps",
+    "backups",
+    "bridge-spawn",
+    "ccr",
+    "chrome",
+    "downloads",
+    "dump-prompts",
+    "feedback",
+    "feedback-bundles",
+    "file-transfers",
+    "history-merged-backup",
+    "image-cache",
+    "jobs",
+    "local",
+    "local-settings",
+    "logs",
+    "mcp-discovery-cache",
+    "mcp-skill-archives",
+    "project-settings",
+    "projects-merged-backup",
+    "remote",
+    "remote-control",
+    "scratch",
+    "seed-admin",
+    "shares",
+    "startup-perf",
+    "state",
+    "storage-v2",
+    "systemd",
+    "teams",
+    "telemetry",
+    "traces",
+    "uploads",
+    "usage-data",
 ];
 /// 프로필 `CLAUDE.md`가 없을 때 쓰는 내용: 사용자 전역 메모리를 import한다(사본이 아니라 원본을 따라간다).
 pub const MEMORY_IMPORT: &str = "@~/.claude/CLAUDE.md\n";
@@ -73,7 +110,9 @@ pub struct Report {
     pub conflicts: Vec<&'static str>,
 }
 
-/// `accounts.toml`이 켜져 있을 때만 등록 프로필을 프로비저닝한다. 실패는 경고만 남긴다.
+/// Claude는 항상, 나머지는 `accounts.toml`이 켜져 있을 때만 등록 프로필을 프로비저닝한다.
+/// 예전 기본값이 저장된 `provisioning = false`는 사용자의 선택과 구분되지 않아 Claude에 적용하지 않는다.
+/// 실패는 경고만 남긴다.
 /// 호스트 기본 계정(`profile_dir` 빈 값)은 건드리지 않는다. agy는 네이티브 인증 미지원이다.
 pub fn provision_if_enabled(
     home: &Path,
@@ -84,6 +123,11 @@ pub fn provision_if_enabled(
     if profile_dir.is_empty() {
         return;
     }
+    // 개발자 셸에서 돌린 테스트가 실제 홈과 상태 폴더를 물려받아도 사용자 프로필을 옮기지 않는다.
+    #[cfg(test)]
+    if krill_proto::os::home_dir().as_deref() == Some(home) {
+        return;
+    }
     let file = super::accounts::load_file(home, state_dir);
     // 등록된 동일 프로바이더 계정 폴더만 프로필이다. 데몬 env에서 물려받은 실제 `CLAUDE_CONFIG_DIR`처럼
     // 사용자 자신의 설정 폴더가 실행 계정으로 들어와도 건드리지 않는다.
@@ -91,8 +135,21 @@ pub fn provision_if_enabled(
         ProviderKind::parse(&a.provider) == Some(provider)
             && a.config_dir() == Path::new(profile_dir)
     });
-    if !file.provisioning || !registered {
+    if !sharing_enabled(&file, provider) || !registered {
         return;
+    }
+    // Orca 프로필은 Orca가 같은 공유를 유지한다. 사본 설정을 링크로 바꾸면 Orca 저장이 건너뛴다.
+    if provider == ProviderKind::Claude
+        && super::accounts::orca_uuid_from_profile_dir(profile_dir).is_some()
+    {
+        return;
+    }
+    // 설정 공유는 대용량 기록 이행을 기다리지 않고 실행 전에 끝낸다.
+    #[cfg(unix)]
+    if provider == ProviderKind::Claude
+        && let Err(error) = share_claude_config(home, Path::new(profile_dir))
+    {
+        tracing::warn!(kind = ?error.kind(), "shared Claude settings failed");
     }
     #[cfg(unix)]
     if match provider {
@@ -108,7 +165,7 @@ pub fn provision_if_enabled(
         let profile = profile_dir.to_owned();
         history_jobs::spawn(Path::new(profile_dir), move || {
             let current = super::accounts::load_file(&home, state.as_deref());
-            if current.provisioning
+            if sharing_enabled(&current, provider)
                 && current.accounts.iter().any(|account| {
                     ProviderKind::parse(&account.provider) == Some(provider)
                         && account.config_dir() == Path::new(&profile)
@@ -120,6 +177,27 @@ pub fn provision_if_enabled(
         return;
     }
     provision_now(home, provider, profile_dir);
+}
+
+fn sharing_enabled(file: &super::accounts::AccountsFile, provider: ProviderKind) -> bool {
+    provider == ProviderKind::Claude || file.provisioning
+}
+
+/// 기록 이행 작업이 잠금을 쥐고 있으면 그 작업이 먼저 같은 공유를 끝낸다.
+#[cfg(unix)]
+fn share_claude_config(home: &Path, profile: &Path) -> io::Result<()> {
+    let _guard = match LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    let (host, profile) = claude_roots(home, profile)?;
+    let mut report = Report::default();
+    claude_config::share(&host, &profile, &mut report)?;
+    if !report.conflicts.is_empty() {
+        tracing::warn!(conflicts = ?report.conflicts, "shared Claude settings left existing entries");
+    }
+    Ok(())
 }
 
 fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
@@ -152,28 +230,56 @@ fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
 
 /// `profile`을 사용자 `~/.claude` 공유 프로필로 맞춘다. `profile`이 `~/.claude` 자신이거나 그 안·조상이면 거부한다.
 pub fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
+    let mut report = Report::default();
+    let (host, profile_real) = claude_roots(home, profile)?;
     #[cfg(unix)]
-    let idle = || claude_history::quiescent(profile);
+    {
+        claude_config::share(&host, &profile_real, &mut report)?;
+        claude_history::share(&host, &profile_real, &mut report)?;
+    }
     #[cfg(not(unix))]
-    let idle = || false;
-    provision_claude_inner(home, profile, &idle)
+    {
+        for &name in HISTORY.iter().chain(EXTENSIONS) {
+            let src = host.join(name);
+            if src.is_dir() {
+                link(&src, &profile.join(name), name, &mut report)?;
+            }
+        }
+        for &name in COPIED {
+            let src = host.join(name);
+            if src.is_file() {
+                let dst = profile.join(name);
+                publish(
+                    &dst,
+                    |tmp| std::fs::copy(&src, tmp).map(drop),
+                    name,
+                    &mut report,
+                )?;
+            }
+        }
+        if host.join("CLAUDE.md").is_file() {
+            publish(
+                &profile.join("CLAUDE.md"),
+                |tmp| std::fs::write(tmp, MEMORY_IMPORT),
+                "CLAUDE.md",
+                &mut report,
+            )?;
+        }
+    }
+    merge_claude_mcp(home, &profile_real, &mut report)?;
+    Ok(report)
 }
 
-#[cfg_attr(
-    not(unix),
-    expect(unused_variables, reason = "기록 이행 프로브는 Unix에서만 사용한다")
-)]
-fn provision_claude_inner(
+/// 기본 폴더와 프로필 실제 경로. 겹치는 경로는 어떤 쓰기도 하기 전에 거부한다.
+fn claude_roots(
     home: &Path,
     profile: &Path,
-    idle: &dyn Fn() -> bool,
-) -> io::Result<Report> {
+) -> io::Result<(std::path::PathBuf, std::path::PathBuf)> {
     let host = super::accounts::host_default_dir(home, ProviderKind::Claude);
-    let mut report = Report::default();
     let profile_real = profile.canonicalize()?;
     let host_real = match host.canonicalize() {
         Ok(path) => path,
-        // ~/.claude가 없어도 ~/.claude.json의 MCP는 공유할 수 있다. 원본 폴더는 만들지 않는다.
+        // ~/.claude가 없어도 ~/.claude.json의 MCP는 공유할 수 있다.
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             home.canonicalize()?.join(".claude")
         }
@@ -186,37 +292,7 @@ fn provision_claude_inner(
             "profile overlaps the host claude folder",
         ));
     }
-    #[cfg(unix)]
-    claude_history::share(&host, &profile_real, idle, &mut report)?;
-    #[cfg(not(unix))]
-    for &name in LINKED {
-        let src = host.join(name);
-        if src.is_dir() {
-            link(&src, &profile.join(name), name, &mut report)?;
-        }
-    }
-    for &name in COPIED {
-        let src = host.join(name);
-        if src.is_file() {
-            let dst = profile.join(name);
-            publish(
-                &dst,
-                |tmp| std::fs::copy(&src, tmp).map(drop),
-                name,
-                &mut report,
-            )?;
-        }
-    }
-    if host.join("CLAUDE.md").is_file() {
-        publish(
-            &profile.join("CLAUDE.md"),
-            |tmp| std::fs::write(tmp, MEMORY_IMPORT),
-            "CLAUDE.md",
-            &mut report,
-        )?;
-    }
-    merge_claude_mcp(home, &profile_real, &mut report)?;
-    Ok(report)
+    Ok((host, profile_real))
 }
 
 /// 허용 목록은 mcpServers뿐이다. Orca claude-accounts/claude-profile-provisioning.ts의

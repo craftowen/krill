@@ -390,6 +390,21 @@ pub fn refresh_codex_trust(home: &Path, command: &str, search: Option<&OsStr>) -
     Ok(true)
 }
 
+/// 계정 프로필의 `settings.json`은 기본 `~/.claude/settings.json`을 가리키는 링크다.
+/// 훅 저장소는 링크를 거부하므로 그 경우에만 기본 파일을 대상으로 삼는다.
+#[must_use]
+pub fn claude_settings_path(config_dir: &Path, home: &Path) -> PathBuf {
+    let path = config_dir.join("settings.json");
+    let host = home.join(".claude").join("settings.json");
+    let shared = path.is_symlink()
+        && path
+            .canonicalize()
+            .ok()
+            .zip(host.canonicalize().ok())
+            .is_some_and(|(linked, host)| linked == host);
+    if shared { host } else { path }
+}
+
 fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<String> {
     hooks::install_claude_json(before, command)
 }
