@@ -9,8 +9,8 @@ use krill_proto::daemon::{self, Paths};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 use krill_proto::usage::{
-    AccountsSnapshot, AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule, FEAT_USAGE, ProviderKind,
-    ResetConsumeOutcome, UsageReply, UsageRequest,
+    AccountsSnapshot, AdvancedPolicy, AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule,
+    FEAT_USAGE, ProviderKind, ResetConsumeOutcome, UsageReply, UsageRequest,
 };
 
 const USAGE: &str = "usage: krill account [list [--json] | history [--json] | provisioning <on|off|status> [--json] | policy <predict|reset-first|cooldown> <on|off|minutes> | switch <provider> <id> | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json] | auto-switch <on|off> [threshold] | rule <provider> <from-id-or-label> <on|off> [threshold%] [max|5h|7d] [target-id-or-label|auto] | rule-rm <provider> <from-id-or-label>]";
@@ -79,6 +79,10 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         [] | ["list" | "ls"] => (UsageRequest::ListAccounts, false),
         ["list" | "ls", "--json"] => (UsageRequest::ListAccounts, true),
         ["policy", key, value] => {
+            if let Err(e) = parse_advanced_policy(key, value, AdvancedPolicy::default()) {
+                eprintln!("account: {e}");
+                return ExitCode::from(2);
+            }
             let snap = match request(&UsageRequest::ListAccounts) {
                 Ok(snap) => snap,
                 Err(e) => {
@@ -95,6 +99,10 @@ pub fn run(raw: &[OsString]) -> ExitCode {
             }
         }
         ["rule" | "rule-rm", ..] => {
+            if let Err(e) = parse_rule_with(&strs, |_, value| Ok(value.to_owned())) {
+                eprintln!("account: {e}");
+                return ExitCode::from(2);
+            }
             let snap = match request(&UsageRequest::ListAccounts) {
                 Ok(snap) => snap,
                 Err(e) => {
@@ -175,6 +183,10 @@ pub fn run(raw: &[OsString]) -> ExitCode {
             )
         }
         ["auto-switch", ..] => {
+            if let Err(e) = parse_auto_switch_command(&strs, &AccountsSnapshot::default()) {
+                eprintln!("account: {e}");
+                return ExitCode::from(2);
+            }
             let snap = match request(&UsageRequest::ListAccounts) {
                 Ok(snap) => snap,
                 Err(e) => {
@@ -376,6 +388,16 @@ fn resolve_account(
 }
 
 fn parse_rule_command(args: &[&str], snap: &AccountsSnapshot) -> Result<UsageRequest, String> {
+    parse_rule_with(args, |provider, value| {
+        resolve_account(snap, provider, value)
+    })
+}
+
+/// 계정 해석(`resolve`)만 빼고 규칙 인자를 검사한다. 데몬 조회 전 문법 검사는 해석 없이 부른다.
+fn parse_rule_with(
+    args: &[&str],
+    resolve: impl Fn(ProviderKind, &str) -> Result<String, String>,
+) -> Result<UsageRequest, String> {
     let (command, provider, from, rest) = match args {
         [command @ ("rule" | "rule-rm"), provider, from, rest @ ..] => {
             (*command, *provider, *from, rest)
@@ -384,7 +406,7 @@ fn parse_rule_command(args: &[&str], snap: &AccountsSnapshot) -> Result<UsageReq
     };
     let provider =
         ProviderKind::parse(provider).ok_or_else(|| format!("unknown provider: {provider}"))?;
-    let from_account_id = resolve_account(snap, provider, from)?;
+    let from_account_id = resolve(provider, from)?;
     if command == "rule-rm" {
         return if rest.is_empty() {
             Ok(UsageRequest::RemoveAutoSwitchRule {
@@ -420,7 +442,7 @@ fn parse_rule_command(args: &[&str], snap: &AccountsSnapshot) -> Result<UsageReq
     })?;
     let target_account_id = match options.get(2) {
         None | Some(&"auto") => None,
-        Some(target) => Some(resolve_account(snap, provider, target)?),
+        Some(target) => Some(resolve(provider, target)?),
     };
     if target_account_id.as_deref() == Some(from_account_id.as_str()) {
         return Err("target account must differ from source account".to_owned());
