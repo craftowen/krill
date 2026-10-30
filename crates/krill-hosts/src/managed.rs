@@ -773,7 +773,7 @@ fn mkdir_remote_command(spec: &InstallSpec) -> String {
 /// 불일치로 새 실행을 SIGKILL한다(packaging/install.sh 참고). 끊긴 전송은 cat이 0으로 끝나므로 크기로 잡는다.
 fn upload_remote_command(remote_path: &str, len: usize, mode: &str) -> String {
     format!(
-        "/bin/sh -c 't=\"$1.krill-upload.$$\"; if cat > \"$t\" && [ $(wc -c < \"$t\") -eq {len} ] && chmod {mode} \"$t\" && mv -f \"$t\" \"$1\"; then exit 0; fi; rm -f \"$t\"; echo \"krill-install: incomplete upload $t\" >&2; exit 1' sh {}",
+        "/bin/sh -c 't=\"$1.krill-upload.$$\"; if cat > \"$t\" && [ $(wc -c < \"$t\") -eq {len} ] && [ ! -d \"$1\" ] && chmod {mode} \"$t\" && mv -f \"$t\" \"$1\"; then exit 0; fi; rm -f \"$t\"; echo \"krill-install: incomplete upload $t\" >&2; exit 1' sh {}",
         shell_quote(remote_path)
     )
 }
