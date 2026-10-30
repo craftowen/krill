@@ -41,6 +41,11 @@ import json, os, pathlib, stat, sys
 base=pathlib.Path(os.environ['KRILL_STATE_DIR'])
 with (base/'argv.jsonl').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
 script=sys.argv[4]
+# Real osascript getopt-parses every dash-leading arg after -e unless it follows a lone `--`.
+rest=sys.argv[5:]
+if rest and rest[0]!='--' and any(a.startswith('-') for a in rest):
+    bad=next(a for a in rest if a.startswith('-'))
+    print('/usr/bin/osascript: illegal option -- '+bad[1:2],file=sys.stderr); sys.exit(2)
 root={'role':'AXWindow','title':'Fixture','bounds':{'x':0,'y':0,'width':400,'height':300},'actions':[],
       'children':[{'role':'AXTextField','title':'Input','value':'before','focused':True,'enabled':True,
                    'bounds':{'x':10,'y':20,'width':200,'height':30},'actions':[],'children':[]}]}

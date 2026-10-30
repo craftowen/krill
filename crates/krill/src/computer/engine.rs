@@ -1132,7 +1132,8 @@ fn run_private_action(script: &str, payload: &str) -> Result<String, String> {
         .map_or_else(|| PathBuf::from("/usr/bin/osascript"), PathBuf::from);
     let mut command = Command::new(bin);
     command
-        .args(["-l", "JavaScript", "-e", script, "--request-file"])
+        // `--` ends osascript's getopt parsing; otherwise `--request-file` is read as an option.
+        .args(["-l", "JavaScript", "-e", script, "--", "--request-file"])
         .arg(&path);
     match run_managed(command) {
         Err(error) => {
@@ -1153,7 +1154,8 @@ pub fn run_jxa(script: &str, args: &[&str]) -> Result<String, String> {
     let bin = std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN")
         .map_or_else(|| PathBuf::from("/usr/bin/osascript"), PathBuf::from);
     let mut cmd = Command::new(bin);
-    cmd.args(["-l", "JavaScript", "-e", script]).args(args);
+    cmd.args(["-l", "JavaScript", "-e", script, "--"])
+        .args(args);
     decode_jxa(run_managed(cmd)?)
 }
 
