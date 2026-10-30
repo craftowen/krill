@@ -16,9 +16,38 @@ pub use tokio::net::{UnixListener as Listener, UnixStream as Stream};
 #[cfg(windows)]
 pub use windows::{Listener, Stream};
 
+#[cfg(any(windows, test))]
+fn write_cancellable(
+    writer: &mut impl std::io::Write,
+    mut bytes: &[u8],
+    is_closed: impl Fn() -> bool,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    while !bytes.is_empty() {
+        if is_closed() {
+            return Err(ErrorKind::Interrupted.into());
+        }
+        match writer.write(bytes) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(count) => {
+                bytes = bytes
+                    .get(count..)
+                    .ok_or_else(|| Error::from(ErrorKind::InvalidData))?;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 mod windows {
-    use std::io::{self, Read as _, Write as _};
+    use std::io::{self, Read as _};
     use std::net::Shutdown;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
@@ -111,6 +140,7 @@ mod windows {
         fn bridge(sock: net::UnixStream, handle: &Handle) -> io::Result<Self> {
             sock.set_nonblocking(false)?;
             sock.set_read_timeout(Some(CLOSE_POLL))?;
+            sock.set_write_timeout(Some(CLOSE_POLL))?;
             let shared = Arc::new(Shared {
                 sock,
                 closed: AtomicBool::new(false),
@@ -154,13 +184,17 @@ mod windows {
                 })?;
             let writer = Arc::clone(&shared);
             let rt = handle.clone();
-            std::thread::Builder::new()
+            let started = std::thread::Builder::new()
                 .name("krill-link-uds-write".to_owned())
                 .spawn(move || {
                     let mut buf = vec![0; BRIDGE_BUFFER];
                     // EOF = tokio 쪽 shutdown(반쪽 닫기) 또는 드롭.
                     while let Ok(n @ 1..) = rt.block_on(from_tokio.read(&mut buf)) {
-                        if (&writer.sock).write_all(&buf[..n]).is_err() {
+                        if super::write_cancellable(&mut &writer.sock, &buf[..n], || {
+                            writer.closed.load(Ordering::Acquire)
+                        })
+                        .is_err()
+                        {
                             writer.write_failed.store(true, Ordering::Release);
                             break;
                         }
@@ -172,7 +206,11 @@ mod windows {
                     }
                     writer.write_done.store(true, Ordering::Release);
                     writer.wake_writer();
-                })?;
+                });
+            if let Err(error) = started {
+                shared.closed.store(true, Ordering::Release);
+                return Err(error);
+            }
             Ok(Self {
                 io,
                 shared,
@@ -181,8 +219,8 @@ mod windows {
         }
     }
 
-    /// 쓰기 스레드는 duplex에 남은 바이트를 마저 보내고 반쪽 닫는다(Unix close처럼 보낸 데이터를 버리지 않음).
-    /// 읽기 스레드는 [`CLOSE_POLL`] 안에 끝나고, 두 스레드가 다 끝나면 소켓이 닫힌다.
+    /// 드롭하면 막힌 소켓 읽기·쓰기도 [`CLOSE_POLL`] 뒤 취소되고 두 스레드가 끝나면 소켓이 닫힌다.
+    /// 전송 완료가 필요하면 드롭 전에 flush 또는 shutdown을 기다린다.
     impl Drop for Stream {
         fn drop(&mut self) {
             self.shared.closed.store(true, Ordering::Release);
@@ -271,12 +309,104 @@ mod windows {
             }
         }
     }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Write as _;
+        use std::time::Instant;
+
+        #[tokio::test]
+        async fn dropping_stream_releases_workers_when_peer_never_reads() {
+            let (mut socket, peer) = net::UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let buffer = vec![1; BRIDGE_BUFFER];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match socket.write(&buffer) {
+                    Ok(_) => assert!(Instant::now() < deadline, "socket did not saturate"),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("fill socket: {error}"),
+                }
+            }
+            let mut stream = Stream::bridge(socket, &Handle::current()).unwrap();
+            let resources = Arc::downgrade(&stream.shared);
+            stream.write_all(b"queued after saturation").await.unwrap();
+            drop(stream);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while resources.upgrade().is_some() {
+                assert!(
+                    Instant::now() < deadline,
+                    "socket workers retained a dropped stream"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(peer);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Listener, Stream};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn partial_writes_retry_only_the_unwritten_suffix_and_cancel() {
+        use std::collections::VecDeque;
+        use std::io::{self, Write};
+        struct Sink {
+            steps: VecDeque<io::Result<usize>>,
+            bytes: Vec<u8>,
+        }
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let count = self.steps.pop_front().unwrap_or(Ok(bytes.len()))?;
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Sink {
+            steps: [
+                Ok(2),
+                Err(io::ErrorKind::TimedOut.into()),
+                Ok(1),
+                Err(io::ErrorKind::Interrupted.into()),
+            ]
+            .into(),
+            bytes: Vec::new(),
+        };
+        super::write_cancellable(&mut sink, b"abcdef", || false).unwrap();
+        assert_eq!(sink.bytes, b"abcdef");
+        assert_eq!(
+            super::write_cancellable(&mut sink, b"later", || true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(sink.bytes, b"abcdef");
+        let mut partial = Sink {
+            steps: [Ok(2)].into(),
+            bytes: Vec::new(),
+        };
+        let checks = std::cell::Cell::new(0);
+        let cancelled = super::write_cancellable(&mut partial, b"abcdef", || {
+            let previous = checks.get();
+            checks.set(previous + 1);
+            previous > 0
+        });
+        assert_eq!(cancelled.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(partial.bytes, b"ab");
+    }
 
     #[tokio::test]
     async fn local_socket_round_trips_and_half_closes() {
