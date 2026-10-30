@@ -749,3 +749,76 @@ fn account_daemon_failure_is_not_a_usage_error() {
         assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
     }
 }
+
+fn krill_in(state: &Path, args: &[&str]) -> Output {
+    Command::new(MK)
+        .args(args)
+        .env("KRILL_STATE_DIR", state)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// `busy`에는 실행 중인 세션을 두고 `idle`은 비워 둔다. 세션 ID를 돌려준다.
+fn busy_and_idle_worktrees(f: &Fixture) -> (PathBuf, PathBuf, String) {
+    let busy = f.dir.join("wt-busy");
+    let idle = f.dir.join("wt-idle");
+    for (wt, branch) in [(&busy, "busy"), (&idle, "idle")] {
+        Fixture::git(
+            &f.repo,
+            &["worktree", "add", "-q", "-b", branch, wt.to_str().unwrap()],
+        );
+    }
+    let created = krill_in(
+        &f.state,
+        &[
+            "new",
+            "--cwd",
+            busy.to_str().unwrap(),
+            "--",
+            "/bin/sleep",
+            "600",
+        ],
+    );
+    assert!(created.status.success(), "{created:?}");
+    let session = String::from_utf8(created.stdout).unwrap().trim().to_owned();
+    (busy, idle, session)
+}
+
+#[test]
+fn cleanup_removes_nothing_when_the_daemon_cannot_report_sessions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new("cleanup-guard");
+    let (busy, idle, session) = busy_and_idle_worktrees(&f);
+    let repo = f.repo.to_str().unwrap();
+    let cleanup = [
+        "worktree", "cleanup", "--repo", repo, "--pr", "any", "--yes",
+    ];
+
+    let socket = f.state.join("run/krilld.sock");
+    let mode = fs::metadata(&socket).unwrap().permissions().mode();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
+    let blind = krill_in(&f.state, &cleanup);
+    fs::set_permissions(&socket, fs::Permissions::from_mode(mode)).unwrap();
+    assert!(
+        busy.exists() && idle.exists(),
+        "nothing may be removed while running sessions cannot be checked: {blind:?}"
+    );
+    assert_eq!(blind.status.code(), Some(1), "{blind:?}");
+
+    let guarded = krill_in(&f.state, &cleanup);
+    assert_eq!(guarded.status.code(), Some(1), "{guarded:?}");
+    assert!(
+        String::from_utf8_lossy(&guarded.stderr).contains("running session"),
+        "{guarded:?}"
+    );
+    assert!(busy.exists(), "{guarded:?}");
+    assert!(!idle.exists(), "{guarded:?}");
+
+    let killed = krill_in(&f.state, &["kill", &session]);
+    assert!(killed.status.success(), "{killed:?}");
+    let no_daemon = krill_in(&f.dir.join("state-without-daemon"), &cleanup);
+    assert!(no_daemon.status.success(), "{no_daemon:?}");
+    assert!(!busy.exists(), "{no_daemon:?}");
+}
