@@ -2227,6 +2227,7 @@ catalog! {
         UNSTAGE => ("스테이징 해제", "Unstage"),
         DISCARD => ("변경 취소", "Discard Changes"),
         CONFIRM_DISCARD => ("\"{path}\"의 작업 트리 변경 사항을 취소할까요? 이 작업은 되돌릴 수 없습니다.", "Discard working tree changes in \"{path}\"? This cannot be undone."),
+        PATCH_UNSAFE => ("UTF-8이 아닌 파일은 Hunk·줄 단위로 처리할 수 없습니다. 파일 단위로 처리하세요.", "Hunk and line edits are unavailable for non-UTF-8 files. Use whole-file actions."),
         CONFIRM_DISCARD_UNTRACKED => ("\"{path}\" 미추적 파일을 휴지통으로 이동할까요?", "Move untracked file \"{path}\" to Trash?"),
         MESSAGE => (platform_text!("커밋 메시지 (⌘Enter로 커밋)", "커밋 메시지 (Ctrl+Enter로 커밋)"), platform_text!("Commit message (⌘Enter to commit)", "Commit message (Ctrl+Enter to commit)")),
         COMMIT => ("커밋", "Commit"),
