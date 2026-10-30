@@ -2,7 +2,7 @@
 use crate::session::lock;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode, Output, Stdio};
@@ -138,8 +138,13 @@ fn command_output(command: &mut Command) -> io::Result<Output> {
     child.wait().ok();
     result
 }
+fn tailscale_command(binary: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(binary);
+    command.env("TAILSCALE_BE_CLI", "1");
+    command
+}
 fn json_command(binary: &std::path::Path, args: &[&str]) -> io::Result<Value> {
-    let output = command_output(Command::new(binary).args(args))?;
+    let output = command_output(tailscale_command(binary).args(args))?;
     if !output.status.success() {
         return Err(io::Error::other(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -382,7 +387,7 @@ pub fn run_guard(mut args: impl Iterator<Item = OsString>) -> ExitCode {
     else {
         return ExitCode::from(2);
     };
-    let Ok(child) = Command::new(cli)
+    let Ok(child) = tailscale_command(cli)
         .arg("serve")
         .arg(format!("--https={https}"))
         .arg(format!("http://127.0.0.1:{loopback}"))
@@ -429,6 +434,63 @@ fn guard_child(mut child: Child, mut owner: impl Read + Send + 'static) -> ExitC
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(unix)]
+    fn status_queries_force_cli_mode_without_terminal_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD: &str = "KRILL_TEST_TAILSCALE_STATUS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = std::thread::current().name().unwrap().to_owned();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .env("TAILSCALE_BE_CLI", "0")
+                .env_remove("TERM")
+                .env_remove("SHLVL")
+                .env_remove("TERM_PROGRAM")
+                .env_remove("PS1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("krill-tailscale-status-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let binary = directory.join("tailscale");
+        std::fs::write(
+            &binary,
+            r"#!/usr/bin/env python3
+import json,os,sys
+if os.environ.get('TAILSCALE_BE_CLI') != '1':
+    print('The Tailscale GUI failed to start.')
+else:
+    print(json.dumps({'args':sys.argv[1:],'terminal':[k for k in ('TERM','SHLVL','TERM_PROGRAM','PS1') if k in os.environ]}))
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let results = [
+            json_command(&binary, &["status", "--json"]),
+            json_command(&binary, &["serve", "status", "--json"]),
+        ];
+        std::fs::remove_dir_all(directory).unwrap();
+        for (result, args) in results.into_iter().zip([
+            serde_json::json!(["status", "--json"]),
+            serde_json::json!(["serve", "status", "--json"]),
+        ]) {
+            let value = result.unwrap();
+            assert_eq!(value["args"], args);
+            assert_eq!(value["terminal"], serde_json::json!([]));
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn guard_kills_and_reaps_its_child_when_owner_pipe_closes() {

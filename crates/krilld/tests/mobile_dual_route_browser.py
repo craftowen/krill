@@ -102,9 +102,12 @@ def main():
     shots = Path(args.screenshots).resolve()
     shots.mkdir(parents=True, exist_ok=True)
     ts = args.tailscale_bin
+    ts_env = dict(os.environ, TAILSCALE_BE_CLI='1')
+    fixture_env = {key: value for key, value in os.environ.items()
+                   if key not in ('TERM', 'SHLVL', 'TERM_PROGRAM', 'PS1', 'TAILSCALE_BE_CLI')}
 
     def ts_json(*arguments):
-        return json.loads(subprocess.check_output([ts, *arguments], text=True, timeout=15))
+        return json.loads(subprocess.check_output([ts, *arguments], env=ts_env, text=True, timeout=15))
 
     before = ts_json('serve', 'status', '--json')
     status = ts_json('status', '--json')
@@ -142,7 +145,7 @@ def main():
             until(lambda: ready.exists() or proxy.poll() is not None)
             assert ready.exists(), proxy.stderr.read().decode()
             serve_log = (shots / 'edge-serve.log').open('w')
-            edge = subprocess.Popen([ts, 'serve', f'--https={args.https_port}', f'http://127.0.0.1:{ready.read_text()}'], stdin=subprocess.DEVNULL, stdout=serve_log, stderr=serve_log)
+            edge = subprocess.Popen([ts, 'serve', f'--https={args.https_port}', f'http://127.0.0.1:{ready.read_text()}'], env=ts_env, stdin=subprocess.DEVNULL, stdout=serve_log, stderr=serve_log)
             owned.append(edge)
 
             def trusted_ready():
@@ -152,7 +155,7 @@ def main():
             fixture_log = (shots / 'fixture.log').open('w')
             metadata = scratch / 'fixture.json'
             fixture = subprocess.Popen(['node', str(tests / 'mobile_pwa.cjs'), str(binaries / 'krilld'), '--keep'],
-                                       env=dict(os.environ, M9_BROWSER_METADATA=str(metadata), M9_BROWSER_ADDRESS='127.0.0.1:0', KRILL_MOBILE_ORIGIN=origin, KRILL_TAILSCALE_BIN=ts), stdout=fixture_log, stderr=fixture_log)
+                                       env=dict(fixture_env, M9_BROWSER_METADATA=str(metadata), M9_BROWSER_ADDRESS='127.0.0.1:0', KRILL_MOBILE_ORIGIN=origin, KRILL_TAILSCALE_BIN=ts), stdout=fixture_log, stderr=fixture_log)
             owned.append(fixture)
             until(lambda: metadata.exists() or fixture.poll() is not None, 120)
             assert metadata.exists(), (shots / 'fixture.log').read_text()
