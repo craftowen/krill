@@ -737,9 +737,9 @@ fn worktree_local_only_subcommands_reject_host() {
 #[test]
 fn account_daemon_failure_is_not_a_usage_error() {
     for args in [
-        ["account", "policy", "a", "b"],
-        ["account", "rule", "x", "y"],
-        ["account", "auto-switch", "on", "z"],
+        &["account", "policy", "predict", "on"][..],
+        &["account", "rule", "claude", "work", "on"],
+        &["account", "auto-switch", "on", "80"],
     ] {
         let out = Command::new(MK)
             .env("KRILL_STATE_DIR", "/dev/null/no-such-state")
@@ -747,6 +747,23 @@ fn account_daemon_failure_is_not_a_usage_error() {
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+    }
+}
+
+#[test]
+fn account_invalid_arguments_are_usage_errors_even_without_a_daemon() {
+    for args in [
+        &["account", "policy", "a", "b"][..],
+        &["account", "rule", "x", "y"],
+        &["account", "rule", "claude", "work", "maybe"],
+        &["account", "auto-switch", "on", "z"],
+    ] {
+        let out = Command::new(MK)
+            .env("KRILL_STATE_DIR", "/dev/null/no-such-state")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
     }
 }
 
