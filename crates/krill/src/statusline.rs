@@ -208,14 +208,17 @@ fn run_chain(command: &OsStr, input: &[u8]) -> Vec<u8> {
 
 fn run_chain_within(command: &OsStr, input: &[u8], wait: Duration) -> Vec<u8> {
     let deadline = std::time::Instant::now() + wait;
-    let mut child = match std::process::Command::new(chain_shell())
+    let mut shell = std::process::Command::new(chain_shell());
+    shell
         .arg("-c")
         .arg(command)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .env(DEPTH_ENV, "1")
-        .spawn()
-    {
+        .env(DEPTH_ENV, "1");
+    // 마감에 셸만 죽이면 셸이 기다리던 자식이 고아로 남는다. 자기 그룹으로 띄워 그룹째 정리한다.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut shell, 0);
+    let mut child = match shell.spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!("krill statusline: chain spawn skipped: {e}");
@@ -257,6 +260,14 @@ fn run_chain_within(command: &OsStr, input: &[u8], wait: Duration) -> Vec<u8> {
     }
     if let Some(output) = collect_until_exit(&mut child, &rx, deadline) {
         return output;
+    }
+    // 거두기 전에 보낸다: 거두지 않은 리더가 그룹 ID를 붙잡아 재사용되지 않는다.
+    #[cfg(unix)]
+    if let Some(pid) = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).ok();
     }
     child.kill().ok();
     child.wait().ok();
