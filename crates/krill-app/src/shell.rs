@@ -3677,7 +3677,7 @@ impl Shell {
                     let panes = self.layout.rebind_session(&host, handoff.from, to);
                     if !panes.is_empty() {
                         // View choices stay on the rebound panes, scoped to their host.
-                        self.chat.logs.remove(&handoff.from);
+                        self.chat.logs.remove(&(host.clone(), handoff.from));
                     }
                     changed |= !panes.is_empty();
                     for pane in panes {
@@ -4519,8 +4519,8 @@ impl Shell {
                         return None;
                     }
                     let n = l.pane.unlink();
-                    if let Some(session) = t.layout.session(pane) {
-                        t.chat.review_pending_prompt(session);
+                    if let Some(key) = t.chat_key(pane) {
+                        t.chat.review_pending_prompt(&key);
                     }
                     t.show(n.as_ref(), cx);
                     Some(())
@@ -4926,9 +4926,9 @@ impl Shell {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
         if ev.notice.is_some()
-            && let Some(session) = self.layout.session(pane)
+            && let Some(key) = self.chat_key(pane)
         {
-            self.chat.review_pending_prompt(session);
+            self.chat.review_pending_prompt(&key);
         }
         self.show(ev.notice.as_ref(), cx);
         !ev.closed

@@ -24,10 +24,10 @@ fn chat_single_line_bracketed_paste_submits_separately_and_keeps_draft_until_ent
                 .unwrap(),
                 cx,
             );
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| state.set_value("한 줄 prompt", window, cx));
-            shell.submit_chat_prompt(SESSION, window, cx);
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             assert_eq!(input.read(cx).value(), "한 줄 prompt");
             input
         })
@@ -79,7 +79,7 @@ fn chat_composer_shift_enter_inserts_newline_enter_sends_one_bracketed_prompt(
                 &postcard::to_stdvec(&modes).unwrap(),
                 cx,
             );
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| state.focus(window, cx));
             input
         })
@@ -136,9 +136,9 @@ fn chat_unbracketed_multiline_and_ime_confirmation_preserve_the_draft(cx: &mut T
     );
     let input = cx.update(|window, cx| {
         view.update(cx, |shell, cx| {
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| state.set_value("one\ntwo", window, cx));
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             assert_eq!(input.read(cx).value(), "one\ntwo");
             input
         })
@@ -152,13 +152,13 @@ fn chat_unbracketed_multiline_and_ime_confirmation_preserve_the_draft(cx: &mut T
                 state.set_value("", window, cx);
                 state.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
             });
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             assert_eq!(input.read(cx).value(), "ㅎ");
             assert!(sent.lock().unwrap().is_empty());
             input.update(cx, |state, cx| {
                 state.replace_text_in_range(None, "한", window, cx);
             });
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
         });
     });
     assert_eq!(*sent.lock().unwrap(), vec!["한\r".as_bytes().to_vec()]);
@@ -185,11 +185,11 @@ fn chat_delayed_submit_keeps_edited_draft_and_never_retargets_a_new_host(cx: &mu
                 &postcard::to_stdvec(&modes).unwrap(),
                 cx,
             );
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| {
                 state.set_value("first\nmessage", window, cx);
             });
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             input.update(cx, |state, cx| state.set_value("new draft", window, cx));
             input
         })
@@ -207,7 +207,7 @@ fn chat_delayed_submit_keeps_edited_draft_and_never_retargets_a_new_host(cx: &mu
             input.update(cx, |state, cx| {
                 state.set_value("second\nmessage", window, cx);
             });
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             let pane = shell.layout.focused().unwrap();
             shell
                 .layout
@@ -226,7 +226,9 @@ fn chat_delayed_submit_keeps_edited_draft_and_never_retargets_a_new_host(cx: &mu
         input.read_with(cx, |state, _| state.value()),
         "second\nmessage"
     );
-    assert!(view.read_with(cx, |shell, _| shell.chat.prompt_review.contains(&SESSION)));
+    assert!(view.read_with(cx, |shell, _| {
+        shell.chat.prompt_review.contains(&local_key(SESSION))
+    }));
 }
 
 #[gpui::test]
@@ -252,11 +254,11 @@ fn chat_multiline_transport_failure_preserves_draft_and_prevents_blind_replay(
                 &postcard::to_stdvec(&modes).unwrap(),
                 cx,
             );
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| {
                 state.set_value("retry\ncarefully", window, cx);
             });
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             shell.chat.send_input = Some(Box::new(|_| false));
             input
         })
@@ -272,14 +274,16 @@ fn chat_multiline_transport_failure_preserves_draft_and_prevents_blind_replay(
     assert!(cx.debug_bounds("chat-prompt-review").is_some());
     cx.update(|window, cx| {
         view.update(cx, |shell, cx| {
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
         });
     });
     assert_eq!(sent.lock().unwrap().len(), 1);
     let recovery = cx.debug_bounds("chat-prompt-review-done").unwrap();
     cx.simulate_click(recovery.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert!(!view.read_with(cx, |shell, _| shell.chat.prompt_review.contains(&SESSION)));
+    assert!(!view.read_with(cx, |shell, _| {
+        shell.chat.prompt_review.contains(&local_key(SESSION))
+    }));
     assert_eq!(
         sent.lock().unwrap().len(),
         1,
@@ -310,11 +314,11 @@ fn chat_paste_waits_for_pty_ack_and_provider_turn_before_clearing(cx: &mut TestA
             );
             shell.chat.prompt_delivery = Some(Delivery::Pending);
             shell.chat.prompt_confirmed = Some(false);
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| {
                 state.set_value("ack gated prompt", window, cx);
             });
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             input
         })
     });
@@ -365,9 +369,9 @@ fn chat_uncertain_paste_never_submits_or_replays_and_preserves_draft(cx: &mut Te
                 cx,
             );
             shell.chat.prompt_delivery = Some(Delivery::Pending);
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| state.set_value("do not replay", window, cx));
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             input
         })
     });
@@ -379,7 +383,7 @@ fn chat_uncertain_paste_never_submits_or_replays_and_preserves_draft(cx: &mut Te
     cx.run_until_parked();
     cx.update(|window, cx| {
         view.update(cx, |shell, cx| {
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
         });
     });
     assert_eq!(sent.lock().unwrap().len(), 1);
@@ -388,7 +392,7 @@ fn chat_uncertain_paste_never_submits_or_replays_and_preserves_draft(cx: &mut Te
         "do not replay"
     );
     view.read_with(cx, |shell, _| {
-        assert!(shell.chat.prompt_review.contains(&SESSION));
+        assert!(shell.chat.prompt_review.contains(&local_key(SESSION)));
     });
 
     view.update(cx, |shell, cx| {
@@ -414,7 +418,7 @@ fn chat_uncertain_paste_never_submits_or_replays_and_preserves_draft(cx: &mut Te
             },
         );
         assert!(
-            shell.chat.prompt_review.contains(&SESSION),
+            shell.chat.prompt_review.contains(&local_key(SESSION)),
             "polling cannot authorize replay"
         );
         cx.notify();

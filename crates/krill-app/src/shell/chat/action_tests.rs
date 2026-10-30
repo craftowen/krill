@@ -173,12 +173,12 @@ fn chat_prompt_failure_preserves_draft_and_success_clears_only_sent_value(cx: &m
     let (view, cx, _, sent) = fixture(cx, "chat-draft", &permission(), "deploy production (y/n)");
     cx.update(|window, cx| {
         view.update(cx, |shell, cx| {
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| state.set_value("draft", window, cx));
             shell.chat.send_input = Some(Box::new(|_| false));
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             assert_eq!(input.read(cx).value().as_ref(), "draft");
-            assert!(shell.chat.prompt_failed.contains(&SESSION));
+            assert!(shell.chat.prompt_failed.contains(&local_key(SESSION)));
             input.update(cx, |state, cx| state.set_value("new draft", window, cx));
             Shell::clear_sent_chat_draft(&input, "draft", window, cx);
             assert_eq!(input.read(cx).value().as_ref(), "new draft");
@@ -187,14 +187,14 @@ fn chat_prompt_failure_preserves_draft_and_success_clears_only_sent_value(cx: &m
                 recorded.lock().unwrap().push(bytes);
                 true
             }));
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             assert!(input.read(cx).value().is_empty());
-            assert!(!shell.chat.prompt_failed.contains(&SESSION));
+            assert!(!shell.chat.prompt_failed.contains(&local_key(SESSION)));
             // Disconnected Pane::input returns None too; it must not clear a draft.
             let pane = shell.layout.focused().unwrap();
             shell.live.get_mut(&pane).unwrap().pane.unlink();
             input.update(cx, |state, cx| state.set_value("offline draft", window, cx));
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             assert_eq!(input.read(cx).value().as_ref(), "offline draft");
         });
     });
@@ -215,14 +215,14 @@ fn chat_permission_duplicate_clicks_wait_for_actual_result(cx: &mut TestAppConte
         assert!(shell.chat_request_is_current(&request, cx));
         shell.approve_chat_permission(request.clone(), true, cx);
         shell.approve_chat_permission(request.clone(), false, cx);
-        assert!(shell.chat.logs[&SESSION].answered.is_empty());
+        assert!(shell.chat.logs[&local_key(SESSION)].answered.is_empty());
     });
     cx.run_until_parked();
     assert_eq!(*sent.lock().unwrap(), vec![b"y\r".to_vec()]);
     assert!(cx.debug_bounds("chat-request-status").is_some());
     view.update(cx, |shell, cx| {
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::Awaiting
         ));
         shell.approve_chat_permission(request.clone(), true, cx);
@@ -234,9 +234,13 @@ fn chat_permission_duplicate_clicks_wait_for_actual_result(cx: &mut TestAppConte
                 ..Default::default()
             }]),
         );
-        assert!(shell.chat.logs[&SESSION].answered.contains(&request.key));
+        assert!(
+            shell.chat.logs[&local_key(SESSION)]
+                .answered
+                .contains(&request.key)
+        );
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::Confirmed
         ));
     });
@@ -244,7 +248,7 @@ fn chat_permission_duplicate_clicks_wait_for_actual_result(cx: &mut TestAppConte
     cx.run_until_parked();
     view.read_with(cx, |shell, _| {
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::Confirmed
         ));
     });
@@ -266,7 +270,7 @@ fn chat_question_failure_keeps_choices_and_can_retry_after_reconnect(cx: &mut Te
     });
     cx.run_until_parked();
     view.update(cx, |shell, cx| {
-        let log = &shell.chat.logs[&SESSION];
+        let log = &shell.chat.logs[&local_key(SESSION)];
         assert!(log.answered.is_empty());
         assert_eq!(log.multi_selected[&request.key], BTreeSet::from([0]));
         assert!(matches!(log.submissions[&request.key], Submission::Failed));
@@ -282,9 +286,9 @@ fn chat_question_failure_keeps_choices_and_can_retry_after_reconnect(cx: &mut Te
     cx.run_until_parked();
     assert_eq!(*sent.lock().unwrap(), vec![b" ".to_vec(), b"\r".to_vec()]);
     view.read_with(cx, |shell, _| {
-        assert!(shell.chat.logs[&SESSION].answered.is_empty());
+        assert!(shell.chat.logs[&local_key(SESSION)].answered.is_empty());
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::Awaiting
         ));
     });
@@ -315,12 +319,12 @@ fn chat_partial_multiselect_stops_and_requires_terminal_review(cx: &mut TestAppC
     cx.run_until_parked();
     view.update(cx, |shell, cx| {
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::ReviewRequired
         ));
-        assert!(shell.chat.logs[&SESSION].answered.is_empty());
+        assert!(shell.chat.logs[&local_key(SESSION)].answered.is_empty());
         assert_eq!(
-            shell.chat.logs[&SESSION].multi_selected[&request.key],
+            shell.chat.logs[&local_key(SESSION)].multi_selected[&request.key],
             BTreeSet::from([1])
         );
         shell.answer_chat_question(request.clone(), vec![1], true, cx);
@@ -424,10 +428,10 @@ fn chat_unconfirmed_approval_leaves_waiting_state_and_new_binding_recovers(
     cx.run_until_parked();
     view.update(cx, |shell, cx| {
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::ReviewRequired
         ));
-        assert!(shell.chat.logs[&SESSION].answered.is_empty());
+        assert!(shell.chat.logs[&local_key(SESSION)].answered.is_empty());
         shell.approve_chat_permission(request.clone(), true, cx);
         let mut reset = snapshot(vec![permission()]);
         reset.reset = true;
@@ -458,7 +462,7 @@ fn chat_permission_delivery_failure_allows_explicit_retry(cx: &mut TestAppContex
     cx.run_until_parked();
     view.update(cx, |shell, cx| {
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::Failed
         ));
         let recorded = sent.clone();
@@ -501,7 +505,7 @@ fn chat_host_session_changes_and_binding_reset_cancel_remaining_question_keys(
         shell.layout.set_host(pane, krill_app::hosts::HostId::Local);
         shell.answer_chat_question(request.clone(), vec![1], false, cx);
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::ReviewRequired
         ));
         let mut reset = snapshot(vec![question(false)]);
@@ -524,7 +528,7 @@ fn chat_host_session_changes_and_binding_reset_cancel_remaining_question_keys(
         shell.layout.set_chat_view(pane, true);
         shell.answer_chat_question(request.clone(), vec![1], false, cx);
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::ReviewRequired
         ));
         let mut reset = snapshot(vec![question(false)]);
@@ -543,7 +547,7 @@ fn chat_host_session_changes_and_binding_reset_cancel_remaining_question_keys(
     cx.run_until_parked();
     assert_eq!(sent.lock().unwrap().len(), 3);
     view.update(cx, |shell, cx| {
-        assert!(shell.chat.logs[&SESSION].answered.is_empty());
+        assert!(shell.chat.logs[&local_key(SESSION)].answered.is_empty());
         shell.answer_chat_question(request.clone(), vec![1], false, cx);
         let pane = shell.layout.focused().unwrap();
         let fresh = shell.chat_request_identity(pane, SESSION, 0, &question(false));
@@ -651,19 +655,19 @@ fn chat_pending_paste_preserves_draft_and_does_not_queue_card_keys(cx: &mut Test
     cx.update(|window, cx| {
         view.update(cx, |shell, cx| {
             let pane = shell.layout.focused().unwrap();
-            let input = shell.ensure_chat_input(SESSION, window, cx);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
             input.update(cx, |state, cx| {
                 state.set_value("draft after paste", window, cx);
             });
             shell.paste_clipboard(window, cx);
             assert!(shell.paste_queue.has_pending_for(pane));
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             shell.approve_chat_permission(request.clone(), true, cx);
             assert_eq!(input.read(cx).value().as_ref(), "draft after paste");
             assert!(sent.lock().unwrap().is_empty());
             shell.cancel_pending_paste_for(pane, cx);
             assert!(!shell.paste_queue.has_pending_for(pane));
-            shell.submit_chat_prompt(SESSION, window, cx);
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             shell.approve_chat_permission(request.clone(), false, cx);
             assert!(input.read(cx).value().is_empty());
         });
@@ -853,7 +857,7 @@ fn chat_partial_single_select_stale_frame_cannot_repeat_cursor_steps(cx: &mut Te
     cx.run_until_parked();
     view.update(cx, |shell, cx| {
         assert!(matches!(
-            shell.chat.logs[&SESSION].submissions[&request.key],
+            shell.chat.logs[&local_key(SESSION)].submissions[&request.key],
             Submission::ReviewRequired
         ));
         // The live frame still claims cursor 0 after the delivered Down key.
@@ -864,7 +868,7 @@ fn chat_partial_single_select_stale_frame_cannot_repeat_cursor_steps(cx: &mut Te
             true
         }));
         shell.answer_chat_question(request.clone(), vec![1], false, cx);
-        assert!(shell.chat.logs[&SESSION].answered.is_empty());
+        assert!(shell.chat.logs[&local_key(SESSION)].answered.is_empty());
     });
     cx.executor().advance_clock(Duration::from_millis(61));
     cx.run_until_parked();

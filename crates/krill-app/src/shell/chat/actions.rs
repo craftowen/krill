@@ -22,6 +22,12 @@ pub(super) enum Submission {
     ReviewRequired,
 }
 
+impl RequestIdentity {
+    pub(super) fn chat_key(&self) -> ChatKey {
+        (self.host.clone(), self.session)
+    }
+}
+
 impl Submission {
     pub(super) fn blocks_input(&self) -> bool {
         matches!(
@@ -96,11 +102,17 @@ impl Shell {
         index: usize,
         item: &ChatItem,
     ) -> RequestIdentity {
+        let host = self.layout.host(pane).clone();
+        let epoch = self
+            .chat
+            .logs
+            .get(&(host.clone(), session))
+            .map_or(0, |log| log.epoch);
         RequestIdentity {
             pane,
-            host: self.layout.host(pane).clone(),
+            host,
             session,
-            epoch: self.chat.logs.get(&session).map_or(0, |log| log.epoch),
+            epoch,
             key: format!("{}:{index}", item.tool_id),
             index,
             item: item.clone(),
@@ -115,7 +127,7 @@ impl Shell {
         {
             return false;
         }
-        let Some(log) = self.chat.logs.get(&request.session) else {
+        let Some(log) = self.chat.logs.get(&request.chat_key()) else {
             return false;
         };
         if !log.bound
@@ -195,7 +207,7 @@ impl Shell {
     }
 
     fn set_chat_submission(&mut self, request: &RequestIdentity, state: Submission) {
-        if let Some(log) = self.chat.logs.get_mut(&request.session)
+        if let Some(log) = self.chat.logs.get_mut(&request.chat_key())
             && log.epoch == request.epoch
         {
             log.submissions.insert(request.key.clone(), state);
@@ -219,7 +231,7 @@ impl Shell {
             return;
         }
         if !self.chat_request_is_current(&request, cx)
-            || self.chat.logs.get(&request.session).is_some_and(|log| {
+            || self.chat.logs.get(&request.chat_key()).is_some_and(|log| {
                 log.submissions
                     .get(&request.key)
                     .is_some_and(Submission::blocks_input)
@@ -227,7 +239,7 @@ impl Shell {
         {
             return;
         }
-        if let Some(log) = self.chat.logs.get_mut(&request.session) {
+        if let Some(log) = self.chat.logs.get_mut(&request.chat_key()) {
             log.multi_selected
                 .insert(request.key.clone(), selected.iter().copied().collect());
         }
@@ -294,7 +306,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if !self.chat_request_is_current(&request, cx)
-            || self.chat.logs.get(&request.session).is_some_and(|log| {
+            || self.chat.logs.get(&request.chat_key()).is_some_and(|log| {
                 log.submissions
                     .get(&request.key)
                     .is_some_and(Submission::blocks_input)
@@ -303,7 +315,7 @@ impl Shell {
             return;
         }
         self.set_chat_submission(&request, Submission::Sending);
-        let session = request.session;
+        let key = request.chat_key();
         let task = cx.spawn(async move |this, cx| {
             for (sent, bytes) in steps.into_iter().enumerate() {
                 if sent > 0 {
@@ -345,7 +357,7 @@ impl Shell {
             // replaying an approval that may already have been accepted.
             cx.background_executor().timer(Duration::from_secs(5)).await;
             this.update(cx, |this, cx| {
-                if this.chat.logs.get(&session).is_some_and(|log| {
+                if this.chat.logs.get(&request.chat_key()).is_some_and(|log| {
                     log.epoch == request.epoch
                         && matches!(
                             log.submissions.get(&request.key),
@@ -358,7 +370,7 @@ impl Shell {
             })
             .ok();
         });
-        self.chat.request_tasks.insert(session, task);
+        self.chat.request_tasks.insert(key, task);
         cx.notify();
     }
 }

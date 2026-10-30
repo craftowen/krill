@@ -6,10 +6,11 @@ impl Shell {
     pub(super) fn render_chat_composer(
         &self,
         pane: super::super::PaneId,
-        session: SessionId,
+        key: ChatKey,
         input_state: &gpui::Entity<TextareaState>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let submit_key = key.clone();
         let palette = ui::palette(cx);
         let bg = palette.background;
         let border = palette.border;
@@ -24,7 +25,7 @@ impl Shell {
                     } else {
                         // Consume the propagated submit action before the platform can
                         // insert a fallback newline into this multiline field.
-                        this.submit_chat_prompt(session, window, cx);
+                        this.submit_chat_prompt(&submit_key, window, cx);
                     }
                 },
             ))
@@ -74,12 +75,12 @@ impl Shell {
                         .primary()
                         .disabled(
                             input_state.read(cx).value().trim().is_empty()
-                                || self.chat.prompt_tasks.contains_key(&session)
-                                || self.chat.prompt_review.contains(&session),
+                                || self.chat.prompt_tasks.contains_key(&key)
+                                || self.chat.prompt_review.contains(&key),
                         )
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                this.submit_chat_prompt(session, window, cx);
+                                this.submit_chat_prompt(&key, window, cx);
                             },
                         )),
                     ),
@@ -89,11 +90,11 @@ impl Shell {
 
     pub(super) fn render_chat_prompt_notices(
         &self,
-        session: SessionId,
+        key: &ChatKey,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut notices = Vec::new();
-        if self.chat.poll_failed.contains(&session) {
+        if self.chat.poll_failed.contains(key) {
             notices.push(
                 ui::error_banner(ui::palette(cx), ctext::POLL_FAILED.get())
                     .id("chat-poll-error")
@@ -101,7 +102,7 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        if self.chat.prompt_failed.contains(&session) {
+        if self.chat.prompt_failed.contains(key) {
             notices.push(
                 ui::error_banner(ui::palette(cx), ctext::PROMPT_FAILED.get())
                     .id("chat-prompt-error")
@@ -109,7 +110,7 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        if self.chat.multiline_blocked.contains(&session) {
+        if self.chat.multiline_blocked.contains(key) {
             notices.push(
                 ui::error_banner(ui::palette(cx), ctext::MULTILINE_BLOCKED.get())
                     .id("chat-multiline-error")
@@ -117,7 +118,7 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        if self.chat.prompt_review.contains(&session) {
+        if self.chat.prompt_review.contains(key) {
             notices.push(
                 div()
                     .w_full()
@@ -137,9 +138,12 @@ impl Shell {
                             .label(ctext::REVIEW_DONE.get())
                             .small()
                             .ghost()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.chat.prompt_review.remove(&session);
-                                cx.notify();
+                            .on_click(cx.listener({
+                                let key = key.clone();
+                                move |this, _, _, cx| {
+                                    this.chat.prompt_review.remove(&key);
+                                    cx.notify();
+                                }
                             })),
                     )
                     .into_any_element(),

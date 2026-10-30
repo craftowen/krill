@@ -27,6 +27,14 @@ use krill_proto::screen::Cell;
 
 use super::{PaneId, Shell};
 
+/// 채팅 상태의 키. 세션 ID는 데몬마다 따로 세므로 로컬과 원격 세션 번호가 겹친다.
+pub(super) type ChatKey = (krill_app::hosts::HostId, SessionId);
+
+#[cfg(test)]
+pub(super) fn local_key(session: SessionId) -> ChatKey {
+    (krill_app::hosts::HostId::Local, session)
+}
+
 mod actions;
 mod body;
 mod composer;
@@ -105,18 +113,18 @@ impl ChatList {
 }
 
 enum ChatFocus {
-    Composer(SessionId),
-    Terminal(SessionId),
+    Composer(ChatKey),
+    Terminal(ChatKey),
 }
 
 #[derive(Default)]
 pub(crate) struct ChatState {
     poll_timer: Option<Task<()>>,
-    poll_failed: BTreeSet<SessionId>,
+    poll_failed: BTreeSet<ChatKey>,
     lists: BTreeMap<(PaneId, SessionId), ChatList>,
     focus_pending: Option<ChatFocus>,
-    pub logs: BTreeMap<SessionId, SessionChatLog>,
-    pub inputs: BTreeMap<SessionId, (gpui::Entity<TextareaState>, Subscription)>,
+    pub logs: BTreeMap<ChatKey, SessionChatLog>,
+    pub inputs: BTreeMap<ChatKey, (gpui::Entity<TextareaState>, Subscription)>,
     pub last_poll: Option<std::time::Instant>,
     pub task: Option<Task<()>>,
     pub poll_generation: u64,
@@ -124,11 +132,11 @@ pub(crate) struct ChatState {
     pub next_poll_io: Option<tokio::sync::oneshot::Receiver<()>>,
     #[cfg(test)]
     pub poll_call: Option<krill_app::agent_history::Call>,
-    request_tasks: BTreeMap<SessionId, Task<()>>,
-    prompt_failed: BTreeSet<SessionId>,
-    prompt_tasks: BTreeMap<SessionId, Task<()>>,
-    prompt_review: BTreeSet<SessionId>,
-    multiline_blocked: BTreeSet<SessionId>,
+    request_tasks: BTreeMap<ChatKey, Task<()>>,
+    prompt_failed: BTreeSet<ChatKey>,
+    prompt_tasks: BTreeMap<ChatKey, Task<()>>,
+    prompt_review: BTreeSet<ChatKey>,
+    multiline_blocked: BTreeSet<ChatKey>,
     #[cfg(test)]
     send_input: Option<Box<dyn FnMut(Vec<u8>) -> bool>>,
     #[cfg(test)]
@@ -138,9 +146,9 @@ pub(crate) struct ChatState {
 }
 
 impl ChatState {
-    pub(super) fn review_pending_prompt(&mut self, session: SessionId) {
-        if self.prompt_tasks.contains_key(&session) {
-            self.prompt_review.insert(session);
+    pub(super) fn review_pending_prompt(&mut self, key: &ChatKey) {
+        if self.prompt_tasks.contains_key(key) {
+            self.prompt_review.insert(key.clone());
         }
     }
 }
@@ -304,6 +312,19 @@ impl Shell {
             .unwrap_or(false)
     }
 
+    pub(super) fn chat_key(&self, pane: PaneId) -> Option<ChatKey> {
+        Some((self.layout.host(pane).clone(), self.layout.session(pane)?))
+    }
+
+    /// 이 호스트·세션을 보여 주는 칸. 포커스 칸을 먼저 본다.
+    fn chat_pane(&self, key: &ChatKey) -> Option<PaneId> {
+        let shows = |pane: &PaneId| self.chat_key(*pane).as_ref() == Some(key);
+        self.layout
+            .focused()
+            .filter(shows)
+            .or_else(|| self.layout.visible().into_iter().find(shows))
+    }
+
     pub(super) fn active_session_id(&self) -> Option<SessionId> {
         let pane = self.layout.focused()?;
         if self.layout.file(pane).is_some() {
@@ -341,13 +362,15 @@ impl Shell {
             return;
         };
         let chat = !self.is_session_chat_view(session, cx);
-        if let Some(pane) = self.layout.focused() {
-            self.set_pane_chat_view(pane, chat, cx);
-        }
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
+        self.set_pane_chat_view(pane, chat, cx);
+        let key = (self.layout.host(pane).clone(), session);
         self.chat.focus_pending = Some(if chat {
-            ChatFocus::Composer(session)
+            ChatFocus::Composer(key)
         } else {
-            ChatFocus::Terminal(session)
+            ChatFocus::Terminal(key)
         });
         if chat {
             self.chat.last_poll = None;
@@ -362,11 +385,13 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.toggle_chat_view(cx);
-        if let Some(session) = self
+        if let Some(key) = self
             .active_session_id()
             .filter(|id| self.is_session_chat_view(*id, cx))
+            .and_then(|_| self.layout.focused())
+            .and_then(|pane| self.chat_key(pane))
         {
-            let input = self.ensure_chat_input(session, window, cx);
+            let input = self.ensure_chat_input(key, window, cx);
             input.update(cx, |input, cx| input.focus(window, cx));
         } else {
             window.focus(&self.focus, cx);
@@ -442,8 +467,9 @@ impl Shell {
         }
         self.ensure_chat_poll_timer(cx);
         let host = self.layout.host(pane).clone();
+        let key = (host.clone(), session);
         let Some(target) = self.target_for_host(&host) else {
-            if self.chat.poll_failed.insert(session) {
+            if self.chat.poll_failed.insert(key) {
                 cx.notify();
             }
             return;
@@ -456,7 +482,7 @@ impl Shell {
         self.chat.last_poll = Some(std::time::Instant::now());
         self.chat.poll_generation = self.chat.poll_generation.wrapping_add(1);
         let generation = self.chat.poll_generation;
-        let offset = self.chat.logs.get(&session).map_or(0, |log| log.offset);
+        let offset = self.chat.logs.get(&key).map_or(0, |log| log.offset);
         self.chat.task = Some(cx.spawn(async move |this, cx| {
             let reply = cx
                 .background_executor()
@@ -476,13 +502,13 @@ impl Shell {
                 if this.layout.host(pane) == &host
                     && this.layout.session(pane) == Some(session)
                     && this.is_pane_chat_view(pane, cx)
-                    && this.chat.logs.get(&session).map_or(0, |log| log.offset) == offset
+                    && this.chat.logs.get(&key).map_or(0, |log| log.offset) == offset
                 {
                     if let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply {
-                        this.chat.poll_failed.remove(&session);
+                        this.chat.poll_failed.remove(&key);
                         this.apply_chat_poll_for_host(session, host, snapshot);
                     } else {
-                        this.chat.poll_failed.insert(session);
+                        this.chat.poll_failed.insert(key);
                     }
                     cx.notify();
                 }
@@ -517,8 +543,9 @@ impl Shell {
         host: krill_app::hosts::HostId,
         snap: ChatPollSnapshot,
     ) {
+        let key = (host.clone(), session);
         let host = Some(host);
-        let log = self.chat.logs.entry(session).or_default();
+        let log = self.chat.logs.entry(key.clone()).or_default();
         let binding = (snap.session_id.clone(), snap.transcript_path.clone());
         let reset = snap.reset || log.binding != binding || log.host != host || !snap.bound;
         if !snap.agent.is_empty() {
@@ -536,7 +563,7 @@ impl Shell {
             log.expanded.clear();
             log.multi_selected.clear();
             log.submissions.clear();
-            self.chat.request_tasks.remove(&session);
+            self.chat.request_tasks.remove(&key);
         }
         log.binding = binding;
         log.host = host;
@@ -579,23 +606,9 @@ impl Shell {
         }
     }
 
-    fn send_to_session(
-        &mut self,
-        session: SessionId,
-        bytes: &[u8],
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let pane = self
-            .layout
-            .focused()
-            .filter(|&pane| self.layout.session(pane) == Some(session))
-            .or_else(|| {
-                self.layout
-                    .visible()
-                    .into_iter()
-                    .find(|&pane| self.layout.session(pane) == Some(session))
-            });
-        pane.is_some_and(|pane| self.send_to_chat_pane(pane, session, bytes, cx))
+    fn send_to_session(&mut self, key: &ChatKey, bytes: &[u8], cx: &mut Context<Self>) -> bool {
+        self.chat_pane(key)
+            .is_some_and(|pane| self.send_to_chat_pane(pane, key.1, bytes, cx))
     }
 
     fn send_to_chat_pane(
@@ -605,7 +618,11 @@ impl Shell {
         bytes: &[u8],
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.chat.prompt_tasks.contains_key(&session) {
+        if self
+            .chat
+            .prompt_tasks
+            .contains_key(&(self.layout.host(pane).clone(), session))
+        {
             return false;
         }
         self.send_chat_prompt_input(pane, session, bytes, cx)
@@ -653,11 +670,11 @@ impl Shell {
 
     fn ensure_chat_input(
         &mut self,
-        session: SessionId,
+        key: ChatKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Entity<TextareaState> {
-        if let Some((input, _)) = self.chat.inputs.get(&session) {
+        if let Some((input, _)) = self.chat.inputs.get(&key) {
             let input = input.clone();
             let placeholder = ctext::PROMPT_PLACEHOLDER.get();
             if input.read(cx).presentation().placeholder().as_ref() != placeholder {
@@ -682,8 +699,10 @@ impl Shell {
                 }
             },
         );
-        self.chat.inputs.insert(session, (input.clone(), sub));
-        if self.active_session_id() == Some(session) {
+        let active =
+            self.layout.focused().and_then(|pane| self.chat_key(pane)) == Some(key.clone());
+        self.chat.inputs.insert(key, (input.clone(), sub));
+        if active {
             input.update(cx, |state, cx| state.focus(window, cx));
         }
         input
@@ -691,16 +710,14 @@ impl Shell {
 
     pub(super) fn submit_chat_prompt(
         &mut self,
-        session: SessionId,
+        key: &ChatKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.chat.prompt_tasks.contains_key(&session)
-            || self.chat.prompt_review.contains(&session)
-        {
+        if self.chat.prompt_tasks.contains_key(key) || self.chat.prompt_review.contains(key) {
             return;
         }
-        let Some((input, _)) = self.chat.inputs.get(&session) else {
+        let Some((input, _)) = self.chat.inputs.get(key) else {
             return;
         };
         let input = input.clone();
@@ -713,19 +730,10 @@ impl Shell {
         if text.trim().is_empty() {
             return;
         }
-        let Some(pane) = self
-            .layout
-            .focused()
-            .filter(|&pane| self.layout.session(pane) == Some(session))
-            .or_else(|| {
-                self.layout
-                    .visible()
-                    .into_iter()
-                    .find(|&pane| self.layout.session(pane) == Some(session))
-            })
-        else {
+        let Some(pane) = self.chat_pane(key) else {
             return;
         };
+        let session = key.1;
         let modes = self
             .live
             .get(&pane)
@@ -735,11 +743,11 @@ impl Shell {
         let krill_app::security::PastePlan::Immediate(mut bytes) =
             self.plan_terminal_paste(pane, text.as_bytes(), modes, cx)
         else {
-            self.chat.multiline_blocked.insert(session);
+            self.chat.multiline_blocked.insert(key.clone());
             cx.notify();
             return;
         };
-        self.chat.multiline_blocked.remove(&session);
+        self.chat.multiline_blocked.remove(key);
         if modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
             || text.contains(['\n', '\r'])
         {
@@ -757,11 +765,11 @@ impl Shell {
             return;
         }
         bytes.push(b'\r');
-        if self.send_to_session(session, &bytes, cx) {
+        if self.send_to_session(key, &bytes, cx) {
             Self::clear_sent_chat_draft(&input, &text, window, cx);
-            self.chat.prompt_failed.remove(&session);
+            self.chat.prompt_failed.remove(key);
         } else {
-            self.chat.prompt_failed.insert(session);
+            self.chat.prompt_failed.insert(key.clone());
         }
         cx.notify();
     }
@@ -787,7 +795,7 @@ impl Shell {
             return;
         }
         let answer_key = request.key.clone();
-        let Some(log) = self.chat.logs.get_mut(&request.session) else {
+        let Some(log) = self.chat.logs.get_mut(&request.chat_key()) else {
             return;
         };
         if log

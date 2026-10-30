@@ -1,5 +1,5 @@
 //! Paste submission waits for PTY receipts, then for the provider's user turn.
-use super::{Context, SessionId, Shell, TextareaState, Window};
+use super::{ChatKey, Context, SessionId, Shell, TextareaState, Window};
 use krill_proto::input::{Delivery, Receipt};
 use std::time::Duration;
 
@@ -24,6 +24,12 @@ struct Origin {
     item: usize,
 }
 
+impl Origin {
+    fn key(&self) -> ChatKey {
+        (self.host.clone(), self.session)
+    }
+}
+
 impl Shell {
     fn chat_prompt_current(&self, origin: &Origin, cx: &Context<Self>) -> bool {
         let Origin {
@@ -37,7 +43,7 @@ impl Shell {
         self.is_pane_chat_view(*pane, cx)
             && self.layout.host(*pane) == host
             && self.layout.session(*pane) == Some(*session)
-            && self.chat.logs.get(session).map_or(0, |log| log.epoch) == *epoch
+            && self.chat.logs.get(&origin.key()).map_or(0, |log| log.epoch) == *epoch
             && self.live.get(pane).is_some_and(|live| {
                 &live.target == target
                     && live.pane.session() == Some(*session)
@@ -77,7 +83,7 @@ impl Shell {
         if self.chat.send_input.is_some() {
             return self.chat.prompt_confirmed.unwrap_or(true);
         }
-        self.chat.logs.get(&origin.session).is_some_and(|log| {
+        self.chat.logs.get(&origin.key()).is_some_and(|log| {
             log.bound
                 && log.epoch == origin.epoch
                 && log.items.iter().enumerate().any(|(i, item)| {
@@ -88,12 +94,12 @@ impl Shell {
         })
     }
 
-    fn finish_chat_prompt(&mut self, session: SessionId, confirmed: bool, cx: &mut Context<Self>) {
-        self.chat.prompt_tasks.remove(&session);
+    fn finish_chat_prompt(&mut self, key: &ChatKey, confirmed: bool, cx: &mut Context<Self>) {
+        self.chat.prompt_tasks.remove(key);
         if confirmed {
-            self.chat.prompt_failed.remove(&session);
+            self.chat.prompt_failed.remove(key);
         } else {
-            self.chat.prompt_review.insert(session);
+            self.chat.prompt_review.insert(key.clone());
         }
         cx.notify();
     }
@@ -111,27 +117,26 @@ impl Shell {
             text,
             bytes,
         } = prompt;
+        let key = (self.layout.host(pane).clone(), session);
+        let log = self.chat.logs.get(&key);
         let origin = Origin {
             pane,
             session,
-            host: self.layout.host(pane).clone(),
+            host: key.0.clone(),
             target: self.live.get(&pane).and_then(|live| live.target.clone()),
-            epoch: self.chat.logs.get(&session).map_or(0, |log| log.epoch),
-            item: self
-                .chat
-                .logs
-                .get(&session)
-                .map_or(0, |log| log.base_index.saturating_add(log.items.len())),
+            epoch: log.map_or(0, |log| log.epoch),
+            item: log.map_or(0, |log| log.base_index.saturating_add(log.items.len())),
         };
         if !self.send_to_chat_pane(pane, session, &bytes, cx) {
-            self.chat.prompt_failed.insert(session);
+            self.chat.prompt_failed.insert(key);
             cx.notify();
             return;
         }
         let Some(receipt) = self.live.get(&pane).map(|live| live.pane.input_receipt()) else {
             return;
         };
-        self.chat.prompt_failed.remove(&session);
+        self.chat.prompt_failed.remove(&key);
+        let task_key = key.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             // Queue acceptance can precede the actual Windows pipe write by an
             // arbitrary interval. Start settling only after the Applied ACK.
@@ -153,7 +158,7 @@ impl Shell {
             }
             if !applied {
                 this.update_in(cx, |this, _, cx| {
-                    this.finish_chat_prompt(session, false, cx);
+                    this.finish_chat_prompt(&task_key, false, cx);
                 })
                 .ok();
                 return;
@@ -174,7 +179,7 @@ impl Shell {
                 .flatten();
             let Some(enter) = enter else {
                 this.update_in(cx, |this, _, cx| {
-                    this.finish_chat_prompt(session, false, cx);
+                    this.finish_chat_prompt(&task_key, false, cx);
                 })
                 .ok();
                 return;
@@ -211,7 +216,7 @@ impl Shell {
                     if confirmed {
                         this.update_in(cx, |this, window, cx| {
                             Self::clear_sent_chat_draft(&input, &text, window, cx);
-                            this.finish_chat_prompt(session, true, cx);
+                            this.finish_chat_prompt(&task_key, true, cx);
                         })
                         .ok();
                         return;
@@ -222,11 +227,11 @@ impl Shell {
             // Applied only proves a PTY write, never provider consumption. Keep
             // the draft and require review rather than replaying or adding Enter.
             this.update_in(cx, |this, _, cx| {
-                this.finish_chat_prompt(session, false, cx);
+                this.finish_chat_prompt(&task_key, false, cx);
             })
             .ok();
         });
-        self.chat.prompt_tasks.insert(session, task);
+        self.chat.prompt_tasks.insert(key, task);
         cx.notify();
     }
 }
