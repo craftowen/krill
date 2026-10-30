@@ -1123,6 +1123,21 @@ Host dev-box
     }
 
     #[test]
+    fn same_label_different_destination_keeps_both_hosts() {
+        let dir = std::env::temp_dir().join(format!("mk-same-label-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        add_host(Some(&dir), "집", "owen@10.0.0.5", None, None).unwrap();
+        let list = add_host(Some(&dir), "집", "owen@10.0.0.6", None, None).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_ne!(list[0].id, list[1].id);
+        let list = add_host(Some(&dir), "집", "owen@10.0.0.6", Some(2200), None).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].port, Some(2200));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn duplicate_hosts_keep_the_first_entry_per_machine() {
         let host = |id: &str, dest: &str| SshHost {
             id: id.into(),

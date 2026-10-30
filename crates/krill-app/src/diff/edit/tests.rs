@@ -1191,3 +1191,13 @@ fn hunk_and_line_patches_refuse_lossy_text() {
     assert!(build_hunk_patch(&raw, 0).is_none());
     assert!(build_line_patch(&raw, false, 1, 1, true).is_none());
 }
+
+#[test]
+fn lossy_hunk_does_not_block_clean_hunks_of_the_same_file() {
+    let head = "diff --git a/f b/f\n--- a/f\n+++ b/f\n";
+    let raw = format!("{head}@@ -1 +1 @@\n-a\n+\u{FFFD}\n@@ -10 +10 @@\n-c\n+d\n");
+    assert!(build_hunk_patch(&raw, 0).is_none());
+    assert!(build_hunk_patch(&raw, 1).is_some());
+    assert!(build_line_patch(&raw, false, 10, 10, true).is_some());
+    assert!(build_line_patch(&raw, false, 1, 1, true).is_none());
+}
