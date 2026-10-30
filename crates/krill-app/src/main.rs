@@ -397,15 +397,20 @@ fn init(cx: &mut App) {
     .detach();
     cx.bind_keys([
         // OWE-864: macOS 표준 창·앱 동작. 터미널 문맥 바인딩과 겹치지 않는 전역 키만 쓴다.
-        krill_app::keys::bind("cmd-h", HideApp, None),
-        krill_app::keys::bind("cmd-alt-h", HideOthers, None),
         krill_app::keys::bind("cmd-m", MinimizeWindow, None),
         krill_app::keys::bind("ctrl-cmd-f", ToggleFullscreen, None),
     ]);
     cx.on_action(|_: &NewWindow, cx| request_open_from_menu(None, cx));
-    cx.on_action(|_: &HideApp, cx| cx.hide());
-    cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
-    cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    #[cfg(target_os = "macos")]
+    {
+        cx.bind_keys([
+            krill_app::keys::bind("cmd-h", HideApp, None),
+            krill_app::keys::bind("cmd-alt-h", HideOthers, None),
+        ]);
+        cx.on_action(|_: &HideApp, cx| cx.hide());
+        cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    }
     cx.on_action(|_: &MinimizeWindow, cx| {
         if let Some(window) = cx.active_window() {
             window
@@ -482,6 +487,7 @@ fn refresh_menus(cx: &mut App) {
             .checked(secure),
         );
     }
+    #[cfg(target_os = "macos")]
     app_items.extend([
         MenuItem::separator(),
         // OWE-864: macOS 표준 가리기. `cx.hide` 계열이라 창이 없어도 동작한다.
@@ -491,6 +497,8 @@ fn refresh_menus(cx: &mut App) {
             HideOthers,
         ),
         MenuItem::action(krill_app::i18n::catalog::general::SHOW_ALL.get(), ShowAll),
+    ]);
+    app_items.extend([
         MenuItem::separator(),
         MenuItem::action(krill_app::i18n::catalog::general::QUIT.get(), shell::Quit),
     ]);

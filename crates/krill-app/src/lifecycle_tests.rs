@@ -68,9 +68,6 @@ fn owe864_native_menus_cover_edit_view_window_help(cx: &mut gpui::TestAppContext
             })
             .collect();
         for expected in [
-            gtext::HIDE_APP.get(),
-            gtext::HIDE_OTHERS.get(),
-            gtext::SHOW_ALL.get(),
             gtext::CLOSE_TAB.get(),
             gtext::CLOSE_PANE.get(),
             gtext::UNDO.get(),
@@ -92,12 +89,17 @@ fn owe864_native_menus_cover_edit_view_window_help(cx: &mut gpui::TestAppContext
         ] {
             assert!(labels.contains(&expected), "missing {expected}");
         }
+        for (label, action) in [
+            (gtext::HIDE_APP.get(), &HideApp as &dyn gpui::Action),
+            (gtext::HIDE_OTHERS.get(), &HideOthers),
+            (gtext::SHOW_ALL.get(), &ShowAll),
+        ] {
+            assert_eq!(labels.contains(&label), cfg!(target_os = "macos"));
+            assert_eq!(cx.is_action_available(action), cfg!(target_os = "macos"));
+        }
         // 창이 없어도 액션은 전역에 등록되어 있고, 창 동작은 조용히 무시된다.
         for action in [
-            &HideApp as &dyn gpui::Action,
-            &HideOthers,
-            &ShowAll,
-            &MinimizeWindow,
+            &MinimizeWindow as &dyn gpui::Action,
             &ZoomWindow,
             &ToggleFullscreen,
             &BringAllToFront,
@@ -105,7 +107,6 @@ fn owe864_native_menus_cover_edit_view_window_help(cx: &mut gpui::TestAppContext
         ] {
             assert!(cx.is_action_available(action));
         }
-        #[cfg(target_os = "macos")]
         let bound = |action: &dyn gpui::Action| {
             cx.key_bindings()
                 .borrow()
@@ -118,13 +119,17 @@ fn owe864_native_menus_cover_edit_view_window_help(cx: &mut gpui::TestAppContext
                 })
                 .collect::<Vec<_>>()
         };
-        #[cfg(target_os = "macos")]
-        {
+        if cfg!(target_os = "macos") {
             assert!(bound(&HideApp).contains(&"cmd-h".to_owned()));
             // `unparse`는 fn-ctrl-alt-cmd-shift- 순이라 `cmd-alt-h`는 `alt-cmd-h`가 된다.
             assert!(bound(&HideOthers).contains(&"alt-cmd-h".to_owned()));
             assert!(bound(&MinimizeWindow).contains(&"cmd-m".to_owned()));
             assert!(bound(&ToggleFullscreen).contains(&"ctrl-cmd-f".to_owned()));
+        } else {
+            assert!(bound(&HideApp).is_empty());
+            assert!(bound(&HideOthers).is_empty());
+            assert!(bound(&MinimizeWindow).contains(&"ctrl-shift-m".to_owned()));
+            assert!(bound(&ToggleFullscreen).contains(&"f11".to_owned()));
         }
     });
 }
