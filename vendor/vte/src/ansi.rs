@@ -367,6 +367,13 @@ impl<T: Timeout> Processor<T> {
         self.state.preceding_char
     }
 
+    /// mk-006 patch: release an idle sync buffer without resetting parser state.
+    pub fn mk_trim_sync_buffer(&mut self) {
+        if self.mk_is_quiescent() && self.state.sync_state.buffer.is_empty() {
+            self.state.sync_state.buffer.shrink_to_fit();
+        }
+    }
+
     /// Number of bytes in the synchronization buffer.
     #[inline]
     pub fn sync_bytes_count(&self) -> usize {
@@ -2402,6 +2409,58 @@ mod tests {
             assert_eq!(parser.state.sync_state.timeout.is_sync, 0);
             assert!(handler.attr.take().is_some());
         }
+    }
+
+    // mk-006 patch: buffer reclamation preserves REP and pending parser state.
+    #[test]
+    fn trim_sync_buffer_releases_capacity_and_keeps_repeat_character() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+        parser.advance(&mut handler, b"A ");
+        assert!(parser.state.sync_state.buffer.capacity() > 0);
+
+        parser.mk_trim_sync_buffer();
+
+        assert_eq!(parser.state.sync_state.buffer.capacity(), 0);
+        assert_eq!(parser.mk_preceding_char(), Some(' '));
+        assert!(parser.mk_is_quiescent());
+    }
+
+    #[test]
+    fn trim_sync_buffer_preserves_pending_synchronized_output() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+        parser.advance(&mut handler, b"A\x1b[?2026h\x1b[31m");
+        let pending = parser.state.sync_state.buffer.clone();
+        let capacity = parser.state.sync_state.buffer.capacity();
+
+        parser.mk_trim_sync_buffer();
+
+        assert_eq!(parser.state.sync_state.buffer, pending);
+        assert_eq!(parser.state.sync_state.buffer.capacity(), capacity);
+        assert!(!parser.mk_is_quiescent());
+        assert!(handler.attr.is_none());
+        parser.advance(&mut handler, b"\x1b[?2026l");
+        assert!(handler.attr.is_some());
+        assert!(parser.mk_is_quiescent());
+        parser.mk_trim_sync_buffer();
+        assert_eq!(parser.state.sync_state.buffer.capacity(), 0);
+    }
+
+    #[test]
+    fn trim_sync_buffer_preserves_partial_escape_sequence() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+        parser.advance(&mut handler, b"A\x1b[3");
+        let capacity = parser.state.sync_state.buffer.capacity();
+
+        parser.mk_trim_sync_buffer();
+
+        assert_eq!(parser.state.sync_state.buffer.capacity(), capacity);
+        assert!(!parser.mk_is_quiescent());
+        parser.advance(&mut handler, b"1m");
+        assert_eq!(handler.attr, Some(Attr::Foreground(Color::Named(NamedColor::Red))));
+        assert!(parser.mk_is_quiescent());
     }
 
     #[test]

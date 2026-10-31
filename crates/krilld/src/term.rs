@@ -692,8 +692,8 @@ impl Engine {
     }
 
     /// 숨긴 세션 강등(MK-035): 핫 스크롤백을 비워 메모리를 돌려주고 새 행을 쌓지 않는다. 화면·모드·제목·파서 꼬리는
-    /// 그대로다. 파서가 바닥 상태(sync 버퍼·미완성 제어열·UTF-8 꼬리 없음)일 때만 vte 파서를 새로 만들어 큰 sync 뒤
-    /// 남은 버퍼 용량도 돌려준다. 버린 행은 세그먼트(MK-024) 콜드 페이지에 있다.
+    /// 그대로다. 파서가 바닥 상태(sync 버퍼·미완성 제어열·UTF-8 꼬리 없음)일 때 빈 sync 버퍼의 용량만 돌려준다.
+    /// REP 직전 문자를 포함한 파서 상태는 유지한다. 버린 행은 세그먼트(MK-024) 콜드 페이지에 있다.
     pub(crate) fn demote(&mut self, look: &Appearance) {
         if !self.demoted {
             if !self.term.mode().contains(TermMode::ALT_SCREEN) {
@@ -707,9 +707,7 @@ impl Engine {
         // ponytail: 대체 화면 중에는 기본 화면 grid가 비활성이라 공개 API로 truncate할 수 없어 캐시가 최대 1,000행
         // 남는다. 대체 화면을 오래 쓰는 에이전트가 문제가 되면 좁은 포크(MK-006)로 비활성 grid도 자른다.
         self.term.grid_mut().truncate();
-        if self.capture_rewind() == 0 {
-            self.parser = Processor::new();
-        }
+        self.parser.mk_trim_sync_buffer();
     }
 
     /// 강등을 푼다: 핫 스크롤백을 다시 만들 때의 상한(≤ [`HOT_LINES`])까지 쌓는다(이전 행은 콜드 페이지로).
