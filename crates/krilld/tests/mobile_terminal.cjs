@@ -288,7 +288,26 @@ async function main(){
  await testLivePreviewAndHeldIme();
  // 스크롤 관성·휠 경로는 가상 시계를 performance.now에도 물려 결정적으로 검사한다.
  context.performance={now:()=>clock};try{await testTuiScrollRouting();await testShortCanvasScroll();await testScrollPhysics();await testHistoryRefreshMerge();await testInitialAndQueuedHistoryScroll();}finally{delete context.performance;}
+ await testKeyboardKeepsLiveView();
  console.log('All terminal adapter regression checks passed.');
+}
+async function testKeyboardKeepsLiveView(){
+ // 인라인 TUI가 화면 위쪽만 쓰면 키보드가 열려도 맨 아래(빈 행)로 갈 수 없다. 커서가 보이면 라이브다.
+ const {root,handle,socket}=await mount(2190,{preferences:{fitToPhone:false}}),port=find(root,'terminal-scroll'),latest=find(root,'terminal-latest');let top=0;
+ Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,port.scrollHeight-port.clientHeight));event(port,'scroll');}});
+ port.clientHeight=180;port.scrollHeight=432;
+ const cell=ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0)),row=(y,text)=>C.concat(T.v(2),T.v(y),T.v(text.length),...[...text].map(cell));
+ const paint=(line,...rows)=>socket.frame(0x21,T.v(1),T.v(1),T.v(1),T.v(rows.length+2),T.v(0),T.v(80),T.v(24),...rows,T.v(3),T.v(line),T.v(3),T.v(1));
+ context.requestAnimationFrame=fn=>context.setTimeout(fn,16);
+ viewport.height=844;event(viewport,'resize');await advance(32);assert.equal(root.dataset.keyboardOpen,'false');
+ paint(8,row(8,'> hi'),row(9,'----'),row(10,'status'));await advance(32);
+ viewport.height=444;event(viewport,'resize');await advance(32);assert.equal(root.dataset.keyboardOpen,'true');
+ assert.equal(top,18,'keyboard reveal keeps the rows under the cursor in view');assert.equal(latest.hidden,true,'a visible cursor is the live view');
+ port.scrollTop=220;assert.equal(latest.hidden,false,'scrolling the cursor away offers Latest output');
+ port.scrollTop=18;assert.equal(latest.hidden,true);
+ paint(20,row(20,'> hi'));await advance(32);assert.equal(latest.hidden,false,'output that moves the cursor away offers Latest output');
+ viewport.height=844;event(viewport,'resize');await advance(32);handle.unmount();delete context.requestAnimationFrame;
+ console.log('PASS open keyboard keeps the live view: rows under the cursor stay visible and Latest output stays hidden');
 }
 async function testInitialAndQueuedHistoryScroll(){
  // 1. Hidden mount (e.g. opened in Chat view) preloads 300 rows as soon as setVisible(true) is called.

@@ -846,7 +846,26 @@ impl Engine {
     }
 
     pub(crate) fn resize(&mut self, size: WinSize) {
+        let history = self.history_len();
         self.term.resize(Dims(size));
+        // 리플로우는 화면 아래가 비어 있어도 늘어난 행만큼 위쪽을 스크롤백으로 밀어낸다. 곧 화면을 다시 그리는
+        // 인라인 TUI에서는 그 행이 폭이 바뀔 때마다 헤더 조각으로 쌓이므로, 빈 행이 있는 만큼 화면으로 되돌린다.
+        let grid = self.term.grid();
+        let mut line = grid.bottommost_line();
+        let mut blank = 0;
+        while line > grid.cursor.point.line && grid[line].is_clear() {
+            blank += 1;
+            line -= 1;
+        }
+        let back = self.history_len().saturating_sub(history).min(blank);
+        if back > 0 {
+            // 행을 늘리면 스크롤백에서 끌어오고, 커서가 위에 있으니 줄이면 맨 아래 빈 행만 떨어진다.
+            let rows = size
+                .rows
+                .saturating_add(u16::try_from(back).unwrap_or(u16::MAX));
+            self.term.resize(Dims(WinSize { rows, ..size }));
+            self.term.resize(Dims(size));
+        }
     }
 
     /// Rebase the harvesting replay view onto the authoritative raw replay state.

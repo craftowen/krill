@@ -985,7 +985,7 @@ globalThis.MkTerminalCodec = (() => {
           this.historyScrollAt = now;
           lastTop = top;
           this.stick = this.atBottom(1);
-          this.latestButton.hidden = this.stick;
+          this.syncLatest();
           this.syncQuestion();
           if (refresh || (up && top < this.historyThreshold()))
             this.guard(() => this.loadHistory(false, refresh));
@@ -2788,6 +2788,19 @@ globalThis.MkTerminalCodec = (() => {
         p.scrollHeight - p.scrollTop - p.clientHeight < slack
       );
     }
+    // 키보드가 열려도 화면 행 수는 그대로라 맨 아래로 내려갈 수 없다. 이때는 커서가 보이면 라이브를 보는 중이다.
+    syncLatest() {
+      const c = this.model.cursor,
+        p = this.port,
+        top = (this.canvas.offsetTop || 0) + (c?.line ?? 0) * this.cellHeight;
+      this.latestButton.hidden =
+        !this.historyWindowed &&
+        (this.stick ||
+          (this.root.dataset.keyboardOpen === "true" &&
+            !!c?.visible &&
+            top >= p.scrollTop &&
+            top + this.cellHeight <= p.scrollTop + p.clientHeight));
+    }
     returnToLive() {
       if (this.historyWindowed) {
         this.resetHistory();
@@ -3052,11 +3065,18 @@ globalThis.MkTerminalCodec = (() => {
       const c = this.model.cursor,
         p = this.port;
       if (this.disposed || !c?.visible) return;
-      const top = (this.canvas.offsetTop || 0) + c.line * this.cellHeight,
-        bottom = top + this.cellHeight;
-      if (top < p.scrollTop) p.scrollTop = top;
-      else if (bottom > p.scrollTop + p.clientHeight)
-        p.scrollTop = bottom - p.clientHeight;
+      // 커서 아래의 입력창 테두리·상태줄까지 보여 주되 커서는 가리지 않는다.
+      let last = this.model.lines - 1;
+      while (
+        last > c.line &&
+        !this.model.rows[last]?.some((cell) => cell.text.trim())
+      )
+        last--;
+      const origin = this.canvas.offsetTop || 0,
+        top = origin + c.line * this.cellHeight,
+        bottom = origin + (last + 1) * this.cellHeight;
+      if (top < p.scrollTop || bottom > p.scrollTop + p.clientHeight)
+        p.scrollTop = Math.min(top, bottom - p.clientHeight);
     }
     input(text, { reveal = true, question = false } = {}) {
       if (this.disposed || this.retired || !this.ready)
@@ -3528,7 +3548,7 @@ globalThis.MkTerminalCodec = (() => {
         this.port.scrollTop = 0;
         this.stick = false;
       }
-      this.latestButton.hidden = this.stick && !this.historyWindowed;
+      this.syncLatest();
 
       const queued = this.historyQueued;
       this.historyQueued = null;
@@ -3707,8 +3727,10 @@ globalThis.MkTerminalCodec = (() => {
         if (this.cursorLine != null) dirty.add(this.cursorLine);
         if (cursor) dirty.add(cursor.line);
       }
+      const moved = cursorKey !== this.cursorKey;
       this.cursorKey = cursorKey;
       this.cursorLine = cursor?.line;
+      if (moved) this.syncLatest();
       ctx.fillStyle = "#1a1b26";
       if (full) ctx.fillRect(0, 0, cssW, cssH);
       else

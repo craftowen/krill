@@ -1,6 +1,6 @@
 //! Display metadata from the selected transcript and its launch account's model catalog.
 use super::composer::Context;
-use super::{Path, Value, fs, io, json};
+use super::{Value, fs, io, json};
 use krill_proto::agent_history::ChatPollSnapshot;
 use std::io::{Read as _, Seek as _, SeekFrom};
 
@@ -68,11 +68,7 @@ fn observe(record: &Value, state: &mut Value) {
     }
 }
 
-pub(super) fn read(
-    snapshot: &ChatPollSnapshot,
-    context: &Context,
-    state_dir: Option<&Path>,
-) -> io::Result<Value> {
+pub(super) fn read(snapshot: &ChatPollSnapshot, context: &Context) -> io::Result<Value> {
     let agent = context.agent.as_str();
     let mut state =
         json!({"agent":agent,"model":null,"effort":null,"context":null,"models":[],"efforts":[]});
@@ -92,32 +88,6 @@ pub(super) fn read(
             if let Ok(record) = serde_json::from_str::<Value>(line) {
                 observe(&record, &mut state);
             }
-        }
-    }
-    let profile = context
-        .config
-        .clone()
-        .unwrap_or_else(|| context.home.join(".claude"));
-    if agent == "claude"
-        && krill_proto::agent::canonical_id(&snapshot.agent) == agent
-        && snapshot.bound
-        && let Some(observed) = state_dir.and_then(|dir| {
-            krill_proto::statusline::context::read(dir, &profile, &snapshot.session_id)
-        })
-        && (state.get("model").is_none_or(Value::is_null)
-            || state.get("model").and_then(Value::as_str) == observed.model.as_deref())
-    {
-        if let Some(model) = observed.model {
-            set(&mut state, "model", model.into());
-        }
-        if let Some(effort) = observed.effort {
-            set(&mut state, "effort", effort.into());
-        }
-        if let Some(percent) = observed
-            .percent
-            .filter(|n| n.is_finite() && (0.0..=100.0).contains(n))
-        {
-            set(&mut state, "context", json!({"percent":percent}));
         }
     }
     Ok(state)

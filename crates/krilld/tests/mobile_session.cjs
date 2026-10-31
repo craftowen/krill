@@ -3092,7 +3092,6 @@ async function testHybridChatToggleAndQuestionCards() {
   diffBtn.action();
   await flush();
   assert(calls.some((c) => c.action === "git" && c.path === "src/lib.rs"));
-  const rawBtn = buttons.find((b) => b.className?.includes("chat-raw-btn"));
   buttons.find((b) => b.textContent === "Terminal actions").action();
   const selectTextEntry = sheets
     .at(-1)
@@ -3129,7 +3128,7 @@ async function testHybridChatToggleAndQuestionCards() {
     root.descendants().find((n) => n.className === "chat-card chat-question"),
     preparedQuestion,
   );
-  rawBtn.action();
+  toggleBtn.action();
   assert.equal(toggleBtn.textContent, "Chat");
   toggleBtn.action();
   assert.equal(

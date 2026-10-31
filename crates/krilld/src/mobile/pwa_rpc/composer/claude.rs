@@ -1,7 +1,141 @@
-//! Verified Claude 2.1.311 native aliases. Discovery is read-only; native /model may save its default.
-use super::{Context, Duration, Instant, Value, io, json, native, read};
-use crate::session::Tap;
+//! Claude native aliases, from 2.1.311. Discovery is read-only; native /model may save its default.
+use super::{
+    Adapter, ChatPollSnapshot, Context, Discovered, Duration, Instant, Live, Tap, Value, io, json,
+    native, read, set,
+};
 use krill_proto::screen::{Flags, Screen};
+use native::border;
+
+const BANNER: &str = "Claude Code v";
+const FLOOR: &[u64] = &[2, 1, 311];
+const EFFORT_FLOOR: &[u64] = &[2, 1, 314];
+const WAIT: &str =
+    "Wait for an idle Claude Code 2.1.311 or later chat with an empty native composer";
+
+pub(super) struct Claude;
+
+impl Adapter for Claude {
+    fn catalog(&self, context: &Context) -> Value {
+        let mut models = Discovered::default();
+        let root = context
+            .config
+            .clone()
+            .unwrap_or_else(|| context.home.join(".claude"));
+        for path in [
+            root.join("settings.json"),
+            context.cwd.join(".claude/settings.json"),
+            context.cwd.join(".claude/settings.local.json"),
+        ] {
+            if let Some(settings) = read(&path).and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            {
+                if let Some(id) = settings.get("model").and_then(Value::as_str) {
+                    models.add(id, id, None);
+                }
+                for id in settings
+                    .get("availableModels")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .take(128)
+                {
+                    models.add(id, id, None);
+                }
+            }
+        }
+        for (key, id) in &context.env {
+            if key == "ANTHROPIC_MODEL"
+                || key.starts_with("ANTHROPIC_DEFAULT_") && key.ends_with("_MODEL")
+            {
+                models.add(id, id, None);
+            }
+        }
+        models.into_catalog("claude", "This running Claude Code session does not expose verified model control. Configured models are shown for reference; no model was changed.")
+    }
+
+    fn control(&self, context: &Context, live: &Live<'_>, catalog: &mut Value) {
+        match live.tap().and_then(|tap| models(context, &tap)) {
+            Ok(native) => *catalog = native,
+            Err(error) => set(catalog, "reason", error.to_string().into()),
+        }
+    }
+
+    fn set_model(
+        &self,
+        context: &Context,
+        live: &Live<'_>,
+        model: &str,
+        effort: Option<&str>,
+    ) -> io::Result<Value> {
+        if effort.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Choose Claude effort separately from the model",
+            ));
+        }
+        set_model(context, &live.tap()?, model)
+    }
+
+    fn set_effort(&self, _context: &Context, live: &Live<'_>, effort: &str) -> io::Result<Value> {
+        set_effort(&live.tap()?, effort)
+    }
+
+    fn observe(
+        &self,
+        context: &Context,
+        live: &Live<'_>,
+        _catalog: &Value,
+        snapshot: &ChatPollSnapshot,
+        status: &mut Value,
+    ) {
+        observe_statusline(context, live, snapshot, status);
+        let effort_supported = status.get("supported").and_then(Value::as_bool) == Some(true)
+            && live
+                .tap()
+                .is_ok_and(|tap| effort_available(&tap.capture().0));
+        set(status, "effort_supported", effort_supported.into());
+        if effort_supported {
+            set(
+                status,
+                "efforts",
+                json!(["low", "medium", "high", "xhigh", "max"]),
+            );
+        }
+    }
+}
+
+fn observe_statusline(
+    context: &Context,
+    live: &Live<'_>,
+    snapshot: &ChatPollSnapshot,
+    status: &mut Value,
+) {
+    let profile = context
+        .config
+        .clone()
+        .unwrap_or_else(|| context.home.join(".claude"));
+    if krill_proto::agent::canonical_id(&snapshot.agent) == "claude"
+        && snapshot.bound
+        && let Some(observed) = live.backend.dir.as_deref().and_then(|dir| {
+            krill_proto::statusline::context::read(dir, &profile, &snapshot.session_id)
+        })
+        && (status.get("model").is_none_or(Value::is_null)
+            || status.get("model").and_then(Value::as_str) == observed.model.as_deref())
+    {
+        if let Some(model) = observed.model {
+            set(status, "model", model.into());
+        }
+        if let Some(effort) = observed.effort {
+            set(status, "effort", effort.into());
+        }
+        if let Some(percent) = observed
+            .percent
+            .filter(|n| n.is_finite() && (0.0..=100.0).contains(n))
+        {
+            set(status, "context", json!({"percent":percent}));
+        }
+    }
+}
 
 const ALIASES: &[(&str, &str)] = &[
     ("default", "Default (recommended)"),
@@ -12,16 +146,7 @@ const ALIASES: &[(&str, &str)] = &[
 ];
 
 fn verified(screen: &Screen) -> bool {
-    screen.rows.iter().enumerate().any(|(y, _)| {
-        ["Claude Code v2.1.311", "Claude Code v2.1.314"]
-            .iter()
-            .any(|version| native::row(screen, y).ends_with(version))
-    })
-}
-
-fn border(screen: &Screen, y: usize) -> bool {
-    let row = native::row(screen, y);
-    row.chars().count() >= 20 && row.chars().all(|c| c == '─')
+    native::banner_meets(screen, BANNER, FLOOR)
 }
 
 fn composer(screen: &Screen, command: Option<&str>) -> bool {
@@ -93,19 +218,17 @@ fn choices(context: &Context) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-pub(super) fn models(context: &Context, tap: &Tap) -> io::Result<Value> {
+fn models(context: &Context, tap: &Tap) -> io::Result<Value> {
     let (screen, _, _) = tap.capture();
     if !verified(&screen) || !composer(&screen, None) {
-        return Err(io::Error::other(
-            "Wait for an idle Claude Code 2.1.311 or 2.1.314 chat with an empty native composer",
-        ));
+        return Err(io::Error::other(WAIT));
     }
     Ok(
         json!({"agent":"claude","supported":true,"current":null,"items":choices(context).iter().map(|(id,label)|json!({"id":id,"label":label})).collect::<Vec<_>>(),"truncated":false,"reason":"Changes the model in this running Claude chat. Claude also saves its default for new sessions.","note":"Claude also saves this as the default for new sessions."}),
     )
 }
 
-pub(super) fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Value> {
+fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Value> {
     let choices = choices(context);
     let Some((_, label)) = choices.iter().find(|(alias, _)| *alias == id) else {
         return Err(io::Error::new(
@@ -115,9 +238,7 @@ pub(super) fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Va
     };
     let (before, revision, seq) = tap.capture();
     if !verified(&before) || !composer(&before, None) {
-        return Err(io::Error::other(
-            "Wait for an idle Claude Code 2.1.311 or 2.1.314 chat with an empty native composer",
-        ));
+        return Err(io::Error::other(WAIT));
     }
     let command = format!("/model {id}");
     tap.guarded_command(revision.0, command.as_bytes(), |screen, pasted| {
@@ -129,7 +250,7 @@ pub(super) fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Va
         let (screen, after, _) = tap.capture();
         if after.0 > revision.0
             && composer(&screen, None)
-            && confirmed(&screen, label)
+            && confirmed(&screen, &command, label)
             && native::contains_phrase(&native::fresh_text(tap, seq.0), "Set model to")
         {
             return Ok(json!({"applied":true,"supported":true,"model":id}));
@@ -141,18 +262,14 @@ pub(super) fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Va
 }
 
 fn effort_version(screen: &Screen) -> bool {
-    screen
-        .rows
-        .iter()
-        .enumerate()
-        .any(|(y, _)| native::row(screen, y).ends_with("Claude Code v2.1.314"))
+    native::banner_meets(screen, BANNER, EFFORT_FLOOR)
 }
 
-pub(super) fn effort_available(screen: &Screen) -> bool {
+fn effort_available(screen: &Screen) -> bool {
     effort_version(screen) && composer(screen, None)
 }
 
-pub(super) fn set_effort(tap: &Tap, effort: &str) -> io::Result<Value> {
+fn set_effort(tap: &Tap, effort: &str) -> io::Result<Value> {
     if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -174,27 +291,32 @@ pub(super) fn set_effort(tap: &Tap, effort: &str) -> io::Result<Value> {
     )
 }
 
-fn confirmed(screen: &Screen, label: &str) -> bool {
-    let Some(row) = screen
-        .rows
+/// The newest prompt row must be this command's echo, which rules out an older confirmation. The
+/// text below it runs on through a wrapped confirmation and the effort indicator.
+fn confirmed(screen: &Screen, command: &str, label: &str) -> bool {
+    let rows: Vec<_> = (0..usize::from(screen.cursor.line).saturating_sub(1))
+        .map(|y| native::row(screen, y))
+        .collect();
+    let Some((echo, output)) = rows
         .iter()
-        .take(usize::from(screen.cursor.line).saturating_sub(1))
-        .rev()
-        .map(|cells| cells.iter().map(|c| c.ch).collect::<String>())
-        .find(|row| !row.trim().is_empty())
+        .rposition(|row| row.starts_with('❯'))
+        .and_then(|echo| rows.get(echo..))
+        .and_then(<[String]>::split_first)
     else {
         return false;
     };
-    let row = row.split_whitespace().collect::<Vec<_>>().join(" ");
+    let output = native::words(output);
     let label = label.strip_suffix(" (recommended)").unwrap_or(label);
-    let Some(rest) = row
+    let Some(rest) = output
         .strip_prefix("⎿ Set model to ")
         .and_then(|value| value.strip_prefix(label))
     else {
         return false;
     };
-    (rest.starts_with(' ') || rest.starts_with('('))
-        && (row.contains("default for new sessions") || row.contains("for this session only"))
+    echo.split_whitespace()
+        .eq(format!("❯ {command}").split_whitespace())
+        && (rest.starts_with(' ') || rest.starts_with('('))
+        && (output.contains("default for new sessions") || output.contains("for this session only"))
 }
 
 #[cfg(test)]

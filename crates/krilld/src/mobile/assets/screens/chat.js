@@ -138,6 +138,9 @@
             ? "Ran {0} command(s)"
             : "Did {0} other step(s)";
   }
+  function toolDetail(item) {
+    return String(item.title || item.file_path || item.text || "").trim().split("\n", 1)[0];
+  }
   const cacheLimit = 8,
     cacheByteLimit = 8 * 1024 * 1024,
     pageLimit = 2048,
@@ -194,13 +197,8 @@
       strip = el("div", undefined, "chat-live-strip"),
       composer = el("form", undefined, "chat-composer");
     const stripBadge = el("span", "IDLE", "badge"),
-      stripText = el("span", "", "chat-live-text"),
-      rawBtn = button(
-        t("Term →"),
-        () => onSwitchTerm?.(),
-        "ghost small chat-raw-btn",
-      );
-    strip.append(stripBadge, stripText, rawBtn);
+      stripText = el("span", "", "chat-live-text");
+    strip.append(stripBadge, stripText);
     const history = el("div", undefined, "chat-actions chat-history"),
       historyText = el("span", undefined, "muted");
     const earlierBtn = button(
@@ -401,7 +399,7 @@
       modelEffort = el("span", undefined, "composer-model-effort"),
       contextMeter = el("span", undefined, "composer-context"),
       contextRing = el("span", undefined, "composer-context-ring"),
-      contextText = el("span", "?");
+      contextText = el("span");
     contextMeter.setAttribute("role", "img");
     contextMeter.append(contextRing, contextText);
     const suggestions = el("div", undefined, "chat-composer-suggestions"),
@@ -439,12 +437,7 @@
       quick.replaceChildren(svg);
       bar.append(quick);
     }
-    const statusRow = el("div", undefined, "chat-composer-status"),
-      actionsRow = el("div", undefined, "chat-composer-actions");
-    actionsRow.append(...Array.from(bar.children));
-    statusRow.append(modelBtn, contextMeter);
-    actionsRow.append(el("span", undefined, "composer-spacer"), sendBtn);
-    bar.replaceChildren(statusRow, actionsRow);
+    bar.append(modelBtn, contextMeter, sendBtn);
     box.append(suggestions, input, bar);
     composer.append(receipt, attachment, box);
     globalThis.MkKeyboard?.keepFocus(composer, ctx.signal);
@@ -774,6 +767,9 @@
         applyModel(token.model, choice.id); return;
       }
       if (token.kind === "models") {
+        if (choice.efforts?.length === 1 && !choice.effortOnly) {
+          applyModel(choice, choice.efforts[0]); return;
+        }
         if (choice.efforts?.length) {
           picker = {kind:"efforts", scope:token.scope, model:choice.effortOnly ? null : choice};
           paintChoices(choice.efforts.map(effort => ({id:effort,label:effort}))); return;
@@ -888,7 +884,7 @@
             efforts: status?.effort_supported ? status.models?.find(model => model.id === item.id)?.efforts || [] : [],
           }));
         const efforts = status?.models?.find(model => model.id === status.model)?.efforts || status?.efforts || [];
-        if (status?.effort_supported && efforts.length) modelChoices.push({id:"effort", label:t("Effort"), effortOnly:true, efforts});
+        if (status?.effort_supported && efforts.length > 1) modelChoices.push({id:"effort", label:t("Effort"), effortOnly:true, efforts});
         paintChoices(
           modelChoices,
           models.length
@@ -943,7 +939,7 @@
             agent: chatAgent(),
             scope: context,
             id,
-            label: id === choice?.id ? choice.label : id,
+            label: result.label || (id === choice?.id ? choice.label : id),
             statusBefore: entry.composerStatus?.model,
           };
           entry.composerStatusAt = 0;
@@ -997,22 +993,24 @@
         agent = chatAgent(),
         status = entry.composerStatus?.agent === agent ? entry.composerStatus : null,
         currentModel = entry.model?.agent === agent && entry.model.scope === context ? entry.model.label : null,
-        label = capability("chat_composer") ? `${currentModel || status?.model || t("Model unknown")} · ${status?.effort || t("Effort unknown")}` : currentModel || t("Model");
+        modelText = currentModel || status?.model_label || status?.model || t("Model unknown"),
+        label = capability("chat_composer") ? `${modelText} · ${status?.effort || t("Effort unknown")}` : currentModel || t("Model");
       shell.dataset.composerStatus = String(capability("chat_composer"));
       if ((modelBtn.getAttribute ? modelBtn.getAttribute("aria-label") : modelBtn.attrs?.["aria-label"]) !== label) modelBtn.setAttribute("aria-label", label);
       if (capability("chat_composer")) {
-        modelName.textContent = currentModel || status?.model || t("Model unknown");
+        modelName.textContent = modelText;
         modelEffort.textContent = `· ${status?.effort || t("Effort unknown")}`;
         if (modelName.parentElement !== modelBtn) modelBtn.replaceChildren(modelName, modelEffort);
       } else if (modelBtn.textContent !== label) modelBtn.textContent = label;
       modelBtn.title = label;
-      contextMeter.hidden = !capability("chat_composer");
-      const percent = !entry.model || matchesModel(agent, entry.model.id, status?.model) ? status?.context?.percent : undefined, known = typeof percent === "number" && Number.isFinite(percent), usage = known ? Math.round(Math.max(0,Math.min(100,percent))) : null;
-      contextMeter.dataset.known = String(known);
-      contextText.textContent = known ? `${usage}%` : "?";
-      contextRing.style.background = known ? `conic-gradient(var(--foreground) ${usage}%, var(--border) 0)` : "var(--border)";
-      const description = known ? t("Context used {0}%", usage) : t("Context usage unknown");
-      contextMeter.title = description; contextMeter.setAttribute("aria-label",description);
+      const percent = !entry.model || matchesModel(agent, entry.model.id, status?.model) ? status?.context?.percent : undefined, known = typeof percent === "number" && Number.isFinite(percent);
+      contextMeter.hidden = !known;
+      if (known) {
+        const usage = Math.round(Math.max(0,Math.min(100,percent))), description = t("Context used {0}%", usage);
+        contextText.textContent = `${usage}%`;
+        contextRing.style.background = `conic-gradient(var(--foreground) ${usage}%, var(--border) 0)`;
+        contextMeter.title = description; contextMeter.setAttribute("aria-label",description);
+      }
       modelBtn.hidden = !agent || !capability("composer_models");
       modelBtn.disabled =
         !!entry.modelPending ||
@@ -1644,6 +1642,7 @@
             run.pending.push(pair);
             if (callId) run.calls.set(String(callId), pair);
             run.count++;
+            run.detail = toolDetail(item) || run.detail;
             const step = toolStep(item.tool_name);
             run.steps.set(step, (run.steps.get(step) || 0) + 1);
           } else {
@@ -1679,6 +1678,7 @@
               ? t(run.errors ? "Tool error" : "Tool activity")
               : "",
             ...[...run.steps].map(([step, n]) => t(step, n)),
+            run.detail,
           ]
             .filter(Boolean)
             .join(" · ");
@@ -1981,6 +1981,8 @@
       const sess = state.sessions?.get(sessionId),
         progress = entry.progress;
       const currentItems = entry.live?.items || entry.items;
+      if (progress?.phase === "accepted" && sess?.state === "Working")
+        progress.confirmed = true;
       if (
         progress?.canConfirm &&
         !progress.confirmed &&
@@ -2087,9 +2089,11 @@
           state.connection?.phase === "ready" &&
           !["Waiting", "Blocked", "Working"].includes(status),
         anchor = strip.hidden !== hidden ? readerAnchor() : null;
-      stripBadge.textContent = t(status);
+      const badge = t(status),
+        bare = (text) => text.replace(/[….]+$/, "");
+      stripBadge.textContent = badge;
       stripBadge.dataset.state = status;
-      stripText.textContent = message;
+      stripText.textContent = bare(message) === bare(badge) ? "" : message;
       strip.hidden = hidden;
       strip.setAttribute("role", "status");
       strip.setAttribute("aria-live", "polite");

@@ -1905,7 +1905,7 @@ pub(crate) mod agy {
     }
 
     /// agy 한 번 실행. 타임아웃·출력 상한을 지킨다. 파이프 교착을 피하려고 stdout은 별도 스레드에서 읽는다.
-    fn run_agy(
+    pub(crate) fn run_agy(
         exe: &Path,
         args: &[String],
         ssh_connection: bool,
@@ -2260,14 +2260,14 @@ pub(crate) mod agy {
 
 /// `PATH`에서 agy를 찾는다(테스트·오프라인에서는 호출하지 않는다).
 #[cfg(not(test))]
-fn agy_exe() -> Option<PathBuf> {
+pub(crate) fn agy_exe() -> Option<PathBuf> {
     use krill_proto::os::ffi::OsStrExt as _;
     let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
     krill_proto::agent::which("agy", path)
 }
 
 #[cfg(test)]
-fn agy_exe() -> Option<PathBuf> {
+pub(crate) fn agy_exe() -> Option<PathBuf> {
     None
 }
 

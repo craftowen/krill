@@ -1018,3 +1018,53 @@ fn cold_keyframe_does_not_turn_implicit_cursor_into_explicit_default() {
         );
     }
 }
+
+#[test]
+fn narrowing_keeps_wrapped_rows_on_screen_while_blank_rows_remain() {
+    let look = Appearance::load(PathBuf::new());
+    let screen = |engine: &Engine| -> Vec<String> {
+        let grid = engine.term.grid();
+        (0..grid.screen_lines())
+            .map(|y| {
+                let line = Line(i32::try_from(y).unwrap_or(i32::MAX));
+                grid[line]
+                    .into_iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    };
+    let rule = "=".repeat(20);
+
+    // Inline TUIs (agy) repaint after a resize, so a pushed header would pile up per width change.
+    let mut engine = Engine::new(WinSize { cols: 20, rows: 6 });
+    engine.feed(
+        format!("top\r\n{rule}\r\nprompt").as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    engine.resize(WinSize { cols: 10, rows: 6 });
+    assert_eq!(engine.history_len(), 0);
+    engine.feed(b"!", Feed::Live, &look);
+    assert_eq!(
+        screen(&engine),
+        ["top", "==========", "==========", "prompt!", "", ""]
+    );
+
+    // A repaint request after the resize leaves nothing behind in the scrollback.
+    engine.feed(b"\x1b[2J\x1b[3J\x1b[Hframe", Feed::Live, &look);
+    assert_eq!(engine.history_rows(0, 10).0, 0);
+
+    // Without blank rows below the cursor the top row really has no room left.
+    let mut full = Engine::new(WinSize { cols: 20, rows: 3 });
+    full.feed(
+        format!("top\r\n{rule}\r\nprompt").as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    full.resize(WinSize { cols: 10, rows: 3 });
+    assert_eq!(full.history_len(), 1);
+    assert_eq!(screen(&full), ["==========", "==========", "prompt"]);
+}

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use krill_proto::agent_history::{
     ChatItem, ChatItemKind, ChatPollSnapshot, ChatQuestionOption, MAX_CHAT_ITEMS, MAX_CHAT_TEXT,
-    MAX_QUESTION_OPTIONS, MAX_TEXT, VaultAgent,
+    MAX_QUESTION_OPTIONS, MAX_TEXT, VaultAgent, is_claude_mem_cwd, is_claude_mem_project_dir,
 };
 use serde_json::Value;
 
@@ -1261,7 +1261,10 @@ fn find_newest_transcript_by_cwd(
                 if !budget.take() {
                     break;
                 }
-                if !proj.file_type().is_ok_and(|t| t.is_dir()) {
+                if !proj.file_type().is_ok_and(|t| t.is_dir())
+                    || (!is_claude_mem_cwd(norm_cwd)
+                        && is_claude_mem_project_dir(&proj.file_name().to_string_lossy()))
+                {
                     continue;
                 }
                 let Ok(files) = fs::read_dir(proj.path()) else {

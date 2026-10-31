@@ -2008,7 +2008,12 @@ async function composerProgress() {
         };
   f.input("Review this");
   f.submit();
-  assert.equal(f.find("chat-live-text").textContent, "Sending…");
+  assert.equal(f.find("badge").textContent, "Sending");
+  assert.equal(
+    f.find("chat-live-text").textContent,
+    "",
+    "the badge already says it",
+  );
   assert.equal(f.find("chat-send-receipt").hidden, false);
   assert(f.find("chat-send-receipt").textContent.includes("Review this"));
   await flush();
@@ -2024,7 +2029,17 @@ async function composerProgress() {
   sess.state_since_unix_ns = "2";
   f.update();
   await flush();
-  assert.equal(f.find("chat-live-text").textContent, "Working");
+  assert.equal(f.find("badge").textContent, "Working");
+  assert.equal(
+    f.find("chat-live-text").textContent,
+    "",
+    "the badge already says it",
+  );
+  assert.equal(
+    f.find("chat-send-receipt").hidden,
+    true,
+    "a working agent has picked up the message",
+  );
   await f.poll({
     generation: "g1",
     bound: true,

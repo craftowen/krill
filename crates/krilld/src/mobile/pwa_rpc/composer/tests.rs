@@ -91,7 +91,7 @@ fn agy_config_env_and_changed_provider_do_not_reuse_wrong_account() {
 }
 
 #[test]
-fn observed_known_provider_wins_over_shell_wrapper_and_version_metadata_is_bound() {
+fn observed_known_provider_wins_over_shell_wrapper() {
     let agents = Agents::load(Some(
         "[agent.claude]\nname='Wrapped Claude'\nlaunch=['/bin/sh']\n",
     ))
@@ -105,23 +105,6 @@ fn observed_known_provider_wins_over_shell_wrapper_and_version_metadata_is_bound
         |_| None,
     );
     assert_eq!(ctx.agent, "claude");
-    let path = std::env::temp_dir().join(format!(
-        "krill-composer-version-{}.jsonl",
-        std::process::id()
-    ));
-    fs::write(
-        &path,
-        r#"{"type":"session_meta","payload":{"id":"bound-session","cli_version":"0.164.0"}}
-{"type":"message","content":"private body"}"#,
-    )
-    .unwrap();
-    let mut launch = stored("codex", None);
-    launch.transcript_path = Some(path.to_str().unwrap().into());
-    launch.session_id = Some("bound-session".into());
-    assert!(verified_codex_transcript(&launch));
-    launch.session_id = Some("different-session".into());
-    assert!(!verified_codex_transcript(&launch));
-    fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -161,7 +144,6 @@ fn model_discovery_uses_account_and_never_claims_config_is_current_or_applied() 
         agent: "codex".into(),
         config: Some(root.join("account")),
         env: BTreeMap::new(),
-        verified_codex: false,
     };
     let value = ctx.models();
     assert_eq!(value["supported"], false);
@@ -188,9 +170,6 @@ fn reasoning_choices_are_model_scoped_and_reject_command_text() {
         assert!(validate_effort(&catalog, "observed-model", Some(effort)).is_err());
     }
     assert!(validate_effort(&catalog, "other-model", Some("max")).is_ok());
-    assert!(codex_version("0.164.0"));
-    assert!(codex_version("0.165.0"));
-    assert!(!codex_version("0.166.0"));
 }
 
 #[test]
