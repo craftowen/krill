@@ -489,6 +489,10 @@ catalog! {
         DETAILS => ("자세히", "Details"),
         HOOK_CONFIRM => ("설치 확정", "Confirm install"),
         FIX_ALL => ("모두 자동 설정", "Auto-setup all"),
+        ERROR_CONSENT_TITLE => ("오류 보고를 보낼까요?", "Send error reports?"),
+        ERROR_CONSENT_DESC => ("켜면 오류 코드·버전·OS 정보만 서버에 보냅니다. 프롬프트·터미널 출력·계정 정보·원본 로그는 보내지 않습니다. 기본은 꺼짐이며, 설정 > Resources에서 언제든 바꿀 수 있습니다.", "When enabled, sends only error codes, versions and OS information. Prompts, terminal output, account information and raw logs are never sent. Off by default; you can change it anytime in Settings > Resources."),
+        ERROR_CONSENT_ENABLE => ("보내기 켜기", "Turn on"),
+        ERROR_CONSENT_DECLINE => ("보내지 않기", "Keep off"),
     }
     setup_actions {
         MOVE_TITLE => ("Krill을 응용 프로그램으로 이동", "Move Krill to Applications"),
