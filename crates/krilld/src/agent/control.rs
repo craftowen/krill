@@ -90,6 +90,10 @@ impl Control {
         lock(&self.rate_limited).remove(&session)
     }
 
+    pub fn is_rate_limited(&self, session: SessionId) -> bool {
+        lock(&self.rate_limited).contains(&session)
+    }
+
     pub fn watch_account_resume(&self, session: SessionId) {
         lock(&self.account_resumes).insert(session, None);
     }
@@ -239,6 +243,7 @@ impl Control {
             .join(format!("{}.json", session.0)))
     }
 
+    #[cfg(all(test, unix))]
     pub fn has(&self, session: SessionId) -> bool {
         self.launch_path(session).is_ok_and(|p| p.exists())
     }

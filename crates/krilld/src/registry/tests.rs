@@ -331,6 +331,13 @@ fn closed_session_leaves_list_only_after_release_reaches_holder() {
 
     use krill_proto::holder::{FromHolder, VERSION};
 
+    let reservation_dir = std::env::temp_dir().join(format!(
+        "krill-reservation-closed_session_l-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&reservation_dir).ok();
+    fs::create_dir_all(&reservation_dir).unwrap();
+
     let (krilld_end, mut holder_end) = UnixStream::pair().unwrap();
     for m in [
         FromHolder::Hello {
@@ -352,7 +359,7 @@ fn closed_session_leaves_list_only_after_release_reaches_holder() {
         status: None,
         master: OwnedFd::from(master),
     };
-    let reg = Registry::new(Some((holder, vec![kept])), None);
+    let reg = Registry::new(Some((holder, vec![kept])), Some(&reservation_dir));
     lock(&reg.state).closing.insert(id);
 
     // krilld → holder 방향을 가득 채운다: 다음 전송(`Release`)은 holder가 읽을 때까지 막힌다.
@@ -381,6 +388,7 @@ fn closed_session_leaves_list_only_after_release_reaches_holder() {
     let mut got = vec![0; release.len()];
     holder_end.read_exact(&mut got).unwrap();
     assert_eq!(got, release);
+    fs::remove_dir_all(reservation_dir).unwrap();
 }
 
 #[test]
@@ -2424,6 +2432,13 @@ fn close_succeeds_when_exited_races_with_failed_terminate_and_preserves_inflight
     use krill_proto::holder::{FromHolder, VERSION};
     use krill_proto::os::net::UnixStream;
 
+    let reservation_dir = std::env::temp_dir().join(format!(
+        "krill-reservation-close_succeeds_w-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&reservation_dir).ok();
+    fs::create_dir_all(&reservation_dir).unwrap();
+
     let (daemon_end, holder_end) = UnixStream::pair().unwrap();
     let mut holder_link = Link::new(OwnedFd::from(holder_end));
     for m in [
@@ -2459,7 +2474,7 @@ fn close_succeeds_when_exited_races_with_failed_terminate_and_preserves_inflight
                 },
             ],
         )),
-        None,
+        Some(&reservation_dir),
     ));
     let reg_reader = Arc::clone(&reg);
     let reader_worker = std::thread::spawn(move || {
@@ -2567,6 +2582,7 @@ fn close_succeeds_when_exited_races_with_failed_terminate_and_preserves_inflight
     drop(reg);
     holder_worker.join().unwrap();
     reader_worker.join().unwrap();
+    fs::remove_dir_all(reservation_dir).unwrap();
 }
 
 #[test]

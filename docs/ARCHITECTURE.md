@@ -125,6 +125,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_SIDEBAR | `1 << 14` | `krill_proto::control` (세션 cwd·워크트리 조회, Request 10 / Reply 14, OWE-411 지휘자 배정) |
 | FEAT_PROVIDER_DETAILS | `1 << 15` | `krill_proto::usage` (제공자별 상세 사용량·계정 전환 상태, 기존 사용량 응답 뒤 확장) |
 | FEAT_ACCOUNT_CANCEL | `1 << 22` | `krill_proto::usage` (실패한 계정 전환 취소·원본 세션 입력 재개, 명시적 동의 후에만 보류 입력 전달) |
+| FEAT_ACCOUNT_INPUT_RECOVERY | `1 << 39` | `krill_proto::usage` (실패한 전환의 대상 계정·원본 생존·미확정 교체 부재를 확인하는 자동 입력 복구 `UsageRequest::RecoverAccountInput`; 미전송 입력만 원본에 이어 전달, 미협상 피어에 전송 금지) |
 | FEAT_SESSION_ACCOUNT_SWITCH | `1 << 28` | `krill_proto::usage` (클릭한 호스트의 단일 세션 계정 전환 `UsageRequest::SwitchSessionAccount`; 기본 계정·다른 세션 유지, 지휘자 배정 2026-10-27) |
 | FEAT_HISTORY | `1 << 16` | `krill_proto::history` (기록 삭제, 전용 요청·응답, OWE-440) |
 | FEAT_USAGE | `1 << 17` | `krill_proto::usage` (사용량·프로바이더 다계정 조회·전환·자동전환, 전용 요청·응답, MK-084·MK-107·MK-108) |

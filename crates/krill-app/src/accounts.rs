@@ -281,6 +281,26 @@ pub fn request_target(
     request_target_with_features(target, req).map(|(snapshot, _)| snapshot)
 }
 
+/// A daemon receipt authorizes automatic continuation; an ambiguous replacement needs recovery.
+pub fn recover_account_input(
+    target: &krill_hosts::HostTarget,
+    session: krill_proto::SessionId,
+    account_id: String,
+) -> Result<Option<AccountsSnapshot>, String> {
+    match exchange_target(
+        target,
+        &UsageRequest::RecoverAccountInput {
+            session,
+            account_id,
+        },
+    )? {
+        UsageReply::Accounts(snapshot) => Ok(Some(snapshot)),
+        UsageReply::Failed(krill_proto::control::Failure::Denied) => Ok(None),
+        UsageReply::Failed(error) => Err(failure_text(error)),
+        _ => Err("unexpected account input recovery reply".into()),
+    }
+}
+
 pub fn request_target_with_features(
     target: &krill_hosts::HostTarget,
     req: &UsageRequest,
@@ -374,6 +394,7 @@ fn exchange_target_with_features(
     hello.features = FEAT_USAGE
         | krill_proto::usage::FEAT_PROVIDER_DETAILS
         | krill_proto::usage::FEAT_ACCOUNT_CANCEL
+        | krill_proto::usage::FEAT_ACCOUNT_INPUT_RECOVERY
         | krill_proto::usage::FEAT_USAGE_AGY
         | krill_proto::usage::FEAT_USAGE_RULES
         | krill_proto::usage::FEAT_USAGE_PROVIDER_METRICS
@@ -426,10 +447,12 @@ pub fn request_local(
     req: &UsageRequest,
 ) -> io::Result<AccountsSnapshot> {
     match req {
-        UsageRequest::CancelAccountSwitch { .. } => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "account handoff cancellation requires the daemon",
-        )),
+        UsageRequest::CancelAccountSwitch { .. } | UsageRequest::RecoverAccountInput { .. } => {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "account handoff cancellation requires the daemon",
+            ))
+        }
         UsageRequest::SwitchSessionAccount { .. } => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "session account switching requires the daemon",

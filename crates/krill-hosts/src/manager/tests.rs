@@ -293,3 +293,44 @@ fn offline_verdict_is_shared_across_managers_until_reconnect() {
     assert!(second.ensure_tunnel_socket("studio").is_err());
     assert_eq!(attempts(), 3, "explicit reconnect retries right away");
 }
+
+#[test]
+fn ssh_target_registration_cannot_follow_a_replaced_or_removed_host_spec() {
+    let manager = HostManager::new();
+    let mut first_spec = spec(Some("/tmp/first-daemon.sock"));
+    let host = HostId::Remote(first_spec.id.clone());
+    manager.sync_specs(&[first_spec.clone()]);
+    let first = manager.target_for(&host, None).unwrap();
+    assert!(first.is_current());
+    assert_eq!(first, manager.target_for(&host, None).unwrap());
+    first_spec.label = "Renamed only".into();
+    manager.sync_specs(&[first_spec.clone()]);
+    assert!(first.is_current());
+    assert_eq!(first, manager.target_for(&host, None).unwrap());
+    first_spec.port = Some(2223);
+    manager.sync_specs(&[first_spec.clone()]);
+    assert!(
+        !first.is_current(),
+        "old connector must be invalid before UI accepts a new target map"
+    );
+    let replacement = manager.target_for(&host, None).unwrap();
+    assert!(replacement.is_current());
+    assert_ne!(first, replacement);
+    let hello = krill_proto::daemon::client_hello(
+        krill_proto::ipc::ClientRole::App,
+        "stale-target-fixture",
+    );
+    assert!(
+        matches!(first.connect(&hello), Err(krill_proto::daemon::Error::Io(error)) if error.kind() == io::ErrorKind::Interrupted)
+    );
+    manager.sync_specs(&[]);
+    assert!(!replacement.is_current());
+    manager.sync_specs(&[first_spec]);
+    let recreated = manager.target_for(&host, None).unwrap();
+    assert!(recreated.is_current());
+    assert_ne!(replacement, recreated);
+    assert!(
+        !replacement.is_current(),
+        "same host ID must not revive a removed registration"
+    );
+}

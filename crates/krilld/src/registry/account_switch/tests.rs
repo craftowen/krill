@@ -12,7 +12,7 @@ use krill_proto::os::net::UnixStream;
 
 #[test]
 fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_old() {
-    for (fail, cancel, unconfirmed, close_fail, process_bound, late_hook, streaming) in [
+    for (fail, cancel, unconfirmed, close_fail, process_bound, late_hook, became_busy) in [
         (false, false, false, false, false, false, false),
         (true, false, false, false, false, false, false),
         (false, true, false, false, false, false, false),
@@ -23,7 +23,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
         (false, false, false, false, false, false, true),
     ] {
         let root = Path::new("/tmp").join(format!(
-            "kas-{}-{fail}-{cancel}-{unconfirmed}-{close_fail}-{process_bound}-{late_hook}-{streaming}",
+            "kas-{}-{fail}-{cancel}-{unconfirmed}-{close_fail}-{process_bound}-{late_hook}-{became_busy}",
             std::process::id()
         ));
         fs::remove_dir_all(&root).ok();
@@ -110,8 +110,6 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             .join(transcript.file_name().unwrap());
         let reselect = cancel.then(|| Arc::clone(&reg));
         let hook_reg = Arc::clone(&reg);
-        let stop_output = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let output_stop = Arc::clone(&stop_output);
         let mock = std::thread::spawn(move || {
             let packet = holder_link.recv().unwrap().unwrap();
             let ToHolder::Spawn {
@@ -151,17 +149,20 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 )
                 .unwrap();
             process.write_all(b"resumed selected account\r\n").unwrap();
-            let output_worker = streaming.then(|| {
-                let mut stream = process.try_clone().unwrap();
-                std::thread::spawn(move || {
-                    while !output_stop.load(std::sync::atomic::Ordering::Acquire) {
-                        if stream.write_all(b"continuing output\r\n").is_err() {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                })
-            });
+            if became_busy {
+                use krill_proto::hook::{EventId, HookEvent, Input};
+                let event = HookEvent {
+                    id: EventId {
+                        pid: 700,
+                        unix_ns: 1,
+                    },
+                    ppid: 700,
+                    agent: "codex".into(),
+                    input: Input::Complete,
+                    payload: br#"{"hook_event_name":"UserPromptSubmit"}"#.to_vec(),
+                };
+                hook_reg.status.hook(&[(SessionId(7), &event)]).unwrap();
+            }
             if !unconfirmed && !process_bound {
                 hook_reg.agents.record_hook_session(
                     id,
@@ -176,7 +177,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             };
             assert_eq!(
                 old,
-                if cancel || unconfirmed {
+                if cancel || unconfirmed || became_busy {
                     id
                 } else {
                     SessionId(7)
@@ -197,7 +198,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 FromHolder::Done { req }
             };
             holder_link.send(&reply.encode().unwrap(), &[]).unwrap();
-            if !close_fail && !cancel && !unconfirmed {
+            if !close_fail {
                 // Done only accepts teardown. Completion must remain hidden until Exited.
                 std::thread::sleep(Duration::from_millis(50));
                 let mut snapshot = AccountsSnapshot::default();
@@ -216,9 +217,10 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 holder_link
                     .send(&FromHolder::Done { req }.encode().unwrap(), &[])
                     .unwrap();
+                lock(&hook_reg.state).exited.insert(cleanup, 0);
             }
             // Keep the new PTY open until the parent has committed its handoff.
-            Some((id, process, replacement_process, output_worker))
+            Some((id, process, replacement_process))
         });
         reg.queue_account_switch(ProviderKind::Codex, &target);
         reg.queue_account_switch(ProviderKind::Codex, "codex-old");
@@ -239,7 +241,6 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             })
         });
         reg.process_account_work_in(&home);
-        stop_output.store(true, std::sync::atomic::Ordering::Release);
         if let Some(binding) = late_binding {
             binding.join().unwrap();
         }
@@ -250,7 +251,15 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 "in-flight cancellation must not rebind the original"
             );
             assert!(!lock(&reg.state).closing.contains(&SessionId(7)));
-        } else if fail || unconfirmed || close_fail {
+        } else if became_busy {
+            let result = saved.get(&SessionId(7)).unwrap();
+            assert!(result.to.is_none() && result.error.is_none());
+            assert!(!lock(&reg.state).closing.contains(&SessionId(7)));
+            assert!(
+                lock(&reg.account_work.pending)
+                    .contains_key(&SwitchScope::Session(SessionId(7), ProviderKind::Codex))
+            );
+        } else if fail || close_fail || unconfirmed {
             let result = saved.get(&SessionId(7)).unwrap();
             assert!(result.to.is_none());
             assert!(result.error.is_some());
@@ -269,12 +278,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             fs::read_to_string(to.join("auth.json")).unwrap(),
             "selected fixture credentials"
         );
-        if let Some((_, process, replacement, output_worker)) = mock.join().unwrap() {
-            if let Some(worker) = output_worker {
-                worker.join().unwrap();
-            }
-            drop((process, replacement));
-        }
+        drop(mock.join().unwrap());
         reader_worker.join().unwrap();
         drop(source_process);
         drop(reg);
@@ -530,7 +534,7 @@ fn completion_snapshot_waits_for_durable_handoff_and_failed_writes_restore_pendi
     clippy::unwrap_used,
     reason = "test fixture setup requires valid local sockets and files"
 )]
-fn kept_fixture(root: &Path, id: SessionId) -> (Arc<Registry>, UnixStream) {
+pub(super) fn kept_fixture(root: &Path, id: SessionId) -> (Arc<Registry>, UnixStream) {
     fs::create_dir_all(root).unwrap();
     let (daemon_end, holder_end) = UnixStream::pair().unwrap();
     let link = Link::new(OwnedFd::from(holder_end));
@@ -628,7 +632,7 @@ fn recovery_keeps_only_remaining_unconfirmed_replacement_without_publishing_comp
 }
 
 #[test]
-fn explicit_cancel_requires_a_failed_live_original_and_preserves_untracked_account() {
+fn explicit_cancel_accepts_pending_or_failed_live_original_and_preserves_untracked_account() {
     use krill_proto::roles::Role;
     use krill_proto::usage::{FEAT_ACCOUNT_CANCEL, UsageReply, UsageRequest};
     let root = Path::new("/tmp").join(format!("kas-cancel-{}", std::process::id()));
@@ -643,10 +647,18 @@ fn explicit_cancel_requires_a_failed_live_original_and_preserves_untracked_accou
         error: None,
     };
     lock(&reg.account_handoffs).insert(session, handoff.clone());
-    assert_eq!(
-        reg.cancel_failed_account_switch(session),
-        Err(Failure::BadRequest)
+    lock(&reg.account_work.pending).insert(
+        SwitchScope::Session(session, ProviderKind::Codex),
+        accounts::switch_work::SwitchTarget {
+            account_id: "selected".into(),
+            prepared: true,
+            not_before: None,
+        },
     );
+    reg.cancel_failed_account_switch(session).unwrap();
+    assert!(lock(&reg.account_work.pending).is_empty());
+    assert!(lock(&reg.account_handoffs).is_empty());
+    lock(&reg.account_handoffs).insert(session, handoff);
     lock(&reg.account_handoffs).get_mut(&session).unwrap().error = Some("fixture failed".into());
     let peer = Peer {
         pid: None,
@@ -872,10 +884,8 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
                 target
             );
         } else {
-            assert!(result.to.is_none());
-            assert!(result.error.as_deref().unwrap().contains("timed out"));
+            assert!(result.to.is_none() && result.error.is_some());
             assert!(!lock(&reg.state).closing.contains(&SessionId(11)));
-            assert!(!lock(&reg.state).exited.contains_key(&SessionId(11)));
         }
         assert!(
             to_agy
@@ -914,13 +924,13 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
 }
 
 #[test]
-fn switch_auto_continues_working_or_rate_limited_session_after_retirement() {
+fn switch_waits_for_working_turn_and_never_injects_continuation() {
     use krill_proto::hook::{EventId, HookEvent, Input};
     use std::io::Read as _;
 
-    for rate_limited in [false, true] {
+    for (rate_limited, typed) in [(false, false), (true, false), (true, true)] {
         let root = Path::new("/tmp").join(format!(
-            "kas-autocontinue-{}-{rate_limited}",
+            "kas-autocontinue-{}-{rate_limited}-{typed}",
             std::process::id()
         ));
         fs::remove_dir_all(&root).ok();
@@ -1047,6 +1057,27 @@ fn switch_auto_continues_working_or_rate_limited_session_after_retirement() {
                 )
                 .unwrap();
             process.write_all(b"resumed prompt > ").unwrap();
+            if typed {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let tap = loop {
+                    if let Some(tap) = lock(&hook_reg.state)
+                        .sessions
+                        .get(&id)
+                        .map(|e| e.session.tap())
+                    {
+                        break tap;
+                    }
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                tap.write_input(b"user draft", None).unwrap();
+                process
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut draft = [0; 10];
+                process.read_exact(&mut draft).unwrap();
+                assert_eq!(&draft, b"user draft");
+            }
             hook_reg.agents.record_hook_session(
                 id,
                 format!("{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{sid}\"}}")
@@ -1064,29 +1095,50 @@ fn switch_auto_continues_working_or_rate_limited_session_after_retirement() {
             lock(&hook_reg.state).exited.insert(old, 0);
 
             process
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_millis(300)))
                 .unwrap();
-            // A stream may split the text and its submission CR across reads.
-            let mut buf = vec![0_u8; "Continue from where you left off.".len() + 1];
-            process
-                .read_exact(&mut buf)
-                .expect("expected continuation prompt on new PTY");
-            let received = String::from_utf8_lossy(&buf).into_owned();
-            (id, received, process)
+            let mut byte = [0; 1];
+            assert!(
+                process.read(&mut byte).is_err(),
+                "held app prompts must never be preceded by synthetic text or Enter"
+            );
+            (id, process)
         });
 
         reg.queue_account_switch(ProviderKind::Codex, &target);
         reg.process_account_work_in(&home);
+        if !rate_limited {
+            assert_eq!(
+                lock(&reg.state).sessions.len(),
+                1,
+                "working session must not spawn a replacement"
+            );
+            assert!(!lock(&reg.state).closing.contains(&SessionId(21)));
+            assert!(
+                load(Some(&state))
+                    .get(&SessionId(21))
+                    .is_some_and(|h| h.to.is_none() && h.error.is_none())
+            );
+            let stop = HookEvent {
+                id: EventId {
+                    pid: 721,
+                    unix_ns: 3,
+                },
+                ppid: 721,
+                agent: "codex".into(),
+                input: Input::Complete,
+                payload: format!("{{\"hook_event_name\":\"Stop\",\"session_id\":\"{sid}\"}}")
+                    .into_bytes(),
+            };
+            reg.status.hook(&[(SessionId(21), &stop)]).unwrap();
+            lock(&reg.account_work.pending)
+                .get_mut(&SwitchScope::Session(SessionId(21), ProviderKind::Codex))
+                .unwrap()
+                .not_before = None;
+            reg.process_account_work_in(&home);
+        }
 
-        let (_new_id, received, _process) = mock.join().unwrap();
-        assert!(
-            received.contains("Continue from where you left off."),
-            "replacement session should auto-receive continuation prompt, got: {received:?}"
-        );
-        assert!(
-            received.ends_with('\r'),
-            "continuation prompt should be submitted with CR: {received:?}"
-        );
+        let (_new_id, _process) = mock.join().unwrap();
 
         reader_worker.join().unwrap();
         drop(reg);
@@ -1095,7 +1147,7 @@ fn switch_auto_continues_working_or_rate_limited_session_after_retirement() {
 }
 
 #[test]
-fn unconfirmed_replacement_preserves_original_and_allows_a_verified_retry() {
+fn unconfirmed_replacement_preserves_original_withholds_input_and_can_retry() {
     use std::io::Read as _;
 
     let root = Path::new("/tmp").join(format!("kas-unconfirmed-{}", std::process::id()));
@@ -1185,8 +1237,7 @@ fn unconfirmed_replacement_preserves_original_and_allows_a_verified_retry() {
     let hook_reg = Arc::clone(&reg);
     let mock = std::thread::spawn(move || {
         let mut replacements = Vec::new();
-        let mut processes = Vec::new();
-        for round in [0, 1] {
+        for round in 0..2 {
             let packet = holder_link.recv().unwrap().unwrap();
             let ToHolder::Spawn { req, id, argv, .. } = ToHolder::decode(packet.frame()).unwrap()
             else {
@@ -1218,9 +1269,7 @@ fn unconfirmed_replacement_preserves_original_and_allows_a_verified_retry() {
             let packet = holder_link.recv().unwrap().unwrap();
             let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap()
             else {
-                panic!(
-                    "expected rollback of an unconfirmed replacement or retirement after confirmation"
-                );
+                panic!("expected verified retirement or failed replacement cleanup");
             };
             let expected = if round == 0 { id } else { SessionId(31) };
             assert_eq!(old, expected);
@@ -1235,26 +1284,20 @@ fn unconfirmed_replacement_preserves_original_and_allows_a_verified_retry() {
                     .unwrap();
                 let mut byte = [0_u8; 1];
                 assert!(
-                    !matches!(process.read(&mut byte), Ok(1..)),
+                    process.read(&mut byte).is_err(),
                     "an unconfirmed replacement must not receive the continuation prompt"
                 );
             }
-            processes.push(process);
         }
-        (replacements, processes)
+        replacements
     });
 
     reg.queue_account_switch(ProviderKind::Codex, &target_ids[0]);
     reg.process_account_work_in(&home);
-    let failed = load(Some(&state))
-        .get(&SessionId(31))
-        .cloned()
-        .expect("failure must preserve the original's recovery record");
+    let failed = load(Some(&state));
+    let failed = failed.get(&SessionId(31)).unwrap();
     assert!(failed.to.is_none() && failed.error.is_some());
-    assert!(
-        reg.agents.stored(SessionId(31)).unwrap().is_some(),
-        "original conversation remains switchable"
-    );
+    assert!(!lock(&reg.state).closing.contains(&SessionId(31)));
     let snapshot = accounts::refresh_accounts_with(&home, Some(&state), false);
     reg.queue_session_account_switch(
         SessionId(31),
@@ -1262,9 +1305,9 @@ fn unconfirmed_replacement_preserves_original_and_allows_a_verified_retry() {
         &target_ids[1],
         &snapshot,
     )
-    .unwrap();
+    .expect("the original conversation remains switchable after a failed resume");
     reg.process_account_work_in(&home);
-    let (replacements, _processes) = mock.join().unwrap();
+    let replacements = mock.join().unwrap();
     assert_ne!(replacements[0], replacements[1]);
     assert_eq!(
         load(Some(&state)).get(&SessionId(31)).and_then(|h| h.to),
@@ -1864,33 +1907,13 @@ fn stale_provider_handoff_is_cancelled_and_rejected_before_reading_transcripts()
     assert!(!load(Some(&state)).contains_key(&session));
     assert!(!lock(&reg.state).closing.contains(&session));
     original.write_all(b"original still running\r\n").unwrap();
-    // Wait for the capture so the store does not write a segment while the fixture is removed.
-    let tap = lock(&reg.state)
-        .sessions
-        .get(&session)
-        .unwrap()
-        .session
-        .tap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while tap.pulse().end < 24 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!tap.pulse().closed);
-    assert!(tap.pulse().end >= 24, "original PTY keeps capturing output");
     assert!(
         fs::read_dir(&to)
             .unwrap()
             .all(|entry| entry.unwrap().file_name() == "auth.json")
     );
     drop(reg);
-    // 취소된 인계의 백그라운드 정리가 끝나기 전에 지우면 DirectoryNotEmpty가 난다(8회 반복 중 2회 재현).
-    for attempt in 0..50 {
-        match fs::remove_dir_all(&root) {
-            Ok(()) => break,
-            Err(error) if attempt == 49 => panic!("{error}"),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
-        }
-    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[expect(clippy::unwrap_used, reason = "deterministic account fixture setup")]
@@ -2358,4 +2381,200 @@ enum TransferSelection {
     FollowUp,
     NewTarget,
     Cancel,
+}
+
+#[test]
+fn unreadable_replacement_evidence_is_preserved_and_blocks_new_spawns() {
+    let root = Path::new("/tmp").join(format!("kas-evidence-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let reg = Registry::new(None, Some(&root));
+    let path = replacement_journal(&root, SessionId(8));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for bytes in [
+        b"broken".to_vec(),
+        vec![b'x'; 4097],
+        serde_json::to_vec(&Prepared {
+            from: SessionId(7),
+            to: SessionId(7),
+            account_id: "fixture".into(),
+        })
+        .unwrap(),
+    ] {
+        fs::write(&path, &bytes).unwrap();
+        assert!(reg.recover_prepared_account().blocks(SessionId(7)));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(
+            reg.ensure_no_unresolved_account_replacement(SessionId(7))
+                .is_err()
+        );
+    }
+    fs::write(
+        &path,
+        serde_json::to_vec(&Prepared {
+            from: SessionId(7),
+            to: SessionId(8),
+            account_id: "fixture".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        reg.ensure_no_unresolved_account_replacement(SessionId(7))
+            .is_err()
+    );
+    assert!(
+        reg.ensure_no_unresolved_account_replacement(SessionId(8))
+            .is_err()
+    );
+    assert!(
+        reg.ensure_no_unresolved_account_replacement(SessionId(9))
+            .is_ok()
+    );
+    // Unknown Spawn outcomes are not evidence that a target process ended.
+    drop(Replacement {
+        registry: &reg,
+        original: SessionId(7),
+        session: SessionId(8),
+        committed: false,
+    });
+    assert!(path.exists());
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(path.parent().unwrap()).unwrap();
+    fs::write(root.join("account-replacements"), b"not a directory").unwrap();
+    assert!(reg.recover_prepared_account().blocks(SessionId(9)));
+    assert!(
+        reg.ensure_no_unresolved_account_replacement(SessionId(9))
+            .is_err()
+    );
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replacement_cleanup_failure_or_done_without_exit_retains_journal_and_fences_retry() {
+    for done in [false, true] {
+        let root = Path::new("/tmp").join(format!("kas-cleanup-{}-{done}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let mut processes = Vec::new();
+        let kept = [SessionId(7), SessionId(8)]
+            .map(|id| {
+                let (master, process) = UnixStream::pair().unwrap();
+                processes.push(process);
+                Kept {
+                    id,
+                    pid: 800,
+                    status: None,
+                    master: OwnedFd::from(master),
+                }
+            })
+            .into();
+        let reg = Arc::new(Registry::new(Some((holder, kept)), Some(&root)));
+        for id in [SessionId(7), SessionId(8)] {
+            reg.agents
+                .remember_session(
+                    id,
+                    &AgentLaunch {
+                        profile: "codex".into(),
+                        permission: Permission::Yolo,
+                    },
+                    Some("conversation".into()),
+                    Vec::new(),
+                    Some(LaunchAccount {
+                        id: "selected".into(),
+                        env_key: "CODEX_HOME".into(),
+                        dir: root.display().to_string(),
+                    }),
+                )
+                .unwrap();
+        }
+        let path = replacement_journal(&root, SessionId(8));
+        let bytes = serde_json::to_vec(&Prepared {
+            from: SessionId(7),
+            to: SessionId(8),
+            account_id: "selected".into(),
+        })
+        .unwrap();
+        accounts::write_atomic_0600(&path, &bytes).unwrap();
+        let r = Arc::clone(&reg);
+        let reader_worker =
+            std::thread::spawn(move || r.holder.as_ref().unwrap().run(reader, |_, _| {}));
+        let mock = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Terminate { req, id } = ToHolder::decode(packet.frame()).unwrap() else {
+                panic!("expected cleanup only")
+            };
+            assert_eq!(id, SessionId(8));
+            let reply = if done {
+                FromHolder::Done { req }
+            } else {
+                FromHolder::Failed {
+                    req,
+                    errno: libc::EPERM,
+                }
+            };
+            holder_link.send(&reply.encode().unwrap(), &[]).unwrap();
+        });
+        let fence = reg.recover_prepared_account();
+        assert!(fence.blocks(SessionId(7)));
+        assert!(fence.blocks(SessionId(8)));
+        assert!(!fence.blocks(SessionId(9)));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(
+            !reg.account_original_ended(SessionId(8)),
+            "Done must not be treated as Exited"
+        );
+        assert!(
+            reg.ensure_no_unresolved_account_replacement(SessionId(7))
+                .is_err()
+        );
+        assert!(
+            reg.ensure_no_unresolved_account_replacement(SessionId(8))
+                .is_err()
+        );
+        mock.join().unwrap();
+        reader_worker.join().unwrap();
+        drop(processes);
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn failed_kept_engine_start_is_not_evidence_that_a_replacement_process_ended() {
+    let root = Path::new("/tmp").join(format!("kas-kept-unknown-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let (reg, _process) = kept_fixture(&root, SessionId(7));
+    lock(&reg.state).unregistered_kept.insert(SessionId(8));
+    let path = replacement_journal(&root, SessionId(8));
+    let raw = serde_json::to_vec(&Prepared {
+        from: SessionId(7),
+        to: SessionId(8),
+        account_id: "selected".into(),
+    })
+    .unwrap();
+    accounts::write_atomic_0600(&path, &raw).unwrap();
+    assert!(!reg.account_original_ended(SessionId(8)));
+    assert!(reg.recover_prepared_account().blocks(SessionId(7)));
+    assert_eq!(fs::read(&path).unwrap(), raw);
+    assert!(
+        reg.ensure_no_unresolved_account_replacement(SessionId(7))
+            .is_err()
+    );
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
 }

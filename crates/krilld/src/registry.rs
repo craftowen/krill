@@ -53,6 +53,7 @@ mod hibernation;
 mod hook_identity;
 mod orch_cache;
 mod schedule;
+mod session_ids;
 mod sidebar;
 #[cfg(all(test, unix))]
 mod stale_sessions_tests;
@@ -134,6 +135,8 @@ fn is_wrapper_argv<S: AsRef<[u8]>>(argv: &[S]) -> bool {
 #[derive(Default)]
 struct State {
     sessions: BTreeMap<SessionId, Entry>,
+    /// Holder still owns these masters; engine startup failure is not process exit.
+    unregistered_kept: HashSet<SessionId>,
     /// 끝난 세션의 상태. `Spawned` 답보다 `Exited`가 먼저 처리될 수 있어 세션과 따로 둔다.
     exited: HashMap<SessionId, i32>,
     /// 닫기를 요청받은 세션. `Exited`가 오면 바로 지운다.
@@ -143,8 +146,6 @@ struct State {
     /// 이미 `Resume`으로 새 세션에 인계된 옛 세션. 중복 `Resume`이 빈 로그인 셸을 또 띄우지 않게 한다.
     resumed: HashSet<SessionId>,
     roots: Roots,
-    /// 다음 세션 id 후보.
-    next: u64,
 }
 
 /// krilld 전체에 하나.
@@ -162,6 +163,7 @@ pub struct Registry {
     /// `krill hook`의 spool 파일.
     spool: Option<PathBuf>,
     state: Mutex<State>,
+    ids: Mutex<session_ids::SessionIds>,
     sidebar: Arc<Mutex<sidebar::Cache>>,
     hibernation: Mutex<hibernation::Clock>,
     schedule_minute: Mutex<Option<u64>>,
@@ -212,6 +214,14 @@ impl Registry {
         if let Some(d) = dir {
             crate::agent::refresh_zsh_sync_env(d);
         }
+        let ids = session_ids::SessionIds::open(
+            dir,
+            holder
+                .as_ref()
+                .into_iter()
+                .flat_map(|(_, kept)| kept.iter().map(|k| k.id)),
+        );
+        let ids_ready = ids.ready();
         let at = |name: &str| dir.map_or_else(PathBuf::new, |d| d.join(name));
         // 기록 저장소를 열지 못해도 세션은 띄운다. 조용히 넘기지 않고 경고를 남겨 `krill doctor`가 보인다.
         let store = dir.and_then(|d| match Store::open(d, Limits::default()) {
@@ -265,10 +275,8 @@ impl Registry {
             hook_commit: Mutex::new(()),
             status: Statuses::open(dir.map(|d| d.join(status::FILE_NAME))),
             spool: dir.map(|d| d.join(hook::SPOOL_FILE)),
-            state: Mutex::new(State {
-                next: 1,
-                ..State::default()
-            }),
+            ids: Mutex::new(ids),
+            state: Mutex::new(State::default()),
         };
         let mut st = lock(&reg.state);
         for k in kept {
@@ -286,11 +294,11 @@ impl Registry {
             );
             #[cfg(windows)]
             let size = FALLBACK_SIZE;
-            st.next = st.next.max(k.id.0.saturating_add(1));
             let Ok(session) = reg.start(k.id, k.master, size) else {
                 // master는 holder가 계속 쥔다. 다음 krilld 기동 때 다시 온다.
                 // 조용히 넘기면 그 krilld 수명 동안 세션이 목록에서 사라진다(K-26).
                 tracing::warn!(session = k.id.0, "kept session failed to start");
+                st.unregistered_kept.insert(k.id);
                 continue;
             };
             st.roots.insert(k.id, k.pid).ok();
@@ -309,7 +317,7 @@ impl Registry {
             );
         }
         let live: Vec<_> = st.sessions.keys().copied().collect();
-        if let Some(store) = &reg.store {
+        if ids_ready && let Some(store) = &reg.store {
             store.gc(&live, SystemTime::now()).ok();
         }
         if let Some(d) = dir {
@@ -344,7 +352,25 @@ impl Registry {
             }
             *last = now;
         }
-        if let Some(store) = &self.store {
+        let ids_ready = lock(&self.ids).ready();
+        if ids_ready {
+            let retired: Vec<_> = {
+                let state = lock(&self.state);
+                state
+                    .closed
+                    .iter()
+                    .filter(|id| state.exited.contains_key(id))
+                    .copied()
+                    .collect()
+            };
+            for id in retired {
+                if let Some(holder) = &self.holder {
+                    holder.notify(|req| ToHolder::Release { req, id }).ok();
+                }
+                self.remove(id);
+            }
+        }
+        if ids_ready && let Some(store) = &self.store {
             let live: Vec<_> = lock(&self.state).sessions.keys().copied().collect();
             if let Err(e) = store.gc(&live, wall) {
                 tracing::warn!(error = %e, "history gc failed");
@@ -452,6 +478,7 @@ impl Registry {
     }
 
     /// 아직 끝나지 않은 세션의 id·pid.
+    #[cfg(unix)]
     pub(crate) fn running(&self) -> Vec<(SessionId, u32)> {
         let st = lock(&self.state);
         st.sessions
@@ -690,6 +717,9 @@ impl Registry {
             let reply = if peer.scope.full() && role != Role::Observer {
                 match &self.store {
                     Some(store) => match request {
+                        HistoryRequest::Clear if !lock(&self.ids).ensure_ready() => {
+                            HistoryReply::Failed(Failure::Os(libc::EIO))
+                        }
                         HistoryRequest::Clear => match store.clear() {
                             Ok(()) => HistoryReply::Cleared,
                             Err(e) => HistoryReply::Failed(os(&e)),
@@ -1379,7 +1409,7 @@ impl Registry {
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
         // 세션 id를 먼저 잡는다. Claude settings 파일 이름(`<id>-<uuid>.json`)에 넣어
         // 세션이 끝나면 그 세션의 파일만 지운다(OWE-499). id 재사용은 `next_id`가 막는다.
-        let session = self.next_id();
+        let session = self.reserve_session_id(None).map_err(|error| os(&error))?;
         let state = self.state_dir();
         let Launch { argv, env } = match c.program {
             Program::Login => crate::agent::login_in(state.as_deref()),
@@ -1486,7 +1516,9 @@ impl Registry {
             source_sid.as_deref(),
         )
         .map_err(|e| os(&e))?;
-        let session = self.next_id();
+        let session = self
+            .reserve_session_id(Some(old))
+            .map_err(|error| os(&error))?;
         crate::agent::pre_trust_workspace(profile, &c.cwd, account.as_ref());
         let (launch, session_id, account) = crate::agent::fork_in(
             profile,
@@ -1577,7 +1609,9 @@ impl Registry {
             c.cwd.clone_from(&s.cwd);
         }
         sanitize_spawn_cwd(&mut c.cwd);
-        let session = self.next_id();
+        let session = self
+            .reserve_session_id(Some(old))
+            .map_err(|error| os(&error))?;
         let Launch { argv, env } = match stored {
             Some(s) => {
                 let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
@@ -1830,21 +1864,15 @@ impl Registry {
         )
     }
 
-    /// 쓰지 않은 id. 닫힌 세션의 디스크 기록(보존 7일)·에이전트 기동 기록과도 겹치지 않는다.
-    fn next_id(&self) -> SessionId {
-        let mut st = lock(&self.state);
-        loop {
-            let id = SessionId(st.next);
-            st.next = st.next.saturating_add(1);
-            let on_disk = self
-                .store
-                .as_ref()
-                .is_some_and(|s| s.session_dir(id).exists())
-                || self.agents.has(id);
-            if !st.sessions.contains_key(&id) && !on_disk {
-                return id;
-            }
-        }
+    /// Persist a reservation before settings, launch metadata, or holder Spawn.
+    fn reserve_session_id(&self, prior: Option<SessionId>) -> io::Result<SessionId> {
+        let floor = lock(&self.state)
+            .sessions
+            .keys()
+            .map(|id| id.0)
+            .max()
+            .unwrap_or_default();
+        lock(&self.ids).reserve_after(prior, floor)
     }
 
     fn list(&self, peer: &Peer) -> Reply {
@@ -2290,6 +2318,12 @@ impl Registry {
             }
         }
         // 이미 끝난 세션: holder가 보관하던 master·상태를 놓게 한다. holder가 없거나 이미 놓았어도 지운다.
+        if !lock(&self.ids).ensure_ready() {
+            // An exited holder record may be the last evidence of a legacy unrecorded ID.
+            // Termination remains allowed; defer only releasing its inventory entry.
+            self.mark_closed(id);
+            return Ok(Reply::Closed);
+        }
         holder.request(|req| ToHolder::Release { req, id }).ok();
         self.mark_closed(id);
         self.remove(id);
@@ -2322,6 +2356,10 @@ impl Registry {
         if !closing {
             return;
         }
+        if !lock(&self.ids).ensure_ready() {
+            self.mark_closed(id);
+            return;
+        }
         // `Release`를 링크에 쓴 뒤에 지운다. 목록에서 사라진 뒤 krilld가 죽어도 holder는 소켓에 남은 `Release`를
         // 먼저 읽고 끝난 세션을 다음 krilld에 다시 넘기지 않는다(OWE-502).
         if let Some(h) = &self.holder {
@@ -2346,13 +2384,18 @@ impl Registry {
     /// 지운 세션의 Claude 주입 settings도 함께 지운다(살아 있는 세션의 파일은 남는다).
     fn remove(&self, id: SessionId) {
         let _commit = lock(&self.hook_commit);
-        self.discard_settings(id);
-        self.agents.forget(id);
+        let ids_durable = lock(&self.ids).ensure_ready();
+        if ids_durable {
+            self.discard_settings(id);
+            self.agents.forget(id);
+        }
         let mut st = lock(&self.state);
         st.sessions.remove(&id);
         st.exited.remove(&id);
         st.closing.remove(&id);
-        st.roots.remove(id);
+        if ids_durable {
+            st.roots.remove(id);
+        }
         drop(st);
         self.status.remove(id);
         self.clear_sleeping(id);
@@ -2453,6 +2496,21 @@ impl Registry {
                     UsageReply::Failed(Failure::BadRequest)
                 } else {
                     match self.cancel_failed_account_switch(session) {
+                        Ok(()) => UsageReply::Accounts(accounts::refresh_accounts_with(
+                            &home, state_ref, false,
+                        )),
+                        Err(error) => UsageReply::Failed(error),
+                    }
+                }
+            }
+            UsageRequest::RecoverAccountInput {
+                session,
+                account_id,
+            } => {
+                if features & krill_proto::usage::FEAT_ACCOUNT_INPUT_RECOVERY == 0 {
+                    UsageReply::Failed(Failure::BadRequest)
+                } else {
+                    match self.recover_failed_account_input(session, &account_id) {
                         Ok(()) => UsageReply::Accounts(accounts::refresh_accounts_with(
                             &home, state_ref, false,
                         )),
@@ -3142,7 +3200,7 @@ impl Registry {
                 .holder
                 .as_ref()
                 .ok_or_else(|| io::Error::other("no holder"))?;
-            let session = self.next_id();
+            let session = self.reserve_session_id(None)?;
             let cwd = dispatch.cwd.as_bytes().to_vec();
             let (launch, agent_session_id, account) = crate::agent::launch_selected_in(
                 &profile,

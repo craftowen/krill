@@ -1419,3 +1419,26 @@ fn session_account_switch_is_appended_scoped_feature_gated_and_not_read_only() {
     };
     assert_ne!(agy.required_features() & FEAT_USAGE_AGY, 0);
 }
+
+#[test]
+fn automatic_account_input_recovery_is_appended_and_feature_gated() {
+    let request = UsageRequest::RecoverAccountInput {
+        session: crate::SessionId(220),
+        account_id: "selected".into(),
+    };
+    assert_eq!(
+        postcard::to_stdvec(&request).unwrap(),
+        b"\x15\xdc\x01\x08selected"
+    );
+    let frame = request.encode().unwrap();
+    assert_eq!(
+        UsageRequest::decode(kind::USAGE_REQ, &frame[5..]).unwrap(),
+        request
+    );
+    assert_eq!(
+        request.required_features(),
+        FEAT_USAGE | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_INPUT_RECOVERY
+    );
+    assert!(!request.is_read());
+    assert!(!request.contains_removed_provider());
+}

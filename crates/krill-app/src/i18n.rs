@@ -1490,7 +1490,7 @@ catalog! {
         METER_EXPIRY_UNKNOWN => ("만료 시각 미제공", "Expiry not provided"),
         METER_EXPIRED => ("만료됨 · {time}", "Expired · {time}"),
         METER_CODE_REVIEW => ("코드 리뷰", "Code review"),
-        ACCOUNT_INPUT_HELD => ("입력을 보관하고 있습니다. 계정 전환을 다시 시도하거나 사용할 계정을 선택하세요.", "Input is held. Retry the account switch or choose an account."),
+        ACCOUNT_INPUT_HELD => ("계정 전환이 끝날 때까지 입력을 보관합니다. 전환을 취소하고 원본 계정에서 계속할 수도 있습니다.", "Input is held until the account switch completes. You can cancel the switch and continue on the original account."),
         ACCOUNT_CONTINUE_ORIGINAL => ("원본 계정에서 계속 · 보관 입력 전송", "Continue on original · send held input"),
         ACCOUNT_SESSION_SWITCHING => ("실행 중인 대화를 전환하는 중…", "Switching running conversations…"),
         WINDOW_7D => ("7일", "7d"),

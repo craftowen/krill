@@ -49,7 +49,7 @@ enum Value {
     Fix(FixNeed),
     Paste(krill_app::security::PendingPaste),
     AccountInput {
-        session: krill_proto::SessionId,
+        hold: Box<account_input::Hold>,
         cancelling: bool,
     },
 }
@@ -62,22 +62,14 @@ pub(super) struct Notifications {
     seen: HashMap<Kind, Value>,
     notes: HashMap<Kind, Entity<Notification>>,
     /// Per-session failed handoffs whose recovery card was explicitly closed.
-    dismissed_account_input: HashMap<krill_proto::SessionId, (String, Option<String>)>,
+    dismissed_account_input: std::collections::HashSet<account_input::Hold>,
 }
 
 impl Shell {
     pub(super) fn sync_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.notifications
-            .dismissed_account_input
-            .retain(|session, (account_id, error)| {
-                self.accounts_snapshot.details.handoffs.iter().any(|h| {
-                    h.from == *session
-                        && h.to.is_none()
-                        && h.error.is_some()
-                        && &h.account_id == account_id
-                        && &h.error == error
-                })
-            });
+        self.notifications.dismissed_account_input.retain(|hold| {
+            self.account_holds.get(&(hold.host.clone(), hold.session)) == Some(hold)
+        });
         let mut current = Vec::new();
         let (sb_notice, sb_pref_err, sb_poll_err, sb_pr_guidance) = {
             let sb = self.sidebar.read(cx);
@@ -118,28 +110,17 @@ impl Shell {
         if let Some(pending) = self.security.pending_paste() {
             current.push((Kind::Paste, Value::Paste(pending.clone())));
         }
-        if let Some(session) = self.failed_account_input() {
-            let dismissed = self
-                .notifications
-                .dismissed_account_input
-                .get(&session)
-                .is_some_and(|(account_id, error)| {
-                    self.accounts_snapshot.details.handoffs.iter().any(|h| {
-                        h.from == session
-                            && h.to.is_none()
-                            && &h.account_id == account_id
-                            && &h.error == error
-                    })
-                });
-            if !dismissed {
-                current.push((
-                    Kind::AccountInput,
-                    Value::AccountInput {
-                        session,
-                        cancelling: self.account_cancel.is_some(),
-                    },
-                ));
-            }
+        if let Some(hold) = self.cancellable_account_hold()
+            && !self.account_input_recovers_silently(&hold, cx)
+            && !self.notifications.dismissed_account_input.contains(&hold)
+        {
+            current.push((
+                Kind::AccountInput,
+                Value::AccountInput {
+                    hold: Box::new(hold),
+                    cancelling: self.account_cancel.is_some(),
+                },
+            ));
         }
         if current.is_empty() && self.notifications.list.is_none() {
             return;
@@ -288,16 +269,17 @@ impl Shell {
                         })
                 }
                 Value::AccountInput {
-                    session,
+                    hold,
                     cancelling,
                 } => {
-                    let session = *session;
+                    let hold = hold.clone();
                     let cancelling = *cancelling;
                     Notification::new()
                         .with_type(NotificationType::Warning)
                         .autohide(false)
                         .content(move |_, _, _| {
                             let shell = shell.clone();
+                            let hold = hold.clone();
                             div()
                                 .debug_selector(|| "account-input-recovery".into())
                                 .flex()
@@ -317,7 +299,7 @@ impl Shell {
                                     .on_click(move |_, _, cx| {
                                         shell
                                             .update(cx, |this, cx| {
-                                                this.continue_original_account(session, cx);
+                                                this.continue_original_account(hold.as_ref().clone(), cx);
                                             })
                                             .ok();
                                     }),
@@ -382,23 +364,12 @@ impl Shell {
                             {
                                 krill_app::onboarding::actions::dismiss_need(id, cx);
                             }
-                            (Kind::AccountInput, Value::AccountInput { session, .. })
+                            (Kind::AccountInput, Value::AccountInput { hold, .. })
                                 if this.notifications.seen.get(&Kind::AccountInput)
                                     == Some(&closed_value)
-                                    && this.failed_account_input() == Some(*session) =>
+                                    && this.cancellable_account_hold().as_ref() == Some(hold.as_ref()) =>
                             {
-                                if let Some(handoff) = this
-                                    .accounts_snapshot
-                                    .details
-                                    .handoffs
-                                    .iter()
-                                    .find(|h| h.from == *session && h.to.is_none() && h.error.is_some())
-                                {
-                                    this.notifications.dismissed_account_input.insert(
-                                        *session,
-                                        (handoff.account_id.clone(), handoff.error.clone()),
-                                    );
-                                }
+                                this.notifications.dismissed_account_input.insert(hold.as_ref().clone());
                                 this.notifications.seen.remove(&Kind::AccountInput);
                                 this.notifications.notes.remove(&Kind::AccountInput);
                             }

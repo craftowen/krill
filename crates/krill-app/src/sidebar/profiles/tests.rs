@@ -161,6 +161,39 @@ fn clicked_session_profile_target_is_host_scoped_and_does_not_activate_a_row(
 }
 
 #[gpui::test]
+fn pending_switch_keeps_sidebar_row_until_replacement_receipt(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let view = cx.new(|_| Sidebar::new_loaded(None));
+    view.update(cx, |s, cx| {
+        s.apply(Ok((snapshot(), Meta::new())), BTreeMap::new(), cx);
+        s.toggle_card_sessions(std::path::Path::new("/repo/tree"), cx);
+        let before = row_sessions(s, &HostId::Local);
+        let mut snap = accounts();
+        snap.details.handoffs.push(SessionHandoff {
+            from: SessionId(20),
+            to: None,
+            account_id: "other".into(),
+            error: None,
+        });
+        s.sync_session_accounts(&HostId::Local, snap.clone().into(), cx);
+        s.mark_session_exited_on(&HostId::Local, SessionId(20), cx);
+        assert_eq!(row_sessions(s, &HostId::Local), before);
+        let mut gap = snapshot();
+        gap.sessions.retain(|s| s.id != SessionId(20));
+        for _ in 0..3 {
+            s.apply(Ok((gap.clone(), Meta::new())), BTreeMap::new(), cx);
+            assert_eq!(row_sessions(s, &HostId::Local), before);
+        }
+        snap.details.handoffs[0].to = Some(SessionId(90));
+        s.sync_session_accounts(&HostId::Local, snap.into(), cx);
+        assert_eq!(
+            row_sessions(s, &HostId::Local),
+            vec![SessionId(10), SessionId(90), SessionId(30)]
+        );
+    });
+}
+
+#[gpui::test]
 fn replacement_preserves_sidebar_slot_cursor_and_host_across_poll_gap_and_chain(
     cx: &mut TestAppContext,
 ) {

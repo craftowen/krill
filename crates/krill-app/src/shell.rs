@@ -17,6 +17,7 @@
 //! 마우스 보고가 꺼져 있을 때만. 프로그램의 OSC 52 쓰기는 krilld가 알려 오면 시스템 클립보드에 쓴다(읽기는 krilld가 막는다).
 
 // Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
+mod account_input;
 mod chat;
 mod close;
 mod commands;
@@ -727,7 +728,17 @@ pub struct Shell {
     pub(super) reset_armed: Option<(krill_proto::usage::ProviderKind, String)>,
     account_handoff_poll: Option<Task<()>>,
     remote_account_handoff_polls: BTreeMap<krill_app::hosts::HostId, Task<()>>,
-    account_cancel: Option<krill_proto::SessionId>,
+    account_cancel: Option<account_input::Cancel>,
+    account_recovery: account_input::Recovery,
+    account_holds:
+        BTreeMap<(krill_app::hosts::HostId, krill_proto::SessionId), account_input::Hold>,
+    account_hold_serial: u64,
+    account_epochs: BTreeMap<krill_app::hosts::HostId, u64>,
+    account_mutations: BTreeMap<krill_app::hosts::HostId, usize>,
+    account_deferred: Vec<(
+        Option<krill_app::hosts::HostTarget>,
+        account_input::DeferredMutation,
+    )>,
     pub(super) accounts_snapshot: Arc<krill_proto::usage::AccountsSnapshot>,
     pub(super) remote_accounts:
         BTreeMap<krill_app::hosts::HostId, Arc<krill_proto::usage::AccountsSnapshot>>,
@@ -1305,6 +1316,12 @@ impl Shell {
             account_handoff_poll: None,
             remote_account_handoff_polls: BTreeMap::new(),
             account_cancel: None,
+            account_recovery: account_input::Recovery::default(),
+            account_holds: BTreeMap::new(),
+            account_hold_serial: 0,
+            account_epochs: BTreeMap::new(),
+            account_mutations: BTreeMap::new(),
+            account_deferred: Vec::new(),
             accounts_poll: None,
             update_poll: None,
             ssh_hosts,
@@ -2539,6 +2556,7 @@ impl Shell {
     }
 
     fn connect_daemon_with_paths(&mut self, paths: Paths, cx: &mut Context<Self>) {
+        self.invalidate_account_cancel(&krill_app::hosts::HostId::Local);
         let target = krill_app::hosts::HostTarget::local(paths.clone());
         self.paths = Some(paths);
         self.start_away_tracking(cx);
@@ -3178,6 +3196,9 @@ impl Shell {
             .and_then(|s| s.home_override.clone())
             .unwrap_or_else(krill_app::accounts::default_home);
         let dir = self.state_dir(cx);
+        let Some(stamp) = self.account_read_stamp(&krill_app::hosts::HostId::Local) else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
@@ -3188,7 +3209,10 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if this.local_generation != generation || this.link == Link::Up {
+                if this.local_generation != generation
+                    || this.link == Link::Up
+                    || !this.account_read_is_current(&stamp)
+                {
                     return;
                 }
                 let (hosts, snap) = loaded;
@@ -3225,6 +3249,9 @@ impl Shell {
     }
 
     fn set_link(&mut self, link: Link, cx: &mut Context<Self>) {
+        if self.link != link {
+            self.invalidate_account_cancel(&krill_app::hosts::HostId::Local);
+        }
         if link != Link::Up {
             krill_app::alert::disconnected(cx);
             self.appearance = None;
@@ -3287,6 +3314,9 @@ impl Shell {
             );
             return;
         };
+        let Some(stamp) = self.account_read_stamp(&host) else {
+            return;
+        };
         cx.notify();
         self.usage_refresh = Some(cx.spawn(async move |this, cx| {
             let first = cx
@@ -3309,16 +3339,22 @@ impl Shell {
                 })
                 .await;
             let ok = this
-                .update(cx, |this, cx| match first {
-                    Ok(snap) => {
-                        this.apply_accounts_snapshot_for_host(host.clone(), snap, cx);
-                        true
-                    }
-                    Err(e) => {
+                .update(cx, |this, cx| {
+                    if !this.account_read_is_current(&stamp) {
                         this.usage_refresh = None;
-                        this.notice = Some(e);
-                        cx.notify();
-                        false
+                        return false;
+                    }
+                    match first {
+                        Ok(snap) => {
+                            this.apply_accounts_snapshot_for_host(host.clone(), snap, cx);
+                            true
+                        }
+                        Err(e) => {
+                            this.usage_refresh = None;
+                            this.notice = Some(e);
+                            cx.notify();
+                            false
+                        }
                     }
                 })
                 .unwrap_or(false);
@@ -3329,6 +3365,11 @@ impl Shell {
                 cx.background_executor()
                     .timer(Duration::from_millis(delay_ms))
                     .await;
+                let Ok(Some(stamp)) =
+                    this.read_with(cx, |this, _| this.account_read_stamp_for(&host, &target))
+                else {
+                    continue;
+                };
                 let follow = cx
                     .background_executor()
                     .spawn({
@@ -3344,7 +3385,9 @@ impl Shell {
                 if let Ok(snap) = follow {
                     let host = host.clone();
                     this.update(cx, |this, cx| {
-                        this.apply_accounts_snapshot_for_host(host, snap, cx);
+                        if this.account_read_is_current(&stamp) {
+                            this.apply_accounts_snapshot_for_host(host, snap, cx);
+                        }
                     })
                     .ok();
                 }
@@ -3383,6 +3426,11 @@ impl Shell {
     }
 
     fn touch_last_seen(&mut self) {
+        // A lifecycle timestamp is not a user edit and must not invalidate the
+        // baseline while the saved layout is still being read.
+        if self.layout_loading {
+            return;
+        }
         self.layout.set_last_seen_unix_ns(away::now_ns());
         self.save();
     }
@@ -3455,6 +3503,21 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let mutating = !matches!(req, krill_proto::usage::UsageRequest::ListAccounts);
+        if mutating && self.defer_account_mutation(&host) {
+            let source = self.target_for_host(&host);
+            self.account_deferred
+                .push((source, account_input::DeferredMutation::Refresh(host, req)));
+            return;
+        }
+        let read_stamp = (!mutating)
+            .then(|| self.account_read_stamp(&host))
+            .flatten();
+        if !mutating && read_stamp.is_none() {
+            return;
+        }
+        if mutating {
+            self.invalidate_account_cancel(&host);
+        }
         if host.is_remote() {
             let Some(target) = self.target_for_host(&host) else {
                 if mutating {
@@ -3467,6 +3530,10 @@ impl Shell {
                 }
                 return;
             };
+            if mutating {
+                self.begin_account_mutation(&host);
+            }
+            let operation_stamp = self.account_operation_stamp(&host);
             cx.spawn(async move |this, cx| {
                 let res = cx
                     .background_executor()
@@ -3474,20 +3541,36 @@ impl Shell {
                         krill_app::accounts::request_target_with_features(&target, &req)
                     })
                     .await;
-                this.update(cx, |this, cx| match res {
-                    Ok((snap, features)) => {
-                        this.sidebar.update(cx, |s, cx| {
-                            s.set_session_account_features(host.clone(), features, cx);
-                        });
-                        this.apply_accounts_snapshot_for_host(host, snap, cx);
-                        if mutating {
-                            cx.defer(krill_app::settings::notify_external_change);
-                        }
+                this.update(cx, |this, cx| {
+                    let current = !mutating || this.account_operation_is_current(&operation_stamp);
+                    if mutating {
+                        this.finish_account_mutation(&host, cx);
                     }
-                    Err(e) => {
-                        if mutating {
-                            this.notice = Some(e);
-                            cx.notify();
+                    if !current {
+                        return;
+                    }
+                    if !mutating
+                        && read_stamp
+                            .as_ref()
+                            .is_none_or(|stamp| !this.account_read_is_current(stamp))
+                    {
+                        return;
+                    }
+                    match res {
+                        Ok((snap, features)) => {
+                            this.sidebar.update(cx, |s, cx| {
+                                s.set_session_account_features(host.clone(), features, cx);
+                            });
+                            this.apply_accounts_snapshot_for_host(host, snap, cx);
+                            if mutating {
+                                cx.defer(krill_app::settings::notify_external_change);
+                            }
+                        }
+                        Err(e) => {
+                            if mutating {
+                                this.notice = Some(e);
+                                cx.notify();
+                            }
                         }
                     }
                 })
@@ -3511,6 +3594,10 @@ impl Shell {
             }
             self.local_generation = self.local_generation.wrapping_add(1);
             let generation = self.local_generation;
+            if mutating {
+                self.begin_account_mutation(&host);
+            }
+            let operation_stamp = self.account_operation_stamp(&host);
             cx.spawn(async move |this, cx| {
                 let result = cx
                     .background_executor()
@@ -3523,6 +3610,20 @@ impl Shell {
                     })
                     .await;
                 this.update(cx, |this, cx| {
+                    let current = !mutating || this.account_operation_is_current(&operation_stamp);
+                    if mutating {
+                        this.finish_account_mutation(&host, cx);
+                    }
+                    if !current {
+                        return;
+                    }
+                    if !mutating
+                        && read_stamp
+                            .as_ref()
+                            .is_none_or(|stamp| !this.account_read_is_current(stamp))
+                    {
+                        return;
+                    }
                     if this.local_generation != generation || this.link == Link::Up {
                         return;
                     }
@@ -3538,6 +3639,10 @@ impl Shell {
             .detach();
             return;
         };
+        if mutating {
+            self.begin_account_mutation(&host);
+        }
+        let operation_stamp = self.account_operation_stamp(&host);
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -3548,26 +3653,42 @@ impl Shell {
                     )
                 })
                 .await;
-            this.update(cx, |this, cx| match res {
-                Ok((snap, features)) => {
-                    this.sidebar.update(cx, |s, cx| {
-                        s.set_session_account_features(
-                            krill_app::hosts::HostId::Local,
-                            features,
-                            cx,
-                        );
-                    });
-                    this.apply_accounts_snapshot(snap, cx);
-                    if mutating {
-                        cx.defer(krill_app::settings::notify_external_change);
-                    }
+            this.update(cx, |this, cx| {
+                let current = !mutating || this.account_operation_is_current(&operation_stamp);
+                if mutating {
+                    this.finish_account_mutation(&host, cx);
                 }
-                Err(e) => {
-                    if mutating {
-                        this.notice = Some(e);
-                        cx.notify();
-                    } else {
-                        tracing::debug!(error = %e, "background account refresh failed");
+                if !current {
+                    return;
+                }
+                if !mutating
+                    && read_stamp
+                        .as_ref()
+                        .is_none_or(|stamp| !this.account_read_is_current(stamp))
+                {
+                    return;
+                }
+                match res {
+                    Ok((snap, features)) => {
+                        this.sidebar.update(cx, |s, cx| {
+                            s.set_session_account_features(
+                                krill_app::hosts::HostId::Local,
+                                features,
+                                cx,
+                            );
+                        });
+                        this.apply_accounts_snapshot(snap, cx);
+                        if mutating {
+                            cx.defer(krill_app::settings::notify_external_change);
+                        }
+                    }
+                    Err(e) => {
+                        if mutating {
+                            this.notice = Some(e);
+                            cx.notify();
+                        } else {
+                            tracing::debug!(error = %e, "background account refresh failed");
+                        }
                     }
                 }
             })
@@ -3585,13 +3706,23 @@ impl Shell {
         account_id: String,
         cx: &mut Context<Self>,
     ) {
+        let host = self.active_account_host();
+        self.consume_reset_credit_for_host(host, provider, account_id, cx);
+    }
+
+    pub(super) fn consume_reset_credit_for_host(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        provider: krill_proto::usage::ProviderKind,
+        account_id: String,
+        cx: &mut Context<Self>,
+    ) {
         use krill_proto::usage::{ResetConsumeOutcome, UsageRequest};
         self.reset_armed = None;
         let req = UsageRequest::ConsumeResetCredit {
             provider,
             account_id,
         };
-        let host = self.active_account_host();
         let target = match &host {
             krill_app::hosts::HostId::Local => self
                 .paths
@@ -3609,6 +3740,9 @@ impl Shell {
             cx.notify();
             return;
         };
+        let Some(stamp) = self.account_read_stamp(&host) else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -3618,7 +3752,9 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| match res {
                 Ok(consumed) => {
-                    this.apply_accounts_snapshot_for_host(host, consumed.snapshot, cx);
+                    if this.account_read_is_current(&stamp) {
+                        this.apply_accounts_snapshot_for_host(host, consumed.snapshot, cx);
+                    }
                     this.notice = Some(match consumed.outcome {
                         ResetConsumeOutcome::Reset | ResetConsumeOutcome::AlreadyRedeemed => {
                             krill_app::i18n::catalog::status::PROVIDER_RESET_USAGE_DONE
@@ -3648,80 +3784,6 @@ impl Shell {
         .detach();
     }
 
-    fn failed_account_input(&self) -> Option<krill_proto::SessionId> {
-        let pane = self.layout.focused()?;
-        let host = self.layout.host(pane);
-        let session = self.layout.session(pane)?;
-        if self
-            .live
-            .get(&pane)
-            .is_none_or(|live| live.pane.is_closed())
-        {
-            return None;
-        }
-        self.accounts_for_host(host)
-            .details
-            .handoffs
-            .iter()
-            .any(|h| h.from == session && h.to.is_none() && h.error.is_some())
-            .then_some(session)
-    }
-
-    fn continue_original_account(
-        &mut self,
-        session: krill_proto::SessionId,
-        cx: &mut Context<Self>,
-    ) {
-        if self.account_cancel.is_some() || self.failed_account_input() != Some(session) {
-            return;
-        }
-        let host = self
-            .layout
-            .focused()
-            .map_or(krill_app::hosts::HostId::Local, |p| {
-                self.layout.host(p).clone()
-            });
-        let target = match &host {
-            krill_app::hosts::HostId::Local => self
-                .paths
-                .clone()
-                .filter(|_| self.link == Link::Up)
-                .map(krill_app::hosts::HostTarget::local),
-            krill_app::hosts::HostId::Remote(_) => self.target_for_host(&host),
-        };
-        let Some(target) = target else {
-            return;
-        };
-        self.account_cancel = Some(session);
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    krill_app::accounts::request_target(
-                        &target,
-                        &krill_proto::usage::UsageRequest::CancelAccountSwitch { session },
-                    )
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.account_cancel = None;
-                match result {
-                    Ok(snapshot) => {
-                        this.notice = None;
-                        this.apply_accounts_snapshot_for_host(host, snapshot, cx);
-                    }
-                    Err(error) => {
-                        this.notice = Some(error);
-                        cx.notify();
-                    }
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
     pub(super) fn apply_accounts_snapshot(
         &mut self,
         snap: krill_proto::usage::AccountsSnapshot,
@@ -3736,6 +3798,13 @@ impl Shell {
         snap: krill_proto::usage::AccountsSnapshot,
         cx: &mut Context<Self>,
     ) {
+        if snap.details.supported {
+            for handoff in &snap.details.handoffs {
+                if handoff.to.is_none() {
+                    self.observe_account_hold(&host, handoff);
+                }
+            }
+        }
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.sync_session_accounts(&host, Arc::new(snap.clone()), cx);
         });
@@ -3754,10 +3823,8 @@ impl Shell {
             match handoff {
                 Some(h) if h.to.is_none() && h.error.is_none() => live.pane.pause_account_input(),
                 Some(h) if h.to.is_some() => {} // moved below, retaining unsent input
-                other => input_notices.extend(
-                    live.pane
-                        .resume_account_input(other.is_some_and(|h| h.error.is_some()), Now::get()),
-                ),
+                Some(_) => input_notices.extend(live.pane.resume_account_input(true, Now::get())),
+                None => {} // Observations cannot authorize delivery to the original account.
             }
         }
         let mut rebound = false;
@@ -3767,8 +3834,12 @@ impl Shell {
             let mut changed = false;
             for handoff in &snap.details.handoffs {
                 if let Some(to) = handoff.to.filter(|to| *to != handoff.from) {
+                    if !self.account_hold_target_matches(&host, handoff.from) {
+                        continue;
+                    }
                     let panes = self.layout.rebind_session(&host, handoff.from, to);
                     if !panes.is_empty() {
+                        self.account_holds.remove(&(host.clone(), handoff.from));
                         // View choices stay on the rebound panes, scoped to their host.
                         self.chat.logs.remove(&(host.clone(), handoff.from));
                     }
@@ -3788,9 +3859,13 @@ impl Shell {
                     }
                 } else if let Some(error) = &handoff.error
                     && self.layout.sessions_for_host(&host).contains(&handoff.from)
+                    && !self
+                        .account_holds
+                        .get(&(host.clone(), handoff.from))
+                        .is_some_and(|hold| self.can_recover_account_input(hold, cx))
                     && self.handoff_errors.insert(error.clone())
                 {
-                    // Failed switches already released the pane above; input is not held.
+                    // Failure preserves held input until an explicit cancellation is acknowledged.
                     self.notice = Some(error.clone());
                 }
             }
@@ -3842,33 +3917,25 @@ impl Shell {
         for notice in &input_notices {
             self.show(Some(notice), cx);
         }
+        self.recover_account_input(cx);
         if pending {
             if host.is_local() {
                 if self.account_handoff_poll.is_none()
-                    && let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up)
+                    && self.paths.is_some()
+                    && self.link == Link::Up
                 {
                     self.account_handoff_poll = Some(cx.spawn(async move |this, cx| {
                         for _ in 0..120 {
                             cx.background_executor()
                                 .timer(Duration::from_millis(500))
                                 .await;
-                            let result = cx
-                                .background_executor()
-                                .spawn({
-                                    let paths = paths.clone();
-                                    async move {
-                                        krill_app::accounts::request_ipc(
-                                            &paths,
-                                            &krill_proto::usage::UsageRequest::ListAccounts,
-                                        )
-                                    }
-                                })
-                                .await;
                             let pending = this
                                 .update(cx, |this, cx| {
-                                    if let Ok(snapshot) = result {
-                                        this.apply_accounts_snapshot(snapshot, cx);
-                                    }
+                                    this.refresh_accounts_for_host(
+                                        krill_app::hosts::HostId::Local,
+                                        krill_proto::usage::UsageRequest::ListAccounts,
+                                        cx,
+                                    );
                                     this.accounts_snapshot
                                         .details
                                         .handoffs
@@ -3887,7 +3954,7 @@ impl Shell {
                     }));
                 }
             } else if !self.remote_account_handoff_polls.contains_key(&host)
-                && let Some(target) = self.target_for_host(&host)
+                && self.target_for_host(&host).is_some()
             {
                 let poll_host = host.clone();
                 let task = cx.spawn(async move |this, cx| {
@@ -3895,28 +3962,14 @@ impl Shell {
                         cx.background_executor()
                             .timer(Duration::from_millis(500))
                             .await;
-                        let result = cx
-                            .background_executor()
-                            .spawn({
-                                let target = target.clone();
-                                async move {
-                                    krill_app::accounts::request_target(
-                                        &target,
-                                        &krill_proto::usage::UsageRequest::ListAccounts,
-                                    )
-                                }
-                            })
-                            .await;
                         let host_for_update = poll_host.clone();
                         let pending = this
                             .update(cx, |this, cx| {
-                                if let Ok(snapshot) = result {
-                                    this.apply_accounts_snapshot_for_host(
-                                        host_for_update.clone(),
-                                        snapshot,
-                                        cx,
-                                    );
-                                }
+                                this.refresh_accounts_for_host(
+                                    host_for_update.clone(),
+                                    krill_proto::usage::UsageRequest::ListAccounts,
+                                    cx,
+                                );
                                 this.accounts_for_host(&host_for_update)
                                     .details
                                     .handoffs
@@ -4948,6 +5001,8 @@ impl Shell {
             self.show(Some(n), cx);
         }
         self.flush_clipboard_pastes(cx);
+        self.rebind_account_input_target(pane);
+        self.recover_account_input(cx);
         cx.notify();
         Next::Read(linked.reader)
     }
@@ -5139,6 +5194,7 @@ impl Shell {
             cx.notify();
             return false;
         }
+        self.recover_account_input(cx);
         if self.queue_input_behind_paste(pane, &out.pty) {
             cx.notify();
             return true;

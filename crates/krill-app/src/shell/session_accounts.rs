@@ -10,6 +10,14 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let host = target.host.clone();
+        if self.defer_account_mutation(&host) {
+            let source = self.target_for_host(&host);
+            self.account_deferred.push((
+                source,
+                super::account_input::DeferredMutation::Sidebar(target),
+            ));
+            return;
+        }
         let daemon = if host.is_local() {
             self.paths
                 .clone()
@@ -30,6 +38,8 @@ impl Shell {
             cx.notify();
             return;
         };
+        self.begin_account_mutation(&host);
+        let stamp = self.account_operation_stamp(&host);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -45,16 +55,20 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |s, cx| {
-                match result {
-                    Ok((snapshot, features)) => {
-                        s.sidebar.update(cx, |sidebar, cx| {
-                            sidebar.set_session_account_features(host.clone(), features, cx);
-                        });
-                        s.apply_accounts_snapshot_for_host(host.clone(), snapshot, cx);
-                    }
-                    Err(error) => {
-                        s.notice = Some(error);
-                        cx.notify();
+                let current = s.account_operation_is_current(&stamp);
+                s.finish_account_mutation(&host, cx);
+                if current {
+                    match result {
+                        Ok((snapshot, features)) => {
+                            s.sidebar.update(cx, |sidebar, cx| {
+                                sidebar.set_session_account_features(host.clone(), features, cx);
+                            });
+                            s.apply_accounts_snapshot_for_host(host.clone(), snapshot, cx);
+                        }
+                        Err(error) => {
+                            s.notice = Some(error);
+                            cx.notify();
+                        }
                     }
                 }
                 // Apply the daemon stage before releasing the API stage so the

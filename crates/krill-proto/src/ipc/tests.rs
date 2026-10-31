@@ -318,6 +318,11 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ("FEAT_ACCOUNT_POLICY", crate::usage::FEAT_ACCOUNT_POLICY, 61),
         ("FEAT_ACCOUNT_CANCEL", crate::usage::FEAT_ACCOUNT_CANCEL, 22),
         (
+            "FEAT_ACCOUNT_INPUT_RECOVERY",
+            crate::usage::FEAT_ACCOUNT_INPUT_RECOVERY,
+            39,
+        ),
+        (
             "FEAT_SESSION_ACCOUNT_SWITCH",
             crate::usage::FEAT_SESSION_ACCOUNT_SWITCH,
             28,

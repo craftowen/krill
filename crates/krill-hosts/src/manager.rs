@@ -135,6 +135,7 @@ struct RemoteSlot {
     last_error: Option<String>,
     tunnel_starts: usize,
     generation: u64,
+    registration: Arc<()>,
     /// 사용자가 사이드바에서 '연결 해제'를 눌러 수동으로 끊은 상태.
     /// `reconnect_now`로만 풀린다. 켜져 있으면 자동 재연결·폴링 재접속을 하지 않는다.
     suspended: bool,
@@ -155,6 +156,7 @@ impl RemoteSlot {
             last_error: None,
             tunnel_starts: 0,
             generation: 0,
+            registration: Arc::new(()),
             suspended: false,
         }
     }
@@ -245,6 +247,7 @@ impl HostManager {
                         || slot.spec.remote_socket != spec.remote_socket;
                     slot.spec = spec.clone();
                     if transport_changed {
+                        slot.registration = Arc::new(());
                         slot.generation = slot.generation.wrapping_add(1);
                         slot.tunnel = None;
                         slot.failures = 0;
@@ -422,7 +425,10 @@ impl HostManager {
                     ));
                 }
                 let slot = self.slot(id)?;
-                let initial_socket = slot.lock().ok()?.current_socket();
+                let (initial_socket, registration) = {
+                    let slot = slot.lock().ok()?;
+                    (slot.current_socket(), slot.registration.clone())
+                };
                 let manager = self.clone();
                 let host_id = id.clone();
                 let connector =
@@ -430,6 +436,24 @@ impl HostManager {
                         let manager = self.clone();
                         let host_id = id.clone();
                         move |ok, err| manager.record_ipc_outcome(&host_id, ok, err)
+                    })
+                    .with_lifetime(registration.clone(), {
+                        let manager = self.clone();
+                        let host_id = id.clone();
+                        let expected = Arc::downgrade(&slot);
+                        move || {
+                            let (Some(current), Some(expected)) =
+                                (manager.slot(&host_id), expected.upgrade())
+                            else {
+                                return false;
+                            };
+                            if !Arc::ptr_eq(&current, &expected) {
+                                return false;
+                            }
+                            current.lock().is_ok_and(|slot| {
+                                !slot.suspended && Arc::ptr_eq(&slot.registration, &registration)
+                            })
+                        }
                     });
                 Some(HostTarget::remote_with_connector(
                     id.clone(),

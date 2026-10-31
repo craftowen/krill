@@ -4,6 +4,7 @@
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
 
 pub(super) mod identity;
+mod input_recovery;
 #[cfg(all(test, unix))]
 mod tests;
 mod transcript;
@@ -31,6 +32,73 @@ struct Prepared {
     from: SessionId,
     to: SessionId,
     account_id: String,
+}
+
+#[derive(Default)]
+struct RecoveryFence {
+    sessions: std::collections::BTreeSet<SessionId>,
+    unidentified: bool,
+}
+
+impl RecoveryFence {
+    fn blocks(&self, session: SessionId) -> bool {
+        self.unidentified || self.sessions.contains(&session)
+    }
+}
+
+fn prepared_paths(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut paths = vec![dir.join(PREPARED_FILE)];
+    let entries = match std::fs::read_dir(dir.join("account-replacements")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+        Err(error) => return Err(error),
+    };
+    for (index, entry) in entries.enumerate() {
+        if index >= krill_proto::holder::MAX_SESSIONS {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn read_prepared(path: &Path) -> std::io::Result<Option<Prepared>> {
+    use std::io::Read as _;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Recovery holds the handoff lock; a replaced FIFO must never stall it.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    let mut raw = Vec::new();
+    file.take(4097).read_to_end(&mut raw)?;
+    let prepared: Prepared = serde_json::from_slice(&raw)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    if raw.len() > 4096 || prepared.from == prepared.to {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok(Some(prepared))
 }
 
 pub(super) fn load(dir: Option<&Path>) -> BTreeMap<SessionId, SessionHandoff> {
@@ -563,40 +631,7 @@ impl Registry {
     }
 
     pub(super) fn cancel_failed_account_switch(&self, session: SessionId) -> Result<(), Failure> {
-        let _selection = lock(&self.account_work.pending);
-        {
-            let state = lock(&self.state);
-            if !state.sessions.contains_key(&session)
-                || state.exited.contains_key(&session)
-                || state.closing.contains(&session)
-            {
-                return Err(Failure::NoSession);
-            }
-        }
-        let mut handoffs = lock(&self.account_handoffs);
-        let Some(handoff) = handoffs
-            .get(&session)
-            .filter(|h| h.to.is_none() && h.error.is_some())
-            .cloned()
-        else {
-            return Err(Failure::BadRequest);
-        };
-        handoffs.remove(&session);
-        if let Err(error) = self.write_account_handoffs(&handoffs) {
-            handoffs.insert(session, handoff);
-            return Err(super::os(&error));
-        }
-        drop(handoffs);
-        if self
-            .agents
-            .stored(session)
-            .ok()
-            .flatten()
-            .is_none_or(|s| s.session_id.is_none() && s.transcript_path.is_none())
-        {
-            lock(&self.account_switch_opt_out).insert(session);
-        }
-        Ok(())
+        self.cancel_account_switch(session, None)
     }
 
     pub(super) fn account_switch_snapshot(&self, snapshot: &mut AccountsSnapshot) {
@@ -789,7 +824,11 @@ impl Registry {
         }))
         .unwrap_or(Err(Failure::BadRequest));
         if result == Err(Failure::Os(libc::EBUSY)) {
-            lock(&self.account_work.pending)
+            let mut pending = lock(&self.account_work.pending);
+            if !self.account_selection_current(old, provider, account_id, &pending) {
+                return;
+            }
+            pending
                 .entry(SwitchScope::Session(old, provider))
                 .or_insert_with(|| accounts::switch_work::SwitchTarget {
                     account_id: account_id.to_owned(),
@@ -866,7 +905,7 @@ impl Registry {
         }
         // A crash between Spawned and the durable handoff must not leave a second agent
         // consuming the selected account while a retry starts another replacement.
-        self.recover_prepared_account();
+        let recovery = self.recover_prepared_account();
         let saved: Vec<_> = lock(&self.account_handoffs).values().cloned().collect();
         if saved.is_empty() {
             return;
@@ -924,6 +963,10 @@ impl Registry {
                     );
                 }
                 lock(&self.account_handoffs).insert(handoff.from, handoff);
+            } else if recovery.blocks(handoff.from) {
+                handoff.error =
+                    Some("Unconfirmed replacement recovery is pending; retry withheld".into());
+                lock(&self.account_handoffs).insert(handoff.from, handoff);
             } else if let Some(account) = snapshot
                 .accounts
                 .iter()
@@ -945,91 +988,127 @@ impl Registry {
         self.save_account_handoffs().ok();
     }
 
-    fn recover_prepared_account(&self) {
-        let Some(dir) = self.state_dir() else { return };
-        // v0.1.37 stored one journal per replacement; earlier versions used one file.
-        // Recover both layouts so upgrading never leaves an unconfirmed duplicate behind.
-        let mut paths = vec![dir.join(PREPARED_FILE)];
-        if let Ok(entries) = std::fs::read_dir(dir.join("account-replacements")) {
-            paths.extend(
-                entries
-                    .flatten()
-                    .take(krill_proto::holder::MAX_SESSIONS)
-                    .filter_map(|entry| {
-                        let path = entry.path();
-                        (entry.file_type().is_ok_and(|kind| kind.is_file())
-                            && path
-                                .extension()
-                                .is_some_and(|extension| extension == "json"))
-                        .then_some(path)
-                    }),
-            );
-        }
+    fn recover_prepared_account(&self) -> RecoveryFence {
+        let mut fence = RecoveryFence::default();
+        let Some(dir) = self.state_dir() else {
+            return fence;
+        };
+        let paths = match prepared_paths(&dir) {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::warn!(kind = ?error.kind(), "replacement inventory is incomplete; retries withheld");
+                fence.unidentified = true;
+                return fence;
+            }
+        };
         for path in paths {
-            self.recover_prepared_record(&path);
-        }
-    }
-
-    fn recover_prepared_record(&self, path: &Path) {
-        let prepared = std::fs::read(path)
-            .ok()
-            .filter(|raw| raw.len() <= 4096)
-            .and_then(|raw| serde_json::from_slice::<Prepared>(&raw).ok());
-        if let Some(prepared) = prepared {
-            let committed = lock(&self.account_handoffs)
-                .get(&prepared.from)
-                .is_some_and(|h| h.to == Some(prepared.to));
-            let source = self.agents.stored(prepared.from).ok().flatten();
-            let owned = self
-                .agents
-                .stored(prepared.to)
-                .ok()
-                .flatten()
-                .is_some_and(|a| {
-                    a.account.is_some_and(|a| a.id == prepared.account_id)
-                        && source.as_ref().is_none_or(|s| {
-                            s.profile == a.profile
-                                && (s.session_id.is_none() || s.session_id == a.session_id)
-                        })
-                });
-            if !committed && owned {
-                let old_live = {
-                    let state = lock(&self.state);
-                    state.sessions.contains_key(&prepared.from)
-                        && !state.exited.contains_key(&prepared.from)
-                        && !state.closing.contains(&prepared.from)
-                };
-                if old_live {
-                    self.close(
-                        &Peer {
-                            pid: None,
-                            scope: Scope::Full,
-                        },
-                        prepared.to,
-                    )
-                    .ok();
-                } else {
-                    // The original ended independently while the daemon was down. Keep the
-                    // replacement and make it reachable instead of closing the remaining PTY.
-                    lock(&self.account_handoffs).insert(
-                        prepared.from,
-                        SessionHandoff {
-                            from: prepared.from,
-                            to: None,
-                            account_id: prepared.account_id,
-                            error: Some(format!("Original session ended during recovery; unconfirmed replacement {} was retained. Select it explicitly to continue; held input was not sent", prepared.to.0)),
-                        },
-                    );
-                    self.save_account_handoffs().ok();
+            match read_prepared(&path) {
+                Ok(None) => {}
+                Ok(Some(prepared)) => {
+                    if !self.recover_prepared_record(&path, &prepared) {
+                        fence.sessions.extend([prepared.from, prepared.to]);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(kind = ?error.kind(), "replacement journal is unreadable; retries withheld");
+                    fence.unidentified = true;
                 }
             }
         }
-        std::fs::remove_file(path).ok();
+        fence
+    }
+
+    fn ensure_no_unresolved_account_replacement(&self, session: SessionId) -> Result<(), Failure> {
+        let Some(dir) = self.state_dir() else {
+            return Ok(());
+        };
+        let paths = prepared_paths(&dir).map_err(|_| Failure::BadRequest)?;
+        for path in paths {
+            if let Some(prepared) = read_prepared(&path).map_err(|_| Failure::BadRequest)?
+                && (prepared.from == session || prepared.to == session)
+            {
+                return Err(Failure::BadRequest);
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_prepared_record(&self, path: &Path, prepared: &Prepared) -> bool {
+        // Only a complete holder inventory makes absence authoritative on recovery.
+        if self.holder.is_none() {
+            return false;
+        }
+        let committed = lock(&self.account_handoffs)
+            .get(&prepared.from)
+            .is_some_and(|h| h.to == Some(prepared.to));
+        let (Ok(source), Ok(target)) = (
+            self.agents.stored(prepared.from),
+            self.agents.stored(prepared.to),
+        ) else {
+            return false;
+        };
+        if self.account_original_ended(prepared.to) {
+            return std::fs::remove_file(path).is_ok();
+        }
+        if committed {
+            return self.account_original_ended(prepared.from)
+                && std::fs::remove_file(path).is_ok();
+        }
+        let owned = target.is_some_and(|a| {
+            a.account.is_some_and(|a| a.id == prepared.account_id)
+                && source.as_ref().is_some_and(|s| {
+                    s.profile == a.profile
+                        && (s.session_id.is_none() || s.session_id == a.session_id)
+                })
+        });
+        if !owned {
+            return false;
+        }
+        if self.account_original_ended(prepared.from) {
+            // Retain the only remaining PTY. Persist the decision before removing evidence.
+            lock(&self.account_handoffs).insert(prepared.from, SessionHandoff {
+                from: prepared.from, to: None, account_id: prepared.account_id.clone(),
+                error: Some(format!("Original session ended during recovery; unconfirmed replacement {} was retained. Select it explicitly to continue; held input was not sent", prepared.to.0)),
+            });
+            return self.save_account_handoffs().is_ok() && std::fs::remove_file(path).is_ok();
+        }
+        if lock(&self.state).closing.contains(&prepared.from) {
+            return false;
+        }
+        // Done acknowledges Terminate; it does not prove that Exited was observed.
+        self.stop_account_replacement(prepared.to) && std::fs::remove_file(path).is_ok()
+    }
+
+    fn stop_account_replacement(&self, session: SessionId) -> bool {
+        if self.account_original_ended(session) {
+            return true;
+        }
+        let closing = lock(&self.state).closing.contains(&session);
+        if !closing
+            && self
+                .close(
+                    &Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    },
+                    session,
+                )
+                .is_err()
+        {
+            return false;
+        }
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while !self.account_original_ended(session) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.account_original_ended(session)
     }
 
     fn account_original_ended(&self, session: SessionId) -> bool {
         let state = lock(&self.state);
-        !state.sessions.contains_key(&session) || state.exited.contains_key(&session)
+        state.exited.contains_key(&session)
+            || (!state.sessions.contains_key(&session)
+                && !state.unregistered_kept.contains(&session))
     }
 
     fn transfer_account_selection(
@@ -1092,6 +1171,7 @@ impl Registry {
         home: &Path,
     ) -> Result<SessionId, Failure> {
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
+        self.ensure_no_unresolved_account_replacement(old)?;
         if !self.account_selection_current(
             old,
             provider,
@@ -1099,6 +1179,9 @@ impl Registry {
             &lock(&self.account_work.pending),
         ) {
             return Err(Failure::BadRequest);
+        }
+        if self.account_switch_busy(old) {
+            return Err(Failure::Os(libc::EBUSY));
         }
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
         let mut stored = self
@@ -1302,7 +1385,9 @@ impl Registry {
             bound_path.as_deref(),
         )
         .map_err(|error| prepare_failure(old, "transcript_preparation", &error))?;
-        let new = self.next_id();
+        let new = self
+            .reserve_session_id(Some(old))
+            .map_err(|error| super::os(&error))?;
         lock(&self.account_replacements).insert(new);
         let mut replacement = Replacement {
             registry: self,
@@ -1364,7 +1449,8 @@ impl Registry {
             size.cols,
             size.rows,
         )?;
-        // Keep the original conversation until the replacement identity is confirmed.
+        // A spawned CLI may still be at login or trust. Keep the original and held
+        // input until this process has reopened the exact conversation.
         let (tap, new_pid) = {
             let state = lock(&self.state);
             let entry = state.sessions.get(&new).ok_or(Failure::NoSession)?;
@@ -1375,6 +1461,14 @@ impl Registry {
         let mut confirmed_at = None;
         let mut next_identity_probe = Instant::now();
         while Instant::now() < deadline {
+            if !self.account_selection_current(
+                old,
+                provider,
+                &target.id,
+                &lock(&self.account_work.pending),
+            ) {
+                break;
+            }
             if lock(&self.state).exited.contains_key(&new) || tap.pulse().closed {
                 self.close(peer, new).ok();
                 return Err(Failure::BadRequest);
@@ -1467,6 +1561,9 @@ impl Registry {
         if !self.account_selection_current(old, provider, account_id, &pending) {
             return Err(Failure::BadRequest);
         }
+        if self.account_switch_busy(old) {
+            return Err(Failure::Os(libc::EBUSY));
+        }
         prepared_transcript
             .verify()
             .map_err(|error| prepare_failure(old, "transcript_preparation", &error))?;
@@ -1506,11 +1603,6 @@ impl Registry {
         let _retiring_binding = self.agents.retire_account_binding(old);
         drop(pending);
         drop(hook_commit);
-        let should_continue = self.agents.take_rate_limited(old) || {
-            let st = self.status.get(old);
-            st.state == krill_proto::control::AgentState::Working
-                && st.source == Some(krill_proto::control::Source::Hook)
-        };
         if !self.account_original_ended(old)
             && let Err(error) = self.close(peer, old)
         {
@@ -1543,35 +1635,11 @@ impl Registry {
             self.agents.finish_account_resume(new);
             return Err(Failure::Os(libc::ETIMEDOUT));
         }
-        // Publish the swap first. The continuation waits on its own thread so the account
-        // worker is free for the next switch; only a confirmed resume may receive input,
-        // so a login or directory prompt never gets an unintended Enter.
+        // Clients now reconnect and deliver their held prompts. A synthetic continuation
+        // could overtake input still in an app journal, so only actual user input is sent.
+        self.agents.take_rate_limited(old);
+        self.agents.finish_account_resume(new);
         drop(replacement);
-        if should_continue {
-            let this = std::sync::Arc::clone(self);
-            let (session_id, target) = (session_id.clone(), target.clone());
-            let watcher = tap.clone();
-            if let Err(error) = std::thread::Builder::new()
-                .name("account-continue".to_owned())
-                .spawn(move || {
-                    this.continue_after_account_switch(
-                        old,
-                        new,
-                        provider,
-                        new_pid,
-                        &watcher,
-                        &session_id,
-                        &claude_homes,
-                        &target,
-                    );
-                })
-            {
-                tracing::warn!(session = new.0, error = %error, "continuation watcher did not start");
-                self.agents.finish_account_resume(new);
-            }
-        } else {
-            self.agents.finish_account_resume(new);
-        }
         // A later selection can arrive while retirement is in progress. The replacement
         // becomes eligible only after its guard is gone, so enqueue that latest selection again.
         self.transfer_account_selection(old, new, provider, account_id, || {
@@ -1581,138 +1649,13 @@ impl Registry {
         Ok(new)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the probe needs the replacement process, terminal, and target home together"
-    )]
-    fn continue_after_account_switch(
-        &self,
-        old: SessionId,
-        new: SessionId,
-        provider: ProviderKind,
-        new_pid: u32,
-        tap: &crate::session::Tap,
-        session_id: &str,
-        claude_homes: &[std::path::PathBuf],
-        target: &krill_proto::usage::AccountInfo,
-    ) {
-        let resumed = self.account_resume_confirmed(
-            provider,
-            new,
-            new_pid,
-            tap,
-            session_id,
-            claude_homes,
-            target,
-        );
-        self.agents.finish_account_resume(new);
-        // A later switch away from the replacement owns it now; never type into it.
-        // ponytail: typing in the new pane during the ~2s resume is not detected; add a
-        // last-input check on Tap if prompts ever collide with user input.
-        let superseded = self.agents.account_binding_retiring(new)
-            || lock(&self.account_handoffs).contains_key(&new)
-            || lock(&self.account_work.pending)
-                .keys()
-                .any(|scope| matches!(scope, SwitchScope::Session(id, _) if *id == new));
-        if !resumed || superseded {
-            tracing::warn!(
-                session = new.0,
-                from = old.0,
-                resumed,
-                "continuation prompt withheld after account switch"
-            );
-            return;
-        }
-        if let Err(error) =
-            Self::deliver_input_to_tap(tap, b"Continue from where you left off.", true)
-        {
-            tracing::warn!(
-                session = new.0,
-                from = old.0,
-                error = %error,
-                "failed to send continuation prompt after account switch"
-            );
-        }
-    }
-
-    /// Wait for the replacement to reopen the exact conversation and settle its output.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the probe needs the replacement process, terminal, and target home together"
-    )]
-    fn account_resume_confirmed(
-        &self,
-        provider: ProviderKind,
-        new: SessionId,
-        new_pid: u32,
-        tap: &crate::session::Tap,
-        session_id: &str,
-        claude_homes: &[std::path::PathBuf],
-        target: &krill_proto::usage::AccountInfo,
-    ) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut next_identity_probe = Instant::now();
-        while Instant::now() < deadline {
-            if lock(&self.state).exited.contains_key(&new) || tap.pulse().closed {
-                return false;
-            }
-            if !self.agents.account_resume_observed(new, session_id)
-                && Instant::now() >= next_identity_probe
-            {
-                next_identity_probe = Instant::now() + Duration::from_millis(200);
-                let mut observed = identity::discover(provider, new_pid, tap.foreground());
-                if matches!(observed, Ok(None)) && provider == ProviderKind::Claude {
-                    observed = identity::discover_claude(claude_homes, new_pid, tap.foreground());
-                }
-                let observed = match observed {
-                    Ok(observed) => observed,
-                    Err(error) => {
-                        tracing::warn!(stage = "resume_identity", kind = ?error.kind(), "account handoff identity probe failed");
-                        return false;
-                    }
-                };
-                if let Some(found) = observed.filter(|found| {
-                    if provider != ProviderKind::Antigravity {
-                        return true;
-                    }
-                    let expected = if target.host_default {
-                        std::path::PathBuf::from(&target.profile_dir)
-                    } else {
-                        Path::new(&target.profile_dir).join(".gemini/antigravity-cli")
-                    };
-                    let host_expected = accounts::host_default_dir(
-                        &accounts::default_home(),
-                        ProviderKind::Antigravity,
-                    );
-                    let actual = found.home.canonicalize().ok();
-                    actual
-                        .as_ref()
-                        .zip(expected.canonicalize().ok().as_ref())
-                        .is_some_and(|(a, b)| a == b)
-                        || actual
-                            .as_ref()
-                            .zip(host_expected.canonicalize().ok().as_ref())
-                            .is_some_and(|(a, b)| a == b)
-                }) && found.id == session_id
-                {
-                    self.agents
-                        .bind_discovered_session(new, &found.id, Some(&found.path));
-                    self.agents.observe_account_resume(new, session_id);
-                }
-            }
-            if self.agents.account_resume_observed(new, session_id)
-                && tap.pulse().end > 0
-                && tap.quiet_ms() >= 150
-            {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        tracing::warn!(
-            stage = "resume_confirmation",
-            "account handoff could not confirm the resumed conversation"
-        );
-        false
+    fn account_switch_busy(&self, session: SessionId) -> bool {
+        use krill_proto::control::AgentState;
+        !self.agents.is_rate_limited(session)
+            && matches!(
+                self.status.get(session).state,
+                AgentState::Working | AgentState::Waiting | AgentState::Blocked
+            )
     }
 }
 
@@ -1765,26 +1708,30 @@ impl Drop for Replacement<'_> {
         let only_remaining = !self.committed
             && self.registry.account_original_ended(self.original)
             && !self.registry.account_original_ended(self.session);
-        if only_remaining {
-            if let Some(handoff) = lock(&self.registry.account_handoffs).get_mut(&self.original) {
+        let resolved = if only_remaining {
+            let retained = if let Some(handoff) =
+                lock(&self.registry.account_handoffs).get_mut(&self.original)
+            {
                 handoff.to = None;
                 handoff.error = Some(format!(
                     "Original session ended; unconfirmed replacement {} was retained. Select it explicitly to continue; held input was not sent",
                     self.session.0
                 ));
-            }
-        } else if !self.committed {
-            self.registry
-                .close(
-                    &Peer {
-                        pid: None,
-                        scope: Scope::Full,
-                    },
-                    self.session,
-                )
-                .ok();
-        }
-        if let Some(dir) = self.registry.state_dir() {
+                true
+            } else {
+                false
+            };
+            retained && self.registry.save_account_handoffs().is_ok()
+        } else if self.committed {
+            self.registry.account_original_ended(self.original)
+        } else {
+            // An unregistered target may be an unknown Spawn outcome. Leave its journal.
+            let registered = lock(&self.registry.state)
+                .sessions
+                .contains_key(&self.session);
+            registered && self.registry.stop_account_replacement(self.session)
+        };
+        if resolved && let Some(dir) = self.registry.state_dir() {
             std::fs::remove_file(replacement_journal(&dir, self.session)).ok();
         }
     }

@@ -13,6 +13,8 @@ pub const FEAT_USAGE: u64 = 1 << 17;
 pub const FEAT_PROVIDER_DETAILS: u64 = 1 << 15;
 /// Explicitly resume input on the original session after a failed account handoff.
 pub const FEAT_ACCOUNT_CANCEL: u64 = 1 << 22;
+/// Verify a failed handoff and continue unsent input on the preserved original automatically.
+pub const FEAT_ACCOUNT_INPUT_RECOVERY: u64 = 1 << 39;
 /// Resume exactly one session under another account without changing the provider default.
 pub const FEAT_SESSION_ACCOUNT_SWITCH: u64 = 1 << 28;
 mod details;
@@ -852,6 +854,12 @@ pub enum UsageRequest {
         provider: ProviderKind,
         account_id: String,
     },
+    /// Recover only the named failed account attempt, never a newer or unconfirmed replacement.
+    /// An absent handoff may acknowledge a prior recovery whose response was lost.
+    RecoverAccountInput {
+        session: crate::SessionId,
+        account_id: String,
+    },
 }
 
 impl UsageRequest {
@@ -909,6 +917,10 @@ impl UsageRequest {
             }
             Self::CancelAccountSwitch { .. } => {
                 features |= FEAT_ACCOUNT_CANCEL;
+                None
+            }
+            Self::RecoverAccountInput { .. } => {
+                features |= FEAT_ACCOUNT_INPUT_RECOVERY | FEAT_PROVIDER_DETAILS;
                 None
             }
             Self::ImportOrcaAntigravity { .. } => {

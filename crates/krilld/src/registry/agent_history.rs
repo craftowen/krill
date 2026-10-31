@@ -51,7 +51,7 @@ impl Registry {
         {
             return Err(Failure::UnknownAgent);
         }
-        let session = self.next_id();
+        let session = self.reserve_session_id(None).map_err(|error| os(&error))?;
         let state = self.state_dir();
         let cwd_bytes = target.cwd.clone().into_bytes();
         // K-13·OWE-698: 비활성 계정 대화를 활성 계정 프로필에서 `--resume`하면 "No conversation found"가 난다.

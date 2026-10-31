@@ -26,7 +26,7 @@ struct HostProfiles {
     spinner_grace: BTreeMap<SessionId, SpinnerGrace>,
     accounts: Arc<AccountsSnapshot>,
     replacements: BTreeMap<SessionId, SessionId>,
-    /// Keep the old row's footprint until a status poll sees its replacement.
+    /// Keep the row through a pending switch and until status sees its replacement.
     fallback: BTreeMap<SessionId, Fallback>,
 }
 
@@ -43,6 +43,15 @@ struct Fallback {
 }
 
 impl HostProfiles {
+    fn remember(&mut self, session: &Session) {
+        if !session.is_exited() {
+            self.fallback.entry(session.id).or_insert_with(|| Fallback {
+                session: session.clone(),
+                missing_polls: 0,
+            });
+        }
+    }
+
     fn is_pending(&self, session: SessionId) -> bool {
         self.pending.contains(&session)
             || self.accounts.details.handoffs.iter().any(|handoff| {
@@ -107,7 +116,16 @@ impl State {
             return false;
         };
         let before = state.fallback.len();
+        let pending: BTreeSet<_> = state
+            .fallback
+            .keys()
+            .copied()
+            .filter(|id| state.is_pending(*id))
+            .collect();
         state.fallback.retain(|id, fallback| {
+            if pending.contains(id) {
+                return true;
+            }
             if snapshot.sessions.iter().any(|s| s.id == *id) {
                 return false;
             }
@@ -126,13 +144,19 @@ impl State {
     }
 
     pub(super) fn remove_fallback(&mut self, host: &HostId, session: SessionId) {
-        if let Some(state) = self.hosts.get_mut(host) {
+        if let Some(state) = self.hosts.get_mut(host)
+            && !state.is_pending(session)
+        {
             state.fallback.remove(&session);
         }
     }
 
     pub(super) fn snapshot<'a>(&self, host: &HostId, snapshot: &'a Snapshot) -> Cow<'a, Snapshot> {
-        let Some(state) = self.hosts.get(host).filter(|s| !s.replacements.is_empty()) else {
+        let Some(state) = self
+            .hosts
+            .get(host)
+            .filter(|s| !s.replacements.is_empty() || !s.fallback.is_empty())
+        else {
             return Cow::Borrowed(snapshot);
         };
         let mut normalized = snapshot.clone();
@@ -140,6 +164,14 @@ impl State {
             .sessions
             .retain(|s| state.destination(s.id) == s.id);
         for (id, fallback) in &state.fallback {
+            if state.is_pending(*id)
+                && let Some(row) = normalized.sessions.iter_mut().find(|s| s.id == *id)
+            {
+                if row.is_exited() {
+                    *row = fallback.session.clone();
+                }
+                continue;
+            }
             if state.destination(*id) == *id && !normalized.sessions.iter().any(|s| s.id == *id) {
                 normalized.sessions.push(fallback.session.clone());
             }
@@ -179,6 +211,12 @@ pub(super) fn account_label(account: &AccountInfo, choices: &[AccountInfo]) -> S
 }
 
 impl Sidebar {
+    pub fn supports_account_input_recovery(&self, host: &HostId) -> bool {
+        self.profiles.hosts.get(host).is_some_and(|state| {
+            state.features & krill_proto::usage::FEAT_ACCOUNT_INPUT_RECOVERY != 0
+        })
+    }
+
     /// Capability comes from this host's account IPC connection, never the active pane.
     pub fn set_session_account_features(
         &mut self,
@@ -203,24 +241,26 @@ impl Sidebar {
         let state = self.profiles.hosts.entry(host.clone()).or_default();
         let mut changed = false;
         for handoff in &accounts.details.handoffs {
+            if handoff.to.is_none()
+                && handoff.error.is_none()
+                && let Some(row) = snapshot.sessions.iter().find(|s| s.id == handoff.from)
+            {
+                state.remember(row);
+            }
             let Some(to) = handoff.to.filter(|to| *to != handoff.from) else {
                 continue;
             };
             if state.replacements.get(&handoff.from) == Some(&to) {
                 continue;
             }
-            let before = snapshot
-                .sessions
-                .iter()
-                .find(|s| s.id == handoff.from)
-                .or_else(|| {
-                    state
-                        .fallback
-                        .get(&handoff.from)
-                        .map(|fallback| &fallback.session)
-                })
+            let before = state
+                .fallback
+                .get(&handoff.from)
+                .map(|fallback| &fallback.session)
+                .or_else(|| snapshot.sessions.iter().find(|s| s.id == handoff.from))
                 .cloned();
             state.replacements.insert(handoff.from, to);
+            state.fallback.remove(&handoff.from);
             if let Some(mut row) = before {
                 row.id = to;
                 if let Some(account) = accounts
@@ -290,7 +330,7 @@ impl Sidebar {
             .as_deref()
     }
 
-    pub(super) fn session_account_pending(&self, host: &HostId, session: SessionId) -> bool {
+    pub fn session_account_pending(&self, host: &HostId, session: SessionId) -> bool {
         self.profiles
             .hosts
             .get(host)
@@ -485,7 +525,11 @@ impl Sidebar {
     ) {
         if let Some(state) = self.profiles.hosts.get_mut(host) {
             state.pending.remove(&session);
+            let removed = !state.is_pending(session) && state.fallback.remove(&session).is_some();
             self.reconcile_spinner_grace(host, cx);
+            if removed {
+                self.rebuild(cx);
+            }
             cx.notify();
         }
     }
@@ -512,12 +556,10 @@ impl Sidebar {
         {
             return;
         }
-        self.profiles
-            .hosts
-            .entry(target.host.clone())
-            .or_default()
-            .pending
-            .insert(target.session);
+        let row = session.clone();
+        let state = self.profiles.hosts.entry(target.host.clone()).or_default();
+        state.remember(&row);
+        state.pending.insert(target.session);
         self.start_spinner_grace(target.host.clone(), target.session, cx);
         cx.emit(target);
         cx.notify();

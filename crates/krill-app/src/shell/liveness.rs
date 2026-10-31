@@ -76,7 +76,10 @@ impl Shell {
                     .timer(Duration::from_millis(500))
                     .await;
                 if this
-                    .update(cx, |this, cx| this.recover_stalled_panes(Now::get(), cx))
+                    .update(cx, |this, cx| {
+                        this.recover_stalled_panes(Now::get(), cx);
+                        this.recover_account_input(cx);
+                    })
                     .is_err()
                 {
                     return;

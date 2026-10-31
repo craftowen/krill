@@ -263,6 +263,25 @@ impl HostTarget {
             .is_none_or(|lifetime| (lifetime.current)())
     }
 
+    /// A forwarding socket may change while the registered remote endpoint stays the same.
+    /// This authorizes rechecking an attached session, never sending commands by itself.
+    pub fn same_session_authority(&self, other: &Self) -> bool {
+        if self.host != other.host {
+            return false;
+        }
+        if self == other {
+            return true;
+        }
+        match (
+            self.connector.as_ref().and_then(|c| c.lifetime.as_ref()),
+            other.connector.as_ref().and_then(|c| c.lifetime.as_ref()),
+        ) {
+            (Some(a), Some(b)) => Arc::ptr_eq(&a.key, &b.key),
+            (None, None) if self.host.is_local() => self.socket == other.socket,
+            _ => false,
+        }
+    }
+
     /// 호스트 데몬에 연결한다.
     ///
     /// - `allow_local_launch == true` (`Local`): 소켓이 없으면 로컬 `krill-holder`/`krilld`를 기동한다.
@@ -291,6 +310,9 @@ impl HostTarget {
             },
             None => self.socket.clone(),
         };
+        if !self.is_current() {
+            return Err(daemon::Error::Io(io::ErrorKind::Interrupted.into()));
+        }
         match ssh::dial_tunnel(&socket, hello, ssh::HELLO_TIMEOUT) {
             Ok(conn) => {
                 // ensure_socket 이후 Hello가 지연되는 동안 등록이 해제될 수 있다.

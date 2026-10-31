@@ -9712,6 +9712,16 @@ fn account_failure_recovery_holds_input_and_dismissed_notice_stays_dismissed(
             shell.paths = None;
             shell.attach_test(pane, session, ours, cx);
             shell.layout.set_session(pane, session);
+            let fixture = state_path("account-cancel-target");
+            let paths = Paths {
+                socket: fixture.join("run/krilld.sock"),
+                holder: fixture.join("holder"),
+                krilld: fixture.join("daemon"),
+            };
+            shell.live.get_mut(&pane).unwrap().target =
+                Some(krill_app::hosts::HostTarget::local(paths.clone()));
+            shell.paths = Some(paths);
+            shell.link = Link::Up;
             shell.apply_accounts_snapshot(failed.clone(), cx);
             assert_eq!(shell.failed_account_input(), Some(session));
             assert!(shell.notice.is_some());
@@ -9732,12 +9742,140 @@ fn account_failure_recovery_holds_input_and_dismissed_notice_stays_dismissed(
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("account-continue-original").is_some());
+    // A stale empty observation cannot authorize delivery or hide recovery.
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            let mut stale = AccountsSnapshot::default();
+            stale.details.supported = true;
+            shell.apply_accounts_snapshot(stale, cx);
+            assert_eq!(shell.failed_account_input(), Some(session));
+            assert!(shell.live[&pane].pane.account_switching());
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("account-continue-original").is_some());
     // Only the acknowledged cancellation removes the failed handoff and releases typing.
     cx.update(|_, cx| {
         view.update(cx, |shell, cx| {
             let mut cancelled = AccountsSnapshot::default();
             cancelled.details.supported = true;
-            shell.apply_accounts_snapshot(cancelled, cx);
+            let fixture = state_path("account-cancel-target");
+            let paths = Paths {
+                socket: fixture.join("run/krilld.sock"),
+                holder: fixture.join("holder"),
+                krilld: fixture.join("daemon"),
+            };
+            let target = krill_app::hosts::HostTarget::local(paths.clone());
+            shell.live.get_mut(&pane).unwrap().target = Some(target.clone());
+            shell.paths = Some(paths);
+            shell.link = Link::Up;
+            let cancel = account_input::Cancel {
+                hold: shell.failed_account_hold().unwrap(),
+                target,
+                epoch: 0,
+            };
+            shell.finish_account_cancel(&cancel, cancelled, cx);
+            assert_eq!(shell.failed_account_input(), None);
+            assert!(!shell.live[&pane].pane.account_switching());
+        });
+    });
+    let bytes = loop {
+        let (kind, body) = ipc::read_frame(&mut peer).unwrap().unwrap();
+        if kind == Input::KIND {
+            break Input::decode(kind, &body).unwrap().bytes;
+        }
+    };
+    assert_eq!(bytes, b"held prompt\r");
+}
+
+#[gpui::test]
+fn pending_account_switch_can_be_cancelled_without_releasing_input_on_stale_observation(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::input::Input;
+    use krill_proto::screen::Msg as _;
+    use krill_proto::usage::{AccountsSnapshot, SessionHandoff};
+    let (view, cx) = open(cx, state_path("pending-account-recovery"));
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let session = SessionId(91);
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let mut failed = AccountsSnapshot::default();
+    failed.details.supported = true;
+    failed.details.handoffs.push(SessionHandoff {
+        from: session,
+        to: None,
+        account_id: "selected".into(),
+        error: None,
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            shell.paths = None;
+            shell.attach_test(pane, session, ours, cx);
+            shell.layout.set_session(pane, session);
+            let fixture = state_path("account-cancel-target");
+            let paths = Paths {
+                socket: fixture.join("run/krilld.sock"),
+                holder: fixture.join("holder"),
+                krilld: fixture.join("daemon"),
+            };
+            shell.live.get_mut(&pane).unwrap().target =
+                Some(krill_app::hosts::HostTarget::local(paths.clone()));
+            shell.paths = Some(paths);
+            shell.link = Link::Up;
+            shell.apply_accounts_snapshot(failed.clone(), cx);
+            assert!(shell.cancellable_account_hold().is_some());
+            assert!(shell.notice.is_none());
+            shell
+                .live
+                .get_mut(&pane)
+                .unwrap()
+                .pane
+                .input(b"held prompt\r", Now::get());
+            shell.notice = None;
+            shell.apply_accounts_snapshot(failed, cx);
+            assert!(
+                shell.notice.is_none(),
+                "the same failed snapshot must not repeat a dismissed toast"
+            );
+            assert!(shell.live[&pane].pane.account_switching());
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("account-continue-original").is_some());
+    // A stale empty observation cannot authorize delivery or hide recovery.
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            let mut stale = AccountsSnapshot::default();
+            stale.details.supported = true;
+            shell.apply_accounts_snapshot(stale, cx);
+            assert!(shell.cancellable_account_hold().is_some());
+            assert!(shell.live[&pane].pane.account_switching());
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("account-continue-original").is_some());
+    // Only the acknowledged cancellation removes the failed handoff and releases typing.
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            let mut cancelled = AccountsSnapshot::default();
+            cancelled.details.supported = true;
+            let fixture = state_path("account-cancel-target");
+            let paths = Paths {
+                socket: fixture.join("run/krilld.sock"),
+                holder: fixture.join("holder"),
+                krilld: fixture.join("daemon"),
+            };
+            let target = krill_app::hosts::HostTarget::local(paths.clone());
+            shell.live.get_mut(&pane).unwrap().target = Some(target.clone());
+            shell.paths = Some(paths);
+            shell.link = Link::Up;
+            let cancel = account_input::Cancel {
+                hold: shell.cancellable_account_hold().unwrap(),
+                target,
+                epoch: 0,
+            };
+            shell.finish_account_cancel(&cancel, cancelled, cx);
             assert_eq!(shell.failed_account_input(), None);
             assert!(!shell.live[&pane].pane.account_switching());
         });
