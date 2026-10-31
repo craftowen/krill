@@ -7,7 +7,8 @@ mod storage;
 mod usage;
 pub use storage::{
     ActivityGeneration, FlushReport, Outcome, Status, activity_generation, flush_with,
-    record_activity, record_activity_for_generation, record_open, status_with,
+    record_activity, record_activity_for_generation, record_agent_active, record_event,
+    record_open, status_with,
 };
 pub use usage::{
     Ack, Batch, ENDPOINT, ENDPOINT_VAR, MAX_BATCH, MAX_PENDING, MAX_REQUEST_BYTES, UsageEvent,
@@ -133,6 +134,9 @@ pub fn consent(state: Option<&Path>, env: &Env) -> Consent {
         }
     }
     match state {
+        Some(dir) if crate::error_reporting::shielded(dir) => {
+            Consent::Disabled(Reason::NoConsentFile)
+        }
         Some(dir) if dir.join(DISABLED_FILE).exists() => Consent::Disabled(Reason::UserDisabled),
         Some(_) => Consent::Enabled,
         None => Consent::Disabled(Reason::NoConsentFile),

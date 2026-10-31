@@ -265,6 +265,19 @@ for (const signal of [
       assert.equal(h.store.has(OUTBOX), false);
     }
   });
+for (const href of [
+  "http://127.0.0.1:9898/m/0123456789abcdef/",
+  "http://localhost:9898/m/0123456789abcdef/",
+  "http://[::1]:9898/m/0123456789abcdef/",
+])
+  test(`loopback origin ${href} never uploads mobile diagnostics`, async () => {
+    const h = harness({ href });
+    assert.equal(h.diagnostics.enabled(), false);
+    assert.equal(h.diagnostics.setEnabled(true), false);
+    event(h);
+    await h.tick();
+    assert.equal(h.requests.length, 0);
+  });
 test("error then close1006 reports automatically before desktop auth, preserves route and actual code", async () => {
   const h = harness();
   const t = h.transport(),

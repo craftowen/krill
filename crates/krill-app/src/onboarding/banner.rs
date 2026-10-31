@@ -18,9 +18,6 @@ pub fn render(cx: &App) -> Option<AnyElement> {
 
 /// Action content shared by the shell toast and the standalone check surface.
 pub fn render_need(need: FixNeed, cx: &App) -> AnyElement {
-    if need.check_id == super::error_consent::CHECK_ID {
-        return render_error_consent(need, cx);
-    }
     let p = crate::ui::palette(cx);
     let fix_id = need.check_id.clone();
     let close_id = need.check_id.clone();
@@ -70,79 +67,6 @@ pub fn render_need(need: FixNeed, cx: &App) -> AnyElement {
                 ),
         )
         .into_any_element()
-}
-
-/// 오류 보고 동의 배너. 기본 OFF이며, 어느 쪽을 눌러도 온보딩 완료·세션은 막지 않는다.
-fn render_error_consent(need: FixNeed, cx: &App) -> AnyElement {
-    let p = crate::ui::palette(cx);
-    div()
-        .id("error-consent-banner")
-        .debug_selector(|| "error-consent-banner".into())
-        .w_full()
-        .min_w_0()
-        .px_3()
-        .py_1p5()
-        .bg(p.popover)
-        .text_color(p.popover_foreground)
-        .font_family(crate::ui::FONT_UI)
-        .text_size(crate::ui::TEXT_XS)
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .whitespace_normal()
-                .debug_selector(|| "error-consent-message".into())
-                .child(need.message),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_end()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_none()
-                        .debug_selector(|| "error-consent-decline".into())
-                        .child(
-                            Button::new("error-consent-decline")
-                                .xsmall()
-                                .ghost()
-                                .label(text::ERROR_CONSENT_DECLINE.get())
-                                .on_click(|_, _, cx| decline_consent(cx)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .debug_selector(|| "error-consent-accept".into())
-                        .child(
-                            Button::new("error-consent-accept")
-                                .xsmall()
-                                .primary()
-                                .label(text::ERROR_CONSENT_ENABLE.get())
-                                .on_click(|_, _, cx| accept_consent(cx)),
-                        ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn accept_consent(cx: &mut App) {
-    let Some(env) = Env::current() else {
-        return;
-    };
-    super::error_consent::accept(&env.state, cx);
-}
-
-fn decline_consent(cx: &mut App) {
-    let Some(env) = Env::current() else {
-        return;
-    };
-    super::error_consent::decline(&env.state, cx);
 }
 
 /// [고치기]: 조치를 돌리고 성공하면 배너를 내린다. 실패하면 남겨 두고 다시 누를 수 있다.

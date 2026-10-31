@@ -161,6 +161,11 @@ pub fn start(cx: &mut App) {
 }
 
 fn send_pending(state: &Path) -> io::Result<()> {
+    if std::env::var_os(error_reporting::ENDPOINT_VAR).is_none()
+        && !error_reporting::is_production_state_dir(state)
+    {
+        return Ok(());
+    }
     if error_reporting::consent_at(state)?.is_none() {
         return Ok(());
     }

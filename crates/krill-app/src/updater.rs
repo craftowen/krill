@@ -1589,14 +1589,6 @@ fn single_flight(
     }
     let mut owner = FlightOwner(flight.clone(), true);
     let result = work();
-    if result.is_err() {
-        krill_proto::error_reporting::capture(
-            krill_proto::error_reporting::Process::App,
-            krill_proto::error_reporting::Code::UpdateFailed,
-            file!(),
-            line!(),
-        );
-    }
     let mut state = flight
         .state
         .lock()
@@ -1640,8 +1632,38 @@ fn check_and_stage_with(
         skip_rolled_back
     );
     single_flight(&key, || {
-        let manifest = fetch_manifest(&cfg.url)?;
-        decide_and_stage(&cfg, &manifest, app_bundle, state_dir, skip_rolled_back)
+        let manifest = match fetch_manifest(&cfg.url) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                if !matches!(error, Error::Http(_)) {
+                    let detail = error.to_string();
+                    krill_proto::error_reporting::capture_detailed_at(
+                        state_dir,
+                        krill_proto::error_reporting::Process::App,
+                        krill_proto::error_reporting::Code::UpdateFailed,
+                        Some(&detail),
+                        &[],
+                        file!(),
+                        line!(),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        decide_and_stage(&cfg, &manifest, app_bundle, state_dir, skip_rolled_back).inspect_err(
+            |error| {
+                let detail = error.to_string();
+                krill_proto::error_reporting::capture_detailed_at(
+                    state_dir,
+                    krill_proto::error_reporting::Process::App,
+                    krill_proto::error_reporting::Code::UpdateFailed,
+                    Some(&detail),
+                    &[],
+                    file!(),
+                    line!(),
+                );
+            },
+        )
     })
 }
 

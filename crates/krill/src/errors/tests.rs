@@ -334,6 +334,7 @@ printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"schema_versio
 fn flush_without_consent_neither_collects_nor_sends() {
     let temp = Temp::new();
     let state = temp.state();
+    reporting::disable(&state).unwrap();
     let report = run_flush(
         &state,
         &Env::stub(&[]),
@@ -342,7 +343,6 @@ fn flush_without_consent_neither_collects_nor_sends() {
     )
     .unwrap();
     assert_eq!(report.outcome, FlushOutcome::NotConsented);
-    assert!(!state.exists(), "동의 없이 상태 디렉터리를 만들지 않는다");
     let consent = consent(&state);
     record(&state, &consent, 1);
     let report = run_flush(

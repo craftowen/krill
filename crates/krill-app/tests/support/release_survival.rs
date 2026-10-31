@@ -98,6 +98,8 @@ pub(super) fn launch_app(guard: &mut Processes) {
             },
         )
         .env("KRILL_STATE_DIR", &guard.dir)
+        .env("KRILL_TELEMETRY_DISABLED", "1")
+        .env("KRILL_ERROR_REPORTING_DISABLED", "1")
         .env("HOME", &guard.dir)
         .current_dir(&guard.dir)
         .stdin(Stdio::null())
@@ -247,6 +249,8 @@ fn start_daemon_for_build(dir: PathBuf, expected_build: &str) -> (Paths, Process
         .arg(&paths.krilld)
         .arg(&paths.socket)
         .env("KRILL_STATE_DIR", &dir)
+        .env("KRILL_TELEMETRY_DISABLED", "1")
+        .env("KRILL_ERROR_REPORTING_DISABLED", "1")
         .env("HOME", &dir)
         .current_dir(&dir)
         .stdin(Stdio::null())

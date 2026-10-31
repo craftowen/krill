@@ -42,6 +42,8 @@ pub use session::{Gap, PARK_GRACE, Session};
 pub use shell::run_windows_shell;
 pub use shell::{Launch, Shell};
 pub use store::{Recorder, Store};
+#[cfg(unix)]
+pub use sys::notify_on_stop_signal;
 #[cfg(windows)]
 pub use sys::run_console_probe;
 pub use term::HOT_LINES;

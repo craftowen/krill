@@ -70,13 +70,20 @@ export async function stats(db, now, days) {
   const start = Math.max(now - RETENTION, (Math.floor(now / 86400) - days + 1) * 86400 - 1);
   const within = 'received_at > ? AND received_at <= ?';
   const queries = [
-    db.prepare(`SELECT count(*) AS rows, coalesce(sum(logical_bytes), 0) AS logical_bytes
+    db.prepare(`SELECT count(*) AS rows, coalesce(sum(logical_bytes), 0) AS logical_bytes,
+      count(DISTINCT json_extract(event_json, '$.install_hash')) AS affected_installs,
+      count(DISTINCT coalesce(json_extract(event_json, '$.diagnostics.attempt_id'), event_id)) AS distinct_attempts
       FROM events WHERE ${within}`).bind(start, now),
     db.prepare(`SELECT date(received_at, 'unixepoch') AS day, count(*) AS rows FROM events
       WHERE ${within} GROUP BY day ORDER BY day`).bind(start, now),
     db.prepare(`SELECT json_extract(event_json, '$.kind') AS kind,
       json_extract(event_json, '$.error_code') AS error_code,
-      json_extract(event_json, '$.process') AS process, count(*) AS rows FROM events
+      json_extract(event_json, '$.process') AS process, count(*) AS rows,
+      count(DISTINCT json_extract(event_json, '$.install_hash')) AS affected_installs,
+      count(DISTINCT coalesce(json_extract(event_json, '$.diagnostics.attempt_id'), event_id)) AS distinct_attempts,
+      coalesce(max(json_extract(event_json, '$.detail')), max(json_extract(event_json, '$.diagnostics.reason'))) AS sample_detail,
+      max(json_extract(event_json, '$.source_loc')) AS sample_source_loc
+      FROM events
       WHERE ${within} GROUP BY kind, error_code, process ORDER BY rows DESC, kind, error_code, process`).bind(start, now),
     db.prepare(`SELECT json_extract(event_json, '$.release') AS release, count(*) AS rows FROM events
       WHERE ${within} GROUP BY release ORDER BY rows DESC, release LIMIT 20`).bind(start, now),
@@ -88,7 +95,10 @@ export async function stats(db, now, days) {
   const rows = result.map(r => r.results);
   return {
     schema_version: 1, as_of_unix: now, timezone: 'UTC', days, retention_days: 30,
-    totals: rows[0][0], timeline: rows[1], groups: rows[2], releases: rows[3],
+    totals: rows[0][0], timeline: rows[1],
+    groups: rows[2].map(({kind, error_code, process, rows: count}) => ({kind, error_code, process, rows: count})),
+    details: rows[2],
+    releases: rows[3],
     storage: rows[4][0], daily_usage: rows[5][0] ?? {rows: 0, bytes: 0}, limits: rows[6][0],
   };
 }

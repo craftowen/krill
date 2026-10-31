@@ -650,8 +650,9 @@ fn seen_cache_is_bounded_and_rejects_corruption() {
 #[test]
 fn collect_without_consent_reads_nothing() {
     let scratch = Scratch::new("native-none");
+    crate::error_reporting::disable(&scratch.0).unwrap();
     assert_eq!(collect(&scratch.0).unwrap(), 0);
-    assert!(!dir(&scratch.0).exists());
+    assert!(!Seen::path(&scratch.0).exists());
 }
 
 #[test]

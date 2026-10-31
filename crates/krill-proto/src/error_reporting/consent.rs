@@ -23,6 +23,8 @@ pub const DISABLED_VAR: &str = "KRILL_ERROR_REPORTING_DISABLED";
 const MAX_CONSENT_BYTES: usize = 512;
 /// 동의·철회가 대기열 잠금을 기다리는 상한. 쓰기 쪽은 파일 몇 개만 다루고 곧 놓는다.
 const MANAGE_WAIT: Duration = Duration::from_secs(3);
+const DEFAULT_CONSENT_DOMAIN: &str = "krill.error-reporting.default-consent.v1";
+const DISABLED_JSON: &[u8] = br#"{"enabled":false}"#;
 
 /// 현재 유효한 동의. 대기열 항목은 기록 당시 `generation`에 묶인다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +32,27 @@ const MANAGE_WAIT: Duration = Duration::from_secs(3);
 pub struct Consent {
     pub generation: String,
     pub enabled_at_ms: u64,
+}
+
+impl Consent {
+    #[must_use]
+    pub(crate) fn default_for(state: &Path) -> Self {
+        Self {
+            generation: super::event_id(
+                DEFAULT_CONSENT_DOMAIN,
+                super::resolve(state).as_os_str().as_encoded_bytes(),
+            ),
+            enabled_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredConsent {
+    enabled: Option<bool>,
+    generation: Option<String>,
+    enabled_at_ms: Option<u64>,
 }
 
 /// 거부 판정에 쓰는 환경 값. [`Env::live`]는 프로세스 환경을, 테스트는 [`Env::stub`]을 쓴다.
@@ -71,7 +94,7 @@ impl Env {
     }
 }
 
-/// 현재 동의(실제 환경의 거부 포함). 거부·파일 없음·손상 파일이면 `None`이다.
+/// 현재 동의(실제 환경의 거부 포함). 거부·명시 철회·손상 파일이면 `None`이다.
 ///
 /// # Errors
 /// 없음 외의 읽기 실패.
@@ -90,13 +113,30 @@ pub fn consent_with(state: &Path, env: &Env) -> io::Result<Option<Consent>> {
     read(state)
 }
 
-/// 환경과 무관한 동의 파일 내용. 없거나 손상됐거나 일반 파일이 아니면(FIFO·링크) `None`이다 — 동의를 증명하지
-/// 못하면 꺼진 것으로 본다. 막히지 않는 열기라 panic hook에서도 기다리지 않는다.
+/// 환경과 무관한 동의 상태. `consent.json`이 없으면 기본 활성화 세대를 돌려주고, 명시적 철회(`{"enabled":false}`)·
+/// 손상 파일·비일반 파일(FIFO·링크)이면 `None`이다. 막히지 않는 열기라 panic hook에서도 기다리지 않는다.
 pub(crate) fn read(state: &Path) -> io::Result<Option<Consent>> {
     if super::shielded(state) {
         return Ok(None);
     }
-    let raw = match file::read_bounded(&dir(state).join(CONSENT_FILE), MAX_CONSENT_BYTES) {
+    let dir = dir(state);
+    if fs::symlink_metadata(&dir).is_ok_and(|m| !m.file_type().is_dir()) {
+        return Ok(None);
+    }
+    let path = dir.join(CONSENT_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.file_type().is_file() => return Ok(None),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(Consent::default_for(state)));
+        }
+        Err(e) => return Err(e),
+    }
+    read_explicit(&path)
+}
+
+fn read_explicit(path: &Path) -> io::Result<Option<Consent>> {
+    let raw = match file::read_bounded(path, MAX_CONSENT_BYTES) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
         Err(e)
@@ -109,9 +149,18 @@ pub(crate) fn read(state: &Path) -> io::Result<Option<Consent>> {
         }
         Err(e) => return Err(e),
     };
-    Ok(serde_json::from_slice::<Consent>(&raw)
-        .ok()
-        .filter(|c| is_hex32(&c.generation)))
+    let Ok(stored) = serde_json::from_slice::<StoredConsent>(&raw) else {
+        return Ok(None);
+    };
+    match (stored.enabled, stored.generation, stored.enabled_at_ms) {
+        (None | Some(true), Some(generation), Some(enabled_at_ms)) if is_hex32(&generation) => {
+            Ok(Some(Consent {
+                generation,
+                enabled_at_ms,
+            }))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// 테스트 프로세스는 실제 사용자 동의를 바꾸지 않는다([`super::shielded`]). `read`가 `None`을 주므로 그대로 두면
@@ -126,7 +175,7 @@ fn refuse_shielded(state: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// 동의한다(멱등: 이미 유효한 동의가 있으면 세대를 유지한다). 새 동의는 남아 있던 대기열·재시도·native
+/// 동의한다(멱등: 이미 명시적으로 동의한 파일이 있으면 세대를 유지한다). 새 동의·재동의는 남아 있던 대기열·재시도·native
 /// 캐시·실행 표식을 먼저 지우고 새 세대를 원자적으로 쓴다. 거부 변수가 켜져 있어도 파일은 남긴다.
 ///
 /// # Errors
@@ -136,7 +185,10 @@ pub fn enable(state: &Path) -> io::Result<()> {
     let dir = dir(state);
     DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
     let lock = Lock::wait(&dir, QUEUE_LOCK, MANAGE_WAIT)?;
-    if read(state)?.is_some() {
+    let path = dir.join(CONSENT_FILE);
+    if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file())
+        && read_explicit(&path)?.is_some()
+    {
         return Ok(());
     }
     wipe(&dir);
@@ -150,29 +202,26 @@ pub fn enable(state: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// 철회한다(없어도 성공). 동의 파일을 먼저 지워 새 기록·전송·응답 반영을 막고, 대기열 잠금을 잠시
+/// 철회한다(영속 opt-out). `{"enabled":false}`를 먼저 기록해 새 기록·전송·응답 반영을 막고, 대기열 잠금을 잠시
 /// 기다린 뒤 대기열·재시도·native 캐시·실행 표식을 지운다. 잠금을 못 얻어도 지우기는 계속한다.
 ///
 /// # Errors
-/// 없음 외의 동의 파일 삭제 실패, 또는 동시 관리 작업 때문에 정리를 직렬화하지 못한 경우.
+/// 동의 파일 기록 실패, 또는 동시 관리 작업 때문에 정리를 직렬화하지 못한 경우.
 pub fn disable(state: &Path) -> io::Result<()> {
     refuse_shielded(state)?;
     let dir = dir(state);
-    match fs::remove_file(dir.join(CONSENT_FILE)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let path = dir.join(CONSENT_FILE);
+    if fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
+        fs::remove_file(&path)?;
     }
-    if !dir.is_dir() {
-        return Ok(());
-    }
+    write_atomic(&dir, CONSENT_FILE, DISABLED_JSON)?;
     let lock = Lock::wait(&dir, QUEUE_LOCK, MANAGE_WAIT);
     // An overlapping enable may have published a fresh consent while we waited.
-    match fs::remove_file(dir.join(CONSENT_FILE)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    if fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
+        fs::remove_file(&path)?;
     }
+    write_atomic(&dir, CONSENT_FILE, DISABLED_JSON)?;
     wipe(&dir);
     // Revocation takes effect immediately, but do not claim completed cleanup
     // if an enable could still publish after our final removal.

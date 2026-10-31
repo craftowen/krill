@@ -31,7 +31,7 @@ def main():
     second_session = session + '-second'
     with tempfile.TemporaryDirectory(prefix='m9live-') as scratch:
         metadata = Path(scratch) / 'fixture.json'
-        env = dict(os.environ, M9_BROWSER_ADDRESS=args.address, M9_BROWSER_METADATA=str(metadata), M9_LIVE_QA='1')
+        env = dict(os.environ, M9_BROWSER_ADDRESS=args.address, M9_BROWSER_METADATA=str(metadata), M9_LIVE_QA='1', KRILL_TELEMETRY_DISABLED='1', KRILL_ERROR_REPORTING_DISABLED='1')
         app = None
         with (evidence / 'fixture.log').open('w+') as log:
             fixture = subprocess.Popen(['node', str(Path(__file__).with_name('mobile_pwa.cjs')), str(krilld), '--keep'], env=env, stdout=log, stderr=log)
@@ -51,7 +51,7 @@ def main():
                         print('PTY',cli('read',str(config['terminalSession'])),flush=True)
                         raise
                 def cli(*args):
-                    return subprocess.check_output([str(krill), *args], env=dict(os.environ, KRILL_STATE_DIR=config['dir']), text=True, timeout=30)
+                    return subprocess.check_output([str(krill), *args], env=dict(os.environ, KRILL_STATE_DIR=config['dir'], KRILL_TELEMETRY_DISABLED='1', KRILL_ERROR_REPORTING_DISABLED='1'), text=True, timeout=30)
                 def footprint(pid, label):
                     result = subprocess.run(['/usr/bin/footprint','-p',str(pid),'-f','bytes'], text=True,capture_output=True,timeout=30)
                     (evidence/f'footprint-{label}.txt').write_text(result.stdout + result.stderr)
@@ -65,13 +65,13 @@ def main():
                     # The desktop is part of the baseline: nine fixture PTYs + its default pane = ten.
                     (Path(config['dir'])/'onboarding.done').touch()
                     app_log=(evidence/'app.log').open('w')
-                    app=subprocess.Popen([str(krilld.with_name('krill-app'))],env=dict(os.environ,KRILL_STATE_DIR=config['dir'],HOME=str(Path(config['dir'])/'home'),KRILL_LOG_DIR=str(evidence/'process-logs')),cwd=config['repo'],stdout=app_log,stderr=app_log)
+                    app=subprocess.Popen([str(krilld.with_name('krill-app'))],env=dict(os.environ,KRILL_STATE_DIR=config['dir'],HOME=str(Path(config['dir'])/'home'),KRILL_LOG_DIR=str(evidence/'process-logs'),KRILL_TELEMETRY_DISABLED='1',KRILL_ERROR_REPORTING_DISABLED='1'),cwd=config['repo'],stdout=app_log,stderr=app_log)
                     time.sleep(12)
                     assert app.poll() is None, f'native app exited: {app.returncode}; see {evidence}/process-logs'
                     assert len([line for line in cli('ls').splitlines() if line.split('\t')[0].isdigit()]) == expected_ptys
                 baseline = footprint(config['daemon'],'daemon-baseline')
                 init=Path(scratch)/'sockets.js'
-                init.write_text('localStorage.setItem("krill-mobile-ui-v1",JSON.stringify({fitToPhone:false,language:"en"}));')
+                init.write_text('localStorage.setItem("krill-mobile-error-reporting-v1","");localStorage.setItem("krill-mobile-ui-v1",JSON.stringify({fitToPhone:false,language:"en"}));')
                 browser('--init-script',str(init),'open',config['url'])
                 browser('set','viewport','390','844')
                 wait('KrillMobile.store.connection.phase==="ready"')

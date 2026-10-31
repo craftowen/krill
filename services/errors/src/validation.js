@@ -13,9 +13,10 @@ export const KINDS = [...new Set(Object.values(CODES))];
 const EXCEPTIONS = ['EXC_BAD_ACCESS', 'EXC_BAD_INSTRUCTION', 'EXC_ARITHMETIC',
   'EXC_BREAKPOINT', 'EXC_CRASH', 'EXC_RESOURCE', 'EXC_GUARD', 'UNKNOWN'];
 const SIGNALS = ['SIGSEGV', 'SIGABRT', 'SIGBUS', 'SIGILL', 'SIGFPE', 'SIGTRAP', 'SIGKILL', 'UNKNOWN'];
-const FIELDS = ['event_id', 'process', 'kind', 'error_code', 'release', 'build_id', 'os', 'arch',
+const BASE_FIELDS = ['event_id', 'process', 'kind', 'error_code', 'release', 'build_id', 'os', 'arch',
   'source_loc', 'hang_bucket_ms', 'native'];
-const OPTIONAL = ['source_loc', 'hang_bucket_ms', 'native'];
+const FIELDS = [...BASE_FIELDS, 'detail', 'frames', 'install_hash'];
+const OPTIONAL = ['source_loc', 'hang_bucket_ms', 'native', 'detail', 'frames', 'install_hash'];
 const bytes = value => new TextEncoder().encode(value).byteLength;
 export class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -35,6 +36,13 @@ function validSource(value) {
   return (parts.length === 2 || parts.length === 3)
     && parts.slice(1).every(p => /^[1-9][0-9]{0,9}$(?![\s\S])/.test(p) && Number(p) <= 4294967295)
     && /^crates\/krill[a-z0-9-]*\/src\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.rs$(?![\s\S])/.test(parts[0]);
+}
+function validDetail(value) {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 256
+    && !/[\x00-\x1f\x7f]/.test(value);
+}
+function validFrames(value) {
+  return Array.isArray(value) && value.length <= 16 && value.every(validSource);
 }
 function validNative(value) {
   return closed(value, ['exception', 'signal', 'frames'])
@@ -58,17 +66,23 @@ export function validate(value) {
       || !['macos', 'windows', 'linux'].includes(e.os)
       || !['aarch64', 'x86_64', 'x86', 'arm', 'other'].includes(e.arch)
       || (e.source_loc != null && !validSource(e.source_loc))
+      || (e.detail != null && !validDetail(e.detail))
+      || (e.frames != null && !validFrames(e.frames))
+      || (e.install_hash != null && (typeof e.install_hash !== 'string' || !HEX32.test(e.install_hash)))
       || (e.kind === 'ui_hang' ? ![500, 1500, 5000, 30000].includes(e.hang_bucket_ms) : e.hang_bucket_ms != null)
       || (e.kind === 'native_crash' ? !validNative(e.native) : e.native != null))
       throw new HttpError(400, 'invalid event');
     seen.add(e.event_id);
     // Rebuild in Rust serialization order; absent Option fields normalize to null.
     // Stable JSON makes ID collisions independent of whitespace/key order.
-    const canonical = Object.fromEntries(FIELDS.map(k => [k, e[k] ?? null]));
+    const canonical = Object.fromEntries(BASE_FIELDS.map(k => [k, e[k] ?? null]));
     if (canonical.native) canonical.native = {
       exception: e.native.exception, signal: e.native.signal,
       frames: e.native.frames.map(f => ({image_uuid: f.image_uuid, offset: f.offset})),
     };
+    if (e.detail != null) canonical.detail = e.detail;
+    if (Array.isArray(e.frames) && e.frames.length > 0) canonical.frames = [...e.frames];
+    if (e.install_hash != null) canonical.install_hash = e.install_hash;
     const json = JSON.stringify(canonical);
     if (bytes(json) > 4096) throw new HttpError(400, 'event too large');
     return {event: canonical, json, bytes: bytes(json)};

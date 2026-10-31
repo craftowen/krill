@@ -176,6 +176,16 @@ test('all Rust event-code/kind variants and architectures accepted with matching
   }
   for (const arch of ['aarch64', 'x86_64', 'x86', 'arm', 'other'])
     assert.equal((await send(env, [event(n++, {arch})])).status, 200);
+  const detailed = event(n++, {
+    detail: 'index out of bounds: the len is 3 but the index is 5',
+    frames: ['crates/krill-app/src/main.rs:42', 'crates/krill-app/src/shell.rs:108:9'],
+    install_hash: id(77),
+  });
+  assert.equal((await send(env, [detailed])).status, 200);
+  const stats = await (await get(env, '/api/stats?days=30')).json();
+  assert.equal(stats.totals.affected_installs, 1);
+  assert.equal(stats.details.find(g => g.error_code === 'session_start_failed').sample_detail,
+    'index out of bounds: the len is 3 but the index is 5');
 });
 
 test('invalid enum pairings, options, paths, integer bounds and string bounds are rejected', async t => {

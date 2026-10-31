@@ -123,7 +123,11 @@
     inflight = null,
     retryNotBefore = 0,
     epoch = 0;
-  const enabled = () => consent && !privacySignal();
+  const loopback = () =>
+    location.hostname === "localhost" ||
+    location.hostname === "[::1]" ||
+    /^127\./.test(location.hostname);
+  const enabled = () => consent && !privacySignal() && !loopback();
   const build =
     /^\/m\/([0-9a-f]{16})\//.exec(location.pathname)?.[1] || "unversioned";
   const ua = navigator.userAgent || "",

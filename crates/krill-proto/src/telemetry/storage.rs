@@ -27,6 +27,8 @@ struct Queue {
     generation: String,
     first_open: bool,
     active_day: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_active_day: Option<u64>,
     #[serde(deserialize_with = "decode_events")]
     events: Vec<UsageEvent>,
     failures: u32,
@@ -62,6 +64,7 @@ impl Queue {
             generation: random_uuid()?,
             first_open: false,
             active_day: None,
+            agent_active_day: None,
             events: Vec::new(),
             failures: 0,
             next_attempt_unix: None,
@@ -104,7 +107,7 @@ pub struct Status {
     pub last_success_unix: Option<u64>,
     pub last_outcome: Outcome,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FlushReport {
     pub outcome: Outcome,
     pub accepted: usize,
@@ -216,6 +219,12 @@ fn write(dir: &Path, queue: &Queue) -> io::Result<()> {
 }
 
 pub(super) fn set_enabled(state: &Path, enabled: bool) -> io::Result<()> {
+    if crate::error_reporting::shielded(state) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "test process must not change the default telemetry consent",
+        ));
+    }
     let dir = dir(state)?;
     let _lock = lock(&dir, "queue.lock", Duration::from_secs(3))?;
     let marker = state.join(DISABLED_FILE);
@@ -316,6 +325,76 @@ pub fn record_open(state: &Path, env: &Env, now: u64) -> io::Result<()> {
 pub fn record_activity(state: &Path, env: &Env, now: u64) -> io::Result<()> {
     record(state, env, now, false, None).map(|_| ())
 }
+
+/// Records `agent_active_day` (and `active_day` if not yet recorded for the UTC day).
+pub fn record_agent_active(state: &Path, env: &Env, now: u64) -> io::Result<bool> {
+    if !consent(Some(state), env).enabled() {
+        return Ok(false);
+    }
+    let dir = dir(state)?;
+    let _lock = lock(&dir, "queue.lock", Duration::from_secs(1))?;
+    if !consent(Some(state), env).enabled() {
+        return Ok(false);
+    }
+    let mut queue = match read(&dir)? {
+        Some(queue) => queue,
+        None => Queue::new()?,
+    };
+    prune(&mut queue, now);
+    let day = now.checked_div(DAY).unwrap_or(0);
+    let mut names = Vec::new();
+    if queue.active_day.is_none_or(|previous| day > previous) {
+        names.push(UsageName::ActiveDay);
+        queue.active_day = Some(day);
+    }
+    if queue.agent_active_day.is_none_or(|previous| day > previous) {
+        names.push(UsageName::AgentActiveDay);
+        queue.agent_active_day = Some(day);
+    }
+    if names.is_empty() {
+        return Ok(false);
+    }
+    for name in names {
+        push_event(&mut queue, name, now)?;
+    }
+    write(&dir, &queue)?;
+    Ok(true)
+}
+
+/// Records an explicit funnel event (e.g. `star_prompt_*`) under the current consent.
+pub fn record_event(state: &Path, env: &Env, name: UsageName, now: u64) -> io::Result<bool> {
+    if !consent(Some(state), env).enabled() {
+        return Ok(false);
+    }
+    let dir = dir(state)?;
+    let _lock = lock(&dir, "queue.lock", Duration::from_secs(1))?;
+    if !consent(Some(state), env).enabled() {
+        return Ok(false);
+    }
+    let mut queue = match read(&dir)? {
+        Some(queue) => queue,
+        None => Queue::new()?,
+    };
+    prune(&mut queue, now);
+    push_event(&mut queue, name, now)?;
+    write(&dir, &queue)?;
+    Ok(true)
+}
+
+fn push_event(queue: &mut Queue, name: UsageName, now: u64) -> io::Result<()> {
+    let event = UsageEvent::new(&queue.install_id, name, now)?;
+    if queue.events.len() >= MAX_PENDING {
+        let oldest = queue
+            .events
+            .iter()
+            .position(|event| event.name != UsageName::FirstOpen)
+            .unwrap_or(0);
+        queue.events.remove(oldest);
+    }
+    queue.events.push(event);
+    Ok(())
+}
+
 fn record(
     state: &Path,
     env: &Env,
@@ -353,16 +432,7 @@ fn record(
         return Ok(false);
     }
     for name in names {
-        let event = UsageEvent::new(&queue.install_id, name, now)?;
-        if queue.events.len() >= MAX_PENDING {
-            let oldest = queue
-                .events
-                .iter()
-                .position(|event| event.name != UsageName::FirstOpen)
-                .unwrap_or(0);
-            queue.events.remove(oldest);
-        }
-        queue.events.push(event);
+        push_event(&mut queue, name, now)?;
     }
     write(&dir, &queue)?;
     Ok(true)

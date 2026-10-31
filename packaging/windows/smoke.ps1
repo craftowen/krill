@@ -15,6 +15,8 @@ $base = Join-Path $env:TEMP "krill-smoke-$PID"
 $dest = Join-Path $base 'Programs\Krill'
 $krill = Join-Path $dest 'krill.exe'
 $env:KRILL_STATE_DIR = Join-Path $base 'state'
+$env:KRILL_TELEMETRY_DISABLED = '1'
+$env:KRILL_ERROR_REPORTING_DISABLED = '1'
 function Get-Ours([string]$name) { Get-Process $name -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$dest\*" } }
 function Invoke-Krill { $out = & $krill @args; if ($LASTEXITCODE -ne 0) { throw "krill $args failed: $LASTEXITCODE" }; $out }
 

@@ -54,6 +54,9 @@ test('mobile commits sanitized details, canonical duplicate, and exposes filtera
   assert.deepEqual((await response.json()).events[0].event, e);
   const stats = await (await admin(env, '/api/stats')).json();
   assert.deepEqual(stats.groups, [{kind: 'operation_error', error_code: e.error_code, process: 'krill-mobile', rows: 1}]);
+  assert.equal(stats.totals.distinct_attempts, 1);
+  assert.equal(stats.details[0].distinct_attempts, 1);
+  assert.equal(stats.details[0].sample_detail, 'websocket_closed');
   assert.deepEqual(stats.releases, [{release: 'web', rows: 1}]);
 });
 

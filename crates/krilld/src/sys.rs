@@ -229,6 +229,55 @@ pub(crate) fn tcgetpgrp(fd: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
     (pgrp > 0).then(|| u32::try_from(pgrp).ok()).flatten()
 }
 
+#[cfg(unix)]
+static STOP_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// SIGTERM·SIGINT를 받으면 `done` 채널을 깨워 main이 `RunGuard`를 정상 정리하고 종료하게 한다.
+#[cfg(unix)]
+pub fn notify_on_stop_signal(done: std::sync::mpsc::Sender<()>) {
+    use std::os::fd::IntoRawFd as _;
+    use std::sync::atomic::Ordering;
+    extern "C" fn on_signal(_: libc::c_int) {
+        let fd = STOP_PIPE.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let byte = 1u8;
+            // SAFETY: write(2)는 async-signal-safe이며 실패해도 무시하므로 panic하지 않는다(U10).
+            unsafe {
+                libc::write(fd, (&raw const byte).cast(), 1);
+            }
+        }
+    }
+    let Ok((reader, writer)) = rustix::pipe::pipe() else {
+        return;
+    };
+    let raw_writer = writer.into_raw_fd();
+    if STOP_PIPE
+        .compare_exchange(-1, raw_writer, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        // SAFETY: 방금 into_raw_fd로 꺼낸 fd이며 전역에 저장되지 않았다.
+        unsafe {
+            libc::close(raw_writer);
+        }
+        return;
+    }
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: `on_signal`은 원자 읽기와 write(2)만 수행하는 async-signal-safe 핸들러다.
+        unsafe {
+            libc::signal(sig, on_signal as *const () as libc::sighandler_t);
+        }
+    }
+    std::thread::Builder::new()
+        .name("sig-stop".to_owned())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let mut buf = [0u8; 1];
+            rustix::io::read(&reader, &mut buf).ok();
+            done.send(()).ok();
+        })
+        .ok();
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     #[test]

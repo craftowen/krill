@@ -58,8 +58,11 @@ test('metrics: UTC timeline, latest properties, exact active windows and mature 
   // Direct storage seeds older than client offline window to exercise historical cohorts.
   await ingest(env.DB,[e(A,'first_open','2026-09-01T23:59:59'),e(A,'active_day','2026-09-08T00:00:00'),e(A,'active_day','2026-10-01T23:00:00'),e(A,'app_opened','2026-10-27T01:00:00',{app_version:'0.3.0'}),e(A,'active_day','2026-10-27T02:00:00',{app_version:'0.3.0'}),e(B,'app_opened','2026-09-10T00:00:00',{os:'windows',arch:'x86_64'}),e(C,'first_open','2026-10-20T23:59:59'),e(C,'active_day','2026-10-27T00:00:00'),e(D,'app_opened','2026-10-26T23:59:59')],NOW);
   // Out-of-order older metadata must not downgrade version, repeated active events don't inflate DAU.
-  await ingest(env.DB,[e(A,'active_day','2026-10-21T00:00:00'),e(A,'active_day','2026-10-27T02:00:00',{app_version:'0.3.0'})],NOW);
+  await ingest(env.DB,[e(A,'active_day','2026-10-21T00:00:00'),e(A,'active_day','2026-10-27T02:00:00',{app_version:'0.3.0'}),e(A,'agent_active_day','2026-10-27T02:00:00',{app_version:'0.3.0'}),e(A,'star_prompt_shown','2026-10-27T02:01:00',{app_version:'0.3.0'}),e(A,'star_prompt_starred','2026-10-27T02:02:00',{app_version:'0.3.0'})],NOW);
   const data=await stats(env.DB,NOW,30);assert.deepEqual({...data.totals},{observed_installs:4,first_open_installs:2,app_opens:3,dau:2,wau:2,mau:2});
+  assert.deepEqual({...data.verified},{verified_active_installs:2,returning_installs:1,agent_active_installs:1});
+  assert.deepEqual(data.verified_operating_systems.map(x=>({...x})),[{value:'macos',installations:2}]);
+  assert.deepEqual(data.star_funnel,{shown:{events:1,installs:1},starred:{events:1,installs:1},later:{events:0,installs:0},dismissed:{events:0,installs:0}});
   assert.equal(data.timeline.length,30);const last=data.timeline.at(-1);assert.equal(last.day,'2026-10-27');assert.equal(last.active_devices,2);assert.equal(last.app_opens,1);assert.equal(data.timeline.at(-2).observed_installs,1);
   assert.equal(data.versions.find(x=>x.value==='0.3.0').installations,1);assert.equal(data.versions.reduce((a,b)=>a+b.installations,0),4);
   assert.deepEqual(data.retention.map(x=>[x.day,x.denominator,x.retained,x.rate]),[[7,2,1,.5],[30,2,1,.5]]);

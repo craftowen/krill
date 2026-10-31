@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA_VERSION: u32 = 1;
 /// 기본 수집 엔드포인트.
 pub const ENDPOINT: &str = "https://errors.krill.page/v1/events";
+/// 테스트·진단용 수집 엔드포인트 환경 변수.
+pub const ENDPOINT_VAR: &str = "KRILL_ERROR_REPORTING_ENDPOINT";
 /// 요청 하나의 이벤트 상한.
 pub const MAX_BATCH: usize = 16;
 /// 요청 본문 상한(바이트). 응답 본문도 이 안에서만 읽는다.
@@ -18,6 +20,10 @@ pub const MAX_REQUEST_BYTES: usize = 65_536;
 pub const MAX_EVENT_BYTES: usize = 4096;
 /// native 프레임 상한.
 pub const MAX_NATIVE_FRAMES: usize = 16;
+/// 소스 프레임(`frames`) 상한.
+pub const MAX_FRAMES: usize = 16;
+/// 리댁션된 상세 사유(`detail`) 상한(바이트).
+pub const MAX_DETAIL_LEN: usize = 256;
 /// 서버가 JSON 숫자로 정확히 읽는 정수 상한(2^53 - 1).
 pub const MAX_SAFE_OFFSET: u64 = 9_007_199_254_740_991;
 /// 대기열 상한(건).
@@ -366,6 +372,12 @@ pub struct Event {
     pub source_loc: Option<String>,
     pub hang_bucket_ms: Option<u32>,
     pub native: Option<NativeData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_hash: Option<String>,
 }
 
 impl Event {
@@ -396,6 +408,9 @@ impl Event {
             source_loc,
             hang_bucket_ms: None,
             native: None,
+            detail: None,
+            frames: Vec::new(),
+            install_hash: None,
         })
     }
 
@@ -422,6 +437,15 @@ impl Event {
             .is_some_and(|s| !valid_source_loc(s))
         {
             return Err(invalid("source_loc"));
+        }
+        if self.detail.as_deref().is_some_and(|d| !valid_detail(d)) {
+            return Err(invalid("detail"));
+        }
+        if self.frames.len() > MAX_FRAMES || self.frames.iter().any(|f| !valid_source_loc(f)) {
+            return Err(invalid("frames"));
+        }
+        if self.install_hash.as_deref().is_some_and(|h| !is_hex32(h)) {
+            return Err(invalid("install_hash"));
         }
         let hang_ok = match self.hang_bucket_ms {
             Some(ms) => self.kind == Kind::UiHang && HANG_BUCKETS_MS.contains(&ms),
@@ -553,6 +577,11 @@ pub(crate) fn valid_build_id(s: &str) -> bool {
         && s.len() <= MAX_BUILD_ID
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
+}
+
+/// 리댁션된 한 줄 상세 사유: 1~256바이트, 제어 문자 없음.
+pub(crate) fn valid_detail(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_DETAIL_LEN && !s.bytes().any(|b| b.is_ascii_control())
 }
 
 /// 공개 소스 위치 `crates/krill*/src/**.rs:line[:column]`(200바이트 이하, 절대·부모·숨김 경로 없음).

@@ -151,8 +151,7 @@ impl RunGuard {
             return Ok(None);
         }
         let runs = super::dir(state).join(super::RUNS_DIR);
-        // 동의 파일이 있는 오류 보고 디렉터리 아래에만 만든다(재귀 생성 없음).
-        match DirBuilder::new().mode(0o700).create(&runs) {
+        match DirBuilder::new().recursive(true).mode(0o700).create(&runs) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),

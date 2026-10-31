@@ -18,10 +18,11 @@ const USAGE: &str = "usage: krill errors status|enable|disable|flush [--json]";
 
 /// 동의 범위(도움말과 `enable` 결과에 그대로 보인다).
 const SCOPE: &str = "\
-error reporting is opt-in and separate from `krill telemetry`.
+error reporting is enabled by default (beta) and separate from `krill telemetry`.
   sent:     error code, public source location (crates/krill*/src file:line), Krill version and build,
-            OS, CPU architecture, UI stall duration bucket, native crash exception and signal type
-  not sent: messages, prompts, terminal output, file paths, account or host names, raw logs or crash reports
+            OS, CPU architecture, UI stall duration bucket, native crash exception and signal type,
+            redacted error detail, and anonymous install hash
+  not sent: prompts, terminal output, personal file paths, account or host names, raw logs or crash reports
   upload:   the Krill app runs `krill errors flush` periodically; without the app, run it yourself
   stop:     `krill errors disable` (also deletes the local queue)";
 
@@ -76,16 +77,20 @@ pub fn run(args: &[OsString]) -> ExitCode {
         eprintln!("errors: HOME is not set");
         return ExitCode::FAILURE;
     };
+    let env_endpoint = std::env::var(reporting::ENDPOINT_VAR).ok();
+    let custom_endpoint = endpoint.or(env_endpoint.as_deref());
     match command.as_str() {
         "enable" => show(&state, reporting::enable(&state), true, json),
         "disable" => show(&state, reporting::disable(&state), false, json),
-        "flush" => match transport::Endpoint::parse(endpoint.unwrap_or(reporting::ENDPOINT)) {
-            Ok(endpoint) => flush(&state, &endpoint, json),
-            Err(e) => {
-                eprintln!("errors: {e}");
-                ExitCode::from(2)
+        "flush" => {
+            match transport::Endpoint::parse(custom_endpoint.unwrap_or(reporting::ENDPOINT)) {
+                Ok(parsed) => flush(&state, &parsed, custom_endpoint.is_some(), json),
+                Err(e) => {
+                    eprintln!("errors: {e}");
+                    ExitCode::from(2)
+                }
             }
-        },
+        }
         _ => show(&state, Ok(()), false, json),
     }
 }
@@ -123,11 +128,11 @@ fn print_status(status: &Status, json: bool) {
                 .map(|at| format!("; retrying in {}s", seconds_until(at)))
                 .unwrap_or_default();
             format!(
-                "on (opt-in; {} pending{retry}; stop with `krill errors disable`)",
+                "on (default; {} pending{retry}; stop with `krill errors disable`)",
                 status.pending
             )
         }
-        (None, _, false) => "off (default; start with `krill errors enable`)".to_owned(),
+        (None, _, false) => "off (disabled; start with `krill errors enable`)".to_owned(),
     };
     println!("error reporting  {line}");
 }
@@ -136,11 +141,19 @@ fn seconds_until(at_ms: u64) -> u64 {
     at_ms.saturating_sub(reporting::now_ms()).div_ceil(1000)
 }
 
-fn flush(state: &Path, endpoint: &transport::Endpoint, json: bool) -> ExitCode {
+fn flush(state: &Path, endpoint: &transport::Endpoint, custom: bool, json: bool) -> ExitCode {
     let curl = transport::system_curl();
-    let result = run_flush(state, &Env::live(), reporting::native::collect, |body| {
-        transport::post(&curl, endpoint, body, transport::DEADLINE)
-    });
+    let result = if !custom && !reporting::is_production_state_dir(state) {
+        reporting::status_with(state, &Env::live()).map(|s| FlushReport {
+            outcome: FlushOutcome::NotConsented,
+            pending: s.pending,
+            ..FlushReport::default()
+        })
+    } else {
+        run_flush(state, &Env::live(), reporting::native::collect, |body| {
+            transport::post(&curl, endpoint, body, transport::DEADLINE)
+        })
+    };
     let report = match result {
         Ok(report) => report,
         Err(e) => {

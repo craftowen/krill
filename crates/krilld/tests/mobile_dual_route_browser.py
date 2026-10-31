@@ -48,6 +48,7 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
 """
 
 INSTRUMENT = r"""
+localStorage.setItem('krill-mobile-error-reporting-v1','');
 localStorage.setItem('krill-mobile-ui-v1',JSON.stringify({language:'en',installOffered:true}));
 globalThis.dualProbe={epoch:crypto.randomUUID(),sockets:[],blocked:[],violations:[],notices:[]};
 addEventListener('securitypolicyviolation',e=>dualProbe.violations.push({directive:e.effectiveDirective,uri:e.blockedURI}));

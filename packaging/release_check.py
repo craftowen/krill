@@ -158,7 +158,8 @@ MOBILE_BROWSER_TESTS = (("mobile_live_browser.py", "--browser-only"), ("mobile_r
 def mobile_browser_gate(release):
     """출고 바이너리를 실제 Chromium 모바일 PWA에 붙여 본다. v0.2.25·v0.2.26은 화면 업데이트 후행 바이트를 모바일
     디코더가 거부해 'Trailing screen data'로 터미널이 안 뜬 채 출고됐다(이 테스트들이 어떤 게이트에도 없었다)."""
-    env = {"KRILLD_BIN": release / "krilld", "KRILL_BIN": release / "krill", "KRILL_MOBILE_TEST_BIN": release}
+    env = {"KRILLD_BIN": release / "krilld", "KRILL_BIN": release / "krill", "KRILL_MOBILE_TEST_BIN": release,
+           "KRILL_TELEMETRY_DISABLED": "1", "KRILL_ERROR_REPORTING_DISABLED": "1"}
     previous = {key: os.environ.get(key) for key in env}
     os.environ.update({key: str(value) for key, value in env.items()})
     try:

@@ -463,7 +463,6 @@ fn dispatch_now(cmd: &HostCommand, cx: &mut App) -> bool {
 
 /// 첫 실행 진입. 모달 없이 완료를 남기고, 격리 상태가 아니면 비번들 스테이징 바이너리
 /// 갱신·자동 준비를 백그라운드로 돌린다(OWE-904). 준비 중 필요한 조치는 조치 배너가 알린다.
-/// 오류 보고 동의는 기본 OFF이며, 아직 묻지 않았으면 같은 배너 경로로 한 번 묻는다.
 pub fn offer(env: Env, cx: &mut App) {
     let dir = env.state.clone();
     let isolated = env.is_isolated_state();
@@ -484,7 +483,6 @@ pub fn offer(env: Env, cx: &mut App) {
         }
     })
     .detach();
-    error_consent::offer_if_needed(&env.state, cx);
     if !isolated {
         actions::auto_prepare(env, cx).detach();
     }
@@ -1187,7 +1185,6 @@ mod access_shim {
 
 pub mod actions;
 pub mod banner;
-pub mod error_consent;
 pub mod state;
 pub mod welcome;
 

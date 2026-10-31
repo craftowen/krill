@@ -65,6 +65,28 @@ pub fn user_activity(cx: &mut App) {
     }
 }
 
+pub fn record_agent_start(cx: &App) {
+    let Some(state) = crate::settings::state_dir(cx) else {
+        return;
+    };
+    cx.background_executor()
+        .spawn(async move {
+            telemetry::record_agent_active(&state, &Env::live(), telemetry::now_unix()).ok();
+        })
+        .detach();
+}
+
+pub fn record_star_prompt(name: telemetry::UsageName, cx: &App) {
+    let Some(state) = crate::settings::state_dir(cx) else {
+        return;
+    };
+    cx.background_executor()
+        .spawn(async move {
+            telemetry::record_event(&state, &Env::live(), name, telemetry::now_unix()).ok();
+        })
+        .detach();
+}
+
 fn drain_activity(state: &Path, activity: &ActivityBuffer, env: &Env) -> io::Result<()> {
     let generation = match telemetry::activity_generation(state, env) {
         Ok(generation) => generation,
@@ -168,6 +190,11 @@ pub fn start(cx: &mut App) {
 }
 
 fn send_pending(state: &Path) -> io::Result<()> {
+    if std::env::var_os(telemetry::ENDPOINT_VAR).is_none()
+        && !krill_proto::error_reporting::is_production_state_dir(state)
+    {
+        return Ok(());
+    }
     let status = telemetry::status_with(state, &Env::live())?;
     let now = telemetry::now_unix();
     if !status.enabled || status.pending == 0 || status.next_attempt_unix.is_some_and(|at| at > now)

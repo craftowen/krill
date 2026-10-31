@@ -45,7 +45,8 @@ pub fn install_panic_hook(process: &'static str) {
     };
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        write_crash(&dir, process, info).ok();
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        write_crash_with_bt(&dir, process, info, &bt).ok();
         crate::error_reporting::runs::note_panic();
         let component = match process {
             "krill-app" => Some(crate::error_reporting::Process::App),
@@ -56,9 +57,12 @@ pub fn install_panic_hook(process: &'static str) {
             let (file, line) = info
                 .location()
                 .map_or(("", 0), |loc| (loc.file(), loc.line()));
-            crate::error_reporting::capture(
+            let frames = crate::error_reporting::extract_backtrace_frames(&bt);
+            crate::error_reporting::capture_detailed(
                 component,
                 crate::error_reporting::Code::Panic,
+                info.payload_as_str(),
+                &frames,
                 file,
                 line,
             );
@@ -72,7 +76,18 @@ pub fn install_panic_hook(process: &'static str) {
 /// 세션에서 동시에 터지면 같은 초에 여러 보고가 온다.
 static CRASH_SEQ: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
 fn write_crash(dir: &Path, process: &str, info: &PanicHookInfo<'_>) -> io::Result<()> {
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    write_crash_with_bt(dir, process, info, &bt)
+}
+
+fn write_crash_with_bt(
+    dir: &Path,
+    process: &str,
+    info: &PanicHookInfo<'_>,
+    bt: &str,
+) -> io::Result<()> {
     if list(dir, PENDING).len() >= MAX_PENDING {
         return Ok(());
     }
@@ -98,12 +113,7 @@ fn write_crash(dir: &Path, process: &str, info: &PanicHookInfo<'_>) -> io::Resul
     if let Some(loc) = info.location() {
         writeln!(text, "location: {loc}").ok();
     }
-    writeln!(
-        text,
-        "\nbacktrace:\n{}",
-        std::backtrace::Backtrace::force_capture()
-    )
-    .ok();
+    writeln!(text, "\nbacktrace:\n{bt}").ok();
     let path = dir.join(crash_filename(now, nanos, pid, process, seq));
     OpenOptions::new()
         .write(true)

@@ -2712,6 +2712,12 @@ impl Registry {
         Ok(entry.session.tap())
     }
 
+    /// Read-only and not gated on the agent being idle, unlike [`Self::mobile_composer_tap`].
+    pub(crate) fn session_capture(&self, id: SessionId) -> Option<krill_proto::screen::Screen> {
+        let tap = lock(&self.state).sessions.get(&id)?.session.tap();
+        Some(tap.capture().0)
+    }
+
     /// 활성 세션의 현재 평문 화면과 Bracketed Paste 모드 여부를 함께 반환한다(OWE-944·OWE-946).
     pub(crate) fn session_screen_and_bracketed_paste(&self, id: SessionId) -> (String, bool) {
         let st = lock(&self.state);

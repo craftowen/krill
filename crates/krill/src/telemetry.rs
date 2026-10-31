@@ -52,17 +52,26 @@ fn execute(state: &Path, command: &str, json: bool) -> io::Result<ExitCode> {
         "enable" => telemetry::enable(state)?,
         "disable" => telemetry::disable(state)?,
         "flush" => {
-            let endpoint = std::env::var(telemetry::ENDPOINT_VAR)
-                .unwrap_or_else(|_| telemetry::ENDPOINT.to_owned());
-            let endpoint = transport::Endpoint::parse(&endpoint).map_err(io::Error::other)?;
-            let curl = transport::system_curl();
-            let report =
+            let custom = std::env::var(telemetry::ENDPOINT_VAR).ok();
+            let report = if custom.is_none()
+                && !krill_proto::error_reporting::is_production_state_dir(state)
+            {
+                telemetry::FlushReport {
+                    outcome: Outcome::Disabled,
+                    pending: telemetry::status_with(state, &Env::live())?.pending,
+                    ..telemetry::FlushReport::default()
+                }
+            } else {
+                let endpoint = custom.unwrap_or_else(|| telemetry::ENDPOINT.to_owned());
+                let endpoint = transport::Endpoint::parse(&endpoint).map_err(io::Error::other)?;
+                let curl = transport::system_curl();
                 telemetry::flush_with(state, &Env::live(), telemetry::now_unix(), |body| {
                     match transport::post(&curl, &endpoint, body, transport::DEADLINE) {
                         transport::Reply::Http { status, body } => Ok((status, body)),
                         transport::Reply::Transport => Err(io::Error::other("upload failed")),
                     }
-                })?;
+                })?
+            };
             if json {
                 println!(
                     "{}",

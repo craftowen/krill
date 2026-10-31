@@ -26,13 +26,16 @@ pub use outbox::{
     FlushOutcome, FlushReport, Reply, UploadLock, flush, record_at, record_with_consent,
 };
 pub use types::{
-    Ack, Arch, Code, ENDPOINT, Event, Exception, HANG_BUCKETS_MS, Kind, MAX_AGE_MS, MAX_ATTEMPTS,
-    MAX_BATCH, MAX_BUILD_ID, MAX_EVENT_BYTES, MAX_FLUSH_REQUESTS, MAX_NATIVE_FRAMES, MAX_PENDING,
-    MAX_REQUEST_BYTES, MAX_SAFE_OFFSET, MAX_SOURCE_LOC, NativeData, NativeFrame, Os, Process,
-    RETRY_MAX_MS, RETRY_MIN_MS, Request, SCHEMA_VERSION, Signal,
+    Ack, Arch, Code, ENDPOINT, ENDPOINT_VAR, Event, Exception, HANG_BUCKETS_MS, Kind, MAX_AGE_MS,
+    MAX_ATTEMPTS, MAX_BATCH, MAX_BUILD_ID, MAX_DETAIL_LEN, MAX_EVENT_BYTES, MAX_FLUSH_REQUESTS,
+    MAX_FRAMES, MAX_NATIVE_FRAMES, MAX_PENDING, MAX_REQUEST_BYTES, MAX_SAFE_OFFSET, MAX_SOURCE_LOC,
+    NativeData, NativeFrame, Os, Process, RETRY_MAX_MS, RETRY_MIN_MS, Request, SCHEMA_VERSION,
+    Signal,
 };
 
 use types::{hex, valid_source_loc};
+
+const INSTALL_HASH_DOMAIN: &str = "krill.error-reporting.install-hash.v1";
 
 /// 오류 보고 디렉터리 이름(상태 디렉터리 바로 아래, 0700). 동의·대기열·잠금 파일이 여기 있다.
 pub const DIR: &str = "error-reporting";
@@ -47,10 +50,24 @@ pub fn dir(state: &Path) -> PathBuf {
     state.join(DIR)
 }
 
+/// 동의 세대 토큰에서 파생한 익명 설치 식별 해시(소문자 16진수 32자).
+#[must_use]
+pub fn install_hash(consent: &Consent) -> String {
+    event_id(INSTALL_HASH_DOMAIN, consent.generation.as_bytes())
+}
+
+pub(crate) fn install_hash_with_salt(consent: &Consent, salt: &str) -> String {
+    let mut material = Vec::new();
+    material.extend_from_slice(salt.as_bytes());
+    material.push(b':');
+    material.extend_from_slice(consent.generation.as_bytes());
+    event_id(INSTALL_HASH_DOMAIN, &material)
+}
+
 /// 상태 JSON(`krill errors status --json`, 설정 화면).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Status {
-    /// 동의 파일이 있다(환경 거부와 무관).
+    /// 동의 상태(기본 활성화 포함, 환경 거부와 무관).
     pub consented: bool,
     /// 실제로 기록·전송한다(동의 + 거부 변수 없음).
     pub enabled: bool,
@@ -58,7 +75,7 @@ pub struct Status {
     pub pending: usize,
     /// 거부를 일으킨 환경 변수 이름.
     pub veto: Option<String>,
-    /// 동의 시각(UNIX 밀리초).
+    /// 명시적 동의 시각(UNIX 밀리초). 기본 동의 상태면 `None`.
     #[serde(default)]
     pub enabled_at_ms: Option<u64>,
     /// 큐 전체 재시도 대기 중이면 다음 시도 시각(UNIX 밀리초).
@@ -90,7 +107,7 @@ pub fn status_with(state: &Path, env: &Env) -> std::io::Result<Status> {
         enabled: consent.is_some() && veto.is_none(),
         pending: outbox::pending(&dir),
         veto: veto.map(str::to_owned),
-        enabled_at_ms: consent.map(|c| c.enabled_at_ms),
+        enabled_at_ms: consent.and_then(|c| (c.enabled_at_ms > 0).then_some(c.enabled_at_ms)),
         next_attempt_at_ms,
     })
 }
@@ -107,7 +124,54 @@ pub fn capture(process: Process, code: Code, file: &str, line: u32) {
 
 /// [`capture`]와 같지만 상태 디렉터리를 받는다.
 pub fn capture_at(state: &Path, process: Process, code: Code, file: &str, line: u32) {
-    capture_with(state, &Env::live(), process, code, None, file, line);
+    capture_with(
+        state,
+        &Env::live(),
+        process,
+        code,
+        None,
+        None,
+        &[],
+        file,
+        line,
+    );
+}
+
+/// 리댁션된 상세 사유와 공개 소스 프레임(예: panic 백트레이스)을 함께 기록한다.
+pub fn capture_detailed(
+    process: Process,
+    code: Code,
+    detail: Option<&str>,
+    frames: &[String],
+    file: &str,
+    line: u32,
+) {
+    if let Some(state) = crate::daemon::state_dir() {
+        capture_detailed_at(&state, process, code, detail, frames, file, line);
+    }
+}
+
+/// [`capture_detailed`]와 같지만 상태 디렉터리를 받는다.
+pub fn capture_detailed_at(
+    state: &Path,
+    process: Process,
+    code: Code,
+    detail: Option<&str>,
+    frames: &[String],
+    file: &str,
+    line: u32,
+) {
+    capture_with(
+        state,
+        &Env::live(),
+        process,
+        code,
+        None,
+        detail,
+        frames,
+        file,
+        line,
+    );
 }
 
 /// UI 멈춤을 구간으로 기록한다. 500ms 미만이면 기록하지 않는다. [`capture`]와 같이 실패를 삼킨다.
@@ -123,6 +187,8 @@ pub fn capture_ui_stall(process: Process, elapsed: Duration, file: &str, line: u
             process,
             Code::UiStall,
             Some(bucket),
+            None,
+            &[],
             file,
             line,
         );
@@ -135,6 +201,38 @@ pub fn capture_ui_stall(process: Process, elapsed: Duration, file: &str, line: u
 /// `KRILL_STATE_DIR`에 기본 경로를 그대로 물려받으므로 오버라이드 여부가 아니라 실제 디렉터리로 가른다.
 pub(crate) fn shielded(state: &Path) -> bool {
     is_test_process() && crate::daemon::default_state_dir().is_some_and(|d| same_dir(state, &d))
+}
+
+/// 프로덕션 수집 서버(`telemetry.krill.page`·`errors.krill.page`)로 기본 전송을 허용하는 실제 사용자 상태 폴더인가.
+/// 임시 `KRILL_STATE_DIR`나 임시 `HOME`으로 띄운 스모크·브라우저·메모리·생존 테스트나 테스트 프로세스가 커스텀 엔드포인트 없이
+/// 프로덕션 D1을 오염시키지 못하게 막는다.
+#[must_use]
+pub fn is_production_state_dir(state: &Path) -> bool {
+    !is_test_process()
+        && !is_temp_dir(state)
+        && crate::daemon::default_state_dir().is_some_and(|d| same_dir(state, &d))
+}
+
+fn is_temp_dir(state: &Path) -> bool {
+    let resolved = resolve(state);
+    let temp = resolve(&std::env::temp_dir());
+    if !temp.as_os_str().is_empty() && resolved.starts_with(&temp) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        for prefix in [
+            "/tmp",
+            "/private/tmp",
+            "/var/folders",
+            "/private/var/folders",
+        ] {
+            if resolved.starts_with(prefix) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 같은 디렉터리인가(`..`·심볼릭 링크 별칭 포함). 아직 없는 폴더도 별칭으로 동의를 만들 수 있으니 글자 비교로
@@ -201,27 +299,96 @@ fn is_test_process_in(
 }
 
 /// 동의·거부를 먼저 보고(꺼져 있으면 이벤트를 만들지 않는다) 종류별 필수 필드를 채워 기록한다.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "내부 기록 진입점으로 테스트 환경·멈춤 구간·상세 사유·프레임을 한곳에서 조합한다"
+)]
 fn capture_with(
     state: &Path,
     env: &Env,
     process: Process,
     code: Code,
     hang_bucket: Option<u32>,
+    detail: Option<&str>,
+    frames: &[String],
     file: &str,
     line: u32,
 ) {
     let Ok(Some(consent)) = consent_with(state, env) else {
         return;
     };
-    let Ok(mut event) = Event::new(process, code, source_location(file, line)) else {
+    let loc = source_location(file, line)
+        .or_else(|| frames.first().filter(|f| valid_source_loc(f)).cloned());
+    let Ok(mut event) = Event::new(process, code, loc) else {
         return;
     };
+    event.detail = detail.and_then(sanitize_detail);
+    event.frames = frames
+        .iter()
+        .filter(|f| valid_source_loc(f))
+        .take(MAX_FRAMES)
+        .cloned()
+        .collect();
     match event.kind {
         Kind::UiHang => event.hang_bucket_ms = hang_bucket.or(HANG_BUCKETS_MS.first().copied()),
         Kind::NativeCrash => event.native = Some(NativeData::unknown()),
         Kind::OperationError | Kind::Panic | Kind::AbnormalExit => {}
     }
     record_with_consent(state, event, &consent).ok();
+}
+
+/// 비밀·사용자 경로·제어 문자를 제거하고 [`MAX_DETAIL_LEN`](256바이트)로 자른 한 줄 상세 사유.
+#[must_use]
+pub fn sanitize_detail(text: &str) -> Option<String> {
+    let redacted = crate::diag::redact(text);
+    let mut out = String::new();
+    let mut prev_space = false;
+    for ch in redacted.chars() {
+        let ch = if ch.is_control() || ch.is_whitespace() {
+            ' '
+        } else {
+            ch
+        };
+        if ch == ' ' {
+            if !out.is_empty() && !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        if out.len().saturating_add(ch.len_utf8()) > MAX_DETAIL_LEN {
+            break;
+        }
+        out.push(ch);
+        prev_space = false;
+    }
+    let trimmed = out.trim_end();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// 백트레이스 문자열에서 공개 크레이트 소스 위치(`crates/krill*/src/**.rs:line[:col]`)만 최대 [`MAX_FRAMES`]개 추출한다.
+#[must_use]
+pub fn extract_backtrace_frames(backtrace: &str) -> Vec<String> {
+    let mut frames = Vec::new();
+    for raw in backtrace.lines() {
+        let normalized = raw.trim().replace('\\', "/");
+        let Some(idx) = normalized.find("crates/krill") else {
+            continue;
+        };
+        let Some(candidate) = normalized.get(idx..).map(str::trim) else {
+            continue;
+        };
+        if candidate.starts_with("crates/krill-proto/src/diag.rs:") {
+            continue;
+        }
+        if valid_source_loc(candidate) && frames.last().is_none_or(|prev| prev != candidate) {
+            frames.push(candidate.to_owned());
+            if frames.len() >= MAX_FRAMES {
+                break;
+            }
+        }
+    }
+    frames
 }
 
 /// 멈춘 시간이 속한 구간(넘은 가장 큰 [`HANG_BUCKETS_MS`] 값). 500ms 미만이면 `None`.

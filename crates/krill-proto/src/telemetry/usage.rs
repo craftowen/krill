@@ -18,6 +18,11 @@ pub enum UsageName {
     FirstOpen,
     AppOpened,
     ActiveDay,
+    AgentActiveDay,
+    StarPromptShown,
+    StarPromptStarred,
+    StarPromptLater,
+    StarPromptDismissed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

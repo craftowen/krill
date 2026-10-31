@@ -25,7 +25,14 @@ def smoke(bundle):
     bundle = Path(bundle).resolve()
     with tempfile.TemporaryDirectory(prefix="krill-signed-", dir="/tmp") as temporary:
         root = Path(temporary)
-        env = dict(os.environ, HOME=str(root), KRILL_STATE_DIR=str(root), KRILL_NO_UPDATE_CHECK="1")
+        env = dict(
+            os.environ,
+            HOME=str(root),
+            KRILL_STATE_DIR=str(root),
+            KRILL_NO_UPDATE_CHECK="1",
+            KRILL_TELEMETRY_DISABLED="1",
+            KRILL_ERROR_REPORTING_DISABLED="1",
+        )
         holder = None
         apps = []
         session = None

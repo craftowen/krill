@@ -27,6 +27,7 @@ pub(crate) const QUEUE_LOCK: &str = "queue.lock";
 const UPLOAD_LOCK: &str = "upload.lock";
 const OUTBOX: &str = "outbox";
 const RETRY_FILE: &str = "retry.json";
+const INSTALL_SALT_FILE: &str = "install-salt";
 const ENTRY_VERSION: u32 = 1;
 /// 대기열 파일 하나의 상한: 이벤트 상한([`MAX_EVENT_BYTES`]) + 봉투(세대·시각·시도 횟수, 실제 약 120바이트).
 pub(crate) const MAX_ENTRY_BYTES: usize = MAX_EVENT_BYTES + 512;
@@ -34,6 +35,8 @@ pub(crate) const MAX_ENTRY_BYTES: usize = MAX_EVENT_BYTES + 512;
 const MAX_SCAN: usize = 256;
 /// 재시도 상태 파일 상한(바이트).
 const MAX_RETRY_BYTES: usize = 4096;
+/// 설치 솔트 파일 상한(바이트).
+const MAX_SALT_BYTES: usize = 64;
 /// 기록 시각이 이만큼 미래면 시계가 어긋난 항목으로 보고 버린다.
 const MAX_FUTURE_MS: u64 = 86_400_000;
 /// flush가 큐 잠금을 기다리는 상한. 기록 쪽은 파일 몇 개만 다루고 곧 놓는다.
@@ -97,7 +100,11 @@ impl UploadLock {
     /// # Errors
     /// 동의 디렉터리가 없거나 잠금 파일을 열지 못하면 OS 오류.
     pub fn try_acquire(state: &Path) -> io::Result<Option<Self>> {
-        Ok(Lock::try_acquire(&dir(state), UPLOAD_LOCK)?.map(|lock| Self { _lock: lock }))
+        let dir = dir(state);
+        if !dir.exists() && consent::read(state)?.is_some() {
+            DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+        }
+        Ok(Lock::try_acquire(&dir, UPLOAD_LOCK)?.map(|lock| Self { _lock: lock }))
     }
 }
 
@@ -192,13 +199,16 @@ pub fn record_at(state: &Path, event: Event) -> io::Result<bool> {
 ///
 /// # Errors
 /// 이벤트 계약 위반(`InvalidData`)이나 파일 쓰기 실패.
-pub fn record_with_consent(state: &Path, event: Event, expected: &Consent) -> io::Result<bool> {
+pub fn record_with_consent(state: &Path, mut event: Event, expected: &Consent) -> io::Result<bool> {
     event.validate()?;
     // 잠금 파일을 열기 전에 먼저 본다: 철회 뒤에는 잠금 파일조차 새로 만들지 않는다.
     if consent::read(state)?.as_ref() != Some(expected) {
         return Ok(false);
     }
     let dir = dir(state);
+    if !dir.exists() {
+        DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    }
     let lock = match Lock::try_acquire(&dir, QUEUE_LOCK) {
         Ok(Some(lock)) => lock,
         Ok(None) => return Ok(false),
@@ -207,6 +217,10 @@ pub fn record_with_consent(state: &Path, event: Event, expected: &Consent) -> io
     };
     if consent::read(state)?.as_ref() != Some(expected) {
         return Ok(false);
+    }
+    if event.install_hash.is_none() {
+        let salt = install_salt(&dir)?;
+        event.install_hash = Some(super::install_hash_with_salt(expected, &salt));
     }
     let now = now_ms();
     if !super::rate::admit(&dir, expected, &event, now)? {
@@ -245,6 +259,21 @@ pub fn record_with_consent(state: &Path, event: Event, expected: &Consent) -> io
     Ok(true)
 }
 
+fn install_salt(dir: &Path) -> io::Result<String> {
+    let path = dir.join(INSTALL_SALT_FILE);
+    if let Ok(Some(raw)) = read_bounded(&path, MAX_SALT_BYTES)
+        && let Ok(text) = std::str::from_utf8(&raw)
+    {
+        let trimmed = text.trim();
+        if is_hex32(trimmed) {
+            return Ok(trimmed.to_owned());
+        }
+    }
+    let salt = super::types::random_id()?;
+    write_atomic(dir, INSTALL_SALT_FILE, salt.as_bytes())?;
+    Ok(salt)
+}
+
 /// 대기 항목 수(이름만 센다, 상한 [`MAX_SCAN`]).
 pub(crate) fn pending(dir: &Path) -> usize {
     count(&dir.join(OUTBOX))
@@ -261,6 +290,7 @@ pub(crate) fn wipe(dir: &Path) {
     fs::remove_dir_all(dir.join(OUTBOX)).ok();
     fs::remove_file(dir.join(RETRY_FILE)).ok();
     fs::remove_file(dir.join(super::rate::FILE)).ok();
+    fs::remove_file(dir.join(INSTALL_SALT_FILE)).ok();
 }
 
 /// 대기열을 비운다: 큐 잠금 안에서 정리·선택하고, 잠금을 놓은 채 `transport`로 보내고, 다시 잠금 안에서
@@ -379,6 +409,13 @@ fn prepare(
     dropped: &mut usize,
 ) -> io::Result<Prepared> {
     let dir = dir(state);
+    if !dir.exists() {
+        return if consent::read(state)?.as_ref() == Some(expected) {
+            Ok(Prepared::Empty)
+        } else {
+            Ok(Prepared::Withdrawn)
+        };
+    }
     let lock = match Lock::wait(&dir, QUEUE_LOCK, FLUSH_WAIT) {
         Ok(lock) => lock,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Prepared::Busy),

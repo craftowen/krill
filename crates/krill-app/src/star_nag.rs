@@ -340,6 +340,7 @@ pub fn init(dir: PathBuf, cx: &mut App) {
 /// 앱에서 에이전트 실행(새 에이전트 탭 또는 세션 Working 전이)이 시작됐다.
 /// 문턱을 넘으면 이미 별을 줬는지 확인한 뒤 카드를 띄운다.
 pub fn record_agent_start(cx: &mut App) {
+    crate::telemetry::record_agent_start(cx);
     if !cx.has_global::<StarNag>() {
         return;
     }
@@ -552,7 +553,7 @@ fn show_card(surface: Surface, cx: &mut App) {
     }
 }
 
-/// 랜딩 화면이 열릴 때 한 번만 백그라운드에서 GitHub 별 상태를 확인한다.
+/// 랜딩 화면이나 설정 > 일반이 열릴 때 한 번만 백그라운드에서 GitHub 별 상태를 확인한다.
 pub fn ensure_checked(cx: &mut App) {
     if !cx.has_global::<StarNag>() {
         return;
@@ -608,6 +609,7 @@ fn run_star_check(cx: &mut App) {
 fn apply_star_check_result(starred: Option<bool>, cx: &mut App) {
     let before = cx.global::<StarNag>().state.clone();
     let mut reschedule_value_moment = false;
+    let mut shown = false;
     let run_pending_onboarding = {
         let nag = cx.global_mut::<StarNag>();
         if starred == Some(true) {
@@ -650,11 +652,13 @@ fn apply_star_check_result(starred: Option<bool>, cx: &mut App) {
                     } else {
                         nag.state.consume_value_moment(env!("CARGO_PKG_VERSION"));
                         nag.card = Card::Shown;
+                        shown = true;
                     }
                 } else {
                     nag.card = if nag.state.completed || !nag.state.can_show_prompt(now()) {
                         Card::Hidden
                     } else {
+                        shown = true;
                         Card::Shown
                     };
                 }
@@ -662,6 +666,12 @@ fn apply_star_check_result(starred: Option<bool>, cx: &mut App) {
         }
         std::mem::take(&mut nag.pending_onboarding_completed)
     };
+    if shown {
+        crate::telemetry::record_star_prompt(
+            krill_proto::telemetry::UsageName::StarPromptShown,
+            cx,
+        );
+    }
     if cx.global::<StarNag>().state != before {
         persist(cx);
     }
@@ -689,14 +699,22 @@ fn update(cx: &mut App, f: impl FnOnce(&mut StarNag)) {
 
 /// `[나중에]`·닫기 X·Escape·웹 열기.
 pub fn later(cx: &mut App) {
+    let mut deferred = false;
     update(cx, |nag| {
         if nag.card == Card::Thanks {
             nag.card = Card::Hidden;
             return;
         }
+        deferred = true;
         nag.state.defer(now());
         nag.card = Card::Hidden;
     });
+    if deferred {
+        crate::telemetry::record_star_prompt(
+            krill_proto::telemetry::UsageName::StarPromptLater,
+            cx,
+        );
+    }
 }
 
 /// 카드가 떠 있을 때 Escape 키로 닫는다(`later` 처리). 닫았으면 `true`.
@@ -718,6 +736,10 @@ pub fn never(cx: &mut App) {
         nag.state.complete();
         nag.card = Card::Hidden;
     });
+    crate::telemetry::record_star_prompt(
+        krill_proto::telemetry::UsageName::StarPromptDismissed,
+        cx,
+    );
 }
 
 /// 카드의 주 버튼 동작:
@@ -732,7 +754,14 @@ pub fn star(cx: &mut App) {
     };
     if mode == Mode::Web {
         cx.open_url(REPO_URL);
-        later(cx);
+        update(cx, |nag| {
+            nag.state.defer(now());
+            nag.card = Card::Hidden;
+        });
+        crate::telemetry::record_star_prompt(
+            krill_proto::telemetry::UsageName::StarPromptStarred,
+            cx,
+        );
         return;
     }
     let mock_put = {
@@ -764,6 +793,10 @@ pub fn star(cx: &mut App) {
                     nag.repo_star = RepoStar::Starred;
                     nag.card = Card::Thanks;
                 });
+                crate::telemetry::record_star_prompt(
+                    krill_proto::telemetry::UsageName::StarPromptStarred,
+                    cx,
+                );
             } else {
                 update(cx, |nag| {
                     nag.mode = Mode::Web;
@@ -786,7 +819,7 @@ pub fn star(cx: &mut App) {
     .detach();
 }
 
-/// 빈 워크스페이스(랜딩) 알약 버튼에서 별 주기 클릭.
+/// 빈 워크스페이스(랜딩) 알약 버튼 또는 설정 > 일반 'Krill 지원' 섹션에서 별 주기 클릭.
 pub fn star_from_surface(cx: &mut App) {
     if !cx.has_global::<StarNag>() {
         cx.open_url(REPO_URL);
@@ -803,6 +836,10 @@ pub fn star_from_surface(cx: &mut App) {
         RepoStar::WebFallback => {
             update(cx, |nag| nag.landing_menu_open = false);
             cx.open_url(REPO_URL);
+            crate::telemetry::record_star_prompt(
+                krill_proto::telemetry::UsageName::StarPromptStarred,
+                cx,
+            );
         }
         RepoStar::Starred => {
             update(cx, |nag| nag.landing_menu_open = !nag.landing_menu_open);
@@ -847,6 +884,12 @@ pub fn star_from_surface(cx: &mut App) {
                             nag.mode = Mode::Web;
                         }
                     });
+                    if ok {
+                        crate::telemetry::record_star_prompt(
+                            krill_proto::telemetry::UsageName::StarPromptStarred,
+                            cx,
+                        );
+                    }
                 });
             })
             .detach();

@@ -2,7 +2,7 @@
 CREATE TABLE events (
   id TEXT PRIMARY KEY,
   install_id TEXT NOT NULL,
-  name TEXT NOT NULL CHECK (name IN ('first_open','app_opened','active_day')),
+  name TEXT NOT NULL CHECK (name IN ('first_open','app_opened','active_day','agent_active_day','star_prompt_shown','star_prompt_starred','star_prompt_later','star_prompt_dismissed')),
   ts_unix INTEGER NOT NULL,
   app_version TEXT NOT NULL,
   os TEXT NOT NULL CHECK (os IN ('macos','windows','linux')),

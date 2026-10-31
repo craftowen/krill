@@ -351,8 +351,14 @@ fn start_is_only_for_app_and_daemon_under_current_consent() {
     }
     assert!(markers(&scratch.0).is_empty());
     let bare = Scratch::new("bare");
+    assert!(
+        RunGuard::start_with(&bare.0, Process::App, &Consent::default_for(&bare.0))
+            .unwrap()
+            .is_some()
+    );
+    crate::error_reporting::disable(&bare.0).unwrap();
     assert!(RunGuard::start(&bare.0, Process::App).unwrap().is_none());
-    assert!(!dir(&bare.0).exists(), "no consent: nothing is created");
+    assert!(markers(&bare.0).is_empty(), "disabled: no markers remain");
     let guard = RunGuard::start_with(&scratch.0, Process::App, &consent)
         .unwrap()
         .unwrap();

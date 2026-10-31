@@ -4,8 +4,6 @@
 //! 있고 `toml`이 없으면 완료로 간주한다. `toml` 쓰기는 임시 파일+rename 원자 교체다.
 //! 단계(`step`)는 구 4단계 마법사 파일과 호환하려고 남긴 값이다. 첫 실행 동의 단계는
 //! 없어졌으므로(OWE-904) 구 `step = "consent"` 파일은 처음 상태로 읽는다.
-//! 오류 보고 동의는 별도 opt-in이다. 첫 설치 후 온보딩 배너에서 한 번 묻고
-//! `error_reporting_asked`에 기록한다. 기본값 OFF는 바꾸지 않는다.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,8 +46,6 @@ pub struct OnboardingState {
     pub completed: bool,
     pub step: Step,
     pub version: u32,
-    /// 오류 보고 동의를 물었는가. 구 파일에는 없어 `false`(아직 묻지 않음)로 읽는다.
-    pub error_reporting_asked: bool,
 }
 
 impl OnboardingState {
@@ -58,7 +54,6 @@ impl OnboardingState {
             completed: false,
             step: Step::Checklist,
             version: STATE_VERSION,
-            error_reporting_asked: false,
         }
     }
 
@@ -76,8 +71,6 @@ struct FileState {
     completed: bool,
     step: String,
     version: u32,
-    #[serde(default)]
-    error_reporting_asked: bool,
 }
 
 /// 상태 디렉터리의 상태 파일 경로.
@@ -106,7 +99,6 @@ pub fn load(state_dir: &Path) -> OnboardingState {
         completed: file.completed,
         step,
         version: file.version,
-        error_reporting_asked: file.error_reporting_asked,
     }
 }
 
@@ -116,7 +108,6 @@ fn migrate_or_fresh(state_dir: &Path) -> OnboardingState {
             completed: true,
             step: Step::Done,
             version: STATE_VERSION,
-            error_reporting_asked: false,
         }
     } else {
         OnboardingState::fresh()
@@ -129,7 +120,6 @@ pub fn save(state_dir: &Path, state: &OnboardingState) -> io::Result<()> {
         completed: state.completed,
         step: state.step.as_str().to_owned(),
         version: state.version,
-        error_reporting_asked: state.error_reporting_asked,
     };
     let body = toml::to_string(&file).map_err(io::Error::other)?;
     atomic_write_0600(&state_path(state_dir), &body)
@@ -236,7 +226,6 @@ mod tests {
             completed: false,
             step: Step::Connect,
             version: STATE_VERSION,
-            error_reporting_asked: false,
         };
         save(&root, &state).unwrap();
         assert_eq!(load(&root), state);

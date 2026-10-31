@@ -5,6 +5,16 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 // Matches Cargo package versions, including bounded SemVer prerelease/build tags.
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const FIELDS = ['id', 'install_id', 'name', 'ts_unix', 'app_version', 'os', 'arch'];
+export const EVENTS = [
+  'first_open',
+  'app_opened',
+  'active_day',
+  'agent_active_day',
+  'star_prompt_shown',
+  'star_prompt_starred',
+  'star_prompt_later',
+  'star_prompt_dismissed',
+];
 export class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
@@ -18,7 +28,7 @@ export function validate(value, now) {
   for (const e of value.events) {
     if (!closed(e, FIELDS) || typeof e.id !== 'string' || !UUID.test(e.id)
       || typeof e.install_id !== 'string' || !UUID.test(e.install_id)
-      || !['first_open', 'app_opened', 'active_day'].includes(e.name)
+      || !EVENTS.includes(e.name)
       || !Number.isSafeInteger(e.ts_unix) || e.ts_unix < now - MAX_AGE || e.ts_unix > now + FUTURE_SKEW
       || typeof e.app_version !== 'string' || e.app_version.length > 64 || !VERSION.test(e.app_version)
       || !['macos', 'windows', 'linux'].includes(e.os) || !['aarch64', 'x86_64'].includes(e.arch)) {

@@ -555,21 +555,6 @@ pub fn dismiss_need(id: &str, cx: &mut App) {
             .items
             .retain(|n| n.check_id != id);
     }
-    // 오류 보고 동의 배너를 토스트 닫기(X)로 내리면 거절과 같이 물었음으로 남긴다.
-    // 묻는 시점에는 동의 파일이 없으므로(있으면 묻지 않는다) 기본 OFF가 유지된다.
-    if id == super::error_consent::CHECK_ID
-        && let Some(env) = Env::current()
-    {
-        let dir = env.state.clone();
-        crate::settings::background_file_io(cx, move || super::error_consent::mark_asked(&dir))
-            .detach();
-    }
-}
-
-/// 오류 보고 동의 배너를 게시한다. 동의 흐름 전용이라 `report_failure`와 달리
-/// 기존 배너 문구를 덮지 않도록 호출자가 중복 게시를 피한다.
-pub fn publish_consent_need(message: String, cx: &mut App) {
-    publish(super::error_consent::CHECK_ID, message, cx);
 }
 
 /// 파일 접근이 실제로 거부됐을 때만 호출한다. 권한을 미리 요청하지 않는다.

@@ -659,7 +659,11 @@ impl Seen {
             return;
         }
         let native = super::dir(state).join(super::NATIVE_DIR);
-        match DirBuilder::new().mode(0o700).create(&native) {
+        match DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&native)
+        {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(_) => return,

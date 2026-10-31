@@ -36,7 +36,7 @@ def main():
                 logs.append(log)
                 fixture = subprocess.Popen(
                     ['node', str(tests / 'mobile_pwa.cjs'), str(krilld), '--keep'],
-                    env=dict(os.environ, M9_BROWSER_METADATA=str(metadata), M9_BROWSER_ADDRESS='127.0.0.1:0'),
+                    env=dict(os.environ, M9_BROWSER_METADATA=str(metadata), M9_BROWSER_ADDRESS='127.0.0.1:0', KRILL_TELEMETRY_DISABLED='1', KRILL_ERROR_REPORTING_DISABLED='1'),
                     stdout=log, stderr=log,
                 )
                 fixtures.append(fixture)

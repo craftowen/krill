@@ -88,7 +88,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='mobile-responsive-') as scratch:
         metadata = Path(scratch) / 'fixture.json'
         env = dict(os.environ, M9_UI_QA='1', M9_BROWSER_ADDRESS=args.address,
-                   M9_BROWSER_METADATA=str(metadata))
+                   M9_BROWSER_METADATA=str(metadata),
+                   KRILL_TELEMETRY_DISABLED='1',
+                   KRILL_ERROR_REPORTING_DISABLED='1')
         with (shots / 'fixture.log').open('w+') as log:
             fixture = subprocess.Popen(['node', str(Path(__file__).with_name('mobile_pwa.cjs')),
                                         str(krilld), '--keep'],
@@ -139,7 +141,7 @@ def main():
 
                 # First-launch states before consuming the one-time pairing ticket.
                 init = Path(scratch) / 'preferences.js'
-                init.write_text('if(!localStorage.getItem("krill-mobile-ui-v1"))localStorage.setItem("krill-mobile-ui-v1",JSON.stringify({language:"en",appearance:"dark"}));const NativeSocket=WebSocket;globalThis.tabletSockets=[];globalThis.WebSocket=class extends NativeSocket{constructor(...args){super(...args);tabletSockets.push(this);}};')
+                init.write_text('if(!localStorage.getItem("krill-mobile-ui-v1"))localStorage.setItem("krill-mobile-ui-v1",JSON.stringify({language:"en",appearance:"dark"}));localStorage.setItem("krill-mobile-error-reporting-v1","");const NativeSocket=WebSocket;globalThis.tabletSockets=[];globalThis.WebSocket=class extends NativeSocket{constructor(...args){super(...args);tabletSockets.push(this);}};')
                 browser('--init-script', str(init), 'open', cfg['base'])
                 wait('!!globalThis.KrillMobile?.app')
                 for width, height in VIEWPORTS:
@@ -289,7 +291,7 @@ def main():
                 evaluate(f'(async()=>{{await KrillMobile.app.transport.rpc({{action:"prompt",session:{fold_sid},text:{json.dumps(history_text)}}});return true;}})()')
                 def history_ready():
                     output = subprocess.check_output([str(krill), 'read', str(fold_sid)],
-                                                     env=dict(os.environ, KRILL_STATE_DIR=cfg['dir']), text=True)
+                                                     env=dict(env, KRILL_STATE_DIR=cfg['dir']), text=True)
                     return 'fold-history-119' in output
                 until(history_ready)
                 fold_route = evaluate(f'"/host/local/group/"+encodeURIComponent(KrillMobile.store.sessions.get({fold_sid}).groupKey)+"/s/{fold_sid}"')
@@ -327,7 +329,7 @@ def main():
                 # Tablet shell, independent terminal panes and real daemon lifetime.
                 def cli(*command):
                     return subprocess.check_output([str(krill), *command],
-                        env=dict(os.environ, KRILL_STATE_DIR=cfg['dir']), text=True)
+                        env=dict(env, KRILL_STATE_DIR=cfg['dir']), text=True)
 
                 def pane_ready():
                     wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===2')

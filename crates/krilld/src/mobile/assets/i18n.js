@@ -4,7 +4,6 @@
   let language = "en";
   const ko = {
     "Requested {0}": "요청한 설정 {0}",
-    "Context usage unknown": "컨텍스트 사용량 확인 불가",
     "Context used {0}%": "컨텍스트 {0}% 사용",
     "No model catalog is available. Open the model picker in Term.": "모델 목록을 불러올 수 없습니다. 터미널에서 모델을 선택하세요.",
     "Applying…": "적용 중…",
@@ -61,6 +60,24 @@
       "연결이 끊겼습니다. 대기 중이던 동작은 다시 보내지 않았습니다. 데스크톱 접근 권한이 해제되었다면 새 QR 코드를 스캔하세요.",
     Skill: "스킬",
     Global: "전역",
+    "Antigravity also saves this as the default for new sessions.":
+      "Antigravity는 이 모델을 새 세션의 기본값으로도 저장합니다.",
+    "Changes the model in this running Antigravity chat. Antigravity also saves it as the default for new sessions.":
+      "실행 중인 Antigravity 채팅의 모델을 바꿉니다. Antigravity는 새 세션의 기본값으로도 저장합니다.",
+    "Antigravity CLI was not found on this computer.":
+      "이 컴퓨터에서 Antigravity CLI를 찾지 못했습니다.",
+    "Model control needs Antigravity CLI 1.4.12 or later. Keep chatting with the current model.":
+      "모델 변경은 Antigravity CLI 1.4.12 이상에서 지원합니다. 현재 모델로 계속 대화하세요.",
+    "Antigravity did not return its model list. Try again in a moment.":
+      "Antigravity가 모델 목록을 주지 않았습니다. 잠시 후 다시 시도하세요.",
+    "Antigravity models are still loading. Try again in a moment.":
+      "Antigravity 모델 목록을 불러오는 중입니다. 잠시 후 다시 시도하세요.",
+    "Wait for the running agent to become idle":
+      "실행 중인 에이전트가 입력을 기다릴 때 바꿀 수 있습니다.",
+    "Wait for an idle Antigravity chat with an empty composer.":
+      "Antigravity가 입력을 기다리고 입력창이 비어 있을 때 바꿀 수 있습니다.",
+    "Antigravity received the model command, but its confirmation was not recognized. It will not be resent.":
+      "Antigravity가 모델 명령을 받았지만 확인 응답을 인식하지 못했습니다. 다시 보내지 않습니다.",
     "Claude also saves this as the default for new sessions.":
       "Claude는 이 모델을 새 세션의 기본값으로도 저장합니다.",
     "Verified model changes are unavailable on Windows. Keep chatting with the current model.":
@@ -69,12 +86,12 @@
       "현재 Codex 세션의 모델만 변경합니다.",
     "Changes the model in this running Claude chat. Claude also saves its default for new sessions.":
       "현재 Claude 모델을 변경하고 새 세션의 기본값으로도 저장합니다.",
-    "Wait for an idle Codex chat with an empty native composer. Direct model control is verified for Codex 0.164.0.":
-      "Codex 작업이 끝난 뒤 터미널 입력란을 비워 주세요. Codex 0.164.0에서 모델 직접 변경을 지원합니다.",
-    "Wait for an idle Codex 0.164.0 chat with an empty native composer":
-      "Codex 작업이 끝난 뒤 터미널 입력란을 비워 주세요. Codex 0.164.0에서 모델 직접 변경을 지원합니다.",
-    "Wait for an idle Claude Code 2.1.311 chat with an empty native composer":
-      "Claude 작업이 끝난 뒤 터미널 입력란을 비워 주세요. Claude Code 2.1.311에서 모델 직접 변경을 지원합니다.",
+    "Wait for an idle Codex chat with an empty native composer. Direct model control needs Codex 0.164.0 or later.":
+      "Codex 작업이 끝난 뒤 터미널 입력란을 비워 주세요. Codex 0.164.0 이상에서 모델 직접 변경을 지원합니다.",
+    "Wait for an idle Codex 0.164.0 or later chat with an empty native composer":
+      "Codex 작업이 끝난 뒤 터미널 입력란을 비워 주세요. Codex 0.164.0 이상에서 모델 직접 변경을 지원합니다.",
+    "Wait for an idle Claude Code 2.1.311 or later chat with an empty native composer":
+      "Claude 작업이 끝난 뒤 터미널 입력란을 비워 주세요. Claude Code 2.1.311 이상에서 모델 직접 변경을 지원합니다.",
     "Codex received the model command, but its session-only change was not confirmed. Check the chat; the command will not be resent.":
       "Codex에 모델 변경 명령을 전달했지만 적용은 확인되지 않았습니다. 활동 내역을 확인하세요. 명령을 자동으로 다시 보내지 않습니다.",
     "Claude received the model command, but its native confirmation was not recognized. It will not be resent.":
@@ -507,7 +524,6 @@
     "Point your camera at the QR code in desktop Settings → Mobile.":
       "컴퓨터의 설정 → 모바일에 표시된 QR 코드를 비추세요.",
     "Waiting for transcript…": "대화 기록을 기다리는 중…",
-    "Term →": "터미널 →",
     "Back to latest": "최신 대화로",
     "Message agent (Bracketed Paste)…": "에이전트에게 메시지 보내기…",
     "Message {0}": "{0}에게 메시지",

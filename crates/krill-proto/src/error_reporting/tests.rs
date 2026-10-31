@@ -197,7 +197,7 @@ fn withdrawal_removes_consent_published_while_waiting_for_queue_lock() {
     let path = state.0.clone();
     let worker = std::thread::spawn(move || disable(&path));
     let deadline = Instant::now() + Duration::from_secs(2);
-    while dir(state.path()).join(CONSENT_FILE).exists() {
+    while consent::read(state.path()).unwrap().is_some() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -636,10 +636,15 @@ fn hang_buckets_round_down_to_the_crossed_threshold() {
 fn consent_is_a_separate_opt_in_with_a_stable_generation() {
     let state = State::new();
     let none = Env::stub(&[]);
-    assert_eq!(consent_with(state.path(), &none).unwrap(), None);
-    // 텔레메트리 동의는 오류 보고 동의가 아니다.
+    let default_consent = consent_with(state.path(), &none).unwrap().unwrap();
+    assert_eq!(default_consent.enabled_at_ms, 0);
+    assert_eq!(default_consent.generation.len(), 32);
+    // 텔레메트리 동의는 오류 보고 세대를 바꾸지 않는다.
     crate::telemetry::enable(state.path()).unwrap();
-    assert_eq!(consent_with(state.path(), &none).unwrap(), None);
+    assert_eq!(
+        consent_with(state.path(), &none).unwrap().as_ref(),
+        Some(&default_consent)
+    );
     assert!(
         !dir(state.path()).exists(),
         "읽기만으로 디렉터리를 만들지 않는다"
@@ -649,6 +654,7 @@ fn consent_is_a_separate_opt_in_with_a_stable_generation() {
     let first = consent_with(state.path(), &none).unwrap().unwrap();
     assert!(first.enabled_at_ms > 0);
     assert_eq!(first.generation.len(), 32);
+    assert_ne!(first.generation, default_consent.generation);
     enable(state.path()).unwrap();
     assert_eq!(
         consent_with(state.path(), &none).unwrap().as_ref(),
@@ -702,6 +708,8 @@ fn env_veto_disables_reporting_and_status_names_it() {
             Process::App,
             Code::Panic,
             None,
+            None,
+            &[],
             "crates/krill-app/src/main.rs",
             1,
         );
@@ -742,8 +750,8 @@ fn status_reports_queue_and_backoff_with_fixed_keys() {
     assert_eq!(
         status_with(state.path(), &none).unwrap(),
         Status {
-            consented: false,
-            enabled: false,
+            consented: true,
+            enabled: true,
             pending: 0,
             veto: None,
             enabled_at_ms: None,
@@ -788,18 +796,21 @@ fn capture_completes_optional_fields_and_respects_consent() {
     let state = State::new();
     let none = Env::stub(&[]);
     let file = "crates/krilld/src/main.rs";
+    disable(state.path()).unwrap();
     capture_with(
         state.path(),
         &none,
         Process::Daemon,
         Code::Panic,
         None,
+        None,
+        &[],
         file,
         9,
     );
     assert!(
-        !dir(state.path()).exists(),
-        "동의 전에는 아무것도 쓰지 않는다"
+        !state.outbox().exists(),
+        "철회 상태에서는 대기열에 아무것도 쓰지 않는다"
     );
     state.consent();
     capture_with(
@@ -808,6 +819,11 @@ fn capture_completes_optional_fields_and_respects_consent() {
         Process::Daemon,
         Code::Panic,
         None,
+        Some("secret sk-ant-api03-12345678901234567890 at /Users/owen/file.rs\nnext line"),
+        &[
+            "crates/krilld/src/main.rs:9:5".to_owned(),
+            "/Users/owen/bad.rs:1".to_owned(),
+        ],
         file,
         9,
     );
@@ -817,6 +833,8 @@ fn capture_completes_optional_fields_and_respects_consent() {
         Process::App,
         Code::UiStall,
         None,
+        None,
+        &[],
         file,
         1,
     );
@@ -826,6 +844,8 @@ fn capture_completes_optional_fields_and_respects_consent() {
         Process::App,
         Code::UiStall,
         Some(5000),
+        None,
+        &[],
         file,
         1,
     );
@@ -835,6 +855,8 @@ fn capture_completes_optional_fields_and_respects_consent() {
         Process::App,
         Code::NativeCrash,
         None,
+        None,
+        &[],
         file,
         1,
     );
@@ -844,6 +866,8 @@ fn capture_completes_optional_fields_and_respects_consent() {
         Process::Cli,
         Code::UpdateFailed,
         None,
+        None,
+        &[],
         "/abs/x.rs",
         1,
     );
@@ -859,12 +883,22 @@ fn capture_completes_optional_fields_and_respects_consent() {
     assert_eq!(events.len(), 5);
     for event in &events {
         event.validate().unwrap();
+        assert_eq!(
+            event.install_hash.as_deref().map(str::len),
+            Some(32),
+            "모든 기록된 이벤트에 익명 install_hash가 들어간다"
+        );
     }
     let panic = events.iter().find(|e| e.kind == Kind::Panic).unwrap();
     assert_eq!(
         panic.source_loc.as_deref(),
         Some("crates/krilld/src/main.rs:9")
     );
+    assert_eq!(
+        panic.detail.as_deref(),
+        Some("secret [REDACTED] at /Users/[USER]/file.rs next line")
+    );
+    assert_eq!(panic.frames, ["crates/krilld/src/main.rs:9:5"]);
     assert_eq!(panic.process, Process::Daemon);
     let mut buckets: Vec<u32> = events.iter().filter_map(|e| e.hang_bucket_ms).collect();
     buckets.sort_unstable();
@@ -952,6 +986,8 @@ fn record_never_waits_for_the_queue_lock() {
         Process::App,
         Code::Panic,
         None,
+        None,
+        &[],
         "crates/krill-app/src/main.rs",
         1,
     );
@@ -1411,7 +1447,7 @@ fn withdrawal_during_upload_never_recreates_deleted_files() {
         );
         assert!(!state.outbox().exists());
         assert!(!state.retry_file().exists());
-        assert!(!dir(state.path()).join(CONSENT_FILE).exists());
+        assert!(consent::read(state.path()).unwrap().is_none());
     }
 }
 
@@ -1592,6 +1628,8 @@ fn fifo_consent_file_never_blocks_capture_or_status() {
             Process::App,
             Code::Panic,
             None,
+            None,
+            &[],
             "crates/krill-app/src/main.rs",
             1,
         );
@@ -1607,7 +1645,8 @@ fn fifo_consent_file_never_blocks_capture_or_status() {
     assert!(state.entries().is_empty());
     let path = state.path().to_path_buf();
     finishes(move || disable(&path).unwrap());
-    assert!(fs::symlink_metadata(&file).is_err());
+    assert!(fs::symlink_metadata(&file).unwrap().file_type().is_file());
+    assert_eq!(consent::read(state.path()).unwrap(), None);
 }
 
 #[cfg(unix)]
@@ -1670,6 +1709,8 @@ fn special_lock_files_fail_fast() {
             Process::App,
             Code::Panic,
             None,
+            None,
+            &[],
             "crates/krill-app/src/main.rs",
             1,
         );
@@ -1854,4 +1895,37 @@ fn test_process_cannot_touch_the_default_state_dir() {
     // 임시 상태 폴더는 그대로 기록할 수 있다.
     let temp = State::new();
     assert!(!shielded(temp.path()));
+    assert!(is_temp_dir(temp.path()));
+    assert!(!is_production_state_dir(temp.path()));
+}
+
+#[test]
+fn default_consent_install_hash_is_randomly_salted_and_rotates_on_reset() {
+    let state = State::new();
+    let none = Env::stub(&[]);
+    let default_consent = consent_with(state.path(), &none).unwrap().unwrap();
+    assert_eq!(default_consent.enabled_at_ms, 0);
+
+    let first_ids = queue(&state, &default_consent, 2);
+    let read_hash = |id: &str| -> String {
+        let raw = fs::read(state.outbox().join(format!("{id}.json"))).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value["event"]["install_hash"].as_str().unwrap().to_owned()
+    };
+    let h1 = read_hash(&first_ids[0]);
+    let h2 = read_hash(&first_ids[1]);
+    assert_eq!(h1.len(), 32);
+    assert_eq!(h1, h2, "같은 설치 폴더 안에서는 install_hash가 일관된다");
+    assert_ne!(
+        h1,
+        install_hash(&default_consent),
+        "경로만으로 결정되는 무솔트 해시와 달라야 한다(사용자명 사전 공격 방지)"
+    );
+
+    // 같은 경로라도 솔트가 초기화(철회 또는 재설치)되면 다른 install_hash가 나온다.
+    disable(state.path()).unwrap();
+    fs::remove_file(dir(state.path()).join(CONSENT_FILE)).unwrap();
+    let second_ids = queue(&state, &default_consent, 1);
+    let h3 = read_hash(&second_ids[0]);
+    assert_ne!(h1, h3, "철회 후 솔트가 바뀌면 install_hash도 회전한다");
 }

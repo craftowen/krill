@@ -28,13 +28,33 @@ export async function stats(db, now, days) {
     ...[7, 30].map(n => db.prepare(`SELECT count(*) AS denominator,
       coalesce(sum(EXISTS(SELECT 1 FROM daily_active a WHERE a.install_id=i.install_id AND a.day=date(i.first_seen_ts,'unixepoch',?))),0) AS retained
       FROM installations i WHERE date(i.first_seen_ts,'unixepoch',?) < ?`).bind(`+${n} days`, `+${n} days`, today)),
+    db.prepare(`SELECT
+      (SELECT count(DISTINCT install_id) FROM daily_active) AS verified_active_installs,
+      (SELECT count(*) FROM (SELECT install_id FROM daily_active GROUP BY install_id HAVING count(DISTINCT day) >= 2)) AS returning_installs,
+      (SELECT count(DISTINCT install_id) FROM events WHERE name='agent_active_day' AND ts_unix <= ?) AS agent_active_installs`).bind(now),
+    db.prepare(`SELECT i.os AS value, count(*) AS installations FROM installations i
+      WHERE EXISTS (SELECT 1 FROM daily_active a WHERE a.install_id = i.install_id)
+      GROUP BY i.os ORDER BY installations DESC, value`),
+    db.prepare(`SELECT name, count(*) AS events, count(DISTINCT install_id) AS installs FROM events
+      WHERE name IN ('star_prompt_shown','star_prompt_starred','star_prompt_later','star_prompt_dismissed') AND ts_unix <= ?
+      GROUP BY name`).bind(now),
   ];
   const result = await db.batch(queries);
   if (result.some(r => !r.success)) throw new Error('stats failed');
   const rows = result.map(r => r.results);
+  const funnelMap = Object.fromEntries((rows[10] || []).map(r => [r.name, {events: r.events, installs: r.installs}]));
+  const funnelEntry = key => funnelMap[key] || {events: 0, installs: 0};
   return {
     as_of_unix: now, timezone: 'UTC', timeline_days: days,
     totals: {...rows[0][0], ...rows[1][0], ...rows[2][0]},
+    verified: rows[8][0],
+    verified_operating_systems: rows[9],
+    star_funnel: {
+      shown: funnelEntry('star_prompt_shown'),
+      starred: funnelEntry('star_prompt_starred'),
+      later: funnelEntry('star_prompt_later'),
+      dismissed: funnelEntry('star_prompt_dismissed'),
+    },
     timeline: rows[3], versions: rows[4], operating_systems: rows[5],
     retention: [7, 30].map((day, i) => ({day, ...rows[6+i][0],
       rate: rows[6+i][0].denominator ? rows[6+i][0].retained / rows[6+i][0].denominator : null,

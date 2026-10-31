@@ -592,7 +592,6 @@ fn wizard_completed_state_only_refreshes_staging(cx: &mut TestAppContext) {
             completed: true,
             step: state::Step::Done,
             version: state::STATE_VERSION,
-            error_reporting_asked: true,
         },
     )
     .unwrap();
@@ -982,7 +981,6 @@ fn wizard_legacy_mid_flow_completes_silently(cx: &mut TestAppContext) {
                 completed: false,
                 step,
                 version: state::STATE_VERSION,
-                error_reporting_asked: true,
             },
         )
         .unwrap();
@@ -1003,7 +1001,6 @@ fn state_failed_save_preserves_existing() {
         completed: false,
         step: state::Step::Connect,
         version: state::STATE_VERSION,
-        error_reporting_asked: false,
     };
     state::save(&root, &before).unwrap();
     let body = fs::read_to_string(state::state_path(&root)).unwrap();
@@ -1012,7 +1009,6 @@ fn state_failed_save_preserves_existing() {
         completed: true,
         step: state::Step::Done,
         version: state::STATE_VERSION,
-        error_reporting_asked: false,
     };
     let result = state::save(&root, &after);
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1037,7 +1033,6 @@ fn state_load_ignores_interrupted_tmp_debris() {
         completed: false,
         step: state::Step::Checklist,
         version: state::STATE_VERSION,
-        error_reporting_asked: false,
     };
     state::save(&root, &saved).unwrap();
     // 중단된 rename이 남긴 임시 파일 흉내. 다음 저장은 다른 고유 이름이라 덮지 않는다.

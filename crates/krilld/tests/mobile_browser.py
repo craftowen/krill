@@ -32,7 +32,7 @@ def main():
     address = args.address if ':' in args.address else f'{args.address}:0'
     with tempfile.TemporaryDirectory(prefix='mobile-shell-') as scratch:
         metadata = Path(scratch) / 'fixture.json'
-        env = dict(os.environ, M9_UI_QA='1', M9_BROWSER_ADDRESS=address, M9_BROWSER_METADATA=str(metadata))
+        env = dict(os.environ, M9_UI_QA='1', M9_BROWSER_ADDRESS=address, M9_BROWSER_METADATA=str(metadata), KRILL_TELEMETRY_DISABLED='1', KRILL_ERROR_REPORTING_DISABLED='1')
         with (Path(scratch) / 'fixture.log').open('w+') as log:
             fixture = subprocess.Popen(['node', str(Path(__file__).with_name('mobile_pwa.cjs')), str(target / 'debug/krilld'), '--keep'], env=env, stdout=log, stderr=log)
             try:
@@ -47,13 +47,14 @@ def main():
                 def wait(script):
                     browser('wait', '--fn', script)
                 def cli(*command):
-                    return subprocess.check_output([str(target/'debug/krill'), *command], env=dict(os.environ, KRILL_STATE_DIR=cfg['dir']), text=True)
+                    return subprocess.check_output([str(target/'debug/krill'), *command], env=dict(os.environ, KRILL_STATE_DIR=cfg['dir'], KRILL_TELEMETRY_DISABLED='1', KRILL_ERROR_REPORTING_DISABLED='1'), text=True)
                 def navigate(route):
                     evaluate(f'KrillMobile.app.navigate({json.dumps(route)});true')
                 def shot(name):
                     browser('screenshot', str(shots / f'{name}.png'))
                 fault = Path(scratch) / 'interrupt.js'
                 fault.write_text("""
+localStorage.setItem('krill-mobile-error-reporting-v1','');
 localStorage.setItem('krill-mobile-ui-v1',JSON.stringify({...JSON.parse(localStorage.getItem('krill-mobile-ui-v1')||'{}'),language:'en'}));
 const NativeWebSocket=WebSocket;globalThis.recoverySockets=[];
 globalThis.WebSocket=class extends NativeWebSocket {

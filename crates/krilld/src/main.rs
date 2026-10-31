@@ -77,14 +77,6 @@ fn main() -> ExitCode {
     tracing::info!("daemon starting");
     // 세션 panic은 `catch_unwind`가 잡지만(P4) 원인은 크래시 로그로 남긴다(MK-067).
     krill_proto::diag::install_panic_hook("krilld");
-    let _error_run = daemon::state_dir().and_then(|state| {
-        krill_proto::error_reporting::runs::RunGuard::start(
-            &state,
-            krill_proto::error_reporting::Process::Daemon,
-        )
-        .ok()
-        .flatten()
-    });
     // 실패해도 데몬은 뜬다: 해제 페이지가 늦게 돌아올 뿐 세션에는 영향이 없다.
     krilld::alloc::return_freed_pages().ok();
     krilld::alloc::mobile_thread().ok();
@@ -221,6 +213,19 @@ fn main() -> ExitCode {
             }
         }
     };
+    let _error_run = owns_mobile(&path)
+        .then(daemon::state_dir)
+        .flatten()
+        .and_then(|state| {
+            krill_proto::error_reporting::runs::RunGuard::start(
+                &state,
+                krill_proto::error_reporting::Process::Daemon,
+            )
+            .ok()
+            .flatten()
+        });
+    #[cfg(unix)]
+    krilld::notify_on_stop_signal(done.clone());
     // 클라이언트를 받기 전에 맡겨야 세션을 가진 holder는 늘 소켓도 쥔다. 링크가 끊겼으면 고아 운영(rejoin)이다.
     // ponytail: 첫 게시와 `HoldListener` 사이에 죽으면 그 holder는 소켓 없이 남아 연결이 거부되고 holder가 하나 더
     // 뜰 수 있다. 세션을 만들기 전이라 갈라질 세션은 없다. 막아야 하면 holder 자체 flock을 더한다.
