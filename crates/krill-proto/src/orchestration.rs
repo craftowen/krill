@@ -3751,13 +3751,25 @@ pub struct PortEntry {
 }
 
 static LOCAL_URL_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(
+    regex::RegexBuilder::new(
         r"(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})(?:/[\x21\x23-\x26\x28\x2a-\x3b\x3d\x3f-\x5c\x5e-\x7e]*)?)|(?:(?:\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0)|\[::1\]):(\d{2,5})\b)",
     )
+    .unicode(false)
+    .build()
     .ok()
 });
 
+fn may_contain_local_url(text: &str) -> bool {
+    text.contains("localhost:")
+        || text.contains("127.0.0.1:")
+        || text.contains("0.0.0.0:")
+        || text.contains("[::1]:")
+}
+
 pub fn extract_local_urls(session_id: u64, text: &str, probe: bool) -> Vec<PortEntry> {
+    if !may_contain_local_url(text) {
+        return Vec::new();
+    }
     let Some(re) = LOCAL_URL_REGEX.as_ref() else {
         return Vec::new();
     };

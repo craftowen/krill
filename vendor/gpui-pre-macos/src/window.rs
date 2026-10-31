@@ -3439,6 +3439,9 @@ fn spawn_display_link_watchdog(state: &Arc<Mutex<MacWindowState>>) {
                     now.duration_since(last_check) > LINK_CHECK_INTERVAL + LINK_CHECK_INTERVAL / 2;
                 last_check = now;
                 let mut lock = state.lock();
+                if !lock.present_pending {
+                    lock.renderer.trim_idle_back_buffers(now);
+                }
                 let visible = unsafe {
                     lock.native_window
                         .occlusionState()

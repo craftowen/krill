@@ -2670,7 +2670,12 @@ impl Shell {
                 let registrations = bg.spawn(async move { service.registrations() }).await;
                 if this
                     .update(cx, |shell, cx| {
-                        if let Ok(hosts) = registrations {
+                        if let Ok(hosts) = registrations
+                            && (!hosts.is_empty()
+                                || !shell.external_hosts.is_empty()
+                                || !shell.ssh_hosts.is_empty()
+                                || !shell.host_statuses.is_empty())
+                        {
                             shell.external_hosts = hosts;
                             shell.sync_hosts(cx);
                         }
@@ -5663,7 +5668,7 @@ impl Shell {
         } else if self.cursor_blink.is_none() {
             let task = cx.spawn(async move |this, cx| {
                 let bg = cx.background_executor().clone();
-                loop {
+                for _ in 0..8 {
                     bg.timer(CURSOR_BLINK).await;
                     let flipped = this.update(cx, |t, cx| {
                         if let Some((_, hidden)) = &mut t.cursor_blink {

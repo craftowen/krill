@@ -50,8 +50,23 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-const DEFAULT_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+const DEFAULT_INSTANCE_BUFFER_SIZE: usize = 512 * 1024;
 const INSTANCE_BUFFER_SHRINK_DELAY: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "macos")]
+fn relieve_malloc_pressure() {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
+    }
+    // SAFETY: Passing a null zone instructs libsystem_malloc to release unused
+    // magazine pages across all zones back to the kernel as reclaimable memory.
+    unsafe {
+        malloc_zone_pressure_relief(ptr::null_mut(), 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn relieve_malloc_pressure() {}
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -141,9 +156,10 @@ impl InstanceBufferPool {
                 self.small_frames_since = None;
             }
         }
-        if buffer.size == self.buffer_size {
+        if buffer.size == self.buffer_size && self.buffers.is_empty() {
             self.buffers.push(buffer.metal_buffer)
         }
+        relieve_malloc_pressure();
     }
 }
 
@@ -155,6 +171,8 @@ pub struct MetalRenderer {
     drawable_acquisition: Option<Acquisition<metal::MetalLayer, Option<metal::MetalDrawable>>>,
     drawable_ready: Arc<Mutex<Option<DrawableReadyCallback>>>,
     drawable_retry_at: Option<Instant>,
+    last_present_at: Option<Instant>,
+    back_buffers_trimmed: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -300,14 +318,94 @@ impl MetalRenderer {
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     ) -> Self {
-        #[cfg(feature = "runtime_shaders")]
-        let library = device
-            .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
-            .expect("error building metal library");
-        #[cfg(not(feature = "runtime_shaders"))]
-        let library = device
-            .new_library_with_data(SHADERS_METALLIB)
-            .expect("error building metal library");
+        let (
+            paths_rasterization_pipeline_state,
+            path_sprites_pipeline_state,
+            shadows_pipeline_state,
+            quads_pipeline_state,
+            underlines_pipeline_state,
+            monochrome_sprites_pipeline_state,
+            polychrome_sprites_pipeline_state,
+            surfaces_pipeline_state,
+        ) = objc2::rc::autoreleasepool(|_| {
+            #[cfg(feature = "runtime_shaders")]
+            let library = device
+                .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
+                .expect("error building metal library");
+            #[cfg(not(feature = "runtime_shaders"))]
+            let library = device
+                .new_library_with_data(SHADERS_METALLIB)
+                .expect("error building metal library");
+
+            (
+                build_path_rasterization_pipeline_state(
+                    &device,
+                    &library,
+                    "paths_rasterization",
+                    "path_rasterization_vertex",
+                    "path_rasterization_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                    PATH_SAMPLE_COUNT,
+                ),
+                build_path_sprite_pipeline_state(
+                    &device,
+                    &library,
+                    "path_sprites",
+                    "path_sprite_vertex",
+                    "path_sprite_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+                build_pipeline_state(
+                    &device,
+                    &library,
+                    "shadows",
+                    "shadow_vertex",
+                    "shadow_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+                build_pipeline_state(
+                    &device,
+                    &library,
+                    "quads",
+                    "quad_vertex",
+                    "quad_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+                build_pipeline_state(
+                    &device,
+                    &library,
+                    "underlines",
+                    "underline_vertex",
+                    "underline_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+                build_pipeline_state(
+                    &device,
+                    &library,
+                    "monochrome_sprites",
+                    "monochrome_sprite_vertex",
+                    "monochrome_sprite_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+                build_pipeline_state(
+                    &device,
+                    &library,
+                    "polychrome_sprites",
+                    "polychrome_sprite_vertex",
+                    "polychrome_sprite_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+                build_pipeline_state(
+                    &device,
+                    &library,
+                    "surfaces",
+                    "surface_vertex",
+                    "surface_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+            )
+        });
+        relieve_malloc_pressure();
 
         fn to_float2_bits(point: PointF) -> u64 {
             let mut output = point.y.to_bits() as u64;
@@ -344,72 +442,6 @@ impl MetalRenderer {
             } else {
                 MTLResourceOptions::StorageModeManaged
             },
-        );
-
-        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
-            &device,
-            &library,
-            "paths_rasterization",
-            "path_rasterization_vertex",
-            "path_rasterization_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            PATH_SAMPLE_COUNT,
-        );
-        let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &library,
-            "path_sprites",
-            "path_sprite_vertex",
-            "path_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let shadows_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "shadows",
-            "shadow_vertex",
-            "shadow_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let quads_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "quads",
-            "quad_vertex",
-            "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let underlines_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "underlines",
-            "underline_vertex",
-            "underline_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let monochrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "monochrome_sprites",
-            "monochrome_sprite_vertex",
-            "monochrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let polychrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "polychrome_sprites",
-            "polychrome_sprite_vertex",
-            "polychrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let surfaces_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "surfaces",
-            "surface_vertex",
-            "surface_fragment",
-            MTLPixelFormat::BGRA8Unorm,
         );
 
         let command_queue = device.new_command_queue();
@@ -463,6 +495,8 @@ impl MetalRenderer {
             drawable_acquisition,
             drawable_ready,
             drawable_retry_at: None,
+            last_present_at: None,
+            back_buffers_trimmed: false,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -570,6 +604,35 @@ impl MetalRenderer {
         *self.drawable_ready.lock() = Some(callback);
     }
 
+    /// Releases unused swap-queue back buffers once presentation has been idle for 1s,
+    /// keeping the currently displayed front buffer intact.
+    pub fn trim_idle_back_buffers(&mut self, now: Instant) {
+        if self.back_buffers_trimmed {
+            return;
+        }
+        let Some(last_present_at) = self.last_present_at else {
+            return;
+        };
+        if now.saturating_duration_since(last_present_at) < Duration::from_secs(1) {
+            return;
+        }
+        self.back_buffers_trimmed = true;
+        if let Some(layer) = &self.layer {
+            // SAFETY: `layer` is a live `CAMetalLayer` owned by this renderer, and
+            // `removeBackBuffers` is a void `CAMetalLayer` selector that drops idle
+            // swap-queue back buffers without disturbing the presented front buffer.
+            unsafe {
+                let objc2_layer: &objc2_quartz_core::CAMetalLayer = &*layer.as_ptr().cast();
+                let _: () = objc2::msg_send![objc2_layer, removeBackBuffers];
+            }
+        }
+        self.release_path_intermediate_textures();
+        self.instance_buffer_pool
+            .lock()
+            .reset(DEFAULT_INSTANCE_BUFFER_SIZE);
+        relieve_malloc_pressure();
+    }
+
     /// Returns false when the latest scene needs presentation on a later tick.
     pub fn draw(&mut self, scene: &Scene) -> bool {
         let layer = match &self.layer {
@@ -629,6 +692,8 @@ impl MetalRenderer {
 
         command_buffer.present_drawable(&drawable);
         command_buffer.commit();
+        self.last_present_at = Some(Instant::now());
+        self.back_buffers_trimmed = false;
         true
     }
 

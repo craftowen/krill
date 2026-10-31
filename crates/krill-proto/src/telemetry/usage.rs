@@ -116,7 +116,16 @@ pub(super) fn valid_uuid(value: &str) -> bool {
 
 fn valid_version(value: &str) -> bool {
     static PATTERN: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
-    value.len() <= 64 && PATTERN.get_or_init(|| regex::Regex::new(
-        r"\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\z"
-    ).ok()).as_ref().is_some_and(|pattern| pattern.is_match(value))
+    value.len() <= 64
+        && PATTERN
+            .get_or_init(|| {
+                regex::RegexBuilder::new(
+                    r"\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\z",
+                )
+                .unicode(false)
+                .build()
+                .ok()
+            })
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(value))
 }
