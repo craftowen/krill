@@ -55,7 +55,7 @@ def main():
                 fault = Path(scratch) / 'interrupt.js'
                 fault.write_text("""
 localStorage.setItem('krill-mobile-error-reporting-v1','');
-localStorage.setItem('krill-mobile-ui-v1',JSON.stringify({...JSON.parse(localStorage.getItem('krill-mobile-ui-v1')||'{}'),language:'en'}));
+localStorage.setItem('krill-mobile-ui-v1',JSON.stringify({...JSON.parse(localStorage.getItem('krill-mobile-ui-v1')||'{}'),language:'en',installOffered:true}));
 const NativeWebSocket=WebSocket;globalThis.recoverySockets=[];
 globalThis.WebSocket=class extends NativeWebSocket {
  constructor(...args){super(...args);recoverySockets.push(this);let received=0;
@@ -127,9 +127,6 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 uploads=list((Path(cfg['dir'])/'paste/krill-paste').glob('mobile-*.jpg'))
                 assert len(uploads)==1 and stat.S_IMODE(uploads[0].stat().st_mode)==0o600
                 original_route=evaluate('location.hash.slice(1)')
-                # 홈 화면 설치 안내 시트가 흐름 중간에 떠 있을 수 있다. 사용자가 하듯 닫고 이어간다.
-                if evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="Cancel")'):
-                    browser('find','role','button','click','--name','Cancel','--exact')
                 browser('find','role','button','click','--name','Create Tab','--exact')
                 browser('find','role','button','click','--name','Terminal','--exact')
                 wait('KrillMobile.store.sessions.size===6')
