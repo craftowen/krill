@@ -1,6 +1,6 @@
 //! 워크스페이스 디스크 용량 분석(`Space`) 및 머지된 워크트리 일괄 클린업(`Cleanup`) 모달(MK-175, OWE-729).
 //!
-//! - `Settings > Resources` 탭 안에서 각 워크트리별 전체 디스크 사용량과 주요 빌드 아티팩트
+//! - 설정의 디스크 용량 페이지에서 각 워크트리별 전체 디스크 사용량과 주요 빌드 아티팩트
 //!   (`target`, `node_modules`, `.next` 등) 용량을 백그라운드 비차단 스캔으로 집계·정렬·시각화한다.
 //! - `Cleanup` 모달에서 PR 상태(`Merged` / `Closed`), 마지막 활동 경과 일수(`7일` / `14일` / `30일` 이상),
 //!   `dirty`(미커밋 변경) 제외 안전 필터로 정리 대상을 고르고 일괄 삭제 및 병합된 로컬 브랜치를 정리한다.
@@ -412,7 +412,7 @@ impl SettingsView {
         .detach();
     }
 
-    /// `Settings > Resources` 탭에 들어가는 디스크 용량 분석(`Space`) 및 클린업 진입 섹션.
+    /// 디스크 용량 페이지의 분석(`Space`) 및 클린업 진입 섹션.
     pub(super) fn render_space_section(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
         let scan_btn = crate::ui::button_with_reserved_label(

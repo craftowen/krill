@@ -944,7 +944,7 @@ fn dashboard_card_click_closes_settings_unzooms_pane_and_routes_remote_host(
                     cx,
                 );
             });
-            shell.open_settings(krill_app::settings::AdminTab::General, None, cx);
+            shell.open_settings(krill_app::settings::AdminTab::Appearance, None, cx);
         });
     });
     cx.run_until_parked();
@@ -1653,17 +1653,12 @@ fn status_menu_open_hides_sibling_tooltips(cx: &mut TestAppContext) {
     );
 }
 
-/// OWE-857: SSH·오케스트레이션 메뉴 하단 버튼은 각 설정 목적에 맞는 라벨을 쓴다.
+/// OWE-857: SSH 메뉴 하단 버튼은 설정 목적에 맞는 라벨을 쓴다.
 #[test]
 fn settings_shortcut_labels_match_their_admin_tabs() {
     assert_eq!(text::OPEN_SSH_SETTINGS.get(), "SSH 호스트 설정…");
-    assert_eq!(text::OPEN_WORKFLOWS_SETTINGS.get(), "워크플로 설정…");
     assert_ne!(
         text::OPEN_SSH_SETTINGS.get(),
-        text::OPEN_ADMIN_ACCOUNTS.get()
-    );
-    assert_ne!(
-        text::OPEN_WORKFLOWS_SETTINGS.get(),
         text::OPEN_ADMIN_ACCOUNTS.get()
     );
 }

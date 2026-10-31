@@ -1,4 +1,4 @@
-//! 개발 환경·프론티어 CLI 원클릭 설치 및 셸 에일리어스 설정 탭(`Settings > Install`).
+//! 개발 환경·프론티어 CLI 원클릭 설치 및 셸 에일리어스 설정 페이지(시스템 탭의 도구 설치에서 연다).
 //!
 //! - 화면 전환 없이 현재 설정 화면 안에서 각 도구(Claude Code, Codex CLI, Antigravity CLI,
 //!   Git, Node.js, GitHub CLI, Homebrew/Winget, uv, Bun, pnpm)의 설치 여부·버전을 백그라운드에서 점검하고,

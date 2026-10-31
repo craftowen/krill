@@ -78,24 +78,6 @@ pub fn parse_pane_tag(tag: &str) -> Option<SessionId> {
         .map(SessionId)
 }
 
-/// 창이 살아 있을 때 알림을 생략할지. `notify_only_inactive`면 활성 창이 하나라도
-/// 있으면 모두 생략하고, 아니면 보고 있는 칸만 생략한다. 활성 창이 없으면
-/// (메뉴바 상주 포함) 항상 보낸다.
-const fn suppress_notification(
-    notify_only_inactive: bool,
-    focused_current: bool,
-    has_active_window: bool,
-) -> bool {
-    if !has_active_window {
-        return false;
-    }
-    if notify_only_inactive {
-        true
-    } else {
-        focused_current
-    }
-}
-
 /// 알림음을 낼 조건(순수 판정, OWE-655). 알림이 꺼져 있거나 사운드가 꺼져 있거나
 /// 새로 보낼 알림이 없으면 조용하다.
 pub fn should_play_sound(cfg: &settings::Settings, new_notifications: usize) -> bool {
@@ -274,7 +256,7 @@ pub fn listen(sidebar: &WeakEntity<Sidebar>, cx: &mut App) {
 }
 
 /// 사이드바가 폴링한 최신 세션 스냅샷을 반영해 알림·Dock 배지·`IOPMAssertion`을 갱신한다.
-/// 활성 창의 포커스 칸만 알림을 생략한다. 창이 없거나 비활성이면 알림을 보낸다(메뉴바 상주).
+/// 활성 창이 있으면 모든 알림을 생략한다. 창이 없거나 비활성이면 알림을 보낸다(메뉴바 상주).
 pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
     ensure_state(cx);
     let cfg = effective_settings(cx);
@@ -314,11 +296,7 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
                         if !muted
                             && should_notify(&cfg, AlertEvent::InputWait)
                             && initialized
-                            && !suppress_notification(
-                                cfg.notify_only_inactive,
-                                state.focused == Some(session.id),
-                                state.window_active && has_window,
-                            )
+                            && !(state.window_active && has_window)
                         {
                             state.active_tags.insert(session.id);
                             to_show.push((session.id, build_notification(session)));
@@ -348,11 +326,7 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
                             && !is_worker
                             && should_notify(&cfg, AlertEvent::Done)
                             && initialized
-                            && !suppress_notification(
-                                cfg.notify_only_inactive,
-                                state.focused == Some(session.id),
-                                state.window_active && has_window,
-                            )
+                            && !(state.window_active && has_window)
                         {
                             state.active_tags.insert(session.id);
                             to_show.push((session.id, build_notification(session)));
@@ -486,7 +460,7 @@ fn play_notification_sound(cx: &mut App) {
 }
 
 /// 터미널 벨 알림(OWE-659). 이벤트 토글이 꺼져 있으면 조용하고, 이미 게시된
-/// 알림이 있거나 보고 있는 칸의 벨이면 생략한다.
+/// 알림이 이미 있거나 활성 창이 있으면 생략한다.
 pub fn notify_bell(id: SessionId, label: &str, cx: &mut App) {
     ensure_state(cx);
     let cfg = effective_settings(cx);
@@ -498,11 +472,7 @@ pub fn notify_bell(id: SessionId, label: &str, cx: &mut App) {
         let state = cx.global::<AlertState>();
         state.active_tags.contains(&id)
             || state.muted_sessions.contains(&id)
-            || suppress_notification(
-                cfg.notify_only_inactive,
-                state.focused == Some(id),
-                state.window_active && has_window,
-            )
+            || (state.window_active && has_window)
     };
     if suppressed {
         return;
@@ -518,25 +488,6 @@ pub fn notify_bell(id: SessionId, label: &str, cx: &mut App) {
             tag: pane_tag(id),
             title: format!("{title} — {}", text::BELL.get()).into(),
             body: text::BELL_BODY.get().into(),
-            actions: Vec::new(),
-        },
-        cx,
-    );
-}
-
-/// 설정 창의 "테스트 알림 보내기"(OWE-659). 기존 발송 경로로 지금 바로 알림을
-/// 하나 띄운다. 마스터 `notifications`가 꺼져 있으면 보내지 않는다. 식별자는
-/// `"pane:"` 접두를 쓰지 않아 클릭해도 세션으로 이동하지 않는다.
-pub fn send_test_notification(cx: &mut App) {
-    ensure_state(cx);
-    if !effective_settings(cx).notifications {
-        return;
-    }
-    crate::onboarding::actions::show_notification(
-        SystemNotification {
-            tag: "settings-test".into(),
-            title: text::TEST_TITLE.get().into(),
-            body: text::TEST_BODY.get().into(),
             actions: Vec::new(),
         },
         cx,

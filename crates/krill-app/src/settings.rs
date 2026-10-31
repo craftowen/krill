@@ -132,9 +132,6 @@ pub struct Settings {
     /// 알림 사운드 켜기/끄기(기본 true).
     #[serde(default = "default_true")]
     pub notification_sound: bool,
-    /// 창이 비활성 상태일 때만 알림 보내기(기본 false).
-    #[serde(default)]
-    pub notify_only_inactive: bool,
     /// 입력·승인 대기 알림(기본 켬, OWE-659). 마스터 `notifications`가 꺼지면 함께 꺼진다.
     #[serde(default = "default_true")]
     pub notify_on_input: bool,
@@ -168,12 +165,6 @@ pub struct Settings {
     /// 새 버전 스테이징 완료 시 자동으로 앱을 재시작해 적용(기본 false, MK-156).
     #[serde(default)]
     pub auto_restart_update: bool,
-    /// Claude 프롬프트 캐시 카운트다운 표시 켜기/끄기(기본 false).
-    #[serde(default)]
-    pub prompt_cache_timer_enabled: bool,
-    /// Claude 프롬프트 캐시 TTL(초, 기본 300초 = 5분, OWE-737).
-    #[serde(default = "default_prompt_cache_ttl_secs")]
-    pub prompt_cache_ttl_secs: u32,
     /// 첫 프롬프트 기반 브랜치·세션 이름 자동 변경 켜기/끄기(기본 true, OWE-737).
     #[serde(default = "default_true")]
     pub auto_rename_branch_from_work: bool,
@@ -194,7 +185,7 @@ pub struct Settings {
     /// false면 라이트 모드에서도 다크 모드 테마를 쓴다.
     #[serde(default = "default_true")]
     pub terminal_use_separate_light_theme: bool,
-    /// 사이드바 자동화 진입점 표시. Workflows 설정에서 다시 켤 수 있다.
+    /// 사이드바 자동화 진입점 표시. 명령 팔레트의 '자동화 열기'가 다시 켠다.
     #[serde(default = "default_true")]
     pub show_automations_button: bool,
     /// 가져온 사용자 터미널 테마(Ghostty·Warp, OWE-956).
@@ -225,12 +216,6 @@ const fn default_terminal_opacity_pct() -> u8 {
 
 const fn default_true() -> bool {
     true
-}
-
-pub const DEFAULT_PROMPT_CACHE_TTL_SECS: u32 = 300;
-
-const fn default_prompt_cache_ttl_secs() -> u32 {
-    DEFAULT_PROMPT_CACHE_TTL_SECS
 }
 
 fn default_terminal_font_family() -> String {
@@ -303,7 +288,6 @@ impl Default for Settings {
             option_as_meta_auto: true,
             copy_on_select: false,
             notification_sound: true,
-            notify_only_inactive: false,
             notify_on_input: true,
             notify_on_done: true,
             notify_on_bell: false,
@@ -315,8 +299,6 @@ impl Default for Settings {
             recording_paused: false,
             secure_keyboard_entry: false,
             auto_restart_update: false,
-            prompt_cache_timer_enabled: false,
-            prompt_cache_ttl_secs: DEFAULT_PROMPT_CACHE_TTL_SECS,
             auto_rename_branch_from_work: true,
             confirm_running_close: true,
             workspace_trust_preset_enabled: true,
@@ -357,6 +339,62 @@ impl Settings {
         self.ui_theme_light = theme;
     }
 
+    /// 모드에 적용되는 터미널 테마가 앱 테마의 짝이 아니면 그 표시 이름을 돌려준다.
+    #[must_use]
+    pub fn unpaired_terminal_theme(&self, mode: ThemeMode) -> Option<&str> {
+        let (selection, paired) = match mode {
+            ThemeMode::Dark => (
+                &self.terminal_theme_dark,
+                self.ui_theme_dark.terminal_theme_name(),
+            ),
+            ThemeMode::Light => (
+                if self.terminal_use_separate_light_theme {
+                    &self.terminal_theme_light
+                } else {
+                    &self.terminal_theme_dark
+                },
+                self.ui_theme_light.terminal_theme_name(),
+            ),
+        };
+        let name = crate::ui::canonical_terminal_theme_name(selection);
+        (name != paired).then(|| {
+            name.strip_prefix(crate::ui::terminal_themes::CUSTOM_TERMINAL_THEME_PREFIX)
+                .and_then(|id| {
+                    self.terminal_custom_themes
+                        .iter()
+                        .find(|theme| theme.id.eq_ignore_ascii_case(id.trim()))
+                })
+                .map_or(name, |theme| theme.name.as_str())
+        })
+    }
+
+    /// 모드의 터미널 테마를 가져온 테마 같은 임의 선택값으로 바꾼다.
+    pub fn select_terminal_theme(&mut self, mode: ThemeMode, selection: String) {
+        match mode {
+            ThemeMode::Dark => self.terminal_theme_dark = selection,
+            ThemeMode::Light => {
+                self.terminal_use_separate_light_theme = true;
+                self.terminal_theme_light = selection;
+            }
+        }
+    }
+
+    /// 모드의 터미널 테마를 앱 테마의 짝으로 되돌린다.
+    pub fn match_terminal_theme(&mut self, mode: ThemeMode) {
+        match mode {
+            ThemeMode::Dark => self
+                .ui_theme_dark
+                .terminal_theme_name()
+                .clone_into(&mut self.terminal_theme_dark),
+            ThemeMode::Light => {
+                self.terminal_use_separate_light_theme = true;
+                self.ui_theme_light
+                    .terminal_theme_name()
+                    .clone_into(&mut self.terminal_theme_light);
+            }
+        }
+    }
+
     pub fn parse(s: &str) -> Result<Self, toml::de::Error> {
         Self::parse_with_language(s, locale::system_language())
     }
@@ -371,7 +409,6 @@ impl Settings {
             .editor_font_size
             .clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
         parsed.terminal_opacity_pct = parsed.terminal_opacity_pct.clamp(50, 100);
-        parsed.prompt_cache_ttl_secs = parsed.prompt_cache_ttl_secs.clamp(60, 86_400);
         if parsed.terminal_theme_dark.trim().is_empty() {
             parsed.terminal_theme_dark = default_terminal_theme_dark();
         }
@@ -506,11 +543,6 @@ impl Settings {
     /// 자른 터미널 배경 불투명도(`50..=100`).
     pub fn terminal_opacity_pct(&self) -> u8 {
         self.terminal_opacity_pct.clamp(50, 100)
-    }
-
-    /// 자른 프롬프트 캐시 TTL(초, `60..=86400`).
-    pub fn prompt_cache_ttl_secs(&self) -> u32 {
-        self.prompt_cache_ttl_secs.clamp(60, 86_400)
     }
 
     /// 해당 프로바이더를 하단 상태바에 표시할지 여부(기본 true).
@@ -1737,6 +1769,70 @@ fn persist_settings_edit(
     Ok((settings, modified(&path)))
 }
 
+/// 테마 드롭다운 끝에 가져온 터미널 테마를 붙인다.
+fn imported_theme_items(
+    mut menu: gpui_component::menu::PopupMenu,
+    themes: &[(String, String)],
+    mode: ThemeMode,
+) -> gpui_component::menu::PopupMenu {
+    use gpui_component::menu::PopupMenuItem;
+    if themes.is_empty() {
+        return menu;
+    }
+    menu = menu.separator().label(text::IMPORTED_TERMINAL_THEMES.get());
+    for (name, selection) in themes.iter().cloned() {
+        menu = menu.item(PopupMenuItem::new(name).on_click(move |_, _, cx| {
+            let selection = selection.clone();
+            edit(cx, move |s| {
+                s.select_terminal_theme(mode, selection.clone());
+            });
+        }));
+    }
+    menu
+}
+
+/// Ghostty·Warp 터미널 테마를 settings.toml로 가져오고 결과 문구를 돌려준다.
+pub fn import_terminal_themes(cx: &mut App) -> gpui::Task<String> {
+    let revision = cx.try_global::<Config>().map(|config| config.revision);
+    let found = cx.background_spawn(async {
+        (
+            crate::ui::discover_and_import_ghostty(),
+            crate::ui::discover_and_import_warp_themes(),
+        )
+    });
+    cx.spawn(async move |cx| {
+        let (ghostty, warp) = found.await;
+        cx.update(|cx| {
+            let select = cx.try_global::<Config>().map(|config| config.revision) == revision;
+            let count = ghostty.custom_themes.len() + warp.themes.len();
+            let has_any = count > 0
+                || ghostty.found
+                || ghostty.dark_theme.is_some()
+                || ghostty.light_theme.is_some();
+            if !has_any {
+                return text::TERMINAL_THEME_IMPORT_NONE.get().to_owned();
+            }
+            edit(cx, move |s| {
+                crate::ui::merge_custom_themes(
+                    &mut s.terminal_custom_themes,
+                    ghostty.custom_themes.clone(),
+                );
+                crate::ui::merge_custom_themes(&mut s.terminal_custom_themes, warp.themes.clone());
+                if select && let Some(dark) = ghostty.dark_theme.clone() {
+                    s.terminal_theme_dark = dark;
+                }
+                if select && let Some(light) = ghostty.light_theme.clone() {
+                    s.terminal_theme_light = light;
+                }
+                if select && let Some(separate) = ghostty.use_separate_light_theme {
+                    s.terminal_use_separate_light_theme = separate;
+                }
+            });
+            text::TERMINAL_THEME_IMPORTED_OK.format(&[("count", &count.max(1).to_string())])
+        })
+    })
+}
+
 /// Select the UI language, apply it to open windows, and persist it in settings.toml.
 pub fn set_language(language: Language, cx: &mut App) {
     edit(cx, move |settings| settings.language = language);
@@ -1987,7 +2083,7 @@ fn close_settings_page_for(view: Option<gpui::EntityId>, window: &mut Window, cx
 }
 
 pub fn open_window(cx: &mut App) {
-    // OWE-860: ⌘, 재입력 시 이미 열린 설정 창은 현재 탭을 유지한 채 앞으로만 가져온다(일반 탭 강제 초기화 없음).
+    // OWE-860: ⌘, 재입력 시 이미 열린 설정 창은 현재 탭을 유지한 채 앞으로만 가져온다(모양 탭 강제 초기화 없음).
     if let Some(handle) = cx
         .windows()
         .into_iter()
@@ -2000,7 +2096,18 @@ pub fn open_window(cx: &mut App) {
         });
         return;
     }
-    open_window_at_tab(AdminTab::General, cx);
+    open_window_at_tab(AdminTab::Appearance, cx);
+}
+
+/// 프로젝트 메뉴가 고른 저장소. 프로젝트 페이지가 처음 그려질 때 가져간다.
+struct PendingProject(Option<String>);
+
+impl gpui::Global for PendingProject {}
+
+/// 프로젝트 설정 페이지를 해당 저장소로 연다.
+pub fn open_project_settings(repo: &Path, cx: &mut App) {
+    cx.set_global(PendingProject(Some(repo.display().to_string())));
+    open_window_at_tab(AdminTab::Project, cx);
 }
 
 pub fn open_window_at_tab(tab: AdminTab, cx: &mut App) {
@@ -2065,22 +2172,29 @@ fn window_options(cx: &App) -> WindowOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AdminTab {
     #[default]
-    General,
-    /// 터미널 글꼴·커서·키보드·선택(OWE-658).
-    Terminal,
-    Accounts,
+    Appearance,
     Agents,
-    /// 프론티어 CLI·개발 도구 원클릭 설치 및 에일리어스 설정.
-    Install,
+    Accounts,
+    /// 내비의 '기기'. 머신과 모바일을 세그먼트로 나눈다.
     Machines,
-    Workflows,
-    Shortcuts,
-    Resources,
     Mobile,
+    Shortcuts,
+    System,
+    /// 내비에 없는 하위 페이지. 프로젝트 메뉴·에이전트 탭에서 연다.
+    Project,
+    /// 내비에 없는 하위 페이지. 에이전트 탭·명령 팔레트·빠른 명령 메뉴에서 연다.
+    QuickCommands,
+    /// 내비에 없는 하위 페이지. 시스템 탭에서 연다.
+    Install,
+    /// 내비에 없는 하위 페이지. 시스템 탭·명령 팔레트에서 연다.
+    Disk,
 }
 
 // 기본 번들 밖 탭 아이콘. 지정한 SVG만 바이너리에 싣는다.
-gpui_kit_assets::icon_assets!(TabIcons, [Keyboard, Server, Smartphone, Monitor, Package]);
+gpui_kit_assets::icon_assets!(
+    TabIcons,
+    [Keyboard, Server, Smartphone, Monitor, Package, Palette]
+);
 
 fn settings_nav_tab(tab: AdminTab, selected: bool) -> gpui::Stateful<gpui::Div> {
     let selector = tab.selector();
@@ -2094,60 +2208,83 @@ fn settings_nav_tab(tab: AdminTab, selected: bool) -> gpui::Stateful<gpui::Div> 
 }
 
 impl AdminTab {
-    pub const ALL: [Self; 10] = [
-        Self::General,
-        Self::Terminal,
-        Self::Accounts,
+    pub const ALL: [Self; 6] = [
+        Self::Appearance,
         Self::Agents,
-        Self::Install,
+        Self::Accounts,
         Self::Machines,
-        Self::Workflows,
         Self::Shortcuts,
-        Self::Mobile,
-        Self::Resources,
+        Self::System,
     ];
+
+    /// 내비에 없고 부모 탭 안에서 여는 페이지.
+    pub const SUBPAGES: [Self; 5] = [
+        Self::Mobile,
+        Self::Project,
+        Self::QuickCommands,
+        Self::Install,
+        Self::Disk,
+    ];
+
+    /// 내비에서 강조할 탭. 세그먼트와 하위 페이지는 부모 탭에 속한다.
+    #[must_use]
+    pub const fn page(self) -> Self {
+        match self {
+            Self::Mobile => Self::Machines,
+            Self::Project | Self::QuickCommands => Self::Agents,
+            Self::Install | Self::Disk => Self::System,
+            tab => tab,
+        }
+    }
 
     pub fn selector(self) -> &'static str {
         match self {
-            Self::General => "admin-tab-general",
-            Self::Terminal => "admin-tab-terminal",
+            Self::Appearance => "admin-tab-appearance",
             Self::Accounts => "admin-tab-accounts",
             Self::Agents => "admin-tab-agents",
             Self::Install => "admin-tab-install",
             Self::Machines => "admin-tab-machines",
-            Self::Workflows => "admin-tab-workflows",
+            Self::Project => "admin-tab-project",
+            Self::QuickCommands => "admin-tab-quick-commands",
             Self::Shortcuts => "admin-tab-shortcuts",
-            Self::Resources => "admin-tab-resources",
+            Self::System => "admin-tab-system",
+            Self::Disk => "admin-tab-disk",
             Self::Mobile => "admin-tab-mobile",
         }
     }
 
     pub fn label(self) -> &'static str {
+        self.title_message().get()
+    }
+
+    pub fn title_message(self) -> crate::i18n::Message {
         match self {
-            Self::General => text::TAB_GENERAL.get(),
-            Self::Terminal => text::TAB_TERMINAL.get(),
-            Self::Accounts => text::TAB_ACCOUNTS.get(),
-            Self::Agents => text::TAB_AGENTS.get(),
-            Self::Install => text::TAB_INSTALL.get(),
-            Self::Machines => text::TAB_MACHINES.get(),
-            Self::Workflows => text::TAB_WORKFLOWS.get(),
-            Self::Shortcuts => text::TAB_SHORTCUTS.get(),
-            Self::Resources => text::TAB_RESOURCES.get(),
-            Self::Mobile => crate::i18n::catalog::mobile::TAB.get(),
+            Self::Appearance => text::TAB_APPEARANCE,
+            Self::Accounts => text::TAB_ACCOUNTS,
+            Self::Agents => text::TAB_AGENTS,
+            Self::Install => text::TAB_INSTALL,
+            Self::Machines => text::TAB_DEVICES,
+            Self::Project => text::TAB_PROJECT,
+            Self::QuickCommands => text::TAB_QUICK_COMMANDS,
+            Self::Shortcuts => text::TAB_SHORTCUTS,
+            Self::System => text::TAB_SYSTEM,
+            Self::Disk => text::TAB_DISK,
+            Self::Mobile => crate::i18n::catalog::mobile::TAB,
         }
     }
 
     pub fn subtitle_message(self) -> crate::i18n::Message {
         match self {
-            Self::General => text::TAB_GENERAL_DESC,
-            Self::Terminal => text::TAB_TERMINAL_DESC,
+            Self::Appearance => text::TAB_APPEARANCE_DESC,
             Self::Accounts => text::TAB_ACCOUNTS_DESC,
             Self::Agents => text::AGENTS_DESC,
             Self::Install => text::TAB_INSTALL_DESC,
-            Self::Machines => text::TAB_MACHINES_DESC,
-            Self::Workflows => text::TAB_WORKFLOWS_DESC,
+            Self::Machines => text::TAB_DEVICES_DESC,
+            Self::Project => text::TAB_PROJECT_DESC,
+            Self::QuickCommands => text::TAB_QUICK_COMMANDS_DESC,
             Self::Shortcuts => text::SHORTCUTS_DESC,
-            Self::Resources => text::TAB_RESOURCES_DESC,
+            Self::System => text::TAB_SYSTEM_DESC,
+            Self::Disk => text::TAB_DISK_DESC,
             Self::Mobile => text::TAB_MOBILE_DESC,
         }
     }
@@ -2160,15 +2297,15 @@ impl AdminTab {
     pub fn icon(self) -> gpui_kit_assets::IconName {
         use gpui_kit_assets::IconName;
         match self {
-            Self::General => IconName::Settings,
-            Self::Terminal => IconName::SquareTerminal,
+            Self::Appearance => IconName::Palette,
             Self::Accounts => IconName::User,
             Self::Agents => IconName::Bot,
             Self::Install => IconName::Package,
             Self::Machines => IconName::Monitor,
-            Self::Workflows => IconName::Cpu,
+            Self::Project | Self::QuickCommands => IconName::Cpu,
             Self::Shortcuts => IconName::Keyboard,
-            Self::Resources => IconName::CircleCheck,
+            Self::System => IconName::Settings,
+            Self::Disk => IconName::CircleCheck,
             Self::Mobile => IconName::Smartphone,
         }
     }
@@ -2181,13 +2318,6 @@ impl AdminTab {
         match TabIcons.load(&name.path()) {
             Ok(Some(svg)) => gpui_component::Icon::default().data(&svg),
             _ => gpui_component::Icon::new(name),
-        }
-    }
-
-    pub fn badge(self) -> Option<&'static str> {
-        match self {
-            Self::Workflows => Some(text::BADGE_BETA.get()),
-            _ => None,
         }
     }
 }
@@ -2576,41 +2706,6 @@ fn canonical_hook_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(result)
 }
 
-/// `krill doctor` 핵심 항목(상태 디렉터리·데몬 바이너리·미보고 크래시·세그먼트 기록 상태)을 자가 진단한다.
-/// 내부 키-값이 아니라 카탈로그 문구로 보인다(OWE-883).
-pub fn run_doctor_check(state: Option<&Path>) -> String {
-    let state_status = match state {
-        Some(d) if d.exists() => text::DOCTOR_OK.get(),
-        Some(_) => text::DOCTOR_NEEDS_INIT.get(),
-        None => text::DOCTOR_MISSING.get(),
-    };
-    let bins_status = match krill_proto::daemon::Paths::dev() {
-        Ok(p) if p.holder.exists() && p.krilld.exists() => text::DOCTOR_OK.get(),
-        Ok(_) => text::DOCTOR_MISSING_BINS.get(),
-        Err(_) => text::DOCTOR_UNAVAILABLE.get(),
-    };
-    let crashes = state.map_or(0, |d| krill_proto::diag::pending(d).len());
-    let rec_warns = state.map_or(0, |d| krill_proto::diag::record_warnings(d).len());
-    let rec_flag = state.is_some_and(|d| {
-        d.join(krill_proto::history::RECORDING_WARNING_FILE)
-            .exists()
-    });
-    let rec_status = if rec_flag || rec_warns > 0 {
-        text::DOCTOR_WARN.format(&[("n", &rec_warns.to_string())])
-    } else {
-        text::DOCTOR_OK.get().to_owned()
-    };
-    text::DOCTOR_REPORT.format(&[
-        ("state", state_status),
-        ("bins", bins_status),
-        (
-            "crashes",
-            &text::DOCTOR_CRASHES.format(&[("n", &crashes.to_string())]),
-        ),
-        ("recording", &rec_status),
-    ])
-}
-
 /// 디스크 기록(zstd 세그먼트) 즉시 삭제(MK-075). 데몬(`krilld`)에 `HistoryRequest::Clear`를
 /// 보내며, PTY·화면·상태·설정은 유지된다. 로컬 폴백은 없다 — 데몬이 살아 있을 수 있어 직접
 /// 지우면 세대 가드(`Store::clear`)를 우회한다.
@@ -2784,7 +2879,6 @@ pub struct SettingsView {
     ssh_auth_failed_host: Option<crate::ssh_hosts::SshHost>,
     ssh_keygen_confirm_host: Option<crate::ssh_hosts::SshHost>,
     skill_status: Option<SharedString>,
-    doctor_status: Option<SharedString>,
     error_reporting: crate::errors::Panel,
     history_status: Option<SharedString>,
     /// 기록 즉시 삭제 IPC 진행 중. UI 스레드를 막지 않고 백그라운드에서 돌린다(AS-01).
@@ -2797,7 +2891,6 @@ pub struct SettingsView {
     agents_parsed: Option<std::sync::Arc<krill_proto::agent::Agents>>,
     font_names: std::sync::Arc<Vec<String>>,
     fonts_pending: bool,
-    theme_imports_pending: std::collections::BTreeSet<&'static str>,
     fonts_checked: Option<std::time::Instant>,
     /// 기록 일시중지 데몬 지원. `None`은 아직 확인 전, `Some(false)`면 토글 비활성.
     history_pause_supported: Option<bool>,
@@ -2837,7 +2930,7 @@ pub struct SettingsView {
     )>,
     /// 단축키 탭 기록기·충돌 확인(OWE-660).
     shortcuts: shortcuts::Recorder,
-    /// 워크플로 탭의 저장소별 심볼릭 링크·훅 입력 폼(MK-174).
+    /// 프로젝트 페이지의 저장소별 심볼릭 링크·훅 입력 폼(MK-174).
     workflow_form: Option<WorkflowRepoForm>,
     /// 워크스페이스 디스크 용량 분석(Space) 및 워크트리 일괄 클린업 패널(MK-175·OWE-729).
     space: space::Panel,
@@ -2851,22 +2944,6 @@ pub struct SettingsView {
     schedule_log: Option<schedules::ScheduleLogView>,
     /// 스케줄 즉시 실행·조작 오류(OWE-740).
     schedule_error: Option<SharedString>,
-    /// 터미널 탭에서 현재 편집·미리보기 중인 테마 모드(OWE-956). `None`이면 앱의 현재 모드를 따른다.
-    terminal_theme_target: Option<ThemeMode>,
-    /// 터미널 테마 목록 검색 입력(OWE-956).
-    terminal_theme_search: Option<(
-        gpui::Entity<gpui_component::input::InputState>,
-        Subscription,
-    )>,
-    /// Ghostty·Warp 테마 가져오기 상태 메시지(OWE-956). 두 번째 값은 경고/실패 여부.
-    terminal_theme_status: Option<(SharedString, bool)>,
-    terminal_theme_swatches: std::collections::BTreeMap<
-        usize,
-        (
-            crate::ui::CustomTerminalTheme,
-            Option<krill_proto::theme::Theme>,
-        ),
-    >,
     /// 설정 창 루트 포커스. 아무것도 포커스되지 않으면 ⌘F 문맥([`SEARCH_CONTEXT`])이 키 경로에 없다.
     file_jobs: std::collections::BTreeMap<&'static str, u64>,
     file_revision: u64,
@@ -2886,7 +2963,6 @@ pub struct SettingsView {
 struct ServiceCache {
     worktree_locations: std::collections::BTreeMap<String, String>,
     worktrees: std::sync::Arc<krill_proto::orchestration::WorktreeStore>,
-    orchestration: std::sync::Arc<krill_proto::orchestration::OrchestrationStore>,
     aliases: std::collections::BTreeMap<String, String>,
     schedules: Vec<krill_proto::schedule::Schedule>,
     runs: Vec<krill_proto::schedule::ScheduleRun>,
@@ -2954,7 +3030,6 @@ fn account_stamps(dir: Option<&Path>) -> Vec<Option<AdminFileStamp>> {
 fn service_stamps(dir: &Path) -> Vec<Option<AdminFileStamp>> {
     [
         krill_proto::orchestration::COMMENTS_FILE,
-        krill_proto::orchestration::ORCH_FILE,
         krill_proto::schedule::FILE,
         krill_proto::schedule::RUNS,
         krill_proto::schedule::PREVIOUS_RUNS,
@@ -3092,7 +3167,7 @@ struct SshForm {
     _subs: Vec<Subscription>,
 }
 
-/// 워크플로 탭의 저장소별 공유 심볼릭 링크·setup/archive 훅·빠른 명령·완료 웹훅 입력 폼(MK-174·OWE-801).
+/// 프로젝트·빠른 명령 페이지의 저장소별 공유 심볼릭 링크·setup/archive 훅·빠른 명령 입력 폼(MK-174·OWE-801).
 struct WorkflowRepoForm {
     repo_path: gpui::Entity<gpui_component::input::InputState>,
     symlink_path: gpui::Entity<gpui_component::input::InputState>,
@@ -3101,8 +3176,6 @@ struct WorkflowRepoForm {
     qc_name: gpui::Entity<gpui_component::input::InputState>,
     qc_text: gpui::Entity<gpui_component::input::InputState>,
     qc_editing: Option<usize>,
-    webhook_url: gpui::Entity<gpui_component::input::InputState>,
-    webhook_error: Option<SharedString>,
     pending_repo_path: Option<String>,
     loaded_repo: Option<String>,
     loaded_setup: String,
@@ -3113,17 +3186,6 @@ struct WorkflowRepoForm {
     refresh_hooks: bool,
     status: Option<(SharedString, bool)>,
     _subs: Vec<Subscription>,
-}
-
-/// 완료 웹훅 종류의 표시 이름(OWE-883). URL에는 비밀 토큰이 들어갈 수 있어
-/// 종류만 보이고 원문·`{:?}`는 노출하지 않는다.
-#[must_use]
-pub fn webhook_kind_label(ep: &crate::webhook::Endpoint) -> &'static str {
-    match ep {
-        crate::webhook::Endpoint::Ntfy { .. } => text::WEBHOOK_KIND_NTFY.get(),
-        crate::webhook::Endpoint::Telegram { .. } => text::WEBHOOK_KIND_TELEGRAM.get(),
-        crate::webhook::Endpoint::Discord { .. } => text::WEBHOOK_KIND_DISCORD.get(),
-    }
 }
 
 /// 오케스트레이션 작업 상태의 표시 이름(OWE-883). 내부 영문(`ready` 등)을 그대로 보이지 않는다.
@@ -3181,13 +3243,12 @@ impl SettingsView {
     /// 계정·호스트는 UI 스레드에서 읽지 않는다(AS-06·OWE-697). 첫 스냅샷은 백그라운드 갱신이 채운다.
     pub fn new(cx: &mut Context<Self>) -> Self {
         crate::orca_import::ensure_scanned(cx);
-        crate::star_nag::ensure_checked(cx);
         let mut view = Self {
             _observe: cx.observe_global::<Config>(|this, cx| {
                 this.refresh_accounts_if_changed(cx);
                 cx.notify();
             }),
-            tab: AdminTab::General,
+            tab: AdminTab::Appearance,
             visible: true,
             account_probe_pending: false,
             account_file_stamp: Vec::new(),
@@ -3232,7 +3293,6 @@ impl SettingsView {
             ssh_auth_failed_host: None,
             ssh_keygen_confirm_host: None,
             skill_status: None,
-            doctor_status: None,
             error_reporting: crate::errors::Panel::default(),
             history_status: None,
             history_clear_pending: false,
@@ -3242,7 +3302,6 @@ impl SettingsView {
             agents_parsed: None,
             font_names: std::sync::Arc::new(Vec::new()),
             fonts_pending: false,
-            theme_imports_pending: std::collections::BTreeSet::new(),
             fonts_checked: None,
             history_pause_supported: None,
             recording_status: None,
@@ -3270,10 +3329,6 @@ impl SettingsView {
             schedule_log_generation: 0,
             schedule_log: None,
             schedule_error: None,
-            terminal_theme_target: None,
-            terminal_theme_search: None,
-            terminal_theme_status: None,
-            terminal_theme_swatches: std::collections::BTreeMap::new(),
             file_jobs: std::collections::BTreeMap::default(),
             file_revision: 0,
             services: ServiceCache::default(),
@@ -3292,7 +3347,7 @@ impl SettingsView {
                 cx.background_executor().timer(POLL).await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.visible && this.tab == AdminTab::Workflows {
+                        if this.visible && this.tab == AdminTab::Project {
                             this.refresh_service_cache(cx);
                         }
                     })
@@ -3303,7 +3358,7 @@ impl SettingsView {
             }
         }));
         view.refresh_accounts_async(cx);
-        // 점검 스냅샷이 바뀌면 일반 탭 요약도 다시 그린다(구독은 앱 수명 동안 둔다).
+        // 점검 스냅샷이 바뀌면 시스템 탭 요약도 다시 그린다(구독은 앱 수명 동안 둔다).
         cx.observe_global::<crate::onboarding::ChecksSnapshot>(|_, cx| cx.notify())
             .detach();
         cx.observe_global::<crate::star_nag::StarNag>(|_, cx| cx.notify())
@@ -3426,11 +3481,7 @@ impl SettingsView {
                 this.file_jobs.remove(key);
                 if matches!(
                     key,
-                    "worktree-edit"
-                        | "worktree-location-edit"
-                        | "schedule-edit"
-                        | "schedule-run"
-                        | "orchestration-reset"
+                    "worktree-edit" | "worktree-location-edit" | "schedule-edit" | "schedule-run"
                 ) {
                     this.services_checked = None;
                 }
@@ -3485,10 +3536,6 @@ impl SettingsView {
                                 ),
                             worktrees: std::sync::Arc::new(
                                 krill_proto::orchestration::WorktreeStore::load(&dir)
-                                    .unwrap_or_default(),
-                            ),
-                            orchestration: std::sync::Arc::new(
-                                krill_proto::orchestration::OrchestrationStore::load(&dir)
                                     .unwrap_or_default(),
                             ),
                             aliases: repo
@@ -3632,7 +3679,7 @@ impl SettingsView {
             if self.tab == AdminTab::Mobile {
                 self.mobile_enter(cx);
             }
-            if self.tab == AdminTab::Workflows {
+            if self.tab == AdminTab::Project {
                 self.refresh_service_cache(cx);
             }
         }
@@ -3652,7 +3699,7 @@ impl SettingsView {
         if tab == AdminTab::Machines && !self.tailscale_loaded {
             self.refresh_tailscale_peers(cx);
         }
-        if tab == AdminTab::Workflows {
+        if tab == AdminTab::Project {
             self.services_checked = None;
             self.refresh_service_cache(cx);
         }
@@ -3660,10 +3707,10 @@ impl SettingsView {
             // 진입 시 기기 목록·활성 오퍼를 자동 조회한다(수동 새로고침 전 빈 화면 방지, OWE-880).
             self.mobile_enter(cx);
         }
-        if tab == AdminTab::Resources && self.space.report.is_none() && !self.space.scanning {
+        if tab == AdminTab::Disk && self.space.report.is_none() && !self.space.scanning {
             self.scan_workspace_space(cx);
         }
-        if tab == AdminTab::Resources {
+        if tab == AdminTab::System {
             self.refresh_error_reporting(cx);
         }
         cx.notify();
@@ -5823,18 +5870,6 @@ impl SettingsView {
         }
     }
 
-    pub fn run_doctor(&mut self, cx: &mut Context<Self>) {
-        let dir = state_dir(cx);
-        self.file_job(
-            "doctor",
-            move || run_doctor_check(dir.as_deref()),
-            |this, report, _| {
-                this.doctor_status = Some(report.into());
-            },
-            cx,
-        );
-    }
-
     fn refresh_error_reporting(&mut self, cx: &mut Context<Self>) {
         if self.error_reporting.pending || self.file_jobs.contains_key("error-reporting-read") {
             return;
@@ -6027,6 +6062,12 @@ impl SettingsView {
                     edit(cx, move |s| s.theme = choice);
                 })
         };
+        let imported: Vec<(String, String)> = s
+            .terminal_custom_themes
+            .iter()
+            .map(|theme| (theme.name.clone(), theme.selection_value()))
+            .collect();
+        let (dark_imported, light_imported) = (imported.clone(), imported);
         let selected_dark = s.ui_theme_dark;
         let dark_themes = layout::secondary("ui-theme-dark", selected_dark.label())
             .dropdown_caret(true)
@@ -6041,7 +6082,7 @@ impl SettingsView {
                             }),
                     );
                 }
-                menu
+                imported_theme_items(menu, &dark_imported, ThemeMode::Dark)
             });
         let selected_light = s.ui_theme_light;
         let light_themes = layout::secondary("ui-theme-light", selected_light.label())
@@ -6057,14 +6098,20 @@ impl SettingsView {
                             }),
                     );
                 }
-                menu
+                imported_theme_items(menu, &light_imported, ThemeMode::Light)
             });
-        let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
-            layout::segment(p, id, label, s.keep_awake == mode)
-                .debug_selector(move || id.into())
-                .on_click(move |_, _, cx| {
-                    edit(cx, move |s| s.keep_awake = mode);
-                })
+        // 터미널 테마가 앱 테마의 짝이 아니면 드롭다운만 바꿔도 터미널 색이 그대로라 맞추는 버튼을 둔다.
+        let terminal_theme_match = |mode: ThemeMode| {
+            let id = match mode {
+                ThemeMode::Dark => "ui-theme-dark-match",
+                ThemeMode::Light => "ui-theme-light-match",
+            };
+            s.unpaired_terminal_theme(mode).map(|name| {
+                layout::ghost(id, text::THEME_MATCH.get())
+                    .tooltip(text::THEME_MATCH_TOOLTIP.format(&[("name", name)]))
+                    .debug_selector(move || id.into())
+                    .on_click(move |_, _, cx| edit(cx, move |s| s.match_terminal_theme(mode)))
+            })
         };
         let language_button = |id: &'static str, label: &'static str, language: Language| {
             layout::segment(p, id, label, s.language == language)
@@ -6078,21 +6125,13 @@ impl SettingsView {
         let zoom_at_min = zoom_val <= ZOOM_MIN + f32::EPSILON;
         let zoom_at_max = zoom_val >= ZOOM_MAX - f32::EPSILON;
         let zoom_at_default = (zoom_val - 1.0).abs() < f32::EPSILON;
-        let notif_disabled = !s.notifications;
         let row = || layout::row(p);
-        let sub_notif_row = |id: &'static str| {
-            layout::row(p)
-                .id(id)
-                .debug_selector(move || id.into())
-                .when(notif_disabled, |d| d.opacity(0.5))
-        };
         let label =
             |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .children(crate::orca_import::render_banner("settings-general", cx))
             .child(layout::section_title(
                 p,
                 "general-section-appearance",
@@ -6133,12 +6172,20 @@ impl SettingsView {
             .child(
                 row()
                     .child(label(text::DARK_THEME.get(), text::DARK_THEME_DESC.get()))
-                    .child(layout::controls().child(dark_themes)),
+                    .child(
+                        layout::controls()
+                            .child(dark_themes)
+                            .children(terminal_theme_match(ThemeMode::Dark)),
+                    ),
             )
             .child(
                 row()
                     .child(label(text::LIGHT_THEME.get(), text::LIGHT_THEME_DESC.get()))
-                    .child(layout::controls().child(light_themes)),
+                    .child(
+                        layout::controls()
+                            .child(light_themes)
+                            .children(terminal_theme_match(ThemeMode::Light)),
+                    ),
             )
             .child(
                 row()
@@ -6185,48 +6232,34 @@ impl SettingsView {
                             ),
                     ),
             )
-            .child(
-                row()
-                    .child(label(
-                        text::DEFAULT_VIEW_MODE_TITLE.get(),
-                        text::DEFAULT_VIEW_MODE_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::segmented_control(
-                                p,
-                                [
-                                    layout::segment(
-                                        p,
-                                        "general-view-mode-terminal",
-                                        text::DEFAULT_VIEW_MODE_TERMINAL.get(),
-                                        s.default_view_mode == DefaultViewMode::Terminal,
-                                    )
-                                    .debug_selector(|| "general-view-mode-terminal".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.default_view_mode = DefaultViewMode::Terminal;
-                                        });
-                                    }),
-                                    layout::segment(
-                                        p,
-                                        "general-view-mode-chat",
-                                        text::DEFAULT_VIEW_MODE_CHAT.get(),
-                                        s.default_view_mode == DefaultViewMode::Chat,
-                                    )
-                                    .debug_selector(|| "general-view-mode-chat".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.default_view_mode = DefaultViewMode::Chat;
-                                        });
-                                    }),
-                                ],
-                            )
-                            .id("general-default-view-mode")
-                            .debug_selector(|| "general-default-view-mode".into()),
-                        ),
-                    ),
-            )
+    }
+
+    /// 시스템 탭 윗부분: 가져오기 배너·알림·전원·설정 파일·업데이트.
+    fn render_system_rows(&self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
+        let search_focus = self.search_focus.clone();
+        let p = crate::ui::palette(cx);
+        let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
+            layout::segment(p, id, label, s.keep_awake == mode)
+                .debug_selector(move || id.into())
+                .on_click(move |_, _, cx| {
+                    edit(cx, move |s| s.keep_awake = mode);
+                })
+        };
+        let notif_disabled = !s.notifications;
+        let row = || layout::row(p);
+        let sub_notif_row = |id: &'static str| {
+            layout::row(p)
+                .id(id)
+                .debug_selector(move || id.into())
+                .when(notif_disabled, |d| d.opacity(0.5))
+        };
+        let label =
+            |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .children(crate::orca_import::render_banner("settings-general", cx))
             .child(layout::section_title(
                 p,
                 "general-section-notifications",
@@ -6254,57 +6287,6 @@ impl SettingsView {
                     ),
             )
             .child(
-                sub_notif_row("notify-input-row")
-                    .child(label(
-                        text::NOTIFY_INPUT.get(),
-                        text::NOTIFY_INPUT_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "notify-input-toggle",
-                                s.notify_on_input,
-                                notif_disabled,
-                                |next, _, cx| edit(cx, move |s| s.notify_on_input = next),
-                            )
-                            .aria_label(text::NOTIFY_INPUT.get()),
-                        ),
-                    ),
-            )
-            .child(
-                sub_notif_row("notify-done-row")
-                    .child(label(text::NOTIFY_DONE.get(), text::NOTIFY_DONE_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "notify-done-toggle",
-                                s.notify_on_done,
-                                notif_disabled,
-                                |next, _, cx| edit(cx, move |s| s.notify_on_done = next),
-                            )
-                            .aria_label(text::NOTIFY_DONE.get()),
-                        ),
-                    ),
-            )
-            .child(
-                sub_notif_row("notify-bell-row")
-                    .child(label(text::NOTIFY_BELL.get(), text::NOTIFY_BELL_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "notify-bell-toggle",
-                                s.notify_on_bell,
-                                notif_disabled,
-                                |next, _, cx| edit(cx, move |s| s.notify_on_bell = next),
-                            )
-                            .aria_label(text::NOTIFY_BELL.get()),
-                        ),
-                    ),
-            )
-            .child(
                 sub_notif_row("notify-sound-row")
                     .child(label(text::ALERT_SOUND.get(), text::ALERT_SOUND_DESC.get()))
                     .child(
@@ -6317,37 +6299,6 @@ impl SettingsView {
                                 |next, _, cx| edit(cx, move |s| s.notification_sound = next),
                             )
                             .aria_label(text::ALERT_SOUND.get()),
-                        ),
-                    ),
-            )
-            .child(
-                sub_notif_row("notify-inactive-row")
-                    .child(label(
-                        text::INACTIVE_ONLY.get(),
-                        text::INACTIVE_ONLY_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "notify-inactive-toggle",
-                                s.notify_only_inactive,
-                                notif_disabled,
-                                |next, _, cx| edit(cx, move |s| s.notify_only_inactive = next),
-                            )
-                            .aria_label(text::INACTIVE_ONLY.get()),
-                        ),
-                    ),
-            )
-            .child(
-                sub_notif_row("notify-test-row")
-                    .child(label(text::TEST_NOTIFY.get(), text::TEST_NOTIFY_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary("send-test-notification", text::TEST_NOTIFY.get())
-                                .disabled(notif_disabled)
-                                .debug_selector(|| "send-test-notification".into())
-                                .on_click(|_, _, cx| crate::alert::send_test_notification(cx)),
                         ),
                     ),
             )
@@ -6424,28 +6375,31 @@ impl SettingsView {
                                     .on_click(|_, _, cx| {
                                         crate::onboarding::open_checks_current(cx);
                                     }),
+                            )
+                            .child(
+                                layout::secondary("open-install", text::TAB_INSTALL.get())
+                                    .debug_selector(|| "open-install".into())
+                                    .on_click(|_, _, cx| {
+                                        open_window_at_tab(AdminTab::Install, cx);
+                                    }),
                             ),
+                    ),
+            )
+            .child(
+                row()
+                    .child(label(text::TAB_DISK.get(), text::TAB_DISK_DESC.get()))
+                    .child(
+                        layout::controls().child(
+                            layout::secondary("open-disk", text::DISK_OPEN.get())
+                                .debug_selector(|| "open-disk".into())
+                                .on_click(|_, _, cx| open_window_at_tab(AdminTab::Disk, cx)),
+                        ),
                     ),
             )
             // 자체 업데이터는 macOS 번들 전용이라 다른 OS에서는 숨긴다(규칙 10).
             .when(cfg!(target_os = "macos"), |el| {
                 el.children(Self::render_update_rows(s, cx))
             })
-            .child(layout::section_title(
-                p,
-                "general-section-support",
-                text::SECTION_SUPPORT.get(),
-            ))
-            .child(
-                row()
-                    .id("settings-support-star-row")
-                    .debug_selector(|| "settings-support-star-row".into())
-                    .child(label(
-                        text::SUPPORT_STAR_TITLE.get(),
-                        text::SUPPORT_STAR_DESC.get(),
-                    ))
-                    .child(layout::controls().child(crate::star_nag::settings_support_control(cx))),
-            )
     }
 
     fn render_update_rows(s: &Settings, cx: &mut Context<Self>) -> [gpui::Div; 2] {
@@ -6565,742 +6519,9 @@ impl SettingsView {
                 ),
         ]
     }
-    fn terminal_theme_search_input(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Entity<gpui_component::input::InputState> {
-        if let Some((input, _)) = &self.terminal_theme_search {
-            return input.clone();
-        }
-        let input = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx)
-                .placeholder(text::TERMINAL_THEME_SEARCH.get())
-        });
-        let sub = cx.subscribe(&input, |_, _, _: &gpui_component::input::InputEvent, cx| {
-            cx.notify();
-        });
-        self.terminal_theme_search = Some((input.clone(), sub));
-        input
-    }
-
-    fn import_ghostty_themes(&mut self, cx: &mut Context<Self>) {
-        if !self.theme_imports_pending.insert("ghostty") {
-            return;
-        }
-        let revision = cx.try_global::<Config>().map(|config| config.revision);
-        cx.spawn(async move |this, cx| {
-            let imported = cx
-                .background_executor()
-                .spawn(async move { crate::ui::discover_and_import_ghostty() })
-                .await;
-            this.update(cx, |this, cx| {
-                this.theme_imports_pending.remove("ghostty");
-                let select = cx.try_global::<Config>().map(|config| config.revision) == revision;
-                let has_any = imported.found
-                    || !imported.custom_themes.is_empty()
-                    || imported.dark_theme.is_some()
-                    || imported.light_theme.is_some();
-                if has_any {
-                    let count = imported.custom_themes.len().max(1);
-                    edit(cx, move |s| {
-                        crate::ui::merge_custom_themes(
-                            &mut s.terminal_custom_themes,
-                            imported.custom_themes.clone(),
-                        );
-                        if select && let Some(dark) = imported.dark_theme.clone() {
-                            s.terminal_theme_dark = dark;
-                        }
-                        if select && let Some(light) = imported.light_theme.clone() {
-                            s.terminal_theme_light = light;
-                        }
-                        if select && let Some(use_sep) = imported.use_separate_light_theme {
-                            s.terminal_use_separate_light_theme = use_sep;
-                        }
-                    });
-                    this.terminal_theme_status = Some((
-                        text::TERMINAL_THEME_IMPORTED_OK
-                            .format(&[("count", &count.to_string())])
-                            .into(),
-                        false,
-                    ));
-                } else {
-                    this.terminal_theme_status =
-                        Some((text::TERMINAL_THEME_IMPORT_NONE.get().into(), true));
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn import_warp_themes(&mut self, cx: &mut Context<Self>) {
-        if !self.theme_imports_pending.insert("warp") {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            let report = cx
-                .background_executor()
-                .spawn(async move { crate::ui::discover_and_import_warp_themes() })
-                .await;
-            this.update(cx, |this, cx| {
-                this.theme_imports_pending.remove("warp");
-                if report.themes.is_empty() {
-                    this.terminal_theme_status =
-                        Some((text::TERMINAL_THEME_IMPORT_NONE.get().into(), true));
-                } else {
-                    let count = report.themes.len();
-                    let themes = report.themes;
-                    edit(cx, move |s| {
-                        crate::ui::merge_custom_themes(
-                            &mut s.terminal_custom_themes,
-                            themes.clone(),
-                        );
-                    });
-                    this.terminal_theme_status = Some((
-                        text::TERMINAL_THEME_IMPORTED_OK
-                            .format(&[("count", &count.to_string())])
-                            .into(),
-                        false,
-                    ));
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn render_terminal_theme_swatch(
-        p: &crate::ui::Palette,
-        theme: &krill_proto::theme::Theme,
-    ) -> gpui::Div {
-        let mut pill = div()
-            .flex_none()
-            .h(px(18.))
-            .px_1p5()
-            .rounded(crate::ui::RADIUS_XS)
-            .border_1()
-            .border_color(p.border)
-            .bg(crate::ui::terminal_rgb_hsla(theme.background))
-            .flex()
-            .items_center()
-            .gap_1();
-        for idx in 1..=6 {
-            pill = pill.child(
-                div()
-                    .w(px(6.))
-                    .h(px(6.))
-                    .rounded(crate::ui::RADIUS_XS)
-                    .bg(crate::ui::terminal_rgb_hsla(theme.ansi[idx])),
-            );
-        }
-        pill
-    }
-
-    fn render_terminal_theme_preview(
-        p: &crate::ui::Palette,
-        s: &Settings,
-        target_mode: ThemeMode,
-        active_label: &str,
-    ) -> gpui::Stateful<gpui::Div> {
-        const PREVIEW_PROMPT: &str = "krill@mac ~/krill ";
-        const PREVIEW_BRANCH: &str = "(main)";
-        const PREVIEW_CMD: &str = " $ cargo nextest run";
-        const PREVIEW_PASS: &str = "     PASS ";
-        const PREVIEW_SUITE: &str = "[ 0.042s] ";
-        const PREVIEW_TEST: &str = "krill-app::ui::terminal_themes";
-        const PREVIEW_KW: &str = "fn ";
-        const PREVIEW_FN: &str = "apply_theme";
-        const PREVIEW_ARGS: &str = "(mode: ThemeMode) -> ";
-        const PREVIEW_RET: &str = "TerminalTheme ";
-        const PREVIEW_COMMENT: &str = "// 30 built-in + custom themes";
-        const PREVIEW_CURSOR_CHAR: &str = " ";
-
-        let preview = crate::ui::terminal_theme_for_mode(target_mode, s);
-        let bg = crate::ui::terminal_rgb_hsla(preview.background);
-        let fg = crate::ui::terminal_rgb_hsla(preview.foreground);
-        let cursor_col = crate::ui::terminal_rgb_hsla(preview.cursor);
-        let c_red = crate::ui::terminal_rgb_hsla(preview.ansi[1]);
-        let c_green = crate::ui::terminal_rgb_hsla(preview.ansi[2]);
-        let c_yellow = crate::ui::terminal_rgb_hsla(preview.ansi[3]);
-        let c_blue = crate::ui::terminal_rgb_hsla(preview.ansi[4]);
-        let c_magenta = crate::ui::terminal_rgb_hsla(preview.ansi[5]);
-        let c_cyan = crate::ui::terminal_rgb_hsla(preview.ansi[6]);
-        let c_muted = crate::ui::terminal_rgb_hsla(preview.ansi[8]);
-
-        let cursor_el = match s.terminal_cursor_shape {
-            TerminalCursorShape::Block => div()
-                .w(px(7.))
-                .h(px(14.))
-                .bg(cursor_col)
-                .child(PREVIEW_CURSOR_CHAR),
-            TerminalCursorShape::Bar => div()
-                .w(px(2.))
-                .h(px(14.))
-                .bg(cursor_col)
-                .child(PREVIEW_CURSOR_CHAR),
-            TerminalCursorShape::Underline => div()
-                .w(px(7.))
-                .h(px(2.))
-                .mt(px(12.))
-                .bg(cursor_col)
-                .child(PREVIEW_CURSOR_CHAR),
-        };
-
-        let mut normal_strip = div().flex().items_center().gap_1();
-        let mut bright_strip = div().flex().items_center().gap_1();
-        for idx in 0..8 {
-            normal_strip = normal_strip.child(
-                div()
-                    .flex_1()
-                    .h(px(10.))
-                    .rounded(crate::ui::RADIUS_XS)
-                    .border_1()
-                    .border_color(p.border)
-                    .bg(crate::ui::terminal_rgb_hsla(preview.ansi[idx])),
-            );
-            bright_strip = bright_strip.child(
-                div()
-                    .flex_1()
-                    .h(px(10.))
-                    .rounded(crate::ui::RADIUS_XS)
-                    .border_1()
-                    .border_color(p.border)
-                    .bg(crate::ui::terminal_rgb_hsla(preview.ansi[idx + 8])),
-            );
-        }
-
-        div()
-            .id("terminal-theme-preview-card")
-            .debug_selector(|| "terminal-theme-preview-card".into())
-            .flex_1()
-            .min_w_0()
-            .w_full()
-            .rounded(crate::ui::RADIUS_MD)
-            .border_1()
-            .border_color(p.border)
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .bg(p.muted)
-                    .border_b_1()
-                    .border_color(p.border)
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(c_red))
-                            .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(c_yellow))
-                            .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(c_green))
-                            .child(
-                                div()
-                                    .ml_1()
-                                    .text_size(crate::ui::TEXT_2XS)
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(p.muted_foreground)
-                                    .child(text::TERMINAL_THEME_PREVIEW.get()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("terminal-theme-active-label")
-                            .debug_selector(|| "terminal-theme-active-label".into())
-                            .truncate()
-                            .text_size(crate::ui::TEXT_2XS)
-                            .text_color(p.foreground)
-                            .child(active_label.to_owned()),
-                    ),
-            )
-            .child(
-                div()
-                    .p_3()
-                    .bg(bg)
-                    .text_color(fg)
-                    .font_family(s.terminal_font_family.clone())
-                    .text_size(crate::ui::TEXT_SM)
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(div().text_color(c_green).child(PREVIEW_PROMPT))
-                            .child(div().text_color(c_magenta).child(PREVIEW_BRANCH))
-                            .child(div().text_color(fg).child(PREVIEW_CMD)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(div().text_color(c_green).child(PREVIEW_PASS))
-                            .child(div().text_color(c_cyan).child(PREVIEW_SUITE))
-                            .child(div().text_color(fg).child(PREVIEW_TEST)),
-                    )
-                    .child(div().text_color(c_muted).child(PREVIEW_COMMENT))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(div().text_color(c_magenta).child(PREVIEW_KW))
-                            .child(div().text_color(c_blue).child(PREVIEW_FN))
-                            .child(div().text_color(fg).child(PREVIEW_ARGS))
-                            .child(div().text_color(c_yellow).child(PREVIEW_RET))
-                            .child(cursor_el),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(p.border)
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(normal_strip)
-                            .child(bright_strip),
-                    ),
-            )
-    }
-
-    #[expect(
-        clippy::too_many_lines,
-        reason = "터미널 테마 섹션은 모드 토글·가져오기·검색·커스텀/내장 목록·실시간 미리보기를 한 카드에 그린다"
-    )]
-    fn render_terminal_themes_section(
-        &mut self,
-        s: &Settings,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
-        let p = crate::ui::palette(cx);
-        let target_mode = self
-            .terminal_theme_target
-            .unwrap_or_else(|| cx.theme().mode);
-        let want_dark = target_mode == ThemeMode::Dark;
-        let match_dark = target_mode == ThemeMode::Light && !s.terminal_use_separate_light_theme;
-
-        let active_selection = if target_mode == ThemeMode::Dark || match_dark {
-            crate::ui::canonical_terminal_theme_name(&s.terminal_theme_dark)
-        } else {
-            crate::ui::canonical_terminal_theme_name(&s.terminal_theme_light)
-        };
-        let active_label =
-            crate::ui::terminal_theme_display_label(active_selection, &s.terminal_custom_themes);
-
-        let search_input = self.terminal_theme_search_input(window, cx);
-        let query = search_input.read(cx).value().trim().to_ascii_lowercase();
-
-        let mode_segment = layout::segmented_control(
-            p,
-            [
-                (
-                    "terminal-theme-mode-dark",
-                    text::DARK.get(),
-                    ThemeMode::Dark,
-                ),
-                (
-                    "terminal-theme-mode-light",
-                    text::LIGHT.get(),
-                    ThemeMode::Light,
-                ),
-            ]
-            .into_iter()
-            .map(|(id, title, m)| {
-                layout::segment(p, id, title, target_mode == m)
-                    .debug_selector(move || id.into())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.terminal_theme_target = Some(m);
-                        cx.notify();
-                    }))
-            }),
-        );
-
-        let import_ghostty_btn = layout::secondary(
-            "terminal-theme-import-ghostty",
-            text::TERMINAL_THEME_IMPORT_GHOSTTY.get(),
-        )
-        .debug_selector(|| "terminal-theme-import-ghostty".into())
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.import_ghostty_themes(cx);
-        }));
-
-        let import_warp_btn = layout::secondary(
-            "terminal-theme-import-warp",
-            text::TERMINAL_THEME_IMPORT_WARP.get(),
-        )
-        .debug_selector(|| "terminal-theme-import-warp".into())
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.import_warp_themes(cx);
-        }));
-
-        let mut list = div()
-            .id("terminal-theme-list")
-            .debug_selector(|| "terminal-theme-list".into())
-            .max_h(px(260.))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_1();
-
-        self.terminal_theme_swatches
-            .retain(|index, _| *index < s.terminal_custom_themes.len());
-        for (index, theme) in s.terminal_custom_themes.iter().enumerate() {
-            let unchanged = self
-                .terminal_theme_swatches
-                .get(&index)
-                .is_some_and(|(previous, _)| previous == theme);
-            if !unchanged {
-                self.terminal_theme_swatches
-                    .insert(index, (theme.clone(), theme.to_terminal_theme()));
-            }
-        }
-        let custom_matches: Vec<(usize, &crate::ui::CustomTerminalTheme)> = s
-            .terminal_custom_themes
-            .iter()
-            .enumerate()
-            .filter(|(_, ct)| ct.is_dark() == want_dark)
-            .filter(|(_, ct)| {
-                query.is_empty()
-                    || ct.name.to_ascii_lowercase().contains(&query)
-                    || ct.source.to_ascii_lowercase().contains(&query)
-            })
-            .collect();
-
-        let builtin_matches: Vec<(usize, &crate::ui::BuiltinTerminalTheme)> =
-            crate::ui::BUILTIN_TERMINAL_THEMES
-                .iter()
-                .enumerate()
-                .filter(|(_, b)| b.is_dark == want_dark)
-                .filter(|(_, b)| query.is_empty() || b.name.to_ascii_lowercase().contains(&query))
-                .collect();
-
-        if custom_matches.is_empty() && builtin_matches.is_empty() {
-            list = list.child(
-                div()
-                    .py_4()
-                    .text_center()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::TERMINAL_THEME_EMPTY.get()),
-            );
-        }
-
-        if !custom_matches.is_empty() {
-            list = list.child(
-                div()
-                    .px_2()
-                    .pt_1()
-                    .text_size(crate::ui::TEXT_XS)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(p.muted_foreground)
-                    .child(text::TERMINAL_THEME_IMPORTED.get()),
-            );
-            for (idx, ct) in custom_matches {
-                let sel_val = ct.selection_value();
-                let selected = active_selection == sel_val;
-                let row_id = SharedString::from(format!("terminal-theme-custom-{idx}"));
-                let del_id = SharedString::from(format!("terminal-theme-delete-{idx}"));
-                let custom_id = ct.id.clone();
-                let source_badge = match ct.source.as_str() {
-                    "ghostty" => text::TERMINAL_THEME_SOURCE_GHOSTTY.get(),
-                    "warp" => text::TERMINAL_THEME_SOURCE_WARP.get(),
-                    _ => text::TERMINAL_THEME_SOURCE_CUSTOM.get(),
-                };
-                let parsed_theme = self
-                    .terminal_theme_swatches
-                    .get(&idx)
-                    .and_then(|(_, theme)| *theme)
-                    .unwrap_or(if want_dark {
-                        crate::ui::TERMINAL_DARK
-                    } else {
-                        crate::ui::TERMINAL_LIGHT
-                    });
-                let swatch = Self::render_terminal_theme_swatch(p, &parsed_theme);
-                let row_sel = row_id.clone();
-                let del_sel = del_id.clone();
-                list = list.child(
-                    div()
-                        .id(row_id)
-                        .debug_selector(move || row_sel.to_string())
-                        .role(gpui::Role::RadioButton)
-                        .aria_label(ct.name.clone())
-                        .aria_toggled(if selected {
-                            gpui::Toggled::True
-                        } else {
-                            gpui::Toggled::False
-                        })
-                        .tab_index(0)
-                        .focus_visible(|style| style.border_color(p.ring))
-                        .px_2()
-                        .py_1p5()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .cursor_pointer()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .when(selected, |d| {
-                            d.bg(p.sidebar_accent).font_weight(gpui::FontWeight::MEDIUM)
-                        })
-                        .hover(|d| d.bg(p.sidebar_accent))
-                        .active(|d| d.bg(p.accent))
-                        .on_click(move |_, _, cx| {
-                            let val = sel_val.clone();
-                            edit(cx, move |s| {
-                                if want_dark {
-                                    s.terminal_theme_dark.clone_from(&val);
-                                } else {
-                                    s.terminal_use_separate_light_theme = true;
-                                    s.terminal_theme_light.clone_from(&val);
-                                }
-                            });
-                        })
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(swatch)
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_size(crate::ui::TEXT_SM)
-                                        .text_color(p.foreground)
-                                        .child(ct.name.clone()),
-                                )
-                                .child(crate::ui::badge(
-                                    p,
-                                    crate::ui::BadgeTone::Muted,
-                                    source_badge,
-                                )),
-                        )
-                        .child(crate::ui::button_with_tooltip(
-                            Button::new(del_id.clone())
-                                .icon(IconName::Close)
-                                .ghost()
-                                .xsmall()
-                                .debug_selector(move || del_sel.to_string())
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    let cid = custom_id.clone();
-                                    edit(cx, move |s| {
-                                        s.terminal_custom_themes.retain(|t| t.id != cid);
-                                        let target_sel = format!("custom:{cid}");
-                                        if s.terminal_theme_dark == target_sel {
-                                            s.terminal_theme_dark = default_terminal_theme_dark();
-                                        }
-                                        if s.terminal_theme_light == target_sel {
-                                            s.terminal_theme_light = default_terminal_theme_light();
-                                        }
-                                    });
-                                }),
-                            del_id,
-                            text::TERMINAL_THEME_REMOVE.get(),
-                        )),
-                );
-            }
-        }
-
-        if !builtin_matches.is_empty() {
-            list = list.child(
-                div()
-                    .px_2()
-                    .pt_1()
-                    .text_size(crate::ui::TEXT_XS)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(p.muted_foreground)
-                    .child(text::TERMINAL_THEME_BUILTIN.get()),
-            );
-            for (idx, entry) in builtin_matches {
-                let selected = active_selection.eq_ignore_ascii_case(entry.name);
-                let row_id = SharedString::from(format!("terminal-theme-builtin-{idx}"));
-                let row_sel = row_id.clone();
-                let theme_name = entry.name;
-                let swatch = Self::render_terminal_theme_swatch(p, &entry.theme);
-                list = list.child(
-                    div()
-                        .id(row_id)
-                        .debug_selector(move || row_sel.to_string())
-                        .role(gpui::Role::RadioButton)
-                        .aria_label(theme_name)
-                        .aria_toggled(if selected {
-                            gpui::Toggled::True
-                        } else {
-                            gpui::Toggled::False
-                        })
-                        .tab_index(0)
-                        .focus_visible(|style| style.border_color(p.ring))
-                        .px_2()
-                        .py_1p5()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .cursor_pointer()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .when(selected, |d| {
-                            d.bg(p.sidebar_accent).font_weight(gpui::FontWeight::MEDIUM)
-                        })
-                        .hover(|d| d.bg(p.sidebar_accent))
-                        .active(|d| d.bg(p.accent))
-                        .on_click(move |_, _, cx| {
-                            edit(cx, move |s| {
-                                if want_dark {
-                                    theme_name.clone_into(&mut s.terminal_theme_dark);
-                                } else {
-                                    s.terminal_use_separate_light_theme = true;
-                                    theme_name.clone_into(&mut s.terminal_theme_light);
-                                }
-                            });
-                        })
-                        .child(swatch)
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .text_size(crate::ui::TEXT_SM)
-                                .text_color(p.foreground)
-                                .child(theme_name),
-                        ),
-                );
-            }
-        }
-
-        let picker_col = div()
-            .w_full()
-            .min_w_0()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .id("terminal-theme-search")
-                    .debug_selector(|| "terminal-theme-search".into())
-                    .child(
-                        gpui_component::input::Input::new(&search_input)
-                            .small()
-                            .prefix(Icon::new(IconName::Search).xsmall()),
-                    ),
-            )
-            .child(list);
-
-        let preview_col = Self::render_terminal_theme_preview(p, s, target_mode, &active_label);
-
-        let mut section = div()
-            .id("terminal-section-themes-wrap")
-            .debug_selector(|| "terminal-section-themes-wrap".into())
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(layout::section_title(
-                p,
-                "terminal-section-themes",
-                text::SECTION_TERMINAL_THEMES.get(),
-            ))
-            .child(
-                layout::row(p)
-                    .child(layout::label(
-                        p,
-                        text::SECTION_TERMINAL_THEMES.get(),
-                        Some(text::SECTION_TERMINAL_THEMES_DESC.get()),
-                    ))
-                    .child(
-                        layout::controls()
-                            .child(mode_segment)
-                            .child(import_ghostty_btn)
-                            .child(import_warp_btn),
-                    ),
-            );
-
-        if let Some((status_msg, is_warn)) = &self.terminal_theme_status {
-            section = section.child(
-                div()
-                    .id("terminal-theme-status")
-                    .debug_selector(|| "terminal-theme-status".into())
-                    .px_3()
-                    .py_1p5()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.muted)
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(if *is_warn {
-                        p.warning
-                    } else {
-                        p.muted_foreground
-                    })
-                    .child(status_msg.clone()),
-            );
-        }
-
-        if target_mode == ThemeMode::Light {
-            section = section.child(
-                layout::row(p)
-                    .id("terminal-theme-match-dark-row")
-                    .debug_selector(|| "terminal-theme-match-dark-row".into())
-                    .child(layout::label(
-                        p,
-                        text::TERMINAL_THEME_MATCH_DARK.get(),
-                        Some(text::TERMINAL_THEME_MATCH_DARK_DESC.get()),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "terminal-theme-match-dark-toggle",
-                                !s.terminal_use_separate_light_theme,
-                                false,
-                                |match_dark_next, _, cx| {
-                                    edit(cx, move |s| {
-                                        s.terminal_use_separate_light_theme = !match_dark_next;
-                                    });
-                                },
-                            )
-                            .aria_label(text::TERMINAL_THEME_MATCH_DARK.get()),
-                        ),
-                    ),
-            );
-        }
-
-        section.child(
-            layout::card(p)
-                .id("terminal-theme-picker-card")
-                .debug_selector(|| "terminal-theme-picker-card".into())
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .items_start()
-                .gap_3()
-                .child(picker_col)
-                .child(preview_col),
-        )
-    }
-
-    /// 터미널 탭(OWE-658, OWE-798, OWE-956): 터미널 테마·미리보기·글꼴·크기·투명도·기본 커서·Option 키·선택 복사.
-    fn render_terminal_tab(
-        &mut self,
-        s: &Settings,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    /// 모양 탭의 터미널 글꼴·크기(OWE-658, OWE-798).
+    fn render_terminal_tab(&mut self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-        let themes_section = self.render_terminal_themes_section(s, window, cx);
         let search_focus = self.search_focus.clone();
         let p = crate::ui::palette(cx);
         let row = || layout::row(p);
@@ -7308,9 +6529,6 @@ impl SettingsView {
             |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
         let font_size = s.terminal_font_size();
         let font_pt = format!("{font_size}pt");
-        let editor_font_pt = format!("{}pt", s.editor_font_size());
-        let opacity_val = s.terminal_opacity_pct();
-        let opacity_pct = format!("{opacity_val}%");
         self.refresh_font_names(cx);
         let font_names = self.font_names.clone();
         let family = s.terminal_font_family.clone();
@@ -7330,16 +6548,10 @@ impl SettingsView {
                 }
                 menu
             });
-        let cursor_button = |id: &'static str, title: &'static str, shape: TerminalCursorShape| {
-            layout::segment(p, id, title, s.terminal_cursor_shape == shape)
-                .debug_selector(move || id.into())
-                .on_click(move |_, _, cx| edit(cx, move |s| s.terminal_cursor_shape = shape))
-        };
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .child(themes_section)
             .child(layout::section_title(
                 p,
                 "terminal-section-appearance",
@@ -7419,272 +6631,6 @@ impl SettingsView {
                                         });
                                     }),
                             ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::EDITOR_FONT_SIZE.get(),
-                        text::EDITOR_FONT_SIZE_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls()
-                            .child(
-                                Button::new("editor-font-dec")
-                                    .accessibility_label(
-                                        text::STEP_DEC
-                                            .format(&[("name", text::EDITOR_FONT_SIZE.get())]),
-                                    )
-                                    .label("−")
-                                    .disabled(s.editor_font_size_step(-1) == s.editor_font_size)
-                                    .debug_selector(|| "editor-font-dec".into())
-                                    .ghost()
-                                    .small()
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.editor_font_size = s.editor_font_size_step(-1);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .w_12()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .child(editor_font_pt),
-                            )
-                            .child(
-                                Button::new("editor-font-inc")
-                                    .accessibility_label(
-                                        text::STEP_INC
-                                            .format(&[("name", text::EDITOR_FONT_SIZE.get())]),
-                                    )
-                                    .label("+")
-                                    .disabled(s.editor_font_size_step(1) == s.editor_font_size)
-                                    .debug_selector(|| "editor-font-inc".into())
-                                    .ghost()
-                                    .small()
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.editor_font_size = s.editor_font_size_step(1);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                Button::new("editor-font-reset")
-                                    .label(text::RESET.get())
-                                    .tooltip(text::EDITOR_FONT_RESET.get())
-                                    .disabled(s.editor_font_size == default_editor_font_size())
-                                    .debug_selector(|| "editor-font-reset".into())
-                                    .ghost()
-                                    .small()
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.editor_font_size = default_editor_font_size();
-                                        });
-                                    }),
-                            ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(text::OPACITY.get(), text::OPACITY_DESC.get()))
-                    .child(
-                        layout::controls()
-                            .child(
-                                layout::secondary("opacity-dec", "−")
-                                    .accessibility_label(
-                                        text::STEP_DEC.format(&[("name", text::OPACITY.get())]),
-                                    )
-                                    .disabled(opacity_val <= 50)
-                                    .debug_selector(|| "opacity-dec".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.terminal_opacity_pct =
-                                                s.terminal_opacity_pct().saturating_sub(5).max(50);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id("opacity-value")
-                                    .debug_selector(|| "opacity-value".into())
-                                    .w(px(48.))
-                                    .text_center()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .child(opacity_pct),
-                            )
-                            .child(
-                                layout::secondary("opacity-inc", "+")
-                                    .accessibility_label(
-                                        text::STEP_INC.format(&[("name", text::OPACITY.get())]),
-                                    )
-                                    .disabled(opacity_val >= 100)
-                                    .debug_selector(|| "opacity-inc".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.terminal_opacity_pct =
-                                                s.terminal_opacity_pct().saturating_add(5).min(100);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                layout::ghost("opacity-reset", text::RESET.get())
-                                    .disabled(opacity_val == default_terminal_opacity_pct())
-                                    .debug_selector(|| "opacity-reset".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| s.terminal_opacity_pct = 100);
-                                    }),
-                            ),
-                    ),
-            )
-            .child(layout::section_title(
-                p,
-                "terminal-section-cursor",
-                text::SECTION_TERMINAL_CURSOR.get(),
-            ))
-            .child(
-                row()
-                    .child(label(
-                        text::CURSOR_SHAPE.get(),
-                        text::CURSOR_SHAPE_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(layout::segmented_control(
-                            p,
-                            [
-                                (
-                                    "cursor-block",
-                                    text::CURSOR_BLOCK.get(),
-                                    TerminalCursorShape::Block,
-                                ),
-                                (
-                                    "cursor-bar",
-                                    text::CURSOR_BAR.get(),
-                                    TerminalCursorShape::Bar,
-                                ),
-                                (
-                                    "cursor-underline",
-                                    text::CURSOR_UNDERLINE.get(),
-                                    TerminalCursorShape::Underline,
-                                ),
-                            ]
-                            .into_iter()
-                            .map(|(id, l, shape)| cursor_button(id, l, shape)),
-                        )),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::CURSOR_BLINK.get(),
-                        text::CURSOR_BLINK_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "cursor-blink-toggle",
-                                s.terminal_cursor_blink,
-                                false,
-                                |next, _, cx| edit(cx, move |s| s.terminal_cursor_blink = next),
-                            )
-                            .aria_label(text::CURSOR_BLINK.get()),
-                        ),
-                    ),
-            )
-            .child(layout::section_title(
-                p,
-                "terminal-section-keyboard",
-                text::SECTION_TERMINAL_KEYBOARD.get(),
-            ))
-            .child(
-                row()
-                    .child(label(
-                        text::OPTION_AS_META.get(),
-                        text::OPTION_AS_META_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "option-meta-toggle",
-                                s.option_as_meta,
-                                false,
-                                |next, _, cx| {
-                                    edit(cx, move |s| {
-                                        s.option_as_meta = next;
-                                        s.option_as_meta_auto = false;
-                                    });
-                                },
-                            )
-                            .aria_label(text::OPTION_AS_META.get()),
-                        ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::OPTION_META_AUTO.get(),
-                        text::OPTION_META_AUTO_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "option-meta-auto",
-                                s.option_as_meta_auto,
-                                false,
-                                |next, _, cx| {
-                                    edit(cx, move |s| {
-                                        s.option_as_meta_auto = next;
-                                        if next {
-                                            s.option_as_meta = false;
-                                        }
-                                    });
-                                },
-                            )
-                            .aria_label(text::OPTION_META_AUTO.get()),
-                        ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::COPY_ON_SELECT.get(),
-                        text::COPY_ON_SELECT_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "copy-select-toggle",
-                                s.copy_on_select,
-                                false,
-                                |next, _, cx| edit(cx, move |s| s.copy_on_select = next),
-                            )
-                            .aria_label(text::COPY_ON_SELECT.get()),
-                        ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(
-                        text::CONFIRM_RUNNING_CLOSE.get(),
-                        text::CONFIRM_RUNNING_CLOSE_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "confirm-running-close-toggle",
-                                s.confirm_running_close,
-                                false,
-                                |next, _, cx| edit(cx, move |s| s.confirm_running_close = next),
-                            )
-                            .aria_label(text::CONFIRM_RUNNING_CLOSE.get()),
-                        ),
                     ),
             )
     }
@@ -9887,26 +8833,6 @@ impl SettingsView {
 
         // 유휴 동면은 `settings.toml` + 상태 디렉터리의 `hibernation.enabled` 표식으로 데몬에
         // 전달한다(OWE-655). 표식 동기화는 `edit`·`reload`가 맡는다.
-        let hib_row = layout::row(p)
-            .child(self.search_focus.label(
-                p,
-                text::HIBERNATION_TITLE.get(),
-                Some(text::HIBERNATION_DESC.get()),
-            ))
-            .child(
-                layout::controls().child(
-                    layout::switch(
-                        p,
-                        "hib-toggle",
-                        s.hibernation_enabled,
-                        false,
-                        |next, _, cx| edit(cx, move |s| s.hibernation_enabled = next),
-                    )
-                    .aria_label(text::HIBERNATION_TITLE.get()),
-                ),
-            );
-
-        // 끄면 Krill이 설치한 훅을 되돌리고, 다시 켜면 설치된 에이전트에 바로 설치한다.
         let hooks_row = layout::row(p)
             .child(self.search_focus.label(
                 p,
@@ -10003,9 +8929,42 @@ impl SettingsView {
             .child(default_agent_row)
             .child(default_view_mode_row)
             .child(yolo_row)
-            .child(hib_row)
             .child(hooks_row)
-            .child(auto_setup_row);
+            .child(auto_setup_row)
+            .child(
+                layout::row(p)
+                    .child(layout::label(
+                        p,
+                        text::TAB_QUICK_COMMANDS.get(),
+                        Some(text::TAB_QUICK_COMMANDS_DESC.get()),
+                    ))
+                    .child(
+                        layout::controls().child(
+                            layout::secondary("open-quick-commands", text::DISK_OPEN.get())
+                                .debug_selector(|| "open-quick-commands".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_tab(AdminTab::QuickCommands, cx);
+                                })),
+                        ),
+                    ),
+            )
+            .child(
+                layout::row(p)
+                    .child(layout::label(
+                        p,
+                        text::TAB_PROJECT.get(),
+                        Some(text::TAB_PROJECT_DESC.get()),
+                    ))
+                    .child(
+                        layout::controls().child(
+                            layout::secondary("open-project-settings", text::DISK_OPEN.get())
+                                .debug_selector(|| "open-project-settings".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_tab(AdminTab::Project, cx);
+                                })),
+                        ),
+                    ),
+            );
 
         let builtin_agents = krill_proto::agent::Agents::load(None).unwrap_or_default();
         let dir = state_dir(cx);
@@ -10033,92 +8992,6 @@ impl SettingsView {
     #[inline(never)]
     fn render_agent_extra_rows(&mut self, s: &Settings, cx: &mut Context<Self>) -> Vec<gpui::Div> {
         let p = crate::ui::palette(cx);
-        let auto_rename_row = layout::row(p)
-            .child(self.search_focus.label(
-                p,
-                text::AUTO_RENAME_BRANCH.get(),
-                Some(text::AUTO_RENAME_BRANCH_DESC.get()),
-            ))
-            .child(
-                layout::controls().child(
-                    layout::switch(
-                        p,
-                        "auto-rename-branch-toggle",
-                        s.auto_rename_branch_from_work,
-                        false,
-                        |next, _, cx| edit(cx, move |s| s.auto_rename_branch_from_work = next),
-                    )
-                    .aria_label(text::AUTO_RENAME_BRANCH.get()),
-                ),
-            );
-
-        let is_1h = s.prompt_cache_ttl_secs >= 3_600;
-        let ttl_5m = layout::segment(p, "prompt-cache-ttl-5m", text::CACHE_TTL_5M.get(), !is_1h)
-            .debug_selector(|| "prompt-cache-ttl-5m".into())
-            .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 300));
-        let ttl_1h = layout::segment(p, "prompt-cache-ttl-1h", text::CACHE_TTL_1H.get(), is_1h)
-            .debug_selector(|| "prompt-cache-ttl-1h".into())
-            .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 3_600));
-        let cache_timer_card = layout::card(p)
-            .debug_selector(|| "prompt-cache-timer-card".into())
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(self.search_focus.label(
-                        p,
-                        text::PROMPT_CACHE_TIMER.get(),
-                        Some(text::PROMPT_CACHE_TIMER_DESC.get()),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::switch(
-                                p,
-                                "prompt-cache-timer-toggle",
-                                s.prompt_cache_timer_enabled,
-                                false,
-                                |next, _, cx| {
-                                    edit(cx, move |s| s.prompt_cache_timer_enabled = next);
-                                },
-                            )
-                            .aria_label(text::PROMPT_CACHE_TIMER.get()),
-                        ),
-                    ),
-            )
-            .when(s.prompt_cache_timer_enabled, |d| {
-                d.child(
-                    div()
-                        .id("prompt-cache-ttl-row")
-                        .debug_selector(|| "prompt-cache-ttl-row".into())
-                        .w_full()
-                        .min_w_0()
-                        .pl_6()
-                        .pt_2()
-                        .border_t_1()
-                        .border_color(p.border)
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(self.search_focus.label(
-                            p,
-                            text::PROMPT_CACHE_TTL.get(),
-                            Some(text::PROMPT_CACHE_TTL_DESC.get()),
-                        ))
-                        .child(
-                            layout::controls()
-                                .child(layout::segmented_control(p, [ttl_5m, ttl_1h])),
-                        ),
-                )
-            });
-
         let view = cx.entity();
         let mut workspace_trust_section = div().w_full().min_w_0().flex().flex_col().gap_2().child(
             layout::row(p)
@@ -10211,7 +9084,7 @@ impl SettingsView {
                     ),
             );
         }
-        vec![auto_rename_row, cache_timer_card, workspace_trust_section]
+        vec![workspace_trust_section]
     }
 
     #[inline(never)]
@@ -10770,10 +9643,6 @@ impl SettingsView {
             gpui_component::input::InputState::new(window, cx)
                 .placeholder(text::QC_TEXT_PLACEHOLDER.get())
         });
-        let webhook_url = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx)
-                .placeholder(text::WEBHOOK_URL_PLACEHOLDER.get())
-        });
         let repo_obs = cx.observe_in(&repo_path, window, |this, _, window, cx| {
             this.sync_workflow_repo_hooks(window, cx);
         });
@@ -10796,8 +9665,6 @@ impl SettingsView {
             qc_name,
             qc_text,
             qc_editing: None,
-            webhook_url,
-            webhook_error: None,
             pending_repo_path: None,
             loaded_repo,
             loaded_setup,
@@ -10962,7 +9829,7 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// 워크플로 탭의 프로젝트 선택 후보. 심볼릭 링크·훅·코멘트·워크트리 부모에 등록된 저장소 중
+    /// 프로젝트 페이지의 프로젝트 선택 후보. 심볼릭 링크·훅·코멘트·워크트리 부모에 등록된 저장소 중
     /// 실제 절대 경로만 남긴다(`내 드라이브::workspace:…` 같은 내부 키는 프로젝트가 아니다).
     fn workflow_repo_candidates(
         store: &krill_proto::orchestration::WorktreeStore,
@@ -11198,147 +10065,18 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub fn add_webhook_url(
-        &mut self,
-        raw_url: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<crate::webhook::Endpoint, String> {
-        if let Ok(ep) = crate::webhook::Endpoint::from_url_input(raw_url) {
-            let ep_clone = ep.clone();
-            edit(cx, move |s| {
-                if !s.webhooks.contains(&ep_clone) {
-                    s.webhooks.push(ep_clone.clone());
-                }
-            });
-            if let Some(form) = &mut self.workflow_form {
-                form.webhook_error = None;
-            }
-            cx.notify();
-            Ok(ep)
-        } else {
-            let msg = text::WEBHOOK_INVALID_URL.get().to_owned();
-            if let Some(form) = &mut self.workflow_form {
-                form.webhook_error = Some(msg.clone().into());
-            }
-            cx.notify();
-            Err(msg)
-        }
-    }
-
-    pub fn submit_webhook_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ensure_workflow_form(window, cx);
-        let Some(form) = &self.workflow_form else {
-            return;
-        };
-        let raw = form.webhook_url.read(cx).value().to_string();
-        let url_inp = form.webhook_url.clone();
-        if self.add_webhook_url(&raw, cx).is_ok() {
-            url_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
-        }
-    }
-
-    fn render_workflows_tab(
+    /// 빠른 명령 편집 페이지. 메뉴·팔레트에서 바로 온다.
+    fn render_quick_commands_page(
         &mut self,
         s: &Settings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         use gpui_component::Sizable as _;
-        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         self.ensure_workflow_form(window, cx);
         let p = crate::ui::palette(cx);
         let qc_count =
             text::QUICK_COMMANDS_COUNT.format(&[("count", &s.quick_commands.len().to_string())]);
-        let wh_count = text::WEBHOOKS_COUNT.format(&[("count", &s.webhooks.len().to_string())]);
-        self.refresh_service_cache(cx);
-        let orch = self.services.orchestration.clone();
-        let pending_gates = orch
-            .gates
-            .iter()
-            .filter(|g| g.status == krill_proto::orchestration::GateStatus::Pending)
-            .count();
-        let orch_summary = text::ORCH_SUMMARY.format(&[
-            ("runs", &orch.runs.len().to_string()),
-            ("tasks", &orch.tasks.len().to_string()),
-            ("workers", &orch.dispatches.len().to_string()),
-            ("gates", &pending_gates.to_string()),
-        ]);
-        let reset = self.confirm_button(
-            "admin-orch-reset",
-            text::ORCH_RESET.get(),
-            cx,
-            |this, cx| {
-                if let Some(dir) = state_dir(cx) {
-                    this.file_job(
-                        "orchestration-reset",
-                        move || {
-                            krill_proto::orchestration::OrchestrationStore::reset_via_daemon_or_disk(&dir, None)
-                            .map_err(|error| error.to_string())
-                        },
-                        |this, result, cx| {
-                            if let Err(error) = result {
-                                this.doctor_status = Some(error.into());
-                            }
-                            cx.defer(notify_external_change);
-                        },
-                        cx,
-                    );
-                }
-            },
-        );
-        let mut orch_card = layout::card(p).flex().flex_col().gap_2().child(
-            div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(
-                    layout::label(p, text::ORCH_TITLE.get(), Some(text::ORCH_DESC.get())).child(
-                        div()
-                            .text_size(crate::ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(orch_summary),
-                    ),
-                )
-                .child(layout::controls().child(reset)),
-        );
-        for task in orch.tasks.iter().take(6) {
-            let line = orchestration_task_line(
-                &task.run_id,
-                &task.id,
-                &task.title,
-                task.status,
-                &task.deps,
-            );
-            orch_card = orch_card.child(div().text_size(crate::ui::TEXT_SM).child(line));
-        }
-        let lines_btns = [50u16, 100, 250, 500].into_iter().map(|lines| {
-            let id = format!("admin-context-lines-{lines}");
-            let label = lines.to_string();
-            let active = s.copy_context_lines == lines;
-            layout::segment(p, gpui::ElementId::Name(id.clone().into()), label, active)
-                .debug_selector(move || id.clone())
-                .on_click(move |_, _, cx| {
-                    edit(cx, move |s| s.copy_context_lines = lines);
-                })
-        });
-        let lines_row = layout::row(p)
-            .child(layout::label(
-                p,
-                text::CONTEXT_LINES.get(),
-                Some(text::CONTEXT_LINES_DESC.get()),
-            ))
-            .child(
-                layout::controls().child(
-                    layout::segmented_control(p, lines_btns)
-                        .id("admin-context-lines-control")
-                        .debug_selector(|| "admin-context-lines-control".into()),
-                ),
-            );
-
         let mut qc_card = layout::card(p)
             .id("admin-qc-card")
             .debug_selector(|| "admin-qc-card".into())
@@ -11481,165 +10219,23 @@ impl SettingsView {
             }
         }
 
-        let clear = self.confirm_button(
-            "admin-webhook-clear",
-            text::WEBHOOK_CLEAR.get(),
-            cx,
-            |_, cx| edit(cx, move |s| s.webhooks.clear()),
-        );
-        let mut wh_card = layout::card(p)
-            .id("admin-webhooks-card")
-            .debug_selector(|| "admin-webhooks-card".into())
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(layout::label(p, wh_count, Some(text::WEBHOOK_DESC.get())))
-                    .child(
-                        layout::controls()
-                            .child(
-                                layout::secondary(
-                                    "admin-webhook-add-local",
-                                    text::WEBHOOK_ADD_LOCAL.get(),
-                                )
-                                .debug_selector(|| "admin-webhook-add-local".into())
-                                .on_click(|_, _, cx| {
-                                    edit(cx, move |s| {
-                                        let n = s.webhooks.len().saturating_add(1);
-                                        s.webhooks.push(crate::webhook::Endpoint::Ntfy {
-                                            url: format!("http://127.0.0.1:8080/krill-hook-{n}"),
-                                        });
-                                    });
-                                }),
-                            )
-                            .child(clear),
-                    ),
-            );
-        if let Some(form) = &self.workflow_form {
-            let webhook_url_input = form.webhook_url.clone();
-            let webhook_err = form.webhook_error.clone();
-            wh_card = wh_card.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("admin-webhook-url-input")
-                            .debug_selector(|| "admin-webhook-url-input".into())
-                            .flex_1()
-                            .min_w_0()
-                            .child(gpui_component::input::Input::new(&webhook_url_input).small()),
-                    )
-                    .child(
-                        layout::controls().child(
-                            layout::primary("admin-webhook-add", text::WEBHOOK_ADD.get())
-                                .debug_selector(|| "admin-webhook-add".into())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.submit_webhook_url(window, cx);
-                                })),
-                        ),
-                    ),
-            );
-            if let Some(err) = webhook_err {
-                wh_card = wh_card.child(
-                    crate::ui::error_banner(p, err)
-                        .id("admin-webhook-error")
-                        .debug_selector(|| "admin-webhook-error".into()),
-                );
-            }
+        div().child(qc_card)
+    }
+
+    /// 프로젝트별 설정 페이지. 프로젝트 메뉴가 고른 저장소가 있으면 먼저 불러온다.
+    fn render_project_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        use gpui_component::Sizable as _;
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+        if let Some(repo) = cx
+            .try_global::<PendingProject>()
+            .and_then(|pending| pending.0.clone())
+        {
+            cx.set_global(PendingProject(None));
+            self.load_repo_hooks_for(&repo, window, cx);
         }
-        if s.webhooks.is_empty() {
-            wh_card = wh_card.child(
-                div()
-                    .id("admin-webhooks-empty")
-                    .debug_selector(|| "admin-webhooks-empty".into())
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::WEBHOOK_EMPTY.get()),
-            );
-        } else {
-            for (idx, ep) in s.webhooks.iter().enumerate() {
-                let row_id = format!("admin-webhook-row-{idx}");
-                let badge_id = format!("admin-webhook-badge-{idx}");
-                let url_id = format!("admin-webhook-url-{idx}");
-                let rm_id = format!("admin-webhook-remove-{idx}");
-                let provider_label = ep.provider_badge();
-                // OWE-883: URL 원문(비밀 토큰 포함 가능) 대신 종류 표시 이름만 보인다.
-                let kind_label = text::WEBHOOK_LABEL.format(&[
-                    ("n", &(idx + 1).to_string()),
-                    ("kind", webhook_kind_label(ep)),
-                ]);
-                wh_card = wh_card.child(
-                    div()
-                        .id(gpui::ElementId::Name(row_id.clone().into()))
-                        .debug_selector(move || row_id.clone())
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .p_2()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .bg(p.background)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    crate::ui::badge(
-                                        p,
-                                        crate::ui::BadgeTone::Accent,
-                                        provider_label,
-                                    )
-                                    .id(SharedString::from(badge_id.clone()))
-                                    .debug_selector(move || badge_id.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(url_id.clone()))
-                                        .debug_selector(move || url_id.clone())
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(crate::ui::TEXT_SM)
-                                        .child(kind_label),
-                                ),
-                        )
-                        .child(
-                            layout::controls().child(
-                                layout::secondary(
-                                    gpui::ElementId::Name(rm_id.clone().into()),
-                                    text::ACCOUNT_REMOVE.get(),
-                                )
-                                .debug_selector(move || rm_id.clone())
-                                .on_click(move |_, _, cx| {
-                                    edit(cx, move |s| {
-                                        if idx < s.webhooks.len() {
-                                            s.webhooks.remove(idx);
-                                        }
-                                    });
-                                }),
-                            ),
-                        ),
-                );
-            }
-        }
+        self.ensure_workflow_form(window, cx);
+        let p = crate::ui::palette(cx);
+        self.refresh_service_cache(cx);
         let wt_store = self.services.worktrees.clone();
 
         let active_repo = self
@@ -12108,19 +10704,10 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_3()
-            .child(orch_card)
             .child(self.render_schedules_section(cx))
             .child(repo_context_card)
             .child(symlinks_card)
             .child(hooks_card)
-            .child(layout::section_title(
-                p,
-                "admin-section-workflows",
-                text::WORKFLOWS_TITLE.get(),
-            ))
-            .child(lines_row)
-            .child(qc_card)
-            .child(wh_card)
     }
 
     fn render_resources_tab(&self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
@@ -12161,12 +10748,6 @@ impl SettingsView {
                 Self::clear_history,
             )
             .disabled(self.history_clear_pending);
-        let info = |body: &'static str| {
-            layout::card(p)
-                .text_size(crate::ui::TEXT_XS)
-                .text_color(p.muted_foreground)
-                .child(body)
-        };
         let mut root = div()
             .flex()
             .flex_col()
@@ -12176,8 +10757,6 @@ impl SettingsView {
                 "admin-section-resources",
                 text::RESOURCES_TITLE.get(),
             ))
-            .child(info(text::RESOURCES_BUDGET.get()))
-            .child(info(text::RESOURCES_SECURITY.get()))
             .child(
                 row()
                     .child(label(
@@ -12233,62 +10812,7 @@ impl SettingsView {
                         text::RECORDING_DELETE_DESC.get(),
                     ))
                     .child(layout::controls().child(clear)),
-            )
-            // Secure Keyboard Entry는 macOS 전용이라 다른 OS에서는 숨긴다(규칙 10).
-            .when(cfg!(target_os = "macos"), |el| {
-                el.child(
-                    row()
-                        .child(label(
-                            crate::security::text::SECURE_KEYBOARD_MENU.get(),
-                            text::SECURE_KB_DESC.get(),
-                        ))
-                        .child(
-                            layout::controls().child(
-                                layout::switch(
-                                    p,
-                                    "admin-secure-kb-toggle",
-                                    s.secure_keyboard_entry,
-                                    false,
-                                    |next, _, cx| {
-                                        edit(cx, move |s| s.secure_keyboard_entry = next);
-                                        crate::platform::set_secure_event_input(next);
-                                    },
-                                )
-                                .aria_label(crate::security::text::SECURE_KEYBOARD_MENU.get()),
-                            ),
-                        ),
-                )
-            })
-            .child(
-                row()
-                    .child(label(text::DOCTOR_TITLE.get(), text::DOCTOR_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary("admin-run-doctor", text::DOCTOR_RUN.get())
-                                .debug_selector(|| "admin-run-doctor".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_doctor(cx);
-                                })),
-                        ),
-                    ),
             );
-        if let Some(status) = &self.doctor_status {
-            root = root.child(
-                div()
-                    .id("admin-doctor-status")
-                    .debug_selector(|| "admin-doctor-status".into())
-                    .w_full()
-                    .min_w_0()
-                    .p_2()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.card)
-                    .border_1()
-                    .border_color(p.border)
-                    .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_SM)
-                    .child(status.clone()),
-            );
-        }
         if let Some(status) = &self.history_status {
             root = root.child(
                 div()
@@ -12321,7 +10845,6 @@ impl SettingsView {
                     .child(status.clone()),
             );
         }
-        root = root.child(self.render_space_section(cx));
         root
     }
 }
@@ -12378,12 +10901,7 @@ impl SettingsView {
                                     .text_size(crate::ui::TEXT_LG)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(tab.label()),
-                            )
-                            .children(tab.badge().map(|badge_text| {
-                                crate::ui::badge(p, crate::ui::BadgeTone::Muted, badge_text)
-                                    .id("admin-page-badge")
-                                    .debug_selector(|| "admin-page-badge".into())
-                            })),
+                            ),
                     )
                     .child(
                         div()
@@ -12443,11 +10961,11 @@ impl Render for SettingsView {
                 (
                     if matches!(
                         self.tab,
-                        AdminTab::General
-                            | AdminTab::Terminal
+                        AdminTab::Appearance
                             | AdminTab::Agents
-                            | AdminTab::Workflows
-                            | AdminTab::Resources
+                            | AdminTab::Project
+                            | AdminTab::QuickCommands
+                            | AdminTab::System
                     ) {
                         c.settings.clone()
                     } else {
@@ -12464,27 +10982,6 @@ impl Render for SettingsView {
         let search_value = search_input.read(cx).value().to_string();
         let has_search_query = !search_value.is_empty();
         let matches = search::search_tabs(&search_value);
-        let groups: &[(&'static str, &[AdminTab])] = &[
-            (
-                text::GROUP_AI.get(),
-                &[AdminTab::Agents, AdminTab::Accounts],
-            ),
-            (
-                text::GROUP_SETUP.get(),
-                &[
-                    AdminTab::General,
-                    AdminTab::Terminal,
-                    AdminTab::Install,
-                    AdminTab::Shortcuts,
-                    AdminTab::Machines,
-                ],
-            ),
-            (
-                text::GROUP_WORKFLOW.get(),
-                &[AdminTab::Workflows, AdminTab::Mobile, AdminTab::Resources],
-            ),
-        ];
-
         let mut nav = div()
             .id("admin-sidebar")
             .debug_selector(|| "admin-sidebar".into())
@@ -12538,7 +11035,7 @@ impl Render for SettingsView {
                                 .filter(|_| !query.trim().is_empty())
                             {
                                 cx.stop_propagation();
-                                this.set_tab(tab, cx);
+                                this.set_tab(search::search_target(&query, tab), cx);
                             }
                         }),
                     )
@@ -12586,26 +11083,10 @@ impl Render for SettingsView {
             );
         }
 
-        for &(group_label, tabs) in groups {
-            let tabs: Vec<AdminTab> = tabs
-                .iter()
-                .copied()
-                .filter(|t| matches.contains(t))
-                .collect();
-            if tabs.is_empty() {
-                continue;
-            }
-            let mut group_col = div().flex_none().flex().flex_col().gap_1().child(
-                div()
-                    .px_2()
-                    .pt_1()
-                    .text_size(crate::ui::TEXT_XS)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(p.muted_foreground)
-                    .child(group_label),
-            );
-            for tab in tabs {
-                let selected = tab == current_tab;
+        {
+            let mut group_col = div().flex_none().flex().flex_col().gap_1();
+            for tab in matches.iter().copied() {
+                let selected = tab == current_tab.page();
                 group_col = group_col.child(
                     settings_nav_tab(tab, selected)
                         .focus_visible(|style| style.border_color(p.ring))
@@ -12630,24 +11111,11 @@ impl Render for SettingsView {
                         .hover(|d| d.bg(p.sidebar_accent).text_color(p.foreground))
                         .active(|d| d.bg(p.accent).text_color(p.foreground))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_tab(tab, cx);
+                            let query = this.search_query(cx);
+                            this.set_tab(search::search_target(&query, tab), cx);
                         }))
                         .child(tab.icon_element().small())
-                        .child(div().flex_1().min_w_0().truncate().child(tab.label()))
-                        .children(tab.badge().map(|badge_text| {
-                            div()
-                                .flex_none()
-                                .px_1p5()
-                                .py(px(1.))
-                                .rounded(crate::ui::RADIUS_XS)
-                                .bg(p.muted)
-                                .border_1()
-                                .border_color(p.border)
-                                .text_size(crate::ui::TEXT_2XS)
-                                .font_weight(gpui::FontWeight::NORMAL)
-                                .text_color(p.muted_foreground)
-                                .child(badge_text)
-                        })),
+                        .child(div().flex_1().min_w_0().truncate().child(tab.label())),
                 );
             }
             nav = nav.child(group_col);
@@ -12730,26 +11198,62 @@ impl Render for SettingsView {
                 )
         } else {
             let page_header = Self::render_page_header(current_tab, None, cx);
-            let body = match current_tab {
-                AdminTab::General => self.render_general_tab(&s, cx),
-                AdminTab::Terminal => self.render_terminal_tab(&s, window, cx),
+            let content = match current_tab {
+                AdminTab::Appearance => self
+                    .render_general_tab(&s, cx)
+                    .child(self.render_terminal_tab(&s, cx)),
                 AdminTab::Accounts => self.render_accounts_tab(window, cx),
                 AdminTab::Agents => self.render_agents_tab(&s, window, cx),
                 AdminTab::Install => self.render_install_tab(window, cx),
                 AdminTab::Machines => self.render_machines_tab(window, cx),
-                AdminTab::Workflows => self.render_workflows_tab(&s, window, cx),
+                AdminTab::Project => self.render_project_page(window, cx),
+                AdminTab::QuickCommands => self.render_quick_commands_page(&s, window, cx),
                 // OWE-799: 단축키 탭은 카테고리 그룹·로컬 검색·인라인 기록을 위해 window를 받는다.
                 AdminTab::Shortcuts => self.render_shortcuts_tab(window, cx),
-                AdminTab::Resources => self.render_resources_tab(&s, cx),
+                AdminTab::System => div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(self.render_system_rows(&s, cx))
+                    .child(self.render_resources_tab(&s, cx)),
+                AdminTab::Disk => div().child(self.render_space_section(cx)),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
-            }
-            .w_full()
-            .min_w_0()
-            .id("admin-tab-body")
-            .when(
-                !self.search_focus.rendered.get() && self.search_pending,
-                |body| body.anchor_scroll(Some(self.search_focus.anchor.clone())),
-            );
+            };
+            let device_tabs = (current_tab.page() == AdminTab::Machines).then(|| {
+                let segment = |id: &'static str, label: &'static str, tab: AdminTab| {
+                    layout::segment(p, id, label, current_tab == tab)
+                        .debug_selector(move || id.into())
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
+                };
+                layout::segmented_control(
+                    p,
+                    vec![
+                        segment(
+                            "admin-machines-segment",
+                            text::TAB_MACHINES.get(),
+                            AdminTab::Machines,
+                        ),
+                        segment(
+                            "admin-tab-mobile",
+                            crate::i18n::catalog::mobile::TAB.get(),
+                            AdminTab::Mobile,
+                        ),
+                    ],
+                )
+            });
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .children(device_tabs)
+                .child(content)
+                .w_full()
+                .min_w_0()
+                .id("admin-tab-body")
+                .when(
+                    !self.search_focus.rendered.get() && self.search_pending,
+                    |body| body.anchor_scroll(Some(self.search_focus.anchor.clone())),
+                );
 
             div()
                 .id("admin-content-column")

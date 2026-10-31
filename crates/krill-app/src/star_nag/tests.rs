@@ -343,12 +343,11 @@ impl Render for SurfaceHost {
             .relative()
             .size_full()
             .children(landing_star_pill(self.has_projects, cx))
-            .child(settings_support_control(cx))
     }
 }
 
 #[gpui::test]
-fn landing_pill_and_settings_support_share_star_state(cx: &mut gpui::TestAppContext) {
+fn landing_pill_tracks_star_state(cx: &mut gpui::TestAppContext) {
     let dir = temp_dir("surfaces");
     cx.update(gpui_component::init);
     cx.update(|cx| init(dir.clone(), cx));
@@ -363,13 +362,10 @@ fn landing_pill_and_settings_support_share_star_state(cx: &mut gpui::TestAppCont
     cx.run_until_parked();
 
     assert!(cx.debug_bounds("landing-star-pill").is_some());
-    assert!(cx.debug_bounds("settings-star-github").is_some());
-    assert!(cx.debug_bounds("settings-star-thanks").is_none());
 
-    // Clicking settings star button stars via gh and updates both settings and landing pill.
-    click("settings-star-github", cx);
+    // Clicking the landing pill stars via gh and keeps the pill as the starred state.
+    click("landing-star-pill", cx);
     cx.run_until_parked();
-    assert!(cx.debug_bounds("settings-star-thanks").is_some());
     assert!(cx.debug_bounds("landing-star-pill").is_some());
     assert!(nag(cx).0.completed);
 
