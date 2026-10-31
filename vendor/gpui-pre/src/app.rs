@@ -1,3 +1,4 @@
+// Krill modification (Apache-2.0 §4(b)): Bound per-frame element and event arena chunk sizes to reduce idle MALLOC_LARGE footprint.
 use scheduler::Instant;
 use std::{
     any::{TypeId, type_name},
@@ -1012,8 +1013,8 @@ impl App {
 
                 #[cfg(any(test, feature = "test-support", debug_assertions))]
                 name: None,
-                element_arena: RefCell::new(Arena::new(1024 * 1024)),
-                event_arena: Arena::new(1024 * 1024),
+                element_arena: RefCell::new(Arena::new(64 * 1024)),
+                event_arena: Arena::new(8 * 1024),
 
                 #[cfg(any(test, gpui_leak_detection))]
                 _ref_counts,

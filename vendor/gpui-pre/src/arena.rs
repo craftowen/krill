@@ -1,3 +1,4 @@
+// Krill modification (Apache-2.0 §4(b)): Release burst chunks beyond 2 in Arena::force_clear.
 use std::{
     alloc::{self, handle_alloc_error},
     cell::Cell,

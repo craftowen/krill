@@ -129,13 +129,13 @@ impl MetalAtlasTextures {
         kind: AtlasTextureKind,
     ) -> &mut MetalAtlasTexture {
         const DEFAULT_MONOCHROME_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(1024),
-            height: DevicePixels(1024),
-        };
-        // Krill 변경(OWE-779): BGRA 4B/px는 512×512가 Monochrome 1024×1024와 같은 1MiB다.
-        const DEFAULT_POLYCHROME_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(512),
             height: DevicePixels(512),
+        };
+        // Krill 변경(OWE-779): BGRA 4B/px는 256×256(256KiB)이 Monochrome 512×512와 같다.
+        const DEFAULT_POLYCHROME_SIZE: Size<DevicePixels> = Size {
+            width: DevicePixels(256),
+            height: DevicePixels(256),
         };
         // Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
         const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {

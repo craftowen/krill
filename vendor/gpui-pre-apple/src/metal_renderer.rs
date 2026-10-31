@@ -50,7 +50,7 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-const DEFAULT_INSTANCE_BUFFER_SIZE: usize = 512 * 1024;
+const DEFAULT_INSTANCE_BUFFER_SIZE: usize = 1024 * 1024;
 const INSTANCE_BUFFER_SHRINK_DELAY: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "macos")]
@@ -156,7 +156,7 @@ impl InstanceBufferPool {
                 self.small_frames_since = None;
             }
         }
-        if buffer.size == self.buffer_size && self.buffers.is_empty() {
+        if buffer.size == self.buffer_size && self.buffers.len() < 2 {
             self.buffers.push(buffer.metal_buffer)
         }
         relieve_malloc_pressure();
@@ -617,6 +617,10 @@ impl MetalRenderer {
             return;
         }
         self.back_buffers_trimmed = true;
+        self.release_path_intermediate_textures();
+        self.instance_buffer_pool
+            .lock()
+            .reset(DEFAULT_INSTANCE_BUFFER_SIZE);
         if let Some(layer) = &self.layer {
             // SAFETY: `layer` is a live `CAMetalLayer` owned by this renderer, and
             // `removeBackBuffers` is a void `CAMetalLayer` selector that drops idle
@@ -626,10 +630,6 @@ impl MetalRenderer {
                 let _: () = objc2::msg_send![objc2_layer, removeBackBuffers];
             }
         }
-        self.release_path_intermediate_textures();
-        self.instance_buffer_pool
-            .lock()
-            .reset(DEFAULT_INSTANCE_BUFFER_SIZE);
         relieve_malloc_pressure();
     }
 
