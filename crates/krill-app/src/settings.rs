@@ -11121,7 +11121,7 @@ impl Render for SettingsView {
             nav = nav.child(group_col);
         }
 
-        // 투명 제목 표시줄 위에 그리는 테마 색 제목 띠(신호등 버튼 자리 포함, 끌어서 창 이동).
+        // 투명 제목 표시줄 또는 중앙 모달 상단에 그리는 테마 색 제목 띠(우측 닫기 ✕ 버튼 포함).
         let titlebar = div()
             .id("admin-titlebar")
             .debug_selector(|| "admin-titlebar".into())
@@ -11130,7 +11130,8 @@ impl Render for SettingsView {
             .flex_none()
             .flex()
             .items_center()
-            .justify_center()
+            .justify_between()
+            .px_3()
             .bg(p.worktree_sidebar)
             .border_b_1()
             .border_color(p.border)
@@ -11138,7 +11139,18 @@ impl Render for SettingsView {
             .text_size(crate::ui::TEXT_XS)
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(p.muted_foreground)
-            .child(text::TITLE.get());
+            .child(div().w(px(24.)))
+            .child(div().child(text::TITLE.get()))
+            .child(
+                Button::new("admin-modal-close")
+                    .icon(IconName::Close)
+                    .ghost()
+                    .xsmall()
+                    .debug_selector(|| "admin-modal-close".into())
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        close_settings_page_for(Some(cx.entity_id()), window, cx);
+                    })),
+            );
 
         self.search_focus.rendered.set(false);
         let content_column = if matches.is_empty() {

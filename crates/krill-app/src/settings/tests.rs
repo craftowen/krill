@@ -1713,10 +1713,16 @@ fn resources_error_reporting_toggle_persists_separate_consent_and_revokes(cx: &m
         view.update(cx, |view, cx| view.set_tab(AdminTab::System, cx));
     });
     vcx.run_until_parked();
-    assert!(!error_reporting::status(&d).unwrap().consented);
+    assert!(error_reporting::status(&d).unwrap().consented);
     let toggle = vcx
         .debug_bounds("admin-error-reporting-toggle")
         .expect("missing error reporting control");
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(!error_reporting::status(&d).unwrap().consented);
+    let toggle = vcx
+        .debug_bounds("admin-error-reporting-toggle")
+        .expect("missing disabled error reporting control");
     vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     let status = error_reporting::status(&d).unwrap();
@@ -10319,5 +10325,71 @@ fn machines_add_same_label_opens_the_submitted_destination(cx: &mut TestAppConte
             MachinePage::Details(crate::hosts::HostId::Remote(new.id.clone()))
         );
     });
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn machines_overview_renders_local_hub_and_inline_remote_actions(cx: &mut TestAppContext) {
+    use crate::machines::{AddMethod, MachinePage};
+    let d = dir("machines-variant-a-overview");
+    init(cx, &d);
+    let hosts = crate::ssh_hosts::add_host(Some(&d), "oci-arm", "ubuntu@158.180.72.19", None, None)
+        .unwrap();
+    let host_id = hosts[0].id.clone();
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(1200.)));
+    vcx.update(|window, cx| {
+        let pairing = cx.new(|cx| {
+            crate::link_ui::PairingView::new(
+                std::sync::Arc::new(crate::link_ui::MockLinkBackend::new()),
+                window,
+                cx,
+            )
+        });
+        view.update(cx, |v, cx| {
+            v.remote_krill = Some(pairing);
+            v.ssh_hosts = hosts.clone();
+            v.set_tab(AdminTab::Machines, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-machines-local-section").is_some());
+    assert!(vcx.debug_bounds("admin-machine-local").is_some());
+    assert!(vcx.debug_bounds("admin-local-open-mobile").is_some());
+    assert!(vcx.debug_bounds("admin-local-open-invite").is_some());
+    assert!(vcx.debug_bounds("admin-machines-remote-section").is_some());
+    assert!(vcx.debug_bounds("admin-machines-add-ssh").is_some());
+    assert!(vcx.debug_bounds("admin-machines-add").is_some());
+
+    let conn_sel: &'static str = format!("admin-machine-connect-{host_id}").leak();
+    let test_sel: &'static str = format!("admin-machine-test-{host_id}").leak();
+    assert!(vcx.debug_bounds(conn_sel).is_some());
+    assert!(vcx.debug_bounds(test_sel).is_some());
+
+    // Clicking "휴대폰 QR 연결" switches to Mobile tab, and returning to Machines keeps overview.
+    let mobile_btn = vcx.debug_bounds("admin-local-open-mobile").unwrap();
+    vcx.simulate_click(mobile_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Mobile));
+
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Machines, cx)));
+    vcx.run_until_parked();
+
+    // Clicking "초대 링크 · 접속 관리" opens ThisComputer details.
+    let invite_btn = vcx.debug_bounds("admin-local-open-invite").unwrap();
+    vcx.simulate_click(invite_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).machine_page, MachinePage::ThisComputer));
+    assert!(vcx.debug_bounds("link-server-panel").is_some());
+
+    // Back to overview, then click "+ SSH 추가" to open SSH form directly.
+    let back_btn = vcx.debug_bounds("admin-machines-back").unwrap();
+    vcx.simulate_click(back_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let add_ssh_btn = vcx.debug_bounds("admin-machines-add-ssh").unwrap();
+    vcx.simulate_click(add_ssh_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).machine_page, MachinePage::Add(AddMethod::Ssh)));
+    assert!(vcx.debug_bounds("admin-ssh-form").is_some());
     fs::remove_dir_all(d).ok();
 }

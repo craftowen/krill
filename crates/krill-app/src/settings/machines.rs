@@ -106,45 +106,270 @@ impl SettingsView {
         crate::machines::project(routes)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Variant A overview combines local hub card and inline remote machine list with direct actions"
+    )]
     fn render_machine_overview(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let p = crate::ui::palette(cx);
+        let catalog = self.machine_catalog(cx);
+        let local_machine = catalog.iter().find(|m| m.is_local());
+        let remote_machines: Vec<&Machine> = catalog.iter().filter(|m| !m.is_local()).collect();
+
+        let mut local_hub = div().flex().flex_col().gap_2().child(layout::section_title(
+            p,
+            "admin-machines-local-section",
+            text::MACHINES_LOCAL_SECTION.get(),
+        ));
+        if let Some(machine) = local_machine {
+            let (color, state) = machine_status(machine.status(), p);
+            let badge_tone = match machine.status() {
+                HostStatus::Connected => crate::ui::BadgeTone::Success,
+                HostStatus::Connecting => crate::ui::BadgeTone::Warning,
+                HostStatus::Disconnected => crate::ui::BadgeTone::Muted,
+            };
+            local_hub = local_hub.child(
+                layout::row(p)
+                    .id("admin-machine-local")
+                    .debug_selector(|| "admin-machine-local".into())
+                    .role(gpui::Role::Button)
+                    .tab_index(0)
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.machine_page = MachinePage::ThisComputer;
+                            this.disarm(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .aria_label(machine.label().to_owned())
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.accent))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.machine_page = MachinePage::ThisComputer;
+                        this.disarm(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .flex_wrap()
+                                    .child(
+                                        div()
+                                            .text_size(crate::ui::TEXT_SM)
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child(machine.label().to_owned()),
+                                    )
+                                    .child(crate::ui::badge(p, badge_tone, state).child(
+                                        div().size(crate::ui::STATE_DOT).rounded_full().bg(color),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(text::MACHINES_LOCAL_HUB_DESC.get()),
+                            ),
+                    )
+                    .child(
+                        layout::controls()
+                            .child(
+                                layout::secondary(
+                                    "admin-local-open-mobile",
+                                    text::MACHINES_OPEN_MOBILE_QR.get(),
+                                )
+                                .debug_selector(|| "admin-local-open-mobile".into())
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.set_tab(AdminTab::Mobile, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                layout::secondary(
+                                    "admin-local-open-invite",
+                                    text::MACHINES_MANAGE_INVITE.get(),
+                                )
+                                .debug_selector(|| "admin-local-open-invite".into())
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.machine_page = MachinePage::ThisComputer;
+                                        this.disarm(cx);
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    ),
+            );
+        }
+
         let mut list = div()
             .id("admin-machines-list")
             .debug_selector(|| "admin-machines-list".into())
             .flex()
             .flex_col()
             .gap_2();
-        for machine in self.machine_catalog(cx) {
-            let selector = format!(
-                "admin-machine-{}",
-                machine.routes.first().map_or("local", |r| r.host.as_key())
+
+        if remote_machines.is_empty() {
+            list = list.child(
+                layout::card(p)
+                    .id("admin-machines-empty")
+                    .debug_selector(|| "admin-machines-empty".into())
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::MACHINES_EMPTY_REMOTE.get()),
             );
-            let page = if machine.is_local() {
-                MachinePage::ThisComputer
-            } else {
-                MachinePage::Details(
-                    machine
-                        .routes
-                        .first()
-                        .map_or(HostId::Local, |r| r.host.clone()),
-                )
-            };
+        }
+
+        for machine in remote_machines {
+            let key = machine
+                .routes
+                .first()
+                .map_or("local", |r| r.host.as_key())
+                .to_owned();
+            let selector = format!("admin-machine-{key}");
+            let detail_btn_id = format!("admin-machine-detail-{key}");
+            let page = MachinePage::Details(
+                machine
+                    .routes
+                    .first()
+                    .map_or(HostId::Local, |r| r.host.clone()),
+            );
             let keyboard_page = page.clone();
+            let detail_page = page.clone();
             let (color, state) = machine_status(machine.status(), p);
-            let methods = machine
+
+            let ssh_host = machine
                 .routes
                 .iter()
-                .filter(|r| r.kind != RouteKind::Local)
-                .map(|r| route_label(r.kind))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let description = if machine.is_local() {
-                text::MACHINES_LOCAL_DESC.get().to_owned()
-            } else if machine.routes.iter().all(|r| r.identity.is_none()) {
-                format!("{methods}. {}", text::MACHINES_UNKNOWN.get())
+                .filter(|r| r.kind == RouteKind::Ssh)
+                .find_map(|r| {
+                    self.ssh_hosts
+                        .iter()
+                        .find(|h| Some(h.id.as_str()) == r.host.remote_id())
+                        .cloned()
+                });
+
+            let address_line = if let Some(host) = &ssh_host {
+                host.format_summary()
             } else {
-                methods
+                text::MACHINES_INVITE_ROUTE_DESC.get().to_owned()
             };
+
+            let mut title_row = div()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(crate::ui::TEXT_SM)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child(machine.label().to_owned()),
+                );
+
+            for route in machine.routes.iter().filter(|r| r.kind != RouteKind::Local) {
+                let tone = match route.kind {
+                    RouteKind::Ssh => crate::ui::BadgeTone::Neutral,
+                    RouteKind::Invite => crate::ui::BadgeTone::Accent,
+                    RouteKind::Local => crate::ui::BadgeTone::Muted,
+                };
+                title_row = title_row.child(crate::ui::badge(p, tone, route_label(route.kind)));
+            }
+
+            title_row = title_row.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(color)
+                            .child(state),
+                    ),
+            );
+
+            let mut row_controls = layout::controls();
+            if let Some(host) = ssh_host {
+                let ssh_status = self.ssh_host_status(&host.id);
+                let conn_id = format!("admin-machine-connect-{}", host.id);
+                let disc_id = format!("admin-machine-disconnect-{}", host.id);
+                let test_id = format!("admin-machine-test-{}", host.id);
+                let host_conn = host.clone();
+                let host_disc = host.clone();
+                let host_test = host.clone();
+                let connect_or_disconnect = if ssh_status == SshHostCardStatus::Connected {
+                    layout::secondary(
+                        gpui::ElementId::Name(disc_id.clone().into()),
+                        text::SSH_DISCONNECT.get(),
+                    )
+                    .debug_selector(move || disc_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.disconnect_ssh_host(&host_disc, cx);
+                    }))
+                } else {
+                    layout::secondary(
+                        gpui::ElementId::Name(conn_id.clone().into()),
+                        text::SSH_CONNECT.get(),
+                    )
+                    .debug_selector(move || conn_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.connect_ssh_host(host_conn.clone(), cx);
+                    }))
+                };
+                let testing = self.is_ssh_test_pending(&host.id);
+                let test_btn = crate::ui::button_with_reserved_label(
+                    gpui::ElementId::Name(test_id.clone().into()),
+                    text::SSH_TEST.get(),
+                    text::SSH_TESTING.get(),
+                    testing,
+                )
+                .outline()
+                .small()
+                .disabled(testing)
+                .debug_selector(move || test_id.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.test_ssh_host(host_test.clone(), cx);
+                }));
+                row_controls = row_controls.child(connect_or_disconnect).child(test_btn);
+            }
+
+            row_controls = row_controls.child(
+                layout::ghost(
+                    gpui::ElementId::Name(detail_btn_id.clone().into()),
+                    text::MACHINES_DETAIL_BUTTON.get(),
+                )
+                .debug_selector(move || detail_btn_id.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.machine_page = detail_page.clone();
+                    this.disarm(cx);
+                    cx.notify();
+                })),
+            );
+
             list = list.child(
                 layout::row(p)
                     .id(SharedString::from(selector.clone()))
@@ -167,33 +392,79 @@ impl SettingsView {
                         this.disarm(cx);
                         cx.notify();
                     }))
-                    .child(layout::label(p, machine.label().to_owned(), description))
                     .child(
-                        layout::controls()
-                            .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(title_row)
                             .child(
                                 div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(crate::ui::FONT_MONO)
                                     .text_size(crate::ui::TEXT_XS)
-                                    .text_color(color)
-                                    .child(state),
+                                    .text_color(p.muted_foreground)
+                                    .child(address_line),
                             ),
-                    ),
+                    )
+                    .child(row_controls),
             );
         }
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div().flex().justify_end().child(
-                    layout::primary("admin-machines-add", text::MACHINES_ADD.get())
-                        .debug_selector(|| "admin-machines-add".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_machine_add(AddMethod::Invite, cx);
-                        })),
-                ),
-            )
-            .child(list)
+
+        div().flex().flex_col().gap_4().child(local_hub).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .pt_2()
+                        .pb_1()
+                        .border_b_1()
+                        .border_color(p.border)
+                        .child(
+                            div()
+                                .id("admin-machines-remote-section")
+                                .debug_selector(|| "admin-machines-remote-section".into())
+                                .text_size(crate::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.muted_foreground)
+                                .child(text::MACHINES_REMOTE_SECTION.get()),
+                        )
+                        .child(
+                            layout::controls()
+                                .child(
+                                    layout::secondary(
+                                        "admin-machines-add-ssh",
+                                        text::MACHINES_ADD_SSH.get(),
+                                    )
+                                    .debug_selector(|| "admin-machines-add-ssh".into())
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.show_machine_add(AddMethod::Ssh, cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    layout::primary("admin-machines-add", text::MACHINES_ADD.get())
+                                        .debug_selector(|| "admin-machines-add".into())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.show_machine_add(AddMethod::Invite, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .child(list)
+                .child(self.render_ssh_status(cx)),
+        )
     }
 
     fn render_machine_details(

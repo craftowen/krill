@@ -78,7 +78,6 @@ impl LabelDesc for SharedString {
 pub fn label(p: &Palette, title: impl Into<SharedString>, desc: impl LabelDesc) -> Div {
     let title: SharedString = title.into();
     let desc = desc.into_label_desc();
-    let help = desc.clone().map(|d| help_dot(p, &title, &d));
     div()
         .flex_1()
         .min_w_0()
@@ -93,8 +92,7 @@ pub fn label(p: &Palette, title: impl Into<SharedString>, desc: impl LabelDesc) 
                 .gap_1p5()
                 .text_size(TEXT_SM)
                 .font_weight(FontWeight::MEDIUM)
-                .child(title)
-                .children(help),
+                .child(title),
         )
         .children(desc.map(|desc| {
             div()
@@ -103,30 +101,6 @@ pub fn label(p: &Palette, title: impl Into<SharedString>, desc: impl LabelDesc) 
                 .text_color(p.muted_foreground)
                 .child(desc)
         }))
-}
-
-/// 설정 행 제목 옆의 (?) 도움말 점. 설명이 눈에 안 들어오거나 잘릴 때 호버하면
-/// 같은 설명 문구를 툴팁으로 다시 보여준다.
-fn help_dot(p: &Palette, title: &SharedString, desc: &SharedString) -> Stateful<Div> {
-    let tip = desc.clone();
-    let debug = format!("label-help:{title}");
-    let element_id: ElementId = format!("label-help-{title}").into();
-    div()
-        .id(element_id)
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(px(14.))
-        .rounded_full()
-        .border_1()
-        .border_color(p.border)
-        .text_size(TEXT_2XS)
-        .text_color(p.muted_foreground)
-        .cursor_pointer()
-        .child("?")
-        .debug_selector(move || debug.clone())
-        .tooltip(move |window, cx| tooltip_view("label-help", tip.clone(), window, cx))
 }
 
 /// 세로 스택 입력 폼(대화상자 등)에서 `<Input>` 위에 놓는 필드 라벨과 선택 꼬리표.
