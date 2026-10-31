@@ -19,7 +19,6 @@
 //! 개발 경로의 재기동 주체는 클라이언트(OWE-493): 인계 소켓이 준비되면 감시 연결에 holder 상실을 알리고,
 //! `krill_proto::daemon::connect`가 기동 락 아래 새 `krill-holder --detach`를 띄운다. 서명 경로는 MK-106에서 전환한다.
 
-#[cfg(unix)]
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -44,7 +43,6 @@ use crate::ipc::{Listener, with_suffix};
 use crate::os::AsFd;
 use crate::registry::Registry;
 use crate::sys;
-#[cfg(unix)]
 use crate::sys::ExitWatch;
 
 /// 인계 소켓 이름 = 소켓 경로 + 이 접미사. `.tmp`와 길이가 같아 [`Listener::bind`]의 경로 길이 검사 안에 든다.
@@ -99,7 +97,6 @@ pub fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
 /// 끝나지 않은 세션마다 `NOTE_EXIT`를 걸고, 끝나면 [`STATUS_UNKNOWN`]으로 알린다(holder가 없어 종료 코드는 없다).
 // ponytail: holder가 죽은 뒤 등록하기 전에 세션이 끝나고 pid가 재사용되면 엉뚱한 프로세스를 본다. 창은 holder 링크
 // EOF부터 등록까지(수 ms 추정). 줄이려면 등록 뒤 proc 시작 시각을 세션 시작 시각과 대조한다.
-#[cfg(unix)]
 fn watch_exits(reg: &Arc<Registry>) {
     let Ok(watch) = ExitWatch::new() else { return };
     let mut by_pid = HashMap::new();
@@ -126,11 +123,6 @@ fn watch_exits(reg: &Arc<Registry>) {
             }
         })
         .ok();
-}
-
-#[cfg(windows)]
-fn watch_exits(reg: &Arc<Registry>) {
-    windows::watch_exits(reg);
 }
 
 /// 리더를 멈추고 세션을 모두 넘긴 뒤 상대의 `Ready`를 기다린다.

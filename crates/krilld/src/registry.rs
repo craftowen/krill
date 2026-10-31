@@ -478,7 +478,6 @@ impl Registry {
     }
 
     /// 아직 끝나지 않은 세션의 id·pid.
-    #[cfg(unix)]
     pub(crate) fn running(&self) -> Vec<(SessionId, u32)> {
         let st = lock(&self.state);
         st.sessions

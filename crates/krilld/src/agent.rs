@@ -18,9 +18,9 @@ use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::usage::ProviderKind;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::process::{Command, Stdio};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::time::{Duration, Instant};
 
 use crate::shell::{Launch, Shell};

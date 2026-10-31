@@ -9,8 +9,10 @@
 //!   호스트 기본 자격증명(`Claude Code-credentials`, `~/.claude/.credentials.json`)에도 동기화한다.
 //! - `OpenCode`(`opencode`): 선택된 프로필의 `data/opencode/auth.json`을 `~/.local/share/opencode/auth.json`에 동기화한다.
 
+#[cfg(target_os = "macos")]
 use std::io::Write as _;
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 
 use krill_proto::usage::ProviderKind;
