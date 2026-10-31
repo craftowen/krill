@@ -55,6 +55,8 @@ tikv-jemalloc-ctl = "0.7.0"
 unicode-width = "0.2.2"
 # krilld setup 스크립트 신뢰 해시(MK-042). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
 sha2 = "0.10.9"
+# 앱 날짜 표시는 gpui 의존성에 이미 잠긴 chrono로 시스템 시간대(DST 포함)를 따른다.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 # MK-063: 자체 업데이터 latest.json Ed25519 서명 검증(T4-D14). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
 ring = "0.17.14"
 # Orca macOS safeStorage account-vault import (Chromium v10 AES-CBC).

@@ -335,16 +335,14 @@ fn owe883_user_facing_lines_hide_debug_and_english_internals() {
         assert_ne!(orchestration_task_status_label(status), raw);
     }
 
-    // 스케줄 실행 시각: epoch 분 대신 날짜·시각(UTC).
-    assert_eq!(schedules::format_run_minute(0), "1970-01-01 00:00 (UTC)");
-    assert_eq!(
-        schedules::format_run_minute(29_453_760),
-        "2026-01-01 00:00 (UTC)"
-    );
-    assert_eq!(
-        schedules::format_run_minute(29_871_930),
-        "2026-10-18 09:30 (UTC)"
-    );
+    // 실행 시각은 저장된 UTC epoch를 기기의 시스템 시간대로 변환한다.
+    for minute in [0, 29_453_760, 29_871_930] {
+        assert_eq!(
+            schedules::format_run_minute(minute),
+            crate::local_time::format_timestamp(i64::try_from(minute * 60).unwrap()).unwrap()
+        );
+    }
+    assert!(schedules::format_run_minute(u64::MAX).is_empty());
 
     // 업데이터 오류: 영문 Display 원문이 아니라 사용자용 문구.
     for err in [

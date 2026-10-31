@@ -26,12 +26,16 @@ pub enum Event {
 }
 
 /// 검색 결과 요약 문구. 일치 항목이 있으면 `1/N`, 없으면 `"0건"`, 아직 응답이 없으면 빈 문자열.
+/// 전체 이력을 검색하지 못했고 일치도 없으면 결과 없음으로 단정하지 않고 일부 검색으로 표시한다.
 /// 이력이 바뀌어 처음부터 시작하면 `" 오래됨"`, 끝에서 순환하면 `" 순환"`을 붙인다.
 /// AS-15: 데몬이 `u64::MAX`를 보내도 panic 없이 포화한다.
 pub fn status_text(result: Option<&SearchResult>) -> String {
     let Some(r) = result else {
         return String::new();
     };
+    if r.incomplete && r.hit.is_none() {
+        return text::INCOMPLETE.get().to_owned();
+    }
     let base = match &r.hit {
         Some(hit) => format!("{}/{}", hit.index.saturating_add(1), r.total),
         None => text::EMPTY.get().to_owned(),
@@ -259,17 +263,37 @@ impl Render for Bar {
                         .on_click(cx.listener(|bar, _, _, cx| bar.toggle_option(true, cx))),
                 )
             })
-            .when(!self.status.is_empty(), |d| {
-                d.child(
-                    div()
-                        .debug_selector(|| "search-status".into())
-                        .px_1()
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(muted)
-                        .child(self.status.clone()),
-                )
-            })
+            .child(
+                div()
+                    .id("search-status")
+                    .debug_selector(|| "search-status".into())
+                    .px_1()
+                    .font_family(crate::ui::FONT_MONO)
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(muted)
+                    .when(
+                        self.result
+                            .as_ref()
+                            .is_some_and(|r| r.incomplete && r.hit.is_none()),
+                        |status| {
+                            status.tooltip(|window, cx| {
+                                crate::ui::tooltip_view(
+                                    "search-incomplete",
+                                    text::INCOMPLETE_HELP.get(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                        },
+                    )
+                    .grid()
+                    // 실패·빈 결과·대기 사이에 입력칸과 탐색 버튼이 움직이지 않게 예약한다.
+                    .children(
+                        [text::EMPTY.get(), text::INCOMPLETE.get()]
+                            .map(|label| div().row_start(1).col_start(1).invisible().child(label)),
+                    )
+                    .child(div().row_start(1).col_start(1).child(self.status.clone())),
+            )
             .child(
                 crate::ui::button_with_tooltip(
                     Button::new("search-prev")

@@ -128,7 +128,14 @@ fn display_labels_format_type_size_and_timestamps_like_orca() {
     assert_eq!(format_byte_size(None), "—");
     assert_eq!(
         format_timestamp_short(md_item.artifact.updated_at.as_deref()),
-        "2026-10-25 14:32"
+        crate::local_time::format_timestamp(
+            krill_proto::time::parse_reset_epoch("2026-10-25T14:32:10Z").unwrap()
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        format_timestamp_short(Some("2026-10-25T14:32:10Z")),
+        format_timestamp_short(Some("2026-10-25T23:32:10+09:00"))
     );
     assert_eq!(format_timestamp_short(Some("2026-11-23")), "2026-11-23");
     assert_eq!(format_timestamp_short(None), "—");

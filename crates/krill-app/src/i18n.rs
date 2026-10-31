@@ -1162,6 +1162,8 @@ catalog! {
         NEXT => ("다음 일치 (↓)", "Next match (↓)"),
         CLOSE => ("검색 닫기 (Esc)", "Close search (Esc)"),
         EMPTY => ("0건", "0 matches"),
+        INCOMPLETE => ("일부 검색", "Partial"),
+        INCOMPLETE_HELP => ("일부 기록을 검색하지 못했습니다. 검색을 다시 실행할 수 있습니다.", "Some history could not be searched. You can run the search again."),
         STALE => ("오래됨", "Stale"),
         WRAPPED => ("순환", "Wrapped"),
     }
@@ -1807,7 +1809,7 @@ catalog! {
         SCHEDULE_VIEW_LOG => ("로그 보기", "View Log"),
         SCHEDULE_CLOSE_LOG => ("로그 닫기", "Close Log"),
         SCHEDULE_LOG_TITLE => ("실행 로그: {id} · {datetime}", "Run Log: {id} · {datetime}"),
-        SCHEDULE_RUN_TIME => ("{date} {time} (UTC)", "{date} {time} (UTC)"),
+        SCHEDULE_RUN_TIME => ("{date} {time} ({timezone})", "{date} {time} ({timezone})"),
         SCHEDULE_RUN_EXIT => ("종료 {code}", "exit {code}"),
         SCHEDULE_RUN_SESSION => ("세션 #{id}", "session #{id}"),
         SCHEDULE_LOG_EMPTY => ("(캡처된 터미널 출력이 없습니다)", "(No terminal output captured)"),

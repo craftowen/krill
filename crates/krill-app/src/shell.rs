@@ -4469,6 +4469,15 @@ impl Shell {
                 let old = resume.filter(|r| want.is_none() || want == Some(*r));
                 let got = bg
                     .spawn(async move {
+                        let diagnostic = pane::StartAttempt {
+                            pane: pane.get(),
+                            wanted_session: want,
+                            attempt,
+                            remote: is_remote,
+                        };
+                        let report = |operation: &'static str, error: &std::io::Error| {
+                            pane::record_start_failure(operation, error, Some(diagnostic));
+                        };
                         // A session already seen alive can attach directly. Avoid
                         // hook setup and Hibernation/List on every tab switch.
                         // Launch metadata is still queried because hooks can rebind
@@ -4479,7 +4488,9 @@ impl Shell {
                             && !allow_cold_resume
                             && let Some(session) = want
                         {
-                            match pane::attach(&p, session, known) {
+                            match pane::attach(&p, session, known)
+                                .inspect_err(|e| report("attach", e))
+                            {
                                 Ok(linked) => {
                                     return Ok(Got::Live {
                                         session,
@@ -4500,26 +4511,38 @@ impl Shell {
                         let (session, prior_cold) = match old {
                             // 앞서 보낸 생성 요청의 결과를 모른다: 아는 세션만 찾고 만들지 않는다.
                             _ if uncertain => match want {
-                                Some(want) => match pane::find_session_in(&p, want)? {
-                                    Some(pane::Found::Live(session, _)) => (session, None),
-                                    Some(pane::Found::Cold(session, cold)) => {
-                                        return Ok(Got::Cold(session, cold));
+                                Some(want) => {
+                                    match pane::find_session_in(&p, want).inspect_err(|e| {
+                                        report("find_session", e);
+                                    })? {
+                                        Some(pane::Found::Live(session, _)) => (session, None),
+                                        Some(pane::Found::Cold(session, cold)) => {
+                                            return Ok(Got::Cold(session, cold));
+                                        }
+                                        None => return Ok(Got::Stopped),
                                     }
-                                    None => return Ok(Got::Stopped),
-                                },
+                                }
                                 None => return Ok(Got::Stopped),
                             },
-                            Some(old) => match pane::resume_session_in(&p, Some(old), &launch) {
+                            Some(old) => match pane::resume_session_in(&p, Some(old), &launch)
+                                .inspect_err(|e| report("resume", e))
+                            {
                                 Ok(session) => {
                                     (session, pane::load_cold(&p, old).map(|c| (old, c)))
                                 }
                                 // 사용자가 직접 누른 "다시 시작"인데 옛 세션이 이미 닫혔다: 새 세션으로 잇는다.
-                                Err(e) if pane::is_session_gone(&e) => {
-                                    (pane::resume_session_in(&p, None, &launch)?, None)
-                                }
+                                Err(e) if pane::is_session_gone(&e) => (
+                                    pane::resume_session_in(&p, None, &launch)
+                                        .inspect_err(|e| report("create", e))?,
+                                    None,
+                                ),
                                 Err(e) => return Err(e),
                             },
-                            None => match pane::ensure_session_in(&p, want, &launch)? {
+                            None => match pane::ensure_session_in(&p, want, &launch).inspect_err(
+                                |e| {
+                                    report(if want.is_some() { "restore" } else { "create" }, e);
+                                },
+                            )? {
                                 pane::Found::Live(session, _) => (session, None),
                                 // OWE-842(시나리오 B): 재부팅 등으로 이전 세션이 콜드가 되었으면
                                 // 같은 cwd·셸 설정으로 새 세션을 즉시 자동 재스폰하고,
@@ -4529,7 +4552,10 @@ impl Shell {
                                     if !allow_cold_resume {
                                         return Ok(Got::Cold(cold_session, cold));
                                     }
-                                    match pane::resume_session_in(&p, Some(cold_session), &launch) {
+                                    match pane::resume_session_in(&p, Some(cold_session), &launch)
+                                        .inspect_err(|e| {
+                                            report("resume_cold", e);
+                                        }) {
                                         Ok(new_session) => {
                                             (new_session, Some((cold_session, cold)))
                                         }
@@ -4549,7 +4575,8 @@ impl Shell {
                             return Err(std::io::ErrorKind::Interrupted.into());
                         }
                         let known = known.filter(|_| want == Some(session));
-                        match pane::attach(&p, session, known) {
+                        match pane::attach(&p, session, known).inspect_err(|e| report("attach", e))
+                        {
                             Ok(linked) => Ok(Got::Live {
                                 session,
                                 linked: Ok(linked),

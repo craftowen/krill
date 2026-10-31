@@ -4,6 +4,8 @@
 // 디스플레이 틱에 `require_presentation`으로 다시 present한다.
 // Krill 변경(앱 멈춤, Apache-2.0 §4(b)): `displayLayer:`(즉시 그리기)·창 활성화 때 디스플레이 링크를 멈췄다 다시 켜지
 // 않는다. 같은 디스플레이를 이미 구독 중이면 `start_display_link`가 그대로 둔다(매번 CVDisplayLink 스레드가 새로 생겼다).
+// Krill modification (Apache-2.0 §4(b)): resume deferred presentation when an
+// on-demand drawable arrives, instead of retaining an unused prefetched drawable.
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -1168,6 +1170,41 @@ impl MacWindow {
                 sheet_parent: None,
             }));
             let mut window = Self(state, marker);
+            let drawable_window = Arc::downgrade(&window.0);
+            window
+                .0
+                .lock()
+                .renderer
+                .set_drawable_ready_callback(Arc::new(move || {
+                    let state = drawable_window.clone();
+                    let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
+                    DispatchQueue::main().exec_async(move || {
+                        let Some(state) = state.upgrade() else {
+                            return;
+                        };
+                        let mut lock = state.lock();
+                        let running = lock
+                            .frame_source
+                            .as_ref()
+                            .is_some_and(WindowFrameSource::is_running);
+                        let MacWindowState {
+                            present_pending,
+                            request_frame_callback,
+                            ..
+                        } = &mut *lock;
+                        let Some((mut callback, request)) = take_ready_presentation(
+                            present_pending,
+                            request_frame_callback,
+                            running,
+                            signal_at.map(|at| (at, FrameRequestSource::NativeCallback)),
+                        ) else {
+                            return;
+                        };
+                        drop(lock);
+                        callback(request);
+                        state.lock().request_frame_callback = Some(callback);
+                    });
+                }));
             spawn_display_link_watchdog(&window.0);
 
             (*native_window).set_ivar(
@@ -3459,6 +3496,21 @@ fn take_frame_request(
     }
 }
 
+/// Hidden/closing windows and callbacks already in progress keep their pending
+/// presentation. A display tick may also have consumed a readiness notification.
+fn take_ready_presentation(
+    pending: &mut bool,
+    callback: &mut Option<Box<dyn FnMut(RequestFrameOptions)>>,
+    source_running: bool,
+    signal: Option<(std::time::Instant, FrameRequestSource)>,
+) -> Option<(Box<dyn FnMut(RequestFrameOptions)>, RequestFrameOptions)> {
+    if !source_running || !*pending {
+        return None;
+    }
+    let callback = callback.take()?;
+    Some((callback, take_frame_request(pending, signal)))
+}
+
 extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
@@ -4098,6 +4150,45 @@ mod tests {
         assert_eq!(link_stall(false, false, &mut last, t0 + ms(9000)), None);
         assert_eq!(last, None, "hidden windows reset the clock");
         assert_eq!(link_stall(true, false, &mut last, t0 + ms(9500)), None);
+    }
+
+    #[test]
+    fn ready_presentation_waits_for_visible_host_and_deliverable_callback() {
+        let calls = Rc::new(Cell::new(0));
+        let observed = calls.clone();
+        let mut callback: Option<Box<dyn FnMut(RequestFrameOptions)>> =
+            Some(Box::new(move |request| {
+                assert!(request.require_presentation);
+                observed.set(observed.get() + 1);
+            }));
+        let mut pending = true;
+        let at = std::time::Instant::now();
+        let signal = Some((at, FrameRequestSource::LocalSchedule));
+        assert!(take_ready_presentation(&mut pending, &mut callback, false, signal).is_none());
+        assert!(pending);
+        assert!(callback.is_some());
+        assert_eq!(calls.get(), 0);
+
+        let in_progress = callback.take();
+        assert!(take_ready_presentation(&mut pending, &mut callback, true, signal).is_none());
+        assert!(pending, "a borrowed callback must not discard the retry");
+        callback = in_progress;
+
+        let (mut deliver, request) =
+            take_ready_presentation(&mut pending, &mut callback, true, signal).unwrap();
+        assert_eq!(request.signal_at, Some(at));
+        assert_eq!(request.signal_source, FrameRequestSource::LocalSchedule);
+        deliver(request);
+        callback = Some(deliver);
+        assert!(!pending);
+        assert_eq!(calls.get(), 1);
+        assert!(take_ready_presentation(&mut pending, &mut callback, true, signal).is_none());
+        assert!(callback.is_some());
+
+        pending = true;
+        assert!(take_frame_request(&mut pending, signal).require_presentation);
+        assert!(take_ready_presentation(&mut pending, &mut callback, true, signal).is_none());
+        assert_eq!(calls.get(), 1, "a late notification must not present twice");
     }
 
     #[test]

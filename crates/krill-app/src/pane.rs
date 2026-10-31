@@ -17,8 +17,12 @@
 //! 연결은 [`daemon::connect`]로 붙는다(holder까지 죽었을 때만 기동, OWE-491). krilld 기동·재기동은 셸의 감시 연결이 맡는다(MK-025·MK-026).
 
 mod context;
+mod diagnostics;
 mod hibernation;
+mod search_hit;
 mod stable_history;
+
+pub use diagnostics::{StartAttempt, record_start_failure};
 
 use krill_proto::os::net::UnixStream;
 use std::io::{self, Write};
@@ -163,18 +167,25 @@ pub enum Found {
 /// 돼도 빈 화면 대신 마지막 기록을 보여준다). 없거나 실패하면 `None`.
 /// 잠정 결정 의존: MK-024 세그먼트 저장소(krilld `Request::Cold`).
 pub fn load_cold(target: impl Into<HostTarget>, session: SessionId) -> Option<Cold> {
-    let target = target.into();
-    let (mut s, features) = reconnect(&target, FEAT_CONTROL).ok()?;
-    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok()?;
+    load_cold_inner(&target.into(), session)
+        .inspect_err(|error| record_start_failure("load_cold", error, None))
+        .ok()
+        .flatten()
+}
+
+fn load_cold_inner(target: &HostTarget, session: SessionId) -> io::Result<Option<Cold>> {
+    let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
     if features & FEAT_COLD == 0 {
-        return None;
+        return Ok(None);
     }
-    s.write_all(&Request::Cold { session }.encode().ok()?)
-        .ok()?;
-    let (k, b) = read(&mut s).ok()?;
-    match Reply::decode(k, &b).ok()? {
-        Reply::Cold(cold) => Some(cold),
-        _ => None,
+    s.write_all(&Request::Cold { session }.encode()?)?;
+    let (k, b) = read(&mut s)?;
+    match Reply::decode(k, &b)? {
+        Reply::Cold(cold) => Ok(Some(cold)),
+        Reply::Failed(krill_proto::control::Failure::NoSession) => Ok(None),
+        Reply::Failed(failure) => Err(failure_to_io_error(failure)),
+        _ => Err(io::ErrorKind::InvalidData.into()),
     }
 }
 
@@ -397,12 +408,14 @@ fn unexpected_reply() -> io::Error {
 
 pub fn failure_to_io_error(failure: krill_proto::control::Failure) -> io::Error {
     match failure {
-        krill_proto::control::Failure::NoHolder => io::Error::other(failure.to_string()),
+        krill_proto::control::Failure::NoHolder => {
+            diagnostics::failure_error(io::ErrorKind::Other, failure)
+        }
         krill_proto::control::Failure::Os(errno) => io::Error::from_raw_os_error(errno),
         krill_proto::control::Failure::NoSession => {
             io::Error::new(io::ErrorKind::InvalidInput, SessionGone)
         }
-        other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
+        other => diagnostics::failure_error(io::ErrorKind::InvalidInput, other),
     }
 }
 
@@ -560,7 +573,7 @@ fn agent_call(target: &HostTarget, request: &Request) -> io::Result<Option<Reply
     stream.write_all(&request.encode()?)?;
     let (kind, body) = read(&mut stream)?;
     match Reply::decode(kind, &body)? {
-        Reply::Failed(failure) => Err(io::Error::other(failure.to_string())),
+        Reply::Failed(failure) => Err(diagnostics::failure_error(io::ErrorKind::Other, failure)),
         reply => Ok(Some(reply)),
     }
 }
@@ -568,10 +581,13 @@ fn agent_call(target: &HostTarget, request: &Request) -> io::Result<Option<Reply
 /// 화면 연결의 쓰기 쪽. `write` 한 번(프레임 하나)을 쓰기 스레드에 넘기고 바로 돌아온다 — 큰 붙여넣기도 UI 스레드를
 /// 막지 않는다(OWE-579). 쓰기가 실패하거나 [`WRITE_TIMEOUT`]만큼 막히면, 또는 이 값을 버리면 스레드가 소켓을 닫는다.
 /// 그러면 읽는 쪽이 EOF를 받아 셸이 다시 붙는다(끊긴 채 열린 연결에 입력이 보류되지 않는다).
+/// 큐 적재 실패는 즉시 소켓을 종료해 재연결 중 이전 큐의 미전송 입력을 추가로 보내지 않는다.
 #[derive(Debug)]
 pub struct Writer {
     send: mpsc::SyncSender<PendingWrite>,
     bytes: Arc<AtomicUsize>,
+    socket: Arc<UnixStream>,
+    failed: bool,
 }
 
 /// 설계 상한: ACK 대기 입력 1MiB와 제어 프레임 여유를 합친다. 쓰는 중인 프레임도 포함한다.
@@ -597,8 +613,10 @@ impl Writer {
         Self::spawn_for(s, None)
     }
 
-    fn spawn_for(mut s: UnixStream, target: Option<HostTarget>) -> io::Result<Self> {
+    fn spawn_for(s: UnixStream, target: Option<HostTarget>) -> io::Result<Self> {
         s.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
+        let socket = Arc::new(s);
+        let stream = Arc::clone(&socket);
         let (tx, rx) = mpsc::sync_channel::<PendingWrite>(WRITE_QUEUE_FRAMES);
         let bytes = Arc::new(AtomicUsize::new(0));
         thread::Builder::new()
@@ -606,31 +624,49 @@ impl Writer {
             .spawn(move || {
                 let _connection_owner = target;
                 while let Ok(frame) = rx.recv() {
-                    if s.write_all(&frame.frame).is_err() {
+                    if stream.as_ref().write_all(&frame.frame).is_err() {
                         break;
                     }
                 }
-                s.shutdown(Shutdown::Both).ok();
+                stream.shutdown(Shutdown::Both).ok();
             })?;
-        Ok(Self { send: tx, bytes })
+        Ok(Self {
+            send: tx,
+            bytes,
+            socket,
+            failed: false,
+        })
+    }
+
+    fn fail(&mut self, kind: io::ErrorKind) -> io::Error {
+        self.failed = true;
+        // Pane abandons this stream on write failure. Stop queued writes before
+        // a replacement connection can deliver newer input to the same PTY.
+        self.socket.shutdown(Shutdown::Both).ok();
+        kind.into()
     }
 }
 
 impl Write for Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
         self.bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 held.checked_add(buf.len())
                     .filter(|n| *n <= WRITE_QUEUE_BYTES)
             })
-            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+            .map_err(|_| self.fail(io::ErrorKind::WouldBlock))?;
         let pending = PendingWrite {
             frame: buf.to_vec(),
             bytes: Arc::clone(&self.bytes),
         };
-        self.send.try_send(pending).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => io::Error::from(io::ErrorKind::WouldBlock),
-            mpsc::TrySendError::Disconnected(_) => io::Error::from(io::ErrorKind::BrokenPipe),
+        self.send.try_send(pending).map_err(|error| {
+            self.fail(match error {
+                mpsc::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                mpsc::TrySendError::Disconnected(_) => io::ErrorKind::BrokenPipe,
+            })
         })?;
         Ok(buf.len())
     }
@@ -752,6 +788,8 @@ struct SearchState {
     scrolled: bool,
     /// 현재 활성 일치 1개(데몬이 준 범위).
     highlight: Option<crate::terminal::Highlight>,
+    /// 화면 일치는 출력 갱신 때 셀 내용을 다시 확인한다. 수동 이동 뒤에는 재활성화하지 않는다.
+    track_screen_hit: bool,
     /// 보이는 화면의 일치 범위 전부(활성 포함 가능, 엷게 칠한다).
     highlights: Vec<crate::terminal::Highlight>,
     row_marks: Vec<Vec<(u16, u16)>>,
@@ -859,6 +897,7 @@ impl SearchState {
         self.top_request = None;
         self.scrolled = false;
         self.highlight = None;
+        self.track_screen_hit = false;
         self.highlights.clear();
     }
 }
@@ -1056,6 +1095,10 @@ impl<W: Write> Pane<W> {
         self.search.supported = true;
         self.search.pending = None;
         self.search.cursor = None;
+        if self.search.track_screen_hit {
+            self.search.highlight = None;
+            self.search.track_screen_hit = false;
+        }
         self.search.hist_req = None;
         self.search.hist_target = None;
         if let Some(cache) = self.history.stable.as_mut() {
@@ -1148,10 +1191,8 @@ impl<W: Write> Pane<W> {
         self.journal.delivery(receipt)
     }
 
-    /// A cancelled switch may continue on the original account. A failed switch drops the held
-    /// bytes with a notice, so prompts intended for the new account never reach the original
-    /// one, and the pane goes back to the preserved original session. The daemon keeps failed
-    /// handoffs in every snapshot, so a pane that is not switching ignores the failure.
+    /// Only an acknowledged cancellation may deliver held input to the original account.
+    /// Failed switches keep their journal paused for an explicit recovery decision.
     pub fn resume_account_input(&mut self, failed: bool, now: Now) -> Vec<Notice> {
         if failed {
             self.account_input = AccountInput::Failed;
@@ -1220,6 +1261,9 @@ impl<W: Write> Pane<W> {
         if self.state != State::Live && !self.account_switching() {
             return None;
         }
+        // 새 입력 뒤 늦게 도착한 검색 결과가 터미널을 다시 이동시키지 않게 한다.
+        self.search.pending = None;
+        self.search.track_screen_hit = false;
         let had_mark = self.search.highlight.take().is_some();
         self.search.hist_req = None;
         self.search.hist_target = None;
@@ -1311,6 +1355,8 @@ impl<W: Write> Pane<W> {
     /// 화면을 `lines`행 위로(음수면 아래로) 넘긴다. 필요하면 히스토리를 요청한다. 화면이 바뀌면 `true`.
     pub fn scroll(&mut self, lines: isize) -> bool {
         self.search.top_request = None;
+        self.search.pending = None;
+        self.search.track_screen_hit = false;
         let had_mark = self.search.highlight.take().is_some();
         let had_fetch =
             self.search.hist_req.take().is_some() || self.search.hist_target.take().is_some();
@@ -1352,12 +1398,14 @@ impl<W: Write> Pane<W> {
     pub fn clear_scrollback(&mut self) {
         self.search.hist_req = None;
         self.search.hist_target = None;
+        self.search.track_screen_hit = false;
+        let had_mark = self.search.highlight.take().is_some();
         let view_dropped = self.forget_search_view();
         let had_local = self.history.offset != 0
             || !self.history.rows.is_empty()
             || !self.history.prior.is_empty();
         self.history.clear_scrollback();
-        if had_local || view_dropped {
+        if had_local || view_dropped || had_mark {
             self.refresh();
         }
         if self.state == State::Live && self.out.is_some() {
@@ -1454,6 +1502,7 @@ impl<W: Write> Pane<W> {
                     self.search.hist_target = None;
                     // 스크롤백 일치는 이웃 행이 올 때 다시 두기 전에는 활성 표시를 비운다.
                     self.search.highlight = None;
+                    self.search.track_screen_hit = false;
                     if let Some(hit) = &r.hit {
                         self.search.cursor = Some(krill_proto::search::Cursor {
                             snapshot: r.snapshot,
@@ -1469,17 +1518,16 @@ impl<W: Write> Pane<W> {
                             krill_proto::search::Source::Screen => {
                                 self.forget_search_view();
                                 self.history.reset();
-                                self.search.highlight = Some(crate::terminal::Highlight {
-                                    line: u16::try_from(hit.row).unwrap_or(u16::MAX),
-                                    column: hit.column,
-                                    cols: hit.cols,
-                                });
+                                self.search.track_screen_hit = true;
                             }
                         }
                     } else {
-                        self.search.cursor = None;
                         self.search.highlight = None;
-                        self.forget_search_view();
+                        // 미완료 검색은 일치 없음이 아니다. 과거 화면과 다음 찾기 위치를 유지한다.
+                        if !r.incomplete {
+                            self.search.cursor = None;
+                            self.forget_search_view();
+                        }
                     }
                     self.search.result = Some(r);
                     ev.redraw = true;
@@ -1585,6 +1633,8 @@ impl<W: Write> Pane<W> {
         let _work = crate::responsiveness::work("pane.refresh");
         let s = self.history.compose(&self.view.screen);
         let previous = std::mem::replace(&mut self.shown, Rc::new(s));
+        self.search
+            .refresh_screen_hit(&self.shown, self.view.revision);
         self.refresh_search_marks(&previous);
     }
 

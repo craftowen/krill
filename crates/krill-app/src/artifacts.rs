@@ -139,18 +139,16 @@ pub fn format_byte_size(byte_size: Option<u64>) -> String {
     format!("{}.{} MB", tenths / 10, tenths % 10)
 }
 
-/// Format ISO-8601 or date strings into compact table timestamps (`YYYY-MM-DD HH:MM` or `YYYY-MM-DD`).
+/// 시간대가 있는 시각은 기기의 현지 날짜·시각으로, 날짜만 있는 값은 그대로 표시한다.
 #[must_use]
 pub fn format_timestamp_short(value: Option<&str>) -> String {
     let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
         return "—".into();
     };
-    if let Some((date, time_part)) = raw.split_once('T') {
-        let hm: String = time_part.chars().take(5).collect();
-        if hm.len() == 5 && hm.as_bytes().get(2) == Some(&b':') {
-            return format!("{date} {hm}");
-        }
-        return date.to_owned();
+    if let Some(local) =
+        krill_proto::time::parse_reset_epoch(raw).and_then(crate::local_time::format_timestamp)
+    {
+        return local;
     }
     raw.to_owned()
 }

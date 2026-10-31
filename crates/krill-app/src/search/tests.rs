@@ -48,6 +48,85 @@ fn status_formats_hit_and_empty() {
 }
 
 #[test]
+fn unfinished_search_is_not_reported_as_zero_matches() {
+    let mut result = SearchResult {
+        req: 1,
+        snapshot: Snapshot::default(),
+        total: 0,
+        hit: None,
+        wrapped: false,
+        stale: false,
+        incomplete: true,
+        approximate: false,
+    };
+    assert_eq!(status_text(Some(&result)), text::INCOMPLETE.get());
+    result.incomplete = false;
+    assert_eq!(status_text(Some(&result)), text::EMPTY.get());
+    assert_eq!(
+        text::INCOMPLETE.in_language(crate::i18n::Language::En),
+        "Partial"
+    );
+}
+
+#[gpui::test]
+fn incomplete_search_status_keeps_bar_and_close_bounds(cx: &mut TestAppContext) {
+    struct Host(Entity<Bar>);
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().relative().child(self.0.clone())
+        }
+    }
+    cx.update(gpui_component::init);
+    let original = crate::i18n::language();
+    for language in [crate::i18n::Language::Ko, crate::i18n::Language::En] {
+        cx.update(|cx| crate::i18n::set_language(language, cx));
+        for width in [600., 240.] {
+            let (host, vcx) =
+                cx.add_window_view(|window, cx| Host(cx.new(|cx| Bar::new(window, cx))));
+            let bar = vcx.update(|_, cx| host.read(cx).0.clone());
+            bar.update(vcx, |bar, cx| {
+                bar.set_options_supported(true);
+                cx.notify();
+            });
+            vcx.simulate_resize(gpui::size(px(width), px(400.)));
+            vcx.run_until_parked();
+            let before = vcx.debug_bounds("search-bar").unwrap();
+            let close = vcx.debug_bounds("search-close").unwrap();
+            let status = vcx.debug_bounds("search-status").unwrap();
+            for incomplete in [true, false, true] {
+                let result = SearchResult {
+                    req: 1,
+                    snapshot: Snapshot::default(),
+                    total: 0,
+                    hit: None,
+                    wrapped: false,
+                    stale: false,
+                    incomplete,
+                    approximate: false,
+                };
+                bar.update(vcx, |bar, cx| bar.set_result(Some(&result), cx));
+                vcx.run_until_parked();
+                assert_eq!(vcx.debug_bounds("search-bar"), Some(before));
+                assert_eq!(vcx.debug_bounds("search-close"), Some(close));
+                assert_eq!(vcx.debug_bounds("search-status"), Some(status));
+            }
+            vcx.simulate_mouse_move(status.center(), None, Modifiers::default());
+            vcx.executor().advance_clock(Duration::from_millis(600));
+            vcx.run_until_parked();
+            assert!(vcx.debug_bounds("tooltip:search-incomplete").is_some());
+            assert_eq!(vcx.debug_bounds("search-bar"), Some(before));
+            assert_eq!(vcx.debug_bounds("search-close"), Some(close));
+            vcx.simulate_mouse_move(gpui::point(px(0.), px(0.)), None, Modifiers::default());
+            bar.update(vcx, |bar, cx| bar.set_result(None, cx));
+            vcx.run_until_parked();
+            assert_eq!(vcx.debug_bounds("search-bar"), Some(before));
+            assert_eq!(vcx.debug_bounds("search-close"), Some(close));
+        }
+    }
+    cx.update(|cx| crate::i18n::set_language(original, cx));
+}
+
+#[test]
 fn status_marks_stale_and_wrapped() {
     let mut stale = SearchResult {
         req: 3,

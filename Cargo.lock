@@ -3807,6 +3807,7 @@ name = "krill-app"
 version = "0.2.42"
 dependencies = [
  "block2 0.6.2",
+ "chrono",
  "embed-resource",
  "gpui-component",
  "gpui-kit-assets",

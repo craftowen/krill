@@ -73,36 +73,14 @@ pub fn run_phase_badge_spec(phase: &str) -> (crate::ui::BadgeTone, &'static str)
     }
 }
 
-/// 유닉스 epoch 분을 `YYYY-MM-DD HH:MM` 날짜·시각으로 푼다(OWE-883, UTC).
-/// `chrono` 없이 윤년을 포함한 그레고리력 역산만 쓴다. 범위를 벗어나면 빈 문자열.
+/// 유닉스 epoch 분을 기기의 시스템 시간대로 표시한다. 범위를 벗어나면 빈 문자열.
 #[must_use]
 pub fn format_run_minute(minute: u64) -> String {
-    let secs = minute.saturating_mul(60);
-    let days = secs / 86_400;
-    let secs_of_day = secs % 86_400;
-    // 1970-01-01 기준 일수를 연·월·일로 푼다(Howard Hinnant civil_from_days).
-    let Ok(z) = i64::try_from(days.saturating_add(719_468)) else {
-        return String::new();
-    };
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    y += i64::from(m <= 2);
-    if !(1970..=9_999).contains(&y) {
-        return String::new();
-    }
-    let (hour, min) = (
-        (secs_of_day / 3_600) as u32,
-        (secs_of_day % 3_600 / 60) as u32,
-    );
-    let date = format!("{y:04}-{m:02}-{d:02}");
-    let time = format!("{hour:02}:{min:02}");
-    text::SCHEDULE_RUN_TIME.format(&[("date", &date), ("time", &time)])
+    minute
+        .checked_mul(60)
+        .and_then(|secs| i64::try_from(secs).ok())
+        .and_then(crate::local_time::format_timestamp)
+        .unwrap_or_default()
 }
 
 pub(crate) fn capture_session_output(

@@ -110,10 +110,12 @@ pub fn meter_value(meter: &krill_proto::usage::UsageMeter, now: u64) -> Option<S
     let Some(epoch) = epoch else {
         return Some(text::METER_EXPIRY_UNKNOWN.get().into());
     };
-    let time = crate::settings::schedules::format_run_minute(epoch / 60);
-    if time.is_empty() {
+    let Some(time) = i64::try_from(epoch)
+        .ok()
+        .and_then(crate::local_time::format_timestamp)
+    else {
         return Some(text::METER_EXPIRY_UNKNOWN.get().into());
-    }
+    };
     Some(if epoch <= now {
         text::METER_EXPIRED.format(&[("time", &time)])
     } else {
@@ -307,14 +309,12 @@ mod tests {
         let expiry = krill_proto::time::parse_reset_epoch("2030-01-01T09:00:00+09:00").unwrap();
         let meter = krill_proto::usage::reset_credit_expiry_meter(0, 2, Some(expiry));
         assert!(meter_label(&meter).contains('2'));
-        assert_eq!(
-            meter_value(&meter, 100),
-            Some("2030-01-01 00:00 (UTC)".into())
-        );
+        let local_expiry = crate::local_time::format_timestamp(expiry).unwrap();
+        assert_eq!(meter_value(&meter, 100), Some(local_expiry.clone()));
         assert!(
             meter_value(&meter, u64::try_from(expiry).unwrap())
                 .unwrap()
-                .contains("2030-01-01")
+                .contains(&local_expiry)
         );
         assert_ne!(
             meter_value(&meter, u64::try_from(expiry).unwrap()),
@@ -332,7 +332,7 @@ mod tests {
             },
             100,
         );
-        assert!(summary.contains("2030-01-01 00:00 (UTC)"));
+        assert!(summary.contains(&local_expiry));
     }
 
     #[test]

@@ -4,6 +4,10 @@ use krill_proto::screen::{Op, Revision, Seq, encode_update};
 
 use super::*;
 
+mod navigation;
+mod search_hit;
+mod writer;
+
 /// AS-27: 데몬이 없으면 디스크 콜드 읽기가 조용히 `None`이다(빈 화면 폴백 유지).
 #[test]
 fn load_cold_is_none_without_daemon() {
@@ -690,10 +694,12 @@ fn large_paste_does_not_block_the_caller() {
 }
 
 #[test]
-fn writer_rejects_pressure_without_blocking_and_releases_budget_after_drain() {
+fn writer_rejects_pressure_without_blocking_and_releases_abandoned_budget() {
     use std::io::Read as _;
 
     let (ours, mut theirs) = UnixStream::pair().unwrap();
+    rustix::net::sockopt::set_socket_send_buffer_size(&ours, 16 << 10).unwrap();
+    rustix::net::sockopt::set_socket_recv_buffer_size(&theirs, 16 << 10).unwrap();
     theirs
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
@@ -721,10 +727,15 @@ fn writer_rejects_pressure_without_blocking_and_releases_budget_after_drain() {
         start.elapsed() < Duration::from_secs(1),
         "queue admission must not wait for socket writes"
     );
+    assert_eq!(
+        writer.write(b"after failure").unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
     let drain = std::thread::spawn(move || {
-        let mut bytes = vec![0; accepted];
-        theirs.read_exact(&mut bytes).unwrap();
+        let mut bytes = Vec::new();
+        theirs.read_to_end(&mut bytes).unwrap();
         assert!(bytes.iter().all(|&b| b == b'x'));
+        assert!(bytes.len() < accepted, "the abandoned backlog must stop");
     });
     drain.join().unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -760,12 +771,15 @@ fn oversized_paste_is_rejected_before_any_frame_is_queued() {
 }
 
 #[test]
-fn writer_budget_is_returned_when_enqueue_or_connection_fails() {
+fn writer_frame_limit_releases_rejected_budget_and_latches_failure() {
     let (send, recv) = mpsc::sync_channel(1);
+    let (socket, _peer) = UnixStream::pair().unwrap();
     let bytes = Arc::new(AtomicUsize::new(0));
     let mut writer = Writer {
         send,
         bytes: Arc::clone(&bytes),
+        socket: Arc::new(socket),
+        failed: false,
     };
     writer.write_all(b"x").unwrap();
     assert_eq!(
@@ -949,6 +963,59 @@ fn search_requests_and_highlights_with_feat_search_check() {
 }
 
 #[test]
+fn delayed_search_result_cannot_override_a_new_query_or_reopen_closed_search() {
+    use krill_proto::search::{Direction, Hit, SearchRequest, SearchResult, Snapshot, Source};
+    let mut pane = linked();
+    update(&mut pane, 1, snapshot(["old needle", "new target", "tail"]));
+    pane.set_searchable(true);
+    assert!(pane.search("needle", Direction::Next));
+    let frames = sent(out(&mut pane));
+    let old = SearchRequest::decode(frames[0].0, &frames[0].1).unwrap();
+    assert!(pane.search("target", Direction::Next));
+    let frames = sent(out(&mut pane));
+    let current = SearchRequest::decode(frames[0].0, &frames[0].1).unwrap();
+    let shown = Rc::clone(&pane.shown);
+    let mut reply = SearchResult {
+        req: old.req,
+        snapshot: Snapshot::default(),
+        total: 1,
+        hit: Some(Hit {
+            index: 0,
+            source: Source::Screen,
+            row: 0,
+            total_rows: 3,
+            column: 4,
+            cols: 6,
+            cells: row("old needle"),
+        }),
+        wrapped: false,
+        stale: false,
+        incomplete: false,
+        approximate: false,
+    };
+    assert!(!feed(&mut pane, &reply.encode().unwrap()).redraw);
+    assert_eq!(pane.search.pending, Some(current.req));
+    assert!(pane.search_result().is_none());
+    assert!(pane.highlight().is_none());
+    assert!(Rc::ptr_eq(&shown, &pane.shown));
+
+    reply.req = current.req;
+    let hit = reply.hit.as_mut().unwrap();
+    hit.row = 1;
+    hit.cols = 6;
+    hit.cells = row("new target");
+    assert!(feed(&mut pane, &reply.encode().unwrap()).redraw);
+    assert_eq!(pane.search_result().unwrap().req, current.req);
+    assert_eq!(pane.highlight().unwrap().line, 1);
+    pane.clear_search();
+    assert!(pane.highlight().is_none());
+    assert!(!feed(&mut pane, &reply.encode().unwrap()).redraw);
+    assert!(pane.highlight().is_none());
+    assert!(pane.search_result().is_none());
+    assert_eq!(pane.shown.rows, shown.rows);
+}
+
+#[test]
 fn search_cold_match_installs_fixed_view_with_context() {
     use crate::terminal::Highlight;
     use krill_proto::search::{
@@ -1015,6 +1082,42 @@ fn search_cold_match_installs_fixed_view_with_context() {
             column: 1,
             cols: 2,
         })
+    );
+    // A failed next search must keep the currently displayed cold context.
+    let shown = p.shown.rows.clone();
+    let offset = p.scroll_offset();
+    assert!(p.search("hit", Direction::Next));
+    let frames = sent(out(&mut p));
+    let next = SearchRequest::decode(frames[0].0, &frames[0].1).unwrap();
+    let failed = SearchResult {
+        req: next.req,
+        hit: None,
+        total: 0,
+        incomplete: true,
+        ..res.clone()
+    };
+    assert!(feed(&mut p, &failed.encode().unwrap()).redraw);
+    assert_eq!(p.shown.rows, shown);
+    assert_eq!(p.scroll_offset(), offset);
+    assert!(p.search.scrolled);
+    assert!(p.search_result().unwrap().incomplete);
+    assert!(p.search.pending.is_none());
+    assert!(p.out.is_some());
+    update(&mut p, 2, snapshot(["alpha", "live-new", "gamma"]));
+    assert_eq!(p.screen().rows[1], row("live-new"));
+    assert_eq!(
+        p.shown.rows, shown,
+        "live output must not displace retained context"
+    );
+    // Retry remains available on the same connection.
+    assert!(p.search("hit", Direction::Next));
+    let frames = sent(out(&mut p));
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        SearchRequest::decode(frames[0].0, &frames[0].1)
+            .unwrap()
+            .after,
+        next.after
     );
     // 손 스크롤은 고정 보기를 걷고 라이브로 돌아간다.
     assert!(p.scroll(1));
@@ -1949,6 +2052,43 @@ fn only_daemon_no_session_reply_is_session_gone() {
     server.join().unwrap();
 }
 
+#[test]
+fn attach_metadata_failure_preserves_identity_without_changing_retry_policy() {
+    use krill_proto::control::Failure;
+    for failure in [
+        Failure::NoHolder,
+        Failure::SessionLimit,
+        Failure::NoSession,
+        Failure::Denied,
+        Failure::UnknownAgent,
+        Failure::BadRequest,
+        Failure::Os(13),
+    ] {
+        let (paths, server) = control_fixture(
+            "metadata-failure-identity",
+            FEAT_CONTROL | FEAT_AGENTS,
+            vec![Box::new(move |stream, seen| {
+                assert_eq!(
+                    next_request(stream, seen),
+                    Some(Request::AgentLaunch {
+                        session: SessionId(7)
+                    })
+                );
+                stream
+                    .write_all(&Reply::Failed(failure).encode().unwrap())
+                    .unwrap();
+            })],
+        );
+        let error = attach(&paths, SessionId(7), None).err().unwrap();
+        assert_eq!(diagnostics::control_failure(&error), Some(failure));
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), failure.to_string());
+        assert_eq!(error.raw_os_error(), None);
+        assert!(!is_session_gone(&error));
+        assert!(!is_unknown_outcome(&error));
+        server.join().unwrap();
+    }
+}
 /// 쓰다 끊긴 생성 요청도 krilld가 프레임을 다 받았는지 알 수 없다. 조회 요청의 같은 실패는 다시 시도해도 된다.
 #[test]
 fn write_failure_of_a_session_request_has_unknown_outcome() {

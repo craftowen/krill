@@ -2,6 +2,11 @@
 // 크기 변경 때 미리 만들지 않고 처음 그릴 때 만들며, 경로 없는 프레임을 그리면 놓는다.
 // Krill modification (Apache-2.0 §4(b)): acquire drawables off the UI thread;
 // present asynchronously instead of waiting for GPU scheduling in a CA transaction.
+// Krill modification (Apache-2.0 §4(b)): double-buffer Apple GPU macOS windows.
+// Krill modification (Apache-2.0 §4(b)): retire oversized instance buffers after
+// sustained small frames, while retaining capacity throughout repeated large frames.
+// Krill modification (Apache-2.0 §4(b)): macOS requests drawables on demand and
+// notifies its host as soon as a drawable is ready, without speculative retention.
 mod acquisition;
 use crate::metal_atlas::MetalAtlas;
 use acquisition::Acquisition;
@@ -45,9 +50,12 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+const DEFAULT_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+const INSTANCE_BUFFER_SHRINK_DELAY: Duration = Duration::from_secs(5);
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
+type DrawableReadyCallback = Arc<dyn Fn() + Send + Sync>;
 
 pub unsafe fn new_renderer(
     context: self::Context,
@@ -62,13 +70,15 @@ pub unsafe fn new_renderer(
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
+    small_frames_since: Option<Instant>,
 }
 
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: DEFAULT_INSTANCE_BUFFER_SIZE,
             buffers: Vec::new(),
+            small_frames_since: None,
         }
     }
 }
@@ -76,12 +86,14 @@ impl Default for InstanceBufferPool {
 pub(crate) struct InstanceBuffer {
     metal_buffer: metal::Buffer,
     size: usize,
+    frame_bytes: usize,
 }
 
 impl InstanceBufferPool {
     pub(crate) fn reset(&mut self, buffer_size: usize) {
         self.buffer_size = buffer_size;
         self.buffers.clear();
+        self.small_frames_since = None;
     }
 
     pub(crate) fn acquire(
@@ -104,10 +116,31 @@ impl InstanceBufferPool {
         InstanceBuffer {
             metal_buffer: buffer,
             size: self.buffer_size,
+            frame_bytes: 0,
         }
     }
 
     pub(crate) fn release(&mut self, buffer: InstanceBuffer) {
+        self.release_at(buffer, Instant::now());
+    }
+
+    fn release_at(&mut self, buffer: InstanceBuffer, now: Instant) {
+        // Completion callbacks from before a resize must not restore retired capacity.
+        if buffer.size != self.buffer_size {
+            return;
+        }
+        if self.buffer_size > DEFAULT_INSTANCE_BUFFER_SIZE {
+            if buffer.frame_bytes <= DEFAULT_INSTANCE_BUFFER_SIZE {
+                let since = *self.small_frames_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= INSTANCE_BUFFER_SHRINK_DELAY {
+                    // The GPU has finished this frame; encoded resources in other
+                    // in-flight frames retain their own buffers, as on pool growth.
+                    self.reset(DEFAULT_INSTANCE_BUFFER_SIZE);
+                }
+            } else {
+                self.small_frames_since = None;
+            }
+        }
         if buffer.size == self.buffer_size {
             self.buffers.push(buffer.metal_buffer)
         }
@@ -120,6 +153,7 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     drawable_acquisition: Option<Acquisition<metal::MetalLayer, Option<metal::MetalDrawable>>>,
+    drawable_ready: Arc<Mutex<Option<DrawableReadyCallback>>>,
     drawable_retry_at: Option<Instant>,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
@@ -188,7 +222,15 @@ impl MetalRenderer {
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        // Use the minimum supported swap-queue depth on Apple GPU macOS windows.
+        // Acquisition stays on the worker, so exhaustion never waits on the UI thread.
+        let drawable_count =
+            if cfg!(target_os = "macos") && device.supports_family(MTLGPUFamily::Apple1) {
+                2
+            } else {
+                3
+            };
+        layer.set_maximum_drawable_count(drawable_count);
         // Allow texture reading for visual tests and UI automation screenshots
         // (captures without ScreenCaptureKit). Only debug builds pay the
         // presentation cost, even when `test-support` is compiled in.
@@ -393,18 +435,33 @@ impl MetalRenderer {
             CFRetained::from_raw(ptr::NonNull::new(cache).expect("CoreVideo returned a null cache"))
         };
 
+        let drawable_ready: Arc<Mutex<Option<DrawableReadyCallback>>> = Arc::new(Mutex::new(None));
         let drawable_acquisition = layer.as_ref().and_then(|_| {
-            Acquisition::new(|layer: metal::MetalLayer| {
+            let acquire = |layer: metal::MetalLayer| {
                 // Retain the drawable before draining the worker's autorelease pool.
                 objc2::rc::autoreleasepool(|_| layer.next_drawable().map(ToOwned::to_owned))
-            })
-            .map_err(|error| log::error!("failed to start drawable worker: {error}"))
-            .ok()
+            };
+            let ready = drawable_ready.clone();
+            let acquisition = if cfg!(target_os = "macos") {
+                Acquisition::with_ready_callback(acquire, move || {
+                    let callback = ready.lock().clone();
+                    if let Some(callback) = callback {
+                        callback();
+                    }
+                })
+            } else {
+                // Other hosts still use their existing display-link/prefetch contract.
+                Acquisition::new(acquire)
+            };
+            acquisition
+                .map_err(|error| log::error!("failed to start drawable worker: {error}"))
+                .ok()
         });
         Self {
             device,
             layer,
             drawable_acquisition,
+            drawable_ready,
             drawable_retry_at: None,
             is_apple_gpu,
             is_unified_memory,
@@ -505,7 +562,12 @@ impl MetalRenderer {
     }
 
     pub fn destroy(&self) {
-        // nothing to do
+        self.drawable_ready.lock().take();
+    }
+
+    /// The host must dispatch this worker notification onto its foreground queue.
+    pub fn set_drawable_ready_callback(&mut self, callback: Arc<dyn Fn() + Send + Sync>) {
+        *self.drawable_ready.lock() = Some(callback);
     }
 
     /// Returns false when the latest scene needs presentation on a later tick.
@@ -530,7 +592,7 @@ impl MetalRenderer {
         let Some(acquisition) = &mut self.drawable_acquisition else {
             return false;
         };
-        let drawable = match acquisition.poll(layer) {
+        let drawable = match acquisition.poll(layer.clone()) {
             Ok(Some(Some(drawable))) => drawable,
             Ok(None) => return false,
             Ok(Some(None)) => {
@@ -549,6 +611,9 @@ impl MetalRenderer {
         if drawable.texture().width() != viewport_size.width.0 as u64
             || drawable.texture().height() != viewport_size.height.0 as u64
         {
+            // Start the replacement now, so its completion can wake the host
+            // without spending another display tick requesting the new size.
+            let _ = acquisition.request(layer);
             return false;
         }
         self.drawable_retry_at = None;
@@ -1590,7 +1655,9 @@ impl InstanceBufferWriter {
 
     fn grow(&mut self, required: usize) -> Result<()> {
         let mut pool = self.pool.lock();
-        let buffer_size = (pool.buffer_size * 2)
+        // Another window's completion can shrink the shared pool while this
+        // writer still owns a larger buffer. Growth must account for both.
+        let buffer_size = (pool.buffer_size.max(self.current.size) * 2)
             .max(required.next_power_of_two())
             .min(MAX_INSTANCE_BUFFER_SIZE);
         anyhow::ensure!(
@@ -1618,7 +1685,7 @@ impl InstanceBufferWriter {
         let Self {
             unified_memory,
             filled,
-            current,
+            mut current,
             offset,
             ..
         } = self;
@@ -1641,6 +1708,9 @@ impl InstanceBufferWriter {
             }
         }
 
+        // Include earlier chunks so a nearly empty final chunk cannot make a
+        // genuinely large frame look small to the pool's retention policy.
+        current.frame_bytes = offset + filled.iter().map(|(_, written)| written).sum::<usize>();
         // Metal retains encoded resources until the command buffer completes.
         // Only the final, largest buffer is worth keeping in the pool.
         drop(filled);
@@ -1739,6 +1809,10 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
         self.renderer.sprite_atlas().clone()
     }
 }
+
+#[cfg(test)]
+#[path = "metal_renderer/instance_buffer_tests.rs"]
+mod instance_buffer_tests;
 
 #[cfg(test)]
 mod tests {
