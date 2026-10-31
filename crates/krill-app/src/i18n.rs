@@ -1983,13 +1983,14 @@ catalog! {
     star_nag {
         TITLE => ("Krill이 도움이 되고 있나요?", "Enjoying Krill?"),
         BODY => ("GitHub 별 하나가 개발을 이어 가는 데 큰 힘이 됩니다.", "A GitHub star helps keep Krill going."),
+        ONBOARDING_TITLE => ("온보딩 완료!", "Onboarding completed!"),
+        ONBOARDING_BODY => ("Krill이 마음에 드신다면 GitHub 별표가 다른 개발자가 Krill을 발견하는 데 도움이 됩니다.", "If you’re enjoying Krill so far, a GitHub star helps other developers discover it."),
         STAR => ("GitHub에 별 주기", "Star on GitHub"),
         STARRING => ("별 주는 중…", "Starring…"),
         OPEN_GITHUB => ("GitHub 열기", "Open GitHub"),
         STARRED_ON_GITHUB => ("GitHub에 별표 표시됨", "Starred on GitHub"),
         HIDE => ("숨기기", "Hide"),
         LATER => ("나중에", "Later"),
-        NEVER => ("다시 보지 않기", "Don't show again"),
         THANKS => ("별 고맙습니다!", "Thanks for the star!"),
     }
     general {

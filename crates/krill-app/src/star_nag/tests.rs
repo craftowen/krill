@@ -41,14 +41,31 @@ fn completed_never_due_and_survives_version_change() {
 }
 
 #[test]
-fn version_change_rebases_count() {
+fn version_change_preserves_counter_threshold_and_cooldown() {
     let mut s = fresh("1.0.0");
-    s.total = 50;
-    s.next_threshold = 140;
+    assert_eq!((s.baseline, s.next_threshold), (0, INITIAL_THRESHOLD));
+    s.total = 20;
     assert!(!s.ensure_version("1.0.0"));
     assert!(s.ensure_version("1.1.0"));
-    assert_eq!((s.baseline, s.next_threshold), (50, INITIAL_THRESHOLD));
-    assert!(!s.due(0));
+    assert_eq!(
+        (s.total, s.baseline, s.next_threshold),
+        (20, 0, INITIAL_THRESHOLD),
+        "app update must preserve progress toward the threshold"
+    );
+    s.total = INITIAL_THRESHOLD;
+    assert!(s.due(0));
+
+    s.defer(1_000);
+    assert!(s.ensure_version("1.2.0"));
+    assert_eq!(
+        (s.baseline, s.next_threshold, s.deferred_until),
+        (
+            INITIAL_THRESHOLD,
+            INITIAL_THRESHOLD * 2,
+            1_000 + COOLDOWN_SECS
+        ),
+        "app update must preserve active cooldown and doubled threshold"
+    );
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -148,20 +165,18 @@ fn card_appears_at_threshold_and_buttons_update_state(cx: &mut gpui::TestAppCont
     cx.run_until_parked();
     assert_eq!(nag(cx).1, Card::Hidden);
 
-    // 쉼이 끝나면 다시 뜨고, [다시 보지 않기]는 영구 완료.
+    // 쉼이 끝나면 다시 뜨고, 닫기 [X] 버튼도 문턱을 2배로 늘리고 3일 쉼으로 전환한다.
     cx.update(|_, cx| cx.global_mut::<StarNag>().state.deferred_until = 0);
     cx.update(|_, cx| record_agent_start(cx));
     cx.run_until_parked();
     assert_eq!(nag(cx).1, Card::Shown);
-    click("star-nag-never", cx);
+    click("star-nag-close", cx);
     cx.run_until_parked();
-    assert!(nag(cx).0.completed);
-    assert!(load(&dir).completed);
-    for _ in 0..100 {
-        cx.update(|_, cx| record_agent_start(cx));
-    }
-    cx.run_until_parked();
-    assert_eq!(nag(cx).1, Card::Hidden);
+    let (state, shown) = nag(cx);
+    assert_eq!(shown, Card::Hidden);
+    assert_eq!(state.next_threshold, INITIAL_THRESHOLD * 4);
+    assert!(state.deferred_until > now());
+    assert_eq!(load(&dir), state, "persisted after close");
 }
 
 #[gpui::test]
@@ -322,9 +337,24 @@ fn agent_value_moment_shows_once_per_version_after_quiet_delay(cx: &mut gpui::Te
     cx.run_until_parked();
     assert_eq!(nag(cx).1, Card::Hidden);
 
-    // Trigger value moment and stay idle for 1200ms -> card shows once for this version.
+    // Trigger value moment; typing a non-modifier key at 600ms resets the 1200ms quiet timer,
+    // while modifier keys do not reset it.
     cx.update(|_, cx| observe_agent_activity(false, true, cx));
-    cx.background_executor.advance_clock(VALUE_MOMENT_DELAY);
+    cx.background_executor
+        .advance_clock(Duration::from_millis(600));
+    cx.update(|_, cx| record_key_down("a", cx));
+    cx.background_executor
+        .advance_clock(Duration::from_millis(700));
+    cx.update(|_, cx| record_key_down("Shift", cx));
+    cx.run_until_parked();
+    assert_eq!(
+        nag(cx).1,
+        Card::Hidden,
+        "non-modifier key must extend quiet delay"
+    );
+
+    cx.background_executor
+        .advance_clock(Duration::from_millis(600));
     cx.run_until_parked();
     let (state, shown) = nag(cx);
     assert_eq!(shown, Card::Shown);
@@ -332,6 +362,50 @@ fn agent_value_moment_shows_once_per_version_after_quiet_delay(cx: &mut gpui::Te
         state.agent_value_moment_app_version,
         env!("CARGO_PKG_VERSION")
     );
+
+    // Once consumed, app updates do not re-arm the value moment.
+    click("star-nag-later", cx);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let nag = cx.global_mut::<StarNag>();
+        nag.state.deferred_until = 0;
+        nag.state.ensure_version("9.9.9");
+        observe_agent_activity(false, true, cx);
+    });
+    cx.background_executor.advance_clock(VALUE_MOMENT_DELAY);
+    cx.run_until_parked();
+    assert_eq!(nag(cx).1, Card::Hidden);
+}
+
+#[gpui::test]
+fn onboarding_completed_shows_toast_and_supersedes_threshold_card(cx: &mut gpui::TestAppContext) {
+    let dir = temp_dir("onboarding-toast");
+    let mut s = fresh(env!("CARGO_PKG_VERSION"));
+    s.total = INITIAL_THRESHOLD - 1;
+    save(&dir, &s).unwrap();
+    cx.update(gpui_component::init);
+    cx.update(|cx| init(dir.clone(), cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        cx.global_mut::<StarNag>().mock_gh = Some((Some(false), true));
+    });
+    let (_host, cx) = cx.add_window_view(|_, _| Host);
+
+    cx.update(|_, cx| record_agent_start(cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let n = cx.global::<StarNag>();
+        assert_eq!(n.card, Card::Shown);
+        assert_eq!(n.surface, Surface::Card);
+    });
+
+    cx.update(|_, cx| onboarding_completed(cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let n = cx.global::<StarNag>();
+        assert_eq!(n.card, Card::Shown);
+        assert_eq!(n.surface, Surface::OnboardingToast);
+    });
 }
 
 struct SurfaceHost {

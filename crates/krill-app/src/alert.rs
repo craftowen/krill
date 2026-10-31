@@ -273,6 +273,7 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
         let mut needs_you = 0usize;
         let mut working = 0usize;
         let mut transitioned_to_done = false;
+        let mut newly_started = 0usize;
 
         for session in &snapshot.sessions {
             present.insert(session.id);
@@ -281,6 +282,16 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
             match session.status.state {
                 AgentState::Working => {
                     working += 1;
+                    if initialized
+                        && prev.is_some_and(|old| {
+                            matches!(
+                                old,
+                                AgentState::Done | AgentState::Waiting | AgentState::Blocked
+                            )
+                        })
+                    {
+                        newly_started += 1;
+                    }
                     state.notified.remove(&session.id);
                     if state.active_tags.remove(&session.id) {
                         to_dismiss.push(session.id);
@@ -359,9 +370,16 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
         state.initialized = true;
         state.needs_you_count = needs_you;
         state.working_count = working;
-        (working > 0 || needs_you > 0, transitioned_to_done)
+        (
+            working > 0 || needs_you > 0,
+            transitioned_to_done,
+            newly_started,
+        )
     };
-    let (any_active, transitioned_to_done) = star_nag_observation;
+    let (any_active, transitioned_to_done, newly_started) = star_nag_observation;
+    for _ in 0..newly_started {
+        crate::star_nag::record_agent_start(cx);
+    }
     crate::star_nag::observe_agent_activity(any_active, transitioned_to_done, cx);
 
     for id in to_dismiss {

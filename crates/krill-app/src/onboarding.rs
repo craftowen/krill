@@ -466,17 +466,26 @@ fn dispatch_now(cmd: &HostCommand, cx: &mut App) -> bool {
 /// 오류 보고 동의는 기본 OFF이며, 아직 묻지 않았으면 같은 배너 경로로 한 번 묻는다.
 pub fn offer(env: Env, cx: &mut App) {
     let dir = env.state.clone();
-    crate::settings::background_file_io(cx, move || {
+    let isolated = env.is_isolated_state();
+    let saved = crate::settings::background_file_io(cx, move || {
         let stored = state::load(&dir);
-        if !stored.completed
-            && let Err(error) = state::save(&dir, &stored.completed())
-        {
+        if stored.completed {
+            return false;
+        }
+        if let Err(error) = state::save(&dir, &stored.completed()) {
             tracing::warn!(%error, "onboarding completion save failed");
+            return false;
+        }
+        true
+    });
+    cx.spawn(async move |cx| {
+        if saved.await && !isolated {
+            cx.update(crate::star_nag::onboarding_completed);
         }
     })
     .detach();
     error_consent::offer_if_needed(&env.state, cx);
-    if !env.is_isolated_state() {
+    if !isolated {
         actions::auto_prepare(env, cx).detach();
     }
 }

@@ -5255,6 +5255,16 @@ impl Shell {
             cx.notify();
             return;
         }
+        if self.role == WindowRole::Main
+            && e.keystroke.key == "escape"
+            && !e.keystroke.modifiers.modified()
+            && !self.has_notifications(cx)
+            && krill_app::star_nag::dismiss_on_escape(cx)
+        {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         // 가운데 diff가 터미널을 덮고 있으면 Esc로 닫고, 다른 키는 가려진 터미널로 보내지 않는다.
         if self.diff.read(cx).has_center_diff() {
             if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
@@ -7993,6 +8003,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_float_terminal))
             .on_action(cx.listener(Self::on_dashboard))
             .capture_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                krill_app::star_nag::record_key_down(&e.keystroke.key, cx);
                 if this.dashboard.is_some()
                     && e.keystroke.key == "escape"
                     && !e.keystroke.modifiers.modified()
