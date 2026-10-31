@@ -290,9 +290,9 @@ fn legacy_disabled_flag_still_shares_claude_but_keeps_other_providers_off() {
 }
 
 #[test]
-fn orca_managed_profile_is_left_to_orca() {
+fn orca_managed_profile_also_shares_host_claude() {
     let home = root("orca-managed");
-    host_fixture(&home);
+    let host = host_fixture(&home);
     let profile = home.join("claude-profiles/dae9286b-d011-4443-9ddb-7ada705db2c1/home");
     std::fs::create_dir_all(&profile).unwrap();
     std::fs::write(profile.join("settings.json"), "{\"orca\":1}").unwrap();
@@ -305,8 +305,18 @@ fn orca_managed_profile_is_left_to_orca() {
     )
     .unwrap();
     provision_if_enabled(&home, Some(&state), ProviderKind::Claude, dir);
-    assert!(!profile.join("settings.json").is_symlink());
-    assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read_link(profile.join("settings.json")).unwrap(),
+        host.join("settings.json")
+    );
+    assert_eq!(
+        std::fs::read_link(profile.join("skills")).unwrap(),
+        host.join("skills")
+    );
+    assert_eq!(
+        std::fs::read_link(profile.join("rules")).unwrap(),
+        host.join("rules")
+    );
     std::fs::remove_dir_all(home).ok();
 }
 

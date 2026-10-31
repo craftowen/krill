@@ -1411,12 +1411,17 @@ impl Registry {
                         } else {
                             Path::new(&target.profile_dir).join(".gemini/antigravity-cli")
                         };
-                        found
-                            .home
-                            .canonicalize()
-                            .ok()
-                            .zip(expected.canonicalize().ok())
-                            .is_some_and(|(actual, expected)| actual == expected)
+                        let host_expected =
+                            accounts::host_default_dir(home, ProviderKind::Antigravity);
+                        let actual = found.home.canonicalize().ok();
+                        actual
+                            .as_ref()
+                            .zip(expected.canonicalize().ok().as_ref())
+                            .is_some_and(|(a, b)| a == b)
+                            || actual
+                                .as_ref()
+                                .zip(host_expected.canonicalize().ok().as_ref())
+                                .is_some_and(|(a, b)| a == b)
                     })
                     .map(|found| (found.id, Some(found.path)));
                 if let Some((sid, path)) = observed
@@ -1675,12 +1680,19 @@ impl Registry {
                     } else {
                         Path::new(&target.profile_dir).join(".gemini/antigravity-cli")
                     };
-                    found
-                        .home
-                        .canonicalize()
-                        .ok()
-                        .zip(expected.canonicalize().ok())
-                        .is_some_and(|(actual, expected)| actual == expected)
+                    let host_expected = accounts::host_default_dir(
+                        &accounts::default_home(),
+                        ProviderKind::Antigravity,
+                    );
+                    let actual = found.home.canonicalize().ok();
+                    actual
+                        .as_ref()
+                        .zip(expected.canonicalize().ok().as_ref())
+                        .is_some_and(|(a, b)| a == b)
+                        || actual
+                            .as_ref()
+                            .zip(host_expected.canonicalize().ok().as_ref())
+                            .is_some_and(|(a, b)| a == b)
                 }) && found.id == session_id
                 {
                     self.agents

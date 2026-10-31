@@ -1515,6 +1515,7 @@ pub(crate) mod agy {
         interval: Duration,
         mut schedule: impl FnMut(&Key, bool, Option<PathBuf>),
     ) {
+        accounts::agy_native::reconcile_host_to_profiles(home, &file.accounts);
         let mut profiles = vec![(
             accounts::host_default_dir(home, ProviderKind::Antigravity),
             true,
@@ -1562,8 +1563,12 @@ pub(crate) mod agy {
                 // An unauthenticated profile must never run `/usage` (it can
                 // start interactive OAuth). Keep this check off request threads.
                 let started = Instant::now();
-                let authenticated =
-                    std::panic::catch_unwind(|| should_probe(&job.1, host)).unwrap_or(false);
+                let authenticated = std::panic::catch_unwind(|| {
+                    let file = accounts::load_file(&job.0, state.as_deref());
+                    accounts::agy_native::reconcile_host_to_profiles(&job.0, &file.accounts);
+                    should_probe(&job.1, host)
+                })
+                .unwrap_or(false);
                 if started.elapsed() >= Duration::from_secs(2) {
                     tracing::info!(
                         host,
@@ -1792,6 +1797,8 @@ pub(crate) mod agy {
         text
     }
 
+    #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn version_text_for_guard(exe: &Path) -> String {
         let (mtime, len) = std::fs::symlink_metadata(exe)
             .and_then(|m| {

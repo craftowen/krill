@@ -138,12 +138,6 @@ pub fn provision_if_enabled(
     if !sharing_enabled(&file, provider) || !registered {
         return;
     }
-    // Orca 프로필은 Orca가 같은 공유를 유지한다. 사본 설정을 링크로 바꾸면 Orca 저장이 건너뛴다.
-    if provider == ProviderKind::Claude
-        && super::accounts::orca_uuid_from_profile_dir(profile_dir).is_some()
-    {
-        return;
-    }
     // 설정 공유는 대용량 기록 이행을 기다리지 않고 실행 전에 끝낸다.
     #[cfg(unix)]
     if provider == ProviderKind::Claude
@@ -208,7 +202,8 @@ fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
         ProviderKind::Claude => provision_claude(home, Path::new(profile_dir)),
         ProviderKind::Codex => codex::provision(home, Path::new(profile_dir)),
         ProviderKind::Antigravity => agy::provision(home, Path::new(profile_dir)),
-        _ => return,
+        ProviderKind::OpenCode => provision_opencode(home, Path::new(profile_dir)),
+        ProviderKind::Gemini => return,
     };
     match result {
         Ok(report) if !report.conflicts.is_empty() => {
@@ -267,6 +262,55 @@ pub fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
         }
     }
     merge_claude_mcp(home, &profile_real, &mut report)?;
+    Ok(report)
+}
+
+fn provision_opencode(home: &Path, profile: &Path) -> io::Result<Report> {
+    let mut report = Report::default();
+    let host_data = home.join(".local/share/opencode");
+    if !host_data.is_dir() {
+        return Ok(report);
+    }
+    let prof_data = profile.join("data/opencode");
+    if prof_data.starts_with(&host_data) || host_data.starts_with(&prof_data) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "profile overlaps the host opencode folder",
+        ));
+    }
+    std::fs::create_dir_all(&prof_data)?;
+    for name in [
+        "opencode.db",
+        "opencode.db-wal",
+        "opencode.db-shm",
+        "snapshot",
+        "repos",
+        "shell",
+        "tool-output",
+    ] {
+        let src = host_data.join(name);
+        if src.symlink_metadata().is_err() {
+            continue;
+        }
+        let dst = prof_data.join(name);
+        match dst.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if std::fs::read_link(&dst)? != src {
+                    report.conflicts.push(name);
+                }
+                continue;
+            }
+            Ok(meta) if meta.is_dir() && std::fs::remove_dir(&dst).is_ok() => {}
+            Ok(_) => {
+                report.conflicts.push(name);
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        crate::os::symlink(&src, &dst)?;
+        report.changed.push(name);
+    }
     Ok(report)
 }
 

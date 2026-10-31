@@ -18,7 +18,9 @@ use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::usage::ProviderKind;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::{Command, Stdio};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use crate::shell::{Launch, Shell};
@@ -149,9 +151,7 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
       . "$_krill_env"
       if [ "${CLAUDE_CONFIG_DIR-}" = "$HOME/.claude" ]; then unset CLAUDE_CONFIG_DIR; fi
       if [ "${CODEX_HOME-}" = "$HOME/.codex" ]; then unset CODEX_HOME; fi
-      if [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME" ] || [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME/.gemini/antigravity-cli" ]; then
-        unset ANTIGRAVITY_CLI_HOME
-      fi
+      unset ANTIGRAVITY_CLI_HOME
       # 호스트 기본 계정은 `host_default_dir`(`$HOME/.config/opencode`)이다. 옛 `.local/share` 경로도 호스트로 본다.
       if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.config/opencode" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
         __krill_opencode_xdg "$OPENCODE_CONFIG_DIR"
@@ -171,23 +171,6 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
   if (( ! ${preexec_functions[(I)__krill_sync_accounts]} )); then
     preexec_functions+=(__krill_sync_accounts)
   fi
-  agy() {
-    __krill_sync_accounts
-    local _arg
-    for _arg in "$@"; do
-      case "$_arg" in
-        --gemini_dir|--gemini_dir=*|--gemini-dir|--gemini-dir=*)
-          command agy "$@"
-          return
-          ;;
-      esac
-    done
-    if [ -n "${ANTIGRAVITY_CLI_HOME-}" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME/.gemini/antigravity-cli" ]; then
-      SSH_CONNECTION=krill command agy --gemini_dir="$ANTIGRAVITY_CLI_HOME/.gemini" "$@"
-    else
-      command agy "$@"
-    fi
-  }
   codex() {
     __krill_sync_accounts
     if [ "${KRILL_CODEX_ISOLATE-1}" = "0" ]; then
@@ -325,6 +308,12 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
                 }
                 _ => {}
             }
+            crate::usage::accounts::agy_native::sync_provider_account_dir(
+                &host_home,
+                Some(state),
+                provider,
+                Path::new(dir),
+            );
         }
         login.env.retain(|(key, _)| {
             !provider
@@ -896,11 +885,12 @@ pub(crate) fn pre_trust_workspace(profile: &Profile, cwd: &[u8], account: Option
         {
             sync_agy_profile_hooks_in(&host_home, acc_home).ok();
         }
-        // 계정 프로필이 있으면 그 폴더가 agy의 home이다(OWE-706).
-        let Some(home) = account_dir.or_else(trust_home_for_runtime) else {
-            return;
-        };
-        pre_trust_workspace_in(&home, &path).ok();
+        if let Some(acc_home) = account_dir.as_deref() {
+            pre_trust_workspace_in(acc_home, &path).ok();
+        }
+        if let Some(host_home) = trust_home_for_runtime() {
+            pre_trust_workspace_in(&host_home, &path).ok();
+        }
         return;
     }
     let Some(home) = trust_home_for_runtime() else {
@@ -1872,29 +1862,40 @@ fn apply_account_env(
     pinned: Option<&LaunchAccount>,
 ) -> Option<LaunchAccount> {
     let prog = profile.program()?;
-    let mut account = pinned.cloned().or_else(|| active_account(state, prog));
-    if (is(profile, "agy") || is(profile, "antigravity"))
-        && account
-            .as_ref()
-            .is_some_and(|account| !account.dir.is_empty())
-        && !cfg!(test)
-        && !agy_gemini_dir_supported()
-    {
-        tracing::warn!("agy --gemini_dir is unavailable; using the host account");
-        account = Some(LaunchAccount {
-            id: accounts::host_default_id(ProviderKind::Antigravity),
-            env_key: ProviderKind::Antigravity.env_var().to_owned(),
-            dir: String::new(),
-        });
-    }
+    let account = pinned.cloned().or_else(|| active_account(state, prog));
     if let Some(account) = &account {
         if !account.dir.is_empty()
             && let Some(host_home) = trust_home_for_runtime()
         {
             if is(profile, "agy") || is(profile, "antigravity") {
                 sync_agy_profile_hooks_in(&host_home, Path::new(&account.dir)).ok();
+                crate::usage::accounts::agy_native::sync_account_dir(
+                    &host_home,
+                    state,
+                    Path::new(&account.dir),
+                );
             } else if is(profile, "claude") {
                 sync_claude_profile_hooks_in(&host_home, Path::new(&account.dir)).ok();
+                crate::usage::accounts::agy_native::sync_provider_account_dir(
+                    &host_home,
+                    state,
+                    ProviderKind::Claude,
+                    Path::new(&account.dir),
+                );
+            } else if is(profile, "codex") {
+                crate::usage::accounts::agy_native::sync_provider_account_dir(
+                    &host_home,
+                    state,
+                    ProviderKind::Codex,
+                    Path::new(&account.dir),
+                );
+            } else if is(profile, "opencode") {
+                crate::usage::accounts::agy_native::sync_provider_account_dir(
+                    &host_home,
+                    state,
+                    ProviderKind::OpenCode,
+                    Path::new(&account.dir),
+                );
             }
         }
         if let Some(provider) = ProviderKind::from_env_var(&account.env_key) {
@@ -1982,21 +1983,6 @@ fn apply_account_env(
     account
 }
 
-/// 숨은 agy 플래그가 사라진 업데이트 뒤 잘못된 프로필로 조용히 실행하지 않도록 격리 HOME에서 확인한다.
-///
-/// 결과는 (실행 경로, mtime, 길이, `--version` 문자열) 키로 캐시한다(OWE-901).
-/// 키에 버전이 들어 있어 agy 업그레이드하면 자동으로 다시 보고, 실패해도 최대 1시간만 기억한다.
-/// 호스트 폴백(`apply_account_env`) 알림은 기존 warn 로그 + 기록 계정(호스트 id)이 맡는다.
-/// 전용 배너·세션 배지는 새 IPC가 필요해 넣지 않았다(OWE-901).
-fn agy_gemini_dir_supported() -> bool {
-    use krill_proto::os::ffi::OsStrExt as _;
-    let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
-    let Some(exe) = krill_proto::agent::which("agy", path) else {
-        return false;
-    };
-    agy_gemini_dir_supported_cached(&exe)
-}
-
 #[cfg(test)]
 #[cfg(unix)]
 pub(crate) fn agy_guard_cache_len_for_tests() -> usize {
@@ -2009,6 +1995,8 @@ pub(crate) fn clear_agy_guard_cache_for_tests() {
     crate::session::lock(&AGY_GUARD_CACHE).clear();
 }
 
+#[cfg(test)]
+#[cfg(unix)]
 fn agy_gemini_dir_supported_cached(exe: &Path) -> bool {
     let (mtime, len) = std::fs::symlink_metadata(exe)
         .and_then(|m| {
@@ -2044,19 +2032,29 @@ fn agy_gemini_dir_supported_cached(exe: &Path) -> bool {
 }
 
 /// agy 가드 결과 캐시(OWE-901). 키는 (실행 경로, mtime, 길이, 버전 문자열).
+#[cfg(test)]
+#[cfg(unix)]
 type AgyGuardKey = (PathBuf, u64, u64, String);
+#[cfg(test)]
+#[cfg(unix)]
 static AGY_GUARD_CACHE: std::sync::Mutex<std::collections::BTreeMap<AgyGuardKey, (Instant, bool)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 /// 가드 결과 기억 상한. 키가 바뀌면(업그레이드) 그 전에 다시 본다.
+#[cfg(test)]
+#[cfg(unix)]
 const AGY_GUARD_TTL: Duration = Duration::from_hours(1);
 /// 가드 프로브(`agy --gemini_dir=… mcp list`) 대기 상한. 테스트는 전체 검사의 병렬 부하에서 갓 만든 가짜 스크립트
 /// 실행이 5초를 넘겨(2026-10-20 실측 5.1·9.6초) 지원 안 함으로 잘못 판정해 30초로 둔다.
+#[cfg(test)]
+#[cfg(unix)]
 const AGY_GUARD_PROBE_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(30)
 } else {
     Duration::from_secs(5)
 };
 
+#[cfg(test)]
+#[cfg(unix)]
 fn agy_gemini_dir_supported_with(exe: &Path, root: &Path) -> bool {
     use krill_proto::os::fs::DirBuilderExt as _;
     if std::fs::DirBuilder::new()
@@ -2259,12 +2257,6 @@ fn wrap_account(
         && codex::no_daemon_supported(profile.program())
     {
         agent_argv.insert(1, "--no-daemon".to_owned());
-    }
-    if (is(profile, "agy") || is(profile, "antigravity"))
-        && let Some(account) = account.filter(|a| !a.dir.is_empty())
-    {
-        let gemini_dir = Path::new(&account.dir).join(".gemini");
-        agent_argv.insert(1, format!("--gemini_dir={}", gemini_dir.display()));
     }
     #[cfg(windows)]
     {

@@ -15,6 +15,8 @@ const LINKED: &[&str] = &[
     "thread-writer-locks",
 ];
 #[cfg(unix)]
+const EXTENSIONS: &[&str] = &["skills", "plugins", "rules", "prompts", "memories"];
+#[cfg(unix)]
 const FILES: &[&str] = &["history.jsonl", "session_index.jsonl"];
 
 #[cfg(unix)]
@@ -31,8 +33,30 @@ fn store<'a>(host: &'a Path, profile: &'a Path) -> super::history_store::Store<'
 }
 
 #[cfg(unix)]
+fn extension_store<'a>(
+    host: &'a Path,
+    profile: &'a Path,
+    dir: &'static [&'static str],
+) -> super::history_store::Store<'a> {
+    super::history_store::Store {
+        host,
+        profile,
+        directories: dir,
+        files: &[],
+        backup_name: "history-merged-backup",
+        foreign_links: super::history_store::ForeignLinks::Copy,
+        live: true,
+    }
+}
+
+#[cfg(unix)]
 pub(super) fn needs_merge(home: &Path, profile: &Path) -> bool {
-    store(&home.join(".codex"), profile).needs_merge()
+    let host = home.join(".codex");
+    store(&host, profile).needs_merge()
+        || EXTENSIONS.iter().any(|name| {
+            host.join(name).is_dir()
+                && extension_store(&host, profile, std::slice::from_ref(name)).needs_merge()
+        })
         || profile.join("config.toml").is_file()
             && std::fs::read_to_string(profile.join("config.toml"))
                 .ok()
@@ -87,7 +111,15 @@ fn provision_inner(home: &Path, profile: &Path, idle: &dyn Fn() -> bool) -> io::
         }
     }
     #[cfg(unix)]
-    store(&host, &profile).share(idle, &mut report)?;
+    {
+        store(&host, &profile).share(idle, &mut report)?;
+        for name in EXTENSIONS {
+            if host.join(name).is_dir() {
+                extension_store(&host, &profile, std::slice::from_ref(name))
+                    .share(idle, &mut report)?;
+            }
+        }
+    }
     #[cfg(not(unix))]
     for &name in LINKED {
         let src = host.join(name);
@@ -615,6 +647,36 @@ mod tests {
             original
         );
         assert!(!profile.join("sessions").is_symlink());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn shares_codex_extensions_and_merges_profile_extensions_into_host() {
+        let (home, host, profile) = fixture("extensions");
+        for name in EXTENSIONS {
+            std::fs::create_dir_all(host.join(name)).unwrap();
+        }
+        std::fs::create_dir_all(host.join("skills/pstack")).unwrap();
+        std::fs::write(host.join("skills/pstack/SKILL.md"), b"host pstack").unwrap();
+        std::fs::create_dir_all(profile.join("rules")).unwrap();
+        std::fs::write(profile.join("rules/custom.mdc"), b"profile rule").unwrap();
+
+        let report = provision(&home, &profile).unwrap();
+        for name in EXTENSIONS {
+            assert!(report.changed.contains(name), "missing {name}");
+            assert_eq!(
+                std::fs::read_link(profile.join(name)).unwrap(),
+                host.canonicalize().unwrap().join(name)
+            );
+        }
+        assert_eq!(
+            std::fs::read(profile.join("skills/pstack/SKILL.md")).unwrap(),
+            b"host pstack"
+        );
+        assert_eq!(
+            std::fs::read(host.join("rules/custom.mdc")).unwrap(),
+            b"profile rule"
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 }

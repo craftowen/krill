@@ -801,7 +801,7 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
             };
             assert!(argv.iter().any(|arg| arg == b"--conversation"));
             assert!(argv.iter().any(|arg| arg == sid.as_bytes()));
-            assert!(argv.iter().any(|arg| arg.starts_with(b"--gemini_dir=")));
+            assert!(!argv.iter().any(|arg| arg.starts_with(b"--gemini_dir=")));
             assert!(
                 env.iter()
                     .any(|(key, val)| key == b"KRILL_ACCOUNT_DIR" && !val.is_empty())
@@ -891,6 +891,19 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
         assert_eq!(
             fs::read(to_agy.join("annotations").join(format!("{sid}.pbtxt"))).unwrap(),
             b"title: \"agy switch\""
+        );
+        assert_eq!(
+            fs::read_to_string(home.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+                .unwrap(),
+            r#"{"access_token":"tok","expiry_date":4102444800000,"email":"agy2@example.com"}"#
+        );
+        assert_eq!(
+            fs::read(
+                home.join(".gemini/antigravity-cli/conversations")
+                    .join(format!("{sid}.db"))
+            )
+            .unwrap(),
+            b"SQLite format 3\0fixture-conversation"
         );
 
         drop(mock.join().unwrap());

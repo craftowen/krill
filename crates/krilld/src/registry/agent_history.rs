@@ -307,8 +307,6 @@ mod tests {
             reg_reader.holder.as_ref().unwrap().run(link, |_, _| {});
         });
 
-        let expected_gemini_flag =
-            format!("--gemini_dir={}", agy_profile.join(".gemini").display());
         let holder_worker = std::thread::spawn(move || {
             let pkt = holder_link.recv().unwrap().unwrap();
             let ToHolder::Spawn { req, id, argv, .. } = ToHolder::decode(pkt.frame()).unwrap()
@@ -320,8 +318,8 @@ mod tests {
                 .map(|a| String::from_utf8_lossy(a).into_owned())
                 .collect();
             assert!(
-                args.iter().any(|a| a == &expected_gemini_flag),
-                "expected {expected_gemini_flag} in {args:?}"
+                !args.iter().any(|a| a.starts_with("--gemini_dir=")),
+                "unexpected --gemini_dir in {args:?}"
             );
             assert_eq!(
                 &args[args.len() - 2..],

@@ -704,10 +704,10 @@ fn codex_and_agy_resume_use_selected_profile() {
             if provider == ProviderKind::Antigravity {
                 assert!(env.is_empty());
                 assert!(
-                    launch
+                    !launch
                         .argv
                         .iter()
-                        .any(|arg| arg == b"--gemini_dir=/fixture/account-b/.gemini")
+                        .any(|arg| arg.starts_with(b"--gemini_dir="))
                 );
                 assert!(!launch.env.iter().any(|(k, _)| k == b"SSH_CONNECTION"));
             } else {
@@ -1219,10 +1219,10 @@ fn fork_in_builds_claude_and_codex_fork_argv() {
         assert_eq!(agy_fork_sid, None);
         assert_eq!(agy_recorded, Some(agy_acc));
         assert!(
-            agy_fork
+            !agy_fork
                 .argv
                 .iter()
-                .any(|arg| arg == b"--gemini_dir=/fixture/agy-b/.gemini"),
+                .any(|arg| arg.starts_with(b"--gemini_dir=")),
             "{prog} fork argv={:?}",
             agy_fork.argv
         );

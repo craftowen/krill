@@ -186,8 +186,24 @@ pub(super) fn prepare_bound(
                 Some((root, _)) => Some(root),
                 None => None,
             };
-            let roots = crate::agent_history::vault::agy_candidate_dirs(&from, true);
+            let mut roots = crate::agent_history::vault::agy_candidate_dirs(&from, true);
+            let host_agy = accounts::host_default_dir(home, ProviderKind::Antigravity);
+            if !roots.iter().any(|r| r == &host_agy) {
+                roots.push(host_agy.clone());
+            }
             let bridged = agy::prepare(bound_root.as_deref(), &roots, &target_root, id)?;
+            if !target.host_default {
+                accounts::agy_native::sync_account_dir(home, None, to);
+                if target_root != host_agy {
+                    agy::prepare(
+                        Some(&target_root),
+                        std::slice::from_ref(&target_root),
+                        &host_agy,
+                        id,
+                    )
+                    .ok();
+                }
+            }
             let path = bridged.target_db().to_path_buf();
             agy_bridge = Some(bridged);
             Some(path)

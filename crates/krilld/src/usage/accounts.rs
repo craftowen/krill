@@ -1,5 +1,6 @@
 //! 프로바이더 다계정 레지스트리(`accounts.toml`)·계정별 5h/7d 사용량 측정·원클릭 전환·자동전환 엔진(MK-107·MK-108).
 
+pub(crate) mod agy_native;
 pub(crate) mod codex_home;
 mod identity;
 pub(super) use identity::from_credentials as identity_from_credentials;
@@ -327,6 +328,7 @@ fn save_inner(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> io:
     let path = config_path(home, state_dir);
     let text = krill_proto::config_document::save_toml(&path, file)?;
     write_atomic_0600(&path, text.as_bytes())?;
+    agy_native::sync_active(home, file);
     if let Err(error) = write_active_env(home, state_dir, file) {
         // accounts.toml은 이미 커밋됐다. env 내보내기 실패를 기록하되 저장 성공은 유지한다.
         tracing::warn!(kind = ?error.kind(), "active account env export failed");

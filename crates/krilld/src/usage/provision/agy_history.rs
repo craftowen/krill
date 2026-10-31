@@ -90,7 +90,50 @@ pub(super) fn provision(
         return Ok(report);
     }
     share_summary(&host, &local, &mut report)?;
+    share_gemini_extensions(&home, &profile, &mut report)?;
     Ok(report)
+}
+
+fn share_gemini_extensions(home: &Path, profile: &Path, report: &mut Report) -> io::Result<()> {
+    for (rel, label) in [
+        (".gemini/config/plugins", "plugins"),
+        (
+            ".gemini/config/import_manifest.json",
+            "import_manifest.json",
+        ),
+        (".gemini/config/config.json", "config.json"),
+        (".gemini/skills", "skills"),
+        (".gemini/GEMINI.md", "GEMINI.md"),
+        (".gemini/antigravity-cli/skills", "antigravity-cli/skills"),
+        (".gemini/antigravity-cli/mcp_config.json", "mcp_config.json"),
+    ] {
+        let target = home.join(rel);
+        if target.symlink_metadata().is_err() {
+            continue;
+        }
+        let source = profile.join(rel);
+        match source.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if fs::read_link(&source)? != target {
+                    report.conflicts.push(label);
+                }
+                continue;
+            }
+            Ok(meta) if meta.is_dir() && fs::remove_dir(&source).is_ok() => {}
+            Ok(_) => {
+                report.conflicts.push(label);
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(parent) = source.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        std::os::unix::fs::symlink(&target, &source)?;
+        report.changed.push(label);
+    }
+    Ok(())
 }
 
 fn share_summary(host: &Path, local: &Path, report: &mut Report) -> io::Result<()> {

@@ -61,14 +61,24 @@ pub(super) fn prepare(home: &Path, source: &Path) -> io::Result<PathBuf> {
         })?;
         write_atomic_0600(&dest, &bytes)?;
     }
+    let host_codex = home.join(".codex");
     for name in [
         "sessions",
         "archived_sessions",
+        "shell_snapshots",
+        "thread-writer-locks",
         "skills",
+        "plugins",
         "prompts",
         "rules",
+        "memories",
     ] {
-        let src = canonical.join(name);
+        let host_src = host_codex.join(name);
+        let src = if host_src.is_dir() {
+            host_src
+        } else {
+            canonical.join(name)
+        };
         let dest = target.join(name);
         if src.is_dir() && std::fs::symlink_metadata(&dest).is_err() {
             std::os::unix::fs::symlink(&src, &dest)?;
