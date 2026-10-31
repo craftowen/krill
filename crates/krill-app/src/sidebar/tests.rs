@@ -2425,10 +2425,10 @@ fn snapshot_poll_preserves_preference_failure(cx: &mut TestAppContext) {
     fs::remove_dir_all(dir).ok();
 }
 
-/// OWE-737: Claude 유휴/대기 세션의 프롬프트 캐시 카운트다운(`CacheTimer`)과 첫 프롬프트 자동 제목(`session-titles.json`)이
-/// 사이드바 세션 행과 워크트리 카드에 표시되고, 만료 시 자동으로 숨겨지며 사용자 지정 이름은 덮어쓰지 않는다.
+/// OWE-737: 첫 프롬프트 자동 제목(`session-titles.json`)이 사이드바 세션 행과 워크트리 카드에 표시되고,
+/// 사용자 지정 이름은 덮어쓰지 않는다.
 #[gpui::test]
-fn owe737_cache_timer_and_auto_titles_render_on_session_and_worktree_rows(cx: &mut TestAppContext) {
+fn owe737_auto_titles_render_on_session_and_worktree_rows(cx: &mut TestAppContext) {
     let dir = std::env::temp_dir().join(format!("mk-sidebar-{}-owe737", std::process::id()));
     fs::remove_dir_all(&dir).ok();
     fs::create_dir_all(&dir).unwrap();
@@ -2440,17 +2440,14 @@ fn owe737_cache_timer_and_auto_titles_render_on_session_and_worktree_rows(cx: &m
     .unwrap();
     let sidebar_file = dir.join("sidebar.bin");
 
-    init_sidebar_test_settings(cx, "cache", "prompt_cache_timer_enabled = true\n");
+    init_sidebar_test_settings(cx, "auto-titles", "");
     cx.update(gpui_component::init);
     let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_file)));
-    let base_ns = 10_000_000_000_000_u64;
-    let now_ns = base_ns + 120 * 1_000_000_000; // 120초 경과 → 5분(300초) 중 3:00 남음
 
     vcx.update(|_, cx| {
         view.update(cx, |s, cx| {
             let mut claude = session(11, AgentState::Done, Some("/repo/wt-1"));
             claude.status.agent = "claude".into();
-            claude.status.since_unix_ns = base_ns;
             let wt = PathBuf::from("/repo/wt-1");
             s.snapshot = Snapshot {
                 sessions: vec![claude.clone()],
@@ -2464,7 +2461,6 @@ fn owe737_cache_timer_and_auto_titles_render_on_session_and_worktree_rows(cx: &m
                 },
             );
             s.expanded_cards.insert(wt.clone());
-            s.set_now_unix_ns_for_test(Some(now_ns), cx);
             s.rebuild(cx);
 
             // 1. 기본 브랜치(`worktree-1`)와 세션 라벨은 첫 프롬프트 기반 자동 제목을 사용한다.
@@ -2479,28 +2475,6 @@ fn owe737_cache_timer_and_auto_titles_render_on_session_and_worktree_rows(cx: &m
             assert_eq!(s.name(&wt), "직접 정한 이름");
         });
     });
-    vcx.run_until_parked();
-
-    // 행 인덱스: 0 = Repository("/repo"), 1 = Worktree("/repo/wt-1"), 2 = Session(11)
-    assert!(
-        vcx.debug_bounds("worktree-cache-timer-1").is_some(),
-        "worktree row must render most urgent Claude prompt cache timer"
-    );
-    assert!(
-        vcx.debug_bounds("session-cache-timer-2").is_some(),
-        "session row must render Claude prompt cache timer"
-    );
-
-    // 3. TTL(300초) 경과 후에는 타이머 배지가 사라진다.
-    vcx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.set_now_unix_ns_for_test(Some(base_ns + 305 * 1_000_000_000), cx);
-        });
-    });
-    vcx.run_until_parked();
-    assert!(vcx.debug_bounds("worktree-cache-timer-1").is_none());
-    assert!(vcx.debug_bounds("session-cache-timer-2").is_none());
-
     fs::remove_dir_all(dir).ok();
 }
 

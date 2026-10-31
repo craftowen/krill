@@ -518,29 +518,15 @@ fn closed_window_does_not_suppress_focused_session(cx: &mut TestAppContext) {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-fn suppress_notification_truth_table() {
-    // 활성 창이 없으면(메뉴바 상주 포함) 항상 보낸다.
-    assert!(!suppress_notification(true, true, false));
-    assert!(!suppress_notification(true, false, false));
-    assert!(!suppress_notification(false, true, false));
-    // 비활성 시 모드: 활성 창이 있으면 포커스 여부와 관계없이 생략한다.
-    assert!(suppress_notification(true, false, true));
-    assert!(suppress_notification(true, true, true));
-    // 기본 모드: 보고 있는 칸만 생략한다.
-    assert!(suppress_notification(false, true, true));
-    assert!(!suppress_notification(false, false, true));
-}
-
 #[gpui::test]
-fn inactive_only_mode_suppresses_while_a_window_is_active(cx: &mut TestAppContext) {
+fn active_window_suppresses_every_session(cx: &mut TestAppContext) {
     let _guard = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = temp_dir("inactive-only");
+    let dir = temp_dir("active-window");
     fs::write(
         dir.join("settings.toml"),
-        "notifications = true\nkeep_awake = \"off\"\nnotify_only_inactive = true\n",
+        "notifications = true\nkeep_awake = \"off\"\n",
     )
     .unwrap();
     init_settings(cx, &dir);
@@ -561,7 +547,7 @@ fn inactive_only_mode_suppresses_while_a_window_is_active(cx: &mut TestAppContex
     });
     assert!(
         cx.shown_system_notifications().is_empty(),
-        "비활성 시 모드에서는 활성 창이 있으면 알림을 생략한다"
+        "활성 창이 있으면 보고 있지 않은 칸의 알림도 생략한다"
     );
     // 창이 비활성이면 같은 세션도 알림을 보낸다.
     cx.update(|cx| {
@@ -572,22 +558,6 @@ fn inactive_only_mode_suppresses_while_a_window_is_active(cx: &mut TestAppContex
         );
     });
     assert_eq!(cx.shown_system_notifications().len(), 1);
-    // 모드를 끄면 활성 창에서도(포커스 칸이 아니면) 알림을 보낸다.
-    fs::write(
-        dir.join("settings.toml"),
-        "notifications = true\nkeep_awake = \"off\"\nnotify_only_inactive = false\n",
-    )
-    .unwrap();
-    cx.update(settings::reload);
-    cx.run_until_parked();
-    cx.update(|cx| {
-        set_active(true, cx);
-        sync_snapshot(
-            &snapshot(vec![session(7, AgentState::Waiting, 4, "/repo/a")]),
-            cx,
-        );
-    });
-    assert_eq!(cx.shown_system_notifications().len(), 2);
     fs::remove_dir_all(dir).ok();
 }
 
@@ -718,11 +688,7 @@ fn event_toggles_gate_snapshot_and_bell(cx: &mut TestAppContext) {
     });
     assert_eq!(cx.shown_system_notifications().len(), 2);
 
-    // 테스트 알림은 기존 발송 경로로 나가고, 마스터를 끄면 나가지 않는다.
-    cx.update(|cx| {
-        send_test_notification(cx);
-    });
-    assert_eq!(cx.shown_system_notifications().len(), 3);
+    // 마스터를 끄면 벨 알림도 나가지 않는다.
     fs::write(
         dir.join("settings.toml"),
         "notifications = false\nkeep_awake = \"off\"\n",
@@ -731,10 +697,9 @@ fn event_toggles_gate_snapshot_and_bell(cx: &mut TestAppContext) {
     cx.update(settings::reload);
     cx.run_until_parked();
     cx.update(|cx| {
-        send_test_notification(cx);
         notify_bell(SessionId(23), "wt-c", cx);
     });
-    assert_eq!(cx.shown_system_notifications().len(), 3);
+    assert_eq!(cx.shown_system_notifications().len(), 2);
     fs::remove_dir_all(dir).ok();
 }
 

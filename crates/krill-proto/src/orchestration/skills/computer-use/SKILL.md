@@ -7,13 +7,13 @@ description: Drive a visible local macOS app through krill computer using immuta
 
 This guide describes `computer/2`. Read `krill computer capabilities --json` for the bundled guide hash, backend, supported actions, and service features. A different installed guide hash means the instructions may be stale; read `krill skills get computer-use` from the same binary.
 
-Use the current JXA backend for visible macOS app windows. Native execution is experimental and must not be inferred from a capability name. GUI execution is separate from terminal session survival.
+The native `krill-app` worker is the default engine for visible macOS app windows: it observes and runs element click (left, single, unmodified), secondary action, and set-value. Every other action, screenshots, `--restore-window`, `--window-index`, and CG window IDs run on JXA for that one call. Results report `path` (`native` or `jxa`) and, when JXA replaced the native engine, `fallbackReason`. `KRILL_COMPUTER_ENGINE=jxa` forces JXA. GUI execution is separate from terminal session survival.
 
 ## Observe, act, inspect
 
 1. Check `krill computer capabilities --json` and `krill computer permissions --json`. To open the relevant Settings page, explicitly use `permissions --id accessibility` or `permissions --id screenshots`.
-2. Discover the exact process/window with `krill computer list-apps --json` and `krill computer list-windows --app pid:123 --json`. Use a PID when names are ambiguous.
-3. Observe with `krill computer get-app-state --app pid:123 --window-id 456 --json`.
+2. Discover the exact process with `krill computer list-apps --json`. Use a PID when names are ambiguous.
+3. Observe the focused window with `krill computer get-app-state --app pid:123 --json`. To reach another window use its `ax:N` ID from an earlier result. `krill computer list-windows` reports CG window numbers; passing one to `--window-id` runs that observation on JXA, which takes seconds and reads a much smaller tree.
 4. Select a reference from that result and bind the action explicitly: `krill computer click --snapshot <snapshotId> --element 2 --json`.
 5. Read all result axes and the returned observation before choosing another action. A fresh observation supplies its own snapshot ID. Never reuse a reference number from a different snapshot.
 
@@ -39,6 +39,8 @@ All actions accept `--snapshot <snapshotId>`, `--json`, and optional `--screensh
 - `krill computer scroll --element 3 --direction down --pages 1`, or a point and `--delta-x` / `--delta-y`.
 - `krill computer drag --from-element 2 --to-element 3`, or explicit `--from-x`, `--from-y`, `--to-x`, `--to-y`.
 
+An element action that falls back to JXA first observes the window with JXA, whose tree is bounded much tighter than the worker's, and the target must match exactly one element of it by role, title, and frame. Otherwise the action is refused before input and `fallbackReason` and the verification reason say why; there is no coordinate fallback. Key, hotkey, and coordinate actions only need the same window.
+
 The target app and window must already be foreground. Text input requires its observed receiver to remain focused. Unexpected foreground/window/receiver changes stop the action; do not force focus back after user intervention. `get-app-state --restore-window` explicitly allows guarded unhide/unminimization and foreground activation with a checked postcondition; it does not authorize targeting Krill itself. Coordinates use the observed desktop logical points, not screenshot pixels. A screenshot carries measured dimensions and capture bounds; changed geometry or occlusion requires a new observation.
 
 ## Read results honestly
@@ -53,7 +55,7 @@ The input lease serializes cooperating Krill executors through the entire comman
 
 ## Experimental persistent native MCP
 
-`krill computer serve --experimental [--worker /absolute/path/to/krill-app]` explicitly selects an isolated native worker for one stdio MCP session. The default CLI commands above still use JXA. This experimental path has not passed every native permission, hang isolation, update, footprint, and end-to-end gate. Do not infer permission inheritance from the worker being the app executable.
+`krill computer serve --experimental [--worker /absolute/path/to/krill-app]` explicitly selects an isolated native worker for one stdio MCP session. The default CLI commands above start one worker per command; this session keeps one worker alive. This experimental path has not passed every native permission, hang isolation, update, footprint, and end-to-end gate. Do not infer permission inheritance from the worker being the app executable.
 
 The proxy supports **MCP 2025-11-25 only**, using `initialize`, then `notifications/initialized`. It reports that exact version, accepts `ping`, and returns `-32601` to `server/discover` so clients that support the documented legacy fallback can initialize. This is not a claim of support for the newer discovery/per-request metadata protocol. Messages are UTF-8 JSON-RPC lines on stdin/stdout; diagnostics go to stderr. The command neither registers an MCP server nor changes configuration, accounts, providers, or remote services.
 
@@ -61,12 +63,12 @@ The worker is discovered beside the current `krill` executable, including a sibl
 
 After the handshake, discover `tools/list` and call:
 
-- `computer_session {}` returns the actual native hello: contract, epoch, context, capabilities, unsupported operations, and limits. These capabilities apply to this worker, separately from the default JXA capabilities.
+- `computer_session {}` returns the actual native hello: contract, epoch, context, capabilities, unsupported operations, and limits. These capabilities apply to this worker, separately from `krill computer capabilities`.
 - `computer_execute {"seq":1,"deadlineMs":5000,"op":{"kind":"apps"}}` submits one operation. `seq` is required, positive, caller-owned, and monotonically increasing within the advertised gap. `deadlineMs` includes queueing and execution and cannot exceed native limits. The returned tool schema lists the supported native op shapes. For example, observe with `{"kind":"observe","pid":123,"window":0,"limit":100}` and mutate only with an observed native target such as `{"kind":"click","target":{"snapshot":"E/C/1","element":"e2"}}`. Native window indices and element references are zero-based (`window:0` and `e0` are valid); copy them exactly from native observations.
 - `computer_status {"seq":1}` queries the original native request without issuing desktop input. `expired` or `unseen` never authorizes replay.
 - `computer_cancel {"seq":1}` attempts cancellation before dispatch. MCP `notifications/cancelled` also forwards cancellation of a pending execute request. `too_late` cannot undo already posted input; inspect all result axes.
 
-The proxy captures epoch/context from native hello; callers cannot replace them. A mutation target must contain a snapshot from that same native epoch/context. JXA snapshots and snapshots from another worker cannot be used. A restarted session always requires a fresh observation and a new assessment of the desktop.
+The proxy captures epoch/context from native hello; callers cannot replace them. A mutation target must contain a snapshot from that same native epoch/context. Snapshots from the CLI commands above and from another worker cannot be used. A restarted session always requires a fresh observation and a new assessment of the desktop.
 
 When the worker advertises `batch` and `limits.maxBatchSteps`, `computer_execute` also accepts `{"kind":"batch","steps":[...]}` with 1..4 mutation steps, bounded by the advertised maximum. Steps may be `action`, `set_value`, `click`, or `type_text`; reads and nested batches are refused. The batch has one seq and one deadline. Inspect each step and aggregate `issuedSteps`/`issuedUnits` (`issuedSteps` is null when dispatch is unknown): a known submitted prefix followed by a refused step reports Partial and `isError` without implying that prior input was undone. Aggregate verification is satisfied only if every step satisfied its explicit predicate; unverified input leaves it not requested. A known Partial result with completed cleanup keeps the session usable; Unknown, incomplete cleanup, or quiescing closes it.
 

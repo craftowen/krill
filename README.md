@@ -135,7 +135,7 @@ Let a coordinator agent break down dependent tasks (`krill orchestration run-cre
 <td width="50%" valign="top">
 
 ### 5. Mobile E2EE Companion (PWA)
-Scan a QR code in **Settings → Mobile** to monitor live agent states and open terminals from your phone browser or Home Screen web app (PWA). Connects over Relay or Tailscale with end-to-end **ChaCha20-Poly1305** (`HKDF-SHA256`) encryption.
+Scan a QR code in **Settings → Devices → Mobile** to monitor live agent states and open terminals from your phone browser or Home Screen web app (PWA). Connects over Relay or Tailscale with end-to-end **ChaCha20-Poly1305** (`HKDF-SHA256`) encryption.
 
 Sign in with Google on your desktop when you choose the hosted relay. Your phone opens the PWA without signing in and authenticates with its QR pairing or saved device key.
 
@@ -218,7 +218,7 @@ The installer verifies the ZIP's SHA-256, installs under `%LOCALAPPDATA%\Program
 |---|---|---|
 | **macOS, Apple Silicon (`arm64`)** | Primary desktop platform | Release app and CLI, or source build |
 | **Windows, `x64`** | Native desktop preview; desktop GUI, interactive logon, sleep, and reboot behavior still need validation beyond the recorded Windows Server VM tests | Windows release ZIP and PowerShell installer |
-| **Mobile (iOS / Android)** | Companion web app (PWA) paired via QR code over Relay or Tailscale (ChaCha20-Poly1305 E2EE) | Scan QR from **Settings → Mobile** in the Mac app (no app-store binary) |
+| **Mobile (iOS / Android)** | Companion web app (PWA) paired via QR code over Relay or Tailscale (ChaCha20-Poly1305 E2EE) | Scan QR from **Settings → Devices → Mobile** in the Mac app (no app-store binary) |
 | **macOS, Intel (`x86_64`)** | Not supported for this public preview | No supported release bundle or source-install promise |
 | **Linux** | Not supported for this public preview | No Linux desktop or downloadable remote-host package promised |
 | **Windows, ARM64 / 32-bit** | Not supported | No release package |
@@ -227,7 +227,7 @@ The installer verifies the ZIP's SHA-256, installs under `%LOCALAPPDATA%\Program
 
 ## First Successful Session
 
-1. Open Krill and use **Open folder…** to select a local Git repository. If the interface is Korean, select **설정 → 일반 · 외관 → 언어 → English** (Settings → General & Appearance → Language).
+1. Open Krill and use **Open folder…** to select a local Git repository. If the interface is Korean, select **설정 → 모양 → 언어 → English** (Settings → Appearance → Language).
 2. Open the **New session** (`+`) menu and choose **Terminal**, or choose an installed, authenticated agent such as Claude Code or Codex. Ask the agent to inspect the repository.
 3. Use **New worktree** in the sidebar, enter a unique name, and choose **Create**. Review any setup script before approving it, or choose **Skip setup**. Start a second agent there to work independently.
 4. Record the session IDs with `krill ls`. Quit and reopen the app while leaving the session tabs intact; check that the running sessions reconnect with the same IDs. Closing a session tab/pane explicitly terminates that session.

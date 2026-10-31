@@ -1,8 +1,8 @@
 //! Computer-use 격리 워커(M13 실험, 설계 C′). 같은 앱 실행 파일을 `--computer-worker`로 띄우면 GPUI 초기화 전에
 //! stdin/stdout 프레임 서버(`krill-computer-worker/1`)로 동작한다.
 //!
-//! - 기본 경로는 여전히 CLI의 JXA다. 이 워커는 실제 TCC·hang 격리·업데이트·footprint·종단간 게이트를 통과하기 전까지
-//!   실험용이며, 같은 실행 파일이라는 이유로 Krill.app의 TCC 허용을 물려받는다고 가정하지 않는다(`permissions` op가
+//! - CLI의 기본 엔진이다. 호출마다 한 번 띄우고, 워커에 없는 동작은 CLI가 동작 단위로 JXA에 넘긴다.
+//!   같은 실행 파일이라는 이유로 Krill.app의 TCC 허용을 물려받는다고 가정하지 않는다(`permissions` op가
 //!   이 프로세스 자신의 상태를 보고한다).
 //! - GUI·AX 작업은 이 프로세스에만 있다. holder·daemon에는 아무것도 추가하지 않는다.
 //! - `unsafe`는 `ffi.rs`에만 있다. 나머지(프로토콜·장부·잠금·정책·AX 실행기)는 safe 코드다.
@@ -82,6 +82,11 @@ fn run(args: &[std::ffi::OsString]) -> u8 {
         return 1;
     };
     let identity = worker::Identity { epoch, context };
+    // TCC와 Process Manager는 프로세스의 첫 호출만 느리다(약 10 ms씩). 검사를 대신하지 않고 첫 요청을 덜 기다리게 한다.
+    std::thread::spawn(|| {
+        crate::platform::permissions::probe_accessibility();
+        ffi::foreground_pid().ok();
+    });
     let backend = ax::MacBackend::new(identity.clone(), protected);
     worker::serve(
         std::io::BufReader::new(std::io::stdin()),

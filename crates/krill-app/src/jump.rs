@@ -520,6 +520,11 @@ pub enum ActionKind {
     ToggleSidebar,
     ToggleExplorer,
     ToggleSearch,
+    ImportTerminalThemes,
+    OpenChecks,
+    OpenDisk,
+    OpenAutomations,
+    EditQuickCommands,
     QuickCommand(usize),
 }
 

@@ -421,6 +421,8 @@ fn snapshot_fixture() -> super::engine::AppStateSnapshot {
     super::engine::AppStateSnapshot {
         snapshot_id: "snap-fixture-1".to_owned(),
         process_start: "1792848000.123456".to_owned(),
+        path: None,
+        fallback_reason: None,
         caller_scope: "caller-fixture".to_owned(),
         captured_at_ms: 123,
         coverage_truncated: false,
@@ -615,7 +617,7 @@ fn observation_and_action_scripts_share_one_identity_prefix() {
     assert!(LIVE_ACTION_JXA_SCRIPT.starts_with(observe));
     assert!(observe.contains("function validateTree"));
     assert!(observe.contains("fresh.value!==target.value"));
-    assert!(observe.contains("refs.length && truncated"));
+    assert!(observe.contains("after.slice(0,-1).some(n=>cutNodes.has(n))"));
     assert!(observe.contains("sameObservedWindow(proc,focused,win)"));
     assert!(!observe.contains("equal(rect(focused),req.winBounds)"));
 }

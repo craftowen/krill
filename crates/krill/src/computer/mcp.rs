@@ -12,7 +12,7 @@ mod retention;
 mod schema;
 #[cfg(test)]
 mod tests;
-mod transport;
+pub(super) mod transport;
 mod view;
 
 use std::collections::{BTreeMap, VecDeque};

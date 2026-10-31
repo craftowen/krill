@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use super::super::ffi::{self, AxError, Cf, CgPoint, ax};
 use super::super::protocol::{Cleanup, Delivery, Observation, Op, Target, Verification};
-use super::super::worker::{Backend, Dispatched, ReadResult, Refusal};
+use super::super::worker::{self, Backend, Dispatched, ReadResult, Refusal};
 use super::{
     ALLOWED_ACTIONS, CAPABILITIES, MAX_ACTIONS, MacBackend, Prepared, Snapshot, TYPE_CHUNK_UTF16,
     UNSUPPORTED, ax_refusal,
@@ -458,7 +458,10 @@ impl Backend for MacBackend {
             ));
         }
         let (snapshot, node) = self.resolve(target)?;
-        let app = self.revalidate(snapshot, node, deadline)?;
+        // 창 전체 census는 발행 직전 `dispatch`의 재검증 한 번이면 된다. 여기와 그 사이에는 장부 문만 있어
+        // 같은 census를 두 번 돌면 결과가 같고 시간만 든다(TypeWhisper 133노드에서 한 번 약 30 ms, 실측).
+        let app = self.validate_instance(snapshot, deadline)?;
+        self.validate_path(snapshot, node, true, deadline)?;
         self.require_enabled(&node.element)?;
         self.require_receiver_window(snapshot, &app, deadline)?;
         let element = node.element.clone();
@@ -528,7 +531,10 @@ impl Backend for MacBackend {
             self.require_enabled(&node.element)?;
             self.require_receiver_window(snapshot, &app, deadline)
         };
-        if let Err(refusal) = validate() {
+        let started = Instant::now();
+        let validated = validate();
+        worker::record("dispatchValidate", started);
+        if let Err(refusal) = validated {
             return simple(Delivery::NotDispatched {
                 reason: refusal.code.to_owned(),
             });
@@ -555,12 +561,18 @@ impl Backend for MacBackend {
                     self.require_receiver_window(snapshot, &app, deadline)?;
                     self.budget(deadline)
                 };
-                if let Err(refusal) = check() {
+                let started = Instant::now();
+                let checked = check();
+                worker::record("inputCheck", started);
+                if let Err(refusal) = checked {
                     return simple(Delivery::NotDispatched {
                         reason: refusal.code.to_owned(),
                     });
                 }
-                simple(side_effect_delivery(ffi::perform_action(&element, &action)))
+                let started = Instant::now();
+                let delivery = side_effect_delivery(ffi::perform_action(&element, &action));
+                worker::record("input", started);
+                simple(delivery)
             }
             Prepared::SetValue {
                 target,
