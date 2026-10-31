@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 mod paths;
-pub use paths::{is_absolute_history_path, normalize_path_for_comparison, path_inside_or_equal};
+pub use paths::{
+    is_absolute_history_path, is_claude_mem_cwd, is_claude_mem_project_dir,
+    normalize_path_for_comparison, path_inside_or_equal,
+};
 
 /// 지휘자 배정. `FEAT_CONTROL`과 함께 협상해야 한다.
 pub const FEAT_AGENT_HISTORY: u64 = 1 << 50;

@@ -28,6 +28,24 @@ fn disk_scan_is_explicit_repeatable_read_only_and_excludes_subagents() {
         claude("22222222-2222-4333-8444-555555555555", "/tmp/sub"),
     )
     .unwrap();
+    let claude_mem_dir = root.join("claude/projects/-Users-macmini--claude-mem-observer-sessions");
+    fs::create_dir_all(&claude_mem_dir).unwrap();
+    fs::write(
+        claude_mem_dir.join("5c18f8ca-5139-42aa-b23c-cebafb67c443.jsonl"),
+        claude(
+            "5c18f8ca-5139-42aa-b23c-cebafb67c443",
+            "/Users/macmini/.claude-mem/observer-sessions",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        c.join("claude-mem-inline.jsonl"),
+        claude(
+            "639f255e-b2ee-4ddc-8171-5f4000000000",
+            "/Users/macmini/.claude-mem/observer-sessions",
+        ),
+    )
+    .unwrap();
     fs::write(
         c.join("sidechain.jsonl"),
         claude(ID, "/tmp").replace("false", "true"),
@@ -127,6 +145,18 @@ fn vault_search_indexes_claude_codex_agy_opencode_titles_summaries_and_bodies() 
     // 1. Claude transcript with customTitle, summary, user & assistant messages, tool_use
     let claude_proj = claude_root.join("projects/-tmp-repo-alpha");
     fs::create_dir_all(&claude_proj).unwrap();
+    let claude_mem_proj = claude_root.join("projects/-Users-macmini--claude-mem-observer-sessions");
+    fs::create_dir_all(&claude_mem_proj).unwrap();
+    fs::write(
+        claude_mem_proj.join("5c18f8ca-5139-42aa-b23c-cebafb67c443.jsonl"),
+        "{\"type\":\"user\",\"sessionId\":\"5c18f8ca-5139-42aa-b23c-cebafb67c443\",\"cwd\":\"/Users/macmini/.claude-mem/observer-sessions\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"Condense the tool payload below auth_service.rs rotation\"}}\n",
+    )
+    .unwrap();
+    fs::write(
+        claude_proj.join("639f255e-b2ee-4ddc-8171-5f4000000000.jsonl"),
+        "{\"type\":\"user\",\"sessionId\":\"639f255e-b2ee-4ddc-8171-5f4000000000\",\"cwd\":\"/Users/macmini/.claude-mem/observer-sessions\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"Condense the tool payload below auth_service.rs rotation\"}}\n",
+    )
+    .unwrap();
     let claude_id = "11111111-2222-4333-8444-555555555555";
     fs::write(
         claude_proj.join(format!("{claude_id}.jsonl")),

@@ -6,7 +6,9 @@ use std::io::{self, BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use krill_proto::agent_history::{Agent, Entry, MAX_ENTRIES, MAX_TEXT, Snapshot};
+use krill_proto::agent_history::{
+    Agent, Entry, MAX_ENTRIES, MAX_TEXT, Snapshot, is_claude_mem_cwd, is_claude_mem_project_dir,
+};
 use serde_json::Value;
 
 pub(crate) mod chat;
@@ -280,13 +282,18 @@ impl Scan {
             if kind.is_symlink() {
                 continue;
             }
+            let name = item.file_name();
+            let name_str = name.to_string_lossy();
             let path = item.path();
             if kind.is_dir() {
+                if agent == Agent::Claude
+                    && (name_str == "subagents" || is_claude_mem_project_dir(&name_str))
+                {
+                    continue;
+                }
                 self.walk(&path, agent, depth.saturating_sub(1));
             } else if kind.is_file() && path.extension().is_some_and(|s| s == "jsonl") {
-                if agent == Agent::Codex
-                    && !item.file_name().to_string_lossy().starts_with("rollout-")
-                {
+                if agent == Agent::Codex && !name_str.starts_with("rollout-") {
                     continue;
                 }
                 self.read(&path, agent);
@@ -295,7 +302,12 @@ impl Scan {
     }
 
     fn read(&mut self, path: &Path, agent: Agent) {
-        let result = (|| -> io::Result<Option<Entry>> {
+        enum ReadOutcome {
+            Found(Entry),
+            Excluded,
+            Missing,
+        }
+        let result = (|| -> io::Result<ReadOutcome> {
             let file = File::open(path)?;
             let modified = file
                 .metadata()?
@@ -310,10 +322,12 @@ impl Scan {
             // 메타데이터를 찾으면 즉시 멈춘다. 큰 transcript의 나머지 본문은 읽지 않는다.
             let result = loop {
                 match reader.read_until(b'\n', &mut line) {
-                    Ok(0) => break Ok(None),
+                    Ok(0) => break Ok(ReadOutcome::Missing),
                     Ok(_) => {
-                        if let Some(entry) = parse(&line, agent, modified) {
-                            break Ok(Some(entry));
+                        match parse_outcome(&line, agent, modified) {
+                            Some(Ok(entry)) => break Ok(ReadOutcome::Found(entry)),
+                            Some(Err(())) => break Ok(ReadOutcome::Excluded),
+                            None => {}
                         }
                         line.clear();
                     }
@@ -327,7 +341,7 @@ impl Scan {
             result
         })();
         match result {
-            Ok(Some(entry)) => {
+            Ok(ReadOutcome::Found(entry)) => {
                 let key = (entry.agent, entry.id.clone());
                 if self
                     .entries
@@ -349,12 +363,18 @@ impl Scan {
                     }
                 }
             }
+            Ok(ReadOutcome::Excluded) => {}
             _ => self.result.skipped = true,
         }
     }
 }
 
+#[cfg(all(test, unix))]
 fn parse(bytes: &[u8], agent: Agent, modified: u64) -> Option<Entry> {
+    parse_outcome(bytes, agent, modified).and_then(Result::ok)
+}
+
+fn parse_outcome(bytes: &[u8], agent: Agent, modified: u64) -> Option<Result<Entry, ()>> {
     // 마지막 잘린 줄과 손상된 줄은 건너뛴다. 전체 transcript를 읽거나 메시지를 보관하지 않는다.
     for line in bytes.split(|b| *b == b'\n') {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
@@ -383,6 +403,9 @@ fn parse(bytes: &[u8], agent: Agent, modified: u64) -> Option<Entry> {
             _ => continue,
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
+            if is_claude_mem_cwd(cwd) {
+                return Some(Err(()));
+            }
             let entry = Entry {
                 agent,
                 id: id.to_owned(),
@@ -390,7 +413,7 @@ fn parse(bytes: &[u8], agent: Agent, modified: u64) -> Option<Entry> {
                 modified,
             };
             if valid(&entry) {
-                return Some(entry);
+                return Some(Ok(entry));
             }
         }
     }

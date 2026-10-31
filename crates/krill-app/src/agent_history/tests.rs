@@ -722,3 +722,43 @@ fn resumed_reply_is_not_dropped_when_a_search_is_pending(cx: &mut TestAppContext
     cx.run_until_parked();
     assert_eq!(*opened.lock().unwrap(), [SessionId(5)]);
 }
+
+#[gpui::test]
+fn panel_hides_claude_mem_observer_sessions_from_scan_and_search(cx: &mut TestAppContext) {
+    let mut mem_entry = sample();
+    mem_entry.agent = Agent::Claude;
+    mem_entry.id = "5c18f8ca-5139-42aa-b23c-cebafb67c443".into();
+    mem_entry.cwd = "/Users/macmini/.claude-mem/observer-sessions".into();
+    let valid_entry = sample();
+
+    let call: Call = Arc::new(move |r| {
+        Ok(Reply::AgentHistory(match r {
+            Request::AgentHistory(Action::Scan) => Response::Scanned(Snapshot {
+                entries: vec![mem_entry.clone(), valid_entry.clone()],
+                truncated: false,
+                skipped: false,
+            }),
+            Request::AgentHistory(Action::Search(_)) => Response::Searched(SearchSnapshot {
+                hits: vec![VaultHit::from(&mem_entry), VaultHit::from(&valid_entry)],
+                truncated: false,
+                skipped: false,
+            }),
+            _ => unreachable!(),
+        }))
+    });
+    let panel = cx.new(|_| Panel::new(call));
+    panel.update(cx, Panel::scan);
+    cx.run_until_parked();
+    panel.read_with(cx, |p, _| {
+        assert_eq!(p.loaded_hits().len(), 1);
+        assert_eq!(p.visible_hits().len(), 1);
+        assert_eq!(p.visible_hits()[0].cwd, "/tmp/한글");
+    });
+    panel.update(cx, |p, cx| p.set_query("한글", cx));
+    cx.run_until_parked();
+    panel.read_with(cx, |p, _| {
+        assert_eq!(p.loaded_hits().len(), 1);
+        assert_eq!(p.visible_hits().len(), 1);
+        assert_eq!(p.visible_hits()[0].cwd, "/tmp/한글");
+    });
+}

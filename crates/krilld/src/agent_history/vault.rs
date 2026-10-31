@@ -16,6 +16,7 @@ use crate::session::lock;
 
 use krill_proto::agent_history::{
     MAX_ENTRIES, MAX_TEXT, SearchQuery, SearchSnapshot, VaultAgent, VaultHit, VaultTarget,
+    is_claude_mem_cwd, is_claude_mem_project_dir,
 };
 use serde_json::Value;
 
@@ -860,6 +861,9 @@ impl Indexer {
     }
 
     fn insert(&mut self, doc: VaultDoc) {
+        if is_claude_mem_cwd(&doc.cwd) {
+            return;
+        }
         let target = VaultTarget {
             agent: doc.agent,
             id: doc.id.clone(),
@@ -1160,7 +1164,7 @@ impl Indexer {
             let name = item.file_name();
             let name_str = name.to_string_lossy();
             if kind.is_dir() {
-                if name_str == "subagents" {
+                if name_str == "subagents" || is_claude_mem_project_dir(&name_str) {
                     continue;
                 }
                 self.collect_jsonl_files(
@@ -1298,7 +1302,7 @@ impl Indexer {
             self.skipped = true;
             return;
         };
-        if sidechain {
+        if sidechain || is_claude_mem_cwd(&cwd) {
             return;
         }
         if id.is_empty()

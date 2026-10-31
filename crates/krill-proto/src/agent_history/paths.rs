@@ -15,6 +15,36 @@ pub fn is_absolute_history_path(path: &str) -> bool {
     path.starts_with('/') || windows_path(path)
 }
 
+/// Whether `cwd` is an internal `claude-mem` observer/plugin directory that should be hidden
+/// from user-facing session history.
+#[must_use]
+pub fn is_claude_mem_cwd(cwd: &str) -> bool {
+    let mut prev = "";
+    for seg in cwd.split(['/', '\\']).filter(|s| !s.is_empty()) {
+        if seg.eq_ignore_ascii_case(".claude-mem")
+            || seg.eq_ignore_ascii_case("observer-sessions")
+            || (prev.eq_ignore_ascii_case("thedotmack") && seg.eq_ignore_ascii_case("claude-mem"))
+        {
+            return true;
+        }
+        prev = seg;
+    }
+    false
+}
+
+/// Whether a directory name under `<claude_config_dir>/projects/` is an encoded `claude-mem`
+/// internal project directory (for example `-Users-macmini--claude-mem-observer-sessions`).
+#[must_use]
+pub fn is_claude_mem_project_dir(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == ".claude-mem"
+        || lower.starts_with(".claude-mem-")
+        || lower.contains("--claude-mem")
+        || lower == "observer-sessions"
+        || lower.ends_with("-observer-sessions")
+        || lower.contains("-observer-sessions-")
+}
+
 /// Normalize separators and ASCII case for syntactically Windows paths. Unresolved
 /// or foreign Unicode aliases (for example Σ/ς) deliberately remain distinct: only
 /// the native filesystem can decide their identity. POSIX case and
@@ -136,6 +166,33 @@ mod tests {
         assert!(path_inside_or_equal("c:/work/app", r"C:\"));
         assert!(!path_inside_or_equal("d:/work/app", r"C:\"));
         assert!(!path_inside_or_equal("/work/app-old", "/work/app"));
+    }
+
+    #[test]
+    fn claude_mem_cwd_and_project_dir_classification() {
+        assert!(is_claude_mem_cwd(
+            "/Users/macmini/.claude-mem/observer-sessions"
+        ));
+        assert!(is_claude_mem_cwd(
+            "/Users/macmini/.claude-mem/observer-sessions/1003"
+        ));
+        assert!(is_claude_mem_cwd(
+            r"C:\Users\macmini\.claude-mem\observer-sessions"
+        ));
+        assert!(is_claude_mem_cwd("/custom/data/observer-sessions"));
+        assert!(is_claude_mem_cwd(
+            "/Users/macmini/.claude/plugins/cache/thedotmack/claude-mem/13.39.0"
+        ));
+        assert!(!is_claude_mem_cwd("/Users/macmini/Krill/worktrees/krill"));
+
+        assert!(is_claude_mem_project_dir(
+            "-Users-macmini--claude-mem-observer-sessions"
+        ));
+        assert!(is_claude_mem_project_dir("-custom-data-observer-sessions"));
+        assert!(is_claude_mem_project_dir(
+            "-custom-data-observer-sessions-42"
+        ));
+        assert!(!is_claude_mem_project_dir("-Users-macmini-Krill-worktrees"));
     }
 
     #[test]
