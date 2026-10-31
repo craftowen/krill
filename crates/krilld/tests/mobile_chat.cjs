@@ -174,7 +174,6 @@ function fixture(options = {}) {
     visible: options.visible,
     getQuestion: options.getQuestion,
     onAnswerQuestion: options.onAnswerQuestion,
-    onQuickActions: options.onQuickActions,
     onSwitchTerm: () => term++,
   });
   const find = (cls) => root.descendants().find((n) => n.className === cls),
@@ -1234,15 +1233,8 @@ async function markdownFormatting() {
   );
 }
 async function quickActions() {
-  let opened = 0;
-  const f = fixture({ onQuickActions: () => opened++ });
+  const f = fixture();
   await flush();
-  const quick = f.find("btn chat-quick-actions-btn");
-  assert(quick);
-  assert.equal(quick.attrs["aria-label"], "Quick actions");
-  assert.equal(quick.title, "Quick actions");
-  quick.action();
-  assert.equal(opened, 1);
   assert.equal(f.insertText("\r\n"), false);
   const input = f.find("chat-input");
   assert.equal(f.insertText("/krill-orchestration "), true);
@@ -1494,8 +1486,9 @@ async function composerDiscovery() {
   key(f, "Enter");
   await flush();
   assert.equal(f.term, 0);
+  assert.equal(f.find("composer-model-name").textContent, "model b");
   assert.equal(
-    f.buttons.find((b) => b.className === "composer-pill").textContent,
+    f.buttons.find((b) => b.className === "composer-pill").attrs["aria-label"],
     "Model B",
   );
   assert(f.calls.some((c) => c.action === "set_model" && c.model === "b"));
@@ -1544,7 +1537,7 @@ async function composerDiscovery() {
   key(model, "Enter");
   await flush();
   assert.equal(
-    model.buttons.find((b) => b.className === "composer-pill").textContent,
+    model.find("composer-model-name").textContent,
     "Model",
     "pending request is not a model change",
   );
@@ -1552,10 +1545,7 @@ async function composerDiscovery() {
   assert.equal(model.find("chat-input").value, "unsent draft");
   changing.resolve({ applied: false, reason: "Native composer busy" });
   await flush();
-  assert.equal(
-    model.buttons.find((b) => b.className === "composer-pill").textContent,
-    "Model",
-  );
+  assert.equal(model.find("composer-model-name").textContent, "Model");
   assert(
     model
       .find("chat-composer-suggestions")
@@ -1803,7 +1793,7 @@ async function composerRaces() {
       req.action === "composer_models" ? known : historyHandler(req);
     modelButton(f).action();
     await flush();
-    assert.equal(modelButton(f).textContent, "Model A");
+    assert.equal(f.find("composer-model-name").textContent, "model a");
     f.button("Close suggestions").action();
     f.handler = async (req) => {
       if (req.action !== "composer_models") return historyHandler(req);
@@ -1812,12 +1802,12 @@ async function composerRaces() {
     };
     modelButton(f).action();
     assert.equal(
-      modelButton(f).textContent,
+      f.find("composer-model-name").textContent,
       "Model",
       "fresh model authority is uncertain until the reply",
     );
     await flush();
-    assert.equal(modelButton(f).textContent, "Model");
+    assert.equal(f.find("composer-model-name").textContent, "Model");
     assert.equal(f.entry.model, null);
     assert.equal(
       f.calls.filter((q) => q.action === "composer_models").length,
@@ -1838,7 +1828,7 @@ async function composerRaces() {
   modelRead.resolve(known);
   await flush();
   assert.equal(staleRead.find("chat-composer-suggestions").hidden, true);
-  assert.equal(modelButton(staleRead).textContent, "Model");
+  assert.equal(staleRead.find("composer-model-name").textContent, "Model");
   staleRead.dispose();
   for (const applied of [true, false]) {
     const f = fixture({ capabilities });
@@ -1883,7 +1873,7 @@ async function composerRaces() {
     await flush();
     assert.equal(f.entry.modelPending, null);
     assert.equal(f.find("primary composer-send").disabled, false);
-    assert.equal(modelButton(f).textContent, applied ? "Model B" : "Model A");
+    assert.equal(f.find("composer-model-name").textContent, applied ? "model b" : "model a");
     assert.equal(f.find("chat-input").value, "newer unsent draft");
     assert.equal(f.state.drafts.get(7), "newer unsent draft");
     f.dispose();
@@ -1915,7 +1905,7 @@ async function composerRaces() {
     null,
     "old scope success cannot claim a model after an A -> B -> A scope transition",
   );
-  assert.equal(modelButton(changed).textContent, "Model");
+  assert.equal(changed.find("composer-model-name").textContent, "Model");
   changed.dispose();
   const host = fixture({ capabilities });
   await flush();
@@ -1959,7 +1949,7 @@ async function composerRaces() {
   assert.equal(oldEntry.modelPending, null);
   newSet.resolve({ applied: true, model: "b" });
   await flush();
-  assert.equal(modelButton(host).textContent, "Model B");
+  assert.equal(host.find("composer-model-name").textContent, "model b");
   host.dispose();
   const pinned = fixture({ capabilities });
   await flush();
@@ -2011,17 +2001,15 @@ async function composerProgress() {
   assert.equal(f.find("badge").textContent, "Sending");
   assert.equal(
     f.find("chat-live-text").textContent,
-    "",
-    "the badge already says it",
+    "Review this",
+    "the badge says Sending and the line keeps the sent draft",
   );
-  assert.equal(f.find("chat-send-receipt").hidden, false);
-  assert(f.find("chat-send-receipt").textContent.includes("Review this"));
   await flush();
   sent.resolve({ sent: true });
   await flush();
   assert.equal(
     f.find("chat-live-text").textContent,
-    "Accepted. Awaiting agent response…",
+    "Accepted. Awaiting agent response… · Review this",
   );
   assert.equal(f.find("chat-input").value, "");
   const sess = f.state.sessions.get(7);
@@ -2033,11 +2021,6 @@ async function composerProgress() {
   assert.equal(
     f.find("chat-live-text").textContent,
     "",
-    "the badge already says it",
-  );
-  assert.equal(
-    f.find("chat-send-receipt").hidden,
-    true,
     "a working agent has picked up the message",
   );
   await f.poll({
@@ -2055,12 +2038,11 @@ async function composerProgress() {
     ],
     next_offset: 3,
   });
-  assert.equal(
-    f.find("chat-send-receipt").hidden,
-    true,
+  assert(f.find("chat-live-text").textContent.includes("read_file"));
+  assert(
+    !f.find("chat-live-text").textContent.includes("Review this"),
     "actual transcript confirmation removes provisional acknowledgement",
   );
-  assert(f.find("chat-live-text").textContent.includes("read_file"));
   sess.state = "Waiting";
   sess.state_since_unix_ns = "3";
   f.update();
@@ -2089,12 +2071,18 @@ async function composerProgress() {
   await flush();
   assert.equal(failure.state.drafts.get(7), "keep draft");
   assert.equal(failure.find("chat-input").value, "keep draft");
-  assert.equal(failure.find("chat-send-receipt").hidden, false);
   assert.equal(
     failure.find("chat-live-text").textContent,
-    "Send not confirmed. Draft kept; check activity before retrying.",
+    "Send not confirmed. Draft kept; check activity before retrying. · keep draft",
   );
   assert.equal(failure.find("primary composer-send").disabled, false);
+  failure.state.connection.phase = "disconnected";
+  failure.update();
+  assert.equal(
+    failure.find("chat-live-text").textContent,
+    "Send not confirmed · Offline. Reconnect to update activity. · keep draft",
+    "losing the connection never hides the failed send",
+  );
   failure.dispose();
   const refreshed = fixture();
   await flush();
@@ -2107,7 +2095,7 @@ async function composerProgress() {
   assert.equal(refreshed.find("chat-input").value, "");
   assert.equal(
     refreshed.find("chat-live-text").textContent,
-    "Accepted. Awaiting agent response…",
+    "Accepted. Awaiting agent response… · accepted request",
     "refresh failure does not relabel an accepted prompt as send failure",
   );
   refreshed.dispose();

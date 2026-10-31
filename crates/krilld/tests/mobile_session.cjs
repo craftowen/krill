@@ -429,8 +429,10 @@ async function testInstalledQuickActions() {
       for (let i = 0; i < 20; i++) await Promise.resolve();
     },
     body = () => {
-      f.buttons
-        .find((b) => b.className === "icon-button session-quick-actions")
+      f.buttons.find((b) => b.textContent === "Terminal actions").action();
+      f.sheets
+        .at(-1)
+        .find((e) => e.label === "Quick actions")
         .action();
       const root = f.ctx.el("div");
       f.sheets.at(-1).render(root);
@@ -1032,11 +1034,7 @@ async function testQuickActions() {
     });
   const first = f.mounts[0];
   wire(first);
-  const quick = f.buttons.find(
-    (b) => b.className === "icon-button session-quick-actions",
-  );
-  assert.equal(quick.parentElement.tag, "header");
-  assert.equal(quick.attrs["aria-haspopup"], "dialog");
+  const more = f.buttons.find((b) => b.textContent === "Terminal actions");
   const open = (h) => {
       if (f.mounts.length > 1) {
         const title = f.root
@@ -1048,7 +1046,11 @@ async function testQuickActions() {
           );
         title?.action();
       }
-      quick.action();
+      more.action();
+      f.sheets
+        .at(-1)
+        .find((e) => e.label === "Quick actions")
+        .action();
       const body = new Element("div");
       f.sheets.at(-1).render(body);
       return body;
@@ -1229,8 +1231,10 @@ async function testQuickActions() {
   });
   const fallbackBody = openFallback();
   function openFallback() {
-    fallback.buttons
-      .find((b) => b.className === "icon-button session-quick-actions")
+    fallback.buttons.find((b) => b.textContent === "Terminal actions").action();
+    fallback.sheets
+      .at(-1)
+      .find((e) => e.label === "Quick actions")
       .action();
     const b = new Element("div");
     fallback.sheets.at(-1).render(b);
@@ -2081,9 +2085,7 @@ async function main() {
     "PASS terminal-only reconnect backoff, generation/cleanup and main connection cancellation",
   );
   f = fixture();
-  const actions = f.buttons.find((b) => b.textContent === "Terminal actions"),
-    git = f.buttons.find((b) => b.textContent === "Git changes");
-  assert(git.hidden);
+  const actions = f.buttons.find((b) => b.textContent === "Terminal actions");
   const replace = (state, branch = null) => {
     const session = { id: 7, state, branch };
     f.state.sessions.set(7, session);
@@ -2102,16 +2104,17 @@ async function main() {
       (e) => e.label === "Approve (Yes)" || e.label === "Deny (No)",
     ),
   );
-  f.view.update();
-  assert.equal(git.hidden, false);
+  assert(entries.some((e) => e.label === "Git changes"));
   replace("Working");
   entries.find((e) => e.label === "Review in Terminal").action();
   assert.equal(f.calls.length, 0);
   assert.equal(f.mounts[0].focused, 1);
   actions.action();
   assert(!f.sheets.at(-1).some((e) => e.label === "Review in Terminal"));
-  f.view.update();
-  assert(git.hidden);
+  assert(
+    !f.sheets.at(-1).some((e) => e.label === "Git changes"),
+    "git changes need a branch",
+  );
   replace("Blocked");
   actions.action();
   entries = f.sheets.at(-1);
@@ -2203,8 +2206,13 @@ async function main() {
     '{"action":"create_terminal","cwd_session":7}',
   );
   assert.deepEqual(f.created.at(-1), ["g", ""]);
+  const tabRow = f.root
+    .descendants()
+    .find((n) => n.className === "session-tabs");
+  assert(!tabRow.hidden, "a single session keeps the tab row and its + button");
   f.buttons.find((b) => b.textContent === "Terminal actions").action();
   assert(!f.sheets.at(-1).some((e) => /^New .* session$/.test(e.label)));
+  assert(!f.sheets.at(-1).some((e) => e.label === "Create Tab"));
   f.view.cleanup();
   console.log(
     "PASS + opens provider sheet (old-daemon Claude/Codex fallback + Terminal) and hands the picked agent to the shared instant create flow",
@@ -3048,14 +3056,10 @@ async function testHybridChatToggleAndQuestionCards() {
   assert.equal(mounts[0].visible, false);
   state.snapshot ||= {};
   state.snapshot.quick_commands = [{ name: "Chat skill", text: "/ship-dev " }];
-  assert(
-    !root
-      .descendants()
-      .some((n) => n.className === "btn chat-quick-actions-btn"),
-    "chat uses the shared header quick actions",
-  );
-  buttons
-    .find((b) => b.className === "icon-button session-quick-actions")
+  buttons.find((b) => b.textContent === "Terminal actions").action();
+  sheets
+    .at(-1)
+    .entries.find((e) => e.label === "Quick actions")
     .action();
   assert.equal(
     sheets.at(-1).entries.length,

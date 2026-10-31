@@ -27,7 +27,7 @@ MEASURE = """(()=>{
  const rect=n=>{const r=n.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height,right:r.right,bottom:r.bottom};};
  const visible=n=>!!n.getClientRects().length&&getComputedStyle(n).visibility!=='hidden';
  const dialog=document.querySelector('dialog[open]'),scope=dialog||document.querySelector('.scanner')||document.querySelector('#route-root');
- const controls=[...scope.querySelectorAll('button,summary,.key-label')].filter(visible).map(n=>({name:n.getAttribute('aria-label')||n.textContent.trim(),compact:!!n.closest('.session.screen>.page-header,.session-tabs,.command-dock,.quick-actions-manager,.quick-actions-list')||n.classList.contains('quick-command-add'),...rect(n)}));
+ const controls=[...scope.querySelectorAll('button,summary,.key-label')].filter(visible).map(n=>({name:n.getAttribute('aria-label')||n.textContent.trim(),compact:!!n.closest('.session.screen>.page-header,.session-tabs,.chat-status-row,.command-dock,.quick-actions-manager,.quick-actions-list')||n.classList.contains('quick-command-add'),...rect(n)}));
  const reading=[...document.querySelectorAll('.home-list,.workspace-list,.settings-list,.detail-list,.connection-log')].filter(visible).map(n=>({name:n.className,...rect(n)}));
  const overflow=[...document.querySelectorAll('#route-root,.screen,.home-list,.workspace-list,.settings-list,.detail-list,.connection-log,.chat-view,.chat-feed,.command-dock')].filter(visible).filter(n=>n.scrollWidth>n.clientWidth+1).map(n=>({name:n.className||n.id,scroll:n.scrollWidth,client:n.clientWidth}));
  const dock=document.querySelector('.terminal-mount:not([hidden]) .command-dock');
@@ -192,7 +192,8 @@ def main():
                     evaluate('KrillMobile.activeTerminal.setInputMode("direct");true')
                     settle()
                     capture('session-direct', width, height)
-                    named('Quick actions')
+                    named('Terminal actions')
+                    click('dialog[open] .sheet-action[aria-label="Quick actions"]')
                     wait('!!document.querySelector(".quick-actions-list")')
                     capture('quick-commands', width, height)
                     named('Find installed skills')
@@ -216,7 +217,7 @@ def main():
                     named('Close terminal')
                     capture('close-confirm', width, height)
                     close()
-                    named('Create Tab')
+                    click('.tab-add')
                     capture('create-tab', width, height)
                     close()
                     evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')

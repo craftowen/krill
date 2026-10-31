@@ -2,6 +2,26 @@
 (() => {
   const M = (globalThis.KrillMobile ||= {});
   M.screens ||= {};
+  const EFFORT_BARS = new Map([
+    ["none", 0],
+    ["minimal", 1],
+    ["low", 1],
+    ["medium", 2],
+    ["high", 3],
+    ["xhigh", 4],
+    ["max", 5],
+    ["ultra", 5],
+  ]);
+  function shortModel(text) {
+    const name = text
+        .toLowerCase()
+        .replace(/\s*[([].*$/, "")
+        .replace(/-\d{8}$/, ""),
+      [, family, major, minor] =
+        /^claude-(.+?)-(\d+)(?:-(\d+))?$/.exec(name) || [];
+    if (family) return `${family} ${major}${minor ? `.${minor}` : ""}`;
+    return name.replace(/^claude[- ]/, "");
+  }
   // Build inline formatting with text nodes/elements only; transcript HTML never becomes markup.
   function renderInline(el, parent, text, depth = 0) {
     if (depth >= 8) {
@@ -194,11 +214,14 @@
     pruneCache(state);
     const shell = el("div", undefined, "chat-view"),
       feed = el("div", undefined, "chat-feed"),
-      strip = el("div", undefined, "chat-live-strip"),
       composer = el("form", undefined, "chat-composer");
-    const stripBadge = el("span", "IDLE", "badge"),
-      stripText = el("span", "", "chat-live-text");
-    strip.append(stripBadge, stripText);
+    const statusRow = el("div", undefined, "chat-status-row"),
+      statusLine = el("div", undefined, "chat-status"),
+      statusBadge = el("span", "IDLE", "badge"),
+      statusText = el("span", "", "chat-live-text");
+    statusLine.setAttribute("role", "status");
+    statusLine.setAttribute("aria-live", "polite");
+    statusLine.append(statusBadge, statusText);
     const history = el("div", undefined, "chat-actions chat-history"),
       historyText = el("span", undefined, "muted");
     const earlierBtn = button(
@@ -388,7 +411,6 @@
       "icon-button composer-icon",
       "plus",
     );
-    // Orca 컴포저: 둥근 카드 안에 입력, 아래 줄에 사진(+)·모델·전송(↑)을 둔다.
     const sendBtn = el("button", undefined, "primary composer-send");
     sendBtn.type = "submit";
     sendBtn.setAttribute("aria-label", t("Send"));
@@ -397,49 +419,21 @@
     const modelBtn = button(t("Model"), () => chooseModel(), "composer-pill"),
       modelName = el("span", undefined, "composer-model-name"),
       modelEffort = el("span", undefined, "composer-model-effort"),
-      contextMeter = el("span", undefined, "composer-context"),
-      contextRing = el("span", undefined, "composer-context-ring"),
-      contextText = el("span");
+      effortBars = Array.from({ length: 5 }, () => el("span")),
+      contextMeter = el("span", undefined, "composer-context");
+    modelEffort.append(...effortBars);
+    modelBtn.replaceChildren(modelName, modelEffort);
     contextMeter.setAttribute("role", "img");
-    contextMeter.append(contextRing, contextText);
     const suggestions = el("div", undefined, "chat-composer-suggestions"),
       choiceList = el("div", undefined, "chat-composer-options");
     choiceList.id = `chat-composer-options-${sessionId}`;
     suggestions.hidden = true;
     choiceList.setAttribute("role", "listbox");
     choiceList.setAttribute("aria-label", t("Commands, skills and files"));
-    const receipt = el("div", undefined, "chat-send-receipt");
-    receipt.hidden = true;
-    const bar = el("div", undefined, "chat-composer-bar"),
-      box = el("div", undefined, "chat-composer-box");
-    bar.append(attachBtn);
-    if (typeof opts.onQuickActions === "function") {
-      const quick = button(
-        t("Quick actions"),
-        () => opts.onQuickActions(),
-        "btn chat-quick-actions-btn",
-      );
-      quick.type = "button";
-      quick.setAttribute("aria-label", t("Quick actions"));
-      quick.title = t("Quick actions");
-      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-      svg.setAttribute("viewBox", "0 0 24 24");
-      svg.setAttribute("aria-hidden", "true");
-      const path = document.createElementNS(
-        "http://www.w3.org/2000/svg",
-        "path",
-      );
-      path.setAttribute("d", "m5 6 6 6-6 6m8 0h6");
-      path.setAttribute("fill", "none");
-      path.setAttribute("stroke", "currentColor");
-      path.setAttribute("stroke-width", "2");
-      svg.append(path);
-      quick.replaceChildren(svg);
-      bar.append(quick);
-    }
-    bar.append(modelBtn, contextMeter, sendBtn);
-    box.append(suggestions, input, bar);
-    composer.append(receipt, attachment, box);
+    const box = el("div", undefined, "chat-composer-box");
+    box.append(suggestions, input, sendBtn);
+    statusRow.append(attachBtn, modelBtn, contextMeter, statusLine);
+    composer.append(attachment, box, statusRow);
     globalThis.MkKeyboard?.keepFocus(composer, ctx.signal);
     // Read-only discovery is scoped to this mount, host cache and current provider/workspace.
     function chatAgent() {
@@ -993,25 +987,27 @@
         agent = chatAgent(),
         status = entry.composerStatus?.agent === agent ? entry.composerStatus : null,
         currentModel = entry.model?.agent === agent && entry.model.scope === context ? entry.model.label : null,
-        modelText = currentModel || status?.model_label || status?.model || t("Model unknown"),
-        label = capability("chat_composer") ? `${modelText} · ${status?.effort || t("Effort unknown")}` : currentModel || t("Model");
-      shell.dataset.composerStatus = String(capability("chat_composer"));
+        observedModel = currentModel || status?.model_label || status?.model,
+        hasStatus = capability("chat_composer"),
+        modelText = observedModel || t(hasStatus ? "Model unknown" : "Model"),
+        label = hasStatus ? `${modelText} · ${status?.effort || t("Effort unknown")}` : modelText,
+        filledBars = EFFORT_BARS.get(status?.effort);
+      shell.dataset.composerStatus = String(hasStatus);
       if ((modelBtn.getAttribute ? modelBtn.getAttribute("aria-label") : modelBtn.attrs?.["aria-label"]) !== label) modelBtn.setAttribute("aria-label", label);
-      if (capability("chat_composer")) {
-        modelName.textContent = modelText;
-        modelEffort.textContent = `· ${status?.effort || t("Effort unknown")}`;
-        if (modelName.parentElement !== modelBtn) modelBtn.replaceChildren(modelName, modelEffort);
-      } else if (modelBtn.textContent !== label) modelBtn.textContent = label;
+      modelName.textContent = observedModel ? shortModel(observedModel) : modelText;
+      modelEffort.hidden = filledBars === undefined;
+      effortBars.forEach((bar, index) => {
+        bar.dataset.on = String(index < filledBars);
+      });
       modelBtn.title = label;
       const percent = !entry.model || matchesModel(agent, entry.model.id, status?.model) ? status?.context?.percent : undefined, known = typeof percent === "number" && Number.isFinite(percent);
       contextMeter.hidden = !known;
       if (known) {
         const usage = Math.round(Math.max(0,Math.min(100,percent))), description = t("Context used {0}%", usage);
-        contextText.textContent = `${usage}%`;
-        contextRing.style.background = `conic-gradient(var(--foreground) ${usage}%, var(--border) 0)`;
+        contextMeter.style.background = `conic-gradient(var(--foreground) ${usage}%, var(--border) 0)`;
         contextMeter.title = description; contextMeter.setAttribute("aria-label",description);
       }
-      modelBtn.hidden = !agent || !capability("composer_models");
+      modelBtn.hidden = !agent || !capability("composer_models") || (!!status && !status.supported && !status.model && !status.model_label && !currentModel);
       modelBtn.disabled =
         !!entry.modelPending ||
         entry.sending ||
@@ -1112,7 +1108,7 @@
           .catch((e) => ctx.error?.(e));
     }
     function updateComposer(sent) {
-      updateStrip();
+      updateStatus();
       // Completion belongs to the shared draft version, including a newly mounted composer.
       if (
         sent &&
@@ -1236,7 +1232,7 @@
       entry.sending = true;
       closeSuggestions();
       updateComposer();
-      updateStrip();
+      updateStatus();
       run(async () => {
         try {
           if (!active()) return;
@@ -1288,7 +1284,7 @@
       liveTitle,
     );
     liveCard.append(liveCopy, liveOpen);
-    shell.append(history, pollStatus, feed, liveCard, strip, composer);
+    shell.append(history, pollStatus, feed, liveCard, composer);
     root.replaceChildren(shell);
     // Only a complete live terminal screen supplies an answer target. Transcript cards stay historical.
     let liveQuestion = null,
@@ -1321,7 +1317,7 @@
       updateComposer();
       syncAgent();
       if (!liveQuestion) {
-        updateStrip();
+        updateStatus();
         return;
       }
       const question = liveQuestion,
@@ -1332,7 +1328,7 @@
       );
       liveOpen.setAttribute("aria-label", liveOpen.textContent);
       liveOpen.disabled = !question.enabled || entry.questionSending;
-      updateStrip();
+      updateStatus();
     }
     function openQuestion() {
       const question = opts.getQuestion?.() || liveQuestion;
@@ -1977,7 +1973,7 @@
         );
       });
     }
-    function updateStrip() {
+    function updateStatus() {
       const sess = state.sessions?.get(sessionId),
         progress = entry.progress;
       const currentItems = entry.live?.items || entry.items;
@@ -1995,18 +1991,6 @@
         )
       )
         progress.confirmed = true;
-      receipt.hidden = !progress || !!progress.confirmed;
-      if (!receipt.hidden) {
-        const label = t(
-            progress.phase === "sending"
-              ? "Sending…"
-              : progress.phase === "error"
-                ? "Send not confirmed"
-                : "Accepted. Awaiting agent response…",
-          ),
-          snippet = progress.text || t("Photo");
-        receipt.textContent = `${label} · ${snippet.length > 240 ? snippet.slice(0, 240) + "…" : snippet}`;
-      }
       let status = sess?.state || "Unknown",
         message = sess?.lines?.at(-1) || "";
       if (state.connection?.phase !== "ready") {
@@ -2084,21 +2068,35 @@
           }
         }
       }
-      const hidden =
-          !liveQuestion && !progress &&
-          state.connection?.phase === "ready" &&
-          !["Waiting", "Blocked", "Working"].includes(status),
-        anchor = strip.hidden !== hidden ? readerAnchor() : null;
-      const badge = t(status),
+      const unconfirmed = progress && !progress.confirmed,
+        // Online, the status above already names the send phase.
+        receipt = !unconfirmed || status !== "Offline"
+          ? ""
+          : t(
+              progress.phase === "sending"
+                ? "Sending…"
+                : progress.phase === "error"
+                  ? "Send not confirmed"
+                  : "Accepted. Awaiting agent response…",
+            ),
+        draft = unconfirmed ? progress.text || t("Photo") : "",
+        badge = t(status),
         bare = (text) => text.replace(/[….]+$/, "");
-      stripBadge.textContent = badge;
-      stripBadge.dataset.state = status;
-      stripText.textContent = bare(message) === bare(badge) ? "" : message;
-      strip.hidden = hidden;
-      strip.setAttribute("role", "status");
-      strip.setAttribute("aria-live", "polite");
+      statusLine.hidden =
+        !liveQuestion && !progress &&
+        state.connection?.phase === "ready" &&
+        !["Waiting", "Blocked", "Working"].includes(status);
+      statusBadge.textContent = badge;
+      statusBadge.dataset.state = status;
+      statusText.textContent = [
+        receipt,
+        bare(message) === bare(badge) ? "" : message,
+        draft.length > 240 ? draft.slice(0, 240) + "…" : draft,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      statusLine.title = statusText.textContent;
       syncAgent();
-      restoreReader(anchor);
     }
     function normalizeItems(res, start) {
       return (res.items || []).map((item, index) => ({
@@ -2190,7 +2188,7 @@
       const when = lastSuccess
         ? new Date(lastSuccess).toTimeString().slice(0, 8)
         : t("never");
-      updateStrip();
+      updateStatus();
       pollText.textContent = `${t("Chat history update failed")} (${failures}). ${t("Last updated")}: ${when}. ${t("Retry or check Term.")} ${String(error?.message || error || "")}`;
       restoreReader(anchor);
     }
@@ -2361,7 +2359,7 @@
           (reset && (hadItems || !renderedItems))
         )
           renderItems(!reset && !trimmed && !reconciled ? before : undefined);
-        updateStrip();
+        updateStatus();
         restoreReader(anchor);
         pruneCache(state);
         refreshStatus();
@@ -2587,7 +2585,7 @@
     entry.notifyComposer = updateComposer;
     active();
     renderItems();
-    updateStrip();
+    updateStatus();
     updateComposer();
     pollNow(true);
     refreshStatus();
@@ -2608,7 +2606,7 @@
           earlierQueued = false;
         }
         if (picker && picker.scope !== scope()) closeSuggestions();
-        updateStrip();
+        updateStatus();
         updateComposer();
         pollNow(); refreshStatus();
       },
@@ -2635,7 +2633,7 @@
       },
     };
   }
-  M.chat = { mount: mountChat, pruneCache, forgetSession };
+  M.chat = { mount: mountChat, pruneCache, forgetSession, shortModel };
   M.screens.chat = (root, ctx) => {
     const session = ctx.state.sessions.get(ctx.route.sessionId);
     if (!session) {

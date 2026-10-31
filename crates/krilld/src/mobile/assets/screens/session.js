@@ -814,13 +814,8 @@
     summary.append(liveDot, summaryText);
     header.querySelector("h1").parentElement.append(summary);
 
-    const git = button(t("Git changes"), () => {}, "icon-button", "git");
-    git.hidden = !group.sessions.some(
-      (s) => s.branch !== null && s.branch !== undefined,
-    );
     for (const node of [
       button(t("Chat"), () => {}, "ghost small mode-toggle"),
-      git,
       button(t("Terminal actions"), () => {}, "icon-button", "more"),
     ]) {
       node.disabled = true;
@@ -981,11 +976,8 @@
       const activeMessage =
         activePane === 1 && splitSession ? secondaryMessage : terminalMessage;
       const connected = isConnected(),
-        count = (
-          state.groups.get(activeSession()?.groupKey) || group
-        ).sessions.filter(live).length,
         text = connected
-          ? t(count === 1 ? "{0} terminal" : "{0} terminals", count)
+          ? ""
           : t(viewMode === "chat" ? "Connecting…" : activeMessage);
       liveDot.dataset.live = String(connected);
       if (connected) delete summary.dataset.reconnectable;
@@ -998,24 +990,6 @@
       "ghost small mode-toggle",
     );
     header.append(modeBtn);
-    const quick = button(
-      t("Quick actions"),
-      quickActions,
-      "icon-button session-quick-actions",
-      "zap",
-    );
-    quick.dataset.testid = "session-quick-actions";
-    quick.setAttribute("aria-haspopup", "dialog");
-    quick.addEventListener("pointerdown", (e) => e.preventDefault());
-    header.append(quick);
-    const git = button(
-      t("Git changes"),
-      () => go(`/git/${activeSession().id}`),
-      "icon-button",
-      "git",
-    );
-    header.append(git);
-
     const more = button(
       t("Terminal actions"),
       () => actions(activeSession()),
@@ -1155,6 +1129,7 @@
       const entries = [
         ...(target.id === activeSession().id
           ? [
+              { label: t("Quick actions"), action: quickActions },
               { label: t("Select text"), action: screenText },
               ...(viewMode === "term"
                 ? [
@@ -1234,7 +1209,9 @@
           agentName(sessionAgent(target)) ||
           t("Terminal #{0}", target.id),
         entries,
-        undefined,
+        [t(target.state || "Unknown"), summaryText.textContent]
+          .filter(Boolean)
+          .join(" · "),
         context
           ? (body) => {
               const pre = el("pre", context, "sheet-context");
@@ -2009,7 +1986,6 @@
         activeGroup = state.groups.get(active.groupKey) || group;
       ctx.rememberSession?.(active, activeGroup);
       title.textContent = activeGroup.label;
-      git.hidden = active.branch === null || active.branch === undefined;
       tabs.setAttribute(
         "aria-label",
         t(splitSession ? "Terminals in active pane" : "Terminals"),
