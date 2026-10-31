@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
 use krill_proto::holder::WinSize;
@@ -14,6 +14,9 @@ use krill_proto::holder::WinSize;
 use super::crypto::{SALT_LEN, Stream};
 use super::segment::{self, Base, HEADER_LEN, Header, Record};
 use super::{LEVEL, OVERHEAD, RESUME, Store, WINDOW_LOG, lock, mkdir, privacy, segments};
+
+/// Keep the compression window during bursts, then release it for quiet sessions.
+const IDLE_SEAL: Duration = Duration::from_secs(5);
 
 struct Open {
     file: File,
@@ -56,6 +59,8 @@ pub struct Recorder {
     generation: u64,
     /// Reused only for record encoding; never retains privacy-sensitive data between writes.
     encoded: Vec<u8>,
+    /// A quiet PTY must not retain the last segment's compression context forever.
+    last_output: Option<Instant>,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -94,6 +99,7 @@ impl Recorder {
             },
             generation,
             encoded: Vec::new(),
+            last_output: None,
         };
         if !store.recording {
             return Ok(rec);
@@ -150,6 +156,12 @@ impl Recorder {
             && self.open.is_none()
             && self.snapshots == Snapshots::Allowed
             && !pause.paused
+    }
+
+    /// The reader wakes once to seal an idle stream, then waits indefinitely again.
+    pub(crate) fn idle_deadline(&self) -> Option<Instant> {
+        self.open.as_ref()?;
+        self.last_output?.checked_add(IDLE_SEAL)
     }
 
     pub(crate) fn keyframe(&mut self, bytes: Vec<u8>) {
@@ -229,6 +241,7 @@ impl Recorder {
         }
         self.crashed = false;
         self.lost = 0;
+        self.last_output = Some(now);
         if self
             .open
             .as_ref()

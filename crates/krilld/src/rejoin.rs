@@ -9,7 +9,8 @@
 //!   [`krill_proto::holder`] 메시지)로 세션을 넘긴다. krilld#2는 세션을 띄우고 holder에 `Adopt`로 맡긴 뒤
 //!   `Ready`를 돌려준다([`adopt`], [`Handover::finish`]). 그 답을 받은 krilld#1이 끝나 소켓 락이 풀리면 krilld#2가
 //!   소켓을 게시한다.
-//! - krilld#2가 `Ready` 전에 끊기면 krilld#1은 master를 그대로 쥐고(리더는 멈춘 채) 다음 krilld를 기다린다. 어느
+//! - master 전송 전 실패는 기존 리더를 재개한다. master 전송을 시도한 뒤 krilld#2가 `Ready` 전에 끊기면
+//!   krilld#1은 master를 그대로 쥐고(리더는 멈춘 채) 다음 krilld를 기다린다. 어느
 //!   순간에도 master 사본이 하나 이상 있어 세션은 SIGHUP을 받지 않는다. 리더를 멈춘 뒤 넘기므로 원본은 두 krilld에
 //!   나뉘어 읽히지 않고, krilld#2는 봉인된 세그먼트 끝에서 이어 기록한다(무손실, ARCHITECTURE §4.1 'holder만 크래시').
 //!
@@ -18,6 +19,7 @@
 //! 개발 경로의 재기동 주체는 클라이언트(OWE-493): 인계 소켓이 준비되면 감시 연결에 holder 상실을 알리고,
 //! `krill_proto::daemon::connect`가 기동 락 아래 새 `krill-holder --detach`를 띄운다. 서명 경로는 MK-106에서 전환한다.
 
+#[cfg(unix)]
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -41,7 +43,9 @@ use crate::holder::{Kept, Master};
 use crate::ipc::{Listener, with_suffix};
 use crate::os::AsFd;
 use crate::registry::Registry;
-use crate::sys::{self, ExitWatch};
+use crate::sys;
+#[cfg(unix)]
+use crate::sys::ExitWatch;
 
 /// 인계 소켓 이름 = 소켓 경로 + 이 접미사. `.tmp`와 길이가 같아 [`Listener::bind`]의 경로 길이 검사 안에 든다.
 const SUFFIX: &str = ".hnd";
@@ -57,6 +61,9 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 const HALT_TIMEOUT: Duration = Duration::from_secs(2);
 /// krilld#1이 끝나 소켓 락이 풀리기를 기다리는 최대 시간.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(all(test, unix))]
+mod tests;
 
 fn handoff_path(sock: &Path) -> PathBuf {
     with_suffix(sock, SUFFIX)
@@ -92,6 +99,7 @@ pub fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
 /// 끝나지 않은 세션마다 `NOTE_EXIT`를 걸고, 끝나면 [`STATUS_UNKNOWN`]으로 알린다(holder가 없어 종료 코드는 없다).
 // ponytail: holder가 죽은 뒤 등록하기 전에 세션이 끝나고 pid가 재사용되면 엉뚱한 프로세스를 본다. 창은 holder 링크
 // EOF부터 등록까지(수 ms 추정). 줄이려면 등록 뒤 proc 시작 시각을 세션 시작 시각과 대조한다.
+#[cfg(unix)]
 fn watch_exits(reg: &Arc<Registry>) {
     let Ok(watch) = ExitWatch::new() else { return };
     let mut by_pid = HashMap::new();
@@ -120,17 +128,20 @@ fn watch_exits(reg: &Arc<Registry>) {
         .ok();
 }
 
+#[cfg(windows)]
+fn watch_exits(reg: &Arc<Registry>) {
+    windows::watch_exits(reg);
+}
+
 /// 리더를 멈추고 세션을 모두 넘긴 뒤 상대의 `Ready`를 기다린다.
 fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
-    // A peer may have started reading transferred masters before failing. Retain
-    // the old rejoin policy: keep parked until another successor adopts them.
-    halt_all(reg)?.commit();
     s.set_read_timeout(Some(PEER_TIMEOUT))?;
     s.set_write_timeout(Some(PEER_TIMEOUT))?;
     #[cfg(unix)]
     let mut link = Link::new(crate::os::link_fd(s)?);
     #[cfg(windows)]
     let mut link = HandoffLink::new(s)?;
+    let mut pause = Some(halt_all(reg)?);
     let hello = FromHolder::Hello {
         version: krill_proto::holder::VERSION,
         holder_pid: std::process::id(),
@@ -140,6 +151,12 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     let mut sent = Ok(());
     reg.each(|id, pid, status, session| {
         if sent.is_ok() {
+            // An fd/handle send can fail after partial delivery. From the first
+            // attempt onward only a successor may consume output. Preparation
+            // and Hello failures still drop the guard and resume the old reader.
+            if let Some(pause) = pause.take() {
+                pause.commit();
+            }
             let m = FromHolder::Session { id, pid, status };
             sent = send(&link, &m, Some(session));
         }
@@ -198,14 +215,57 @@ pub struct Handover {
     sessions: Vec<Kept>,
 }
 
+/// A missing handover listener is a duplicate start; a failed transfer must be retried.
+#[derive(Debug)]
+pub enum TakeError {
+    Unavailable(io::Error),
+    Transfer(io::Error),
+}
+
+impl From<io::Error> for TakeError {
+    fn from(error: io::Error) -> Self {
+        Self::Transfer(error)
+    }
+}
+
+impl std::fmt::Display for TakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(error) => write!(f, "handover unavailable: {error}"),
+            Self::Transfer(error) => write!(f, "handover transfer failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TakeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unavailable(error) | Self::Transfer(error) => Some(error),
+        }
+    }
+}
+
+fn connect_handover(sock: &Path) -> Result<UnixStream, TakeError> {
+    UnixStream::connect(handoff_path(sock)).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ) {
+            TakeError::Unavailable(error)
+        } else {
+            TakeError::Transfer(error)
+        }
+    })
+}
+
 impl Handover {
     /// `sock`의 인계 소켓에 붙어 세션을 받는다. 고아 krilld가 없으면 오류(다른 krilld가 정상으로 떠 있다).
     ///
     /// # Errors
     /// 인계 소켓이 없거나 `Ready` 전에 끊기면 오류.
     #[cfg(unix)]
-    pub fn take(sock: &Path) -> io::Result<Self> {
-        let s = UnixStream::connect(handoff_path(sock))?;
+    pub fn take(sock: &Path) -> Result<Self, TakeError> {
+        let s = connect_handover(sock)?;
         s.set_read_timeout(Some(PEER_TIMEOUT))?;
         s.set_write_timeout(Some(PEER_TIMEOUT))?;
         let mut link = Link::new(crate::os::link_fd(s)?);
@@ -215,8 +275,8 @@ impl Handover {
 
     /// Windows uses authenticated `AF_UNIX` with process-local `DuplicateHandle` values.
     #[cfg(windows)]
-    pub fn take(sock: &Path) -> io::Result<Self> {
-        let stream = UnixStream::connect(handoff_path(sock))?;
+    pub fn take(sock: &Path) -> Result<Self, TakeError> {
+        let stream = connect_handover(sock)?;
         stream.set_read_timeout(Some(PEER_TIMEOUT))?;
         stream.set_write_timeout(Some(PEER_TIMEOUT))?;
         let mut link = HandoffLink::new(stream)?;

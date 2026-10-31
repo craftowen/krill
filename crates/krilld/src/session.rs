@@ -1008,14 +1008,26 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
             shared.live().update_engine(Engine::trim);
             continue;
         }
-        let deadline = sync_at.into_iter().chain(trim_at).min();
+        let record_deadline = rec.as_ref().and_then(Recorder::idle_deadline);
+        let deadline = sync_at
+            .into_iter()
+            .chain(trim_at)
+            .chain(record_deadline)
+            .min();
         let timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
         #[cfg(unix)]
         let ready = read_ready(&shared.master, source, &mut buf, timeout);
         #[cfg(windows)]
         let ready = source.read(&mut buf, timeout);
         let Some(n) = (match ready {
-            Ok(Some(0)) => continue,
+            Ok(Some(0)) => {
+                if record_deadline.is_some_and(|at| at <= Instant::now())
+                    && let Some(recorder) = rec.as_mut()
+                {
+                    seal(shared, recorder);
+                }
+                continue;
+            }
             Ok(n) => n,
             Err(e) => {
                 errors = errors.saturating_add(1);

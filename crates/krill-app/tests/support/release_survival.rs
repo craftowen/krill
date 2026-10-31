@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::FileTypeExt as _;
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::process::ExitStatusExt as _;
 
 use krill_proto::SessionId;
@@ -12,6 +12,11 @@ use krill_proto::control::{Create, Info, Reply, Request};
 use krill_proto::screen::{Attach, Attached, Msg, Seq, Stream, decode_output};
 
 use super::*;
+
+#[path = "release_survival/preconditions.rs"]
+mod preconditions;
+#[path = "release_survival/sustained.rs"]
+mod sustained;
 
 const BATCH: usize = 4_000;
 const ROUNDS: usize = 3;
@@ -83,7 +88,15 @@ fn info(paths: &Paths, session: SessionId) -> Info {
 
 pub(super) fn launch_app(guard: &mut Processes) {
     let log = fs::File::create(guard.dir.join(format!("app-{}.log", guard.apps.len()))).unwrap();
-    let child = Command::new(APP)
+    let child = fixture_command(APP, &guard.dir)
+        .env(
+            "KRILL_TEST_WINDOW_GEOMETRY",
+            if guard.dir.join("memory-window-request").exists() {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("KRILL_STATE_DIR", &guard.dir)
         .env("HOME", &guard.dir)
         .current_dir(&guard.dir)
@@ -189,7 +202,35 @@ fn release_app_kill9_survives_and_replays_hash_three_times() {
 /// 새 상태 디렉터리 `dir`에 release holder(→ krilld)를 띄우고 소켓이 열릴 때까지 기다린다. 반환: 경로, 정리 가드, krilld
 /// instance(= PID).
 pub(super) fn start_daemon(dir: PathBuf) -> (Paths, Processes, u64) {
+    start_daemon_for_build(dir, krill_proto::BUILD)
+}
+
+fn start_daemon_for_build(dir: PathBuf, expected_build: &str) -> (Paths, Processes, u64) {
     fs::create_dir(&dir).unwrap();
+    // System login rc can add installed providers back to an isolated PATH.
+    // Keep startup discovery inside the fixture instead of launching real CLIs.
+    let shell = dir.join("fixture-shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\nif [ \"$1\" = -l ]; then shift; fi\nif [ \"$1\" = -i ]; then shift; fi\nexec /bin/sh \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    // Daemon auth discovery also resolves the passwd login PATH. Explicit
+    // absent profiles prevent that path from probing installed host providers.
+    let mut agents = krill_proto::agent::Agents::load(None).unwrap();
+    for (id, profile) in &mut agents.profiles {
+        profile.launch = vec![
+            dir.join(format!("uninstalled-{id}"))
+                .to_string_lossy()
+                .into_owned(),
+        ];
+    }
+    fs::write(
+        dir.join(krill_proto::agent::FILE_NAME),
+        toml::to_string(&agents).unwrap(),
+    )
+    .unwrap();
     let paths = paths(&dir);
     for binary in [
         APP,
@@ -201,7 +242,7 @@ pub(super) fn start_daemon(dir: PathBuf) -> (Paths, Processes, u64) {
             "missing release binary: {binary}"
         );
     }
-    let holder = Command::new(&paths.holder)
+    let holder = fixture_command(&paths.holder, &dir)
         .arg(daemon::DETACH_ARG)
         .arg(&paths.krilld)
         .arg(&paths.socket)
@@ -226,8 +267,15 @@ pub(super) fn start_daemon(dir: PathBuf) -> (Paths, Processes, u64) {
             .metadata()
             .is_ok_and(|m| m.file_type().is_socket())
     });
-    let instance = connection(&paths).server.instance_id;
+    let server = connection(&paths).server;
+    let instance = server.instance_id;
     guard.krilld = Some(u32::try_from(instance).unwrap());
+    // A newer app would upgrade this daemon and invalidate the PID being measured.
+    // Record ownership before rejecting a mismatched helper so unwinding also stops it.
+    assert_eq!(
+        server.build, expected_build,
+        "native fixture build mismatch before GUI launch (daemon PID {instance}); rebuild the app and helpers from the same source"
+    );
     (paths, guard, instance)
 }
 
@@ -335,4 +383,36 @@ fn survival_round(round: usize) {
     );
     assert_eq!(request(&paths, &Request::Close { session }), Reply::Closed);
     guard.sessions.clear();
+}
+
+fn fixture_command(program: impl AsRef<std::ffi::OsStr>, dir: &Path) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env("KRILL_STATE_DIR", dir)
+        .env("KRILL_LOG_DIR", dir.join("logs"))
+        .env("HOME", dir)
+        .env("ZDOTDIR", dir)
+        .env("SHELL", dir.join("fixture-shell"))
+        .env("ENV", "/dev/null")
+        .env("BASH_ENV", "/dev/null")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("DO_NOT_TRACK", "1")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    for name in [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "KRILL_ACCOUNT_PROVIDER",
+        "KRILL_ACCOUNT_DIR",
+    ] {
+        command.env_remove(name);
+    }
+    command
 }

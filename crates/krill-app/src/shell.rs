@@ -7594,7 +7594,11 @@ impl Render for Shell {
             }));
         }
         if self.bounds_observer.is_none() && self.role == WindowRole::Main {
-            self.bounds_observer = Some(cx.observe_window_bounds(window, |this, window, _| {
+            self.bounds_observer = Some(cx.observe_window_bounds(window, |this, window, cx| {
+                #[cfg(target_os = "macos")]
+                crate::record_test_window_geometry(window, cx);
+                #[cfg(not(target_os = "macos"))]
+                let _ = cx;
                 if this.role == WindowRole::Main {
                     let saved = saved_window_bounds_from_gpui(window.window_bounds());
                     if this.layout.set_window_bounds(saved) {

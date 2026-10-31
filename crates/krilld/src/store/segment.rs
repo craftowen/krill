@@ -41,7 +41,7 @@ fn decompress_stream(
         return false;
     }
     let mut buf = [0u8; 8 * 1024];
-    let mut remaining = usize::try_from(MAX_RAW).unwrap_or(usize::MAX);
+    let mut remaining = usize::try_from(MAX_RAW.saturating_add(1)).unwrap_or(usize::MAX);
     let mut finished_frame = false;
     loop {
         let cap = buf.len().min(remaining);
@@ -102,6 +102,15 @@ pub const KEYFRAME_V1: u8 = 1;
 const CHUNK_HEAD: usize = 8;
 /// 레코드 하나·세그먼트 하나를 풀 때의 상한. 봉인 크기(1MiB)보다 넉넉히 크고, 깨진 파일이 메모리를 키우지 못하게 한다.
 const MAX_RAW: u64 = 16 << 20;
+/// flush마다 붙는 zstd 블록 헤더를 포함한 압축 스트림 상한.
+const MAX_STREAM: usize = 32 << 20;
+/// 청크 헤더·인증 태그를 포함한 파일 상한. 빈 청크 반복도 유한하게 읽는다.
+const MAX_FILE: u64 = 128 << 20;
+
+#[cfg(all(test, unix))]
+mod input_tests;
+#[cfg(all(test, unix))]
+mod limit_tests;
 
 const TAG_DATA: u8 = 1;
 const TAG_RESIZE: u8 = 2;
@@ -288,62 +297,106 @@ impl Segment {
 }
 
 /// 세그먼트 파일을 읽는다. 헤더가 깨졌거나 모르는 버전이면 `Ok(None)`.
+/// 크기 상한 초과는 오류이며, 복구 호출자가 원본을 잘라 내지 않게 한다.
 pub(super) fn read(path: &Path, key: Option<&Key>) -> io::Result<Option<Segment>> {
-    decode_mut(&mut fs::read(path)?, key)
+    let file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len > MAX_FILE {
+        return Err(size_error());
+    }
+    read_from(io::BufReader::with_capacity(64 * 1024, file), file_len, key)
 }
 
 #[cfg(test)]
 #[cfg(unix)]
 pub(super) fn decode(bytes: &[u8], key: Option<&Key>) -> io::Result<Option<Segment>> {
-    decode_mut(&mut bytes.to_vec(), key)
+    read_from(bytes, bytes.len() as u64, key)
 }
 
-fn decode_mut(bytes: &mut [u8], key: Option<&Key>) -> io::Result<Option<Segment>> {
-    let Some((header, keyframe)) = bytes
-        .get(..HEADER_LEN)
-        .and_then(Header::decode_with_keyframe)
-    else {
+fn size_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "segment encoded size exceeds limit",
+    )
+}
+
+/// EOF로 잘린 꼬리와 실제 읽기 오류를 구분한다.
+fn read_full(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<bool> {
+    match reader.read_exact(bytes) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_from(reader: impl Read, file_len: u64, key: Option<&Key>) -> io::Result<Option<Segment>> {
+    // 읽는 중 파일이 자라도 시작 시점의 범위 밖은 읽거나 할당하지 않는다.
+    let mut reader = reader.take(file_len);
+    let mut prefix = [0; HEADER_LEN];
+    if !read_full(&mut reader, &mut prefix)? {
         return Ok(None);
-    };
-    let Some((prefix, mut content)) = bytes.split_at_mut_checked(HEADER_LEN) else {
+    }
+    let Some((header, keyframe)) = Header::decode_with_keyframe(&prefix) else {
         return Ok(None);
     };
     let mut crypto = if header.encrypted {
         let key = key.ok_or_else(|| {
             io::Error::new(io::ErrorKind::PermissionDenied, "segment key unavailable")
         })?;
-        let Some((salt, rest)) = content.split_at_mut_checked(SALT_LEN) else {
+        let mut salt = [0; SALT_LEN];
+        if !read_full(&mut reader, &mut salt)? {
             return Ok(None);
-        };
-        let salt = <[u8; SALT_LEN]>::try_from(&*salt).map_err(io::Error::other)?;
-        content = rest;
-        Some(Stream::open(key, prefix, &salt)?)
+        }
+        Some(Stream::open(key, &prefix, &salt)?)
     } else {
         None
     };
     let mut stream = Vec::new();
-    let mut valid_len = HEADER_LEN + if header.encrypted { SALT_LEN } else { 0 };
-    while let Some((meta, rest)) = content.split_at_mut_checked(CHUNK_HEAD) {
-        let mut meta = Cur(meta);
+    let mut valid_len = (HEADER_LEN + if header.encrypted { SALT_LEN } else { 0 }) as u64;
+    let mut meta = [0; CHUNK_HEAD];
+    while read_full(&mut reader, &mut meta)? {
+        let mut meta = Cur(&meta);
         let Some((len, crc)) = meta.u32().zip(meta.u32()) else {
             break;
         };
         let Ok(len) = usize::try_from(len) else {
             break;
         };
-        let Some((body, rest)) = rest.split_at_mut_checked(len) else {
+        // 인증 태그도 할당 전에 검사하고, 복호화 뒤에는 버퍼에서 제거한다.
+        let start = stream.len();
+        let end = start.checked_add(len).ok_or_else(size_error)?;
+        let next_len = valid_len
+            .checked_add(CHUNK_HEAD as u64)
+            .and_then(|size| size.checked_add(len as u64))
+            .ok_or_else(size_error)?;
+        // 파일 범위 밖을 가리키는 길이는 잘린 꼬리다. 큰 할당 없이 앞 청크를 복구한다.
+        if next_len > file_len {
             break;
-        };
+        }
+        if end > MAX_STREAM || next_len > MAX_FILE {
+            return Err(size_error());
+        }
+        if end > stream.capacity() {
+            let capacity = stream.capacity().saturating_mul(2).max(end).min(MAX_STREAM);
+            stream
+                .try_reserve_exact(capacity - start)
+                .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        }
+        stream.resize(end, 0);
+        let body = stream.get_mut(start..end).ok_or_else(size_error)?;
+        if !read_full(&mut reader, body)? {
+            stream.truncate(start);
+            break;
+        }
         if crc32fast::hash(body) != crc {
+            stream.truncate(start);
             break;
         }
         if let Some(crypto) = &mut crypto {
-            stream.extend_from_slice(crypto.decrypt(body)?);
-        } else {
-            stream.extend_from_slice(body);
+            let decrypted_len = crypto.decrypt(body)?.len();
+            stream.truncate(start + decrypted_len);
         }
-        valid_len += CHUNK_HEAD + len;
-        content = rest;
+        valid_len = next_len;
     }
     drop(crypto);
     let mut raw = Vec::new();
@@ -351,7 +404,8 @@ fn decode_mut(bytes: &mut [u8], key: Option<&Key>) -> io::Result<Option<Segment>
     if guard.is_none() {
         *guard = Some(zstd::stream::raw::Decoder::new()?);
     }
-    // 프레임이 끝나지 않았으면(봉인 전 크래시) 풀 수 있는 데까지 담고 오류를 낸다.
+    // 프레임이 끝나지 않았으면(봉인 전 크래시) 풀 수 있는 데까지 담고 미봉인으로 표시한다.
+    // 상한 초과 시 끝 seq를 신뢰할 수 없어 복구를 거부한다.
     let finished = guard
         .as_mut()
         .is_some_and(|d| decompress_stream(d, &stream, &mut raw));
@@ -362,6 +416,12 @@ fn decode_mut(bytes: &mut [u8], key: Option<&Key>) -> io::Result<Option<Segment>
     let sealed = finished && !stream.is_empty();
     drop(stream);
     crate::sys::release_malloc_cache();
+    if raw.len() as u64 > MAX_RAW {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment decompressed size exceeds limit",
+        ));
+    }
     let mut records = decode_records(&raw);
     drop(raw);
     let keyframe_bytes =
@@ -377,7 +437,7 @@ fn decode_mut(bytes: &mut [u8], key: Option<&Key>) -> io::Result<Option<Segment>
         header,
         keyframe_bytes,
         records,
-        valid_len: valid_len as u64,
+        valid_len,
         sealed,
     }))
 }

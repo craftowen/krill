@@ -22,6 +22,7 @@ use krill_proto::SessionId;
 use krill_proto::control::{Create, Failure, Info, Program, Reply, Request};
 use krill_proto::daemon::{self, HolderStatus, client_hello};
 use krill_proto::holder::STATUS_UNKNOWN;
+use krill_proto::input::{Input, InputAck, InputId, InputResult};
 use krill_proto::ipc::{self, ClientRole, ServerHello};
 use krill_proto::screen::{Attach, Attached, Msg, Seq, Stream, decode_output, kind};
 use krilld::store::{Limits, Piece, Store};
@@ -106,7 +107,7 @@ fn holder(dir: &Path, sock: &Path) -> Child {
         exe.is_file(),
         "krill-holder is not built next to krilld (run the whole workspace: cargo nextest run --workspace)"
     );
-    Command::new(exe)
+    fixture_command(exe, dir)
         .arg(KRILLD)
         .arg(sock)
         .env("KRILL_STATE_DIR", dir)
@@ -241,7 +242,24 @@ fn tmp(name: &str) -> PathBuf {
 
 #[test]
 fn holder_crash_orphan_then_rejoin() {
-    let dir = tmp("e2e");
+    rejoin_round(false);
+}
+
+#[test]
+fn failed_master_receiver_then_rejoin_restores_live_input_and_output() {
+    rejoin_round(true);
+}
+
+#[expect(
+    clippy::panic,
+    reason = "integration fixture requires successful spawn replies"
+)]
+fn rejoin_round(failed_receiver: bool) {
+    let dir = tmp(if failed_receiver {
+        "failed-receiver"
+    } else {
+        "e2e"
+    });
     let sock = dir.join("run/krilld.sock");
     let mut kids = Kids::default();
     kids.holders.push(holder(&dir, &sock));
@@ -255,7 +273,7 @@ fn holder_crash_orphan_then_rejoin() {
         &mut c,
         &dir,
         // 0.5ms마다 한 줄: 인계 중 두 krilld가 함께 읽는 창(수 ms)이 생기면 줄이 섞이거나 빠진다.
-        "exec /usr/bin/perl -e '$|=1; for ($i=1;;$i++) { print \"tick $i\\n\"; select(undef,undef,undef,0.0005) }'",
+        "stty raw -echo; exec /usr/bin/perl -MIO::Select -e '$|=1; $r=IO::Select->new(\\*STDIN); for ($i=1;;$i++) { print \"tick $i\\r\\n\"; if ($r->can_read(0)) { $s=<STDIN>; chomp $s; print \"REPLY:$s\\r\\n\"; } select(undef,undef,undef,0.0005) }'",
     )
     else {
         panic!("create ticker failed");
@@ -308,11 +326,32 @@ fn holder_crash_orphan_then_rejoin() {
             .any(|i| i.session == sleeper && i.status == Some(STATUS_UNKNOWN))
     });
 
+    if failed_receiver {
+        // Consume a real master fd, then disappear without acknowledging Ready.
+        // The next successor must recover while the old reader stays parked.
+        let stream = UnixStream::connect(sock.with_extension("sock.hnd")).unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        let mut link = krilld::holder::link::Link::new(stream.into());
+        let hello = link.recv().unwrap().unwrap();
+        assert!(matches!(
+            krill_proto::holder::FromHolder::decode(hello.frame()).unwrap(),
+            krill_proto::holder::FromHolder::Hello { .. }
+        ));
+        let transferred = link.recv().unwrap().unwrap();
+        assert!(matches!(
+            krill_proto::holder::FromHolder::decode(transferred.frame()).unwrap(),
+            krill_proto::holder::FromHolder::Session { .. }
+        ));
+        assert_eq!(transferred.fds.len(), 1);
+        drop((transferred, link));
+        assert!(alive(k1) && alive(tick_pid));
+    }
+
     // 새 holder: krilld#2가 krilld#1에게서 세션을 넘겨받고 krilld#1은 끝난다.
     // 실제 krill 클라이언트가 새 holder를 띄운다. 자식에도 격리한 상태 디렉터리를 전달한다.
     let krill = Path::new(KRILLD).with_file_name("krill");
     assert!(krill.is_file(), "krill must be built next to krilld");
-    let doctor = Command::new(krill)
+    let doctor = fixture_command(krill, &dir)
         .arg("doctor")
         .env("KRILL_STATE_DIR", &dir)
         .output()
@@ -358,6 +397,7 @@ fn holder_crash_orphan_then_rejoin() {
             },
         ]
     );
+    assert_round_trip(&sock, ticker, b"AFTER-REJOIN\n");
     // 홀더 크래시·인계 내내 원본이 빠지지 않았다: 처음부터 인계 경계 너머까지 읽은 줄 번호가 1부터 끊김 없이 이어진다.
     let (_, handed) = raw_until(&sock, ticker, Seq(0), |_| true);
     let (all, _) = raw_until(&sock, ticker, Seq(0), |t| t.len() as u64 > handed + 200);
@@ -403,6 +443,7 @@ fn holder_crash_orphan_then_rejoin() {
         }]
     );
     raw_until(&sock, ticker, Seq(0), |t| last_tick(t) > now + 15);
+    assert_round_trip(&sock, ticker, b"AFTER-ADOPTED-DAEMON-CRASH\n");
 
     // 닫기: holder가 Adopt한 세션을 끝내고(NOTE_EXIT) krilld가 지운다.
     assert_eq!(
@@ -416,4 +457,84 @@ fn holder_crash_orphan_then_rejoin() {
     drop(kids);
     assert_no_holders(&sock_held);
     fs::remove_dir_all(&dir).ok();
+}
+
+fn assert_round_trip(sock: &Path, session: SessionId, bytes: &[u8]) {
+    use std::io::Write as _;
+    let (mut stream, _) = connect(sock).unwrap();
+    stream
+        .write_all(
+            &Attach {
+                session,
+                stream: Stream::Raw { from: Seq(0) },
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+    Attached::decode(kind, &body).unwrap();
+    stream
+        .write_all(
+            &Input {
+                id: InputId(1),
+                bytes: bytes.to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let expected = format!("REPLY:{}\r\n", String::from_utf8_lossy(bytes).trim_end());
+    let mut output = Vec::new();
+    let mut acknowledged = false;
+    let deadline = Instant::now() + WAIT;
+    while !acknowledged || !String::from_utf8_lossy(&output).contains(&expected) {
+        assert!(
+            Instant::now() < deadline,
+            "no fresh response after handover"
+        );
+        stream
+            .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .unwrap();
+        let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+        if kind == krill_proto::input::kind::INPUT_ACK {
+            let ack = InputAck::decode(kind, &body).unwrap();
+            assert_eq!(ack.id, InputId(1));
+            assert_eq!(ack.result, InputResult::Applied);
+            acknowledged = true;
+        } else {
+            let (seq, bytes) = decode_output(kind, &body).unwrap();
+            assert_eq!(seq.0, output.len() as u64, "round-trip output gap");
+            output.extend_from_slice(bytes);
+        }
+    }
+}
+
+fn fixture_command(program: impl AsRef<std::ffi::OsStr>, dir: &Path) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env("KRILL_STATE_DIR", dir)
+        .env("KRILL_LOG_DIR", dir.join("logs"))
+        .env("HOME", dir)
+        .env("ZDOTDIR", dir)
+        .env("BASH_ENV", "/dev/null")
+        .env("DO_NOT_TRACK", "1")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    for name in [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "KRILL_ACCOUNT_PROVIDER",
+        "KRILL_ACCOUNT_DIR",
+    ] {
+        command.env_remove(name);
+    }
+    command
 }

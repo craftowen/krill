@@ -325,6 +325,10 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
     });
     match opened {
         Ok(window) => {
+            #[cfg(target_os = "macos")]
+            window
+                .update(cx, |_, window, cx| record_test_window_geometry(window, cx))
+                .ok();
             krill_app::menu_bar::sync_window_mode(cx);
             cx.activate(true);
             Some(window)
@@ -335,6 +339,43 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
             None
         }
     }
+}
+
+/// Test-only opt-in observation of AppKit/GPUI bounds; `CGWindow` includes compositor framing.
+#[cfg(target_os = "macos")]
+fn record_test_window_geometry(window: &gpui::Window, cx: &mut gpui::App) {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if std::env::var_os("KRILL_TEST_WINDOW_GEOMETRY").as_deref() != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+    let Some(state) = krill_proto::daemon::state_dir_override() else {
+        return;
+    };
+    let state = std::path::PathBuf::from(state);
+    if !state.is_absolute() {
+        return;
+    }
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let bounds = window.bounds();
+    let value = serde_json::json!({
+        "pid": std::process::id(),
+        "width": bounds.size.width.as_f32(),
+        "height": bounds.size.height.as_f32(),
+        "scale": window.scale_factor(),
+        "window_count": cx.windows().len(),
+        "windowed": !window.is_fullscreen() && !window.is_simple_fullscreen() && !window.is_maximized(),
+    });
+    cx.background_spawn(async move {
+        let path = state.join(format!("memory-window-{sequence:020}.json"));
+        let temporary = path.with_extension("tmp");
+        let result = std::fs::write(&temporary, value.to_string())
+            .and_then(|()| std::fs::rename(&temporary, &path));
+        if let Err(error) = result {
+            tracing::warn!(kind = ?error.kind(), "memory window probe write failed");
+        }
+    })
+    .detach();
 }
 
 /// OWE-842: 저장된 위치에 드래그할 제목 영역이 남아 있지 않으면 저장 크기로

@@ -28,6 +28,9 @@ use crate::registry::Registry;
 /// 이 krilld의 빌드. `ServerHello.build`와 같다.
 const BUILD: &str = krill_proto::BUILD;
 
+#[cfg(all(test, unix))]
+mod tests;
+
 /// 업그레이드를 준비한다. `Started`면 호출자가 답을 보낸 뒤 프로세스를 끝낸다.
 pub(crate) fn prepare(reg: &Registry, holder: &Holder, u: Upgrade) -> Result<Upgraded, Failure> {
     match is_newer(&u.build, BUILD) {
@@ -65,6 +68,8 @@ pub(crate) fn prepare(reg: &Registry, holder: &Holder, u: Upgrade) -> Result<Upg
         tracing::warn!(kind = ?e.kind(), "upgrade: readers did not pause");
         Failure::Os(e.raw_os_error().unwrap_or(libc::EIO))
     })?;
+    #[cfg(all(test, unix))]
+    tests::after_pause();
     // Done 뒤·정지 중에 holder가 죽었으면 `Started`를 보내고 끝나면 세션이 유실된다
     // (새 holder를 띄울 주체가 없다). 실패로 보고하고 구 krilld가 계속 쥔다.
     // 판정과 종료 사이의 수 μs 경합은 핸드오프 재설계(needs-owen a) 없이 막지 못한다.

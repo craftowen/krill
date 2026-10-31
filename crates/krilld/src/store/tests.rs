@@ -108,6 +108,77 @@ fn segment_fixture_reads() {
 }
 
 #[test]
+fn idle_encoder_seals_without_closing_pty_and_resumes_without_a_gap() {
+    let root = tmp("idle-encoder");
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let id = SessionId(73);
+    let rec = store.recorder(id, SIZE).unwrap();
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let mut settings = rustix::termios::tcgetattr(&pty.user).unwrap();
+    settings.make_raw();
+    rustix::termios::tcsetattr(&pty.user, rustix::termios::OptionalActions::Now, &settings)
+        .unwrap();
+    let mut output = fs::File::from(pty.user);
+    let session = crate::session::Session::start(
+        id,
+        pty.controller,
+        SIZE,
+        std::sync::Arc::new(crate::appearance::Appearance::load(PathBuf::new())),
+        Some(rec),
+    )
+    .unwrap();
+
+    let before = b"before-idle|";
+    let after = b"after-idle|";
+    output.write_all(before).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let sealed = super::segments(&store.session_dir(id))
+            .unwrap()
+            .first()
+            .and_then(|path| segment::read(path, None).unwrap())
+            .is_some_and(|segment| segment.sealed);
+        if sealed {
+            break;
+        }
+        assert!(Instant::now() < deadline, "quiet PTY kept its encoder open");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!session.is_closed(), "idle sealing must keep the PTY alive");
+    output.write_all(after).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while session.tap().pulse().end < (before.len() + after.len()) as u64 {
+        assert!(
+            Instant::now() < deadline,
+            "PTY did not resume after idle sealing"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(output);
+    session.wait().unwrap();
+
+    let mut raw = Vec::new();
+    store
+        .raw(id, 0, (before.len() + after.len()) as u64, |piece| {
+            match piece {
+                super::Piece::Data { bytes, .. } => raw.extend(bytes),
+                super::Piece::Gap { seq, len } => {
+                    panic!("idle sealing introduced a gap at {seq}: {len} bytes");
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(raw, [before.as_slice(), after.as_slice()].concat());
+    let paths = super::segments(&store.session_dir(id)).unwrap();
+    assert_eq!(paths.len(), 2, "resume starts a new complete zstd frame");
+    for path in paths {
+        assert!(segment::read(&path, None).unwrap().unwrap().sealed);
+    }
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn roundtrip_and_permissions() {
     let root = tmp("roundtrip");
     let store = Store::open(&root, Limits::default()).unwrap();

@@ -23,6 +23,7 @@ use krill_proto::control::{
     CaptureFormat, Create, FEAT_UPGRADE, Failure, Info, Program, Reply, Request, Upgrade, Upgraded,
 };
 use krill_proto::daemon::{self, Paths, client_hello};
+use krill_proto::input::{Input, InputAck, InputId, InputResult};
 use krill_proto::ipc::{self, ClientHello, ClientRole, ServerHello};
 use krill_proto::screen::{Attach, Attached, Msg, Seq, Stream, decode_output, kind};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
@@ -43,13 +44,18 @@ fn alive(p: u32) -> bool {
 struct Daemon {
     holder: Child,
     krilld: Vec<u32>,
+    detached_holders: Vec<u32>,
+    sessions: Vec<u32>,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.holder.kill().ok();
         self.holder.wait().ok();
-        for &k in &self.krilld {
+        for &holder in &self.detached_holders {
+            kill_process(pid(holder), Signal::KILL).ok();
+        }
+        for &k in self.krilld.iter().chain(&self.sessions) {
             kill_process(pid(k), Signal::KILL).ok();
         }
     }
@@ -266,6 +272,8 @@ fn upgrade_keeps_sessions_lossless_and_one_generation() {
     let mut daemon = Daemon {
         holder,
         krilld: Vec::new(),
+        detached_holders: Vec::new(),
+        sessions: Vec::new(),
     };
     let (mut c, mut hello) = wait_daemon(&sock, 0);
     daemon
@@ -472,6 +480,8 @@ fn failed_upgrade_rolls_back_and_preserves_session() {
     let mut daemon = Daemon {
         holder,
         krilld: Vec::new(),
+        detached_holders: Vec::new(),
+        sessions: Vec::new(),
     };
     let (mut c, mut hello) = wait_daemon(&sock, 0);
     daemon
@@ -542,18 +552,23 @@ fn upgrade_holder_death_without_done_is_failure_and_sessions_survive() {
     )
     .unwrap();
     fs::set_permissions(&killer, fs::Permissions::from_mode(0o755)).unwrap();
-    let holder = Command::new(Path::new(KRILLD).parent().unwrap().join("krill-holder"))
-        .arg(KRILLD)
-        .arg(&sock)
-        .env("KRILL_STATE_DIR", &dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let holder = fixture_command(
+        Path::new(KRILLD).parent().unwrap().join("krill-holder"),
+        &dir,
+    )
+    .arg(KRILLD)
+    .arg(&sock)
+    .env("KRILL_STATE_DIR", &dir)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
     let mut daemon = Daemon {
         holder,
         krilld: Vec::new(),
+        detached_holders: Vec::new(),
+        sessions: Vec::new(),
     };
     let (mut c, hello) = wait_daemon(&sock, 0);
     daemon
@@ -563,8 +578,9 @@ fn upgrade_holder_death_without_done_is_failure_and_sessions_survive() {
         &mut c,
         &dir,
         b"/bin/sh",
-        &[b"-c", b"echo MK684-MARK; exec sleep 600"],
+        &[b"-c", b"stty raw -echo; exec /usr/bin/perl -e '$|=1; print \"MK684-MARK\\r\\n\"; while (<STDIN>) { chomp; print \"REPLY:$_\\r\\n\"; }'"],
     );
+    daemon.sessions.push(quiet_pid);
     let deadline = Instant::now() + WAIT;
     while !screen(&mut c, quiet).contains("MK684-MARK") {
         assert!(Instant::now() < deadline, "marker not on screen");
@@ -596,6 +612,7 @@ fn upgrade_holder_death_without_done_is_failure_and_sessions_survive() {
     assert_eq!(connect(&sock).unwrap().1.instance_id, hello.instance_id);
     assert!(alive(quiet_pid), "session died with holder");
     assert!(screen(&mut c, quiet).contains("MK684-MARK"));
+    assert_live_round_trip(&sock, quiet, "AFTER-HOLDER-LOSS");
     // 죽은 holder(좀비)를 거두고 나면 소켓에는 krilld만 남지만 스스로 재시작하지 않는다.
     daemon.holder.wait().ok();
     thread::sleep(Duration::from_secs(1));
@@ -611,7 +628,7 @@ fn upgrade_holder_death_without_done_is_failure_and_sessions_survive() {
     // 그 상태에서 `krill doctor --json --no-start`는 holder 상실을 경고한다(치유 없음).
     let krill = Path::new(KRILLD).with_file_name("krill");
     assert!(krill.is_file(), "krill is not built next to krilld");
-    let out = Command::new(&krill)
+    let out = fixture_command(&krill, &dir)
         .args(["doctor", "--json", "--no-start"])
         .env("KRILL_STATE_DIR", &dir)
         .output()
@@ -627,7 +644,7 @@ fn upgrade_holder_death_without_done_is_failure_and_sessions_survive() {
     );
     // `krill ls`는 세션을 보여주고 holder 상실 경고를 stderr에 남긴다.
     // 새 holder를 띄워 복구하므로 인계 뒤 세션 생존도 함께 확인한다.
-    let out = Command::new(&krill)
+    let out = fixture_command(&krill, &dir)
         .arg("ls")
         .env("KRILL_STATE_DIR", &dir)
         .output()
@@ -650,8 +667,6 @@ fn upgrade_holder_death_without_done_is_failure_and_sessions_survive() {
     let (mut c2, hello2) = wait_daemon(&sock, hello.instance_id);
     let k2 = u32::try_from(hello2.instance_id).unwrap();
     daemon.krilld.push(k2);
-    assert!(screen(&mut c2, quiet).contains("MK684-MARK"));
-    assert!(alive(quiet_pid), "session died during recovery");
     // 복구에 뜬 새 holder를 찾아 정리한다(분리 기동이라 Drop이 모른다).
     let parent = Command::new("/bin/ps")
         .args(["-o", "ppid=", "-p", &k2.to_string()])
@@ -662,10 +677,14 @@ fn upgrade_holder_death_without_done_is_failure_and_sessions_survive() {
         .trim()
         .parse()
         .unwrap();
+    daemon.detached_holders.push(h2);
+    assert!(screen(&mut c2, quiet).contains("MK684-MARK"));
+    assert!(alive(quiet_pid), "session died during recovery");
+    assert_live_round_trip(&sock, quiet, "AFTER-HOLDER-REJOIN");
     kill_process(pid(h2), Signal::KILL).ok();
     // 기본 모드 `krill doctor`도 치유(연결) 전에 관측해 holder 상실을 경고해야 한다.
     thread::sleep(Duration::from_secs(1));
-    let out = Command::new(&krill)
+    let out = fixture_command(&krill, &dir)
         .args(["doctor", "--json"])
         .env("KRILL_STATE_DIR", &dir)
         .output()
@@ -690,12 +709,63 @@ fn upgrade_holder_death_without_done_is_failure_and_sessions_survive() {
         .trim()
         .parse::<u32>()
     {
+        daemon.detached_holders.push(h3);
         kill_process(pid(h3), Signal::KILL).ok();
     }
     // 세션 프로세스(원 holder의 자식, init에 입양됨)도 정리한다.
     kill_process(pid(quiet_pid), Signal::KILL).ok();
     drop(daemon);
     fs::remove_dir_all(&dir).ok();
+}
+
+fn assert_live_round_trip(sock: &Path, session: SessionId, marker: &str) {
+    let (mut stream, _) = connect(sock).unwrap();
+    stream
+        .write_all(
+            &Attach {
+                session,
+                stream: Stream::Raw { from: Seq(0) },
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+    Attached::decode(kind, &body).unwrap();
+    stream
+        .write_all(
+            &Input {
+                id: InputId(1),
+                bytes: format!("{marker}\n").into_bytes(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let expected = format!("REPLY:{marker}\r\n");
+    let mut output = Vec::new();
+    let mut acknowledged = false;
+    let deadline = Instant::now() + WAIT;
+    while !acknowledged || !String::from_utf8_lossy(&output).contains(&expected) {
+        assert!(
+            Instant::now() < deadline,
+            "no fresh response after recovery: {marker}"
+        );
+        stream
+            .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .unwrap();
+        let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+        if kind == krill_proto::input::kind::INPUT_ACK {
+            let ack = InputAck::decode(kind, &body).unwrap();
+            assert_eq!(ack.id, InputId(1));
+            assert_eq!(ack.result, InputResult::Applied);
+            acknowledged = true;
+        } else {
+            let (seq, bytes) = decode_output(kind, &body).unwrap();
+            assert_eq!(seq.0, output.len() as u64, "recovered output gap");
+            output.extend_from_slice(bytes);
+        }
+    }
 }
 
 /// OWE-589: 이미 건강한 데몬이 있으면 새 holder는 빈 채로 끝나며 재기동하지 않는다.
@@ -719,12 +789,16 @@ fn duplicate_holder_exits_without_restarting_healthy_daemon() {
     let mut first = Daemon {
         holder: launch(),
         krilld: Vec::new(),
+        detached_holders: Vec::new(),
+        sessions: Vec::new(),
     };
     let (mut c, hello) = wait_daemon(&sock, 0);
     first.krilld.push(u32::try_from(hello.instance_id).unwrap());
     let mut duplicate = Daemon {
         holder: launch(),
         krilld: Vec::new(),
+        detached_holders: Vec::new(),
+        sessions: Vec::new(),
     };
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -922,4 +996,33 @@ fn upgrade_holder_loss_after_done_resumes_readers_and_keeps_output() {
     drop(child);
     drop(krilld);
     fs::remove_dir_all(&dir).ok();
+}
+
+fn fixture_command(program: impl AsRef<std::ffi::OsStr>, dir: &Path) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env("KRILL_STATE_DIR", dir)
+        .env("KRILL_LOG_DIR", dir.join("logs"))
+        .env("HOME", dir)
+        .env("ZDOTDIR", dir)
+        .env("BASH_ENV", "/dev/null")
+        .env("DO_NOT_TRACK", "1")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    for name in [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "KRILL_ACCOUNT_PROVIDER",
+        "KRILL_ACCOUNT_DIR",
+    ] {
+        command.env_remove(name);
+    }
+    command
 }
