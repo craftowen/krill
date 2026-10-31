@@ -1,6 +1,6 @@
 # Error reporting
 
-Error reporting is off by default and has its own consent, separate from usage telemetry. Enable it in **Settings → Resources → Send error reports**, or run:
+Error reporting is off by default and has its own consent, separate from usage telemetry. After the first install, onboarding asks once with a non-blocking banner (keeping it off is also a valid choice that completes onboarding). Enable it in **Settings → Send error reports**, or run:
 
 ```sh
 krill errors status --json

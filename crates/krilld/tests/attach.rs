@@ -492,6 +492,56 @@ fn retained_view_applies_scroll_after_same_revision_reconnect() {
 }
 
 #[test]
+fn parked_screen_reconnect_preserves_rep_spacing() {
+    let dir = tmp("parked-rep");
+    let gate = dir.join("continue");
+    let st = store(&dir, Limits::default());
+    let script = format!(
+        "/usr/bin/perl -e '$|=1; print \"A \"; $end=time+25; \
+         until (-e $ARGV[0]) {{ exit 2 if time>$end; select undef,undef,undef,0.01; }} \
+         print \"\\e[5bZ\";' '{}'",
+        gate.display()
+    );
+    let (mut child, session) = spawn(Some(&st), 1, SMALL, &script);
+    let tap = session.tap();
+    let progress = tap.wait(|p| p.end >= 2 || p.closed);
+    assert!(progress.end >= 2, "child must print its initial character");
+    let sock = server(&dir, vec![tap.clone()]);
+    let (mut connection, _) = connect(&sock, screen(1, None));
+    connection
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    read_snapshot(&mut connection, &mut View::default());
+    drop(connection);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !tap.is_parked() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !tap.is_parked() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("disconnected screen must park before its next output");
+    }
+    let (mut connection, _) = connect(&sock, screen(1, None));
+    connection
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut view = View::default();
+    read_snapshot(&mut connection, &mut view);
+    fs::write(&gate, []).unwrap();
+    follow_to_close(&mut connection, &mut view);
+    assert!(child.wait().unwrap().success());
+    fs::remove_dir_all(&dir).unwrap();
+    let row: String = view.screen.rows[0].iter().map(|cell| cell.ch).collect();
+    assert_eq!(
+        row.trim_end(),
+        "A      Z",
+        "REP spacing after a tab reconnect"
+    );
+    assert_eq!(view.screen.cursor.column, 8);
+}
+
+#[test]
 fn same_revision_skips_snapshot_and_resync_resends() {
     let dir = tmp("known");
     let (mut child, s) = spawn(None, 1, SMALL, "printf 'hello 한글'; exec cat");

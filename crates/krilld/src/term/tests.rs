@@ -409,6 +409,32 @@ fn demote_mid_sequence_keeps_parser_tail() {
     }
 }
 
+#[test]
+fn demote_keeps_repeat_character_and_cursor_position() {
+    let look = fresh();
+    for head in ["A ", "한"] {
+        let (mut parked, mut plain) = (Engine::new(SIZE), Engine::new(SIZE));
+        for engine in [&mut parked, &mut plain] {
+            engine.feed(head.as_bytes(), Feed::Live, &look);
+        }
+        parked.demote(&look);
+        parked.promote(&look);
+        for engine in [&mut parked, &mut plain] {
+            engine.feed(b"\x1b[5bZ", Feed::Live, &look);
+        }
+        assert_eq!(
+            parked.screen().cursor,
+            plain.screen().cursor,
+            "tab switch must preserve REP cursor position after {head:?}"
+        );
+        assert_eq!(
+            parked.screen(),
+            plain.screen(),
+            "tab switch must preserve REP output and cursor position after {head:?}"
+        );
+    }
+}
+
 /// MK-033: OSC 52 쓰기는 살아 있는 출력만 남기고, 읽기에는 답하지 않으며, 너무 큰 값은 버린다.
 #[test]
 fn osc52_write_only_live() {

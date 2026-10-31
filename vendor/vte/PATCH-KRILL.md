@@ -15,6 +15,12 @@
 | `src/lib.rs` `Parser::mk_is_ground` | 추가 | 파서 정지점 판정(ground + 미완성 UTF-8 없음) |
 | `src/ansi.rs` `Processor::mk_is_quiescent`·`mk_preceding_char` | 추가 | 정지점(ground + sync 아님), REP 직전 문자 |
 
+## 메모리 회수 (2026-10-30)
+
+| 위치 | 변경 | 이유 |
+|---|---|---|
+| `src/ansi.rs` `Processor::mk_trim_sync_buffer` | 정지점의 빈 sync 버퍼 용량만 반환 | 숨긴 세션 강등 시 파서를 초기화하면 REP 직전 문자를 잃어 이후 출력과 커서 위치가 어긋난다. 파서 상태를 보존하면서 버퍼 메모리를 회수한다. |
+
 ## 버그 수정(동작 변경, 오웬 승인 2026-10-15)
 
 | 위치 | 버그 | 재현 |
