@@ -52,6 +52,29 @@ mod action_tests;
 #[cfg(test)]
 mod poll_tests;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ComposerModelItem {
+    pub id: String,
+    pub label: String,
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ComposerMeta {
+    pub model: Option<String>,
+    pub model_label: Option<String>,
+    pub current_model_id: Option<String>,
+    pub effort: Option<String>,
+    pub context_percent: Option<u8>,
+    pub models: Vec<ComposerModelItem>,
+    pub efforts: Vec<String>,
+    pub supported: bool,
+    pub effort_supported: bool,
+    pub reason: Option<String>,
+    pub pending: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct SessionChatLog {
     pub agent: String,
@@ -60,6 +83,7 @@ pub(crate) struct SessionChatLog {
     pub base_index: usize,
     pub items: Vec<Arc<ChatItem>>,
     pub revision: u64,
+    pub meta: ComposerMeta,
     expanded: BTreeSet<usize>,
     pub answered: BTreeSet<String>,
     binding: (String, String),
@@ -128,10 +152,17 @@ pub(crate) struct ChatState {
     pub last_poll: Option<std::time::Instant>,
     pub task: Option<Task<()>>,
     pub poll_generation: u64,
+    pub copied_item: Option<(ChatKey, usize, std::time::Instant)>,
+    pub quick_menu: BTreeSet<ChatKey>,
+    pub model_picker: BTreeSet<ChatKey>,
+    composer_tasks: BTreeMap<ChatKey, Task<()>>,
+    last_composer_poll: BTreeMap<ChatKey, std::time::Instant>,
     #[cfg(test)]
     pub next_poll_io: Option<tokio::sync::oneshot::Receiver<()>>,
     #[cfg(test)]
     pub poll_call: Option<krill_app::agent_history::Call>,
+    #[cfg(test)]
+    pub workflow_call: Option<krill_app::agent_history::WorkflowCall>,
     request_tasks: BTreeMap<ChatKey, Task<()>>,
     prompt_failed: BTreeSet<ChatKey>,
     prompt_tasks: BTreeMap<ChatKey, Task<()>>,
@@ -155,6 +186,372 @@ impl ChatState {
 
 fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_valid_token_string(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-:/@[]".contains(&b))
+}
+
+fn ratio_percent(used: u64, limit: u64) -> Option<u8> {
+    if limit == 0 {
+        return None;
+    }
+    let pct = ((u128::from(used) * 100 + u128::from(limit) / 2) / u128::from(limit)).min(100);
+    u8::try_from(pct).ok()
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to 0.0..=100.0"
+)]
+fn float_percent(percent: f64) -> Option<u8> {
+    (percent.is_finite() && (0.0..=100.0).contains(&percent))
+        .then(|| percent.round().clamp(0.0, 100.0) as u8)
+}
+
+pub(crate) fn parse_transcript_record(record: &serde_json::Value, meta: &mut ComposerMeta) {
+    let payload = record.get("payload").unwrap_or(record);
+    let message = record.get("message").unwrap_or(record);
+
+    if record.get("type").and_then(serde_json::Value::as_str) == Some("turn_context") {
+        if let Some(model) = payload
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| is_valid_token_string(v))
+        {
+            meta.model = Some(model.to_owned());
+        }
+        for field in ["effort", "reasoning_effort"] {
+            if let Some(effort) = payload
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| is_valid_token_string(v))
+            {
+                meta.effort = Some(effort.to_owned());
+            }
+        }
+    }
+
+    if let Some(model) = message
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| is_valid_token_string(v) && !v.starts_with('<'))
+    {
+        meta.model = Some(model.to_owned());
+    }
+
+    if let Some(info) = payload.get("info") {
+        let used = info
+            .pointer("/last_token_usage/total_tokens")
+            .and_then(serde_json::Value::as_u64);
+        let limit = info
+            .get("model_context_window")
+            .and_then(serde_json::Value::as_u64);
+        if let (Some(used), Some(limit)) = (used, limit)
+            && let Some(pct) = ratio_percent(used, limit)
+        {
+            meta.context_percent = Some(pct);
+        }
+    }
+
+    if let Some(usage) = message.get("usage") {
+        let input = usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let output = usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let cache_create = usage
+            .get("cache_creation_input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let total = input + output + cache_read + cache_create;
+        if total > 0
+            && let Some(pct) = ratio_percent(total, 200_000)
+        {
+            meta.context_percent = Some(pct);
+        }
+    }
+}
+
+pub(crate) fn observe_composer_meta(
+    state_dir: Option<&std::path::Path>,
+    session_id: &str,
+    transcript_path: &str,
+) -> ComposerMeta {
+    let mut meta = ComposerMeta::default();
+    if !transcript_path.is_empty()
+        && let Ok(mut file) = std::fs::File::open(transcript_path)
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        if let Ok(len) = file.metadata().map(|m| m.len()) {
+            let tail_bytes = 64 * 1024;
+            let start = len.saturating_sub(tail_bytes);
+            if file.seek(SeekFrom::Start(start)).is_ok() {
+                let mut buf = Vec::new();
+                if file.take(tail_bytes).read_to_end(&mut buf).is_ok() {
+                    let text = String::from_utf8_lossy(&buf);
+                    for line in text.lines().skip(usize::from(start > 0)) {
+                        if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
+                            parse_transcript_record(&record, &mut meta);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(state_dir) = state_dir {
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            let claude_profile = home.join(".claude");
+            if let Some(obs) =
+                krill_proto::statusline::context::read(state_dir, &claude_profile, session_id)
+            {
+                if let Some(model) = obs.model {
+                    meta.model = Some(model);
+                }
+                if let Some(effort) = obs.effort {
+                    meta.effort = Some(effort);
+                }
+                if let Some(percent) = obs.percent.and_then(float_percent) {
+                    meta.context_percent = Some(percent);
+                }
+            }
+        }
+        let context_dir = state_dir.join("session-context");
+        if (meta.model.is_none() || meta.context_percent.is_none())
+            && context_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&context_dir)
+        {
+            for entry in entries.flatten() {
+                let file_path = entry.path().join(format!("{session_id}.json"));
+                if file_path.is_file()
+                    && let Ok(content) = std::fs::read_to_string(&file_path)
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+                {
+                    if meta.model.is_none()
+                        && let Some(m) = json.get("model").and_then(serde_json::Value::as_str)
+                    {
+                        meta.model = Some(m.to_owned());
+                    }
+                    if meta.effort.is_none()
+                        && let Some(e) = json.get("effort").and_then(serde_json::Value::as_str)
+                    {
+                        meta.effort = Some(e.to_owned());
+                    }
+                    if meta.context_percent.is_none()
+                        && let Some(p) = json
+                            .get("percent")
+                            .and_then(serde_json::Value::as_f64)
+                            .and_then(float_percent)
+                    {
+                        meta.context_percent = Some(p);
+                    }
+                }
+            }
+        }
+    }
+    meta
+}
+
+pub(crate) fn parse_composer_items(items: &[serde_json::Value]) -> Vec<ComposerModelItem> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = item
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            let label = item
+                .get("label")
+                .or_else(|| item.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id);
+            let efforts = item
+                .get("efforts")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            let default_effort = item
+                .get("default_effort")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            Some(ComposerModelItem {
+                id: id.to_owned(),
+                label: label.to_owned(),
+                efforts,
+                default_effort,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn apply_composer_status_json(raw: &str, meta: &mut ComposerMeta) -> Option<String> {
+    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let data = root.get("data")?;
+    let agent = data
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    if let Some(model) = data
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        meta.model = Some(model.to_owned());
+    }
+    if let Some(label) = data
+        .get("model_label")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        meta.model_label = Some(label.to_owned());
+    }
+    if let Some(effort) = data
+        .get("effort")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        meta.effort = Some(effort.to_owned());
+    }
+    if let Some(pct) = data
+        .pointer("/context/percent")
+        .and_then(serde_json::Value::as_f64)
+        .and_then(float_percent)
+    {
+        meta.context_percent = Some(pct);
+    }
+    if let Some(supported) = data.get("supported").and_then(serde_json::Value::as_bool) {
+        meta.supported = supported;
+    }
+    if let Some(effort_supported) = data
+        .get("effort_supported")
+        .and_then(serde_json::Value::as_bool)
+    {
+        meta.effort_supported = effort_supported;
+    }
+    if let Some(models) = data.get("models").and_then(serde_json::Value::as_array) {
+        let parsed = parse_composer_items(models);
+        if !parsed.is_empty() {
+            meta.models = parsed;
+        }
+    }
+    if let Some(efforts) = data.get("efforts").and_then(serde_json::Value::as_array) {
+        let parsed: Vec<String> = efforts
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        if !parsed.is_empty() {
+            meta.efforts = parsed;
+        }
+    }
+    agent
+}
+
+pub(crate) fn apply_composer_models_json(raw: &str, meta: &mut ComposerMeta) {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return;
+    }
+    let Some(data) = root.get("data") else {
+        return;
+    };
+    if let Some(supported) = data.get("supported").and_then(serde_json::Value::as_bool) {
+        meta.supported = supported;
+    }
+    if let Some(current) = data
+        .get("current")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        meta.current_model_id = Some(current.to_owned());
+    }
+    if let Some(items) = data.get("items").and_then(serde_json::Value::as_array) {
+        let parsed = parse_composer_items(items);
+        if !parsed.is_empty() {
+            meta.models = parsed;
+        }
+    }
+    meta.reason = data
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+}
+
+pub(crate) fn apply_composer_set_json(raw: &str, meta: &mut ComposerMeta) -> bool {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        meta.reason = root
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        return false;
+    }
+    let Some(data) = root.get("data") else {
+        return false;
+    };
+    let applied = data
+        .get("applied")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if applied {
+        if let Some(model) = data
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            meta.model = Some(model.to_owned());
+            meta.current_model_id = Some(model.to_owned());
+        }
+        if let Some(label) = data
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            meta.model_label = Some(label.to_owned());
+        }
+        if let Some(effort) = data
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            meta.effort = Some(effort.to_owned());
+        }
+        meta.reason = None;
+        true
+    } else {
+        meta.reason = data
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        false
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -505,8 +902,18 @@ impl Shell {
                     && this.chat.logs.get(&key).map_or(0, |log| log.offset) == offset
                 {
                     if let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply {
+                        let refresh_composer = snapshot.reset
+                            || !snapshot.items.is_empty()
+                            || this
+                                .chat
+                                .last_composer_poll
+                                .get(&key)
+                                .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
                         this.chat.poll_failed.remove(&key);
                         this.apply_chat_poll_for_host(session, host, snapshot);
+                        if refresh_composer {
+                            this.refresh_chat_composer(&key, false, cx);
+                        }
                     } else {
                         this.chat.poll_failed.insert(key);
                     }
@@ -559,6 +966,7 @@ impl Shell {
             log.epoch = log.epoch.wrapping_add(1);
             log.items.clear();
             log.base_index = 0;
+            log.meta = ComposerMeta::default();
             log.answered.clear();
             log.expanded.clear();
             log.multi_selected.clear();
@@ -566,7 +974,24 @@ impl Shell {
             self.chat.request_tasks.remove(&key);
         }
         log.binding = binding;
+        let is_local = host
+            .as_ref()
+            .is_some_and(krill_app::hosts::HostId::is_local);
         log.host = host;
+        if is_local && snap.bound && (reset || !snap.items.is_empty() || log.meta.model.is_none()) {
+            let state_dir = krill_proto::daemon::state_dir();
+            let observed =
+                observe_composer_meta(state_dir.as_deref(), &log.binding.0, &log.binding.1);
+            if observed.model.is_some() {
+                log.meta.model = observed.model;
+            }
+            if observed.effort.is_some() {
+                log.meta.effort = observed.effort;
+            }
+            if observed.context_percent.is_some() {
+                log.meta.context_percent = observed.context_percent;
+            }
+        }
         if !snap.items.is_empty() {
             log.items.extend(snap.items.into_iter().map(Arc::new));
             if log.items.len() > 250 {
@@ -609,6 +1034,210 @@ impl Shell {
     fn send_to_session(&mut self, key: &ChatKey, bytes: &[u8], cx: &mut Context<Self>) -> bool {
         self.chat_pane(key)
             .is_some_and(|pane| self.send_to_chat_pane(pane, key.1, bytes, cx))
+    }
+
+    fn workflow_call_for_key(
+        &self,
+        key: &ChatKey,
+    ) -> Option<krill_app::agent_history::WorkflowCall> {
+        #[cfg(test)]
+        if let Some(call) = &self.chat.workflow_call {
+            return Some(call.clone());
+        }
+        let target = self.target_for_host(&key.0)?;
+        Some(krill_app::agent_history::workflow_call_for(Some(target)))
+    }
+
+    pub(super) fn refresh_chat_composer(
+        &mut self,
+        key: &ChatKey,
+        include_models: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chat.logs.get(key).is_some_and(|log| log.meta.pending) {
+            return;
+        }
+        let Some(call) = self.workflow_call_for_key(key) else {
+            return;
+        };
+        let task_key = key.clone();
+        let session = key.1.0;
+        self.chat
+            .last_composer_poll
+            .insert(key.clone(), std::time::Instant::now());
+        let task = cx.spawn(async move |this, cx| {
+            let (status_raw, models_raw) = cx
+                .background_executor()
+                .spawn(async move {
+                    let status_req =
+                        serde_json::json!({"action": "chat_composer", "session": session})
+                            .to_string();
+                    let status_res = call(&status_req).ok();
+                    let models_res = if include_models {
+                        let models_req =
+                            serde_json::json!({"action": "composer_models", "session": session})
+                                .to_string();
+                        call(&models_req).ok()
+                    } else {
+                        None
+                    };
+                    (status_res, models_res)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.chat.composer_tasks.remove(&task_key);
+                let log = this.chat.logs.entry(task_key.clone()).or_default();
+                if let Some(raw) = status_raw
+                    && let Some(agent) = apply_composer_status_json(&raw, &mut log.meta)
+                    && log.agent.is_empty()
+                {
+                    log.agent = agent;
+                }
+                if let Some(raw) = models_raw {
+                    apply_composer_models_json(&raw, &mut log.meta);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.chat.composer_tasks.insert(key.clone(), task);
+    }
+
+    pub(super) fn toggle_chat_model_picker(&mut self, key: &ChatKey, cx: &mut Context<Self>) {
+        self.chat.quick_menu.remove(key);
+        if self.chat.model_picker.contains(key) {
+            self.chat.model_picker.remove(key);
+        } else {
+            if let Some(log) = self.chat.logs.get_mut(key) {
+                log.meta.reason = None;
+            }
+            self.chat.model_picker.insert(key.clone());
+            self.refresh_chat_composer(key, true, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn select_chat_model(
+        &mut self,
+        key: &ChatKey,
+        model_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat.quick_menu.remove(key);
+        let Some(call) = self.workflow_call_for_key(key) else {
+            return;
+        };
+        let log = self.chat.logs.entry(key.clone()).or_default();
+        if log.meta.pending {
+            return;
+        }
+        let effort = log
+            .meta
+            .models
+            .iter()
+            .find(|item| item.id == model_id)
+            .and_then(|item| {
+                log.meta
+                    .effort
+                    .as_ref()
+                    .filter(|eff| item.efforts.contains(eff))
+                    .cloned()
+                    .or_else(|| item.default_effort.clone())
+            });
+        log.meta.pending = true;
+        log.meta.reason = None;
+        let task_key = key.clone();
+        let session = key.1.0;
+        let model = model_id.to_owned();
+        let req_json = serde_json::json!({
+            "action": "set_model",
+            "session": session,
+            "model": model,
+            "effort": effort,
+        })
+        .to_string();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = cx
+                .background_executor()
+                .spawn(async move { call(&req_json) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.chat.composer_tasks.remove(&task_key);
+                let applied = {
+                    let log = this.chat.logs.entry(task_key.clone()).or_default();
+                    log.meta.pending = false;
+                    match reply {
+                        Ok(raw) => apply_composer_set_json(&raw, &mut log.meta),
+                        Err(err) => {
+                            log.meta.reason = Some(err.to_string());
+                            false
+                        }
+                    }
+                };
+                if applied {
+                    this.chat.model_picker.remove(&task_key);
+                    this.refresh_chat_composer(&task_key, false, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.chat.composer_tasks.insert(key.clone(), task);
+        cx.notify();
+    }
+
+    pub(super) fn select_chat_effort(
+        &mut self,
+        key: &ChatKey,
+        effort: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat.quick_menu.remove(key);
+        let Some(call) = self.workflow_call_for_key(key) else {
+            return;
+        };
+        let log = self.chat.logs.entry(key.clone()).or_default();
+        if log.meta.pending {
+            return;
+        }
+        log.meta.pending = true;
+        log.meta.reason = None;
+        let task_key = key.clone();
+        let session = key.1.0;
+        let req_json = serde_json::json!({
+            "action": "set_effort",
+            "session": session,
+            "effort": effort,
+        })
+        .to_string();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = cx
+                .background_executor()
+                .spawn(async move { call(&req_json) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.chat.composer_tasks.remove(&task_key);
+                let applied = {
+                    let log = this.chat.logs.entry(task_key.clone()).or_default();
+                    log.meta.pending = false;
+                    match reply {
+                        Ok(raw) => apply_composer_set_json(&raw, &mut log.meta),
+                        Err(err) => {
+                            log.meta.reason = Some(err.to_string());
+                            false
+                        }
+                    }
+                };
+                if applied {
+                    this.chat.model_picker.remove(&task_key);
+                    this.refresh_chat_composer(&task_key, false, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.chat.composer_tasks.insert(key.clone(), task);
+        cx.notify();
     }
 
     fn send_to_chat_pane(

@@ -7645,7 +7645,8 @@ impl Render for Shell {
         };
         let artifacts_view = self.artifacts.clone();
         let automations_view = self.automations.clone();
-        let tree = if self.page_open() {
+        let surface_replaced = artifacts_view.is_some() || automations_view.is_some() || sub_page;
+        let tree = if surface_replaced {
             None
         } else {
             let root = if let Some(zoomed) = self.layout.zoomed_pane() {
@@ -7662,7 +7663,7 @@ impl Render for Shell {
                 None => self.render_empty_workspace(cx),
             })
         };
-        let center_diff = if self.page_open() {
+        let center_diff = if surface_replaced {
             None
         } else {
             self.render_center_diff(window, cx)
@@ -8125,9 +8126,7 @@ impl Render for Shell {
             .text_color(fg)
             .font_family(krill_app::ui::FONT_UI)
             .text_size(krill_app::ui::TEXT_MD)
-            .child(if let Some(settings) = settings_view {
-                div().flex_1().min_h_0().w_full().child(settings)
-            } else {
+            .child(
                 div()
                     .flex_1()
                     .min_h_0()
@@ -8223,9 +8222,56 @@ impl Render for Shell {
                                     .child(div().flex_1().min_h_0().child(self.diff.clone())),
                             )
                         },
-                    )
-            })
+                    ),
+            )
             .child(self.render_status_bar(window, cx))
+            .children(settings_view.map(|settings| {
+                let viewport = window.viewport_size();
+                let modal_w = (viewport.width - krill_app::ui::SPACE_4 * 4.)
+                    .clamp(px(680.), px(1080.))
+                    .min(viewport.width - krill_app::ui::SPACE_2 * 2.);
+                let modal_h = (viewport.height - krill_app::ui::SPACE_4 * 4.)
+                    .clamp(px(480.), px(760.))
+                    .min(viewport.height - krill_app::ui::SPACE_2 * 2.);
+                krill_app::ui::modal_backdrop(
+                    viewport,
+                    div()
+                        .id("admin-modal-backdrop")
+                        .debug_selector(|| "admin-modal-backdrop".into())
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.close_settings(Some(window), cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .id("admin-modal")
+                                .debug_selector(|| "admin-modal".into())
+                                .role(gpui::Role::Dialog)
+                                .aria_label(krill_app::i18n::catalog::settings::TITLE.get())
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .w(modal_w)
+                                .h(modal_h)
+                                .rounded(krill_app::ui::RADIUS_XL)
+                                .bg(p.background)
+                                .border_1()
+                                .border_color(p.border)
+                                .shadow_lg()
+                                .overflow_hidden()
+                                .flex()
+                                .flex_col()
+                                .child(settings),
+                        ),
+                )
+            }))
             .children(self.jump.as_ref().map(|(palette, _)| palette.clone()))
             .children(self.add_project.as_ref().map(|(dialog, _)| dialog.clone()))
             .children(

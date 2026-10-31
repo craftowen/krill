@@ -5787,10 +5787,11 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     cx.simulate_click(btn.center(), Modifiers::default());
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1, "must not open a second OS window");
+    assert!(cx.debug_bounds("admin-modal").is_some());
     assert!(cx.debug_bounds("admin-center").is_some());
     assert!(
-        cx.debug_bounds("titlebar").is_none(),
-        "workspace tab bar is replaced while Settings is active"
+        cx.debug_bounds("titlebar").is_some(),
+        "workspace tab bar stays visible behind the centered Settings modal"
     );
     assert!(
         cx.debug_bounds("status-bar-left").is_some(),
@@ -5878,6 +5879,20 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     assert!(cx.debug_bounds("admin-center").is_none());
     assert!(cx.debug_bounds("titlebar").is_some());
     assert!(cx.update(|_, cx| view.read(cx).live.contains_key(&pane)));
+
+    // 4b. Modal close button (✕) in the modal header also closes the centered Settings modal.
+    cx.update(|_, cx| {
+        krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Machines, cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-modal").is_some());
+    let modal_close = cx
+        .debug_bounds("admin-modal-close")
+        .expect("admin-modal-close button");
+    cx.simulate_click(modal_close.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-modal").is_none());
+    assert!(cx.debug_bounds("admin-center").is_none());
 
     // 5. After returning from Settings, typing in the workspace reaches the live PTY again.
     cx.simulate_keystrokes("x");

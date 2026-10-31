@@ -9,6 +9,73 @@ use gpui::prelude::FluentBuilder as _;
 use gpui_component::IconName;
 use std::hash::{Hash as _, Hasher as _};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolStepKind {
+    Read,
+    Edit,
+    Search,
+    Command,
+    Other,
+}
+
+impl ToolStepKind {
+    pub(crate) fn from_name_and_title(name: &str, title: &str) -> Self {
+        let n = name.to_ascii_lowercase();
+        let t = title.to_ascii_lowercase();
+        if n.contains("read")
+            || n.contains("view")
+            || n == "cat"
+            || t.contains("read")
+            || t.contains("view")
+        {
+            Self::Read
+        } else if n.contains("edit")
+            || n.contains("write")
+            || n.contains("patch")
+            || t.contains("edit")
+            || t.contains("write")
+        {
+            Self::Edit
+        } else if n.contains("grep")
+            || n.contains("glob")
+            || n.contains("search")
+            || n.contains("find")
+            || n == "ls"
+            || t.contains("search")
+            || t.contains("grep")
+        {
+            Self::Search
+        } else if n.contains("bash")
+            || n.contains("shell")
+            || n.contains("exec")
+            || n.contains("command")
+            || t.contains("run")
+            || t.contains("command")
+        {
+            Self::Command
+        } else {
+            Self::Other
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Read => ctext::STEP_READ.get(),
+            Self::Edit => ctext::STEP_EDIT.get(),
+            Self::Search => ctext::STEP_SEARCH.get(),
+            Self::Command => ctext::STEP_COMMAND.get(),
+            Self::Other => ctext::STEP_OTHER.get(),
+        }
+    }
+
+    pub(crate) fn tone(self) -> ui::BadgeTone {
+        match self {
+            Self::Edit => ui::BadgeTone::Warning,
+            Self::Read | Self::Search | Self::Command | Self::Other => ui::BadgeTone::Neutral,
+        }
+    }
+}
+
 impl Shell {
     fn render_chat_item(
         &mut self,
@@ -24,25 +91,57 @@ impl Shell {
         let fg = palette.foreground;
         let muted_fg = palette.muted_foreground;
         let is_user = item.kind == ChatItemKind::User;
+        let is_assistant = item.kind == ChatItemKind::Assistant;
+        let is_tool = matches!(item.kind, ChatItemKind::ToolCall | ChatItemKind::ToolResult);
         let is_request = matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission);
         let disclosure = matches!(
             item.kind,
             ChatItemKind::Reasoning | ChatItemKind::ToolCall | ChatItemKind::ToolResult
         );
+        let log_agent = self
+            .chat
+            .logs
+            .get(&key)
+            .map(|log| log.agent.clone())
+            .unwrap_or_default();
         let expanded = self
             .chat
             .logs
             .get(&key)
             .is_some_and(|log| log.expanded.contains(&abs_idx));
-        let role_label = match item.kind {
-            ChatItemKind::User => ctext::YOU.get(),
-            ChatItemKind::Assistant => ctext::ASSISTANT.get(),
-            ChatItemKind::Reasoning => ctext::REASONING.get(),
-            ChatItemKind::ToolCall => ctext::TOOL_CALL.get(),
-            ChatItemKind::ToolResult => ctext::TOOL_RESULT.get(),
-            ChatItemKind::Question => ctext::QUESTION.get(),
-            ChatItemKind::Permission => ctext::PERMISSION.get(),
+        let role_label: String = match item.kind {
+            ChatItemKind::User => ctext::YOU.get().to_owned(),
+            ChatItemKind::Assistant => {
+                if log_agent.is_empty() {
+                    ctext::ASSISTANT.get().to_owned()
+                } else {
+                    composer::agent_display_name(&log_agent)
+                }
+            }
+            ChatItemKind::Reasoning => ctext::REASONING.get().to_owned(),
+            ChatItemKind::ToolCall => ctext::TOOL_CALL.get().to_owned(),
+            ChatItemKind::ToolResult => ctext::TOOL_RESULT.get().to_owned(),
+            ChatItemKind::Question => ctext::QUESTION.get().to_owned(),
+            ChatItemKind::Permission => ctext::PERMISSION.get().to_owned(),
         };
+        let step_badge = if is_tool {
+            let (tone, text) = if item.is_error {
+                (ui::BadgeTone::Destructive, ctext::TOOL_ERROR.get())
+            } else {
+                let kind = ToolStepKind::from_name_and_title(&item.tool_name, &item.title);
+                (kind.tone(), kind.label())
+            };
+            Some(ui::badge(palette, tone, text))
+        } else {
+            None
+        };
+        let is_copied = self
+            .chat
+            .copied_item
+            .as_ref()
+            .is_some_and(|(copied_key, idx, at)| {
+                *copied_key == key && *idx == abs_idx && at.elapsed() < Duration::from_secs(2)
+            });
         let card_border = if is_request {
             palette.agent_question
         } else {
@@ -58,10 +157,14 @@ impl Shell {
             .overflow_hidden()
             .p_3()
             .when(is_user || is_request, |card| {
-                card.rounded(ui::RADIUS_MD)
-                    .border_1()
-                    .border_color(card_border)
-                    .bg(if is_user { palette.muted } else { palette.card })
+                card.rounded(if is_user {
+                    ui::RADIUS_LG
+                } else {
+                    ui::RADIUS_MD
+                })
+                .border_1()
+                .border_color(card_border)
+                .bg(if is_user { palette.muted } else { palette.card })
             })
             .flex()
             .flex_col()
@@ -77,15 +180,32 @@ impl Shell {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(muted_fg)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(if item.title.is_empty() {
-                                SharedString::from(role_label)
-                            } else {
-                                SharedString::from(format!("{role_label} • {}", item.title))
-                            }),
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .children(is_assistant.then(|| {
+                                let icon_agent = if log_agent.is_empty() {
+                                    "agent"
+                                } else {
+                                    log_agent.as_str()
+                                };
+                                ui::icons::agent_brand_icon(icon_agent, ui::ICON_XS, fg)
+                            }))
+                            .children(step_badge)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_XS)
+                                    .text_color(if is_assistant { fg } else { muted_fg })
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(if item.title.is_empty() {
+                                        SharedString::from(role_label)
+                                    } else {
+                                        SharedString::from(format!("{role_label} • {}", item.title))
+                                    }),
+                            ),
                     )
                     .children((!item.file_path.is_empty()).then(|| {
                         let raw_path = std::path::PathBuf::from(&item.file_path);
@@ -119,19 +239,32 @@ impl Shell {
                     }))
                     .children((!item.text.trim().is_empty()).then(|| {
                         let copy_text = krill_term::select::clean_text(&item.text);
+                        let copy_key = key.clone();
                         Button::new(SharedString::from(format!(
                             "chat-copy-{}-{abs_idx}",
                             pane.get()
                         )))
                         .debug_selector(|| "chat-copy-item".into())
-                        .label(ctext::COPY.get())
+                        .icon(if is_copied {
+                            IconName::Check
+                        } else {
+                            IconName::Copy
+                        })
+                        .label(if is_copied {
+                            ctext::COPIED.get()
+                        } else {
+                            ctext::COPY.get()
+                        })
                         .ghost()
                         .xsmall()
-                        .on_click(move |_, _, cx| {
+                        .on_click(cx.listener(move |this, _, _, cx| {
                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                 copy_text.clone(),
                             ));
-                        })
+                            this.chat.copied_item =
+                                Some((copy_key.clone(), abs_idx, std::time::Instant::now()));
+                            cx.notify();
+                        }))
                     })),
             );
 
@@ -701,6 +834,33 @@ impl Shell {
             Some(line) => format!("{agent_label} · {line}"),
             None => agent_label.clone(),
         };
+        let host = self.layout.host(pane);
+        let agent_state = self
+            .sidebar
+            .read(cx)
+            .session_on(host, session)
+            .map_or(krill_proto::control::AgentState::Unknown, |s| {
+                s.status.state
+            });
+        let unread = host.is_local() && self.sidebar.read(cx).is_unread(session);
+        let state_badge = match agent_state {
+            krill_proto::control::AgentState::Working => Some(ui::badge(
+                palette,
+                ui::BadgeTone::Warning,
+                ctext::STATE_WORKING.get(),
+            )),
+            krill_proto::control::AgentState::Waiting => Some(ui::badge(
+                palette,
+                ui::BadgeTone::Accent,
+                ctext::STATE_WAITING.get(),
+            )),
+            krill_proto::control::AgentState::Blocked => Some(ui::badge(
+                palette,
+                ui::BadgeTone::Destructive,
+                ctext::STATE_BLOCKED.get(),
+            )),
+            _ => None,
+        };
 
         let strip = div()
             .flex_none()
@@ -716,11 +876,18 @@ impl Shell {
             .items_center()
             .justify_between()
             .gap_2()
+            .child(ui::status::status_glyph(
+                agent_state,
+                unread,
+                ui::status::Size::Sm,
+                cx,
+            ))
             .child(ui::icons::agent_brand_icon(
                 &agent_label,
                 ui::ICON_XS,
                 palette.foreground,
             ))
+            .children(state_badge)
             .child(
                 div()
                     .text_size(ui::TEXT_XS)

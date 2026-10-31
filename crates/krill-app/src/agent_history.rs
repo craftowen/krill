@@ -11,7 +11,7 @@ use gpui_component::{Disableable as _, Sizable as _};
 use krill_proto::SessionId;
 use krill_proto::agent_history::{
     Action, Entry, FEAT_AGENT_HISTORY, FEAT_AI_VAULT, FEAT_CHAT_POLL, Response, SearchQuery,
-    SearchSnapshot, Snapshot, VaultAgent, VaultHit, VaultScope, VaultTarget,
+    SearchSnapshot, Snapshot, VaultAgent, VaultHit, VaultScope, VaultTarget, is_claude_mem_cwd,
 };
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
@@ -22,9 +22,45 @@ use crate::hosts::{HostId, HostTarget};
 use crate::i18n::catalog::agent_history as text;
 
 pub type Call = Arc<dyn Fn(&Request) -> io::Result<Reply> + Send + Sync>;
+pub type WorkflowCall = Arc<dyn Fn(&str) -> io::Result<String> + Send + Sync>;
 
 fn daemon_call() -> Call {
     daemon_call_for(None)
+}
+
+pub fn workflow_call_for(target: Option<HostTarget>) -> WorkflowCall {
+    #[cfg(test)]
+    if target.is_none() {
+        return Arc::new(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "daemon disabled in unit tests",
+            ))
+        });
+    }
+    Arc::new(move |json| {
+        let mut hello = daemon::client_hello(ClientRole::App, "krill-app-composer");
+        hello.features = krill_proto::mobile::FEAT_MOBILE;
+        let target = match &target {
+            Some(t) => t.clone(),
+            None => HostTarget::local_dev()?,
+        };
+        let conn = target.connect(&hello).map_err(io::Error::other)?;
+        if conn.negotiated.features & krill_proto::mobile::FEAT_MOBILE == 0 {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        let mut sock = conn.stream;
+        sock.set_read_timeout(Some(Duration::from_secs(15)))?;
+        sock.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let req = krill_proto::mobile::MobileRequest::Workflow(json.to_owned());
+        sock.write_all(&req.encode()?)?;
+        let (kind, body) = ipc::read_frame(&mut sock)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+        match krill_proto::mobile::MobileReply::decode(kind, &body)? {
+            krill_proto::mobile::MobileReply::Workflow(out) => Ok(out),
+            krill_proto::mobile::MobileReply::Failed(err) => Err(io::Error::other(err)),
+            _ => Err(io::ErrorKind::InvalidData.into()),
+        }
+    })
 }
 
 pub fn daemon_call_for(target: Option<HostTarget>) -> Call {
@@ -451,9 +487,18 @@ impl Panel {
     #[must_use]
     pub fn loaded_hits(&self) -> Vec<VaultHit> {
         if let Some(vault) = &self.vault {
-            vault.hits.clone()
+            vault
+                .hits
+                .iter()
+                .filter(|hit| !is_claude_mem_cwd(&hit.cwd))
+                .cloned()
+                .collect()
         } else if let Some(data) = &self.data {
-            data.entries.iter().map(VaultHit::from).collect()
+            data.entries
+                .iter()
+                .filter(|entry| !is_claude_mem_cwd(&entry.cwd))
+                .map(VaultHit::from)
+                .collect()
         } else {
             Vec::new()
         }
@@ -465,12 +510,23 @@ impl Panel {
         // Search is evaluated against complete messages on the daemon host. A snippet cannot
         // reproduce keyword matches, and local filesystem rules cannot classify remote paths.
         if let Some(vault) = &self.vault {
-            return vault.hits.clone();
+            return vault
+                .hits
+                .iter()
+                .filter(|hit| !is_claude_mem_cwd(&hit.cwd))
+                .cloned()
+                .collect();
         }
         let base = self
             .data
             .as_ref()
-            .map(|d| d.entries.iter().map(VaultHit::from).collect::<Vec<_>>())
+            .map(|d| {
+                d.entries
+                    .iter()
+                    .filter(|entry| !is_claude_mem_cwd(&entry.cwd))
+                    .map(VaultHit::from)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         if base.is_empty() {
             return Vec::new();
@@ -585,11 +641,13 @@ impl Panel {
                     return;
                 }
                 match got {
-                    Ok(Reply::AgentHistory(Response::Scanned(data))) => {
+                    Ok(Reply::AgentHistory(Response::Scanned(mut data))) => {
+                        data.entries.retain(|e| !is_claude_mem_cwd(&e.cwd));
                         this.data = Some(data);
                         this.vault = None;
                     }
-                    Ok(Reply::AgentHistory(Response::Searched(vault))) => {
+                    Ok(Reply::AgentHistory(Response::Searched(mut vault))) => {
+                        vault.hits.retain(|h| !is_claude_mem_cwd(&h.cwd));
                         this.vault = Some(vault);
                     }
                     Ok(Reply::AgentHistory(Response::Resumed { session })) => {

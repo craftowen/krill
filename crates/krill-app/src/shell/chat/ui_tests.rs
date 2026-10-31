@@ -593,3 +593,221 @@ fn same_session_number_on_two_hosts_keeps_logs_drafts_and_target_apart(cx: &mut 
         });
     });
 }
+
+#[gpui::test]
+fn chat_orca_composer_controls_and_quick_menu_work_and_fit_narrow_pane(cx: &mut TestAppContext) {
+    let items = vec![
+        ChatItem {
+            kind: ChatItemKind::User,
+            text: "Inspect composer".into(),
+            ..Default::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_name: "Read".into(),
+            title: "Read composer.rs".into(),
+            text: "crates/krill-app/src/shell/chat/composer.rs".into(),
+            ..Default::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Composer is ready.".into(),
+            ..Default::default()
+        },
+    ];
+    let (shell, cx) = fixture(cx, "chat-orca-composer", items);
+    cx.simulate_resize(size(px(320.), px(680.)));
+    let workflow_requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::default();
+    let recorded = std::sync::Arc::clone(&workflow_requests);
+    shell.update(cx, |shell, cx| {
+        shell.chat.workflow_call = Some(std::sync::Arc::new(move |raw| {
+            let req: serde_json::Value = serde_json::from_str(raw).unwrap();
+            recorded.lock().unwrap().push(req.clone());
+            let action = req.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+            let resp = match action {
+                "chat_composer" => serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "agent": "claude",
+                        "model": "claude-sonnet-4-6",
+                        "model_label": "Sonnet 4.6",
+                        "effort": "high",
+                        "context": { "used": 84_000, "limit": 200_000, "percent": 42.0 },
+                        "supported": true,
+                        "effort_supported": true,
+                        "efforts": ["low", "medium", "high", "xhigh", "max"],
+                        "models": [
+                            { "id": "default", "label": "Default (recommended)", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+                            { "id": "opus", "label": "Opus", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+                            { "id": "sonnet", "label": "Sonnet", "efforts": ["low", "medium", "high", "xhigh", "max"] }
+                        ]
+                    }
+                }),
+                "composer_models" => serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "agent": "claude",
+                        "supported": true,
+                        "current": "sonnet",
+                        "items": [
+                            { "id": "default", "label": "Default (recommended)", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+                            { "id": "opus", "label": "Opus", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+                            { "id": "sonnet", "label": "Sonnet", "efforts": ["low", "medium", "high", "xhigh", "max"] }
+                        ]
+                    }
+                }),
+                "set_model" => {
+                    let model = req.get("model").and_then(serde_json::Value::as_str).unwrap_or("opus");
+                    serde_json::json!({
+                        "ok": true,
+                        "data": {
+                            "applied": true,
+                            "supported": true,
+                            "model": model,
+                            "label": "Opus 4.7"
+                        }
+                    })
+                }
+                "set_effort" => {
+                    let effort = req.get("effort").and_then(serde_json::Value::as_str).unwrap_or("max");
+                    serde_json::json!({
+                        "ok": true,
+                        "data": {
+                            "applied": true,
+                            "supported": true,
+                            "effort": effort
+                        }
+                    })
+                }
+                _ => serde_json::json!({ "ok": false, "error": "unknown" }),
+            };
+            Ok(resp.to_string())
+        }));
+        shell.refresh_chat_composer(&local_key(SESSION), false, cx);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    for selector in [
+        "desktop-chat-composer",
+        "chat-composer-plus",
+        "chat-composer-model",
+        "chat-composer-effort",
+        "chat-composer-context",
+        "desktop-chat-send",
+    ] {
+        let target = cx.debug_bounds(selector).expect(selector);
+        assert!(
+            target.left() >= overlay.left() && target.right() <= overlay.right(),
+            "{selector} overflowed pane horizontally: {target:?} outside {overlay:?}"
+        );
+    }
+
+    assert!(cx.debug_bounds("chat-quick-model").is_none());
+    let plus = cx.debug_bounds("chat-composer-plus").unwrap();
+    cx.simulate_click(plus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-quick-model").is_some());
+    let compact = cx.debug_bounds("chat-quick-compact").unwrap();
+    cx.simulate_click(compact.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-quick-model").is_none());
+    shell.read_with(cx, |shell, cx| {
+        let (input, _) = &shell.chat.inputs[&local_key(SESSION)];
+        assert_eq!(input.read(cx).value().as_ref(), "/compact");
+    });
+
+    assert!(cx.debug_bounds("chat-model-picker").is_none());
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let picker = cx.debug_bounds("chat-model-picker").unwrap();
+    assert!(
+        picker.left() >= overlay.left() && picker.right() <= overlay.right(),
+        "chat-model-picker overflowed pane horizontally: {picker:?} outside {overlay:?}"
+    );
+    let opus_opt = cx.debug_bounds("chat-model-option-opus").unwrap();
+    cx.simulate_click(opus_opt.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_none());
+    shell.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell.chat.logs[&local_key(SESSION)]
+                .meta
+                .current_model_id
+                .as_deref(),
+            Some("opus")
+        );
+    });
+
+    let effort_btn = cx.debug_bounds("chat-composer-effort").unwrap();
+    cx.simulate_click(effort_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let max_opt = cx.debug_bounds("chat-effort-option-max").unwrap();
+    cx.simulate_click(max_opt.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_none());
+    let actions: Vec<String> = workflow_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|v| {
+            v.get("action")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    assert!(actions.contains(&"chat_composer".to_owned()));
+    assert!(actions.contains(&"composer_models".to_owned()));
+    assert!(actions.contains(&"set_model".to_owned()));
+    assert!(actions.contains(&"set_effort".to_owned()));
+
+    let copy_btn = cx.debug_bounds("chat-copy-item").unwrap();
+    cx.simulate_click(copy_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |shell, _| {
+        assert!(shell.chat.copied_item.is_some());
+    });
+}
+
+#[test]
+fn composer_meta_observation_extracts_codex_and_claude_records() {
+    let mut codex_meta = ComposerMeta::default();
+    let turn_ctx = serde_json::json!({
+        "type": "turn_context",
+        "payload": {
+            "model": "gpt-5.4",
+            "reasoning_effort": "high"
+        }
+    });
+    let token_cnt = serde_json::json!({
+        "payload": {
+            "info": {
+                "last_token_usage": { "total_tokens": 64_000 },
+                "model_context_window": 128_000
+            }
+        }
+    });
+    parse_transcript_record(&turn_ctx, &mut codex_meta);
+    parse_transcript_record(&token_cnt, &mut codex_meta);
+    assert_eq!(codex_meta.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(codex_meta.effort.as_deref(), Some("high"));
+    assert_eq!(codex_meta.context_percent, Some(50));
+
+    let mut claude_meta = ComposerMeta::default();
+    let claude_msg = serde_json::json!({
+        "message": {
+            "model": "claude-opus-4-7",
+            "usage": {
+                "input_tokens": 30_000,
+                "output_tokens": 10_000,
+                "cache_read_input_tokens": 20_000
+            }
+        }
+    });
+    parse_transcript_record(&claude_msg, &mut claude_meta);
+    assert_eq!(claude_meta.model.as_deref(), Some("claude-opus-4-7"));
+    assert_eq!(claude_meta.context_percent, Some(30));
+}
