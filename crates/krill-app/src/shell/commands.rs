@@ -253,8 +253,21 @@ impl Shell {
             quick_tooltip,
         )
         .dropdown_menu(move |mut menu, window, cx| {
+            let edit = {
+                let this = this.clone();
+                PopupMenuItem::new(text::EDIT.get()).on_click(move |_, window, cx| {
+                    this.update(cx, |s, cx| {
+                        s.open_settings(
+                            krill_app::settings::AdminTab::QuickCommands,
+                            Some(window),
+                            cx,
+                        );
+                    })
+                    .ok();
+                })
+            };
             if commands.is_empty() {
-                return menu.label(text::EMPTY.get());
+                return menu.label(text::EMPTY.get()).separator().item(edit);
             }
             if commands.len() > QUICK_MENU_THRESHOLD {
                 let parent = cx.weak_entity();
@@ -268,7 +281,10 @@ impl Shell {
                         cx,
                     )
                 });
-                return menu.item(PopupMenuItem::element(move |_, _| list.clone()));
+                return menu
+                    .item(PopupMenuItem::element(move |_, _| list.clone()))
+                    .separator()
+                    .item(edit);
             }
             menu = menu.scrollable(true).max_h(krill_app::ui::DIALOG_WIDTH);
             for command in commands.iter() {
@@ -283,7 +299,7 @@ impl Shell {
                         }),
                 );
             }
-            menu
+            menu.separator().item(edit)
         });
         div()
             .flex()

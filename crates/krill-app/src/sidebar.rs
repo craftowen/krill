@@ -1000,8 +1000,6 @@ pub struct Sidebar {
     /// 세션별 최근 프롬프트 턴 히스토리(`session-prompts.json`).
     prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
     remote_prompt_histories: BTreeMap<String, PromptHistories>,
-    /// 활성 Claude 프롬프트 캐시 카운트다운의 마지막 1초 틱(`now_ns / 1e9`, OWE-737).
-    last_cache_tick_sec: Option<u64>,
     last_activity_minute: Option<u64>,
     /// 테스트용 시각 고정(ns, OWE-737).
     now_override_ns: Option<u64>,
@@ -1371,7 +1369,6 @@ impl Sidebar {
             auto_titles: BTreeMap::new(),
             prompt_histories: BTreeMap::new(),
             remote_prompt_histories: BTreeMap::new(),
-            last_cache_tick_sec: None,
             last_activity_minute: None,
             now_override_ns: None,
             focused: None,
@@ -3010,24 +3007,6 @@ impl Sidebar {
             .then_some(now_ns / 60_000_000_000)
     }
 
-    fn has_active_cache_timer(&self, now_ns: u64, cx: &App) -> bool {
-        let settings = crate::settings::current(cx);
-        if !settings.prompt_cache_timer_enabled {
-            return false;
-        }
-        let ttl = settings.prompt_cache_ttl_secs;
-        self.snapshot.sessions.iter().any(|s| {
-            crate::ui::status::session_cache_remaining_secs(
-                &s.status.agent,
-                s.status.state,
-                s.status.since_unix_ns,
-                now_ns,
-                ttl,
-            )
-            .is_some()
-        })
-    }
-
     /// MK-093: 워크트리에 설정된 CLI 코멘트.
     pub fn comment(&self, path: &Path) -> Option<&str> {
         external::comment_for(&self.comments, path)
@@ -3365,9 +3344,6 @@ impl Sidebar {
                     }
                     let now_ns = self.now_unix_ns();
                     self.last_activity_minute = self.activity_minute(now_ns);
-                    self.last_cache_tick_sec = self
-                        .has_active_cache_timer(now_ns, cx)
-                        .then_some(now_ns / 1_000_000_000);
                     if auto_changed {
                         self.persist(cx);
                     } else {
@@ -3398,14 +3374,8 @@ impl Sidebar {
                 } else {
                     let now_ns = self.now_unix_ns();
                     let activity_minute = self.activity_minute(now_ns);
-                    let next_tick = self
-                        .has_active_cache_timer(now_ns, cx)
-                        .then_some(now_ns / 1_000_000_000);
-                    if self.last_activity_minute != activity_minute
-                        || self.last_cache_tick_sec != next_tick
-                    {
+                    if self.last_activity_minute != activity_minute {
                         self.last_activity_minute = activity_minute;
-                        self.last_cache_tick_sec = next_tick;
                         cx.notify();
                     }
                 }

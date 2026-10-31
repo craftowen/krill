@@ -2,7 +2,6 @@
 //! UI 언어와 상관없이 한글·영어 검색어가 모두 맞는다(Orca `settings-search.ts`와 같은 방식).
 
 use super::AdminTab;
-use super::text;
 use crate::i18n::{Language, Message, SETTINGS_SEARCH_INDEX as INDEX};
 
 /// 검색어와 맞는 탭([`AdminTab::ALL`] 순). 빈 검색어면 전부. 대소문자는 가리지 않는다.
@@ -16,31 +15,22 @@ pub(super) fn search_tabs(query: &str) -> Vec<AdminTab> {
     AdminTab::ALL
         .into_iter()
         .filter(|&tab| {
-            both(tab_title(tab)).into_iter().any(hit)
-                || both(tab.subtitle_message()).into_iter().any(hit)
+            AdminTab::SUBPAGES
+                .into_iter()
+                .chain([tab])
+                .filter(|sub| sub.page() == tab)
+                .any(|sub| {
+                    both(sub.title_message()).into_iter().any(hit)
+                        || both(sub.subtitle_message()).into_iter().any(hit)
+                })
                 || INDEX
                     .iter()
-                    .filter(|(t, ..)| *t == tab)
+                    .filter(|(t, ..)| t.page() == tab)
                     .any(|(_, title, words)| {
                         both(*title).into_iter().any(hit) || words.iter().copied().any(hit)
                     })
         })
         .collect()
-}
-
-fn tab_title(tab: AdminTab) -> Message {
-    match tab {
-        AdminTab::General => text::TAB_GENERAL,
-        AdminTab::Terminal => text::TAB_TERMINAL,
-        AdminTab::Accounts => text::TAB_ACCOUNTS,
-        AdminTab::Agents => text::TAB_AGENTS,
-        AdminTab::Install => text::TAB_INSTALL,
-        AdminTab::Machines => text::TAB_MACHINES,
-        AdminTab::Workflows => text::TAB_WORKFLOWS,
-        AdminTab::Shortcuts => text::TAB_SHORTCUTS,
-        AdminTab::Resources => text::TAB_RESOURCES,
-        AdminTab::Mobile => crate::i18n::catalog::mobile::TAB,
-    }
 }
 
 #[cfg(test)]
@@ -49,44 +39,50 @@ mod tests {
 
     #[test]
     fn korean_and_english_queries_filter_tabs() {
-        assert_eq!(search_tabs("글꼴"), [AdminTab::Terminal]);
-        assert_eq!(search_tabs("font"), [AdminTab::Terminal]);
-        assert_eq!(search_tabs("  FONT "), [AdminTab::Terminal]);
-        // 터미널 탭(OWE-658) 키워드: 커서·Option·Meta·복사(한·영).
+        assert_eq!(search_tabs("글꼴"), [AdminTab::Appearance]);
+        assert_eq!(search_tabs("font"), [AdminTab::Appearance]);
+        assert_eq!(search_tabs("  FONT "), [AdminTab::Appearance]);
+        // 파일 전용 옵션은 설정 파일 행으로 안내한다.
         for q in ["커서", "cursor", "옵션", "meta", "복사", "copy", "blink"] {
-            assert!(search_tabs(q).contains(&AdminTab::Terminal), "{q}");
+            assert!(search_tabs(q).contains(&AdminTab::System), "{q}");
         }
         assert_eq!(search_tabs("ssh"), [AdminTab::Machines]);
         for q in ["원격 Krill", "remote krill", "초대", "invite", "p2p"] {
             assert_eq!(search_tabs(q), [AdminTab::Machines], "{q}");
         }
         assert!(search_tabs("페어링").contains(&AdminTab::Machines));
-        assert_eq!(search_tabs("동면"), [AdminTab::Agents]);
-        assert!(search_tabs("webhook").contains(&AdminTab::Workflows));
-        // 알림 이벤트별 토글·테스트 알림(OWE-659)은 일반 탭에서 찾는다.
-        for q in [
-            "벨",
-            "bell",
-            "입력",
-            "input",
-            "승인",
-            "완료",
-            "done",
-            "테스트 알림",
-            "test",
-            "스타",
-            "응원",
-            "star",
-            "github",
-            "support",
-        ] {
-            assert!(search_tabs(q).contains(&AdminTab::General), "{q}");
+        assert_eq!(search_tabs("동면"), [AdminTab::System]);
+        assert!(search_tabs("webhook").contains(&AdminTab::System));
+        // 알림 이벤트(OWE-659)는 알림 항목에서 찾는다.
+        for q in ["벨", "bell", "입력", "input", "승인", "완료", "done"] {
+            assert!(search_tabs(q).contains(&AdminTab::System), "{q}");
         }
         // 탭 이름·부제(한·영 모두)도 맞는다(OWE-795).
         assert!(search_tabs("shortcuts").contains(&AdminTab::Shortcuts));
-        assert_eq!(search_tabs("스마트폰"), [AdminTab::Mobile]);
-        assert_eq!(search_tabs("qr"), [AdminTab::Machines, AdminTab::Mobile]);
+        assert_eq!(search_tabs("스마트폰"), [AdminTab::Machines]);
+        assert_eq!(search_tabs("qr"), [AdminTab::Machines]);
         assert!(search_tabs("zzz-no-such-setting").is_empty());
+    }
+
+    #[test]
+    fn search_reaches_segments_and_subpages() {
+        assert_eq!(search_target("qr", AdminTab::Machines), AdminTab::Machines);
+        assert_eq!(
+            search_target("초대", AdminTab::Machines),
+            AdminTab::Machines
+        );
+        assert_eq!(
+            search_target("스마트폰", AdminTab::Machines),
+            AdminTab::Mobile
+        );
+        assert_eq!(search_target("ssh", AdminTab::Machines), AdminTab::Machines);
+        assert_eq!(
+            search_target("빠른 명령", AdminTab::Agents),
+            AdminTab::QuickCommands
+        );
+        assert_eq!(search_target("심링크", AdminTab::Agents), AdminTab::Project);
+        assert_eq!(search_target("디스크", AdminTab::System), AdminTab::Disk);
+        assert_eq!(search_target("", AdminTab::System), AdminTab::System);
     }
 
     #[test]
@@ -94,6 +90,30 @@ mod tests {
         assert_eq!(search_tabs(""), AdminTab::ALL);
         assert_eq!(search_tabs("   "), AdminTab::ALL);
     }
+}
+
+/// 내비 탭에서 검색어가 가리키는 실제 페이지. 세그먼트·하위 페이지 항목이면 그 페이지로 간다.
+pub(super) fn search_target(query: &str, tab: AdminTab) -> AdminTab {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return tab;
+    }
+    let hit = |s: &str| s.to_lowercase().contains(&query);
+    let both = |m: Message| [Language::Ko, Language::En].map(|l| m.in_language(l));
+    INDEX
+        .iter()
+        .find(|(t, title, words)| {
+            t.page() == tab && (both(*title).into_iter().any(hit) || words.iter().copied().any(hit))
+        })
+        .map(|(t, ..)| *t)
+        .or_else(|| {
+            AdminTab::SUBPAGES.into_iter().find(|sub| {
+                sub.page() == tab
+                    && (both(sub.title_message()).into_iter().any(hit)
+                        || both(sub.subtitle_message()).into_iter().any(hit))
+            })
+        })
+        .unwrap_or(tab)
 }
 
 /// 탭 제목보다 실제 설정 제목·키워드가 일치하는 행을 우선한다.

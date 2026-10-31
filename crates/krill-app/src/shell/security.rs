@@ -278,7 +278,10 @@ impl Shell {
     }
 
     pub(super) fn toggle_secure_keyboard(&mut self, cx: &mut Context<Self>) {
-        self.security.toggle_secure_keyboard();
+        let enabled = self.security.toggle_secure_keyboard();
+        if cx.has_global::<krill_app::settings::Config>() {
+            krill_app::settings::edit(cx, move |s| s.secure_keyboard_entry = enabled);
+        }
         crate::set_menus(&self.security, cx);
         cx.notify();
     }
@@ -1255,7 +1258,7 @@ impl Shell {
                             .debug_selector(|| "sidebar-settings".into())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_settings(
-                                    krill_app::settings::AdminTab::General,
+                                    krill_app::settings::AdminTab::Appearance,
                                     Some(window),
                                     cx,
                                 );

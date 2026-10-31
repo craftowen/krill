@@ -289,6 +289,12 @@ pub struct AppStateSnapshot {
     pub snapshot_id: String,
     #[serde(default)]
     pub process_start: String,
+    /// Engine that observed this snapshot: `native` (krill-app worker) or `jxa`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Why a live observation ran on JXA instead of the native worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
     #[serde(default)]
     pub caller_scope: String,
     #[serde(default)]

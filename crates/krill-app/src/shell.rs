@@ -1282,7 +1282,12 @@ impl Shell {
             resources,
             _resources_open: resources_open,
             status_menus_open: 0,
-            security: krill_app::security::State::default(),
+            security: {
+                let mut security = krill_app::security::State::default();
+                security
+                    .set_secure_keyboard(krill_app::settings::current(cx).secure_keyboard_entry);
+                security
+            },
             paste_queue: security::PasteQueue::default(),
             character_input_keys: BTreeSet::new(),
             files: files::Files::default(),
@@ -2238,6 +2243,17 @@ impl Shell {
             (Kind::ToggleSidebar, jtext::ACT_TOGGLE_SIDEBAR.get()),
             (Kind::ToggleExplorer, jtext::ACT_TOGGLE_EXPLORER.get()),
             (Kind::ToggleSearch, jtext::ACT_TOGGLE_SEARCH.get()),
+            (
+                Kind::ImportTerminalThemes,
+                jtext::ACT_IMPORT_TERMINAL_THEMES.get(),
+            ),
+            (Kind::OpenChecks, jtext::ACT_OPEN_CHECKS.get()),
+            (Kind::OpenDisk, jtext::ACT_OPEN_DISK.get()),
+            (Kind::OpenAutomations, jtext::ACT_OPEN_AUTOMATIONS.get()),
+            (
+                Kind::EditQuickCommands,
+                jtext::ACT_EDIT_QUICK_COMMANDS.get(),
+            ),
         ]
         .into_iter()
         .map(|(kind, label)| jump::ActionEntry::new(kind, label.to_owned()))
@@ -2359,11 +2375,39 @@ impl Shell {
             jump::ActionKind::SplitRight => self.split_active(Axis::Horizontal, cx),
             jump::ActionKind::SplitDown => self.split_active(Axis::Vertical, cx),
             jump::ActionKind::OpenSettings => {
-                self.open_settings(krill_app::settings::AdminTab::General, Some(window), cx);
+                self.open_settings(krill_app::settings::AdminTab::Appearance, Some(window), cx);
             }
             jump::ActionKind::ToggleSidebar => self.toggle_sidebar(cx),
             jump::ActionKind::ToggleExplorer => self.toggle_explorer(window, cx),
             jump::ActionKind::ToggleSearch => self.toggle_workspace_search(window, cx),
+            jump::ActionKind::OpenChecks => krill_app::onboarding::open_checks_current(cx),
+            jump::ActionKind::OpenDisk => {
+                self.open_settings(krill_app::settings::AdminTab::Disk, Some(window), cx);
+            }
+            jump::ActionKind::OpenAutomations => {
+                // 사이드바에서 숨긴 자동화를 되돌리는 경로이기도 하다.
+                krill_app::settings::edit(cx, |s| s.show_automations_button = true);
+                self.open_automations(Some(window), cx);
+            }
+            jump::ActionKind::EditQuickCommands => {
+                self.open_settings(
+                    krill_app::settings::AdminTab::QuickCommands,
+                    Some(window),
+                    cx,
+                );
+            }
+            jump::ActionKind::ImportTerminalThemes => {
+                let imported = krill_app::settings::import_terminal_themes(cx);
+                cx.spawn(async move |this, cx| {
+                    let message = imported.await;
+                    this.update(cx, |this, cx| {
+                        this.notice = Some(message);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             jump::ActionKind::QuickCommand(index) => {
                 if let Some(command) = krill_app::settings::current(cx)
                     .quick_commands
@@ -7539,7 +7583,7 @@ impl Render for Shell {
                         this.close_settings(Some(&mut *window), cx);
                     } else {
                         this.open_settings(
-                            krill_app::settings::AdminTab::General,
+                            krill_app::settings::AdminTab::Appearance,
                             Some(window),
                             cx,
                         );

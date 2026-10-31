@@ -6,7 +6,7 @@
 //! - 미리보기: `krill import orca --dry-run --json --from <orca-dir>`
 //! - 실행: `krill import orca --json [--only <domains_csv>] --from <orca-dir>`
 //! - 완료 즉시 앱 재시작 없이 `settings::reload` + `settings::notify_external_change`를 통해
-//!   사이드바 프로젝트/워크트리 트리, `Settings > Accounts`, `Settings > Ssh`, 상태바를 갱신한다.
+//!   사이드바 프로젝트/워크트리 트리, `Settings > Accounts`, `Settings > Devices`, 상태바를 갱신한다.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -490,7 +490,7 @@ enum DiscoveryPhase {
     Ready,
 }
 
-/// 앱 전역 Orca 마이그레이션 상태(온보딩 마법사 및 `Settings > General` / `Accounts` 공유).
+/// 앱 전역 Orca 마이그레이션 상태(온보딩 마법사 및 `Settings > System` / `Accounts` 공유).
 #[derive(Debug, Clone)]
 pub struct OrcaImportState {
     pub orca_dir_override: Option<PathBuf>,
@@ -1156,7 +1156,7 @@ pub fn import_selected(cx: &mut App) {
     .detach();
 }
 
-/// 온보딩 마법사 및 `Settings > General` / `Settings > Accounts` 상단에 삽입되는 자동 감지 카드.
+/// 온보딩 마법사 및 `Settings > System` / `Settings > Accounts` 상단에 삽입되는 자동 감지 카드.
 #[must_use]
 pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>> {
     let _orca_dir = detect_orca_dir(cx)?;
@@ -1946,12 +1946,15 @@ mod tests {
             .find(|w| w.downcast::<SettingsView>().is_some())
             .expect("settings window");
         let mut settings_vcx = VisualTestContext::from_window(settings_win, cx);
+        settings_view.update(&mut settings_vcx, |view, cx| {
+            view.set_tab(AdminTab::System, cx);
+        });
         settings_vcx.run_until_parked();
         assert!(
             settings_vcx
                 .debug_bounds("settings-general-orca-import-card")
                 .is_some(),
-            "Settings > General should render settings-general-orca-import-card"
+            "Settings > System should render settings-general-orca-import-card"
         );
 
         // 4. Switch SettingsView to Accounts tab and verify `settings-accounts-orca-import-card`
@@ -1998,9 +2001,16 @@ mod tests {
             .find(|w| w.downcast::<SettingsView>().is_some())
             .expect("settings window");
         let mut settings_vcx = VisualTestContext::from_window(settings_win, cx);
+        settings_win
+            .downcast::<SettingsView>()
+            .expect("settings window")
+            .update(&mut settings_vcx, |view, _, cx| {
+                view.set_tab(AdminTab::System, cx);
+            })
+            .unwrap();
         settings_vcx.run_until_parked();
 
-        // Click "항목 선택…" button on Settings > General banner to open the category selection modal
+        // Click "항목 선택…" button on Settings > System banner to open the category selection modal
         let choose_center = settings_vcx
             .debug_bounds("settings-general-orca-choose-btn")
             .expect("choose button")

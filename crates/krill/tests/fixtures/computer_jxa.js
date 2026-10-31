@@ -48,6 +48,13 @@ function runCase(mode) {
   const button=element('AXButton','Save',{x:220,y:20,width:60,height:30});
   let children=[text,button];
   if(mode==='incomplete-census') children=[text,button,...Array.from({length:38},(_,i)=>element('AXGroup','Filler'+i,bounds)),element('AXButton','Save',{x:220,y:20,width:60,height:30})];
+  // Partial census away from the target: a depth-limited subtree elsewhere in the window.
+  const setKids=(e,kids)=>{e.uiElements={role:()=>kids.map(k=>k.role()),...Object.fromEntries(kids.map((k,i)=>[i,k]))};};
+  const deepPanel=()=>{const panel=element('AXGroup','Panel',bounds);let node=panel;for(let d=2;d<=4;d++){const next=element('AXGroup','Deep'+d,bounds);setKids(node,[next]);node=next;}setKids(node,[element('AXGroup','TooDeep',bounds)]);return panel;};
+  if(mode==='partial-census-elsewhere') children=[text,button,deepPanel()];
+  if(mode==='partial-census-duplicate') children=[text,button,element('AXButton','Save',{x:220,y:20,width:60,height:30}),deepPanel()];
+  if(mode==='partial-census-unreadable-bounds'){button.position=()=>{throw Error('no position');};children=[text,button,deepPanel()];}
+  if(mode==='partial-census-ancestor-cut'){const rows=element('AXGroup','Rows',bounds);setKids(rows,[text,button,...Array.from({length:40},(_,i)=>element('AXGroup','Filler'+i,bounds))]);children=[rows];}
   const noNumber=['same-geometry-no-number','geometry-unique-no-number'].includes(mode);
   const win=windowEl('Fixture',noNumber?null:101);
   const collection=()=>({role:()=>children.map(e=>e.role()),...Object.fromEntries(children.map((e,i)=>[i,e]))});
@@ -104,6 +111,7 @@ function runCase(mode) {
     return {mode,result:out?{rootRole:out.root.role}:{error:err},effects};
   }
   const observed=JSON.parse(observer.run([JSON.stringify(request)]));
+  if(mode.startsWith('partial-census')) assert.equal(observed.truncated,true,mode);
   if(mode.startsWith('metadata-settable-')) {
     const expected=mode==='metadata-settable-unavailable'?null:mode==='metadata-settable-true';
     assert.equal(observed.root.children[0].valueSettable,expected);
@@ -141,12 +149,15 @@ function runCase(mode) {
   }
   const actor=sandbox();vm.runInContext(actionScript,actor);
   const result=JSON.parse(actor.run([JSON.stringify(request)]));
-  const refused=['reorder','ambiguous','pid-reused','foreground-changed','value-reused','focused-other-number','same-geometry-no-number','geometry-same-winid-different','incomplete-census','disabled-target','press-unavailable-no-fallback','drag-target-value-changed','drag-target-disabled'];
+  const refused=['reorder','ambiguous','pid-reused','foreground-changed','value-reused','focused-other-number','same-geometry-no-number','geometry-same-winid-different','incomplete-census','partial-census-duplicate','partial-census-unreadable-bounds','partial-census-ancestor-cut','disabled-target','press-unavailable-no-fallback','drag-target-value-changed','drag-target-disabled'];
   if(refused.includes(mode)){assert.equal(result.delivery,'not_dispatched',mode+': '+result.reason);assert.equal(effects.length,0,mode);assert.equal(state.writes,0,mode);}
   if(mode==='geometry-same-winid-different') assert.match(result.reason,/window correspondence/);
+  // A twin inside the partial census is refused by the uniqueness rule, not by the census rule.
+  if(mode==='partial-census-duplicate') assert.match(result.reason,/ambiguous/);
+  if(mode==='partial-census-unreadable-bounds' || mode==='partial-census-ancestor-cut') assert.match(result.reason,/census is partial/);
   const beforeWrite=['paste-selection-unavailable','paste-selection-ambiguous','paste-noop','paste-utf16-split'];
   if(beforeWrite.includes(mode)){assert.equal(result.delivery,'not_dispatched',mode+': '+result.reason);assert.equal(state.pbWrites,0,mode);assert.equal(effects.length,0);assert.equal(state.clipboard,'original');}
-  if(mode==='normal' || mode==='geometry-unique-no-number'){assert.equal(result.delivery,'submitted',result.reason);assert.equal(result.status,'unverified');assert.deepEqual(effects,['AXPress']);}
+  if(mode==='normal' || mode==='geometry-unique-no-number' || mode==='partial-census-elsewhere'){assert.equal(result.delivery,'submitted',result.reason);assert.equal(result.status,'unverified');assert.deepEqual(effects,['AXPress']);}
   if(mode==='press-throws-after-effect'){assert.equal(result.delivery,'unknown');assert.deepEqual(effects,['AXPress']);assert.equal(result.ok,false);}
   if(mode==='long-full-value'){assert.equal(result.status,'verified');assert.equal(state.value,request.value);assert.equal(state.writes,1);}
   if(mode==='setvalue-normalized'){assert.equal(result.status,'unverified');assert.equal(result.delivery,'submitted');assert.equal(state.writes,1);}
@@ -169,7 +180,7 @@ function runCase(mode) {
   return {mode,result,effects,clipboard:state.clipboard,writes:state.writes};
 }
 const modes=['metadata-settable-true','metadata-settable-false','metadata-settable-unavailable','ancestor-reused','disable-after-first-key','paste-throws-after-effect','secure-unavailable','secure-binding-noop','secure-bound-active','secure-bound-inactive','normal','reorder','ambiguous','value-reused','pid-reused','foreground-changed','press-throws-after-effect','long-full-value','write-throws-after-effect','clipboard-conflict','clipboard-too-large','clipboard-write-fails','paste-unconfirmed','paste-confirmed',
-  'focused-other-number','same-geometry-no-number','geometry-unique-no-number','geometry-same-winid-different','incomplete-census','disabled-target','press-unavailable-no-fallback','setvalue-normalized',
+  'focused-other-number','same-geometry-no-number','geometry-unique-no-number','geometry-same-winid-different','incomplete-census','partial-census-elsewhere','partial-census-duplicate','partial-census-unreadable-bounds','partial-census-ancestor-cut','disabled-target','press-unavailable-no-fallback','setvalue-normalized',
   'drag-normal','drag-target-value-changed','drag-target-disabled',
   'paste-contains-unrelated','paste-extra-suffix','paste-long-selection','paste-selection-unavailable','paste-selection-ambiguous','paste-noop','paste-utf16-split','paste-selection-changed',
   'restore-normal','restore-postcondition-fails','restore-focus-other'];

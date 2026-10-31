@@ -1230,3 +1230,26 @@ fn batch_verification_is_satisfied_only_when_every_step_is() {
     );
     h.finish();
 }
+
+#[test]
+fn timing_is_summed_per_phase_and_never_replaces_data() {
+    let mut empty = Outcome::not_dispatched(1, "cancelled", "x");
+    attach_timing(
+        &mut empty,
+        &[("prepare", 1.5), ("dispatch", 2.0), ("prepare", 0.5)],
+    );
+    let phases = &empty.data.as_ref().unwrap()["timingMs"];
+    assert_eq!(phases["prepare"], json!(2.0));
+    assert_eq!(phases["dispatch"], json!(2.0));
+
+    let mut with_data = Outcome::not_dispatched(2, "cancelled", "x");
+    with_data.data = Some(json!({"snapshot": "s"}));
+    attach_timing(&mut with_data, &[("read", 3.0)]);
+    let data = with_data.data.as_ref().unwrap();
+    assert_eq!(data["snapshot"], "s");
+    assert_eq!(data["timingMs"]["read"], json!(3.0));
+
+    let mut untouched = Outcome::not_dispatched(3, "cancelled", "x");
+    attach_timing(&mut untouched, &[]);
+    assert!(untouched.data.is_none());
+}

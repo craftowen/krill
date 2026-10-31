@@ -72,7 +72,7 @@ fn terminate_child(child: &mut Child) {
     }
 }
 
-pub(super) fn worker_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
+pub(in crate::computer) fn worker_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
         if !path.is_absolute() || !path.is_file() {
             return Err("--worker must name an existing absolute krill-app executable".into());
@@ -221,7 +221,10 @@ fn writer(
     });
 }
 
-pub(super) fn read_line(reader: &mut impl BufRead, bytes: &mut Vec<u8>) -> io::Result<bool> {
+pub(in crate::computer) fn read_line(
+    reader: &mut impl BufRead,
+    bytes: &mut Vec<u8>,
+) -> io::Result<bool> {
     bytes.clear();
     let count = reader
         .by_ref()

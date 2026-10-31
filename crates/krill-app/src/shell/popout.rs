@@ -1868,19 +1868,7 @@ impl Shell {
                                     }),
                             );
                     }
-                    let open_weak = weak.clone();
-                    menu.separator().item(
-                        PopupMenuItem::new(text::OPEN_WORKFLOWS_SETTINGS.get()).on_click(
-                            move |_, window, cx| {
-                                open_settings_from_menu(
-                                    &open_weak,
-                                    krill_app::settings::AdminTab::Workflows,
-                                    window,
-                                    cx,
-                                );
-                            },
-                        ),
-                    )
+                    menu
                 }
             })
             .on_open_change(track_menu_open(cx.weak_entity()));

@@ -9,7 +9,7 @@ For an installed release, start with the GUI or CLI steps below. Rust is unneces
 ## First GUI workflow
 
 1. Launch **Krill** from Applications on macOS or the Start menu on Windows.
-2. If necessary, switch to English in **설정 → 일반 · 외관 → 언어 → English** (Settings → General & Appearance → Language). Saved language choices are retained.
+2. If necessary, switch to English in **설정 → 모양 → 언어 → English** (Settings → Appearance → Language). Saved language choices are retained.
 3. Choose **Open folder…** in the sidebar and open your local Git repository. Select that workspace.
 4. Open **New session** (`+`) and choose **Terminal**. Run `git status` to confirm the directory. Choose an installed agent from the same menu to create its session, then ask it to describe the repository.
 5. In the sidebar, choose **New worktree**, enter a unique name such as `first-review`, and choose **Create**. Review any setup hook before approval or choose **Skip setup**. Select the new worktree and start another terminal or agent; it has a separate working directory and branch.

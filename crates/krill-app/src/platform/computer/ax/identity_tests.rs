@@ -16,6 +16,7 @@ fn semantic(role: &str, title: &str, identifier: Option<&str>) -> Semantic {
                 height: 30.0,
             },
         )),
+        unreadable: 0,
     }
 }
 
@@ -266,4 +267,48 @@ fn ancestor_context_value_change_requires_new_observation() {
     let mut current = observed.nodes.clone();
     current[1].identity.as_mut().unwrap().value = SemanticValue::Text("record-b".into());
     assert_eq!(refusal(&observed, &current), "element_changed");
+}
+
+#[test]
+fn partially_unreadable_nodes_count_as_candidates_and_never_as_targets() {
+    // One attribute error (seen live: toolbar button AXSubrole → kAXErrorFailure) keeps the rest of the node.
+    let mut batch: Vec<Result<Option<Cf>, AxError>> = vec![Ok(None); B_SIZE + 1];
+    batch[B_ROLE] = Ok(ffi::cf_string("AXButton"));
+    batch[B_TITLE] = Ok(ffi::cf_string("Toolbar"));
+    batch[B_SUBROLE] = Err(ax::FAILURE);
+    batch[B_POSITION] = Err(ax::FAILURE);
+    batch[B_ENABLED] = Err(ax::FAILURE);
+    let (values, failed) = split_batch(batch.clone());
+    let partial = Semantic::from_batch(&values, failed).unwrap();
+    assert_eq!(
+        partial.unreadable,
+        1 << B_SUBROLE | 1 << B_POSITION | 1 << B_SIZE
+    );
+    assert_eq!(partial.frame, None);
+    batch[B_ROLE] = Err(ax::FAILURE);
+    let (values, failed) = split_batch(batch);
+    assert!(Semantic::from_batch(&values, failed).is_none());
+
+    // A readable unique target stays actionable next to an unrelated partial node.
+    let mut observed = fixture(None);
+    let mut other = observed.nodes[4].clone();
+    other.element = ffi::cf_string("toolbar-handle").unwrap();
+    other.identity = Some(partial);
+    observed.nodes.push(other);
+    assert!(validate_observed_graph(&observed, &observed.nodes[2], &observed.nodes, true).is_ok());
+
+    // An unreadable subrole could hide a duplicate of the target: refuse instead of guessing.
+    let mut twin = observed.nodes[2].identity.clone().unwrap();
+    twin.subrole = None;
+    twin.unreadable = 1 << B_SUBROLE;
+    observed.nodes[5].identity = Some(twin.clone());
+    assert_eq!(refusal(&observed, &observed.nodes), "identity_ambiguous");
+
+    // A partial target or ancestor is never matched.
+    observed.nodes[5].identity = observed.nodes[4].identity.clone();
+    observed.nodes[2].identity = Some(twin);
+    assert_eq!(refusal(&observed, &observed.nodes), "identity_incomplete");
+    let mut observed = fixture(None);
+    observed.nodes[1].identity.as_mut().unwrap().unreadable = 1 << B_DESCRIPTION;
+    assert_eq!(refusal(&observed, &observed.nodes), "element_changed");
 }

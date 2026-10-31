@@ -339,7 +339,9 @@ where
             return EXIT_TRANSPORT;
         }
         let Ok(job) = job else { continue };
-        let outcome = executor.execute(&job, &shared);
+        TIMING.take();
+        let mut outcome = executor.execute(&job, &shared);
+        attach_timing(&mut outcome, &TIMING.take());
         guard(&shared.ledger).settle(&outcome);
         shared.outbox.send(&Outbound::Result(Box::new(outcome)));
     }
@@ -496,6 +498,39 @@ struct Executor<B> {
     quiescing: Option<InputLock>,
 }
 
+thread_local! {
+    /// 지금 요청의 구간별 소요(ms). 결과 `data.timingMs`로 나간다. 진단용이며 판정에 쓰지 않는다.
+    static TIMING: std::cell::RefCell<Vec<(&'static str, f64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `started`부터 지금까지를 `label` 구간에 더한다(실행기 스레드에서만 의미가 있다).
+pub fn record(label: &'static str, started: Instant) {
+    let ms = (started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0;
+    TIMING.with_borrow_mut(|timing| timing.push((label, ms)));
+}
+
+/// `data`가 객체거나 없을 때만 붙인다.
+fn attach_timing(outcome: &mut Outcome, timing: &[(&'static str, f64)]) {
+    if timing.is_empty() {
+        return;
+    }
+    let data = outcome
+        .data
+        .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(object) = data.as_object_mut() {
+        let mut phases = serde_json::Map::new();
+        for (label, ms) in timing {
+            let total = phases
+                .get(*label)
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0)
+                + ms;
+            phases.insert((*label).to_owned(), serde_json::json!(total));
+        }
+        object.insert("timingMs".to_owned(), serde_json::Value::Object(phases));
+    }
+}
+
 impl<B: Backend> Executor<B> {
     fn execute(&mut self, job: &Job, shared: &Shared) -> Outcome {
         let seq = job.frame.seq;
@@ -528,6 +563,7 @@ impl<B: Backend> Executor<B> {
                 "a previous input has an unknown outcome; restart the worker before more input",
             );
         }
+        let lock_started = Instant::now();
         let input = match lock::acquire(&self.lock_path, job.deadline, || {
             state() == RequestState::Queued && shared.outbox.alive()
         }) {
@@ -538,6 +574,7 @@ impl<B: Backend> Executor<B> {
             }
             Err(error) => return Outcome::not_dispatched(seq, error.code(), error.message()),
         };
+        record("lock", lock_started);
         if let Op::Batch { steps } = op {
             return self.batch(seq, steps, job.deadline, input, shared);
         }
@@ -577,12 +614,18 @@ impl<B: Backend> Executor<B> {
         if Instant::now() >= deadline {
             return Err(late());
         }
-        let prepared = self.backend.prepare(op, deadline)?;
+        let started = Instant::now();
+        let prepared = self.backend.prepare(op, deadline);
+        record("prepare", started);
+        let prepared = prepared?;
         if Instant::now() >= deadline {
             return Err(late());
         }
         gate()?;
-        Ok(self.backend.dispatch(prepared, deadline))
+        let started = Instant::now();
+        let dispatched = self.backend.dispatch(prepared, deadline);
+        record("dispatch", started);
+        Ok(dispatched)
     }
 
     /// 잠금 `input`을 쥔 채 단계를 차례로 실행한다. 결과 축은 단계 합이고 `data.steps`에 단계별 축이 있다.
@@ -781,7 +824,10 @@ impl<B: Backend> Executor<B> {
                 }),
             })
         } else {
-            self.backend.read(op, deadline)
+            let started = Instant::now();
+            let result = self.backend.read(op, deadline);
+            record("read", started);
+            result
         };
         let (observation, error, data) = match result {
             Ok(read) => (read.observation, None, Some(read.data)),

@@ -410,8 +410,12 @@ pub fn copy_attribute_values(element: &Cf, attr: &Cf, max: usize) -> Result<Vec<
         .unwrap_or_default())
 }
 
-/// 여러 속성을 한 번의 IPC로 읽는다. 미지원·값 없음만 `None`이며 다른 개별 오류도 보존한다.
-pub fn copy_multiple(element: &Cf, batch: &AttrBatch) -> Result<Vec<Option<Cf>>, AxError> {
+/// 여러 속성을 한 번의 IPC로 읽는다. 미지원·값 없음만 `Ok(None)`이며 다른 개별 오류는 속성별 `Err`로 보존한다.
+/// 바깥 `Err`는 호출 자체의 실패다.
+pub fn copy_multiple(
+    element: &Cf,
+    batch: &AttrBatch,
+) -> Result<Vec<Result<Option<Cf>, AxError>>, AxError> {
     let mut out: CfTypeRef = ptr::null();
     // SAFETY: `element`·`batch.array`는 살아 있고 `out`은 유효한 출력 위치다.
     let error = unsafe {
@@ -433,7 +437,7 @@ pub fn copy_multiple(element: &Cf, batch: &AttrBatch) -> Result<Vec<Option<Cf>>,
     if items.len() != batch.names.len() {
         return Err(ax::FAILURE);
     }
-    items.into_iter().map(optional_attribute).collect()
+    Ok(items.into_iter().map(optional_attribute).collect())
 }
 
 /// 배치의 개별 `AXError`를 값 없음으로 오인하면 불완전한 지문으로 변경을 허용할 수 있다.
@@ -634,7 +638,8 @@ pub fn running_apps(max: usize) -> Vec<RunningApp> {
             }
             // SAFETY: `app`은 NSRunningApplication이다.
             let policy: isize = unsafe { msg_send![app, activationPolicy] };
-            if policy != 0 {
+            // Regular(0)와 accessory(1, 메뉴 막대 앱의 설정 창 등). CLI `list-apps`와 같은 범위다.
+            if policy != 0 && policy != 1 {
                 continue;
             }
             // SAFETY: `app`은 NSRunningApplication이다.
