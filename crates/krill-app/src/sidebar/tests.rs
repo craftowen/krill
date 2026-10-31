@@ -1479,7 +1479,7 @@ fn failed_snapshot_releases_agent_sleep_assertion_and_badge(cx: &mut TestAppCont
 }
 
 /// Orca 정합(사이드바): 헤더 높이 `h-8`(32px), 빈 상태 가운데 정렬·`py-6` 여백,
-/// 미커밋 배지는 있을 때만 보이고 없어지면 사라진다.
+/// 워크트리 카드에는 미커밋 파일 수(`±N`) 배지를 표시하지 않는다.
 #[gpui::test]
 fn header_empty_and_dirty_badge_match_orca(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -1530,19 +1530,8 @@ fn header_empty_and_dirty_badge_match_orca(cx: &mut TestAppContext) {
         "empty state must disappear once rows exist"
     );
     assert!(
-        cx.debug_bounds("dirty-badge-1").is_some(),
-        "dirty badge must show when uncommitted files exist"
-    );
-    cx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.meta = Meta::new();
-            s.rebuild(cx);
-        });
-    });
-    cx.run_until_parked();
-    assert!(
         cx.debug_bounds("dirty-badge-1").is_none(),
-        "dirty badge must disappear when the tree is clean"
+        "dirty badge must not show on worktree cards"
     );
 }
 
@@ -2364,7 +2353,7 @@ fn orca_card_expansion_agent_counts_and_reveal_focused(cx: &mut TestAppContext) 
         });
     });
     cx.run_until_parked();
-    assert!(cx.debug_bounds("dirty-badge-3").is_some());
+    assert!(cx.debug_bounds("dirty-badge-3").is_none());
     assert!(cx.debug_bounds("pr-badge-3").is_some());
 }
 

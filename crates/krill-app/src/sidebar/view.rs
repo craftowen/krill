@@ -1940,11 +1940,6 @@ impl Sidebar {
             folder_name.replace('-', " ")
         };
         let branch_subtitle = raw_branch.map_or_else(|| folder_name, str::to_owned);
-        let dirty = self
-            .meta_for(&row_host)
-            .get(path)
-            .and_then(|m| m.dirty)
-            .filter(|n| *n > 0);
         let tree_sessions: Vec<_> = self
             .snapshot_for(&row_host)
             .sessions
@@ -1986,14 +1981,10 @@ impl Sidebar {
             })
             .flatten();
         let mut label = super::external::worktree_a11y_label(text::TITLE.get(), &name, comment);
-        for part in [
-            branch.clone(),
-            checkpoint_badge,
-            dirty.map(|n| format!("{} {n}", text::DIRTY.get())),
-        ]
-        .into_iter()
-        .flatten()
-        .chain(states)
+        for part in [branch.clone(), checkpoint_badge]
+            .into_iter()
+            .flatten()
+            .chain(states)
         {
             label.push_str(", ");
             label.push_str(&part);
@@ -2102,25 +2093,6 @@ impl Sidebar {
                     }))
             }))
         };
-
-        let dirty_badge = dirty.map(|n| {
-            let dirty_label = text::DIRTY_COUNT.format(&[("n", &n.to_string())]);
-            div()
-                .id(("dirty-badge", index))
-                .aria_label(dirty_label.clone())
-                .debug_selector(move || format!("dirty-badge-{index}"))
-                .flex_none()
-                .px_1()
-                .rounded(ui::RADIUS_XS)
-                .font_family(ui::FONT_MONO)
-                .text_size(ui::TEXT_2XS)
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(p.warning)
-                .child(format!("±{n}"))
-                .tooltip(move |window, cx| {
-                    gpui_component::tooltip::Tooltip::new(dirty_label.clone()).build(window, cx)
-                })
-        });
 
         let props = self.options.card_properties;
         let show_branch_subtitle = props.branch
@@ -2343,7 +2315,6 @@ impl Sidebar {
                                         .children(host_badge)
                                         .children(issue_badge)
                                         .children(ports_badge)
-                                        .children(dirty_badge)
                                         .children(pr_badge)
                                         .when(has_agent_pill, |d| {
                                             d.child(
@@ -2398,7 +2369,6 @@ impl Sidebar {
         let checkpoint_visible = card_checkpoint_parts
             .as_ref()
             .is_some_and(|parts| parts.label(has_issue_badge).is_some() || parts.unread);
-        // 미커밋 수(`±N`)는 1행 오른쪽 수치 열로 옮겼으므로 배지 줄에서 뺀다.
         let has_badges = checkpoint_visible
             || host_badge.is_some()
             || issue_badge.is_some()
@@ -2420,7 +2390,6 @@ impl Sidebar {
                 .child(super::external::checkpoint_badge_element(parts, p))
         });
 
-        // 왼쪽은 이름·브랜치·코멘트, 오른쪽 수치 열은 `±N`(1행)과 계보 접기(2행)를 세로로 맞춘다.
         // 호버 액션은 1행 오른쪽 위에 겹쳐 띄우고, 핀 고정 별이 상시 보이는 동안만 그 폭을 비워 둔다.
         let header = div()
             .id(("worktree-header", index))
@@ -2428,7 +2397,7 @@ impl Sidebar {
             .flex()
             .flex_col()
             .gap_0p5()
-            // 1행: 상태 아이콘/점 + 워크트리 표시 이름 + [기본] 배지 | 미커밋 수 + 호버 액션 오버레이
+            // 1행: 상태 아이콘/점 + 워크트리 표시 이름 + [기본] 배지 | 호버 액션 오버레이
             .child(
                 div()
                     .relative()
@@ -2474,7 +2443,7 @@ impl Sidebar {
                             }),
                     )
                     .when(!is_editing_this, |d| {
-                        d.children(dirty_badge).child(
+                        d.child(
                             div()
                                 .absolute()
                                 .top_0()
