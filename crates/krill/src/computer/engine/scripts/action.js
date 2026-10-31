@@ -18,7 +18,7 @@ function guard(proc,win) {
       const receiver=proc.attributes.byName("AXFocusedUIElement").value();
       if(!receiver || String(receiver.role())!==req.receiver.role || !equal(rect(receiver),req.receiver.bounds)) throw Error("keyboard receiver changed");
       let title=null;try {title=receiver.title();} catch(_) {}
-      if(title!==req.receiver.title) throw Error("keyboard receiver label changed");
+      if((title||null)!==(req.receiver.title||null)) throw Error("keyboard receiver label changed");
     }
   }
   if(["pressKey","hotkey","typeText","pasteText"].indexOf(String(req.kind))>=0) {
@@ -109,10 +109,16 @@ function restoreClipboard(pb,saved,owned) {
 function run(argv) {
   req=parseRequest(argv);
   try {
+    // Fallback from a native snapshot for an action without element targets: nothing to find in a tree,
+    // and the worker reads the process start through another API, measured 6 ms apart for one process.
+    if(req.noTree) {
+      const start=processStart();
+      if(Math.abs(Number(start)-Number(req.processStart))>=1) throw Error("process instance changed");
+      req.processStart=start;
+    }
     if(!req.processStart || processStart()!==req.processStart) throw Error("process instance changed");
     checkCGWindow(false);proc=getProcess();win=selectTargetWindow(proc);
-    const root=readNode(win,0,true);
-    refs=validateTree(root);
+    if(!req.noTree) refs=validateTree(readNode(win,0,true));
     el=req.targetRef ? entries[Number(req.targetRef)] : null;
     guard(proc,win);
     const kind=String(req.kind||"");

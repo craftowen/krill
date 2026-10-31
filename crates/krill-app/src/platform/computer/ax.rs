@@ -19,7 +19,8 @@ use crate::platform::permissions;
 mod input;
 
 const MAX_SNAPSHOTS: usize = 4;
-const MAX_DEPTH: usize = 24;
+/// `MAX_ANCESTRY`보다 얕아야 대상의 조상 검사가 창까지 닿는다. Electron 앱(Slack)은 깊이 24를 넘어 census가 잘렸다.
+const MAX_DEPTH: usize = 63;
 const MAX_CHILDREN: usize = 200;
 const MAX_WINDOWS: usize = 64;
 const MAX_ACTIONS: usize = 24;
@@ -84,6 +85,10 @@ const B_ENABLED: usize = 6;
 const B_FOCUSED: usize = 7;
 const B_POSITION: usize = 8;
 const B_SIZE: usize = 9;
+/// 관찰 순회(`Attrs::walk`)에서만 같이 읽는다. 노드마다 개수·목록 두 번의 AX 왕복을 없앤다.
+const B_CHILDREN: usize = 10;
+/// 지문에 들어가는 속성 비트. 활성·포커스·자식 목록은 지문이 아니다.
+const IDENTITY_BITS: u16 = !(1 << B_ENABLED | 1 << B_FOCUSED | 1 << B_CHILDREN);
 
 #[derive(Debug)]
 struct Attrs {
@@ -100,6 +105,7 @@ struct Attrs {
     sheets: Cf,
     modal: Cf,
     batch: AttrBatch,
+    walk: AttrBatch,
 }
 
 impl Attrs {
@@ -115,7 +121,8 @@ impl Attrs {
         let focused = s("AXFocused")?;
         let position = s("AXPosition")?;
         let size = s("AXSize")?;
-        let batch = AttrBatch::new(&[
+        let children = s("AXChildren")?;
+        let identity = [
             &role,
             &subrole,
             &title,
@@ -126,13 +133,17 @@ impl Attrs {
             &focused,
             &position,
             &size,
-        ])?;
+        ];
+        let batch = AttrBatch::new(&identity)?;
+        let mut walk = identity.to_vec();
+        walk.push(&children);
+        let walk = AttrBatch::new(&walk)?;
         Some(Self {
             role,
             value,
             position,
             size,
-            children: s("AXChildren")?,
+            children,
             windows: s("AXWindows")?,
             focused_window: s("AXFocusedWindow")?,
             focused_element: s("AXFocusedUIElement")?,
@@ -141,6 +152,7 @@ impl Attrs {
             sheets: s("AXSheets")?,
             modal: s("AXModal")?,
             batch,
+            walk,
         })
     }
 }
@@ -162,6 +174,33 @@ struct Semantic {
     identifier: Option<String>,
     value: SemanticValue,
     frame: Option<(ffi::CgPoint, ffi::CgSize)>,
+    /// 읽기 오류가 난 속성(`B_*` 비트). 값 없음과 다르다. 0이 아니면 입력 대상·조상이 될 수 없고,
+    /// 유일성 판정에서는 그 속성이 어느 값과도 같을 수 있는 후보로 센다.
+    unreadable: u16,
+}
+
+/// 배치 결과를 값과 읽기 오류 비트로 나눈다. 위치·크기는 한쪽만 실패해도 둘 다 실패로 본다.
+fn split_batch(batch: Vec<Result<Option<Cf>, AxError>>) -> (Vec<Option<Cf>>, u16) {
+    let mut failed = 0u16;
+    let mut values: Vec<Option<Cf>> = batch
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.unwrap_or_else(|_| {
+                failed |= 1 << index;
+                None
+            })
+        })
+        .collect();
+    if failed & (1 << B_POSITION | 1 << B_SIZE) != 0 {
+        failed |= 1 << B_POSITION | 1 << B_SIZE;
+        for index in [B_POSITION, B_SIZE] {
+            if let Some(value) = values.get_mut(index) {
+                *value = None;
+            }
+        }
+    }
+    (values, failed)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,7 +260,19 @@ impl Semantic {
             identifier: text(B_IDENTIFIER)?,
             value,
             frame,
+            unreadable: 0,
         })
+    }
+
+    /// 실제 앱(macOS 툴바 버튼의 `AXSubrole` → `kAXErrorFailure`)에서 속성 하나만 읽기 오류가 나는 일이 관찰됐다.
+    /// 역할을 못 읽으면 지문이 없다.
+    fn from_batch(values: &[Option<Cf>], failed: u16) -> Option<Self> {
+        if failed & 1 << B_ROLE != 0 {
+            return None;
+        }
+        let mut identity = Self::from_values(values)?;
+        identity.unreadable = failed & IDENTITY_BITS;
+        Some(identity)
     }
 
     fn bytes(&self) -> usize {
@@ -252,19 +303,24 @@ impl Semantic {
     }
 
     fn matches(&self, other: &Self, compare_value: bool) -> bool {
-        self.stable_matches(other) && (!compare_value || self.value == other.value)
+        self.unreadable == 0
+            && other.unreadable == 0
+            && self.stable_matches(other)
+            && (!compare_value || self.value == other.value)
     }
 
     /// 유일성 판정에서 위치는 제외한다. 같은 라벨 두 개를 좌표로 억지 구별하지 않는다.
+    /// `other`의 읽지 못한 속성은 같다고 본다(후보를 줄이지 않는다).
     fn same_candidate(&self, other: &Self, compare_value: bool) -> bool {
+        let same = |bit: usize, equal: bool| equal || other.unreadable & 1 << bit != 0;
         if let Some(identifier) = &self.identifier {
-            return other.identifier.as_ref() == Some(identifier);
+            return same(B_IDENTIFIER, other.identifier.as_ref() == Some(identifier));
         }
         self.role == other.role
-            && self.subrole == other.subrole
-            && self.title == other.title
-            && self.description == other.description
-            && (!compare_value || self.value == other.value)
+            && same(B_SUBROLE, self.subrole == other.subrole)
+            && same(B_TITLE, self.title == other.title)
+            && same(B_DESCRIPTION, self.description == other.description)
+            && (!compare_value || same(B_VALUE, self.value == other.value))
     }
 
     fn has_identity(&self) -> bool {
@@ -297,6 +353,12 @@ fn validate_observed_graph(
         .identity
         .as_ref()
         .ok_or_else(|| Refusal::new("identity_incomplete", "observed identity is unreadable"))?;
+    if expected.unreadable != 0 {
+        return Err(Refusal::new(
+            "identity_incomplete",
+            "target identity is partially unreadable",
+        ));
+    }
     if !snapshot.complete
         || !expected.has_identity()
         || (!compare_target_value
@@ -508,6 +570,11 @@ impl MacBackend {
 
     /// 실행기·부모(제어 프로세스)·지정 PID·Krill 번들은 대상이 될 수 없다.
     fn guard(&self, pid: i32) -> Result<(), Refusal> {
+        self.guard_known(pid, ffi::bundle_id_of(pid).as_deref())
+    }
+
+    /// [`Self::guard`]에서 번들 ID를 이미 읽은 경우(앱 목록).
+    fn guard_known(&self, pid: i32, bundle_id: Option<&str>) -> Result<(), Refusal> {
         let me = i32::try_from(std::process::id()).unwrap_or(-1);
         let parent = rustix::process::Pid::as_raw(rustix::process::getppid());
         if pid == me || pid == parent || self.protected.contains(&pid) {
@@ -516,7 +583,7 @@ impl MacBackend {
                 "refusing to drive the executor or its controller",
             ));
         }
-        if ffi::bundle_id_of(pid).is_some_and(|id| {
+        if bundle_id.is_some_and(|id| {
             id == krill_proto::daemon::BUNDLE_ID || id.starts_with(SELF_BUNDLE_PREFIX)
         }) {
             return Err(Refusal::new(
@@ -631,7 +698,7 @@ impl MacBackend {
                     "bundleId": app.bundle_id,
                     "active": app.active,
                     "hidden": app.hidden,
-                    "protected": self.guard(app.pid).is_err(),
+                    "protected": self.guard_known(app.pid, app.bundle_id.as_deref()).is_err(),
                     "startWitness": ffi::process_start(app.pid).map(|(s, us)| format!("{s}.{us:06}")),
                 })
             })
@@ -683,7 +750,7 @@ impl MacBackend {
             (windows.iter().position(|w| *w == focused), focused)
         };
         let limit = limit.unwrap_or(DEFAULT_OBSERVE_NODES);
-        let (nodes, elements, coverage) = self.walk(&root, limit, deadline)?;
+        let (nodes, elements, coverage) = self.walk(&root, limit, false, deadline)?;
         let generation = self.next_generation;
         self.next_generation += 1;
         let id = format!(
@@ -720,10 +787,12 @@ impl MacBackend {
     }
 
     /// 창에서 시작하는 전위 순회. 노드·깊이·자식·바이트·시간 상한과 방문 집합(`CFEqual`)으로 순환을 끊는다.
+    /// `census`는 지문과 부모만 쓰는 재검증용이다. 표시용 동작 목록·값 쓰기 가능 여부 왕복을 건너뛴다.
     fn walk(
         &self,
         root: &Cf,
         limit: usize,
+        census: bool,
         deadline: Instant,
     ) -> Result<(Vec<Node>, Vec<Value>, Coverage), Refusal> {
         let (attrs, _) = self.ax()?;
@@ -752,8 +821,8 @@ impl MacBackend {
                 continue;
             }
             self.budget(deadline)?;
-            let values = match ffi::copy_multiple(&element, &attrs.batch) {
-                Ok(values) => values,
+            let (values, failed) = match ffi::copy_multiple(&element, &attrs.walk) {
+                Ok(values) => split_batch(values),
                 Err(error) => {
                     if depth == 0 {
                         root_error = Some(error);
@@ -805,9 +874,11 @@ impl MacBackend {
                 } else if let Some(flag) = ffi::bool_value(value) {
                     node["value"] = json!(flag);
                 }
-                self.budget(deadline)?;
-                if let Ok(settable) = ffi::is_settable(&element, &attrs.value) {
-                    node["valueSettable"] = json!(settable);
+                if !census {
+                    self.budget(deadline)?;
+                    if let Ok(settable) = ffi::is_settable(&element, &attrs.value) {
+                        node["valueSettable"] = json!(settable);
+                    }
                 }
             }
             for (field, index) in [("enabled", B_ENABLED), ("focused", B_FOCUSED)] {
@@ -823,46 +894,40 @@ impl MacBackend {
                     "x": origin.x, "y": origin.y, "width": size.width, "height": size.height,
                 });
             }
-            self.budget(deadline)?;
-            if let Ok(actions) = ffi::action_names(&element, MAX_ACTIONS)
-                && !actions.is_empty()
-            {
-                node["actions"] = json!(actions);
+            if !census {
+                self.budget(deadline)?;
+                if let Ok(actions) = ffi::action_names(&element, MAX_ACTIONS)
+                    && !actions.is_empty()
+                {
+                    node["actions"] = json!(actions);
+                }
             }
             if depth >= MAX_DEPTH {
                 node["unexpanded"] = json!(true);
                 coverage.truncate("depth");
-            } else {
-                self.budget(deadline)?;
-                match ffi::attribute_count(&element, &attrs.children) {
-                    Ok(0) | Err(ax::NO_VALUE | ax::ATTRIBUTE_UNSUPPORTED) => {}
-                    Ok(count) => {
-                        let take = count.min(MAX_CHILDREN);
-                        self.budget(deadline)?;
-                        if let Ok(children) =
-                            ffi::copy_attribute_values(&element, &attrs.children, take)
-                        {
-                            node["childCount"] = json!(count);
-                            if count > take {
-                                node["childrenTruncated"] = json!(true);
-                                coverage.truncate("children");
-                            }
-                            for child in children.into_iter().rev() {
-                                stack.push((child, Some(key), depth + 1));
-                            }
-                        } else {
-                            node["unexpanded"] = json!(true);
-                            coverage.truncate("ax_error");
-                        }
+            } else if failed & 1 << B_CHILDREN != 0 {
+                node["unexpanded"] = json!(true);
+                coverage.truncate("ax_error");
+            } else if let Some(list) = get(B_CHILDREN) {
+                if let Some(children) = ffi::array_items(list) {
+                    let count = children.len();
+                    if count > 0 {
+                        node["childCount"] = json!(count);
                     }
-                    Err(_) => {
-                        node["unexpanded"] = json!(true);
-                        coverage.truncate("ax_error");
+                    if count > MAX_CHILDREN {
+                        node["childrenTruncated"] = json!(true);
+                        coverage.truncate("children");
                     }
+                    for child in children.into_iter().take(MAX_CHILDREN).rev() {
+                        stack.push((child, Some(key), depth + 1));
+                    }
+                } else {
+                    node["unexpanded"] = json!(true);
+                    coverage.truncate("ax_error");
                 }
             }
-            let identity = Semantic::from_values(&values);
-            if identity.is_none() {
+            let identity = Semantic::from_batch(&values, failed);
+            if identity.as_ref().is_none_or(|id| id.unreadable != 0) {
                 node["inputRefusal"] = json!("identity_incomplete");
             }
             bytes += serde_json::to_vec(&node).map_or(0, |b| b.len())
@@ -943,7 +1008,8 @@ impl MacBackend {
         compare_value: bool,
         deadline: Instant,
     ) -> Result<(), Refusal> {
-        let (current, _, coverage) = self.walk(&snapshot.window, MAX_OBSERVE_NODES, deadline)?;
+        let (current, _, coverage) =
+            self.walk(&snapshot.window, MAX_OBSERVE_NODES, true, deadline)?;
         if coverage.truncated {
             return Err(Refusal::new(
                 "identity_incomplete",
@@ -992,9 +1058,10 @@ impl MacBackend {
                     "element process identity changed",
                 ));
             }
-            let values = ffi::copy_multiple(&current.element, &attrs.batch)
+            let (values, failed) = ffi::copy_multiple(&current.element, &attrs.batch)
+                .map(split_batch)
                 .map_err(|error| ax_refusal(error, "identity"))?;
-            let identity = Semantic::from_values(&values).ok_or_else(|| {
+            let identity = Semantic::from_batch(&values, failed).ok_or_else(|| {
                 Refusal::new(
                     "identity_incomplete",
                     "current identity cannot be read in full",

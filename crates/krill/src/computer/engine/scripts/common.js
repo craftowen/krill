@@ -115,7 +115,9 @@ function checkCGWindow(includeOffscreen) {
   if (!equal({x:Number(b.X),y:Number(b.Y),width:Number(b.Width),height:Number(b.Height)},req.winBounds)) throw Error("window geometry changed");
 }
 var rolesInteractive={AXButton:1,AXTextField:1,AXTextArea:1,AXCheckBox:1,AXRadioButton:1,AXPopUpButton:1,AXComboBox:1,AXMenuItem:1,AXLink:1,AXTab:1,AXSlider:1,AXRow:1,AXCell:1};
-var truncated=false, budget=160, nextRef=1, entries={}, nodeHandles=new WeakMap(), targetPaths={};
+var truncated=false, budget=160, nextRef=1, entries={}, nodeHandles=new WeakMap(), cutNodes=new WeakSet(), targetPaths={};
+// A node whose child list was not read in full: unreadable, over 40, depth/budget limit.
+function cut(node) {truncated=true;cutNodes.add(node);}
 function scalarValue(raw) {
   return (raw !== null && raw !== undefined && ["string","number","boolean"].indexOf(typeof raw)>=0) ? String(raw) : null;
 }
@@ -142,14 +144,14 @@ function readNode(el, depth, isRoot) {
   if (!isRoot && (rolesInteractive[role] || actions.length)) {node.referenceId=nextRef++;entries[node.referenceId]=el;}
   const children=el.uiElements;
   let childRoles;
-  try { childRoles=children.role(); } catch (_) {truncated=true;return node;}
-  if (!Array.isArray(childRoles)) {truncated=true;return node;}
-  if(isRoot && childRoles.length===0) truncated=true;
-  if (depth >= 4 || budget <= 0) {if (childRoles.length) truncated=true;return node;}
+  try { childRoles=children.role(); } catch (_) {cut(node);return node;}
+  if (!Array.isArray(childRoles)) {cut(node);return node;}
+  if(isRoot && childRoles.length===0) cut(node);
+  if (depth >= 4 || budget <= 0) {if (childRoles.length) cut(node);return node;}
   const count=Math.min(childRoles.length,40);
-  if (count<childRoles.length) truncated=true;
+  if (count<childRoles.length) cut(node);
   for(let i=0;i<count;i++) {
-    if(budget--<=0) {truncated=true;break;}
+    if(budget--<=0) {cut(node);break;}
     node.children.push(readNode(children[i],depth+1,false));
   }
   return node;
@@ -185,10 +187,12 @@ function requestRefs() {
 }
 // The fresh node must sit at the SAME reference/position as the original, be the only
 // node with its identity, be enabled and hold the identical full value. Never rebind.
+// A partial census is tolerated only away from the target: every ancestor must have listed
+// all its children and the target needs a readable position, so an unseen twin would also
+// have to share its exact geometry. Twins inside the census are still refused below.
 function validateTree(root) {
   if (!req.baseRoot || !equal(identity(root,true),identity(req.baseRoot,true))) throw Error("snapshot structure changed or reordered");
   const refs=requestRefs();
-  if (refs.length && truncated) throw Error("bounded AX census is partial; target uniqueness unprovable");
   refs.forEach(ref=>{
     const target=findRef(req.baseRoot,ref);
     if(!target) throw Error("reference absent from immutable snapshot");
@@ -199,6 +203,7 @@ function validateTree(root) {
     if(fresh.value!==target.value) throw Error("target value changed since observation; possible semantic reuse");
     const before=pathToRef(req.baseRoot,ref), after=pathToRef(root,ref);
     if(!before || !after || before.length!==after.length) throw Error("target ancestry changed");
+    if(truncated && (!fresh.bounds || after.slice(0,-1).some(n=>cutNodes.has(n)))) throw Error("bounded AX census is partial; target uniqueness unprovable");
     targetPaths[ref]=before.map((node,index)=>{
       if(node.value!==after[index].value || node.enabled!==after[index].enabled) throw Error("target ancestor value or enabled state changed");
       return {node,el:nodeHandles.get(after[index]),isTarget:index===before.length-1};
