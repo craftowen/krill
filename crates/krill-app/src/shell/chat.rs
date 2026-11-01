@@ -1057,12 +1057,17 @@ impl Shell {
         let host = Some(host);
         let log = self.chat.logs.entry(key.clone()).or_default();
         let binding = (snap.session_id.clone(), snap.transcript_path.clone());
-        let reset = snap.reset || log.binding != binding || log.host != host || !snap.bound;
+        let same_host = log.host.is_none() || log.host == host;
+        let initial_bind = !log.bound && snap.bound && !snap.reset && same_host;
+        let stay_unbound = !log.bound && !snap.bound && !snap.reset && same_host;
+        let reset = !initial_bind
+            && !stay_unbound
+            && (snap.reset || log.binding != binding || !same_host || !snap.bound);
         if !snap.agent.is_empty() {
             log.agent = snap.agent;
         }
         log.bound = snap.bound;
-        if reset || !snap.items.is_empty() {
+        if initial_bind || reset || !snap.items.is_empty() {
             log.revision = log.revision.wrapping_add(1);
         }
         if reset {
@@ -1083,7 +1088,10 @@ impl Shell {
             .as_ref()
             .is_some_and(krill_app::hosts::HostId::is_local);
         log.host = host;
-        if is_local && snap.bound && (reset || !snap.items.is_empty() || log.meta.model.is_none()) {
+        if is_local
+            && snap.bound
+            && (initial_bind || reset || !snap.items.is_empty() || log.meta.model.is_none())
+        {
             let state_dir = krill_proto::daemon::state_dir();
             let observed =
                 observe_composer_meta(state_dir.as_deref(), &log.binding.0, &log.binding.1);

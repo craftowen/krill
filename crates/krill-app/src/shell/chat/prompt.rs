@@ -80,10 +80,10 @@ impl Shell {
 
     fn chat_prompt_confirmed(&self, origin: &Origin, text: &str) -> bool {
         #[cfg(test)]
-        if self.chat.send_input.is_some() {
-            return self.chat.prompt_confirmed.unwrap_or(true);
+        if let Some(confirmed) = self.chat.prompt_confirmed {
+            return confirmed;
         }
-        self.chat.logs.get(&origin.key()).is_some_and(|log| {
+        let found = self.chat.logs.get(&origin.key()).is_some_and(|log| {
             log.bound
                 && log.epoch == origin.epoch
                 && log.items.iter().enumerate().any(|(i, item)| {
@@ -91,7 +91,12 @@ impl Shell {
                         && item.kind == krill_proto::agent_history::ChatItemKind::User
                         && super::normalized(&item.text) == super::normalized(text)
                 })
-        })
+        });
+        #[cfg(test)]
+        if !found && self.chat.send_input.is_some() && self.chat.poll_call.is_none() {
+            return true;
+        }
+        found
     }
 
     fn finish_chat_prompt(&mut self, key: &ChatKey, confirmed: bool, cx: &mut Context<Self>) {
@@ -201,12 +206,14 @@ impl Shell {
                 }
             }
             if applied {
-                for _ in 0..TURN_POLLS {
+                for step in 0..TURN_POLLS {
                     let Ok((current, confirmed)) = this.update_in(cx, |this, _, cx| {
-                        (
-                            this.chat_prompt_current(&origin, cx),
-                            this.chat_prompt_confirmed(&origin, &text),
-                        )
+                        let current = this.chat_prompt_current(&origin, cx);
+                        let confirmed = current && this.chat_prompt_confirmed(&origin, &text);
+                        if current && !confirmed && step % 5 == 0 {
+                            this.poll_session_chat(pane, session, cx);
+                        }
+                        (current, confirmed)
                     }) else {
                         return;
                     };

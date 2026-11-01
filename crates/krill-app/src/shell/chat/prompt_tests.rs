@@ -345,10 +345,135 @@ fn chat_paste_waits_for_pty_ack_and_provider_turn_before_clearing(cx: &mut TestA
         input.read_with(cx, |state, _| state.value()),
         "ack gated prompt"
     );
-    view.update(cx, |shell, _| shell.chat.prompt_confirmed = Some(true));
+    view.update(cx, |shell, _| {
+        shell.apply_chat_poll(
+            SESSION,
+            krill_proto::agent_history::ChatPollSnapshot {
+                bound: true,
+                session_id: "agent-991".into(),
+                transcript_path: "/fake/chat.jsonl".into(),
+                items: vec![krill_proto::agent_history::ChatItem {
+                    kind: krill_proto::agent_history::ChatItemKind::User,
+                    text: "ack gated prompt".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        shell.chat.prompt_confirmed = None;
+    });
     cx.executor().advance_clock(Duration::from_millis(20));
     cx.run_until_parked();
     assert!(input.read_with(cx, |state, _| state.value()).is_empty());
+}
+
+#[gpui::test]
+fn chat_first_turn_unbound_to_bound_poll_confirms_and_clears_draft_without_review_warning(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::input::Delivery;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (view, cx, _, sent) = fixture(cx, "chat-first-turn-bind", &permission(), "ready");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let input = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            shell.paths = Some(krill_proto::daemon::Paths {
+                socket: "/unused".into(),
+                holder: "/unused".into(),
+                krilld: "/unused".into(),
+            });
+            // Start from a fresh unbound session (before Turn 1 creates a transcript).
+            shell.chat.logs.remove(&local_key(SESSION));
+            shell.apply_chat_poll(
+                SESSION,
+                krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "agy".into(),
+                    bound: false,
+                    ..Default::default()
+                },
+            );
+            let recorded_polls = polls.clone();
+            shell.chat.poll_call = Some(Arc::new(move |_| {
+                let n = recorded_polls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(Reply::AgentHistory(Response::ChatPolled(
+                        krill_proto::agent_history::ChatPollSnapshot {
+                            agent: "agy".into(),
+                            bound: false,
+                            ..Default::default()
+                        },
+                    )))
+                } else {
+                    Ok(Reply::AgentHistory(Response::ChatPolled(
+                        krill_proto::agent_history::ChatPollSnapshot {
+                            agent: "agy".into(),
+                            session_id: "d9f46ca3-075d-4a88-8788-954ef91d444b".into(),
+                            transcript_path:
+                                "/fake/brain/d9f46ca3/.system_generated/logs/transcript_full.jsonl"
+                                    .into(),
+                            bound: true,
+                            next_offset: 512,
+                            items: vec![krill_proto::agent_history::ChatItem {
+                                kind: krill_proto::agent_history::ChatItemKind::User,
+                                text: "/tmp/image.png\n\n테마 시안좀 5개 더 뽑아줘 다크테마.\n\n대충하지말고 유명 디자인 테마들 참조해서 완성도 있게 해줘".into(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    )))
+                }
+            }));
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| {
+                state.set_value(
+                    "/tmp/image.png\n\n테마 시안좀 5개 더 뽑아줘 다크테마.\n\n대충하지말고 유명 디자인 테마들 참조해서 완성도 있게 해줘",
+                    window,
+                    cx,
+                );
+            });
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+            // An unbound poll lands while PASTE_SUBMIT_DELAY is still waiting.
+            shell.apply_chat_poll(
+                SESSION,
+                krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "agy".into(),
+                    bound: false,
+                    ..Default::default()
+                },
+            );
+            input
+        })
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(260));
+    cx.run_until_parked();
+    for _ in 0..10 {
+        cx.executor().advance_clock(Duration::from_millis(25));
+        cx.run_until_parked();
+    }
+    assert_eq!(sent.lock().unwrap().len(), 2);
+    assert!(
+        input.read_with(cx, |state, _| state.value()).is_empty(),
+        "draft must be cleared once Turn 1 binds and confirms the user prompt"
+    );
+    view.read_with(cx, |shell, _| {
+        assert!(
+            !shell.chat.prompt_review.contains(&local_key(SESSION)),
+            "initial transcript binding must not trigger PROMPT_REVIEW"
+        );
+    });
 }
 
 #[gpui::test]
