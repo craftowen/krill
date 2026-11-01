@@ -992,6 +992,18 @@ fn resolve_transcript_uncached(
                 }
                 agy_bound_root = Some(root);
             }
+        } else if crate::agent::control::is_agy_compact_transcript_path(tp)
+            && let Some(full) = p.parent().map(|d| d.join("transcript_full.jsonl"))
+            && full.is_file()
+        {
+            let inferred_sid = if sid.is_empty() {
+                super::vault::agy_root_and_id_from_path(&full)
+                    .map(|(_, id)| id)
+                    .unwrap_or_default()
+            } else {
+                sid
+            };
+            return Some((full, inferred_sid));
         } else if p.is_file() {
             let inferred_sid = if sid.is_empty() {
                 p.file_stem()
@@ -1158,8 +1170,8 @@ fn find_transcript_by_id(
                 let conv_dir = cand.join("brain").join(sid);
                 let logs = conv_dir.join(".system_generated/logs");
                 for p in [
-                    logs.join("transcript.jsonl"),
                     logs.join("transcript_full.jsonl"),
+                    logs.join("transcript.jsonl"),
                     conv_dir.join("transcript.jsonl"),
                     cand.join("sessions").join(format!("{sid}.jsonl")),
                 ] {
@@ -1467,8 +1479,8 @@ fn scan_agy_brain_for_cwd(
         let conv_dir = entry.path();
         let logs = conv_dir.join(".system_generated/logs");
         let Some(p) = [
-            logs.join("transcript.jsonl"),
             logs.join("transcript_full.jsonl"),
+            logs.join("transcript.jsonl"),
             conv_dir.join("transcript.jsonl"),
         ]
         .into_iter()
@@ -3073,6 +3085,22 @@ mod tests {
         assert_eq!(snap.items[3].text, "The command exited with code 0.");
         assert_eq!(snap.items[4].kind, ChatItemKind::Assistant);
         assert_eq!(snap.items[4].text, "수정을 마쳤습니다.");
+
+        // Both transcript.jsonl and transcript_full.jsonl exist: resolve_transcript prefers
+        // transcript_full.jsonl (matching agy's hook payload) even if stored bound transcript.jsonl.
+        let transcript_full = logs.join("transcript_full.jsonl");
+        fs::write(&transcript_full, format!("{}\n", lines.join("\n"))).unwrap();
+        let stored_compact = StoredLaunch {
+            session_id: Some("conv-agy-77".to_owned()),
+            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+            ..stored
+        };
+        let snap_full = poll_session_in(&roots, Some(&stored_compact), b"/tmp/agy-demo", 0);
+        assert!(snap_full.bound);
+        assert_eq!(
+            snap_full.transcript_path,
+            transcript_full.to_string_lossy().as_ref()
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }

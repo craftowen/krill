@@ -674,8 +674,7 @@ impl Control {
             let should_upgrade_db_path = stored
                 .transcript_path
                 .as_deref()
-                .is_some_and(is_agy_conversation_db_path)
-                && !is_agy_conversation_db_path(tp);
+                .is_some_and(|old| should_upgrade_agy_transcript_path(old, tp));
             if stored.transcript_path.is_none() || should_upgrade_db_path {
                 stored.transcript_path = Some(tp.to_owned());
                 changed = true;
@@ -858,6 +857,20 @@ pub(crate) fn is_agy_conversation_db_path(path: &str) -> bool {
         && p.file_stem()
             .and_then(|s| s.to_str())
             .is_some_and(valid_session_id)
+}
+
+pub(crate) fn is_agy_compact_transcript_path(path: &str) -> bool {
+    let p = Path::new(path);
+    p.file_name().and_then(|n| n.to_str()) == Some("transcript.jsonl")
+        && p.parent()
+            .is_some_and(|d| d.ends_with(".system_generated/logs"))
+}
+
+pub(crate) fn should_upgrade_agy_transcript_path(existing: &str, incoming: &str) -> bool {
+    (is_agy_conversation_db_path(existing) && !is_agy_conversation_db_path(incoming))
+        || (is_agy_compact_transcript_path(existing)
+            && Path::new(incoming).file_name().and_then(|n| n.to_str())
+                == Some("transcript_full.jsonl"))
 }
 
 pub(crate) fn valid_transcript_path(path: &str) -> bool {

@@ -2510,8 +2510,8 @@ fn agy_transcript_for_conv(agy_root: &Path, conv_id: &str) -> Option<PathBuf> {
     let conv_dir = agy_root.join("brain").join(conv_id);
     let logs = conv_dir.join(".system_generated/logs");
     [
-        logs.join("transcript.jsonl"),
         logs.join("transcript_full.jsonl"),
+        logs.join("transcript.jsonl"),
         conv_dir.join("transcript.jsonl"),
         agy_root.join("sessions").join(format!("{conv_id}.jsonl")),
         agy_root.join("conversations").join(format!("{conv_id}.db")),

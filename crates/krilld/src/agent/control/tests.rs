@@ -124,6 +124,18 @@ fn switch_identity_merge_keeps_late_hook_and_source_account_across_restart() {
             .as_deref(),
         jsonl_path.to_str()
     );
+    let full_jsonl_path = Path::new(
+        "/tmp/profile/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript_full.jsonl",
+    );
+    c.bind_discovered_session(agy_session, "conv-1", Some(full_jsonl_path));
+    assert_eq!(
+        c.stored(agy_session)
+            .unwrap()
+            .unwrap()
+            .transcript_path
+            .as_deref(),
+        full_jsonl_path.to_str()
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
