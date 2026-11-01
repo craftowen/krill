@@ -267,8 +267,8 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
     assert!(
         visual
             .debug_bounds("status-provider-details-host")
-            .is_some(),
-        "시안 D는 팝오버를 열면 우측 인라인 상세 패널에 활성 계정을 바로 표시한다"
+            .is_none(),
+        "우측 상세 패널은 계정 카드에 마우스를 올리거나 클릭하기 전에는 표시하지 않는다"
     );
     assert!(
         visual
@@ -480,11 +480,16 @@ fn active_saved_account_has_one_detail_even_with_system_and_saved_duplicates(
     let pill = visual.debug_bounds("status-provider-pill-codex").unwrap();
     visual.simulate_click(pill.center(), gpui::Modifiers::default());
     visual.run_until_parked();
+    let saved_row = visual
+        .debug_bounds("status-provider-account-codex-saved")
+        .expect("saved account card");
     assert!(
         visual
-            .debug_bounds("status-provider-account-codex-saved")
-            .is_some()
+            .debug_bounds("status-provider-detail-status-saved")
+            .is_none()
     );
+    visual.simulate_mouse_move(saved_row.center(), None, gpui::Modifiers::default());
+    visual.run_until_parked();
     assert!(
         visual
             .debug_bounds("status-provider-detail-status-saved")
@@ -1147,7 +1152,7 @@ fn long_details_scroll_independently_and_new_selection_starts_at_top(
             snap.details.accounts.push(AccountMeters {
                 account_id: id.into(),
                 plan: None,
-                meters: (0..if id == "short" { 2 } else { 20 })
+                meters: (0..if id == "short" { 5 } else { 20 })
                     .map(|i| UsageMeter {
                         key: format!("pool-{i}"),
                         label: format!("Pool {i}"),
@@ -1171,9 +1176,6 @@ fn long_details_scroll_independently_and_new_selection_starts_at_top(
         .unwrap();
     visual.simulate_click(pill.center(), gpui::Modifiers::default());
     visual.run_until_parked();
-    let viewport = visual
-        .debug_bounds("status-provider-detail-scroll")
-        .unwrap();
     let header = visual.debug_bounds("status-provider-table-header").unwrap();
     let footer = visual
         .debug_bounds("status-provider-open-accounts")
@@ -1183,6 +1185,16 @@ fn long_details_scroll_independently_and_new_selection_starts_at_top(
         .unwrap();
     let second = visual
         .debug_bounds("status-provider-account-opencode-second")
+        .unwrap();
+    assert!(
+        visual
+            .debug_bounds("status-provider-details-first")
+            .is_none()
+    );
+    visual.simulate_mouse_move(first.center(), None, gpui::Modifiers::default());
+    visual.run_until_parked();
+    let viewport = visual
+        .debug_bounds("status-provider-detail-scroll")
         .unwrap();
     let last_selector = "status-provider-detail-first-pool-19-percent";
     assert!(
@@ -1252,8 +1264,9 @@ fn long_details_scroll_independently_and_new_selection_starts_at_top(
         .debug_bounds("status-provider-details-short")
         .unwrap();
     assert!(
-        short_detail.size.height < short_viewport.size.height
-            || short_detail.size.height < px(312.)
+        short_detail.size.height > px(312.)
+            && short_detail.size.height <= short_viewport.size.height,
+        "five-meter flyout must fit without scrolling: detail={short_detail:?}, viewport={short_viewport:?}"
     );
     visual.simulate_event(gpui::ScrollWheelEvent {
         position: short_viewport.center(),
@@ -1352,15 +1365,17 @@ fn short_window_detail_reset_confirmation_stays_reachable(cx: &mut gpui::TestApp
     let pill = visual.debug_bounds("status-provider-pill-codex").unwrap();
     visual.simulate_click(pill.center(), gpui::Modifiers::default());
     visual.run_until_parked();
-    let viewport = visual
-        .debug_bounds("status-provider-detail-scroll")
-        .unwrap();
     let header = visual.debug_bounds("status-provider-table-header").unwrap();
     let footer = visual
         .debug_bounds("status-provider-open-accounts")
         .unwrap();
     let row = visual
         .debug_bounds("status-provider-account-codex-reset-scroll")
+        .unwrap();
+    visual.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    visual.run_until_parked();
+    let viewport = visual
+        .debug_bounds("status-provider-detail-scroll")
         .unwrap();
     visual.simulate_event(gpui::ScrollWheelEvent {
         position: viewport.center(),

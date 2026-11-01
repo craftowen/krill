@@ -340,6 +340,7 @@ pub struct PopupMenu {
     max_width: Option<Pixels>,
     max_height: Option<Pixels>,
     bounds: Bounds<Pixels>,
+    flyout_bounds: Option<Bounds<Pixels>>,
     size: Size,
     check_side: Side,
 
@@ -387,6 +388,7 @@ impl PopupMenu {
             max_height: None,
             check_side: Side::Left,
             bounds: Bounds::default(),
+            flyout_bounds: None,
             scrollable: false,
             scroll_handle: ScrollHandle::default(),
             external_link_icon: true,
@@ -803,8 +805,20 @@ impl PopupMenu {
         let mut menu = std::mem::replace(self, Self::new(cx));
         menu.menu_items.clear();
         menu.selected_index = None;
+        menu.flyout_bounds = None;
         *self = f(menu, window, cx);
         cx.notify();
+    }
+
+    /// Set the window bounds of an auxiliary flyout rendered by a custom element
+    /// item so outside-click dismissal treats clicks inside it as in-menu.
+    pub fn set_flyout_bounds(&mut self, bounds: Option<Bounds<Pixels>>) {
+        self.flyout_bounds = bounds;
+    }
+
+    /// Return whether a child submenu is currently active.
+    pub fn has_active_submenu(&self) -> bool {
+        self.active_submenu().is_some()
     }
 
     fn add_menu_item(
@@ -1105,6 +1119,7 @@ impl PopupMenu {
     /// The submenu is closed together with its parent, same as macOS menus.
     fn dismiss(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_index = None;
+        self.flyout_bounds = None;
         cx.emit(DismissEvent);
 
         // Focus back to the previous focused handle, unless the item's click
@@ -1145,6 +1160,10 @@ impl PopupMenu {
                     return;
                 }
             }
+        }
+
+        if self.flyout_bounds.is_some_and(|b| b.contains(position)) {
+            return;
         }
 
         // Do not dismiss, if there have an active submenu, the click may be
@@ -1511,6 +1530,7 @@ struct RenderOptions {
 
 impl Render for PopupMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.flyout_bounds = None;
         self.update_submenu_menu_anchor(window, cx);
 
         // Submenus attached via the public `item()` + `PopupMenuItem::submenu()`

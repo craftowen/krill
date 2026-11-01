@@ -1692,7 +1692,7 @@ impl Shell {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(div().flex_1().min_w_0().text_size(ui::TEXT_SM).child(summary.clone()));
+                                    .child(div().flex_1().min_w_0().text_size(ui::TEXT_SM).truncate().child(summary.clone()));
                                 for (answer, label) in [
                                     ("yes", text::QUESTION_YES.get()),
                                     ("no", text::QUESTION_NO.get()),
@@ -1749,7 +1749,7 @@ impl Shell {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(div().flex_1().min_w_0().text_size(ui::TEXT_SM).child(label.clone()))
+                                    .child(div().flex_1().min_w_0().text_size(ui::TEXT_SM).truncate().child(label.clone()))
                                     .child(
                                         Button::new(gpui::ElementId::Name(button_id.clone().into()))
                                             .label(text::WORKER_RELEASE.get())
@@ -1939,6 +1939,7 @@ impl Shell {
             .flex()
             .items_center()
             .justify_between()
+            .overflow_hidden()
             .bg(p.sidebar)
             .border_t_1()
             .border_color(p.border)
@@ -1951,7 +1952,9 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .flex_none()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
                     .child(provider_pills)
                     .child(refresh_button),
             )
@@ -1961,6 +1964,7 @@ impl Shell {
                     .debug_selector(|| "status-bar-right".into())
                     .flex()
                     .items_center()
+                    .flex_none()
                     .gap_2()
                     .children(krill_app::recording::warning(self.recording, cx))
                     .children({

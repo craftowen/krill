@@ -1,4 +1,4 @@
-//! 상태바 계정 비교표(시안 D: 로컬/원격 상단 탭 분리 + 좌우 마스터-디테일 인라인 상세 뷰).
+//! 상태바 계정 비교표(로컬/원격 상단 탭 분리 + 계정 카드 호버 시 우측 플라이아웃 상세 뷰).
 //! 같은 이메일은 활성 프로필을 대표로 한 번만 표시하며 원본 프로필·전환 대상은 보존한다.
 
 use super::*;
@@ -25,18 +25,10 @@ fn selected_account_for(
         .try_global::<ProviderPopupState>()
         .and_then(|s| s.selected_account.as_ref())
         .filter(|(p, _)| *p == provider)
-        .map(|(_, id)| id.as_str());
-    if let Some(id) = wanted
-        && let Some(found) = groups
-            .iter()
-            .find(|g| g.selected().is_some_and(|a| a.id == id))
-    {
-        return Some(found.clone());
-    }
+        .map(|(_, id)| id.as_str())?;
     groups
         .iter()
-        .find(|g| g.selected().is_some_and(|a| a.active))
-        .or_else(|| groups.first())
+        .find(|g| g.selected().is_some_and(|a| a.id == wanted))
         .cloned()
 }
 
@@ -72,6 +64,9 @@ fn set_remote_tab(provider: ProviderKind, remote: bool, cx: &mut App) {
         .cloned()
         .unwrap_or_default();
     state.remote_tab = Some((provider, remote));
+    if remote {
+        state.selected_account = None;
+    }
     cx.set_global(state);
 }
 
@@ -526,279 +521,126 @@ fn window_bar_color(win: Option<&UsageWindow>, p: &ui::Palette) -> gpui::Hsla {
         .map_or(p.muted_foreground, |pct| provider_usage_color(pct, p))
 }
 
-fn render_popover_usage_ghost_row(
-    window_label: &str,
-    win: Option<&UsageWindow>,
-    p: &ui::Palette,
-) -> gpui::Div {
-    let display = krill_app::accounts::display::window(
-        win,
-        i64::try_from(krill_app::accounts::display::now()).unwrap_or(i64::MAX),
-    );
-    div()
-        .w_full()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap_x_2()
-                .gap_y_0p5()
-                .text_size(ui::TEXT_XS)
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .font_family(ui::FONT_MONO)
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(p.muted_foreground)
-                                .child(window_label.to_owned()),
-                        )
-                        .child(
-                            div()
-                                .font_family(ui::FONT_MONO)
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(p.foreground)
-                                .child(display.text),
-                        ),
-                )
-                .children(krill_app::settings::window_reset_suffix(win).map(|reset| {
-                    div()
-                        .min_w_0()
-                        .whitespace_normal()
-                        .text_color(p.muted_foreground)
-                        .child(reset)
-                })),
-        )
-        .child(div().w_full().h(px(5.)).rounded_full())
+/// 팝오버 바깥 우측(좁은 창 오른쪽 끝이면 좌측)에 독립 높이로 띄우는 계정 상세 플라이아웃.
+struct DetailFlyout {
+    child: gpui::AnyElement,
+    master_width: gpui::Pixels,
+    menu: WeakEntity<PopupMenu>,
 }
 
-fn render_detail_reset_controls_ghost(
-    snap: &AccountsSnapshot,
-    account: &AccountInfo,
-    armed: bool,
-    p: &ui::Palette,
-) -> Option<gpui::Div> {
-    if !matches!(account.provider, ProviderKind::Codex | ProviderKind::Claude)
-        || krill_app::accounts::orca_managed(account)
-    {
-        return None;
+impl gpui::IntoElement for DetailFlyout {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
     }
-    let credits = super::reset_credit_count(snap, account);
-    if armed {
-        let (title, _) = krill_app::settings::account_heading(account);
-        let info = provider_text::PROVIDER_RESET_USAGE_INFO.format(&[("account", &title)]);
-        return Some(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1p5()
-                .pt_1()
-                .child(
-                    div()
-                        .text_size(ui::TEXT_XS)
-                        .text_color(p.muted_foreground)
-                        .child(info),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(
-                            Button::new("ghost-reset-confirm")
-                                .small()
-                                .danger()
-                                .label(provider_text::PROVIDER_RESET_USAGE_CONFIRM.get()),
-                        )
-                        .child(
-                            Button::new("ghost-reset-cancel")
-                                .small()
-                                .outline()
-                                .label(provider_text::PROVIDER_RESET_USAGE_CANCEL.get()),
-                        ),
-                ),
-        );
-    }
-    let label = match credits {
-        Some(0) => provider_text::PROVIDER_RESET_USAGE_NONE.get().to_owned(),
-        Some(c) => format!("{} ({c})", provider_text::PROVIDER_RESET_USAGE.get()),
-        None => provider_text::PROVIDER_RESET_USAGE.get().to_owned(),
-    };
-    Some(
-        div().pt_1().child(
-            Button::new("ghost-reset-btn")
-                .small()
-                .outline()
-                .label(label),
-        ),
-    )
 }
 
-fn render_detail_panel_ghost(
-    snap: &AccountsSnapshot,
-    group: &AccountGroup,
-    detail_panel_width: gpui::Pixels,
-    p: &ui::Palette,
-) -> gpui::Div {
-    let Some(panel_account) = group.selected() else {
-        return div().w(detail_panel_width).flex_none();
-    };
-    let peak = account_peak_percent(snap, panel_account);
-    let (tone, tone_label) = usage_tone_badge(peak);
-    let mut detail = div()
-        .w_full()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_size(ui::TEXT_XS)
-        .text_color(p.muted_foreground);
-    let account = panel_account;
-    let mut profile = div()
-        .w_full()
-        .min_w_0()
-        .pt_2()
-        .border_t_1()
-        .border_color(p.border)
-        .flex()
-        .flex_col()
-        .gap_2();
-    let status = krill_app::accounts::display::account(
-        account,
-        snap.status_for(&account.id),
-        krill_app::accounts::display::now(),
-    );
-    profile = profile.child(krill_app::accounts::display::render_status(
-        format!("ghost-detail-status-{}", account.id),
-        &status,
-        p,
-    ));
-    if let Some(meters) = snap.meters_for(&account.id) {
-        profile = profile.children(meters.plan.as_ref().map(|plan| div().child(plan.clone())));
-        for meter in &meters.meters {
-            let label = krill_app::accounts::display::meter_label(meter);
-            profile = profile.child(
-                if let Some(value) = krill_app::accounts::display::meter_value(
-                    meter,
-                    krill_app::accounts::display::now(),
-                ) {
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .justify_between()
-                        .gap_2()
-                        .child(label)
-                        .child(div().font_family(ui::FONT_MONO).child(value.clone()))
-                        .into_any_element()
-                } else {
-                    render_popover_usage_ghost_row(&label, meter.window.as_ref(), p)
-                        .into_any_element()
-                },
-            );
-        }
-    } else {
-        for (label, window) in [
-            (
-                provider_text::PROVIDER_USED_5H.get(),
-                account.usage.five_hour.as_ref(),
-            ),
-            (
-                provider_text::PROVIDER_USED_7D.get(),
-                account.usage.seven_day.as_ref(),
-            ),
-        ] {
-            profile = profile.child(render_popover_usage_ghost_row(label, window, p));
-        }
-    }
-    if let Some(rule) = snap.auto_switch.rule_for(account.provider, &account.id) {
-        profile = profile.child(format!(
-            "{} · {}",
-            provider_text::PROVIDER_AUTO_SWITCH_HEADER.get(),
-            krill_app::settings::rule_summary(rule, &snap.accounts)
-        ));
-    }
-    profile = profile.children(
-        advanced_notes(snap, account)
-            .into_iter()
-            .map(|note| div().child(note)),
-    );
-    if let Some(reset_box) = render_detail_reset_controls_ghost(snap, account, false, p) {
-        profile = profile.child(reset_box);
+impl gpui::Element for DetailFlyout {
+    type RequestLayoutState = gpui::LayoutId;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
     }
 
-    profile =
-        profile.child(
-            div()
-                .pt_1p5()
-                .border_t_1()
-                .border_color(p.border)
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .grid()
-                        .child(div().row_start(1).col_start(1).flex().items_center().child(
-                            ui::badge(
-                                p,
-                                ui::BadgeTone::Success,
-                                provider_text::PROVIDER_ACTIVE_NOW.get(),
-                            ),
-                        ))
-                        .child(
-                            div().row_start(1).col_start(1).child(
-                                Button::new("ghost-detail-use")
-                                    .small()
-                                    .primary()
-                                    .label(provider_text::PROVIDER_SWITCH_NOW.get()),
-                            ),
-                        ),
-                ),
-        );
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
 
-    detail = detail.child(profile);
-    div()
-        .w(detail_panel_width)
-        .flex_none()
-        .p_2p5()
-        .rounded(ui::RADIUS_SM)
-        .border_1()
-        .border_color(p.border)
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(ui::TEXT_SM)
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(account_name(panel_account)),
-                )
-                .child(ui::badge(p, tone, tone_label)),
-        )
-        .child(detail)
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let child_id = self.child.request_layout(window, cx);
+        let zero = gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(0.)));
+        let style = gpui::Style {
+            position: gpui::Position::Absolute,
+            inset: gpui::Edges {
+                top: gpui::Length::Definite(zero),
+                right: gpui::Length::Auto,
+                bottom: gpui::Length::Auto,
+                left: gpui::Length::Definite(zero),
+            },
+            display: gpui::Display::Flex,
+            ..gpui::Style::default()
+        };
+        let layout_id = window.request_layout(style, [child_id], cx);
+        (layout_id, child_id)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        child_id: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self
+            .menu
+            .upgrade()
+            .is_some_and(|m| m.read(cx).has_active_submenu())
+        {
+            return;
+        }
+        let child_size = window.layout_bounds(*child_id).size;
+        let viewport = window.viewport_size();
+        let right_x = bounds.origin.x + self.master_width + ui::SPACE_4 + ui::SPACE_1;
+        let x = if right_x + child_size.width <= viewport.width - ui::SPACE_2 {
+            right_x
+        } else {
+            let left_x = bounds.origin.x - ui::SPACE_4 - ui::SPACE_1 - child_size.width;
+            if left_x >= ui::SPACE_2 {
+                left_x
+            } else {
+                (viewport.width - ui::SPACE_2 - child_size.width).max(ui::SPACE_2)
+            }
+        };
+        let max_bottom = (viewport.height - ui::STATUS_BAR_HEIGHT - ui::SPACE_2).max(ui::SPACE_2);
+        let y = if bounds.origin.y + child_size.height <= max_bottom {
+            bounds.origin.y.max(ui::SPACE_2)
+        } else {
+            (max_bottom - child_size.height).max(ui::SPACE_2)
+        };
+        let origin = gpui::point(x.round(), y.round());
+        let offset = origin - bounds.origin;
+        self.menu
+            .update(cx, |m, _| {
+                m.set_flyout_bounds(Some(gpui::Bounds {
+                    origin,
+                    size: child_size,
+                }));
+            })
+            .ok();
+        window.with_element_offset(offset, |window| {
+            self.child.prepaint(window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self
+            .menu
+            .upgrade()
+            .is_some_and(|m| m.read(cx).has_active_submenu())
+        {
+            return;
+        }
+        self.child.paint(window, cx);
+    }
 }
 
 /// 로컬과 같은 미터·갱신 상태를 각 호스트의 스냅샷에서 표시한다.
@@ -1456,10 +1298,12 @@ pub(super) fn provider_usage_menu(
     let has_remote_hosts = !other_hosts.is_empty();
 
     let available = window.bounds().size.width - ui::SPACE_4 * 2.;
-    let width = px(580.).min(available);
+    let detail_panel_width = px(276.).min((available * 0.44).floor()).max(px(180.));
+    let width = px(368.)
+        .min(available - detail_panel_width - ui::SPACE_3)
+        .max(px(220.));
     let content_width = width - ui::SPACE_4 * 2.;
-    let master_width = ((content_width - ui::SPACE_3) * 0.52).floor();
-    let detail_panel_width = (content_width - master_width - ui::SPACE_3).max(px(180.));
+    let master_width = content_width;
     let columns = comparison_columns(snap, provider);
     let col_count = u8::try_from(columns.len().max(1)).unwrap_or(2);
     let master_inner = (master_width - ui::SPACE_2 * 2.).max(px(120.));
@@ -1477,9 +1321,9 @@ pub(super) fn provider_usage_menu(
         .or_else(|| groups.first().and_then(AccountGroup::selected))
         .cloned();
 
-    // 팝오버를 새로 열 때는 현재 호스트 탭과 활성 계정을 기본 선택한다.
+    // 팝오버를 새로 열 때는 현재 호스트 탭만 열고, 우측 상세 패널은 계정 카드에 마우스를 올리거나 클릭할 때 띄운다.
     cx.set_global(ProviderPopupState {
-        selected_account: active.as_ref().map(|a| (provider, a.id.clone())),
+        selected_account: None,
         remote_tab: Some((provider, false)),
     });
 
@@ -1512,11 +1356,13 @@ pub(super) fn provider_usage_menu(
                     div()
                         .w_full()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap_2()
                         .child(
                             div()
+                                .min_w_0()
                                 .flex()
                                 .items_center()
                                 .gap_2()
@@ -1536,11 +1382,14 @@ pub(super) fn provider_usage_menu(
                                     div()
                                         .id("status-provider-active-host")
                                         .debug_selector(|| "status-provider-active-host".into())
-                                        .child(ui::badge(
-                                            p,
-                                            ui::BadgeTone::Accent,
-                                            host_label.clone(),
-                                        ))
+                                        .max_w(px(160.))
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(
+                                            ui::badge(p, ui::BadgeTone::Accent, host_label.clone())
+                                                .max_w(px(160.))
+                                                .truncate(),
+                                        )
                                 })),
                         )
                         .child(if has_remote_hosts {
@@ -1802,7 +1651,9 @@ pub(super) fn provider_usage_menu(
 
             // Account for the local row's .py_1() at the current zoom.
             let column_max_height = (body_max_height - window.rem_size() * 0.5).max(ui::SPACE_1);
-            let detail_col = if let Some(panel_group) = selected_group
+            let detail_max_height = (room - ui::SPACE_2).min(px(560.)).max(ui::SPACE_4);
+            let detail_flyout = if !remote_tab
+                && let Some(panel_group) = selected_group
                 && let Some(panel_account) = panel_group.selected().cloned()
             {
                 let armed = body_weak
@@ -1819,14 +1670,15 @@ pub(super) fn provider_usage_menu(
                     .w(detail_panel_width)
                     .flex_none()
                     .p_2p5()
-                    .rounded(ui::RADIUS_SM)
+                    .rounded(ui::RADIUS_MD)
                     .border_1()
                     .border_color(if panel_account.active {
                         p.success.opacity(0.45)
                     } else {
                         p.border
                     })
-                    .bg(p.secondary.opacity(0.55))
+                    .bg(p.popover)
+                    .text_color(p.popover_foreground)
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -1869,55 +1721,39 @@ pub(super) fn provider_usage_menu(
                     .w(detail_panel_width)
                     .flex_none()
                     .min_h_0()
-                    .max_h(column_max_height)
+                    .max_h(detail_max_height)
                     .overflow_y_scroll()
+                    .rounded(ui::RADIUS_MD)
+                    .bg(p.popover)
+                    .shadow_lg()
+                    .occlude()
                     .child(active_detail);
-                let mut stack = div().w(detail_panel_width).flex_none().grid();
-                for group in &body_groups {
-                    if group.selected().is_some_and(|a| a.id == panel_account.id) {
-                        continue;
-                    }
-                    // Bound each reservation before the grid; a long hidden
-                    // detail must never become blank scroll space in a short one.
-                    stack = stack.child(
-                        div()
-                            .row_start(1)
-                            .col_start(1)
-                            .invisible()
-                            .min_h_0()
-                            .max_h(column_max_height)
-                            .overflow_hidden()
-                            .child(render_detail_panel_ghost(
-                                &body_snap,
-                                group,
-                                detail_panel_width,
-                                p,
-                            )),
-                    );
-                }
-                stack
-                    .child(div().row_start(1).col_start(1).child(active_detail))
-                    .into_any_element()
+                Some(
+                    gpui::deferred(DetailFlyout {
+                        child: active_detail.into_any_element(),
+                        master_width,
+                        menu: body_menu.clone(),
+                    })
+                    .with_priority(2),
+                )
             } else {
-                div().w(detail_panel_width).flex_none().into_any_element()
+                None
             };
 
-            // Scrolling to a lower account must leave its detail at the top of
-            // the adjacent column. Both columns share the same height budget.
             let master_col = provider_body_viewport(
                 "status-provider-local-scroll",
                 master_col,
                 master_width,
                 column_max_height,
             );
-            let local_view = div()
-                .w(content_width)
-                .py_1()
-                .flex()
-                .items_start()
-                .gap_3()
-                .child(master_col)
-                .child(detail_col);
+            let local_view = div().w(content_width).py_1().flex().items_start().child(
+                div()
+                    .w(master_width)
+                    .flex_none()
+                    .relative()
+                    .child(master_col)
+                    .children(detail_flyout),
+            );
             if !has_remote_hosts {
                 return local_view.into_any_element();
             }
