@@ -123,7 +123,7 @@ class ComparisonTests(unittest.TestCase):
             app["target"][0] = "krill_app"
             self.write(case, "compilation.json", {"artifacts": [artifact, app], "clippy_artifacts": [copy.deepcopy(artifact)], "build": "same+dev.id", "helpers": sorted(HELPERS)})
             (folder / "cargo-timing.html").write_text('const UNIT_DATA = [{"start":1,"duration":100}];')
-            self.jobs["jobs"].append(dict(name=f"{case} / vendor-cache-{case} (macos-14)", head_sha="a" * 40,
+            self.jobs["jobs"].append(dict(name=f"{case} / vendor-cache-{case} (macos-15)", head_sha="a" * 40,
                 run_id=10, run_attempt=1, conclusion="success", created_at="2026-10-26T00:00:00Z",
                 started_at="2026-10-26T00:00:05Z", completed_at="2026-10-26T00:05:00Z",
                 steps=[{"name": s, "conclusion": "success"} for s in STAGES]))

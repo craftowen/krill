@@ -265,7 +265,7 @@ def compare(directory, jobs):
             raise ValueError("source, toolchain, hardware, profile or graph differs")
         if any(value[key] != baseline[key] for key in ("listing", "executed", "signatures", "build")):
             raise ValueError("test IDs/skips, compiled features/profiles or BUILD differs")
-        candidates = [j for j in jobs["jobs"] if j["name"].endswith(f"vendor-cache-{name} (macos-14)")]
+        candidates = [j for j in jobs["jobs"] if j["name"].endswith(f"vendor-cache-{name} (macos-15)")]
         if len(candidates) != 1:
             raise ValueError("missing or ambiguous measurement job")
         job = candidates[0]

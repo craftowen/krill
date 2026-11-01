@@ -16,8 +16,8 @@ permissions:
 
 jobs:
   measure:
-    name: vendor-cache-${{ inputs.case }} (macos-14)
-    runs-on: macos-14
+    name: vendor-cache-${{ inputs.case }} (macos-15)
+    runs-on: macos-15
     timeout-minutes: 180
     defaults:
       run:
@@ -45,7 +45,7 @@ jobs:
         id: baseline
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          shared-key: ci-macos-14
+          shared-key: ci-macos-15
           cache-bin: 'false'
           save-if: 'false'
       - name: Stage unchanged vendor and external Cargo configuration
@@ -61,7 +61,7 @@ jobs:
         with:
           # This pinned action ignores `key` when `shared-key` is provided.
           prefix-key: ${{ inputs.cache-prefix }}-${{ steps.stage.outputs.vendor-hash }}
-          shared-key: ci-macos-14
+          shared-key: ci-macos-15
           cache-directories: ${{ steps.stage.outputs.vendor-directory }}
           cache-bin: 'false'
           save-if: ${{ inputs.case == 'producer' }}

@@ -129,7 +129,7 @@ def compare(directory, jobs):
             raise ValueError("source, toolchain, machine or restored cache differs")
         if any(value[key] != baseline[key] for key in ("inventory", "signatures", "skipped")):
             raise ValueError("test inventory, skipped tests or Cargo features differ")
-        matches = [j for j in jobs["jobs"] if j["name"] == f"cgu-{case} (macos-14)"]
+        matches = [j for j in jobs["jobs"] if j["name"] == f"cgu-{case} (macos-15)"]
         if len(matches) != 1:
             raise ValueError("missing or ambiguous workflow job")
         job = matches[0]

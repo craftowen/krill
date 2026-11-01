@@ -35,7 +35,7 @@ class ComparisonTests(unittest.TestCase):
                 "Running `rustc --crate-name krill_app --edition=2024 -C opt-level=2"
                 f" -C debuginfo=line-tables-only -C debug-assertions=on{cgu} --test`\n"
                 "Summary [ 1s] 1 tests run: 1 passed, 17 skipped\n")
-            self.jobs["jobs"].append({"name": f"cgu-{case} (macos-14)", "run_id": 10,
+            self.jobs["jobs"].append({"name": f"cgu-{case} (macos-15)", "run_id": 10,
                                      "run_attempt": 2, "head_sha": "a" * 40, "conclusion": "success",
                                      "started_at": "2026-10-25T00:00:00Z", "completed_at": "2026-10-25T00:03:00Z",
                                      "steps": [{"name": name, "conclusion": "success"} for name in STAGES]})

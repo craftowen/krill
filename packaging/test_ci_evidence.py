@@ -105,7 +105,7 @@ class ProofTests(unittest.TestCase):
             with self.subTest(conclusion=conclusion):
                 fixture = Fixture()
                 packaging = next(job for job in fixture.jobs
-                                 if job["name"] == "packaging regressions (macos-14)")
+                                 if job["name"] == "packaging regressions (macos-15)")
                 if conclusion == "missing":
                     fixture.jobs.remove(packaging)
                 else:
@@ -156,7 +156,7 @@ class ProofTests(unittest.TestCase):
         proof = evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
         self.assertEqual(proof["source"]["run_id"], 100)
         candidate.jobs = [job for job in candidate.jobs
-                          if job["name"] != "packaging regressions (macos-14)"]
+                          if job["name"] != "packaging regressions (macos-15)"]
         with self.assertRaises(EvidenceError):
             evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
 
