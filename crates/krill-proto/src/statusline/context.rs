@@ -75,8 +75,10 @@ pub fn record(state: &Path, profile: &Path, payload: &Value) -> io::Result<()> {
             .and_then(Value::as_str)
             .filter(|s| s.len() <= 128)
             .map(str::to_owned),
+        // Claude Code sends `{"effort":{"level":"high"}}`.
         effort: payload
-            .get("effort")
+            .pointer("/effort/level")
+            .or_else(|| payload.get("effort"))
             .and_then(Value::as_str)
             .filter(|s| matches!(*s, "low" | "medium" | "high" | "xhigh" | "max"))
             .map(str::to_owned),
@@ -127,10 +129,11 @@ mod tests {
         let profile = dir.join("profile");
         std::fs::create_dir_all(&profile).unwrap();
         let scope = ProfileScope::from_profile(&profile).unwrap();
-        let payload = serde_json::json!({"session_id":"context-a", "model":{"id":"observed-claude"}, "context_window":{"used_percentage":37.5}, "transcript":"private conversation", "cwd":"private path"});
+        let payload = serde_json::json!({"session_id":"context-a", "model":{"id":"observed-claude"}, "effort":{"level":"xhigh"}, "context_window":{"used_percentage":37.5}, "transcript":"private conversation", "cwd":"private path"});
         record(&dir, &profile, &payload).unwrap();
         let observed = read(&dir, &profile, "context-a").unwrap();
         assert_eq!(observed.model.as_deref(), Some("observed-claude"));
+        assert_eq!(observed.effort.as_deref(), Some("xhigh"));
         assert_eq!(observed.percent, Some(37.5));
         assert!(read(&dir, &profile, "context-b").is_none());
         assert!(read(&dir, &profile, "../context-a").is_none());
