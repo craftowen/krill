@@ -948,6 +948,187 @@ fn owe924_merge_and_draft_toggle_commands_and_service_updates_cache() {
     );
 }
 
+#[test]
+fn orca_parity_default_branch_tracked_upstream_git_operation_and_stale_merged_pr() {
+    let root = std::env::temp_dir().join(format!(
+        "krill-orca-pr-parity-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    drop(std::fs::remove_dir_all(&root));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(&root)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    };
+
+    git(&["init", "-q", "-b", "main"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/krill.git",
+    ]);
+    std::fs::write(root.join("README.md"), "first\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-q", "-m", "initial"]);
+
+    let first_oid = git_output(&root, &["rev-parse", "--verify", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    assert!(is_default_branch(&root, "main"));
+    assert!(is_default_branch(&root, "master"));
+    assert!(is_default_branch(&root, "dev"));
+    assert!(!is_default_branch(&root, "feat/topic"));
+
+    git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/trunk",
+    ]);
+    assert!(is_default_branch(&root, "trunk"));
+
+    assert_eq!(
+        Gh.run(&root, "HEAD", Action::Refresh).unwrap(),
+        Status::NoPr
+    );
+    assert_eq!(
+        Gh.run(&root, "main", Action::Refresh).unwrap(),
+        Status::NoPr
+    );
+    assert_eq!(
+        Gh.run(&root, "trunk", Action::Refresh).unwrap(),
+        Status::NoPr
+    );
+    assert_eq!(
+        checks::inspect_with_gh(&root, "HEAD").unwrap().status,
+        Status::NoPr
+    );
+    assert_eq!(
+        checks::inspect_with_gh(&root, "main").unwrap().status,
+        Status::NoPr
+    );
+
+    git(&["update-ref", "refs/remotes/origin/main", &first_oid]);
+    git(&[
+        "update-ref",
+        "refs/remotes/origin/feat/remote-pr",
+        &first_oid,
+    ]);
+    git(&["checkout", "-q", "-b", "미니멀리즘"]);
+    git(&["branch", "--set-upstream-to=origin/main", "미니멀리즘"]);
+    assert_eq!(tracked_upstream_branch(&root, "미니멀리즘"), None);
+
+    git(&[
+        "branch",
+        "--set-upstream-to=origin/feat/remote-pr",
+        "미니멀리즘",
+    ]);
+    assert_eq!(
+        tracked_upstream_branch(&root, "미니멀리즘").as_deref(),
+        Some("feat/remote-pr")
+    );
+
+    assert!(!is_stale_merged_pr(&root, &first_oid));
+    std::fs::write(root.join("README.md"), "second\n").unwrap();
+    git(&["commit", "-q", "-am", "second"]);
+    let second_oid = git_output(&root, &["rev-parse", "--verify", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert!(is_stale_merged_pr(&root, &first_oid));
+    assert!(!is_stale_merged_pr(&root, &second_oid));
+
+    assert_eq!(detect_git_operation(&root), None);
+    let git_dir = PathBuf::from(
+        git_output(&root, &["rev-parse", "--git-dir"])
+            .unwrap()
+            .trim(),
+    );
+    let abs_git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        root.join(git_dir)
+    };
+    std::fs::create_dir_all(abs_git_dir.join("rebase-merge")).unwrap();
+    assert_eq!(detect_git_operation(&root), Some(GitOperation::Rebase));
+    std::fs::remove_dir_all(abs_git_dir.join("rebase-merge")).unwrap();
+
+    std::fs::write(abs_git_dir.join("MERGE_HEAD"), &first_oid).unwrap();
+    assert_eq!(detect_git_operation(&root), Some(GitOperation::Merge));
+    std::fs::remove_file(abs_git_dir.join("MERGE_HEAD")).unwrap();
+
+    std::fs::write(abs_git_dir.join("CHERRY_PICK_HEAD"), &first_oid).unwrap();
+    assert_eq!(detect_git_operation(&root), Some(GitOperation::CherryPick));
+    std::fs::remove_file(abs_git_dir.join("CHERRY_PICK_HEAD")).unwrap();
+
+    drop(std::fs::remove_dir_all(&root));
+}
+
+#[gpui::test]
+fn pr_checks_tab_renders_orca_empty_states_and_hides_create_button_on_blockers(
+    cx: &mut gpui::TestAppContext,
+) {
+    struct NoPrRunner(AtomicUsize);
+    impl Runner for NoPrRunner {
+        fn run(&self, _: &Path, _: &str, _: Action) -> io::Result<Status> {
+            Ok(Status::NoPr)
+        }
+        fn inspect_pr(&self, _: &Path, _: &str) -> io::Result<PrInspection> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(PrInspection::default())
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let runner = Arc::new(NoPrRunner(AtomicUsize::new(0)));
+    let service = Arc::new(Service::new(runner.clone()));
+
+    let (panel, cx) = cx.add_window_view(|_, cx| {
+        let mut p = crate::diff::Panel::unconnected(PathBuf::from("/no-such-git-repo"), cx);
+        p.set_pr_service(service);
+        p.set_tab(crate::diff::PanelTab::Checks, cx);
+        p
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("pr-checks-detached-head").is_some());
+    assert!(cx.debug_bounds("pr-checks-create").is_none());
+    assert_eq!(runner.0.load(Ordering::SeqCst), 0);
+
+    panel.update(cx, |p, cx| {
+        p.set_checks_branch("main");
+        p.refresh_checks(cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("pr-checks-default-branch").is_some());
+    assert!(cx.debug_bounds("pr-checks-create").is_none());
+    assert_eq!(runner.0.load(Ordering::SeqCst), 0);
+
+    panel.update(cx, |p, cx| {
+        p.set_checks_branch("feat/orca-parity");
+        p.refresh_checks(cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("pr-checks-no-pr").is_some());
+    assert!(cx.debug_bounds("pr-checks-create").is_some());
+    assert_eq!(runner.0.load(Ordering::SeqCst), 1);
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_command_output_status_and_timeout_are_bounded() {

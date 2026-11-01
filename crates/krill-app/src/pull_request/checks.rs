@@ -803,10 +803,7 @@ query($owner: String!, $name: String!, $prNumber: Int!) {
 }
 ";
 
-pub(super) fn inspect_with_gh(folder: &Path, branch: &str) -> io::Result<PrInspection> {
-    if branch.trim().is_empty() || !super::has_github_remote(folder) {
-        return Ok(PrInspection::default());
-    }
+fn query_gh_pr_list(folder: &Path, branch: &str) -> io::Result<PrInspection> {
     let mut list_cmd = gh_base_command(folder);
     list_cmd.args([
         "pr",
@@ -821,7 +818,33 @@ pub(super) fn inspect_with_gh(folder: &Path, branch: &str) -> io::Result<PrInspe
         "number,title,url,state,isDraft,statusCheckRollup,baseRefName,headRefName,baseRefOid,headRefOid",
     ]);
     let bytes = execute(&mut list_cmd, TIMEOUT)?;
-    let mut inspection = parse_checks_from_pr_json(&bytes)?;
+    let inspection = parse_checks_from_pr_json(&bytes)?;
+    if inspection.status == Status::Merged
+        && inspection
+            .metadata
+            .as_ref()
+            .is_some_and(|m| super::is_stale_merged_pr(folder, &m.head_ref_oid))
+    {
+        return Ok(PrInspection::default());
+    }
+    Ok(inspection)
+}
+
+pub(super) fn inspect_with_gh(folder: &Path, branch: &str) -> io::Result<PrInspection> {
+    let branch = branch.trim();
+    if branch.is_empty()
+        || branch == "HEAD"
+        || !super::has_github_remote(folder)
+        || super::is_default_branch(folder, branch)
+    {
+        return Ok(PrInspection::default());
+    }
+    let mut inspection = query_gh_pr_list(folder, branch)?;
+    if inspection.status == Status::NoPr
+        && let Some(upstream) = super::tracked_upstream_branch(folder, branch)
+    {
+        inspection = query_gh_pr_list(folder, &upstream)?;
+    }
     let Some(pr_number) = inspection.number else {
         return Ok(inspection);
     };

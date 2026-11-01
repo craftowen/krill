@@ -39,7 +39,7 @@ use krill_proto::screen::Msg as _;
 use crate::hosts::{HostId, HostTarget};
 
 mod checks;
-pub use checks::PanelTab;
+pub use checks::{ChecksEmptyState, PanelTab};
 mod comments;
 pub use comments::{CommentSource, SendComments, input_bytes};
 mod explorer;

@@ -20,7 +20,8 @@ use gpui_component::{Icon, IconName, Sizable as _};
 use super::{Panel, SendComments};
 use crate::i18n::catalog::pull_request as text;
 use crate::pull_request::{
-    CheckItem, CheckState, PrInspection, ReviewComment, Status, build_fix_with_ai_prompt,
+    CheckItem, CheckState, GitOperation, PrInspection, ReviewComment, Status,
+    build_fix_with_ai_prompt, detect_git_operation, is_default_branch,
 };
 
 mod merge;
@@ -112,6 +113,54 @@ impl PanelTab {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ChecksEmptyState {
+    OperationInProgress(GitOperation),
+    DetachedHead,
+    DefaultBranch,
+    #[default]
+    NoPr,
+}
+
+impl ChecksEmptyState {
+    #[must_use]
+    pub fn selector(&self) -> &'static str {
+        match self {
+            Self::OperationInProgress(_) => "pr-checks-operation-in-progress",
+            Self::DetachedHead => "pr-checks-detached-head",
+            Self::DefaultBranch => "pr-checks-default-branch",
+            Self::NoPr => "pr-checks-no-pr",
+        }
+    }
+
+    #[must_use]
+    pub fn title(&self) -> String {
+        match self {
+            Self::OperationInProgress(op) => {
+                text::OP_IN_PROGRESS_TITLE.format(&[("op", op.label())])
+            }
+            Self::DetachedHead => text::DETACHED_HEAD_TITLE.get().to_owned(),
+            Self::DefaultBranch => text::DEFAULT_BRANCH_TITLE.get().to_owned(),
+            Self::NoPr => text::NO_PR_TITLE.get().to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::OperationInProgress(_) => text::OP_IN_PROGRESS_DESC.get(),
+            Self::DetachedHead => text::DETACHED_HEAD_DESC.get(),
+            Self::DefaultBranch => text::DEFAULT_BRANCH_DESC.get(),
+            Self::NoPr => text::NO_PR_DESC.get(),
+        }
+    }
+
+    #[must_use]
+    pub const fn can_create_pr(&self) -> bool {
+        matches!(self, Self::NoPr)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct State {
     pub branch_override: Option<String>,
@@ -120,6 +169,7 @@ pub(super) struct State {
     merge_task: Option<Task<()>>,
     pub action_error: Option<String>,
     pub branch: String,
+    pub empty: ChecksEmptyState,
     pub inspection: Option<PrInspection>,
     pub loading: bool,
     pub error: Option<String>,
@@ -153,17 +203,29 @@ impl State {
     }
 }
 
-fn resolve_branch(repo: &Path, branch_override: Option<&str>) -> String {
-    if let Some(custom) = branch_override
-        && !custom.trim().is_empty()
-    {
-        return custom.trim().to_owned();
+fn resolve_branch_and_empty_state(
+    repo: &Path,
+    branch_override: Option<&str>,
+) -> (Option<String>, ChecksEmptyState) {
+    if let Some(op) = detect_git_operation(repo) {
+        return (None, ChecksEmptyState::OperationInProgress(op));
     }
-    crate::pull_request::git_output(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .map(|s| s.trim().to_owned())
-        .ok()
-        .filter(|s| !s.is_empty() && s != "HEAD")
-        .unwrap_or_else(|| "HEAD".to_owned())
+    let resolved = if let Some(custom) = branch_override {
+        let trimmed = custom.trim();
+        (!trimmed.is_empty() && trimmed != "HEAD").then(|| trimmed.to_owned())
+    } else {
+        crate::pull_request::git_output(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|s| s.trim().to_owned())
+            .ok()
+            .filter(|s| !s.is_empty() && s != "HEAD")
+    };
+    let Some(branch) = resolved else {
+        return (None, ChecksEmptyState::DetachedHead);
+    };
+    if is_default_branch(repo, &branch) {
+        return (Some(branch), ChecksEmptyState::DefaultBranch);
+    }
+    (Some(branch), ChecksEmptyState::NoPr)
 }
 
 impl Panel {
@@ -237,12 +299,16 @@ impl Panel {
         let service = Arc::clone(&self.editing.pr_service);
 
         self.checks.task = Some(cx.spawn(async move |this, cx| {
-            let (branch, result) = cx
+            let (branch, empty_state, result) = cx
                 .background_executor()
                 .spawn(async move {
-                    let branch = resolve_branch(&repo, branch_override.as_deref());
-                    let res = service.inspect(&repo, &branch);
-                    (branch, res)
+                    let (branch, empty_state) =
+                        resolve_branch_and_empty_state(&repo, branch_override.as_deref());
+                    let res = match (&branch, &empty_state) {
+                        (Some(branch), ChecksEmptyState::NoPr) => service.inspect(&repo, branch),
+                        _ => Ok(PrInspection::default()),
+                    };
+                    (branch.unwrap_or_default(), empty_state, res)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -251,6 +317,7 @@ impl Panel {
                 }
                 this.checks.loading = false;
                 this.checks.branch = branch;
+                this.checks.empty = empty_state;
                 match result {
                     Ok(inspection) => {
                         this.checks.selected_checks.clear();
@@ -297,7 +364,11 @@ impl Panel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let branch = resolve_branch(&repo, branch_override.as_deref());
+                    let (branch, _) =
+                        resolve_branch_and_empty_state(&repo, branch_override.as_deref());
+                    let Some(branch) = branch else {
+                        return Err(text::GH_FAILED.get());
+                    };
                     service.set_draft(&repo, &branch, to_draft)
                 })
                 .await;
@@ -866,17 +937,22 @@ impl Panel {
             return Self::render_empty_state(
                 "pr-checks-empty",
                 IconName::CircleCheck,
-                text::NO_PR_TITLE.get(),
-                text::NO_PR_DESC.get(),
+                &self.checks.empty.title(),
+                self.checks.empty.description(),
                 cx,
             )
             .into_any_element();
         };
 
         if pr.status == Status::NoPr {
+            let empty_state = &self.checks.empty;
+            let selector = empty_state.selector();
+            let title = empty_state.title();
+            let desc = empty_state.description();
+            let can_create = empty_state.can_create_pr();
             return div()
-                .id("pr-checks-no-pr")
-                .debug_selector(|| "pr-checks-no-pr".into())
+                .id(selector)
+                .debug_selector(move || selector.into())
                 .flex_1()
                 .min_h_0()
                 .px_4()
@@ -897,24 +973,26 @@ impl Panel {
                         .text_size(crate::ui::TEXT_SM)
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(p.sidebar_foreground)
-                        .child(text::NO_PR_TITLE.get()),
+                        .child(title),
                 )
                 .child(
                     div()
                         .text_size(crate::ui::TEXT_XS)
                         .text_color(p.muted_foreground)
-                        .child(text::NO_PR_DESC.get()),
+                        .child(desc),
                 )
-                .child(
-                    Button::new("pr-checks-create")
-                        .debug_selector(|| "pr-checks-create".into())
-                        .small()
-                        .outline()
-                        .label(text::CREATE.get())
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_pr_dialog(window, cx);
-                        })),
-                )
+                .when(can_create, |d| {
+                    d.child(
+                        Button::new("pr-checks-create")
+                            .debug_selector(|| "pr-checks-create".into())
+                            .small()
+                            .outline()
+                            .label(text::CREATE.get())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_pr_dialog(window, cx);
+                            })),
+                    )
+                })
                 .into_any_element();
         }
 

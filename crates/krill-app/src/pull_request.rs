@@ -509,15 +509,25 @@ pub fn shared() -> Arc<Service> {
 struct Gh;
 impl Runner for Gh {
     fn run(&self, folder: &Path, branch: &str, action: Action) -> io::Result<Status> {
-        if action == Action::Refresh && !has_github_remote(folder) {
+        let branch = branch.trim();
+        if branch.is_empty() || branch == "HEAD" {
             return Ok(Status::NoPr);
         }
-        let bytes = execute(&mut command(folder, branch, action), TIMEOUT)?;
-        if action == Action::Create {
-            Ok(Status::NoPr)
-        } else {
-            parse(&bytes)
+        if action == Action::Refresh {
+            if !has_github_remote(folder) || is_default_branch(folder, branch) {
+                return Ok(Status::NoPr);
+            }
+            let status = refresh_branch_status(folder, branch)?;
+            if status != Status::NoPr {
+                return Ok(status);
+            }
+            if let Some(upstream) = tracked_upstream_branch(folder, branch) {
+                return refresh_branch_status(folder, &upstream);
+            }
+            return Ok(Status::NoPr);
         }
+        execute(&mut command(folder, branch, action), TIMEOUT)?;
+        Ok(Status::NoPr)
     }
 
     fn create_pr(
@@ -604,10 +614,23 @@ fn command(folder: &Path, branch: &str, action: Action) -> Command {
             "--limit",
             "1",
             "--json",
-            "state,isDraft",
+            "state,isDraft,headRefOid",
         ]);
     }
     cmd
+}
+
+fn refresh_branch_status(folder: &Path, branch: &str) -> io::Result<Status> {
+    let bytes = execute(&mut command(folder, branch, Action::Refresh), TIMEOUT)?;
+    let (status, head_ref_oid) = parse_with_head_oid(&bytes)?;
+    if status == Status::Merged
+        && head_ref_oid
+            .as_deref()
+            .is_some_and(|oid| is_stale_merged_pr(folder, oid))
+    {
+        return Ok(Status::NoPr);
+    }
+    Ok(status)
 }
 
 fn create_command(folder: &Path, branch: &str, title: &str, body: &str) -> Command {
@@ -755,19 +778,166 @@ struct PullRequest {
     state: String,
     #[serde(rename = "isDraft")]
     draft: bool,
+    #[serde(rename = "headRefOid", default)]
+    head_ref_oid: String,
 }
+
+#[cfg(test)]
 fn parse(bytes: &[u8]) -> io::Result<Status> {
+    parse_with_head_oid(bytes).map(|(status, _)| status)
+}
+
+fn parse_with_head_oid(bytes: &[u8]) -> io::Result<(Status, Option<String>)> {
     let prs: Vec<PullRequest> = serde_json::from_slice(bytes).map_err(io::Error::other)?;
     match prs.first() {
-        None => Ok(Status::NoPr),
-        Some(pr) => match pr.state.as_str() {
-            "OPEN" if pr.draft => Ok(Status::Draft),
-            "OPEN" => Ok(Status::Open),
-            "MERGED" => Ok(Status::Merged),
-            "CLOSED" => Ok(Status::Closed),
-            _ => Err(io::Error::other("unknown PR state")),
-        },
+        None => Ok((Status::NoPr, None)),
+        Some(pr) => {
+            let status = match pr.state.as_str() {
+                "OPEN" if pr.draft => Status::Draft,
+                "OPEN" => Status::Open,
+                "MERGED" => Status::Merged,
+                "CLOSED" => Status::Closed,
+                _ => return Err(io::Error::other("unknown PR state")),
+            };
+            let oid =
+                (!pr.head_ref_oid.trim().is_empty()).then(|| pr.head_ref_oid.trim().to_owned());
+            Ok((status, oid))
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitOperation {
+    Rebase,
+    Merge,
+    CherryPick,
+}
+
+impl GitOperation {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rebase => text::GIT_OP_REBASE.get(),
+            Self::Merge => text::GIT_OP_MERGE.get(),
+            Self::CherryPick => text::GIT_OP_CHERRY_PICK.get(),
+        }
+    }
+}
+
+#[must_use]
+pub fn detect_git_operation(folder: &Path) -> Option<GitOperation> {
+    for (marker, op) in [
+        ("rebase-merge", GitOperation::Rebase),
+        ("rebase-apply", GitOperation::Rebase),
+        ("MERGE_HEAD", GitOperation::Merge),
+        ("CHERRY_PICK_HEAD", GitOperation::CherryPick),
+    ] {
+        if let Ok(rel) = git_output(folder, &["rev-parse", "--git-path", marker]) {
+            let trimmed = rel.trim();
+            if !trimmed.is_empty() {
+                let path = Path::new(trimmed);
+                let full = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    folder.join(path)
+                };
+                if full.exists() {
+                    return Some(op);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[must_use]
+pub fn is_default_branch_name(branch: &str) -> bool {
+    matches!(branch.trim(), "main" | "master" | "dev")
+}
+
+#[must_use]
+pub fn is_default_branch(folder: &Path, branch: &str) -> bool {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return false;
+    }
+    if is_default_branch_name(branch) {
+        return true;
+    }
+    if let Ok(symref) = git_output(
+        folder,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    ) {
+        let symref = symref.trim();
+        let origin_default = symref
+            .strip_prefix("refs/remotes/origin/")
+            .unwrap_or(symref);
+        if !origin_default.is_empty() && origin_default == branch {
+            return true;
+        }
+    }
+    false
+}
+
+#[must_use]
+pub fn tracked_upstream_branch(folder: &Path, branch: &str) -> Option<String> {
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    let upstream_arg = format!("{branch}@{{upstream}}");
+    let raw = git_output(
+        folder,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            &upstream_arg,
+        ],
+    )
+    .or_else(|_| {
+        git_output(
+            folder,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        )
+    })
+    .ok()?;
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix("refs/remotes/").unwrap_or(trimmed);
+    let (_, remote_branch) = stripped.split_once('/')?;
+    let remote_branch = remote_branch.trim();
+    if remote_branch.is_empty()
+        || remote_branch == "HEAD"
+        || remote_branch == branch
+        || is_default_branch(folder, remote_branch)
+    {
+        return None;
+    }
+    Some(remote_branch.to_owned())
+}
+
+#[must_use]
+pub fn is_stale_merged_pr(folder: &Path, head_ref_oid: &str) -> bool {
+    let pr_oid = head_ref_oid.trim();
+    if pr_oid.is_empty() {
+        return false;
+    }
+    let Ok(local_head) = git_output(folder, &["rev-parse", "--verify", "HEAD"]) else {
+        return false;
+    };
+    let local_oid = local_head.trim();
+    if local_oid.is_empty() || local_oid.eq_ignore_ascii_case(pr_oid) {
+        return false;
+    }
+    if git_output(folder, &["merge-base", "--is-ancestor", local_oid, pr_oid]).is_ok() {
+        return false;
+    }
+    true
 }
 
 const AI_TIMEOUT: Duration = Duration::from_secs(20);

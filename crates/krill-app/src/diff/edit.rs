@@ -1392,12 +1392,32 @@ impl Panel {
             cx.notify();
             return;
         }
-        let branch =
+        let branch = if let Some(custom) = self.checks.branch_override.as_deref()
+            && !custom.trim().is_empty()
+            && custom.trim() != "HEAD"
+        {
+            custom.trim().to_owned()
+        } else if let Ok(out) =
             crate::pull_request::git_output(&self.repo, &["rev-parse", "--abbrev-ref", "HEAD"])
-                .map(|s| s.trim().to_owned())
-                .ok()
-                .filter(|s| !s.is_empty() && s != "HEAD")
-                .unwrap_or_else(|| "HEAD".to_owned());
+            && let trimmed = out.trim()
+            && !trimmed.is_empty()
+            && trimmed != "HEAD"
+        {
+            trimmed.to_owned()
+        } else {
+            self.editing.note = crate::i18n::catalog::pull_request::DETACHED_HEAD_DESC
+                .get()
+                .into();
+            cx.notify();
+            return;
+        };
+        if crate::pull_request::is_default_branch(&self.repo, &branch) {
+            self.editing.note = crate::i18n::catalog::pull_request::DEFAULT_BRANCH_DESC
+                .get()
+                .into();
+            cx.notify();
+            return;
+        }
         let repo = self.repo.clone();
         let service = Arc::clone(&self.editing.pr_service);
         let dialog =
