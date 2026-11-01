@@ -183,35 +183,19 @@ impl SettingsView {
                             ),
                     )
                     .child(
-                        layout::controls()
-                            .child(
-                                layout::secondary(
-                                    "admin-local-open-mobile",
-                                    text::MACHINES_OPEN_MOBILE_QR.get(),
-                                )
-                                .debug_selector(|| "admin-local-open-mobile".into())
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.set_tab(AdminTab::Mobile, cx);
-                                    },
-                                )),
+                        layout::controls().child(
+                            layout::secondary(
+                                "admin-local-open-invite",
+                                text::MACHINES_MANAGE_INVITE.get(),
                             )
-                            .child(
-                                layout::secondary(
-                                    "admin-local-open-invite",
-                                    text::MACHINES_MANAGE_INVITE.get(),
-                                )
-                                .debug_selector(|| "admin-local-open-invite".into())
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.machine_page = MachinePage::ThisComputer;
-                                        this.disarm(cx);
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
+                            .debug_selector(|| "admin-local-open-invite".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.machine_page = MachinePage::ThisComputer;
+                                this.disarm(cx);
+                                cx.notify();
+                            })),
+                        ),
                     ),
             );
         }

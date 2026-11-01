@@ -2175,7 +2175,6 @@ pub enum AdminTab {
     Appearance,
     Agents,
     Accounts,
-    /// 내비의 '기기'. 머신과 모바일을 세그먼트로 나눈다.
     Machines,
     Mobile,
     Shortcuts,
@@ -2208,29 +2207,28 @@ fn settings_nav_tab(tab: AdminTab, selected: bool) -> gpui::Stateful<gpui::Div> 
 }
 
 impl AdminTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Appearance,
         Self::Agents,
         Self::Accounts,
         Self::Machines,
+        Self::Mobile,
         Self::Shortcuts,
         Self::System,
     ];
 
     /// 내비에 없고 부모 탭 안에서 여는 페이지.
-    pub const SUBPAGES: [Self; 5] = [
-        Self::Mobile,
+    pub const SUBPAGES: [Self; 4] = [
         Self::Project,
         Self::QuickCommands,
         Self::Install,
         Self::Disk,
     ];
 
-    /// 내비에서 강조할 탭. 세그먼트와 하위 페이지는 부모 탭에 속한다.
+    /// 내비에서 강조할 탭. 하위 페이지는 부모 탭에 속한다.
     #[must_use]
     pub const fn page(self) -> Self {
         match self {
-            Self::Mobile => Self::Machines,
             Self::Project | Self::QuickCommands => Self::Agents,
             Self::Install | Self::Disk => Self::System,
             tab => tab,
@@ -2263,7 +2261,7 @@ impl AdminTab {
             Self::Accounts => text::TAB_ACCOUNTS,
             Self::Agents => text::TAB_AGENTS,
             Self::Install => text::TAB_INSTALL,
-            Self::Machines => text::TAB_DEVICES,
+            Self::Machines => text::TAB_REMOTE,
             Self::Project => text::TAB_PROJECT,
             Self::QuickCommands => text::TAB_QUICK_COMMANDS,
             Self::Shortcuts => text::TAB_SHORTCUTS,
@@ -2279,7 +2277,7 @@ impl AdminTab {
             Self::Accounts => text::TAB_ACCOUNTS_DESC,
             Self::Agents => text::AGENTS_DESC,
             Self::Install => text::TAB_INSTALL_DESC,
-            Self::Machines => text::TAB_DEVICES_DESC,
+            Self::Machines => text::TAB_REMOTE_DESC,
             Self::Project => text::TAB_PROJECT_DESC,
             Self::QuickCommands => text::TAB_QUICK_COMMANDS_DESC,
             Self::Shortcuts => text::SHORTCUTS_DESC,
@@ -11231,33 +11229,10 @@ impl Render for SettingsView {
                 AdminTab::Disk => div().child(self.render_space_section(cx)),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
             };
-            let device_tabs = (current_tab.page() == AdminTab::Machines).then(|| {
-                let segment = |id: &'static str, label: &'static str, tab: AdminTab| {
-                    layout::segment(p, id, label, current_tab == tab)
-                        .debug_selector(move || id.into())
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
-                };
-                layout::segmented_control(
-                    p,
-                    vec![
-                        segment(
-                            "admin-machines-segment",
-                            text::TAB_MACHINES.get(),
-                            AdminTab::Machines,
-                        ),
-                        segment(
-                            "admin-tab-mobile",
-                            crate::i18n::catalog::mobile::TAB.get(),
-                            AdminTab::Mobile,
-                        ),
-                    ],
-                )
-            });
             let body = div()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .children(device_tabs)
                 .child(content)
                 .w_full()
                 .min_w_0()

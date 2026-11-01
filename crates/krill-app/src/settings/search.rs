@@ -59,20 +59,20 @@ mod tests {
         }
         // 탭 이름·부제(한·영 모두)도 맞는다(OWE-795).
         assert!(search_tabs("shortcuts").contains(&AdminTab::Shortcuts));
-        assert_eq!(search_tabs("스마트폰"), [AdminTab::Machines]);
-        assert_eq!(search_tabs("qr"), [AdminTab::Machines]);
+        assert_eq!(search_tabs("스마트폰"), [AdminTab::Mobile]);
+        assert_eq!(search_tabs("qr"), [AdminTab::Mobile]);
         assert!(search_tabs("zzz-no-such-setting").is_empty());
     }
 
     #[test]
     fn search_reaches_segments_and_subpages() {
-        assert_eq!(search_target("qr", AdminTab::Machines), AdminTab::Machines);
+        assert_eq!(search_target("qr", AdminTab::Mobile), AdminTab::Mobile);
         assert_eq!(
             search_target("초대", AdminTab::Machines),
             AdminTab::Machines
         );
         assert_eq!(
-            search_target("스마트폰", AdminTab::Machines),
+            search_target("스마트폰", AdminTab::Mobile),
             AdminTab::Mobile
         );
         assert_eq!(search_target("ssh", AdminTab::Machines), AdminTab::Machines);
