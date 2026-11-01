@@ -152,6 +152,59 @@ fn new_agent_sessions_default_to_yolo_unless_manual_is_explicit() {
 }
 
 #[gpui::test]
+fn many_account_hosts_wrap_below_their_description(cx: &mut TestAppContext) {
+    let d = dir("account-host-bar");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1000.), px(3000.)));
+    vcx.run_until_parked();
+    let names = [
+        "oci-arm",
+        "이상덕세무사사무소",
+        "이상덕세무사사무소 2",
+        "설미니",
+        "ssh-1790155265904-4y0gto",
+        "ssh-1792230568883-ji8og8",
+    ];
+    view.update(vcx, |v, cx| {
+        v.set_tab(AdminTab::Accounts, cx);
+        let mut hosts = vec![(crate::hosts::HostId::Local, "내 Mac".to_owned(), None)];
+        hosts.extend(names.iter().enumerate().map(|(i, name)| {
+            (
+                crate::hosts::HostId::Remote(format!("host-{i}")),
+                (*name).to_owned(),
+                None,
+            )
+        }));
+        v.sync_account_hosts(hosts, std::collections::BTreeMap::new(), cx);
+    });
+    vcx.run_until_parked();
+    let bar = vcx.debug_bounds("admin-accounts-host-bar").unwrap();
+    assert!(bar.size.height < px(200.), "description collapsed: {bar:?}");
+    let first = vcx.debug_bounds("admin-accounts-host-local").unwrap();
+    assert!(
+        first.top() > bar.top() + px(24.),
+        "selector is below the text"
+    );
+    for selector in [
+        "admin-accounts-host-host-0",
+        "admin-accounts-host-host-1",
+        "admin-accounts-host-host-2",
+        "admin-accounts-host-host-3",
+        "admin-accounts-host-host-4",
+        "admin-accounts-host-host-5",
+    ] {
+        let host = vcx.debug_bounds(selector).unwrap();
+        assert!(
+            bar.left() <= host.left() && host.right() <= bar.right(),
+            "{host:?} {bar:?}"
+        );
+        assert!(host.bottom() <= bar.bottom(), "{host:?} {bar:?}");
+    }
+    fs::remove_dir_all(d).unwrap();
+}
+
+#[gpui::test]
 fn account_login_and_status_badges_are_visible_without_launching_cli(cx: &mut TestAppContext) {
     use krill_proto::usage::{
         AccountInfo, AccountStatus, AccountStatusInfo, ProviderKind, Snapshot,

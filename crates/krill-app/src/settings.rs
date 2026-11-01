@@ -7954,16 +7954,25 @@ impl SettingsView {
                     }))
                 })
                 .collect::<Vec<_>>();
+            // Host count is unbounded, so the selector must never share a row with the text.
             root = root.child(
-                layout::row(p)
+                layout::card(p)
                     .id("admin-accounts-host-bar")
                     .debug_selector(|| "admin-accounts-host-bar".into())
+                    .flex()
+                    .flex_col()
+                    .gap_2()
                     .child(layout::label(
                         p,
                         text::ACCOUNTS_HOST_TITLE.get(),
                         Some(text::ACCOUNTS_HOST_DESC.get()),
                     ))
-                    .child(layout::controls().child(layout::segmented_control(p, host_btns))),
+                    .child(
+                        layout::segmented_control(p, host_btns)
+                            .self_start()
+                            .max_w_full()
+                            .flex_wrap(),
+                    ),
             );
         }
 
