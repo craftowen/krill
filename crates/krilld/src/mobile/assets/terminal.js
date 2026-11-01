@@ -30,6 +30,7 @@ globalThis.MkKeyboard = (() => {
         "input,textarea,[contenteditable]:not([contenteditable=false])",
       );
   let inset = 0,
+    top = 0,
     frame = 0,
     resized = false;
 
@@ -50,6 +51,12 @@ globalThis.MkKeyboard = (() => {
     ) {
       globalThis.scrollTo?.(0, 0);
       next = occlusion();
+    }
+    // iOS can keep the page panned above the keyboard, so the app follows the visual viewport.
+    const nextTop = next > 0 ? Math.max(0, Math.round(vv.offsetTop || 0)) : 0;
+    if (nextTop !== top) {
+      top = nextTop;
+      doc?.documentElement?.style.setProperty("--viewport-top", `${top}px`);
     }
     const changed = next !== inset,
       notify = changed || resized;
