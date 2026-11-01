@@ -73,11 +73,11 @@ impl Adapter for Claude {
                 "Choose Claude effort separately from the model",
             ));
         }
-        set_model(context, &live.tap()?, model)
+        set_model(context, &live.tap()?, live.working(), model)
     }
 
     fn set_effort(&self, _context: &Context, live: &Live<'_>, effort: &str) -> io::Result<Value> {
-        set_effort(&live.tap()?, effort)
+        set_effort(&live.tap()?, live.working(), effort)
     }
 
     fn observe(
@@ -228,7 +228,7 @@ fn models(context: &Context, tap: &Tap) -> io::Result<Value> {
     )
 }
 
-fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Value> {
+fn set_model(context: &Context, tap: &Tap, working: bool, id: &str) -> io::Result<Value> {
     let choices = choices(context);
     let Some((_, label)) = choices.iter().find(|(alias, _)| *alias == id) else {
         return Err(io::Error::new(
@@ -241,17 +241,20 @@ fn set_model(context: &Context, tap: &Tap, id: &str) -> io::Result<Value> {
         return Err(io::Error::other(WAIT));
     }
     let command = format!("/model {id}");
-    tap.guarded_command(revision.0, command.as_bytes(), |screen, pasted| {
-        verified(screen) && composer(screen, pasted.then_some(command.as_str()))
-    })?;
+    super::command(
+        tap,
+        working,
+        revision.0,
+        command.as_bytes(),
+        |screen, pasted| verified(screen) && composer(screen, pasted.then_some(command.as_str())),
+    )?;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(2) {
         std::thread::sleep(Duration::from_millis(25));
         let (screen, after, _) = tap.capture();
         if after.0 > revision.0
             && composer(&screen, None)
-            && confirmed(&screen, &command, label)
-            && native::contains_phrase(&native::fresh_text(tap, seq.0), "Set model to")
+            && confirmed(&native::fresh_text(tap, seq.0), label)
         {
             return Ok(json!({"applied":true,"supported":true,"model":id}));
         }
@@ -269,7 +272,7 @@ fn effort_available(screen: &Screen) -> bool {
     effort_version(screen) && composer(screen, None)
 }
 
-fn set_effort(tap: &Tap, effort: &str) -> io::Result<Value> {
+fn set_effort(tap: &Tap, working: bool, effort: &str) -> io::Result<Value> {
     if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -283,40 +286,25 @@ fn set_effort(tap: &Tap, effort: &str) -> io::Result<Value> {
         ));
     }
     let command = format!("/effort {effort}");
-    tap.guarded_command(revision.0, command.as_bytes(), |screen, pasted| {
-        effort_version(screen) && composer(screen, pasted.then_some(command.as_str()))
-    })?;
+    super::command(
+        tap,
+        working,
+        revision.0,
+        command.as_bytes(),
+        |screen, pasted| {
+            effort_version(screen) && composer(screen, pasted.then_some(command.as_str()))
+        },
+    )?;
     Ok(
         json!({"applied":false,"requested":true,"supported":true,"effort":effort,"reason":"Claude received the effort command. Its current effort has not been observed; the command will not be resent."}),
     )
 }
 
-/// The newest prompt row must be this command's echo, which rules out an older confirmation. The
-/// text below it runs on through a wrapped confirmation and the effort indicator.
-fn confirmed(screen: &Screen, command: &str, label: &str) -> bool {
-    let rows: Vec<_> = (0..usize::from(screen.cursor.line).saturating_sub(1))
-        .map(|y| native::row(screen, y))
-        .collect();
-    let Some((echo, output)) = rows
-        .iter()
-        .rposition(|row| row.starts_with('❯'))
-        .and_then(|echo| rows.get(echo..))
-        .and_then(<[String]>::split_first)
-    else {
-        return false;
-    };
-    let output = native::words(output);
+/// Only output since the command counts, so an older confirmation cannot match. Claude draws
+/// this as a transcript row when idle and as a floating note mid-turn.
+fn confirmed(fresh: &str, label: &str) -> bool {
     let label = label.strip_suffix(" (recommended)").unwrap_or(label);
-    let Some(rest) = output
-        .strip_prefix("⎿ Set model to ")
-        .and_then(|value| value.strip_prefix(label))
-    else {
-        return false;
-    };
-    echo.split_whitespace()
-        .eq(format!("❯ {command}").split_whitespace())
-        && (rest.starts_with(' ') || rest.starts_with('('))
-        && (output.contains("default for new sessions") || output.contains("for this session only"))
+    native::contains_phrase(fresh, &format!("Set model to {label}"))
 }
 
 #[cfg(test)]

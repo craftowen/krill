@@ -155,9 +155,15 @@ impl Adapter for Codex {
             || format!("/model {model}"),
             |effort| format!("/model {model} --reasoning={effort}"),
         );
-        tap.guarded_command(revision.0, command.as_bytes(), |screen, pasted| {
-            verified(screen) && composer(screen, pasted.then_some(command.as_str()))
-        })?;
+        super::command(
+            &tap,
+            live.working(),
+            revision.0,
+            command.as_bytes(),
+            |screen, pasted| {
+                verified(screen) && composer(screen, pasted.then_some(command.as_str()))
+            },
+        )?;
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(25));

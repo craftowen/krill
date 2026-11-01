@@ -98,6 +98,42 @@ fn stale_busy_draft_and_incomplete_paste_write_nothing() {
 }
 
 #[test]
+fn a_streaming_turn_needs_the_composer_check_but_not_settled_output() {
+    let (session, mut user) = fixture();
+    let tap = session.tap();
+    user.write_all(b"\x1b[2J\x1b[HEMPTY")
+        .expect("PTY fixture operation");
+    while !text(&tap.capture().0).contains("EMPTY") {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(streaming_command(&tap, b"/model actual", |_, _| false).is_err());
+    let mut b = [0; 512];
+    assert_eq!(
+        user.read(&mut b)
+            .expect_err("write must be rejected")
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let writer = tap.clone();
+    let command = b"/model actual";
+    let worker = thread::spawn(move || {
+        streaming_command(&writer, command, |s, pasted| {
+            text(s).contains(if pasted { "/model actual" } else { "EMPTY" })
+        })
+    });
+    assert_eq!(read_until(&mut user, command.len()), command);
+    user.write_all(b"\x1b[2J\x1b[H/model actual")
+        .expect("PTY fixture operation");
+    assert_eq!(read_until(&mut user, 1), b"\r");
+    worker
+        .join()
+        .expect("PTY fixture operation")
+        .expect("PTY fixture operation");
+    drop(user);
+    session.wait().expect("PTY fixture operation");
+}
+
+#[test]
 fn echo_precedes_enter_and_other_input_cannot_interleave() {
     let (session, mut user) = fixture();
     let tap = session.tap();

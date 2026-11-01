@@ -25,8 +25,6 @@ fn screen(lines: &[&str]) -> Screen {
 }
 
 const RULE: &str = "────────────────────────────────────────";
-const EFFORT_ROW: &str = "                                                                                  ● high · /effort";
-const SAVED: &str = "  ⎿  Set model to Opus 5.5 and saved as your default for new sessions";
 
 /// Rows `above` the composer, then the 2.1.316 composer and footer.
 fn composer_below(above: &[&str]) -> Screen {
@@ -123,66 +121,19 @@ fn empty_draft_and_exact_command_require_native_borders_cursor_and_nbsp() {
     assert!(!composer(&s, Some("/model")));
 }
 #[test]
-fn native_persistence_is_disclosed_but_unrelated_models_are_not_confirmed() {
-    let s = composer_below(&[
-        "❯ /model sonnet",
-        "  ⎿  Set model to Sonnet actual-version for this session only",
-    ]);
-    assert!(confirmed(&s, "/model sonnet", "Sonnet"));
-    assert!(!confirmed(&s, "/model sonnet", "Opus"));
-    let persistent = composer_below(&[
-        "❯ /model sonnet",
-        "  ⎿  Set model to Sonnet actual-version and saved as your default for new sessions",
-    ]);
-    assert!(confirmed(&persistent, "/model sonnet", "Sonnet"));
-    let default = composer_below(&[
-        "❯ /model default",
-        "  ⎿  Set model to Default (Opus 5.5) for this session only",
-    ]);
+fn only_the_chosen_model_is_confirmed_as_a_row_or_a_floating_note() {
+    let row = "⎿ Set model to Sonnet 4.6 and saved as your default for new sessions";
+    assert!(confirmed(row, "Sonnet"));
+    assert!(!confirmed(row, "Opus"));
+    let note = "   1562\n        Set model to Opus 5.5 and saved as your default";
+    assert!(confirmed(note, "Opus"));
     assert!(confirmed(
-        &default,
-        "/model default",
+        "Set model to Default (Opus 5.5)",
         "Default (recommended)"
     ));
+    assert!(!confirmed("/model opus", "Opus"));
 }
 
-#[test]
-fn the_effort_indicator_row_does_not_hide_the_confirmation() {
-    let s = composer_below(&["❯ /model opus", SAVED, EFFORT_ROW]);
-    assert!(confirmed(&s, "/model opus", "Opus"));
-    assert!(!confirmed(&s, "/model sonnet", "Sonnet"));
-}
-
-#[test]
-fn a_confirmation_wrapped_by_a_narrow_terminal_is_recognized() {
-    let s = composer_below(&[
-        "❯ /model opus",
-        "  ⎿  Set model to Opus 5.5 and saved as your default for",
-        "     new sessions",
-        "                                      ● high · /effort",
-    ]);
-    assert!(confirmed(&s, "/model opus", "Opus"));
-}
-
-#[test]
-fn an_older_confirmation_is_not_this_commands_confirmation() {
-    for above in [
-        &["❯ /model opus", SAVED, "❯ /model opus", EFFORT_ROW][..],
-        &["❯ /model opus", SAVED, "❯ hello", "● Hi", EFFORT_ROW],
-        &[
-            "❯ /model opus",
-            SAVED,
-            "❯ /model opus",
-            "  ⎿  Model unavailable",
-        ],
-        &["❯ /model sonnet", SAVED, EFFORT_ROW],
-        &[SAVED, EFFORT_ROW],
-    ] {
-        assert!(!confirmed(&composer_below(above), "/model opus", "Opus"));
-    }
-}
-
-#[cfg(unix)]
 #[test]
 fn excluded_known_alias_is_rejected_before_any_pty_write() {
     use crate::{appearance::Appearance, session::Session};
@@ -218,7 +169,7 @@ fn excluded_known_alias_is_rejected_before_any_pty_write() {
     )
     .unwrap();
     assert_eq!(
-        set_model(&context, &session.tap(), "sonnet")
+        set_model(&context, &session.tap(), false, "sonnet")
             .unwrap_err()
             .kind(),
         io::ErrorKind::InvalidInput

@@ -342,14 +342,20 @@ impl Adapter for Agy {
             return Ok(done(true));
         }
         let command = format!("/model {}", level.id);
-        tap.guarded_command(revision.0, command.as_bytes(), |screen, pasted| {
-            verified(screen)
-                && if pasted {
-                    echoed(screen, &command, level)
-                } else {
-                    composer(screen, None)
-                }
-        })?;
+        super::command(
+            &tap,
+            live.working(),
+            revision.0,
+            command.as_bytes(),
+            |screen, pasted| {
+                verified(screen)
+                    && if pasted {
+                        echoed(screen, &command, level)
+                    } else {
+                        composer(screen, None)
+                    }
+            },
+        )?;
         let started = Instant::now();
         while started.elapsed() < CONFIRM {
             std::thread::sleep(Duration::from_millis(25));

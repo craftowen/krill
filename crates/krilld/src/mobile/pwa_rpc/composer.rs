@@ -57,7 +57,7 @@ struct Live<'a> {
 }
 
 impl Live<'_> {
-    /// Gated on an idle agent, so holding one is the authority to write.
+    /// Refused during a question or permission prompt, so holding one is the authority to write.
     fn tap(&self) -> io::Result<Tap> {
         self.backend
             .registry
@@ -66,12 +66,34 @@ impl Live<'_> {
             .mobile_composer_tap(self.session)
     }
 
+    fn working(&self) -> bool {
+        self.backend
+            .registry
+            .upgrade()
+            .is_some_and(|registry| registry.agent_working(self.session))
+    }
+
     /// Read-only, so it also works while the agent is busy.
     fn screen(&self) -> Option<Screen> {
         self.backend
             .registry
             .upgrade()?
             .session_capture(self.session)
+    }
+}
+
+/// Native CLIs accept these commands mid-turn, while their output keeps the terminal moving.
+fn command(
+    tap: &Tap,
+    working: bool,
+    revision: u64,
+    bytes: &[u8],
+    accepts: impl Fn(&Screen, bool) -> bool,
+) -> io::Result<()> {
+    if working {
+        tap.streaming_command(bytes, accepts)
+    } else {
+        tap.guarded_command(revision, bytes, accepts)
     }
 }
 

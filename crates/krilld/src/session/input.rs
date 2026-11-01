@@ -185,6 +185,27 @@ pub(super) fn guarded_command(
     command: &[u8],
     accepts: impl Fn(&krill_proto::screen::Screen, bool) -> bool,
 ) -> io::Result<()> {
+    write_command(tap, Some(revision), command, accepts)
+}
+
+/// Output never settles during an agent turn, so the composer inspected under the live lock is
+/// the only authority here.
+#[cfg(unix)]
+pub(super) fn streaming_command(
+    tap: &Tap,
+    command: &[u8],
+    accepts: impl Fn(&krill_proto::screen::Screen, bool) -> bool,
+) -> io::Result<()> {
+    write_command(tap, None, command, accepts)
+}
+
+#[cfg(unix)]
+fn write_command(
+    tap: &Tap,
+    settled: Option<u64>,
+    command: &[u8],
+    accepts: impl Fn(&krill_proto::screen::Screen, bool) -> bool,
+) -> io::Result<()> {
     if command.is_empty() || command.len() > 256 || command.iter().any(u8::is_ascii_control) {
         return Err(io::ErrorKind::InvalidInput.into());
     }
@@ -202,15 +223,17 @@ pub(super) fn guarded_command(
     if clients.sleeping
         || state.paste
         || state.matched != 0
-        || live.revision != revision
+        || settled.is_some_and(|revision| {
+            live.revision != revision || live.last_output.elapsed() < Duration::from_millis(100)
+        })
         || crate::status::now_ns().saturating_sub(live.last_input_ns) < 250_000_000
-        || live.last_output.elapsed() < Duration::from_millis(100)
         || !accepts(&live.engine.screen(), false)
     {
         return Err(io::Error::other(
             "Wait for an idle terminal with an empty native composer",
         ));
     }
+    let revision = live.revision;
     let bytes = if live
         .engine
         .input_modes()
@@ -269,6 +292,15 @@ pub(super) fn guarded_command(
         io::ErrorKind::Unsupported,
         "Verified atomic model input is unavailable on Windows",
     ))
+}
+
+#[cfg(windows)]
+pub(super) fn streaming_command(
+    tap: &Tap,
+    command: &[u8],
+    accepts: impl Fn(&krill_proto::screen::Screen, bool) -> bool,
+) -> io::Result<()> {
+    guarded_command(tap, 0, command, accepts)
 }
 
 pub(super) fn write_input(tap: &Tap, bytes: &[u8], peer: Option<BorrowedFd<'_>>) -> io::Result<()> {

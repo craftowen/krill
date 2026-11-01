@@ -2699,8 +2699,7 @@ impl Registry {
             || self.agents.account_binding_retiring(id)
             || matches!(
                 self.status.get(id).state,
-                control::AgentState::Working
-                    | control::AgentState::Waiting
+                control::AgentState::Waiting
                     | control::AgentState::Blocked
                     | control::AgentState::Exited
             )
@@ -2710,6 +2709,10 @@ impl Registry {
             ));
         }
         Ok(entry.session.tap())
+    }
+
+    pub(crate) fn agent_working(&self, id: SessionId) -> bool {
+        self.status.get(id).state == control::AgentState::Working
     }
 
     /// Read-only and not gated on the agent being idle, unlike [`Self::mobile_composer_tap`].
