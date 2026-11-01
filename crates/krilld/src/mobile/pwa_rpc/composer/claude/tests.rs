@@ -134,6 +134,7 @@ fn only_the_chosen_model_is_confirmed_as_a_row_or_a_floating_note() {
     assert!(!confirmed("/model opus", "Opus"));
 }
 
+#[cfg(unix)]
 #[test]
 fn excluded_known_alias_is_rejected_before_any_pty_write() {
     use crate::{appearance::Appearance, session::Session};
