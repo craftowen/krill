@@ -98,7 +98,7 @@
   const events=[['input',activity],['pointerdown',activity],['keydown',activity],['compositionstart',startComposition],['compositionend',endComposition],['visibilitychange',resume]];
   function start(){if(started||stopped)return;started=true;endpoint.setUpdateHandler?.(check);for(const [name,fn] of events)document.addEventListener(name,fn,true);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);navigator.serviceWorker?.addEventListener?.('controllerchange',resume);schedule();check();}
   function stop(){stopped=true;invalidate();clearTimeout(timer);endpoint.setUpdateHandler?.(null);for(const [name,fn] of events)document.removeEventListener(name,fn,true);globalThis.removeEventListener('pageshow',resume);globalThis.removeEventListener('online',resume);navigator.serviceWorker?.removeEventListener?.('controllerchange',resume);}
-  return {start,stop,check,invalidate,restore,hold(){holds++;let released=false;return ()=>{if(!released){released=true;holds--;activity();}};}};
+  return {start,stop,check,invalidate,restore,get held(){return holds>0;},hold(){holds++;let released=false;return ()=>{if(!released){released=true;holds--;activity();}};}};
  }
  function pickFile(picker){const release=M.update?.hold?.()||(()=>{}),done=()=>{picker.removeEventListener('change',done);picker.removeEventListener('cancel',done);release();};picker.addEventListener('change',done);picker.addEventListener('cancel',done);try{picker.click();}catch(error){done();throw error;}}
  M.updates={create,prepare,manifest,pickFile,captureView,restoreView};

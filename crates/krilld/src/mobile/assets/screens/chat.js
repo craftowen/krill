@@ -394,19 +394,22 @@
     });
     const attachment = el("div", undefined, "chat-actions");
     attachment.setAttribute("role", "status");
+    const photoPicker = el("input");
+    photoPicker.type = "file";
+    photoPicker.accept = "image/*";
+    photoPicker.hidden = true;
+    photoPicker.addEventListener("change", () => {
+      const f = photoPicker.files?.[0];
+      photoPicker.value = "";
+      if (f) preparePhoto(f);
+    });
     const attachBtn = button(
       t("Photo"),
       () => {
         if (entry.photo || entry.sending) return;
-        const picker = el("input");
-        picker.type = "file";
-        picker.accept = "image/*";
-        picker.addEventListener("change", () => {
-          const f = picker.files?.[0];
-          if (f) preparePhoto(f);
-        });
-        if (M.updates?.pickFile) M.updates.pickFile(picker);
-        else picker.click?.();
+        photoPicker.value = "";
+        if (M.updates?.pickFile) M.updates.pickFile(photoPicker);
+        else photoPicker.click?.();
       },
       "icon-button composer-icon",
       "plus",
@@ -433,7 +436,7 @@
     const box = el("div", undefined, "chat-composer-box");
     box.append(suggestions, input, sendBtn);
     statusRow.append(attachBtn, modelBtn, contextMeter, statusLine);
-    composer.append(attachment, box, statusRow);
+    composer.append(attachment, box, statusRow, photoPicker);
     globalThis.MkKeyboard?.keepFocus(composer, ctx.signal);
     // Read-only discovery is scoped to this mount, host cache and current provider/workspace.
     function chatAgent() {

@@ -927,20 +927,21 @@ globalThis.MkTerminalCodec = (() => {
           timer;
         this.listen(photo, "pointerdown", () => {
           held = false;
+          clearTimeout(timer);
           timer = setTimeout(() => {
             held = true;
-            (globalThis.KrillMobile?.updates?.pickFile || ((p) => p.click()))(
-              files,
-            );
           }, 350);
         });
         for (const event of ["pointerup", "pointercancel", "pointerleave"])
           this.listen(photo, event, () => clearTimeout(timer));
         this.listen(photo, "click", () => {
-          if (!held)
-            (globalThis.KrillMobile?.updates?.pickFile || ((p) => p.click()))(
-              images,
-            );
+          clearTimeout(timer);
+          const picker = held ? files : images;
+          held = false;
+          picker.value = "";
+          (globalThis.KrillMobile?.updates?.pickFile || ((p) => p.click()))(
+            picker,
+          );
         });
         this.listen(this.abort.signal, "abort", () => clearTimeout(timer));
         for (const picker of [images, files])
