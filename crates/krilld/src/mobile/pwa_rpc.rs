@@ -1197,7 +1197,7 @@ impl Backend {
             let git = git_cwd(cwd_bytes, &group)
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
-            cards.push(json!({"id":info.session.0,"state":state.state,"agent":agent,"title":title,"foreground":state.foreground,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+            cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
                 "profile_id":stored_launch.as_ref().map(|s|s.profile.as_str()),
                 "account_id":stored_launch.as_ref().and_then(|s|s.account.as_ref()).map(|a|a.id.as_str()),
                 "command_context":composer::command_context(stored_launch.as_ref(), &agent_profiles, &agent),
@@ -2037,6 +2037,15 @@ fn plan_question_keystrokes_from(
     Ok(steps)
 }
 
+/// An agent that exits and leaves its shell behind is a live shell session, not a closed one.
+fn card_state(state: control::AgentState, exited: bool) -> control::AgentState {
+    if state == control::AgentState::Exited && !exited {
+        control::AgentState::Unknown
+    } else {
+        state
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2047,6 +2056,14 @@ mod tests {
 
     fn rpc(backend: &Backend, request: &Value) -> Value {
         serde_json::from_str(&backend.request(&request.to_string())).unwrap()
+    }
+
+    #[test]
+    fn exited_agent_with_a_live_shell_stays_listed() {
+        use control::AgentState::{Exited, Unknown, Working};
+        assert_eq!(card_state(Exited, false), Unknown);
+        assert_eq!(card_state(Exited, true), Exited);
+        assert_eq!(card_state(Working, false), Working);
     }
 
     #[test]
