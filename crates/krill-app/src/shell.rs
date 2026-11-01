@@ -6821,7 +6821,14 @@ impl Shell {
                                         .child(krill_app::i18n::cached_notice(&err))
                                 })),
                         )
-                        .child(div().flex_1().child(el))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(el),
+                        )
                         .into_any_element()
                 } else {
                     el.into_any_element()
@@ -6876,10 +6883,10 @@ impl Shell {
                             .children(self.scroll_chrome(id, cx))
                             // 실행 중인 패인의 헤더만 터미널 위 오버레이로 남는다.
                             // 종료·콜드 패인의 헤더는 body가 이미 가져갔다.
-                            .children(pane_header.filter(|_| show_header))
-                            .children(sticky_popover),
+                            .children(pane_header.filter(|_| show_header)),
                     )
-                    .children(self.render_pane_chat_overlay(id, window, cx)),
+                    .children(self.render_pane_chat_overlay(id, window, cx))
+                    .children(sticky_popover),
             )
             .when(self.files.hover.as_ref().is_some_and(|h| h.0 == id), |d| {
                 d.cursor_pointer()
@@ -7343,6 +7350,9 @@ impl Shell {
                 .left(px(0.))
                 .right(px(0.))
                 .max_w(px(580.))
+                .max_h(px(320.))
+                .min_h_0()
+                .overflow_y_scroll()
                 .occlude()
                 .rounded(krill_app::ui::RADIUS_MD)
                 .bg(p.popover)

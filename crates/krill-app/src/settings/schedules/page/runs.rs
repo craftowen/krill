@@ -92,6 +92,7 @@ impl SettingsView {
                     .id(SharedString::from(selector.clone()))
                     .debug_selector(move || selector.clone())
                     .flex_1()
+                    .min_w(gpui::px(150.))
                     .child(label)
                     .child(
                         div()
@@ -189,6 +190,7 @@ impl SettingsView {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .truncate()
                             .font_family(ui::FONT_MONO)
                             .text_color(p.muted_foreground)
                             .child(run.cwd.clone().unwrap_or_default()),
@@ -293,6 +295,12 @@ impl SettingsView {
                     )
                     .child(
                         div()
+                            .id("automations-run-detail-output-scroll")
+                            .w_full()
+                            .min_w_0()
+                            .max_h(gpui::px(400.))
+                            .min_h_0()
+                            .overflow_scroll()
                             .font_family(ui::FONT_MONO)
                             .text_size(TEXT_SM)
                             .child(output),

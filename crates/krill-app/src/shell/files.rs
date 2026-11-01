@@ -1250,7 +1250,6 @@ impl Shell {
         let file_host = self.file_host_for_pane(id);
         let header = div()
             .min_h(krill_app::ui::PANE_HEADER_HEIGHT)
-            .flex_wrap()
             .px_2()
             .flex_none()
             .flex()

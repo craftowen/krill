@@ -316,22 +316,26 @@ impl Panel {
                             .text_size(crate::ui::TEXT_SM)
                             .child(
                                 div()
-                                    .flex_none()
+                                    .min_w_0()
+                                    .max_w(gpui::px(140.))
+                                    .truncate()
                                     .font_family(crate::ui::FONT_MONO)
                                     .child(format!("{}:", c.location())),
                             )
                             .child(div().flex_1().min_w_0().truncate().child(c.body.clone())),
                     )
                     .child(
-                        Button::new(("comment-remove", i))
-                            .label(text::REMOVE.get())
-                            .ghost()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if i < this.review.comments.len() {
-                                    this.review.comments.remove(i);
-                                }
-                                cx.notify();
-                            })),
+                        div().flex_none().child(
+                            Button::new(("comment-remove", i))
+                                .label(text::REMOVE.get())
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if i < this.review.comments.len() {
+                                        this.review.comments.remove(i);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
                     )
             })
             .collect::<Vec<_>>();

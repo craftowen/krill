@@ -624,6 +624,7 @@ impl SettingsView {
                             .min_w_0()
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_size(crate::ui::TEXT_SM)
                                     .font_weight(FontWeight::MEDIUM)
                                     .truncate()
@@ -665,6 +666,8 @@ impl SettingsView {
                     .child(art_row)
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .font_family(crate::ui::FONT_MONO)
                             .text_size(crate::ui::TEXT_SM)
                             .text_color(p.muted_foreground)
@@ -949,6 +952,7 @@ impl SettingsView {
                                                 .gap_1p5()
                                                 .child(
                                                     div()
+                                                        .min_w_0()
                                                         .text_size(crate::ui::TEXT_SM)
                                                         .font_weight(FontWeight::MEDIUM)
                                                         .truncate()

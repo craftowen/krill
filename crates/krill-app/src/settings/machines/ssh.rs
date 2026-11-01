@@ -63,6 +63,7 @@ impl SettingsView {
                     .id("admin-ssh-duplicates")
                     .debug_selector(|| "admin-ssh-duplicates".into())
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_3()
@@ -627,6 +628,7 @@ impl SettingsView {
             .items_start()
             .child(
                 div()
+                    .w_full()
                     .flex_1()
                     .min_w_0()
                     .flex()

@@ -236,6 +236,8 @@ pub fn session_orch_element(badge: &OrchBadge, p: &crate::ui::Palette) -> Div {
     };
     div()
         .flex_none()
+        .max_w(px(80.))
+        .overflow_hidden()
         .flex()
         .items_center()
         .gap_1()
@@ -252,7 +254,7 @@ pub fn session_orch_element(badge: &OrchBadge, p: &crate::ui::Palette) -> Div {
             crate::ui::ICON_XS,
             fg,
         ))
-        .child(label)
+        .child(div().min_w_0().truncate().child(label))
 }
 
 pub(super) fn path_aliases(worktree: &Path) -> Vec<String> {

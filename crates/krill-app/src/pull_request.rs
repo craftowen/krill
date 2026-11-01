@@ -1403,6 +1403,8 @@ impl Render for Dialog {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
+                                    .truncate()
                                     .font_family(crate::ui::FONT_MONO)
                                     .text_size(crate::ui::TEXT_XS)
                                     .text_color(p.muted_foreground)

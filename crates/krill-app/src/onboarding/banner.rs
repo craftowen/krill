@@ -33,12 +33,14 @@ pub fn render_need(need: FixNeed, cx: &App) -> AnyElement {
         .font_family(crate::ui::FONT_UI)
         .text_size(crate::ui::TEXT_XS)
         .flex()
+        .flex_wrap()
         .items_center()
         .gap_2()
         .child(
             div()
                 .flex_1()
                 .min_w_0()
+                .min_w(gpui::px(140.))
                 .whitespace_normal()
                 .child(need.message),
         )

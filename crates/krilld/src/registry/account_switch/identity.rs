@@ -274,8 +274,8 @@ fn agy_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> io::Result<Option
             let conv_dir = home.join("brain").join(&id);
             let logs = conv_dir.join(".system_generated/logs");
             let transcript = [
-                logs.join("transcript.jsonl"),
                 logs.join("transcript_full.jsonl"),
+                logs.join("transcript.jsonl"),
                 conv_dir.join("transcript.jsonl"),
                 home.join("sessions").join(format!("{id}.jsonl")),
             ]

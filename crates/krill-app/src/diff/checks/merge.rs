@@ -144,6 +144,9 @@ impl Panel {
             let debug_value = value.clone();
             div()
                 .debug_selector(move || format!("{selector}:{debug_value}"))
+                .w_full()
+                .min_w_0()
+                .truncate()
                 .text_size(crate::ui::TEXT_SM)
                 .child(value)
         };

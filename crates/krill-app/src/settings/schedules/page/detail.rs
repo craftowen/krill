@@ -43,6 +43,9 @@ impl SettingsView {
             )
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
+                    .truncate()
                     .font_family(ui::FONT_MONO)
                     .text_color(p.muted_foreground)
                     .child(entry.cwd.clone()),
@@ -141,7 +144,12 @@ impl SettingsView {
         for (label, value) in values {
             metrics = metrics.child(
                 layout::row(p)
-                    .child(layout::label(p, label, None))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(gpui::px(140.))
+                            .child(layout::label(p, label, None)),
+                    )
                     .child(div().flex_1().min_w_0().child(value)),
             );
         }

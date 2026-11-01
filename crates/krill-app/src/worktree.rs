@@ -121,9 +121,16 @@ impl<V: Clone + PartialEq> SearchableListItem for PickItem<V> {
             .items_baseline()
             .justify_between()
             .gap_2()
-            .child(div().min_w_0().truncate().child(self.title.clone()))
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(self.title.clone()),
+            )
+            .child(
+                div()
+                    .max_w(px(180.))
                     .min_w_0()
                     .truncate()
                     .text_size(crate::ui::TEXT_XS)

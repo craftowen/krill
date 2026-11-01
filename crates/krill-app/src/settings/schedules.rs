@@ -1016,6 +1016,7 @@ impl SettingsView {
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .min_w(gpui::px(200.))
                                 .flex()
                                 .flex_col()
                                 .gap_1()
@@ -1034,6 +1035,8 @@ impl SettingsView {
                                         }))
                                         .child(
                                             div()
+                                                .min_w_0()
+                                                .truncate()
                                                 .text_size(crate::ui::TEXT_SM)
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(sched.id.clone()),
@@ -1255,11 +1258,15 @@ impl SettingsView {
                         .gap_2()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .flex()
                                 .items_center()
                                 .gap_2()
                                 .child(
                                     div()
+                                        .min_w_0()
+                                        .truncate()
                                         .text_size(crate::ui::TEXT_SM)
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(title),
@@ -1282,6 +1289,9 @@ impl SettingsView {
                     div()
                         .id("admin-schedule-log-cwd")
                         .debug_selector(|| "admin-schedule-log-cwd".into())
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
                         .font_family(crate::ui::FONT_MONO)
                         .text_size(crate::ui::TEXT_SM)
                         .text_color(p.muted_foreground)

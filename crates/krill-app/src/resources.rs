@@ -404,12 +404,14 @@ fn row(label: impl Into<String>, value: impl Into<String>, p: &crate::ui::Palett
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .truncate()
                 .text_color(p.muted_foreground)
                 .child(label.into()),
         )
         .child(
             div()
+                .flex_none()
                 .font_family(crate::ui::FONT_MONO)
                 .text_color(p.popover_foreground)
                 .child(value.into()),
@@ -494,6 +496,7 @@ impl Render for Panel {
                                         .child(
                                             row(self.session_name(cx, id), value, p).child(
                                                 div()
+                                                    .flex_none()
                                                     .ml_2()
                                                     .pl_2()
                                                     .border_l_1()

@@ -199,7 +199,7 @@ impl SettingsView {
             .gap_2()
             .child(
                 div()
-                    .h(px(40.))
+                    .min_h(px(40.))
                     .flex()
                     .flex_col()
                     .gap_1()

@@ -1631,6 +1631,7 @@ fn render_location_chip(
                 )
                 .child(
                     div()
+                        .min_w_0()
                         .truncate()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(pal.popover_foreground)
@@ -1648,6 +1649,7 @@ fn render_location_chip(
             .when(show_worktree, |d| {
                 d.child(
                     div()
+                        .min_w_0()
                         .truncate()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(pal.muted_foreground)

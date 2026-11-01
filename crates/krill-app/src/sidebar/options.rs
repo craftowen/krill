@@ -2538,11 +2538,12 @@ fn render_submenu_label(
         .gap_2()
         .text_size(ui::TEXT_XS)
         .text_color(p.popover_foreground)
-        .child(target.label())
+        .child(div().flex_1().min_w_0().truncate().child(target.label()))
         .child(
             div()
                 .id(summary_id)
                 .debug_selector(move || summary_id.into())
+                .flex_none()
                 .max_w(px(140.))
                 .truncate()
                 .text_color(p.muted_foreground)

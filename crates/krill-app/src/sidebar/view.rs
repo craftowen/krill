@@ -513,7 +513,7 @@ impl Sidebar {
             .id(("project-host", index))
             .debug_selector(move || format!("project-host-{index}"))
             .flex_none()
-            .max_w(px(100.))
+            .max_w(px(72.))
             .flex()
             .items_center()
             .gap_1()
@@ -874,6 +874,8 @@ impl Sidebar {
                                 d.child(
                                     div()
                                         .debug_selector(move || format!("host-route-{detail_key}"))
+                                        .min_w_0()
+                                        .truncate()
                                         .text_size(ui::TEXT_2XS)
                                         .text_color(p.muted_foreground)
                                         .child(detail),
@@ -1104,8 +1106,17 @@ impl Sidebar {
                                 .child(wt_count.to_string()),
                         )
                     })
-                    .child(self.project_host_control(index, &row_host, cx))
-                    .children(merged_hosts)
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(110.))
+                            .overflow_hidden()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(self.project_host_control(index, &row_host, cx))
+                            .children(merged_hosts),
+                    )
                     .when(!dimmed, |d| {
                         let new_wt_host = row_host.clone();
                         d.child(
@@ -1188,8 +1199,17 @@ impl Sidebar {
                             .truncate()
                             .child(self.project_header_name(path)),
                     )
-                    .child(self.project_host_control(index, &row_host, cx))
-                    .children(merged_hosts)
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(110.))
+                            .overflow_hidden()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(self.project_host_control(index, &row_host, cx))
+                            .children(merged_hosts),
+                    )
                     .child(
                         div()
                             .invisible()
@@ -1391,7 +1411,7 @@ impl Sidebar {
                             div()
                                 .debug_selector(move || format!("session-host-{index}"))
                                 .flex_none()
-                                .max_w(px(100.))
+                                .max_w(px(64.))
                                 .truncate()
                                 .px_1()
                                 .rounded(ui::RADIUS_XS)
@@ -1783,6 +1803,7 @@ impl Sidebar {
                     )
                     .child(
                         div()
+                            .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_size(ui::TEXT_SM)
@@ -1791,6 +1812,7 @@ impl Sidebar {
                     )
                     .child(
                         div()
+                            .flex_none()
                             .min_w_0()
                             .truncate()
                             .text_size(ui::TEXT_XS)
@@ -2268,13 +2290,13 @@ impl Sidebar {
                                     .flex()
                                     .items_center()
                                     .gap_1p5()
-                                    .child(self.card_title_el(
+                                    .child(div().flex_1().min_w_0().child(self.card_title_el(
                                         path,
                                         card_title,
                                         ui::TEXT_SM,
                                         index,
                                         cx,
-                                    ))
+                                    )))
                                     .when(!is_editing_this, |d| {
                                         d.children(lineage_toggle_btn)
                                             .when(show_branch_subtitle, |d| {
@@ -2309,6 +2331,8 @@ impl Sidebar {
                                 d.child(
                                     div()
                                         .flex_none()
+                                        .max_w(px(140.))
+                                        .overflow_hidden()
                                         .flex()
                                         .items_center()
                                         .gap_1()
@@ -3392,6 +3416,8 @@ impl Render for Sidebar {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_size(ui::TEXT_XS)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(p.muted_foreground)

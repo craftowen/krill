@@ -717,7 +717,13 @@ impl View {
             .text_size(ui::TEXT_XS)
             .font_weight(FontWeight::MEDIUM)
             .text_color(p.muted_foreground)
-            .child(div().flex_1().min_w(px(160.)).child(text::COL_NAME.get()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(120.))
+                    .min_w_0()
+                    .child(text::COL_NAME.get()),
+            )
             .child(div().w(px(84.)).flex_none().child(text::COL_TYPE.get()))
             .child(div().w(px(72.)).flex_none().child(text::COL_SIZE.get()))
             .child(div().w(px(116.)).flex_none().child(text::COL_UPDATED.get()))
@@ -944,11 +950,14 @@ impl View {
                                             .gap_2()
                                             .child(
                                                 div()
+                                                    .flex_none()
                                                     .text_color(p.muted_foreground)
                                                     .child(text::SLUG_LABEL.get()),
                                             )
                                             .child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .font_family(ui::FONT_MONO)
                                                     .text_color(p.foreground)
                                                     .child(item.artifact.slug.clone()),
@@ -962,11 +971,13 @@ impl View {
                                                 .gap_2()
                                                 .child(
                                                     div()
+                                                        .flex_none()
                                                         .text_color(p.muted_foreground)
                                                         .child(text::COL_NAME.get()),
                                                 )
                                                 .child(
                                                     div()
+                                                        .min_w_0()
                                                         .font_family(ui::FONT_MONO)
                                                         .text_color(p.foreground)
                                                         .truncate()
@@ -1197,7 +1208,8 @@ impl Render for View {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(160.))
+                                .min_w(px(120.))
+                                .min_w_0()
                                 .flex()
                                 .flex_col()
                                 .gap_0p5()
@@ -1337,11 +1349,13 @@ impl Render for View {
                 })
                 .child(
                     div()
+                        .id("artifacts-table-scroll")
                         .flex_1()
                         .min_h_0()
+                        .min_w_0()
                         .flex()
                         .flex_col()
-                        .overflow_hidden()
+                        .overflow_x_scroll()
                         .rounded(ui::RADIUS_MD)
                         .border_1()
                         .border_color(p.border)
@@ -1398,6 +1412,7 @@ impl Render for View {
                             .pb_3()
                             .child(
                                 div()
+                                    .flex_none()
                                     .flex()
                                     .items_center()
                                     .gap_2()
@@ -1417,6 +1432,7 @@ impl Render for View {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_size(ui::TEXT_XS)
                                     .text_color(p.muted_foreground)
                                     .truncate()

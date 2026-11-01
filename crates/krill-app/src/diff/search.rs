@@ -2147,6 +2147,7 @@ impl Panel {
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
+                                .overflow_hidden()
                                 .cursor_pointer()
                                 .text_color(if is_selected {
                                     p.sidebar_accent_foreground
@@ -2183,7 +2184,6 @@ impl Panel {
                                         .overflow_hidden()
                                         .child(
                                             div()
-                                                .flex_none()
                                                 .min_w_0()
                                                 .truncate()
                                                 .text_size(ui::TEXT_SM)

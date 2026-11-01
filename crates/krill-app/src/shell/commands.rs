@@ -185,7 +185,13 @@ impl Render for CommandList {
                                         .when(enabled, |d| {
                                             d.cursor_pointer().hover(|d| d.bg(p.accent))
                                         })
-                                        .child(div().truncate().child(command.name.clone()))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(command.name.clone()),
+                                        )
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.inject(row, window, cx);
                                         })),

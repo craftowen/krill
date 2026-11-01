@@ -345,10 +345,13 @@ impl SettingsView {
         for entry in entries {
             let selector = format!("automations-row-{}", entry.id);
             let id = entry.id.clone();
-            let mut name = cell(entry.display_name().to_owned(), 160.);
+            let mut name = cell(entry.display_name().to_owned(), 160.).truncate();
             if entry.display_name() != entry.id {
                 name = name.child(
                     div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
                         .text_size(TEXT_XS)
                         .text_color(p.muted_foreground)
                         .child(entry.id.clone()),
@@ -357,12 +360,17 @@ impl SettingsView {
             let project = Path::new(&entry.cwd)
                 .file_name()
                 .map_or_else(|| entry.cwd.clone(), |n| n.to_string_lossy().into_owned());
-            let mut project_cell = cell(project, 150.).child(
-                div()
-                    .text_size(TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(entry.cwd.clone()),
-            );
+            let mut project_cell = cell("", 150.)
+                .child(div().w_full().min_w_0().truncate().child(project))
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(entry.cwd.clone()),
+                );
             if entry.workspace_mode == WorkspaceMode::Isolate {
                 project_cell = project_cell.child(ui::badge(
                     p,
@@ -439,7 +447,7 @@ impl SettingsView {
                 p.muted_foreground,
             ));
         }
-        element.child(div().min_w_0().child(label))
+        element.child(div().min_w_0().truncate().child(label))
     }
 
     pub(super) fn automation_actions(

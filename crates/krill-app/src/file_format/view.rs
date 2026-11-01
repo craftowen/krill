@@ -370,7 +370,8 @@ impl Render for CsvView {
             }),
         )
         .track_scroll(&self.scroll)
-        .flex_1();
+        .flex_1()
+        .min_h_0();
         let notice = self.table.truncated.then(|| {
             div()
                 .flex_none()
@@ -811,6 +812,9 @@ pub fn placeholder_on(
         .text_color(pal.foreground)
         .child(
             div()
+                .max_w_full()
+                .px_4()
+                .truncate()
                 .font_family(crate::ui::FONT_MONO)
                 .text_size(crate::ui::TEXT_SM)
                 .child(name),
@@ -827,7 +831,15 @@ pub fn placeholder_on(
                 .text_color(pal.muted_foreground)
                 .child(text::NO_PREVIEW.get()),
         )
-        .child(div().flex().gap_2().child(open_action).child(reveal_action))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_center()
+                .gap_2()
+                .child(open_action)
+                .child(reveal_action),
+        )
         .into_any_element()
 }
 

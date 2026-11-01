@@ -773,6 +773,7 @@ impl SettingsView {
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .min_w(px(200.))
                                 .flex()
                                 .flex_col()
                                 .gap_1()
@@ -1189,7 +1190,11 @@ impl SettingsView {
                                             }),
                                     )
                                     .child(
-                                        div().truncate().child(device_line(device, connected, now)),
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(device_line(device, connected, now)),
                                     ),
                             ),
                     ),

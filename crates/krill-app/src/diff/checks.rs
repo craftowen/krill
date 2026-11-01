@@ -712,6 +712,9 @@ impl Panel {
                 div()
                     .id(("pr-check-log-tail", idx))
                     .debug_selector(move || format!("pr-check-log-tail-{idx}"))
+                    .max_h(px(160.))
+                    .min_h_0()
+                    .overflow_scroll()
                     .mt_1()
                     .p_2()
                     .rounded(crate::ui::RADIUS_XS)
@@ -1352,24 +1355,32 @@ impl Panel {
                     .justify_between()
                     .text_size(crate::ui::TEXT_2XS)
                     .text_color(p.muted_foreground)
-                    .child(if selected_total > 0 {
-                        text::SELECTED_COUNT.format(&[("n", &selected_total.to_string())])
-                    } else {
-                        text::FIX_QUEUE_HINT.get().to_owned()
-                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(if selected_total > 0 {
+                                text::SELECTED_COUNT.format(&[("n", &selected_total.to_string())])
+                            } else {
+                                text::FIX_QUEUE_HINT.get().to_owned()
+                            }),
+                    )
                     .when(selected_total > 0, |d| {
                         d.child(
-                            Button::new("pr-clear-selection")
-                                .debug_selector(|| "pr-clear-selection".into())
-                                .ghost()
-                                .xsmall()
-                                .label(text::CLEAR_SELECTION.get())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.checks.selected_checks.clear();
-                                    this.checks.selected_comments.clear();
-                                    this.checks.fix_status = None;
-                                    cx.notify();
-                                })),
+                            div().flex_none().child(
+                                Button::new("pr-clear-selection")
+                                    .debug_selector(|| "pr-clear-selection".into())
+                                    .ghost()
+                                    .xsmall()
+                                    .label(text::CLEAR_SELECTION.get())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.checks.selected_checks.clear();
+                                        this.checks.selected_comments.clear();
+                                        this.checks.fix_status = None;
+                                        cx.notify();
+                                    })),
+                            ),
                         )
                     }),
             )

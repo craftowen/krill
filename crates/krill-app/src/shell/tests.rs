@@ -10785,6 +10785,43 @@ fn sticky_last_prompt_bar_and_tab_hover_card_render_and_toggle_timeline(cx: &mut
         cx.debug_bounds(pop_sel).is_none(),
         "clicking close button must dismiss timeline popover"
     );
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.toggle_chat_view_with_focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("desktop-chat-overlay").is_some(),
+        "pane must be in Chat view"
+    );
+
+    let bar_bounds = cx.debug_bounds(bar_sel).unwrap();
+    cx.simulate_click(bar_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds(pop_sel).is_some(),
+        "clicking sticky prompt bar in Chat view must open timeline popover"
+    );
+
+    let item1_bounds = cx.debug_bounds(item1_sel).unwrap();
+    cx.simulate_click(item1_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("Add 5-turn timeline popover and copy button".into()),
+        "clicking turn item in Chat view must not be occluded by desktop-chat-overlay"
+    );
+
+    let close_bounds = cx.debug_bounds(close_sel).unwrap();
+    cx.simulate_click(close_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds(pop_sel).is_none(),
+        "clicking close button in Chat view must dismiss timeline popover"
+    );
 }
 
 /// APP-RUNTIME-004: 저장된 레이아웃을 백그라운드에서 읽는 동안 사용자가 새 탭을 열면, 복원이 끝난 뒤 초기 칸들의

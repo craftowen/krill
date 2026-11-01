@@ -884,6 +884,7 @@ impl ServerPanel {
                     .debug_selector(|| "link-remote-rename-input".into())
                     .flex_1()
                     .min_w_0()
+                    .min_w(gpui::px(160.))
                     .capture_action(cx.listener(
                         |this, _: &gpui_component::input::Escape, window, cx| {
                             cx.stop_propagation();
@@ -901,6 +902,7 @@ impl ServerPanel {
                 None => div()
                     .flex_1()
                     .min_w_0()
+                    .min_w(gpui::px(160.))
                     .truncate()
                     .text_size(crate::ui::TEXT_SM)
                     .child(host.name.clone())
@@ -953,6 +955,7 @@ impl ServerPanel {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
                             .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))

@@ -1691,6 +1691,7 @@ impl Panel {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_1()

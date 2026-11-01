@@ -35,7 +35,12 @@ pub fn card(p: &Palette) -> Div {
 
 /// 2열 설정·폼 행(Orca `SettingsRow` 대응): 왼쪽 [`label`], 오른쪽 [`controls`].
 pub fn row(p: &Palette) -> Div {
-    card(p).flex().items_center().justify_between().gap_3()
+    card(p)
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_3()
 }
 
 /// [`label`]의 선택 설명 인자 변환 트레이트.
@@ -81,6 +86,7 @@ pub fn label(p: &Palette, title: impl Into<SharedString>, desc: impl LabelDesc) 
     div()
         .flex_1()
         .min_w_0()
+        .min_w(px(180.))
         .flex()
         .flex_col()
         .gap_0p5()
@@ -117,7 +123,13 @@ pub fn field_label(name: &'static str, optional: Option<&'static str>, p: &Palet
 
 /// 2열 행의 오른쪽 컨트롤 묶음(`shrink-0` / `flex_none`). 라벨 열에 밀려 줄어들지 않는다.
 pub fn controls() -> Div {
-    div().flex_none().flex().items_center().gap_1p5()
+    div()
+        .flex_none()
+        .max_w_full()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1p5()
 }
 
 /// 카드가 아닌 섹션 머리글(Orca `SettingsSubsectionHeader` 대응).
@@ -237,7 +249,9 @@ pub fn switch(
 pub fn segmented_control(p: &Palette, items: impl IntoIterator<Item = impl IntoElement>) -> Div {
     div()
         .flex_none()
+        .max_w_full()
         .flex()
+        .flex_wrap()
         .items_center()
         .gap_0p5()
         .p(px(2.))

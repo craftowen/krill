@@ -1821,7 +1821,6 @@ impl Panel {
                     .overflow_hidden()
                     .child(
                         div()
-                            .flex_none()
                             .min_w_0()
                             .truncate()
                             .font_family(crate::ui::FONT_MONO)
@@ -2039,11 +2038,12 @@ impl Panel {
         let has_selected_lines = self.state.read(cx).selected_lines().is_some();
         let can_patch = file.status != *b"??" && hunk_count > 0 && !self.editing.busy;
         let header = div()
-            .h(if center {
+            .min_h(if center {
                 crate::ui::TAB_BAR_HEIGHT
             } else {
                 px(26.)
             })
+            .when(!center, |d| d.flex_wrap().py_0p5())
             .px_2p5()
             .flex_none()
             .flex()
@@ -2064,6 +2064,7 @@ impl Panel {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .min_w(px(80.))
                     .truncate()
                     .font_family(crate::ui::FONT_MONO)
                     .text_size(crate::ui::TEXT_SM)
@@ -2262,8 +2263,10 @@ impl Panel {
             .into_any_element()
         };
         div()
+            .w_full()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .flex()
             .flex_col()
             .when(!center, |d| d.border_t_1().border_color(p.sidebar_border))

@@ -1056,7 +1056,7 @@ impl View {
     }
 
     fn render_top_bar(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
-        let mut breadcrumbs = div().flex().items_center().gap_1p5();
+        let mut breadcrumbs = div().flex().items_center().gap_1p5().min_w_0();
 
         let is_root = matches!(self.screen, PageView::List);
         breadcrumbs = breadcrumbs.child(
@@ -1094,6 +1094,8 @@ impl View {
                     )
                     .child(
                         div()
+                            .min_w_0()
+                            .truncate()
                             .text_size(ui::TEXT_LG)
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.foreground)
@@ -1179,6 +1181,7 @@ impl View {
             .pb_3()
             .child(
                 div()
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1191,14 +1194,16 @@ impl View {
                     .child(breadcrumbs),
             )
             .child(
-                ui::ghost("automations-open-toml", stext::SCHEDULE_OPEN_TOML.get())
-                    .debug_selector(|| "automations-open-toml".into())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(dir) = &this.state_dir {
-                            let path = dir.join(krill_proto::schedule::FILE);
-                            cx.open_with_system(&path);
-                        }
-                    })),
+                div().flex_none().child(
+                    ui::ghost("automations-open-toml", stext::SCHEDULE_OPEN_TOML.get())
+                        .debug_selector(|| "automations-open-toml".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(dir) = &this.state_dir {
+                                let path = dir.join(krill_proto::schedule::FILE);
+                                cx.open_with_system(&path);
+                            }
+                        })),
+                ),
             )
     }
 
@@ -2126,6 +2131,7 @@ impl View {
                             .gap_4()
                             .child(
                                 div()
+                                    .min_w_0()
                                     .flex()
                                     .flex_col()
                                     .gap_1()
@@ -2157,6 +2163,9 @@ impl View {
                                     )
                                     .child(
                                         div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .truncate()
                                             .font_family(ui::FONT_MONO)
                                             .text_size(ui::TEXT_XS)
                                             .text_color(p.muted_foreground)
@@ -3305,6 +3314,7 @@ impl View {
                 div()
                     .flex_none()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_4()
@@ -3314,6 +3324,8 @@ impl View {
                     .border_color(p.border)
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap_1p5()
@@ -3324,10 +3336,17 @@ impl View {
                                 ui::icons::ICON_XS,
                                 p.muted_foreground,
                             ))
-                            .child(text::FOOTER_AUTO_NOTE.get()),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(text::FOOTER_AUTO_NOTE.get()),
+                            ),
                     )
                     .child(
                         div()
+                            .flex_none()
                             .flex()
                             .items_center()
                             .gap_2()
