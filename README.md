@@ -135,7 +135,7 @@ Let a coordinator agent break down dependent tasks (`krill orchestration run-cre
 <td width="50%" valign="top">
 
 ### 5. Mobile E2EE Companion (PWA)
-Scan a QR code in **Settings → Devices → Mobile** to monitor live agent states and open terminals from your phone browser or Home Screen web app (PWA). Connects over Relay or Tailscale with end-to-end **ChaCha20-Poly1305** (`HKDF-SHA256`) encryption.
+Scan a QR code in **Settings → Mobile** to monitor live agent states and open terminals from your phone browser or Home Screen web app (PWA). Connects over Relay or Tailscale with end-to-end **ChaCha20-Poly1305** (`HKDF-SHA256`) encryption.
 
 Sign in with Google on your desktop when you choose the hosted relay. Your phone opens the PWA without signing in and authenticates with its QR pairing or saved device key.
 
@@ -218,7 +218,7 @@ The installer verifies the ZIP's SHA-256, installs under `%LOCALAPPDATA%\Program
 |---|---|---|
 | **macOS, Apple Silicon (`arm64`)** | Primary desktop platform | Release app and CLI, or source build |
 | **Windows, `x64`** | Native desktop preview; desktop GUI, interactive logon, sleep, and reboot behavior still need validation beyond the recorded Windows Server VM tests | Windows release ZIP and PowerShell installer |
-| **Mobile (iOS / Android)** | Companion web app (PWA) paired via QR code over Relay or Tailscale (ChaCha20-Poly1305 E2EE) | Scan QR from **Settings → Devices → Mobile** in the Mac app (no app-store binary) |
+| **Mobile (iOS / Android)** | Companion web app (PWA) paired via QR code over Relay or Tailscale (ChaCha20-Poly1305 E2EE) | Scan QR from **Settings → Mobile** in the Mac app (no app-store binary) |
 | **macOS, Intel (`x86_64`)** | Not supported for this public preview | No supported release bundle or source-install promise |
 | **Linux** | Not supported for this public preview | No Linux desktop or downloadable remote-host package promised |
 | **Windows, ARM64 / 32-bit** | Not supported | No release package |

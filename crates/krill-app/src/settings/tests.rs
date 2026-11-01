@@ -2053,12 +2053,11 @@ fn shortcuts_and_sidebar_use_readable_labels() {
     assert!(matches!(AdminTab::Machines.icon(), IconName::Monitor));
 }
 
-/// 내비는 6개 탭이고, 세그먼트와 하위 페이지는 부모 탭을 강조한다.
 #[gpui::test]
 fn settings_nav_shows_six_tabs_and_subpages_keep_their_parent(cx: &mut TestAppContext) {
     let d = dir("six-tabs");
     init(cx, &d);
-    assert_eq!(AdminTab::ALL.len(), 6);
+    assert_eq!(AdminTab::ALL.len(), 7);
     assert!(
         AdminTab::SUBPAGES
             .iter()
@@ -2073,6 +2072,7 @@ fn settings_nav_shows_six_tabs_and_subpages_keep_their_parent(cx: &mut TestAppCo
         "admin-tab-agents",
         "admin-tab-accounts",
         "admin-tab-machines",
+        "admin-tab-mobile",
         "admin-tab-shortcuts",
         "admin-tab-system",
     ] {
@@ -2086,11 +2086,10 @@ fn settings_nav_shows_six_tabs_and_subpages_keep_their_parent(cx: &mut TestAppCo
         vcx.update(|window, cx| window.draw(cx).clear(cx));
     };
     click(vcx, "admin-tab-machines");
-    assert!(vcx.debug_bounds("admin-machines-segment").is_some());
+    assert!(vcx.debug_bounds("admin-machines-segment").is_none());
     vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Machines));
     click(vcx, "admin-tab-mobile");
     vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Mobile));
-    assert!(vcx.debug_bounds("admin-tab-machines").is_some());
 
     click(vcx, "admin-tab-system");
     click(vcx, "open-disk");
@@ -10355,7 +10354,7 @@ fn machines_overview_renders_local_hub_and_inline_remote_actions(cx: &mut TestAp
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-machines-local-section").is_some());
     assert!(vcx.debug_bounds("admin-machine-local").is_some());
-    assert!(vcx.debug_bounds("admin-local-open-mobile").is_some());
+    assert!(vcx.debug_bounds("admin-local-open-mobile").is_none());
     assert!(vcx.debug_bounds("admin-local-open-invite").is_some());
     assert!(vcx.debug_bounds("admin-machines-remote-section").is_some());
     assert!(vcx.debug_bounds("admin-machines-add-ssh").is_some());
@@ -10365,15 +10364,6 @@ fn machines_overview_renders_local_hub_and_inline_remote_actions(cx: &mut TestAp
     let test_sel: &'static str = format!("admin-machine-test-{host_id}").leak();
     assert!(vcx.debug_bounds(conn_sel).is_some());
     assert!(vcx.debug_bounds(test_sel).is_some());
-
-    // Clicking "휴대폰 QR 연결" switches to Mobile tab, and returning to Machines keeps overview.
-    let mobile_btn = vcx.debug_bounds("admin-local-open-mobile").unwrap();
-    vcx.simulate_click(mobile_btn.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Mobile));
-
-    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Machines, cx)));
-    vcx.run_until_parked();
 
     // Clicking "초대 링크 · 접속 관리" opens ThisComputer details.
     let invite_btn = vcx.debug_bounds("admin-local-open-invite").unwrap();
