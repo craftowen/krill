@@ -1794,7 +1794,7 @@ async function composerRaces() {
     modelButton(f).action();
     await flush();
     assert.equal(f.find("composer-model-name").textContent, "model a");
-    f.button("Close suggestions").action();
+    f.button("Close").action();
     f.handler = async (req) => {
       if (req.action !== "composer_models") return historyHandler(req);
       if (data === null) throw Error("model unavailable");

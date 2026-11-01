@@ -557,7 +557,7 @@
       suggestions.hidden = false;
       const head = el("div", undefined, "chat-actions"),
         close = button(
-          t("Close suggestions"),
+          t(picker?.kind === "models" || picker?.kind === "efforts" ? "Close" : "Close suggestions"),
           () => {
             closeSuggestions();
             input.focus?.();
