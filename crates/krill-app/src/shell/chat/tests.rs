@@ -332,3 +332,29 @@ fn chat_view_choice_does_not_leak_to_same_session_number_on_another_host(cx: &mu
         assert!(this.is_session_chat_view(SessionId(9242), cx));
     });
 }
+
+#[test]
+fn composer_meta_reads_the_statusline_record_from_any_profile_scope() {
+    let dir = std::env::temp_dir().join(format!("krill-chat-meta-{}", std::process::id()));
+    let scope = dir.join("session-context/profile-scope");
+    std::fs::create_dir_all(&scope).unwrap();
+    std::fs::write(
+        scope.join("sid.json"),
+        r#"{"model":"claude-opus-5-5","effort":"high","percent":14.0}"#,
+    )
+    .unwrap();
+    let transcript = dir.join("sid.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"message":{"model":"older","usage":{"input_tokens":900000}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let meta = observe_composer_meta(Some(&dir), "sid", transcript.to_str().unwrap());
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(meta.model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(meta.effort.as_deref(), Some("high"));
+    assert_eq!(meta.context_percent, Some(14));
+}

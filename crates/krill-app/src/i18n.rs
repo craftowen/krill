@@ -1908,7 +1908,6 @@ catalog! {
         REVIEW_DONE => ("Term에서 확인했어요 · 입력 다시 허용", "Checked in Term · enable sending"),
         PROMPT_REVIEW => ("본문을 붙여넣은 뒤 전송을 마치지 못했습니다. 초안을 보존했습니다. 중복 전송 전에 Term에서 확인하세요.", "The text was pasted but submission did not finish. Your draft is preserved. Check in Term before sending again."),
         MULTILINE_BLOCKED => ("이 터미널은 여러 줄 붙여넣기를 지원하지 않습니다. 초안을 보존했습니다. Term에서 확인하세요.", "This terminal does not support multiline paste. Your draft is preserved. Check in Term."),
-        COMPOSER_HINT => ("Enter 전송 · Shift+Enter 줄바꿈", "Enter to send · Shift+Enter for a new line"),
         YOU => ("나", "You"),
         ASSISTANT => ("에이전트", "Assistant"),
         REASONING => ("생각 과정", "Thinking"),
@@ -1952,7 +1951,14 @@ catalog! {
         STATE_WAITING => ("응답 대기", "Waiting"),
         STATE_BLOCKED => ("승인 대기", "Blocked"),
         PICKER_MODEL => ("모델", "Model"),
-        PICKER_EFFORT => ("추론", "Effort"),
+        PICKER_EFFORT => ("사고 수준", "Thinking level"),
+        PICKER_WAIT => ("에이전트가 입력을 기다릴 때 바꿀 수 있습니다", "Available while the agent waits for input"),
+        EFFORT_LOW => ("낮음", "Low"),
+        EFFORT_MEDIUM => ("보통", "Medium"),
+        EFFORT_HIGH => ("높음", "High"),
+        EFFORT_XHIGH => ("매우 높음", "Extra high"),
+        EFFORT_MAX => ("최대", "Max"),
+        CONTEXT_USED => ("컨텍스트 {percent}% 사용", "{percent}% of context used"),
     }
     updater_relaunch {
         ROLLBACK_DONE_TITLE => ("업데이트 실패로 이전 버전으로 롤백했습니다", "Update failed; restored the previous version"),

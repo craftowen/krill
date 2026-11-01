@@ -89,6 +89,10 @@ pub(crate) struct SessionChatLog {
     binding: (String, String),
     host: Option<krill_app::hosts::HostId>,
     epoch: u64,
+    /// The first read for this log came from the end of the transcript.
+    seeded: bool,
+    /// Byte boundary of the oldest loaded row, while older rows remain on disk.
+    earlier: Option<u64>,
     submissions: BTreeMap<String, Submission>,
     pub multi_selected: BTreeMap<String, BTreeSet<usize>>,
 }
@@ -111,14 +115,18 @@ impl ChatList {
         epoch: u64,
     ) -> gpui::ListState {
         let removed = base_index.saturating_sub(self.base_index);
-        if epoch != self.epoch || base_index < self.base_index || removed > self.count {
+        let added = self.base_index.saturating_sub(base_index);
+        if epoch != self.epoch || removed > self.count {
             self.state.reset(count);
             self.state.set_follow_mode(gpui::FollowMode::Tail);
         } else {
             if removed != 0 {
                 self.state.splice(0..removed, 0);
             }
-            let kept = self.count - removed;
+            if added != 0 {
+                self.state.splice(0..0, added);
+            }
+            let kept = self.count - removed + added;
             if count >= kept {
                 self.state.splice(kept..kept, count - kept);
             } else {
@@ -156,6 +164,7 @@ pub(crate) struct ChatState {
     pub quick_menu: BTreeSet<ChatKey>,
     pub model_picker: BTreeSet<ChatKey>,
     composer_tasks: BTreeMap<ChatKey, Task<()>>,
+    earlier_tasks: BTreeMap<ChatKey, Task<()>>,
     last_composer_poll: BTreeMap<ChatKey, std::time::Instant>,
     #[cfg(test)]
     pub next_poll_io: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -193,6 +202,43 @@ fn is_valid_token_string(s: &str) -> bool {
         && s.len() <= 128
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-:/@[]".contains(&b))
+}
+
+/// Absolute row indices stay stable when older rows are prepended, so a log starts high.
+const CHAT_BASE_ORIGIN: usize = 1 << 31;
+// ponytail: fixed row cap to hold the app memory budget; page rows out if deep history is wanted.
+const MAX_CHAT_KEPT: usize = 1_000;
+const CHAT_PRELOAD_ITEMS: usize = 256;
+
+struct ChatPage {
+    snapshot: ChatPollSnapshot,
+    start: u64,
+    has_earlier: bool,
+}
+
+fn chat_tail_request(session: SessionId, before: Option<u64>) -> String {
+    serde_json::json!({
+        "action": "chat_poll",
+        "session": session.0,
+        "offset": 0,
+        "latest": true,
+        "end_offset": before,
+    })
+    .to_string()
+}
+
+/// `None` also covers an older daemon, which has no tail page and is read from the start instead.
+fn parse_chat_page(raw: &str) -> Option<ChatPage> {
+    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let data = root.get("data")?;
+    Some(ChatPage {
+        start: data.get("page_start")?.as_u64()?,
+        has_earlier: data.get("has_earlier")?.as_bool()?,
+        snapshot: serde_json::from_value(data.clone()).ok()?,
+    })
 }
 
 fn ratio_percent(used: u64, limit: u64) -> Option<u8> {
@@ -257,31 +303,6 @@ pub(crate) fn parse_transcript_record(record: &serde_json::Value, meta: &mut Com
             meta.context_percent = Some(pct);
         }
     }
-
-    if let Some(usage) = message.get("usage") {
-        let input = usage
-            .get("input_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let output = usage
-            .get("output_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let cache_read = usage
-            .get("cache_read_input_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let cache_create = usage
-            .get("cache_creation_input_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let total = input + output + cache_read + cache_create;
-        if total > 0
-            && let Some(pct) = ratio_percent(total, 200_000)
-        {
-            meta.context_percent = Some(pct);
-        }
-    }
 }
 
 pub(crate) fn observe_composer_meta(
@@ -312,52 +333,33 @@ pub(crate) fn observe_composer_meta(
     }
 
     if let Some(state_dir) = state_dir {
-        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-            let claude_profile = home.join(".claude");
-            if let Some(obs) =
-                krill_proto::statusline::context::read(state_dir, &claude_profile, session_id)
-            {
-                if let Some(model) = obs.model {
-                    meta.model = Some(model);
-                }
-                if let Some(effort) = obs.effort {
-                    meta.effort = Some(effort);
-                }
-                if let Some(percent) = obs.percent.and_then(float_percent) {
-                    meta.context_percent = Some(percent);
-                }
-            }
-        }
+        // The statusline record is the agent's own report, so it beats the transcript. Session ids
+        // are unique, and the profile scope directory belongs to whichever account ran the session.
         let context_dir = state_dir.join("session-context");
-        if (meta.model.is_none() || meta.context_percent.is_none())
-            && context_dir.is_dir()
-            && let Ok(entries) = std::fs::read_dir(&context_dir)
+        for entry in std::fs::read_dir(context_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
         {
-            for entry in entries.flatten() {
-                let file_path = entry.path().join(format!("{session_id}.json"));
-                if file_path.is_file()
-                    && let Ok(content) = std::fs::read_to_string(&file_path)
-                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-                {
-                    if meta.model.is_none()
-                        && let Some(m) = json.get("model").and_then(serde_json::Value::as_str)
-                    {
-                        meta.model = Some(m.to_owned());
-                    }
-                    if meta.effort.is_none()
-                        && let Some(e) = json.get("effort").and_then(serde_json::Value::as_str)
-                    {
-                        meta.effort = Some(e.to_owned());
-                    }
-                    if meta.context_percent.is_none()
-                        && let Some(p) = json
-                            .get("percent")
-                            .and_then(serde_json::Value::as_f64)
-                            .and_then(float_percent)
-                    {
-                        meta.context_percent = Some(p);
-                    }
-                }
+            let Some(json) =
+                std::fs::read_to_string(entry.path().join(format!("{session_id}.json")))
+                    .ok()
+                    .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            else {
+                continue;
+            };
+            if let Some(model) = json.get("model").and_then(serde_json::Value::as_str) {
+                meta.model = Some(model.to_owned());
+            }
+            if let Some(effort) = json.get("effort").and_then(serde_json::Value::as_str) {
+                meta.effort = Some(effort.to_owned());
+            }
+            if let Some(percent) = json
+                .get("percent")
+                .and_then(serde_json::Value::as_f64)
+                .and_then(float_percent)
+            {
+                meta.context_percent = Some(percent);
             }
         }
     }
@@ -880,15 +882,31 @@ impl Shell {
         self.chat.poll_generation = self.chat.poll_generation.wrapping_add(1);
         let generation = self.chat.poll_generation;
         let offset = self.chat.logs.get(&key).map_or(0, |log| log.offset);
+        let seed = self
+            .chat
+            .logs
+            .get(&key)
+            .is_none_or(|log| !log.seeded)
+            .then(|| self.workflow_call_for_key(&key))
+            .flatten();
+        #[cfg(test)]
+        let seed = seed.filter(|_| self.chat.workflow_call.is_some());
         self.chat.task = Some(cx.spawn(async move |this, cx| {
-            let reply = cx
+            let seeding = seed.is_some();
+            let (page, reply) = cx
                 .background_executor()
                 .spawn(async move {
                     #[cfg(test)]
                     if let Some(gate) = gate {
                         gate.await.ok();
                     }
-                    call(&Request::AgentHistory(Action::ChatPoll { session, offset }))
+                    let page = seed.and_then(|workflow| {
+                        parse_chat_page(&workflow(&chat_tail_request(session, None)).ok()?)
+                    });
+                    let reply = page.is_none().then(|| {
+                        call(&Request::AgentHistory(Action::ChatPoll { session, offset }))
+                    });
+                    (page, reply)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -901,7 +919,16 @@ impl Shell {
                     && this.is_pane_chat_view(pane, cx)
                     && this.chat.logs.get(&key).map_or(0, |log| log.offset) == offset
                 {
-                    if let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply {
+                    if seeding {
+                        this.chat.logs.entry(key.clone()).or_default().seeded = true;
+                    }
+                    if let Some(page) = page {
+                        this.chat.poll_failed.remove(&key);
+                        this.apply_chat_tail(session, host, page);
+                        this.refresh_chat_composer(&key, false, cx);
+                    } else if let Some(Ok(Reply::AgentHistory(Response::ChatPolled(snapshot)))) =
+                        reply
+                    {
                         let refresh_composer = snapshot.reset
                             || !snapshot.items.is_empty()
                             || this
@@ -915,8 +942,9 @@ impl Shell {
                             this.refresh_chat_composer(&key, false, cx);
                         }
                     } else {
-                        this.chat.poll_failed.insert(key);
+                        this.chat.poll_failed.insert(key.clone());
                     }
+                    this.load_earlier_chat(pane, &key, cx);
                     cx.notify();
                 }
                 if this
@@ -928,6 +956,81 @@ impl Shell {
             })
             .ok();
         }));
+    }
+
+    /// Shows the newest rows at once. Older rows arrive above the viewport through
+    /// `load_earlier_chat`, so nothing visible moves while they load.
+    fn apply_chat_tail(
+        &mut self,
+        session: SessionId,
+        host: krill_app::hosts::HostId,
+        page: ChatPage,
+    ) {
+        let key = (host.clone(), session);
+        self.chat.logs.entry(key.clone()).or_default().binding = Default::default();
+        self.apply_chat_poll_for_host(session, host, page.snapshot);
+        let log = self.chat.logs.entry(key).or_default();
+        log.base_index = CHAT_BASE_ORIGIN;
+        log.seeded = true;
+        log.earlier = page.has_earlier.then_some(page.start);
+    }
+
+    fn load_earlier_chat(&mut self, pane: super::PaneId, key: &ChatKey, cx: &mut Context<Self>) {
+        let Some(log) = self.chat.logs.get(key) else {
+            return;
+        };
+        let Some(before) = log.earlier else {
+            return;
+        };
+        let near_top = log.items.len() < CHAT_PRELOAD_ITEMS
+            || self.chat.lists.get(&(pane, key.1)).is_some_and(|list| {
+                list.state.logical_scroll_top().item_ix < CHAT_PRELOAD_ITEMS / 2
+            });
+        if !near_top
+            || log.items.len() >= MAX_CHAT_KEPT
+            || self.chat.earlier_tasks.contains_key(key)
+        {
+            return;
+        }
+        let Some(call) = self.workflow_call_for_key(key) else {
+            return;
+        };
+        let task_key = key.clone();
+        let session = key.1;
+        let task = cx.spawn(async move |this, cx| {
+            let page = cx
+                .background_executor()
+                .spawn(async move {
+                    parse_chat_page(&call(&chat_tail_request(session, Some(before))).ok()?)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.chat.earlier_tasks.remove(&task_key);
+                let Some(log) = this.chat.logs.get_mut(&task_key) else {
+                    return;
+                };
+                if log.earlier != Some(before) {
+                    return;
+                }
+                let Some(page) = page else {
+                    log.earlier = None;
+                    return;
+                };
+                let snapshot = page.snapshot;
+                if log.binding != (snapshot.session_id, snapshot.transcript_path) {
+                    return;
+                }
+                let count = snapshot.items.len();
+                log.items
+                    .splice(0..0, snapshot.items.into_iter().map(Arc::new));
+                log.base_index = log.base_index.saturating_sub(count);
+                log.earlier = (page.has_earlier && page.start < before).then_some(page.start);
+                log.revision = log.revision.wrapping_add(1);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.chat.earlier_tasks.insert(key.clone(), task);
     }
 
     #[cfg(test)]
@@ -966,6 +1069,8 @@ impl Shell {
             log.epoch = log.epoch.wrapping_add(1);
             log.items.clear();
             log.base_index = 0;
+            log.seeded = false;
+            log.earlier = None;
             log.meta = ComposerMeta::default();
             log.answered.clear();
             log.expanded.clear();
@@ -994,10 +1099,11 @@ impl Shell {
         }
         if !snap.items.is_empty() {
             log.items.extend(snap.items.into_iter().map(Arc::new));
-            if log.items.len() > 250 {
-                let excess = log.items.len() - 250;
+            if log.items.len() > MAX_CHAT_KEPT {
+                let excess = log.items.len() - MAX_CHAT_KEPT;
                 log.items.drain(0..excess);
                 log.base_index = log.base_index.saturating_add(excess);
+                log.earlier = None;
                 let retained: BTreeSet<_> = log
                     .items
                     .iter()

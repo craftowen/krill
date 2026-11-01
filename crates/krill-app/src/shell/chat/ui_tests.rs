@@ -694,7 +694,6 @@ fn chat_orca_composer_controls_and_quick_menu_work_and_fit_narrow_pane(cx: &mut 
         "desktop-chat-composer",
         "chat-composer-plus",
         "chat-composer-model",
-        "chat-composer-effort",
         "chat-composer-context",
         "desktop-chat-send",
     ] {
@@ -742,8 +741,8 @@ fn chat_orca_composer_controls_and_quick_menu_work_and_fit_narrow_pane(cx: &mut 
         );
     });
 
-    let effort_btn = cx.debug_bounds("chat-composer-effort").unwrap();
-    cx.simulate_click(effort_btn.center(), gpui::Modifiers::default());
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let max_opt = cx.debug_bounds("chat-effort-option-max").unwrap();
     cx.simulate_click(max_opt.center(), gpui::Modifiers::default());
@@ -809,5 +808,8 @@ fn composer_meta_observation_extracts_codex_and_claude_records() {
     });
     parse_transcript_record(&claude_msg, &mut claude_meta);
     assert_eq!(claude_meta.model.as_deref(), Some("claude-opus-4-7"));
-    assert_eq!(claude_meta.context_percent, Some(30));
+    assert_eq!(
+        claude_meta.context_percent, None,
+        "the context window is unknown here; a 1M model must not read as full"
+    );
 }

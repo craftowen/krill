@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Lovecast Inc.
 use super::*;
 use gpui::prelude::FluentBuilder as _;
-use gpui_component::{IconName, Selectable as _};
+use gpui::{StatefulInteractiveElement as _, px};
+use gpui_component::{Icon, IconName, Selectable as _, progress::ProgressCircle, tooltip::Tooltip};
 
 pub(super) fn agent_display_name(agent: &str) -> String {
     match agent.to_ascii_lowercase().as_str() {
@@ -157,13 +158,140 @@ pub(super) fn fallback_choices_for_agent(agent: &str) -> (Vec<ComposerModelItem>
     }
 }
 
+/// `claude-opus-5-5` reads as `opus 5.5`, the way the phone shows it. Other labels stay as reported.
+pub(super) fn short_model_name(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let name = lower.split(['(', '[']).next().unwrap_or_default().trim();
+    let Some(rest) = name.strip_prefix("claude-") else {
+        return name
+            .strip_prefix("claude ")
+            .map_or_else(|| text.to_owned(), str::to_owned);
+    };
+    let mut parts: Vec<_> = rest.split('-').collect();
+    if parts
+        .last()
+        .is_some_and(|part| part.len() == 8 && part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        parts.pop();
+    }
+    let digits = parts
+        .iter()
+        .rev()
+        .take_while(|part| part.bytes().all(|b| b.is_ascii_digit()))
+        .count()
+        .min(2);
+    match parts.split_at(parts.len() - digits) {
+        (family, []) => family.join("-"),
+        (family, version) => format!("{} {}", family.join("-"), version.join(".")),
+    }
+}
+
+fn effort_bars(effort: &str) -> Option<usize> {
+    match effort {
+        "minimal" | "low" => Some(1),
+        "medium" => Some(2),
+        "high" => Some(3),
+        "xhigh" => Some(4),
+        "max" | "ultra" => Some(5),
+        _ => None,
+    }
+}
+
+fn effort_text(effort: &str) -> String {
+    match effort {
+        "low" => ctext::EFFORT_LOW.get().to_owned(),
+        "medium" => ctext::EFFORT_MEDIUM.get().to_owned(),
+        "high" => ctext::EFFORT_HIGH.get().to_owned(),
+        "xhigh" => ctext::EFFORT_XHIGH.get().to_owned(),
+        "max" => ctext::EFFORT_MAX.get().to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn model_is_selected(active: Option<&str>, id: &str) -> bool {
+    active.is_some_and(|active| active == id || active.starts_with(&format!("claude-{id}-")))
+}
+
+fn effort_bars_icon(palette: &ui::Palette, filled: usize) -> gpui::Div {
+    div()
+        .flex()
+        .items_end()
+        .gap(px(1.))
+        .h(px(11.))
+        .children((0..5u8).map(|bar| {
+            div()
+                .w(px(2.))
+                .h(px(3. + f32::from(bar) * 2.))
+                .rounded(px(1.))
+                .bg(if usize::from(bar) < filled {
+                    palette.foreground
+                } else {
+                    palette.border
+                })
+        }))
+}
+
+fn composer_popup(palette: &ui::Palette) -> gpui::Div {
+    div()
+        .absolute()
+        .left_0()
+        .bottom_full()
+        .mb_1p5()
+        .w(px(280.))
+        .max_w_full()
+        .rounded(ui::RADIUS_LG)
+        .border_1()
+        .border_color(palette.border)
+        .bg(palette.popover)
+        .p_1p5()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+}
+
+fn popup_row(palette: &ui::Palette, id: SharedString, enabled: bool) -> gpui::Stateful<gpui::Div> {
+    let hover = palette.muted;
+    div()
+        .id(id)
+        .role(gpui::Role::ListBoxOption)
+        .w_full()
+        .min_h(px(28.))
+        .px_2()
+        .rounded(ui::RADIUS_SM)
+        .flex()
+        .items_center()
+        .justify_between()
+        .text_size(ui::TEXT_SM)
+        .text_color(if enabled {
+            palette.foreground
+        } else {
+            palette.muted_foreground
+        })
+        .when(enabled, |row| {
+            row.cursor_pointer().hover(move |style| style.bg(hover))
+        })
+}
+
+fn popup_heading(palette: &ui::Palette, text: &'static str) -> gpui::Div {
+    div()
+        .px_2()
+        .pt_1()
+        .pb_0p5()
+        .text_size(ui::TEXT_XS)
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(palette.muted_foreground)
+        .child(text)
+}
+
 fn resolved_composer_choices(
     agent: &str,
     meta: Option<&ComposerMeta>,
 ) -> (Vec<ComposerModelItem>, Vec<String>) {
     let (fallback_models, fallback_efforts) = fallback_choices_for_agent(agent);
+    // A busy Claude session only reports its configured model, so keep every native alias listed.
+    let claude = agent.eq_ignore_ascii_case("claude");
     let models = meta
-        .filter(|m| !m.models.is_empty())
+        .filter(|m| !m.models.is_empty() && (m.supported || !claude))
         .map_or(fallback_models, |m| m.models.clone());
     let active_id = meta.and_then(|m| m.current_model_id.as_deref().or(m.model.as_deref()));
     let efforts = meta
@@ -204,341 +332,315 @@ impl Shell {
         let current_effort = meta.and_then(|m| m.effort.as_deref());
         let is_pending = meta.is_some_and(|m| m.pending);
 
+        let supported = meta.is_some_and(|m| m.supported);
         let model_label = if let Some(label) = meta.and_then(|m| m.model_label.as_deref()) {
-            label.to_owned()
+            short_model_name(label)
         } else if let Some(m) = current_model {
             model_choices
                 .iter()
                 .find(|item| item.id == m)
-                .map_or_else(|| m.to_owned(), |item| item.label.clone())
+                .map_or_else(|| short_model_name(m), |item| item.label.clone())
         } else if let Some(agent) = log.map(|l| &l.agent).filter(|a| !a.is_empty()) {
             agent_display_name(agent)
         } else {
             "Agent".to_string()
         };
+        let filled_bars = current_effort.and_then(effort_bars);
 
-        let effort_label =
-            current_effort.map_or_else(|| ctext::PICKER_EFFORT.get().to_owned(), str::to_owned);
-
-        let context_badge = meta.and_then(|m| m.context_percent).map(|pct| {
-            let tone = if pct >= 85 {
-                ui::BadgeTone::Destructive
+        let context_ring = meta.and_then(|m| m.context_percent).map(|pct| {
+            let color = if pct >= 85 {
+                palette.destructive
             } else if pct >= 65 {
-                ui::BadgeTone::Warning
+                palette.warning
             } else {
-                ui::BadgeTone::Neutral
+                muted_fg
             };
-            ui::badge(palette, tone, format!("{pct}%"))
+            let description: SharedString = ctext::CONTEXT_USED
+                .get()
+                .replace("{percent}", &pct.to_string())
+                .into();
+            div()
                 .id(SharedString::from(format!(
                     "chat-composer-context-{}",
                     pane.get()
                 )))
                 .debug_selector(|| "chat-composer-context".into())
+                .tooltip({
+                    let description = description.clone();
+                    move |window, cx| Tooltip::new(description.clone()).build(window, cx)
+                })
+                .child(
+                    ProgressCircle::new(SharedString::from(format!(
+                        "chat-composer-context-ring-{}",
+                        pane.get()
+                    )))
+                    .value(f32::from(pct))
+                    .color(color)
+                    .size_4()
+                    .accessibility_label(description),
+                )
         });
 
-        let quick_menu_row = if self.chat.quick_menu.contains(&key) {
-            let commands = ["/model", "/compact", "/clear", "/review"];
-            Some(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_1p5()
-                    .children(commands.into_iter().map(|cmd| {
-                        let cmd_str = cmd.to_owned();
-                        let input_state = input_state.clone();
-                        let key = key.clone();
-                        let slug = cmd.trim_start_matches('/').to_owned();
-                        Button::new(SharedString::from(format!(
-                            "chat-quick-{slug}-{}",
-                            pane.get()
-                        )))
-                        .debug_selector(move || format!("chat-quick-{slug}"))
-                        .label(cmd)
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.chat.quick_menu.remove(&key);
-                                if cmd_str == "/model" {
-                                    this.toggle_chat_model_picker(&key, cx);
-                                    return;
-                                }
-                                input_state.update(cx, |state, cx| {
-                                    let val = state.value();
-                                    let new_val = if val.trim().is_empty() {
-                                        cmd_str.clone()
-                                    } else {
-                                        format!("{cmd_str} {val}")
-                                    };
-                                    state.set_value(new_val, window, cx);
-                                    state.focus(window, cx);
-                                });
-                                cx.notify();
-                            },
-                        ))
-                    })),
-            )
-        } else {
-            None
-        };
+        let quick_menu = self.chat.quick_menu.contains(&key).then(|| {
+            let close_key = key.clone();
+            composer_popup(palette)
+                .id(SharedString::from(format!(
+                    "chat-quick-menu-{}",
+                    pane.get()
+                )))
+                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                    this.chat.quick_menu.remove(&close_key);
+                    cx.notify();
+                }))
+                .children(
+                    ["/model", "/compact", "/clear", "/review"]
+                        .into_iter()
+                        .map(|cmd| {
+                            let cmd_str = cmd.to_owned();
+                            let input_state = input_state.clone();
+                            let key = key.clone();
+                            let slug = cmd.trim_start_matches('/').to_owned();
+                            popup_row(
+                                palette,
+                                SharedString::from(format!("chat-quick-{slug}-{}", pane.get())),
+                                true,
+                            )
+                            .debug_selector(move || format!("chat-quick-{slug}"))
+                            .child(cmd)
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.chat.quick_menu.remove(&key);
+                                    if cmd_str == "/model" {
+                                        this.toggle_chat_model_picker(&key, cx);
+                                        return;
+                                    }
+                                    input_state.update(cx, |state, cx| {
+                                        let val = state.value();
+                                        let new_val = if val.trim().is_empty() {
+                                            cmd_str.clone()
+                                        } else {
+                                            format!("{cmd_str} {val}")
+                                        };
+                                        state.set_value(new_val, window, cx);
+                                        state.focus(window, cx);
+                                    });
+                                    cx.notify();
+                                },
+                            ))
+                        }),
+                )
+        });
 
-        let model_picker_panel = if self.chat.model_picker.contains(&key) {
-            let active_model = current_model.map(str::to_owned);
-            let active_effort = current_effort.map(str::to_owned);
-            let reason_text = meta.and_then(|m| m.reason.clone());
-            Some(
-                div()
+        let model_picker =
+            self.chat.model_picker.contains(&key).then(|| {
+                let active_model = current_model.map(str::to_owned);
+                let active_effort = current_effort.map(str::to_owned);
+                let reason = meta.and_then(|m| m.reason.as_deref());
+                let waiting = !supported || reason.is_some_and(|text| text.starts_with("Wait for"));
+                let notice = if waiting {
+                    Some(SharedString::from(ctext::PICKER_WAIT.get()))
+                } else {
+                    reason.map(|text| SharedString::from(text.to_owned()))
+                };
+                let close_key = key.clone();
+                composer_popup(palette)
                     .id(SharedString::from(format!(
                         "chat-model-picker-{}",
                         pane.get()
                     )))
                     .debug_selector(|| "chat-model-picker".into())
-                    .w_full()
-                    .min_w_0()
-                    .p_2()
-                    .rounded(ui::RADIUS_MD)
-                    .border_1()
-                    .border_color(border)
-                    .bg(palette.muted)
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(muted_fg)
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .child(ctext::PICKER_MODEL.get()),
-                            )
-                            .children(model_choices.into_iter().map(|item| {
-                                let id = item.id;
-                                let label = item.label;
-                                let is_selected = active_model.as_deref() == Some(id.as_str());
-                                let key = key.clone();
-                                let option_id = id.clone();
-                                let selector_id = id.clone();
-                                Button::new(SharedString::from(format!(
-                                    "chat-model-option-{id}-{}",
-                                    pane.get()
-                                )))
-                                .debug_selector(move || format!("chat-model-option-{selector_id}"))
-                                .when(is_selected, |btn| btn.icon(IconName::Check).selected(true))
-                                .disabled(is_pending)
-                                .label(label)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.select_chat_model(&key, &option_id, cx);
-                                    },
-                                ))
-                            })),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(muted_fg)
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .child(ctext::PICKER_EFFORT.get()),
-                            )
-                            .children(effort_choices.into_iter().map(|effort| {
-                                let is_selected = active_effort.as_deref() == Some(effort.as_str());
-                                let key = key.clone();
-                                let option_effort = effort.clone();
-                                let selector_effort = effort.clone();
-                                Button::new(SharedString::from(format!(
-                                    "chat-effort-option-{effort}-{}",
-                                    pane.get()
-                                )))
-                                .debug_selector(move || {
-                                    format!("chat-effort-option-{selector_effort}")
-                                })
-                                .when(is_selected, |btn| btn.icon(IconName::Check).selected(true))
-                                .disabled(is_pending)
-                                .label(effort)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.select_chat_effort(&key, &option_effort, cx);
-                                    },
-                                ))
-                            })),
-                    )
-                    .children(reason_text.map(|reason| {
+                    .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                        this.chat.model_picker.remove(&close_key);
+                        cx.notify();
+                    }))
+                    .child(popup_heading(palette, ctext::PICKER_MODEL.get()))
+                    .children(model_choices.into_iter().map(|item| {
+                        let id = item.id;
+                        let is_selected = model_is_selected(active_model.as_deref(), &id);
+                        let key = key.clone();
+                        let option_id = id.clone();
+                        let selector_id = id.clone();
+                        let enabled = supported && !is_pending;
+                        popup_row(
+                            palette,
+                            SharedString::from(format!("chat-model-option-{id}-{}", pane.get())),
+                            enabled,
+                        )
+                        .debug_selector(move || format!("chat-model-option-{selector_id}"))
+                        .child(item.label)
+                        .when(is_selected, |row| {
+                            row.child(Icon::new(IconName::Check).size(px(ui::ICON_SM)))
+                        })
+                        .when(enabled, |row| {
+                            row.on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_chat_model(&key, &option_id, cx);
+                            }))
+                        })
+                    }))
+                    .child(popup_heading(palette, ctext::PICKER_EFFORT.get()))
+                    .child(div().flex().flex_wrap().gap_0p5().children(
+                        effort_choices.into_iter().map(|effort| {
+                            let is_selected = active_effort.as_deref() == Some(effort.as_str());
+                            let key = key.clone();
+                            let option_effort = effort.clone();
+                            let selector_effort = effort.clone();
+                            Button::new(SharedString::from(format!(
+                                "chat-effort-option-{effort}-{}",
+                                pane.get()
+                            )))
+                            .debug_selector(move || format!("chat-effort-option-{selector_effort}"))
+                            .label(effort_text(&effort))
+                            .selected(is_selected)
+                            .disabled(is_pending || !supported)
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.select_chat_effort(&key, &option_effort, cx);
+                                },
+                            ))
+                        }),
+                    ))
+                    .children(notice.map(|notice| {
                         div()
                             .id(SharedString::from(format!(
                                 "chat-model-picker-reason-{}",
                                 pane.get()
                             )))
                             .debug_selector(|| "chat-model-picker-reason".into())
+                            .px_2()
+                            .pt_1()
                             .text_size(ui::TEXT_XS)
                             .text_color(muted_fg)
-                            .child(reason)
-                    })),
-            )
-        } else {
-            None
-        };
+                            .child(notice)
+                    }))
+            });
 
         let can_send = !input_state.read(cx).value().trim().is_empty()
             && !self.chat.prompt_tasks.contains_key(&key)
             && !self.chat.prompt_review.contains(&key);
 
-        let inner_card = div()
-            .id("desktop-chat-composer")
-            .debug_selector(|| "desktop-chat-composer".into())
-            .on_action(cx.listener(
-                move |this, action: &gpui_component::input::Enter, window, cx| {
-                    if action.secondary || action.shift {
-                        cx.propagate();
-                    } else {
-                        this.submit_chat_prompt(&submit_key, window, cx);
-                    }
-                },
-            ))
-            .w_full()
-            .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
-            .min_w_0()
-            .rounded(ui::RADIUS_LG)
-            .border_1()
-            .border_color(border)
-            .bg(palette.card)
-            .p_2p5()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .children(quick_menu_row)
-            .children(model_picker_panel)
-            .child(
-                Textarea::new(input_state)
-                    .small()
-                    .w_full()
-                    .min_w_0()
-                    .accessibility_id("chat-composer-input")
-                    .aria_label(ctext::PROMPT_PLACEHOLDER.get()),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "chat-composer-plus-{}",
-                                    pane.get()
-                                )))
-                                .debug_selector(|| "chat-composer-plus".into())
-                                .icon(IconName::Plus)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener({
-                                    let key = key.clone();
-                                    move |this, _, _, cx| {
-                                        this.chat.model_picker.remove(&key);
-                                        if this.chat.quick_menu.contains(&key) {
-                                            this.chat.quick_menu.remove(&key);
-                                        } else {
-                                            this.chat.quick_menu.insert(key.clone());
-                                        }
-                                        cx.notify();
-                                    }
-                                })),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "chat-composer-model-{}",
-                                    pane.get()
-                                )))
-                                .debug_selector(|| "chat-composer-model".into())
-                                .icon(IconName::ChevronDown)
-                                .label(model_label)
-                                .disabled(is_pending)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener({
-                                    let key = key.clone();
-                                    move |this, _, _, cx| {
-                                        this.toggle_chat_model_picker(&key, cx);
-                                    }
-                                })),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "chat-composer-effort-{}",
-                                    pane.get()
-                                )))
-                                .debug_selector(|| "chat-composer-effort".into())
-                                .icon(IconName::ChevronDown)
-                                .label(effort_label)
-                                .disabled(is_pending)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener({
-                                    let key = key.clone();
-                                    move |this, _, _, cx| {
-                                        this.toggle_chat_model_picker(&key, cx);
-                                    }
-                                })),
-                            )
-                            .children(context_badge)
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(muted_fg)
-                                    .child(ctext::COMPOSER_HINT.get()),
-                            ),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "desktop-chat-send-{}",
-                            pane.get()
-                        )))
-                        .debug_selector(|| "desktop-chat-send".into())
-                        .icon(IconName::ArrowUp)
-                        .label(ctext::SEND.get())
+        let inner_card =
+            div()
+                .id("desktop-chat-composer")
+                .debug_selector(|| "desktop-chat-composer".into())
+                .on_action(cx.listener(
+                    move |this, action: &gpui_component::input::Enter, window, cx| {
+                        if action.secondary || action.shift {
+                            cx.propagate();
+                        } else {
+                            this.submit_chat_prompt(&submit_key, window, cx);
+                        }
+                    },
+                ))
+                .relative()
+                .w_full()
+                .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                .min_w_0()
+                .rounded(ui::RADIUS_LG)
+                .border_1()
+                .border_color(border)
+                .bg(palette.card)
+                .px_2()
+                .pt_1p5()
+                .pb_1p5()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(quick_menu)
+                .children(model_picker)
+                .child(
+                    Textarea::new(input_state)
                         .small()
-                        .primary()
-                        .disabled(!can_send)
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.submit_chat_prompt(&key, window, cx);
-                            },
-                        )),
-                    ),
-            );
+                        .appearance(false)
+                        .w_full()
+                        .min_w_0()
+                        .accessibility_id("chat-composer-input")
+                        .aria_label(ctext::PROMPT_PLACEHOLDER.get()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "chat-composer-plus-{}",
+                                        pane.get()
+                                    )))
+                                    .debug_selector(|| "chat-composer-plus".into())
+                                    .icon(IconName::Plus)
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener({
+                                        let key = key.clone();
+                                        move |this, _, _, cx| {
+                                            this.chat.model_picker.remove(&key);
+                                            if this.chat.quick_menu.contains(&key) {
+                                                this.chat.quick_menu.remove(&key);
+                                            } else {
+                                                this.chat.quick_menu.insert(key.clone());
+                                            }
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "chat-composer-model-{}",
+                                        pane.get()
+                                    )))
+                                    .debug_selector(|| "chat-composer-model".into())
+                                    .label(model_label)
+                                    .children(
+                                        filled_bars.map(|filled| effort_bars_icon(palette, filled)),
+                                    )
+                                    .dropdown_caret(true)
+                                    .disabled(is_pending)
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener({
+                                        let key = key.clone();
+                                        move |this, _, _, cx| {
+                                            this.toggle_chat_model_picker(&key, cx);
+                                        }
+                                    })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .children(context_ring)
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "desktop-chat-send-{}",
+                                        pane.get()
+                                    )))
+                                    .debug_selector(|| "desktop-chat-send".into())
+                                    .icon(IconName::ArrowUp)
+                                    .tooltip(ctext::SEND.get())
+                                    .small()
+                                    .primary()
+                                    .rounded(px(999.))
+                                    .disabled(!can_send)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.submit_chat_prompt(&key, window, cx);
+                                    })),
+                                ),
+                        ),
+                );
 
         div()
             .w_full()
@@ -616,5 +718,34 @@ impl Shell {
             );
         }
         notices
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn model_ids_read_like_the_phone() {
+        for (raw, short) in [
+            ("claude-opus-5-5", "opus 5.5"),
+            ("claude-fable-5-1", "fable 5.1"),
+            ("claude-sonnet-4-5-20251101", "sonnet 4.5"),
+            ("claude-opus-5-5[1m]", "opus 5.5"),
+            ("Claude Opus 5.5", "opus 5.5"),
+            ("GPT-6.1-Sol", "GPT-6.1-Sol"),
+            ("Opus", "Opus"),
+        ] {
+            assert_eq!(short_model_name(raw), short, "{raw}");
+        }
+    }
+
+    #[test]
+    fn aliases_match_the_running_model_and_unknown_effort_shows_no_bars() {
+        assert!(model_is_selected(Some("claude-opus-5-5"), "opus"));
+        assert!(model_is_selected(Some("opus"), "opus"));
+        assert!(!model_is_selected(Some("claude-opus-5-5"), "sonnet"));
+        assert_eq!(effort_bars("high"), Some(3));
+        assert_eq!(effort_bars("unknown"), None);
     }
 }
