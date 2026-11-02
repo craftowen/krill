@@ -342,9 +342,10 @@ impl Adapter for Agy {
             return Ok(done(true));
         }
         let command = format!("/model {}", level.id);
+        let working = live.working();
         super::command(
             &tap,
-            live.working(),
+            working,
             revision.0,
             command.as_bytes(),
             |screen, pasted| {
@@ -362,11 +363,16 @@ impl Adapter for Agy {
             let (screen, after, _) = tap.capture();
             if after.0 > revision.0
                 && composer(&screen, None)
-                && confirmed(&screen, &level.label)
-                && native::contains_phrase(
-                    &native::fresh_text(&tap, seq.0),
-                    &format!("set to {}", level.label),
-                )
+                // Mid-turn output pushes the note away, and the footer is Antigravity's own report.
+                && (working
+                    && footer(&screen).is_some_and(|(label, effort)| {
+                        label == family.label && effort == level.effort
+                    })
+                    || confirmed(&screen, &level.label)
+                        && native::contains_phrase(
+                            &native::fresh_text(&tap, seq.0),
+                            &format!("set to {}", level.label),
+                        ))
             {
                 return Ok(done(false));
             }

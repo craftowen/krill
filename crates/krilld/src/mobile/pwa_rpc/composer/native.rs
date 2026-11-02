@@ -155,9 +155,10 @@ impl Adapter for Codex {
             || format!("/model {model}"),
             |effort| format!("/model {model} --reasoning={effort}"),
         );
+        let working = live.working();
         super::command(
             &tap,
-            live.working(),
+            working,
             revision.0,
             command.as_bytes(),
             |screen, pasted| {
@@ -168,12 +169,14 @@ impl Adapter for Codex {
         while started.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(25));
             let (screen, observed, _) = tap.capture();
-            if observed.0 > revision.0
-                && composer(&screen, None)
+            let settled = composer(&screen, None)
                 && observed_model(&catalog, &screen).as_deref() == Some(model)
                 && latest_confirmation(&screen, model)
                 && fresh_confirmation(&tap, seq.0, model)
-                && effort.is_none_or(|effort| self::effort(&screen).as_deref() == Some(effort))
+                && effort.is_none_or(|effort| self::effort(&screen).as_deref() == Some(effort));
+            // Codex hides its cursor while it streams, so only fresh output can confirm mid-turn.
+            if observed.0 > revision.0
+                && (settled || working && streamed_confirmation(&tap, seq.0, model, effort))
             {
                 return Ok(json!({"applied":true,"supported":true,"model":model,"effort":effort}));
             }
@@ -349,6 +352,26 @@ fn fresh_confirmation(tap: &crate::session::Tap, from: u64, id: &str) -> bool {
 
 /// Reads from the newest bullet down. Below it can sit the acknowledgment's own wrapped tail and
 /// the right-aligned rate-limit warning Codex pins above the composer.
+fn streamed_confirmation(
+    tap: &crate::session::Tap,
+    from: u64,
+    id: &str,
+    effort: Option<&str>,
+) -> bool {
+    confirms_change(&fresh_text(tap, from), id, effort)
+}
+
+fn confirms_change(output: &str, id: &str, effort: Option<&str>) -> bool {
+    let change = format!("Model changed to {id}");
+    contains_phrase(
+        output,
+        &effort.map_or_else(
+            || format!("{change} "),
+            |effort| format!("{change} {effort} "),
+        ),
+    )
+}
+
 fn latest_confirmation(screen: &Screen, id: &str) -> bool {
     let rows: Vec<_> = (0..usize::from(screen.cursor.line))
         .map(|y| row(screen, y))
@@ -369,6 +392,15 @@ fn latest_confirmation(screen: &Screen, id: &str) -> bool {
 mod tests {
     use super::*;
     use krill_proto::screen::{Cell, Cursor};
+    #[test]
+    fn streamed_output_confirms_the_requested_model_and_effort_only() {
+        let output = "234\n• Model changed to gpt-luna high for this session only\n235";
+        assert!(confirms_change(output, "gpt-luna", None));
+        assert!(confirms_change(output, "gpt-luna", Some("high")));
+        assert!(!confirms_change(output, "gpt-luna", Some("low")));
+        assert!(!confirms_change("/model gpt-luna", "gpt-luna", None));
+    }
+
     #[test]
     fn cursor_positioned_words_are_fresh_confirmation_text() {
         let printed = plain(b"\x1b[2GSet\x1b[6Gmodel\x1b[12Gto\x1b[15GOpus\x1b[20G5.5");

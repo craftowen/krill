@@ -18,6 +18,7 @@
     ["high", "High"],
     ["xhigh", "Extra high"],
     ["max", "Max"],
+    ["ultra", "Ultra"],
   ]);
   const fullModel = (text) => {
     const name = shortModel(text);

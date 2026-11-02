@@ -16,6 +16,7 @@
     "High": "높음",
     "Extra high": "매우 높음",
     "Max": "최대",
+    "Ultra": "울트라",
     "This pairing code is invalid. Scan a fresh QR code from desktop Settings → Mobile.": "올바르지 않은 페어링 코드입니다. 데스크톱 설정 → 모바일에서 새 QR 코드를 스캔하세요.",
     "Desktop backup added.": "데스크톱의 예비 연결을 추가했습니다.",
     "Pair this desktop again?": "이 데스크톱을 다시 페어링할까요?",
