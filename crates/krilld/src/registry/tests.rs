@@ -2245,6 +2245,36 @@ fn explicit_close_marks_session_closed_and_blocks_cold_or_resume_resurrection() 
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// K-26: 앱이 목록에서 못 찾아도 살아 있는 PTY의 대화를 새 에이전트로 다시 띄우지 않는다.
+#[test]
+fn resume_refuses_a_kept_session_that_failed_to_register() {
+    let reg = Registry::new(None, None);
+    let full = Peer {
+        pid: None,
+        scope: Scope::Session(SessionId(7)),
+    };
+    let id = SessionId(46);
+    lock(&reg.state).unregistered_kept.insert(id);
+    let create = Create {
+        account: None,
+        program: Program::Login,
+        cwd: Vec::new(),
+        cols: 80,
+        rows: 24,
+    };
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Resume {
+                session: id,
+                create,
+            },
+            &mut HashMap::new()
+        ),
+        Reply::Failed(Failure::BadRequest)
+    );
+}
+
 #[test]
 fn spawn_strips_workspace_suffix_and_falls_back_when_cwd_is_missing() {
     use crate::holder::link::Link;

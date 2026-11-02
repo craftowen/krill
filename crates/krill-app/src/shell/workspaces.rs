@@ -63,7 +63,17 @@ impl Shell {
                         .details
                         .handoffs
                         .iter()
-                        .any(|h| h.from == session || h.to == Some(session))
+                        .any(|h| {
+                            // A failed handoff no longer moves this pane; only unsent input does.
+                            let failed = h.to.is_none() && h.error.is_some();
+                            let held = self
+                                .live
+                                .get(&pane)
+                                .is_some_and(|live| live.pane.holds_account_input());
+                            // A durable `to` outlives its session; it must not pin a closed one.
+                            let gone = self.gone_sessions.contains(&(host.clone(), session));
+                            h.from == session && (!failed || held) || h.to == Some(session) && !gone
+                        })
             })
             .collect();
         if !stale_panes.is_empty() {

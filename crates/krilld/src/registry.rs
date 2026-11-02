@@ -1612,7 +1612,10 @@ impl Registry {
             if st.resumed.contains(&old) {
                 return Err(Failure::NoSession);
             }
-            if st.sessions.contains_key(&old) && !st.exited.contains_key(&old) {
+            // K-26: 이 PTY는 holder에 살아 있다. 목록에 없다고 되살리면 같은 대화의 에이전트가 둘이 된다.
+            if st.unregistered_kept.contains(&old)
+                || st.sessions.contains_key(&old) && !st.exited.contains_key(&old)
+            {
                 return Err(Failure::BadRequest);
             }
         }

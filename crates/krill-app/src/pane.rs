@@ -39,7 +39,7 @@ use krill_proto::agent::Permission;
 pub use krill_proto::control::Program;
 use krill_proto::control::{
     AgentLaunch, AgentSettings, Cold, Create, FEAT_AGENTS, FEAT_CLEAR_SCROLLBACK, FEAT_COLD,
-    FEAT_CONTROL, FEAT_RESUME, FEAT_SESSION_FORK, Reply, Request,
+    FEAT_CONTROL, FEAT_RESUME, FEAT_SESSION_FORK, Failure, Reply, Request,
 };
 use krill_proto::daemon::{self, Paths};
 use krill_proto::input::{self, InputAck, Journal, Notice, Now};
@@ -573,6 +573,12 @@ fn agent_call(target: &HostTarget, request: &Request) -> io::Result<Option<Reply
     stream.write_all(&request.encode()?)?;
     let (kind, body) = read(&mut stream)?;
     match Reply::decode(kind, &body)? {
+        // A missing session is permanent: without NotFound the pane retries forever and never
+        // reaches the handoff/cold/Resume path that decides what happened to it.
+        Reply::Failed(Failure::NoSession) => Err(diagnostics::failure_error(
+            io::ErrorKind::NotFound,
+            Failure::NoSession,
+        )),
         Reply::Failed(failure) => Err(diagnostics::failure_error(io::ErrorKind::Other, failure)),
         reply => Ok(Some(reply)),
     }
@@ -1176,6 +1182,11 @@ impl<W: Write> Pane<W> {
     pub fn keep_account_input(&self) -> bool {
         self.account_switching()
             || self.account_input == AccountInput::Delivering && self.journal.has_pending_input()
+    }
+
+    /// 계정 전환 때문에 붙들려 아직 보내지 못한 입력이 있다. [`Self::show_cold`]는 이 입력을 지우므로 먼저 확인한다.
+    pub fn holds_account_input(&self) -> bool {
+        self.account_switching() && self.has_pending_input()
     }
 
     /// 아직 데몬이 확인하지 않은 보류·미확정 입력이 저널에 남아 있으면 `true`.

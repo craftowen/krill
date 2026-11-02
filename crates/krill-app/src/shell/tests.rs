@@ -3090,6 +3090,112 @@ fn no_such_session_pane_is_removed_but_other_failures_and_siblings_stay(cx: &mut
     });
 }
 
+/// 2026-11-02: Codex 자동 계정 전환이 확인 시간 초과로 끝나면 `to=None`+`error` 기록이 데몬에 남는다. 이 기록이 닫힌
+/// 세션의 칸을 영원히 보호해 "no such session" 화면이 탭으로 남았다. 진행 중인 전환과 보내지 못한 입력만 칸을 지킨다.
+#[gpui::test]
+fn failed_handoff_no_longer_pins_a_gone_pane_unless_input_is_held(cx: &mut TestAppContext) {
+    use krill_proto::usage::{AccountsSnapshot, SessionHandoff};
+    let (view, cx) = open(cx, state_path("gone-failed-handoff"));
+    cx.simulate_keystrokes("cmd-t");
+    let stale = layout_of(&view, cx).active_tab().focused;
+    let session = krill_proto::SessionId(803);
+    let snapshot = |error: Option<&str>| {
+        let mut snapshot = AccountsSnapshot::default();
+        snapshot.details.handoffs.push(SessionHandoff {
+            from: session,
+            to: None,
+            account_id: "next".into(),
+            error: error.map(str::to_owned),
+        });
+        Arc::new(snapshot)
+    };
+    let gone = || pane::failure_to_io_error(krill_proto::control::Failure::NoSession);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.layout.set_session(stale, session);
+            s.live.insert(stale, Live::new(Task::ready(())));
+            // 아직 진행 중인 전환: 칸을 거두면 이어받을 곳이 사라진다.
+            s.accounts_snapshot = snapshot(None);
+            assert!(matches!(s.settled(stale, Err(gone()), cx), Next::Gone));
+            assert!(
+                s.layout.pane_exists(stale),
+                "pending handoff keeps the pane"
+            );
+            // 실패했어도 보내지 못한 입력이 남았으면 사용자가 정할 때까지 둔다.
+            s.accounts_snapshot = snapshot(Some("timed out"));
+            let held = s.live.get_mut(&stale).unwrap();
+            held.pane.resume_account_input(true, Now::get());
+            held.pane.input(b"held prompt\r", Now::get());
+            assert!(matches!(s.settled(stale, Err(gone()), cx), Next::Gone));
+            let cold = krill_proto::control::Cold {
+                screen: Vec::new(),
+                history: Vec::new(),
+            };
+            assert!(matches!(
+                s.settled(stale, Ok(Got::Cold(session, cold)), cx),
+                Next::Gone
+            ));
+            assert!(s.layout.pane_exists(stale), "held input keeps the pane");
+            assert!(
+                s.live[&stale].pane.has_pending_input(),
+                "neither gone nor cold may wipe held input"
+            );
+            // 입력 없이 실패로 끝난 전환은 칸을 지키지 않는다. Failed 표시만 남은 칸도 마찬가지다.
+            let mut idle = Live::new(Task::ready(()));
+            idle.pane.resume_account_input(true, Now::get());
+            s.live.insert(stale, idle);
+            assert!(matches!(s.settled(stale, Err(gone()), cx), Next::Gone));
+            assert!(!s.layout.pane_exists(stale), "failed handoff must not pin");
+        });
+    });
+}
+
+/// 성공한 이어받기의 `to` 기록은 지워지지 않는다. 대체 세션이 닫히면 그 기록이 탭을 붙들면 안 되고, 옛 세션의 늦은
+/// 거절이 이미 옮겨 간 살아 있는 칸을 닫아서도 안 된다.
+#[gpui::test]
+fn closed_replacement_is_removed_but_a_late_refusal_keeps_the_rebound_pane(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::SessionId;
+    use krill_proto::usage::{AccountsSnapshot, SessionHandoff};
+    let (view, cx) = open(cx, state_path("gone-replacement"));
+    cx.simulate_keystrokes("cmd-t");
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let (original, replacement) = (SessionId(804), SessionId(805));
+    let gone = || pane::failure_to_io_error(krill_proto::control::Failure::NoSession);
+    let mut snapshot = AccountsSnapshot::default();
+    snapshot.details.handoffs.push(SessionHandoff {
+        from: original,
+        to: Some(replacement),
+        account_id: "next".into(),
+        error: None,
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.layout.set_session(pane, replacement);
+            s.live.insert(pane, Live::new(Task::ready(())));
+            s.accounts_snapshot = Arc::new(snapshot);
+            assert!(matches!(
+                s.settled_attempt(pane, Some(original), Err(gone()), cx),
+                Next::Retry
+            ));
+            assert!(s.layout.pane_exists(pane), "late refusal keeps the pane");
+            assert!(
+                s.gone_sessions.is_empty(),
+                "it says nothing about the new session"
+            );
+            assert!(matches!(
+                s.settled_attempt(pane, Some(replacement), Err(gone()), cx),
+                Next::Gone
+            ));
+            assert!(
+                !s.layout.pane_exists(pane),
+                "closed replacement must not pin"
+            );
+        });
+    });
+}
+
 /// OWE-615 원인 1: 연속 음절 입력에서 `insertText` 직후 프레임이 와도 이전 확정 글자가 사라지지 않고
 /// 새 preedit가 그 다음 칸에 그려진다. 에코(커서 전진)가 오면 낙관적 글자가 지워진다.
 #[gpui::test]
