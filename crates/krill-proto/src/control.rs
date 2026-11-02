@@ -587,6 +587,160 @@ pub struct SessionStatus {
     pub status: AgentStatus,
 }
 
+/// [`Reply::Sidebar`] 꼬리에 실을 수 있는 닫힌 세션 구간 상한.
+pub const MAX_CLOSED_RANGES: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosedRange {
+    pub start: SessionId,
+    pub end: SessionId,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<ClosedRange>", into = "Vec<ClosedRange>")]
+pub struct ClosedSessionRanges {
+    ranges: Vec<ClosedRange>,
+}
+
+impl ClosedSessionRanges {
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    pub fn ranges(&self) -> &[ClosedRange] {
+        &self.ranges
+    }
+
+    pub fn max_session(&self) -> Option<SessionId> {
+        self.ranges.last().map(|r| r.end)
+    }
+
+    pub fn contains(&self, id: SessionId) -> bool {
+        if id.0 == 0 {
+            return false;
+        }
+        let idx = self.ranges.partition_point(|r| r.end.0 < id.0);
+        self.ranges.get(idx).is_some_and(|r| r.start.0 <= id.0)
+    }
+
+    pub fn insert(&mut self, id: SessionId) -> bool {
+        if id.0 == 0 {
+            return false;
+        }
+        let idx = self.ranges.partition_point(|r| r.end.0 < id.0);
+        if self.ranges.get(idx).is_some_and(|r| r.start.0 <= id.0) {
+            return false;
+        }
+        let merge_left = idx
+            .checked_sub(1)
+            .and_then(|prev| self.ranges.get(prev))
+            .is_some_and(|r| r.end.0.checked_add(1) == Some(id.0));
+        let merge_right = self
+            .ranges
+            .get(idx)
+            .is_some_and(|r| id.0.checked_add(1) == Some(r.start.0));
+        match (merge_left, merge_right) {
+            (true, true) => {
+                if let Some(prev) = idx.checked_sub(1) {
+                    let right_end = self.ranges.remove(idx).end;
+                    if let Some(left) = self.ranges.get_mut(prev) {
+                        left.end = right_end;
+                    }
+                }
+            }
+            (true, false) => {
+                if let Some(prev) = idx.checked_sub(1)
+                    && let Some(left) = self.ranges.get_mut(prev)
+                {
+                    left.end = id;
+                }
+            }
+            (false, true) => {
+                if let Some(right) = self.ranges.get_mut(idx) {
+                    right.start = id;
+                }
+            }
+            (false, false) => {
+                self.ranges.insert(idx, ClosedRange { start: id, end: id });
+                if self.ranges.len() > MAX_CLOSED_RANGES {
+                    self.ranges.remove(0);
+                }
+            }
+        }
+        true
+    }
+
+    pub fn remove(&mut self, id: SessionId) -> bool {
+        if id.0 == 0 {
+            return false;
+        }
+        let idx = self.ranges.partition_point(|r| r.end.0 < id.0);
+        let Some(&cur) = self.ranges.get(idx) else {
+            return false;
+        };
+        if cur.start.0 > id.0 {
+            return false;
+        }
+        if cur.start == id && cur.end == id {
+            self.ranges.remove(idx);
+        } else if cur.start == id {
+            if let Some(slot) = self.ranges.get_mut(idx) {
+                slot.start = SessionId(id.0.saturating_add(1));
+            }
+        } else if cur.end == id {
+            if let Some(slot) = self.ranges.get_mut(idx) {
+                slot.end = SessionId(id.0.saturating_sub(1));
+            }
+        } else {
+            if let Some(slot) = self.ranges.get_mut(idx) {
+                slot.end = SessionId(id.0.saturating_sub(1));
+            }
+            self.ranges.insert(
+                idx.saturating_add(1),
+                ClosedRange {
+                    start: SessionId(id.0.saturating_add(1)),
+                    end: cur.end,
+                },
+            );
+            if self.ranges.len() > MAX_CLOSED_RANGES {
+                self.ranges.remove(0);
+            }
+        }
+        true
+    }
+
+    pub fn from_canonical_wire(ranges: Vec<ClosedRange>) -> Result<Self, &'static str> {
+        if ranges.len() > MAX_CLOSED_RANGES {
+            return Err("too many closed session ranges");
+        }
+        let mut prev_end: Option<u64> = None;
+        for r in &ranges {
+            if r.start.0 == 0 || r.start.0 > r.end.0 {
+                return Err("invalid closed session range bounds");
+            }
+            if prev_end.is_some_and(|end| end.saturating_add(1) >= r.start.0) {
+                return Err("non-canonical closed session ranges");
+            }
+            prev_end = Some(r.end.0);
+        }
+        Ok(Self { ranges })
+    }
+}
+
+impl From<ClosedSessionRanges> for Vec<ClosedRange> {
+    fn from(value: ClosedSessionRanges) -> Self {
+        value.ranges
+    }
+}
+
+impl TryFrom<Vec<ClosedRange>> for ClosedSessionRanges {
+    type Error = &'static str;
+
+    fn try_from(value: Vec<ClosedRange>) -> Result<Self, Self::Error> {
+        Self::from_canonical_wire(value)
+    }
+}
+
 /// MK-046 paths use OS bytes, including non-UTF-8 names.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidebarData {
@@ -600,6 +754,8 @@ pub struct SidebarData {
     /// 세션 프롬프트 기록. 기존 브랜치 확장 뒤 선택 꼬리로 전달한다.
     #[serde(default, skip)]
     pub prompt_histories: Vec<(SessionId, crate::git::SessionPromptHistory)>,
+    #[serde(default, skip)]
+    pub closed_sessions: ClosedSessionRanges,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -630,6 +786,12 @@ struct Branches(#[serde(deserialize_with = "bounded::<_, Branch, 512>")] Vec<Bra
 #[serde(transparent)]
 struct PromptHistories(
     #[serde(deserialize_with = "bounded::<_, PromptHistory, MAX_SESSIONS>")] Vec<PromptHistory>,
+);
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct ClosedWire(
+    #[serde(deserialize_with = "bounded::<_, ClosedRange, MAX_CLOSED_RANGES>")] Vec<ClosedRange>,
 );
 
 #[derive(Deserialize)]
@@ -1207,12 +1369,19 @@ impl Msg for Reply {
         }
         if let Self::Sidebar(data) = self {
             let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
-            if !data.branches.is_empty() || !data.prompt_histories.is_empty() {
+            let has_closed = !data.closed_sessions.is_empty();
+            if !data.branches.is_empty() || !data.prompt_histories.is_empty() || has_closed {
                 body.extend(postcard::to_stdvec(&data.branches).map_err(crate::ipc::Error::Codec)?);
             }
-            if !data.prompt_histories.is_empty() {
+            if !data.prompt_histories.is_empty() || has_closed {
                 body.extend(
                     postcard::to_stdvec(&data.prompt_histories)
+                        .map_err(crate::ipc::Error::Codec)?,
+                );
+            }
+            if has_closed {
+                body.extend(
+                    postcard::to_stdvec(data.closed_sessions.ranges())
                         .map_err(crate::ipc::Error::Codec)?,
                 );
             }
@@ -1324,7 +1493,7 @@ impl Msg for Reply {
                 }
                 data.branches = branches;
                 if !tail.is_empty() {
-                    let (histories, _) = postcard::take_from_bytes::<PromptHistories>(tail)
+                    let (histories, tail) = postcard::take_from_bytes::<PromptHistories>(tail)
                         .map_err(crate::ipc::Error::Codec)?;
                     data.prompt_histories = histories
                         .0
@@ -1347,6 +1516,14 @@ impl Msg for Reply {
                             )
                         })
                         .collect();
+                    if !tail.is_empty() {
+                        let (ClosedWire(ranges), _) = postcard::take_from_bytes::<ClosedWire>(tail)
+                            .map_err(crate::ipc::Error::Codec)?;
+                        data.closed_sessions = ClosedSessionRanges::from_canonical_wire(ranges)
+                            .map_err(|_| {
+                                crate::ipc::Error::Codec(postcard::Error::DeserializeBadEncoding)
+                            })?;
+                    }
                 }
             }
             return Ok(reply);

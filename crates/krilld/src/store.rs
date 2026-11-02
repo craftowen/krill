@@ -537,6 +537,9 @@ impl Store {
             let age = newest.map_or(Duration::MAX, |t| now.duration_since(t).unwrap_or_default());
             // 세그먼트가 하나도 없는 죽은 세션 디렉터리도 걷는다. 살아 있는 세션의 빈 디렉터리는 둔다.
             if !is_live && (newest.is_none() || age > self.limits.keep_closed) {
+                if dir.join(CLOSED_FILE).is_file() {
+                    lock(&self.closed).insert(id);
+                }
                 if let Err(e) = self.discard(&dir, generation) {
                     tracing::warn!(kind = ?e.kind(), "history gc could not discard a session");
                 }

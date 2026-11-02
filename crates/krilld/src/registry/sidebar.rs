@@ -121,6 +121,7 @@ pub(super) fn snapshot(
         repositories: repositories.into_values().collect(),
         branches: Vec::new(),
         prompt_histories: Vec::new(),
+        closed_sessions: krill_proto::control::ClosedSessionRanges::default(),
     };
     populate_branches(&mut data);
     Ok(data)
@@ -508,6 +509,7 @@ mod tests {
             }],
             branches: Vec::new(),
             prompt_histories: Vec::new(),
+            closed_sessions: krill_proto::control::ClosedSessionRanges::default(),
         };
         merge_projects(&mut data, &dir);
         let git_repo_bytes = git_repo.as_os_str().as_bytes().to_vec();

@@ -45,6 +45,10 @@ impl Shell {
                     && (sidebar
                         .session_on(host, session)
                         .is_some_and(sidebar::Session::is_exited)
+                        || sidebar.is_session_closed_on(host, session)
+                            && sidebar
+                                .session_on(host, session)
+                                .is_none_or(sidebar::Session::is_exited)
                         // krilld가 닫힘·이미 재개됨(`NoSession`)으로 확정한 세션: 목록 부재와 달리 증거가 있다.
                         || self.gone_sessions.contains(&(host.clone(), session))
                             && sidebar
@@ -53,17 +57,13 @@ impl Shell {
                         // A local daemon restarting for an update may briefly
                         // publish an incomplete list. Absence is not proof of
                         // PTY exit; keep saved tabs until an explicit exit.
-                        || host.is_remote() && sidebar.host_has_trees(host)
+                        || host.is_remote()
+                            && sidebar.host_has_trees(host)
                             && self.observed_sessions.contains(&(host.clone(), session))
                             && sidebar.session_on(host, session).is_none())
                     && !self.restoring_sessions.contains(&session)
                     && !self.restarting_panes.contains(&pane)
-                    && !self
-                        .accounts_for_host(host)
-                        .details
-                        .handoffs
-                        .iter()
-                        .any(|h| h.from == session || h.to == Some(session))
+                    && !self.blocks_session_prune(pane, host, session)
             })
             .collect();
         if !stale_panes.is_empty() {
@@ -413,11 +413,49 @@ impl Shell {
                                 for rebound in this.layout.rebind_session(&HostId::Local, old, new)
                                 {
                                     this.drop_stale_pastes_for_pane(rebound, Some(new), cx);
+                                    if this
+                                        .live
+                                        .get(&rebound)
+                                        .is_some_and(|l| !l.pane.keep_account_input())
+                                        && let Some(rebound_target) = this.target_for_pane(rebound)
+                                    {
+                                        let task =
+                                            Self::spawn_pane(rebound, rebound_target, None, cx);
+                                        if let Some(live) = this.live.get_mut(&rebound) {
+                                            live.cut();
+                                            live.pane.unlink();
+                                            live.task = task;
+                                            live.error = None;
+                                        }
+                                    }
                                 }
                                 this.sync_sidebar_tab_state(cx);
                                 this.save();
                             }
                             new
+                        }
+                        Err(ref e) if pane::is_session_gone(e) => {
+                            this.restore_attempted.insert(old);
+                            if this.layout.pane_exists(pane_id)
+                                && this.layout.session(pane_id) == Some(old)
+                            {
+                                this.gone_sessions.insert((HostId::Local, old));
+                                if this
+                                    .sidebar
+                                    .read(cx)
+                                    .session_on(&HostId::Local, old)
+                                    .is_some_and(|s| !s.is_exited())
+                                    || this.sidebar.read(cx).is_unread(old)
+                                {
+                                    this.sidebar.update(cx, |s, cx| {
+                                        s.mark_session_exited_on(&HostId::Local, old, cx);
+                                    });
+                                }
+                                if this.sidebar.read(cx).has_source(&HostId::Local) {
+                                    this.reconcile_workspace_sessions(cx);
+                                }
+                            }
+                            old
                         }
                         // 실패·구 데몬이면 옛 ID를 유지한다. 선택돼 있었다면 콜드 폴백을 보여준다.
                         _ => old,

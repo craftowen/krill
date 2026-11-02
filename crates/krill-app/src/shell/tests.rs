@@ -11800,3 +11800,86 @@ fn clicking_observed_closed_tab_prunes_without_infinite_retry_or_respawn(cx: &mu
     });
     assert_eq!(resume_or_create_calls.load(Ordering::SeqCst), 0);
 }
+
+#[gpui::test]
+fn settled_attempt_fencing_drops_stale_completion_after_pane_rebind(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostTarget};
+
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (view, cx) = open(cx, state_path("settled-attempt-fencing"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let paths = Paths {
+                socket: "/tmp/kr-fencing-unused.sock".into(),
+                holder: PathBuf::new(),
+                krilld: PathBuf::new(),
+            };
+            s.paths = Some(paths.clone());
+            let target = HostTarget::local(paths);
+            let pane = s.layout.active_tab().focused;
+            s.layout.set_session(pane, SessionId(610));
+            s.live.insert(pane, Live::new(Task::ready(())));
+            s.restarting_panes.insert(pane);
+            let snapshot = sidebar::Snapshot {
+                sessions: [610_u64, 620]
+                    .into_iter()
+                    .map(|id| sidebar::Session {
+                        id: SessionId(id),
+                        status: krill_proto::control::AgentStatus::UNKNOWN,
+                        worktree: Some("/work/a".into()),
+                        cwd: Some("/work/a".into()),
+                        account: None,
+                    })
+                    .collect(),
+                trees: std::collections::BTreeMap::from([(
+                    PathBuf::from("/work"),
+                    vec![PathBuf::from("/work/a")],
+                )]),
+            };
+            s.sidebar.update(cx, |sidebar, cx| {
+                sidebar.connect_source(Arc::new(Memory(snapshot)), cx);
+            });
+
+            let stale_attempt = SettledAttempt {
+                layout_session: Some(SessionId(610)),
+                target,
+                had_registered_target: true,
+            };
+            s.layout.set_session(pane, SessionId(620));
+
+            let next = s.settled_for_attempt(
+                pane,
+                &stale_attempt,
+                Err(pane::failure_to_io_error(
+                    krill_proto::control::Failure::NoSession,
+                )),
+                cx,
+            );
+            assert!(matches!(next, Next::Gone));
+            assert!(!s.restarting_panes.contains(&pane));
+            assert!(s.layout.pane_exists(pane));
+            assert_eq!(s.layout.session(pane), Some(SessionId(620)));
+            assert!(!s.gone_sessions.contains(&(HostId::Local, SessionId(610))));
+            assert!(!s.gone_sessions.contains(&(HostId::Local, SessionId(620))));
+
+            let next_live = s.settled_for_attempt(
+                pane,
+                &stale_attempt,
+                Ok(Got::Live {
+                    session: SessionId(610),
+                    linked: Err(std::io::ErrorKind::TimedOut.into()),
+                    prior_cold: None,
+                }),
+                cx,
+            );
+            assert!(matches!(next_live, Next::Gone));
+            assert_eq!(s.layout.session(pane), Some(SessionId(620)));
+        });
+    });
+}

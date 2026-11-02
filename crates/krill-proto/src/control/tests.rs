@@ -371,6 +371,7 @@ fn sidebar_fixtures_and_shared_badge() {
             repositories: vec![],
             branches: vec![],
             prompt_histories: Vec::new(),
+            closed_sessions: ClosedSessionRanges::default(),
         })),
         "04000000310e0000"
     );
@@ -386,6 +387,7 @@ fn sidebar_fixtures_and_shared_badge() {
             }],
             branches: vec![],
             prompt_histories: Vec::new(),
+            closed_sessions: ClosedSessionRanges::default(),
         })),
         "0f000000310e0101022f6101022f6101022f61"
     );
@@ -397,6 +399,7 @@ fn sidebar_fixtures_and_shared_badge() {
         }],
         branches: vec![(b"/a".to_vec(), "main".into())],
         prompt_histories: Vec::new(),
+        closed_sessions: ClosedSessionRanges::default(),
     });
     let _ = roundtrip(&with_branches);
     let mut status = AgentStatus::UNKNOWN;
@@ -419,18 +422,21 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             repositories: vec![],
             branches: vec![(vec![b'x'; 4097], "main".into())],
             prompt_histories: Vec::new(),
+            closed_sessions: ClosedSessionRanges::default(),
         },
         SidebarData {
             sessions: vec![],
             repositories: vec![],
             branches: vec![(b"/a".to_vec(), "x".repeat(MAX_TITLE_TEXT + 1))],
             prompt_histories: Vec::new(),
+            closed_sessions: ClosedSessionRanges::default(),
         },
         SidebarData {
             sessions: vec![],
             repositories: vec![],
             branches: vec![(b"/a".to_vec(), "main".into()); 513],
             prompt_histories: Vec::new(),
+            closed_sessions: ClosedSessionRanges::default(),
         },
         SidebarData {
             sessions: vec![SessionDirectory {
@@ -440,6 +446,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             repositories: vec![],
             branches: vec![],
             prompt_histories: Vec::new(),
+            closed_sessions: ClosedSessionRanges::default(),
         },
         SidebarData {
             sessions: vec![
@@ -452,6 +459,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             repositories: vec![],
             branches: vec![],
             prompt_histories: Vec::new(),
+            closed_sessions: ClosedSessionRanges::default(),
         },
         SidebarData {
             sessions: vec![],
@@ -461,6 +469,7 @@ fn sidebar_metadata_rejects_oversized_paths_and_collections() {
             }],
             branches: vec![],
             prompt_histories: Vec::new(),
+            closed_sessions: ClosedSessionRanges::default(),
         },
     ];
     for data in cases {
@@ -1475,5 +1484,161 @@ proptest::proptest! {
         let mut body = vec![32];
         body.extend(bytes);
         Reply::decode(kind::REPLY, &body).ok();
+    }
+}
+
+#[test]
+fn closed_session_ranges_coalesce_split_and_evict_bounded() {
+    let mut ranges = ClosedSessionRanges::default();
+    assert!(!ranges.insert(SessionId(0)));
+    assert!(!ranges.contains(SessionId(0)));
+    assert!(ranges.is_empty());
+    assert_eq!(ranges.max_session(), None);
+
+    assert!(ranges.insert(SessionId(10)));
+    assert!(!ranges.insert(SessionId(10)));
+    assert!(ranges.insert(SessionId(12)));
+    assert_eq!(
+        ranges.ranges(),
+        &[
+            ClosedRange {
+                start: SessionId(10),
+                end: SessionId(10),
+            },
+            ClosedRange {
+                start: SessionId(12),
+                end: SessionId(12),
+            },
+        ]
+    );
+    assert!(ranges.insert(SessionId(11)));
+    assert!(ranges.insert(SessionId(9)));
+    assert!(ranges.insert(SessionId(13)));
+    assert_eq!(
+        ranges.ranges(),
+        &[ClosedRange {
+            start: SessionId(9),
+            end: SessionId(13),
+        }]
+    );
+    assert_eq!(ranges.max_session(), Some(SessionId(13)));
+    for id in 9..=13 {
+        assert!(ranges.contains(SessionId(id)));
+    }
+    assert!(!ranges.contains(SessionId(8)));
+    assert!(!ranges.contains(SessionId(14)));
+
+    assert!(!ranges.remove(SessionId(0)));
+    assert!(!ranges.remove(SessionId(8)));
+    assert!(ranges.remove(SessionId(9)));
+    assert!(ranges.remove(SessionId(13)));
+    assert!(ranges.remove(SessionId(11)));
+    assert_eq!(
+        ranges.ranges(),
+        &[
+            ClosedRange {
+                start: SessionId(10),
+                end: SessionId(10),
+            },
+            ClosedRange {
+                start: SessionId(12),
+                end: SessionId(12),
+            },
+        ]
+    );
+    assert!(ranges.remove(SessionId(10)));
+    assert!(ranges.remove(SessionId(12)));
+    assert!(ranges.is_empty());
+
+    let mut bounded = ClosedSessionRanges::default();
+    for i in 1_u64..=4097_u64 {
+        bounded.insert(SessionId(i.saturating_mul(2)));
+    }
+    assert_eq!(bounded.ranges().len(), MAX_CLOSED_RANGES);
+    assert!(!bounded.contains(SessionId(2)));
+    assert!(bounded.contains(SessionId(4)));
+    assert!(bounded.contains(SessionId(8194)));
+
+    bounded.insert(SessionId(8196));
+    bounded.insert(SessionId(8197));
+    bounded.insert(SessionId(8198));
+    assert_eq!(bounded.ranges().len(), MAX_CLOSED_RANGES);
+    assert!(bounded.remove(SessionId(8197)));
+    assert_eq!(bounded.ranges().len(), MAX_CLOSED_RANGES);
+    assert!(!bounded.contains(SessionId(8197)));
+    assert!(bounded.contains(SessionId(8198)));
+}
+
+#[test]
+fn sidebar_closed_sessions_tail_roundtrips_and_rejects_non_canonical_wire() {
+    let mut closed = ClosedSessionRanges::default();
+    closed.insert(SessionId(3));
+    closed.insert(SessionId(4));
+    closed.insert(SessionId(9));
+
+    let reply = Reply::Sidebar(SidebarData {
+        closed_sessions: closed.clone(),
+        ..SidebarData::default()
+    });
+    let _ = roundtrip(&reply);
+    let bytes = reply.encode().unwrap();
+    let (_, body) = read_frame(&mut bytes.as_slice()).unwrap().unwrap();
+    let (Reply::Sidebar(legacy), rest) = postcard::take_from_bytes::<Reply>(&body).unwrap() else {
+        panic!("expected sidebar");
+    };
+    assert!(legacy.closed_sessions.is_empty());
+    let (Branches(branches), rest) = postcard::take_from_bytes::<Branches>(rest).unwrap();
+    assert!(branches.is_empty());
+    let (PromptHistories(histories), rest) =
+        postcard::take_from_bytes::<PromptHistories>(rest).unwrap();
+    assert!(histories.is_empty());
+    assert!(!rest.is_empty());
+
+    let base_body = postcard::to_stdvec(&Reply::Sidebar(SidebarData::default())).unwrap();
+    let empty_branches = postcard::to_stdvec(&Vec::<(Vec<u8>, String)>::new()).unwrap();
+    let empty_histories =
+        postcard::to_stdvec(&Vec::<(SessionId, crate::git::SessionPromptHistory)>::new()).unwrap();
+    let bad_tails: [Vec<ClosedRange>; 5] = [
+        vec![ClosedRange {
+            start: SessionId(0),
+            end: SessionId(1),
+        }],
+        vec![ClosedRange {
+            start: SessionId(5),
+            end: SessionId(4),
+        }],
+        vec![
+            ClosedRange {
+                start: SessionId(1),
+                end: SessionId(2),
+            },
+            ClosedRange {
+                start: SessionId(3),
+                end: SessionId(4),
+            },
+        ],
+        vec![
+            ClosedRange {
+                start: SessionId(2),
+                end: SessionId(4),
+            },
+            ClosedRange {
+                start: SessionId(3),
+                end: SessionId(5),
+            },
+        ],
+        (1_u64..=4097_u64)
+            .map(|i| {
+                let id = SessionId(i.saturating_mul(2));
+                ClosedRange { start: id, end: id }
+            })
+            .collect(),
+    ];
+    for bad in bad_tails {
+        let mut forged = base_body.clone();
+        forged.extend_from_slice(&empty_branches);
+        forged.extend_from_slice(&empty_histories);
+        forged.extend(postcard::to_stdvec(&bad).unwrap());
+        assert!(Reply::decode(kind::REPLY, &forged).is_err());
     }
 }

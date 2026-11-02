@@ -168,7 +168,9 @@ fn known_floor(root: &Path) -> io::Result<u64> {
         Err(error) => return Err(error),
     }
     // Account aliases outlive recordings. Reusing one would pause or redirect a new shell.
-    Ok(floor.max(handoffs::known_floor(root)?))
+    Ok(floor
+        .max(handoffs::known_floor(root)?)
+        .max(super::closed_sessions::known_floor(root)?))
 }
 
 #[cfg(test)]
