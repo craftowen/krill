@@ -2824,9 +2824,9 @@ impl Registry {
                     let should_upgrade_db = s
                         .transcript_path
                         .as_deref()
-                        .is_some_and(crate::agent::control::is_agy_conversation_db_path)
-                        && found.path.to_str().is_some_and(|p| {
-                            !crate::agent::control::is_agy_conversation_db_path(p)
+                        .zip(found.path.to_str())
+                        .is_some_and(|(old, new_path)| {
+                            crate::agent::control::should_upgrade_agy_transcript_path(old, new_path)
                         });
                     if (s.transcript_path.is_none() || should_upgrade_db)
                         && let Some(p) = found
@@ -2876,9 +2876,13 @@ impl Registry {
             && stored.as_ref().is_some_and(|s| {
                 s.session_id.as_deref() == Some(&sid)
                     && (s.transcript_path.is_none()
-                        || s.transcript_path
-                            .as_deref()
-                            .is_some_and(crate::agent::control::is_agy_conversation_db_path))
+                        || s.transcript_path.as_deref().zip(path.to_str()).is_some_and(
+                            |(old, new_path)| {
+                                crate::agent::control::should_upgrade_agy_transcript_path(
+                                    old, new_path,
+                                )
+                            },
+                        ))
             })
         {
             // Cwd/recency fallback is for displaying history only. It must never become
