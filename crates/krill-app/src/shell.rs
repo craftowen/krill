@@ -4660,7 +4660,7 @@ impl Shell {
                         }
                     })
                     .await;
-                let next = this.update(cx, |t, cx| t.settled(pane, got, cx));
+                let next = this.update(cx, |t, cx| t.settled_attempt(pane, want, got, cx));
                 let mut reader = match next {
                     Ok(Next::Read(r)) => r,
                     Ok(Next::Retry) => {
@@ -4714,6 +4714,25 @@ impl Shell {
 
     /// 붙기 시도가 끝났다. `got`은 세션 정하기의 결과와, 정했다면 그 세션에 붙기의 결과. 정한 세션은 붙기가 실패해도
     /// 레이아웃에 적는다 — 안 적으면 다음 시도가 세션을 또 만든다(OWE-506). 콜드 기록이면 읽기 전용 화면을 띄운다(MK-032).
+    fn settled_attempt(
+        &mut self,
+        pane: PaneId,
+        want: Option<krill_proto::SessionId>,
+        got: std::io::Result<Got>,
+        cx: &mut Context<Self>,
+    ) -> Next {
+        // 응답을 기다리는 사이 칸이 다른 세션으로 옮겨졌다면 옛 세션의 끝을 새 세션의 끝으로 적지 않는다.
+        if got.as_ref().err().is_some_and(pane::is_session_gone)
+            && self
+                .layout
+                .session(pane)
+                .is_some_and(|now| Some(now) != want)
+        {
+            return Next::Retry;
+        }
+        self.settled(pane, got, cx)
+    }
+
     fn settled(&mut self, pane: PaneId, got: std::io::Result<Got>, cx: &mut Context<Self>) -> Next {
         let next = self.settled_inner(pane, got, cx);
         // Keep an in-flight first Create/Attach alive across tab switches until
@@ -4820,17 +4839,28 @@ impl Shell {
                     .detach();
                 }
                 let old = self.layout.session(pane);
+                // 계정 전환이 붙든 입력은 콜드 화면이 지운다. 이어받기가 끝나면 재바인딩이 칸을 다시 붙인다.
+                let held = self
+                    .live
+                    .get(&pane)
+                    .is_some_and(|l| l.pane.holds_account_input());
                 // 데몬이 끝났다고 확정한 세션의 칸은 오류 문구로 남기지 않고 reconcile이 거둔다.
                 if pane::is_session_gone(&e)
+                    && !held
                     && let Some(session) = old
                 {
                     let host = self.layout.host(pane).clone();
-                    self.gone_sessions.insert((host, session));
+                    self.gone_sessions.insert((host.clone(), session));
+                    // 계정 이어받기가 남긴 사이드바 사본 행이 reconcile을 막지 않게 먼저 지운다.
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.mark_session_exited_on(&host, session, cx);
+                    });
                     self.reconcile_workspace_sessions(cx);
                 }
                 match self.live.get_mut(&pane) {
                     Some(l) => {
                         if permanent
+                            && !held
                             && !l.pane.is_cold()
                             && !l.pane.is_closed()
                             && let Some(session) = l.pane.session().or(old)
@@ -4872,6 +4902,13 @@ impl Shell {
         cold: krill_proto::control::Cold,
         cx: &mut Context<Self>,
     ) -> Next {
+        if self
+            .live
+            .get(&pane)
+            .is_some_and(|l| l.pane.holds_account_input())
+        {
+            return Next::Gone;
+        }
         let had_session = self
             .live
             .get(&pane)

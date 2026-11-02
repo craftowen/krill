@@ -383,6 +383,28 @@ pub fn normalize(payload: &[u8]) -> Option<AgentState> {
     Some(state)
 }
 
+/// 부모 세션이 한 턴을 끝내고 프롬프트로 돌아왔음을 뜻하는 hook인가.
+/// 기동(`SessionStart`), 중간 단계(`PostInvocation`), 한도·인터럽트(`StopFailure`·`Interrupt`), 서브에이전트는 제외한다.
+pub(crate) fn is_turn_stop(payload: &[u8]) -> bool {
+    let Ok(f) = serde_json::from_slice::<Fields>(payload) else {
+        return false;
+    };
+    let is_subagent = f.is_subagent
+        || f.agent_id.as_deref().is_some_and(|s| !s.is_empty())
+        || f.parent_session_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        || f.teammate_id.as_deref().is_some_and(|s| !s.is_empty());
+    if is_subagent {
+        return false;
+    }
+    match f.hook_event_name.as_deref() {
+        Some("Stop") => f.fully_idle != Some(false),
+        Some("AfterAgent" | "stop") => true,
+        _ => false,
+    }
+}
+
 /// 서브에이전트가 띄운 권한·질문(`Waiting`)이 끝났음을 뜻하는 서브에이전트 후속 이벤트인가(Orca `claude-roster-state` 준용).
 fn subagent_clears_waiting(payload: &[u8]) -> bool {
     let Ok(f) = serde_json::from_slice::<Fields>(payload) else {

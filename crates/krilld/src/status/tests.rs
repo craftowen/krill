@@ -789,3 +789,28 @@ fn process_name_maps_versioned_claude_binary() {
     }
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn is_turn_stop_distinguishes_final_turn_stop_from_startup_and_mid_turn_hooks() {
+    use super::is_turn_stop;
+    assert!(is_turn_stop(br#"{"hook_event_name":"Stop"}"#));
+    assert!(is_turn_stop(
+        br#"{"hook_event_name":"Stop","fullyIdle":true}"#
+    ));
+    assert!(!is_turn_stop(
+        br#"{"hook_event_name":"Stop","fullyIdle":false}"#
+    ));
+    assert!(is_turn_stop(br#"{"hookEventName":"AfterAgent"}"#));
+    assert!(is_turn_stop(br#"{"event":"stop"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"SessionStart"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"sessionStart"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"PostInvocation"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"StopFailure"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"Interrupt"}"#));
+    assert!(!is_turn_stop(
+        br#"{"hook_event_name":"Stop","agent_id":"sub-1"}"#
+    ));
+    assert!(!is_turn_stop(
+        br#"{"hook_event_name":"Stop","isSubagent":true}"#
+    ));
+}

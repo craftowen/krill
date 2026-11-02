@@ -534,7 +534,8 @@ fn consume_request(
     parse_consume_response(std::str::from_utf8(&body).ok()?)
 }
 
-/// 소진 요청 curl 설정. `data`는 JSON 큰따옴표와 겹치지 않게 작은따옴표로 감싼다.
+/// 소진 요청 curl 설정. `curl --config`는 큰따옴표(`"..."`)만 인용 부호로 해석하고
+/// 작은따옴표는 공백에서 값을 잘라 버리므로 JSON 큰따옴표는 `\"`로 이스케이프한다.
 fn consume_config(
     provider: ProviderKind,
     token: &str,
@@ -559,9 +560,9 @@ fn consume_config(
         config.push_str(account);
         config.push_str("\"\n");
     }
-    config.push_str("data = '{\"redeem_request_id\": \"");
+    config.push_str("data = \"{\\\"redeem_request_id\\\": \\\"");
     config.push_str(redeem_id);
-    config.push_str("\"}'\n");
+    config.push_str("\\\"}\"\n");
     Some(config)
 }
 
@@ -826,7 +827,7 @@ pub(super) fn claude_claim_reset(
         return None;
     }
     let config = Zeroizing::new(format!(
-        "url = \"https://api.anthropic.com/api/organizations/{org_uuid}/reset_rate_limits\"\nrequest = \"POST\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: claude-code/2.1.0\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"Content-Type: application/json\"\nheader = \"Accept: application/json\"\ndata = '{{\"program\": \"{}\"}}'\n",
+        "url = \"https://api.anthropic.com/api/organizations/{org_uuid}/reset_rate_limits\"\nrequest = \"POST\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: claude-code/2.1.0\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"Content-Type: application/json\"\nheader = \"Accept: application/json\"\ndata = \"{{\\\"program\\\": \\\"{}\\\"}}\"\n",
         program.as_str()
     ));
     let (status, body) = send(&config)?;
@@ -2587,7 +2588,9 @@ mod tests {
         assert!(consume.contains("rate-limit-reset-credits/consume"));
         assert!(consume.contains("request = \"POST\""));
         assert!(consume.contains("ChatGPT-Account-Id: acct-1"));
-        assert!(consume.contains("\"redeem_request_id\": \"55cbe0c1-71ab-4c52-b855-70746ff52\""));
+        assert!(consume.contains(
+            "data = \"{\\\"redeem_request_id\\\": \\\"55cbe0c1-71ab-4c52-b855-70746ff52\\\"}\""
+        ));
         assert!(consume_config(ProviderKind::Claude, &token, None, "k").is_none());
         assert!(consume_config(ProviderKind::Codex, &token, None, "bad id!").is_none());
         for invalid in ["token\r\ninjected", "token\"", "token\\"] {
@@ -2750,6 +2753,86 @@ mod tests {
             parts
                 .iter()
                 .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut received = Vec::with_capacity(2);
+            for reply in [
+                br#"{"code":"reset","windows_reset":2}"#.as_slice(),
+                br#"{"result":"reset"}"#.as_slice(),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = req
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b.to_owned())
+                    .unwrap_or_default();
+                received.push(body);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.write_all(reply).unwrap();
+            }
+            received
+        });
+        let codex_res = consume_request(
+            ProviderKind::Codex,
+            "fixture-only",
+            Some("acct-1"),
+            &id,
+            |config| {
+                let config = Zeroizing::new(config.replace(
+                    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+                    &format!("http://{addr}/consume"),
+                ));
+                pipe_command(
+                    system_curl(),
+                    &[
+                        "-q",
+                        "--config",
+                        "-",
+                        "--silent",
+                        "--fail",
+                        "--max-time",
+                        "2",
+                    ],
+                    config.as_bytes(),
+                )
+            },
+        );
+        assert_eq!(codex_res, Some((ResetConsumeOutcome::Reset, 2)));
+        let claude_res = claude_claim_reset(
+            "fixture-only",
+            "12345678-1234-1234-1234-1234567890ab",
+            ClaudeResetProgram::Juniper,
+            |config| {
+                let config = Zeroizing::new(config.replace(
+                    "https://api.anthropic.com/api/organizations/12345678-1234-1234-1234-1234567890ab/reset_rate_limits",
+                    &format!("http://{addr}/reset_rate_limits"),
+                ));
+                curl_status(&config)
+            },
+        );
+        assert_eq!(claude_res, Some((ResetConsumeOutcome::Reset, 1)));
+        let bodies = server.join().unwrap();
+        let codex_json: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(
+            codex_json.get("redeem_request_id").and_then(|v| v.as_str()),
+            Some(id.as_str())
+        );
+        let claude_json: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(
+            claude_json.get("program").and_then(|v| v.as_str()),
+            Some("juniper_tide")
         );
     }
 
@@ -2948,6 +3031,20 @@ mod tests {
             .is_none()
         );
         // 조직 UUID 조회: 경로·형식 검증.
+        let mut claim_cfg = String::new();
+        assert_eq!(
+            claude_claim_reset(
+                "fixture-only",
+                "12345678-1234-1234-1234-1234567890ab",
+                ClaudeResetProgram::Juniper,
+                |cfg| {
+                    claim_cfg = cfg.to_owned();
+                    Some((200, br#"{"result":"reset"}"#.to_vec().into()))
+                },
+            ),
+            Some((ResetConsumeOutcome::Reset, 1))
+        );
+        assert!(claim_cfg.contains("data = \"{\\\"program\\\": \\\"juniper_tide\\\"}\""));
         let org = |body: &str| {
             claude_org_uuid("fixture-only", |_| {
                 Some(Zeroizing::new(body.as_bytes().to_vec()))

@@ -2053,7 +2053,7 @@ fn only_daemon_no_session_reply_is_session_gone() {
 }
 
 #[test]
-fn attach_metadata_failure_preserves_identity_without_changing_retry_policy() {
+fn attach_metadata_failure_preserves_identity_and_only_no_session_is_permanent() {
     use krill_proto::control::Failure;
     for failure in [
         Failure::NoHolder,
@@ -2081,7 +2081,14 @@ fn attach_metadata_failure_preserves_identity_without_changing_retry_policy() {
         );
         let error = attach(&paths, SessionId(7), None).err().unwrap();
         assert_eq!(diagnostics::control_failure(&error), Some(failure));
-        assert_eq!(error.kind(), io::ErrorKind::Other);
+        // Only NoSession is permanent; the others stay retryable. It is still not `gone`:
+        // attach refusal alone never removes a pane, the Resume reply decides.
+        let kind = if failure == Failure::NoSession {
+            io::ErrorKind::NotFound
+        } else {
+            io::ErrorKind::Other
+        };
+        assert_eq!(error.kind(), kind, "{failure:?}");
         assert_eq!(error.to_string(), failure.to_string());
         assert_eq!(error.raw_os_error(), None);
         assert!(!is_session_gone(&error));

@@ -836,6 +836,37 @@ impl Tap {
         }
     }
 
+    /// [`Tap::wait`]에 상한 시간을 둔다. 기한이 지나면 그 시점의 [`Pulse`]를 돌려준다.
+    pub(crate) fn wait_timeout(&self, timeout: Duration, ready: impl Fn(&Pulse) -> bool) -> Pulse {
+        let deadline = Instant::now() + timeout;
+        let mut out = lock(&self.0.out);
+        loop {
+            let p = Pulse {
+                revision: out.revision,
+                end: out.end,
+                closed: out.closed,
+            };
+            let generation = out.generation;
+            drop(out);
+            if ready(&p) {
+                return p;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return p;
+            }
+            out = lock(&self.0.out);
+            if out.generation == generation {
+                out = self
+                    .0
+                    .changed
+                    .wait_timeout(out, remaining)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+    }
+
     /// [`Tap::wait`] 중인 스레드를 모두 깨운다(조건을 다시 본다).
     pub fn wake(&self) {
         let mut out = lock(&self.0.out);

@@ -148,6 +148,14 @@ struct State {
     roots: Roots,
 }
 
+type IdleMailScope = (u64, String, Option<String>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MailEpochState {
+    InFlight(u64),
+    Delivered(u64),
+}
+
 /// krilld 전체에 하나.
 pub struct Registry {
     holder: Option<Arc<Holder>>,
@@ -188,6 +196,7 @@ pub struct Registry {
     webhooks: Mutex<crate::webhook::Dispatcher>,
     orch_signal: (Mutex<u64>, std::sync::Condvar),
     orch_cache: Mutex<orch_cache::Cache>,
+    orch_mail_notified_done: Mutex<BTreeMap<IdleMailScope, MailEpochState>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -262,6 +271,7 @@ impl Registry {
             webhooks: Mutex::new(crate::webhook::Dispatcher::new(dir)),
             orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
             orch_cache: Mutex::default(),
+            orch_mail_notified_done: Mutex::default(),
             watch: crate::watch::Watch::new(if holder.is_some() {
                 HolderStatus::Linked
             } else {
@@ -409,6 +419,15 @@ impl Registry {
         drop(commit);
         for (id, payload, event_id) in &hooked {
             self.maybe_rename_from_hook(*id, payload, *event_id);
+            if status::is_turn_stop(payload)
+                && let Some(dir) = self.state_dir()
+                && let Err(error) = self.notify_idle_orchestration_mail_for(&dir, Some(*id))
+            {
+                tracing::warn!(
+                    kind = ?error.kind(),
+                    "orchestration idle mail notification failed"
+                );
+            }
         }
     }
 
@@ -705,6 +724,15 @@ impl Registry {
             drop(s);
             if let Some(id) = session {
                 self.maybe_rename_from_hook(id, &e.payload, e.id);
+                if status::is_turn_stop(&e.payload)
+                    && let Some(dir) = self.state_dir()
+                    && let Err(error) = self.notify_idle_orchestration_mail_for(&dir, Some(id))
+                {
+                    tracing::warn!(
+                        kind = ?error.kind(),
+                        "orchestration idle mail notification failed"
+                    );
+                }
             }
             return ack;
         }
@@ -1584,7 +1612,10 @@ impl Registry {
             if st.resumed.contains(&old) {
                 return Err(Failure::NoSession);
             }
-            if st.sessions.contains_key(&old) && !st.exited.contains_key(&old) {
+            // K-26: 이 PTY는 holder에 살아 있다. 목록에 없다고 되살리면 같은 대화의 에이전트가 둘이 된다.
+            if st.unregistered_kept.contains(&old)
+                || st.sessions.contains_key(&old) && !st.exited.contains_key(&old)
+            {
                 return Err(Failure::BadRequest);
             }
         }
@@ -2206,6 +2237,9 @@ impl Registry {
         if allow_status_hook && self.status.hook(&[(id, e)])? > 0 {
             self.observe_webhook(id);
             let status = self.status.get(id);
+            if status.state != control::AgentState::Done {
+                lock(&self.orch_mail_notified_done).retain(|(sid, _, _), _| *sid != id.0);
+            }
             if status.state == control::AgentState::Working {
                 self.agents.clear_rate_limited(id);
             }
@@ -2397,6 +2431,7 @@ impl Registry {
         }
         drop(st);
         self.status.remove(id);
+        lock(&self.orch_mail_notified_done).retain(|(sid, _, _), _| *sid != id.0);
         self.clear_sleeping(id);
         self.forget_failed_account_handoff(id);
     }
@@ -2894,7 +2929,7 @@ impl Registry {
     }
 
     pub(crate) fn deliver_input_to_tap(tap: &Tap, bytes: &[u8], submit: bool) -> io::Result<()> {
-        let (_, _, _, modes) = tap.capture_with_modes();
+        let (_, _, _, modes) = tap.capture_shared_with_modes();
         let bracketed = modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE);
         let payload = if submit {
             bytes
@@ -2913,6 +2948,7 @@ impl Registry {
             && !payload.is_empty()
             && !is_control_seq
             && (submit || payload.contains(&b'\n') || payload.contains(&b'\r'));
+        let before_end = tap.pulse().end;
         if use_bracketed {
             let mut framed = Vec::with_capacity(payload.len() + 12);
             framed.extend_from_slice(b"\x1b[200~");
@@ -2924,19 +2960,56 @@ impl Registry {
             framed.extend_from_slice(rest);
             framed.extend_from_slice(b"\x1b[201~");
             tap.write_input(&framed, None)?;
-            if submit {
-                std::thread::sleep(krill_proto::input::PASTE_SUBMIT_DELAY);
-                tap.write_input(b"\r", None)?;
+        } else if !payload.is_empty() {
+            tap.write_input(payload, None)?;
+        }
+        if submit {
+            // ConPTY without VT passthrough never exposes DECSET 2004, and busy TUIs can echo a
+            // paste tens or hundreds of ms after write_input returns. Always separate text and CR
+            // until after echo settles so the TUI does not fold Enter into the paste burst.
+            if !payload.is_empty() && !is_control_seq {
+                Self::wait_for_paste_submit_settle(tap, before_end);
             }
-        } else {
-            if !payload.is_empty() {
-                tap.write_input(payload, None)?;
-            }
-            if submit {
-                tap.write_input(b"\r", None)?;
-            }
+            tap.write_input(b"\r", None)?;
         }
         Ok(())
+    }
+
+    fn wait_for_paste_submit_settle(tap: &Tap, before_end: u64) {
+        const ECHO_WAIT_MAX: Duration = Duration::from_millis(500);
+        const ECHO_QUIET: Duration = Duration::from_millis(60);
+        const ECHO_DRAIN_MAX: Duration = Duration::from_millis(400);
+
+        let first = tap.wait_timeout(ECHO_WAIT_MAX, |p| p.closed || p.end > before_end);
+        if first.closed || first.end == before_end {
+            return;
+        }
+        let mut last_end = first.end;
+        let mut last_echo_at = Instant::now();
+        let drain_deadline = last_echo_at + ECHO_DRAIN_MAX;
+        loop {
+            let budget = drain_deadline
+                .saturating_duration_since(Instant::now())
+                .min(ECHO_QUIET);
+            if budget.is_zero() {
+                break;
+            }
+            let next = tap.wait_timeout(budget, |p| p.closed || p.end > last_end);
+            if next.closed {
+                return;
+            }
+            if next.end > last_end {
+                last_end = next.end;
+                last_echo_at = Instant::now();
+            } else {
+                break;
+            }
+        }
+        let remaining =
+            krill_proto::input::PASTE_SUBMIT_DELAY.saturating_sub(last_echo_at.elapsed());
+        if !remaining.is_zero() {
+            std::thread::sleep(remaining);
+        }
     }
 
     fn send_input(
@@ -3254,6 +3327,22 @@ impl Registry {
             if let Ok(sid) = u32::try_from(session.0) {
                 store.session_runs.insert(sid, dispatch.run_id);
             }
+            let dispatch_msg_ids: Vec<String> = store
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.dispatch_id.as_deref() == Some(dispatch_id)
+                        && m.msg_type == krill_proto::orchestration::MessageType::Dispatch
+                })
+                .map(|m| m.id.clone())
+                .collect();
+            if !dispatch_msg_ids.is_empty() {
+                store
+                    .idle_mail_notified
+                    .entry(session.0)
+                    .or_default()
+                    .extend(dispatch_msg_ids);
+            }
             Ok(result)
         })
     }
@@ -3261,81 +3350,178 @@ impl Registry {
     /// Submit only a mailbox pointer to an idle live PTY, once per unacknowledged mail.
     /// Message content stays in the durable mailbox, not in terminal input.
     fn notify_idle_orchestration_mail(&self, dir: &Path) -> io::Result<()> {
+        self.notify_idle_orchestration_mail_for(dir, None)
+    }
+
+    fn notify_idle_orchestration_mail_for(
+        &self,
+        dir: &Path,
+        only_session: Option<SessionId>,
+    ) -> io::Result<()> {
         use krill_proto::orchestration::{
-            DispatchReleaseState, DispatchStatus, OrchestrationStore,
+            DispatchReleaseState, DispatchStatus, ORCH_FILE, OrchestrationStore,
         };
-        OrchestrationStore::mutate(dir, |store| {
-            let mut targets: BTreeMap<(u64, String, Option<String>), Vec<String>> = BTreeMap::new();
-            for message in store.messages.iter().filter(|m| !m.acked) {
-                let session = if message.to == "coordinator" {
-                    store
-                        .runs
-                        .iter()
-                        .find(|r| Some(&r.id) == message.run_id.as_ref())
-                        .and_then(|r| r.coordinator_session_id)
-                } else {
-                    store
-                        .dispatches
-                        .iter()
-                        .rev()
-                        .find(|d| {
-                            d.worker_name == message.to
-                                && message.run_id.as_ref().is_none_or(|id| &d.run_id == id)
-                                && d.release_state != DispatchReleaseState::Released
-                                && !matches!(
-                                    d.status,
-                                    DispatchStatus::Abandoned
-                                        | DispatchStatus::Failed
-                                        | DispatchStatus::Released
-                                )
-                        })
-                        .and_then(|d| d.session_id)
-                };
-                let Some(sid) = session else {
-                    continue;
-                };
-                if store
-                    .idle_mail_notified
-                    .get(&sid)
-                    .is_some_and(|ids| ids.contains(&message.id))
-                {
-                    continue;
-                }
-                targets
-                    .entry((sid, message.to.clone(), message.run_id.clone()))
-                    .or_default()
-                    .push(message.id.clone());
+        if !dir.join(ORCH_FILE).exists() {
+            return Ok(());
+        }
+        if let Some(session) = only_session
+            && self.status.get(session).state != control::AgentState::Done
+        {
+            return Ok(());
+        }
+        let store = OrchestrationStore::load(dir)?;
+        let mut targets: BTreeMap<IdleMailScope, Vec<String>> = BTreeMap::new();
+        for message in store.messages.iter().filter(|m| !m.acked) {
+            let session = if message.to == "coordinator" {
+                store
+                    .runs
+                    .iter()
+                    .find(|r| Some(&r.id) == message.run_id.as_ref())
+                    .and_then(|r| r.coordinator_session_id)
+            } else {
+                store
+                    .dispatches
+                    .iter()
+                    .rev()
+                    .find(|d| {
+                        d.worker_name == message.to
+                            && message.run_id.as_ref().is_none_or(|id| &d.run_id == id)
+                            && d.release_state != DispatchReleaseState::Released
+                            && !matches!(
+                                d.status,
+                                DispatchStatus::Abandoned
+                                    | DispatchStatus::Failed
+                                    | DispatchStatus::Released
+                            )
+                    })
+                    .and_then(|d| d.session_id)
+            };
+            let Some(sid) = session else {
+                continue;
+            };
+            if only_session.is_some_and(|only| only.0 != sid) {
+                continue;
             }
-            for ((sid, recipient, run_id), ids) in targets {
-                let session = SessionId(sid);
-                // Waiting includes approval/questions; never type mail into those prompts.
-                if self.status.get(session).state != control::AgentState::Done {
+            if store
+                .idle_mail_notified
+                .get(&sid)
+                .is_some_and(|ids| ids.contains(&message.id))
+            {
+                continue;
+            }
+            targets
+                .entry((sid, message.to.clone(), message.run_id.clone()))
+                .or_default()
+                .push(message.id.clone());
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut delivered: Vec<(u64, Vec<String>)> = Vec::new();
+        for (scope, ids) in targets {
+            let (sid, ref recipient, ref run_id) = scope;
+            let session = SessionId(sid);
+            // Waiting includes approval/questions; never type mail into those prompts.
+            let initial = self.status.get(session);
+            if initial.state != control::AgentState::Done {
+                continue;
+            }
+            let epoch = initial.since_unix_ns;
+            let tap = lock(&self.state)
+                .sessions
+                .get(&session)
+                .map(|entry| entry.session.tap());
+            let Some(tap) = tap.filter(|tap| !tap.pulse().closed) else {
+                continue;
+            };
+            {
+                let mut epochs = lock(&self.orch_mail_notified_done);
+                if matches!(
+                    epochs.get(&scope),
+                    Some(MailEpochState::InFlight(e) | MailEpochState::Delivered(e)) if *e == epoch
+                ) {
                     continue;
                 }
-                let tap = lock(&self.state)
-                    .sessions
-                    .get(&session)
-                    .map(|entry| entry.session.tap());
-                let Some(tap) = tap.filter(|tap| !tap.pulse().closed) else {
-                    continue;
-                };
-                // Avoid interpreting names as shell fragments, even for a login shell.
-                let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-                let run_flag = run_id
-                    .as_deref()
-                    .map(|id| format!(" --run {}", quote(id)))
-                    .unwrap_or_default();
-                let pointer = format!(
-                    "[Krill orchestration] Unread mail. Read with: krill orchestration check --to {}{} --unread --json",
-                    quote(&recipient),
-                    run_flag
-                );
-                if Self::deliver_input_to_tap(&tap, pointer.as_bytes(), true).is_ok() {
-                    store.idle_mail_notified.entry(sid).or_default().extend(ids);
+                epochs.insert(scope.clone(), MailEpochState::InFlight(epoch));
+            }
+            if !self.wait_for_idle_mail_prompt(session, epoch, &tap) {
+                let mut epochs = lock(&self.orch_mail_notified_done);
+                if epochs.get(&scope) == Some(&MailEpochState::InFlight(epoch)) {
+                    epochs.remove(&scope);
+                }
+                continue;
+            }
+            // Avoid interpreting names as shell fragments, even for a login shell.
+            let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+            let run_flag = run_id
+                .as_deref()
+                .map(|id| format!(" --run {}", quote(id)))
+                .unwrap_or_default();
+            let pointer = format!(
+                "[Krill orchestration] Unread mail. Read with: krill orchestration check --to {}{} --unread --json",
+                quote(recipient),
+                run_flag
+            );
+            let sent = Self::deliver_input_to_tap(&tap, pointer.as_bytes(), true).is_ok();
+            {
+                let mut epochs = lock(&self.orch_mail_notified_done);
+                if epochs.get(&scope) == Some(&MailEpochState::InFlight(epoch)) {
+                    if sent {
+                        epochs.insert(scope, MailEpochState::Delivered(epoch));
+                    } else {
+                        epochs.remove(&scope);
+                    }
                 }
             }
-            Ok(())
-        })
+            if sent {
+                delivered.push((sid, ids));
+            }
+        }
+        if !delivered.is_empty() {
+            OrchestrationStore::mutate(dir, |store| {
+                let unread: std::collections::BTreeSet<&str> = store
+                    .messages
+                    .iter()
+                    .filter(|m| !m.acked)
+                    .map(|m| m.id.as_str())
+                    .collect();
+                for (sid, ids) in delivered {
+                    let notified = store.idle_mail_notified.entry(sid).or_default();
+                    for id in ids {
+                        if unread.contains(id.as_str()) {
+                            notified.insert(id);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_idle_mail_prompt(&self, session: SessionId, epoch: u64, tap: &Tap) -> bool {
+        const MIN_DONE_AGE_NS: u64 = 250_000_000;
+        const MIN_QUIET_MS: u64 = 200;
+        const MAX_SETTLE: Duration = Duration::from_millis(450);
+        const POLL: Duration = Duration::from_millis(20);
+
+        let started = Instant::now();
+        loop {
+            if tap.pulse().closed {
+                return false;
+            }
+            let current = self.status.get(session);
+            if current.state != control::AgentState::Done || current.since_unix_ns != epoch {
+                return false;
+            }
+            let done_age_ns = status::now_ns().saturating_sub(epoch);
+            if (done_age_ns >= MIN_DONE_AGE_NS && tap.quiet_ms() >= MIN_QUIET_MS)
+                || started.elapsed() >= MAX_SETTLE
+            {
+                return true;
+            }
+            std::thread::sleep(POLL);
+        }
     }
 
     fn orchestration(
@@ -3662,6 +3848,12 @@ impl Registry {
             } => OrchestrationStore::mutate(&dir, |s| s.reply_message(&question_id, &from, &body))
                 .map(|m| {
                     self.notify_orch();
+                    if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            "orchestration idle mail notification failed"
+                        );
+                    }
                     OrchResponse::Message(m)
                 }),
             OrchAction::CreateGate {
@@ -4277,6 +4469,236 @@ mod orchestration_delivery_tests {
         reg.notify_idle_orchestration_mail(&dir)?;
         assert!(terminal.read(&mut bytes).is_err());
         assert_eq!(OrchestrationStore::load(&dir)?.idle_mail_notified, recorded);
+        drop(reg);
+        drop(terminal);
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn deliver_input_to_tap_paces_unbracketed_and_delayed_echo_submit() -> io::Result<()> {
+        use std::io::Write as _;
+
+        let look = Arc::new(Appearance::load(PathBuf::new()));
+
+        // 1. Unbracketed mode (ConPTY without VT passthrough / rejoined PTY): payload and CR must
+        //    not coalesce into one paste burst.
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            SessionId(412),
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&look),
+            None,
+        )?;
+        let tap = session.tap();
+        let tui = std::thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>, Duration)> {
+            let mut buf = [0_u8; 512];
+            let n1 = terminal.read(&mut buf)?;
+            let first = buf[..n1].to_vec();
+            terminal.write_all(b"> [Krill orchestration] Unread mail.")?;
+            let echoed_at = Instant::now();
+            let n2 = terminal.read(&mut buf)?;
+            let gap = echoed_at.elapsed();
+            let second = buf[..n2].to_vec();
+            Ok((first, second, gap))
+        });
+        let text = b"[Krill orchestration] Unread mail.";
+        Registry::deliver_input_to_tap(&tap, text, true)?;
+        let (first, second, gap) = tui.join().unwrap()?;
+        assert_eq!(first, text);
+        assert_eq!(second, b"\r");
+        assert!(
+            gap >= Duration::from_millis(220),
+            "expected PASTE_SUBMIT_DELAY after unbracketed echo, got {gap:?}"
+        );
+        drop(session);
+
+        // 2. Bracketed mode with delayed multi-chunk echo: CR must wait PASTE_SUBMIT_DELAY after
+        //    the final echoed chunk, not merely from write_input enqueue time.
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            SessionId(413),
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            look,
+            None,
+        )?;
+        let tap = session.tap();
+        terminal.write_all(b"\x1b[?2004h")?;
+        tap.wait_timeout(Duration::from_secs(1), |p| p.end >= 8);
+        assert!(
+            tap.capture_shared_with_modes()
+                .3
+                .contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
+        );
+        let tui = std::thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>, Duration)> {
+            let mut buf = [0_u8; 512];
+            let n1 = terminal.read(&mut buf)?;
+            let first = buf[..n1].to_vec();
+            std::thread::sleep(Duration::from_millis(200));
+            terminal.write_all(b"> [Krill orchestration] ")?;
+            std::thread::sleep(Duration::from_millis(30));
+            terminal.write_all(b"Unread mail.")?;
+            let last_echo_at = Instant::now();
+            let n2 = terminal.read(&mut buf)?;
+            let gap = last_echo_at.elapsed();
+            let second = buf[..n2].to_vec();
+            Ok((first, second, gap))
+        });
+        Registry::deliver_input_to_tap(&tap, text, true)?;
+        let (first, second, gap) = tui.join().unwrap()?;
+        assert!(first.starts_with(b"\x1b[200~") && first.ends_with(b"\x1b[201~"));
+        assert_eq!(second, b"\r");
+        assert!(
+            gap >= Duration::from_millis(220),
+            "expected PASTE_SUBMIT_DELAY after delayed echo, got {gap:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_mail_pointer_skips_mid_turn_post_invocation_and_dedupes_same_done_epoch()
+    -> io::Result<()> {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!("krill-idle-mail-agy-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let id = SessionId(414);
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_millis(120)))?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )?;
+        let root_pid = std::process::id();
+        {
+            let mut st = lock(&reg.state);
+            st.roots.insert(id, root_pid).unwrap();
+            st.sessions.insert(
+                id,
+                Entry {
+                    session,
+                    pid: root_pid,
+                    cwd: PathBuf::from("/tmp"),
+                    wrapped: false,
+                },
+            );
+        }
+        let run = OrchestrationStore::mutate(&dir, |s| s.create_run("agy mail", Some(id.0)))?;
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let emit_hook = move |reg: &Registry, name: &str, pid: u32| -> io::Result<()> {
+            let (mut client, server) = UnixStream::pair()?;
+            let hello = krill_proto::daemon::client_hello(ipc::ClientRole::Cli, "test");
+            client.write_all(&hello.encode()?)?;
+            let ev = HookEvent {
+                id: hook::EventId {
+                    pid,
+                    unix_ns: status::now_ns(),
+                },
+                agent: "agy".into(),
+                ppid: root_pid,
+                input: hook::Input::Complete,
+                payload: serde_json::to_vec(&serde_json::json!({"hook_event_name": name}))?,
+            };
+            client.write_all(&ev.encode()?)?;
+            let server_hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            };
+            let res = reg.serve(server, &server_hello);
+            drop(client);
+            res
+        };
+        let send = |summary: &str| -> io::Result<()> {
+            reg.orchestration(
+                &peer,
+                OrchAction::SendMessage(SendParams {
+                    from: "worker-1".into(),
+                    to: "coordinator".into(),
+                    msg_type: MessageType::Status,
+                    summary: summary.into(),
+                    body: "details".into(),
+                    run_id: Some(run.id.clone()),
+                    task_id: None,
+                    dispatch_id: None,
+                    outcome: None,
+                    reply_to: None,
+                }),
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            Ok(())
+        };
+
+        // 1. Mid-turn PostInvocation followed quickly by PreInvocation must defer, not inject.
+        emit_hook(&reg, "PostInvocation", 101)?;
+        let resume_reg = Arc::clone(&reg);
+        let resume = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            emit_hook(&resume_reg, "PreInvocation", 102)
+        });
+        send("mid-turn report")?;
+        resume.join().unwrap()?;
+        let mut buf = [0_u8; 4096];
+        assert!(terminal.read(&mut buf).is_err());
+        assert!(
+            OrchestrationStore::load(&dir)?
+                .idle_mail_notified
+                .is_empty()
+        );
+
+        // 2. Final Stop hook delivers the deferred pointer once, and additional sends in the same
+        //    Done epoch (before PreInvocation) do not type duplicate pointers onto the composer.
+        emit_hook(&reg, "Stop", 103)?;
+        send("second report in same idle epoch")?;
+        let mut captured = Vec::new();
+        while let Ok(n) = terminal.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            captured.extend_from_slice(&buf[..n]);
+        }
+        let text = String::from_utf8_lossy(&captured);
+        assert_eq!(
+            text.matches("[Krill orchestration] Unread mail.").count(),
+            1,
+            "expected exactly one pointer in same Done epoch, got: {text:?}"
+        );
+        assert!(text.ends_with('\r'));
+
+        // 3. After a new turn runs and finishes without acking the second message, the new Done
+        //    epoch notifies again cleanly.
+        emit_hook(&reg, "PreInvocation", 104)?;
+        std::thread::sleep(Duration::from_millis(5));
+        emit_hook(&reg, "Stop", 105)?;
+        captured.clear();
+        while let Ok(n) = terminal.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            captured.extend_from_slice(&buf[..n]);
+        }
+        let second_text = String::from_utf8_lossy(&captured);
+        assert_eq!(
+            second_text
+                .matches("[Krill orchestration] Unread mail.")
+                .count(),
+            1,
+            "expected unacked second message to notify on next Stop, got: {second_text:?}"
+        );
+        assert!(second_text.ends_with('\r'));
+
         drop(reg);
         drop(terminal);
         std::fs::remove_dir_all(dir)
