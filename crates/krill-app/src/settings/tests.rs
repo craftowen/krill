@@ -8868,10 +8868,10 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
     };
 
     vcx.update(|_, cx| {
-        assert_eq!(current(cx).ui_theme_dark, DarkUiTheme::Trench);
-        assert_eq!(crate::ui::palette(cx), &crate::ui::TRENCH);
+        assert_eq!(current(cx).ui_theme_dark, DarkUiTheme::TokyoNight);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::TOKYO_NIGHT);
     });
-    choose(vcx, "ui-theme-dark", 9);
+    choose(vcx, "ui-theme-dark", 12);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_dark, DarkUiTheme::Glow);
@@ -8888,7 +8888,7 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
     // 사용자가 고른 터미널 테마는 앱 테마를 바꿔도 그대로 둔다.
     vcx.update(|_, cx| edit(cx, |s| s.terminal_theme_dark = "Dracula".to_owned()));
     vcx.run_until_parked();
-    choose(vcx, "ui-theme-dark", 7);
+    choose(vcx, "ui-theme-dark", 10);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_dark, DarkUiTheme::Abyss);
@@ -8916,11 +8916,11 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
     fs::remove_dir_all(&d).ok();
 }
 
-/// 앱 테마 키가 없으면 새 기본값 해구·종이를 쓰고, 저장된 선택값은 계속 읽는다.
+/// 앱 테마 키가 없으면 새 기본값 야광·종이를 쓰고, 저장된 선택값은 계속 읽는다.
 #[test]
 fn settings_without_ui_theme_keys_use_default_themes() {
     let s = Settings::parse("theme = \"light\"").unwrap();
-    assert_eq!(s.ui_theme_dark, DarkUiTheme::Trench);
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::TokyoNight);
     assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
     assert_eq!(
         s.terminal_theme_dark,

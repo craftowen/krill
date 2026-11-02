@@ -175,7 +175,7 @@ pub struct Settings {
     /// 워크스페이스 신뢰 프리셋 자동 등록 켜기/끄기(기본 true, OWE-737).
     #[serde(default = "default_true")]
     pub workspace_trust_preset_enabled: bool,
-    /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Krill Trench"`, OWE-956).
+    /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Tokyo Night"`, OWE-956).
     #[serde(default = "default_terminal_theme_dark")]
     pub terminal_theme_dark: String,
     /// 라이트 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Krill Paper"`, OWE-956).
@@ -6561,7 +6561,10 @@ impl SettingsView {
                         text::TERMINAL_FONT.get(),
                         text::TERMINAL_FONT_DESC.get(),
                     ))
-                    .child(layout::controls().child(font_family)),
+                    .child(
+                        layout::controls()
+                            .child(div().max_w(px(240.)).overflow_hidden().child(font_family)),
+                    ),
             )
             // 지정 글꼴이 고정폭으로 해석되지 않으면 Menlo로 대신 그리고 사유를 밝힌다(OWE-899).
             .children(terminal_font_fallback(cx).map(|(requested, effective)| {
@@ -8050,11 +8053,15 @@ impl SettingsView {
 
             let header = div()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .gap_3()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_w(px(180.))
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -8168,6 +8175,7 @@ impl SettingsView {
             let sub_id = format!("admin-accounts-subheader-{}", provider.as_str());
             let subheader = div()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .gap_3()
@@ -8425,6 +8433,8 @@ impl SettingsView {
                     )
                     .children(self.orphan_profiles.iter().map(|o| {
                         div()
+                            .w_full()
+                            .min_w_0()
                             .font_family(crate::ui::FONT_MONO)
                             .text_size(crate::ui::TEXT_SM)
                             .text_color(p.muted_foreground)
@@ -8500,6 +8510,7 @@ impl SettingsView {
             });
         let threshold_row = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_2()
@@ -8615,6 +8626,7 @@ impl SettingsView {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap_2()
@@ -9388,6 +9400,7 @@ impl SettingsView {
                     .w_full()
                     .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_2()
@@ -9397,6 +9410,7 @@ impl SettingsView {
                             .debug_selector(move || header_id.clone())
                             .flex_1()
                             .min_w_0()
+                            .min_w(px(180.))
                             .flex()
                             .items_center()
                             .gap_2p5()
