@@ -2906,3 +2906,288 @@ fn wrapper_argv_is_recognized_only_for_agent_launches() {
         "/bin/sh", "-c", "x", "y", "z", "mk-agent"
     ]));
 }
+
+#[cfg(unix)]
+struct FakeHolderGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    holder_worker: Option<std::thread::JoinHandle<()>>,
+    reader_worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Drop for FakeHolderGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(worker) = self.holder_worker.take() {
+            worker.join().ok();
+        }
+        if let Some(worker) = self.reader_worker.take() {
+            worker.join().ok();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn fake_holder_registry(
+    dir: Option<&Path>,
+) -> (
+    Arc<Registry>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    FakeHolderGuard,
+) {
+    use crate::holder::link::Link;
+    use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+    use krill_proto::os::net::UnixStream;
+    use std::os::fd::AsFd as _;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (krilld_end, holder_end) = UnixStream::pair().unwrap();
+    holder_end
+        .set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    for m in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    let (holder, link, kept, _) =
+        crate::holder::Holder::connect(OwnedFd::from(krilld_end)).unwrap();
+    let reg = Arc::new(Registry::new(Some((holder, kept)), dir));
+    let reg_for_reader = Arc::clone(&reg);
+    let reader_worker = std::thread::spawn(move || {
+        reg_for_reader.run_holder(link);
+    });
+    let spawn_calls = Arc::new(AtomicUsize::new(0));
+    let spawn_calls_bg = Arc::clone(&spawn_calls);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = Arc::clone(&stop);
+    let holder_worker = std::thread::spawn(move || {
+        let mut holder_link = holder_link;
+        let mut children: HashMap<SessionId, UnixStream> = HashMap::new();
+        while !stop_bg.load(Ordering::SeqCst) {
+            let pkt = match holder_link.recv() {
+                Ok(Some(pkt)) => pkt,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Ok(None) | Err(_) => break,
+            };
+            match ToHolder::decode(pkt.frame()).unwrap() {
+                ToHolder::Spawn { req, id, .. } => {
+                    spawn_calls_bg.fetch_add(1, Ordering::SeqCst);
+                    let (master, child) = UnixStream::pair().unwrap();
+                    children.insert(id, child);
+                    holder_link
+                        .send(
+                            &FromHolder::Spawned {
+                                req,
+                                id,
+                                pid: u32::MAX,
+                            }
+                            .encode()
+                            .unwrap(),
+                            &[master.as_fd()],
+                        )
+                        .unwrap();
+                }
+                ToHolder::Terminate { req, id } | ToHolder::Kill { req, id, .. } => {
+                    children.remove(&id);
+                    holder_link
+                        .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                        .unwrap();
+                    holder_link
+                        .send(&FromHolder::Exited { id, status: 0 }.encode().unwrap(), &[])
+                        .unwrap();
+                }
+                ToHolder::Release { req, id } => {
+                    children.remove(&id);
+                    holder_link
+                        .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    });
+    let guard = FakeHolderGuard {
+        stop,
+        holder_worker: Some(holder_worker),
+        reader_worker: Some(reader_worker),
+    };
+    (reg, spawn_calls, guard)
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_close_tombstone_survives_zero_segment_gc_and_store_clear() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = std::env::temp_dir().join(format!("close-tombstone-gc-clear-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (reg, _, guard_first) = fake_holder_registry(Some(&dir));
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let create = Create {
+        account: None,
+        program: Program::Login,
+        cwd: dir.as_os_str().as_bytes().to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+
+    let Reply::Created {
+        session: session_a, ..
+    } = reg.handle(&full, Request::Create(create.clone()), &mut HashMap::new())
+    else {
+        panic!("expected Created for session A");
+    };
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Close { session: session_a },
+            &mut HashMap::new()
+        ),
+        Reply::Closed
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !lock(&reg.state).sessions.is_empty() {
+        assert!(Instant::now() < deadline, "session A should be removed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reg.store
+        .as_ref()
+        .unwrap()
+        .gc(&[], SystemTime::now() + Duration::from_hours(720))
+        .unwrap();
+
+    let Reply::Created {
+        session: session_b, ..
+    } = reg.handle(&full, Request::Create(create.clone()), &mut HashMap::new())
+    else {
+        panic!("expected Created for session B");
+    };
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Close { session: session_b },
+            &mut HashMap::new()
+        ),
+        Reply::Closed
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !lock(&reg.state).sessions.is_empty() {
+        assert!(Instant::now() < deadline, "session B should be removed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reg.store.as_ref().unwrap().clear().unwrap();
+
+    drop(reg);
+    drop(guard_first);
+
+    let (reloaded, _, _guard_reloaded) = fake_holder_registry(Some(&dir));
+    assert!(
+        matches!(
+            reloaded.handle(
+                &full,
+                Request::Resume {
+                    session: SessionId(999),
+                    create: create.clone(),
+                },
+                &mut HashMap::new(),
+            ),
+            Reply::Resumed { .. }
+        ),
+        "unclosed session must resume on reloaded registry with live holder"
+    );
+    for closed_id in [session_a, session_b] {
+        assert_eq!(
+            reloaded.handle(
+                &full,
+                Request::Cold { session: closed_id },
+                &mut HashMap::new()
+            ),
+            Reply::Failed(Failure::NoSession),
+            "closed session {closed_id:?} must reject Cold after reload"
+        );
+        assert_eq!(
+            reloaded.handle(
+                &full,
+                Request::Resume {
+                    session: closed_id,
+                    create: create.clone(),
+                },
+                &mut HashMap::new(),
+            ),
+            Reply::Failed(Failure::NoSession),
+            "closed session {closed_id:?} must reject Resume after gc/clear and reload"
+        );
+    }
+
+    drop(reloaded);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn unregistered_kept_session_rejects_resume_and_cold_without_spawning() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::sync::atomic::Ordering;
+
+    let dir = std::env::temp_dir().join(format!("unregistered-kept-guard-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (reg, spawn_calls, _guard_holder) = fake_holder_registry(Some(&dir));
+    let kept_id = SessionId(77);
+    lock(&reg.state).unregistered_kept.insert(kept_id);
+
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let create = Create {
+        account: None,
+        program: Program::Login,
+        cwd: dir.as_os_str().as_bytes().to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Resume {
+                session: kept_id,
+                create,
+            },
+            &mut HashMap::new(),
+        ),
+        Reply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Cold { session: kept_id },
+            &mut HashMap::new()
+        ),
+        Reply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
+
+    drop(reg);
+    std::fs::remove_dir_all(dir).ok();
+}

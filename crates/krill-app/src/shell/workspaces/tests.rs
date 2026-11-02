@@ -1284,3 +1284,51 @@ fn visible_remote_pane_attaches_while_same_id_local_restores(cx: &mut TestAppCon
     });
     assert_eq!(connects.load(SeqCst), 1);
 }
+
+#[gpui::test]
+fn hidden_restore_session_gone_prunes_zombie_tab_when_sidebar_connected(cx: &mut TestAppContext) {
+    let (socket, _) = fake_restore_daemon("closed-prune", FakeDaemon::ListEofs(0)).unwrap();
+    let (view, cx) = open(cx, state_path("hidden-restore-prunes-closed"));
+    let (tab0_pane, tab1_pane) = view.update(cx, |s, cx| {
+        let launch = Create {
+            account: None,
+            program: Program::Login,
+            cwd: b"/work/a".to_vec(),
+            cols: 80,
+            rows: 24,
+        };
+        let tab0_pane = s.layout.active_tab().focused;
+        s.layout.set_launch(tab0_pane, launch.clone());
+        s.layout.set_session(tab0_pane, SessionId(910));
+        s.layout.new_tab();
+        let tab1_pane = s.layout.active_tab().focused;
+        s.layout.set_launch(tab1_pane, launch);
+        s.layout.set_session(tab1_pane, SessionId(911));
+        s.layout.activate(0);
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(Arc::new(LiveSnapshot(live_snapshot(&[910], "/work/a"))), cx);
+        });
+        (tab0_pane, tab1_pane)
+    });
+    cx.run_until_parked();
+
+    view.update(cx, |s, cx| {
+        s.paths = Some(Paths {
+            socket: socket.clone(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        s.restore_hidden_sessions(&[tab0_pane], cx);
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+
+    view.read_with(cx, |s, _| {
+        assert!(!s.layout.pane_exists(tab1_pane));
+        assert_eq!(
+            s.layout.sessions_for_host(&HostId::Local),
+            vec![SessionId(910)]
+        );
+    });
+}
