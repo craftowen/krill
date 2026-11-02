@@ -673,6 +673,11 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 .chat-composer-suggestions>.chat-actions{justify-content:space-between;flex-wrap:nowrap;min-height:var(--touch-target)}
 .chat-composer-suggestions>p{padding:var(--space-sm)}
 .chat-composer-options{display:flex;flex-direction:column}
+.chat-composer-chips{display:flex;flex-wrap:wrap;gap:var(--space-xs)}
+.chat-composer-section{display:block;padding:var(--space-sm) var(--space-xs) var(--space-xs)}
+.chat-composer-chip{font:inherit;color:var(--foreground);min-height:var(--touch-target);padding:0 var(--space-md);border:1px solid var(--border);border-radius:var(--radius-row);white-space:nowrap}
+#mobile-app .chat-composer-chip[aria-current=true]{background:var(--foreground);border-color:var(--foreground);color:var(--surface-base)}
+.chat-composer-chip>.chat-composer-option-label{color:inherit;font:inherit}
 .chat-composer-option{width:100%;min-height:var(--touch-target);display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:var(--space-xs);padding:var(--space-sm);border-radius:var(--radius-row);text-align:start;overflow-wrap:anywhere}
 .chat-composer-option[aria-selected=true]{background:var(--surface-raised)}
 .chat-composer-option-label{font-family:var(--font-mono);color:var(--foreground)}

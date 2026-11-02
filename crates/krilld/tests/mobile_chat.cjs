@@ -1481,7 +1481,7 @@ async function composerDiscovery() {
   assert(!f.calls.some((c) => c.action === "prompt"));
   f.buttons.find((b) => b.className === "composer-pill").action();
   await flush();
-  assert.equal(f.find("chat-composer-options").children.length, 2);
+  assert.equal(f.find("chat-composer-options").children[0].children.length, 2);
   key(f, "ArrowDown");
   key(f, "Enter");
   await flush();
@@ -1571,7 +1571,7 @@ async function composerDiscovery() {
   await flush();
   assert.equal(commandModel.find("chat-input").value, "");
   assert.equal(
-    commandModel.find("chat-composer-options").children[0].children[0]
+    commandModel.find("chat-composer-options").children[0].children[0].children[0]
       .textContent,
     "Real model",
   );

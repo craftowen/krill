@@ -12,6 +12,17 @@
     ["max", 5],
     ["ultra", 5],
   ]);
+  const EFFORT_LABELS = new Map([
+    ["low", "Low"],
+    ["medium", "Medium"],
+    ["high", "High"],
+    ["xhigh", "Extra high"],
+    ["max", "Max"],
+  ]);
+  const fullModel = (text) => {
+    const name = shortModel(text);
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  };
   function shortModel(text) {
     const name = text
         .toLowerCase()
@@ -222,37 +233,33 @@
     statusLine.setAttribute("role", "status");
     statusLine.setAttribute("aria-live", "polite");
     statusLine.append(statusBadge, statusText);
-    const history = el("div", undefined, "chat-actions chat-history"),
-      historyText = el("span", undefined, "muted");
+    const history = el("div", undefined, "chat-actions chat-history");
     const earlierBtn = button(
       t("Load earlier messages"),
       () => run(loadEarlier),
       "ghost small",
     );
-    const latestBtn = button(
-      t("Back to latest"),
-      () => {
-        if (!active()) return;
-        if (failedEarlier) requestLatest();
-        earlierEpoch++;
-        prefetchedEarlier = null;
-        fillPages = 0;
-        earlierQueued = false;
-        failedEarlier = false;
-        autoBlocked = null;
-        pollStatus.hidden = true;
-        if (entry.live && !resetHistory) {
-          entry.items = entry.live.items;
-          entry.offset = entry.live.offset;
-          entry.live = null;
-        }
-        following = true;
-        renderItems();
-        pollNow();
-      },
-      "ghost small",
-    );
-    history.append(historyText, earlierBtn, latestBtn);
+    function returnToLatest() {
+      if (!active()) return;
+      if (failedEarlier) requestLatest();
+      earlierEpoch++;
+      prefetchedEarlier = null;
+      fillPages = 0;
+      earlierQueued = false;
+      failedEarlier = false;
+      autoBlocked = null;
+      pollStatus.hidden = true;
+      if (entry.live && !resetHistory) {
+        entry.items = entry.live.items;
+        entry.offset = entry.live.offset;
+        entry.live = null;
+      }
+      following = true;
+      renderItems();
+      pollNow();
+    }
+    const latestBtn = button(t("Back to latest"), returnToLatest, "ghost small");
+    history.append(earlierBtn, latestBtn);
     const pollStatus = el("div", undefined, "chat-actions"),
       pollText = el("span", undefined, "muted");
     pollStatus.setAttribute("role", "status");
@@ -338,6 +345,11 @@
         lastHeight === feed.scrollHeight &&
         lastViewport === feed.clientHeight;
       syncScroll();
+      // A reader back at the newest row resumes live updates. A trimmed window keeps its place.
+      if (gap <= 1 && entry.live && !earlierPending && entry.items.at(-1)?.id === entry.live.items.at(-1)?.id) {
+        returnToLatest();
+        return;
+      }
       if (!canReadEarlier()) return;
       if (gap <= 1) following = true;
       else if (upward) following = false;
@@ -560,7 +572,7 @@
       suggestions.hidden = false;
       const head = el("div", undefined, "chat-actions"),
         close = button(
-          t(picker?.kind === "models" || picker?.kind === "efforts" ? "Close" : "Close suggestions"),
+          t(picker?.kind === "models" ? "Close" : "Close suggestions"),
           () => {
             closeSuggestions();
             input.focus?.();
@@ -572,9 +584,7 @@
         el(
           "span",
           t(
-            picker?.kind === "efforts"
-              ? "Effort"
-              : picker?.kind === "models"
+            picker?.kind === "models"
               ? "Model"
               : picker?.kind === "files"
                 ? "Workspace files"
@@ -587,12 +597,22 @@
       suggestions.append(head);
       input.setAttribute("aria-expanded", "true");
       if (message) suggestions.append(el("p", message, "muted"));
+      let row = null,
+        group;
       for (const [index, item] of items.entries()) {
+        if (item.group !== group) {
+          group = item.group;
+          row = el("div", undefined, "chat-composer-chips");
+          if (group === "efforts")
+            choiceList.append(el("span", t("Effort"), "muted chat-composer-section"));
+          choiceList.append(row);
+        }
         const node = button(
           "",
           () => selectChoice(index),
-          "ghost chat-composer-option",
+          group ? "ghost chat-composer-chip" : "ghost chat-composer-option",
         );
+        if (item.current) node.setAttribute("aria-current", "true");
         node.type = "button";
         node.tabIndex = -1;
         node.id = `chat-option-${sessionId}-${index}`;
@@ -600,7 +620,7 @@
         node.append(el("span", item.label, "chat-composer-option-label"));
         if (item.detail) node.append(el("span", item.detail, "muted"));
         node.addEventListener("pointerdown", (event) => event.preventDefault());
-        choiceList.append(node);
+        (group ? row : choiceList).append(node);
         item.node = node;
       }
       suggestions.append(choiceList);
@@ -760,18 +780,12 @@
         closeSuggestions();
         return;
       }
-      if (token.kind === "efforts") {
-        applyModel(token.model, choice.id); return;
-      }
       if (token.kind === "models") {
-        if (choice.efforts?.length === 1 && !choice.effortOnly) {
-          applyModel(choice, choice.efforts[0]); return;
+        if (choice.group === "efforts") {
+          applyModel(null, choice.id); return;
         }
-        if (choice.efforts?.length) {
-          picker = {kind:"efforts", scope:token.scope, model:choice.effortOnly ? null : choice};
-          paintChoices(choice.efforts.map(effort => ({id:effort,label:effort}))); return;
-        }
-        applyModel(choice); return;
+        const effort = entry.composerStatus?.effort;
+        applyModel(choice, choice.efforts?.length === 1 ? choice.efforts[0] : choice.efforts?.includes(effort) ? effort : undefined); return;
       }
       const current = trigger();
       if (
@@ -850,8 +864,7 @@
       entry.model = null;
       syncAgent();
       picker = { kind: "models", scope: context };
-      paintChoices([], t("Loading models…"));
-      input.focus?.();
+      paintChoices(entry.modelChoices?.scope === context ? entry.modelChoices.items : []);
       try {
         await refreshStatus(true);
         const data = await discover("composer_models");
@@ -873,25 +886,27 @@
             }
           : null;
         syncAgent();
-        const status = entry.composerStatus;
-        const modelChoices = models.map((item) => ({
+        const status = entry.composerStatus,
+          agent = chatAgent();
+        const items = models.map((item) => {
+          const current = item.id === data.current || matchesModel(agent, item.id, status?.model),
+            label = t(item.label || item.name || item.id);
+          return {
             id: item.id,
-            label: item.label || item.name || item.id,
-            detail: item.id === data.current ? t("Current model") : undefined,
+            group: "models",
+            current,
+            label: current && agent === "claude" && status?.model ? fullModel(status.model) : label,
             efforts: status?.effort_supported ? status.models?.find(model => model.id === item.id)?.efforts || [] : [],
-          }));
+          };
+        });
         const efforts = status?.models?.find(model => model.id === status.model)?.efforts || status?.efforts || [];
-        if (status?.effort_supported && efforts.length > 1) modelChoices.push({id:"effort", label:t("Effort"), effortOnly:true, efforts});
+        if (status?.effort_supported && efforts.length > 1)
+          for (const effort of efforts)
+            items.push({id:effort, group:"efforts", current:effort === status.effort, label:t(EFFORT_LABELS.get(effort) || effort)});
+        entry.modelChoices = {scope:context, items};
         paintChoices(
-          modelChoices,
-          models.length
-            ? data.note
-              ? t(data.note)
-              : undefined
-            : t(
-                data?.reason ||
-                  "Model selection is unavailable for this session.",
-              ),
+          items,
+          models.length ? undefined : t(data?.reason || "Model selection is unavailable for this session."),
         );
       } catch (error) {
         if (active() && version === suggestVersion && scope() === context)
@@ -913,7 +928,6 @@
         version = suggestVersion,
         operation = { scope: context };
       entry.modelPending = operation;
-      paintChoices([], t("Requesting model change…"));
       updateComposer();
       try {
         const result = await ctx.rpc({
@@ -1739,12 +1753,6 @@
         !earlierPending &&
         !failedEarlier &&
         !entry.latestRecovery;
-      historyText.textContent = t(
-        entry.live
-          ? "Reading earlier messages; live updates are paused."
-          : "Showing up to 1000 messages. Load earlier messages to read more.",
-      );
-      historyText.hidden = !entry.live;
       history.hidden = earlierBtn.hidden && latestBtn.hidden;
       pinLatest();
       restoreReader(anchor);

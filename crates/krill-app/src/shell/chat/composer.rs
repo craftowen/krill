@@ -106,7 +106,7 @@ pub(super) fn fallback_choices_for_agent(agent: &str) -> (Vec<ComposerModelItem>
                 },
                 ComposerModelItem {
                     id: "opus".to_owned(),
-                    label: "Opus".to_owned(),
+                    label: "Opus 5.5".to_owned(),
                     efforts: vec![
                         "low".to_owned(),
                         "medium".to_owned(),
@@ -118,7 +118,7 @@ pub(super) fn fallback_choices_for_agent(agent: &str) -> (Vec<ComposerModelItem>
                 },
                 ComposerModelItem {
                     id: "fable".to_owned(),
-                    label: "Fable".to_owned(),
+                    label: "Fable 5.1".to_owned(),
                     efforts: vec![
                         "low".to_owned(),
                         "medium".to_owned(),
@@ -130,7 +130,7 @@ pub(super) fn fallback_choices_for_agent(agent: &str) -> (Vec<ComposerModelItem>
                 },
                 ComposerModelItem {
                     id: "sonnet".to_owned(),
-                    label: "Sonnet".to_owned(),
+                    label: "Sonnet 5.5".to_owned(),
                     efforts: vec![
                         "low".to_owned(),
                         "medium".to_owned(),
@@ -142,7 +142,7 @@ pub(super) fn fallback_choices_for_agent(agent: &str) -> (Vec<ComposerModelItem>
                 },
                 ComposerModelItem {
                     id: "haiku".to_owned(),
-                    label: "Haiku".to_owned(),
+                    label: "Haiku 5.5".to_owned(),
                     efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
                     default_effort: None,
                 },

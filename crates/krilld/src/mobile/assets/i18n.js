@@ -11,6 +11,11 @@
     "Model unknown": "모델 확인 불가",
     "Model and effort": "모델 및 사고 수준",
     "Effort": "사고 수준",
+    "Low": "낮음",
+    "Medium": "보통",
+    "High": "높음",
+    "Extra high": "매우 높음",
+    "Max": "최대",
     "This pairing code is invalid. Scan a fresh QR code from desktop Settings → Mobile.": "올바르지 않은 페어링 코드입니다. 데스크톱 설정 → 모바일에서 새 QR 코드를 스캔하세요.",
     "Desktop backup added.": "데스크톱의 예비 연결을 추가했습니다.",
     "Pair this desktop again?": "이 데스크톱을 다시 페어링할까요?",
@@ -112,11 +117,8 @@
     "More results available. Keep typing.":
       "결과가 더 있습니다. 계속 입력해 범위를 좁히세요.",
     "Search unavailable. Try again.": "검색할 수 없습니다. 다시 시도하세요.",
-    "Loading models…": "모델 목록 확인 중…",
-    "Current model": "현재 모델",
     "Model selection is unavailable for this session.":
       "이 세션에서는 모델을 선택할 수 없습니다.",
-    "Requesting model change…": "모델 변경 요청 중…",
     "Model change was not confirmed.": "모델 변경이 확인되지 않았습니다.",
     "Send not confirmed": "전송이 확인되지 않았습니다",
     "Accepted. Awaiting agent response…":
@@ -398,8 +400,6 @@
     "Type a command…": "내용을 입력하세요…",
     "Edit terminal keys": "하단 버튼 편집",
     "Tool activity": "작업 내역",
-    "Showing up to 1000 messages. Load earlier messages to read more.":
-      "최근 메시지 최대 1000개를 표시합니다. 이전 대화를 불러와 더 볼 수 있습니다.",
     Command: "명령",
     "Send prompt": "프롬프트 보내기",
     "Select text": "텍스트 선택",
@@ -528,7 +528,7 @@
     "Message agent (Bracketed Paste)…": "에이전트에게 메시지 보내기…",
     "Message {0}": "{0}에게 메시지",
     Model: "모델",
-    "Default (recommended)": "기본값 (권장)",
+    "Default (recommended)": "기본값",
     "Sends /model to {0}.": "{0}에 /model 명령을 보냅니다.",
     "Copy is not available in this browser":
       "이 브라우저에서는 복사할 수 없습니다",
@@ -577,8 +577,6 @@
     "Enter a new message": "새 메시지를 입력하세요",
     "No chat turns recorded yet.": "새 메시지를 입력하세요",
     "Waiting for agent hook or transcript binding…": "새 메시지를 입력하세요",
-    "Reading earlier messages; live updates are paused.":
-      "이전 대화를 읽는 동안 실시간 갱신이 멈춥니다.",
     "Could not remove desktop. Try again.":
       "저장된 컴퓨터를 삭제하지 못했습니다. 다시 시도하세요.",
     "New Workspace": "새 작업 공간",

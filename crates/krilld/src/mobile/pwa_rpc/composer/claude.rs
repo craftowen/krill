@@ -137,6 +137,15 @@ fn observe_statusline(
     }
 }
 
+// Claude Code names an alias's version only once that model runs, and the phone shows the running
+// model's observed id. ponytail: static list; update it when a Claude model family moves.
+const VERSIONS: &[(&str, &str)] = &[
+    ("opus", "Opus 5.5"),
+    ("fable", "Fable 5.1"),
+    ("sonnet", "Sonnet 5.5"),
+    ("haiku", "Haiku 5.5"),
+];
+
 const ALIASES: &[(&str, &str)] = &[
     ("default", "Default (recommended)"),
     ("opus", "Opus"),
@@ -224,7 +233,7 @@ fn models(context: &Context, tap: &Tap) -> io::Result<Value> {
         return Err(io::Error::other(WAIT));
     }
     Ok(
-        json!({"agent":"claude","supported":true,"current":null,"items":choices(context).iter().map(|(id,label)|json!({"id":id,"label":label})).collect::<Vec<_>>(),"truncated":false,"reason":"Changes the model in this running Claude chat. Claude also saves its default for new sessions.","note":"Claude also saves this as the default for new sessions."}),
+        json!({"agent":"claude","supported":true,"current":null,"items":choices(context).iter().map(|(id,label)|json!({"id":id,"label":VERSIONS.iter().find(|(alias,_)|alias==id).map_or(*label,|(_,name)|*name)})).collect::<Vec<_>>(),"truncated":false,"reason":"Changes the model in this running Claude chat. Claude also saves its default for new sessions.","note":"Claude also saves this as the default for new sessions."}),
     )
 }
 
