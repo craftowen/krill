@@ -11,7 +11,8 @@ use krill_proto::theme::{Rgb, Theme as TerminalTheme};
 use serde::{Deserialize, Serialize};
 
 use super::app_themes::{
-    AMETHYST, CELADON, DUSK, GLACIER, GRAPHITE, LIMESTONE, MOONLIGHT, PEAT, PINE, TRENCH,
+    AMETHYST, CELADON, DUSK, GLACIER, GRAPHITE, LIMESTONE, MOCHA, MOONLIGHT, PEAT, PINE, ROSE_PINE,
+    TOKYO_NIGHT, TRENCH,
 };
 
 /// UI 크롬(사이드바·탭 바·패널·대화상자·상태 바) 기본 산세리프 글꼴.
@@ -539,6 +540,9 @@ pub const PAPER: Palette = Palette {
 #[serde(rename_all = "snake_case")]
 pub enum DarkUiTheme {
     #[default]
+    TokyoNight,
+    Mocha,
+    RosePine,
     Trench,
     Graphite,
     Pine,
@@ -552,7 +556,10 @@ pub enum DarkUiTheme {
 }
 
 impl DarkUiTheme {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
+        Self::TokyoNight,
+        Self::Mocha,
+        Self::RosePine,
         Self::Trench,
         Self::Graphite,
         Self::Pine,
@@ -568,6 +575,9 @@ impl DarkUiTheme {
     #[must_use]
     pub const fn palette(self) -> &'static Palette {
         match self {
+            Self::TokyoNight => &TOKYO_NIGHT,
+            Self::Mocha => &MOCHA,
+            Self::RosePine => &ROSE_PINE,
             Self::Trench => &TRENCH,
             Self::Graphite => &GRAPHITE,
             Self::Pine => &PINE,
@@ -586,6 +596,9 @@ impl DarkUiTheme {
     pub fn label(self) -> &'static str {
         use crate::i18n::catalog::settings as text;
         match self {
+            Self::TokyoNight => text::UI_THEME_TOKYO_NIGHT.get(),
+            Self::Mocha => text::UI_THEME_MOCHA.get(),
+            Self::RosePine => text::UI_THEME_ROSE_PINE.get(),
             Self::Trench => text::UI_THEME_TRENCH.get(),
             Self::Graphite => text::UI_THEME_GRAPHITE.get(),
             Self::Pine => text::UI_THEME_PINE.get(),
@@ -603,7 +616,10 @@ impl DarkUiTheme {
     #[must_use]
     pub const fn terminal_theme_name(self) -> &'static str {
         match self {
-            Self::Trench => super::terminal_themes::DEFAULT_TERMINAL_THEME_DARK,
+            Self::TokyoNight => super::terminal_themes::DEFAULT_TERMINAL_THEME_DARK,
+            Self::Mocha => super::terminal_themes::CATPPUCCIN_MOCHA,
+            Self::RosePine => super::terminal_themes::ROSE_PINE,
+            Self::Trench => super::terminal_themes::KRILL_TRENCH,
             Self::Graphite => super::terminal_themes::KRILL_GRAPHITE,
             Self::Pine => super::terminal_themes::KRILL_PINE,
             Self::Amethyst => super::terminal_themes::KRILL_AMETHYST,
@@ -685,7 +701,7 @@ struct ActivePalette(&'static Palette);
 
 impl gpui::Global for ActivePalette {}
 
-/// Krill 다크 터미널 기본 테마 `Krill Trench`. 데몬이 테마를 받기 전에 답하는 [`krill_proto::theme::DEFAULT`]와 같은 값이다.
+/// Krill 다크 터미널 기본 테마 `Tokyo Night`(야광). 데몬이 테마를 받기 전에 답하는 [`krill_proto::theme::DEFAULT`]와 같은 값이다.
 pub const TERMINAL_DARK: TerminalTheme = krill_proto::theme::DEFAULT;
 
 /// Orca 다크 터미널 팔레트(`Ghostty Default Style Dark`, `.ref/orca/src/shared/terminal-themes/defaults.ts`).
@@ -808,11 +824,11 @@ pub fn terminal_theme(cx: &App) -> TerminalTheme {
     terminal_theme_for_mode(mode, &crate::settings::current(cx))
 }
 
-/// 주어진 [`ThemeMode`]의 기본 팔레트(해구·[`PAPER`]). 설정 테마는 [`palette`]가 반영한다.
+/// 주어진 [`ThemeMode`]의 기본 팔레트(야광·[`PAPER`]). 설정 테마는 [`palette`]가 반영한다.
 #[inline]
 pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
     if matches!(mode, ThemeMode::Dark) {
-        &TRENCH
+        &TOKYO_NIGHT
     } else {
         &PAPER
     }
@@ -820,7 +836,7 @@ pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
 
 /// [`apply`]가 설정 테마(`ui_theme_dark`·`ui_theme_light`)로 고른 [`Palette`]를 돌려준다. [`apply`] 전에는 활성
 /// [`ThemeMode`]의 기본 팔레트다.
-/// `gpui_component::init`를 부르지 않은 단위 테스트에서도 패닉 없이 해구 팔레트로 동작한다.
+/// `gpui_component::init`를 부르지 않은 단위 테스트에서도 패닉 없이 야광 팔레트로 동작한다.
 #[inline]
 pub fn palette(cx: &App) -> &'static Palette {
     if let Some(active) = cx.try_global::<ActivePalette>() {
@@ -828,7 +844,7 @@ pub fn palette(cx: &App) -> &'static Palette {
     } else if cx.has_global::<Theme>() {
         palette_for(cx.theme().mode)
     } else {
-        &TRENCH
+        &TOKYO_NIGHT
     }
 }
 
@@ -1073,11 +1089,11 @@ mod tests {
         let light = palette_for(ThemeMode::Light);
         let dark = palette_for(ThemeMode::Dark);
         assert!(light.background.l > 0.95);
-        assert!(dark.background.l < 0.10);
+        assert!(dark.background.l < 0.15);
         assert!(light.foreground.l < 0.15);
         assert!(dark.foreground.l > 0.90);
         assert_eq!(light, &PAPER);
-        assert_eq!(dark, &TRENCH);
+        assert_eq!(dark, &TOKYO_NIGHT);
     }
 
     #[gpui::test]
@@ -1086,8 +1102,8 @@ mod tests {
             gpui_component::init(cx);
             apply(ThemeMode::Dark, cx);
             assert_eq!(cx.theme().mode, ThemeMode::Dark);
-            assert_eq!(cx.theme().background, TRENCH.background);
-            assert_eq!(cx.theme().sidebar, TRENCH.sidebar);
+            assert_eq!(cx.theme().background, TOKYO_NIGHT.background);
+            assert_eq!(cx.theme().sidebar, TOKYO_NIGHT.sidebar);
             assert_eq!(cx.theme().radius, RADIUS_SM);
             assert_ne!(cx.theme().button, cx.theme().button_hover);
             assert_ne!(cx.theme().button_hover, cx.theme().button_active);
@@ -1209,7 +1225,7 @@ mod tests {
     /// 앱 테마마다 자기 팔레트를 쓰고, 짝 터미널 테마는 같은 밝기(다크·라이트)의 내장 테마다.
     #[test]
     fn ui_themes_map_to_palettes_and_paired_terminal_themes() {
-        assert_eq!(DarkUiTheme::default().palette(), &TRENCH);
+        assert_eq!(DarkUiTheme::default().palette(), &TOKYO_NIGHT);
         assert_eq!(LightUiTheme::default().palette(), &PAPER);
         for theme in DarkUiTheme::ALL {
             let p = theme.palette();
@@ -1226,7 +1242,7 @@ mod tests {
             assert!(!paired.is_dark, "{theme:?}");
         }
         assert_eq!(
-            DarkUiTheme::Trench.terminal_theme_name(),
+            DarkUiTheme::TokyoNight.terminal_theme_name(),
             super::super::DEFAULT_TERMINAL_THEME_DARK
         );
         assert_eq!(
@@ -1235,18 +1251,18 @@ mod tests {
         );
     }
 
-    /// 해구의 화면·데몬 기본값이 일치하며 기존 심해 터미널의 색도 유지한다.
+    /// 야광의 화면·데몬 기본값이 일치하며 기존 심해·해구 터미널의 색도 유지한다.
     #[test]
     fn krill_trench_terminal_matches_daemon_default() {
         assert_eq!(TERMINAL_DARK, krill_proto::theme::DEFAULT);
-        assert_eq!(TERMINAL_DARK.background, term_rgb(0x06, 0x16, 0x20));
-        assert_eq!(TERMINAL_DARK.foreground, term_rgb(0xdf, 0xed, 0xf2));
-        assert_eq!(TERMINAL_DARK.cursor, term_rgb(0xd3, 0xe5, 0xee));
+        assert_eq!(TERMINAL_DARK.background, term_rgb(0x1a, 0x1b, 0x26));
+        assert_eq!(TERMINAL_DARK.foreground, term_rgb(0xc0, 0xca, 0xf5));
+        assert_eq!(TERMINAL_DARK.cursor, term_rgb(0xc0, 0xca, 0xf5));
         assert_eq!(TERMINAL_DEEP.ansi, TERMINAL_GHOSTTY_DARK.ansi);
         assert_eq!(TERMINAL_DEEP.foreground, TERMINAL_GHOSTTY_DARK.foreground);
         assert_eq!(TERMINAL_DEEP.background, term_rgb(0x10, 0x13, 0x1b));
         assert_eq!(TERMINAL_DEEP.cursor, term_rgb(0xff, 0x52, 0x38));
-        assert!(terminal_surface(TERMINAL_DARK).l < 0.10);
+        assert!(terminal_surface(TERMINAL_DARK).l < 0.15);
     }
 
     /// OWE-655: 터미널 배경 불투명도는 50..=100으로 자르고 그 외 색은 그대로 둔다.

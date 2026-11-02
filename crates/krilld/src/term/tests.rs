@@ -100,10 +100,10 @@ const QUERIES: &[&str] = &[
 const REPLIES_DEFAULT: &str = concat!(
     "\x1b[1;1R",
     "\x1b[?0u",
-    "\x1b]11;rgb:0606/1616/2020\x1b\\",
-    "\x1b]10;rgb:dfdf/eded/f2f2\x07",
-    "\x1b]12;rgb:d3d3/e5e5/eeee\x07",
-    "\x1b]4;1;rgb:e5e5/7a7a/8b8b\x07",
+    "\x1b]11;rgb:1a1a/1b1b/2626\x1b\\",
+    "\x1b]10;rgb:c0c0/caca/f5f5\x07",
+    "\x1b]12;rgb:c0c0/caca/f5f5\x07",
+    "\x1b]4;1;rgb:f7f7/7676/8e8e\x07",
     "\x1b]4;196;rgb:ffff/0000/0000\x07",
     "\x1b[?2026;2$y",
     "\x1b[?2031;2$y",
@@ -137,11 +137,11 @@ fn pushed_theme_cell_size_and_program_colors() {
     let q = "\x1b]11;?\x07\x1b[14t\x1b[c";
     assert_eq!(
         e.feed(q.as_bytes(), Feed::Live, &look),
-        "\x1b]11;rgb:0606/1616/2020\x07\x1b[4;720;720t\x1b[?6c"
+        "\x1b]11;rgb:1a1a/1b1b/2626\x07\x1b[4;720;720t\x1b[?6c"
     );
     // Default color mutation is unsupported; report the actual theme background.
     let r = e.feed(b"\x1b]11;#123456\x07\x1b]11;?\x07", Feed::Live, &look);
-    assert_eq!(r, "\x1b]11;rgb:0606/1616/2020\x07");
+    assert_eq!(r, "\x1b]11;rgb:1a1a/1b1b/2626\x07");
 }
 
 #[test]

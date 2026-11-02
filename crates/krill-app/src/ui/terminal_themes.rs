@@ -15,9 +15,13 @@ use super::theme::{
     rgba_bytes, term_rgb,
 };
 
-/// 기본 다크 터미널 테마 이름(Krill 고유 [`TERMINAL_DARK`], 데몬 기본 테마와 같다).
-pub const DEFAULT_TERMINAL_THEME_DARK: &str = "Krill Trench";
+/// 기본 다크 터미널 테마 이름(`Tokyo Night`, 데몬 기본 테마 [`TERMINAL_DARK`]와 같다).
+pub const DEFAULT_TERMINAL_THEME_DARK: &str = TOKYO_NIGHT;
+pub const KRILL_TRENCH: &str = "Krill Trench";
 pub const KRILL_DEEP: &str = "Krill Deep";
+pub const TOKYO_NIGHT: &str = "Tokyo Night";
+pub const CATPPUCCIN_MOCHA: &str = "Catppuccin Mocha";
+pub const ROSE_PINE: &str = "Rose Pine";
 /// 기본 라이트 터미널 테마 이름(Krill 고유 [`TERMINAL_LIGHT`]).
 pub const DEFAULT_TERMINAL_THEME_LIGHT: &str = "Krill Paper";
 /// Orca 라이트 터미널 테마 이름(`Builtin Tango Light`). 앱 테마 `기본`의 짝이다.
@@ -96,14 +100,34 @@ const fn builtin(
     }
 }
 
-/// 내장 터미널 테마 카탈로그: 해구 기본값, 기존 심해·Orca 30종, 나머지 Krill 앱 테마 짝.
+/// 내장 터미널 테마 카탈로그: 해구·종이·심해·Orca 30종(야광 기본값 `Tokyo Night` 포함)·나머지 Krill 앱 테마 짝.
 pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
-    // 0: Krill 고유 다크 기본
-    BuiltinTerminalTheme {
-        name: DEFAULT_TERMINAL_THEME_DARK,
-        is_dark: true,
-        theme: TERMINAL_DARK,
-    },
+    // 0: Krill 해구 다크 테마
+    builtin(
+        KRILL_TRENCH,
+        true,
+        0x0006_1620,
+        0x00df_edf2,
+        0x00d3_e5ee,
+        [
+            0x006f_8b9c,
+            0x00e5_7a8b,
+            0x008f_c7ac,
+            0x00d4_c77d,
+            0x0082_b6e1,
+            0x00b4_9fd7,
+            0x0083_c3ce,
+            0x00c8_dce6,
+            0x0094_aebc,
+            0x00f7_9aa8,
+            0x00a9_e1c3,
+            0x00ed_dfa0,
+            0x00a4_d0f3,
+            0x00cd_b9ed,
+            0x00a3_dce4,
+            0x00ed_f6fa,
+        ],
+    ),
     BuiltinTerminalTheme {
         name: KRILL_DEEP,
         is_dark: true,
@@ -2191,8 +2215,11 @@ mod tests {
     fn builtin_catalog_has_krill_trench_and_all_existing_themes_with_unique_names() {
         // Krill 15종(기존 5종 + 신규 10종) + Orca 30종.
         assert_eq!(BUILTIN_TERMINAL_THEMES.len(), 45);
-        assert_eq!(BUILTIN_TERMINAL_THEMES[0].name, "Krill Trench");
-        assert_eq!(BUILTIN_TERMINAL_THEMES[0].theme, TERMINAL_DARK);
+        assert_eq!(BUILTIN_TERMINAL_THEMES[0].name, KRILL_TRENCH);
+        assert_eq!(
+            builtin_terminal_theme(DEFAULT_TERMINAL_THEME_DARK).map(|b| b.theme),
+            Some(TERMINAL_DARK)
+        );
         assert_eq!(
             builtin_terminal_theme("Ghostty Default Style Dark").map(|b| b.theme),
             Some(TERMINAL_GHOSTTY_DARK)

@@ -7,7 +7,7 @@
 
 mod app_themes;
 
-pub use app_themes::TRENCH;
+pub use app_themes::{MOCHA, ROSE_PINE, TOKYO_NIGHT, TRENCH};
 
 pub mod icons;
 pub mod primitives;

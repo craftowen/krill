@@ -175,9 +175,10 @@ fn wide_chars_get_own_segment_and_two_column_background() {
         }]
     );
     // 2칸 묶음의 칸별 색 위치는 바이트 기준(한글은 3바이트)
+    let expected_fg = ensure_contrast(DEFAULT.foreground, RED, DARK_BG_MIN_CONTRAST);
     assert_eq!(
         plan.segments[1].colors,
-        [(0, DEFAULT.foreground), (3, DEFAULT.foreground)]
+        [(0, expected_fg), (3, expected_fg)]
     );
 }
 
@@ -323,11 +324,11 @@ fn underline_follows_inverse_and_dim_glyph_color() {
         ),
     ];
     let plan = plan_row(&cells, &DEFAULT);
-    // 흐림: (2 × 글자 + 배경) / 3. 빨강 255·0·0, DEFAULT(Krill Trench) 배경 6·22·32.
+    // 흐림: (2 × 글자 + 배경) / 3. 빨강 255·0·0, DEFAULT(Tokyo Night) 배경 26·27·38.
     let dim = Rgb {
-        r: 172,
-        g: 7,
-        b: 10,
+        r: 178,
+        g: 9,
+        b: 12,
     };
     assert_eq!(plan.segments[0].color_at(0), Some(DEFAULT.background));
     assert_eq!(plan.segments[0].color_at(1), Some(dim));
