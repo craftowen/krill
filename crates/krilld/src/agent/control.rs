@@ -758,7 +758,7 @@ impl Control {
         lock(&self.account_retirements).contains(&session)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn hibernation_blocked(&self, session: SessionId) -> bool {
         lock(&self.veto).contains(&session)
     }

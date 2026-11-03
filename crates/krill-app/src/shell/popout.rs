@@ -242,7 +242,7 @@ fn existing<T: 'static>(cx: &App) -> Option<WindowHandle<T>> {
     cx.windows().into_iter().find_map(|w| w.downcast::<T>())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn existing_dashboard(cx: &App) -> Option<Entity<Dashboard>> {
     cx.windows()
         .into_iter()

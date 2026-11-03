@@ -2530,7 +2530,7 @@ pub fn agent_install_command(agent_id: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn install_hook_file_at(
     path: &Path,
     target: krill_proto::hook_install::TargetAgent,
