@@ -4372,6 +4372,7 @@ impl Shell {
         let visible = self.layout.visible();
         self.restore_hidden_sessions(&visible, cx);
         self.forget_closed_tab_targets();
+        self.prune_chat_sessions();
         let layout = &self.layout;
         let paste_queue = &self.paste_queue;
         self.creations.retain(|p, _| layout.pane_exists(*p));

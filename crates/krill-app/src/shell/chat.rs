@@ -744,6 +744,39 @@ impl Shell {
         });
     }
 
+    /// After a layout change, drops per-session chat state no pane shows any more.
+    /// An in-flight prompt send is left to finish.
+    pub(super) fn prune_chat_sessions(&mut self) {
+        let layout = &self.layout;
+        let shown: BTreeSet<ChatKey> = (0..layout.tabs().len())
+            .flat_map(|index| layout.tab_panes(index))
+            .filter_map(|pane| self.chat_key(pane))
+            .collect();
+        let chat = &mut self.chat;
+        let keep = |key: &ChatKey| shown.contains(key);
+        chat.poll_failed.retain(keep);
+        chat.logs.retain(|key, _| keep(key));
+        chat.inputs.retain(|key, _| keep(key));
+        chat.quick_menu.retain(keep);
+        chat.model_picker.retain(keep);
+        chat.composer_tasks.retain(|key, _| keep(key));
+        chat.earlier_tasks.retain(|key, _| keep(key));
+        chat.last_composer_poll.retain(|key, _| keep(key));
+        chat.request_tasks.retain(|key, _| keep(key));
+        chat.prompt_failed.retain(keep);
+        chat.multiline_blocked.retain(keep);
+        let sending = &chat.prompt_tasks;
+        chat.prompt_review
+            .retain(|key| keep(key) || sending.contains_key(key));
+        if chat
+            .copied_item
+            .as_ref()
+            .is_some_and(|(key, ..)| !keep(key))
+        {
+            chat.copied_item = None;
+        }
+    }
+
     fn set_pane_chat_view(&mut self, pane: PaneId, chat: bool, cx: &mut Context<Self>) {
         if self.layout.session(pane).is_none() {
             return;
