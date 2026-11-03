@@ -220,28 +220,25 @@ struct Intent {
 }
 impl Intent {
     fn load(dir: Option<&Path>) -> io::Result<Self> {
-        let mut intent = dir
-            .and_then(|d| {
-                super::devices::read_private(&d.join(INTENT_FILE))
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
-            .unwrap_or_else(|| Self {
-                mode: ConnectMode::Tunnel,
-                custom: None,
-                tailscale_address: None,
-                rid: String::new(),
-                host_id: String::new(),
-                tailscale_enabled: false,
-                key: String::new(),
-                relay_owner: None,
-                port: None,
-                tunnel_pid: None,
-                tunnel_url: None,
-                tunnel_token: None,
-                tunnel_hostname: None,
-            });
+        let saved = match dir {
+            Some(d) => Self::read(&d.join(INTENT_FILE))?,
+            None => None,
+        };
+        let mut intent = saved.unwrap_or_else(|| Self {
+            mode: ConnectMode::Tunnel,
+            custom: None,
+            tailscale_address: None,
+            rid: String::new(),
+            host_id: String::new(),
+            tailscale_enabled: false,
+            key: String::new(),
+            relay_owner: None,
+            port: None,
+            tunnel_pid: None,
+            tunnel_url: None,
+            tunnel_token: None,
+            tunnel_hostname: None,
+        });
         // Retire LAN exposure without deleting any paired-device credential or PTY.
         // Explicit loopback remains available to isolated QA fixtures only.
         let loopback = intent
@@ -267,6 +264,19 @@ impl Intent {
             intent.save(dir)?;
         }
         Ok(intent)
+    }
+    /// 없으면 `None`. 읽을 수 없는 파일을 새 신원으로 덮어쓰면 모든 폰의 페어링과 터널 토큰을 잃으므로,
+    /// 해석할 수 없는 파일은 옆에 보존하고 오류를 낸다. 권한·입출력 오류는 파일을 건드리지 않는다.
+    fn read(path: &Path) -> io::Result<Option<Self>> {
+        let Some(bytes) = super::devices::read_private(path)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            let backup = path.with_extension(format!("json.corrupt-{}", now_ms()));
+            let kept = std::fs::rename(path, &backup).is_ok();
+            tracing::error!(%error, kept, "mobile-gateway.json is unreadable; moved aside");
+            io::Error::new(io::ErrorKind::InvalidData, error)
+        })
     }
     fn save(&self, dir: &Path) -> io::Result<()> {
         super::devices::write_private(

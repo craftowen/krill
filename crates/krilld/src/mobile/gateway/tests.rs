@@ -816,8 +816,9 @@ fn connect_mode_survives_daemon_restart() {
     let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
     assert_eq!(lock(&g.shared.state).mode, ConnectMode::Tunnel);
     drop(g);
-    // 손상된 파일은 기본 Relay 모드로 시작한다.
+    // 손상된 파일은 옆으로 보존하고 이번 시작은 실패한다. 다음 시작은 기본 Tunnel 모드다.
     std::fs::write(dir.join(INTENT_FILE), b"{").unwrap();
+    assert!(Gateway::start(Weak::new(), Some(&dir), hello()).is_err());
     let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
     assert_eq!(lock(&g.shared.state).mode, ConnectMode::Tunnel);
     drop(g);
@@ -1064,6 +1065,39 @@ fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
     state.tunnel = None;
     assert!(pairing_offer(&state, now_ms()).is_err());
 }
+#[test]
+#[cfg(unix)]
+fn unreadable_intent_is_backed_up_instead_of_replaced_by_a_new_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("mk-mobile-corrupt-{}", hex(&random().unwrap())));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INTENT_FILE);
+    let corrupt = br#"{"mode":"tunnel","rid":"0123"#;
+    super::super::devices::write_private(&path, corrupt).unwrap();
+
+    assert!(Intent::load(Some(&dir)).is_err());
+    let backups: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|p| p != &path)
+        .collect();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read(backups.first().unwrap()).unwrap(), corrupt);
+
+    let valid = Intent::load(Some(&dir)).unwrap();
+    super::super::devices::write_private(&path, &serde_json::to_vec(&valid).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(Intent::load(Some(&dir)).is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let reloaded = Intent::load(Some(&dir)).unwrap();
+    assert_eq!(
+        (reloaded.rid, reloaded.key),
+        (valid.rid, valid.key),
+        "a file that could not be read is never overwritten"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 #[cfg(unix)]
 fn rendezvous_credentials_migrate_old_intent_and_survive_mode_changes() {
