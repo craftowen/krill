@@ -12,10 +12,9 @@ pub(crate) mod switch_work;
 pub use profile_name::{Keychain, Vault, adopt_email_dirs};
 
 use std::collections::BTreeMap;
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use krill_proto::usage::{
@@ -138,8 +137,6 @@ fn manually_pinned(
 /// `accounts.toml` 읽기-수정-쓰기 전체를 직렬화하는 프로세스 전역 잠금(K-09). 파일 IO만 안에서 하고
 /// 자동전환 작업 알림은 마지막에 발행하며, 작업 큐 잠금 안에서는 이 잠금을 잡지 않는다.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
-/// 원자 쓰기 임시 파일명 중복 방지용 단조 증가 값(K-09). pid와 합쳐 같은 프로세스 스레드끼리도 겹치지 않는다.
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredAccount {
@@ -336,40 +333,7 @@ fn save_inner(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> io:
     Ok(())
 }
 
-pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no parent dir"));
-    };
-    std::fs::create_dir_all(parent)?;
-    // K-09: pid만으로는 같은 프로세스의 연결 스레드끼리 겹친다. 단조 증가 값을 더해 겹치지 않게 한다.
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(
-        ".{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("accounts"),
-        std::process::id(),
-        seq
-    ));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use krill_proto::os::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let write = (|| {
-        let mut f = opts.open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path)
-    })();
-    if write.is_err() {
-        std::fs::remove_file(&tmp).ok();
-    }
-    write
-}
+pub(crate) use krill_proto::os::write_atomic_0600;
 
 pub(crate) fn resolve_codex_dir(home: &Path, id: &str, raw_dir: &Path) -> PathBuf {
     let slug = id.strip_prefix("codex-").unwrap_or(id);

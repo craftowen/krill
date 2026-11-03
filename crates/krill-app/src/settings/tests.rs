@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 
 use gpui::{Action as _, Focusable as _, TestAppContext};
 use gpui_component::ActiveTheme as _;

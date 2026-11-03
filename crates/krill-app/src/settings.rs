@@ -5,10 +5,7 @@
 //! 라이트/다크는 터미널 팔레트도 바꾸며 셸이 krilld에 전달한다(OWE-590). 줌은 rem 기반 UI 크기에 적용한다.
 
 // Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
-use krill_proto::os::fs::OpenOptionsExt as _;
 use std::io::Write as _;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -1843,10 +1840,7 @@ pub fn set_language(language: Language, cx: &mut App) {
 /// `base`는 [`edit`]이 읽은 디스크 원문이다. 저장 직전 다시 읽은 원문과 다르면
 /// 외부 편집이 낀 것이므로 덮어쓰지 않고 오류를 낸다(AS-07 lost-update 방지).
 fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::io::Result<()> {
-    use krill_proto::os::fs::OpenOptionsExt as _;
-    use std::io::{self, Write as _};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+    use std::io;
     let _document_lock = krill_proto::config_document::lock_toml(path)?;
 
     let body = match std::fs::read_to_string(path) {
@@ -1884,64 +1878,7 @@ fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::i
         }
         Err(e) => return Err(e),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!(
-        "toml.{}-{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    let result = (|| {
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        std::fs::remove_file(tmp).ok();
-    }
-    result
-}
-
-/// 웹훅 비밀 토큰을 담을 수 있으므로 0600으로 쓴다. 기존 파일을 `set_len(0)`으로
-/// 비우던 방식은 중간 크래시에 0바이트 파일을 남기므로, 고유 임시 파일에 다 쓰고
-/// 같은 디렉터리에서 바꿔 다는 원자 교체로 통일한다(AS-08).
-fn write_settings(path: &Path, body: &str) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!(
-        "toml.{}-{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    #[cfg(unix)]
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    let result = (|| {
-        use std::io::Write as _;
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        std::fs::remove_file(&tmp).ok();
-    }
-    result
+    krill_proto::os::write_atomic_0600(path, body.as_bytes())
 }
 
 /// 에이전트 카드의 추가 인자·환경변수를 `agents.toml`의 `[agent.<id>]`에 쓴다(OWE-657). 인자는 공백으로
@@ -1970,7 +1907,7 @@ fn save_agent_profile(dir: &Path, id: &str, args: &str, env: &str) -> Result<(),
     let body = krill_proto::agent::set_user_profile(user.as_deref(), id, &profile)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // krilld가 읽는 도중 반쯤 쓴 파일을 보지 않게 원자 교체한다(AS-08).
-    write_settings(&path, &body).map_err(|e| e.to_string())
+    krill_proto::os::write_atomic_0600(&path, body.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// 파일을 시스템 편집기로 연다. 없으면 `template`로 만든다.
@@ -1985,7 +1922,7 @@ fn open_file(name: &str, template: &str, cx: &mut App) {
         if !path.exists() {
             std::fs::create_dir_all(&dir).ok();
             if name == SETTINGS_FILE {
-                write_settings(&path, &template).ok();
+                krill_proto::os::write_atomic_0600(&path, template.as_bytes()).ok();
             } else {
                 std::fs::write(&path, template).ok();
             }

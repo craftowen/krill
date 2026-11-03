@@ -985,7 +985,7 @@ impl OrchestrationStore {
                 self.runs.len()
             )));
         }
-        atomic_write(&state_dir.join(ORCH_FILE), body.as_bytes())
+        crate::os::write_atomic_0600(&state_dir.join(ORCH_FILE), body.as_bytes())
     }
 
     pub fn mutate<T, F>(state_dir: &Path, f: F) -> io::Result<T>
@@ -3259,7 +3259,7 @@ impl WorktreeStore {
         if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_COMMENTS_BYTES {
             return Err(invalid("worktree-comments.toml exceeds size limit"));
         }
-        atomic_write(&state_dir.join(COMMENTS_FILE), body.as_bytes())?;
+        crate::os::write_atomic_0600(&state_dir.join(COMMENTS_FILE), body.as_bytes())?;
         if let Ok(mut guard) = WORKTREE_STORE_CACHE.lock() {
             *guard = None;
         }
@@ -3858,30 +3858,6 @@ pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("state");
-    let tmp = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let mut f = opts.open(&tmp)?;
-    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-        fs::remove_file(&tmp).ok();
-        return Err(e);
-    }
-    drop(f);
-    if let Err(e) = fs::rename(&tmp, target) {
-        fs::remove_file(&tmp).ok();
-        return Err(e);
-    }
-    Ok(())
 }
 
 struct LockGuard {
