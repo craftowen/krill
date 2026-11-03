@@ -109,8 +109,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
     if let Some(state) = sys::take_handoff()? {
         h.restore(state);
     }
-    // exec 복원 ACK를 로그 디렉터리·파일 IO 뒤로 늦추지 않는다(OWE-606).
+    // exec 복원 ACK를 로그 디렉터리·소켓 소유 락 파일 IO 뒤로 늦추지 않는다(OWE-606).
     krill_log::init(krill_log::Component::Holder).ok();
+    h.owner = h.listener.as_ref().and_then(own_socket);
     tracing::info!("holder starting");
     h.event_loop()
 }
@@ -572,7 +573,6 @@ impl Holder {
     fn restore(&mut self, h: sys::Handoff) {
         self.sessions = h.sessions;
         self.listener = h.listener;
-        self.owner = self.listener.as_ref().and_then(own_socket);
         self.krilld = Some(Krilld {
             pid: h.krilld,
             link: Some(Link::new(h.link)),
@@ -609,9 +609,10 @@ fn own_socket(listener: &OwnedFd) -> Option<File> {
     let path = OsStr::from_bytes(&[sock, b".holder.lock"].concat()).to_os_string();
     let mut open = File::options();
     let f = open.read(true).write(true).create(true).truncate(false);
-    let f = f.mode(0o600).open(path).ok()?;
-    f.try_lock().ok()?;
-    Some(f)
+    let f = f.mode(0o600).open(path);
+    let f = f.and_then(|f| f.try_lock().map(|()| f).map_err(io::Error::from));
+    f.inspect_err(|e| tracing::warn!(kind = ?e.kind(), "socket owner lock not taken"))
+        .ok()
 }
 
 fn hello() -> FromHolder {
