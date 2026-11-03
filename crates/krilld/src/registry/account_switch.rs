@@ -104,8 +104,7 @@ fn read_prepared(path: &Path) -> std::io::Result<Option<Prepared>> {
 }
 
 /// Handoffs and replacement journals describe this registry's own sessions, so they live only in
-/// its own state folder. `state_dir()` falls back to the process default (the operational folder in
-/// a Krill session); a registry without a folder keeps no records there.
+/// its own state folder; a registry without a folder keeps no records.
 pub(super) fn load(dir: Option<&Path>) -> BTreeMap<SessionId, SessionHandoff> {
     dir.and_then(|d| std::fs::read(d.join(FILE)).ok())
         .and_then(|raw| serde_json::from_slice::<Vec<SessionHandoff>>(&raw).ok())

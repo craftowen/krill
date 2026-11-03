@@ -1181,11 +1181,14 @@ impl Registry {
                     .map(|id| (id, self.session_cwd(id)))
                     .collect();
                 sidebar::snapshot(&self.sidebar, &entries).map(|mut data| {
+                    let state = self.state_dir();
                     if peer.scope.full() {
-                        sidebar::include_projects(&mut data);
+                        if let Some(dir) = &state {
+                            sidebar::include_projects(&mut data, dir);
+                        }
                         data.closed_sessions = self.closed_sidebar_ranges();
                     }
-                    if let Some(dir) = self.state_dir() {
+                    if let Some(dir) = state {
                         data.prompt_histories =
                             krill_proto::git::load_session_prompt_histories(&dir)
                                 .into_iter()
@@ -2482,8 +2485,9 @@ impl Registry {
         self.remove(id);
     }
 
+    /// 자기 상태 폴더만 쓴다. 폴더 없는 레지스트리(단독 테스트)가 운영 폴더로 넘어가지 않게 기본값으로 폴백하지 않는다.
     fn state_dir(&self) -> Option<PathBuf> {
-        self.dir.clone().or_else(krill_proto::daemon::state_dir)
+        self.dir.clone()
     }
 
     /// 상태 디렉터리가 있으면 세션 `id`의 Claude 주입 settings를 지운다.

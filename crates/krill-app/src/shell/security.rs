@@ -2070,16 +2070,12 @@ fn upload_bytes_with_program(
         return None;
     }
     let destination = host.destination.trim();
-    if destination.is_empty() || destination.starts_with('-') {
+    if !krill_hosts::ssh::valid_host(destination) {
         return None;
     }
     let filename = sanitize_remote_filename(filename);
-    let mut args = host.common_ssh_args(10);
+    let mut args = host.to_ssh_options().common_args(10);
     args.extend([
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
-        "StrictHostKeyChecking=accept-new".to_owned(),
         destination.to_owned(),
         // A private, unique directory prevents collisions and follows the remote TMPDIR.
         format!(

@@ -669,6 +669,48 @@ fn remote_upload_closes_stdin_and_uses_private_unique_paths() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// 앱의 ssh도 krill-hosts와 같은 규칙(`BatchMode`, 사용자 `StrictHostKeyChecking` 존중)으로 띄운다.
+/// 예전에는 accept-new를 직접 넣어 `~/.ssh/config`의 `StrictHostKeyChecking yes`를 덮어썼다.
+#[test]
+fn app_ssh_calls_use_the_shared_host_key_policy() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = state_path("upload-argv").parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&root).unwrap();
+    let argv = root.join("argv");
+    let script = root.join("ssh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 1\n",
+            argv.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let host = upload_test_host();
+    let shared = |timeout| host.to_ssh_options().common_args(timeout);
+    assert!(host.test_args().starts_with(&shared(4)));
+    assert!(
+        super::upload_bytes_with_program(
+            &host,
+            "image.png",
+            b"x",
+            script.as_os_str(),
+            Duration::from_secs(3),
+        )
+        .is_none()
+    );
+    let sent: Vec<String> = std::fs::read_to_string(&argv)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let mut expected = shared(10);
+    expected.push(host.destination.clone());
+    assert_eq!(sent[..expected.len()], expected[..]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn remote_upload_stalled_stdin_is_bounded() {
     use std::os::unix::fs::PermissionsExt as _;
