@@ -1324,6 +1324,187 @@ fn unconfirmed_replacement_preserves_original_withholds_input_and_can_retry() {
     fs::remove_dir_all(root).unwrap();
 }
 
+// Codex 0.166 shares `thread-writer-locks` across profiles. A resumed TUI that finds the
+// original still writing shows a lock prompt and opens nothing until the user presses r.
+#[test]
+fn codex_replacement_blocked_by_the_original_writer_takes_over_after_retirement() {
+    use std::io::Read as _;
+
+    let root = Path::new("/tmp").join(format!("kas-writer-lock-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let from = root.join("from");
+    let to = root.join("to");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(from.join("sessions/2026/11/03")).unwrap();
+    fs::create_dir_all(&to).unwrap();
+    fs::write(to.join("auth.json"), "selected fixture credentials").unwrap();
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Selected",
+        None,
+        to.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id
+        .clone();
+    let sid = "cccccccc-dddd-eeee-ffff-222222222222";
+    let transcript = from.join(format!("sessions/2026/11/03/rollout-date-{sid}.jsonl"));
+    fs::write(
+        &transcript,
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
+    )
+    .unwrap();
+    let original_proc = FileHolder::new(&transcript);
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (master, _old_process) = UnixStream::pair().unwrap();
+    let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Arc::new(Registry::new(
+        Some((
+            holder,
+            vec![Kept {
+                id: SessionId(41),
+                pid: original_proc.0.id(),
+                status: None,
+                size: None,
+                master: OwnedFd::from(master),
+            }],
+        )),
+        Some(&state),
+    ));
+    reg.agents
+        .remember_session(
+            SessionId(41),
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Yolo,
+            },
+            Some(sid.into()),
+            root.as_os_str().as_encoded_bytes().to_vec(),
+            Some(LaunchAccount {
+                id: "codex-old".into(),
+                env_key: "CODEX_HOME".into(),
+                dir: from.display().to_string(),
+            }),
+        )
+        .unwrap();
+    let reader = Arc::clone(&reg);
+    let reader_worker =
+        std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+    let hook_reg = Arc::clone(&reg);
+    let expected_transcript = to
+        .join("sessions/2026/11/03")
+        .join(transcript.file_name().unwrap());
+    let released = root.join("original-released");
+    let resumed_transcript = expected_transcript.clone();
+    let mock = std::thread::spawn(move || {
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn { req, id, argv, .. } = ToHolder::decode(packet.frame()).unwrap()
+        else {
+            panic!("expected replacement spawn");
+        };
+        assert!(argv.iter().any(|arg| arg == sid.as_bytes()));
+        // The resumed CLI opens the conversation only once the writer lock is free.
+        let replacement_proc = FileHolder(
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "while [ ! -e \"$1\" ]; do sleep 0.02; done; exec 3<\"$2\"; read -r line",
+                    "blocked-resume",
+                ])
+                .arg(&released)
+                .arg(&resumed_transcript)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let (master, mut process) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned {
+                    req,
+                    id,
+                    pid: replacement_proc.0.id(),
+                }
+                .encode()
+                .unwrap(),
+                &[master.as_fd()],
+            )
+            .unwrap();
+        process
+            .write_all(
+                b"This conversation is open in another app\r\nClose it there and press R to continue here.\r\n",
+            )
+            .unwrap();
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Terminate { req, id: retired } = ToHolder::decode(packet.frame()).unwrap()
+        else {
+            panic!("expected a terminate request");
+        };
+        holder_link
+            .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+            .unwrap();
+        lock(&hook_reg.state).exited.insert(retired, 0);
+        drop(original_proc);
+        process
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut key = [0_u8; 1];
+        let retried = process
+            .read(&mut key)
+            .is_ok_and(|n| n == 1 && key[0] == b'r');
+        if retried {
+            fs::write(&released, b"").unwrap();
+        }
+        (id, retired, retried, process, replacement_proc)
+    });
+
+    reg.queue_account_switch(ProviderKind::Codex, &target);
+    reg.process_account_work_in(&home);
+    let (replacement, retired, retried, _process, _replacement_proc) = mock.join().unwrap();
+    assert_eq!(
+        retired,
+        SessionId(41),
+        "the original writer must be retired, not the waiting replacement"
+    );
+    assert!(
+        retried,
+        "the replacement must be told to retry once the lock is free"
+    );
+    let saved = load(Some(&state));
+    let handoff = saved.get(&SessionId(41)).unwrap();
+    assert_eq!(handoff.error, None);
+    assert_eq!(handoff.to, Some(replacement));
+    let bound = reg.agents.stored(replacement).unwrap().unwrap();
+    assert_eq!(
+        bound.transcript_path.map(|p| fs::canonicalize(p).unwrap()),
+        Some(expected_transcript.canonicalize().unwrap()),
+        "the replacement's held conversation is bound after takeover"
+    );
+    reader_worker.join().unwrap();
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn unmanaged_shell_skips_unidentifiable_daemon_agent_and_switches_open_transcript_agent() {
     use krill_proto::hook::{EventId, HookEvent, Input};
