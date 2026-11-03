@@ -117,7 +117,8 @@ impl Monitor {
     fn reserve(&self, now: u64) -> io::Result<bool> {
         let path = self.dir.join("monitor-restart");
         let last = match fs::read_to_string(&path) {
-            Ok(text) => Some(text.trim().parse::<u64>().map_err(io::Error::other)?),
+            // A torn or empty record must not disable the memory restart forever; rewrite it.
+            Ok(text) => text.trim().parse::<u64>().ok(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
@@ -148,6 +149,17 @@ impl Monitor {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn corrupt_restart_record_does_not_block_restart() {
+        let dir = std::env::temp_dir().join(format!("mk068-corrupt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("monitor-restart"), b"").unwrap();
+        let m = Monitor::new(dir.clone(), 100);
+        assert!(m.reserve(10_000).unwrap());
+        assert!(!m.reserve(10_001).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn consecutive_samples_and_persistent_cooldown() {
