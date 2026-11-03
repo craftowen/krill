@@ -2603,9 +2603,9 @@ fn exercise_account_rule_transport(cx: &mut TestAppContext, timeout: bool) {
     fs::remove_dir_all(d).unwrap();
 }
 
-/// OWE-655: 네 옵션의 자름·기본값·저장 왕복과 동면 표식 파일 동기화.
+/// OWE-655: 네 옵션의 자름·기본값·저장 왕복.
 #[gpui::test]
-fn owe655_terminal_options_and_hibernation_flag_sync(cx: &mut TestAppContext) {
+fn owe655_terminal_options_clamp_and_roundtrip(cx: &mut TestAppContext) {
     let d = dir("owe655-options");
     init(cx, &d);
     cx.update(|cx| {
@@ -2613,13 +2613,7 @@ fn owe655_terminal_options_and_hibernation_flag_sync(cx: &mut TestAppContext) {
         assert_eq!(terminal_opacity_pct(cx), 100);
         assert!((terminal_opacity_alpha(cx) - 1.).abs() < f32::EPSILON);
         assert!(notification_sound(cx));
-        assert!(!current(cx).hibernation_enabled);
     });
-    // 기본값은 꺼짐(opt-in)이라 초기화가 표식을 만들지 않는다.
-    assert!(!d.join(HIBERNATION_FLAG).exists());
-    cx.update(|cx| edit(cx, |s| s.hibernation_enabled = true));
-    cx.run_until_parked();
-    assert!(d.join(HIBERNATION_FLAG).is_file());
     // 파싱 자름: 범위를 벗어나면 경계로 붙는다.
     assert_eq!(
         Settings::parse("terminal_font_size = 5\n")
@@ -2645,10 +2639,9 @@ fn owe655_terminal_options_and_hibernation_flag_sync(cx: &mut TestAppContext) {
             .terminal_opacity_pct(),
         100
     );
-    // UI 편집 경로(`edit`)로 끄면 표식이 지워지고 파일에 남는다.
+    // UI 편집 경로(`edit`)로 바꾼 값이 파일에 남는다.
     cx.update(|cx| {
         edit(cx, |s| {
-            s.hibernation_enabled = false;
             s.terminal_font_size = 20;
             s.terminal_opacity_pct = 75;
             s.notification_sound = false;
@@ -2659,24 +2652,10 @@ fn owe655_terminal_options_and_hibernation_flag_sync(cx: &mut TestAppContext) {
         assert!(!notification_sound(cx));
     });
     cx.run_until_parked();
-    assert!(!d.join(HIBERNATION_FLAG).exists());
     let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
-    assert!(!saved.hibernation_enabled);
     assert_eq!(saved.terminal_font_size(), 20);
     assert_eq!(saved.terminal_opacity_pct(), 75);
     assert!(!saved.notification_sound);
-    // 외부 편집으로 다시 켜면 폴링 리로드가 표식을 되살린다.
-    fs::write(d.join(SETTINGS_FILE), "hibernation_enabled = true\n").unwrap();
-    cx.update(reload);
-    cx.run_until_parked();
-    cx.update(|cx| assert!(current(cx).hibernation_enabled));
-    assert!(d.join(HIBERNATION_FLAG).is_file());
-    // 사람이 직접 만든 표식은 설정 파일이 끔이어도 리로드가 지우지 않고 켜짐으로 읽는다.
-    fs::write(d.join(SETTINGS_FILE), "hibernation_enabled = false\n").unwrap();
-    cx.update(reload);
-    cx.run_until_parked();
-    cx.update(|cx| assert!(current(cx).hibernation_enabled));
-    assert!(d.join(HIBERNATION_FLAG).is_file());
     fs::remove_dir_all(d).ok();
 }
 
@@ -3810,14 +3789,13 @@ fn owe884_ssh_form_enter_test_pending_remove_confirm_and_copy_id_notice(cx: &mut
 }
 
 /// AS-02: 일시 IO 오류를 `NotFound`로 취급해 설정을 기본값으로 리셋하면 안 된다.
-/// 직전 설정을 유지하고 오류를 표시하며 동면 표식 동기화를 건너뛴다.
+/// 직전 설정을 유지하고 오류를 표시한다.
 #[gpui::test]
-fn as02_transient_io_error_keeps_settings_and_hibernation_flag(cx: &mut TestAppContext) {
+fn as02_transient_io_error_keeps_settings(cx: &mut TestAppContext) {
     let d = dir("as02-io-error");
-    fs::write(d.join(SETTINGS_FILE), "hibernation_enabled = true\n").unwrap();
+    fs::write(d.join(SETTINGS_FILE), "notification_sound = false\n").unwrap();
     init(cx, &d);
-    cx.update(|cx| assert!(current(cx).hibernation_enabled));
-    assert!(d.join(HIBERNATION_FLAG).is_file());
+    cx.update(|cx| assert!(!current(cx).notification_sound));
     // 일시 IO 오류 흉내: settings.toml 자리에 디렉터리를 둔다(NotFound가 아닌 읽기 실패).
     fs::remove_file(d.join(SETTINGS_FILE)).unwrap();
     fs::create_dir(d.join(SETTINGS_FILE)).unwrap();
@@ -3825,7 +3803,7 @@ fn as02_transient_io_error_keeps_settings_and_hibernation_flag(cx: &mut TestAppC
     cx.run_until_parked();
     cx.update(|cx| {
         assert!(
-            current(cx).hibernation_enabled,
+            !current(cx).notification_sound,
             "transient IO error must not reset settings to default"
         );
         assert!(
@@ -3833,10 +3811,6 @@ fn as02_transient_io_error_keeps_settings_and_hibernation_flag(cx: &mut TestAppC
             "transient IO error must be surfaced"
         );
     });
-    assert!(
-        d.join(HIBERNATION_FLAG).is_file(),
-        "hibernation flag must survive transient read error"
-    );
     fs::remove_dir_all(d).ok();
 }
 

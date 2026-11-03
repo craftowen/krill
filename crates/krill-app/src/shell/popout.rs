@@ -2731,7 +2731,6 @@ impl Render for Dashboard {
     }
 }
 
-
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;

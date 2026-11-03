@@ -2487,8 +2487,6 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
             "meta",
             "복사",
             "copy",
-            "동면",
-            "hibernate",
             "에디터",
             "editor",
         ],

@@ -201,7 +201,6 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
             reg.with_status(id, |s| s.inferred(id, e, super::now_ns()));
         }
     }
-    reg.hibernate_idle();
 }
 
 #[cfg(test)]

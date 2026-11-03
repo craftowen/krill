@@ -148,9 +148,6 @@ pub struct Settings {
     /// 새 에이전트 세션 YOLO 권한 우회 모드(기본 true).
     #[serde(default = "default_true")]
     pub yolo_mode: bool,
-    /// 유휴 세션 하이버네이션 opt-in(기본 false, docs/agents/hibernation.md).
-    #[serde(default)]
-    pub hibernation_enabled: bool,
     /// 설치된 에이전트의 상태 감지 훅을 앱 시작 때 자동 설치(기본 켬). 끄면 Krill이 설치한 훅을 되돌린다.
     #[serde(default = "default_true")]
     pub agent_status_hooks: bool,
@@ -291,7 +288,6 @@ impl Default for Settings {
             default_agent: "claude".to_owned(),
             default_view_mode: DefaultViewMode::Terminal,
             yolo_mode: true,
-            hibernation_enabled: false,
             agent_status_hooks: true,
             recording_paused: false,
             secure_keyboard_entry: false,
@@ -1271,9 +1267,7 @@ fn read_config(dir: Option<&Path>, mut settings: Settings) -> LoadedConfig {
             }
         }
     }
-    settings.hibernation_enabled |= dir.is_some_and(|d| d.join(HIBERNATION_FLAG).is_file());
     if !settings_read_failed {
-        sync_hibernation_file(dir, settings.hibernation_enabled);
         sync_auto_rename_file(dir, settings.auto_rename_branch_from_work);
         sync_workspace_trust_file(dir, settings.workspace_trust_preset_enabled);
     }
@@ -1560,28 +1554,6 @@ fn restart_staged_update(staged: crate::updater::StagedUpdate, cx: &mut App) {
     crate::updater::restart_staged_update(staged, cx);
 }
 
-/// 동면 opt-in 표식 파일명(krilld `hibernate_idle`이 존재 여부로 읽는다).
-pub const HIBERNATION_FLAG: &str = "hibernation.enabled";
-
-/// `hibernation_enabled` 값을 상태 디렉터리의 opt-in 파일에 반영한다(OWE-655).
-/// 켜면 빈 파일을 만들고(있으면 두드리지 않는다) 끄면 지운다(없으면 무시).
-/// 데몬은 다음 검사 주기부터 따른다. 디스크 오류는 조용히 둔다(표시·동작은 설정값 기준).
-pub fn sync_hibernation_file(dir: Option<&Path>, enabled: bool) {
-    let Some(dir) = dir else { return };
-    let path = dir.join(HIBERNATION_FLAG);
-    if enabled {
-        if path.is_file() {
-            return;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(&path, "").ok();
-    } else {
-        std::fs::remove_file(&path).ok();
-    }
-}
-
 /// `auto_rename_branch_from_work` 값을 상태 디렉터리의 비활성화 표식(`auto-rename-branch.disabled`)에 반영한다(OWE-737).
 /// 기본값이 `true`이므로 켜져 있으면 파일을 지우고, 꺼져 있을 때만 빈 파일을 남긴다.
 pub fn sync_auto_rename_file(dir: Option<&Path>, enabled: bool) {
@@ -1760,7 +1732,6 @@ fn persist_settings_edit(
         .unwrap_or_default();
     edit(&mut settings);
     save_settings(&path, &settings, base.as_deref()).map_err(|error| error.to_string())?;
-    sync_hibernation_file(Some(dir), settings.hibernation_enabled);
     sync_auto_rename_file(Some(dir), settings.auto_rename_branch_from_work);
     sync_workspace_trust_file(Some(dir), settings.workspace_trust_preset_enabled);
     Ok((settings, modified(&path)))
@@ -8774,8 +8745,6 @@ impl SettingsView {
                 ),
             );
 
-        // 유휴 동면은 `settings.toml` + 상태 디렉터리의 `hibernation.enabled` 표식으로 데몬에
-        // 전달한다(OWE-655). 표식 동기화는 `edit`·`reload`가 맡는다.
         let hooks_row = layout::row(p)
             .child(self.search_focus.label(
                 p,

@@ -104,7 +104,7 @@
 | MK-078 | 최소 접근성(VoiceOver 이름·역할) | M4 | P2 | VoiceOver로 세션 목록 탐색과 새 세션 생성 | MK-046 | T3#24, T1#27 | OWE-443 |
 | MK-079 | holder 드레인 모드 | M5 | P2 | krilld 30초 SIGSTOP 중 에이전트 블록 없음, 링 범위 손실 0 | MK-018 | T2#26 | OWE-444 |
 | MK-080 | .worktreeinclude(APFS clonefile) + orca.yaml setup 호환 + ORCA·CONDUCTOR 환경 변수 | M5 | P2 | Orca 설정 레포에서 .env 복사와 setup 자동 실행 | MK-042 | T1#28, T4-D9 | OWE-445 |
-| MK-081 | Hibernation(Orca 안전 조건 8가지) | M5 | P2 | done 30분 지난 백그라운드 에이전트 종료·열면 자동 resume, 대기·입력 중은 절대 종료 안 함 | MK-052 | T1#29 | OWE-446 |
+| MK-081 | Hibernation(Orca 안전 조건 8가지; 자동 종료 제거됨, 2026-11-03 0.3 필수 기능 정리, 기존 표식 재개만 유지) | M5 | P2 | done 30분 지난 백그라운드 에이전트 종료·열면 자동 resume, 대기·입력 중은 절대 종료 안 함 | MK-052 | T1#29 | OWE-446 |
 | MK-082 | 에이전트 세션 히스토리(요청 시 스캔) | M5 | P2 | 과거 세션 목록에서 Resume, 상주 프로세스 없음 | MK-052 | T1#30 | OWE-447 |
 | MK-083 | `claude agents --json` 연동 | M5 | P2 | agent view 백그라운드 세션이 사이드바에 상태와 함께 표시 | MK-039 | T1#31 | OWE-448 |
 | MK-084 | 사용량·레이트리밋 표시(Claude·Codex 로컬 파일) | M5 | P2 | 상태바에 5시간·주간 사용률, 80% 경고 | MK-039 | T1#32 | OWE-449 |
