@@ -197,6 +197,10 @@ pub trait Source: Send + Sync {
     fn prompt_histories(&self) -> PromptHistories {
         PromptHistories::new()
     }
+    fn closed_sessions(&self) -> krill_proto::control::ClosedSessionRanges {
+        krill_proto::control::ClosedSessionRanges::default()
+    }
+    fn disable_background_worker(&self) {}
     /// 워크트리 행의 git 정보. 모르면 비워 둔다(UI가 숨긴다).
     fn meta(&self, _trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
         Meta::new()
@@ -1000,6 +1004,8 @@ pub struct Sidebar {
     /// 세션별 최근 프롬프트 턴 히스토리(`session-prompts.json`).
     prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
     remote_prompt_histories: BTreeMap<String, PromptHistories>,
+    closed_sessions: krill_proto::control::ClosedSessionRanges,
+    remote_closed_sessions: BTreeMap<String, krill_proto::control::ClosedSessionRanges>,
     last_activity_minute: Option<u64>,
     /// 테스트용 시각 고정(ns, OWE-737).
     now_override_ns: Option<u64>,
@@ -1369,6 +1375,8 @@ impl Sidebar {
             auto_titles: BTreeMap::new(),
             prompt_histories: BTreeMap::new(),
             remote_prompt_histories: BTreeMap::new(),
+            closed_sessions: krill_proto::control::ClosedSessionRanges::default(),
+            remote_closed_sessions: BTreeMap::new(),
             last_activity_minute: None,
             now_override_ns: None,
             focused: None,
@@ -1717,6 +1725,20 @@ impl Sidebar {
         !self.snapshot_for(host).trees.is_empty()
     }
 
+    #[must_use]
+    pub fn is_session_closed_on(&self, host: &HostId, id: SessionId) -> bool {
+        if !self.host_connected(host) {
+            return false;
+        }
+        match host {
+            HostId::Local => self.closed_sessions.contains(id),
+            HostId::Remote(h) => self
+                .remote_closed_sessions
+                .get(h)
+                .is_some_and(|closed| closed.contains(id)),
+        }
+    }
+
     /// 현재 연결된 모든 호스트의 세션 목록을 `(HostId, SessionId)`로 순회한다.
     pub fn connected_sessions(&self) -> impl Iterator<Item = (HostId, SessionId)> + '_ {
         let local = (self.local_status == HostStatus::Connected)
@@ -1909,8 +1931,14 @@ impl Sidebar {
                                 .machine_identities
                                 .remove(&HostId::Remote(spec.id.clone()))
                                 .is_some();
+                            changed |= s.remote_closed_sessions.remove(&spec.id).is_some();
                         }
                         if (entry.source.is_none() || replaced) && s.visible {
+                            if cx.background_executor().is_test()
+                                && let Some(ref src) = next
+                            {
+                                src.disable_background_worker();
+                            }
                             entry.source = next;
                             new_source |= entry.source.is_some();
                         }
@@ -1923,6 +1951,8 @@ impl Sidebar {
                             .iter()
                             .any(|entry| *host == HostId::Remote(entry.id.clone()))
                 });
+                s.remote_closed_sessions
+                    .retain(|id, _| s.remote_hosts.iter().any(|entry| entry.id == *id));
                 if changed {
                     s.rebuild(cx);
                 }
@@ -1946,7 +1976,11 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let id = id.into();
+        if cx.background_executor().is_test() {
+            source.disable_background_worker();
+        }
         self.machine_identities.remove(&HostId::Remote(id.clone()));
+        self.remote_closed_sessions.remove(&id);
         let label = label.into();
         if let Some(existing) = self.remote_hosts.iter_mut().find(|r| r.id == id) {
             existing.label = label;
@@ -2043,11 +2077,12 @@ impl Sidebar {
                     let bg = bg.clone();
                     let this = this.clone();
                     tasks.push(cx.spawn(async move |cx| {
-                        let (id, source, res, histories) = bg
+                        let (id, source, res, histories, mut closed) = bg
                             .spawn(async move {
                                 let res = source.poll_snapshot().await;
                                 let histories = source.prompt_histories();
-                                (id, source, res, histories)
+                                let closed = source.closed_sessions();
+                                (id, source, res, histories, closed)
                             })
                             .await;
                         this.update(cx, |s, cx| {
@@ -2071,6 +2106,9 @@ impl Sidebar {
                             let mut probe_repos = Vec::new();
                             if let Ok(PolledSnapshot { observed, mut meta }) = res {
                                 let snap = (*observed.snapshot).clone();
+                                for session in &snap.sessions {
+                                    closed.remove(session.id);
+                                }
                                 let host = HostId::Remote(id.clone());
                                 if let Some(identity) = observed.machine_identity {
                                     changed |= s.machine_identities.insert(host, identity)
@@ -2092,11 +2130,13 @@ impl Sidebar {
                                     || entry.snapshot != snap
                                     || entry.meta != meta
                                     || s.remote_prompt_histories.get(&id) != Some(&histories)
+                                    || s.remote_closed_sessions.get(&id) != Some(&closed)
                                 {
                                     entry.status = HostStatus::Connected;
                                     entry.snapshot = snap;
                                     entry.meta = meta;
                                     s.remote_prompt_histories.insert(id.clone(), histories);
+                                    s.remote_closed_sessions.insert(id.clone(), closed);
                                     changed = true;
                                 }
                                 let repo_keys: Vec<PathBuf> =
@@ -2234,7 +2274,7 @@ impl Sidebar {
 
     /// 화면 스트림의 CLOSED를 폴링보다 먼저 반영해 종료 알림·행을 정리한다.
     pub fn mark_session_exited_on(&mut self, host: &HostId, id: SessionId, cx: &mut Context<Self>) {
-        self.profiles.remove_fallback(host, id);
+        let mut changed = self.profiles.remove_fallback(host, id);
         let snapshot = match host {
             HostId::Local => Some(&mut self.snapshot),
             HostId::Remote(host) => self
@@ -2252,12 +2292,27 @@ impl Sidebar {
             session.status.state = AgentState::Exited;
             session.status.source = Some(krill_proto::control::Source::Process);
             session.status.foreground = None;
+            changed = true;
+        } else {
+            match host {
+                HostId::Local => {
+                    self.closed_sessions.insert(id);
+                }
+                HostId::Remote(host) => {
+                    self.remote_closed_sessions
+                        .entry(host.clone())
+                        .or_default()
+                        .insert(id);
+                }
+            }
         }
         if host.is_local() {
-            self.unread.remove(&id);
+            changed |= self.unread.remove(&id);
             crate::alert::dismiss(id, cx);
         }
-        self.rebuild(cx);
+        if changed {
+            self.rebuild(cx);
+        }
     }
 
     /// 세션이 속한 호스트(로컬 또는 원격)를 찾는다.
@@ -2311,6 +2366,11 @@ impl Sidebar {
                 .find(|r| r.id == *id)
                 .and_then(|r| r.source.clone()),
         }
+    }
+
+    #[must_use]
+    pub fn has_source(&self, host: &HostId) -> bool {
+        self.source_for(host).is_some()
     }
 
     #[must_use]
@@ -3276,7 +3336,15 @@ impl Sidebar {
     ) {
         let auto_titles = self.auto_titles.clone();
         let prompt_histories = self.prompt_histories.clone();
-        self.apply_with_auto_titles(result, comments, auto_titles, prompt_histories, cx);
+        let closed_sessions = self.closed_sessions.clone();
+        self.apply_with_auto_titles(
+            result,
+            comments,
+            auto_titles,
+            prompt_histories,
+            closed_sessions,
+            cx,
+        );
     }
 
     fn apply_with_auto_titles(
@@ -3285,10 +3353,14 @@ impl Sidebar {
         comments: BTreeMap<PathBuf, String>,
         auto_titles: BTreeMap<SessionId, String>,
         prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
+        mut closed_sessions: krill_proto::control::ClosedSessionRanges,
         cx: &mut Context<Self>,
     ) {
         match result {
             Ok((snapshot, meta)) => {
+                for session in &snapshot.sessions {
+                    closed_sessions.remove(session.id);
+                }
                 let profiles_changed = self.profiles.observe(&HostId::Local, &snapshot);
                 if self.relink == Relink::AwaitingList {
                     self.relink = Relink::Steady;
@@ -3304,6 +3376,7 @@ impl Sidebar {
                     || comments != self.comments
                     || auto_titles != self.auto_titles
                     || prompt_histories != self.prompt_histories
+                    || closed_sessions != self.closed_sessions
                     || self.poll_error.is_some()
                     || status_changed
                     || crate::alert::needs_snapshot(cx)
@@ -3328,6 +3401,7 @@ impl Sidebar {
                     self.comments = comments;
                     self.auto_titles = auto_titles;
                     self.prompt_histories = prompt_histories;
+                    self.closed_sessions = closed_sessions;
                     let auto_changed = self.include_imported_snapshot();
                     self.poll_error = None;
                     let live = &self.snapshot.sessions;
@@ -3423,6 +3497,9 @@ impl Sidebar {
     }
 
     pub fn connect_source(&mut self, source: Arc<dyn Source>, cx: &mut Context<Self>) {
+        if cx.background_executor().is_test() {
+            source.disable_background_worker();
+        }
         self.ensure_external_polling(cx);
         self.disk.poll_generation = self.disk.poll_generation.wrapping_add(1);
         self.task = None;
@@ -3449,8 +3526,8 @@ impl Sidebar {
                     return;
                 };
                 let sp = sidebar_path.clone();
-                let (result, comments, auto_titles, prompt_histories, fallback) = bg
-                    .spawn(async move {
+                let (result, comments, auto_titles, prompt_histories, closed_sessions, fallback) =
+                    bg.spawn(async move {
                         let mut comments = source.comments();
                         if comments.is_empty() {
                             comments = external::load_comments_from_sidebar_path(sp.as_deref());
@@ -3486,6 +3563,7 @@ impl Sidebar {
                             }
                             (snapshot, meta, observed.machine_identity)
                         });
+                        let closed_sessions = source.closed_sessions();
                         // 데몬이 응답하지 않아도 등록된 로컬 프로젝트는 목록에 남긴다.
                         let fallback = if result.is_err()
                             && let Some(ref dir) = state_dir
@@ -3501,7 +3579,14 @@ impl Sidebar {
                         } else {
                             None
                         };
-                        (result, comments, auto_titles, prompt_histories, fallback)
+                        (
+                            result,
+                            comments,
+                            auto_titles,
+                            prompt_histories,
+                            closed_sessions,
+                            fallback,
+                        )
                     })
                     .await;
                 let next_delay = this.update(cx, |s, cx| {
@@ -3522,7 +3607,14 @@ impl Sidebar {
                         }
                         (snapshot, meta)
                     });
-                    s.apply_with_auto_titles(result, comments, auto_titles, prompt_histories, cx);
+                    s.apply_with_auto_titles(
+                        result,
+                        comments,
+                        auto_titles,
+                        prompt_histories,
+                        closed_sessions,
+                        cx,
+                    );
                     s.is_visible().then(|| s.poll_interval())
                 });
                 forced = false;

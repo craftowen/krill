@@ -148,6 +148,7 @@ struct CachedSnapshot {
     at: Instant,
     observed: IdentifiedSnapshot,
     histories: super::PromptHistories,
+    closed: krill_proto::control::ClosedSessionRanges,
     target: HostTarget,
 }
 
@@ -195,7 +196,7 @@ pub(super) struct Socket {
     worker: Mutex<Option<mpsc::Sender<Job>>>,
     /// gpui 테스트 스케줄러는 다른 스레드의 깨우기를 비결정으로 보고 실패시킨다. 단위 테스트 빌드는
     /// 기본으로 호출 스레드에서 바로 돌리고(종전 동작), 전용 스레드 경로는 [`Socket::threaded`]로 검증한다.
-    threaded: bool,
+    threaded: std::sync::atomic::AtomicBool,
 }
 
 struct Shared {
@@ -229,13 +230,13 @@ impl Socket {
                 external: Mutex::new(ExternalCache::default()),
             }),
             worker: Mutex::new(None),
-            threaded,
+            threaded: std::sync::atomic::AtomicBool::new(threaded),
         }
     }
 
     /// 작업을 전용 스레드에 넣는다. 스레드는 처음 쓸 때 띄우고, 소켓이 사라지면 남은 작업을 마친 뒤 끝난다.
     fn enqueue(&self, job: Job) -> bool {
-        if !self.threaded {
+        if !self.threaded.load(std::sync::atomic::Ordering::Relaxed) {
             job();
             return true;
         }
@@ -423,7 +424,7 @@ impl Shared {
             |stream| fetch_from(stream, &external, is_local),
         );
         match result {
-            Ok(((snapshot, branches, histories), identities)) => {
+            Ok(((snapshot, branches, histories, closed), identities)) => {
                 if let Ok(mut guard) = self.branches.lock() {
                     *guard = branches;
                 }
@@ -436,6 +437,7 @@ impl Shared {
                     at: Instant::now(),
                     observed: snapshot.clone(),
                     histories,
+                    closed,
                     target: self.target.clone(),
                 });
                 Ok(snapshot)
@@ -517,6 +519,20 @@ impl Source for Socket {
             .ok()
             .and_then(|cached| cached.as_ref().map(|cached| cached.histories.clone()))
             .unwrap_or_default()
+    }
+
+    fn closed_sessions(&self) -> krill_proto::control::ClosedSessionRanges {
+        self.shared
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|cached| cached.as_ref().map(|cached| cached.closed.clone()))
+            .unwrap_or_default()
+    }
+
+    fn disable_background_worker(&self) {
+        self.threaded
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn meta(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
@@ -849,7 +865,12 @@ fn fetch_from(
     stream: &mut UnixStream,
     external: &BTreeMap<PathBuf, super::external::ExternalHit>,
     is_local: bool,
-) -> io::Result<(Snapshot, BTreeMap<PathBuf, String>, super::PromptHistories)> {
+) -> io::Result<(
+    Snapshot,
+    BTreeMap<PathBuf, String>,
+    super::PromptHistories,
+    krill_proto::control::ClosedSessionRanges,
+)> {
     use krill_proto::ipc;
     let mut call = |request: Request| -> io::Result<Reply> {
         stream.write_all(&request.encode()?)?;
@@ -949,12 +970,16 @@ fn fetch_from(
         })
         .collect();
     sessions.sort_by_key(|s| s.id);
+    let mut closed = data.closed_sessions;
+    for s in &sessions {
+        closed.remove(s.id);
+    }
     let histories = data
         .prompt_histories
         .into_iter()
         .filter(|(id, _)| sessions.iter().any(|s| s.id == *id))
         .collect();
-    Ok((Snapshot { sessions, trees }, branches, histories))
+    Ok((Snapshot { sessions, trees }, branches, histories, closed))
 }
 
 #[cfg(test)]
@@ -982,6 +1007,7 @@ mod tests {
                 machine_identity: Some(krill_proto::ipc::MachineIdentity([8; 16])),
             },
             histories: BTreeMap::new(),
+            closed: krill_proto::control::ClosedSessionRanges::default(),
             target: first.shared.target.clone(),
         });
         assert_eq!(first.fetch_identified().unwrap().daemon_identity, identity);
@@ -1051,10 +1077,11 @@ mod tests {
                     server.write_all(&reply.encode().unwrap()).unwrap();
                 }
             });
-            let (snapshot, _, histories) =
+            let (snapshot, _, histories, closed) =
                 fetch_from(&mut client, &BTreeMap::new(), false).unwrap();
             worker.join().unwrap();
             assert_eq!(snapshot.sessions.len(), 1);
+            assert!(closed.is_empty());
             assert_eq!(histories.len(), usize::from(include_prompts));
             if include_prompts {
                 assert_eq!(histories[&krill_proto::SessionId(7)].total_turns, 1);
@@ -1298,6 +1325,7 @@ mod tests {
                 machine_identity: Some(krill_proto::ipc::MachineIdentity([8; 16])),
             },
             histories: BTreeMap::new(),
+            closed: krill_proto::control::ClosedSessionRanges::default(),
             target: old.shared.target.clone(),
         });
         assert!(
@@ -1354,6 +1382,7 @@ mod tests {
                 machine_identity: Some(krill_proto::ipc::MachineIdentity([8; 16])),
             },
             histories: BTreeMap::new(),
+            closed: krill_proto::control::ClosedSessionRanges::default(),
             target: socket.shared.target.clone(),
         });
         let polled = socket.shared.poll().unwrap();
