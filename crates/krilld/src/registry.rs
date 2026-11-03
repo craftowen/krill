@@ -3037,6 +3037,17 @@ impl Registry {
             && !payload.is_empty()
             && !is_control_seq
             && (submit || payload.contains(&b'\n') || payload.contains(&b'\r'));
+        let single_line;
+        let payload = if submit
+            && !use_bracketed
+            && !is_control_seq
+            && (payload.contains(&b'\n') || payload.contains(&b'\r'))
+        {
+            single_line = Self::flatten_unbracketed_submit_lines(payload);
+            single_line.as_slice()
+        } else {
+            payload
+        };
         let before_end = tap.pulse().end;
         if use_bracketed {
             let mut framed = Vec::with_capacity(payload.len() + 12);
@@ -3064,22 +3075,60 @@ impl Registry {
         Ok(())
     }
 
+    fn flatten_unbracketed_submit_lines(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(payload.len() + 16);
+        let mut pending_sep = false;
+        for &b in payload {
+            match b {
+                b'\r' | b'\n' => {
+                    if !out.is_empty() {
+                        pending_sep = true;
+                    }
+                }
+                _ => {
+                    if pending_sep {
+                        if !out.ends_with(b" ") {
+                            out.push(b' ');
+                        }
+                        out.extend_from_slice(b"| ");
+                        pending_sep = false;
+                    }
+                    out.push(b);
+                }
+            }
+        }
+        out
+    }
+
     fn wait_for_paste_submit_settle(tap: &Tap, before_end: u64) {
         const ECHO_WAIT_MAX: Duration = Duration::from_millis(500);
-        const ECHO_QUIET: Duration = Duration::from_millis(60);
-        const ECHO_DRAIN_MAX: Duration = Duration::from_millis(400);
+        const ECHO_DRAIN_MAX: Duration = Duration::from_millis(800);
 
+        let write_at = Instant::now();
         let first = tap.wait_timeout(ECHO_WAIT_MAX, |p| p.closed || p.end > before_end);
-        if first.closed || first.end == before_end {
+        if first.closed {
+            return;
+        }
+        if first.end == before_end {
+            let remaining =
+                krill_proto::input::PASTE_SUBMIT_DELAY.saturating_sub(write_at.elapsed());
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining);
+            }
             return;
         }
         let mut last_end = first.end;
         let mut last_echo_at = Instant::now();
         let drain_deadline = last_echo_at + ECHO_DRAIN_MAX;
         loop {
+            let quiet_remaining =
+                krill_proto::input::PASTE_SUBMIT_DELAY.saturating_sub(last_echo_at.elapsed());
+            if quiet_remaining.is_zero() {
+                break;
+            }
             let budget = drain_deadline
                 .saturating_duration_since(Instant::now())
-                .min(ECHO_QUIET);
+                .min(quiet_remaining);
             if budget.is_zero() {
                 break;
             }
@@ -4592,14 +4641,50 @@ mod orchestration_delivery_tests {
             let second = buf[..n2].to_vec();
             Ok((first, second, gap))
         });
-        let text = b"[Krill orchestration] Unread mail.";
+        let text = b"[Krill orchestration]\nUnread mail.\r\n\nCheck now.";
         Registry::deliver_input_to_tap(&tap, text, true)?;
         let (first, second, gap) = tui.join().unwrap()?;
-        assert_eq!(first, text);
+        assert_eq!(first, b"[Krill orchestration] | Unread mail. | Check now.");
         assert_eq!(second, b"\r");
         assert!(
             gap >= Duration::from_millis(220),
             "expected PASTE_SUBMIT_DELAY after unbracketed echo, got {gap:?}"
+        );
+        drop(session);
+
+        // 1b. Unbracketed mode where OpenConsole emits an immediate cursor-hide byte and the TUI
+        //     echoes the pasted text 120ms later (> 60ms): CR must wait PASTE_SUBMIT_DELAY after
+        //     the late echo chunk instead of firing right after a blind sleep.
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            SessionId(415),
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&look),
+            None,
+        )?;
+        let tap = session.tap();
+        let tui = std::thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>, Duration)> {
+            let mut buf = [0_u8; 512];
+            let n1 = terminal.read(&mut buf)?;
+            let first = buf[..n1].to_vec();
+            terminal.write_all(b"\x1b[?25l")?;
+            std::thread::sleep(Duration::from_millis(120));
+            terminal.write_all(b"> [Krill orchestration] | Unread mail. | Check now.\x1b[?25h")?;
+            let late_echo_at = Instant::now();
+            let n2 = terminal.read(&mut buf)?;
+            let gap = late_echo_at.elapsed();
+            let second = buf[..n2].to_vec();
+            Ok((first, second, gap))
+        });
+        Registry::deliver_input_to_tap(&tap, text, true)?;
+        let (first, second, gap) = tui.join().unwrap()?;
+        assert_eq!(first, b"[Krill orchestration] | Unread mail. | Check now.");
+        assert_eq!(second, b"\r");
+        assert!(
+            gap >= Duration::from_millis(220),
+            "expected PASTE_SUBMIT_DELAY after late ConPTY echo, got {gap:?}"
         );
         drop(session);
 

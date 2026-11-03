@@ -4415,6 +4415,7 @@ impl Shell {
                         || live.pane.session().is_none()
                         || paste_queue.has_pending_for(*p))
         });
+        self.fits.0.retain(|p, _| self.live.contains_key(p));
         let mut notices = Vec::new();
         for (id, live) in &mut self.live {
             if live.target.as_ref().is_some_and(|target| {
@@ -5262,8 +5263,19 @@ impl Shell {
             {
                 l.clear_selection();
             }
+            let diverged_fit = (self.layout.focused() == Some(pane))
+                .then(|| {
+                    let s = l.pane.screen();
+                    l.pane
+                        .grid()
+                        .filter(|&want| s.cols > 0 && s.lines > 0 && (s.cols, s.lines) != want)
+                })
+                .flatten();
             if self.layout.focused() == Some(pane) {
                 self.maybe_poll_active_chat(cx);
+            }
+            if let Some(want) = diverged_fit {
+                self.schedule_fit(pane, want, cx);
             }
             cx.notify();
         }
@@ -5561,6 +5573,26 @@ impl Shell {
         let Some(pane) = self.layout.focused().filter(|&p| self.is_terminal_pane(p)) else {
             return;
         };
+        if !e.is_held
+            && ks.key == "c"
+            && ks.modifiers.control
+            && !ks.modifiers.shift
+            && !ks.modifiers.alt
+            && !ks.modifiers.platform
+            && self
+                .live
+                .get(&pane)
+                .and_then(Live::selected_text)
+                .is_some_and(|t| !t.is_empty())
+        {
+            self.copy(cx);
+            if let Some(l) = self.live.get_mut(&pane) {
+                l.clear_selection();
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let (composing, modes) = self
             .live
             .get(&pane)

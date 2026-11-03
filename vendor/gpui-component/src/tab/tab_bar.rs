@@ -456,7 +456,7 @@ impl RenderOnce for TabBar {
             },
             num_tabs,
         };
-        reveal.advance(window, cx);
+        let manually_scrolled = reveal.advance(window, cx);
         // reveal_selected: 코드로 바뀐 선택 탭도 보이게 한다. 이전 프레임의 탭 위치가 있어야 계산되므로,
         // 위치를 아직 모르면 다음 렌더에서 다시 시도한다.
         if let Some(sel) = self
@@ -469,6 +469,11 @@ impl RenderOnce for TabBar {
                 (None::<usize>, 0u8, None::<(gpui::Size<Pixels>, Pixels)>, None::<Pixels>)
             });
             let (mut done, tries, last_size, done_at) = *shown.read(cx);
+            if manually_scrolled {
+                let at = scroll_handle.offset().x;
+                shown.update(cx, |s, _| *s = (Some(sel), 0, None, Some(at)));
+                done = Some(sel);
+            }
             // 완료 뒤에 탭 제목이 늦게 와(복원 직후 데몬 연결) 탭들이 자라면 활성 탭이 다시 밀려난다. 사용자가
             // 스크롤하지 않았고(완료 때 위치 그대로) 활성 탭이 가려졌으면 다시 보이게 한다.
             if done == Some(sel)
@@ -647,7 +652,6 @@ impl RenderOnce for TabBar {
                             .relative()
                             .gap(gap)
                             .overflow_x_scroll()
-                            .lock_scroll_axis()
                             .track_scroll(&scroll_handle)
                             .children(rendered_tabs)
                             .when(has_suffix_or_menu, |this| this.child(self.last_empty_space)),
@@ -789,16 +793,16 @@ impl TabReveal {
         Some(offset.min(px(0.)).max(-max))
     }
 
-    /// Steps a running reveal by one frame.
-    fn advance(&self, window: &mut Window, cx: &mut App) {
+    /// Steps a running reveal by one frame. Returns `true` if a manual scroll cancelled the reveal.
+    fn advance(&self, window: &mut Window, cx: &mut App) -> bool {
         let Some(target) = *self.target.read(cx) else {
-            return;
+            return false;
         };
         let offset = self.scroll_handle.offset();
         // A wheel or trackpad scroll since the last frame hands the strip back.
         if target.last.is_some_and(|last| last != offset.x) {
             self.target.update(cx, |target, _| *target = None);
-            return;
+            return true;
         }
 
         let policy = cx.theme().motion_tokens().spring_move;
@@ -820,6 +824,7 @@ impl TabReveal {
                 ..target
             })
         });
+        false
     }
 }
 
@@ -1463,5 +1468,27 @@ mod tests {
             next_frame(cx);
         }
         assert_eq!(scroll_handle.offset().x, px(-52.));
+    }
+
+    #[gpui::test]
+    fn vertical_mouse_wheel_scrolls_tab_bar_horizontally(cx: &mut TestAppContext) {
+        let scroll_handle = ScrollHandle::new();
+        let cx = click_reveal_harness(cx, true, Some(scroll_handle.clone()), true);
+        let bar = cx.debug_bounds("click-bar").unwrap();
+        assert_eq!(scroll_handle.offset().x, px(0.));
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: bar.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-40.))),
+            modifiers: Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        draw(cx);
+
+        assert!(
+            scroll_handle.offset().x < px(0.),
+            "vertical wheel delta should scroll tab bar horizontally, got {:?}",
+            scroll_handle.offset()
+        );
     }
 }

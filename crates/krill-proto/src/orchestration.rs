@@ -1616,6 +1616,12 @@ impl OrchestrationStore {
         }
 
         let msg_id = self.alloc_id("msg");
+        if let Some(sid) = session_id {
+            self.idle_mail_notified
+                .entry(sid)
+                .or_default()
+                .insert(msg_id.clone());
+        }
         self.messages.push(OrchMessage {
             id: msg_id,
             run_id: Some(run_id.to_owned()),
@@ -6691,5 +6697,37 @@ mod frame_bound_tests {
             snapshot_page(b"abc", None, 0),
             OrchResponse::SnapshotPage { total: 3, offset: 0, bytes, .. } if bytes == b"abc"
         ));
+    }
+
+    #[test]
+    fn start_worker_with_bound_session_marks_dispatch_mail_notified() {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("bound session run", Some(1)).unwrap();
+        let dispatch = store
+            .start_worker_with_depth(
+                &run.id,
+                None,
+                "worker-bound",
+                "claude",
+                Some(77),
+                "/tmp",
+                "inspect and report",
+                0,
+                DEFAULT_MAX_WORKER_DEPTH,
+            )
+            .unwrap();
+        assert_eq!(dispatch.session_id, Some(77));
+        let msg = store
+            .messages
+            .iter()
+            .find(|m| m.dispatch_id.as_deref() == Some(dispatch.id.as_str()))
+            .expect("dispatch message created");
+        assert!(
+            store
+                .idle_mail_notified
+                .get(&77)
+                .is_some_and(|ids| ids.contains(&msg.id)),
+            "bound session dispatch message must be pre-marked in idle_mail_notified"
+        );
     }
 }
