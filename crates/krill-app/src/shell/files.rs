@@ -2917,14 +2917,21 @@ impl Shell {
                 let recent = recent.clone();
                 let remote = remote_target.clone();
                 let is_remote = ws_host.is_remote();
-                if let Some(result) = cx
+                // Ok(None): a local scan already owns admission, so retry. Err: the remote list failed.
+                let listed = cx
                     .background_executor()
                     .spawn(async move {
                         let files = if is_remote {
-                            let target = remote?;
-                            krill_app::remote_fs::quick_open_list(&target, &scan)?
+                            remote
+                                .and_then(|target| {
+                                    krill_app::remote_fs::quick_open_list(&target, &scan)
+                                })
+                                .ok_or(())?
                         } else {
-                            editor::quick_open::try_list(&scan)?
+                            let Some(files) = editor::quick_open::try_list(&scan) else {
+                                return Ok(None);
+                            };
+                            files
                         };
                         let membership: std::collections::HashSet<_> = files.iter().collect();
                         let mut ordered: Vec<_> = recent
@@ -2935,11 +2942,24 @@ impl Shell {
                             ordered.iter().cloned().collect();
                         ordered.extend(files.into_iter().filter(|file| seen.insert(file.clone())));
                         let items = editor::quick_open::items(&ordered);
-                        Some((ordered, items))
+                        Ok(Some((ordered, items)))
                     })
-                    .await
-                {
-                    break result;
+                    .await;
+                match listed {
+                    Ok(Some(result)) => break result,
+                    Ok(None) => {}
+                    Err(()) => {
+                        this.update(cx, |this, cx| {
+                            if this.files.quick_generation == generation && this.files.quick_loading
+                            {
+                                this.files.quick_loading = false;
+                                this.notice = Some(etext::QUICK_OPEN_FAILED.get().to_owned());
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                        return;
+                    }
                 }
                 cx.background_executor()
                     .timer(Duration::from_millis(100))

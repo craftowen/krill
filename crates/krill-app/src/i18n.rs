@@ -1118,6 +1118,7 @@ catalog! {
     }
     editor {
         QUICK_OPEN => (platform_text!("파일 열기 (⌘P)", "파일 열기 (Ctrl+Shift+P)"), platform_text!("Open file (⌘P)", "Open file (Ctrl+Shift+P)")),
+        QUICK_OPEN_FAILED => ("파일 목록을 불러오지 못했습니다", "Couldn't load the file list"),
         CHANGED_ON_DISK => ("디스크에서 파일이 바뀌었습니다. 편집 중인 내용은 그대로 있습니다.", "The file changed on disk. Your edits are kept."),
         RELOAD => ("디스크 내용으로 다시 읽기", "Reload from disk"),
         KEEP => ("내 편집 유지", "Keep my edits"),
