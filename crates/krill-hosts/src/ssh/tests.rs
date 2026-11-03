@@ -2,7 +2,14 @@ use super::*;
 
 #[test]
 fn host_validation_rejects_flags_paths_and_blanks() {
-    for good in ["mac-studio", "mac-studio.local", "owen@mac", "u@h-1.local"] {
+    for good in [
+        "mac-studio",
+        "mac-studio.local",
+        "owen@mac",
+        "u@h-1.local",
+        "mac_studio",
+        "owen.k@100.65.102.14",
+    ] {
         assert!(valid_host(good), "{good}");
     }
     for bad in [
@@ -17,6 +24,17 @@ fn host_validation_rejects_flags_paths_and_blanks() {
         "u@",
         "u@h@x",
         "한글호스트",
+        "h;id",
+        "h$(id)",
+        "h`id`",
+        "h|x",
+        "h'x",
+        "h\"x",
+        "h%h",
+        "h*",
+        "u@-oProxyCommand=x",
+        "-u@h",
+        "u;id@h",
     ] {
         assert!(!valid_host(bad), "{bad}");
     }
@@ -71,6 +89,8 @@ fn ssh_options_argv_builder_includes_port_key_and_stability_flags() {
         tunnel,
         vec![
             "-o",
+            "BatchMode=yes",
+            "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",
             "ServerAliveInterval=15",
@@ -99,6 +119,8 @@ fn ssh_options_argv_builder_includes_port_key_and_stability_flags() {
         home_query,
         vec![
             "-o",
+            "BatchMode=yes",
+            "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",
             "ServerAliveInterval=15",
@@ -110,8 +132,6 @@ fn ssh_options_argv_builder_includes_port_key_and_stability_flags() {
             "2222",
             "-i",
             "~/.ssh/id_ed25519_work",
-            "-o",
-            "BatchMode=yes",
             "alice@mac-studio.local",
             &remote_query(),
         ]
@@ -396,9 +416,10 @@ fn sweep_removes_only_dead_forward_sockets() {
 fn machine_key_reuses_recent_result_without_running_ssh() {
     let dest = "cache-probe.invalid";
     let key = (ssh_program(), dest.to_owned(), Some(2222));
-    MACHINE_KEYS.lock().unwrap().insert(
+    let cached = Some("user cached\nhostname host\nport 1\n".to_owned());
+    SSH_CONFIGS.lock().unwrap().insert(
         key.clone(),
-        (Instant::now(), ssh_config_mtime(), "cached@host:1".into()),
+        (Instant::now(), ssh_config_mtime(), cached.clone()),
     );
     assert_eq!(machine_key(dest, Some(2222)), "cached@host:1");
     // 기한이 지난 항목은 쓰지 않는다(이 대상은 `ssh -G`가 실패해도 입력 그대로가 나온다).
@@ -406,11 +427,35 @@ fn machine_key_reuses_recent_result_without_running_ssh() {
     let Some(stale) = Instant::now().checked_sub(MACHINE_KEY_TTL) else {
         return;
     };
-    MACHINE_KEYS
+    SSH_CONFIGS
         .lock()
         .unwrap()
-        .insert(key, (stale, ssh_config_mtime(), "cached@host:1".into()));
+        .insert(key, (stale, ssh_config_mtime(), cached));
     assert_ne!(machine_key(dest, Some(2222)), "cached@host:1");
+}
+
+#[test]
+fn host_key_checking_defers_to_an_explicit_user_setting() {
+    let argv = |dest: &str, value: &str| {
+        SSH_CONFIGS.lock().unwrap().insert(
+            (ssh_program(), dest.to_owned(), None),
+            (
+                Instant::now(),
+                ssh_config_mtime(),
+                Some(format!(
+                    "user u\nhostname {dest}\nstricthostkeychecking {value}\n"
+                )),
+            ),
+        );
+        SshOptions::new(dest).tunnel_args(Path::new("/tmp/l.sock"), Path::new("/r.sock"))
+    };
+    let accept_new = "StrictHostKeyChecking=accept-new".to_owned();
+    for (dest, value) in [("hk-strict.invalid", "true"), ("hk-off.invalid", "false")] {
+        let args = argv(dest, value);
+        assert!(!args.contains(&accept_new), "{value}: {args:?}");
+        assert!(args.contains(&"BatchMode=yes".to_owned()));
+    }
+    assert!(argv("hk-default.invalid", "ask").contains(&accept_new));
 }
 
 #[test]

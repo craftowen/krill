@@ -487,10 +487,75 @@ fn legitimate_reconnects_and_pre_auth_eof_do_not_consume_failure_budget() {
     }
     // Five failures must still fit: none of the successful or dropped sockets counted.
     let mut state = lock(&g.shared.state);
-    for _ in 0..5 {
-        state.devices.attempt(now_ms()).unwrap();
+    for principal in [Some(device.as_str()), None] {
+        for _ in 0..5 {
+            state.devices.attempt(now_ms(), principal).unwrap();
+        }
+        assert!(state.devices.check_cooldown(now_ms(), principal).is_err());
     }
-    assert!(state.devices.check_cooldown(now_ms()).is_err());
+}
+
+/// Sends an `AuthHello` (and a proof sealed with the wrong key when `proof`) and returns the close code.
+fn rejected_auth(port: u16, token: Option<[u8; 32]>, device_id: Option<&str>, proof: bool) -> u16 {
+    let (mut socket, challenge) = websocket(port);
+    let nonce = random().unwrap();
+    send(
+        &mut socket,
+        ws::TEXT,
+        &serde_json::to_vec(&AuthHello {
+            token: token.map(|t| hex(&t)),
+            device_id: device_id.map(str::to_owned),
+            client_nonce: hex(&nonce),
+        })
+        .unwrap(),
+    );
+    if proof {
+        let mut salt = [0; 64];
+        for (a, b) in salt.iter_mut().zip(challenge.into_iter().chain(nonce)) {
+            *a = b;
+        }
+        let mut channel = Channel::new(&[0; 32], &salt, Endpoint::Client).unwrap();
+        send(&mut socket, ws::BINARY, &channel.seal(b"{}").unwrap());
+    }
+    let (opcode, body) = receive(&mut socket).unwrap();
+    assert_eq!(opcode, 8);
+    u16::from_be_bytes(body.get(..2).unwrap().try_into().unwrap())
+}
+
+#[test]
+fn one_device_auth_failures_do_not_lock_out_other_devices() {
+    let (_r, g) = start();
+    let (port, first) = offer(&g);
+    let a = Client::pair(port, &first);
+    let (_, second) = offer(&g);
+    let b = Client::pair(port, &second);
+    let (a_id, b_id, b_credential) = (a.device.clone(), b.device.clone(), b.credential);
+    drop((a, b));
+    until(|| lock(&g.shared.state).connections.is_empty());
+
+    let unknown = hex(&random().unwrap());
+    for device in [a_id.as_str(), unknown.as_str()] {
+        for _ in 0..5 {
+            assert_eq!(rejected_auth(port, None, Some(device), true), 1008);
+            until(|| lock(&g.shared.state).connections.is_empty());
+        }
+        assert_eq!(
+            rejected_auth(port, None, Some(device), false),
+            1013,
+            "the failing principal itself stays rate limited"
+        );
+        until(|| lock(&g.shared.state).connections.is_empty());
+        let client = Client::reconnect(port, &b_id, &b_credential);
+        assert_eq!(client.device, b_id);
+        drop(client);
+        until(|| lock(&g.shared.state).connections.is_empty());
+    }
+    let (_, ticket) = offer(&g);
+    assert_eq!(
+        rejected_auth(port, Some(ticket.token), None, false),
+        1013,
+        "unknown device ids share the unauthenticated pairing budget"
+    );
 }
 
 #[test]
@@ -530,24 +595,7 @@ fn wrong_e2ee_proof_never_consumes_ticket_and_is_rate_limited() {
     assert_eq!(s.devices.active_count(), 0);
     assert!(s.devices.ticket(now_ms()).is_some());
     drop(s);
-    let mut socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    socket.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
-    let mut bytes = Vec::new();
-    socket.read_to_end(&mut bytes).unwrap();
-    let header_end = bytes
-        .windows(4)
-        .position(|part| part == b"\r\n\r\n")
-        .unwrap()
-        + 4;
-    assert!(
-        std::str::from_utf8(&bytes[..header_end])
-            .unwrap()
-            .starts_with("HTTP/1.1 101")
-    );
-    assert_eq!(&bytes[header_end..], &[0x88, 2, 0x03, 0xf5]); // 1013: 인증 cooldown
+    assert_eq!(rejected_auth(port, Some(t.token), None, false), 1013);
 }
 
 #[test]
@@ -768,8 +816,9 @@ fn connect_mode_survives_daemon_restart() {
     let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
     assert_eq!(lock(&g.shared.state).mode, ConnectMode::Tunnel);
     drop(g);
-    // 손상된 파일은 기본 Relay 모드로 시작한다.
+    // 손상된 파일은 옆으로 보존하고 이번 시작은 실패한다. 다음 시작은 기본 Tunnel 모드다.
     std::fs::write(dir.join(INTENT_FILE), b"{").unwrap();
+    assert!(Gateway::start(Weak::new(), Some(&dir), hello()).is_err());
     let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
     assert_eq!(lock(&g.shared.state).mode, ConnectMode::Tunnel);
     drop(g);
@@ -1016,6 +1065,39 @@ fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
     state.tunnel = None;
     assert!(pairing_offer(&state, now_ms()).is_err());
 }
+#[test]
+#[cfg(unix)]
+fn unreadable_intent_is_backed_up_instead_of_replaced_by_a_new_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("mk-mobile-corrupt-{}", hex(&random().unwrap())));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INTENT_FILE);
+    let corrupt = br#"{"mode":"tunnel","rid":"0123"#;
+    super::super::devices::write_private(&path, corrupt).unwrap();
+
+    assert!(Intent::load(Some(&dir)).is_err());
+    let backups: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|p| p != &path)
+        .collect();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read(backups.first().unwrap()).unwrap(), corrupt);
+
+    let valid = Intent::load(Some(&dir)).unwrap();
+    super::super::devices::write_private(&path, &serde_json::to_vec(&valid).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(Intent::load(Some(&dir)).is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let reloaded = Intent::load(Some(&dir)).unwrap();
+    assert_eq!(
+        (reloaded.rid, reloaded.key),
+        (valid.rid, valid.key),
+        "a file that could not be read is never overwritten"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 #[cfg(unix)]
 fn rendezvous_credentials_migrate_old_intent_and_survive_mode_changes() {

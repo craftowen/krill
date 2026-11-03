@@ -808,7 +808,7 @@ fn serve_mux_client(
     registry: &Weak<Registry>,
     hello: &ServerHello,
 ) -> io::Result<()> {
-    lock(&shared.state).devices.check_cooldown(now_ms())?;
+    let mut principal = None;
     let result = (|| {
         let greeting = serde_json::json!({"version": 2, "challenge": hex(&challenge)});
         outbox.send_mux(MUX_TEXT, conn_id, greeting.to_string().as_bytes())?;
@@ -822,8 +822,10 @@ fn serve_mux_client(
         let auth: AuthHello = serde_json::from_slice(&body).map_err(|_| invalid())?;
         let client_nonce = decode_hex::<32>(&auth.client_nonce)?;
         let token = auth.token.as_deref().map(decode_hex::<32>).transpose()?;
+        principal.clone_from(&auth.device_id);
         let secret = {
-            let s = lock(&shared.state);
+            let mut s = lock(&shared.state);
+            s.devices.check_cooldown(now_ms(), principal.as_deref())?;
             match (&token, &auth.device_id) {
                 (Some(t), None) => s.devices.pairing_secret(t, now_ms())?,
                 (None, Some(d)) => s.devices.device_secret(d)?,
@@ -873,7 +875,10 @@ fn serve_mux_client(
         .as_ref()
         .is_err_and(|error: &io::Error| error.kind() == io::ErrorKind::InvalidData)
     {
-        lock(&shared.state).devices.attempt(now_ms()).ok();
+        lock(&shared.state)
+            .devices
+            .attempt(now_ms(), principal.as_deref())
+            .ok();
     }
     let channel = result?;
     shared.wake();

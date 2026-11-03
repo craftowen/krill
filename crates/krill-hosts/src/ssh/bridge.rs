@@ -164,12 +164,7 @@ pub(crate) fn reached_remote(status: std::process::ExitStatus) -> bool {
 /// 원격이 Windows로 보이지만 krill이 없거나 중계를 모르거나(구버전) 원격 krilld가 꺼져 있을 때 원인을 담는다.
 pub(crate) fn probe(opts: &SshOptions, ssh_bin: &OsStr) -> io::Result<Option<Probe>> {
     let mut args = opts.common_args(5);
-    args.extend([
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        opts.destination.clone(),
-        format!("{COMMAND} {PROBE_FLAG}"),
-    ]);
+    args.extend([opts.destination.clone(), format!("{COMMAND} {PROBE_FLAG}")]);
     let out = super::run_ssh_output(ssh_bin, &args, PROBE_TIMEOUT)?;
     classify(
         &String::from_utf8_lossy(&out.stdout),

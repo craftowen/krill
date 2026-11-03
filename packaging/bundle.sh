@@ -224,6 +224,9 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>NSDocumentsFolderUsageDescription</key><string>Krill이 워크스페이스 및 에이전트 세션의 문서 폴더 파일에 접근합니다.</string>
     <key>NSDesktopFolderUsageDescription</key><string>Krill이 워크스페이스 및 에이전트 세션의 데스크톱 폴더 파일에 접근합니다.</string>
     <key>NSDownloadsFolderUsageDescription</key><string>Krill이 워크스페이스 및 에이전트 세션의 다운로드 폴더 파일에 접근합니다.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Krill 터미널에서 실행한 프로그램이 마이크를 사용합니다.</string>
+    <key>NSCameraUsageDescription</key><string>Krill 터미널에서 실행한 프로그램이 카메라를 사용합니다.</string>
+    <key>NSAppleEventsUsageDescription</key><string>Krill 터미널에서 실행한 프로그램이 다른 앱을 제어합니다.</string>
 </dict></plist>
 PLIST
 /usr/bin/plutil -lint "$app/Contents/Info.plist"

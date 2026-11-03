@@ -12,14 +12,16 @@ use crate::{Error, is_serve_running};
 const PREFERENCE: &str = "link/incoming.enabled";
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 저장된 선택이 없으면 수신 접속을 허용한다. 읽기 오류는 켜기로 간주하지 않는다.
+/// 저장된 선택이 없으면 페어링한 기기가 있을 때만 수신 접속을 허용한다. 읽기 오류는 켜기로 간주하지 않는다.
 pub fn incoming_enabled(state_dir: &Path) -> Result<bool, Error> {
     match fs::read_to_string(state_dir.join(PREFERENCE)) {
         Ok(value) => value
             .trim()
             .parse()
             .map_err(|_| Error::InvalidConfig("invalid incoming access preference".to_owned())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Ok(!crate::store::load_devices(state_dir)?.is_empty())
+        }
         Err(e) => Err(Error::Io(e)),
     }
 }
@@ -61,7 +63,7 @@ fn lock(state_dir: &Path) -> Result<File, Error> {
     }
 }
 
-/// 앱 시작 시 기본으로 수신 서버를 시작한다. 명시적으로 끈 설정은 유지한다.
+/// 앱 시작 시 수신 서버를 켜야 하면([`incoming_enabled`]) 시작하고, 아니면 등록된 launchd 잡을 내린다.
 pub fn ensure_default_server(executable: &Path, state_dir: &Path) -> Result<(), Error> {
     #[cfg(target_os = "macos")]
     {
@@ -74,6 +76,14 @@ pub fn ensure_default_server(executable: &Path, state_dir: &Path) -> Result<(), 
     let _lock = lock(state_dir)?;
     if incoming_enabled(state_dir)? {
         start(executable, state_dir)?;
+    } else {
+        // 예전 기본값(항상 켜짐)으로 페어링 없이 등록된 잡이 남아 있으면 내린다.
+        #[cfg(target_os = "macos")]
+        if crate::launch_agent_plist_path(&crate::link_label(crate::isolated_state_dir(state_dir)))?
+            .exists()
+        {
+            crate::disable_launch_agent(state_dir)?;
+        }
     }
     Ok(())
 }
@@ -155,13 +165,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn incoming_defaults_on_and_preserves_explicit_choice() {
+    fn incoming_defaults_on_only_with_a_paired_device_and_preserves_explicit_choice() {
         let dir = std::env::temp_dir().join(format!("kl-pref-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
-        assert!(incoming_enabled(&dir).unwrap());
+        assert!(
+            !incoming_enabled(&dir).unwrap(),
+            "no paired device and no choice keeps the listener off"
+        );
+        // 꺼져 있으면 존재하지 않는 실행 파일로도 자동 시작하지 않는다.
+        ensure_default_server(Path::new("missing-krill-link"), &dir).unwrap();
+        crate::store::upsert_device(&dir, iroh::SecretKey::generate().public(), "phone", 1)
+            .unwrap();
+        assert!(
+            incoming_enabled(&dir).unwrap(),
+            "an existing pairing keeps working"
+        );
         save_preference(&dir, false).unwrap();
         assert!(!incoming_enabled(&dir).unwrap());
-        // 꺼져 있으면 존재하지 않는 실행 파일로도 자동 시작하지 않는다.
         ensure_default_server(Path::new("missing-krill-link"), &dir).unwrap();
         save_preference(&dir, true).unwrap();
         assert!(incoming_enabled(&dir).unwrap());

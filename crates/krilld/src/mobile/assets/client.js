@@ -49,14 +49,7 @@
     // Mobile clients prove their paired device key to krilld. Google sessions
     // belong to the desktop host and must never gate a phone connection.
     relayFetch = (url, { isCurrent, ...options } = {}) =>
-      fetch(url, { ...options, credentials: "omit" }),
-    AUTH = /^([0-9a-f]{32,128})\.([0-9a-f]{64})(?:\.([0-9a-f]{32}))?$/,
-    handoff = (c) => {
-      const token = [c?.device_id, c?.credential, c?.rid]
-        .filter(Boolean)
-        .join(".");
-      return AUTH.test(token) ? token : null;
-    };
+      fetch(url, { ...options, credentials: "omit" });
   function clearRelayReturn() {
     try {
       globalThis.sessionStorage?.removeItem("krill-relay-return");
@@ -232,7 +225,6 @@
         ticket && secret && !invalidDirect && !hinted && !(fragment.has("install") && saved?.credential)
           ? { ticket, secret }
           : null,
-      auth = parameters.get("auth"),
       sensitive = ["p", "pair", "key", "t", "r", "d", "h", "install"],
       consumed = sensitive.some((key) => fragment.has(key));
     for (const key of [...sensitive, "auth"]) parameters.delete(key);
@@ -340,17 +332,6 @@
       ((directOrigin = active.origin || location.origin),
       (destinationFixed = active.fixed ?? fixed)),
       pair && ((directOrigin = location.origin), (destinationFixed = fixed)));
-    const seed = AUTH.exec(auth || "");
-    if (!pair && !saved && seed && (!fixed || seed[3])) {
-      credentials = {
-        device_id: seed[1],
-        credential: seed[2],
-        ...(fixed && { rid: seed[3], url: null, hash }),
-      };
-      try {
-        localStorage.setItem(STORE, JSON.stringify(credentials));
-      } catch {}
-    }
     let rid = pair ? fragment.get("r") : credentials?.rid,
       url = pair
         ? fragment.get("t")
@@ -1084,7 +1065,6 @@
   }
   M.transport = {
     bootstrap,
-    handoff,
     pool({ endpoint, onChange = () => {}, create } = {}) {
       const entries = new Map(),
         cache = M.storage?.create();

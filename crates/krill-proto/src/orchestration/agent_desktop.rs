@@ -5,7 +5,6 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use super::{LockGuard, invalid};
 #[cfg(unix)]
@@ -14,18 +13,13 @@ use crate::os::fs::OpenOptionsExt as _;
 pub const AGENT_DESKTOP_VERSION: &str = "1.0.2";
 pub const AGENT_DESKTOP_TAG: &str = "v1.0.2";
 pub const AGENT_DESKTOP_REPO: &str = "vercel-labs/agent-desktop";
-pub const LATEST_CHECKSUMS_URL: &str =
-    "https://github.com/vercel-labs/agent-desktop/releases/latest/download/checksums.txt";
 pub const MAX_AGENT_DESKTOP_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_CHECKSUMS_BYTES: u64 = 64 * 1024;
-const UPDATE_CHECK_TTL: Duration = Duration::from_hours(12);
 
 pub const ENV_BIN_OVERRIDE: &str = "KRILL_AGENT_DESKTOP_BIN";
 pub const ENV_ARCHIVE_OVERRIDE: &str = "KRILL_AGENT_DESKTOP_ARCHIVE";
 pub const ENV_SHA256_OVERRIDE: &str = "KRILL_AGENT_DESKTOP_SHA256";
 
 const VERSION_STAMP_FILE: &str = ".agent-desktop.version";
-const CHECK_STAMP_FILE: &str = ".agent-desktop.checked";
 const LOCK_FILE: &str = ".krill-agent-desktop.lock";
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -82,34 +76,6 @@ pub struct AgentDesktopAsset {
     pub sha256_bytes: [u8; 32],
     pub main_binary: &'static str,
     pub colocated_helper: Option<&'static str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedReleaseAsset {
-    pub target: AgentDesktopTarget,
-    pub version: String,
-    pub tag: String,
-    pub archive_name: String,
-    pub url: String,
-    pub sha256_bytes: [u8; 32],
-    pub main_binary: &'static str,
-    pub colocated_helper: Option<&'static str>,
-}
-
-impl AgentDesktopAsset {
-    #[must_use]
-    pub fn to_resolved(self) -> ResolvedReleaseAsset {
-        ResolvedReleaseAsset {
-            target: self.target,
-            version: self.version.to_owned(),
-            tag: format!("v{}", self.version),
-            archive_name: self.archive_name.to_owned(),
-            url: self.url.to_owned(),
-            sha256_bytes: self.sha256_bytes,
-            main_binary: self.main_binary,
-            colocated_helper: self.colocated_helper,
-        }
-    }
 }
 
 pub const PINNED_ASSETS: &[AgentDesktopAsset] = &[
@@ -260,54 +226,6 @@ pub fn parse_sha256_hex(hex: &str) -> io::Result<[u8; 32]> {
     Ok(out)
 }
 
-pub fn parse_latest_checksums(
-    checksums_txt: &str,
-    asset: &AgentDesktopAsset,
-) -> io::Result<ResolvedReleaseAsset> {
-    let suffix = format!("-{}.tar.gz", asset.target.triple());
-    for line in checksums_txt.lines() {
-        let mut parts = line.split_whitespace();
-        let (Some(sha_hex), Some(raw_name), None) = (parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        let name = raw_name.trim_start_matches('*');
-        let Some(rest) = name.strip_prefix("agent-desktop-v") else {
-            continue;
-        };
-        let Some(version) = rest.strip_suffix(&suffix) else {
-            continue;
-        };
-        if version.is_empty()
-            || !version
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
-        {
-            return Err(invalid("invalid version in agent-desktop checksums.txt"));
-        }
-        let sha256_bytes = parse_sha256_hex(sha_hex)?;
-        let tag = format!("v{version}");
-        let url = format!("https://github.com/{AGENT_DESKTOP_REPO}/releases/download/{tag}/{name}");
-        return Ok(ResolvedReleaseAsset {
-            target: asset.target,
-            version: version.to_owned(),
-            tag,
-            archive_name: name.to_owned(),
-            url,
-            sha256_bytes,
-            main_binary: asset.main_binary,
-            colocated_helper: asset.colocated_helper,
-        });
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!(
-            "no agent-desktop release archive for {} in checksums.txt",
-            asset.target.triple()
-        ),
-    ))
-}
-
 pub fn verify_archive_sha256(bytes: &[u8], expected: &[u8; 32]) -> io::Result<()> {
     let actual = ring::digest::digest(&ring::digest::SHA256, bytes);
     if actual.as_ref() == expected.as_slice() {
@@ -380,17 +298,12 @@ pub fn stage_agent_desktop(
         | ProvisionSource::UnsupportedPlatform
         | ProvisionSource::RemoteRelease(_) => Ok(None),
         ProvisionSource::LocalDir(dir) => {
-            provision_from_source(home, asset, ProvisionSource::LocalDir(dir), None, false)
+            provision_from_source(home, asset, ProvisionSource::LocalDir(dir), None).map(Some)
+        }
+        ProvisionSource::ColocatedBundle(dir) => {
+            provision_from_source(home, asset, ProvisionSource::ColocatedBundle(dir), None)
                 .map(Some)
         }
-        ProvisionSource::ColocatedBundle(dir) => provision_from_source(
-            home,
-            asset,
-            ProvisionSource::ColocatedBundle(dir),
-            None,
-            false,
-        )
-        .map(Some),
         ProvisionSource::LocalArchive {
             path,
             expected_sha256,
@@ -402,7 +315,6 @@ pub fn stage_agent_desktop(
                 expected_sha256,
             },
             None,
-            false,
         )
         .map(Some),
     }
@@ -415,26 +327,10 @@ pub fn ensure_agent_desktop_installed(
     ensure_agent_desktop_installed_with_path(home, krill_exe, None)
 }
 
-pub fn ensure_agent_desktop_latest(
-    home: &Path,
-    krill_exe: Option<&Path>,
-) -> io::Result<AgentDesktopReport> {
-    ensure_agent_desktop_with_options(home, krill_exe, None, true)
-}
-
 pub fn ensure_agent_desktop_installed_with_path(
     home: &Path,
     krill_exe: Option<&Path>,
     search_path: Option<&OsStr>,
-) -> io::Result<AgentDesktopReport> {
-    ensure_agent_desktop_with_options(home, krill_exe, search_path, false)
-}
-
-fn ensure_agent_desktop_with_options(
-    home: &Path,
-    krill_exe: Option<&Path>,
-    search_path: Option<&OsStr>,
-    force_update_check: bool,
 ) -> io::Result<AgentDesktopReport> {
     let bin_dir = crate::user_dirs::share_dir(home).join("bin");
     let Some(asset) = current_agent_desktop_asset() else {
@@ -458,11 +354,7 @@ fn ensure_agent_desktop_with_options(
         return Err(invalid("agent-desktop lock must not be a symlink"));
     }
 
-    if !has_override
-        && !force_update_check
-        && has_staged_executables(&bin_dir, asset)
-        && is_update_check_fresh(&bin_dir)
-    {
+    if !has_override && is_staged_version(&bin_dir, asset) {
         let staged_main = bin_dir.join(asset.main_binary);
         let staged_helper = asset.colocated_helper.map(|h| bin_dir.join(h));
         let link = ensure_agent_desktop_cli_link(home, &staged_main, search_path)?;
@@ -484,7 +376,7 @@ fn ensure_agent_desktop_with_options(
         sha256_override.as_deref(),
         offline_or_isolated,
     )?;
-    provision_from_source(home, asset, source, search_path, force_update_check)
+    provision_from_source(home, asset, source, search_path)
 }
 
 fn is_isolated_or_offline(home: &Path) -> bool {
@@ -504,7 +396,6 @@ fn provision_from_source(
     asset: &'static AgentDesktopAsset,
     source: ProvisionSource,
     search_path: Option<&OsStr>,
-    force_update_check: bool,
 ) -> io::Result<AgentDesktopReport> {
     let bin_dir = crate::user_dirs::share_dir(home).join("bin");
     super::skills::ensure_directory_safe(&bin_dir)?;
@@ -569,57 +460,21 @@ fn provision_from_source(
                 link,
             })
         }
-        ProvisionSource::RemoteRelease(fallback_asset) => {
+        ProvisionSource::RemoteRelease(pinned) => {
             let Some(_lock) = try_acquire_lock(&bin_dir)? else {
                 return Ok(busy_report(staged_main, staged_helper));
             };
-            if !force_update_check
-                && has_staged_executables(&bin_dir, fallback_asset)
-                && is_update_check_fresh(&bin_dir)
-            {
-                let link = ensure_agent_desktop_cli_link(home, &staged_main, search_path)?;
-                return Ok(AgentDesktopReport {
-                    executable: staged_main,
-                    helper: staged_helper,
-                    source: AgentDesktopSource::AlreadyStaged,
-                    link,
-                });
+            if !is_staged_version(&bin_dir, pinned) {
+                let bytes = download_release_archive(&bin_dir, pinned)?;
+                verify_archive_sha256(&bytes, &pinned.sha256_bytes)?;
+                extract_and_stage_archive(
+                    &bytes,
+                    &bin_dir,
+                    pinned,
+                    pinned.archive_name,
+                    pinned.version,
+                )?;
             }
-            let resolved =
-                if let Some(latest) = fetch_latest_release_asset(&bin_dir, fallback_asset) {
-                    write_check_stamp(&bin_dir).ok();
-                    if is_staged_version(&bin_dir, fallback_asset, &latest.version) {
-                        let link = ensure_agent_desktop_cli_link(home, &staged_main, search_path)?;
-                        return Ok(AgentDesktopReport {
-                            executable: staged_main,
-                            helper: staged_helper,
-                            source: AgentDesktopSource::AlreadyStaged,
-                            link,
-                        });
-                    }
-                    latest
-                } else {
-                    if has_staged_executables(&bin_dir, fallback_asset) {
-                        let link = ensure_agent_desktop_cli_link(home, &staged_main, search_path)?;
-                        return Ok(AgentDesktopReport {
-                            executable: staged_main,
-                            helper: staged_helper,
-                            source: AgentDesktopSource::AlreadyStaged,
-                            link,
-                        });
-                    }
-                    fallback_asset.to_resolved()
-                };
-            let bytes = download_release_archive(&bin_dir, &resolved)?;
-            verify_archive_sha256(&bytes, &resolved.sha256_bytes)?;
-            extract_and_stage_archive(
-                &bytes,
-                &bin_dir,
-                fallback_asset,
-                &resolved.archive_name,
-                &resolved.version,
-            )?;
-            write_check_stamp(&bin_dir).ok();
             let link = ensure_agent_desktop_cli_link(home, &staged_main, search_path)?;
             Ok(AgentDesktopReport {
                 executable: staged_main,
@@ -657,53 +512,10 @@ fn try_acquire_lock(bin_dir: &Path) -> io::Result<Option<LockGuard>> {
     }
 }
 
-fn has_staged_executables(bin_dir: &Path, asset: &AgentDesktopAsset) -> bool {
-    let stamp = bin_dir.join(VERSION_STAMP_FILE);
-    let Ok(version) = fs::read_to_string(stamp) else {
-        return false;
-    };
-    if version.trim().is_empty() {
-        return false;
-    }
-    if !is_regular_executable(&bin_dir.join(asset.main_binary)) {
-        return false;
-    }
-    if let Some(helper) = asset.colocated_helper
-        && !is_regular_executable(&bin_dir.join(helper))
-    {
-        return false;
-    }
-    true
-}
-
-fn is_staged_version(bin_dir: &Path, asset: &AgentDesktopAsset, expected_version: &str) -> bool {
-    let stamp = bin_dir.join(VERSION_STAMP_FILE);
-    let Ok(version) = fs::read_to_string(stamp) else {
-        return false;
-    };
-    version.trim() == expected_version && has_staged_executables(bin_dir, asset)
-}
-
-fn is_update_check_fresh(bin_dir: &Path) -> bool {
-    let check_path = bin_dir.join(CHECK_STAMP_FILE);
-    let Ok(meta) = fs::symlink_metadata(check_path) else {
-        return false;
-    };
-    if !meta.is_file() || meta.file_type().is_symlink() {
-        return false;
-    }
-    meta.modified()
-        .ok()
-        .and_then(|mtime| mtime.elapsed().ok())
-        .is_some_and(|age| age < UPDATE_CHECK_TTL)
-}
-
-fn write_check_stamp(bin_dir: &Path) -> io::Result<()> {
-    let check_path = bin_dir.join(CHECK_STAMP_FILE);
-    if !super::skills::regular_or_missing(&check_path)? {
-        return Err(invalid("check stamp must not be a symlink"));
-    }
-    fs::write(check_path, format!("{}\n", super::now_secs()))
+fn is_staged_version(bin_dir: &Path, asset: &AgentDesktopAsset) -> bool {
+    fs::read_to_string(bin_dir.join(VERSION_STAMP_FILE))
+        .is_ok_and(|version| version.trim() == asset.version)
+        && has_pair_in_dir(bin_dir, asset)
 }
 
 fn is_regular_executable(path: &Path) -> bool {
@@ -836,63 +648,7 @@ fn read_bounded_archive(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn fetch_latest_release_asset(
-    bin_dir: &Path,
-    asset: &AgentDesktopAsset,
-) -> Option<ResolvedReleaseAsset> {
-    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_checksums = bin_dir.join(format!(".krill-ad-chk-{}-{seq}.txt", std::process::id()));
-    let curl_ok = crate::os::background_command("curl")
-        .args([
-            "-fsSL",
-            "--retry",
-            "1",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "15",
-            "-o",
-        ])
-        .arg(&tmp_checksums)
-        .arg(LATEST_CHECKSUMS_URL)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success() && tmp_checksums.is_file());
-
-    let downloaded = if curl_ok {
-        true
-    } else {
-        fs::remove_file(&tmp_checksums).ok();
-        crate::os::background_command("gh")
-            .args([
-                "release",
-                "download",
-                "--repo",
-                AGENT_DESKTOP_REPO,
-                "--pattern",
-                "checksums.txt",
-                "--output",
-            ])
-            .arg(&tmp_checksums)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success() && tmp_checksums.is_file())
-    };
-    if !downloaded {
-        fs::remove_file(&tmp_checksums).ok();
-        return None;
-    }
-    let bytes = read_bounded_archive(&tmp_checksums, MAX_CHECKSUMS_BYTES).ok();
-    fs::remove_file(&tmp_checksums).ok();
-    let text = String::from_utf8(bytes?).ok()?;
-    parse_latest_checksums(&text, asset).ok()
-}
-
-fn download_release_archive(bin_dir: &Path, asset: &ResolvedReleaseAsset) -> io::Result<Vec<u8>> {
+fn download_release_archive(bin_dir: &Path, asset: &AgentDesktopAsset) -> io::Result<Vec<u8>> {
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_archive = bin_dir.join(format!(".krill-ad-dl-{}-{seq}.tar.gz", std::process::id()));
     let curl_status = crate::os::background_command("curl")
@@ -907,7 +663,7 @@ fn download_release_archive(bin_dir: &Path, asset: &ResolvedReleaseAsset) -> io:
             "-o",
         ])
         .arg(&tmp_archive)
-        .arg(&asset.url)
+        .arg(asset.url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -921,11 +677,11 @@ fn download_release_archive(bin_dir: &Path, asset: &ResolvedReleaseAsset) -> io:
                 .args([
                     "release",
                     "download",
-                    &asset.tag,
+                    AGENT_DESKTOP_TAG,
                     "--repo",
                     AGENT_DESKTOP_REPO,
                     "--pattern",
-                    &asset.archive_name,
+                    asset.archive_name,
                     "--output",
                 ])
                 .arg(&tmp_archive)
@@ -1073,46 +829,57 @@ mod tests {
     }
 
     #[test]
-    fn pinned_assets_and_latest_checksums_parser_resolve_versions_and_hashes() {
+    fn pinned_assets_carry_their_version_and_hashes() {
         assert_eq!(PINNED_ASSETS.len(), 6);
         for asset in PINNED_ASSETS {
             let parsed = parse_sha256_hex(asset.sha256_hex).unwrap();
             assert_eq!(parsed, asset.sha256_bytes, "{}", asset.archive_name);
             assert!(asset.url.ends_with(asset.archive_name));
+            assert!(
+                asset
+                    .url
+                    .contains(&format!("/releases/download/{AGENT_DESKTOP_TAG}/")),
+                "{}",
+                asset.url
+            );
             assert_eq!(asset.version, AGENT_DESKTOP_VERSION);
         }
+    }
 
-        let sample_checksums = "\
-495a76b557650af4191d3d23bdf1313489bd42eb622c52b7bf0c1ea6de7e69b4  agent-desktop-ffi-v1.4.0-aarch64-apple-darwin.tar.gz\n\
-7bee385196d7b478de80cf05ca4304aaa38f0eba593b3406ad3c247c1773be19  agent-desktop-v1.4.0-aarch64-apple-darwin.tar.gz\n\
-2186c76e7df197c0e67365e45d36d869f74714c56bb8a73817e2a66f3e18e222  *agent-desktop-v1.4.0-x86_64-pc-windows-msvc.tar.gz\n";
-        let mac_asset = PINNED_ASSETS
-            .iter()
-            .find(|a| a.target == AgentDesktopTarget::MacosArm64)
-            .unwrap();
-        let resolved = parse_latest_checksums(sample_checksums, mac_asset).unwrap();
-        assert_eq!(resolved.version, "1.4.0");
-        assert_eq!(resolved.tag, "v1.4.0");
-        assert_eq!(
-            resolved.archive_name,
-            "agent-desktop-v1.4.0-aarch64-apple-darwin.tar.gz"
-        );
-        assert_eq!(
-            resolved.url,
-            "https://github.com/vercel-labs/agent-desktop/releases/download/v1.4.0/agent-desktop-v1.4.0-aarch64-apple-darwin.tar.gz"
-        );
-        assert_eq!(resolved.sha256_bytes, mac_asset.sha256_bytes);
+    #[test]
+    #[cfg(unix)]
+    fn only_the_pinned_version_counts_as_installed() {
+        use std::os::unix::fs::PermissionsExt as _;
 
-        let win_asset = PINNED_ASSETS
-            .iter()
-            .find(|a| a.target == AgentDesktopTarget::WindowsX64)
-            .unwrap();
-        let win_resolved = parse_latest_checksums(sample_checksums, win_asset).unwrap();
-        assert_eq!(win_resolved.version, "1.4.0");
-        assert_eq!(
-            win_resolved.archive_name,
-            "agent-desktop-v1.4.0-x86_64-pc-windows-msvc.tar.gz"
+        let home = temp_home("pinned-only");
+        let asset = current_agent_desktop_asset().unwrap();
+        let bin_dir = crate::user_dirs::share_dir(&home).join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        for name in std::iter::once(asset.main_binary).chain(asset.colocated_helper) {
+            let path = bin_dir.join(name);
+            fs::write(&path, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(bin_dir.join(".agent-desktop.checked"), "0\n").unwrap();
+
+        fs::write(bin_dir.join(VERSION_STAMP_FILE), "9.9.9\n").unwrap();
+        let report =
+            ensure_agent_desktop_installed_with_path(&home, None, Some(OsStr::new(""))).unwrap();
+        assert_ne!(
+            report.source,
+            AgentDesktopSource::AlreadyStaged,
+            "a version not pinned in source must not be trusted"
         );
+
+        fs::write(
+            bin_dir.join(VERSION_STAMP_FILE),
+            format!("{AGENT_DESKTOP_VERSION}\n"),
+        )
+        .unwrap();
+        let report =
+            ensure_agent_desktop_installed_with_path(&home, None, Some(OsStr::new(""))).unwrap();
+        assert_eq!(report.source, AgentDesktopSource::AlreadyStaged);
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -1232,7 +999,6 @@ mod tests {
                 expected_sha256: bad_sha,
             },
             Some(OsStr::new("")),
-            false,
         );
         assert!(bad.is_err());
 
@@ -1244,7 +1010,6 @@ mod tests {
                 expected_sha256: expected_sha,
             },
             Some(OsStr::new("")),
-            false,
         )
         .unwrap();
         assert_eq!(report.source, AgentDesktopSource::LocalOverride);
