@@ -9399,38 +9399,6 @@ fn ui_audit_settings_default_agent_accepts_keyboard_activation(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn ui_audit_closed_import_modal_render_does_not_notify_global_observers(cx: &mut TestAppContext) {
-    use std::cell::Cell;
-    use std::rc::Rc;
-    struct Probe;
-    impl gpui::Render for Probe {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div().children(crate::orca_import::render_modal(window, cx))
-        }
-    }
-    let notifications = Rc::new(Cell::new(0));
-    cx.update(crate::orca_import::ensure_state);
-    let observed = notifications.clone();
-    let _observer = cx.update(|cx| {
-        cx.observe_global::<crate::orca_import::OrcaImportState>(move |_| {
-            observed.set(observed.get() + 1);
-        })
-    });
-    let (_probe, vcx) = cx.add_window_view(|_, _| Probe);
-    for _ in 0..3 {
-        vcx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-        vcx.run_until_parked();
-    }
-    assert_eq!(
-        notifications.get(),
-        0,
-        "a closed dialog render must not invalidate settings observers"
-    );
-}
-
-#[gpui::test]
 fn settings_navigation_exposes_selected_tab_metadata(_cx: &mut TestAppContext) {
     use gpui::Element as _;
     for tab in AdminTab::ALL {

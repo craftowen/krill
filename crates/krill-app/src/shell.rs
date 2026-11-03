@@ -2511,7 +2511,6 @@ impl Shell {
                     this.daemon_task = None;
                     this.link = Link::connect_failure(&daemon::Error::Io(e));
                     krill_app::errors::daemon_connection_failed(cx);
-                    krill_app::orca_import::set_daemon_link_up(false, cx);
                     cx.notify();
                 }
             })
@@ -3233,9 +3232,7 @@ impl Shell {
             self.refresh_ssh_hosts(cx);
             return;
         }
-        let home = krill_app::orca_import::state(cx)
-            .and_then(|s| s.home_override.clone())
-            .unwrap_or_else(krill_app::accounts::default_home);
+        let home = krill_app::accounts::default_home();
         let dir = self.state_dir(cx);
         let Some(stamp) = self.account_read_stamp(&krill_app::hosts::HostId::Local) else {
             return;
@@ -3312,7 +3309,6 @@ impl Shell {
                 view.sync_machine_local_status(self.machine_local_status(), cx);
             });
         }
-        krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
         if self.link == Link::Up {
             self.load_agents(None, cx);

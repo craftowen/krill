@@ -985,7 +985,6 @@ pub struct Sidebar {
     hovered_worktree: Option<(HostId, PathBuf)>,
     editing: Option<(PathBuf, Entity<InputState>)>,
     edit_subscription: Option<Subscription>,
-    orca_import_subscription: Option<Subscription>,
     pub(crate) creating: Option<(Entity<worktree::Dialog>, Subscription)>,
     pub(super) creating_background: Vec<(u64, Entity<worktree::Dialog>, Subscription)>,
     pub(super) creating_dialog_id: u64,
@@ -1361,7 +1360,6 @@ impl Sidebar {
             local_rows_cache: std::cell::RefCell::default(),
             editing: None,
             edit_subscription: None,
-            orca_import_subscription: None,
             creating: None,
             creating_background: Vec::new(),
             creating_dialog_id: 0,
@@ -1511,32 +1509,6 @@ impl Sidebar {
         self.disk.generation = self.disk.generation.wrapping_add(1);
         self.disk.task = None;
         self.ensure_external_polling(cx);
-    }
-
-    #[cfg(test)]
-    #[cfg(unix)]
-    pub(crate) fn trees(&self) -> &BTreeMap<PathBuf, Vec<PathBuf>> {
-        &self.snapshot.trees
-    }
-
-    #[cfg(test)]
-    #[cfg(unix)]
-    pub(crate) fn comments(&self) -> &BTreeMap<PathBuf, String> {
-        &self.comments
-    }
-
-    #[cfg(test)]
-    #[cfg(unix)]
-    pub(crate) fn issues(&self) -> &BTreeMap<PathBuf, String> {
-        &self.issues
-    }
-
-    #[cfg(test)]
-    #[cfg(unix)]
-    pub(crate) fn worktree_statuses(
-        &self,
-    ) -> &BTreeMap<PathBuf, krill_proto::orchestration::WorkspaceStatus> {
-        &self.worktree_statuses
     }
 
     #[must_use]

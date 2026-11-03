@@ -3176,7 +3176,6 @@ impl std::fmt::Debug for SettingsView {
 impl SettingsView {
     /// 계정·호스트는 UI 스레드에서 읽지 않는다(AS-06·OWE-697). 첫 스냅샷은 백그라운드 갱신이 채운다.
     pub fn new(cx: &mut Context<Self>) -> Self {
-        crate::orca_import::ensure_scanned(cx);
         let mut view = Self {
             _observe: cx.observe_global::<Config>(|this, cx| {
                 this.refresh_accounts_if_changed(cx);
@@ -3297,16 +3296,6 @@ impl SettingsView {
             .detach();
         cx.observe_global::<crate::accounts::installed::Installed>(|_, cx| cx.notify())
             .detach();
-        cx.observe_global::<crate::orca_import::OrcaImportState>(|this, cx| {
-            if crate::orca_import::state(cx)
-                .is_some_and(|st| !st.importing && st.last_result.is_some())
-            {
-                this.accounts_refresh_pending = false;
-                this.refresh_accounts_async(cx);
-            }
-            cx.notify();
-        })
-        .detach();
         view
     }
 
@@ -4067,9 +4056,7 @@ impl SettingsView {
         let file_revision = self.file_revision;
         cx.notify();
         let before = (self.accounts_snapshot.clone(), self.account_error.clone());
-        let home = crate::orca_import::state(cx)
-            .and_then(|s| s.home_override.clone())
-            .unwrap_or_else(crate::accounts::default_home);
+        let home = crate::accounts::default_home();
         let dir = state_dir(cx);
         let daemon = is_daemon_state_dir(dir.as_deref());
         cx.spawn(async move |this, cx| {
@@ -4635,13 +4622,9 @@ impl SettingsView {
         let dir = state_dir(cx);
         let daemon = is_daemon_state_dir(dir.as_deref());
         let n = self.added_counter;
-        let home = crate::orca_import::state(cx)
-            .and_then(|s| s.home_override.clone())
-            .or_else(|| {
-                cfg!(test)
-                    .then(|| dir.as_ref().map(|d| d.join("test-home")))
-                    .flatten()
-            })
+        let home = cfg!(test)
+            .then(|| dir.as_ref().map(|d| d.join("test-home")))
+            .flatten()
             .unwrap_or_else(crate::accounts::default_home);
         self.added_counter = n.saturating_add(1);
         let request = move || {
@@ -4727,13 +4710,9 @@ impl SettingsView {
 
     fn opencode_home_and_state(cx: &App) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
         let dir = state_dir(cx);
-        let home = crate::orca_import::state(cx)
-            .and_then(|s| s.home_override.clone())
-            .or_else(|| {
-                cfg!(test)
-                    .then(|| dir.as_ref().map(|d| d.join("test-home")))
-                    .flatten()
-            })
+        let home = cfg!(test)
+            .then(|| dir.as_ref().map(|d| d.join("test-home")))
+            .flatten()
             .unwrap_or_else(crate::accounts::default_home);
         (home, dir)
     }
@@ -6152,7 +6131,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_3()
-            .children(crate::orca_import::render_banner("settings-general", cx))
             .child(layout::section_title(
                 p,
                 "general-section-notifications",
@@ -7810,7 +7788,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_8()
-            .children(crate::orca_import::render_banner("settings-accounts", cx))
             .when(self.accounts_offline, |d| {
                 d.child(
                     div()
@@ -11195,11 +11172,6 @@ impl Render for SettingsView {
             .key_context(SEARCH_CONTEXT)
             .capture_action(
                 cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
-                    if crate::orca_import::state(cx).is_some_and(|st| st.modal_open) {
-                        crate::orca_import::close_modal(cx);
-                        cx.stop_propagation();
-                        return;
-                    }
                     if this.schedule_modal.is_some() {
                         this.close_schedule_modal(cx);
                         cx.stop_propagation();
@@ -11282,15 +11254,6 @@ impl Render for SettingsView {
                         return;
                     }
                 }
-                if ev.keystroke.key == "escape"
-                    && crate::orca_import::state(cx).is_some_and(|st| st.modal_open)
-                {
-                    if !crate::orca_import::state(cx).is_some_and(|st| st.importing) {
-                        crate::orca_import::close_modal(cx);
-                    }
-                    cx.stop_propagation();
-                    return;
-                }
                 if this.schedule_modal.is_some() && ev.keystroke.key == "escape" {
                     this.close_schedule_modal(cx);
                     window.focus(&this.focus, cx);
@@ -11368,7 +11331,6 @@ impl Render for SettingsView {
             .children(self.render_remove_dialog(window, cx))
             .children(self.render_cleanup_modal(window, cx))
             .children(self.render_schedule_modal(window, cx))
-            .children(crate::orca_import::render_modal(window, cx))
             .child(titlebar)
             .child(
                 div().flex_1().min_h_0().w_full().flex().child(nav).child(

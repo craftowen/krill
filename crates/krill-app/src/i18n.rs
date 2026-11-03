@@ -2025,6 +2025,7 @@ catalog! {
         THANKS => ("별 고맙습니다!", "Thanks for the star!"),
     }
     general {
+        ERR_CLI_MISSING => ("krill CLI 실행 파일을 찾을 수 없습니다", "Could not find the krill CLI binary"),
         CONTROL_UNAVAILABLE => ("현재 사용할 수 없음", "Currently unavailable"),
         JUMP_SHORTCUT => (platform_text!("⌘J", "Ctrl+Shift+J"), platform_text!("⌘J", "Ctrl+Shift+J")),
         HASH => ("SHA-256 {hash}", "SHA-256 {hash}"),
@@ -2343,40 +2344,6 @@ catalog! {
         FOLDER_DESKTOP => ("데스크톱", "Desktop"),
         FOLDER_DOWNLOADS => ("다운로드", "Downloads"),
     }
-
-    orca_import {
-        TITLE => ("Orca 설정·계정·프로젝트 가져오기", "Import settings, accounts & projects from Orca"),
-        SUBTITLE => ("이 컴퓨터에서 Orca 데이터를 감지했습니다. 원하는 항목만 골라 재시작 없이 바로 가져옵니다.", "Detected existing Orca data on this computer. Choose categories to import immediately without restarting."),
-        MODAL_TITLE => ("Orca에서 가져오기", "Import from Orca"),
-        MODAL_SUBTITLE => ("가져올 카테고리를 선택하세요. 원본 Orca 파일은 변경하거나 삭제하지 않습니다.", "Choose categories to import. Your original Orca files are never modified or deleted."),
-        SUMMARY => ("Claude 계정 {claude}개 · Codex 계정 {codex}개 · 원격 호스트 {ssh}개 · 프로젝트/폴더 {projects}개 · 워크트리 메타 {worktrees}개 · 빠른 명령/스케줄 {commands}개 · 에이전트 세션 {sessions}개", "Claude accounts {claude} · Codex accounts {codex} · Remote hosts {ssh} · Projects/folders {projects} · Worktree metadata {worktrees} · Quick commands/schedules {commands} · Agent sessions {sessions}"),
-        SCANNING => ("Orca 데이터 스캔 중…", "Scanning Orca data…"),
-        OPEN_MODAL => ("선택하여 가져오기…", "Choose & Import…"),
-        IMPORT_ALL => ("전체 가져오기", "Import All"),
-        IMPORT_SELECTED => ("선택 항목 가져오기 ({n}개)", "Import Selected ({n})"),
-        IMPORTING => ("가져오는 중…", "Importing…"),
-        RESCAN => ("다시 스캔", "Rescan"),
-        CLOSE => ("닫기", "Close"),
-        CANCEL => ("취소", "Cancel"),
-        CAT_ACCOUNTS => ("멀티 계정 (Claude · Codex)", "Multi-Accounts (Claude · Codex)"),
-        CAT_ACCOUNTS_DESC => ("Claude {claude}개 · Codex {codex}개 (프로필 디렉터리 경로 등록)", "Claude {claude} · Codex {codex} (profile directory paths registered)"),
-        CAT_SSH => ("원격 SSH 호스트", "Remote SSH Hosts"),
-        CAT_SSH_DESC => ("원격 호스트 {ssh}개 (hosts.toml에 멱등 병합)", "Remote hosts {ssh} (idempotently merged into hosts.toml)"),
-        CAT_PROJECTS => ("프로젝트 · 폴더 · 워크트리 메타", "Projects, Folders & Worktree Metadata"),
-        CAT_PROJECTS_DESC => ("프로젝트/폴더 {projects}개 · 워크트리 {worktrees}개 · 코멘트 {comments}개", "Projects/folders {projects} · Worktrees {worktrees} · Comments {comments}"),
-        CAT_SETTINGS => ("환경설정 · 빠른 명령 · 스케줄", "Preferences, Quick Commands & Schedules"),
-        CAT_SETTINGS_DESC => ("테마·글꼴·단축키 및 빠른 명령 {commands}개 · 스케줄 {schedules}개", "Theme, font, shortcuts, quick commands {commands} & schedules {schedules}"),
-        CAT_SESSIONS => ("열린 에이전트 세션", "Open Agent Sessions"),
-        CAT_SESSIONS_DESC => ("Orca 탭의 에이전트 세션 {sessions}개를 각 워크트리에서 이어서 띄웁니다", "Resume {sessions} agent sessions from Orca tabs in their worktrees"),
-        DAEMON_REQUIRED_BADGE => ("데몬 필요 (건너뜀)", "Daemon required (skipped)"),
-        DAEMON_REQUIRED_NOTE => ("데몬(krilld)이 실행 중이지 않아 계정 가져오기는 건너뜁니다: {reason}", "Daemon (krilld) is not running, so account import was skipped: {reason}"),
-        RESULT_DONE => ("가져오기 완료: 계정 +{accounts} · SSH +{ssh} · 프로젝트 +{projects} · 워크트리 +{worktrees} · 설정 {settings} · 세션 +{sessions}", "Import complete: Accounts +{accounts} · SSH +{ssh} · Projects +{projects} · Worktrees +{worktrees} · Settings {settings} · Sessions +{sessions}"),
-        RESULT_DONE_SKIPPED_ACCOUNTS => ("가져오기 완료 (계정 건너뜀 — 데몬 필요): SSH +{ssh} · 프로젝트 +{projects} · 워크트리 +{worktrees} · 설정 {settings} · 세션 +{sessions}", "Import complete (accounts skipped — daemon required): SSH +{ssh} · Projects +{projects} · Worktrees +{worktrees} · Settings {settings} · Sessions +{sessions}"),
-        SETTINGS_APPLIED => ("적용됨", "Applied"),
-        SETTINGS_UNCHANGED => ("유지됨", "Unchanged"),
-        ERR_CLI_MISSING => ("krill CLI 실행 파일을 찾을 수 없습니다", "Could not find the krill CLI binary"),
-        ERR_IMPORT_FAILED => ("Orca 가져오기 실패: {error}", "Orca import failed: {error}"),
-    }
 }
 
 fn cached_notice_line(value: &str) -> String {
@@ -2500,30 +2467,6 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         crate::settings::AdminTab::System,
         catalog::settings::UPDATES_AUTO_RESTART,
         &["자동 재시작", "업데이트", "auto restart", "relaunch"],
-    ),
-    (
-        crate::settings::AdminTab::System,
-        catalog::orca_import::TITLE,
-        &[
-            "orca",
-            "오르카",
-            "마이그레이션",
-            "가져오기",
-            "import",
-            "migration",
-        ],
-    ),
-    (
-        crate::settings::AdminTab::Accounts,
-        catalog::orca_import::TITLE,
-        &[
-            "orca",
-            "오르카",
-            "마이그레이션",
-            "가져오기",
-            "import",
-            "migration",
-        ],
     ),
     (
         crate::settings::AdminTab::Accounts,
@@ -2957,7 +2900,6 @@ mod platform_shortcut_tests {
         for message in link_ui::ALL.iter().chain([
             &catalog::settings::TAB_REMOTE_KRILL_DESC,
             &catalog::mobile::PAGE_DESC,
-            &catalog::orca_import::SUBTITLE,
             &catalog::settings::SSH_DESC,
             &catalog::settings::SSH_KEYGEN_CONFIRM_PROMPT,
             &catalog::settings::SSH_REGISTER_STARTED,

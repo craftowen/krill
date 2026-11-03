@@ -1572,7 +1572,7 @@ impl Shell {
         let Some(run) = krill_app::artifacts::runner(cx) else {
             self.notice = Some(atext::ERROR.format(&[(
                 "error",
-                krill_app::i18n::catalog::orca_import::ERR_CLI_MISSING.get(),
+                krill_app::i18n::catalog::general::ERR_CLI_MISSING.get(),
             )]));
             cx.notify();
             return;

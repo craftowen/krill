@@ -29,7 +29,6 @@ pub mod machines;
 pub mod menu_bar;
 pub mod onboarding;
 pub mod open_in;
-pub mod orca_import;
 pub mod pane;
 pub mod platform;
 pub(crate) mod process_io;
