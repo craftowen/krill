@@ -7,7 +7,6 @@ use super::gateway::{
     AuthHello, AuthProof, Connection, MAX_CONNECTIONS, MAX_PENDING, RPC_STACK, Shared,
     ShutdownHandle, TIMEOUT, authenticated_reply, now_ms,
 };
-use super::tunnel::Publication;
 use super::ws;
 use crate::registry::Registry;
 use crate::session::lock;
@@ -16,10 +15,27 @@ use krill_proto::os::net::UnixStream;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// 릴레이 랑데부 신원. 비밀은 Debug·프로세스 인자로 노출하지 않는다.
+#[derive(Clone)]
+pub(super) struct Publication {
+    pub origin: String,
+    pub rid: String,
+    pub key: String,
+    pub session: Option<super::relay_auth::Session>,
+}
+impl std::fmt::Debug for Publication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Publication").finish_non_exhaustive()
+    }
+}
 
 pub const MUX_OPEN: u8 = 1;
 pub const MUX_TEXT: u8 = 2;
@@ -360,10 +376,9 @@ fn supervise_loop(
     registry: &Weak<Registry>,
     hello: &ServerHello,
 ) {
-    // 고정 출처에 이 앱 버전이 없으면 새 QR만 404가 된다(게이트웨이가 터널 QR로 낸다). 릴레이는 그래도 붙는다:
+    // 고정 출처에 이 앱 버전이 없으면 새 QR만 404가 되므로 게이트웨이는 새 페어링을 거절한다. 릴레이는 그래도 붙는다:
     // 이미 짝지은 PWA(이전 해시)는 릴레이로 계속 접속해야 하고, 해시는 UI 식별용이지 프로토콜이 아니다.
-    // 첫 확인은 연결 전에 끝내 배포된 버전에서 터널을 괜히 띄우지 않게 한다.
-    if super::tunnel::publication_available(publication) {
+    if publication_available(publication) {
         assets.store(true, Ordering::Release);
     } else {
         watch_assets(
@@ -418,7 +433,7 @@ fn watch_assets(
         .stack_size(128 * 1024)
         .spawn(move || {
             while !stop.wait(Duration::from_secs(60)) {
-                if super::tunnel::publication_available(&publication) {
+                if publication_available(&publication) {
                     assets.store(true, Ordering::Release);
                     shared.wake();
                     return;
@@ -426,6 +441,39 @@ fn watch_assets(
             }
         })
         .ok();
+}
+
+/// 현재 에셋 해시가 고정 출처에 배포돼 있는지. 네트워크 IO는 상태 락 밖에서 수행한다.
+fn publication_available(publication: &Publication) -> bool {
+    http_status(&format!(
+        "{}/m/{}/manifest.json",
+        publication.origin,
+        super::pwa::asset_hash()
+    )) == Some(200)
+}
+fn http_status(url: &str) -> Option<u16> {
+    let mut command = Command::new("curl");
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let out = command
+        .args([
+            "-sS",
+            "-o",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "5",
+            url,
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&out.stdout).ok()?.parse().ok()
 }
 
 #[expect(clippy::too_many_arguments, reason = "단일 세션 루프 인자 전달")]
@@ -458,18 +506,7 @@ fn run_once(
     } else {
         Transport::Plain(tcp)
     };
-    let tunnel_query = lock(&shared.state)
-        .tunnel
-        .as_ref()
-        .and_then(|t| t.ready_url())
-        .filter(|u| super::tunnel::parse_url(u).is_some())
-        .map(|u| format!("&url={u}"))
-        .unwrap_or_default();
-    let path = format!(
-        "/r/{}?hash={}{tunnel_query}",
-        publication.rid,
-        super::pwa::asset_hash()
-    );
+    let path = format!("/r/{}?hash={}", publication.rid, super::pwa::asset_hash());
     let session = lock(&shared.state)
         .account
         .session

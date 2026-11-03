@@ -58,7 +58,6 @@ impl Daemon {
         let holder = Command::new(bin.join("krill-holder"))
             .arg(bin.join("krilld"))
             .arg(&socket)
-            .env("KRILL_CLOUDFLARED_BIN", dir.join("cloudflared-test"))
             // 외부 릴레이·공개 PWA 배포 상태에 의존하지 않는 격리된 모바일 게이트웨이.
             .env("KRILL_MOBILE_ORIGIN", "http://127.0.0.1:0")
             .env("KRILL_STATE_DIR", &dir)
@@ -1559,8 +1558,7 @@ fn orchestration_agy_full_and_minimal_workers_read_guide_ask_and_report() {
 }
 
 #[test]
-fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
-    use std::os::unix::fs::PermissionsExt;
+fn mobile_cli_pair_list_revoke_and_relay_contract() {
     let d = Daemon::new("mobile");
     assert_eq!(d.ok(&["mobile", "devices", "--json"]).trim(), "[]");
     assert!(d.ok(&["mobile", "--help"]).contains("krill mobile"));
@@ -1587,14 +1585,7 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
     assert!(url.contains("/#pair=") && url.contains("&key="));
     assert!(!url.split('#').next().unwrap().contains("key="));
     d.ok(&["mobile", "revoke", "--all", "--json"]);
-    let script = d.dir.join("cloudflared-test");
-    fs::write(
-        &script,
-        "#!/bin/sh\n: > \"${0%/*}/cloudflared-started\"\nprintf 'https://cli-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 120\n",
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    // 로그인 전에는 릴레이 접속을 거부하고, 설치된 퀵터널로 폴백하지 않는다.
+    // 로그인 전에는 릴레이 접속을 거부한다.
     let out = d.run(&["mobile", "pair", "--tunnel", "--json"]);
     assert!(!out.status.success());
     assert!(
@@ -1613,7 +1604,6 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
             ..
         }
     ));
-    assert!(!d.dir.join("cloudflared-started").exists());
     d.ok(&["mobile", "revoke", "--all"]);
 }
 
