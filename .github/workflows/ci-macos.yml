@@ -185,6 +185,10 @@ jobs:
         run: cargo nextest run --profile ci --workspace --locked --no-tests=pass --cargo-profile test --timings
         timeout-minutes: 120
 
+      - name: FLAKY report (unknown flaky passes fail)
+        if: always() && hashFiles('target/nextest/ci/junit.xml') != ''
+        run: python3 packaging/ci_evidence.py flaky
+
       - name: Preserve test and build evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

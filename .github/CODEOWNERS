@@ -8,7 +8,7 @@
 /clippy.toml             @craftowen
 /rustfmt.toml            @craftowen
 /deny.toml               @craftowen
-/.config/nextest.toml    @craftowen
+/.config/                @craftowen
 /.cargo/                @craftowen
 /.github/                @craftowen
 /.claude/settings.json   @craftowen

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GitHub의 동일 SHA·저장소·workflow·attempt·실제 잡 성공을 확인한다."""
+"""GitHub의 동일 SHA·저장소·workflow·attempt·실제 잡 성공을 확인하고, CI의 FLAKY 통과를 보고한다."""
 
 import argparse
 from datetime import datetime, timezone
@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from urllib.parse import urlencode
+import xml.etree.ElementTree as ET
 
 CANDIDATE_BRANCH = "release/nightly"
 CANDIDATE_PREFIX = "release/"
@@ -156,14 +157,39 @@ class Evidence:
         return proof
 
 
+def flaky(junit, known):
+    """Tests that passed only on retry (nextest JUnit flakyFailure), and those not in the known list."""
+    found = sorted({f"{case.get('classname')} {case.get('name')}" for case in ET.parse(junit).iter("testcase")
+                    if case.find("flakyFailure") is not None})
+    allowed = {line.split("#", 1)[0].strip() for line in Path(known).read_text().splitlines()}
+    return found, [test for test in found if test not in allowed]
+
+
+def report_flaky(junit, known):
+    found, new = flaky(junit, known)
+    for test in found:
+        print(f"::{'error' if test in new else 'warning'} title=FLAKY::{test}")
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
+            stream.write(f"### FLAKY (passed only on retry): {len(found)}, new: {len(new)}\n")
+            stream.writelines(f"- {'**new** ' if test in new else ''}`{test}`\n" for test in found)
+    if new:
+        print(f"{len(new)} new FLAKY test(s); fix them or add them to {known} with a reason", file=sys.stderr)
+    return int(bool(new))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("reuse", "verify"))
+    parser.add_argument("action", choices=("reuse", "verify", "flaky"))
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"), required=False)
     parser.add_argument("--sha", default=os.environ.get("GITHUB_SHA"), required=False)
     parser.add_argument("--branch", default="main")
     parser.add_argument("--workflow", choices=tuple(REUSE_JOBS))
+    parser.add_argument("--junit", type=Path, default=Path("target/nextest/ci/junit.xml"))
+    parser.add_argument("--known", type=Path, default=Path(".config/known-flaky.txt"))
     args = parser.parse_args()
+    if args.action == "flaky":
+        sys.exit(report_flaky(args.junit, args.known))
     evidence = Evidence(args.repo or "")
     if args.action == "reuse":
         proof = None
