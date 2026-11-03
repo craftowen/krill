@@ -12,7 +12,11 @@ const assets = path.join(__dirname, "../src/mobile/assets"),
     for (let i = 0; i < 40; i++) await Promise.resolve();
   };
 const KEY = "krill-mobile-error-reporting-v1",
-  OUTBOX = "krill-mobile-error-outbox-v1";
+  OUTBOX = "krill-mobile-error-outbox-v1",
+  settle = async (h) => {
+    await h.tick(10000);
+    await h.tick();
+  };
 function harness({
   store = new Map(),
   dnt,
@@ -278,21 +282,21 @@ for (const href of [
     await h.tick();
     assert.equal(h.requests.length, 0);
   });
-test("error then close1006 reports automatically before desktop auth, preserves route and actual code", async () => {
+test("error then close1006 files one report before desktop auth, preserves route and actual code", async () => {
   const h = harness();
   const t = h.transport(),
     { pending, socket } = await h.start(t);
   socket.emit("error");
   await pending;
   socket.emit("close", { code: 1006 });
-  await h.tick();
+  await settle(h);
   const events = h.events();
-  assert.equal(
-    events.filter((e) => e.diagnostics.reason === "websocket_error").length,
-    1,
+  assert.equal(events.length, 1);
+  const closed = events[0];
+  assert.equal(closed.diagnostics.ws_code, 1006);
+  assert(
+    closed.diagnostics.breadcrumbs.some((c) => c.reason === "websocket_error"),
   );
-  assert(events.some((e) => e.diagnostics.reason === "websocket_error"));
-  const closed = events.find((e) => e.diagnostics.ws_code === 1006);
   assert.equal(closed.diagnostics.route, "direct");
   assert.equal(closed.diagnostics.phase, "socket_open");
   assert.match(closed.diagnostics.attempt_id, /^[0-9a-f]{32}$/);
@@ -332,7 +336,7 @@ for (const [stage, phase] of [
       { pending } = await h.start(t, stage);
     await h.tick(20000);
     await pending;
-    await h.tick();
+    await settle(h);
     const e = h.events().find((e) => e.diagnostics.reason === "timeout");
     assert(e);
     assert.equal(e.diagnostics.phase, phase);
@@ -362,7 +366,8 @@ for (const status of [401, 403, 503])
       { pending, socket } = await h.start(t);
     socket.emit("error");
     await pending;
-    await h.tick();
+    await settle(h);
+    assert.equal(h.events().length, 1);
     const e = h
       .events()
       .find((e) => e.error_code === "mobile_discovery_failed");
@@ -401,7 +406,7 @@ test("discovery timeout has no invented HTTP status; cancellation sends no disco
   const pending = endpoint.locate({ diagnosticsTrace: trace });
   await h.tick(5000);
   await pending;
-  await h.tick();
+  await settle(h);
   const e = h.events().find((e) => e.error_code === "mobile_discovery_failed");
   assert.equal(e.diagnostics.reason, "timeout");
   assert.equal(e.diagnostics.http_status, undefined);
@@ -413,7 +418,7 @@ test("discovery timeout has no invented HTTP status; cancellation sends no disco
     });
   controller.abort();
   await cancel;
-  await h.tick();
+  await settle(h);
   assert.equal(h.events().length, count);
 });
 test("successful discovery fallback is reflected in the next socket route", async () => {
@@ -447,7 +452,8 @@ test("successful discovery fallback is reflected in the next socket route", asyn
   assert.match(next.url, /private.trycloudflare.com/);
   next.emit("close", { code: 1006 });
   await flush();
-  await h.tick();
+  await settle(h);
+  assert.equal(h.events().length, 1);
   assert(
     h
       .events()
@@ -466,7 +472,8 @@ for (const code of [1008, 4009])
       { pending, socket } = await h.start(t, 2);
     socket.emit("close", { code });
     await pending;
-    await h.tick();
+    await settle(h);
+    assert.equal(h.events().length, 1);
     assert(
       h
         .events()
@@ -480,7 +487,7 @@ for (const code of [1008, 4009])
     );
     t.close();
   });
-test("RPC rejection includes no request, response, error message or terminal content", async () => {
+test("desktop ok:false reply is an application answer, not a transport report", async () => {
   const h = harness();
   h.diagnostics.setEnabled(true);
   const t = h.transport(),
@@ -491,15 +498,31 @@ test("RPC rejection includes no request, response, error message or terminal con
   await flush();
   h.response(socket, {}, false);
   await assert.rejects(rpc);
-  await h.tick();
-  assert(
-    h
-      .events()
-      .some(
-        (e) =>
-          e.error_code === "mobile_rpc_failed" && e.diagnostics.phase === "rpc",
-      ),
-  );
+  await settle(h);
+  assert.equal(h.events().length, 0);
+  t.close();
+});
+test("RPC timeout files one report with no request, follow-on or own-close duplicates", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 4);
+  socket.close = () =>
+    Promise.resolve().then(() => socket.emit("close", { code: 1000 }));
+  h.response(socket, { sessions: [] });
+  await pending;
+  const first = t.rpc({ action: "input", text: "terminal-private-content" }),
+    queued = t.rpc({ action: "git" });
+  await flush();
+  await h.tick(15000);
+  await assert.rejects(first);
+  await assert.rejects(queued);
+  await settle(h);
+  const events = h.events();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].error_code, "mobile_rpc_failed");
+  assert.equal(events[0].diagnostics.phase, "rpc");
+  assert.equal(events[0].diagnostics.reason, "timeout");
   assert.doesNotMatch(
     JSON.stringify(h.events()),
     /terminal-private-content|device_id|credential/,
@@ -513,9 +536,22 @@ test("tailscale route is an enum without private address leakage", async () => {
     { pending, socket } = await h.start(t);
   socket.emit("close", { code: 1006 });
   await pending;
-  await h.tick();
+  await settle(h);
   assert(h.events().some((e) => e.diagnostics.route === "tailscale"));
   assert.doesNotMatch(JSON.stringify(h.events()), /100.100.2.3/);
+  t.close();
+});
+test("MagicDNS ts.net host is labeled tailscale", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const t = h.transport({ url: "wss://desktop.tail123.ts.net/ws" }),
+    { pending, socket } = await h.start(t);
+  socket.emit("close", { code: 1006 });
+  await pending;
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].diagnostics.route, "tailscale");
+  assert.doesNotMatch(JSON.stringify(h.events()), /tail123/);
   t.close();
 });
 test("global runtime, rejection, resource hooks sanitize exception names, asset files and stack frames", async () => {
@@ -862,23 +898,191 @@ test("late close preserves an observable server cooldown code after opaque onerr
   socket.emit("error");
   await pending;
   socket.emit("close", { code: 1013 });
-  await h.tick();
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].diagnostics.ws_code, 1013);
+  assert.equal(h.events()[0].diagnostics.phase, "socket_open");
   assert(
-    h
-      .events()
-      .some(
-        (e) =>
-          e.diagnostics.ws_code === 1013 &&
-          e.diagnostics.phase === "socket_open",
-      ),
-  );
-  assert.equal(
-    h.events().filter((e) => e.diagnostics.reason === "websocket_error").length,
-    1,
+    h.events()[0].diagnostics.breadcrumbs.some(
+      (c) => c.reason === "websocket_error",
+    ),
   );
   t.close();
 });
 
+async function establish(h, socket) {
+  for (const data of [
+    undefined,
+    JSON.stringify({ version: 2, challenge: "challenge-secret" }),
+    enc.encode("{}"),
+    Uint8Array.from([0, 0, 0, 0, 1]),
+  ]) {
+    socket.emit(data === undefined ? "open" : "message", { data });
+    await flush();
+  }
+  h.response(socket, { sessions: [] });
+  await flush();
+}
+async function fail(h) {
+  const socket = h.sockets.at(-1);
+  socket.emit("error");
+  socket.emit("close", { code: 1006 });
+  await flush();
+}
+const relayHost = (h) =>
+  h.store.set(
+    "krill-mobile-v2",
+    JSON.stringify({
+      device_id: "a".repeat(64),
+      credential: "b".repeat(64),
+      rid: "c".repeat(32),
+      hash: "0123456789abcdef",
+    }),
+  );
+test("an outage across automatic retries files one report carrying the retries as breadcrumbs", async () => {
+  const h = harness();
+  const t = h.transport();
+  t.connect();
+  await flush();
+  for (const delay of [1000, 2000, 4000, 8000, 15000, 15000, 15000]) {
+    const sockets = h.sockets.length;
+    await fail(h);
+    await h.tick(delay);
+    assert.equal(h.sockets.length, sockets + 1, "retried");
+  }
+  await settle(h);
+  const events = h.events();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].diagnostics.ws_code, 1006);
+  const crumbs = events[0].diagnostics.breadcrumbs;
+  assert(crumbs.length <= 12);
+  assert.equal(crumbs.filter((c) => c.ws_code === 1006).length, 4);
+  t.close();
+});
+test("a failure that recovers inside the hold window files nothing", async () => {
+  const h = harness();
+  const t = h.transport();
+  t.connect();
+  await flush();
+  await fail(h);
+  await h.tick(1000);
+  await establish(h, h.sockets.at(-1));
+  await h.tick(60000);
+  assert.equal(h.events().length, 0);
+  t.close();
+});
+test("a failure while hidden is held and dropped when the connection recovers on return", async () => {
+  const h = harness();
+  h.context.document.visibilityState = "hidden";
+  const t = h.transport();
+  t.connect();
+  await flush();
+  await fail(h);
+  for (let i = 0; i < 6; i++) await h.tick(60000);
+  assert.equal(h.events().length, 0);
+  h.context.document.visibilityState = "visible";
+  t.reconnect();
+  await flush();
+  await establish(h, h.sockets.at(-1));
+  await h.tick(60000);
+  assert.equal(h.events().length, 0);
+  t.close();
+});
+test("an overdue hold timer from a frozen hidden page waits for recovery after return", async () => {
+  const h = harness();
+  h.context.document.visibilityState = "hidden";
+  const t = h.transport();
+  t.connect();
+  await flush();
+  await fail(h);
+  h.context.document.visibilityState = "visible";
+  await h.tick(600000);
+  t.reconnect();
+  await flush();
+  await establish(h, h.sockets.at(-1));
+  await settle(h);
+  assert.equal(h.events().length, 0);
+  t.close();
+});
+test("a failure while hidden that persists after return files one visible report", async () => {
+  const h = harness();
+  h.context.document.visibilityState = "hidden";
+  const t = h.transport();
+  t.connect();
+  await flush();
+  await fail(h);
+  await h.tick(60000);
+  assert.equal(h.events().length, 0);
+  h.context.document.visibilityState = "visible";
+  for (let i = 0; i < 4; i++) await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].diagnostics.visibility, "visible");
+  t.close();
+});
+test("connect deadline and our own close file one timeout report", async () => {
+  const h = harness();
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 1);
+  socket.close = () =>
+    Promise.resolve().then(() => socket.emit("close", { code: 1000 }));
+  await h.tick(20000);
+  await pending;
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].diagnostics.reason, "timeout");
+  t.close();
+});
+test("a drop after a long-lived connection still files one report", async () => {
+  const h = harness();
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 4);
+  h.response(socket, { sessions: [] });
+  await pending;
+  await h.tick(360000);
+  socket.emit("close", { code: 1006 });
+  await flush();
+  await settle(h);
+  const events = h.events();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].error_code, "mobile_connect_failed");
+  assert.equal(events[0].diagnostics.phase, "ipc");
+  assert.equal(events[0].diagnostics.ws_code, 1006);
+  t.close();
+});
+test("relay outage with unreachable discovery files one report", async () => {
+  const h = harness();
+  relayHost(h);
+  h.setDiscovery(async () => {
+    throw new TypeError("Load failed");
+  });
+  const endpoint = h.context.KrillMobile.transport.bootstrap(),
+    t = h.transport({ endpoint }),
+    { pending } = await h.start(t);
+  await fail(h);
+  await pending;
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].diagnostics.ws_code, 1006);
+  t.close();
+});
+test("relay discovery 403 after an opaque socket failure is the one reported cause", async () => {
+  const h = harness();
+  relayHost(h);
+  h.setDiscovery(async () => ({ ok: false, status: 403 }));
+  const endpoint = h.context.KrillMobile.transport.bootstrap(),
+    t = h.transport({ endpoint }),
+    { pending } = await h.start(t);
+  await fail(h);
+  await pending;
+  await settle(h);
+  const events = h.events();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].error_code, "mobile_discovery_failed");
+  assert.equal(events[0].diagnostics.reason, "auth_required");
+  assert.equal(events[0].diagnostics.http_status, 403);
+  assert(events[0].diagnostics.breadcrumbs.some((c) => c.ws_code === 1006));
+  t.close();
+});
 test("429 Retry-After holds the memory retry budget; reload cannot restore reports or cooldown", async () => {
   const h = harness();
   h.setCollector(async () => ({
