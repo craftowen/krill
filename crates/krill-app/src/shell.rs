@@ -5955,9 +5955,7 @@ impl Shell {
         let focused = self.layout.focused();
         let before = self.layout.clone();
         f(&mut self.layout);
-        if self.hold_dirty_close(&before, policy, cx) {
-            return;
-        }
+        self.forget_closed_file_tabs();
         self.cancel_closed_pastes(cx);
         if policy == close::Policy::Terminate {
             for index in 0..before.tabs().len() {

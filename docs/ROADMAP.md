@@ -142,7 +142,7 @@
 | MK-116 | 워크스페이스 체크포인트·상태 카드(`--workspace-status`, `--unread`, `--pr`, `--issue`) 및 `krill reference` CLI | M8 | P0 | `krill set` 확장 플래그 및 `krill reference list/add/remove/find` 동작, 테스트 통과 | MK-093 | M8 | OWE-626 |
 | MK-117 | 로컬 개발 서버 포트·URL 자동 감지(`krill ports`) 및 브라우저 열기 연동 | M8 | P1 | 세션 출력 URL/포트 감지, `krill ports [--json]` 동작 및 단위 테스트 통과 | MK-045 | M8 | OWE-627 |
 | MK-118 | GUI 오케스트레이션 팝오버·포트 팝오버·사이드바 체크포인트 배지·관리자 스킬 설치 통합 및 실화면 QA | M8 | P0 | 상태바 오케스트레이션/포트 팝오버, 사이드바 배지, 관리자 페이지 연동, 실화면 검증 완료, `scripts/check.sh` 0 | MK-114, MK-115, MK-116, MK-117 | M8 | OWE-628 |
-| MK-119 | 가운데 에디터 탭 코어(세션 영역 파일 탭, 코드 편집·⌘S 원자적 저장·dirty·외부 변경 재로드, 변경 패널·⌘P·터미널 링크 열기) | M8 | P0 | 파일 탭 열기·편집·저장·외부 변경 상태기계 테스트 통과, 실화면 캡처, `scripts/check.sh` 0 | MK-054 | M8 | OWE-663 |
+| MK-119 | 가운데 에디터 탭 코어(세션 영역 파일 탭, 코드 편집·⌘S 원자적 저장·dirty·외부 변경 재로드, 변경 패널·⌘P·터미널 링크 열기; 편집·저장은 제거됨, 2026-11-03 0.3 필수 기능 정리, 읽기 전용 보기 + Open in) | M8 | P0 | 파일 탭 열기·편집·저장·외부 변경 상태기계 테스트 통과, 실화면 캡처, `scripts/check.sh` 0 | MK-054 | M8 | OWE-663 |
 | MK-120 | 에디터 지원 포맷(파일 종류 분류, 이미지·마크다운 미리보기·CSV 표·ipynb·바이너리/미디어/PDF 자리표시자) | M8 | P0 | 분류·NUL 검사·크기 한도·CSV·ipynb 파싱 테스트 통과, `scripts/check.sh` 0 | — | M8 | OWE-664 |
 | MK-121 | 에디터 포맷 뷰어 통합 + 실화면 QA | M8 | P0 | 포맷별 실화면 검증 완료, 앱 ≤ 120MB, `scripts/check.sh` 0 | MK-119, MK-120 | — | OWE-665 |
 | MK-122 | 모바일 기기 레지스트리(`mobile-devices.json`)·`ring` 기반 E2EE v2 핸드셰이크·크기 비소유 `Role::Interactive` 확장 | M9 | P0 | `FEAT_MOBILE`(`1<<56`)·`0x45`/`0x65` 등록, E2EE(`CHACHA20_POLY1305`·`HKDF_SHA256`) 핸드셰이크·재전송 거부·기기 등록/회수·크기 비소유 Interactive 단위·통합 테스트 통과, `scripts/check.sh` 0 | MK-050 | M9 | OWE-678 |
