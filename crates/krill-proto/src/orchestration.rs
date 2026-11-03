@@ -3829,10 +3829,9 @@ pub mod agent_desktop;
 mod skills;
 pub use agent_desktop::{
     AGENT_DESKTOP_VERSION, AgentDesktopAsset, AgentDesktopLinkStatus, AgentDesktopReport,
-    AgentDesktopSource, AgentDesktopTarget, ResolvedReleaseAsset, current_agent_desktop_asset,
+    AgentDesktopSource, AgentDesktopTarget, current_agent_desktop_asset,
     ensure_agent_desktop_cli_link, ensure_agent_desktop_installed,
-    ensure_agent_desktop_installed_with_path, ensure_agent_desktop_latest, parse_latest_checksums,
-    stage_agent_desktop, verify_archive_sha256,
+    ensure_agent_desktop_installed_with_path, stage_agent_desktop, verify_archive_sha256,
 };
 #[cfg(test)]
 use skills::ORCA_SKILL_NAMES;
