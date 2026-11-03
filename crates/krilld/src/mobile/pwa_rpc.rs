@@ -1088,6 +1088,7 @@ impl Backend {
                 repositories: Vec::new(),
                 branches: Vec::new(),
                 prompt_histories: Vec::new(),
+                closed_sessions: control::ClosedSessionRanges::default(),
             },
         };
         let catalog = self.catalog(&sidebar.repositories);

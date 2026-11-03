@@ -216,7 +216,7 @@ OWE-722(MK-159)의 `SetProvisioning`·`GetProvisioning`/`UsageReply::Provisionin
 
 `krill_proto::control`의 Request/Reply enum은 postcard 변형 순서가 곧 와이어 번호라 **끝에 추가만** 하고, 병렬 작업 중에는 지휘자가 변형 번호를 배정한다(2026-10-15 MK-045: Request 7·8, Reply 11·12).
 
-`Reply::Sidebar`는 기존 세션·저장소 본문 뒤에 브랜치 목록, 세션별 최근 프롬프트 목록 순서로 선택 꼬리를 붙인다. 프롬프트 꼬리만 있으면 빈 브랜치 목록을 먼저 쓴다. 구 클라이언트는 모르는 뒤쪽 꼬리를 무시하고, 새 클라이언트는 꼬리 없는 구 응답을 빈 기록으로 읽는다. 프롬프트는 요청 범위에 포함된 세션만 전달하며 세션 수·턴 수·문자 수 상한을 디코딩 때 적용한다. 앱의 기록 키는 호스트와 세션 ID를 함께 사용한다.
+`Reply::Sidebar`는 기존 세션·저장소 본문 뒤에 브랜치 목록, 세션별 최근 프롬프트 목록, 병합된 종료 세션 ID 구간 목록(`closed_sessions`, 상한 4,096구간) 순서로 선택 꼬리를 붙인다. 뒤쪽 꼬리가 비어 있지 않으면 앞선 빈 꼬리를 먼저 쓰고, 남은 꼬리가 모두 비어 있으면 바이트를 생략한다. 구 클라이언트는 모르는 뒤쪽 꼬리를 무시하고, 새 클라이언트는 꼬리 없는 구 응답을 빈 기록으로 읽는다. 프롬프트는 요청 범위에 포함된 세션만 전달하며 세션 수·턴 수·문자 수 상한을 디코딩 때 적용한다. `closed_sessions`는 전체 범위(`Scope::Full`) 피어에만 전달하며 실행 중 세션, `unregistered_kept` 세션, 진행 중인 계정 전환, 대체 체인의 끝 세션이 아직 닫히지 않은 이전 세션을 제외한다. 앱의 기록 키는 호스트와 세션 ID를 함께 사용한다.
 
 Resource Manager(MK-071)는 control에 `Request::Resources(Action)`·`Reply::Resources` 한 쌍만 더한다(페이로드 `krill_proto::resources`, `FEAT_RESOURCES`를 협상했을 때만 보낸다 — 앱은 미지원 데몬이면 '데몬 업데이트 필요'를 보이고 요청하지 않는다). 메모리는 krilld가 `proc_pid_rusage`로 읽은 `phys_footprint`(요청자·krilld·holder·세션 루트와 ppid 후손 합), 디스크는 상태 디렉터리의 할당 블록 합이다. `RestartDaemon`은 전체 범위 interactive만, 확인 대화상자는 앱이 띄우고, krilld는 holder `UpgradeKrilld`(MK-068과 같은 경로) 승인 뒤 답을 보내고 끝난다. 세션 kill은 기존 `Close`.
 

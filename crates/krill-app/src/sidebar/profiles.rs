@@ -143,12 +143,13 @@ impl State {
             .map(|row| &row.session)
     }
 
-    pub(super) fn remove_fallback(&mut self, host: &HostId, session: SessionId) {
+    pub(super) fn remove_fallback(&mut self, host: &HostId, session: SessionId) -> bool {
         if let Some(state) = self.hosts.get_mut(host)
             && !state.is_pending(session)
         {
-            state.fallback.remove(&session);
+            return state.fallback.remove(&session).is_some();
         }
+        false
     }
 
     pub(super) fn snapshot<'a>(&self, host: &HostId, snapshot: &'a Snapshot) -> Cow<'a, Snapshot> {

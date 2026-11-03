@@ -931,8 +931,8 @@ fn fake_restore_daemon(
     mode: FakeDaemon,
 ) -> std::io::Result<(PathBuf, Arc<[std::sync::atomic::AtomicUsize; 3]>)> {
     use krill_proto::control::{
-        FEAT_AGENTS, FEAT_CONTROL, FEAT_HIBERNATION, FEAT_RESUME, FEAT_RESUME_HISTORY, Failure,
-        Reply, Request,
+        ClosedSessionRanges, FEAT_AGENTS, FEAT_CONTROL, FEAT_HIBERNATION, FEAT_RESUME,
+        FEAT_RESUME_HISTORY, FEAT_SIDEBAR, Failure, Reply, Request, SidebarData,
     };
     use krill_proto::screen::Msg as _;
     use std::io::Write as _;
@@ -949,7 +949,7 @@ fn fake_restore_daemon(
             std::thread::spawn(move || {
                 let extra = match mode {
                     FakeDaemon::RefuseHibernation => FEAT_HIBERNATION,
-                    FakeDaemon::ClosedSession => FEAT_AGENTS,
+                    FakeDaemon::ClosedSession => FEAT_AGENTS | FEAT_SIDEBAR,
                     _ => 0,
                 };
                 let hello = krill_proto::ipc::ServerHello {
@@ -988,6 +988,15 @@ fn fake_restore_daemon(
                             Reply::Failed(Failure::NoSession)
                         }
                         Ok(Request::AgentLaunch { .. }) => Reply::Failed(Failure::NoSession),
+                        Ok(Request::Sidebar) if matches!(mode, FakeDaemon::ClosedSession) => {
+                            seen[1].fetch_add(1, SeqCst);
+                            let mut closed_sessions = ClosedSessionRanges::default();
+                            closed_sessions.insert(SessionId(936));
+                            Reply::Sidebar(SidebarData {
+                                closed_sessions,
+                                ..SidebarData::default()
+                            })
+                        }
                         _ => Reply::Failed(Failure::BadRequest),
                     };
                     let Ok(frame) = reply.encode() else { return };
@@ -1058,7 +1067,11 @@ fn opening_a_closed_observed_session_removes_its_tab(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     view.update(cx, |s, _| {
-        assert_eq!(counts[1].load(SeqCst), 1, "Resume 응답이 끝을 확정한다");
+        assert_eq!(
+            counts[1].load(SeqCst),
+            1,
+            "Sidebar 닫힘 응답이 프로세스 재스폰 없이 끝을 확정한다"
+        );
         assert!(!s.layout.pane_exists(pane), "닫힌 세션의 탭은 남지 않는다");
     });
     std::fs::remove_file(socket).ok();
@@ -1320,4 +1333,52 @@ fn visible_remote_pane_attaches_while_same_id_local_restores(cx: &mut TestAppCon
         assert!(s.live.contains_key(&remote), "원격 칸이 붙기 시작해야 한다");
     });
     assert_eq!(connects.load(SeqCst), 1);
+}
+
+#[gpui::test]
+fn hidden_restore_session_gone_prunes_zombie_tab_when_sidebar_connected(cx: &mut TestAppContext) {
+    let (socket, _) = fake_restore_daemon("closed-prune", FakeDaemon::ListEofs(0)).unwrap();
+    let (view, cx) = open(cx, state_path("hidden-restore-prunes-closed"));
+    let (tab0_pane, tab1_pane) = view.update(cx, |s, cx| {
+        let launch = Create {
+            account: None,
+            program: Program::Login,
+            cwd: b"/work/a".to_vec(),
+            cols: 80,
+            rows: 24,
+        };
+        let tab0_pane = s.layout.active_tab().focused;
+        s.layout.set_launch(tab0_pane, launch.clone());
+        s.layout.set_session(tab0_pane, SessionId(910));
+        s.layout.new_tab();
+        let tab1_pane = s.layout.active_tab().focused;
+        s.layout.set_launch(tab1_pane, launch);
+        s.layout.set_session(tab1_pane, SessionId(911));
+        s.layout.activate(0);
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(Arc::new(LiveSnapshot(live_snapshot(&[910], "/work/a"))), cx);
+        });
+        (tab0_pane, tab1_pane)
+    });
+    cx.run_until_parked();
+
+    view.update(cx, |s, cx| {
+        s.paths = Some(Paths {
+            socket: socket.clone(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        s.restore_hidden_sessions(&[tab0_pane], cx);
+    });
+    cx.run_until_parked();
+    std::fs::remove_file(socket).ok();
+
+    view.read_with(cx, |s, _| {
+        assert!(!s.layout.pane_exists(tab1_pane));
+        assert_eq!(
+            s.layout.sessions_for_host(&HostId::Local),
+            vec![SessionId(910)]
+        );
+    });
 }

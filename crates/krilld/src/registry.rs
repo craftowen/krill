@@ -49,6 +49,7 @@ use crate::store::{Limits, Store};
 mod account_switch;
 pub mod admission;
 mod agent_history;
+mod closed_sessions;
 mod hibernation;
 mod hook_identity;
 mod orch_cache;
@@ -171,6 +172,7 @@ pub struct Registry {
     /// `krill hook`의 spool 파일.
     spool: Option<PathBuf>,
     state: Mutex<State>,
+    closed_ledger: closed_sessions::ClosedLedger,
     ids: Mutex<session_ids::SessionIds>,
     sidebar: Arc<Mutex<sidebar::Cache>>,
     hibernation: Mutex<hibernation::Clock>,
@@ -257,6 +259,7 @@ impl Registry {
         let (holder, kept) = holder.map_or((None, Vec::new()), |(h, k)| (Some(Arc::new(h)), k));
         let kept_count = kept.len();
         let kept_ids: Vec<_> = kept.iter().map(|session| session.id).collect();
+        let closed_ledger = closed_sessions::ClosedLedger::open(dir, &kept_ids);
         let reg = Self {
             app_opened: OnceLock::new(),
             last_gc: Mutex::new(Instant::now()),
@@ -296,6 +299,7 @@ impl Registry {
             status: Statuses::open(dir.map(|d| d.join(status::FILE_NAME))),
             spool: dir.map(|d| d.join(hook::SPOOL_FILE)),
             ids: Mutex::new(ids),
+            closed_ledger,
             state: Mutex::new(State::default()),
         };
         let mut st = lock(&reg.state);
@@ -1190,6 +1194,7 @@ impl Registry {
                 sidebar::snapshot(&self.sidebar, &entries).map(|mut data| {
                     if peer.scope.full() {
                         sidebar::include_projects(&mut data);
+                        data.closed_sessions = self.closed_sidebar_ranges();
                     }
                     if let Some(dir) = self.state_dir() {
                         data.prompt_histories =
@@ -1414,6 +1419,9 @@ impl Registry {
     fn cold(&self, peer: &Peer, id: SessionId) -> Result<Reply, Failure> {
         if !peer.authorize("cold", id, &self.audit) {
             return Err(Failure::Denied);
+        }
+        if lock(&self.state).unregistered_kept.contains(&id) {
+            return Err(Failure::BadRequest);
         }
         if self.is_closed(id) {
             return Err(Failure::NoSession);
@@ -1641,9 +1649,6 @@ impl Registry {
         if !peer.authorize("resume", old, &self.audit) {
             return Err(Failure::Denied);
         }
-        if self.is_closed(old) {
-            return Err(Failure::NoSession);
-        }
         {
             let st = lock(&self.state);
             if st.resumed.contains(&old) {
@@ -1656,9 +1661,15 @@ impl Registry {
                 return Err(Failure::BadRequest);
             }
         }
+        if self.is_closed(old) {
+            return Err(Failure::NoSession);
+        }
         // 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다. 두 창이 동시에 눌러도
         // `claude --resume`이 두 번 뜨지 않는다(K-25).
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
+        if lock(&self.state).unregistered_kept.contains(&old) {
+            return Err(Failure::BadRequest);
+        }
         // A competing resume may have completed between the first check and claim.
         if self.is_closed(old) || lock(&self.state).resumed.contains(&old) {
             return Err(Failure::NoSession);
@@ -2402,6 +2413,7 @@ impl Registry {
 
     fn mark_closed(&self, id: SessionId) {
         lock(&self.state).closed.insert(id);
+        self.closed_ledger.record_closed(id);
         if let Some(store) = &self.store {
             store.mark_closed(id);
         }
@@ -2409,7 +2421,47 @@ impl Registry {
 
     fn is_closed(&self, id: SessionId) -> bool {
         lock(&self.state).closed.contains(&id)
+            || self.closed_ledger.contains(id)
             || self.store.as_ref().is_some_and(|s| s.is_closed(id))
+    }
+
+    fn closed_sidebar_ranges(&self) -> krill_proto::control::ClosedSessionRanges {
+        let mut ranges = self.closed_ledger.snapshot();
+        {
+            let st = lock(&self.state);
+            for &id in &st.closed {
+                ranges.insert(id);
+            }
+            for &id in st.sessions.keys() {
+                ranges.remove(id);
+            }
+            for &id in &st.unregistered_kept {
+                ranges.remove(id);
+            }
+        }
+        {
+            let handoffs = lock(&self.account_handoffs);
+            let max_hops = handoffs.len().saturating_add(1);
+            for (&from, h) in handoffs.iter() {
+                if h.to.is_none() && h.error.is_none() {
+                    ranges.remove(from);
+                } else if let Some(mut target) = h.to {
+                    for _ in 0..max_hops {
+                        let Some(next) = handoffs.get(&target).and_then(|nh| nh.to) else {
+                            break;
+                        };
+                        if next == target {
+                            break;
+                        }
+                        target = next;
+                    }
+                    if !ranges.contains(target) {
+                        ranges.remove(from);
+                    }
+                }
+            }
+        }
+        ranges
     }
 
     /// holder `Exited` 송신 큐의 워커. 응답 리더와 분리해 `Release`가 exec 잠금을 기다려도 응답을 계속 읽는다.

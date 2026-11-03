@@ -277,34 +277,117 @@ pub fn find_session_in(
     let target = target.into();
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
-    known_session(&target, &mut s, features, session, true)
+    known_session(&target, &mut s, features, session, true, None).map(|(found, _)| found)
 }
 
-/// 목록·계정 이어받기·콜드 기록에서 `id`를 찾는다(읽기만).
 fn known_session(
     target: &HostTarget,
     s: &mut UnixStream,
     features: u64,
     id: SessionId,
     allow_cold: bool,
-) -> io::Result<Option<Found>> {
-    if let Reply::Sessions(list) = call(s, &Request::List)?
-        && list.iter().any(|i| i.session == id)
-    {
-        return Ok(Some(Found::Live(id, false)));
+    wake_create: Option<&Create>,
+) -> io::Result<(Option<Found>, SessionId)> {
+    let list = match call(s, &Request::List)? {
+        Reply::Sessions(list) => list,
+        _ => Vec::new(),
+    };
+    if list.iter().any(|i| i.session == id) {
+        return Ok((Some(Found::Live(id, false)), id));
     }
-    if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0
-        && let Some(replacement) = account_handoff(target, id)?
-    {
-        return Ok(Some(Found::Live(replacement, false)));
+    let effective_id = if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0 {
+        account_handoff(target, id)?.unwrap_or(id)
+    } else {
+        id
+    };
+    if effective_id != id {
+        if list.iter().any(|i| i.session == effective_id) {
+            return Ok((Some(Found::Live(effective_id, false)), effective_id));
+        }
+        if let Some(create) = wake_create
+            && let Some(woken) =
+                hibernation::wake(&mut |req| call(s, req), features, effective_id, create)?
+        {
+            return Ok((Some(Found::Live(woken, true)), effective_id));
+        }
     }
     if allow_cold
         && features & FEAT_COLD != 0
-        && let Reply::Cold(cold) = call(s, &Request::Cold { session: id })?
+        && let Reply::Cold(cold) = call(
+            s,
+            &Request::Cold {
+                session: effective_id,
+            },
+        )?
     {
-        return Ok(Some(Found::Cold(id, cold)));
+        return Ok((Some(Found::Cold(effective_id, cold)), effective_id));
     }
-    Ok(None)
+    Ok((None, effective_id))
+}
+
+/// # Errors
+/// krilld 연결·프레임 읽기가 실패했거나 데몬이 세션 닫힘을 확정했다.
+pub fn resolve_observed_session_in(
+    target: impl Into<HostTarget>,
+    session: SessionId,
+    create: &Create,
+) -> io::Result<Found> {
+    let target = target.into();
+    let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    if let Some(woken) = hibernation::wake(&mut |req| call(&mut s, req), features, session, create)?
+    {
+        return Ok(Found::Live(woken, true));
+    }
+    let (found, effective_id) =
+        known_session(&target, &mut s, features, session, false, Some(create))?;
+    if let Some(found) = found {
+        return Ok(found);
+    }
+    let mut cold_no_session = false;
+    if features & FEAT_COLD != 0 {
+        match call(
+            &mut s,
+            &Request::Cold {
+                session: effective_id,
+            },
+        )? {
+            Reply::Cold(cold) => return Ok(Found::Cold(effective_id, cold)),
+            Reply::Failed(krill_proto::control::Failure::NoSession) => {
+                cold_no_session = true;
+            }
+            Reply::Failed(other) => return Err(failure_to_io_error(other)),
+            _ => return Err(io::ErrorKind::InvalidData.into()),
+        }
+    }
+    if features & krill_proto::control::FEAT_SIDEBAR != 0 {
+        match call(&mut s, &Request::Sidebar)? {
+            Reply::Sidebar(data) if data.closed_sessions.contains(effective_id) => Err(
+                failure_to_io_error(krill_proto::control::Failure::NoSession),
+            ),
+            Reply::Sidebar(_) => Ok(Found::Cold(
+                effective_id,
+                Cold {
+                    screen: Vec::new(),
+                    history: Vec::new(),
+                },
+            )),
+            Reply::Failed(failure) => Err(failure_to_io_error(failure)),
+            _ => Err(io::ErrorKind::InvalidData.into()),
+        }
+    } else if cold_no_session {
+        Err(failure_to_io_error(
+            krill_proto::control::Failure::NoSession,
+        ))
+    } else {
+        Ok(Found::Cold(
+            effective_id,
+            Cold {
+                screen: Vec::new(),
+                history: Vec::new(),
+            },
+        ))
+    }
 }
 
 /// [`ensure_session_in`]과 같으나 숨은 칸 복원 등에서 콜드 화면 재생(`Request::Cold`)을 거치지 않고
@@ -360,15 +443,19 @@ fn ensure_session_attempt(
     prepare_status_hook(target, &create.program);
     let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    let mut effective_want = want;
     if let Some(id) = want {
         if let Some(session) =
             hibernation::wake(&mut |req| call(&mut s, req), features, id, create)?
         {
             return Ok(Found::Live(session, true));
         }
-        if let Some(found) = known_session(target, &mut s, features, id, allow_cold)? {
+        let (found, effective_id) =
+            known_session(target, &mut s, features, id, allow_cold, Some(create))?;
+        if let Some(found) = found {
             return Ok(found);
         }
+        effective_want = Some(effective_id);
     }
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {
         return Err(io::Error::new(
@@ -385,7 +472,7 @@ fn ensure_session_attempt(
         ));
     }
     // 디스크 출력이 없거나 기록을 껐어도 옛 에이전트 ID는 Resume으로 이어야 한다.
-    let create = match want.filter(|_| features & FEAT_RESUME != 0) {
+    let create = match effective_want.filter(|_| features & FEAT_RESUME != 0) {
         Some(session) => Request::Resume {
             session,
             create: create.clone(),
@@ -1185,6 +1272,7 @@ impl<W: Write> Pane<W> {
     }
 
     /// 계정 전환 때문에 붙들려 아직 보내지 못한 입력이 있다. [`Self::show_cold`]는 이 입력을 지우므로 먼저 확인한다.
+    #[must_use]
     pub fn holds_account_input(&self) -> bool {
         self.account_switching() && self.has_pending_input()
     }
