@@ -669,7 +669,7 @@ fn remote_upload_closes_stdin_and_uses_private_unique_paths() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// 앱의 ssh도 krill-hosts와 같은 규칙(BatchMode, 사용자 StrictHostKeyChecking 존중)으로 띄운다.
+/// 앱의 ssh도 krill-hosts와 같은 규칙(`BatchMode`, 사용자 `StrictHostKeyChecking` 존중)으로 띄운다.
 /// 예전에는 accept-new를 직접 넣어 `~/.ssh/config`의 `StrictHostKeyChecking yes`를 덮어썼다.
 #[test]
 fn app_ssh_calls_use_the_shared_host_key_policy() {
