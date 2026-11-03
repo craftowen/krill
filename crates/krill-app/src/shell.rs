@@ -370,10 +370,10 @@ actions!(
 
 const MAX_NAV_HISTORY: usize = 50;
 
-/// OWE-872: 실행 중인 탭·칸 닫기 확인 대기 대상.
+/// OWE-872: 실행 중인 탭·칸 닫기 확인 대기 대상. 탭은 그 탭 안의 칸으로 기억한다(`Layout::tab_of_pane`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PendingRunningClose {
-    Tab(usize),
+    Tab(PaneId),
     Pane(PaneId),
 }
 
@@ -786,12 +786,12 @@ pub struct Shell {
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
     pub(super) role: WindowRole,
     pending_focus: PendingFocus,
-    /// OWE-734: 탭 우클릭 컨텍스트 메뉴 `(탭 인덱스, 클릭 위치)`.
-    pub(super) tab_context_menu: Option<(usize, Point<Pixels>)>,
+    /// OWE-734: 탭 우클릭 컨텍스트 메뉴 `(탭 안의 칸, 클릭 위치)`.
+    pub(super) tab_context_menu: Option<(PaneId, Point<Pixels>)>,
     tab_menu_focus: FocusHandle,
     tab_menu_previous_focus: Option<FocusHandle>,
-    /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 인덱스.
-    pub(super) confirm_close_tab: Option<usize>,
+    /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 안의 칸.
+    pub(super) confirm_close_tab: Option<PaneId>,
     recent_tab_scroll: gpui::ScrollHandle,
     tab_dialog_focus: FocusHandle,
     tab_dialog_was_open: bool,
@@ -1443,25 +1443,14 @@ impl Shell {
                 if let Some(rename) = &this.tab_rename {
                     retained_panes.insert(rename.pane);
                 }
-                let mut retained_tabs = std::collections::BTreeSet::new();
-                if let Some(idx) = this.confirm_close_tab {
-                    retained_tabs.insert(idx);
+                retained_panes.extend(this.confirm_close_tab);
+                retained_panes.extend(this.tab_context_menu.map(|(pane, _)| pane));
+                if let Some((PendingRunningClose::Tab(pane) | PendingRunningClose::Pane(pane), _)) =
+                    this.pending_running_close
+                {
+                    retained_panes.insert(pane);
                 }
-                if let Some((idx, _)) = this.tab_context_menu {
-                    retained_tabs.insert(idx);
-                }
-                match &this.pending_running_close {
-                    Some((PendingRunningClose::Tab(idx), _)) => {
-                        retained_tabs.insert(*idx);
-                    }
-                    Some((PendingRunningClose::Pane(pane), _)) => {
-                        retained_panes.insert(*pane);
-                    }
-                    None => {}
-                }
-                let edited_while_loading = this.layout != baseline
-                    || !retained_panes.is_empty()
-                    || !retained_tabs.is_empty();
+                let edited_while_loading = this.layout != baseline || !retained_panes.is_empty();
                 match loaded {
                     Ok(mut layout) => {
                         if let Some(bounds) = bounds {
@@ -1473,30 +1462,9 @@ impl Shell {
                         // 초기 칸 번호를 보존한 채 그 위에 합친다(ARCHITECTURE §4.1, APP-RUNTIME-004).
                         if edited_while_loading {
                             let edited = std::mem::replace(&mut this.layout, layout);
-                            let tab_map = this.layout.absorb_startup_edits(
-                                &baseline,
-                                &edited,
-                                &retained_panes,
-                                &retained_tabs,
-                            );
-                            this.confirm_close_tab = this
-                                .confirm_close_tab
-                                .and_then(|idx| tab_map.get(&idx).copied());
-                            this.tab_context_menu = this
-                                .tab_context_menu
-                                .and_then(|(idx, pos)| tab_map.get(&idx).map(|&new| (new, pos)));
-                            this.pending_running_close = this
-                                .pending_running_close
-                                .take()
-                                .and_then(|(target, dont_ask)| match target {
-                                    PendingRunningClose::Tab(idx) => tab_map
-                                        .get(&idx)
-                                        .map(|&new| (PendingRunningClose::Tab(new), dont_ask)),
-                                    PendingRunningClose::Pane(pane) => this
-                                        .layout
-                                        .pane_exists(pane)
-                                        .then_some((PendingRunningClose::Pane(pane), dont_ask)),
-                                });
+                            this.layout
+                                .absorb_startup_edits(&baseline, &edited, &retained_panes);
+                            this.forget_closed_tab_targets();
                             if this
                                 .tab_rename
                                 .as_ref()
@@ -4403,6 +4371,7 @@ impl Shell {
         }
         let visible = self.layout.visible();
         self.restore_hidden_sessions(&visible, cx);
+        self.forget_closed_tab_targets();
         let layout = &self.layout;
         let paste_queue = &self.paste_queue;
         self.creations.retain(|p, _| layout.pane_exists(*p));
