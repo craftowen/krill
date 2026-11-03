@@ -32,7 +32,7 @@
 
 use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use crate::os::net::UnixStream;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
@@ -278,6 +278,19 @@ pub fn state_dir_override() -> Option<OsString> {
     std::env::var_os("KRILL_STATE_DIR")
 }
 
+/// 상태 디렉터리가 기본 위치 밖으로 격리됐는지(테스트·임시 실행). Krill 세션 셸은 기본 경로를 그대로
+/// `KRILL_STATE_DIR`로 내보내므로 값이 있다는 것만으로는 격리가 아니다.
+pub fn state_dir_isolated() -> bool {
+    is_isolated(
+        state_dir_override().as_deref(),
+        default_state_dir().as_deref(),
+    )
+}
+
+fn is_isolated(state_override: Option<&OsStr>, default: Option<&Path>) -> bool {
+    state_override.is_some_and(|dir| Some(Path::new(dir)) != default)
+}
+
 /// 상태 디렉터리. [`state_dir_override`]가 있으면 그것, 없으면 `~/Library/Application Support/<번들 id>`
 /// (Windows는 `%LOCALAPPDATA%\Krill`).
 pub fn state_dir() -> Option<PathBuf> {
@@ -431,7 +444,7 @@ fn is_temp_home(home: &Path) -> bool {
 /// 임시 `HOME`(`HOME=/tmp/...` 등)에서는 호스트에 설치된 운영 `/Applications/Krill.app`의 헬퍼를
 /// 띄워 고아 holder·krilld를 남기지 않도록 제외한다.
 fn allow_installed_apps(exe: &Path, home: Option<&Path>) -> bool {
-    if cfg!(test) || state_dir_override().is_some() {
+    if cfg!(test) || state_dir_isolated() {
         return false;
     }
     if !allow_installed_apps_for_paths(exe, home) {
