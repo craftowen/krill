@@ -111,7 +111,9 @@ class ValidationTests(unittest.TestCase):
                         (target / "release" / name).write_bytes(b"canonical-" + name.encode())
                 if args[-1] == "--list":
                     if args[0].endswith("pane_e2e"):
-                        return "" if state["missing"] else "release_survival::release_app_kill9_survives_and_replays_hash_three_times: test\n"
+                        return "release_survival::release_app_kill9_survives_and_replays_hash_three_times: test\n"
+                    if args[0].endswith("fault_ci"):
+                        return "" if state["missing"] else "release_gui_survival_e2e_2_and_3_three_rounds: test\n"
                     return "krilld_kill: test\nprotocol_contract: test\nupgrade::exec_handoff: test\n"
                 if "release_survival::release_app_kill9_survives_and_replays_hash_three_times" in args:
                     if state["fail_gate"]:
@@ -129,6 +131,9 @@ class ValidationTests(unittest.TestCase):
                 state["fail_gate"] = False
                 receipt = rc.validate(HEAD, root / "stage2", key)
                 self.assertEqual(sum("scripts/check.sh" in call for call in calls), 1)
+                # B-08: GUI update (vN->vN+1) and krilld kill -9 survival run on the release binaries.
+                self.assertTrue(any(call[0].endswith("fault_ci") and "release_gui_survival_e2e_2_and_3_three_rounds" in call
+                                    and "--ignored" in call for call in calls))
                 self.assertEqual(rc.verify(receipt, HEAD, key, allowed_root=root), root / "stage2/bin")
                 state["missing"] = True
                 with self.assertRaisesRegex(ValueError, "test is missing"):
