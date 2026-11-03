@@ -23,5 +23,17 @@ class WorkflowTests(unittest.TestCase):
                     self.assertRegex(match[1], r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
 
 
+    def test_local_ci_and_nightly_build_tests_with_the_same_profile(self):
+        # Timing-budget tests passed locally at opt-level 0 but ran at 2 in CI and nightly (F-14).
+        ci = (ROOT / ".github/workflows/ci-macos.yml").read_text()
+        check = (ROOT / "scripts/check.sh").read_text()
+        nightly = (ROOT / "packaging/nightly.py").read_text()
+        for key in ("CARGO_PROFILE_TEST_OPT_LEVEL", "CARGO_PROFILE_TEST_DEBUG"):
+            with self.subTest(key=key):
+                value = re.search(r"\b" + key + r":\s*(\S+)", ci)[1]
+                self.assertRegex(check, r"(?m)^export .*\b" + key + r"=\$\{" + key + r":-" + re.escape(value) + r"\}")
+                self.assertIn(key + '="' + value + '"', nightly)
+
+
 if __name__ == "__main__":
     unittest.main()
