@@ -2,16 +2,26 @@
 """Run non-Cargo regressions by scope; no product daemon or browser is started."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import os
 from pathlib import Path
 import shlex
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 
 
 ROOT = Path(__file__).resolve().parent.parent
 SCOPES = ("harness", "packaging", "mobile", "telemetry")
+# Programs run concurrently; each one's output is buffered and printed whole, in command order.
+# They share no fixed paths or ports (each makes its own temp directories and ephemeral ports).
+JOBS = 4
+ACTIVE = set()
+ACTIVE_LOCK = threading.Lock()
+STOPPING = threading.Event()
 # Explicit inventory of every *.cjs/*.py program in crates/krilld/tests: a standalone Node check (MOBILE),
 # a real-Chromium release gate (packaging/release_check.py MOBILE_BROWSER_TESTS), or an entry below saying who runs it.
 MOBILE = ("transport", "storage", "terminal", "updates", "quick_commands", "session", "chat", "screens", "diagnostics", "feed")
@@ -76,19 +86,31 @@ def commands(root, scopes):
     return checks
 
 
-def stop(child):
-    # Queue repeated termination signals until the bounded cleanup finishes.
-    # Unmasking delivers them afterward, so cancellation is deferred, not lost.
-    previous_mask = None
-    if hasattr(signal, "pthread_sigmask"):
-        watched = {getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGALRM")
-                   if hasattr(signal, name)}
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+WATCHED = {getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGALRM") if hasattr(signal, name)}
+
+
+@contextlib.contextmanager
+def deferred_signals():
+    # Queue repeated termination signals until the bounded cleanup finishes, then re-deliver
+    # them, so cancellation is deferred, not lost. A thread mask would not do: with worker
+    # threads the kernel may hand the signal to a worker and Python still runs it here.
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending = []
+    previous = {sig: signal.signal(sig, lambda signum, _frame: pending.append(signum)) for sig in WATCHED}
     try:
-        stop_group(child)
+        yield
     finally:
-        if previous_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        for sig in pending[:1]:
+            signal.raise_signal(sig)
+
+
+def stop(child):
+    with deferred_signals():
+        stop_group(child)
 
 
 def stop_group(child):
@@ -119,11 +141,16 @@ def stop_group(child):
         print("regression: could not reap process {} after cleanup".format(child.pid), file=sys.stderr)
 
 
-def run(command, root, timeout):
-    print("regression: " + shlex.join(command), flush=True)
+def run(command, root, timeout, output=None):
+    print("regression: " + shlex.join(command), file=output or sys.stdout, flush=True)
     # Popen's context manager waits without a deadline on exit, even if cleanup
     # cannot signal a child. Keep every wait bounded and report the failure.
-    child = subprocess.Popen(command, cwd=root, start_new_session=(os.name == "posix"))
+    with ACTIVE_LOCK:
+        if STOPPING.is_set():
+            return 130
+        child = subprocess.Popen(command, cwd=root, start_new_session=(os.name == "posix"),
+                                 stdout=output, stderr=output and subprocess.STDOUT)
+        ACTIVE.add(child)
     try:
         result = child.wait(timeout=timeout)
         if os.name == "posix":
@@ -143,6 +170,46 @@ def run(command, root, timeout):
     except BaseException:
         stop(child)
         raise
+    finally:
+        with ACTIVE_LOCK:
+            ACTIVE.discard(child)
+
+
+def run_buffered(command, root, timeout):
+    with tempfile.TemporaryFile("w+") as output:
+        try:
+            result = run(command, root, timeout, output)
+        except OSError as error:
+            output.write("regression: could not execute {}: {}\n".format(shlex.join(command), error))
+            result = 1
+        output.seek(0)
+        return result, output.read()
+
+
+def run_all(checks, root, timeout):
+    """Run concurrently; print each program's output in order. Returns the failed commands."""
+    failed = []
+    with ThreadPoolExecutor(max_workers=JOBS) as pool:
+        futures = [pool.submit(run_buffered, command, root, timeout) for command in checks]
+        try:
+            for command, future in zip(checks, futures):
+                result, text = future.result()
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                if result != 0:
+                    failed.append(shlex.join(command))
+        except BaseException:
+            # Signals arrive in this thread; stop every running program group before exiting.
+            with deferred_signals():
+                STOPPING.set()
+                for future in futures:
+                    future.cancel()
+                with ACTIVE_LOCK:
+                    children = list(ACTIVE)
+                for child in children:
+                    stop(child)
+            raise
+    return failed
 
 
 def main():
@@ -156,23 +223,14 @@ def main():
         parser.error("--timeout must be positive")
     try:
         checks = commands(ROOT, args.scope or SCOPES)
-        failed = []
-        for command in checks:
-            if args.list:
+        if args.list:
+            for command in checks:
                 print(shlex.join(command))
-            else:
-                try:
-                    failed_check = run(command, ROOT, args.timeout) != 0
-                except OSError as error:
-                    print("regression: could not execute {}: {}".format(shlex.join(command), error),
-                          file=sys.stderr)
-                    failed_check = True
-                if failed_check:
-                    failed.append(shlex.join(command))
-        if not args.list:
-            print("regression: {} programs, {} failed".format(len(checks), len(failed)), flush=True)
-            for command in failed:
-                print("FAILED: " + command, file=sys.stderr)
+            return 0
+        failed = run_all(checks, ROOT, args.timeout)
+        print("regression: {} programs, {} failed".format(len(checks), len(failed)), flush=True)
+        for command in failed:
+            print("FAILED: " + command, file=sys.stderr)
         return int(bool(failed))
     except (OSError, ValueError) as error:
         print("regression: " + str(error), file=sys.stderr)
