@@ -8,7 +8,7 @@ use krill_proto::{
     SessionId,
     daemon::KRILLD_DUPLICATE,
     holder::{
-        FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION,
+        FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION, WinSize,
         request_id,
     },
 };
@@ -17,6 +17,10 @@ use std::io::{self, Write};
 use std::os::windows::io::{AsHandle, AsSocket, BorrowedHandle, OwnedHandle, OwnedSocket};
 use std::time::{Duration, Instant};
 
+fn non_zero(size: Option<WinSize>) -> Option<WinSize> {
+    size.filter(|s| s.cols > 0 && s.rows > 0)
+}
+
 #[derive(Debug)]
 struct Session {
     id: SessionId,
@@ -24,6 +28,7 @@ struct Session {
     console: Console,
     job: Job,
     status: Option<i32>,
+    size: Option<WinSize>,
     deadline: Option<Instant>,
 }
 impl Session {
@@ -41,6 +46,7 @@ impl Session {
         id: SessionId,
         pid: u32,
         status: Option<i32>,
+        size: Option<WinSize>,
         mut handles: Vec<OwnedHandle>,
     ) -> io::Result<Self> {
         if handles.len() != 8 {
@@ -67,6 +73,7 @@ impl Session {
             console,
             job: Job { handle, port },
             status,
+            size: non_zero(size),
             deadline: None,
         })
     }
@@ -151,6 +158,7 @@ impl Holder {
                         id: s.id,
                         pid: s.process.pid,
                         status: s.status,
+                        size: s.size,
                     },
                     &s.handles(),
                     target.as_handle(),
@@ -410,6 +418,7 @@ impl Holder {
                     console,
                     job,
                     status: None,
+                    size: Some(size),
                     deadline: None,
                 };
                 let message = FromHolder::Spawned {
@@ -422,7 +431,11 @@ impl Holder {
                 self.send(&message, self.sessions.last())?;
                 return Ok(None);
             }
-            ToHolder::Resize { id, size, .. } => self.live(id)?.console.resize(size)?,
+            ToHolder::Resize { id, size, .. } => {
+                let s = self.live(id)?;
+                s.console.resize(size)?;
+                s.size = Some(size);
+            }
             ToHolder::Terminate { id, .. } => {
                 let s = self.live(id)?;
                 s.console.stop_host().ok();
@@ -464,10 +477,10 @@ impl Holder {
             ToHolder::HoldListener { info, .. } => {
                 self.listener = Some(sys::restore_socket(&info)?);
             }
-            ToHolder::Adopt { id, pid, .. } => {
+            ToHolder::Adopt { id, pid, size, .. } => {
                 if !self.sessions.iter().any(|s| s.id == id) {
                     self.sessions
-                        .push(Session::restore(self.api, id, pid, None, handles)?);
+                        .push(Session::restore(self.api, id, pid, None, size, handles)?);
                 }
             }
             ToHolder::UpgradeHolder { .. } => {
@@ -498,16 +511,7 @@ impl Holder {
             link.output.as_handle(),
         ];
         for s in &self.sessions {
-            use std::fmt::Write as _;
-            writeln!(
-                metadata,
-                "{} {} {}",
-                s.id.0,
-                s.process.pid,
-                s.status
-                    .map_or_else(|| "live".to_owned(), |v| v.to_string())
-            )
-            .map_err(io::Error::other)?;
+            format_handoff_session(&mut metadata, s.id, s.process.pid, s.status, s.size)?;
             handles.push(s.process.handle.as_handle());
             handles.extend(s.console.pty.handles());
             handles.extend([s.job.handle.as_handle(), s.job.port.as_handle()]);
@@ -528,13 +532,7 @@ impl Holder {
         Ok(())
     }
     fn restore(&mut self, metadata: &str, handles: Vec<OwnedHandle>) -> io::Result<u32> {
-        let mut words = metadata.split_whitespace();
-        let req = number(words.next())?;
-        let pid = number(words.next())?;
-        let remaining = words.clone().count();
-        if !remaining.is_multiple_of(3) || handles.len() != 4 + remaining / 3 * 8 {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
+        let (req, pid, entries) = parse_handoff(metadata, handles.len())?;
         let mut handles = handles.into_iter();
         let mut next = || handles.next().ok_or(io::ErrorKind::InvalidData.into());
         let process = Process {
@@ -549,22 +547,14 @@ impl Holder {
             link: Some(link),
             started: Instant::now(),
         });
-        while let Some(id) = words.next() {
-            let id = SessionId(number(Some(id))?);
-            let pid = number(words.next())?;
-            let status = words.next().ok_or(io::ErrorKind::InvalidData)?;
-            let status = if status == "live" {
-                None
-            } else {
-                Some(number(Some(status))?)
-            };
+        for (id, pid, status, size) in entries {
             let mut session = (0..8).map(|_| next()).collect::<io::Result<Vec<_>>>()?;
             session
                 .get_mut(..6)
                 .ok_or(io::ErrorKind::InvalidData)?
                 .rotate_left(1);
             self.sessions
-                .push(Session::restore(self.api, id, pid, status, session)?);
+                .push(Session::restore(self.api, id, pid, status, size, session)?);
         }
         if handles.next().is_some() {
             return Err(io::ErrorKind::InvalidData.into());
@@ -605,6 +595,67 @@ fn number<T: std::str::FromStr>(word: Option<&str>) -> io::Result<T> {
     word.ok_or(io::ErrorKind::InvalidData)?
         .parse()
         .map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
+type HandoffSession = (SessionId, u32, Option<i32>, Option<WinSize>);
+
+fn format_handoff_session(
+    metadata: &mut String,
+    id: SessionId,
+    pid: u32,
+    status: Option<i32>,
+    size: Option<WinSize>,
+) -> io::Result<()> {
+    use std::fmt::Write as _;
+    let (cols, rows) = non_zero(size).map_or((0, 0), |sz| (sz.cols, sz.rows));
+    writeln!(
+        metadata,
+        "{} {pid} {} {cols} {rows}",
+        id.0,
+        status.map_or_else(|| "live".to_owned(), |v| v.to_string()),
+    )
+    .map_err(io::Error::other)
+}
+
+fn parse_handoff(
+    metadata: &str,
+    handle_count: usize,
+) -> io::Result<(u32, u32, Vec<HandoffSession>)> {
+    if handle_count < 4 || !(handle_count - 4).is_multiple_of(8) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let count = (handle_count - 4) / 8;
+    let mut words = metadata.split_whitespace();
+    let req = number(words.next())?;
+    let pid = number(words.next())?;
+    let remaining = words.clone().count();
+    let has_size = if remaining == count * 5 {
+        true
+    } else if remaining == count * 3 {
+        false
+    } else {
+        return Err(io::ErrorKind::InvalidData.into());
+    };
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = SessionId(number(words.next())?);
+        let session_pid = number(words.next())?;
+        let status = words.next().ok_or(io::ErrorKind::InvalidData)?;
+        let status = if status == "live" {
+            None
+        } else {
+            Some(number(Some(status))?)
+        };
+        let size = if has_size {
+            let cols = number(words.next())?;
+            let rows = number(words.next())?;
+            non_zero(Some(WinSize { cols, rows }))
+        } else {
+            None
+        };
+        entries.push((id, session_pid, status, size));
+    }
+    Ok((req, pid, entries))
 }
 
 #[cfg(test)]
@@ -884,5 +935,54 @@ mod tests {
             FromHolder::decode(packet.frame()).unwrap(),
             FromHolder::Failed { req: 2, errno: 3 }
         );
+    }
+
+    #[test]
+    fn handoff_metadata_preserves_five_word_size_and_accepts_three_word_legacy() {
+        let mut metadata = String::from("9 4242\n");
+        format_handoff_session(
+            &mut metadata,
+            SessionId(7),
+            101,
+            None,
+            Some(WinSize {
+                cols: 160,
+                rows: 45,
+            }),
+        )
+        .unwrap();
+        format_handoff_session(&mut metadata, SessionId(8), 102, Some(-1), None).unwrap();
+
+        let (req, pid, entries) = parse_handoff(&metadata, 4 + 2 * 8).unwrap();
+        assert_eq!((req, pid), (9, 4242));
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    SessionId(7),
+                    101,
+                    None,
+                    Some(WinSize {
+                        cols: 160,
+                        rows: 45,
+                    }),
+                ),
+                (SessionId(8), 102, Some(-1), None),
+            ]
+        );
+
+        let legacy = "9 4242\n7 101 live\n8 102 0\n";
+        let (req, pid, entries) = parse_handoff(legacy, 4 + 2 * 8).unwrap();
+        assert_eq!((req, pid), (9, 4242));
+        assert_eq!(
+            entries,
+            vec![
+                (SessionId(7), 101, None, None),
+                (SessionId(8), 102, Some(0), None),
+            ]
+        );
+
+        assert!(parse_handoff("9 4242\n7 101 live 160\n", 4 + 8).is_err());
+        assert!(parse_handoff(&metadata, 4 + 8).is_err());
     }
 }

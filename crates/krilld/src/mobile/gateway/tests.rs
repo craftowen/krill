@@ -626,6 +626,7 @@ fn ws_attach_input_and_resize_preserve_real_desktop_pty() {
                 id,
                 pid: child.0.id(),
                 status: None,
+                size: None,
                 master: pty.controller,
             }],
         )),

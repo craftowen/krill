@@ -30,9 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
-#[cfg(unix)]
-use krill_proto::holder::ToHolder;
-use krill_proto::holder::{FromHolder, STATUS_UNKNOWN};
+use krill_proto::holder::{FromHolder, STATUS_UNKNOWN, ToHolder, WinSize};
 use krill_proto::os::net::{UnixListener, UnixStream};
 
 use crate::holder;
@@ -149,7 +147,12 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
             if let Some(pause) = pause.take() {
                 pause.commit();
             }
-            let m = FromHolder::Session { id, pid, status };
+            let m = FromHolder::Session {
+                id,
+                pid,
+                status,
+                size: session.tap().size().ok(),
+            };
             sent = send(&link, &m, Some(session));
         }
     });
@@ -197,6 +200,14 @@ fn send(link: &HandoffLink, m: &FromHolder, with: Option<&crate::Session>) -> io
         Some(s) => link.send_session(m, s.master()),
         None => link.send(&frame, &[]),
     }
+}
+
+#[derive(Debug)]
+pub struct Adopt {
+    id: SessionId,
+    pid: u32,
+    reported_size: Option<WinSize>,
+    master: Master,
 }
 
 /// krilld#2 쪽: 고아 krilld에게서 받은 세션. [`Handover::merge`] → 레지스트리 생성 → [`adopt`] →
@@ -281,14 +292,19 @@ impl Handover {
     ///
     /// # Errors
     /// master fd 복제 실패.
-    pub fn merge(&mut self, kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, Master)>> {
+    pub fn merge(&mut self, kept: &mut Vec<Kept>) -> io::Result<Vec<Adopt>> {
         let mut adopt = Vec::new();
         for k in self.sessions.drain(..) {
             if kept.iter().any(|h| h.id == k.id) {
                 continue;
             }
             if k.status.is_none() {
-                adopt.push((k.id, k.pid, k.master.try_clone()?));
+                adopt.push(Adopt {
+                    id: k.id,
+                    pid: k.pid,
+                    reported_size: k.size,
+                    master: k.master.try_clone()?,
+                });
             }
             kept.push(k);
         }
@@ -318,17 +334,43 @@ impl Handover {
 /// 넘겨받은 세션을 holder에 `Adopt`로 맡긴다(holder 리더 스레드가 돈 뒤). 그새 끝난 세션(`ESRCH`)은 끝난 것으로
 /// 표시한다.
 // A failed Adopt must not acknowledge handover: the old daemon keeps its handles for a retry.
-pub fn adopt(reg: &Registry, sessions: Vec<(SessionId, u32, Master)>) -> io::Result<()> {
+pub fn adopt(reg: &Registry, sessions: Vec<Adopt>) -> io::Result<()> {
     let h = reg.holder().ok_or(io::ErrorKind::NotConnected)?;
-    for (id, pid, master) in sessions {
+    for a in sessions {
+        let resolved = reg.session_size(a.id);
+        let size = resolved.or(a.reported_size);
         #[cfg(windows)]
-        let r = h.adopt(id, pid, &master);
+        let r = h.adopt(a.id, a.pid, size, &a.master);
         #[cfg(unix)]
-        let r = h.request_with(|req| ToHolder::Adopt { req, id, pid }, &[master.as_fd()]);
+        let r = {
+            let _ = size;
+            h.request_with(
+                |req| ToHolder::Adopt {
+                    req,
+                    id: a.id,
+                    pid: a.pid,
+                    size: None,
+                },
+                &[a.master.as_fd()],
+            )
+        };
         match r? {
-            (FromHolder::Done { .. }, _) => {}
+            (FromHolder::Done { .. }, _) => {
+                #[cfg(windows)]
+                if a.reported_size != resolved
+                    && let Some(sz) = resolved
+                    && h.version() >= 4
+                {
+                    h.request(|req| ToHolder::Resize {
+                        req,
+                        id: a.id,
+                        size: sz,
+                    })
+                    .ok();
+                }
+            }
             (FromHolder::Failed { errno, .. }, _) if errno == libc::ESRCH => {
-                reg.on_exited(id, STATUS_UNKNOWN);
+                reg.on_exited(a.id, STATUS_UNKNOWN);
             }
             (FromHolder::Failed { errno, .. }, _) => {
                 return Err(io::Error::from_raw_os_error(errno));

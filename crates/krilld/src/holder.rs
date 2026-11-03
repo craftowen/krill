@@ -19,7 +19,7 @@ use std::sync::mpsc::{self, Sender};
 
 pub use krill_holder::link;
 use krill_proto::SessionId;
-use krill_proto::holder::{Error as WireError, FromHolder, ToHolder};
+use krill_proto::holder::{Error as WireError, FromHolder, ToHolder, WinSize};
 
 use self::link::{Link, Packet};
 use crate::os::{BorrowedFd, OwnedFd};
@@ -38,6 +38,7 @@ pub struct Kept {
     pub pid: u32,
     /// 이미 끝났으면 `waitpid` 원시 상태.
     pub status: Option<i32>,
+    pub size: Option<WinSize>,
     pub master: Master,
 }
 
@@ -211,13 +212,19 @@ impl Holder {
     }
 
     #[cfg(windows)]
-    pub(crate) fn adopt(&self, id: SessionId, pid: u32, master: &Master) -> io::Result<Answer> {
+    pub(crate) fn adopt(
+        &self,
+        id: SessionId,
+        pid: u32,
+        size: Option<WinSize>,
+        master: &Master,
+    ) -> io::Result<Answer> {
         use std::os::windows::io::AsHandle as _;
         let (req, rx) = self.register()?;
         let sent = (|| {
             let target = link::duplicate_target(self.pid)?;
             let remote = link::Remote::duplicate(target.as_handle(), &master.handles())?;
-            let frame = remote.request(&ToHolder::Adopt { req, id, pid })?;
+            let frame = remote.request(&ToHolder::Adopt { req, id, pid, size })?;
             lock(&self.out).send(&frame, &[])?;
             remote.commit();
             Ok::<_, io::Error>(())
@@ -308,11 +315,20 @@ pub(crate) fn receive(link: &mut Link) -> io::Result<(u16, Vec<Kept>, Option<Own
         }
         match decode(p)? {
             Some((FromHolder::Hello { version: v, .. }, _)) => version = Some(v),
-            Some((FromHolder::Session { id, pid, status }, Some(master))) => {
+            Some((
+                FromHolder::Session {
+                    id,
+                    pid,
+                    status,
+                    size,
+                },
+                Some(master),
+            )) => {
                 kept.push(Kept {
                     id,
                     pid,
                     status,
+                    size: size.filter(|s| s.cols > 0 && s.rows > 0),
                     master,
                 });
             }
