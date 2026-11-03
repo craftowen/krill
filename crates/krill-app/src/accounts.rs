@@ -161,6 +161,172 @@ mod status_negotiation_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod reset_credit_ipc_tests {
+    use super::*;
+    use krill_proto::control::Failure;
+    use krill_proto::ipc::{ClientHello, ServerHello};
+    use krill_proto::usage::{FEAT_USAGE_RESET, FEAT_USAGE_STATUS};
+
+    struct TempRoot(PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn accept_usage_request(
+        listener: &krill_proto::os::net::UnixListener,
+    ) -> Result<(krill_proto::os::net::UnixStream, UsageRequest, u64), String> {
+        let server = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: FEAT_USAGE | FEAT_USAGE_STATUS | FEAT_USAGE_RESET,
+            build: "test".to_owned(),
+            instance_id: 1,
+        };
+        let encoded_server = server.encode().map_err(|e| e.to_string())?;
+        let (mut watch, _) = listener.accept().map_err(|e| e.to_string())?;
+        watch
+            .write_all(&encoded_server)
+            .map_err(|e| e.to_string())?;
+        ipc::read_frame(&mut watch)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "watch eof".to_owned())?;
+        drop(watch);
+
+        let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .write_all(&encoded_server)
+            .map_err(|e| e.to_string())?;
+        let (kind, body) = ipc::read_frame(&mut stream)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "hello eof".to_owned())?;
+        let client = ClientHello::decode(kind, &body).map_err(|e| e.to_string())?;
+        let features = ipc::negotiate(&server, &client)
+            .ok_or_else(|| "negotiate failed".to_owned())?
+            .features;
+        let (kind, body) = ipc::read_frame(&mut stream)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "request eof".to_owned())?;
+        let req = UsageRequest::decode(kind, &body).map_err(|e| e.to_string())?;
+        Ok((stream, req, features))
+    }
+
+    #[test]
+    fn consume_reset_credit_waits_for_slow_redeem() {
+        let root =
+            TempRoot(std::env::temp_dir().join(format!("mk-rst-slow-{}", std::process::id())));
+        std::fs::remove_dir_all(&root.0).ok();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let paths = Paths {
+            socket: root.0.join("d.sock"),
+            holder: root.0.join("holder"),
+            krilld: root.0.join("krilld"),
+        };
+        let listener = krill_proto::os::net::UnixListener::bind(&paths.socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, req, features) = accept_usage_request(&listener).unwrap();
+            assert_eq!(
+                req,
+                UsageRequest::ConsumeResetCredit {
+                    provider: ProviderKind::Codex,
+                    account_id: "codex-host".to_owned(),
+                }
+            );
+            std::thread::sleep(Duration::from_millis(5_300));
+            let reply = UsageReply::ResetConsumed {
+                snapshot: AccountsSnapshot::default(),
+                outcome: ResetConsumeOutcome::Reset,
+                windows_reset: 2,
+            }
+            .for_features(features);
+            stream.write_all(&reply.encode().unwrap()).ok();
+        });
+
+        let req = UsageRequest::ConsumeResetCredit {
+            provider: ProviderKind::Codex,
+            account_id: "codex-host".to_owned(),
+        };
+        let result = consume_reset_credit_ipc(&paths, &req);
+        worker.join().unwrap();
+        let consumed = result.expect("slow 5.3s redeem should succeed within reset IPC timeout");
+        assert_eq!(consumed.outcome, ResetConsumeOutcome::Reset);
+        assert_eq!(consumed.windows_reset, 2);
+    }
+
+    #[test]
+    fn consume_reset_credit_surfaces_reset_diagnostics() {
+        let root =
+            TempRoot(std::env::temp_dir().join(format!("mk-rst-diag-{}", std::process::id())));
+        std::fs::remove_dir_all(&root.0).ok();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let paths = Paths {
+            socket: root.0.join("d.sock"),
+            holder: root.0.join("holder"),
+            krilld: root.0.join("krilld"),
+        };
+        let listener = krill_proto::os::net::UnixListener::bind(&paths.socket).unwrap();
+        let failures = [Failure::Os(16), Failure::Os(13), Failure::Os(60)];
+        let worker = std::thread::spawn(move || {
+            for failure in failures {
+                let (mut stream, req, features) = accept_usage_request(&listener).unwrap();
+                assert_eq!(
+                    req,
+                    UsageRequest::ConsumeResetCredit {
+                        provider: ProviderKind::Codex,
+                        account_id: "codex-host".to_owned(),
+                    }
+                );
+                let reply = UsageReply::Failed(failure).for_features(features);
+                stream.write_all(&reply.encode().unwrap()).unwrap();
+            }
+        });
+
+        let req = UsageRequest::ConsumeResetCredit {
+            provider: ProviderKind::Codex,
+            account_id: "codex-host".to_owned(),
+        };
+        let rate_err = consume_reset_credit_ipc(&paths, &req).unwrap_err();
+        let auth_err = consume_reset_credit_ipc(&paths, &req).unwrap_err();
+        let timeout_err = consume_reset_credit_ipc(&paths, &req).unwrap_err();
+        worker.join().unwrap();
+
+        let delete_busy = crate::i18n::catalog::settings::ACCOUNT_DELETE_BUSY.get();
+        let summary = format!("rate={rate_err:?}, auth={auth_err:?}, timeout={timeout_err:?}");
+        for err in [&rate_err, &auth_err, &timeout_err] {
+            assert_ne!(
+                err, delete_busy,
+                "reset failure collided with ACCOUNT_DELETE_BUSY ({summary})"
+            );
+            assert!(
+                !err.contains("세션이 아직 열려") && !err.contains("세션이 남아 있어"),
+                "reset failure mentioned open sessions ({summary})"
+            );
+            assert!(
+                !err.contains("os error"),
+                "reset failure leaked raw errno ({summary})"
+            );
+        }
+        assert!(
+            rate_err.contains("제한"),
+            "rate limit failure should mention 제한, got: {rate_err}"
+        );
+        assert!(
+            auth_err.contains("로그인"),
+            "auth failure should mention 로그인, got: {auth_err}"
+        );
+        assert!(
+            timeout_err.contains("크레딧"),
+            "timeout failure should warn about credit status (크레딧), got: {timeout_err}"
+        );
+    }
+}
+
 /// OWE-696: Orca가 감지·관리하는 계정. Krill이 아는 프로필 폴더가 없어 이 계정으로 실행·전환·제거할 수 없다.
 #[must_use]
 pub fn orca_managed(acc: &AccountInfo) -> bool {
