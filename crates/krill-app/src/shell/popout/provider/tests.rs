@@ -1568,3 +1568,36 @@ fn detail_flyout_keeps_outer_gap_and_comfortable_inner_padding(cx: &mut gpui::Te
         "provider detail content lacked 16px horizontal padding: left_pad={left_pad:?}, right_pad={right_pad:?}, detail={detail:?}, meter={meter:?}"
     );
 }
+
+#[test]
+fn detail_flyout_origin_uses_symmetric_gap_on_right_left_flip_and_zoom() {
+    let detail_size = gpui::size(px(288.), px(260.));
+    let viewport = gpui::size(px(1280.), px(800.));
+
+    let right_origin = compute_detail_flyout_origin(
+        gpui::point(px(24.), px(476.)),
+        px(368.),
+        px(16.),
+        detail_size,
+        viewport,
+    );
+    assert_eq!(right_origin, gpui::point(px(392.), px(476.)));
+
+    let flipped_origin = compute_detail_flyout_origin(
+        gpui::point(px(760.), px(476.)),
+        px(368.),
+        px(16.),
+        detail_size,
+        viewport,
+    );
+    assert_eq!(flipped_origin, gpui::point(px(448.), px(476.)));
+
+    let zoomed_origin = compute_detail_flyout_origin(
+        gpui::point(px(30.), px(476.)),
+        px(368.),
+        px(24.),
+        detail_size,
+        viewport,
+    );
+    assert_eq!(zoomed_origin, gpui::point(px(392.), px(476.)));
+}

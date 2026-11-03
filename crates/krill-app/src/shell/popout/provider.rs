@@ -454,7 +454,7 @@ fn render_detail_reset_controls(
                         .child(
                             Button::new(gpui::SharedString::from(cancel_id))
                                 .small()
-                                .outline()
+                                .ghost()
                                 .label(provider_text::PROVIDER_RESET_USAGE_CANCEL.get())
                                 .debug_selector(move || cancel_selector.clone())
                                 .on_click(move |_, _, cx| {
@@ -521,10 +521,41 @@ fn window_bar_color(win: Option<&UsageWindow>, p: &ui::Palette) -> gpui::Hsla {
         .map_or(p.muted_foreground, |pct| provider_usage_color(pct, p))
 }
 
+const DETAIL_FLYOUT_GAP: gpui::Pixels = ui::SPACE_3;
+
+fn compute_detail_flyout_origin(
+    anchor_origin: gpui::Point<gpui::Pixels>,
+    menu_width: gpui::Pixels,
+    rem_size: gpui::Pixels,
+    detail_size: gpui::Size<gpui::Pixels>,
+    viewport: gpui::Size<gpui::Pixels>,
+) -> gpui::Point<gpui::Pixels> {
+    let menu_left = anchor_origin.x - rem_size * 0.75;
+    let menu_right = menu_left + menu_width;
+    let right_x = menu_right + DETAIL_FLYOUT_GAP;
+    let x = if right_x + detail_size.width <= viewport.width - ui::SPACE_2 {
+        right_x
+    } else {
+        let left_x = menu_left - DETAIL_FLYOUT_GAP - detail_size.width;
+        if left_x >= ui::SPACE_2 {
+            left_x
+        } else {
+            (viewport.width - ui::SPACE_2 - detail_size.width).max(ui::SPACE_2)
+        }
+    };
+    let max_bottom = (viewport.height - ui::STATUS_BAR_HEIGHT - ui::SPACE_2).max(ui::SPACE_2);
+    let y = if anchor_origin.y + detail_size.height <= max_bottom {
+        anchor_origin.y.max(ui::SPACE_2)
+    } else {
+        (max_bottom - detail_size.height).max(ui::SPACE_2)
+    };
+    gpui::point(x.round(), y.round())
+}
+
 /// 팝오버 바깥 우측(좁은 창 오른쪽 끝이면 좌측)에 독립 높이로 띄우는 계정 상세 플라이아웃.
 struct DetailFlyout {
     child: gpui::AnyElement,
-    master_width: gpui::Pixels,
+    menu_width: gpui::Pixels,
     menu: WeakEntity<PopupMenu>,
 }
 
@@ -589,25 +620,13 @@ impl gpui::Element for DetailFlyout {
             return;
         }
         let child_size = window.layout_bounds(*child_id).size;
-        let viewport = window.viewport_size();
-        let right_x = bounds.origin.x + self.master_width + ui::SPACE_4 + ui::SPACE_1;
-        let x = if right_x + child_size.width <= viewport.width - ui::SPACE_2 {
-            right_x
-        } else {
-            let left_x = bounds.origin.x - ui::SPACE_4 - ui::SPACE_1 - child_size.width;
-            if left_x >= ui::SPACE_2 {
-                left_x
-            } else {
-                (viewport.width - ui::SPACE_2 - child_size.width).max(ui::SPACE_2)
-            }
-        };
-        let max_bottom = (viewport.height - ui::STATUS_BAR_HEIGHT - ui::SPACE_2).max(ui::SPACE_2);
-        let y = if bounds.origin.y + child_size.height <= max_bottom {
-            bounds.origin.y.max(ui::SPACE_2)
-        } else {
-            (max_bottom - child_size.height).max(ui::SPACE_2)
-        };
-        let origin = gpui::point(x.round(), y.round());
+        let origin = compute_detail_flyout_origin(
+            bounds.origin,
+            self.menu_width,
+            window.rem_size(),
+            child_size,
+            window.viewport_size(),
+        );
         let offset = origin - bounds.origin;
         self.menu
             .update(cx, |m, _| {
@@ -1298,7 +1317,7 @@ pub(super) fn provider_usage_menu(
     let has_remote_hosts = !other_hosts.is_empty();
 
     let available = window.bounds().size.width - ui::SPACE_4 * 2.;
-    let detail_panel_width = px(276.).min((available * 0.44).floor()).max(px(180.));
+    let detail_panel_width = px(288.).min((available * 0.44).floor()).max(px(180.));
     let width = px(368.)
         .min(available - detail_panel_width - ui::SPACE_3)
         .max(px(220.));
@@ -1651,7 +1670,7 @@ pub(super) fn provider_usage_menu(
 
             // Account for the local row's .py_1() at the current zoom.
             let column_max_height = (body_max_height - window.rem_size() * 0.5).max(ui::SPACE_1);
-            let detail_max_height = (room - ui::SPACE_2).min(px(560.)).max(ui::SPACE_4);
+            let detail_max_height = (room - ui::SPACE_2 - px(2.)).min(px(560.)).max(ui::SPACE_4);
             let detail_flyout = if !remote_tab
                 && let Some(panel_group) = selected_group
                 && let Some(panel_account) = panel_group.selected().cloned()
@@ -1667,17 +1686,9 @@ pub(super) fn provider_usage_menu(
                 let active_detail = div()
                     .id(gpui::SharedString::from(selector))
                     .debug_selector(move || debug_id.clone())
-                    .w(detail_panel_width)
-                    .flex_none()
-                    .p_2p5()
-                    .rounded(ui::RADIUS_MD)
-                    .border_1()
-                    .border_color(if panel_account.active {
-                        p.success.opacity(0.45)
-                    } else {
-                        p.border
-                    })
-                    .bg(p.popover)
+                    .w_full()
+                    .min_w_0()
+                    .p(ui::SPACE_4)
                     .text_color(p.popover_foreground)
                     .flex()
                     .flex_col()
@@ -1711,27 +1722,37 @@ pub(super) fn provider_usage_menu(
                         p,
                     ));
 
-                let active_detail = div()
+                let detail_scroll = div()
                     // Keep detail scroll independent and reset it on selection.
                     .id(gpui::SharedString::from(format!(
                         "status-provider-detail-scroll-{}",
                         panel_account.id
                     )))
                     .debug_selector(|| "status-provider-detail-scroll".into())
-                    .w(detail_panel_width)
-                    .flex_none()
+                    .w_full()
+                    .min_w_0()
                     .min_h_0()
                     .max_h(detail_max_height)
                     .overflow_y_scroll()
+                    .child(active_detail);
+                let detail_card = div()
+                    .w(detail_panel_width)
+                    .flex_none()
                     .rounded(ui::RADIUS_MD)
+                    .border_1()
+                    .border_color(if panel_account.active {
+                        p.success.opacity(0.45)
+                    } else {
+                        p.border
+                    })
                     .bg(p.popover)
                     .shadow_lg()
                     .occlude()
-                    .child(active_detail);
+                    .child(detail_scroll);
                 Some(
                     gpui::deferred(DetailFlyout {
-                        child: active_detail.into_any_element(),
-                        master_width,
+                        child: detail_card.into_any_element(),
+                        menu_width: width,
                         menu: body_menu.clone(),
                     })
                     .with_priority(2),
