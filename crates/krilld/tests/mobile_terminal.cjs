@@ -212,6 +212,16 @@ async function main(){
  update(cursor(2,0));assert.equal((await drawn()).text,2);
  // 후행 cursor_explicit 바이트(0x01)와 미래 확장 바이트가 붙은 Update도 해독해야 한다(v0.2.25부터 모바일 터미널이 'Trailing screen data'로 안 뜬 회귀).
  socket.frame(0x21,T.v(2),T.v(2),T.v(1),T.v(1),line(1,'zz'),Uint8Array.of(1,9));assert.deepEqual(await drawn(),{text:1,font:0,draws:1},'update with optional postfix still draws');
+ // Bytes written by the Rust encoder (krill-proto screen tests keep mobile_wire.txt equal to its output): every op and tail decodes here.
+ {const wire=Object.fromEntries(fs.readFileSync(path.join(__dirname,'../../krill-proto/src/screen/mobile_wire.txt'),'utf8').split('\n').filter(l=>l&&!l.startsWith('#')).map(l=>l.split(' ')));
+  const body=(name,kind)=>{const b=Uint8Array.from(Buffer.from(wire[name],'hex'));assert.equal(new DataView(b.buffer).getUint32(0,true),b.length-4,name);assert.equal(b[4],kind,name);return b.slice(5);};
+  const model={},result=T.update(body('update',0x21),model),json=JSON.stringify;
+  assert.equal(result.done,true);assert.equal(model.revision,300n);assert.equal(model.seq,70000n);assert.equal(model.cols,80);assert.equal(model.lines,24);
+  assert.equal(json(model.rows[3].map(c=>c.text)),json(['a','한‍'.normalize('NFC')]));assert.equal(json(model.cursor),json({line:3,column:2,visible:true}));
+  assert.equal(model.title,'빌드 – zsh');assert.equal(json(model.cursorStyle),json({shape:2,blink:true}));assert.equal(model.cursorExplicit,true,'Update cursor_explicit tail');
+  const rows=T.history(body('history_rows',0x26));
+  assert.equal(json([rows.req,rows.total,rows.pages,rows.skip]),json([9,1000,3,10]));assert.equal(json(rows.rows.map(r=>r.map(c=>c.ch))),json([['x','한'],[]]));
+  console.log('PASS Rust-encoded screen wire fixture: Update with every op and the cursor tail, HistoryRows read to the end');}
  update(line(0,'a'));update(line(2,'g'));assert.deepEqual(await drawn(),{text:2,font:0,draws:1});
  update(C.concat(T.v(0),T.v(80),T.v(24)),line(0,'abc'),line(3,'jk'));assert.equal((await drawn()).text,2);
  handle.setFontScale(1.25);assert.deepEqual(await drawn(),{text:2,font:1,draws:1});assert.equal(canvas.width,Math.round(80*8*16/13));

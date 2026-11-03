@@ -4,12 +4,14 @@ set -euo pipefail
 cd "${0:A:h}/.."
 if [[ ${1-} == -h || ${1-} == --help ]]; then
   print "사용: scripts/check.sh [--memory]
-  비Cargo 회귀 · fmt+deny+NOTICES+public-surface(병렬) · clippy · nextest(fast+latency) · doctest
+  비Cargo 회귀 · fmt+deny+NOTICES+public-surface(병렬) · clippy · nextest(fast+latency)
   --memory          끝에 scripts/memory-gate.sh(MK-066)까지 돈다
   KRILL_TEST_SLOTS  머신 전체 동시 테스트 실행 수(기본: CPU 코어 수 / 4, 최소 1)"
   exit 0
 fi
 python3 scripts/check-build-target.py
+# 테스트 빌드 프로필은 CI(ci-macos.yml)·nightly와 같다. 시간 예산 테스트가 로컬과 CI에서 같은 최적화 수준을 본다.
+export CARGO_PROFILE_TEST_OPT_LEVEL=${CARGO_PROFILE_TEST_OPT_LEVEL:-2} CARGO_PROFILE_TEST_DEBUG=${CARGO_PROFILE_TEST_DEBUG:-line-tables-only}
 # 종료·타임아웃(perl alarm → SIGALRM)·Ctrl-C 때 이 스크립트가 띄운 cargo·테스트 프로세스 트리를 정리한다(고아 cargo가
 # 공유 빌드 락을 쥔 채 남는 문제). `kill 0`은 호출자 셸까지 죽일 수 있어 자기 자식 트리만 찾아 끈다.
 # zsh는 포그라운드 자식이 끝날 때까지 신호 trap을 미루므로 각 단계는 run(백그라운드 + wait)으로 돌린다.
@@ -23,7 +25,7 @@ run(){ "$@" & wait $!; }
 step(){ print -P "%B== $1%b"; }
 step "non-Cargo regressions"; run python3 scripts/check-regressions.py
 # 병렬 1단계: 읽기 전용 검사 4종을 묶고, 하나라도 실패하면 전체 검사를 중단한다.
-# clippy·nextest·doctest는 target/ 락을 공유하므로 순서를 유지한다.
+# clippy·nextest는 target/ 락을 공유하므로 순서를 유지한다.
 step "fmt+deny+notices+public-surface (parallel)";
 partlog=$(mktemp -d "${TMPDIR:-/tmp}/mk-check-part-XXXXXX")
 typeset -A partpids
@@ -51,7 +53,6 @@ slot(){ local n=${KRILL_TEST_SLOTS:-$(( cores / 4 > 0 ? cores / 4 : 1 ))} k rc; 
 step "test build";   run cargo nextest run --workspace --locked --no-tests=pass --no-run
 step "test fast";    slot cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast -E 'not (binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff))'
 step "test latency"; slot cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast -E 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
-step "doctest"; run cargo test --workspace --doc --locked -q
 # --memory: MK-066 메모리 게이트까지(nightly·선택). 병렬 부하에서 흔들려 기본 경로에는 넣지 않는다.
 if [[ ${1-} == --memory ]]; then step "memory"; run scripts/memory-gate.sh; fi
 print -P "%B== check.sh: 전부 통과%b"

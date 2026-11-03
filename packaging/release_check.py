@@ -19,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 VOLUME = Path("/Volumes/krill-build")
 TARGETS = VOLUME / "targets"
 BINARIES = ("krill-app", "krill", "krill-holder", "krilld", "krill-link")
-SCOPE = ("scripts/check.sh", "windows-clippy", "release-gui-kill9-replay", "release-holder-survival",
-         "mobile-real-browser")
+SCOPE = ("scripts/check.sh", "windows-clippy", "release-gui-kill9-replay", "release-gui-update-krilld-crash",
+         "release-daemon-memory-60mib", "release-holder-survival", "mobile-real-browser")
 SCHEMA = 1
 
 
@@ -152,7 +152,8 @@ def test_executable(package, target):
 
 
 MOBILE_BROWSER_TESTS = (("mobile_live_browser.py", "--browser-only"), ("mobile_responsive_browser.py",), ("mobile_hosts_browser.py",),
-                        ("mobile_terminal_input_browser.py",))
+                        ("mobile_terminal_input_browser.py",), ("mobile_browser.py", "--address", "127.0.0.1:0"),
+                        ("chat_scroll_browser.cjs",), ("mobile_scroll_browser.cjs",), ("mobile_terminal_scroll_browser.cjs",))
 
 
 def mobile_browser_gate(release):
@@ -164,7 +165,8 @@ def mobile_browser_gate(release):
     os.environ.update({key: str(value) for key, value in env.items()})
     try:
         for script, *arguments in MOBILE_BROWSER_TESTS:
-            run(["python3", ROOT / "crates/krilld/tests" / script, *arguments], timeout=1800)
+            interpreter = "node" if script.endswith(".cjs") else "python3"
+            run([interpreter, ROOT / "crates/krilld/tests" / script, *arguments], timeout=1800)
     finally:
         for key, value in previous.items():
             os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
@@ -195,6 +197,7 @@ def validate(head, directory, key_file):
         checkpoint.chmod(0o600)
     run(["/bin/bash", "scripts/check-windows.sh", "--clippy", "--target-dir", TARGETS / "nightly-windows"], timeout=7200)
     pane = test_executable("krill-app", "pane_e2e")
+    fault = test_executable("krilld", "fault_ci")
     holder = test_executable("krill-holder", "survive")
     # 테스트 컴파일 뒤 최종 출고 프로필을 만든다. 이후 게이트는 Cargo 재빌드 없이 실행한다.
     build = ["cargo", "build", "--release", "--locked", "--bins"]
@@ -203,11 +206,13 @@ def validate(head, directory, key_file):
     run(build)
     before = {name: sha256(target / "release" / name) for name in BINARIES}
     gates = ([pane, "release_survival::release_app_kill9_survives_and_replays_hash_three_times", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
+             [fault, "release_gui_survival_e2e_2_and_3_three_rounds", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
+             # AGENTS rule 2 daemon budget (10 terminals, phys_footprint <= 60MiB) on the shipped profile, no GUI needed.
+             [fault, "fault_injection_accelerated_24h_memory_soak", "--exact", "--nocapture", "--test-threads=1"],
              [holder, "--nocapture", "--test-threads=1"])
-    pane_tests = run([pane, "--list"], capture=True)
     holder_tests = run([holder, "--list"], capture=True)
-    for test in (gates[0][1],):
-        if f"{test}: test" not in pane_tests.splitlines():
+    for executable, test, *_ in gates[:-1]:
+        if f"{test}: test" not in run([executable, "--list"], capture=True).splitlines():
             raise ValueError(f"required release test is missing: {test}")
     for test in ("krilld_kill", "protocol_contract", "upgrade::exec_handoff"):
         if f"{test}: test" not in holder_tests.splitlines():
