@@ -212,12 +212,22 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
     drop(reg);
 
     // With no cwd evidence, leave the session unclassified rather than selecting another project.
-    let reg = Registry::new(None, None);
+    let fresh = dir.join("fresh-state");
+    fs::create_dir_all(&fresh).unwrap();
+    let reg = Registry::new(None, Some(&fresh));
     let writer = insert(&reg, PathBuf::new());
     check(&reg, b"");
     drop(writer);
     drop(reg);
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// 상태 폴더 없이 만든 레지스트리(단독 테스트)가 `KRILL_STATE_DIR`·운영 기본 폴더로 넘어가 사용자 파일
+/// (Claude 주입 settings 삭제, 프롬프트 기록, 오케스트레이션 저장소)을 건드리지 않는다.
+#[test]
+fn registry_without_state_dir_has_no_state_folder() {
+    assert!(krill_proto::daemon::state_dir().is_some());
+    assert_eq!(Registry::new(None, None).state_dir(), None);
 }
 
 #[test]
