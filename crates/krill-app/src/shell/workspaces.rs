@@ -63,7 +63,7 @@ impl Shell {
                             && sidebar.session_on(host, session).is_none())
                     && !self.restoring_sessions.contains(&session)
                     && !self.restarting_panes.contains(&pane)
-                    && !self.blocks_session_prune(pane, host, session)
+                    && !self.blocks_session_prune(pane, host, session, cx)
             })
             .collect();
         if !stale_panes.is_empty() {

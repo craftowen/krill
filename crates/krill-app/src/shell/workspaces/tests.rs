@@ -921,6 +921,8 @@ enum FakeDaemon {
     OddResumeReply,
     /// `Hibernation`을 광고하고 `NoSession`으로 거부한다.
     RefuseHibernation,
+    /// 닫힌 세션: 붙을 때 쓰는 `AgentLaunch`도 `NoSession`으로 거부한다.
+    ClosedSession,
 }
 
 /// 가짜 krilld를 띄우고 소켓 경로와 (List, Resume, Hibernation) 요청 수를 돌려준다.
@@ -929,7 +931,8 @@ fn fake_restore_daemon(
     mode: FakeDaemon,
 ) -> std::io::Result<(PathBuf, Arc<[std::sync::atomic::AtomicUsize; 3]>)> {
     use krill_proto::control::{
-        FEAT_CONTROL, FEAT_HIBERNATION, FEAT_RESUME, FEAT_RESUME_HISTORY, Failure, Reply, Request,
+        ClosedSessionRanges, FEAT_AGENTS, FEAT_CONTROL, FEAT_HIBERNATION, FEAT_RESUME,
+        FEAT_RESUME_HISTORY, FEAT_SIDEBAR, Failure, Reply, Request, SidebarData,
     };
     use krill_proto::screen::Msg as _;
     use std::io::Write as _;
@@ -944,14 +947,15 @@ fn fake_restore_daemon(
             let Ok(mut stream) = stream else { return };
             let seen = Arc::clone(&seen);
             std::thread::spawn(move || {
-                let hibernation = match mode {
+                let extra = match mode {
                     FakeDaemon::RefuseHibernation => FEAT_HIBERNATION,
+                    FakeDaemon::ClosedSession => FEAT_AGENTS | FEAT_SIDEBAR,
                     _ => 0,
                 };
                 let hello = krill_proto::ipc::ServerHello {
                     proto_min: krill_proto::ipc::PROTO_MIN,
                     proto_max: krill_proto::ipc::PROTO_MAX,
-                    features: FEAT_CONTROL | FEAT_RESUME | FEAT_RESUME_HISTORY | hibernation,
+                    features: FEAT_CONTROL | FEAT_RESUME | FEAT_RESUME_HISTORY | extra,
                     build: "test".into(),
                     instance_id: 1,
                 };
@@ -982,6 +986,16 @@ fn fake_restore_daemon(
                         Ok(Request::Hibernation { .. }) => {
                             seen[2].fetch_add(1, SeqCst);
                             Reply::Failed(Failure::NoSession)
+                        }
+                        Ok(Request::AgentLaunch { .. }) => Reply::Failed(Failure::NoSession),
+                        Ok(Request::Sidebar) if matches!(mode, FakeDaemon::ClosedSession) => {
+                            seen[1].fetch_add(1, SeqCst);
+                            let mut closed_sessions = ClosedSessionRanges::default();
+                            closed_sessions.insert(SessionId(936));
+                            Reply::Sidebar(SidebarData {
+                                closed_sessions,
+                                ..SidebarData::default()
+                            })
                         }
                         _ => Reply::Failed(Failure::BadRequest),
                     };
@@ -1025,6 +1039,42 @@ fn sync_four_times(view: &gpui::Entity<Shell>, cx: &mut gpui::VisualTestContext)
         view.update(cx, Shell::sync);
         cx.run_until_parked();
     }
+}
+
+/// 2026-11-02: 이 앱이 살아 있는 동안 본 세션이 닫힌 뒤 탭을 열면, 붙기 전 메타데이터 조회의 `NoSession`이 일시 오류로
+/// 분류돼 "no such session" 글자만 띄우고 끝없이 다시 붙었다. 데몬의 확정 응답까지 가서 칸을 거둬야 한다.
+#[gpui::test]
+fn opening_a_closed_observed_session_removes_its_tab(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (socket, counts) = fake_restore_daemon("attach-closed", FakeDaemon::ClosedSession).unwrap();
+    let old = SessionId(936);
+    let (view, cx) = open(cx, state_path("attach-closed"));
+    cx.simulate_keystrokes("cmd-t");
+    let pane = layout_of(&view, cx).active_tab().focused;
+    view.update(cx, |s, cx| {
+        s.layout.set_session(pane, old);
+        s.observed_sessions
+            .insert((krill_app::hosts::HostId::Local, old));
+        s.paths = Some(Paths {
+            socket: socket.clone(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.link = Link::Up;
+        s.live.remove(&pane);
+        s.sync(cx);
+        assert!(s.live.contains_key(&pane));
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, _| {
+        assert_eq!(
+            counts[1].load(SeqCst),
+            1,
+            "Sidebar 닫힘 응답이 프로세스 재스폰 없이 끝을 확정한다"
+        );
+        assert!(!s.layout.pane_exists(pane), "닫힌 세션의 탭은 남지 않는다");
+    });
+    std::fs::remove_file(socket).ok();
 }
 
 #[gpui::test]

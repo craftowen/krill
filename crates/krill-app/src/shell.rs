@@ -2887,16 +2887,48 @@ impl Shell {
         pane: PaneId,
         host: &krill_app::hosts::HostId,
         session: krill_proto::SessionId,
+        cx: &App,
     ) -> bool {
-        self.accounts_for_host(host)
-            .details
-            .handoffs
-            .iter()
-            .any(|h| h.from == session && h.to.is_none() && h.error.is_none())
-            || self
-                .live
-                .get(&pane)
-                .is_some_and(|l| l.pane.holds_account_input())
+        if self
+            .live
+            .get(&pane)
+            .is_some_and(|l| l.pane.holds_account_input())
+        {
+            return true;
+        }
+        let handoffs = &self.accounts_for_host(host).details.handoffs;
+        let sidebar = self.sidebar.read(cx);
+        let max_hops = handoffs.len().saturating_add(1);
+        handoffs.iter().any(|h| {
+            if h.from != session {
+                return false;
+            }
+            if h.to.is_none() {
+                return h.error.is_none();
+            }
+            let Some(mut target) = h.to else {
+                return false;
+            };
+            for _ in 0..max_hops {
+                let Some(next) = handoffs
+                    .iter()
+                    .find(|nh| nh.from == target)
+                    .and_then(|nh| nh.to)
+                else {
+                    break;
+                };
+                if next == target {
+                    break;
+                }
+                target = next;
+            }
+            let target_closed = sidebar
+                .session_on(host, target)
+                .is_some_and(sidebar::Session::is_exited)
+                || sidebar.is_session_closed_on(host, target)
+                || self.gone_sessions.contains(&(host.clone(), target));
+            !target_closed
+        })
     }
 
     /// 상태바·새 세션·설정 진입 시 우선할 계정 대상 호스트.
@@ -4618,10 +4650,7 @@ impl Shell {
                                         prior_cold: None,
                                     });
                                 }
-                                Err(error)
-                                    if !is_permanent_error(&error)
-                                        && !pane::is_no_session_failure(&error) =>
-                                {
+                                Err(error) if !is_permanent_error(&error) => {
                                     return Ok(Got::Live {
                                         session,
                                         linked: Err(error),
@@ -4792,7 +4821,7 @@ impl Shell {
         })
     }
 
-    fn settled_attempt_is_current(&self, pane: PaneId, attempt: &SettledAttempt) -> bool {
+    fn settled_target_is_current(&self, pane: PaneId, attempt: &SettledAttempt) -> bool {
         let current_target_matches = if attempt.had_registered_target {
             self.target_for_pane(pane).as_ref() == Some(&attempt.target)
         } else {
@@ -4800,7 +4829,6 @@ impl Shell {
                 .is_none_or(|cur| cur == attempt.target)
         };
         self.layout.pane_exists(pane)
-            && self.layout.session(pane) == attempt.layout_session
             && self.layout.host(pane) == attempt.target.host()
             && attempt.target.is_current()
             && current_target_matches
@@ -4813,15 +4841,38 @@ impl Shell {
         got: std::io::Result<Got>,
         cx: &mut Context<Self>,
     ) -> Next {
-        if !self.settled_attempt_is_current(pane, attempt) {
+        if !self.settled_target_is_current(pane, attempt) {
             self.restarting_panes.remove(&pane);
             return Next::Gone;
         }
-        self.settled(pane, got, cx)
+        if self.layout.session(pane) != attempt.layout_session {
+            self.restarting_panes.remove(&pane);
+            return Next::Retry;
+        }
+        self.settled_attempt(pane, attempt.layout_session, got, cx)
     }
 
     /// 붙기 시도가 끝났다. `got`은 세션 정하기의 결과와, 정했다면 그 세션에 붙기의 결과. 정한 세션은 붙기가 실패해도
     /// 레이아웃에 적는다 — 안 적으면 다음 시도가 세션을 또 만든다(OWE-506). 콜드 기록이면 읽기 전용 화면을 띄운다(MK-032).
+    fn settled_attempt(
+        &mut self,
+        pane: PaneId,
+        want: Option<krill_proto::SessionId>,
+        got: std::io::Result<Got>,
+        cx: &mut Context<Self>,
+    ) -> Next {
+        // 응답을 기다리는 사이 칸이 다른 세션으로 옮겨졌다면 옛 세션의 끝을 새 세션의 끝으로 적지 않는다.
+        if got.as_ref().err().is_some_and(pane::is_session_gone)
+            && self
+                .layout
+                .session(pane)
+                .is_some_and(|now| Some(now) != want)
+        {
+            return Next::Retry;
+        }
+        self.settled(pane, got, cx)
+    }
+
     fn settled(&mut self, pane: PaneId, got: std::io::Result<Got>, cx: &mut Context<Self>) -> Next {
         let next = self.settled_inner(pane, got, cx);
         // Keep an in-flight first Create/Attach alive across tab switches until
@@ -4928,12 +4979,19 @@ impl Shell {
                     .detach();
                 }
                 let old = self.layout.session(pane);
+                // 계정 전환이 붙든 입력은 콜드 화면이 지운다. 이어받기가 끝나면 재바인딩이 칸을 다시 붙인다.
+                let held = self
+                    .live
+                    .get(&pane)
+                    .is_some_and(|l| l.pane.holds_account_input());
                 // 데몬이 끝났다고 확정한 세션의 칸은 오류 문구로 남기지 않고 reconcile이 거둔다.
                 if pane::is_session_gone(&e)
+                    && !held
                     && let Some(session) = old
                 {
                     let host = self.layout.host(pane).clone();
                     self.gone_sessions.insert((host.clone(), session));
+                    // 계정 이어받기가 남긴 사이드바 사본 행이 reconcile을 막지 않게 먼저 지운다.
                     if self
                         .sidebar
                         .read(cx)
@@ -4952,9 +5010,9 @@ impl Shell {
                 match self.live.get_mut(&pane) {
                     Some(l) => {
                         if permanent
+                            && !held
                             && !l.pane.is_cold()
                             && !l.pane.is_closed()
-                            && !l.pane.holds_account_input()
                             && let Some(session) = l.pane.session().or(old)
                         {
                             l.pane

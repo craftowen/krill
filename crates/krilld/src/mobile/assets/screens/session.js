@@ -1540,7 +1540,7 @@
             cancelRetry();
             if (refocus) {
               refocus = false;
-              handle?.focus();
+              if (viewMode !== "chat") handle?.focus();
             }
           } else if (status.phase === "disconnected") retry();
           else if (status.phase === "ended") ended(target.id);
