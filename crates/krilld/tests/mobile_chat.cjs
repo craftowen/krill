@@ -3437,6 +3437,116 @@ async function main() {
   console.log(
     "PASS late previous-host prompt completion cannot erase the new host draft with an identical session ID/text",
   );
+  // Scrolled-up / historical submit immediately exits history, renders optimistic user bubble, pins bottom, and deduplicates on poll.
+  f = fixture();
+  await flush();
+  await f.poll({
+    generation: "g1",
+    page_start: 100,
+    items: [
+      { id: "m1", kind: "assistant", text: "Earlier 1" },
+      { id: "m2", kind: "assistant", text: "Earlier 2" },
+      { id: "m3", kind: "assistant", text: "Latest 3" },
+    ],
+    next_offset: 300,
+    bound: true,
+  });
+  f.handler = async (req) => ({
+    generation: "g1",
+    page_start: 0,
+    items: [{ id: "m0", kind: "assistant", text: "Oldest 0" }],
+    next_offset: 100,
+    bound: true,
+  });
+  const feedEl = f.find("chat-feed");
+  feedEl.scrollTop = 0;
+  f.button("Load earlier messages").action();
+  await flush();
+  assert(f.entry.live, "entered historical reading mode");
+  feedEl.scrollTop = 0;
+  const promptDeferred = deferred(),
+    pollDeferred = deferred();
+  f.handler = async (req) =>
+    req.action === "prompt"
+      ? promptDeferred.promise
+      : req.action === "chat_poll"
+        ? pollDeferred.promise
+        : {};
+  const inputEl = f.find("chat-input");
+  let heightWrites = 0,
+    currentHeight = inputEl.style.height;
+  Object.defineProperty(inputEl.style, "height", {
+    configurable: true,
+    get: () => currentHeight,
+    set: (v) => {
+      heightWrites++;
+      currentHeight = v;
+    },
+  });
+  f.input("방금 음성으로 입력한 메시지");
+  const writesAfterInput = heightWrites;
+  f.update();
+  f.update();
+  assert.equal(
+    heightWrites,
+    writesAfterInput,
+    "idle background updates do not thrash textarea style.height during dictation",
+  );
+  f.submit();
+  assert.equal(f.entry.live, null, "submit exits history mode immediately");
+  const optimistic = feedEl.children.at(-1);
+  assert.equal(
+    optimistic?.className,
+    "chat-card chat-user chat-optimistic",
+    "optimistic user bubble mounts immediately at the bottom of feed",
+  );
+  assert.equal(optimistic.dataset.phase, "sending");
+  assert(
+    optimistic.descendants().some((n) => n.textContent === "방금 음성으로 입력한 메시지"),
+  );
+  assert.equal(
+    feedEl.scrollTop,
+    feedEl.scrollHeight,
+    "feed scrolls immediately to the very bottom on submit",
+  );
+  promptDeferred.resolve({ sent: true });
+  await flush();
+  assert.equal(inputEl.value, "");
+  assert.equal(
+    feedEl.children.at(-1)?.dataset.phase,
+    "accepted",
+    "optimistic user bubble stays visible after composer clears before chat_poll",
+  );
+  assert.equal(feedEl.scrollTop, feedEl.scrollHeight);
+  pollDeferred.resolve({
+    generation: "g1",
+    page_start: 300,
+    items: [
+      { id: "u4", kind: "user", text: "방금 음성으로 입력한 메시지" },
+      { id: "a5", kind: "assistant", text: "답변입니다" },
+    ],
+    next_offset: 400,
+    bound: true,
+  });
+  await flush();
+  assert(
+    !feedEl.children.some((n) => n.className?.includes("chat-optimistic")),
+    "optimistic bubble removes cleanly when transcript user item arrives",
+  );
+  assert.equal(
+    feedEl.children.filter((n) => n.className?.includes("chat-user")).length,
+    1,
+    "exactly one user bubble remains without duplicates",
+  );
+  assert.equal(feedEl.scrollTop, feedEl.scrollHeight);
+  // Native dictation commit without input event survives blur and unmount.
+  inputEl.value = "음성 받아쓰기 마지막 문장";
+  inputEl.dispatchEvent(new Event("blur"));
+  assert.equal(f.state.drafts.get(7), "음성 받아쓰기 마지막 문장");
+  f.dispose();
+  console.log(
+    "PASS scrolled-up submit jumps to bottom with optimistic user bubble, reconciles without duplicate, and protects dictation input",
+  );
 }
 main().catch((error) => {
   console.error(error);

@@ -482,6 +482,7 @@ button.account-row:disabled{opacity:1}
 #mobile-app .chat-user{background:transparent;border:0;padding:0;max-width:85%;gap:2px;align-items:flex-end}
 #mobile-app .chat-user>.chat-role{display:none}
 #mobile-app .chat-user>.chat-md{padding:10px 16px;border-radius:20px;background:var(--surface-raised)}
+.chat-optimistic[data-phase=sending]{opacity:.72}
 
 
 .chat-h{margin:0;font-size:var(--font-body);font-weight:600;line-height:1.5}
