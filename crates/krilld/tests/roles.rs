@@ -570,12 +570,14 @@ fn session_peer_can_wait_read_and_send_to_created_child_and_unrelated_session() 
             id: session_a,
             pid: std::process::id(),
             status: None,
+            size: None,
             master: OwnedFd::from(master_a),
         },
         Kept {
             id: session_c,
             pid: 1,
             status: None,
+            size: None,
             master: OwnedFd::from(master_c),
         },
     ];

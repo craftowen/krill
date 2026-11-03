@@ -181,6 +181,7 @@ fn fixture() -> (Registry, UnixStream, Link) {
                 id: SessionId(1),
                 pid: std::process::id(),
                 status: None,
+                size: None,
                 master: OwnedFd::from(master),
             }],
         )),

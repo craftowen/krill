@@ -227,6 +227,10 @@ mod tests {
             req: 1,
             id: krill_proto::SessionId(2),
             pid: std::process::id(),
+            size: Some(krill_proto::holder::WinSize {
+                cols: 160,
+                rows: 45,
+            }),
         };
         a.send(&remote.request(&message)?, &[])?;
         remote.commit();
