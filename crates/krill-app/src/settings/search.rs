@@ -52,7 +52,6 @@ mod tests {
         }
         assert!(search_tabs("페어링").contains(&AdminTab::Machines));
         assert_eq!(search_tabs("동면"), [AdminTab::System]);
-        assert!(search_tabs("webhook").contains(&AdminTab::System));
         // 알림 이벤트(OWE-659)는 알림 항목에서 찾는다.
         for q in ["벨", "bell", "입력", "input", "승인", "완료", "done"] {
             assert!(search_tabs(q).contains(&AdminTab::System), "{q}");

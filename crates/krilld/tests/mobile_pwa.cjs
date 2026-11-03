@@ -133,7 +133,7 @@ assert.equal(sandbox.KrillMobile.terminal.keys.length,24);
 const dir=fs.mkdtempSync('/tmp/m9pwa-'),repo=path.join(dir,'repo'),home=path.join(dir,'home'),profile=path.join(dir,'account');
 fs.mkdirSync(repo);fs.mkdirSync(home);fs.mkdirSync(profile);fs.mkdirSync(path.join(dir,'paste'),{mode:0o700});
 const env={...process.env,KRILL_TEST_OFFLINE:'1',KRILL_TELEMETRY_DISABLED:'1',KRILL_ERROR_REPORTING_DISABLED:'1',KRILL_STATE_DIR:dir,HOME:home,CLAUDE_CONFIG_DIR:path.join(home,'.claude'),CODEX_HOME:path.join(home,'.codex'),TMPDIR:path.join(dir,'paste')};
-const log=fs.openSync(path.join(dir,'holder.log'),'a');let holder,daemon=0,phone,other,webhookServer,files=[];
+const log=fs.openSync(path.join(dir,'holder.log'),'a');let holder,daemon=0,phone,other,files=[];
 const deadline=setTimeout(()=>{console.error('PWA E2E deadline exceeded');cleanup();process.exit(1);},150_000);
 function cli(args){return execFileSync(mk,args,{env,encoding:'utf8',timeout:20000,stdio:['ignore','pipe','pipe']}).trim();}
 function jsonCli(args){return JSON.parse(cli([...args,'--json']));}
@@ -143,7 +143,7 @@ function string(s){const bytes=Buffer.from(s);return Buffer.concat([v(bytes.leng
 function frame(k,body){const h=Buffer.alloc(5);h.writeUInt32LE(body.length+1);h[4]=k;return Buffer.concat([h,body]);}
 function reader(bytes){let at=0;return{u(){let n=0n,shift=0n;for(;;){const b=bytes[at++];n|=BigInt(b&127)<<shift;if(!(b&128))return n;shift+=7n;}},text(){const n=Number(this.u()),s=bytes.subarray(at,at+n).toString();at+=n;return s;}};}
 async function until(fn){const end=Date.now()+15000;while(Date.now()<end){try{const value=await fn();if(value)return value;}catch{}await new Promise(r=>setTimeout(r,30));}throw Error('condition timed out');}
-function cleanup(){clearTimeout(deadline);webhookServer?.close();phone?.socket.close();other?.socket.close();if(holder){try{const list=cli(['ls']).split('\n');for(const line of list){const id=line.split('\t')[0];if(/^\d+$/.test(id))cli(['kill',id]);}}catch{}holder.kill('SIGKILL');}if(daemon)try{process.kill(daemon,'SIGKILL');}catch{}for(const f of files)try{fs.unlinkSync(f);}catch{}fs.closeSync(log);fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
+function cleanup(){clearTimeout(deadline);phone?.socket.close();other?.socket.close();if(holder){try{const list=cli(['ls']).split('\n');for(const line of list){const id=line.split('\t')[0];if(/^\d+$/.test(id))cli(['kill',id]);}}catch{}holder.kill('SIGKILL');}if(daemon)try{process.kill(daemon,'SIGKILL');}catch{}for(const f of files)try{fs.unlinkSync(f);}catch{}fs.closeSync(log);fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
 async function connect(url,credential){
  const u=new URL(url),socket=new WebSocket(`ws://${u.host}/ws`);socket.binaryType='arraybuffer';const messages=[],waiting=[];let failure;
  socket.addEventListener('message',e=>{const w=waiting.shift();if(w)w.resolve(e.data);else messages.push(e.data);});
@@ -286,15 +286,6 @@ async function connect(url,credential){
   const rejectedCode=await new Promise((resolve,reject)=>{const u=new URL(url),ws=new WebSocket(`ws://${u.host}/ws`);ws.binaryType='arraybuffer';ws.addEventListener('error',reject,{once:true});ws.addEventListener('message',e=>{const ch=JSON.parse(e.data),nonce=crypto.randomBytes(32),chan=new C.Channel(new Uint8Array(32),C.concat(C.unhex(ch.challenge),nonce));ws.send(JSON.stringify({token:null,device_id:saved.device_id,client_nonce:nonce.toString('hex')}));ws.send(chan.seal(new TextEncoder().encode('{"label":"Bad credential"}')));},{once:true});ws.addEventListener('close',e=>resolve(e.code),{once:true});});
   assert.equal(rejectedCode,1008);
   other=await connect(url,saved);const resumed=await other.rpc({action:'snapshot'});assert(resumed.sessions.some(s=>s.id===session));
-  // Daemon-owned notifications reach all providers with no desktop process running.
-  const posts=[];webhookServer=require('node:http').createServer((req,res)=>{let body='';req.on('data',b=>body+=b);req.on('end',()=>{posts.push({path:req.url,body});res.writeHead(204);res.end();});});await new Promise(r=>webhookServer.listen(0,'127.0.0.1',r));
-  const webhookBase=`http://127.0.0.1:${webhookServer.address().port}`;
-  fs.writeFileSync(path.join(dir,'settings.toml'),`notifications = false\n[[webhooks]]\nprovider = "ntfy"\nurl = "${webhookBase}/ntfy"\n[[webhooks]]\nprovider = "telegram"\nurl = "${webhookBase}/telegram"\nchat_id = "fixture"\n[[webhooks]]\nprovider = "discord"\nurl = "${webhookBase}/discord"\n`);
-  for(const [file,event] of [['working','UserPromptSubmit'],['waiting','PermissionRequest'],['done','Stop']])fs.writeFileSync(path.join(dir,file+'.json'),JSON.stringify({hook_event_name:event}));
-  const hookCommand=`while [ ! -f '${dir}/webhook-go' ]; do sleep 0.02; done; '${mk}' hook claude < '${dir}/working.json'; '${mk}' hook claude < '${dir}/waiting.json'; '${mk}' hook claude < '${dir}/done.json'; printf 'SECRET_TERMINAL_CONTENT\\n'; exec /bin/cat`;
-  const notifiedSession=Number(cli(['new','--cwd',repo,'--','/bin/sh','-c',hookCommand]));fs.writeFileSync(path.join(dir,'webhook-go'),'');await until(()=>posts.length===6);
-  for(const provider of ['ntfy','telegram','discord']){const pair=posts.filter(p=>p.path==='/'+provider);assert.equal(pair.length,2);for(const p of pair){assert(p.body.includes(base+'/?session='+notifiedSession));assert(!p.body.includes('SECRET'));assert(!p.body.includes('pair='));assert(!p.body.includes('key='));}assert(pair[0].body.includes('waiting for input'));assert(pair[1].body.includes('completed'));}
-  console.log('Daemon webhook E2E passed: ntfy, Telegram, Discord, waiting/done, credential-free deep links and no app process');
   const {fragment}=await other.rpc({action:'install_handoff'});assert.match(fragment,/^pair=[0-9a-f]{64}&key=[\w-]{43}$/);await require('./mobile_install.cjs').main({base,fragment});
   console.log('PWA E2E passed: non-secure pure JS E2EE, gzip assets, approval, IME text, photo 0600, account switch, gate reply, diff, mock handoff and credential reconnect');
  } finally {cleanup();}

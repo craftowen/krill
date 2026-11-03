@@ -95,8 +95,6 @@ pub struct Settings {
     /// 하단 상태바 사용량에서 숨길 프로바이더 목록(기본 빈 목록 = 모두 표시).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_status_providers: Vec<String>,
-    /// 완료 웹훅 opt-in. 기본은 빈 목록이며 URL에 비밀 토큰이 들어갈 수 있다.
-    pub webhooks: Vec<crate::webhook::Endpoint>,
     /// Copy Context의 최근 출력 행 수(1..=1000으로 제한).
     pub copy_context_lines: u16,
     /// 저장 명령·프롬프트(MK-092). 클릭하면 실행 키 없이 붙여넣는다.
@@ -275,7 +273,6 @@ impl Default for Settings {
             notifications: true,
             keep_awake: KeepAwake::Off,
             hidden_status_providers: Vec::new(),
-            webhooks: Vec::new(),
             copy_context_lines: 100,
             quick_commands: Vec::new(),
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
@@ -1246,7 +1243,7 @@ fn read_config(dir: Option<&Path>, mut settings: Settings) -> LoadedConfig {
                     }
                     settings = parsed;
                 }
-                // TOML 원문 진단에는 웹훅 토큰이 섞일 수 있어 원문을 표시하지 않는다.
+                // TOML 원문 진단에는 비밀 토큰이 섞일 수 있어 원문을 표시하지 않는다.
                 Err(_) => {
                     errors.push(format!("{SETTINGS_FILE}: {}", text::INVALID_SETTINGS.get()));
                 }
@@ -1908,7 +1905,7 @@ fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::i
     result
 }
 
-/// 웹훅 비밀 토큰을 담을 수 있으므로 0600으로 쓴다. 기존 파일을 `set_len(0)`으로
+/// 비밀 토큰을 담을 수 있으므로 0600으로 쓴다. 기존 파일을 `set_len(0)`으로
 /// 비우던 방식은 중간 크래시에 0바이트 파일을 남기므로, 고유 임시 파일에 다 쓰고
 /// 같은 디렉터리에서 바꿔 다는 원자 교체로 통일한다(AS-08).
 fn write_settings(path: &Path, body: &str) -> std::io::Result<()> {

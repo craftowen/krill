@@ -2476,8 +2476,6 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         catalog::settings::FILES_TITLE,
         &[
             "settings.toml",
-            "웹훅",
-            "webhook",
             "커서",
             "cursor",
             "깜박임",

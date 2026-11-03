@@ -281,7 +281,6 @@ fn settings_parse_defaults_and_zoom() {
     let def = Settings::default();
     assert_eq!(Settings::parse("").unwrap(), def);
     assert!(def.notifications);
-    assert!(def.webhooks.is_empty());
     assert_eq!(def.keep_awake, KeepAwake::Off);
     // OWE-872: 실행 중 닫기 확인은 기본 켜짐이며, 끈 값도 그대로 왕복한다.
     assert!(def.confirm_running_close);
@@ -309,51 +308,6 @@ fn settings_parse_defaults_and_zoom() {
     assert!((z(f32::NAN).zoom() - 1.0).abs() < f32::EPSILON);
     assert!((z(1.0).zoom_step(1) - 1.1).abs() < 1e-6);
     assert!((z(ZOOM_MIN).zoom_step(-1) - ZOOM_MIN).abs() < f32::EPSILON);
-}
-
-#[gpui::test]
-fn webhook_settings_roundtrip_survive_ui_edits_and_redact_parse_errors(cx: &mut TestAppContext) {
-    let d = dir("webhooks");
-    let body = "[[webhooks]]\nprovider = \"telegram\"\nurl = \"https://api.telegram.org/botSECRET/sendMessage\"\nchat_id = \"PRIVATE\"\n";
-    fs::write(d.join(SETTINGS_FILE), body).unwrap();
-    init(cx, &d);
-    cx.update(|cx| {
-        assert_eq!(current(cx).webhooks.len(), 1);
-        assert_eq!(
-            Settings::parse(&current(cx).to_toml()).unwrap(),
-            current(cx)
-        );
-        assert!(!format!("{:?}", current(cx)).contains("SECRET"));
-        edit(cx, |s| s.zoom = 1.3);
-        assert_eq!(current(cx).webhooks.len(), 1);
-    });
-    cx.run_until_parked();
-    let saved = fs::read_to_string(d.join(SETTINGS_FILE)).unwrap();
-    assert_eq!(
-        fs::metadata(d.join(SETTINGS_FILE))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-    assert_eq!(Settings::parse(&saved).unwrap().webhooks.len(), 1);
-    fs::write(
-        d.join(SETTINGS_FILE),
-        body.replace("telegram", "SECRET_INVALID"),
-    )
-    .unwrap();
-    cx.update(|cx| {
-        reload(cx);
-    });
-    cx.run_until_parked();
-    cx.update(|cx| {
-        assert_eq!(current(cx).webhooks.len(), 1);
-        let error = cx.global::<Config>().error.as_ref().unwrap();
-        assert!(!error.contains("SECRET"));
-        assert!(!error.contains("PRIVATE"));
-    });
-    fs::remove_dir_all(d).ok();
 }
 
 /// OWE-883: 사람에게 보이는 한 줄·문구에 Rust 디버그 포맷(`{:?}`)과 내부 영문이 그대로 노출되지 않는다.
@@ -4766,7 +4720,7 @@ fn confirm_button_keeps_bounds_and_disarms_outside_escape_and_timeout(cx: &mut T
     fs::remove_dir_all(d).ok();
 }
 
-/// 같은 헬퍼를 쓰는 다른 위험 버튼(웹훅 비우기·기록 삭제·오케스트레이션 초기화)도 무장 시 폭이 그대로고
+/// 같은 헬퍼를 쓰는 다른 위험 버튼(기록 삭제·오케스트레이션 초기화)도 무장 시 폭이 그대로고
 /// 바깥 클릭으로 풀리며 실행하지 않는다.
 #[gpui::test]
 fn other_confirm_buttons_keep_width_and_disarm_on_outside_click(cx: &mut TestAppContext) {
@@ -4774,13 +4728,6 @@ fn other_confirm_buttons_keep_width_and_disarm_on_outside_click(cx: &mut TestApp
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(6000.)));
-    vcx.update(|_, cx| {
-        edit(cx, |s| {
-            s.webhooks.push(crate::webhook::Endpoint::Ntfy {
-                url: "http://127.0.0.1:9/hook".into(),
-            });
-        });
-    });
     let id = "admin-history-clear";
     vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx)));
     vcx.run_until_parked();
@@ -4796,7 +4743,6 @@ fn other_confirm_buttons_keep_width_and_disarm_on_outside_click(cx: &mut TestApp
     vcx.simulate_click(outside, gpui::Modifiers::default());
     vcx.run_until_parked();
     vcx.update(|_, cx| assert_eq!(view.read(cx).armed, None, "{id} stayed armed"));
-    vcx.update(|_, cx| assert_eq!(current(cx).webhooks.len(), 1));
     fs::remove_dir_all(d).ok();
 }
 
@@ -8049,7 +7995,7 @@ fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut Test
 }
 
 /// OWE-801: Workflows 탭의 컨텍스트 줄 수 `SegmentedControl`, 저장소 선택 컨텍스트 통합,
-/// 심볼릭 링크 등폭 칩 추가/제거, 빠른 명령 추가/수정/삭제, 완료 웹훅 배지+URL 표시 및 추가/삭제,
+/// 심볼릭 링크 등폭 칩 추가/제거, 빠른 명령 추가/수정/삭제,
 /// 예약 작업 활성/일시정지 `Switch` 및 820px 좁은 창 경계 준수를 검증한다.
 #[gpui::test]
 fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switch(

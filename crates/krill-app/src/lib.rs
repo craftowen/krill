@@ -50,5 +50,4 @@ pub mod terminal;
 pub mod terminal_font;
 pub mod ui;
 pub mod updater;
-pub mod webhook;
 pub mod worktree;
