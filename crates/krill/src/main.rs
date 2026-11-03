@@ -19,8 +19,6 @@ macro_rules! println {
 mod account;
 mod artifacts;
 mod changes;
-#[cfg(target_os = "macos")]
-mod computer;
 mod doctor;
 mod errors;
 mod file;
@@ -51,23 +49,7 @@ use std::process::ExitCode;
 use krill_proto::agent::{self, Agents, Permission};
 use krill_proto::daemon;
 
-#[cfg(target_os = "macos")]
-macro_rules! computer_usage {
-    () => {
-        " | krill computer <cmd>"
-    };
-}
-#[cfg(not(target_os = "macos"))]
-macro_rules! computer_usage {
-    () => {
-        ""
-    };
-}
-
-const USAGE: &str = concat!(
-    "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|retention|unshare|status|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable|flush [--json] | krill errors status|enable|disable|flush [--json] | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]",
-    computer_usage!()
-);
+const USAGE: &str = "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|retention|unshare|status|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable|flush [--json] | krill errors status|enable|disable|flush [--json] | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]";
 
 fn main() -> ExitCode {
     run(std::env::args_os().skip(1).collect())
@@ -215,10 +197,6 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
     if raw.first().is_some_and(|s| s == "skills") {
         return skills::run_skills(&raw[1..]);
     }
-    #[cfg(target_os = "macos")]
-    if raw.first().is_some_and(|s| s == "computer") {
-        return computer::run(&raw[1..]);
-    }
     if raw.first().is_some_and(|s| s == "handoff") {
         return skills::run_handoff(&raw[1..]);
     }
@@ -353,8 +331,6 @@ mod tests {
             vec!["update", "--help"],
             vec!["search", "--help"],
             vec!["mobile", "pair", "--help"],
-            #[cfg(target_os = "macos")]
-            vec!["computer", "--help"],
             vec!["ls", "--help"],
             vec!["new", "--help"],
             vec!["send", "--help"],
@@ -382,11 +358,6 @@ mod tests {
             assert_eq!(run(raw.clone()), ExitCode::SUCCESS, "{raw:?}");
         }
         // send -- --help는 리터럴이므로 도움말이 아니다(세션 모듈 단위 테스트에서 보장).
-    }
-
-    #[test]
-    fn computer_command_is_advertised_only_on_macos() {
-        assert_eq!(USAGE.contains("krill computer"), cfg!(target_os = "macos"));
     }
 
     #[test]
