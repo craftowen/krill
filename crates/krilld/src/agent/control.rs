@@ -809,6 +809,7 @@ impl Control {
     pub fn forget(&self, session: SessionId) {
         self.finish_account_resume(session);
         lock(&self.veto).remove(&session);
+        self.clear_rate_limited(session);
         let _guard = lock(&self.config);
         if let Ok(path) = self.launch_path(session) {
             fs::remove_file(path).ok();
