@@ -915,6 +915,7 @@ fn upgrade_holder_loss_after_done_resumes_readers_and_keeps_output() {
                 id: session,
                 pid: child_pid,
                 status: None,
+                size: None,
             },
             &[controller.as_fd()],
         );

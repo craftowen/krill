@@ -283,6 +283,32 @@ impl Store {
         result
     }
 
+    pub(crate) fn last_size(&self, id: SessionId) -> Option<WinSize> {
+        if !self.recording {
+            return None;
+        }
+        segment::warm_decoder();
+        let mut paths = segments(&self.session_dir(id)).ok()?;
+        while let Some(path) = paths.pop() {
+            let seg = match segment::read(&path, self.key.as_deref()) {
+                Ok(Some(seg)) if !seg.records.is_empty() => seg,
+                Ok(_) => continue,
+                Err(_) => return None,
+            };
+            let size = seg
+                .records
+                .iter()
+                .rev()
+                .find_map(|r| match r {
+                    Record::Resize(sz) => Some(*sz),
+                    _ => None,
+                })
+                .unwrap_or(seg.header.size);
+            return (size.cols > 0 && size.rows > 0).then_some(size);
+        }
+        None
+    }
+
     /// 세션 `id`의 콜드 스크롤백 기준선(`seq`)을 기록한다(OWE-873b).
     /// 세그먼트 파일은 지우지 않고 기준선 이전 원본에서 밀려난 행만 히스토리 응답에서 제외한다.
     pub fn clear_scrollback(&self, id: SessionId, seq: u64) {

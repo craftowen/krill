@@ -600,7 +600,12 @@ fn adopt(link: &mut Link, dir: &Path, sessions: usize) {
         while link.recv().unwrap().is_some() {} // holder kill -9 → EOF. master는 여기 남아 있다.
         let (s, _) = l.accept().unwrap();
         let status = None;
-        let m = FromHolder::Session { id, pid, status };
+        let m = FromHolder::Session {
+            id,
+            pid,
+            status,
+            size: None,
+        };
         Link::new(OwnedFd::from(s))
             .send(&m.encode().unwrap(), &[master.as_fd()])
             .unwrap();
@@ -620,15 +625,26 @@ fn adopt(link: &mut Link, dir: &Path, sessions: usize) {
         req: 1,
         id: SessionId(4),
         pid: dead,
+        size: None,
     };
     assert_eq!(
         ask(link, m, &fd),
         FromHolder::Failed { req: 1, errno: 3 },
         "끝난 pid ESRCH"
     );
-    let m = ToHolder::Adopt { req: 2, id, pid };
+    let m = ToHolder::Adopt {
+        req: 2,
+        id,
+        pid,
+        size: None,
+    };
     assert_eq!(ask(link, m, &fd), FromHolder::Done { req: 2 });
-    let m = ToHolder::Adopt { req: 3, id, pid };
+    let m = ToHolder::Adopt {
+        req: 3,
+        id,
+        pid,
+        size: None,
+    };
     assert_eq!(
         ask(link, m, &fd),
         FromHolder::Failed { req: 3, errno: 17 },
