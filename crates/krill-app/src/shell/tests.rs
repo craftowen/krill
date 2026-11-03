@@ -11743,6 +11743,123 @@ fn sticky_prompt_bar_uses_polled_remote_history_with_colliding_session_id(cx: &m
 }
 
 #[gpui::test]
+fn ctrl_c_copies_selected_terminal_text_without_sending_sigint_and_interrupts_when_unselected(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::input::Input;
+    use krill_proto::screen::{Cell, Msg as _, Op, Revision, Seq, encode_update};
+
+    let (view, cx) = open(cx, state_path("ctrl-c-selection"));
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let cells = "copy-me"
+        .chars()
+        .map(|ch| Cell {
+            ch,
+            ..Cell::default()
+        })
+        .collect::<Vec<_>>();
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.focus.focus(window, cx);
+            s.attach_test(pane, krill_proto::SessionId(77), ours, cx);
+            let ops = vec![
+                Op::Reset { cols: 20, lines: 4 },
+                Op::Line { line: 0, cells },
+            ];
+            let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+            let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+            assert!(s.on_frame(pane, k, &body, cx));
+            let l = s.live.get_mut(&pane).unwrap();
+            l.selection = Some(Anchored {
+                anchor: (0, 0),
+                head: (0, 6),
+                block: false,
+            });
+            l.selecting = true;
+            assert!(s.select_end(pane, cx));
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).live[&pane].selected_text()),
+        Some("copy-me".to_owned())
+    );
+
+    // 1. 선택 영역이 있을 때 Ctrl+C는 클립보드로 복사하고 선택을 해제하며 PTY에 0x03(SIGINT)을 보내지 않는다.
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("copy-me")
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).live[&pane].selected_text()),
+        None
+    );
+
+    // 2. 선택 영역이 없을 때 Ctrl+C는 기존처럼 PTY에 0x03(SIGINT)을 보낸다.
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    let (k, body) = ipc::read_frame(&mut theirs).unwrap().unwrap();
+    let input = Input::decode(k, &body).unwrap();
+    assert_eq!(input.bytes, vec![0x03]);
+}
+
+#[gpui::test]
+fn vertical_mouse_wheel_over_tab_bar_scrolls_tabs_horizontally(cx: &mut TestAppContext) {
+    let (_view, cx) = open(cx, state_path("tab-wheel-scroll"));
+    for _ in 0..15 {
+        cx.simulate_keystrokes("cmd-t");
+    }
+    cx.simulate_keystrokes("cmd-1");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let tab0_before = cx.debug_bounds("session-tab-0").expect("session-tab-0");
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: tab0_before.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-120.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let tab0_scrolled = cx
+        .debug_bounds("session-tab-0")
+        .expect("session-tab-0 after wheel down");
+    assert!(
+        tab0_scrolled.left() < tab0_before.left(),
+        "vertical mouse wheel down over tab bar should scroll tabs right: before={:?}, after={:?}",
+        tab0_before.left(),
+        tab0_scrolled.left()
+    );
+
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: tab0_before.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(120.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let tab0_back = cx
+        .debug_bounds("session-tab-0")
+        .expect("session-tab-0 after wheel up");
+    assert!(
+        tab0_back.left() > tab0_scrolled.left(),
+        "vertical mouse wheel up over tab bar should scroll tabs left: scrolled={:?}, back={:?}",
+        tab0_scrolled.left(),
+        tab0_back.left()
+    );
+}
+
+#[gpui::test]
 fn clicking_observed_closed_tab_prunes_without_infinite_retry_or_respawn(cx: &mut TestAppContext) {
     use krill_app::hosts::HostId;
     use krill_proto::control::{

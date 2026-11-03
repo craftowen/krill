@@ -613,6 +613,28 @@ fn fit_sends_resize_and_focus_once_per_size_and_on_relink() {
     out(&mut p).clear();
     assert!(p.fit(120, 40).is_none());
     assert!(out(&mut p).is_empty());
+    // 데몬 화면 크기가 어긋나 있으면(재기동·외부 리사이즈 등) 같은 칸 크기라도 다시 보낸다.
+    update(
+        &mut p,
+        1,
+        vec![Op::Reset {
+            cols: 80,
+            lines: 24,
+        }],
+    );
+    assert!(p.fit(120, 40).is_none());
+    assert_eq!(role_requests(out(&mut p)), [resize, Focus]);
+    update(
+        &mut p,
+        2,
+        vec![Op::Reset {
+            cols: 120,
+            lines: 40,
+        }],
+    );
+    out(&mut p).clear();
+    assert!(p.fit(120, 40).is_none());
+    assert!(out(&mut p).is_empty());
     assert!(p.fit(90, 20).is_none());
     assert_eq!(
         role_requests(out(&mut p)),

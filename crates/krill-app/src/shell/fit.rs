@@ -10,14 +10,16 @@ use krill_app::terminal::{cell_size, grid};
 use super::Shell;
 
 #[derive(Default)]
-pub(super) struct Pending(HashMap<PaneId, ((u16, u16), Task<()>)>);
+pub(super) struct Pending(pub(super) HashMap<PaneId, ((u16, u16), Task<()>)>);
 
 impl Shell {
     pub(super) fn schedule_fit(&mut self, pane: PaneId, want: (u16, u16), cx: &mut Context<Self>) {
         let Some(live) = self.live.get(&pane) else {
             return;
         };
-        if live.pane.grid() == Some(want) {
+        let s = live.pane.screen();
+        let screen_diverged = s.cols > 0 && s.lines > 0 && (s.cols, s.lines) != want;
+        if live.pane.grid() == Some(want) && !screen_diverged {
             self.fits.0.remove(&pane);
             return;
         }
@@ -36,6 +38,7 @@ impl Shell {
             this.update(cx, |this, cx| {
                 this.fits.0.remove(&pane);
                 if cx.has_active_drag() {
+                    this.schedule_fit(pane, want, cx);
                     return;
                 }
                 if let Some(live) = this.live.get_mut(&pane) {
@@ -61,14 +64,12 @@ impl Shell {
         let probe = canvas(
             move |bounds, window, cx| {
                 let want = grid(bounds.size, cell_size(window, cx));
-                if !cx.has_active_drag() {
-                    cx.defer(move |cx| {
-                        me.update(cx, |t, cx| {
-                            t.schedule_fit(pane, want, cx);
-                        })
-                        .ok();
-                    });
-                }
+                cx.defer(move |cx| {
+                    me.update(cx, |t, cx| {
+                        t.schedule_fit(pane, want, cx);
+                    })
+                    .ok();
+                });
             },
             |_, (), _, _| {},
         );
