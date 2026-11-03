@@ -242,6 +242,9 @@ pub const SUN_PATH_MAX: usize = 108;
 const NOFILE: u32 = 10_240;
 /// 띄운 뒤 소켓이 생길 때까지 기다리는 최대 시간.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// 실패한 기동의 holder가 SIGTERM으로 끝나기를 기다리는 최대 시간(세션을 새 krilld에 넘기는 시간 포함).
+#[cfg(unix)]
+const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
 /// 붙은 뒤 `ServerHello`를 기다리는 최대 시간. krilld가 멈춰 있어도 앱·CLI가 붙잡히지 않게 한다.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -880,18 +883,34 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
         }
         thread::sleep(POLL);
     };
+    // 실패한 기동의 holder를 남기면 krilld를 백오프로 영구 재기동한다(A-05). Windows에서 띄운 것은 곧바로 끝나는
+    // bootstrap이라 실제 holder에 닿지 않는다. 그 holder는 세션이 없으면 스스로 포기한다.
+    #[cfg(unix)]
+    if ready.is_err() {
+        stop_launched(&mut holder);
+    }
     // ponytail: 붙으면 holder는 띄운 프로세스의 자식으로 남는다(앱이 먼저 끝나면 launchd가 거둔다).
     // 앱보다 먼저 죽으면 앱이 끝날 때까지 좀비 하나가 남는다. 거슬리면 앱에서 waitpid 스레드.
-    ready
-        .map(|c| Connection {
-            launched: true,
-            ..c
-        })
-        .inspect_err(|_| {
-            // 실패한 기동의 holder를 남기면 krilld를 백오프로 영구 재기동한다(A-05).
-            holder.kill().ok();
-            holder.wait().ok();
-        })
+    ready.map(|c| Connection {
+        launched: true,
+        ..c
+    })
+}
+
+/// 띄운 holder를 SIGTERM으로 끝낸다. 그 holder는 고아 krilld에게서 세션을 넘겨받아 master 마지막 사본을 쥐고 있을 수
+/// 있어 SIGKILL하지 않는다. SIGTERM이면 holder가 세션을 krilld에 넘기고 끝난다. [`STOP_TIMEOUT`] 안에 끝나지 않는
+/// holder는 세션이 있는지 알 수 없어 그대로 둔다.
+#[cfg(unix)]
+fn stop_launched(holder: &mut std::process::Child) {
+    use rustix::process::{Pid, Signal, kill_process};
+    // 아직 거두지 않은 자식이라 pid가 재사용되지 않았다.
+    if let Some(pid) = i32::try_from(holder.id()).ok().and_then(Pid::from_raw) {
+        kill_process(pid, Signal::TERM).ok();
+    }
+    let deadline = Instant::now().checked_add(STOP_TIMEOUT);
+    while matches!(holder.try_wait(), Ok(None)) && deadline.is_some_and(|d| Instant::now() < d) {
+        thread::sleep(POLL);
+    }
 }
 
 /// 소켓은 살아 있는데 Hello 전에 닫혔다(업그레이드로 끝나는 구 krilld, 재결합 중 닫힌 구 krilld, 막 뜬 뒤 죽은
