@@ -255,19 +255,22 @@ fn holder_that_dies_is_reported() {
 }
 
 /// A-05: 띄운 뒤 핸드셰이크가 다시 해도 안 되는 오류로 끝나면 띄운 holder를 남기지 않는다. 남기면 그 holder가
-/// krilld를 30초마다 영구 재기동한다.
+/// krilld를 30초마다 영구 재기동한다. 그 holder는 고아 krilld에게서 세션을 넘겨받았을 수 있어 SIGKILL하지 않고
+/// 종료 신호로 세션을 새 krilld에 넘기고 끝나게 한다.
 #[cfg(unix)]
 #[test]
-fn launched_holder_is_killed_when_connect_fails() {
+fn launched_holder_is_stopped_gracefully_when_connect_fails() {
     use std::os::unix::fs::PermissionsExt as _;
     let d = dir("launch-fails");
     std::fs::create_dir_all(d.join("run")).unwrap();
     let pid_file = d.join("holder.pid");
+    let handed = d.join("handed-off");
     let holder = d.join("holder.sh");
     std::fs::write(
         &holder,
         format!(
-            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            "#!/bin/sh\ntrap \"touch '{}'; exit 0\" TERM\necho $$ > '{}'\nwhile :; do sleep 0.05; done\n",
+            handed.display(),
             pid_file.display()
         ),
     )
@@ -308,6 +311,10 @@ fn launched_holder_is_killed_when_connect_fails() {
         .status()
         .ok();
     assert!(!alive, "connect left the launched holder running");
+    assert!(
+        handed.exists(),
+        "connect killed the launched holder before it could hand its sessions off"
+    );
     std::fs::remove_dir_all(&d).ok();
 }
 

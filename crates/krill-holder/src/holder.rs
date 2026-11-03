@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::sys::kq::{Event, EventFilter, EventFlags, ProcessEvents};
 use krill_proto::SessionId;
-use krill_proto::daemon::KRILLD_DUPLICATE;
+use krill_proto::daemon::{KRILLD_DUPLICATE, KRILLD_HANDOVER_FAILED};
 use krill_proto::holder::Error::UnknownKind;
 use krill_proto::holder::{
     FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION, WinSize,
@@ -109,8 +109,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
     if let Some(state) = sys::take_handoff()? {
         h.restore(state);
     }
-    // exec 복원 ACK를 로그 디렉터리·파일 IO 뒤로 늦추지 않는다(OWE-606).
+    // exec 복원 ACK를 로그 디렉터리·소켓 소유 락 파일 IO 뒤로 늦추지 않는다(OWE-606).
     krill_log::init(krill_log::Component::Holder).ok();
+    h.owner = h.listener.as_ref().and_then(own_socket);
     tracing::info!("holder starting");
     h.event_loop()
 }
@@ -370,13 +371,14 @@ impl Holder {
         while let Ok(Some((pid, st))) = rustix::process::wait(WaitOptions::NOHANG) {
             let status = st.as_raw();
             if self.krilld.as_ref().is_some_and(|k| k.pid == pid) {
-                if st.exit_status() == Some(i32::from(KRILLD_DUPLICATE)) {
-                    // 다른 데몬이 소켓을 쥐어 다시 띄워도 같다(30초마다 영구 재기동, A-01). master는 세션이 끝날 때까지 쥔다.
+                let code = st.exit_status().and_then(|c| u8::try_from(c).ok());
+                if code == Some(KRILLD_DUPLICATE) && self.owner.is_none() {
+                    // 다른 데몬이 소켓을 쥐어 다시 띄워도 같다(A-01). 소켓을 맡은 holder의 중복은 bind 탐침과 겹친 일시 충돌이고, 멈추면 owner 락 때문에 아무도 그 소켓을 받지 못해 백오프로 다시 띄운다.
                     tracing::warn!(sessions = self.sessions.len(), "daemon duplicate");
                     self.krilld = None;
                     self.restart_at = None;
                 } else {
-                    self.on_krilld_exit();
+                    self.on_krilld_exit(code == Some(KRILLD_HANDOVER_FAILED));
                 }
             } else if let Some(s) = Self::reap_target(&mut self.sessions, pid) {
                 s.status = Some(status);
@@ -412,29 +414,26 @@ impl Holder {
             .iter_mut()
             .filter(|s| s.adopted && s.status.is_none());
         if let Some(s) = live.find(|s| s.pid == pid) {
-            s.status = Some(STATUS_UNKNOWN);
-            let id = s.id;
-            self.send(&FromHolder::Exited {
-                id,
-                status: STATUS_UNKNOWN,
-            });
+            let (id, status) = (s.id, STATUS_UNKNOWN);
+            s.status = Some(status);
+            self.send(&FromHolder::Exited { id, status });
             self.teardowns.iter_mut().for_each(|t| t.exited(pid));
         }
     }
 
-    fn on_krilld_exit(&mut self) {
-        let uptime = self
+    fn on_krilld_exit(&mut self, failed_handover: bool) {
+        let stable = self
             .krilld
             .take()
-            .map_or(Duration::ZERO, |k| k.started.elapsed());
+            .is_some_and(|k| !failed_handover && k.started.elapsed() >= STABLE);
         let handover = std::mem::take(&mut self.upgrading);
-        self.streak = match (handover, uptime >= STABLE) {
+        self.streak = match (handover, stable) {
             (true, _) => 0,
             (false, true) => 1,
             (false, false) => self.streak.saturating_add(1),
         };
         if !handover {
-            if uptime >= STABLE {
+            if stable {
                 // 새 경로가 안정됐다: 롤백 대상을 버린다.
                 self.prev_krilld = None;
                 self.unstable = 0;
@@ -574,7 +573,6 @@ impl Holder {
     fn restore(&mut self, h: sys::Handoff) {
         self.sessions = h.sessions;
         self.listener = h.listener;
-        self.owner = self.listener.as_ref().and_then(own_socket);
         self.krilld = Some(Krilld {
             pid: h.krilld,
             link: Some(Link::new(h.link)),
@@ -611,9 +609,10 @@ fn own_socket(listener: &OwnedFd) -> Option<File> {
     let path = OsStr::from_bytes(&[sock, b".holder.lock"].concat()).to_os_string();
     let mut open = File::options();
     let f = open.read(true).write(true).create(true).truncate(false);
-    let f = f.mode(0o600).open(path).ok()?;
-    f.try_lock().ok()?;
-    Some(f)
+    let f = f.mode(0o600).open(path);
+    let f = f.and_then(|f| f.try_lock().map(|()| f).map_err(io::Error::from));
+    f.inspect_err(|e| tracing::warn!(kind = ?e.kind(), "socket owner lock not taken"))
+        .ok()
 }
 
 fn hello() -> FromHolder {
