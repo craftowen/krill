@@ -224,10 +224,13 @@ impl Registry {
     /// 다시 넘긴 세션은 바로 다시 띄운다. 기록을 열지 못해도 세션은 띄운다(그 세션만 디스크 기록이 없다).
     pub fn new(holder: Option<(Holder, Vec<Kept>)>, dir: Option<&Path>) -> Self {
         let started = Instant::now();
+        // Only the daemon that owns a state folder upgrades account registrations. `cfg!(test)` does
+        // not cover other crates' tests that link krilld.
         if !cfg!(test)
+            && let Some(dir) = dir
             && let Err(error) = crate::usage::accounts::codex_home::migrate(
                 &crate::usage::accounts::default_home(),
-                dir,
+                Some(dir),
             )
         {
             tracing::warn!(kind = ?error.kind(), "Codex account home migration failed");
