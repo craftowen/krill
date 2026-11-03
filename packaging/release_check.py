@@ -20,7 +20,7 @@ VOLUME = Path("/Volumes/krill-build")
 TARGETS = VOLUME / "targets"
 BINARIES = ("krill-app", "krill", "krill-holder", "krilld", "krill-link")
 SCOPE = ("scripts/check.sh", "windows-clippy", "release-gui-kill9-replay", "release-gui-update-krilld-crash",
-         "release-holder-survival", "mobile-real-browser")
+         "release-daemon-memory-60mib", "release-holder-survival", "mobile-real-browser")
 SCHEMA = 1
 
 
@@ -207,6 +207,8 @@ def validate(head, directory, key_file):
     before = {name: sha256(target / "release" / name) for name in BINARIES}
     gates = ([pane, "release_survival::release_app_kill9_survives_and_replays_hash_three_times", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
              [fault, "release_gui_survival_e2e_2_and_3_three_rounds", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
+             # AGENTS rule 2 daemon budget (10 terminals, phys_footprint <= 60MiB) on the shipped profile, no GUI needed.
+             [fault, "fault_injection_accelerated_24h_memory_soak", "--exact", "--nocapture", "--test-threads=1"],
              [holder, "--nocapture", "--test-threads=1"])
     holder_tests = run([holder, "--list"], capture=True)
     for executable, test, *_ in gates[:-1]:

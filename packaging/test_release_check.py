@@ -113,7 +113,8 @@ class ValidationTests(unittest.TestCase):
                     if args[0].endswith("pane_e2e"):
                         return "release_survival::release_app_kill9_survives_and_replays_hash_three_times: test\n"
                     if args[0].endswith("fault_ci"):
-                        return "" if state["missing"] else "release_gui_survival_e2e_2_and_3_three_rounds: test\n"
+                        return "" if state["missing"] else ("release_gui_survival_e2e_2_and_3_three_rounds: test\n"
+                                                            "fault_injection_accelerated_24h_memory_soak: test\n")
                     return "krilld_kill: test\nprotocol_contract: test\nupgrade::exec_handoff: test\n"
                 if "release_survival::release_app_kill9_survives_and_replays_hash_three_times" in args:
                     if state["fail_gate"]:
@@ -134,6 +135,9 @@ class ValidationTests(unittest.TestCase):
                 # B-08: GUI update (vN->vN+1) and krilld kill -9 survival run on the release binaries.
                 self.assertTrue(any(call[0].endswith("fault_ci") and "release_gui_survival_e2e_2_and_3_three_rounds" in call
                                     and "--ignored" in call for call in calls))
+                # B-07: the daemon memory budget is measured on the release krilld, not only the test profile.
+                self.assertTrue(any(call[0].endswith("fault_ci") and "fault_injection_accelerated_24h_memory_soak" in call
+                                    for call in calls))
                 self.assertEqual(rc.verify(receipt, HEAD, key, allowed_root=root), root / "stage2/bin")
                 state["missing"] = True
                 with self.assertRaisesRegex(ValueError, "test is missing"):
