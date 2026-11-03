@@ -13,6 +13,7 @@ import time
 from urllib.parse import urlencode
 
 CANDIDATE_BRANCH = "release/nightly"
+CANDIDATE_PREFIX = "release/"
 CHECKS = {
     "ci.yml": {"hygiene"},
     "ci-macos.yml": {"changes", "ci-macos", "clippy · nextest · doctest (macos-15)",
@@ -134,16 +135,23 @@ class Evidence:
             return proof
         reuse_name = REUSE_JOBS.get(filename)
         if allow_reuse and branch == "main" and reuse_name and names.get(reuse_name, {}).get("conclusion") == "success":
-            source = self.proof(filename, sha, CANDIDATE_BRANCH)
-            if self.run(filename, sha, CANDIDATE_BRANCH)["event"] != "push":
-                raise EvidenceError("reused validation must come from a candidate push")
-            proof.update(mode="reused", source=source)
+            proof.update(mode="reused", source=self.reusable(filename, sha))
             return proof
         raise EvidenceError(f"{filename}: missing, skipped, or unsuccessful required validation jobs")
 
     def reusable(self, filename, sha):
-        proof = self.proof(filename, sha, CANDIDATE_BRANCH)
-        if self.run(filename, sha, CANDIDATE_BRANCH)["event"] != "push":
+        # Every release/** push runs full CI (workflow trigger), so any of them is a candidate.
+        # The newest one decides: a later failure on another release branch is not hidden.
+        query = urlencode({"head_sha": sha, "per_page": 100})
+        pages = self.read(f"repos/{self.repository}/actions/workflows/{self.workflow(filename)}/runs?{query}",
+                          paginate=True)
+        candidates = [run for page in pages for run in page["workflow_runs"]
+                      if str(run.get("head_branch")).startswith(CANDIDATE_PREFIX)]
+        if not candidates:
+            raise Pending(f"waiting for {filename} at {sha} on a {CANDIDATE_PREFIX} branch")
+        branch = max(candidates, key=lambda item: (item["id"], item["run_attempt"]))["head_branch"]
+        proof = self.proof(filename, sha, branch)
+        if self.run(filename, sha, branch)["event"] != "push":
             raise EvidenceError("reused validation must come from a candidate push")
         return proof
 

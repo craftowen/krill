@@ -161,6 +161,16 @@ class ProofTests(unittest.TestCase):
             evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
 
 
+    def test_any_release_branch_push_is_a_reusable_candidate_but_other_branches_are_not(self):
+        # Full CI runs on every release/** push; release/vX-topic candidates must not run macOS twice.
+        for branch in ("release/v0.2.48", "release/afternoon-20261031"):
+            with self.subTest(branch=branch):
+                fixture = Fixture(branch=branch)
+                self.assertEqual(fixture.evidence().reusable(fixture.filename, SHA)["branch"], branch)
+        fixture = Fixture(branch="feat/x")
+        with self.assertRaises(Pending):
+            fixture.evidence().reusable(fixture.filename, SHA)
+
 class MacosGateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
