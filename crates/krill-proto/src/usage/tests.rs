@@ -1146,6 +1146,33 @@ fn reset_credit_request_reply_roundtrip_and_feature_gate() {
     // 새 비트를 모르는 피어에는 스냅샷만 남는다.
     let gated = reply.for_features(FEAT_USAGE);
     assert_eq!(gated, UsageReply::Accounts(AccountsSnapshot::default()));
+
+    let default_timeout = std::time::Duration::from_secs(5);
+    assert_eq!(
+        request.ipc_timeout(default_timeout),
+        RESET_CONSUME_IPC_TIMEOUT
+    );
+    assert_eq!(
+        UsageRequest::ListAccounts.ipc_timeout(default_timeout),
+        default_timeout
+    );
+    for err in [
+        ResetConsumeError::AuthRequired,
+        ResetConsumeError::RateLimited,
+        ResetConsumeError::TimedOut,
+        ResetConsumeError::Transport,
+        ResetConsumeError::UpstreamRejected,
+        ResetConsumeError::AccountNotFound,
+        ResetConsumeError::InvalidTarget,
+        ResetConsumeError::PermissionDenied,
+    ] {
+        let encoded = UsageReply::Failed(err.to_failure()).encode().unwrap();
+        let (kind, body) = ipc::read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+        let UsageReply::Failed(decoded) = UsageReply::decode(kind, &body).unwrap() else {
+            panic!("expected Failed reply");
+        };
+        assert_eq!(ResetConsumeError::from_failure(decoded), err);
+    }
 }
 
 #[test]
