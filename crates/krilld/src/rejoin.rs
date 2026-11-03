@@ -68,6 +68,7 @@ fn handoff_path(sock: &Path) -> PathBuf {
 /// holder 링크가 끊긴 뒤(리더 스레드에서) 부른다. 세션 종료 감시를 걸고 다음 krilld를 기다린다. 세션을 넘겼으면
 /// `Ok` — 호출자는 프로세스를 끝낸다. 인계 소켓을 열지 못하면 오류(고아 운영만 계속한다).
 pub fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
+    tracing::warn!("holder lost; serving sessions as orphan");
     watch_exits(reg);
     let path = handoff_path(sock);
     // 소켓 락을 쥔 이 krilld만 이 이름을 쓴다. 남은 파일은 고아인 채 죽은 이전 krilld의 것이다.

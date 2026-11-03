@@ -16,6 +16,8 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
+#[cfg(unix)]
+use std::time::Duration;
 
 pub use krill_holder::link;
 use krill_proto::SessionId;
@@ -24,6 +26,13 @@ use krill_proto::holder::{Error as WireError, FromHolder, ToHolder, WinSize};
 use self::link::{Link, Packet};
 use crate::os::{BorrowedFd, OwnedFd};
 use crate::session::lock;
+
+/// 링크가 holder 쪽 EOF가 아닌 이유(프레임·수신 오류, 리더 panic)로 끊긴 뒤 holder가 거두기를 기다리는 시간.
+/// holder가 살아 있으면 shutdown으로 생긴 EOF를 보고 바로 krilld를 죽이고 fd를 모두 넘겨 다시 띄운다. 그 전에
+/// 고아가 되면 클라이언트가 holder를 하나 더 띄워 세션을 넘겨받고, 남은 holder가 krilld를 영구 재기동했다(A-01).
+/// 이 시간이 지나도 살아 있으면 holder가 없는 것이라 호출자가 고아 운영을 시작한다.
+#[cfg(unix)]
+const HOLDER_GRACE: Duration = Duration::from_secs(2);
 
 /// 세션 전송 핸들: Unix master fd 또는 Windows `ConPTY` 핸들 묶음.
 #[cfg(unix)]
@@ -238,8 +247,10 @@ impl Holder {
 
     /// 리더: 답을 기다리는 요청에 나눠 주고 `Exited` 처리는 별도 큐로 넘긴다. 그 큐의 `Release` 송신이
     /// exec 핸드오프의 송신 잠금을 기다려도 리더는 `Done`을 받아 잠금을 풀 수 있다. 링크가 끊기면 기다리던
-    /// 요청을 모두 `NotConnected`로 끝낸 뒤 종료 이벤트 큐를 비운다.
+    /// 요청을 모두 `NotConnected`로 끝낸 뒤 종료 이벤트 큐를 비운다. holder가 닫은 것이 아니면 [`HOLDER_GRACE`]
+    /// 동안 holder의 재기동을 기다린 뒤 돌아온다.
     pub fn run(&self, mut link: Link, mut exited: impl FnMut(SessionId, i32) + Send) {
+        let mut closed = false;
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::channel();
             let worker = std::thread::Builder::new()
@@ -257,7 +268,7 @@ impl Holder {
                 // `decode`·송신 panic에도 `pending` 정리가 실행되게 격리한다.
                 // 정리 없이 죽으면 holder 요청이 영원히 걸린다(K-06).
                 if panic::catch_unwind(AssertUnwindSafe(|| {
-                    self.read(&mut link, |id, status| {
+                    closed = self.read(&mut link, |id, status| {
                         tx.send((id, status)).ok();
                     });
                 }))
@@ -266,14 +277,30 @@ impl Holder {
                     tracing::warn!("holder link reader panicked; treating link as down");
                 }
             }
+            // `out`이 같은 소켓을 쥐고 있어 닫지 않으면 holder는 끊김을 모른다.
+            #[cfg(unix)]
+            if !closed {
+                rustix::net::shutdown(&link, rustix::net::Shutdown::Both).ok();
+            }
             *lock(&self.pending) = None;
             drop(tx);
         });
+        if !closed {
+            tracing::warn!("holder link broken");
+            #[cfg(unix)]
+            std::thread::sleep(HOLDER_GRACE);
+        }
     }
 
-    fn read(&self, link: &mut Link, mut exited: impl FnMut(SessionId, i32)) {
-        while let Ok(Some(p)) = link.recv() {
-            let Ok(m) = decode(p) else { break }; // 프로토콜 위반: 끊긴 것으로 본다
+    /// holder가 링크를 닫았으면(EOF) `true`. 수신 오류·프로토콜 위반이면 `false`: holder는 살아 있을 수 있다.
+    fn read(&self, link: &mut Link, mut exited: impl FnMut(SessionId, i32)) -> bool {
+        loop {
+            let p = match link.recv() {
+                Ok(Some(p)) => p,
+                Ok(None) => return true,
+                Err(_) => return false,
+            };
+            let Ok(m) = decode(p) else { return false };
             match m {
                 Some((FromHolder::Exited { id, status }, _)) => exited(id, status),
                 Some((

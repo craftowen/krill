@@ -614,8 +614,9 @@ fn send_to(link: &Link, m: &FromHolder, fd: Option<BorrowedFd<'_>>) -> io::Resul
 
 /// 링크가 깨진 krilld는 쓸모가 없다. 죽여서 재기동 경로로 보낸다.
 fn drop_link(k: &mut Krilld) {
-    k.link = None;
+    // 죽인 뒤 닫는다: 먼저 닫으면 krilld가 EOF를 holder의 죽음으로 보고 고아가 될 틈이 생긴다.
     rustix::process::kill_process(k.pid, Signal::KILL).ok();
+    k.link = None;
 }
 
 /// 연속 k번째 크래시의 재기동 지연: 1번째 0, 이후 base·2^(k-2), 상한 cap.

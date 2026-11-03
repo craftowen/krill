@@ -538,3 +538,66 @@ fn fixture_command(program: impl AsRef<std::ffi::OsStr>, dir: &Path) -> Command 
     }
     command
 }
+
+/// `<sock><suffix>` 경로.
+fn beside(sock: &Path, suffix: &str) -> PathBuf {
+    let mut s = sock.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// A-01: holder 링크가 holder의 죽음(EOF)이 아닌 이유로 깨지면 krilld는 바로 고아가 되지 않는다. 링크를 닫아 살아 있는
+/// holder가 krilld를 다시 띄우게 한다(고아가 되면 클라이언트가 holder를 하나 더 띄워 두 holder가 생긴다). 아무도
+/// 거두지 않으면(holder도 없다) 유예 뒤 고아 운영으로 세션을 지킨다.
+#[test]
+fn broken_holder_link_is_closed_before_orphaning() {
+    use krill_proto::holder::{FromHolder, VERSION};
+    use krilld::holder::link::Link;
+    use std::sync::mpsc;
+
+    let dir = tmp("broken-link");
+    let sock = dir.join("run/k.sock");
+    let (ours, theirs) = rustix::net::socketpair(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::STREAM,
+        rustix::net::SocketFlags::empty(),
+        None,
+    )
+    .unwrap();
+    rustix::io::fcntl_setfd(&ours, rustix::io::FdFlags::CLOEXEC).unwrap();
+    rustix::io::fcntl_setfd(&theirs, rustix::io::FdFlags::CLOEXEC).unwrap();
+    let mut kids = Kids::default();
+    // `holders`는 kill 뒤 wait까지 한다(거두지 않으면 좀비가 살아 있는 것으로 보인다).
+    kids.holders.push(
+        fixture_command(KRILLD, &dir)
+            .arg(&sock)
+            .stdin(Stdio::from(theirs))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut link = Link::new(ours);
+    let hello = FromHolder::Hello {
+        version: VERSION,
+        holder_pid: std::process::id(),
+        inbox: false,
+    };
+    for m in [hello, FromHolder::Ready] {
+        link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    wait_daemon(&sock, 0);
+    link.send(&[0, 0, 0, 0], &[]).unwrap(); // 길이 0 프레임: 프로토콜 위반
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(Some(_)) = link.recv() {} // HoldListener 뒤 EOF
+        tx.send(()).ok();
+    });
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("krilld kept the broken link open; a live holder would never restart it");
+    let hnd = beside(&sock, ".hnd");
+    assert!(!hnd.exists(), "orphaned while the holder may be alive");
+    wait_until("orphan after the grace period", || hnd.exists());
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}
