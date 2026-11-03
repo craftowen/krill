@@ -3252,7 +3252,6 @@ fn prompt_unsaved(
     async move { answer.await.ok() }
 }
 
-pub(crate) mod bench;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
