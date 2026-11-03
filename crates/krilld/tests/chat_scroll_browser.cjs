@@ -62,7 +62,72 @@ async function main(){
   for(const width of [320,390]){await browser('set','viewport',String(width),'844');const bounds=await evaluate('const box=selector=>document.querySelector(selector).getBoundingClientRect(),pill=box(".composer-pill"),effort=box(".composer-model-effort"),send=box(".composer-send"),input=box(".chat-input"),attach=box(".composer-icon"),meter=box(".composer-context"),card=box(".chat-composer-box"),row=box(".chat-status-row"),hit=(x,y)=>!!document.elementFromPoint(x,y)?.closest(".composer-pill"),hitPhoto=(x,y)=>!!document.elementFromPoint(x,y)?.closest(".composer-icon"),inRow=b=>b.top>=row.top&&b.bottom<=row.bottom;return {width:innerWidth,scroll:document.documentElement.scrollWidth,pill:{left:pill.left,right:pill.right,top:pill.top,height:pill.height},effort:{left:effort.left,right:effort.right},send:{left:send.left},order:attach.right<=pill.left&&pill.right<=meter.left&&[attach,pill,meter].every(inRow),input:{left:input.left,right:input.right,bottom:input.bottom,height:input.height},card:{bottom:card.bottom},row:{height:row.height,top:row.top},chipHits:[pill.top-5.5,pill.top+14,pill.bottom+9].map(y=>hit(pill.left+pill.width/2,y)),aboveChip:hit(pill.left+pill.width/2,card.bottom-1),photoHits:[[attach.left-7,attach.top+14],[attach.right+7,attach.top+14],[attach.left+14,attach.top-5.5],[attach.left+14,attach.bottom+9]].map(p=>hitPhoto(...p))};');assert.equal(bounds.scroll,width,'composer has no horizontal overflow');assert(bounds.effort.right<=bounds.pill.right&&bounds.effort.left>=bounds.pill.left,'effort remains visible alongside the truncated model');assert(bounds.input.right<=bounds.send.left,'input and send share one row');assert(bounds.order,'photo, model and context share the control row');assert(bounds.photoHits.every(Boolean),'photo hit area spans the touch target');assert(Math.round(bounds.input.height)===44,'empty input is one line tall');assert(bounds.row.top>=bounds.card.bottom&&bounds.row.height===32,'control row sits under the input row');assert(bounds.chipHits.every(Boolean),'chip hit area spans the touch target');assert(!bounds.aboveChip,'chip hit area stops short of the input row');await browser('screenshot',path.join(evidence,`composer-${width}.png`));}
   await evaluate('document.querySelector(".chat-input").focus();return true;');const typing=await evaluate('const row=document.querySelector(".chat-status-row"),before=feed.clientHeight;state.sessions.get(7).state="Done";view.update();const idle=getComputedStyle(row).display;state.sessions.get(7).state="Waiting";view.update();const waiting=getComputedStyle(row).display;state.sessions.get(7).state="Done";view.update();document.activeElement.blur();return {idle,waiting};');assert.equal(typing.idle,'flex','the control row stays while typing');assert.equal(typing.waiting,'flex','a waiting agent keeps the control row while typing');
   await browser('click','.composer-pill');await browser('wait','--fn','document.querySelectorAll(".chat-composer-chip").length>=3');await browser('click','#chat-option-7-1');await browser('wait','--fn','calls.some(q=>q.action==="set_model"&&q.model==="other-model")');
-  console.log('PASS Chromium 390x844 chat prefetch, automatic pagination, stable reader anchor, trusted touch and bounded collapsed-history gesture continuation');
+  // Mobile 390x844 voice dictation stability + immediate scroll-to-bottom & optimistic focus on submit.
+  const appSource=fs.readFileSync(path.join(assets,'app.js'),'utf8'),busyExpr=appSource.includes('editable(document.activeElement)||');
+  assert(busyExpr,'app.js treats any focused editable element as update-busy even before first dictated word');
+  const dictation=await evaluate(`
+   const input=document.querySelector(".chat-input");
+   feed.scrollTop=feed.scrollHeight;feed.dispatchEvent(new Event("scroll"));
+   input.focus();
+   const editable=node=>node?.isContentEditable||node?.matches?.("textarea,input:not([type=button]):not([type=submit]):not([type=file]):not([type=checkbox]):not([type=radio]):not([type=range]),select");
+   const focusedEmptyBusy=editable(document.activeElement);
+   let heightWrites=0,rawHeight=input.style.height;
+   Object.defineProperty(input.style,"height",{configurable:true,get:()=>rawHeight,set:v=>{heightWrites++;rawHeight=v;input.setAttribute("style",v?"height:"+v:"");}});
+   input.value="첫 번째 음성 문장입니다\\n두 번째 음성 문장입니다\\n세 번째 음성 문장입니다\\n네 번째 음성 문장입니다\\n다섯 번째 음성 문장입니다\\n여섯 번째 음성 문장입니다";
+   input.dispatchEvent(new Event("input",{bubbles:true}));
+   const afterDictationWrites=heightWrites;
+   view.update();view.update();view.update();
+   const idleWrites=heightWrites-afterDictationWrites;
+   const active=document.activeElement===input,value=input.value,pinnedGap=feed.scrollHeight-feed.scrollTop-feed.clientHeight;
+   delete input.style.height;
+   input.value="음성 커밋 누락 방지 문장";
+   input.dispatchEvent(new Event("blur"));
+   const savedDraft=state.drafts.get(7);
+   input.value="";input.dispatchEvent(new Event("input",{bubbles:true}));
+   return {focusedEmptyBusy,idleWrites,active,valueLen:value.length,pinnedGap,savedDraft};
+  `);
+  assert.equal(dictation.focusedEmptyBusy,true,'focused empty chat input blocks background reload during initial speech');
+  assert.equal(dictation.idleWrites,0,'1.5s background update ticks do not reset textarea height during dictation');
+  assert.equal(dictation.active,true,'chat input retains focus across background updates');
+  assert(dictation.pinnedGap<=2,'growing multiline dictation keeps latest chat feed pinned above composer');
+  assert.equal(dictation.savedDraft,'음성 커밋 누락 방지 문장','blur commits native dictated text to drafts');
+  await evaluate(`
+   feed.scrollTop=200;feed.dispatchEvent(new Event("scroll"));
+   window.promptGate=null;window.pollGate=null;
+   const prevRpc=ctx.rpc;
+   ctx.rpc=async q=>{
+    if(q.action==="prompt"){calls.push(q);await new Promise(r=>window.promptGate=r);records.push({id:"u300",kind:"user",text:q.text},{id:"a301",kind:"assistant",text:"바로 확인했습니다."});return {sent:true};}
+    if(q.action==="chat_poll"&&window.holdNextPoll){window.holdNextPoll=false;await new Promise(r=>window.pollGate=r);return {generation:"g",agent:"codex",bound:true,page_start:Math.max(0,records.length-30),next_offset:records.length,items:records.slice(-30)};}
+    return prevRpc(q);
+   };
+   window.holdNextPoll=true;
+   const input=document.querySelector(".chat-input");
+   input.focus();input.value="모바일 채팅 최하단 즉시 이동 테스트";input.dispatchEvent(new Event("input",{bubbles:true}));
+   document.querySelector(".composer-send").click();
+   return true;
+  `);
+  const sendingSnap=await evaluate(`
+   const opt=document.querySelector(".chat-optimistic"),feedBox=feed.getBoundingClientRect(),optBox=opt?.getBoundingClientRect(),compBox=document.querySelector(".chat-composer").getBoundingClientRect();
+   return {hasOpt:!!opt,phase:opt?.dataset.phase,text:opt?.innerText||"",gap:feed.scrollHeight-feed.scrollTop-feed.clientHeight,visible:!!optBox&&optBox.bottom<=compBox.top+1.5&&optBox.top>=feedBox.top};
+  `);
+  assert.equal(sendingSnap.hasOpt,true,'submitted message appears immediately in chat feed');
+  assert.equal(sendingSnap.phase,'sending');
+  assert(sendingSnap.text.includes('모바일 채팅 최하단 즉시 이동 테스트'));
+  assert(sendingSnap.gap<=2,'scrolled-up chat feed jumps immediately to bottom on submit');
+  assert.equal(sendingSnap.visible,true,'newly submitted message is immediately visible above composer');
+  await evaluate('window.promptGate();return true;');
+  await browser('wait','--fn','document.querySelector(".chat-input").value===""&&document.querySelector(".chat-optimistic")?.dataset.phase==="accepted"');
+  const acceptedSnap=await evaluate('return {hasOpt:!!document.querySelector(".chat-optimistic"),gap:feed.scrollHeight-feed.scrollTop-feed.clientHeight};');
+  assert.equal(acceptedSnap.hasOpt,true,'message does not vanish after input clears while awaiting transcript poll');
+  assert(acceptedSnap.gap<=2,'feed stays pinned at bottom when composer clears');
+  await evaluate('window.pollGate();return true;');
+  await browser('wait','--fn','!document.querySelector(".chat-optimistic")&&Array.from(document.querySelectorAll(".chat-user")).some(n=>n.innerText.includes("모바일 채팅 최하단 즉시 이동 테스트"))');
+  const settledSnap=await evaluate('const users=Array.from(document.querySelectorAll(".chat-user")).filter(n=>n.innerText.includes("모바일 채팅 최하단 즉시 이동 테스트"));return {count:users.length,gap:feed.scrollHeight-feed.scrollTop-feed.clientHeight,reply:feed.lastElementChild?.innerText||""};');
+  assert.equal(settledSnap.count,1,'real transcript user item replaces optimistic card without duplication');
+  assert(settledSnap.gap<=2,'feed stays pinned at bottom when agent reply arrives');
+  assert(settledSnap.reply.includes('바로 확인했습니다.'));
+  await browser('screenshot',path.join(evidence,'chat-submit-bottom-390.png'));
+  console.log('PASS Chromium 390x844 chat prefetch, automatic pagination, stable reader anchor, trusted touch, dictation stability and immediate scroll-to-bottom on submit');
  }finally{for(const p of pending.values()){clearTimeout(p.timer);p.reject(Error('CDP closed'));}socket?.close();await browser('close').catch(()=>{});await new Promise(resolve=>server.close(resolve));}
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

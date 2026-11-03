@@ -242,20 +242,7 @@
     );
     function returnToLatest() {
       if (!active()) return;
-      if (failedEarlier) requestLatest();
-      earlierEpoch++;
-      prefetchedEarlier = null;
-      fillPages = 0;
-      earlierQueued = false;
-      failedEarlier = false;
-      autoBlocked = null;
-      pollStatus.hidden = true;
-      if (entry.live && !resetHistory) {
-        entry.items = entry.live.items;
-        entry.offset = entry.live.offset;
-        entry.live = null;
-      }
-      following = true;
+      followLatest();
       renderItems();
       pollNow();
     }
@@ -275,12 +262,27 @@
     input.rows = 1;
     input.placeholder = t("Message agent (Bracketed Paste)…");
     input.setAttribute("aria-label", t("Chat prompt"));
-    function sizeInput() {
+    let sizedValue = null,
+      sizedWidth = -1;
+    function sizeInput(force = false) {
       if (!input.style) return;
+      const width = input.clientWidth || 0;
+      if (!force && sizedValue === input.value && sizedWidth === width) return;
+      const prev = input.style.height;
+      sizedValue = input.value;
+      sizedWidth = width;
       input.style.height = "auto";
       if (input.scrollHeight)
         input.style.height =
           Math.min(140, Math.max(28, input.scrollHeight)) + "px";
+      if (input.style.height !== prev) {
+        if (
+          globalThis.document?.activeElement === input &&
+          input.scrollHeight > (input.clientHeight || 0)
+        )
+          input.scrollTop = input.scrollHeight;
+        pinLatest();
+      }
     }
     input.value = drafts.get(sessionId) || "";
     function insertText(text) {
@@ -374,21 +376,60 @@
     feed.addEventListener("touchend", () => touchStartY = null, {passive:true});
     feed.addEventListener("touchcancel", () => touchStartY = null, {passive:true});
     feed.addEventListener("wheel", e => {const now = Date.now(), continuing = now - wheelAt < 250; wheelAt = now; if (e.deltaY < 0 && !continuing) earlierGesture();}, {passive:true});
+    function followLatest() {
+      if (failedEarlier) requestLatest();
+      earlierEpoch++;
+      prefetchedEarlier = null;
+      fillPages = 0;
+      earlierQueued = false;
+      failedEarlier = false;
+      autoBlocked = null;
+      pollStatus.hidden = true;
+      if (entry.live && !resetHistory) {
+        entry.items = entry.live.items;
+        entry.offset = entry.live.offset;
+        entry.live = null;
+      }
+      following = true;
+    }
     function pinLatest() {
       if (visible && following && !entry.live)
         feed.scrollTop = feed.scrollHeight || 0;
       syncScroll();
+    }
+    function pinLatestSoon() {
+      pinLatest();
+      globalThis.requestAnimationFrame?.(() => {
+        if (!disposed) pinLatest();
+      });
     }
     // Late fonts, disclosures, a shown pane or keyboard resize re-pin a following reader.
     const resize = globalThis.ResizeObserver
       ? new ResizeObserver(() => pinLatest())
       : null;
     resize?.observe(feed);
+    const unsubscribeKeyboard = globalThis.MkKeyboard?.subscribe?.(() => {
+      if (!disposed && visible) {
+        sizeInput(true);
+        pinLatest();
+      }
+    });
     const cards = new Map(),
       toolRuns = new Map();
     let tailRun = null,
       renderedCount = 0,
-      renderedItems = null;
+      renderedItems = null,
+      optimisticCard = null,
+      optimisticShown = "";
+    function syncDraft() {
+      if (!ownsEntry() || entry.sending) return;
+      const current = drafts.get(sessionId) || "";
+      if (input.value === current) return;
+      entry.draftVersion = (entry.draftVersion || 0) + 1;
+      input.value
+        ? drafts.set(sessionId, input.value)
+        : drafts.delete(sessionId);
+    }
     input.addEventListener("input", () => {
       entry.draftVersion = (entry.draftVersion || 0) + 1;
       input.value
@@ -396,6 +437,21 @@
         : drafts.delete(sessionId);
       sizeInput();
       suggest();
+    });
+    input.addEventListener("change", syncDraft);
+    input.addEventListener("blur", syncDraft);
+    input.addEventListener("focus", () => {
+      if (
+        !entry.live &&
+        (following ||
+          (feed.scrollHeight || 0) -
+            (feed.scrollTop || 0) -
+            (feed.clientHeight || 0) <
+            120)
+      ) {
+        following = true;
+        pinLatestSoon();
+      }
     });
     input.addEventListener("compositionstart", () => {
       composing = true;
@@ -1127,14 +1183,20 @@
     }
     function updateComposer(sent) {
       updateStatus();
+      let cleared = false;
       // Completion belongs to the shared draft version, including a newly mounted composer.
       if (
         sent &&
         (entry.draftVersion || 0) === sent.version &&
         input.value === sent.text
-      )
+      ) {
         input.value = "";
+        cleared = true;
+      }
+      if (liveQuestion) syncDraft();
       sizeInput();
+      syncOptimistic();
+      if (cleared) pinLatestSoon();
       input.disabled = !!liveQuestion;
       modelBtn.disabled = !!liveQuestion;
       sendBtn.disabled =
@@ -1237,20 +1299,24 @@
         return;
       }
       if (!text.trim() && !photo) return;
+      const hadLive = !!entry.live;
+      followLatest();
       entry.progress = {
         phase: "sending",
         text,
         photo: !!photo,
+        at: Date.now(),
         canConfirm: entry.loaded && entry.bound,
         generation: entry.generation,
         lastState: state.sessions?.get(sessionId)?.state,
         stamp: state.sessions?.get(sessionId)?.state_since_unix_ns,
-        ids: new Set((entry.live?.items || entry.items).map((item) => item.id)),
+        ids: new Set(entry.items.map((item) => item.id)),
       };
       entry.sending = true;
       closeSuggestions();
+      if (hadLive) renderItems();
       updateComposer();
-      updateStatus();
+      pinLatestSoon();
       run(async () => {
         try {
           if (!active()) return;
@@ -1588,6 +1654,78 @@
         lastTop = feed.scrollTop;
       }
     }
+    function optimisticText() {
+      const p = entry.progress;
+      if (
+        !p ||
+        p.rendered ||
+        entry.live ||
+        (p.phase !== "sending" && p.phase !== "accepted") ||
+        (p.generation && entry.generation && p.generation !== entry.generation)
+      )
+        return "";
+      if (p.phase !== "sending" && state.sessions?.get(sessionId)?.exited)
+        return "";
+      if (
+        entry.items.some(
+          (item) =>
+            !p.ids.has(item.id) &&
+            (item.kind === "user" || (!p.canConfirm && item.kind === "assistant")),
+        )
+      ) {
+        p.rendered = true;
+        return "";
+      }
+      return p.text || (p.photo ? t("Photo") : "");
+    }
+    function syncOptimistic() {
+      const text = optimisticText(),
+        phase = entry.progress?.phase || "";
+      if (!text) {
+        if (optimisticCard) {
+          optimisticCard.remove();
+          resize?.unobserve(optimisticCard);
+          optimisticCard = null;
+          optimisticShown = "";
+          if (
+            !entry.items.length &&
+            entry.loaded &&
+            !Array.from(feed.children || []).some(
+              (c) => c.className === "chat-empty",
+            )
+          ) {
+            const empty = el("div", undefined, "chat-empty");
+            empty.append(el("p", t("Enter a new message"), "muted"));
+            feed.append(empty);
+          }
+        }
+        return;
+      }
+      for (const child of Array.from(feed.children || []))
+        if (child.className === "chat-empty") child.remove();
+      if (!optimisticCard || optimisticShown !== text) {
+        const next = renderCard(
+          { kind: "user", text, at: entry.progress?.at },
+          "optimistic",
+        );
+        next.className = "chat-card chat-user chat-optimistic";
+        next.dataset.chatOptimistic = "true";
+        if (optimisticCard?.parentElement === feed) {
+          feed.insertBefore(next, optimisticCard);
+          optimisticCard.remove();
+          resize?.unobserve(optimisticCard);
+        } else feed.append(next);
+        resize?.observe(next);
+        optimisticCard = next;
+        optimisticShown = text;
+      } else if (
+        optimisticCard.parentElement !== feed ||
+        feed.children?.[feed.children.length - 1] !== optimisticCard
+      ) {
+        feed.append(optimisticCard);
+      }
+      optimisticCard.dataset.phase = phase;
+    }
     function renderItems(appendFrom) {
       const anchor = readerAnchor();
       const incremental =
@@ -1702,7 +1840,11 @@
         }
       }
       for (const [idx, node] of nodes.entries()) {
-        const at = incremental ? null : feed.children?.[idx];
+        const at = incremental
+          ? optimisticCard?.parentElement === feed
+            ? optimisticCard
+            : null
+          : feed.children?.[idx];
         if (at !== node) {
           feed.insertBefore(node, at || null);
           resize?.observe(node);
@@ -1737,7 +1879,7 @@
       tailRun = run;
       renderedCount = entry.items.length;
       renderedItems = entry.items;
-      if (!entry.items.length && entry.loaded) {
+      if (!entry.items.length && entry.loaded && !optimisticText()) {
         const empty = el("div", undefined, "chat-empty");
         empty.append(el("p", t("Enter a new message"), "muted"));
         feed.append(empty);
@@ -1755,6 +1897,7 @@
         !failedEarlier &&
         !entry.latestRecovery;
       history.hidden = earlierBtn.hidden && latestBtn.hidden;
+      syncOptimistic();
       pinLatest();
       restoreReader(anchor);
     }
@@ -2130,6 +2273,8 @@
       entry.bound = false;
       cards.clear();
       toolRuns.clear();
+      optimisticCard = null;
+      optimisticShown = "";
       feed.replaceChildren();
       resize?.disconnect();
       resize?.observe(feed);
@@ -2323,6 +2468,8 @@
             (!sameTail && (rItems.length || metaChanged)) || !pollStatus.hidden
               ? readerAnchor()
               : null;
+        if (res.reset && entry.progress && entry.progress.phase !== "sending")
+          entry.progress.rendered = true;
         if (reset) {
           clearTranscript();
           following = true;
@@ -2624,6 +2771,7 @@
       },
       unmount() {
         if (disposed) return;
+        syncDraft();
         earlierEpoch++;
         earlierQueued = false;
         closeSuggestions();
@@ -2636,6 +2784,7 @@
           "visibilitychange",
           visibilityChanged,
         );
+        unsubscribeKeyboard?.();
         resize?.disconnect();
         pruneCache(state);
         clearTimeout(pollTimer);

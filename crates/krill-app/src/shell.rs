@@ -134,6 +134,13 @@ enum Got {
     Stopped,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SettledAttempt {
+    layout_session: Option<krill_proto::SessionId>,
+    target: krill_app::hosts::HostTarget,
+    had_registered_target: bool,
+}
+
 pub(crate) fn saved_window_bounds_from_gpui(wb: gpui::WindowBounds) -> layout::SavedWindowBounds {
     let (mode, bounds) = match wb {
         gpui::WindowBounds::Windowed(b) => (layout::SavedWindowMode::Windowed, b),
@@ -2708,6 +2715,7 @@ impl Shell {
                 .iter()
                 .any(|(spec, _)| *host == krill_app::hosts::HostId::Remote(spec.id.clone()))
         });
+        self.purge_stale_remote_session_authority();
         if let krill_app::hosts::HostId::Remote(id) = &self.launch_host
             && !allowed.iter().any(|spec| &spec.id == id)
         {
@@ -2792,7 +2800,21 @@ impl Shell {
                 {
                     this.host_aliases = aliases;
                     this.host_statuses = statuses;
-                    this.host_targets = targets;
+                    let prev_targets = std::mem::replace(&mut this.host_targets, targets);
+                    let invalidated: Vec<krill_app::hosts::HostId> = prev_targets
+                        .into_iter()
+                        .filter(|(host, old_target)| {
+                            this.host_targets.get(host) != Some(old_target)
+                        })
+                        .map(|(host, _)| host)
+                        .collect();
+                    if !invalidated.is_empty() {
+                        this.gone_sessions
+                            .retain(|(host, _)| !invalidated.contains(host));
+                        this.observed_sessions
+                            .retain(|(host, _)| !invalidated.contains(host));
+                    }
+                    this.purge_stale_remote_session_authority();
                     this.remote_accounts
                         .retain(|host, _| this.host_targets.contains_key(host));
                     this.remote_account_handoff_polls
@@ -2850,6 +2872,63 @@ impl Shell {
     pub(super) fn target_for_pane(&self, pane: PaneId) -> Option<krill_app::hosts::HostTarget> {
         let host = self.layout.host(pane);
         self.target_for_host(host)
+    }
+
+    fn purge_stale_remote_session_authority(&mut self) {
+        let keep = |host: &krill_app::hosts::HostId| {
+            host.is_local() || self.host_targets.contains_key(host)
+        };
+        self.gone_sessions.retain(|(host, _)| keep(host));
+        self.observed_sessions.retain(|(host, _)| keep(host));
+    }
+
+    pub(super) fn blocks_session_prune(
+        &self,
+        pane: PaneId,
+        host: &krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &App,
+    ) -> bool {
+        if self
+            .live
+            .get(&pane)
+            .is_some_and(|l| l.pane.holds_account_input())
+        {
+            return true;
+        }
+        let handoffs = &self.accounts_for_host(host).details.handoffs;
+        let sidebar = self.sidebar.read(cx);
+        let max_hops = handoffs.len().saturating_add(1);
+        handoffs.iter().any(|h| {
+            if h.from != session {
+                return false;
+            }
+            if h.to.is_none() {
+                return h.error.is_none();
+            }
+            let Some(mut target) = h.to else {
+                return false;
+            };
+            for _ in 0..max_hops {
+                let Some(next) = handoffs
+                    .iter()
+                    .find(|nh| nh.from == target)
+                    .and_then(|nh| nh.to)
+                else {
+                    break;
+                };
+                if next == target {
+                    break;
+                }
+                target = next;
+            }
+            let target_closed = sidebar
+                .session_on(host, target)
+                .is_some_and(sidebar::Session::is_exited)
+                || sidebar.is_session_closed_on(host, target)
+                || self.gone_sessions.contains(&(host.clone(), target));
+            !target_closed
+        })
     }
 
     /// 상태바·새 세션·설정 진입 시 우선할 계정 대상 호스트.
@@ -3923,6 +4002,7 @@ impl Shell {
             self.show(Some(notice), cx);
         }
         self.recover_account_input(cx);
+        self.reconcile_workspace_sessions(cx);
         if pending {
             if host.is_local() {
                 if self.account_handoff_poll.is_none()
@@ -4487,42 +4567,56 @@ impl Shell {
                 if !target.is_current() {
                     return;
                 }
-                let Ok(Some((want, known, launch, creation, allow_cold_resume, uncertain))) = this
-                    .read_with(cx, |t, _| {
-                        let l = t.live.get(&pane)?;
-                        // 레이아웃에 아직 없는 ID라도 이 칸이 이미 발행한 세션이면 그 세션에 붙는다(APP-RUNTIME-001).
-                        let want = t
-                            .layout
-                            .session(pane)
-                            .or_else(|| close::Creation::published(&l.creation));
-                        let host = t.layout.host(pane);
-                        let allow_cold_resume = want.is_some_and(|w| {
-                            !t.observed_sessions.contains(&(host.clone(), w))
-                                && !t.workspace_closing.contains(&(host.clone(), w))
-                                && l.pane.session().is_none()
-                        });
-                        let mut launch = t.launch_for(pane);
-                        if let Some((cols, rows)) = l.pane.grid() {
-                            (launch.cols, launch.rows) = (cols, rows); // 새 세션도 칸 크기로(OWE-534)
-                        }
-                        // OWE-842: 죽은 세션 자리 재스폰은 셸 내부 `cd` 포함 최신 cwd로.
-                        // 폴더(`launches`)는 워크트리 루트를 유지하므로 세션 없는 새 칸에는 덮지 않는다.
-                        if want.is_some()
-                            && let Some(respawn) = t.layout.respawn_cwd(pane)
-                        {
-                            apply_respawn_cwd(&mut launch.cwd, respawn, host.is_remote());
-                        }
-                        Some((
-                            want,
-                            want.and_then(|w| l.pane.known(w)),
-                            launch,
-                            l.creation.clone(),
-                            allow_cold_resume,
-                            t.outcome_unknown.contains_key(&pane),
-                        ))
-                    })
+                let Ok(Some((
+                    layout_session,
+                    had_registered_target,
+                    want,
+                    known,
+                    launch,
+                    creation,
+                    allow_cold_resume,
+                    uncertain,
+                ))) = this.read_with(cx, |t, _| {
+                    let l = t.live.get(&pane)?;
+                    let layout_session = t.layout.session(pane);
+                    let had_registered_target = t.target_for_pane(pane).is_some();
+                    // 레이아웃에 아직 없는 ID라도 이 칸이 이미 발행한 세션이면 그 세션에 붙는다(APP-RUNTIME-001).
+                    let want = layout_session.or_else(|| close::Creation::published(&l.creation));
+                    let host = t.layout.host(pane);
+                    let allow_cold_resume = want.is_some_and(|w| {
+                        !t.observed_sessions.contains(&(host.clone(), w))
+                            && !t.workspace_closing.contains(&(host.clone(), w))
+                            && l.pane.session().is_none()
+                    });
+                    let mut launch = t.launch_for(pane);
+                    if let Some((cols, rows)) = l.pane.grid() {
+                        (launch.cols, launch.rows) = (cols, rows); // 새 세션도 칸 크기로(OWE-534)
+                    }
+                    // OWE-842: 죽은 세션 자리 재스폰은 셸 내부 `cd` 포함 최신 cwd로.
+                    // 폴더(`launches`)는 워크트리 루트를 유지하므로 세션 없는 새 칸에는 덮지 않는다.
+                    if want.is_some()
+                        && let Some(respawn) = t.layout.respawn_cwd(pane)
+                    {
+                        apply_respawn_cwd(&mut launch.cwd, respawn, host.is_remote());
+                    }
+                    Some((
+                        layout_session,
+                        had_registered_target,
+                        want,
+                        want.and_then(|w| l.pane.known(w)),
+                        launch,
+                        l.creation.clone(),
+                        allow_cold_resume,
+                        t.outcome_unknown.contains_key(&pane),
+                    ))
+                })
                 else {
                     return;
+                };
+                let settled_attempt = SettledAttempt {
+                    layout_session,
+                    target: target.clone(),
+                    had_registered_target,
                 };
                 let p = target.clone();
                 let old = resume.filter(|r| want.is_none() || want == Some(*r));
@@ -4597,36 +4691,49 @@ impl Shell {
                                 ),
                                 Err(e) => return Err(e),
                             },
-                            None => match pane::ensure_session_in(&p, want, &launch).inspect_err(
-                                |e| {
-                                    report(if want.is_some() { "restore" } else { "create" }, e);
-                                },
-                            )? {
-                                pane::Found::Live(session, _) => (session, None),
-                                // OWE-842(시나리오 B): 재부팅 등으로 이전 세션이 콜드가 되었으면
-                                // 같은 cwd·셸 설정으로 새 세션을 즉시 자동 재스폰하고,
-                                // 이전 세션의 콜드 화면·스크롤백을 새 세션 위쪽 히스토리로 보존한다.
-                                // 이미 라이브로 관찰된 세션이 닫혀 사라진 경우에는 자동 재스폰하지 않는다.
-                                pane::Found::Cold(cold_session, cold) => {
-                                    if !allow_cold_resume {
-                                        return Ok(Got::Cold(cold_session, cold));
-                                    }
-                                    match pane::resume_session_in(&p, Some(cold_session), &launch)
+                            None => {
+                                let resolved = if !allow_cold_resume && let Some(want_id) = want {
+                                    pane::resolve_observed_session_in(&p, want_id, &launch)
+                                        .inspect_err(|e| report("restore", e))?
+                                } else {
+                                    pane::ensure_session_in(&p, want, &launch).inspect_err(|e| {
+                                        report(
+                                            if want.is_some() { "restore" } else { "create" },
+                                            e,
+                                        );
+                                    })?
+                                };
+                                match resolved {
+                                    pane::Found::Live(session, _) => (session, None),
+                                    // OWE-842(시나리오 B): 재부팅 등으로 이전 세션이 콜드가 되었으면
+                                    // 같은 cwd·셸 설정으로 새 세션을 즉시 자동 재스폰하고,
+                                    // 이전 세션의 콜드 화면·스크롤백을 새 세션 위쪽 히스토리로 보존한다.
+                                    // 이미 라이브로 관찰된 세션이 닫혀 사라진 경우에는 자동 재스폰하지 않는다.
+                                    pane::Found::Cold(cold_session, cold) => {
+                                        if !allow_cold_resume {
+                                            return Ok(Got::Cold(cold_session, cold));
+                                        }
+                                        match pane::resume_session_in(
+                                            &p,
+                                            Some(cold_session),
+                                            &launch,
+                                        )
                                         .inspect_err(|e| {
                                             report("resume_cold", e);
                                         }) {
-                                        Ok(new_session) => {
-                                            (new_session, Some((cold_session, cold)))
+                                            Ok(new_session) => {
+                                                (new_session, Some((cold_session, cold)))
+                                            }
+                                            Err(e) if pane::is_unknown_outcome(&e) => {
+                                                return Ok(Got::ColdUnknown(cold_session, cold, e));
+                                            }
+                                            // 데몬이 이미 이어졌다고 확정한 옛 세션: 콜드 칸으로 남기지 않는다.
+                                            Err(e) if pane::is_session_gone(&e) => return Err(e),
+                                            Err(_) => return Ok(Got::Cold(cold_session, cold)),
                                         }
-                                        Err(e) if pane::is_unknown_outcome(&e) => {
-                                            return Ok(Got::ColdUnknown(cold_session, cold, e));
-                                        }
-                                        // 데몬이 이미 이어졌다고 확정한 옛 세션: 콜드 칸으로 남기지 않는다.
-                                        Err(e) if pane::is_session_gone(&e) => return Err(e),
-                                        Err(_) => return Ok(Got::Cold(cold_session, cold)),
                                     }
                                 }
-                            },
+                            }
                         };
                         // 명시적 닫기가 Create 응답보다 먼저 와도 새 세션을 남기지 않는다.
                         if !close::Creation::publish(&creation, session) {
@@ -4661,7 +4768,9 @@ impl Shell {
                         }
                     })
                     .await;
-                let next = this.update(cx, |t, cx| t.settled_attempt(pane, want, got, cx));
+                let next = this.update(cx, |t, cx| {
+                    t.settled_for_attempt(pane, &settled_attempt, got, cx)
+                });
                 let mut reader = match next {
                     Ok(Next::Read(r)) => r,
                     Ok(Next::Retry) => {
@@ -4711,6 +4820,37 @@ impl Shell {
                 bg.timer(retry_delay(0)).await;
             }
         })
+    }
+
+    fn settled_target_is_current(&self, pane: PaneId, attempt: &SettledAttempt) -> bool {
+        let current_target_matches = if attempt.had_registered_target {
+            self.target_for_pane(pane).as_ref() == Some(&attempt.target)
+        } else {
+            self.target_for_pane(pane)
+                .is_none_or(|cur| cur == attempt.target)
+        };
+        self.layout.pane_exists(pane)
+            && self.layout.host(pane) == attempt.target.host()
+            && attempt.target.is_current()
+            && current_target_matches
+    }
+
+    fn settled_for_attempt(
+        &mut self,
+        pane: PaneId,
+        attempt: &SettledAttempt,
+        got: std::io::Result<Got>,
+        cx: &mut Context<Self>,
+    ) -> Next {
+        if !self.settled_target_is_current(pane, attempt) {
+            self.restarting_panes.remove(&pane);
+            return Next::Gone;
+        }
+        if self.layout.session(pane) != attempt.layout_session {
+            self.restarting_panes.remove(&pane);
+            return Next::Retry;
+        }
+        self.settled_attempt(pane, attempt.layout_session, got, cx)
     }
 
     /// 붙기 시도가 끝났다. `got`은 세션 정하기의 결과와, 정했다면 그 세션에 붙기의 결과. 정한 세션은 붙기가 실패해도
@@ -4853,10 +4993,20 @@ impl Shell {
                     let host = self.layout.host(pane).clone();
                     self.gone_sessions.insert((host.clone(), session));
                     // 계정 이어받기가 남긴 사이드바 사본 행이 reconcile을 막지 않게 먼저 지운다.
-                    self.sidebar.update(cx, |sidebar, cx| {
-                        sidebar.mark_session_exited_on(&host, session, cx);
-                    });
+                    if self
+                        .sidebar
+                        .read(cx)
+                        .session_on(&host, session)
+                        .is_some_and(|s| !s.is_exited())
+                        || (host.is_local() && self.sidebar.read(cx).is_unread(session))
+                    {
+                        self.sidebar
+                            .update(cx, |s, cx| s.mark_session_exited_on(&host, session, cx));
+                    }
                     self.reconcile_workspace_sessions(cx);
+                    if !self.layout.pane_exists(pane) {
+                        return Next::Gone;
+                    }
                 }
                 match self.live.get_mut(&pane) {
                     Some(l) => {
@@ -4908,6 +5058,7 @@ impl Shell {
             .get(&pane)
             .is_some_and(|l| l.pane.holds_account_input())
         {
+            cx.notify();
             return Next::Gone;
         }
         let had_session = self

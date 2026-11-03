@@ -11858,3 +11858,264 @@ fn vertical_mouse_wheel_over_tab_bar_scrolls_tabs_horizontally(cx: &mut TestAppC
         tab0_back.left()
     );
 }
+
+#[gpui::test]
+fn clicking_observed_closed_tab_prunes_without_infinite_retry_or_respawn(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostId;
+    use krill_proto::control::{
+        FEAT_AGENTS, FEAT_COLD, FEAT_CONTROL, FEAT_RESUME, Failure, Info, Reply, Request,
+    };
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let snapshot_for = |ids: &[u64]| sidebar::Snapshot {
+        sessions: ids
+            .iter()
+            .map(|&id| sidebar::Session {
+                id: SessionId(id),
+                status: krill_proto::control::AgentStatus::UNKNOWN,
+                worktree: Some("/work/a".into()),
+                cwd: Some("/work/a".into()),
+                account: None,
+            })
+            .collect(),
+        trees: std::collections::BTreeMap::from([(
+            PathBuf::from("/work"),
+            vec![PathBuf::from("/work/a")],
+        )]),
+    };
+
+    let sock_path = PathBuf::from(format!(
+        "/tmp/kr-observed-closed-click-{}.sock",
+        std::process::id()
+    ));
+    std::fs::remove_file(&sock_path).ok();
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+    let agent_launch_calls = Arc::new(AtomicUsize::new(0));
+    let resume_or_create_calls = Arc::new(AtomicUsize::new(0));
+    let launch_bg = Arc::clone(&agent_launch_calls);
+    let spawn_bg = Arc::clone(&resume_or_create_calls);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            if stop_bg.load(Ordering::SeqCst) {
+                return;
+            }
+            let launch_bg = Arc::clone(&launch_bg);
+            let spawn_bg = Arc::clone(&spawn_bg);
+            std::thread::spawn(move || {
+                let hello = krill_proto::ipc::ServerHello {
+                    proto_min: krill_proto::ipc::PROTO_MIN,
+                    proto_max: krill_proto::ipc::PROTO_MAX,
+                    features: FEAT_CONTROL | FEAT_AGENTS | FEAT_COLD | FEAT_RESUME,
+                    build: "test".into(),
+                    instance_id: 1,
+                };
+                if stream.write_all(&hello.encode().unwrap()).is_err() {
+                    return;
+                }
+                let Ok(Some(_)) = krill_proto::ipc::read_frame(&mut stream) else {
+                    return;
+                };
+                while let Ok(Some((kind, body))) = krill_proto::ipc::read_frame(&mut stream) {
+                    let reply = match Request::decode(kind, &body) {
+                        Ok(Request::AgentLaunch {
+                            session: SessionId(502),
+                        }) => {
+                            launch_bg.fetch_add(1, Ordering::SeqCst);
+                            Reply::Failed(Failure::NoSession)
+                        }
+                        Ok(Request::List) => Reply::Sessions(vec![Info {
+                            session: SessionId(501),
+                            pid: 1,
+                            status: None,
+                        }]),
+                        Ok(Request::Cold {
+                            session: SessionId(502),
+                        }) => Reply::Failed(Failure::NoSession),
+                        Ok(Request::Resume { .. } | Request::Create(_)) => {
+                            spawn_bg.fetch_add(1, Ordering::SeqCst);
+                            Reply::Failed(Failure::NoSession)
+                        }
+                        _ => Reply::Failed(Failure::BadRequest),
+                    };
+                    if stream.write_all(&reply.encode().unwrap()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let (view, cx) = open(cx, state_path("observed-closed-click"));
+    let tab1_pane = cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let launch = Create {
+                account: None,
+                program: Program::Login,
+                cwd: b"/work/a".to_vec(),
+                cols: 80,
+                rows: 24,
+            };
+            let tab0_pane = s.layout.active_tab().focused;
+            s.layout.set_launch(tab0_pane, launch.clone());
+            s.layout.set_session(tab0_pane, SessionId(501));
+            s.layout.new_tab();
+            let tab1_pane = s.layout.active_tab().focused;
+            s.layout.set_launch(tab1_pane, launch);
+            s.layout.set_session(tab1_pane, SessionId(502));
+            s.layout.activate(0);
+            s.sidebar.update(cx, |sidebar, cx| {
+                sidebar.connect_source(Arc::new(Memory(snapshot_for(&[501, 502]))), cx);
+            });
+            tab1_pane
+        })
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            assert!(
+                s.observed_sessions
+                    .contains(&(HostId::Local, SessionId(502)))
+            );
+            s.sidebar.update(cx, |sidebar, cx| {
+                sidebar.connect_source(Arc::new(Memory(snapshot_for(&[501]))), cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.paths = Some(Paths {
+                socket: sock_path.clone(),
+                holder: PathBuf::new(),
+                krilld: PathBuf::new(),
+            });
+            s.link = Link::Up;
+            s.change(true, cx, |l| l.activate(1));
+            s.sync(cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+
+    stop.store(true, Ordering::SeqCst);
+    std::os::unix::net::UnixStream::connect(&sock_path).ok();
+    std::fs::remove_file(&sock_path).ok();
+
+    cx.update(|_, cx| {
+        view.read_with(cx, |s, _| {
+            assert!(!s.layout.pane_exists(tab1_pane));
+        });
+    });
+    assert_eq!(resume_or_create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[gpui::test]
+fn settled_attempt_fencing_drops_stale_completion_after_pane_rebind(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostTarget};
+
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (view, cx) = open(cx, state_path("settled-attempt-fencing"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let paths = Paths {
+                socket: "/tmp/kr-fencing-unused.sock".into(),
+                holder: PathBuf::new(),
+                krilld: PathBuf::new(),
+            };
+            s.paths = Some(paths.clone());
+            let target = HostTarget::local(paths);
+            let pane = s.layout.active_tab().focused;
+            s.layout.set_session(pane, SessionId(610));
+            s.live.insert(pane, Live::new(Task::ready(())));
+            s.restarting_panes.insert(pane);
+            let snapshot = sidebar::Snapshot {
+                sessions: [610_u64, 620]
+                    .into_iter()
+                    .map(|id| sidebar::Session {
+                        id: SessionId(id),
+                        status: krill_proto::control::AgentStatus::UNKNOWN,
+                        worktree: Some("/work/a".into()),
+                        cwd: Some("/work/a".into()),
+                        account: None,
+                    })
+                    .collect(),
+                trees: std::collections::BTreeMap::from([(
+                    PathBuf::from("/work"),
+                    vec![PathBuf::from("/work/a")],
+                )]),
+            };
+            s.sidebar.update(cx, |sidebar, cx| {
+                sidebar.connect_source(Arc::new(Memory(snapshot)), cx);
+            });
+
+            let stale_attempt = SettledAttempt {
+                layout_session: Some(SessionId(610)),
+                target,
+                had_registered_target: true,
+            };
+            s.layout.set_session(pane, SessionId(620));
+
+            let next = s.settled_for_attempt(
+                pane,
+                &stale_attempt,
+                Err(pane::failure_to_io_error(
+                    krill_proto::control::Failure::NoSession,
+                )),
+                cx,
+            );
+            assert!(matches!(next, Next::Retry));
+            assert!(!s.restarting_panes.contains(&pane));
+            assert!(s.layout.pane_exists(pane));
+            assert_eq!(s.layout.session(pane), Some(SessionId(620)));
+            assert!(!s.gone_sessions.contains(&(HostId::Local, SessionId(610))));
+            assert!(!s.gone_sessions.contains(&(HostId::Local, SessionId(620))));
+
+            let next_live = s.settled_for_attempt(
+                pane,
+                &stale_attempt,
+                Ok(Got::Live {
+                    session: SessionId(610),
+                    linked: Err(std::io::ErrorKind::TimedOut.into()),
+                    prior_cold: None,
+                }),
+                cx,
+            );
+            assert!(matches!(next_live, Next::Retry));
+            assert_eq!(s.layout.session(pane), Some(SessionId(620)));
+
+            s.layout.set_host(pane, HostId::Remote("r1".into()));
+            let next_host_changed = s.settled_for_attempt(
+                pane,
+                &stale_attempt,
+                Ok(Got::Live {
+                    session: SessionId(610),
+                    linked: Err(std::io::ErrorKind::TimedOut.into()),
+                    prior_cold: None,
+                }),
+                cx,
+            );
+            assert!(matches!(next_host_changed, Next::Gone));
+        });
+    });
+}
