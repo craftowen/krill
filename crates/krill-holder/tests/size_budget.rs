@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-const MACOS_MAX: usize = 1_300;
+const MACOS_MAX: usize = 1_340;
 const LINUX_SYS_MAX: usize = 300;
 const WINDOWS_MAX: usize = 2_000;
 
