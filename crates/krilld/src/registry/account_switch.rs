@@ -26,6 +26,8 @@ const MAX_HANDOFF_WORKERS: usize = 4;
 
 const FILE: &str = "account-handoffs.json";
 const PREPARED_FILE: &str = "account-replacement.json";
+/// Codex shows this while another process holds the conversation's writer lock, then waits for `r`.
+const CODEX_WRITER_LOCKED: &str = "This conversation is open in another app";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Prepared {
@@ -1460,6 +1462,7 @@ impl Registry {
         let mut ready = false;
         let mut confirmed_at = None;
         let mut next_identity_probe = Instant::now();
+        let mut blocked_by_original = false;
         while Instant::now() < deadline {
             if !self.account_selection_current(
                 old,
@@ -1524,6 +1527,19 @@ impl Registry {
                     self.agents
                         .bind_discovered_session(new, &sid, path.as_deref());
                     self.agents.observe_account_resume(new, &session_id);
+                } else if provider == ProviderKind::Codex
+                    && tap.screen_text_and_modes().0.contains(CODEX_WRITER_LOCKED)
+                    && identity::discover(provider, old_pid, old_fg)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|found| found.id == session_id)
+                {
+                    // Profiles share Codex's writer locks, so the replacement can never open
+                    // the conversation while the original runs. Seeing it wait on exactly the
+                    // original's lock is the strongest evidence available before retirement.
+                    blocked_by_original = true;
+                    ready = true;
+                    break;
                 }
             }
             // Preserve a short preflight interval to observe immediate exits, but do not
@@ -1634,6 +1650,31 @@ impl Registry {
             self.save_account_handoffs().ok();
             self.agents.finish_account_resume(new);
             return Err(Failure::Os(libc::ETIMEDOUT));
+        }
+        if blocked_by_original {
+            tap.write_input(b"r", None).ok();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let took_over = loop {
+                if let Ok(Some(found)) =
+                    resume_identity(|| identity::discover(provider, new_pid, tap.foreground()))
+                    && found.id == session_id
+                {
+                    self.agents
+                        .bind_discovered_session(new, &found.id, Some(&found.path));
+                    break true;
+                }
+                if Instant::now() >= deadline || tap.pulse().closed {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            if !took_over {
+                tracing::warn!(
+                    original = old.0,
+                    replacement = new.0,
+                    "codex replacement did not reopen the conversation after the original released it"
+                );
+            }
         }
         // Clients now reconnect and deliver their held prompts. A synthetic continuation
         // could overtake input still in an app journal, so only actual user input is sent.
