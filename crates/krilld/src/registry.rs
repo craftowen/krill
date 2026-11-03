@@ -207,6 +207,16 @@ impl std::fmt::Debug for Registry {
     }
 }
 
+fn kept_session_size(
+    live_pty: Option<WinSize>,
+    reported: Option<WinSize>,
+    stored: Option<WinSize>,
+) -> (WinSize, bool) {
+    let actual = live_pty.or(reported);
+    let size = crate::term::clamp_size(actual.or(stored).unwrap_or(FALLBACK_SIZE));
+    (size, actual != Some(size))
+}
+
 impl Registry {
     /// `dir`(상태 디렉터리)이 있으면 세그먼트 저장소·테마·감사 로그·에이전트 프로필을 그 아래에 둔다. `holder`가
     /// 다시 넘긴 세션은 바로 다시 띄운다. 기록을 열지 못해도 세션은 띄운다(그 세션만 디스크 기록이 없다).
@@ -296,14 +306,7 @@ impl Registry {
                 // 종료 요청 전후에 krilld가 죽었으면 살아 있는 프로세스를 우선 보존한다.
                 reg.clear_sleeping(k.id);
             }
-            // 보관 세션의 PTY 크기를 그대로 쓰면 세션 안 `stty`로 키운 거대 winsize가
-            // 재기동 때 Term에 들어가 수백 MB를 할당한다(K-01). 엔진·PTY 모두 자른다.
-            #[cfg(unix)]
-            let size = crate::term::clamp_size(
-                crate::session::pty::size(&k.master).unwrap_or(FALLBACK_SIZE),
-            );
-            #[cfg(windows)]
-            let size = FALLBACK_SIZE;
+            let size = reg.resolve_kept_size(&k);
             let Ok(session) = reg.start(k.id, k.master, size) else {
                 // master는 holder가 계속 쥔다. 다음 krilld 기동 때 다시 온다.
                 // 조용히 넘기면 그 krilld 수명 동안 세션이 목록에서 사라진다(K-26).
@@ -522,6 +525,40 @@ impl Registry {
     /// 모바일 제어는 하나의 게이트웨이 인스턴스로 직렬화한다.
     pub fn mobile_gateway(&self) -> Option<&Arc<crate::mobile::gateway::Gateway>> {
         self.mobile.get()
+    }
+
+    fn resolve_kept_size(&self, k: &Kept) -> WinSize {
+        #[cfg(unix)]
+        let live_pty = crate::session::pty::size(&k.master).ok();
+        #[cfg(windows)]
+        let live_pty = None;
+        let stored = if live_pty.is_none() && k.size.is_none() {
+            self.store.as_deref().and_then(|s| s.last_size(k.id))
+        } else {
+            None
+        };
+        let (size, needs_holder_resize) = kept_session_size(live_pty, k.size, stored);
+        #[cfg(unix)]
+        let _ = needs_holder_resize;
+        #[cfg(windows)]
+        if k.status.is_none()
+            && needs_holder_resize
+            && let Some(h) = &self.holder
+            && h.version() >= 4
+        {
+            h.notify(|req| ToHolder::Resize {
+                req,
+                id: k.id,
+                size,
+            })
+            .ok();
+        }
+        size
+    }
+
+    pub(crate) fn session_size(&self, id: SessionId) -> Option<WinSize> {
+        let tap = lock(&self.state).sessions.get(&id).map(|e| e.session.tap());
+        tap?.size().ok()
     }
 
     pub fn start_mobile(self: &Arc<Self>, hello: ServerHello) -> io::Result<()> {

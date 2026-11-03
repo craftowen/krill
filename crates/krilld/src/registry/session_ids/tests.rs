@@ -260,6 +260,7 @@ fn recording_disabled_create_and_resume_commit_before_spawn_and_kept_survives_ba
                 id,
                 pid: std::process::id(),
                 status: None,
+                size: None,
                 master: OwnedFd::from(master),
             }],
         )),

@@ -48,11 +48,13 @@ fn from_holder() -> Vec<FromHolder> {
             id: SessionId(7),
             pid: 99,
             status: None,
+            size: None,
         },
         FromHolder::Session {
             id: SessionId(8),
             pid: 100,
             status: Some(0x0100),
+            size: None,
         },
         FromHolder::Listener { info: Vec::new() },
         FromHolder::Ready,
@@ -125,6 +127,7 @@ fn fixtures_v2() {
         req: 8,
         id: SessionId(7),
         pid: 99,
+        size: None,
     };
     let b = adopt.encode().unwrap();
     assert_eq!(hex(&b), "12000000070108000000070000000000000063000000");
@@ -231,6 +234,7 @@ fn windows_handles() {
         id: SessionId(8),
         pid: 100,
         status: None,
+        size: None,
     };
     let h = [1, 2, 3, 4, 0xffff_ffff_ffff_fffe];
     let b = session.encode_handles(&h).unwrap();
@@ -242,6 +246,7 @@ fn windows_handles() {
         req: 2,
         id: SessionId(8),
         pid: 100,
+        size: None,
     };
     let b = adopt.encode_handles(&h[..3]).unwrap();
     assert_eq!(
@@ -333,6 +338,74 @@ fn tail_fields_owe832() {
         info: Vec::new(),
     };
     assert_eq!(hex(&unix.encode().unwrap()), "06000000040104000000");
+}
+
+#[test]
+fn session_and_adopt_optional_size_tail() {
+    let size = Some(WinSize {
+        cols: 160,
+        rows: 45,
+    });
+    let handles = [1, 2, 3, 4, 5, 6, 7, 8];
+    for status in [None, Some(0x0100)] {
+        let session = FromHolder::Session {
+            id: SessionId(77),
+            pid: 4242,
+            status,
+            size,
+        };
+        let b = session.encode().unwrap();
+        assert_eq!(FromHolder::decode(one(&b)), Ok(session.clone()));
+        let bh = session.encode_handles(&handles).unwrap();
+        assert_eq!(
+            FromHolder::decode_handles(one(&bh)),
+            Ok((session.clone(), handles.to_vec()))
+        );
+        for cut in 1..4 {
+            let mut short = b[..b.len() - cut].to_vec();
+            short[0] -= u8::try_from(cut).unwrap();
+            assert_eq!(FromHolder::decode(one(&short)), Err(Error::Truncated));
+            let mut short_h = bh[..bh.len() - cut].to_vec();
+            short_h[0] -= u8::try_from(cut).unwrap();
+            assert_eq!(
+                FromHolder::decode_handles(one(&short_h)),
+                Err(Error::Truncated)
+            );
+        }
+        let mut extra = b.clone();
+        extra.extend([0xde, 0xad, 0xbe]);
+        extra[0] += 3;
+        assert_eq!(FromHolder::decode(one(&extra)), Ok(session));
+    }
+
+    let adopt = ToHolder::Adopt {
+        req: 12,
+        id: SessionId(77),
+        pid: 4242,
+        size,
+    };
+    let b = adopt.encode().unwrap();
+    assert_eq!(ToHolder::decode(one(&b)), Ok(adopt.clone()));
+    let bh = adopt.encode_handles(&handles).unwrap();
+    assert_eq!(
+        ToHolder::decode_handles(one(&bh)),
+        Ok((adopt.clone(), handles.to_vec()))
+    );
+    for cut in 1..4 {
+        let mut short = b[..b.len() - cut].to_vec();
+        short[0] -= u8::try_from(cut).unwrap();
+        assert_eq!(ToHolder::decode(one(&short)), Err(Error::Truncated));
+        let mut short_h = bh[..bh.len() - cut].to_vec();
+        short_h[0] -= u8::try_from(cut).unwrap();
+        assert_eq!(
+            ToHolder::decode_handles(one(&short_h)),
+            Err(Error::Truncated)
+        );
+    }
+    let mut extra = b;
+    extra.extend([0xca, 0xfe]);
+    extra[0] += 2;
+    assert_eq!(ToHolder::decode(one(&extra)), Ok(adopt));
 }
 
 #[test]

@@ -357,6 +357,7 @@ fn closed_session_leaves_list_only_after_release_reaches_holder() {
         id,
         pid: 1,
         status: None,
+        size: None,
         master: OwnedFd::from(master),
     };
     let reg = Registry::new(Some((holder, vec![kept])), Some(&reservation_dir));
@@ -993,12 +994,14 @@ fn session_accounts_returns_launch_account_with_label() {
                     id: SessionId(7),
                     pid: 1,
                     status: None,
+                    size: None,
                     master: OwnedFd::from(master_a),
                 },
                 Kept {
                     id: SessionId(8),
                     pid: 2,
                     status: None,
+                    size: None,
                     master: OwnedFd::from(master_b),
                 },
             ],
@@ -1229,6 +1232,7 @@ fn fork_creates_new_session_and_keeps_original_session_alive() {
                 id: SessionId(7),
                 pid: 700,
                 status: None,
+                size: None,
                 master: OwnedFd::from(master_orig),
             }],
         )),
@@ -2494,12 +2498,14 @@ fn close_succeeds_when_exited_races_with_failed_terminate_and_preserves_inflight
                     id: s1,
                     pid: 101,
                     status: None,
+                    size: None,
                     master: OwnedFd::from(m1),
                 },
                 Kept {
                     id: s2,
                     pid: 102,
                     status: None,
+                    size: None,
                     master: OwnedFd::from(m2),
                 },
             ],
@@ -2935,4 +2941,353 @@ fn wrapper_argv_is_recognized_only_for_agent_launches() {
     assert!(!is_wrapper_argv(&[
         "/bin/sh", "-c", "x", "y", "z", "mk-agent"
     ]));
+}
+
+#[cfg(unix)]
+fn screen_row(screen: &krill_proto::screen::Screen, row: usize) -> String {
+    screen.rows[row]
+        .iter()
+        .filter(|c| !c.flags.contains(krill_proto::screen::Flags::SPACER))
+        .map(|c| c.ch)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn kept_session_restart_hidden_tab_preserves_size_without_overprint_or_clipped_rows() {
+    use krill_holder::link::Link;
+    use krill_proto::holder::{FromHolder, VERSION};
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let dir = std::env::temp_dir().join(format!("krill-kept-hidden-size-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let id = SessionId(77);
+    let size = WinSize {
+        cols: 160,
+        rows: 45,
+    };
+    let store = Store::open(&dir, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, size).unwrap();
+    rec.append_at(b"boot\r\n", Instant::now());
+    rec.seal();
+    drop(rec);
+    drop(store);
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let (master, mut writer) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    holder_link
+        .send(
+            &FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            }
+            .encode()
+            .unwrap(),
+            &[],
+        )
+        .unwrap();
+    holder_link
+        .send(
+            &FromHolder::Session {
+                id,
+                pid: 1,
+                status: None,
+                size: None,
+            }
+            .encode()
+            .unwrap(),
+            &[master.as_fd()],
+        )
+        .unwrap();
+    holder_link
+        .send(&FromHolder::Ready.encode().unwrap(), &[])
+        .unwrap();
+    drop(master);
+
+    let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Registry::new(Some((holder, kept)), Some(&dir));
+    let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
+
+    let update = "\x1b[2J\x1b[Hh1\r\nh2\r\nh3\r\nh4\r\n• Added D:\\OneTabStorage\\Artifacts\\session-supervision-20261103\\storage-owner-r2252\\report.md\r\n\x1b[6;6H1\x1b[2C# 저장 공간 후속 확인 결과\x1b[40;1Hstatus-row-40";
+    writer.write_all(update.as_bytes()).unwrap();
+    let expected_end = 6 + update.len() as u64;
+    tap.wait_timeout(Duration::from_secs(5), |p| {
+        p.end >= expected_end || p.closed
+    });
+
+    let screen = tap.capture().0;
+    drop(writer);
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        (
+            screen.cols,
+            screen.lines,
+            screen_row(&screen, 4).as_str(),
+            screen_row(&screen, 5).as_str(),
+            screen.rows.get(39).map(|_| screen_row(&screen, 39)),
+        ),
+        (
+            160,
+            45,
+            "• Added D:\\OneTabStorage\\Artifacts\\session-supervision-20261103\\storage-owner-r2252\\report.md",
+            "     1  # 저장 공간 후속 확인 결과",
+            Some(String::from("status-row-40")),
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn kept_session_restart_active_tab_does_not_reflow_into_two_columns() {
+    use krill_holder::link::Link;
+    use krill_proto::holder::{FromHolder, VERSION};
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let dir = std::env::temp_dir().join(format!("krill-kept-active-reflow-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let id = SessionId(78);
+    let size = WinSize {
+        cols: 160,
+        rows: 45,
+    };
+    let store = Store::open(&dir, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, size).unwrap();
+    rec.append_at(b"boot\r\n", Instant::now());
+    rec.seal();
+    drop(rec);
+    drop(store);
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let (master, mut writer) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    holder_link
+        .send(
+            &FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            }
+            .encode()
+            .unwrap(),
+            &[],
+        )
+        .unwrap();
+    holder_link
+        .send(
+            &FromHolder::Session {
+                id,
+                pid: 1,
+                status: None,
+                size: None,
+            }
+            .encode()
+            .unwrap(),
+            &[master.as_fd()],
+        )
+        .unwrap();
+    holder_link
+        .send(&FromHolder::Ready.encode().unwrap(), &[])
+        .unwrap();
+    drop(master);
+
+    let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Registry::new(Some((holder, kept)), Some(&dir));
+    let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
+
+    let update = format!(
+        "\x1b[2J\x1b[1;1H• 기존{}\x1b[2;1H  작업들에게{}\x1b[3;1H\x1b[48;5;238m> 크릴 연결됐어/\x1b[K\x1b[0m\r\n",
+        " ".repeat(154),
+        " ".repeat(148),
+    );
+    writer.write_all(update.as_bytes()).unwrap();
+    let expected_end = 6 + update.len() as u64;
+    tap.wait_timeout(Duration::from_secs(5), |p| {
+        p.end >= expected_end || p.closed
+    });
+    let restarted_screen = tap.capture().0;
+    let restarted_size = WinSize {
+        cols: restarted_screen.cols,
+        rows: restarted_screen.lines,
+    };
+    drop(writer);
+    tap.wait_timeout(Duration::from_secs(5), |p| p.closed);
+    drop(reg);
+
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let store = Store::open(&dir, Limits::default()).unwrap();
+    let session = Session::start(
+        id,
+        pty.controller,
+        restarted_size,
+        Arc::new(Appearance::load(PathBuf::new())),
+        Some(store.recorder(id, size).unwrap()),
+    )
+    .unwrap();
+    session
+        .tap()
+        .wait_timeout(Duration::from_secs(5), |p| p.revision >= 1 || p.closed);
+    session.tap().resize(size).unwrap();
+    let screen = session.tap().capture().0;
+    drop(pty.user);
+    session.wait().unwrap();
+    fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        (
+            screen.cols,
+            screen.lines,
+            screen_row(&screen, 0).as_str(),
+            screen_row(&screen, 1).as_str(),
+            screen_row(&screen, 2).as_str(),
+        ),
+        (160, 45, "• 기존", "  작업들에게", "> 크릴 연결됐어/")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn kept_quiet_session_wire_size_prevents_two_column_reflow() {
+    use krill_holder::link::Link;
+    use krill_proto::holder::{FromHolder, VERSION};
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let dir = std::env::temp_dir().join(format!("krill-kept-quiet-wire-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let id = SessionId(79);
+    let size = WinSize {
+        cols: 160,
+        rows: 45,
+    };
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let (master, mut writer) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    holder_link
+        .send(
+            &FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            }
+            .encode()
+            .unwrap(),
+            &[],
+        )
+        .unwrap();
+    holder_link
+        .send(
+            &FromHolder::Session {
+                id,
+                pid: 1,
+                status: None,
+                size: Some(size),
+            }
+            .encode()
+            .unwrap(),
+            &[master.as_fd()],
+        )
+        .unwrap();
+    holder_link
+        .send(&FromHolder::Ready.encode().unwrap(), &[])
+        .unwrap();
+    drop(master);
+
+    let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Registry::new(Some((holder, kept)), Some(&dir));
+    let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
+
+    let update = format!(
+        "\x1b[2J\x1b[1;1H• 기존{}\x1b[2;1H  작업들에게{}\x1b[3;1H\x1b[48;5;238m> 크릴 연결됐어/\x1b[K\x1b[0m\r\n",
+        " ".repeat(154),
+        " ".repeat(148),
+    );
+    writer.write_all(update.as_bytes()).unwrap();
+    let expected_end = update.len() as u64;
+    tap.wait_timeout(Duration::from_secs(5), |p| {
+        p.end >= expected_end || p.closed
+    });
+    let live_screen = tap.capture().0;
+    let restarted_size = WinSize {
+        cols: live_screen.cols,
+        rows: live_screen.lines,
+    };
+    drop(writer);
+    tap.wait_timeout(Duration::from_secs(5), |p| p.closed);
+    drop(reg);
+
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let store = Store::open(&dir, Limits::default()).unwrap();
+    let session = Session::start(
+        id,
+        pty.controller,
+        restarted_size,
+        Arc::new(Appearance::load(PathBuf::new())),
+        Some(store.recorder(id, size).unwrap()),
+    )
+    .unwrap();
+    session
+        .tap()
+        .wait_timeout(Duration::from_secs(5), |p| p.revision >= 1 || p.closed);
+    session.tap().resize(size).unwrap();
+    let replayed_screen = session.tap().capture().0;
+    drop(pty.user);
+    session.wait().unwrap();
+    fs::remove_dir_all(&dir).ok();
+
+    for screen in [live_screen, replayed_screen] {
+        assert_eq!(
+            (
+                screen.cols,
+                screen.lines,
+                screen_row(&screen, 0).as_str(),
+                screen_row(&screen, 1).as_str(),
+                screen_row(&screen, 2).as_str(),
+            ),
+            (160, 45, "• 기존", "  작업들에게", "> 크릴 연결됐어/")
+        );
+    }
+}
+
+#[test]
+fn kept_session_size_reconciles_only_when_holder_size_diverges() {
+    use krill_proto::screen::{MAX_COLS, MAX_LINES};
+
+    let size = WinSize {
+        cols: 160,
+        rows: 45,
+    };
+    assert_eq!(kept_session_size(None, Some(size), None), (size, false));
+    assert_eq!(kept_session_size(None, None, Some(size)), (size, true));
+    assert_eq!(
+        kept_session_size(
+            None,
+            Some(WinSize {
+                cols: 9999,
+                rows: 9999,
+            }),
+            None,
+        ),
+        (
+            WinSize {
+                cols: MAX_COLS,
+                rows: MAX_LINES,
+            },
+            true,
+        )
+    );
 }

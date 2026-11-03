@@ -79,6 +79,7 @@ fn holder_loss_after_pause_restores_existing_reader_and_input() {
                 id: SessionId(1),
                 pid: std::process::id(),
                 status: None,
+                size: None,
                 master: master.into(),
             }],
         )),

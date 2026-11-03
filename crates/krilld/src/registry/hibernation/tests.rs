@@ -111,6 +111,7 @@ fn timer_sends_terminate_only_for_safe_group_and_preserves_resume_marker() {
                 id: SessionId(u64::try_from(i + 1).unwrap()),
                 pid: child.id(),
                 status: None,
+                size: None,
                 master: pty.controller,
             }
         })
@@ -315,6 +316,7 @@ fn terminate_send_failure_leaves_no_sleep_marker() {
         id: SessionId(1),
         pid: child.id(),
         status: None,
+        size: None,
         master: pty.controller,
     }];
     let reg = Registry::new(Some((holder, kept)), Some(&dir));

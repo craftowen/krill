@@ -474,12 +474,13 @@ impl Holder {
         };
         let link = Link::new(sock);
         let sessions = self.sessions.iter().map(|s| {
-            let pid = s.pid.as_raw_pid().unsigned_abs();
-            let (id, status) = (s.id, s.status);
-            (
-                FromHolder::Session { id, pid, status },
-                Some(s.master.as_fd()),
-            )
+            let msg = FromHolder::Session {
+                id: s.id,
+                pid: s.pid.as_raw_pid().unsigned_abs(),
+                status: s.status,
+                size: None,
+            };
+            (msg, Some(s.master.as_fd()))
         });
         let listener = self
             .listener
@@ -663,11 +664,10 @@ mod tests {
     }
 
     fn test_session(id: u64, pid: i32, status: Option<i32>) -> Session {
-        let file = std::fs::File::open("/dev/null").unwrap();
         Session {
             id: SessionId(id),
             pid: Pid::from_raw(pid).unwrap(),
-            master: OwnedFd::from(file),
+            master: OwnedFd::from(std::fs::File::open("/dev/null").unwrap()),
             status,
             adopted: false,
         }
@@ -677,12 +677,11 @@ mod tests {
     fn reap_ignores_exited_session_when_pid_is_reused() {
         // PH-01: 끝난 채 열린 탭(옛 id, status 있음)과 pid 순환으로 같은 pid를 받은 새 세션 —
         // 거둔 종료는 살아 있는 새 세션에 붙어야 한다.
-        let pid = Pid::from_raw(4242).unwrap();
         let mut sessions = vec![
             test_session(1, 4242, Some(0x700)),
             test_session(101, 4242, None),
         ];
-        let hit = super::Holder::reap_target(&mut sessions, pid).map(|s| s.id);
-        assert_eq!(hit, Some(SessionId(101)));
+        let hit = super::Holder::reap_target(&mut sessions, Pid::from_raw(4242).unwrap());
+        assert_eq!(hit.map(|s| s.id), Some(SessionId(101)));
     }
 }
