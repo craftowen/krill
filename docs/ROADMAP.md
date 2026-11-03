@@ -15,10 +15,10 @@
 | M7 Orca 패리티 | 관리자 페이지(7탭)·프로바이더 다계정/자동전환·Orca 단축키·이미지 붙여넣기·PC-to-PC SSH·실화면 QA | 2026-10-18 | MK-107~113 전부 통과 및 실화면 검증 완료 |
 | M8 오케스트레이션·핵심 고도화 | 멀티 에이전트 오케스트레이션(`krill orchestration`)·스킬 레지스트리(`krill skills`)·세션 핸드오프(`krill handoff`)·워크스페이스 체크포인트/레퍼런스·리스닝 포트 감지(`krill ports`)·에디터·GUI 통합 | 2026-10-19 | MK-114~121 전부 통과 및 실화면 검증 완료 |
 | M9 모바일 원격 제어 | `krilld` 모바일 기기 레지스트리·`ring` E2EE v2·지연 바인딩 게이트웨이(Tailscale/릴레이 우선·`cloudflared` 폴백)·1-스캔 QR 페어링(관리자 `Mobile` 8번째 탭 + `krill mobile`)·내장 모바일 PWA·라이브 터미널 뷰 | 2026-10-20 | MK-122~126 전부 통과, 데몬 ≤ 60MB, 실화면 검증 완료 |
-| M10 Orca 이관·워크벤치 확장 | Orca 설정·다계정·원격 SSH·등록 프로젝트/워크트리 원클릭 이관(`krill import orca`)·공유 심볼릭 링크·디스크 클린업·사이드바 계보/필터·우측 파일 탐색기/전문검색·탭 고정/색상/MRU·AI Vault 검색·세션 포크·Git/PR AI 복구·Precheck 스케줄러·`krill computer` | 2026-10-25 | MK-172~187 전부 통과, 앱 ≤ 120MB·데몬 ≤ 60MB, `scripts/check.sh` 0 |
+| M10 Orca 이관·워크벤치 확장 | Orca 설정·다계정·원격 SSH·등록 프로젝트/워크트리 원클릭 이관(`krill import orca`)·공유 심볼릭 링크·디스크 클린업·사이드바 계보/필터·우측 파일 탐색기/전문검색·탭 고정/색상/MRU·AI Vault 검색·세션 포크·Git/PR AI 복구·Precheck 스케줄러·`krill computer`(2026-11-03 삭제, vercel-labs/agent-desktop으로 대체) | 2026-10-25 | MK-172~187 전부 통과, 앱 ≤ 120MB·데몬 ≤ 60MB, `scripts/check.sh` 0 |
 | M11 Windows 포팅 | Windows(주 타깃 `x86_64-pc-windows-msvc`) 지원: 공통 컴파일 계층(Mac에서 Windows 타깃 `cargo check` 0) → GCP Windows VM 네이티브 ConPTY 실기 스파이크(S-W1~S-W5) → 합격 시 네이티브 본구현·배포. WSL2·앱만 원격은 보류(PRD 플랫폼 절) | 미정 | MK-205 Windows check 0, 스파이크 결과표로 본구현 여부 결정, 본구현 시 MK-217 Windows 생존 e2e 손실 0, macOS `scripts/check.sh` 0 유지 |
 | M12 Orca 심층 패리티 | 서브모듈·심링크·`.worktreeinclude` 글롭·Codex `SUN_LEN` 격리·훅 서브에이전트 보호·재귀 자식 워크트리 안전 삭제·스케줄 실행 상세/취소·오케스트레이션 `--question-id`/`--preamble`·AI Vault 증분 인덱싱·멀티 에이전트 Fan-Out 생성·Hunk/Line 스테이징·인앱 PR 머지 | 2026-10-19 | MK-223~229 전부 통과, `scripts/check.sh` 0 |
-| M13 Computer-use 신뢰성·격리·효율 | 대상 동일성·실행 결과·전역 입력 잠금·데드라인/취소·격리 네이티브 실행기·압축 관찰·짧은 배치 | 미정 | MK-244~251 관련 자동 테스트·실제 macOS 검증, 네이티브 TCC/장애 격리/메모리/지연 게이트 판정, 미통과 시 개선 JXA 유지 |
+| M13 Computer-use 신뢰성·격리·효율 | **중단(2026-11-03)**: computer use는 Krill이 직접 만들지 않고 vercel-labs/agent-desktop을 번들 스킬로 쓴다(`computer-use` 스킬, `krill-proto/src/orchestration/agent_desktop.rs`). 내장 `krill computer` CLI·워커는 삭제(5af5d174) | — | MK-244~251 진행 안 함 |
 
 ## 이슈 (우선순위 → 선행 순으로 진행)
 
@@ -181,7 +181,7 @@
 | MK-184 | Git 패널 `Push`/`Pull`/`Sync` 액션 + AI 커밋 메시지·PR 본문 자동 생성 + Git 실패 AI 복구 배너 | M10 | P0 | Git 패널 Push/Pull/Sync 동작, AI 커밋/PR 문구 생성, Git 실패 시 에러 배너→에이전트 프롬프트 주입 테스트 통과, `scripts/check.sh` 0 | MK-088, MK-090 | M10 | OWE-738 |
 | MK-185 | PR CI Checks 실패 로그 조회 & "AI로 CI 실패 / PR 리뷰 코멘트 수정" 원클릭 큐 | M10 | P1 | PR CI 체크 상태·실패 로그·리뷰 코멘트 파싱 및 선택 항목 에이전트 프롬프트 일괄 전송 테스트 통과, `scripts/check.sh` 0 | MK-085, MK-090 | M10 | OWE-739 |
 | MK-186 | 스케줄 자동화 Precheck 셸 게이트 & 새 워크트리 격리 실행 · 실행 상세 로그 뷰어 | M10 | P1 | `precheck` 비-0 종료 시 에이전트 실행 생략(`skipped`), 새 워크트리 격리 실행, Workflows 탭 실행 로그 조회 및 `Run Now` 테스트 통과, `scripts/check.sh` 0 | MK-101 | M10 | OWE-740 |
-| MK-187 | macOS 네이티브 Computer Use (`krill computer` CLI + `computer-use` 내장 스킬) | M10 | P1 | `krill computer` 서브커맨드(앱/창 목록, AX 스냅샷, 클릭/키 입력 합성) 및 `computer-use` 내장 스킬 설치·조회 테스트 통과, `scripts/check.sh` 0 | MK-115 | M10 | OWE-741 |
+| MK-187 | macOS 네이티브 Computer Use (`krill computer` CLI + `computer-use` 내장 스킬). **2026-11-03 대체**: CLI·워커 삭제, `computer-use` 스킬이 vercel-labs/agent-desktop을 설치·사용 | M10 | P1 | `krill computer` 서브커맨드(앱/창 목록, AX 스냅샷, 클릭/키 입력 합성) 및 `computer-use` 내장 스킬 설치·조회 테스트 통과, `scripts/check.sh` 0 | MK-115 | M10 | OWE-741 |
 | MK-188 | Windows 포팅 기획·전략(상위) | M11 | P1 | 하위 MK-189~222 진행, Phase별 결정 기록 | — | boost-2026-10-18 | OWE-807 |
 | MK-189 | 문서: PRD·ROADMAP M11·MK 행 신설, ARCHITECTURE §4.1 Windows 열(미확정) 추가 | M11 | P1 | 문서 diff 리뷰, `scripts/check.sh` 0 | — | boost WIN-D1 | OWE-808 |
 | MK-190 | 하네스 문구: AGENTS 규칙 5·CONVENTIONS Windows 조항·holder 상한 해석 | M11 | P1 | 문서 diff, `scripts/check.sh` 0 | — | boost WIN-D2 | OWE-809 |

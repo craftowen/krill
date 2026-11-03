@@ -37,7 +37,7 @@ AI 코딩 에이전트를 동시에 여러 개(5~20개) 돌리는 macOS(Apple Si
 |---|---|
 | 데몬이 PTY 소유 → 앱 재시작·크래시·업데이트에도 세션 생존 | 내장 브라우저, 파일 에디터(→ "Open in" VS Code·Cursor·Zed·Finder) |
 | 놓친 출력 바이트 재생, 연결 상태 배너, 자동 재연결 | 모바일 앱·클라우드 relay(→ M5 알림 웹훅) |
-| 워크트리 생성·삭제, 워크트리별 에이전트 병렬 실행 | 음성(STT), computer-use |
+| 워크트리 생성·삭제, 워크트리별 에이전트 병렬 실행 | 음성(STT), computer-use 자체 구현(→ vercel-labs/agent-desktop을 `computer-use` 번들 스킬로 사용) |
 | 에이전트 상태 6종·알림·Dock 배지·잠자기 방지 | 이슈 트래커 연동, orchestration(→ M6 재평가) |
 | `krill` CLI(ls/new/send/read/wait/attach/doctor), 일반 터미널에서 `krill attach` | 원격 SSH(→ M6) |
 | 변경 파일 목록 + 읽기 전용 diff | 커밋 UI·줄 주석(→ M5) |
