@@ -6085,6 +6085,13 @@ fn workflows_schedule_modal_precheck_isolated_worktree_and_log_viewer(cx: &mut T
             .success()
     );
 
+    // krilld is linked as a library here, so its trust preset would write the real HOME's
+    // agent configs for the isolated worktree. This test does not exercise the preset.
+    fs::write(
+        d.join(SETTINGS_FILE),
+        "workspace_trust_preset_enabled = false\n",
+    )
+    .unwrap();
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(4000.)));
