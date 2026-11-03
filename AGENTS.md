@@ -27,7 +27,7 @@ scripts/install-hooks.sh    # 클론마다 1회: git pre-push 훅(보호 ref 승
 
 - 반복 수정 중에는 변경한 크레이트의 `cargo check -p <크레이트> --locked`와 변경 동작에 관련된 테스트만 실행한다. 작은 수정마다 워크스페이스 전체를 빌드·검사하지 않는다.
 - 시작할 때 `git status`로 기존 작업과 소유 범위를 확인한다. 다른 작업의 미커밋 변경을 덮어쓰거나 자신의 변경으로 커밋하지 않는다. 과거 이력의 수정은 현재 소스·테스트와 대조한 뒤 반영한다.
-- 로컬 macOS의 Cargo 산출물(`CARGO_TARGET_DIR`·`--target-dir`·Cargo 설정)은 **마운트된 `/Volumes/krill-build/targets/<이름>` 아래에만** 둔다. 내장 SSD로 폴백하거나 활성 빌드의 캐시를 지우지 않는다. 빌드 전 `python3 scripts/check-build-target.py`로 실제 Cargo 설정을 확인한다(`check.sh`·Windows 교차 검사도 실행). GitHub Actions 러너·네이티브 Windows 경로에는 이 로컬 규칙을 적용하지 않는다.
+- 로컬 macOS의 Cargo 산출물은 **워크트리별 `/Volumes/krill-build/targets/<이름>`** 에만 둔다(`targets/shared`·내장 SSD 금지). 빌드 전 `python3 scripts/check-build-target.py`가 실제 Cargo 설정으로 강제한다(`check.sh`·Windows 교차 검사도 실행). 활성 빌드의 캐시를 지우지 않는다.
 - 변경 경계별 재발 방지와 검증 선택은 [CONVENTIONS §11](docs/CONVENTIONS.md#11-변경-경계별-재발-방지)를 따른다. 비Cargo 검사에는 Python 3.9 이상·Node 22.13 이상이 필요하다. `check-regressions.py --list`로 범위를 확인하고 `--scope`는 여러 번 지정할 수 있다. 브라우저·네이티브 실행·서명·메모리 측정은 해당 변경이 필요로 할 때 별도로 검증한다.
 - 논리 변경을 마무리하거나 커밋할 때는 포맷 검사, 영향받은 크레이트의 clippy, 관련 테스트를 확인한다. 이 범위의 검증으로 개발 작업 완료·커밋이 가능하며, 전체 `scripts/check.sh`를 요구하지 않는다.
 - IPC·공유 프로토콜·PTY/FFI·세션 생존 등 여러 크레이트의 계약을 바꾸면 해당 경로의 통합·생존 테스트도 개발 중에 실행한다. 전체 통합 검사와 구분한다.

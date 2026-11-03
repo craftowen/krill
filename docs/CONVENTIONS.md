@@ -129,6 +129,6 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 
 **테스트 격리 MUST**: 사용자 설정·계정·launchd·설치 경로에 접근하는 테스트는 쓰기 전에 전용 임시 상태 경로(`KRILL_STATE_DIR`)와 소유한 helper/프로필을 명시한다. 임시 `HOME`만으로 실제 launchd 도메인·설치 앱 helper·상속된 `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/XDG 경로가 격리됐다고 가정하지 않는다. 자식 `Command`에 필요한 환경만 덮어쓰거나 제거하고, 이번 테스트가 만든 프로세스·잡·파일만 종료/정리한다. 모든 테스트의 `HOME`을 전역으로 강제 변경해 실제 경로 계약을 가리지 않는다. 관련 fixture에서는 정상 종료와 실패 뒤 모두 사용자 설정 불변·잔여 자원 없음을 확인한다.
 
-**준비·완료 판정 SHOULD**: 고정 sleep만으로 준비/완료를 판정하지 않는다. 조건과 상한 있는 대기로 바꾸고 실패 시 관찰 상태를 남긴다. 재시도 통과는 FLAKY로 기록하며 원인 조사 없이 회귀를 무시하지 않는다. `check.sh`의 fast/latency 필터와 nextest의 latency 그룹은 `scripts/test_harness_contracts.py`가 동일성을 검사한다. 운영 작업·벤치·검사기는 실패 시 비0 종료를 검증하고, 실제 적용/관찰 이전에 성공을 보고하지 않는다.
+**준비·완료 판정 SHOULD**: 고정 sleep만으로 준비/완료를 판정하지 않는다. 조건과 상한 있는 대기로 바꾸고 실패 시 관찰 상태를 남긴다. CI는 `.config/known-flaky.txt`에 없는 FLAKY(재시도 통과)를 실패시킨다. 목록에 넣으려면 원인과 횟수를 적는다. `check.sh`의 fast/latency 필터와 nextest의 latency 그룹은 `scripts/test_harness_contracts.py`가 동일성을 검사한다. 운영 작업·벤치·검사기는 실패 시 비0 종료를 검증하고, 실제 적용/관찰 이전에 성공을 보고하지 않는다.
 
 **회귀 추가 SHOULD**: 버그를 수정하면 관련 경계를 따라 실패 전 재현·수정 후 통과하는 최소 검사를 추가한다. 자동화하기 어려운 실기 조건은 미검증 범위와 재현 절차를 남긴다. Python/Git 훅·패키징 계약·독립 JS·수집기 검사는 `scripts/check-regressions.py`로 로컬 전체 검사와 hygiene CI에서 함께 실행한다. 새 Python 검사 파일은 해당 scope의 `test_*.py`로 추가하고, 모바일 검사는 데몬/브라우저 필요 여부를 구분해 목록에 등록한다. 새로운 사고는 원인·기존 방어·필요한 회귀 검사를 대조한 뒤 해당 규칙/검사 한 곳을 보완한다.
