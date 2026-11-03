@@ -7,6 +7,7 @@
 //! 설정·확장은 `claude_config`가 링크로 공유한다. 로그인 정보는 프로필에 남기고 MCP의 없는 서버 정의만 병합한다.
 //! 멱등이라 계정 추가 때와 실행 전마다 다시 불러도 된다.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
@@ -206,10 +207,7 @@ fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
         ProviderKind::Gemini => return,
     };
     match result {
-        Ok(report) if !report.conflicts.is_empty() => {
-            tracing::warn!(conflicts = ?report.conflicts, "profile provisioning left existing entries");
-        }
-        Ok(_) => {}
+        Ok(report) => report_conflicts(profile_dir, report.conflicts),
         Err(error)
             if provider == ProviderKind::Antigravity
                 && error.kind() == io::ErrorKind::Unsupported =>
@@ -220,6 +218,22 @@ fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
         Err(error) => {
             tracing::warn!(provider = provider.as_str(), kind = ?error.kind(), "profile provisioning failed");
         }
+    }
+}
+
+/// Kept entries are a lasting user choice, and account status polls re-provision every minute, so
+/// each profile's conflict set is reported only when it changes.
+fn report_conflicts(profile_dir: &str, conflicts: Vec<&'static str>) {
+    static REPORTED: std::sync::Mutex<BTreeMap<String, Vec<&'static str>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let mut reported = REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if conflicts.is_empty() {
+        reported.remove(profile_dir);
+    } else if reported.get(profile_dir) != Some(&conflicts) {
+        tracing::warn!(conflicts = ?conflicts, "profile provisioning left existing entries");
+        reported.insert(profile_dir.to_owned(), conflicts);
     }
 }
 
