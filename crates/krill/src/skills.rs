@@ -8,7 +8,8 @@ use std::process::ExitCode;
 
 use krill_proto::daemon;
 use krill_proto::orchestration::{
-    PortEntry, WorktreeStore, builtin_skills, extract_local_urls, install_skill, skill_references,
+    PortEntry, WorktreeStore, builtin_skills, canonical_skill_name, ensure_agent_desktop_latest,
+    extract_local_urls, install_skill, skill_references,
 };
 
 pub fn run_skills(raw: &[OsString]) -> ExitCode {
@@ -133,12 +134,8 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
                 }
             }
             let name = name.ok_or_else(|| bad_arg("missing skill <name>"))?;
-            let trimmed = name.trim();
-            let stripped = trimmed.strip_prefix("krill-").unwrap_or(trimmed);
-            let Some(skill) = builtin_skills()
-                .iter()
-                .find(|s| s.name == trimmed || s.name == stripped)
-            else {
+            let canonical = canonical_skill_name(name);
+            let Some(skill) = builtin_skills().iter().find(|s| s.name == canonical) else {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("skill not found: {name}"),
@@ -248,6 +245,9 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
             } else {
                 let home = krill_proto::os::home_dir()
                     .ok_or_else(|| io::Error::other("home directory unavailable"))?;
+                if canonical_skill_name(name) == "computer-use" {
+                    ensure_agent_desktop_latest(&home, None)?;
+                }
                 krill_proto::orchestration::skill_directories(&home, &target)
             };
             let mut installed = Vec::new();
@@ -746,7 +746,7 @@ mod tests {
         dispatch_skills(&args(&["get", "krill", "--full"]))?;
         dispatch_skills(&args(&["get", "krill", "--full", "--json"]))?;
         dispatch_skills(&args(&["get", "computer-use", "--full"]))?;
-        dispatch_skills(&args(&["get", "computer-use", "--full", "--json"]))?;
+        dispatch_skills(&args(&["get", "agent-desktop", "--json"]))?;
         dispatch_skills(&args(&["get", "orchestration", "--references"]))?;
         dispatch_skills(&args(&["get", "orchestration", "--references", "--json"]))?;
         dispatch_skills(&args(&[

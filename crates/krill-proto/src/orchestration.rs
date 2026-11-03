@@ -3825,12 +3825,20 @@ pub fn probe_port(port: u16) -> bool {
 // Built-in Agent Skills Registry (MK-115)
 // ============================================================================
 
+pub mod agent_desktop;
 mod skills;
+pub use agent_desktop::{
+    AGENT_DESKTOP_VERSION, AgentDesktopAsset, AgentDesktopLinkStatus, AgentDesktopReport,
+    AgentDesktopSource, AgentDesktopTarget, ResolvedReleaseAsset, current_agent_desktop_asset,
+    ensure_agent_desktop_cli_link, ensure_agent_desktop_installed,
+    ensure_agent_desktop_installed_with_path, ensure_agent_desktop_latest, parse_latest_checksums,
+    stage_agent_desktop, verify_archive_sha256,
+};
 #[cfg(test)]
 use skills::ORCA_SKILL_NAMES;
 pub use skills::{
     BUILTIN_SKILLS, ORCHESTRATION_REFERENCES, SkillEntry, SkillSyncReport, builtin_skills,
-    install_skill, skill_directories, skill_references, sync_builtin_skills,
+    canonical_skill_name, install_skill, skill_directories, skill_references, sync_builtin_skills,
     sync_builtin_skills_at,
 };
 
@@ -4982,21 +4990,17 @@ mod tests {
             .iter()
             .find(|s| s.name == "computer-use")
             .ok_or_else(|| not_found("computer-use skill"))?;
+        assert!(!computer.content.contains("krill computer"));
         for sub in [
-            "krill computer capabilities",
-            "krill computer permissions",
-            "krill computer list-apps",
-            "krill computer list-windows",
-            "krill computer get-app-state",
-            "krill computer click",
-            "krill computer perform-secondary-action",
-            "krill computer set-value",
-            "krill computer type-text",
-            "krill computer press-key",
-            "krill computer hotkey",
-            "krill computer paste-text",
-            "krill computer scroll",
-            "krill computer drag",
+            "agent-desktop status",
+            "agent-desktop skills get platform",
+            "agent-desktop skills get desktop",
+            "agent-desktop snapshot",
+            "agent-desktop click",
+            "commands-observation",
+            "commands-interaction",
+            "commands-system",
+            "workflows",
         ] {
             assert!(computer.content.contains(sub), "{sub}");
         }

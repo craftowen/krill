@@ -40,7 +40,7 @@ pub const BUILTIN_SKILLS: &[SkillEntry] = &[
     },
     SkillEntry {
         name: "computer-use",
-        description: "Drive visible macOS native app and external browser windows via `krill computer` (accessibility tree snapshots, clicks, typing, keys, hotkeys, clipboard paste, and value setting).",
+        description: "Operate desktop applications on macOS, Windows, and Linux through native accessibility trees using the bundled agent-desktop CLI.",
         content: include_str!("skills/computer-use/SKILL.md"),
     },
 ];
@@ -80,8 +80,21 @@ pub const ORCHESTRATION_REFERENCES: &[(&str, &str)] = &[
     ),
 ];
 
+#[must_use]
+pub fn canonical_skill_name(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let stripped = trimmed
+        .strip_prefix("krill-")
+        .or_else(|| trimmed.strip_prefix("mk-"))
+        .unwrap_or(trimmed);
+    match stripped {
+        "agent-desktop" => "computer-use",
+        other => other,
+    }
+}
+
 pub fn skill_references(name: &str) -> &'static [(&'static str, &'static str)] {
-    match name.trim().trim_start_matches("krill-") {
+    match canonical_skill_name(name) {
         "orchestration" => ORCHESTRATION_REFERENCES,
         _ => &[],
     }
@@ -166,11 +179,11 @@ pub fn sync_builtin_skills_at(home: &Path) -> SkillSyncReport {
 }
 
 pub fn install_skill(name: &str, base_dir: &Path) -> io::Result<PathBuf> {
-    let name = name.trim().strip_prefix("krill-").unwrap_or(name.trim());
+    let canonical = canonical_skill_name(name);
     let skill = builtin_skills()
         .iter()
-        .find(|s| s.name == name)
-        .ok_or_else(|| not_found(format!("unknown skill: {name}")))?;
+        .find(|s| s.name == canonical)
+        .ok_or_else(|| not_found(format!("unknown skill: {}", name.trim())))?;
     install(skill, base_dir).map(|(path, _)| path)
 }
 
@@ -272,6 +285,22 @@ fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
         let bytes = format!("{}\n{MARKER}\n", body.trim_end());
         changed |= write_if_changed(path, bytes.as_bytes())?;
     }
+    if skill_references(skill.name).is_empty() {
+        let refs_dir = dir.join("references");
+        if ensure_directory_safe(&refs_dir).is_ok()
+            && let Ok(entries) = fs::read_dir(&refs_dir)
+        {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if regular_or_missing(&p).unwrap_or(false)
+                    && fs::read_to_string(&p).is_ok_and(|s| s.contains(MARKER))
+                {
+                    fs::remove_file(&p).ok();
+                }
+            }
+            fs::remove_dir(&refs_dir).ok();
+        }
+    }
     let mut stale = vec![base_dir.join(format!("mk-{}", skill.name))];
     if orca_owned {
         stale.push(base_dir.join(skill.name));
@@ -304,7 +333,7 @@ fn skill_lock(path: &Path) -> io::Result<LockGuard> {
 
 /// Reject user-controlled directory redirects. Root-level OS aliases such as macOS
 /// `/var` -> `/private/var` are outside the provider directory ownership boundary.
-fn ensure_directory_safe(dir: &Path) -> io::Result<()> {
+pub(super) fn ensure_directory_safe(dir: &Path) -> io::Result<()> {
     // Relative manual install paths need the same ancestor checks as discovery roots.
     let dir = std::path::absolute(dir)?;
     for path in dir
@@ -329,7 +358,7 @@ fn ensure_directory_safe(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn regular_or_missing(path: &Path) -> io::Result<bool> {
+pub(super) fn regular_or_missing(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(meta) => Ok(meta.is_file() && !meta.file_type().is_symlink()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
