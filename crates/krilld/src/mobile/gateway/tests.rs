@@ -18,15 +18,14 @@ fn hello() -> ServerHello {
 pub(super) fn start() -> (Arc<Registry>, Arc<Gateway>) {
     let r = Arc::new(Registry::new(None, None));
     r.start_mobile(hello()).unwrap();
-    lock(&r.mobile_gateway().unwrap().shared.state).tunnel_start =
-        Some(super::super::tunnel::Tunnel::fixture);
     let gateway = Arc::clone(r.mobile_gateway().unwrap());
     (r, gateway)
 }
+/// 직접 경로 픽스처: 격리 QA용 명시적 loopback 페어링.
 fn offer(g: &Gateway) -> (u16, krill_proto::mobile::PairingTicket) {
     let reply = g.request(MobileRequest::MintPairingTicket {
-        mode: ConnectMode::Tunnel,
-        custom_address: None,
+        mode: ConnectMode::Lan,
+        custom_address: Some("127.0.0.1:0".into()),
         rotate: true,
     });
     let MobileReply::PairingOffer { port, url, .. } = reply else {
@@ -244,8 +243,8 @@ fn lazy_binding_expiry_and_mode_rotation() {
     drop(s);
     // 설정 변경은 이전 QR을 즉시 폐기하고 새로운 티켓을 발급한다.
     g.request(MobileRequest::SetConnectMode {
-        mode: ConnectMode::Tunnel,
-        custom_address: Some("127.0.0.1:0".into()),
+        mode: ConnectMode::Lan,
+        custom_address: Some(format!("127.0.0.1:{port}")),
     });
     assert!(
         lock(&g.shared.state)
@@ -286,7 +285,7 @@ fn invalid_backup_selection_preserves_live_connection_ticket_and_port() {
     ));
     {
         let state = lock(&gateway.shared.state);
-        assert_eq!(state.mode, ConnectMode::Tunnel);
+        assert_eq!(state.mode, ConnectMode::Lan);
         assert_eq!(state.selected.unwrap().port(), port);
         assert_eq!(state.devices.ticket(now_ms()).unwrap().token, before);
         assert_eq!(state.devices.active_count(), 1);
@@ -681,8 +680,6 @@ fn ws_attach_input_and_resize_preserve_real_desktop_pty() {
         None,
     ));
     r.start_mobile(hello()).unwrap();
-    lock(&r.mobile_gateway().unwrap().shared.state).tunnel_start =
-        Some(super::super::tunnel::Tunnel::fixture);
     let g = Arc::clone(r.mobile_gateway().unwrap());
     let (mut desktop, server) = UnixStream::pair().unwrap();
     desktop
@@ -790,10 +787,9 @@ fn notification_deep_link_exists_only_while_gateway_is_exposed_and_has_no_secret
     let (_registry, gateway) = start();
     let id = krill_proto::SessionId(42);
     assert!(gateway.deep_link(id).is_none());
-    let (_port, _ticket) = offer(&gateway);
+    let (port, _ticket) = offer(&gateway);
     let link = gateway.deep_link(id).unwrap();
-    assert!(link.starts_with("https://"));
-    assert!(link.ends_with("/?session=42"));
+    assert_eq!(link, format!("http://127.0.0.1:{port}/?session=42"));
     assert!(!link.contains("pair="));
     assert!(!link.contains("key="));
     gateway.request(MobileRequest::RevokeDevice {
@@ -831,7 +827,6 @@ fn tailscale_preference_restart_preserves_port_backup_address_and_device_credent
     std::fs::remove_dir_all(&dir).ok();
     let registry = Arc::new(Registry::new(None, None));
     let gateway = Gateway::start(Arc::downgrade(&registry), Some(&dir), hello()).unwrap();
-    lock(&gateway.shared.state).tunnel_start = Some(super::super::tunnel::Tunnel::fixture);
     let (port, ticket) = offer(&gateway);
     let mut phone = Client::pair(port, &ticket);
     phone.ipc();
@@ -937,24 +932,6 @@ fn manual_loopback_bind_survives_restart_with_multiple_interfaces() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[test]
-fn supervisor_replaces_unreachable_tunnel_with_backoff() {
-    let (_r, g) = start();
-    offer(&g);
-    let mut s = lock(&g.shared.state);
-    let port = s.selected.unwrap().port();
-    s.tunnel = Some(super::super::tunnel::Tunnel::stale(port).unwrap());
-    reconcile(&mut s, now_ms()).unwrap();
-    assert!(s.tunnel.is_none());
-    assert_eq!(s.tunnel_failures, 1);
-    assert!(s.tunnel_retry_at.is_some());
-    // 백오프가 지나면 새 터널을 띄우고, 준비되면 실패 횟수를 되돌린다.
-    s.tunnel_retry_at = None;
-    reconcile(&mut s, now_ms()).unwrap();
-    assert!(s.tunnel.as_ref().unwrap().ready_url().is_some());
-    reconcile(&mut s, now_ms()).unwrap();
-    assert_eq!(s.tunnel_failures, 0);
-}
-#[test]
 fn idle_authenticated_socket_is_pinged_then_closed_without_pong() {
     let (_r, g) = start();
     lock(&g.shared.state).ping = Duration::from_millis(100);
@@ -1008,62 +985,26 @@ fn ws_closes_when_registry_ends_before_first_request() {
 }
 
 #[test]
-fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
+fn relay_mode_without_relay_has_no_offer_or_deep_link_and_direct_offer_has_no_rendezvous() {
     let (_registry, gateway) = start();
-    let (port, ticket) = offer(&gateway);
-    {
-        let mut state = lock(&gateway.shared.state);
-        state.tunnel = Some(super::super::tunnel::Tunnel::fixed_fixture(port).unwrap());
-        state.publication.origin = "https://stage.test".into();
-    }
-    let state = lock(&gateway.shared.state);
+    offer(&gateway);
+    let mut state = lock(&gateway.shared.state);
     let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
         panic!("페어링 응답 없음");
     };
-    assert_eq!(
-        url,
-        format!(
-            "https://stage.test/m/{}/#pair={}&key={}&t=fixture-mobile.trycloudflare.com&r={}",
-            super::super::pwa::asset_hash(),
-            hex(&ticket.token),
-            ws::base64(&ticket.secret, true),
-            state.publication.rid
-        )
-    );
-    drop(state);
-    assert_eq!(
-        gateway.deep_link(krill_proto::SessionId(7)).unwrap(),
-        format!(
-            "https://stage.test/m/{}/?session=7",
-            super::super::pwa::asset_hash()
-        )
-    );
-    let mut state = lock(&gateway.shared.state);
-    state.tunnel = Some(super::super::tunnel::Tunnel::fixture(port).unwrap());
-    for mode in [ConnectMode::Tunnel, ConnectMode::Lan] {
-        state.mode = mode;
-        let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
-            panic!("페어링 응답 없음");
-        };
-        assert!(url.contains("/#pair="));
-        assert!(url.contains("&key="));
-        assert!(!url.contains("?pair="));
-        assert!(!url.contains("&r="));
-    }
+    assert!(url.contains("/#pair="));
+    assert!(url.contains("&key="));
+    assert!(!url.contains("?pair="));
+    assert!(!url.contains("&r="));
     state.mode = ConnectMode::Tailscale;
     assert!(
         pairing_offer(&state, now_ms()).is_err(),
         "never advertise localhost as a tailnet backup"
     );
     state.mode = ConnectMode::Tunnel;
-    // 준비 확인 전 터널은 고정 출처를 쓰지 않고 찍힌 터널 URL로 강등한다.
-    state.tunnel = Some(super::super::tunnel::Tunnel::stale(port).unwrap());
-    let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
-        panic!("페어링 응답 없음");
-    };
-    assert!(url.starts_with("https://fixture-mobile.trycloudflare.com/#pair="));
-    state.tunnel = None;
     assert!(pairing_offer(&state, now_ms()).is_err());
+    drop(state);
+    assert!(gateway.deep_link(krill_proto::SessionId(7)).is_none());
 }
 #[test]
 #[cfg(unix)]
@@ -1105,8 +1046,15 @@ fn rendezvous_credentials_migrate_old_intent_and_survive_mode_changes() {
     let dir = std::env::temp_dir().join(format!("mk-mobile-migrate-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
-    // 열거형의 실제 직렬화 표기를 사용해 구버전 파일을 만든다.
-    let legacy = serde_json::json!({"mode":ConnectMode::Tunnel,"custom":null});
+    // 열거형의 실제 직렬화 표기를 사용해 구버전 파일을 만든다. 제거된 cloudflared 필드는 무시하고 다시 쓰지 않는다.
+    let legacy = serde_json::json!({
+        "mode": ConnectMode::Tunnel,
+        "custom": null,
+        "tunnel_pid": 4242,
+        "tunnel_url": "https://old.trycloudflare.com",
+        "tunnel_token": "legacy-secret",
+        "tunnel_hostname": "krill.example.test",
+    });
     super::super::devices::write_private(
         &dir.join(INTENT_FILE),
         &serde_json::to_vec(&legacy).unwrap(),
@@ -1114,6 +1062,8 @@ fn rendezvous_credentials_migrate_old_intent_and_survive_mode_changes() {
     .unwrap();
     let first = Intent::load(Some(&dir)).unwrap();
     assert_eq!(first.mode, ConnectMode::Tunnel);
+    let rewritten = std::fs::read_to_string(dir.join(INTENT_FILE)).unwrap();
+    assert!(!rewritten.contains("tunnel_"), "{rewritten}");
     assert_eq!(first.rid.len(), 32);
     assert_eq!(first.key.len(), 64);
     let gateway = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
@@ -1138,57 +1088,6 @@ fn rendezvous_credentials_migrate_old_intent_and_survive_mode_changes() {
 }
 
 #[test]
-fn mint_waits_for_pending_download_without_holding_state_lock() {
-    fn downloading(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
-        Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "cloudflared 내려받는 중",
-        ))
-    }
-    let (_registry, gateway) = start();
-    lock(&gateway.shared.state).tunnel_start = Some(downloading);
-    let worker_gateway = Arc::clone(&gateway);
-    let (send, receive) = std::sync::mpsc::channel();
-    let worker = thread::spawn(move || {
-        send.send(worker_gateway.request(MobileRequest::MintPairingTicket {
-            mode: ConnectMode::Tunnel,
-            custom_address: None,
-            rotate: true,
-        }))
-        .unwrap();
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while lock(&gateway.shared.state)
-        .devices
-        .ticket(now_ms())
-        .is_none()
-        && Instant::now() < deadline
-    {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        lock(&gateway.shared.state)
-            .devices
-            .ticket(now_ms())
-            .is_some()
-    );
-    assert!(receive.try_recv().is_err());
-    {
-        let mut state = lock(&gateway.shared.state);
-        assert!(state.tunnel.is_none());
-        assert_eq!(state.tunnel_failures, 0);
-        state.tunnel_start = Some(super::super::tunnel::Tunnel::fixture);
-        reconcile(&mut state, now_ms()).unwrap();
-    }
-    gateway.shared.wake();
-    assert!(matches!(
-        receive.recv_timeout(Duration::from_secs(5)).unwrap(),
-        MobileReply::PairingOffer { .. }
-    ));
-    worker.join().unwrap();
-}
-
-#[test]
 #[cfg(unix)]
 fn closing_listener_waits_for_polling_accept_thread_to_release_its_fd() {
     let (_r, g) = start();
@@ -1209,10 +1108,6 @@ fn closing_listener_waits_for_polling_accept_thread_to_release_its_fd() {
 #[test]
 fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_isolation() {
     use super::super::relay::{MUX_BINARY, MUX_CLOSE, MUX_OPEN, MUX_TEXT, decode_mux, encode_mux};
-    fn must_not_start_tunnel(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
-        panic!("a healthy relay must not start cloudflared")
-    }
-
     let relay_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let relay_port = relay_listener.local_addr().unwrap().port();
     let (_r, g) = start();
@@ -1225,8 +1120,6 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
             email: "test@example.test".into(),
             origin: s.publication.origin.clone(),
         });
-        s.relay_enabled = true;
-        s.tunnel_start = Some(must_not_start_tunnel);
         (s.publication.rid.clone(), s.publication.key.clone())
     };
 
@@ -1314,17 +1207,6 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
         )
     );
 
-    {
-        let mut state = lock(&g.shared.state);
-        let port = state.selected.unwrap().port();
-        state.tunnel = Some(super::super::tunnel::Tunnel::fixture(port).unwrap());
-        let MobileReply::PairingOffer { url: restored, .. } =
-            pairing_offer(&state, now_ms()).unwrap()
-        else {
-            panic!("missing offer")
-        };
-        assert_eq!(restored, url, "relay must win over an existing tunnel URL");
-    }
     assert!(
         g.deep_link(krill_proto::SessionId(42))
             .unwrap()
@@ -1623,97 +1505,7 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
 }
 
 #[test]
-fn daemon_restart_readopts_loopback_port_and_live_cloudflared_pid_in_zero_ms() {
-    fn must_not_spawn(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
-        Err(io::Error::other("must re-adopt existing cloudflared PID"))
-    }
-    let dir = std::env::temp_dir().join(format!("mk-mobile-readopt-{}", std::process::id()));
-    std::fs::remove_dir_all(&dir).ok();
-    let r = Arc::new(Registry::new(None, None));
-    let g = Gateway::start(Arc::downgrade(&r), Some(&dir), hello()).unwrap();
-    lock(&g.shared.state).tunnel_start = Some(super::super::tunnel::Tunnel::persistent_fixture);
-    g.request(MobileRequest::SetConnectMode {
-        mode: ConnectMode::Tunnel,
-        custom_address: Some("eyJ-named-token@krill.example.com".into()),
-    });
-
-    let MobileReply::PairingOffer { port, url, .. } = g.request(MobileRequest::MintPairingTicket {
-        mode: ConnectMode::Tunnel,
-        custom_address: None,
-        rotate: true,
-    }) else {
-        panic!("expected tunnel offer");
-    };
-    assert!(url.starts_with("https://fixture-mobile.trycloudflare.com/#pair="));
-    let (ticket, pid) = {
-        let s = lock(&g.shared.state);
-        assert_eq!(s.tunnel_token.as_deref(), Some("eyJ-named-token"));
-        assert_eq!(s.tunnel_hostname.as_deref(), Some("krill.example.com"));
-        (
-            s.devices.ticket(now_ms()).unwrap().clone(),
-            s.tunnel.as_ref().unwrap().pid().unwrap(),
-        )
-    };
-    let mut phone = Client::pair(port, &ticket);
-    phone.ipc();
-    let (device, credential) = (phone.device.clone(), phone.credential);
-    drop(phone);
-
-    // 1. 데몬 종료(Gateway::drop): 기기가 등록되어 있으므로 cloudflared PID는 죽지 않고 살아남는다.
-    drop(g);
-    assert!(
-        super::super::tunnel::pid_alive(pid),
-        "cloudflared process must survive Gateway::drop when a device is enrolled"
-    );
-    let saved = Intent::load(Some(&dir)).unwrap();
-    assert_eq!(saved.port, Some(port));
-    assert_eq!(saved.tunnel_pid, Some(pid));
-    assert_eq!(
-        saved.tunnel_url.as_deref(),
-        Some("https://fixture-mobile.trycloudflare.com")
-    );
-    assert_eq!(saved.tunnel_token.as_deref(), Some("eyJ-named-token"));
-    assert_eq!(saved.tunnel_hostname.as_deref(), Some("krill.example.com"));
-
-    // 2. 데몬 재시작(Gateway::start): 새 cloudflared를 띄우지 않고 기존 port와 PID를 0초 만에 재입양한다.
-    let g2 = Gateway::start(Arc::downgrade(&r), Some(&dir), hello()).unwrap();
-    lock(&g2.shared.state).tunnel_start = Some(must_not_spawn);
-    until(|| {
-        let s = lock(&g2.shared.state);
-        !s.listeners.is_empty() && s.tunnel.as_ref().is_some_and(|t| t.ready_url().is_some())
-    });
-    {
-        let s = lock(&g2.shared.state);
-        assert_eq!(s.selected.unwrap().port(), port);
-        assert_eq!(s.tunnel.as_ref().unwrap().pid(), Some(pid));
-        assert_eq!(
-            s.tunnel.as_ref().unwrap().ready_url(),
-            Some("https://fixture-mobile.trycloudflare.com")
-        );
-    }
-    let mut reconnected = Client::reconnect(port, &device, &credential);
-    reconnected.ipc();
-    drop(reconnected);
-
-    // 3. 모든 기기 해제 시 입양된 cloudflared 프로세스까지 즉시 종료하고 Intent의 터널 정보를 비운다.
-    g2.request(MobileRequest::RevokeDevice {
-        device_id: None,
-        all: true,
-    });
-    until(|| !super::super::tunnel::pid_alive(pid));
-    let cleared = Intent::load(Some(&dir)).unwrap();
-    assert!(cleared.port.is_none());
-    assert!(cleared.tunnel_pid.is_none());
-    assert!(cleared.tunnel_url.is_none());
-    drop(g2);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn missing_relay_pwa_fails_fast_without_quick_tunnel_fallback() {
-    fn must_not_start_tunnel(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
-        panic!("relay failure must not start a quick tunnel")
-    }
+fn missing_relay_pwa_fails_fast() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let (_registry, gateway) = start();
     {
@@ -1725,8 +1517,6 @@ fn missing_relay_pwa_fails_fast_without_quick_tunnel_fallback() {
             email: "test@example.test".into(),
             origin: state.publication.origin.clone(),
         });
-        state.relay_enabled = true;
-        state.tunnel_start = Some(must_not_start_tunnel);
     }
     let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
@@ -1756,17 +1546,24 @@ fn missing_relay_pwa_fails_fast_without_quick_tunnel_fallback() {
         "{message}"
     );
     assert!(started.elapsed() < MINT_WAIT);
-    assert!(lock(&gateway.shared.state).tunnel.is_none());
     server.join().unwrap();
 }
 
 #[test]
 fn revoking_all_devices_cancels_a_pending_pairing_wait() {
-    fn pending(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
-        Err(io::Error::new(io::ErrorKind::WouldBlock, "still preparing"))
-    }
+    // 응답하지 않는 릴레이: 페어링 요청은 릴레이 준비를 기다린다.
+    let silent = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let (_registry, gateway) = start();
-    lock(&gateway.shared.state).tunnel_start = Some(pending);
+    {
+        let mut state = lock(&gateway.shared.state);
+        state.publication.origin = format!("http://{}", silent.local_addr().unwrap());
+        state.account.session = Some(super::super::relay_auth::Session {
+            token: "test-session".into(),
+            expires_at_ms: u64::MAX,
+            email: "test@example.test".into(),
+            origin: state.publication.origin.clone(),
+        });
+    }
     let worker_gateway = Arc::clone(&gateway);
     let (send, receive) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || {
@@ -1791,7 +1588,10 @@ fn revoking_all_devices_cancels_a_pending_pairing_wait() {
         MobileReply::Revoked { .. }
     ));
     let reply = receive.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(matches!(reply, MobileReply::Failed(_)));
+    assert!(
+        matches!(&reply, MobileReply::Failed(message) if message.contains("취소")),
+        "{reply:?}"
+    );
     assert!(lock(&gateway.shared.state).listeners.is_empty());
     worker.join().unwrap();
 }
@@ -1936,10 +1736,6 @@ fn relay_account_requires_local_ipc_and_does_not_gate_direct_pairing() {
         }),
         MobileReply::PairingOffer { .. }
     ));
-    {
-        let mut state = lock(&gateway.shared.state);
-        state.tunnel_start = None;
-    }
     let MobileReply::Failed(message) = gateway.request(MobileRequest::MintPairingTicket {
         mode: ConnectMode::Tunnel,
         custom_address: None,
@@ -1963,6 +1759,7 @@ fn relay_logout_invalidates_pending_approval_without_revoking_pairing() {
             .unwrap()
             .0
             .device_id;
+        state.mode = ConnectMode::Tunnel;
         state.devices.mint(now_ms(), true).unwrap();
         state.account.pending = Some(super::super::relay_auth::Pending {
             code: "secret-code".into(),
@@ -1989,41 +1786,30 @@ fn relay_logout_invalidates_pending_approval_without_revoking_pairing() {
 }
 
 #[test]
-fn target_named_configuration_controls_google_gate_before_any_mutation() {
+fn relay_google_gate_rejects_before_any_mutation() {
     for mint in [false, true] {
         let (_registry, gateway) = start();
-        lock(&gateway.shared.state).relay_enabled = true;
-        let request = |custom_address| {
-            if mint {
-                MobileRequest::MintPairingTicket {
-                    mode: ConnectMode::Tunnel,
-                    custom_address,
-                    rotate: true,
-                }
-            } else {
-                MobileRequest::SetConnectMode {
-                    mode: ConnectMode::Tunnel,
-                    custom_address,
-                }
-            }
-        };
-        let named = gateway.request(request(Some("fixture-token@krill.example.test".into())));
-        assert!(!matches!(named, MobileReply::Failed(_)), "{named:?}");
+        offer(&gateway);
         let original_ticket = lock(&gateway.shared.state)
             .devices
             .ticket(now_ms())
             .cloned();
-        if environment_named_tunnel().is_none() {
-            let hosted = gateway.request(request(Some(String::new())));
-            assert!(matches!(hosted, MobileReply::Failed(message) if message.contains("Google")));
-        }
-        let invalid = gateway.request(request(Some("@invalid".into())));
-        assert!(
-            matches!(invalid, MobileReply::Failed(message) if message.contains("Named Tunnel"))
-        );
+        let request = if mint {
+            MobileRequest::MintPairingTicket {
+                mode: ConnectMode::Tunnel,
+                custom_address: None,
+                rotate: true,
+            }
+        } else {
+            MobileRequest::SetConnectMode {
+                mode: ConnectMode::Tunnel,
+                custom_address: None,
+            }
+        };
+        let hosted = gateway.request(request);
+        assert!(matches!(hosted, MobileReply::Failed(message) if message.contains("Google")));
         let state = lock(&gateway.shared.state);
-        assert_eq!(state.tunnel_token.as_deref(), Some("fixture-token"));
-        assert_eq!(state.tunnel_hostname.as_deref(), Some("krill.example.test"));
+        assert_eq!(state.mode, ConnectMode::Lan);
         assert_eq!(
             state.devices.ticket(now_ms()).map(|ticket| ticket.token),
             original_ticket.map(|ticket| ticket.token)
@@ -2035,8 +1821,6 @@ fn target_named_configuration_controls_google_gate_before_any_mutation() {
 fn start_in(dir: &Path) -> (Arc<Registry>, Arc<Gateway>) {
     let r = Arc::new(Registry::new(None, Some(dir)));
     r.start_mobile(hello()).unwrap();
-    lock(&r.mobile_gateway().unwrap().shared.state).tunnel_start =
-        Some(super::super::tunnel::Tunnel::fixture);
     let gateway = Arc::clone(r.mobile_gateway().unwrap());
     (r, gateway)
 }
@@ -2205,9 +1989,6 @@ fn change_feed_pushes_on_the_direct_e2ee_channel_and_stops_with_the_connection()
 #[test]
 fn change_feed_pushes_through_the_relay_mux_and_ends_with_mux_close() {
     use super::super::relay::{MUX_BINARY, MUX_CLOSE, MUX_OPEN, MUX_TEXT, decode_mux, encode_mux};
-    fn must_not_start_tunnel(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
-        panic!("a healthy relay must not start cloudflared")
-    }
     struct Relay {
         host: TcpStream,
         channel: Channel,
@@ -2283,8 +2064,6 @@ fn change_feed_pushes_through_the_relay_mux_and_ends_with_mux_close() {
             email: "test@example.test".into(),
             origin: s.publication.origin.clone(),
         });
-        s.relay_enabled = true;
-        s.tunnel_start = Some(must_not_start_tunnel);
     }
     let server = thread::spawn(move || {
         let (mut manifest, _) = relay_listener.accept().unwrap();
@@ -2544,9 +2323,6 @@ fn accept_within(listener: &TcpListener, wait: Duration) -> Option<TcpStream> {
 fn relay_with_upgrade_status(
     status: &'static str,
 ) -> (Arc<Registry>, Arc<Gateway>, Option<TcpStream>) {
-    fn must_not_start_tunnel(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
-        panic!("relay tests must not start cloudflared")
-    }
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let (registry, gateway) = start();
     {
@@ -2558,8 +2334,6 @@ fn relay_with_upgrade_status(
             email: "test@example.test".into(),
             origin: state.publication.origin.clone(),
         });
-        state.relay_enabled = true;
-        state.tunnel_start = Some(must_not_start_tunnel);
     }
     let server = thread::spawn(move || {
         let (mut manifest, _) = listener.accept().unwrap();
