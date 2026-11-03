@@ -67,8 +67,8 @@ impl Registry {
             }
             // A prepared replacement can still own the conversation. Never infer rollback
             // from an error string or the absence of a UI handoff alone.
-            if let Some(dir) = self.state_dir() {
-                for path in prepared_paths(&dir).map_err(|_| Failure::Denied)? {
+            if let Some(dir) = self.dir.as_deref() {
+                for path in prepared_paths(dir).map_err(|_| Failure::Denied)? {
                     if read_prepared(&path)
                         .map_err(|_| Failure::Denied)?
                         .is_some_and(|p| p.from == session || p.to == session)

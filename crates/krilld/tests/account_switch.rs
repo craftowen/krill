@@ -367,3 +367,43 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
     drop(daemon);
     fs::remove_dir_all(root).unwrap();
 }
+
+// Account migration belongs to the daemon that owns a state folder. A registry without one (a
+// standalone krilld, or another crate's test that links krilld) must not rewrite the user's files.
+#[test]
+fn stateless_daemon_does_not_migrate_the_users_codex_accounts() {
+    let root = PathBuf::from(format!("/tmp/kas-mig-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let source = root.join("a-codex-profile-whose-canonical-path-exceeds-the-socket-limit");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("auth.json"), "fixture-only").unwrap();
+    let config = home.join(".config/krill/accounts.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let accounts = format!(
+        "[[accounts]]\nid = \"codex-long\"\nprovider = \"codex\"\nlabel = \"long\"\nprofile_dir = \"{}\"\n",
+        source.display()
+    );
+    fs::write(&config, &accounts).unwrap();
+    let socket = root.join("run/k.sock");
+    let mut daemon = Command::new(KRILLD)
+        .arg(&socket)
+        .env("HOME", &home)
+        .env_remove("KRILL_STATE_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The hello is served after the registry is built, so any startup migration has finished.
+    wait_for(|| connect(&socket));
+    daemon.kill().ok();
+    daemon.wait().ok();
+    let after = fs::read_to_string(&config).unwrap();
+    let short_home = home.join(".krill").exists();
+    fs::remove_dir_all(&root).ok();
+    assert_eq!(after, accounts, "accounts.toml was rewritten");
+    assert!(!short_home, "a short Codex home was created under HOME");
+}
