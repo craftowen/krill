@@ -12,6 +12,9 @@ fi
 python3 scripts/check-build-target.py
 # 테스트 빌드 프로필은 CI(ci-macos.yml)·nightly와 같다. 시간 예산 테스트가 로컬과 CI에서 같은 최적화 수준을 본다.
 export CARGO_PROFILE_TEST_OPT_LEVEL=${CARGO_PROFILE_TEST_OPT_LEVEL:-2} CARGO_PROFILE_TEST_DEBUG=${CARGO_PROFILE_TEST_DEBUG:-line-tables-only}
+# Krill 세션에서 물려받은 운영 상태 폴더·에이전트 설정 경로를 지워 CI와 같은 환경에서 검사한다(F-01).
+# 테스트 HOME 격리는 .config/nextest.toml setup 스크립트가 맡는다.
+unset KRILL_STATE_DIR CLAUDE_CONFIG_DIR CODEX_HOME XDG_CONFIG_HOME KRILL_CLI KRILL_ROOT_PATH KRILL_WORKSPACE_NAME KRILL_WORKTREE_PATH
 # 종료·타임아웃(perl alarm → SIGALRM)·Ctrl-C 때 이 스크립트가 띄운 cargo·테스트 프로세스 트리를 정리한다(고아 cargo가
 # 공유 빌드 락을 쥔 채 남는 문제). `kill 0`은 호출자 셸까지 죽일 수 있어 자기 자식 트리만 찾아 끈다.
 # zsh는 포그라운드 자식이 끝날 때까지 신호 trap을 미루므로 각 단계는 run(백그라운드 + wait)으로 돌린다.
