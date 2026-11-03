@@ -103,6 +103,9 @@ fn read_prepared(path: &Path) -> std::io::Result<Option<Prepared>> {
     Ok(Some(prepared))
 }
 
+/// Handoffs and replacement journals describe this registry's own sessions, so they live only in
+/// its own state folder. `state_dir()` falls back to the process default (the operational folder in
+/// a Krill session); a registry without a folder keeps no records there.
 pub(super) fn load(dir: Option<&Path>) -> BTreeMap<SessionId, SessionHandoff> {
     dir.and_then(|d| std::fs::read(d.join(FILE)).ok())
         .and_then(|raw| serde_json::from_slice::<Vec<SessionHandoff>>(&raw).ok())
@@ -673,7 +676,7 @@ impl Registry {
         &self,
         handoffs: &BTreeMap<SessionId, SessionHandoff>,
     ) -> std::io::Result<()> {
-        let Some(dir) = self.state_dir() else {
+        let Some(dir) = self.dir.as_deref() else {
             return Ok(());
         };
         let handoffs: Vec<_> = handoffs.values().collect();
@@ -992,10 +995,10 @@ impl Registry {
 
     fn recover_prepared_account(&self) -> RecoveryFence {
         let mut fence = RecoveryFence::default();
-        let Some(dir) = self.state_dir() else {
+        let Some(dir) = self.dir.as_deref() else {
             return fence;
         };
-        let paths = match prepared_paths(&dir) {
+        let paths = match prepared_paths(dir) {
             Ok(paths) => paths,
             Err(error) => {
                 tracing::warn!(kind = ?error.kind(), "replacement inventory is incomplete; retries withheld");
@@ -1021,10 +1024,10 @@ impl Registry {
     }
 
     fn ensure_no_unresolved_account_replacement(&self, session: SessionId) -> Result<(), Failure> {
-        let Some(dir) = self.state_dir() else {
+        let Some(dir) = self.dir.as_deref() else {
             return Ok(());
         };
-        let paths = prepared_paths(&dir).map_err(|_| Failure::BadRequest)?;
+        let paths = prepared_paths(dir).map_err(|_| Failure::BadRequest)?;
         for path in paths {
             if let Some(prepared) = read_prepared(&path).map_err(|_| Failure::BadRequest)?
                 && (prepared.from == session || prepared.to == session)
@@ -1432,7 +1435,7 @@ impl Registry {
                 applied,
             )
             .map_err(|e| prepare_failure(old, "replacement_identity", &e))?;
-        if let Some(dir) = state_dir.as_deref() {
+        if let Some(dir) = self.dir.as_deref() {
             let raw = serde_json::to_vec(&Prepared {
                 from: old,
                 to: new,
@@ -1772,8 +1775,8 @@ impl Drop for Replacement<'_> {
                 .contains_key(&self.session);
             registered && self.registry.stop_account_replacement(self.session)
         };
-        if resolved && let Some(dir) = self.registry.state_dir() {
-            std::fs::remove_file(replacement_journal(&dir, self.session)).ok();
+        if resolved && let Some(dir) = self.registry.dir.as_deref() {
+            std::fs::remove_file(replacement_journal(dir, self.session)).ok();
         }
     }
 }
