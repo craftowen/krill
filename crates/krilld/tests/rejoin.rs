@@ -730,3 +730,53 @@ fn second_holder_cannot_take_the_socket_while_its_owner_restarts_krilld() {
     drop(kids);
     fs::remove_dir_all(dir).ok();
 }
+
+/// 소켓을 맡은 holder가 krilld를 다시 띄우는 순간 다른 krilld의 bind 탐침이 `.lock`을 잠깐 쥐면 새 krilld는 중복으로
+/// 끝난다. 그 holder가 owner 락과 listener를 쥔 채 멈추면 아무도 소켓을 받지 못해 세션에 영영 붙지 못한다.
+/// 탐침이 끝나면 krilld를 다시 띄워 세션을 돌려줘야 한다.
+#[test]
+fn socket_owner_restarts_krilld_after_a_lock_probe_overlaps() {
+    let dir = tmp("owner-probe");
+    let sock = dir.join("run/k.sock");
+    let mut kids = Kids::default();
+    kids.holders.push(holder(&dir, &sock));
+    let (mut c, first) = wait_daemon(&sock, 0);
+    kids.pids.push(first);
+    let Reply::Created {
+        session,
+        pid: shell,
+    } = create(&mut c, &dir, "sleep 60")
+    else {
+        unreachable!("create failed")
+    };
+    kids.pids.push(shell);
+    drop(c);
+    let owner = Pid::from_child(&kids.holders[0]);
+    kill_process(owner, Signal::STOP).unwrap();
+    kill_process(pid(first), Signal::KILL).unwrap();
+    let probe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(beside(&sock, ".lock"))
+        .unwrap();
+    wait_until("krilld released the socket lock", || {
+        probe.try_lock().is_ok()
+    });
+    // 실제 탐침은 수십 µs다. owner가 다시 띄우는 동안 쥐고 있어 겹침을 고정한다.
+    kill_process(owner, Signal::CONT).unwrap();
+    thread::sleep(Duration::from_secs(1));
+    drop(probe);
+    let (mut c, next) = wait_daemon(&sock, u64::from(first));
+    kids.pids.push(next);
+    assert_eq!(
+        list(&mut c),
+        vec![Info {
+            session,
+            pid: shell,
+            status: None
+        }]
+    );
+    drop(c);
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}

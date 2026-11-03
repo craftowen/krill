@@ -370,8 +370,8 @@ impl Holder {
         while let Ok(Some((pid, st))) = rustix::process::wait(WaitOptions::NOHANG) {
             let status = st.as_raw();
             if self.krilld.as_ref().is_some_and(|k| k.pid == pid) {
-                if st.exit_status() == Some(i32::from(KRILLD_DUPLICATE)) {
-                    // 다른 데몬이 소켓을 쥐어 다시 띄워도 같다(30초마다 영구 재기동, A-01). master는 세션이 끝날 때까지 쥔다.
+                if st.exit_status() == Some(i32::from(KRILLD_DUPLICATE)) && self.owner.is_none() {
+                    // 다른 데몬이 소켓을 쥐어 다시 띄워도 같다(A-01). 소켓을 맡은 holder의 중복은 bind 탐침과 겹친 일시 충돌이고, 멈추면 owner 락 때문에 아무도 그 소켓을 받지 못해 백오프로 다시 띄운다.
                     tracing::warn!(sessions = self.sessions.len(), "daemon duplicate");
                     self.krilld = None;
                     self.restart_at = None;
