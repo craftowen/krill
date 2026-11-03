@@ -295,6 +295,8 @@ impl Holder {
     }
     fn failed(&mut self) {
         self.streak = self.streak.saturating_add(1);
+        // A daemon that keeps dying at start with no sessions (a bind permission error) never recovers.
+        self.parked |= self.sessions.is_empty() && self.streak >= 5;
         if self.streak >= 3
             && let Some(path) = self.previous.take()
         {
@@ -831,6 +833,16 @@ mod tests {
             i32::from(krill_proto::daemon::KRILLD_DUPLICATE),
             Duration::ZERO
         ));
+    }
+
+    /// A-05: 세션 없이 뜨자마자 계속 끝나는 krilld는 다섯 번째에 포기하고 holder가 나간다.
+    #[test]
+    fn empty_holder_gives_up_after_repeated_start_failures() {
+        let mut h = holder();
+        for _ in 0..4 {
+            assert!(!h.daemon_exited(1, Duration::ZERO));
+        }
+        assert!(h.daemon_exited(1, Duration::ZERO));
     }
 
     #[test]

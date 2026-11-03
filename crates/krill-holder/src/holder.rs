@@ -36,6 +36,8 @@ const NOFILE: u64 = 10_240;
 /// `UpgradeKrilld`로 바꾼 krilld가 뜨자마자 죽기를 이 횟수 연속으로 반복하면 바꾸기 전 경로로 되돌린다(OWE-589).
 /// 백오프 1번째(즉시)·2번째(즉시)·3번째(250ms) 뒤라 롤백까지 1초 안에 끝난다.
 const ROLLBACK_AFTER: u32 = 3;
+/// 세션 없는 holder의 krilld가 이만큼 연속으로 뜨자마자 끝나면(bind 권한 오류 등) 다시 띄우지 않고 끝낸다(약 2초).
+const GIVE_UP: u32 = 5;
 
 #[derive(Debug)]
 pub(crate) struct Session {
@@ -133,7 +135,7 @@ impl Holder {
                 && self.restart_at.is_none()
                 && self.sessions.iter().all(|s| s.status.is_some())
             {
-                return Ok(()); // 재기동을 멈췄고 쥔 세션도 모두 끝났다
+                return Ok(()); // 재기동을 멈췄고(중복 기동·포기) 쥔 세션도 모두 끝났다
             }
             // 종료 신호(기동 직후·대기 중 모두 루프 맨 앞에서 본다): 사유를 남기고 끝낸다. 세션은 master fd를 쥔 krilld가 고아로 이어 받는다(rejoin). SIGKILL은 못 남긴다.
             let stop = sys::STOPPED.load(std::sync::atomic::Ordering::Relaxed);
@@ -424,8 +426,13 @@ impl Holder {
                 self.note_unstable();
             }
         }
-        tracing::warn!(streak = self.streak, "daemon restart scheduled");
-        self.restart_at = Some(Instant::now() + backoff(self.streak));
+        self.schedule();
+    }
+
+    fn schedule(&mut self) {
+        let give_up = self.sessions.is_empty() && self.streak >= GIVE_UP;
+        tracing::warn!(streak = self.streak, give_up, "daemon restart scheduled");
+        self.restart_at = (!give_up).then(|| Instant::now() + backoff(self.streak));
     }
 
     /// 현 krilld 경로가 한 번 실패했다(뜨자마자 죽거나 뜨지 못함). `UpgradeKrilld` 뒤 연속 실패가
@@ -468,7 +475,7 @@ impl Holder {
             self.streak = self.streak.saturating_add(1);
             // 뜨지 못한 것도 실패로 센다(업그레이드 preflight를 피한 교체 등).
             self.note_unstable();
-            self.restart_at = Some(Instant::now() + backoff(self.streak));
+            self.schedule();
             return;
         };
         let link = Link::new(sock);
