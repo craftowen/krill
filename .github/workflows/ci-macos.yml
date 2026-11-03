@@ -176,12 +176,6 @@ jobs:
       - name: Verify restored vendor and external configuration
         run: python3 packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
 
-      - name: fmt, supply chain and notices
-        run: |
-          cargo fmt --all --check
-          cargo deny --locked check --hide-inclusion-graph
-          python3 docs/licensing/generate_notices.py --check
-
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
         timeout-minutes: 60
