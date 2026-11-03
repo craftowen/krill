@@ -13,13 +13,17 @@ if [[ $tool == Bash ]]; then
   [[ ${KRILL_ALLOW_REMOTE-} == 1 ]] && exit 0
   cmd=$(jq -r '.tool_input.command // empty' <<<"$input")
   s='[[:space:]]'
-  # 명령 시작 위치(줄 처음, ; & | ( ` $( 뒤, 환경변수 대입 허용)에서만 잡는다 — 커밋 메시지 속 글자는 통과.
-  pre="(^|[;&|(\`]|\\\$\\()$s*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$s+)*"
+  # 명령 시작 위치(줄 처음, ; & | ( ` $( 뒤)에서만 잡는다 — 커밋 메시지 속 글자는 통과.
+  # 그 앞의 환경변수 대입, env·command·exec 같은 래퍼(옵션 포함), 절대 경로 실행도 같은 명령으로 본다.
+  pre="(^|[;&|(\`]|\\\$\\()$s*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|([^[:space:]]*/)?(env|command|exec|builtin|nohup|sudo|time)|-[A-Za-z-]+($s+[A-Z_][A-Z0-9_]*)?)$s+)*([^[:space:]]*/)?"
+  gh="${pre}gh($s+(-R|--repo)($s+|=)[^[:space:]]+)?$s+"
   why=''
   if grep -Eq "${pre}git($s+(-C|-c)$s+[^[:space:]]+|$s+--[^[:space:]]+)*$s+push($s|$)" <<<"$cmd"; then why='git push'
-  elif grep -Eq "${pre}gh$s+release$s+(create|upload|delete)" <<<"$cmd"; then why='gh release create/upload/delete'
-  elif grep -Eiq "${pre}gh$s+api$s.*(-X|--method)($s*|=)(PUT|POST|PATCH|DELETE)" <<<"$cmd"; then why='gh api 쓰기 요청'
-  elif grep -Eq "${pre}gh$s+api$s.*$s(-f|-F|--field|--raw-field|--input)($s|=)" <<<"$cmd" \
+  elif grep -Eq "${gh}release$s+(create|upload|delete)" <<<"$cmd"; then why='gh release create/upload/delete'
+  elif grep -Eq "${gh}pr$s+merge" <<<"$cmd"; then why='gh pr merge'
+  elif grep -Eq "${gh}(workflow$s+(run|enable|disable)|run$s+rerun)" <<<"$cmd"; then why='gh workflow 실행·설정(유료 실행 포함)'
+  elif grep -Eiq "${gh}api$s.*(-X|--method)($s*|=)(PUT|POST|PATCH|DELETE)" <<<"$cmd"; then why='gh api 쓰기 요청'
+  elif grep -Eq "${gh}api$s.*$s(-f|-F|--field|--raw-field|--input)($s|=)" <<<"$cmd" \
     && ! grep -Eiq "(-X|--method)($s*|=)GET" <<<"$cmd"; then why='gh api 필드 지정(기본 POST)'
   elif grep -Eq "${pre}((ba|z)?sh$s+)?[^[:space:]]*publish-github\.sh" <<<"$cmd"; then why='publish-github.sh 게시'
   fi
