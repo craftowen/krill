@@ -418,11 +418,21 @@
       /* Diagnostics must never interfere with the application. */
     }
   }
-  function attempt(retry = 0) {
+  // An episode is the run of attempts until one succeeds. It files at most
+  // one report, held briefly so a quick recovery or a hidden page files none.
+  const weight = (code, input) =>
+    code === "mobile_auth_failed" || input.reason === "auth_required"
+      ? 2
+      : input.ws_code || input.http_status
+        ? 1
+        : 0;
+  function attempt(retry = 0, previous) {
     const started = Date.now(),
-      attemptId = id();
-    let state = { phase: "socket_open", route: "unknown" },
-      breadcrumbs = [];
+      attemptId = id(),
+      episode = previous?.episode.open
+        ? previous.episode
+        : { open: false, held: null, timer: null, away: false, crumbs: [] };
+    let state = { phase: "socket_open", route: "unknown" };
     const metadata = (extra) => ({
       ...state,
       attempt_id: attemptId,
@@ -430,14 +440,54 @@
       retry_count: Math.min(10000, Math.max(0, retry)),
       ...extra,
     });
+    const remember = (input) => {
+      episode.away ||= document.visibilityState === "hidden";
+      episode.crumbs.push(crumb(input));
+      episode.crumbs = episode.crumbs.slice(-12);
+    };
+    const release = () => {
+      clearTimeout(episode.timer);
+      const hidden = document.visibilityState === "hidden";
+      if (hidden || episode.away) {
+        episode.away = hidden;
+        episode.timer = setTimeout(release, 10000);
+        return;
+      }
+      const held = episode.held;
+      episode.held = null;
+      if (held)
+        report(held.code, { ...held.input, breadcrumbs: episode.crumbs });
+    };
     return {
+      episode,
       mark(phase, extra = {}) {
         state = { ...state, ...fields(extra), phase };
-        breadcrumbs.push(crumb(metadata(extra)));
-        breadcrumbs = breadcrumbs.slice(-12);
+        remember(metadata(extra));
       },
       report(code, extra = {}) {
-        report(code, { ...metadata(extra), breadcrumbs });
+        const input = metadata(extra);
+        remember(input);
+        if (episode.open) {
+          if (
+            episode.held &&
+            weight(code, input) > weight(episode.held.code, episode.held.input)
+          )
+            episode.held = { code, input };
+          return;
+        }
+        episode.open = true;
+        episode.held = { code, input };
+        if (code === "mobile_rpc_failed") release();
+        else episode.timer = setTimeout(release, 10000);
+      },
+      ok() {
+        clearTimeout(episode.timer);
+        Object.assign(episode, {
+          open: false,
+          held: null,
+          away: false,
+          crumbs: [],
+        });
       },
     };
   }

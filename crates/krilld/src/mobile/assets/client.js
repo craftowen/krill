@@ -1462,7 +1462,7 @@
           (serial = operation.catch(() => {})),
           operation
             .catch((error) => {
-              if (current === generation)
+              if (current === generation && !error.definitive)
                 diagnosticsTrace?.report("mobile_rpc_failed", {
                   phase: "rpc",
                   reason:
@@ -1636,7 +1636,7 @@
           return;
         }
         ((connecting = !0), clearTimeout(retryTimer), clearTimeout(timer));
-        diagnosticsTrace = M.diagnostics?.attempt(retryCount);
+        diagnosticsTrace = M.diagnostics?.attempt(retryCount, diagnosticsTrace);
         const trace = diagnosticsTrace;
         const current = ++generation,
           controller = (connectController = new AbortController()),
@@ -1680,7 +1680,7 @@
                   ? "tunnel"
                   : "direct";
               const octets = target.hostname.split(".").map(Number);
-              if (octets.length === 4 && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) timing.route = "tailscale";
+              if ((octets.length === 4 && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) || target.hostname.endsWith(".ts.net")) timing.route = "tailscale";
               trace?.mark("socket_open", {route: timing.route});
               const active = (socket = new WebSocket(attempted));
               active.binaryType = "arraybuffer";
@@ -1717,7 +1717,7 @@
                         : "websocket_error";
                   if (
                     !failed ||
-                    e?.code ||
+                    (e?.code && failed.diagnosticReported) ||
                     diagnosticReason === "auth_rejected"
                   )
                     trace?.report(
@@ -1887,6 +1887,7 @@
               rejectedRoutes.clear();
               authInterruptedRoutes.clear();
               retryCount = 0;
+              trace?.ok();
               nextRetryAt = 0;
               retryNotBefore = 0;
               warmTerminal();
