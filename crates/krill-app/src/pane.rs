@@ -1134,13 +1134,24 @@ impl<W: Write> Pane<W> {
     /// 칸 크기가 (열, 행)이다. 붙어 있고 보낸 크기와 다르면 `Resize`·`Focus`로 PTY를 맞춘다(MK-050: 이 연결이 크기
     /// 주인이 된다). 끊겨 있으면 다음 [`Pane::link`]에서 보낸다. 쓰기가 실패하면 연결을 끊고 그 알림.
     pub fn fit(&mut self, cols: u16, rows: u16) -> Option<Notice> {
-        self.grid = Some((cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_LINES)));
-        let (cols, rows) = self.grid.filter(|g| self.sent != Some(*g))?;
+        let want = (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_LINES));
+        self.grid = Some(want);
+        let screen_diverged = self.view.screen.cols > 0
+            && self.view.screen.lines > 0
+            && (self.view.screen.cols, self.view.screen.lines) != want;
+        if self.sent == Some(want) && !screen_diverged {
+            return None;
+        }
         if !self.roles || self.out.is_none() {
             return None;
         }
-        self.sent = self.grid;
-        let failed = self.send(&roles::Request::Resize { cols, rows }).is_err()
+        self.sent = Some(want);
+        let failed = self
+            .send(&roles::Request::Resize {
+                cols: want.0,
+                rows: want.1,
+            })
+            .is_err()
             || self.send(&roles::Request::Focus).is_err();
         failed.then(|| self.unlink()).flatten()
     }
