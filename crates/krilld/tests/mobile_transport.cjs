@@ -116,7 +116,7 @@ function harness(
     crypto: { getRandomValues: (b) => b },
     location: url,
     history: { replaceState() {} },
-    navigator: {},
+    navigator: { connection: new EventTarget() },
     localStorage: {
       getItem: (key) => store.get(key) || null,
       setItem: (key, value) => store.set(key, value),
@@ -240,9 +240,19 @@ test("RPC total deadline breaks serial queue and never resends a mutation", asyn
   assert.equal(socket.sent.length, before + 1);
   await h.tick(15000);
   await assert.rejects(first, /timed out/);
-  await assert.rejects(second);
   assert.equal(h.transport.ready, false);
   assert.equal(socket.sent.length, before + 1);
+  await h.tick(0);
+  const next = h.sockets.at(-1);
+  await h.advance(next);
+  h.response(next, { sessions: [] });
+  await flush();
+  h.response(next, { etag: "retried" });
+  assert.equal((await second).etag, "retried", "the queued read is retried");
+  assert(
+    !next.sent.some((b) => Buffer.from(b).includes(Buffer.from('"once"'))),
+    "the mutation is not resent on the new connection",
+  );
   h.transport.close();
 });
 test("updates wait for queued RPCs and uncertain mutation results until explicit reconnect", async () => {
@@ -1956,5 +1966,85 @@ test("relay attachment saves the authenticated connection origin instead of its 
   assert.equal(peer.selectRoute(next.routeUrl), true);
   assert.equal(peer.socketUrl(), probe.url);
   assert.equal(stored.credential, saved.credential);
+  h.transport.close();
+});
+
+async function feeding(h) {
+  const { pending, socket } = await h.start(4);
+  h.transport.setActive(false);
+  h.response(socket, {
+    sessions: [],
+    etag: "e1",
+    capabilities: { change_feed: true },
+  });
+  await pending;
+  await h.tick(2500);
+  h.response(socket, { unchanged: true, etag: "e1", feed: 2500 });
+  await flush();
+  return socket;
+}
+test("a silent change feed is probed and its dead socket replaced within 10s of silence", async () => {
+  const h = harness(),
+    socket = await feeding(h),
+    sent = socket.sent.length;
+  for (let silent = 0; silent < 10000; silent += 2500) await h.tick(2500);
+  assert.equal(socket.sent.length, sent + 1, "one liveness probe");
+  assert.equal(h.transport.ready, false, "dead socket found within 10s");
+  assert.equal(socket.closed, true);
+  assert(
+    !h.events.some((e) => /timed out|not resent/.test(e.message)),
+    "recovery does not show a timeout",
+  );
+  await h.tick(0);
+  assert.notEqual(h.sockets.at(-1), socket, "reconnecting");
+  h.transport.close();
+});
+test("a live idle feed answers probes and stays connected; a hidden page sends nothing", async () => {
+  const h = harness(),
+    socket = await feeding(h);
+  for (let i = 0; i < 24; i++) {
+    const sent = socket.sent.length;
+    await h.tick(2500);
+    if (socket.sent.length > sent)
+      h.response(socket, { unchanged: true, etag: "e1", feed: 2500 });
+    await flush();
+  }
+  assert.equal(h.transport.ready, true);
+  assert.equal(socket.closed, undefined);
+  h.context.document = { hidden: true };
+  const hidden = socket.sent.length;
+  for (let i = 0; i < 24; i++) await h.tick(2500);
+  assert.equal(socket.sent.length, hidden, "no probes while hidden");
+  assert.equal(h.transport.ready, true);
+  h.transport.close();
+});
+test("a network change probes the live socket at once", async () => {
+  const h = harness(),
+    socket = await feeding(h),
+    sent = socket.sent.length;
+  h.context.navigator.connection.dispatchEvent(new Event("change"));
+  await flush();
+  assert.equal(socket.sent.length, sent + 1, "probe sent without waiting");
+  await h.tick(5000);
+  assert.equal(h.transport.ready, false, "unanswered probe drops the socket");
+  h.transport.close();
+});
+test("a read is retried once; a second transport failure surfaces", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(4);
+  h.transport.setActive(false);
+  h.response(socket, { sessions: [] });
+  await pending;
+  const read = h.transport.rpc({ action: "git" });
+  read.catch(() => {});
+  await flush();
+  await h.tick(15000);
+  await h.tick(0);
+  const next = h.sockets.at(-1);
+  await h.advance(next);
+  h.response(next, { sessions: [] });
+  await flush();
+  await h.tick(15000);
+  await assert.rejects(read, /Disconnected. Reconnecting/);
   h.transport.close();
 });

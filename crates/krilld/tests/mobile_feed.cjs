@@ -39,16 +39,18 @@ test('legacy daemon: requests stay byte-compatible and keep the 2.5s cadence',as
  h.transport.close();
 });
 
-test('feed daemon: idle minute needs 2 snapshot requests instead of 24 while pushes arrive without a request',async()=>{
- const h=harness(),socket=await armed(h),before=h.requests(socket).length,rendered=h.snapshots.length;
- await h.tick(10000);h.push(socket,body('e2',{rev:2}));const pushedAt=h.now;await flush();
+test('feed daemon: an idle minute needs 12 liveness probes instead of 24 polls while pushes arrive without a request',async()=>{
+ const h=harness(),socket=await armed(h),rendered=h.snapshots.length;
+ await h.tick(2500);h.push(socket,body('e2',{rev:2}));const pushedAt=h.now;await flush();
  assert.equal(h.snapshots.length,rendered+1,'push renders without any request');assert.equal(h.snapshots.at(-1).at,pushedAt,'zero client-side delay after the daemon push');assert.equal(h.snapshots.at(-1).data.etag,'e2');
- // Only the 30s reconciliation refresh remains; it carries the newest etag and keeps the feed armed.
- await h.tick(29999);assert.equal(h.requests(socket).length,before);await h.tick(1);
+ const before=h.requests(socket).length;
+ // Only a probe after 5s without any frame remains; it carries the newest etag and keeps the feed armed.
+ await h.tick(4999);assert.equal(h.requests(socket).length,before);await h.tick(1);
  const extra=h.requests(socket).slice(before);assert.equal(extra.length,1);assert.deepEqual(JSON.parse(JSON.stringify(extra[0])),{action:'snapshot',since:'e2',feed:2500});
  h.respond(socket,{unchanged:true,etag:'e2',rev:2,feed:2500});await flush();
  // Measured window: 60s after the push. Polling would send 24 snapshot requests (one per 2.5s).
- await h.tick(30000);assert.equal(h.requests(socket).length-before,2);h.respond(socket,{unchanged:true,etag:'e2',rev:2,feed:2500});await flush();
+ for(let i=0;i<55;i++){const n=h.requests(socket).length;await h.tick(1000);if(h.requests(socket).length>n){h.respond(socket,{unchanged:true,etag:'e2',rev:2,feed:2500});await flush();}}
+ assert.equal(h.requests(socket).length-before,12);
  assert.equal(h.errors.length,0);assert.equal(h.transport.ready,true);h.transport.close();
 });
 
@@ -84,7 +86,8 @@ test('hidden tab pauses the feed and sends nothing until it is visible again',as
 test('terminal focus re-arms the feed at the legacy 10s terminal cadence',async()=>{
  const h=harness(),socket=await armed(h),count=h.requests(socket).length;
  h.M.activeTerminal={};await h.tick(2500);const request=h.requests(socket).at(-1);assert.equal(h.requests(socket).length,count+1);assert.equal(request.feed,10000);
- h.respond(socket,{unchanged:true,etag:'e1',rev:1,feed:10000});await flush();await h.tick(25000);assert.equal(h.requests(socket).length,count+1);
+ h.respond(socket,{unchanged:true,etag:'e1',rev:1,feed:10000});await flush();await h.tick(4999);assert.equal(h.requests(socket).length,count+1);
+ await h.tick(1);assert.equal(h.requests(socket).at(-1).feed,10000,'the liveness probe keeps the terminal cadence');
  h.transport.close();
 });
 
@@ -120,10 +123,10 @@ test('a frame that fails decryption closes the connection instead of desynchroni
  assert.equal(h.transport.ready,false);assert.equal(socket.closed,true);h.transport.close();
 });
 
-test('a lost push is reconciled by the 30s refresh and the next change still pushes',async()=>{
+test('a lost push is reconciled by the 5s liveness probe and the next change still pushes',async()=>{
  const h=harness(),socket=await armed(h),before=h.requests(socket).length;
  // The daemon changed to e2 but its push never arrived (e.g. dropped under relay backpressure).
- await h.tick(30000);const reconcile=h.requests(socket).slice(before);assert.equal(reconcile.length,1);assert.equal(reconcile[0].since,'e1');
+ await h.tick(5000);const reconcile=h.requests(socket).slice(before);assert.equal(reconcile.length,1);assert.equal(reconcile[0].since,'e1');
  h.respond(socket,body('e2',{rev:2,feed:2500}));await flush();assert.equal(h.snapshots.at(-1).data.etag,'e2');
  h.push(socket,body('e3',{rev:3}));await flush();assert.equal(h.snapshots.at(-1).data.etag,'e3');
  assert.equal(h.requests(socket).length,before+1);h.transport.close();
@@ -140,8 +143,8 @@ test('a definitive read error after the feed is armed keeps the feed instead of 
  const h=harness(),socket=await armed(h),before=h.requests(socket).length;
  const refresh=h.transport.refresh();await flush();h.respond(socket,null,false);await assert.rejects(refresh,/invalid/);
  assert.equal(h.requests(socket).length,before+1,'no plain retry once the daemon accepted feed');
- await h.tick(25000);assert.equal(h.requests(socket).length,before+1,'still push mode: no 2.5s polling');
- await h.tick(5000);const next=h.requests(socket).at(-1);assert.equal(h.requests(socket).length,before+2);assert.equal(next.feed,2500,'reconcile keeps negotiating feed');h.respond(socket,{unchanged:true,etag:'e1',rev:1,feed:2500});await flush();
+ await h.tick(4999);assert.equal(h.requests(socket).length,before+1,'still push mode: no 2.5s polling');
+ await h.tick(1);const next=h.requests(socket).at(-1);assert.equal(h.requests(socket).length,before+2);assert.equal(next.feed,2500,'reconcile keeps negotiating feed');h.respond(socket,{unchanged:true,etag:'e1',rev:1,feed:2500});await flush();
  const mutation=h.transport.rpc({action:'prompt',session:1,text:'once'});await flush();h.respond(socket,null,false);await assert.rejects(mutation,/invalid/);
  await h.tick(1000);assert.equal(h.requests(socket).filter(r=>r.action==='prompt').length,1,'mutations are never retried');
  h.transport.close();

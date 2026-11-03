@@ -516,7 +516,10 @@ test("RPC timeout files one report with no request, follow-on or own-close dupli
   await flush();
   await h.tick(15000);
   await assert.rejects(first);
-  await assert.rejects(queued);
+  await h.tick(0);
+  await establish(h, h.sockets.at(-1));
+  h.response(h.sockets.at(-1), { files: [] });
+  await queued;
   await settle(h);
   const events = h.events();
   assert.equal(events.length, 1);
@@ -1251,4 +1254,23 @@ test("cross-tab saved legacy off is migrated and queue is cleared, while explici
   assert.equal(h.store.get(KEY), "1");
   await h.tick();
   assert.equal(h.requests.length, 0);
+});
+test("a read whose socket died is retried on the next connection and files no report", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 4);
+  h.response(socket, { sessions: [] });
+  await pending;
+  const read = t.rpc({ action: "git" });
+  read.catch(() => {});
+  await flush();
+  await h.tick(15000);
+  await h.tick(0);
+  await establish(h, h.sockets.at(-1));
+  h.response(h.sockets.at(-1), { files: ["retried"] });
+  assert.equal((await read).files[0], "retried");
+  await settle(h);
+  assert.equal(h.events().length, 0);
+  t.close();
 });
