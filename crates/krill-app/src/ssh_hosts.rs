@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
 
+use krill_hosts::ssh::valid_host;
 use serde::{Deserialize, Serialize};
 
 const HOSTS_FILE: &str = "hosts.toml";
@@ -48,41 +49,11 @@ impl SshHost {
         self
     }
 
-    /// 안정성 기본 옵션(`ServerAliveInterval=15`, `ServerAliveCountMax=3`, `ConnectTimeout`)과
-    /// 포트(`-p`)·키 파일(`-i`)을 조립하는 공통 argv 빌더.
-    #[must_use]
-    pub fn common_ssh_args(&self, connect_timeout_secs: u16) -> Vec<String> {
-        let mut args = vec![
-            "-o".to_owned(),
-            "ServerAliveInterval=15".to_owned(),
-            "-o".to_owned(),
-            "ServerAliveCountMax=3".to_owned(),
-            "-o".to_owned(),
-            format!("ConnectTimeout={connect_timeout_secs}"),
-        ];
-        if let Some(port) = self.port {
-            args.push("-p".to_owned());
-            args.push(port.to_string());
-        }
-        if let Some(id_file) = &self.identity_file {
-            let trimmed = id_file.trim();
-            if !trimmed.is_empty() {
-                args.push("-i".to_owned());
-                args.push(trimmed.to_owned());
-            }
-        }
-        args
-    }
-
     /// 연결 테스트(`test_connection`)용 ssh 인자 목록.
     #[must_use]
     pub fn test_args(&self) -> Vec<String> {
-        let mut args = self.common_ssh_args(4);
+        let mut args = self.to_ssh_options().common_args(4);
         args.extend([
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            "-o".to_owned(),
-            "StrictHostKeyChecking=accept-new".to_owned(),
             "--".to_owned(),
             self.destination.clone(),
             "uname -sr && ([ -x \"$HOME/.local/bin/krill\" ] || command -v krill >/dev/null 2>&1) && echo 'krill: ready' || echo 'krill: not installed'".to_owned(),
@@ -171,20 +142,6 @@ pub fn validate_host_input(
         port,
         identity_file,
     })
-}
-
-/// `[user@]host` 또는 `~/.ssh/config` 별칭만 허용한다. `-`로 시작하면 `ssh`가 옵션으로
-/// 해석하므로(`-oProxyCommand=...`) 거부한다.
-#[must_use]
-pub fn valid_host(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 253
-        && !s.starts_with('-')
-        && !s.starts_with('@')
-        && !s.ends_with('@')
-        && s.chars().filter(|&c| c == '@').count() <= 1
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@'))
 }
 
 /// 키 파일 경로 검증: 빈 값·`-` 시작(옵션 인젝션)·제어 문자·널 바이트를 거부한다.
