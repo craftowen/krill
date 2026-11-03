@@ -37,9 +37,15 @@ class RegressionTests(unittest.TestCase):
             root = Path(directory)
             tests = root / "crates/krilld/tests"
             tests.mkdir(parents=True)
-            for name in ["mobile_" + n + ".cjs" for n in runner.MOBILE] + list(runner.MOBILE_INTEGRATION):
+            for name in (["mobile_" + n + ".cjs" for n in runner.MOBILE] + list(runner.MOBILE_INTEGRATION)
+                         + sorted(runner.release_browser_tests())):
                 (tests / name).touch()
             self.assertEqual(len(runner.commands(root, ["mobile"])), len(runner.MOBILE))
+            for orphan in ("chat_new_browser.cjs", "mobile_new_browser.py"):
+                (tests / orphan).write_text("")
+                with self.assertRaisesRegex(ValueError, "unregistered=.*" + orphan):
+                    runner.commands(root, ["mobile"])
+                (tests / orphan).unlink()
             extra = tests / "mobile_new_regression.cjs"
             extra.touch()
             with self.assertRaisesRegex(ValueError, "unregistered=.*mobile_new_regression"):

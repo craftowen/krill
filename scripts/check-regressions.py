@@ -12,15 +12,24 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 SCOPES = ("harness", "packaging", "mobile", "telemetry")
-# Explicit inventory: mobile_pwa.cjs needs compiled helpers; *_browser.* needs Chrome.
-# Those remain integration/visual checks, not standalone Node test programs.
+# Explicit inventory of every *.cjs/*.py program in crates/krilld/tests: a standalone Node check (MOBILE),
+# a real-Chromium release gate (packaging/release_check.py MOBILE_BROWSER_TESTS), or an entry below saying who runs it.
 MOBILE = ("transport", "storage", "terminal", "updates", "quick_commands", "session", "chat", "screens", "diagnostics", "feed")
 MOBILE_INTEGRATION = {
     "mobile_pwa.cjs": "compiled holder/daemon; invoked by Rust mobile_pwa integration tests",
     "mobile_install.cjs": "Chrome/real daemon fixture invoked by mobile_pwa.cjs",
-    "mobile_scroll_browser.cjs": "real Chromium touch/scroll integration",
-    "mobile_terminal_scroll_browser.cjs": "real Chromium terminal/CSS integration",
+    "chat_release_ui.cjs": "helper module loaded by mobile_chat.cjs",
+    "mobile_dual_route_browser.py": "manual: needs this Mac on Tailscale with HTTPS and a headed browser",
 }
+
+
+def release_browser_tests():
+    sys.path.insert(0, str(ROOT / "packaging"))
+    try:
+        from release_check import MOBILE_BROWSER_TESTS
+    finally:
+        sys.path.remove(str(ROOT / "packaging"))
+    return {script for script, *_ in MOBILE_BROWSER_TESTS}
 PACKAGING_INTEGRATION = {
     "packaging/macos/test_pipeline.py": "native codesign/keychain pipeline; dedicated macOS CI gate",
     "packaging/homebrew/test_release.py": "native DMG/Homebrew integration; dedicated macOS CI gate",
@@ -30,12 +39,13 @@ PACKAGING_INTEGRATION = {
 def mobile_commands(root):
     directory = root / "crates/krilld/tests"
     standalone = ["mobile_" + name + ".cjs" for name in MOBILE]
-    known = set(standalone) | set(MOBILE_INTEGRATION)
-    present = {path.name for path in directory.glob("mobile_*.cjs")}
+    known = set(standalone) | set(MOBILE_INTEGRATION) | release_browser_tests()
+    present = {path.name for pattern in ("*.cjs", "*.py") for path in directory.glob(pattern)}
     unknown, missing = sorted(present - known), sorted(known - present)
     if unknown or missing:
         raise ValueError("mobile test inventory: unregistered={}; missing={}. "
-                         "Register standalone checks or document their integration dependency."
+                         "Register standalone checks, add browser checks to the release gate, "
+                         "or document who runs them."
                          .format(unknown, missing))
     return [["node", str(directory / name)] for name in standalone]
 

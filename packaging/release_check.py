@@ -152,7 +152,8 @@ def test_executable(package, target):
 
 
 MOBILE_BROWSER_TESTS = (("mobile_live_browser.py", "--browser-only"), ("mobile_responsive_browser.py",), ("mobile_hosts_browser.py",),
-                        ("mobile_terminal_input_browser.py",))
+                        ("mobile_terminal_input_browser.py",), ("mobile_browser.py", "--address", "127.0.0.1:0"),
+                        ("chat_scroll_browser.cjs",), ("mobile_scroll_browser.cjs",), ("mobile_terminal_scroll_browser.cjs",))
 
 
 def mobile_browser_gate(release):
@@ -164,7 +165,8 @@ def mobile_browser_gate(release):
     os.environ.update({key: str(value) for key, value in env.items()})
     try:
         for script, *arguments in MOBILE_BROWSER_TESTS:
-            run(["python3", ROOT / "crates/krilld/tests" / script, *arguments], timeout=1800)
+            interpreter = "node" if script.endswith(".cjs") else "python3"
+            run([interpreter, ROOT / "crates/krilld/tests" / script, *arguments], timeout=1800)
     finally:
         for key, value in previous.items():
             os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
