@@ -3,9 +3,11 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -63,6 +65,8 @@ struct Holder {
     krilld_args: Vec<OsString>,
     sessions: Vec<Session>,
     listener: Option<OwnedFd>,
+    /// 맡은 listen 소켓의 소유 락([`own_socket`]).
+    owner: Option<File>,
     krilld: Option<Krilld>,
     restart_at: Option<Instant>,
     /// 짧게 살고 죽은 연속 횟수(첫 크래시 = 1).
@@ -92,6 +96,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
         krilld_args: args.collect(),
         sessions: Vec::new(),
         listener: None,
+        owner: None,
         krilld: None,
         restart_at: Some(Instant::now()),
         streak: 0,
@@ -307,7 +312,11 @@ impl Holder {
                     return Err(Errno::SRCH.into());
                 }
             }
-            ToHolder::HoldListener { .. } => self.listener = fds.pop(),
+            ToHolder::HoldListener { .. } => {
+                self.owner = None; // 같은 파일을 새로 잠그기 전에 놓는다
+                self.listener = fds.pop();
+                self.owner = self.listener.as_ref().and_then(own_socket);
+            }
             ToHolder::UpgradeKrilld { path, .. } => {
                 let next = OsStr::from_bytes(&path).to_os_string();
                 if next != self.krilld_path {
@@ -565,6 +574,7 @@ impl Holder {
     fn restore(&mut self, h: sys::Handoff) {
         self.sessions = h.sessions;
         self.listener = h.listener;
+        self.owner = self.listener.as_ref().and_then(own_socket);
         self.krilld = Some(Krilld {
             pid: h.krilld,
             link: Some(Link::new(h.link)),
@@ -588,6 +598,22 @@ impl Holder {
             }
         }
     }
+}
+
+/// krilld가 게시한 listen 소켓(`<소켓>.tmp`에 bind한 뒤 rename)을 맡으면 `<소켓>.holder.lock` flock을 잡는다.
+/// krilld가 재기동을 기다려 소켓 락이 비어도 다른 holder의 krilld는 이 락을 보고 살아 있는 소켓을 덮어쓰지 않는다
+/// (krilld `Listener::bind`). 덮어쓰면 이 holder의 세션에 아무도 붙지 못한다. exec 핸드오프 뒤 다시 잡는다.
+fn own_socket(listener: &OwnedFd) -> Option<File> {
+    let l = std::os::unix::net::UnixListener::from(listener.try_clone().ok()?);
+    let addr = l.local_addr().ok()?;
+    let bound = addr.as_pathname()?.as_os_str().as_bytes();
+    let sock = bound.strip_suffix(b".tmp")?;
+    let path = OsStr::from_bytes(&[sock, b".holder.lock"].concat()).to_os_string();
+    let mut open = File::options();
+    let f = open.read(true).write(true).create(true).truncate(false);
+    let f = f.mode(0o600).open(path).ok()?;
+    f.try_lock().ok()?;
+    Some(f)
 }
 
 fn hello() -> FromHolder {

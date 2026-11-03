@@ -668,3 +668,65 @@ fn failed_handover_transfer_is_retried_under_the_same_holder() {
     drop(kids);
     fs::remove_dir_all(dir).ok();
 }
+
+/// 경로 B: krilld가 재기동을 기다리는 동안(소켓 락이 비었다) 클라이언트가 holder를 하나 더 띄워도 그 krilld는 살아
+/// 있는 holder의 소켓을 덮어쓰지 않는다. 새 holder는 중복으로 끝나고, 원래 holder가 krilld를 다시 띄워 세션을
+/// 그대로 돌려준다. 덮어쓰면 원래 holder의 세션에는 아무도 붙지 못한다.
+#[test]
+fn second_holder_cannot_take_the_socket_while_its_owner_restarts_krilld() {
+    let dir = tmp("owner-lock");
+    let sock = dir.join("run/k.sock");
+    let mut kids = Kids::default();
+    kids.holders.push(holder(&dir, &sock));
+    let (mut c, first) = wait_daemon(&sock, 0);
+    kids.pids.push(first);
+    let Reply::Created {
+        session,
+        pid: shell,
+    } = create(&mut c, &dir, "sleep 60")
+    else {
+        unreachable!("create failed")
+    };
+    kids.pids.push(shell);
+    drop(c);
+    // 원래 holder를 멈춰 krilld 재기동 대기를 붙잡아 둔다.
+    let owner = Pid::from_child(&kids.holders[0]);
+    kill_process(owner, Signal::STOP).unwrap();
+    kill_process(pid(first), Signal::KILL).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(beside(&sock, ".lock"))
+        .unwrap();
+    wait_until("krilld released the socket lock", || {
+        lock.try_lock().is_ok()
+    });
+    drop(lock);
+    kids.holders.push(holder(&dir, &sock));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = kids.holders[1].try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second holder took over a socket whose holder is alive"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "second holder: {status}");
+    kill_process(owner, Signal::CONT).unwrap();
+    let (mut c, next) = wait_daemon(&sock, u64::from(first));
+    kids.pids.push(next);
+    assert_eq!(
+        list(&mut c),
+        vec![Info {
+            session,
+            pid: shell,
+            status: None
+        }]
+    );
+    drop(c);
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}
