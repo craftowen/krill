@@ -843,36 +843,38 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
     let deadline = Instant::now()
         .checked_add(LAUNCH_TIMEOUT)
         .ok_or(Error::Timeout)?;
-    loop {
+    let ready = loop {
         match ready_handshake(&paths.socket, hello) {
-            Ok(Some(c)) => {
-                // ponytail: holder는 띄운 프로세스의 자식으로 남는다(앱이 먼저 끝나면 launchd가 거둔다).
-                // 앱보다 먼저 죽으면 앱이 끝날 때까지 좀비 하나가 남는다. 거슬리면 앱에서 waitpid 스레드.
-                return Ok(Connection {
-                    launched: true,
-                    ..c
-                });
-            }
+            Ok(Some(c)) => break Ok(c),
             Ok(None) => {}
             Err(e) if is_absent(&e) || is_transition(&e) => {}
-            Err(e) => return Err(Error::Io(e)),
+            Err(e) => break Err(Error::Io(e)),
         }
-        if let Some(status) = holder.try_wait().map_err(Error::Io)? {
+        match holder.try_wait() {
             #[cfg(unix)]
-            return Err(Error::HolderExited(status));
+            Ok(Some(status)) => break Err(Error::HolderExited(status)),
             #[cfg(windows)]
-            if !status.success() {
-                return Err(Error::HolderExited(status));
-            }
+            Ok(Some(status)) if !status.success() => break Err(Error::HolderExited(status)),
+            Err(e) => break Err(Error::Io(e)),
+            _ => {}
         }
         if Instant::now() >= deadline {
-            // 백오프로 krilld를 계속 다시 띄우는 holder를 남기지 않는다.
-            holder.kill().ok();
-            holder.wait().ok();
-            return Err(Error::Timeout);
+            break Err(Error::Timeout);
         }
         thread::sleep(POLL);
-    }
+    };
+    // ponytail: 붙으면 holder는 띄운 프로세스의 자식으로 남는다(앱이 먼저 끝나면 launchd가 거둔다).
+    // 앱보다 먼저 죽으면 앱이 끝날 때까지 좀비 하나가 남는다. 거슬리면 앱에서 waitpid 스레드.
+    ready
+        .map(|c| Connection {
+            launched: true,
+            ..c
+        })
+        .inspect_err(|_| {
+            // 실패한 기동의 holder를 남기면 krilld를 백오프로 영구 재기동한다(A-05).
+            holder.kill().ok();
+            holder.wait().ok();
+        })
 }
 
 /// 소켓은 살아 있는데 Hello 전에 닫혔다(업그레이드로 끝나는 구 krilld, 재결합 중 닫힌 구 krilld, 막 뜬 뒤 죽은
