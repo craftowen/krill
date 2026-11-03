@@ -1438,11 +1438,38 @@
           throw Object.assign(Error(reply.error), { definitive: !0 });
         return reply.data;
       }
-      function rpc(request, latest) {
+      // A read that loses its socket waits for the next connection and is asked once more there.
+      // Mutations are never resent: their delivery is unknown.
+      function reconnected() {
+        return new Promise((resolve, reject) => {
+          if (connected) return resolve();
+          const done = () => {
+            (clearTimeout(timeout), routeListeners.delete(done), resolve());
+          };
+          const timeout = setTimeout(() => {
+            (routeListeners.delete(done), reject());
+          }, 20e3);
+          routeListeners.add(done);
+        });
+      }
+      function rpc(request, latest, probe = !1, retried = !1) {
         const current = generation,
           mutation = !isRead(request);
         pendingRpc++;
         let submitted = !1;
+        const surface = (error, report) => {
+          report &&
+            !error.definitive &&
+            diagnosticsTrace?.report("mobile_rpc_failed", {
+              phase: "rpc",
+              reason:
+                error.diagnosticReason ||
+                (error.transport ? "websocket_closed" : "protocol_error"),
+              ...M.diagnostics?.exception(error),
+            });
+          mutation && submitted && !error.definitive && (uncertainMutation = !0);
+          return error;
+        };
         const operation = deadline(
           serial.then(() => {
             if (!connected || current !== generation)
@@ -1454,29 +1481,30 @@
               answer(current)
             );
           }),
-          15e3,
-          "Desktop response timed out. The result may be unknown; pending actions were not resent.",
+          probe ? 5e3 : 15e3,
+          mutation
+            ? "Desktop response timed out. The result may be unknown; pending actions were not resent."
+            : "Disconnected. Reconnecting\u2026",
           current,
         );
         return (
           (serial = operation.catch(() => {})),
           operation
             .catch((error) => {
-              if (current === generation && !error.definitive)
-                diagnosticsTrace?.report("mobile_rpc_failed", {
-                  phase: "rpc",
-                  reason:
-                    error.diagnosticReason ||
-                    (error.transport ? "websocket_closed" : "protocol_error"),
-                  ...M.diagnostics?.exception(error),
-                });
-              throw (
-                mutation &&
-                  submitted &&
-                  !error.definitive &&
-                  (uncertainMutation = !0),
-                error
-              );
+              if (
+                !mutation &&
+                !retried &&
+                !error.definitive &&
+                !stopped &&
+                (!connected || current !== generation)
+              )
+                return reconnected().then(
+                  () => rpc(request, latest, !1, !0),
+                  () => {
+                    throw surface(error, !stopped);
+                  },
+                );
+              throw surface(error, current === generation);
             })
             .finally(() => pendingRpc--)
         );
@@ -1499,7 +1527,7 @@
       // 폴링은 직전 etag를 보내고, 바뀐 게 없으면 데몬이 본문을 생략한다(unchanged). 화면도 다시 그리지 않는다.
       // 변경 피드: 새 데몬은 capabilities.change_feed를 알리고, 그걸 본 클라이언트만 snapshot에 feed 간격(ms)을 싣는다.
       // 데몬은 같은 간격으로 같은 스냅샷을 계산해 바뀐 것만 같은 채널로 푸시한다. rev는 늦게 온 옛 스냅샷을 거른다.
-      const FEED_FALLBACK = 30000,
+      const FEED_FALLBACK = 5000,
         wanted = () =>
           globalThis.document?.hidden ? 0 : M.activeTerminal ? 10000 : 2500;
       const query = () => ({
@@ -1522,7 +1550,6 @@
         return again();
       };
       function apply(data, push) {
-        heard = Date.now();
         if (!push) armed = Number.isSafeInteger(data.feed) ? data.feed : 0;
         if (Number.isSafeInteger(data.rev)) {
           if (data.rev < rev) return last;
@@ -1569,13 +1596,13 @@
           });
         return ((refreshing = pending), pending);
       }
-      function refresh() {
+      function refresh(probe = !1) {
         if (refreshing) return refreshing;
         const request = query(),
           current = generation;
         return snapshot(
           current,
-          rpc(request).catch((e) =>
+          rpc(request, undefined, probe).catch((e) =>
             downgrade(request, current, e, () => rpc(query())),
           ),
         );
@@ -1598,25 +1625,33 @@
             .catch(() => {});
       }
       globalThis.document?.addEventListener?.("visibilitychange", visibility);
+      // 다른 요청이 진행 중이면 그 요청의 마감이 이미 연결을 확인한다.
+      function probe() {
+        const current = generation;
+        if (connected && armed > 0 && !globalThis.document?.hidden && !pendingRpc)
+          return refresh(!0).catch((e) => {
+            connected && current === generation && options.onError?.(e);
+          });
+      }
+      globalThis.navigator?.connection?.addEventListener?.("change", probe);
       // 숨은 탭은 갱신하지 않고(복귀 시 resume이 즉시 갱신), 라이브 터미널이 열려 있으면 화면 스트림이 주가 되므로 간격을 늘린다.
-      // 피드가 켜져 있으면 타이머는 로컬 확인만 한다: 간격이 바뀌었거나(터미널 전환) 30초 동안 소식이 없을 때만 묻는다.
+      // 피드가 켜져 있으면 타이머는 로컬 확인만 한다: 간격이 바뀌었으면(터미널 전환) 묻고,
+      // 5초 동안 아무 프레임도 없으면 작은 snapshot(since)으로 살아 있는지 묻는다. 5초 안에 답이 없으면 끊고 다시 붙는다.
       function poll() {
         if ((clearTimeout(timer), !connected || stopped)) return;
         const current = generation;
         timer = setTimeout(
           async () => {
-            const feeding = armed > 0;
             if (
               !globalThis.document?.hidden &&
-              (!feeding ||
-                armed !== wanted() ||
-                Date.now() - heard >= FEED_FALLBACK)
+              (!armed || armed !== wanted())
             )
               try {
                 await refresh();
               } catch (e) {
                 connected && current === generation && options.onError?.(e);
               }
+            else if (Date.now() - heard >= FEED_FALLBACK) await probe();
             poll();
           },
           armed > 0 ? 2500 : M.activeTerminal ? 10000 : 2500,
@@ -1689,6 +1724,7 @@
               // 인증 뒤 프레임은 도착 순서대로 바로 연다. 피드 푸시는 응답 대기열을 거치지 않는다.
               active.addEventListener("message", (e) => {
                 if (current !== generation) return;
+                heard = Date.now();
                 let data = e.data;
                 if (channel && typeof data !== "string") {
                   try {
@@ -2075,6 +2111,7 @@
             "visibilitychange",
             visibility,
           );
+          globalThis.navigator?.connection?.removeEventListener?.("change", probe);
           connectController?.abort();
           clearTimeout(timer);
           clearTimeout(retryTimer);
