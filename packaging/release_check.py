@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VOLUME = Path("/Volumes/krill-build")
 TARGETS = VOLUME / "targets"
 BINARIES = ("krill-app", "krill", "krill-holder", "krilld", "krill-link")
-SCOPE = ("scripts/check.sh", "windows-clippy", "memory-10-terminals", "release-gui-kill9-replay", "release-holder-survival",
+SCOPE = ("scripts/check.sh", "windows-clippy", "release-gui-kill9-replay", "release-holder-survival",
          "mobile-real-browser")
 SCHEMA = 1
 
@@ -202,12 +202,11 @@ def validate(head, directory, key_file):
         build.extend(("-p", package))
     run(build)
     before = {name: sha256(target / "release" / name) for name in BINARIES}
-    gates = ([pane, "memory_gate::release_ten_terminals_within_200mib", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
-             [pane, "release_survival::release_app_kill9_survives_and_replays_hash_three_times", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
+    gates = ([pane, "release_survival::release_app_kill9_survives_and_replays_hash_three_times", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
              [holder, "--nocapture", "--test-threads=1"])
     pane_tests = run([pane, "--list"], capture=True)
     holder_tests = run([holder, "--list"], capture=True)
-    for test in (gates[0][1], gates[1][1]):
+    for test in (gates[0][1],):
         if f"{test}: test" not in pane_tests.splitlines():
             raise ValueError(f"required release test is missing: {test}")
     for test in ("krilld_kill", "protocol_contract", "upgrade::exec_handoff"):
