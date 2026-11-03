@@ -190,6 +190,22 @@ class HookTests(unittest.TestCase):
         self.assertEqual(self.guard(path=path, KRILL_ALLOW_REMOTE="1").returncode, 2)
         self.assertEqual(self.guard(path=path, KRILL_HARNESS_APPROVED="1").returncode, 0)
 
+    def test_every_codeowners_entry_is_guarded_and_release_gates_are_listed(self):
+        owners = [line.split()[0].lstrip("/") for line in (ROOT / ".github/CODEOWNERS").read_text().splitlines()
+                  if line.startswith("/")]
+        for name in (".gitleaks.toml", "packaging/release_check.py", "packaging/publish-github.sh",
+                     "packaging/ci_evidence.py", ".claude/hooks/"):
+            self.assertIn(name, owners)
+        for name in owners:
+            if name == "Cargo.toml":
+                continue
+            path = str(self.work / (name + "x" if name.endswith("/") else name))
+            with self.subTest(path=name):
+                self.assertEqual(self.guard(path=path).returncode, 2)
+        for name in ("Cargo.toml", ".claude/settings.local.json", "packaging/nightly.py", "crates/krilld/src/lib.rs"):
+            with self.subTest(path=name):
+                self.assertEqual(self.guard(path=str(self.work / name)).returncode, 0)
+
     def test_cargo_configuration_is_a_protected_harness_file(self):
         path = str(self.work / ".cargo/config.toml")
         self.assertEqual(self.guard(path=path).returncode, 2)

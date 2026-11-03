@@ -65,8 +65,7 @@ packaging/            # macOS 번들·DMG·Ed25519 매니페스트·설치 스�
 5. **unsafe는 krill-holder·krilld의 FFI 모듈(Unix·Windows FFI 포함)과 krill-app의 platform 모듈(objc2·Win32)에만.** 모든 `unsafe` 블록에 `// SAFETY:` 주석.
 6. **데몬 panic 격리**: krilld는 세션 작업 단위 `catch_unwind`(panic=unwind, CONVENTIONS P4), krill-holder는 panic 금지. 비테스트 코드 `unwrap`/`expect`/`panic!` 금지(clippy가 막음, 불변식은 `#[expect(..., reason)]`). C·objc2 콜백 밖으로 panic이 나가지 않게.
 7. 측정하지 않은 수치는 문서·커밋·이슈에 쓰지 않는다. 추정이면 "추정".
-8. 하네스 파일(`AGENTS.md`, `docs/CONVENTIONS.md`, `scripts/`, lint·deny·fmt 설정)은 메인테이너 승인 없이 바꾸지 않는다.
-   기계 강제: `.claude` 훅(`.claude/hooks/guard.sh`, Claude Code 전용)·`.github/CODEOWNERS`·git `pre-push`(`scripts/hooks/`).
+8. 하네스 파일(목록은 `.github/CODEOWNERS` 하나)은 메인테이너 승인 없이 바꾸지 않는다. Claude Code에서는 `.claude/hooks/guard.sh`가 그 목록으로 편집을 막는다.
 9. 사용자가 배포·릴리스·push를 명시적으로 지시하면 에이전트는 그 범위에 필요한 `main` 반영·push, `v*` 태그 push, 게시(`publish-github.sh`)까지 수행한다. 같은 작업의 승인을 단계마다 다시 묻지 않는다. 보호 ref push에는 `KRILL_ALLOW_PROTECTED_PUSH='<사용자 지시와 작업 사유>'`를 지정해 사유를 기록한다. Claude Code의 원격 명령은 첫 줄에 `# KRILL_ALLOW_REMOTE: <사용자 지시와 작업 사유>`를 적으면 현재 세션에서 실행할 수 있다. 승인 표시는 실제 사용자 지시가 있을 때만 쓴다. 최종 HEAD 검사·CI·공개 표면 점검과 기존 릴리스 덮어쓰기 금지는 유지한다. 그 외 원격 쓰기·원격 설정 변경·유료 작업은 별도의 명시 지시가 있을 때만 한다.
 10. **UI/UX는 [docs/STYLEGUIDE.md](docs/STYLEGUIDE.md)와 `krill_app::ui` 토큰·프리미티브만 쓴다.** 미구현 기능을 UI에 미리 표기하지 않는다.
 

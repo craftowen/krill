@@ -108,7 +108,7 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 ## 10. Git·작업
 
 - 한 커밋 = 한 논리 변경, 마지막 줄 Co-Authored-By.
-- 하네스 파일(AGENTS.md, 이 문서, scripts/, .cargo/, lint·deny·fmt·clippy 설정)은 메인테이너 승인 없이 바꾸지 않는다.
+- 하네스 파일(목록: `.github/CODEOWNERS`)은 메인테이너 승인 없이 바꾸지 않는다.
 
 ## 11. 변경 경계별 재발 방지
 

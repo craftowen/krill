@@ -47,9 +47,16 @@ d=$(dirname "$path"); while [[ ! -d $d ]]; do d=$(dirname "$d"); done
 root=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || exit 0
 root=$(cd "$root" && pwd -P)
 rel="$(cd "$d" && pwd -P)${path#"$d"}"; rel=${rel#"$root"}; rel=${rel#/}
-case $rel in
-  AGENTS.md|CLAUDE.md|docs/CONVENTIONS.md|clippy.toml|rustfmt.toml|deny.toml|.cargo/*|.config/nextest.toml|scripts/*|.github/*|.claude/settings.json|.claude/hooks/*) ;;
-  *) exit 0 ;;
-esac
+# 보호 목록은 이 훅이 속한 저장소의 .github/CODEOWNERS 하나다('/x/'는 하위 전체, '/x'는 그 파일).
+# Cargo.toml은 리뷰 대상이지만 의존성·버전 편집이 일상이라 여기서는 막지 않는다.
+owners="$(dirname "${BASH_SOURCE[0]}")/../../.github/CODEOWNERS"
+[[ -f $owners ]] || { echo "guard.sh: $owners가 없어 하네스 보호 목록을 읽을 수 없다(차단)" >&2; exit 2; }
+hit=''
+while read -r pattern _; do
+  [[ $pattern == /* && $pattern != /Cargo.toml ]] || continue
+  pattern=${pattern#/}
+  if [[ $pattern == */ ]]; then [[ $rel == "$pattern"* ]] && hit=1; else [[ $rel == "$pattern" ]] && hit=1; fi
+done < "$owners"
+[[ -z $hit ]] && exit 0
 echo "차단: 하네스 파일 $rel — AGENTS.md 규칙 8. 메인테이너 승인 필요 — 승인받았으면 사람이 KRILL_HARNESS_APPROVED=1로 Claude를 다시 띄운다." >&2
 exit 2
