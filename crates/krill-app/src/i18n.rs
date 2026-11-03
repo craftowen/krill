@@ -2059,6 +2059,7 @@ catalog! {
         BRING_ALL_FRONT => ("모두 앞으로 가져오기", "Bring All to Front"),
         HELP => ("도움말", "Help"),
         SHORTCUTS_HELP => ("단축키 보기", "View Keyboard Shortcuts"),
+        SEND_FEEDBACK => ("피드백 보내기…", "Send Feedback…"),
         HIDE_APP => ("Krill 가리기", "Hide Krill"),
         HIDE_OTHERS => ("다른 앱 가리기", "Hide Others"),
         SHOW_ALL => ("모두 보기", "Show All"),
