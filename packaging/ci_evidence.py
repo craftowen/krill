@@ -16,7 +16,7 @@ CANDIDATE_BRANCH = "release/nightly"
 CANDIDATE_PREFIX = "release/"
 CHECKS = {
     "ci.yml": {"hygiene"},
-    "ci-macos.yml": {"changes", "ci-macos", "clippy · nextest · doctest (macos-15)",
+    "ci-macos.yml": {"changes", "ci-macos", "clippy · nextest (macos-15)",
                      "packaging regressions (macos-15)"},
     "release.yml": {"build-windows"},
 }

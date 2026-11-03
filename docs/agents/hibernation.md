@@ -31,4 +31,4 @@ Dispatch 미지원의 위 대응과 보수적 roster 정책, 기본 꺼짐은 �
 
 - `cargo nextest run --locked -p krilld -p krill-proto -p krill-app -E 'test(hibernation)'`: 단조 시계 30분 경계, 상태/입력/foreground 보호, 묶음 전체 gate, 표식 보존, 프로토콜 fixture, 기능 협상 및 자동 재개.
 - `krilld`의 `hibernation_auto_resume_keeps_conversation_and_is_idempotent`: 임시 상태 디렉터리와 가짜 Codex 실행 파일, 실제 holder·krilld를 사용해 종료 후 같은 대화 ID·cwd·권한으로 재개하며 중복 요청이 새 프로세스를 추가하지 않는지 확인. 실제 유료 CLI는 호출하지 않는다.
-- `scripts/check.sh`: 포맷·clippy·전체 nextest·doctest·deny 최종 게이트.
+- `scripts/check.sh`: 포맷·clippy·전체 nextest·deny 최종 게이트.

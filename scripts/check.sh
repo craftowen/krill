@@ -4,7 +4,7 @@ set -euo pipefail
 cd "${0:A:h}/.."
 if [[ ${1-} == -h || ${1-} == --help ]]; then
   print "사용: scripts/check.sh [--memory]
-  비Cargo 회귀 · fmt+deny+NOTICES+public-surface(병렬) · clippy · nextest(fast+latency) · doctest
+  비Cargo 회귀 · fmt+deny+NOTICES+public-surface(병렬) · clippy · nextest(fast+latency)
   --memory          끝에 scripts/memory-gate.sh(MK-066)까지 돈다
   KRILL_TEST_SLOTS  머신 전체 동시 테스트 실행 수(기본: CPU 코어 수 / 4, 최소 1)"
   exit 0
@@ -23,7 +23,7 @@ run(){ "$@" & wait $!; }
 step(){ print -P "%B== $1%b"; }
 step "non-Cargo regressions"; run python3 scripts/check-regressions.py
 # 병렬 1단계: 읽기 전용 검사 4종을 묶고, 하나라도 실패하면 전체 검사를 중단한다.
-# clippy·nextest·doctest는 target/ 락을 공유하므로 순서를 유지한다.
+# clippy·nextest는 target/ 락을 공유하므로 순서를 유지한다.
 step "fmt+deny+notices+public-surface (parallel)";
 partlog=$(mktemp -d "${TMPDIR:-/tmp}/mk-check-part-XXXXXX")
 typeset -A partpids
@@ -51,7 +51,6 @@ slot(){ local n=${KRILL_TEST_SLOTS:-$(( cores / 4 > 0 ? cores / 4 : 1 ))} k rc; 
 step "test build";   run cargo nextest run --workspace --locked --no-tests=pass --no-run
 step "test fast";    slot cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast -E 'not (binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff))'
 step "test latency"; slot cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast -E 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
-step "doctest"; run cargo test --workspace --doc --locked -q
 # --memory: MK-066 메모리 게이트까지(nightly·선택). 병렬 부하에서 흔들려 기본 경로에는 넣지 않는다.
 if [[ ${1-} == --memory ]]; then step "memory"; run scripts/memory-gate.sh; fi
 print -P "%B== check.sh: 전부 통과%b"

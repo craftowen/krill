@@ -13,7 +13,7 @@ Krill = 어떤 AI 코딩 에이전트든 끊기지 않게 병렬로 돌리는 �
 ## 명령
 
 ```bash
-scripts/check.sh            # 릴리스 후보의 전체 통합 검사: 비Cargo 회귀 · fmt · clippy · nextest · doctest · cargo deny · NOTICES --check · 공개 표면
+scripts/check.sh            # 릴리스 후보의 전체 통합 검사: 비Cargo 회귀 · fmt · clippy · nextest · cargo deny · NOTICES --check · 공개 표면
 python3 scripts/check-regressions.py --scope harness   # Python·Git 훅·빌드 경로·검사 필터 회귀(빌드 없음)
 python3 scripts/check-regressions.py --scope mobile    # 독립 Node 회귀(데몬·브라우저 없음)
 python3 scripts/check-regressions.py --scope packaging # 패키징 계약 회귀(네이티브 서명·DMG 검사는 별도)
