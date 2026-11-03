@@ -1660,8 +1660,8 @@ pub(super) fn auth_close_code(error: &io::Error) -> Option<u16> {
 }
 
 fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Result<Channel> {
-    // 주소와 무관한 실패 예산. 미인증 연결은 최대 4개·5초로 제한한다.
-    lock(&shared.state).devices.check_cooldown(now_ms())?;
+    // 실패 예산은 주소가 아니라 주장한 인증 주체별이다(`Devices::attempt`). 미인증 연결은 최대 4개·5초로 제한한다.
+    let mut principal = None;
     let result = (|| {
         let challenge = random()?;
         ws::write(
@@ -1681,8 +1681,10 @@ fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Re
         let auth: AuthHello = serde_json::from_slice(&body).map_err(|_| invalid())?;
         let client_nonce = decode_hex::<32>(&auth.client_nonce)?;
         let token = auth.token.as_deref().map(decode_hex::<32>).transpose()?;
+        principal.clone_from(&auth.device_id);
         let secret = {
-            let s = lock(&shared.state);
+            let mut s = lock(&shared.state);
+            s.devices.check_cooldown(now_ms(), principal.as_deref())?;
             match (&token, &auth.device_id) {
                 (Some(t), None) => s.devices.pairing_secret(t, now_ms())?,
                 (None, Some(d)) => s.devices.device_secret(d)?,
@@ -1732,7 +1734,10 @@ fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Re
         .as_ref()
         .is_err_and(|error: &io::Error| error.kind() == io::ErrorKind::InvalidData)
     {
-        lock(&shared.state).devices.attempt(now_ms()).ok();
+        lock(&shared.state)
+            .devices
+            .attempt(now_ms(), principal.as_deref())
+            .ok();
     }
     result
 }

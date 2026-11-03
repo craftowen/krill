@@ -487,10 +487,75 @@ fn legitimate_reconnects_and_pre_auth_eof_do_not_consume_failure_budget() {
     }
     // Five failures must still fit: none of the successful or dropped sockets counted.
     let mut state = lock(&g.shared.state);
-    for _ in 0..5 {
-        state.devices.attempt(now_ms()).unwrap();
+    for principal in [Some(device.as_str()), None] {
+        for _ in 0..5 {
+            state.devices.attempt(now_ms(), principal).unwrap();
+        }
+        assert!(state.devices.check_cooldown(now_ms(), principal).is_err());
     }
-    assert!(state.devices.check_cooldown(now_ms()).is_err());
+}
+
+/// Sends an `AuthHello` (and a proof sealed with the wrong key when `proof`) and returns the close code.
+fn rejected_auth(port: u16, token: Option<[u8; 32]>, device_id: Option<&str>, proof: bool) -> u16 {
+    let (mut socket, challenge) = websocket(port);
+    let nonce = random().unwrap();
+    send(
+        &mut socket,
+        ws::TEXT,
+        &serde_json::to_vec(&AuthHello {
+            token: token.map(|t| hex(&t)),
+            device_id: device_id.map(str::to_owned),
+            client_nonce: hex(&nonce),
+        })
+        .unwrap(),
+    );
+    if proof {
+        let mut salt = [0; 64];
+        for (a, b) in salt.iter_mut().zip(challenge.into_iter().chain(nonce)) {
+            *a = b;
+        }
+        let mut channel = Channel::new(&[0; 32], &salt, Endpoint::Client).unwrap();
+        send(&mut socket, ws::BINARY, &channel.seal(b"{}").unwrap());
+    }
+    let (opcode, body) = receive(&mut socket).unwrap();
+    assert_eq!(opcode, 8);
+    u16::from_be_bytes(body.get(..2).unwrap().try_into().unwrap())
+}
+
+#[test]
+fn one_device_auth_failures_do_not_lock_out_other_devices() {
+    let (_r, g) = start();
+    let (port, first) = offer(&g);
+    let a = Client::pair(port, &first);
+    let (_, second) = offer(&g);
+    let b = Client::pair(port, &second);
+    let (a_id, b_id, b_credential) = (a.device.clone(), b.device.clone(), b.credential);
+    drop((a, b));
+    until(|| lock(&g.shared.state).connections.is_empty());
+
+    let unknown = hex(&random().unwrap());
+    for device in [a_id.as_str(), unknown.as_str()] {
+        for _ in 0..5 {
+            assert_eq!(rejected_auth(port, None, Some(device), true), 1008);
+            until(|| lock(&g.shared.state).connections.is_empty());
+        }
+        assert_eq!(
+            rejected_auth(port, None, Some(device), false),
+            1013,
+            "the failing principal itself stays rate limited"
+        );
+        until(|| lock(&g.shared.state).connections.is_empty());
+        let client = Client::reconnect(port, &b_id, &b_credential);
+        assert_eq!(client.device, b_id);
+        drop(client);
+        until(|| lock(&g.shared.state).connections.is_empty());
+    }
+    let (_, ticket) = offer(&g);
+    assert_eq!(
+        rejected_auth(port, Some(ticket.token), None, false),
+        1013,
+        "unknown device ids share the unauthenticated pairing budget"
+    );
 }
 
 #[test]
@@ -530,24 +595,7 @@ fn wrong_e2ee_proof_never_consumes_ticket_and_is_rate_limited() {
     assert_eq!(s.devices.active_count(), 0);
     assert!(s.devices.ticket(now_ms()).is_some());
     drop(s);
-    let mut socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    socket.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
-    let mut bytes = Vec::new();
-    socket.read_to_end(&mut bytes).unwrap();
-    let header_end = bytes
-        .windows(4)
-        .position(|part| part == b"\r\n\r\n")
-        .unwrap()
-        + 4;
-    assert!(
-        std::str::from_utf8(&bytes[..header_end])
-            .unwrap()
-            .starts_with("HTTP/1.1 101")
-    );
-    assert_eq!(&bytes[header_end..], &[0x88, 2, 0x03, 0xf5]); // 1013: 인증 cooldown
+    assert_eq!(rejected_auth(port, Some(t.token), None, false), 1013);
 }
 
 #[test]
