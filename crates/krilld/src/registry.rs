@@ -195,7 +195,6 @@ pub struct Registry {
     last_gc: Mutex<Instant>,
     app_opened: OnceLock<()>,
     mobile: OnceLock<Arc<crate::mobile::gateway::Gateway>>,
-    webhooks: Mutex<crate::webhook::Dispatcher>,
     orch_signal: (Mutex<u64>, std::sync::Condvar),
     orch_cache: Mutex<orch_cache::Cache>,
     orch_mail_notified_done: Mutex<BTreeMap<IdleMailScope, MailEpochState>>,
@@ -284,7 +283,6 @@ impl Registry {
             exit: OnceLock::new(),
             dir: dir.map(Path::to_path_buf),
             mobile: OnceLock::new(),
-            webhooks: Mutex::new(crate::webhook::Dispatcher::new(dir)),
             orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
             orch_cache: Mutex::default(),
             orch_mail_notified_done: Mutex::default(),
@@ -460,19 +458,6 @@ impl Registry {
             st.sessions.contains_key(&id) && !st.exited.contains_key(&id)
         };
         allowed.then(|| f(&self.status))
-    }
-
-    /// 프로세스·제목·화면 보조 감시. PTY 읽기와 별도 스레드에서 호출한다.
-    pub(crate) fn observe_webhook(&self, id: SessionId) {
-        let state = self.status.get(id).state;
-        let link = self
-            .mobile_gateway()
-            .and_then(|gateway| gateway.deep_link(id));
-        lock(&self.webhooks).observe(id, state, link);
-    }
-
-    pub(crate) fn retain_webhooks(&self, ids: &[SessionId]) {
-        lock(&self.webhooks).retain(ids);
     }
 
     pub fn monitor_status(&self) {
@@ -2282,11 +2267,9 @@ impl Registry {
             }
         }
         self.status.subagent_hook(id, e, !is_subagent_or_foreign);
-        self.observe_webhook(id);
         let allow_status_hook = !is_subagent_or_foreign
             || crate::agent::control::Control::is_explicit_subagent_hook(&e.payload);
         if allow_status_hook && self.status.hook(&[(id, e)])? > 0 {
-            self.observe_webhook(id);
             let status = self.status.get(id);
             if status.state != control::AgentState::Done {
                 lock(&self.orch_mail_notified_done).retain(|(sid, _, _), _| *sid != id.0);

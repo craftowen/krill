@@ -242,6 +242,7 @@ fn existing<T: 'static>(cx: &App) -> Option<WindowHandle<T>> {
     cx.windows().into_iter().find_map(|w| w.downcast::<T>())
 }
 
+#[cfg(test)]
 pub(crate) fn existing_dashboard(cx: &App) -> Option<Entity<Dashboard>> {
     cx.windows()
         .into_iter()
@@ -1203,28 +1204,6 @@ impl Shell {
             && let Some(l) = self.focused_live()
         {
             l.pane.clear_search();
-        }
-        let owner = cx.weak_entity();
-        let sidebar = self.sidebar.clone();
-        let previews = Dashboard::collect_previews(self);
-        let dashboard = cx.new(|cx| Dashboard::new(owner, sidebar, previews, cx));
-        self.dashboard = Some(dashboard);
-        self.sync_sidebar_visibility(cx);
-        self.sync_focused_session(cx);
-        cx.notify();
-    }
-
-    /// OWE-851: 대시보드 카드·리소스 행 클릭 → 메인 창 해당 세션으로 포커스하고 메인 창을 앞으로.
-    #[expect(dead_code, reason = "dashboard window navigation helper")]
-    pub(super) fn focus_session_window(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        self.open_session(session, cx);
-        if let Some(win) = self.window {
-            let focus = self.focus.clone();
-            win.update(cx, |_, window, cx| {
-                window.activate_window();
-                window.focus(&focus, cx);
-            })
-            .ok();
         }
         let owner = cx.weak_entity();
         let sidebar = self.sidebar.clone();
@@ -2751,8 +2730,6 @@ impl Render for Dashboard {
         ui::modal_backdrop(viewport, ui::modal_focus_scope(card, &self.focus))
     }
 }
-
-pub(crate) mod bench;
 
 #[cfg(test)]
 #[cfg(unix)]

@@ -34,7 +34,6 @@ mod term;
 mod upgrade;
 pub mod usage;
 mod watch;
-pub mod webhook;
 
 pub use appearance::{Appearance, CellSize};
 pub use session::{Gap, PARK_GRACE, Session};

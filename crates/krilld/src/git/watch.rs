@@ -105,11 +105,6 @@ impl std::fmt::Debug for Watch {
 }
 
 impl Watch {
-    /// Use the same daemon queue as worktree creation, removal, and CLI queries.
-    pub fn for_repo(repo: PathBuf) -> Result<Self, String> {
-        Ok(Self::new(Arc::clone(super::queue()?), repo))
-    }
-
     pub fn new(q: Arc<GitQueue>, repo: PathBuf) -> Self {
         Self {
             q,

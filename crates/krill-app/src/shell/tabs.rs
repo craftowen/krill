@@ -258,7 +258,7 @@ impl Shell {
                 } else {
                     description
                 };
-                let file_prefix = self.file_tab_prefix(pane, cx);
+                let file_prefix = self.file_tab_prefix(pane);
                 let rename_input = self
                     .tab_rename
                     .as_ref()

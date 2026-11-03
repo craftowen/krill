@@ -1181,10 +1181,6 @@ impl Shell {
                 return Some(false);
             }
             Some(entity.update(cx, |this, cx| match cmd {
-                krill_app::settings::HostCommand::Login { session } => {
-                    this.open_session(session, cx);
-                    true
-                }
                 krill_app::settings::HostCommand::Open { tab, window } => {
                     if window.is_some_and(|w| this.window != Some(w)) {
                         return false;
@@ -1971,7 +1967,6 @@ impl Shell {
         }
         let view = if let Some(existing) = &self.settings {
             existing.update(cx, |v, cx| {
-                v.set_automations_page(false, cx);
                 v.set_tab(tab, cx);
                 v.set_mobile_page(mobile_page, cx);
             });
@@ -2018,12 +2013,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.open_automations(window, cx);
-    }
-
-    pub(super) fn automations_page_open(&self, cx: &App) -> bool {
-        self.settings
-            .as_ref()
-            .is_some_and(|s| s.read(cx).automations_page())
     }
 
     pub(super) fn open_mobile_page(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
@@ -2522,7 +2511,6 @@ impl Shell {
                     this.daemon_task = None;
                     this.link = Link::connect_failure(&daemon::Error::Io(e));
                     krill_app::errors::daemon_connection_failed(cx);
-                    krill_app::orca_import::set_daemon_link_up(false, cx);
                     cx.notify();
                 }
             })
@@ -3245,9 +3233,7 @@ impl Shell {
             self.refresh_ssh_hosts(cx);
             return;
         }
-        let home = krill_app::orca_import::state(cx)
-            .and_then(|s| s.home_override.clone())
-            .unwrap_or_else(krill_app::accounts::default_home);
+        let home = krill_app::accounts::default_home();
         let dir = self.state_dir(cx);
         let Some(stamp) = self.account_read_stamp(&krill_app::hosts::HostId::Local) else {
             return;
@@ -3324,7 +3310,6 @@ impl Shell {
                 view.sync_machine_local_status(self.machine_local_status(), cx);
             });
         }
-        krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
         if self.link == Link::Up {
             self.load_agents(None, cx);
@@ -5971,9 +5956,7 @@ impl Shell {
         let focused = self.layout.focused();
         let before = self.layout.clone();
         f(&mut self.layout);
-        if self.hold_dirty_close(&before, policy, cx) {
-            return;
-        }
+        self.forget_closed_file_tabs();
         self.cancel_closed_pastes(cx);
         if policy == close::Policy::Terminate {
             for index in 0..before.tabs().len() {
@@ -7723,9 +7706,7 @@ impl Render for Shell {
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
         // 플로팅 창 제목은 Floating::render가 소유하므로 건드리지 않는다.
         if self.role == WindowRole::Main {
-            if self.settings.is_some()
-                && !(self.mobile_page_open(cx) || self.automations_page_open(cx))
-            {
+            if self.settings.is_some() && !self.mobile_page_open(cx) {
                 window.set_window_title(krill_app::i18n::catalog::settings::TITLE.get());
             } else {
                 window.set_window_title(&self.main_window_title(cx));
@@ -7838,7 +7819,7 @@ impl Render for Shell {
             window.is_window_active() && !self.page_open() && self.dashboard.is_none();
         self.resources
             .update(cx, |view, cx| view.set_visible(resources_visible, cx));
-        let sub_page = self.mobile_page_open(cx) || self.automations_page_open(cx);
+        let sub_page = self.mobile_page_open(cx);
         let (settings_view, mobile_view) = if sub_page {
             (None, self.settings.clone())
         } else {

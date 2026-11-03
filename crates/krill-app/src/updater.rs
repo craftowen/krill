@@ -96,12 +96,6 @@ pub struct StagedUpdate {
 }
 
 impl StagedUpdate {
-    /// 분리된 relauncher 프로세스를 띄워 번들 스왑·재실행·헬스체크를 수행하게 한다.
-    /// 호출자는 이 함수가 성공한 직후 앱을 종료(`cx.quit()`)해야 한다.
-    pub fn spawn_relauncher(&self) -> Result<(), Error> {
-        self.spawn_relauncher_child().map(drop)
-    }
-
     pub(super) fn spawn_relauncher_child(&self) -> Result<std::process::Child, Error> {
         let exe = std::env::current_exe()?;
         spawn_detached_relauncher(

@@ -1,13 +1,13 @@
-//! MK-119: 가운데 영역 파일(에디터) 탭의 셸 통합 — 파일 칸 그리기·⌘S·⌘P·디스크 감시·미저장 닫기/종료 확인.
+//! MK-119: 가운데 영역 파일 탭(읽기 전용)의 셸 통합 — 파일 칸 그리기·⌘P·디스크 감시·닫기/종료 때 레이아웃 저장.
 //! 상태기계와 디스크 IO는 [`krill_app::editor`](Orca 참조 출처도 그쪽 문서). 파일 칸은 세션에 붙지 않는다.
-//! MK-121: 분류([`editor::open`])에 따라 코드 에디터·편집/미리보기 토글(마크다운·CSV·ipynb·SVG)·이미지·표·자리표시자를 고른다.
+//! MK-121: 분류([`editor::open`])에 따라 코드 보기·원본/미리보기 토글(마크다운·CSV·ipynb·SVG)·이미지·표·자리표시자를 고른다.
 
 use std::path::Path;
 
-use gpui::{Focusable as _, PromptLevel};
+use gpui::Focusable as _;
 use gpui_component::Icon;
-use gpui_component::input::{Editor, EditorState, InputEvent};
-use krill_app::editor::{self, Disk, Doc, Opened, Poll, Preview, SaveError, Unopenable};
+use gpui_component::input::{Editor, EditorState};
+use krill_app::editor::{self, Disk, Doc, Opened, Poll, Preview, Unopenable};
 use krill_app::file_format::view::{self as fview, CsvView, ImageView};
 use krill_app::file_format::{Kind, csv, ipynb};
 use krill_app::i18n::catalog::artifacts as atext;
@@ -18,14 +18,11 @@ use krill_app::terminal::path_link::{self, PathLink};
 
 use super::*;
 
-mod reload;
-use reload::{FileComparison, ReloadRecovery};
-
 /// 열린 파일의 디스크 지문을 보는 간격.
 // ponytail: stat 폴링(파일 수 × 1Hz). 탭이 수백 개가 되면 FSEvents 감시로.
 const WATCH_EVERY: Duration = Duration::from_secs(1);
-// Conservative retention accounting, not a phys_footprint measurement. Dirty,
-// selected, visible, saving and conflicted documents may exceed this budget.
+// Conservative retention accounting, not a phys_footprint measurement. Selected,
+// visible and deleted-on-disk documents may exceed this budget.
 const CLEAN_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const CLEAN_CACHE_TABS: usize = 16;
 const FILE_REQUESTS_FILE: &str = "file-requests.json";
@@ -103,54 +100,11 @@ fn take_pending_file_requests(state_dir: &Path) -> Vec<CliFileRequest> {
         .unwrap_or_default()
 }
 
-/// The app owns queued disk writes even when the originating tab/window goes away.
-#[derive(Default)]
-struct PendingEditorWrites(Option<tokio::sync::oneshot::Receiver<()>>);
-impl gpui::Global for PendingEditorWrites {}
-
-fn editor_write_queue(cx: &mut App) -> Option<tokio::sync::oneshot::Receiver<()>> {
-    if !cx.has_global::<PendingEditorWrites>() {
-        cx.set_global(PendingEditorWrites::default());
-        cx.on_app_quit(|cx| {
-            let tail = cx.global_mut::<PendingEditorWrites>().0.take();
-            cx.background_executor().spawn(async move {
-                if let Some(tail) = tail {
-                    tail.await.ok();
-                }
-            })
-        })
-        .detach();
-    }
-    cx.global_mut::<PendingEditorWrites>().0.take()
-}
-
-fn flush_editor_writes(cx: &mut App) -> Task<()> {
-    let previous = editor_write_queue(cx);
-    let (finish, tail) = tokio::sync::oneshot::channel();
-    let (done, wait) = tokio::sync::oneshot::channel();
-    cx.global_mut::<PendingEditorWrites>().0 = Some(tail);
-    cx.background_executor()
-        .spawn(async move {
-            if let Some(previous) = previous {
-                previous.await.ok();
-            }
-            finish.send(()).ok();
-            done.send(()).ok();
-        })
-        .detach();
-    cx.background_executor().spawn(async move {
-        wait.await.ok();
-    })
-}
-
-actions!(shell, [SaveFile, QuickOpen]);
+actions!(shell, [QuickOpen]);
 
 pub(super) fn bind_keys(cx: &mut App) {
     let ctx = Some(KEY_CONTEXT);
-    cx.bind_keys([
-        krill_app::keys::bind("cmd-s", SaveFile, ctx),
-        krill_app::keys::bind("cmd-p", QuickOpen, ctx),
-    ]);
+    cx.bind_keys([krill_app::keys::bind("cmd-p", QuickOpen, ctx)]);
 }
 
 #[expect(
@@ -169,7 +123,6 @@ pub(super) struct Files {
     closing: bool,
     next_request: u64,
     loading: HashMap<PaneId, (u64, PathBuf)>,
-    comparing: std::collections::HashSet<PaneId>,
     cache_clock: u64,
     cache_visible: Vec<PaneId>,
     cache_count: usize,
@@ -182,7 +135,7 @@ pub(super) struct Files {
     next_io: Option<tokio::sync::oneshot::Receiver<()>>,
     #[cfg(test)]
     link_next_io: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// 다음 그리기 전에 디코드 캐시를 버릴 이미지 경로(재로드·저장·탭 닫힘). 놓으려면 창이 있어야 해서 모아 둔다.
+    /// 다음 그리기 전에 디코드 캐시를 버릴 이미지 경로(재로드·탭 닫힘). 놓으려면 창이 있어야 해서 모아 둔다.
     released: Vec<PathBuf>,
     /// 터미널 링크(OWE-663 4번, OWE-867): 디스크 확인 캐시, ⌘ 아래 링크(칸, 밑줄 범위), 열고 나서 옮길 (파일, 줄, 열).
     link_lookup: Option<LinkLookup>,
@@ -248,7 +201,6 @@ impl Default for Files {
             closing: false,
             next_request: 0,
             loading: HashMap::new(),
-            comparing: std::collections::HashSet::new(),
             cache_clock: 0,
             cache_visible: Vec::new(),
             cache_count: 0,
@@ -305,14 +257,11 @@ impl Files {
 }
 
 struct FileTab {
-    comparison: Option<FileComparison>,
-    recovery: Option<ReloadRecovery>,
     path: PathBuf,
     /// 본문을 읽어 온 호스트. 칸의 호스트가 달라지면 본문을 재사용하지 않는다(APP-F01 후속).
     host: krill_app::hosts::HostId,
     staged_image: Option<PathBuf>,
     revision: u64,
-    saving: bool,
     preview_generation: u64,
     selection_pin: bool,
     doc: Option<Doc>,
@@ -323,8 +272,8 @@ struct FileTab {
 enum Body {
     Text {
         state: gpui::Entity<EditorState>,
-        _edits: Vec<Subscription>,
-        /// 편집/미리보기 토글이 있는 종류.
+        _cursor: Subscription,
+        /// 원본/미리보기 토글이 있는 종류.
         preview: Option<Preview>,
         /// 미리보기를 보는 중. 들어갈 때 에디터 내용으로 만든 사본이다.
         shown: Option<Shown>,
@@ -404,13 +353,7 @@ fn build_preview(prepared: PreparedPreview, cx: &mut App) -> Shown {
 struct PreparedFile {
     opened: std::io::Result<(Opened, editor::Stamp)>,
     preview: Option<PreparedPreview>,
-    baseline: Option<Doc>,
     staged_image: Option<PathBuf>,
-}
-
-#[cfg(all(test, unix))]
-fn read_file(path: &Path, preview: bool) -> PreparedFile {
-    read_file_on(path, preview, None)
 }
 
 fn read_file_on(
@@ -431,44 +374,31 @@ fn read_file_on(
         }
         _ => None,
     };
-    let baseline = match &opened {
-        Ok((Opened::Text(_, text), stamp)) => Some(Doc::new(path.to_owned(), text.clone(), *stamp)),
-        _ => None,
-    };
     PreparedFile {
         opened,
         preview: prepared,
-        baseline,
         staged_image,
     }
 }
 
-/// (미리보기 버튼, 편집 버튼) 이름.
-fn toggle_labels(preview: Preview) -> (&'static str, &'static str) {
+/// 미리보기 버튼 이름. 다른 쪽 버튼은 늘 원본 보기다.
+fn preview_label(preview: Preview) -> &'static str {
     match preview {
-        Preview::Markdown => (etext::PREVIEW.get(), etext::EDIT.get()),
-        Preview::Table(_) => (etext::TABLE.get(), etext::EDIT_TEXT.get()),
-        Preview::Notebook => (etext::CELLS.get(), etext::EDIT_TEXT.get()),
-        Preview::Svg => (etext::IMAGE.get(), etext::EDIT_TEXT.get()),
-        Preview::Html => (etext::PREVIEW.get(), etext::EDIT_CODE.get()),
+        Preview::Markdown | Preview::Html => etext::PREVIEW.get(),
+        Preview::Table(_) => etext::TABLE.get(),
+        Preview::Notebook => etext::CELLS.get(),
+        Preview::Svg => etext::IMAGE.get(),
     }
 }
 
 impl FileTab {
-    fn is_dirty(&self) -> bool {
-        self.doc.as_ref().is_some_and(Doc::is_dirty)
-    }
-
-    /// 전송이 없는 원격 파일 칸. 디스크를 읽지 않았으므로 문서·편집 상태가 없다.
+    /// 전송이 없는 원격 파일 칸. 디스크를 읽지 않았으므로 문서 상태가 없다.
     fn offline(host: krill_app::hosts::HostId, path: PathBuf) -> Self {
         Self {
-            comparison: None,
-            recovery: None,
             path,
             host,
             staged_image: None,
             revision: 0,
-            saving: false,
             preview_generation: 0,
             selection_pin: false,
             doc: None,
@@ -488,9 +418,6 @@ impl FileTab {
 
     /// 키보드 포커스를 받을 에디터. 미리보기 중이면 숨은 에디터에 입력이 가지 않게 `None`.
     fn focus_editor(&self) -> Option<&gpui::Entity<EditorState>> {
-        if self.comparison.is_some() {
-            return None;
-        }
         match &self.body {
             Body::Text {
                 state, shown: None, ..
@@ -519,7 +446,7 @@ fn unopenable_text(reason: Unopenable) -> String {
     }
 }
 
-/// 텍스트 탭을 다시 읽었더니 텍스트가 아니게 됐다(편집 내용은 그대로 둔다).
+/// 텍스트 탭을 다시 읽었더니 텍스트가 아니게 됐다(보이던 내용은 그대로 둔다).
 fn not_text(opened: &Opened) -> String {
     const MIB: u64 = 1024 * 1024;
     match opened {
@@ -576,22 +503,17 @@ impl Shell {
         }
     }
 
-    /// 전송이 없는 원격 칸의 디스크 작업을 거부했다: 버퍼·dirty는 그대로 두고 오류 띠만 띄운다.
+    /// 전송이 없는 원격 칸의 디스크 작업을 거부했다: 보이던 내용은 그대로 두고 오류 띠만 띄운다.
     fn mark_remote_unavailable(&mut self, pane: PaneId, cx: &mut Context<Self>) {
         if let Some(tab) = self.files.tabs.get_mut(&pane) {
-            tab.error = Some(etext::REMOTE_DISCONNECTED_KEPT.get().to_owned());
+            tab.error = Some(etext::REMOTE_DISCONNECTED.get().to_owned());
             self.files.cache_count = usize::MAX;
             cx.notify();
         }
     }
 
     pub(super) fn file_actions(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
-        root.on_action(cx.listener(|this, _: &SaveFile, _, cx| {
-            if let Some(pane) = this.layout.focused() {
-                this.save_file(pane, cx).detach();
-            }
-        }))
-        .on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
+        root.on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
             this.toggle_quick_open(window, cx);
         }))
         .on_action(
@@ -1246,7 +1168,6 @@ impl Shell {
         let is_split = self.layout.visible().len() > 1;
         let path = self.layout.file(id).map(Path::to_owned).unwrap_or_default();
         let tab = self.files.tabs.get(&id);
-        let dirty = tab.is_some_and(FileTab::is_dirty);
         let file_host = self.file_host_for_pane(id);
         let header = div()
             .min_h(krill_app::ui::PANE_HEADER_HEIGHT)
@@ -1274,14 +1195,6 @@ impl Shell {
                     // OWE-849: 절대 경로 대신 워크트리 상대 경로(또는 `~` 축약)를 보인다.
                     .child(self.diff.read(cx).display_path(&path)),
             )
-            .when(dirty, |d| {
-                d.child(
-                    div()
-                        .text_size(krill_app::ui::TEXT_2XS)
-                        .text_color(p.muted_foreground)
-                        .child(etext::UNSAVED.get()),
-                )
-            })
             .children(self.preview_toggle(id, cx))
             .children(Self::open_browser_button(id, &path, &file_host))
             .children(self.share_button(id, &path, &file_host, cx))
@@ -1321,42 +1234,8 @@ impl Shell {
         let disk = tab
             .and_then(|t| t.doc.as_ref())
             .map_or(Disk::Same, Doc::disk);
-        let disk_banner = match disk {
-            Disk::Same => None,
-            Disk::Deleted => {
-                Some(banner(etext::DELETED.get()).debug_selector(|| "file-deleted".into()))
-            }
-            Disk::Changed => Some(
-                banner(etext::CHANGED_ON_DISK.get())
-                    .debug_selector(|| "file-changed-on-disk".into())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .gap_1()
-                            .child(
-                                Button::new(("file-reload", id.get()))
-                                    .debug_selector(|| "file-reload".into())
-                                    .label(etext::COMPARE.get())
-                                    .outline()
-                                    .xsmall()
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.compare_file(id, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new(("file-keep", id.get()))
-                                    .debug_selector(|| "file-keep".into())
-                                    .label(etext::KEEP.get())
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.keep_file(id, cx);
-                                    })),
-                            ),
-                    ),
-            ),
-        };
+        let disk_banner = (disk == Disk::Deleted)
+            .then(|| banner(etext::DELETED.get()).debug_selector(|| "file-deleted".into()));
         let error = tab.and_then(|t| t.error.clone()).map(|e| {
             div()
                 .flex_none()
@@ -1384,57 +1263,58 @@ impl Shell {
                 .child(notice(etext::REMOTE_DISCONNECTED.get().to_owned()))
                 .into_any_element()
         };
-        let body = if let Some(comparison) = tab.and_then(|tab| tab.comparison.as_ref()) {
-            self.render_file_comparison(id, comparison, cx)
-        } else {
-            match tab.map(|t| &t.body) {
-                Some(Body::Text {
-                    shown: Some(shown), ..
-                }) => match shown {
-                    Shown::Markdown(src, md_id) => fview::markdown(md_id.clone(), src.clone(), cx),
-                    Shown::Table(view) => view.clone().into_any_element(),
-                    Shown::Notebook(Ok(nb)) => {
-                        fview::notebook(("file-ipynb", id.get()), nb.clone(), window, cx)
-                    }
-                    Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
-                    Shown::Image(view) => view.clone().into_any_element(),
-                    Shown::Html { title, len } => match file_host.transport() {
-                        // 브라우저 열기·Finder 보기가 같은 경로의 로컬 파일로 가므로 띄우지 않는다.
-                        Err(_) => offline(),
-                        Ok(remote) => {
-                            let weak = cx.weak_entity();
-                            fview::html_preview_on(
-                                &path,
-                                remote,
-                                title.as_deref(),
-                                *len,
-                                move |window, cx| {
-                                    weak.update(cx, |this, cx| {
-                                        this.set_preview(id, false, window, cx);
-                                    })
-                                    .ok();
-                                },
-                                cx,
-                            )
-                        }
-                    },
-                },
-                Some(Body::Text { state, .. }) => div()
-                    .size_full()
-                    .bg(p.editor_surface)
-                    .child(Editor::new(state).bordered(false).h(gpui::relative(1.)))
-                    .into_any_element(),
-                Some(Body::Image(view)) => view.clone().into_any_element(),
-                Some(Body::Table(view)) => view.clone().into_any_element(),
-                Some(Body::Placeholder(kind, len)) => match file_host.transport() {
+        let body = match tab.map(|t| &t.body) {
+            Some(Body::Text {
+                shown: Some(shown), ..
+            }) => match shown {
+                Shown::Markdown(src, md_id) => fview::markdown(md_id.clone(), src.clone(), cx),
+                Shown::Table(view) => view.clone().into_any_element(),
+                Shown::Notebook(Ok(nb)) => {
+                    fview::notebook(("file-ipynb", id.get()), nb.clone(), window, cx)
+                }
+                Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
+                Shown::Image(view) => view.clone().into_any_element(),
+                Shown::Html { title, len } => match file_host.transport() {
+                    // 브라우저 열기·Finder 보기가 같은 경로의 로컬 파일로 가므로 띄우지 않는다.
                     Err(_) => offline(),
-                    Ok(remote) => fview::placeholder_on(&path, remote, *kind, *len, cx),
+                    Ok(remote) => {
+                        let weak = cx.weak_entity();
+                        fview::html_preview_on(
+                            &path,
+                            remote,
+                            title.as_deref(),
+                            *len,
+                            move |window, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.set_preview(id, false, window, cx);
+                                })
+                                .ok();
+                            },
+                            cx,
+                        )
+                    }
                 },
-                Some(Body::Offline) => offline(),
-                Some(Body::Unopenable(reason)) => notice(unopenable_text(*reason)),
-                Some(Body::Failed(err)) => notice(etext::OPEN_FAILED.format(&[("error", err)])),
-                None => notice(String::new()),
-            }
+            },
+            Some(Body::Text { state, .. }) => div()
+                .size_full()
+                .bg(p.editor_surface)
+                .child(
+                    Editor::new(state)
+                        .readonly(true)
+                        .bordered(false)
+                        .h(gpui::relative(1.)),
+                )
+                .into_any_element(),
+            Some(Body::Image(view)) => view.clone().into_any_element(),
+            Some(Body::Table(view)) => view.clone().into_any_element(),
+            Some(Body::Placeholder(kind, len)) => match file_host.transport() {
+                Err(_) => offline(),
+                Ok(remote) => fview::placeholder_on(&path, remote, *kind, *len, cx),
+            },
+            Some(Body::Offline) => offline(),
+            Some(Body::Unopenable(reason)) => notice(unopenable_text(*reason)),
+            Some(Body::Failed(err)) => notice(etext::OPEN_FAILED.format(&[("error", err)])),
+            None => notice(String::new()),
         };
         div()
             .id(ElementId::Name(format!("file-pane-{}", id.get()).into()))
@@ -1448,7 +1328,6 @@ impl Shell {
             .child(header)
             .children(disk_banner)
             .children(error)
-            .children(self.reload_recovery_banner(id, cx))
             .child(div().flex_1().min_h_0().child(body))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1559,11 +1438,6 @@ impl Shell {
             cx.notify();
             return;
         }
-        if self.files.tabs.get(&id).is_some_and(FileTab::is_dirty) {
-            self.notice = Some(atext::SAVE_FIRST.get().to_owned());
-            cx.notify();
-            return;
-        }
         // 설정을 아직 안 열었으면 게이트·CLI가 krilld와 같은 상태 디렉터리를 보게 먼저 맞춘다.
         if !cx.has_global::<krill_app::settings::Config>() {
             let dir = self.state_dir(cx);
@@ -1572,7 +1446,7 @@ impl Shell {
         let Some(run) = krill_app::artifacts::runner(cx) else {
             self.notice = Some(atext::ERROR.format(&[(
                 "error",
-                krill_app::i18n::catalog::orca_import::ERR_CLI_MISSING.get(),
+                krill_app::i18n::catalog::general::ERR_CLI_MISSING.get(),
             )]));
             cx.notify();
             return;
@@ -1607,7 +1481,7 @@ impl Shell {
         .detach();
     }
 
-    /// 파일 칸 머리의 편집/미리보기 토글(마크다운·CSV·ipynb·SVG만).
+    /// 파일 칸 머리의 원본/미리보기 토글(마크다운·CSV·ipynb·SVG·HTML만).
     fn preview_toggle(&self, id: PaneId, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let Some(Body::Text {
             preview: Some(preview),
@@ -1617,7 +1491,7 @@ impl Shell {
         else {
             return None;
         };
-        let (preview_label, edit_label) = toggle_labels(*preview);
+        let preview_label = preview_label(*preview);
         let previewing = shown.is_some();
         let p = krill_app::ui::palette(cx);
         let segment_button = |name: &'static str, label: &'static str, on: bool| {
@@ -1633,7 +1507,7 @@ impl Shell {
                 p,
                 [
                     segment_button("file-preview", preview_label, true),
-                    segment_button("file-edit", edit_label, false),
+                    segment_button("file-edit", etext::SOURCE.get(), false),
                 ],
             )
             .debug_selector(|| "file-preview-toggle".into())
@@ -1642,7 +1516,7 @@ impl Shell {
         )
     }
 
-    /// 편집/미리보기를 바꾼다. 미리보기는 들어갈 때마다 지금 에디터 내용으로 다시 만든다.
+    /// 원본/미리보기를 바꾼다. 미리보기는 들어갈 때마다 지금 에디터 내용으로 다시 만든다.
     pub(super) fn set_preview(
         &mut self,
         pane: PaneId,
@@ -1768,7 +1642,7 @@ impl Shell {
         }
     }
 
-    /// OWE-874: 파일 탭이 포커스된 상태에서 ⌘F — 미리보기면 편집 모드로 돌린 뒤 에디터 내장 검색을
+    /// OWE-874: 파일 탭이 포커스된 상태에서 ⌘F — 미리보기면 원본 보기로 돌린 뒤 에디터 내장 검색을
     /// 연다. 에디터 본문이 없으면(이미지·표·자리표시자) false를 돌려 호출자가 터미널 검색으로 이어가게 한다.
     pub(super) fn open_editor_search(
         &mut self,
@@ -1802,26 +1676,14 @@ impl Shell {
         true
     }
 
-    /// 탭 바의 파일 탭 앞 아이콘(파일 + 미저장 점). 세션 칸이면 `None`.
-    pub(super) fn file_tab_prefix(&self, pane: PaneId, cx: &App) -> Option<gpui::Div> {
+    /// 탭 바의 파일 탭 앞 아이콘. 세션 칸이면 `None`.
+    pub(super) fn file_tab_prefix(&self, pane: PaneId) -> Option<gpui::Div> {
         self.layout.file(pane)?;
-        let p = krill_app::ui::palette(cx);
-        let dirty = self.files.tabs.get(&pane).is_some_and(FileTab::is_dirty);
         Some(
             div()
                 .flex()
                 .items_center()
-                .gap(krill_app::ui::SPACE_1)
-                .child(Icon::new(IconName::FileText).small())
-                .when(dirty, |d| {
-                    d.child(
-                        div()
-                            .debug_selector(|| "file-dirty".into())
-                            .size(krill_app::ui::STATE_DOT)
-                            .rounded_full()
-                            .bg(p.foreground),
-                    )
-                }),
+                .child(Icon::new(IconName::FileText).small()),
         )
     }
 
@@ -1998,10 +1860,7 @@ impl Shell {
                     .unwrap_or(usize::MAX)
             } else {
                 match &tab.body {
-                    Body::Text { .. } => tab
-                        .doc
-                        .as_ref()
-                        .map_or(0, |doc| doc.saved().len().saturating_mul(3)),
+                    Body::Text { state, .. } => state.read(cx).text().len().saturating_mul(3),
                     Body::Image(_) => {
                         usize::try_from(krill_app::file_format::raster::MAX_PIXELS * 4)
                             .unwrap_or(usize::MAX)
@@ -2018,13 +1877,8 @@ impl Shell {
             if visible.contains(&pane)
                 || self.layout.focused() == Some(pane)
                 || selected
-                || tab.is_dirty()
-                || tab.saving
-                || tab.recovery.is_some()
-                || tab.comparison.is_some()
                 || tab.error.is_some()
                 || self.files.loading.contains_key(&pane)
-                || self.files.comparing.contains(&pane)
                 || tab.doc.as_ref().is_some_and(|doc| doc.disk() != Disk::Same)
             {
                 continue;
@@ -2058,45 +1912,28 @@ impl Shell {
         }
     }
 
-    /// Close only after dirty-file decisions and a durable layout barrier.
+    /// Close only after a durable layout barrier.
     pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.files.closing {
             return;
         }
         self.files.closing = true;
-        let dirty = self.dirty_files();
-        let close = if dirty.is_empty() {
-            Task::ready(true)
-        } else {
-            let answer = prompt_unsaved(&self.unsaved_detail(&dirty), window, cx);
-            Self::resolve_unsaved(answer, &dirty, cx)
-        };
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
-            let close = close.await;
-            if close {
-                let Ok((barrier, layout, editor_saved)) = this.update(cx, |this, cx| {
-                    (
-                        this.layout_barrier(cx),
-                        this.layout.clone(),
-                        flush_editor_writes(cx),
-                    )
-                }) else {
+            let Ok((barrier, layout)) = this.update(cx, |this, cx| {
+                (this.layout_barrier(cx), this.layout.clone())
+            }) else {
+                return;
+            };
+            if barrier.await {
+                let unchanged = this
+                    .read_with(cx, |this, _| this.layout == layout)
+                    .unwrap_or(false);
+                if unchanged {
+                    handle
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
                     return;
-                };
-                editor_saved.await;
-                if barrier.await {
-                    let unchanged = this
-                        .read_with(cx, |this, _| {
-                            this.dirty_files().is_empty() && this.layout == layout
-                        })
-                        .unwrap_or(false);
-                    if unchanged {
-                        handle
-                            .update(cx, |_, window, _| window.remove_window())
-                            .ok();
-                        return;
-                    }
                 }
             }
             this.update(cx, |this, cx| {
@@ -2217,13 +2054,10 @@ impl Shell {
         let PreparedFile {
             opened,
             preview: prepared,
-            baseline,
             staged_image,
         } = loaded;
         let (body, stamp) = match opened {
             Ok((Opened::Text(kind, text), stamp)) => {
-                let baseline =
-                    baseline.unwrap_or_else(|| Doc::new(path.clone(), text.clone(), stamp));
                 let language = editor::language(kind, &path);
                 let preview = editor::preview(kind);
                 let shown = prepared.map(|prepared| build_preview(prepared, cx));
@@ -2237,8 +2071,6 @@ impl Shell {
                     editor::syntax::install(&mut ed, language, cx);
                     ed
                 });
-                // EditorMode preserves source bytes, including CRLF. The IO worker
-                // already prepared the baseline, avoiding a full UI rope conversion.
                 if let Some(s) = saved
                     && (s.line != 0 || s.column != 0)
                 {
@@ -2251,11 +2083,6 @@ impl Shell {
                         window.focus(&prev, cx);
                     }
                 }
-                let edits = cx.subscribe(&state, move |this, _, e: &InputEvent, cx| {
-                    if matches!(e, InputEvent::Change) {
-                        this.file_edited(pane, cx);
-                    }
-                });
                 let cursor = cx.observe(&state, move |this, state, cx| {
                     let selected = state.read(cx).is_copyable();
                     if let Some(tab) = this.files.tabs.get_mut(&pane)
@@ -2268,19 +2095,16 @@ impl Shell {
                     this.sync_file_state(pane, cx);
                 });
                 return FileTab {
-                    comparison: None,
-                    recovery: None,
                     path: path.clone(),
                     host,
                     staged_image: None,
                     revision: 0,
-                    saving: false,
                     preview_generation: 0,
                     selection_pin: false,
-                    doc: Some(baseline),
+                    doc: Some(Doc::new(path, stamp)),
                     body: Body::Text {
                         state,
-                        _edits: vec![edits, cursor],
+                        _cursor: cursor,
                         preview,
                         shown,
                     },
@@ -2306,13 +2130,10 @@ impl Shell {
                     krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
                 }
                 return FileTab {
-                    comparison: None,
-                    recovery: None,
                     path: path.clone(),
                     host,
                     staged_image: None,
                     revision: 0,
-                    saving: false,
                     preview_generation: 0,
                     selection_pin: false,
                     doc: None,
@@ -2321,281 +2142,31 @@ impl Shell {
                 };
             }
         };
-        // 텍스트가 아닌 탭도 디스크 지문을 들고 있어 바뀌면 다시 읽는다(편집이 없어 늘 깨끗하다).
+        // 텍스트가 아닌 탭도 디스크 지문을 들고 있어 바뀌면 다시 읽는다.
         FileTab {
-            comparison: None,
-            recovery: None,
             path: path.clone(),
             host,
             staged_image,
             revision: 0,
-            saving: false,
             preview_generation: 0,
             selection_pin: false,
-            doc: Some(Doc::new(path, String::new(), stamp)),
+            doc: Some(Doc::new(path, stamp)),
             body,
             error: None,
         }
     }
 
-    fn file_edited(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        let Some(tab) = self.files.tabs.get_mut(&pane) else {
-            return;
-        };
-        let (Some(doc), Body::Text { .. }) = (tab.doc.as_mut(), &tab.body) else {
-            return;
-        };
-        tab.revision = tab.revision.wrapping_add(1);
-        tab.recovery = None;
-        tab.comparison = None;
-        doc.edited(false);
-        cx.notify();
-        if !self.files.comparing.insert(pane) {
-            return;
-        }
-        // One comparator per document. Edits while it runs replace the next
-        // snapshot instead of spawning another full-buffer comparison.
-        cx.spawn(async move |this, cx| {
-            loop {
-                let Ok(Some((revision, state_id, text, baseline))) =
-                    this.read_with(cx, |this, cx| {
-                        let tab = this.files.tabs.get(&pane)?;
-                        let (Some(doc), Body::Text { state, .. }) = (&tab.doc, &tab.body) else {
-                            return None;
-                        };
-                        Some((
-                            tab.revision,
-                            state.entity_id(),
-                            state.read(cx).text().clone(),
-                            doc.saved_snapshot(),
-                        ))
-                    })
-                else {
-                    this.update(cx, |this, _| {
-                        this.files.comparing.remove(&pane);
-                    })
-                    .ok();
-                    return;
-                };
-                let compared_baseline = baseline.clone();
-                let unchanged = cx
-                    .background_executor()
-                    .spawn(async move { text == *compared_baseline })
-                    .await;
-                let again = this
-                    .update(cx, |this, cx| {
-                        let Some(tab) = this.files.tabs.get_mut(&pane) else {
-                            this.files.comparing.remove(&pane);
-                            return false;
-                        };
-                        let (Some(doc), Body::Text { state, .. }) = (tab.doc.as_mut(), &tab.body)
-                        else {
-                            this.files.comparing.remove(&pane);
-                            return false;
-                        };
-                        if tab.revision != revision
-                            || state.entity_id() != state_id
-                            || !Arc::ptr_eq(&doc.saved_snapshot(), &baseline)
-                        {
-                            return true;
-                        }
-                        if doc.edited(unchanged) {
-                            this.files.cache_count = usize::MAX;
-                            cx.notify();
-                        }
-                        this.files.comparing.remove(&pane);
-                        false
-                    })
-                    .unwrap_or(false);
-                if !again {
-                    return;
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Save a snapshot off-thread. Edits made while fsync runs stay dirty.
-    pub(super) fn save_file(&mut self, pane: PaneId, cx: &mut Context<Self>) -> Task<bool> {
-        let file_host = self.file_host_for_pane(pane);
-        let Some(tab) = self.files.tabs.get_mut(&pane) else {
-            return Task::ready(false);
-        };
-        let (Some(doc), Body::Text { state, .. }) = (tab.doc.as_ref(), &tab.body) else {
-            return Task::ready(false);
-        };
-        if tab.saving {
-            return Task::ready(false);
-        }
-        let Ok(remote) = file_host.transport() else {
-            // 전송이 없는 원격: 같은 경로의 로컬 파일에 쓰지 않는다. 버퍼·dirty는 그대로, 닫기·종료도 멈춘다.
-            self.mark_remote_unavailable(pane, cx);
-            return Task::ready(false);
-        };
-        let local = remote.is_none();
-        tab.saving = true;
-        let mut snapshot = doc.clone();
-        let path = doc.path().to_owned();
-        let text = state.read(cx).text().clone();
-        let revision = tab.revision;
-        let state_id = state.entity_id();
-        #[cfg(test)]
-        let gate = self.files.next_io.take();
-        let previous = editor_write_queue(cx);
-        let (finish, tail) = tokio::sync::oneshot::channel();
-        cx.global_mut::<PendingEditorWrites>().0 = Some(tail);
-        let (completed, result) = tokio::sync::oneshot::channel();
-        cx.background_executor()
-            .spawn(async move {
-                if let Some(previous) = previous {
-                    previous.await.ok();
-                }
-                #[cfg(test)]
-                if let Some(gate) = gate {
-                    gate.await.ok();
-                }
-                let text_str = text.to_string();
-                let result = if let Some((_, target)) = remote {
-                    if snapshot.disk() == Disk::Changed {
-                        Err(SaveError::Conflict)
-                    } else {
-                        match krill_app::remote_fs::save_atomic(
-                            &target,
-                            snapshot.path(),
-                            &text_str,
-                            snapshot.stamp(),
-                        ) {
-                            Ok(stamp) => {
-                                snapshot.saved_as(text_str, stamp);
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                } else {
-                    snapshot.save(text_str)
-                };
-                completed.send((snapshot, result)).ok();
-                finish.send(()).ok();
-            })
-            .detach();
-        cx.spawn(async move |this, cx| {
-            let Ok((snapshot, result)) = result.await else {
-                return false;
-            };
-            this.update(cx, |this, cx| {
-                let Some(tab) = this.files.tabs.get_mut(&pane) else {
-                    return false;
-                };
-                let Body::Text { state, .. } = &tab.body else {
-                    return false;
-                };
-                if state.entity_id() != state_id || this.layout.file(pane) != Some(path.as_path()) {
-                    return false;
-                }
-                tab.saving = false;
-                this.files.cache_count = usize::MAX;
-                let saved = match result {
-                    Ok(()) => {
-                        tab.doc = Some(snapshot);
-                        let unchanged = tab.revision == revision;
-                        if let Some(doc) = &mut tab.doc {
-                            doc.edited(unchanged);
-                        }
-                        tab.error = None;
-                        unchanged
-                    }
-                    Err(SaveError::Conflict) => {
-                        tab.error = Some(etext::SAVE_CONFLICT.get().to_owned());
-                        false
-                    }
-                    Err(SaveError::Io(e)) => {
-                        if local {
-                            krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
-                        }
-                        tab.error = Some(etext::SAVE_FAILED.format(&[("error", &e.to_string())]));
-                        false
-                    }
-                };
-                if !saved && tab.error.is_none() {
-                    this.file_edited(pane, cx);
-                }
-                cx.notify();
-                saved
-            })
-            .unwrap_or(false)
-        })
-    }
-
-    fn keep_file(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        let file_host = self.file_host_for_pane(pane);
-        let Some(tab) = self.files.tabs.get(&pane) else {
-            return;
-        };
-        let Some(doc) = &tab.doc else { return };
-        let Ok(remote) = file_host.transport() else {
-            // 전송이 없는 원격: 같은 경로의 로컬 파일 지문을 '내 편집 유지'의 기준으로 삼지 않는다.
-            self.mark_remote_unavailable(pane, cx);
-            return;
-        };
-        let remote = remote.map(|(_, target)| target);
-        let path = doc.path().to_owned();
-        let revision = tab.revision;
-        let before = doc.clone();
-        cx.spawn(async move |this, cx| {
-            let read_path = path.clone();
-            let now = cx
-                .background_executor()
-                .spawn(async move {
-                    match remote {
-                        Some(target) => krill_app::remote_fs::stat(&target, &read_path),
-                        None => editor::stamp(&read_path),
-                    }
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                let Some(tab) = this.files.tabs.get_mut(&pane) else {
-                    return;
-                };
-                if tab.revision != revision || tab.saving {
-                    return;
-                }
-                let Some(doc) = &mut tab.doc else { return };
-                if *doc != before || this.layout.file(pane) != Some(path.as_path()) {
-                    return;
-                }
-                if let Ok(now) = now {
-                    doc.keep_mine(now);
-                    this.files.cache_count = usize::MAX;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Read and parse off-thread; refuse stale results after any edit, save or close.
+    /// Read and parse off-thread; refuse stale results after another reload or close.
     fn reload_file(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
-        self.reload_file_checked(pane, None, window, cx);
-    }
-
-    fn reload_file_checked(
-        &mut self,
-        pane: PaneId,
-        expected: Option<reload::ComparedVersion>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         let Some(tab) = self.files.tabs.get(&pane) else {
             return;
         };
-        if tab.saving || self.files.loading.contains_key(&pane) {
+        if self.files.loading.contains_key(&pane) {
             return;
         }
         let Some(doc) = &tab.doc else { return };
         let Ok(remote) = self.file_host_for_pane(pane).transport() else {
-            // 전송이 없는 원격: 같은 경로의 로컬 파일을 읽어 버퍼를 덮지 않는다.
+            // 전송이 없는 원격: 같은 경로의 로컬 파일을 읽어 보이던 내용을 덮지 않는다.
             self.mark_remote_unavailable(pane, cx);
             return;
         };
@@ -2624,7 +2195,7 @@ impl Shell {
                     if let Some(gate) = gate {
                         gate.await.ok();
                     }
-                    reload::read_current_file(&read_path, previewing, expected, remote.as_ref())
+                    read_file_on(&read_path, previewing, remote.as_ref())
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -2641,7 +2212,6 @@ impl Shell {
                 };
                 if current_state_id != state_id
                     || tab.revision != revision
-                    || tab.saving
                     || tab.doc.as_ref() != Some(&before)
                     || this.layout.file(pane) != Some(path.as_path())
                     || *this.layout.host(pane) != host
@@ -2669,23 +2239,10 @@ impl Shell {
                 let PreparedFile {
                     opened,
                     preview: prepared,
-                    baseline,
                     staged_image: _,
                 } = loaded;
                 match opened {
                     Ok((Opened::Text(_, text), stamp)) => {
-                        let baseline =
-                            baseline.unwrap_or_else(|| Doc::new(path.clone(), text.clone(), stamp));
-                        if let Some(recovery) = &mut tab.recovery {
-                            recovery.advance(tab.revision.wrapping_add(1));
-                        } else {
-                            tab.recovery = Some(ReloadRecovery::capture(
-                                state,
-                                tab.revision.wrapping_add(1),
-                                cx,
-                            ));
-                        }
-                        tab.comparison = None;
                         let prev_focus = window.focused(cx);
                         let next_shown = prepared.map(|p| build_preview(p, cx));
                         let editor_focused =
@@ -2699,7 +2256,7 @@ impl Shell {
                             window.focus(&prev, cx);
                         }
                         *shown = next_shown;
-                        *doc = baseline;
+                        *doc = Doc::new(path.clone(), stamp);
                         this.files.refocus = true;
                         this.files.cache_count = usize::MAX;
                         tab.revision = tab.revision.wrapping_add(1);
@@ -2743,7 +2300,6 @@ impl Shell {
                         .filter(|(pane, tab)| {
                             cycle == 0
                                 || visible.contains(pane)
-                                || tab.is_dirty()
                                 || tab.doc.as_ref().is_some_and(|doc| doc.disk() != Disk::Same)
                         })
                         .filter_map(|(p, t)| {
@@ -2790,10 +2346,7 @@ impl Shell {
                         let Some(tab) = this.files.tabs.get_mut(&pane) else {
                             continue;
                         };
-                        if tab.saving
-                            || tab.revision != revision
-                            || tab.doc.as_ref() != Some(&before)
-                        {
+                        if tab.revision != revision || tab.doc.as_ref() != Some(&before) {
                             continue;
                         }
                         let Some(doc) = tab.doc.as_mut() else {
@@ -2995,135 +2548,25 @@ impl Shell {
         self.files.quick_open.as_ref().map(|(p, _)| p.clone())
     }
 
-    /// 닫히는 칸에 미저장 파일이 있으면 레이아웃 변경을 되돌리고 묻는다. 물었으면 true.
-    pub(super) fn hold_dirty_close(
-        &mut self,
-        before: &Layout,
-        policy: close::Policy,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let lost: Vec<PaneId> = self
+    /// 레이아웃에서 사라진 파일 칸의 탭 상태를 버린다.
+    pub(super) fn forget_closed_file_tabs(&mut self) {
+        let gone: Vec<PaneId> = self
             .files
             .tabs
             .iter()
-            .filter(|(p, t)| {
-                (t.is_dirty() || t.saving) && self.layout.file(**p) != Some(t.path.as_path())
-            })
+            .filter(|(p, t)| self.layout.file(**p) != Some(t.path.as_path()))
             .map(|(p, _)| *p)
             .collect();
-        if lost.is_empty() {
-            let gone: Vec<PaneId> = self
-                .files
-                .tabs
-                .keys()
-                .filter(|p| {
-                    self.files
-                        .tabs
-                        .get(p)
-                        .is_some_and(|t| self.layout.file(**p) != Some(t.path.as_path()))
-                })
-                .copied()
-                .collect();
-            for p in gone {
-                if let Some(tab) = self.files.tabs.remove(&p) {
-                    self.files.forget(&tab);
-                }
+        for p in gone {
+            if let Some(tab) = self.files.tabs.remove(&p) {
+                self.files.forget(&tab);
             }
-            return false;
         }
-        let after = std::mem::replace(&mut self.layout, before.clone());
-        let detail = self.unsaved_detail(&lost);
-        let Some(handle) = self.window else {
-            return true;
-        };
-        // 액션 전달 중에는 창이 빌려져 있어 대화상자는 다음 틱에 띄운다.
-        // ponytail: 확정 시 묻기 전 스냅샷(`after`)을 그대로 쓴다. 대화상자가 떠 있는 동안 생긴 레이아웃 변경(세션 붙기 등)은
-        // 덮인다 — 세션은 분리된 세션으로 남는다. 잦아지면 닫기 연산을 다시 적용하는 방식으로.
-        cx.spawn(async move |this, cx| {
-            let Ok(answer) =
-                cx.update_window(handle, |_, window, cx| prompt_unsaved(&detail, window, cx))
-            else {
-                return;
-            };
-            let Ok(close) = this.update(cx, |_, cx| Self::resolve_unsaved(answer, &lost, cx))
-            else {
-                return;
-            };
-            if close.await {
-                this.update(cx, |this, cx| {
-                    this.change_with_policy(true, policy, cx, move |l| *l = after);
-                })
-                .ok();
-            }
-        })
-        .detach();
-        true
-    }
-
-    fn dirty_files(&self) -> Vec<PaneId> {
-        self.files
-            .tabs
-            .iter()
-            .filter(|(_, t)| t.is_dirty() || t.saving)
-            .map(|(p, _)| *p)
-            .collect()
-    }
-
-    fn unsaved_detail(&self, panes: &[PaneId]) -> String {
-        let names: Vec<String> = panes
-            .iter()
-            .filter_map(|p| self.layout.file(*p).map(editor::file_name))
-            .collect();
-        etext::UNSAVED_DETAIL.format(&[("files", &names.join("\n"))])
-    }
-
-    /// 대화상자 답을 기다려 처리한다: 저장(모두 성공해야 진행)·저장 안 함(편집 버림)·취소. 진행하면 true.
-    fn resolve_unsaved(
-        answer: impl std::future::Future<Output = Option<usize>> + 'static,
-        panes: &[PaneId],
-        cx: &mut Context<Self>,
-    ) -> Task<bool> {
-        let panes = panes.to_vec();
-        cx.spawn(async move |this, cx| {
-            let choice = answer.await;
-            if choice == Some(0) {
-                for pane in &panes {
-                    let Ok(save) = this.update(cx, |this, cx| this.save_file(*pane, cx)) else {
-                        return false;
-                    };
-                    if !save.await {
-                        return false;
-                    }
-                }
-                return this
-                    .read_with(cx, |this, _| {
-                        panes.iter().all(|p| {
-                            this.files
-                                .tabs
-                                .get(p)
-                                .is_none_or(|t| !t.is_dirty() && !t.saving)
-                        })
-                    })
-                    .unwrap_or(false);
-            }
-            this.update(cx, |this, _cx| match choice {
-                Some(1) => {
-                    for p in &panes {
-                        if let Some(tab) = this.files.tabs.remove(p) {
-                            this.files.forget(&tab);
-                        }
-                    }
-                    true
-                }
-                _ => false,
-            })
-            .unwrap_or(false)
-        })
     }
 }
 
-/// 앱 종료의 유일한 경로(⌘Q·메뉴·메뉴바 아이콘). 셸 창마다 미저장 파일을 차례로 묻고, 취소가 없으면 끝낸다.
-/// 액션 처리 중에는 그 창이 빌려져 있어 읽히지 않으므로(미저장을 못 보고 끝냄) 다음 틱에 본다.
+/// 앱 종료의 유일한 경로(⌘Q·메뉴·메뉴바 아이콘). 셸 창마다 레이아웃을 디스크에 내려쓴 뒤 끝낸다.
+/// 액션 처리 중에는 그 창이 빌려져 있어 갱신되지 않으므로(레이아웃을 못 내려씀) 다음 틱에 본다.
 pub(super) fn quit_app(cx: &mut App) {
     cx.defer(quit_now);
 }
@@ -3134,97 +2577,67 @@ struct QuitObserved(std::rc::Rc<std::cell::Cell<bool>>);
 impl gpui::Global for QuitObserved {}
 
 fn quit_now(cx: &mut App) {
-    // A restart helper can time out while a save prompt or durable flush waits.
+    // A restart helper can time out while a durable flush waits.
     // Do not finish that update-triggered quit after its helper has failed.
     let restart = cx
         .try_global::<krill_app::updater::UpdateState>()
         .filter(|state| state.restart.is_starting())
         .and_then(|state| state.staged.clone());
-    let dirty = cx
+    // GPUI quit observers only have a 200ms budget. Finish filesystem work
+    // while the event loop is still running, before requesting app shutdown.
+    let pending = cx
         .windows()
         .into_iter()
         .filter_map(|w| w.downcast::<Shell>())
-        .find(|w| w.read(cx).is_ok_and(|s| !s.dirty_files().is_empty()));
-    let Some(handle) = dirty else {
-        // GPUI quit observers only have a 200ms budget. Finish filesystem work
-        // while the event loop is still running, before requesting app shutdown.
-        let pending = cx
-            .windows()
-            .into_iter()
-            .filter_map(|w| w.downcast::<Shell>())
-            .filter_map(|window| {
-                window
-                    .update(cx, |shell, _, cx| {
-                        // Include the final last-seen value in the unbounded-time
-                        // preflush, rather than creating another write at shutdown.
-                        shell.touch_last_seen();
-                        (window, shell.layout.clone(), shell.layout_barrier(cx))
-                    })
-                    .ok()
-            })
-            .collect::<Vec<_>>();
-        let editor_saved = flush_editor_writes(cx);
-        let settings_saved = krill_app::settings::flush_file_io(cx);
-        let sidebar_saved = krill_app::sidebar::flush_file_io(cx);
-        let star_saved = krill_app::star_nag::flush(cx);
-        cx.spawn(async move |cx| {
-            editor_saved.await;
-            settings_saved.await;
-            sidebar_saved.await;
-            star_saved.await;
-            let mut snapshots = Vec::new();
-            for (window, layout, barrier) in pending {
-                if !barrier.await {
-                    return;
-                }
-                snapshots.push((window, layout));
+        .filter_map(|window| {
+            window
+                .update(cx, |shell, _, cx| {
+                    // Include the final last-seen value in the unbounded-time
+                    // preflush, rather than creating another write at shutdown.
+                    shell.touch_last_seen();
+                    (window, shell.layout.clone(), shell.layout_barrier(cx))
+                })
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    let settings_saved = krill_app::settings::flush_file_io(cx);
+    let sidebar_saved = krill_app::sidebar::flush_file_io(cx);
+    let star_saved = krill_app::star_nag::flush(cx);
+    cx.spawn(async move |cx| {
+        settings_saved.await;
+        sidebar_saved.await;
+        star_saved.await;
+        let mut snapshots = Vec::new();
+        for (window, layout, barrier) in pending {
+            if !barrier.await {
+                return;
             }
-            cx.update(|cx| {
-                if !restart_quit_is_current(restart.as_ref(), cx) {
-                    return;
-                }
-                if snapshots.iter().all(|(window, layout)| {
-                    window.read(cx).is_ok_and(|shell| {
-                        shell.layout == *layout && shell.dirty_files().is_empty()
-                    })
-                }) {
-                    for (window, _) in &snapshots {
-                        if let Ok(shell) = window.read(cx) {
-                            shell.quit_layout_ready.set(true);
-                        }
+            snapshots.push((window, layout));
+        }
+        cx.update(|cx| {
+            if !restart_quit_is_current(restart.as_ref(), cx) {
+                return;
+            }
+            if snapshots
+                .iter()
+                .all(|(window, layout)| window.read(cx).is_ok_and(|shell| shell.layout == *layout))
+            {
+                for (window, _) in &snapshots {
+                    if let Ok(shell) = window.read(cx) {
+                        shell.quit_layout_ready.set(true);
                     }
-                    #[cfg(test)]
-                    if let Some(observed) = cx.try_global::<QuitObserved>() {
-                        observed.0.set(true);
-                    }
-                    cx.quit();
-                } else {
-                    quit_app(cx);
                 }
-            });
-        })
-        .detach();
-        return;
-    };
-    handle
-        .update(cx, |shell, window, cx| {
-            window.activate_window();
-            let dirty = shell.dirty_files();
-            let answer = prompt_unsaved(&shell.unsaved_detail(&dirty), window, cx);
-            let close = Shell::resolve_unsaved(answer, &dirty, cx);
-            cx.spawn(async move |_, cx| {
-                // 이 창을 저장했거나 버렸으면 다음 창을 본다.
-                if close.await {
-                    cx.update(|cx| {
-                        if restart_quit_is_current(restart.as_ref(), cx) {
-                            quit_app(cx);
-                        }
-                    });
+                #[cfg(test)]
+                if let Some(observed) = cx.try_global::<QuitObserved>() {
+                    observed.0.set(true);
                 }
-            })
-            .detach();
-        })
-        .ok();
+                cx.quit();
+            } else {
+                quit_app(cx);
+            }
+        });
+    })
+    .detach();
 }
 
 fn restart_quit_is_current(staged: Option<&krill_app::updater::StagedUpdate>, cx: &App) -> bool {
@@ -3236,23 +2649,6 @@ fn restart_quit_is_current(staged: Option<&krill_app::updater::StagedUpdate>, cx
     })
 }
 
-/// 미저장 확인 대화상자(저장 · 저장 안 함 · 취소). 답은 버튼 순서.
-fn prompt_unsaved(
-    detail: &str,
-    window: &mut Window,
-    cx: &mut App,
-) -> impl std::future::Future<Output = Option<usize>> + use<> {
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        etext::UNSAVED_TITLE.get(),
-        Some(detail),
-        &[etext::SAVE.get(), etext::DISCARD.get(), etext::CANCEL.get()],
-        cx,
-    );
-    async move { answer.await.ok() }
-}
-
-pub(crate) mod bench;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;

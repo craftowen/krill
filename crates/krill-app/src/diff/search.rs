@@ -286,37 +286,6 @@ impl WorkspaceSearch {
         self.rows.clear();
     }
 
-    pub fn run_sync(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.cancel = None;
-        self.search_task = None;
-        self.searching = false;
-        if self.options.query.is_empty() || self.remote {
-            self.result = SearchResult::default();
-            self.collapsed_files.clear();
-            self.rows.clear();
-            self.selected_row = None;
-            self.error = None;
-            return;
-        }
-        match search_worktree(&self.repo, &self.options) {
-            Ok(res) => {
-                self.error = None;
-                self.result = res;
-                self.collapsed_files
-                    .retain(|rel| self.result.files.iter().any(|f| &f.relative_path == rel));
-                self.selected_row = None;
-                self.rebuild_rows();
-            }
-            Err(err) => {
-                self.error = Some(err);
-                self.result = SearchResult::default();
-                self.rows.clear();
-                self.selected_row = None;
-            }
-        }
-    }
-
     pub fn toggle_file_collapse(&mut self, relative_path: &str) {
         if !self.collapsed_files.remove(relative_path) {
             self.collapsed_files.insert(relative_path.to_owned());
@@ -1587,18 +1556,6 @@ impl Panel {
         self.spawn_async_search(cx);
     }
 
-    /// 포함 glob 필터(`files to include`)를 설정하고 비동기 검색을 갱신한다.
-    pub fn set_search_include(&mut self, include: impl Into<String>, cx: &mut Context<Self>) {
-        self.search.options.include_pattern = include.into();
-        self.spawn_async_search(cx);
-    }
-
-    /// 제외 glob 필터(`files to exclude`)를 설정하고 비동기 검색을 갱신한다.
-    pub fn set_search_exclude(&mut self, exclude: impl Into<String>, cx: &mut Context<Self>) {
-        self.search.options.exclude_pattern = exclude.into();
-        self.spawn_async_search(cx);
-    }
-
     /// 대소문자 구분(`Aa`) 옵션을 토글하고 비동기 검색을 갱신한다.
     pub fn toggle_search_case_sensitive(&mut self, cx: &mut Context<Self>) {
         self.search.options.case_sensitive = !self.search.options.case_sensitive;
@@ -1627,27 +1584,6 @@ impl Panel {
     pub fn collapse_all_search_files(&mut self, cx: &mut Context<Self>) {
         self.search.collapse_all();
         cx.notify();
-    }
-
-    /// 검색 결과 행 인덱스를 클릭 처리한다(파일 헤더면 접기/펼치기, 매치 행이면 `OpenFileAt` 발행).
-    pub fn activate_search_row(&mut self, row_idx: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.search.rows.get(row_idx).cloned() else {
-            return;
-        };
-        match row {
-            SearchRow::FileHeader { relative_path, .. } => {
-                self.toggle_search_file_collapse(&relative_path, cx);
-            }
-            SearchRow::Match { path, hit, .. } => {
-                self.search.selected_row = Some(row_idx);
-                cx.emit(OpenFileAt {
-                    path,
-                    line: hit.line,
-                    column: hit.column,
-                });
-                cx.notify();
-            }
-        }
     }
 
     pub(crate) fn spawn_async_search(&mut self, cx: &mut Context<Self>) {

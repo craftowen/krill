@@ -729,18 +729,6 @@ pub fn dismiss_on_escape(cx: &mut App) -> bool {
     }
 }
 
-/// 영구 완료 처리(별 성공·이미 별을 준 상태).
-pub fn never(cx: &mut App) {
-    update(cx, |nag| {
-        nag.state.complete();
-        nag.card = Card::Hidden;
-    });
-    crate::telemetry::record_star_prompt(
-        krill_proto::telemetry::UsageName::StarPromptDismissed,
-        cx,
-    );
-}
-
 /// 카드의 주 버튼 동작:
 /// - `Mode::Gh`: `gh api -X PUT`으로 바로 별을 주고, 실패하면 브라우저를 강제로 열지 않고 카드를 `Mode::Web`(`GitHub 열기`)으로 전환한다(Orca `StarNagCard` 패리티).
 /// - `Mode::Web`: 브라우저에서 저장소를 열고 3일 쉼(`later`)으로 전환한다.

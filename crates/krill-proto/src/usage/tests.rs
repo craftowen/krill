@@ -577,13 +577,6 @@ fn account_status_display_helpers_for_step_two_ui() {
     assert_eq!(AccountStatus::default(), AccountStatus::Unknown);
 
     let now = 1_792_123_200_u64;
-    assert_eq!(format_updated_ago_ko(None, now), "갱신 없음");
-    assert_eq!(format_updated_ago_ko(Some(now), now), "방금 전");
-    assert_eq!(format_updated_ago_ko(Some(now + 60), now), "방금 전");
-    assert_eq!(format_updated_ago_ko(Some(now - 45), now), "45초 전");
-    assert_eq!(format_updated_ago_ko(Some(now - 120), now), "2분 전");
-    assert_eq!(format_updated_ago_ko(Some(now - 7_200), now), "2시간 전");
-    assert_eq!(format_updated_ago_ko(Some(now - 172_800), now), "2일 전");
     assert!(!is_updated_stale(Some(now - 60), now));
     assert!(is_updated_stale(Some(now - 1_801), now));
     assert!(is_updated_stale(None, now));
@@ -783,8 +776,6 @@ fn auto_switch_policy_upsert_clamps_and_keys_by_provider_and_account() {
     first.provider = ProviderKind::Codex;
     policy.upsert_rule(first);
     assert_eq!(policy.rules.len(), 2);
-    assert!(policy.remove_rule(ProviderKind::Claude, "host"));
-    assert!(!policy.remove_rule(ProviderKind::Claude, "host"));
     assert!(policy.rule_for(ProviderKind::Codex, "host").is_some());
 }
 

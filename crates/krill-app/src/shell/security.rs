@@ -2035,8 +2035,7 @@ fn upload_bytes_via_windows_target(
         return None;
     }
     let path = format!("{dir}\\{filename}");
-    krill_app::remote_fs::save_atomic_bytes(target, std::path::Path::new(&path), bytes, None)
-        .ok()?;
+    krill_app::remote_fs::save_atomic_bytes(target, std::path::Path::new(&path), bytes).ok()?;
     Some(path)
 }
 
