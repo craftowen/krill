@@ -150,7 +150,7 @@
   blocked:()=>!credentials||!!pairing||transport.blocked,
   busy:()=>productPending>0||(transport.updateBusy||pool.updateBusy)||dialog.open||!!scanner||M.terminal.updateBusy("")||
    [...hostViews.values()].some(v=>v.drafts.size||[...v.chatCache?.values()||[]].some(e=>e.sending||e.modelPending||e.questionSending||e.questionDraft?.changed||e.questionDraft?.selected?.length||e.photo||e.live))||[...state.chatCache?.values()||[]].some(e=>e.sending||e.modelPending||e.questionSending||e.questionDraft?.changed||e.questionDraft?.selected?.length||e.photo||e.live)||!!document.querySelector('.chat-opt[aria-pressed=true],.file-row[aria-pressed=true]')||
-   (editable(document.activeElement)&&!!document.activeElement.value)||
+   editable(document.activeElement)||
    [...document.querySelectorAll('textarea,input,select,[contenteditable=true]')].some(n=>!n.readOnly&&editable(n)&&!n.matches('.chat-input,.command-input,.live-capture,input[type=search],select')&&(n.isContentEditable||!!n.value)),
   capture:()=>({drafts:[...state.drafts],terminalDrafts:M.terminal.snapshotDrafts().filter(row=>Array.isArray(row)&&row.length===2&&typeof row[0]==='string'&&typeof row[1]==='string'),ui:{...state.ui},view:M.updates.captureView(document),disclosures:[...state.chatCache||[]].map(([id,entry])=>[id,[...entry.disclosures||[]]])}),
   restore:saved=>{
