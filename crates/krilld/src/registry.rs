@@ -416,17 +416,17 @@ impl Registry {
             };
             for (id, cwd, tap, e) in found {
                 if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
-                    self.auto_switch_from_hook(id, e);
-                    hooked.push((id, e.payload.clone(), e.id));
+                    hooked.push((id, e.clone()));
                 }
             }
             Ok(())
         })
         .ok();
         drop(commit);
-        for (id, payload, event_id) in &hooked {
-            self.maybe_rename_from_hook(*id, payload, *event_id);
-            if status::is_turn_stop(payload)
+        for (id, e) in &hooked {
+            self.auto_switch_from_hook(*id, e);
+            self.maybe_rename_from_hook(*id, &e.payload, e.id);
+            if status::is_turn_stop(&e.payload)
                 && let Some(dir) = self.state_dir()
                 && let Err(error) = self.notify_idle_orchestration_mail_for(&dir, Some(*id))
             {
@@ -764,6 +764,7 @@ impl Registry {
             let ack = s.write_all(&hook::ack());
             drop(s);
             if let Some(id) = session {
+                self.auto_switch_from_hook(id, &e);
                 self.maybe_rename_from_hook(id, &e.payload, e.id);
                 if status::is_turn_stop(&e.payload)
                     && let Some(dir) = self.state_dir()
@@ -2158,7 +2159,6 @@ impl Registry {
         };
         if let Some((id, cwd, tap)) = target {
             if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
-                self.auto_switch_from_hook(id, e);
                 Ok(Some(id))
             } else {
                 Ok(None)
@@ -2322,8 +2322,13 @@ impl Registry {
     }
 
     // Account evaluation wakes the session worker. Release `state` first: the worker's
-    // final handoff holds its queue lock while retiring the old session.
+    // final handoff holds its queue lock while retiring the old session. This also runs account
+    // CLIs and the keychain without a deadline, so callers must not hold `hook_commit` or the spool lock.
     fn auto_switch_from_hook(&self, id: SessionId, e: &HookEvent) {
+        #[cfg(all(test, unix))]
+        if let Some(probe) = tests::AUTO_SWITCH_PROBE.take() {
+            return probe(self);
+        }
         if let Some(switched) = status::auto_switch_on_rate_limit(
             &crate::usage::accounts::default_home(),
             self.state_dir().as_deref(),
