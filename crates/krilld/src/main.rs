@@ -115,11 +115,11 @@ fn main() -> ExitCode {
                     tracing::warn!("socket owned by a healthy daemon; exiting as duplicate");
                     return ExitCode::from(daemon::KRILLD_DUPLICATE);
                 }
-                // 고아 krilld는 있는데 전송이 끊겼다. holder가 다시 띄워 재시도한다(중복으로 끝내면 고아의
-                // 멈춘 리더가 다음 접속까지 출력을 못 읽는다).
+                // 고아 krilld는 있는데 전송이 끊겼다. holder가 백오프로 다시 띄워 재시도한다(중복으로 끝내면
+                // 고아의 멈춘 리더가 다음 접속까지 출력을 못 읽는다).
                 Some(Err(TakeError::Transfer(error))) => {
                     tracing::warn!(kind = ?error.kind(), "handover transfer failed");
-                    return ExitCode::FAILURE;
+                    return ExitCode::from(daemon::KRILLD_HANDOVER_FAILED);
                 }
                 None => return ExitCode::SUCCESS,
             }

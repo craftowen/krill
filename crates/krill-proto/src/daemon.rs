@@ -53,6 +53,10 @@ pub const FEAT_HOLDER_WATCH: u64 = 1 << 7;
 /// 이미 건강한 데몬이 떠 있는 중복 기동이다. 정상(0)·실패(1)·인자 오류(2)와 구별해 holder가 재기동 없이
 /// 끝낸다. 직접 실행한 krilld는 MK-022대로 0으로 끝낸다.
 pub const KRILLD_DUPLICATE: u8 = 3;
+/// holder 아래에서 뜬 krilld가 고아 krilld에게서 세션을 넘겨받지 못하고 끝날 때의 종료 코드. 상대를 기다리느라 1초
+/// 넘게 살았어도 holder는 뜨자마자 죽은 것으로 세어 백오프한다. 바로 다시 띄우면 시도마다 고아의 리더가 멈추고
+/// 세션 없는 holder는 포기하지 못한다. 이 코드를 모르는 holder는 일반 실패로 본다.
+pub const KRILLD_HANDOVER_FAILED: u8 = 4;
 /// EOF 없이 멈춘 데몬을 감지하는 감시 연결 확장(OWE-586, ARCHITECTURE §4.3).
 pub const FEAT_HEARTBEAT: u64 = 1 << 45;
 /// 데몬→클라이언트 holder 상태 프레임(ARCHITECTURE §4.3).

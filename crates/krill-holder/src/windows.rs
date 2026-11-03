@@ -6,7 +6,7 @@ use crate::{
 };
 use krill_proto::{
     SessionId,
-    daemon::KRILLD_DUPLICATE,
+    daemon::{KRILLD_DUPLICATE, KRILLD_HANDOVER_FAILED},
     holder::{
         FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION, WinSize,
         request_id,
@@ -278,7 +278,9 @@ impl Holder {
             return self.idle();
         }
         let upgrading = std::mem::take(&mut self.upgrading);
-        if uptime >= Duration::from_secs(1) && !upgrading {
+        let stable =
+            uptime >= Duration::from_secs(1) && status != i32::from(KRILLD_HANDOVER_FAILED);
+        if stable && !upgrading {
             self.streak = 0;
             self.previous = None;
         }
@@ -843,6 +845,17 @@ mod tests {
             assert!(!h.daemon_exited(1, Duration::ZERO));
         }
         assert!(h.daemon_exited(1, Duration::ZERO));
+    }
+
+    /// 인계 전송 실패는 상대를 기다리느라 오래 살았어도 짧은 실패로 센다(Unix `reap`과 같은 계약).
+    #[test]
+    fn empty_holder_gives_up_after_repeated_handover_failures() {
+        let mut h = holder();
+        let code = i32::from(KRILLD_HANDOVER_FAILED);
+        for _ in 0..4 {
+            assert!(!h.daemon_exited(code, Duration::from_secs(2)));
+        }
+        assert!(h.daemon_exited(code, Duration::from_secs(2)));
     }
 
     #[test]

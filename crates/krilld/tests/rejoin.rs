@@ -780,3 +780,55 @@ fn socket_owner_restarts_krilld_after_a_lock_probe_overlaps() {
     drop(kids);
     fs::remove_dir_all(dir).ok();
 }
+
+/// 고아 krilld의 인계 전송이 계속 실패하면(상대를 1초 넘게 기다린 뒤 끊김) holder는 krilld를 백오프 없이 다시 띄우지
+/// 않는다. 그러면 시도마다 고아의 리더를 멈추고, 세션 없는 holder는 영영 포기하지 못한다. 세션 없는 holder는 끝난다.
+#[test]
+fn empty_holder_gives_up_when_handover_keeps_failing() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+
+    let dir = tmp("transfer-gives-up");
+    let sock = dir.join("run/k.sock");
+    fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    fs::set_permissions(sock.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    // 고아 krilld 흉내: 소켓 락을 쥐고, 인계 시도마다 1초 넘게 붙잡았다가 Ready 없이 끊는다.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(beside(&sock, ".lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let hnd = UnixListener::bind(beside(&sock, ".hnd")).unwrap();
+    hnd.set_nonblocking(true).unwrap();
+    let mut kids = Kids::default();
+    kids.holders.push(holder(&dir, &sock));
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut attempts = 0;
+    let status = loop {
+        if let Some(s) = kids.holders[0].try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder kept restarting krilld after {attempts} failed handovers"
+        );
+        match hnd.accept() {
+            Ok((s, _)) => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(1200));
+                drop(s);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert!(status.success(), "holder: {status}");
+    drop(lock);
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}
