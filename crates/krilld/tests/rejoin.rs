@@ -601,3 +601,70 @@ fn broken_holder_link_is_closed_before_orphaning() {
     drop(kids);
     fs::remove_dir_all(dir).ok();
 }
+
+/// C-2: 고아 krilld는 있는데 인계 전송이 끊기면 중복 기동으로 끝내지 않는다. 같은 holder가 krilld를 다시 띄워
+/// 재시도하고, 두 번째 인계가 끝나면 소켓을 게시한다.
+#[test]
+fn failed_handover_transfer_is_retried_under_the_same_holder() {
+    use krill_proto::holder::{FromHolder, VERSION};
+    use krilld::holder::link::Link;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+
+    let dir = tmp("transfer-retry");
+    let sock = dir.join("run/k.sock");
+    fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    fs::set_permissions(sock.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    // 고아 krilld 흉내: 소켓 락을 쥐고 인계 소켓에서 기다린다.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(beside(&sock, ".lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let hnd = UnixListener::bind(beside(&sock, ".hnd")).unwrap();
+    hnd.set_nonblocking(true).unwrap();
+    let accept = || {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match hnd.accept() {
+                Ok((s, _)) => {
+                    s.set_nonblocking(false).unwrap();
+                    return s;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no handover attempt");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    };
+    let mut kids = Kids::default();
+    kids.holders.push(holder(&dir, &sock));
+    drop(accept()); // 첫 시도: Ready 전에 끊는다
+    let mut link = Link::new(OwnedFd::from(accept()));
+    let hello = FromHolder::Hello {
+        version: VERSION,
+        holder_pid: std::process::id(),
+        inbox: false,
+    };
+    for m in [hello, FromHolder::Ready] {
+        link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    let p = link.recv().unwrap().unwrap();
+    assert_eq!(FromHolder::decode(p.frame()).unwrap(), FromHolder::Ready);
+    drop(lock);
+    drop(link);
+    let (_c, krilld) = wait_daemon(&sock, 0);
+    kids.pids.push(krilld);
+    assert!(
+        kids.holders[0].try_wait().unwrap().is_none(),
+        "holder gave up after a failed transfer"
+    );
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}
