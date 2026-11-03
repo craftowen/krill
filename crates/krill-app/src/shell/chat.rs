@@ -366,6 +366,25 @@ pub(crate) fn observe_composer_meta(
     meta
 }
 
+/// Reads composer meta off the UI thread when the poll may have changed it. `settled` is the
+/// binding whose meta is already known; `None` means it must be read.
+fn poll_composer_meta(
+    snap: &ChatPollSnapshot,
+    local: bool,
+    settled: Option<&(String, String)>,
+) -> Option<ComposerMeta> {
+    let fresh = snap.reset
+        || !snap.items.is_empty()
+        || settled.is_none_or(|(id, path)| *id != snap.session_id || *path != snap.transcript_path);
+    (local && snap.bound && fresh).then(|| {
+        observe_composer_meta(
+            krill_proto::daemon::state_dir().as_deref(),
+            &snap.session_id,
+            &snap.transcript_path,
+        )
+    })
+}
+
 pub(crate) fn parse_composer_items(items: &[serde_json::Value]) -> Vec<ComposerModelItem> {
     items
         .iter()
@@ -924,9 +943,16 @@ impl Shell {
             .flatten();
         #[cfg(test)]
         let seed = seed.filter(|_| self.chat.workflow_call.is_some());
+        let local = host.is_local();
+        let settled = self
+            .chat
+            .logs
+            .get(&key)
+            .filter(|log| log.bound && log.meta.model.is_some())
+            .map(|log| log.binding.clone());
         self.chat.task = Some(cx.spawn(async move |this, cx| {
             let seeding = seed.is_some();
-            let (page, reply) = cx
+            let (page, reply, meta) = cx
                 .background_executor()
                 .spawn(async move {
                     #[cfg(test)]
@@ -939,7 +965,14 @@ impl Shell {
                     let reply = page.is_none().then(|| {
                         call(&Request::AgentHistory(Action::ChatPoll { session, offset }))
                     });
-                    (page, reply)
+                    let meta = match (&page, &reply) {
+                        (Some(page), _) => poll_composer_meta(&page.snapshot, local, None),
+                        (None, Some(Ok(Reply::AgentHistory(Response::ChatPolled(snap))))) => {
+                            poll_composer_meta(snap, local, settled.as_ref())
+                        }
+                        _ => None,
+                    };
+                    (page, reply, meta)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -957,7 +990,7 @@ impl Shell {
                     }
                     if let Some(page) = page {
                         this.chat.poll_failed.remove(&key);
-                        this.apply_chat_tail(session, host, page);
+                        this.apply_chat_tail(session, host, page, meta);
                         this.refresh_chat_composer(&key, false, cx);
                     } else if let Some(Ok(Reply::AgentHistory(Response::ChatPolled(snapshot)))) =
                         reply
@@ -970,7 +1003,7 @@ impl Shell {
                                 .get(&key)
                                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
                         this.chat.poll_failed.remove(&key);
-                        this.apply_chat_poll_for_host(session, host, snapshot);
+                        this.apply_chat_poll_for_host(session, host, snapshot, meta);
                         if refresh_composer {
                             this.refresh_chat_composer(&key, false, cx);
                         }
@@ -998,10 +1031,11 @@ impl Shell {
         session: SessionId,
         host: krill_app::hosts::HostId,
         page: ChatPage,
+        meta: Option<ComposerMeta>,
     ) {
         let key = (host.clone(), session);
         self.chat.logs.entry(key.clone()).or_default().binding = Default::default();
-        self.apply_chat_poll_for_host(session, host, page.snapshot);
+        self.apply_chat_poll_for_host(session, host, page.snapshot, meta);
         let log = self.chat.logs.entry(key).or_default();
         log.base_index = CHAT_BASE_ORIGIN;
         log.seeded = true;
@@ -1077,7 +1111,7 @@ impl Shell {
         let Some(host) = host else {
             return;
         };
-        self.apply_chat_poll_for_host(session, host, snap);
+        self.apply_chat_poll_for_host(session, host, snap, None);
     }
 
     pub(super) fn apply_chat_poll_for_host(
@@ -1085,6 +1119,7 @@ impl Shell {
         session: SessionId,
         host: krill_app::hosts::HostId,
         snap: ChatPollSnapshot,
+        observed: Option<ComposerMeta>,
     ) {
         let key = (host.clone(), session);
         let host = Some(host);
@@ -1124,10 +1159,8 @@ impl Shell {
         if is_local
             && snap.bound
             && (initial_bind || reset || !snap.items.is_empty() || log.meta.model.is_none())
+            && let Some(observed) = observed
         {
-            let state_dir = krill_proto::daemon::state_dir();
-            let observed =
-                observe_composer_meta(state_dir.as_deref(), &log.binding.0, &log.binding.1);
             if observed.model.is_some() {
                 log.meta.model = observed.model;
             }

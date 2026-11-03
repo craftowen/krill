@@ -102,6 +102,7 @@ pub(super) fn install(shell: &mut Shell, window: &mut gpui::Window, cx: &mut Con
             items,
             ..Default::default()
         },
+        None,
     );
     if let Ok(width) = std::env::var("KRILL_BENCH_WIDTH")
         && let Ok(width) = width.parse::<f32>()
