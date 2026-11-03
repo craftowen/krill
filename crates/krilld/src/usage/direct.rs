@@ -2428,7 +2428,7 @@ pub(crate) fn agy_exe() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod failure_tests;
+pub(crate) mod failure_tests;
 
 #[cfg(test)]
 mod tests {

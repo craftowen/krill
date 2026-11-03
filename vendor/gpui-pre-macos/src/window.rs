@@ -866,10 +866,19 @@ impl MacWindowState {
             return;
         };
         let data = self.native_view.as_ptr() as *mut c_void;
-        self.frame_source
+        let started = self
+            .frame_source
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
-            .start(display_id)
-            .log_err();
+            .start(display_id);
+        if !self.quiet_stall_streak() {
+            started.log_err();
+        }
+    }
+
+    /// A sleeping or absent display fails every restart of a stall streak the same way; only the
+    /// first two stalls (restart, then recreate) are logged until a frame arrives again.
+    fn quiet_stall_streak(&self) -> bool {
+        self.link_stalls > 2
     }
 
     fn stop_display_link(&mut self) {
@@ -3458,15 +3467,21 @@ fn spawn_display_link_watchdog(state: &Arc<Mutex<MacWindowState>>) {
                     .frame_source
                     .as_ref()
                     .is_some_and(WindowFrameSource::is_running);
-                log::warn!(
-                    "display link stalled for {}ms (stall #{}, subscribed: {subscribed}, display: {display:?}); restarting",
-                    stalled.as_millis(),
-                    lock.link_stalls,
-                );
+                let quiet = lock.quiet_stall_streak();
+                if !quiet {
+                    log::warn!(
+                        "display link stalled for {}ms (stall #{}, subscribed: {subscribed}, display: {display:?}); restarting",
+                        stalled.as_millis(),
+                        lock.link_stalls,
+                    );
+                }
                 if lock.link_stalls >= 2
                     && let Some(display) = display
                 {
-                    crate::display_link::recreate_display_link(display).log_err();
+                    let recreated = crate::display_link::recreate_display_link(display);
+                    if !quiet {
+                        recreated.log_err();
+                    }
                 }
                 lock.stop_display_link();
                 lock.start_display_link();

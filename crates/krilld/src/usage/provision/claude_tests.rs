@@ -529,3 +529,38 @@ fn real_home_is_never_provisioned_from_a_test_process() {
     assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 0);
     std::fs::remove_dir_all(state).ok();
 }
+
+#[test]
+fn unchanged_provisioning_conflicts_warn_once_per_change() {
+    let events = crate::usage::direct::failure_tests::Events::default();
+    tracing::subscriber::with_default(events.clone(), || {
+        let profile = "/fixture-provision-conflicts/profile";
+        for _ in 0..3 {
+            report_conflicts(profile, vec!["sessions", "archived_sessions"]);
+        }
+        report_conflicts(profile, vec!["sessions"]);
+        report_conflicts(profile, vec![]);
+        report_conflicts(profile, vec![]);
+        report_conflicts(profile, vec!["sessions"]);
+        report_conflicts("/fixture-provision-conflicts/other", vec!["sessions"]);
+    });
+    let warned: Vec<_> = crate::session::lock(&events.0)
+        .iter()
+        .map(|(level, fields)| (*level, fields.clone()))
+        .collect();
+    let conflicts = |list: &str| {
+        (
+            tracing::Level::WARN,
+            format!(" message=profile provisioning left existing entries conflicts={list}"),
+        )
+    };
+    assert_eq!(
+        warned,
+        [
+            conflicts(r#"["sessions", "archived_sessions"]"#),
+            conflicts(r#"["sessions"]"#),
+            conflicts(r#"["sessions"]"#),
+            conflicts(r#"["sessions"]"#),
+        ]
+    );
+}

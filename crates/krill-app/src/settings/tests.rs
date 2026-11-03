@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 
 use gpui::{Action as _, Focusable as _, TestAppContext};
 use gpui_component::ActiveTheme as _;
@@ -9325,6 +9326,7 @@ fn install_tab_renders_tools_runs_inline_install_and_saves_shell_aliases(cx: &mu
         });
         window.draw(cx).clear(cx);
     });
+    vcx.run_until_parked();
 
     // Verify shell profile alias block and quick_commands sync
     let rc_path = install::shell_rc_path(&d.join("test-home"));
@@ -9360,6 +9362,7 @@ fn saving_shell_aliases_never_overwrites_an_unreadable_rc(cx: &mut TestAppContex
     vcx.run_until_parked();
 
     vcx.update(|_, cx| view.update(cx, SettingsView::save_shell_aliases));
+    vcx.run_until_parked();
 
     assert_eq!(fs::read(&rc_path).unwrap(), original);
     vcx.update(|_, cx| {

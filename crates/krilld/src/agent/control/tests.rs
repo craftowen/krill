@@ -6,6 +6,14 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 #[test]
+fn forgotten_session_drops_its_rate_limit_mark() {
+    let control = Control::new(None);
+    control.mark_rate_limited(SessionId(5));
+    control.forget(SessionId(5));
+    assert!(!control.is_rate_limited(SessionId(5)));
+}
+
+#[test]
 fn startup_sweep_prunes_only_expired_orphan_launches() {
     use std::time::{Duration, SystemTime};
 

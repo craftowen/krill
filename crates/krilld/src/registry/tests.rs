@@ -4,6 +4,111 @@ use std::fs;
 
 use krill_proto::agent::Permission;
 
+thread_local! {
+    /// Stands in for the rate-limit account refresh, which can block on `security` indefinitely.
+    pub(super) static AUTO_SWITCH_PROBE: std::cell::Cell<Option<fn(&Registry)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[test]
+fn hook_account_refresh_runs_without_blocking_other_daemon_work() {
+    fn other_work_proceeds(reg: &Registry) {
+        assert!(
+            reg.hook_commit.try_lock().is_ok(),
+            "account refresh held hook_commit, stalling Spawn, exits, and new connections"
+        );
+        let spool = reg.spool.as_ref().unwrap();
+        let next = HookEvent {
+            id: hook::EventId {
+                pid: 1,
+                unix_ns: 99,
+            },
+            agent: "claude".into(),
+            ppid: 0,
+            input: hook::Input::Complete,
+            payload: b"{}".to_vec(),
+        };
+        hook::append_spool(
+            spool,
+            &next.encode().unwrap(),
+            Instant::now() + Duration::from_millis(50),
+        )
+        .expect("account refresh held the spool lock, blocking `krill hook` appends");
+    }
+
+    let dir = std::env::temp_dir().join(format!("hook-refresh-unlocked-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(77);
+    let root_pid = std::process::id();
+    let (master, _user) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    {
+        let mut st = lock(&reg.state);
+        st.roots.insert(id, root_pid).unwrap();
+        st.sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: root_pid,
+                cwd: dir.clone(),
+                wrapped: false,
+            },
+        );
+    }
+    let event = |unix_ns| HookEvent {
+        id: hook::EventId {
+            pid: root_pid,
+            unix_ns,
+        },
+        agent: "claude".into(),
+        ppid: root_pid,
+        input: hook::Input::Complete,
+        payload: br#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#.to_vec(),
+    };
+
+    AUTO_SWITCH_PROBE.set(Some(other_work_proceeds));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let hello = krill_proto::daemon::client_hello(ipc::ClientRole::Cli, "test");
+    client.write_all(&hello.encode().unwrap()).unwrap();
+    client.write_all(&event(1).encode().unwrap()).unwrap();
+    let server_hello = ServerHello {
+        proto_min: ipc::PROTO_MIN,
+        proto_max: ipc::PROTO_MAX,
+        features: ipc::FEATURES,
+        build: "test".into(),
+        instance_id: 1,
+    };
+    reg.serve(server, &server_hello).unwrap();
+    assert!(
+        AUTO_SWITCH_PROBE.take().is_none(),
+        "socket hook skipped the refresh"
+    );
+
+    AUTO_SWITCH_PROBE.set(Some(other_work_proceeds));
+    hook::append_spool(
+        reg.spool.as_ref().unwrap(),
+        &event(2).encode().unwrap(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    reg.drain_spool();
+    assert!(
+        AUTO_SWITCH_PROBE.take().is_none(),
+        "spooled hook skipped the refresh"
+    );
+    drop(reg);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
     use krill_proto::os::ffi::OsStrExt as _;
