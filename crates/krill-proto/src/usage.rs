@@ -63,6 +63,8 @@ pub const AUTO_SWITCH_HYSTERESIS: u8 = 5;
 pub const AUTO_SWITCH_THRESHOLD_MIN: u8 = 1;
 /// 자동전환 임계값 범위(문서 규범 1~100, K-27). krilld·krill-app 평가 클램프가 공유한다.
 pub const AUTO_SWITCH_THRESHOLD_MAX: u8 = 100;
+/// `ConsumeResetCredit` IPC 읽기·쓰기 타임아웃(비멱등 업스트림 소진 최대 45초 + 여유 5초).
+pub const RESET_CONSUME_IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(50);
 
 pub mod kind {
     /// 클라이언트 → krilld: [`super::UsageRequest`].
@@ -980,6 +982,15 @@ impl UsageRequest {
         }
         features
     }
+
+    #[must_use]
+    pub const fn ipc_timeout(&self, default: std::time::Duration) -> std::time::Duration {
+        if matches!(self, Self::ConsumeResetCredit { .. }) {
+            RESET_CONSUME_IPC_TIMEOUT
+        } else {
+            default
+        }
+    }
 }
 
 /// Codex banked rate-limit reset 소진 결과. `wham/rate-limit-reset-credits/consume` 응답의
@@ -990,6 +1001,100 @@ pub enum ResetConsumeOutcome {
     NothingToReset,
     NoCredit,
     AlreadyRedeemed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetConsumeError {
+    AuthRequired,
+    RateLimited,
+    TimedOut,
+    Transport,
+    UpstreamRejected,
+    AccountNotFound,
+    InvalidTarget,
+    PermissionDenied,
+}
+
+impl ResetConsumeError {
+    #[must_use]
+    pub const fn to_failure(self) -> crate::control::Failure {
+        use crate::control::Failure;
+        match self {
+            Self::AuthRequired => Failure::Os(13),
+            Self::RateLimited => Failure::Os(16),
+            Self::TimedOut => {
+                #[cfg(target_os = "linux")]
+                {
+                    Failure::Os(110)
+                }
+                #[cfg(windows)]
+                {
+                    Failure::Os(138)
+                }
+                #[cfg(not(any(target_os = "linux", windows)))]
+                {
+                    Failure::Os(60)
+                }
+            }
+            Self::Transport => {
+                #[cfg(target_os = "linux")]
+                {
+                    Failure::Os(111)
+                }
+                #[cfg(windows)]
+                {
+                    Failure::Os(107)
+                }
+                #[cfg(not(any(target_os = "linux", windows)))]
+                {
+                    Failure::Os(61)
+                }
+            }
+            Self::UpstreamRejected => Failure::Os(5),
+            Self::AccountNotFound => Failure::Os(2),
+            Self::InvalidTarget => Failure::Os(22),
+            Self::PermissionDenied => Failure::Denied,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_failure(failure: crate::control::Failure) -> Self {
+        use crate::control::Failure;
+        match failure {
+            Failure::Denied | Failure::Os(1) => Self::PermissionDenied,
+            Failure::NoSession | Failure::Os(2) => Self::AccountNotFound,
+            Failure::Os(13) => Self::AuthRequired,
+            Failure::Os(16) => Self::RateLimited,
+            Failure::BadRequest | Failure::UnknownAgent | Failure::Os(22) => Self::InvalidTarget,
+            Failure::Os(60 | 110 | 138 | 10_060 | 10_110) => Self::TimedOut,
+            Failure::Os(54 | 61 | 104 | 107 | 111 | 10_054 | 10_061 | 10_104 | 10_111) => {
+                Self::Transport
+            }
+            Failure::NoHolder | Failure::SessionLimit | Failure::Os(_) => Self::UpstreamRejected,
+        }
+    }
+}
+
+impl std::fmt::Display for ResetConsumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            Self::AuthRequired => "authentication failed or expired; sign in again and retry",
+            Self::RateLimited => "usage API rate limited (HTTP 429); wait and retry",
+            Self::TimedOut => {
+                "usage reset timed out; refresh usage to check remaining credits before retrying"
+            }
+            Self::Transport => "could not reach usage reset server; check network and retry",
+            Self::UpstreamRejected => {
+                "usage reset request was rejected; refresh usage to check credit status"
+            }
+            Self::AccountNotFound => "account not found",
+            Self::InvalidTarget => {
+                "reset credits are only available for runnable codex and claude accounts"
+            }
+            Self::PermissionDenied => "permission denied",
+        };
+        f.write_str(msg)
+    }
 }
 
 /// [`kind::USAGE_REPLY`]. variant는 끝에만 붙인다.

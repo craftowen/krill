@@ -1495,3 +1495,109 @@ fn every_provider_popup_fits_short_windows_at_supported_zoom(cx: &mut gpui::Test
         }
     }
 }
+
+#[gpui::test]
+fn detail_flyout_keeps_outer_gap_and_comfortable_inner_padding(cx: &mut gpui::TestAppContext) {
+    use gpui::VisualTestContext;
+    let (shell, handle) = super::super::tests::open(cx);
+    shell.update(cx, |s, cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::Codex,
+        ])));
+        let mut host = profile("host", Some("host@example.com"));
+        host.host_default = true;
+        host.active = true;
+        let snap = std::sync::Arc::make_mut(&mut s.accounts_snapshot);
+        snap.accounts = vec![host];
+        snap.details.accounts = vec![AccountMeters {
+            account_id: "host".into(),
+            plan: Some("plus".into()),
+            meters: vec![
+                UsageMeter {
+                    key: "5h".into(),
+                    label: "5h".into(),
+                    value: None,
+                    window: Some(UsageWindow {
+                        percent: 17,
+                        resets_at: None,
+                    }),
+                },
+                UsageMeter {
+                    key: "7d".into(),
+                    label: "7d".into(),
+                    value: None,
+                    window: Some(UsageWindow {
+                        percent: 65,
+                        resets_at: None,
+                    }),
+                },
+            ],
+        }];
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(px(1280.), px(800.)));
+    visual.run_until_parked();
+    let pill = visual.debug_bounds("status-provider-pill-codex").unwrap();
+    visual.simulate_click(pill.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let header = visual.debug_bounds("status-provider-table-header").unwrap();
+    let row = visual
+        .debug_bounds("status-provider-account-codex-host")
+        .unwrap();
+    visual.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    visual.run_until_parked();
+    let scroll = visual
+        .debug_bounds("status-provider-detail-scroll")
+        .unwrap();
+    let detail = visual.debug_bounds("status-provider-details-host").unwrap();
+    let meter = visual
+        .debug_bounds("status-provider-detail-host-5h")
+        .unwrap();
+    let menu_right = header.origin.x - px(12.) + px(368.);
+    let outer_gap = scroll.origin.x - menu_right;
+    let left_pad = meter.origin.x - detail.origin.x;
+    let right_pad = detail.right() - meter.right();
+    assert!(
+        outer_gap >= ui::SPACE_3,
+        "provider detail flyout collided with menu edge: outer_gap={outer_gap:?}, menu_right={menu_right:?}, scroll={scroll:?}, left_pad={left_pad:?}, right_pad={right_pad:?}"
+    );
+    assert!(
+        left_pad >= ui::SPACE_4 && right_pad >= ui::SPACE_4,
+        "provider detail content lacked 16px horizontal padding: left_pad={left_pad:?}, right_pad={right_pad:?}, detail={detail:?}, meter={meter:?}"
+    );
+}
+
+#[test]
+fn detail_flyout_origin_uses_symmetric_gap_on_right_left_flip_and_zoom() {
+    let detail_size = gpui::size(px(288.), px(260.));
+    let viewport = gpui::size(px(1280.), px(800.));
+
+    let right_origin = compute_detail_flyout_origin(
+        gpui::point(px(24.), px(476.)),
+        px(368.),
+        px(16.),
+        detail_size,
+        viewport,
+    );
+    assert_eq!(right_origin, gpui::point(px(392.), px(476.)));
+
+    let flipped_origin = compute_detail_flyout_origin(
+        gpui::point(px(760.), px(476.)),
+        px(368.),
+        px(16.),
+        detail_size,
+        viewport,
+    );
+    assert_eq!(flipped_origin, gpui::point(px(448.), px(476.)));
+
+    let zoomed_origin = compute_detail_flyout_origin(
+        gpui::point(px(30.), px(476.)),
+        px(368.),
+        px(24.),
+        detail_size,
+        viewport,
+    );
+    assert_eq!(zoomed_origin, gpui::point(px(392.), px(476.)));
+}
