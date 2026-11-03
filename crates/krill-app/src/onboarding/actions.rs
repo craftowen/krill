@@ -707,6 +707,15 @@ pub fn auto_prepare(env: Env, cx: &mut App) -> Task<FixOutcome> {
                     install_default_hooks(&env, &path);
                 }
                 install_managed_cli_at(&env, &path).map_err(|e| ("cli.path", e))?;
+                if let Err(error) =
+                    krill_proto::orchestration::ensure_agent_desktop_installed_with_path(
+                        &env.home,
+                        Some(&env.krill),
+                        Some(&path),
+                    )
+                {
+                    tracing::warn!(%error, "agent-desktop provisioning skipped");
+                }
                 Ok(())
             })
             .await;

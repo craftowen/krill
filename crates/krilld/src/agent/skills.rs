@@ -12,7 +12,14 @@ pub(super) fn prepare(profile: Option<&Profile>, launch: &Launch, account: Optio
     if cfg!(test) || krill_proto::daemon::state_dir_override().is_some() {
         return;
     }
-    synchronize(&super::accounts::default_home(), profile, launch, account);
+    let home = super::accounts::default_home();
+    synchronize(&home, profile, launch, account);
+    std::thread::Builder::new()
+        .name("krilld-agent-desktop".into())
+        .spawn(move || {
+            krill_proto::orchestration::ensure_agent_desktop_installed(&home, None).ok();
+        })
+        .ok();
 }
 
 fn env_path(launch: &Launch, key: &str) -> Option<PathBuf> {
@@ -72,6 +79,7 @@ fn synchronize(
     launch: &Launch,
     account: Option<&LaunchAccount>,
 ) {
+    krill_proto::orchestration::stage_agent_desktop(None, home).ok();
     let report = sync_builtin_skills(&directories(home, profile, launch, account));
     for dir in report.busy {
         // 앱·CLI·다른 세션 시작이 같은 폴더를 동기화하는 중이다. 같은 묶음을 쓰고 다음 세션 시작에 다시 맞춘다.

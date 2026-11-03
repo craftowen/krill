@@ -1119,6 +1119,7 @@ pub(crate) fn stage_binaries(krill: &Path, home: &Path) -> Result<PathBuf, Strin
             }
         }
     }
+    krill_proto::orchestration::stage_agent_desktop(Some(krill), home).ok();
     Ok(target)
 }
 

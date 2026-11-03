@@ -4590,7 +4590,8 @@ mod orchestration_delivery_tests {
         assert!(
             OrchestrationStore::load(&dir)?
                 .idle_mail_notified
-                .is_empty()
+                .get(&id.0)
+                .is_some_and(|ids| ids.len() == 1)
         );
         status("Stop", 2)?;
         // A subsequent send retries previously unnotified mail for newly idle recipients.

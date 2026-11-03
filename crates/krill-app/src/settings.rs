@@ -2591,6 +2591,7 @@ pub fn setup_all_agents_and_skills_at(home: &Path, state: &Path) -> Vec<String> 
     }
     let skills = install_all_skills_at(home);
     summary.extend(skills);
+    krill_proto::orchestration::ensure_agent_desktop_installed(home, None).ok();
     summary
 }
 
