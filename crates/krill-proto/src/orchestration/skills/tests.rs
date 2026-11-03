@@ -200,3 +200,25 @@ fn pi_and_shared_agent_skill_roots_sync_builtin_bundle() {
     assert!(body.contains("On pi, use the `bash` tool"));
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn agent_desktop_alias_installs_computer_use_and_cleans_stale_references() {
+    let home = home("agent-desktop-alias");
+    assert_eq!(canonical_skill_name("agent-desktop"), "computer-use");
+    assert_eq!(canonical_skill_name("krill-agent-desktop"), "computer-use");
+    assert_eq!(canonical_skill_name("mk-computer-use"), "computer-use");
+    assert!(skill_references("agent-desktop").is_empty());
+
+    let stale_refs = home.join("krill-computer-use/references");
+    fs::create_dir_all(&stale_refs).unwrap();
+    fs::write(stale_refs.join("workflows.md"), format!("old\n{MARKER}\n")).unwrap();
+
+    let path = install_skill("agent-desktop", &home).unwrap();
+    assert_eq!(path, home.join("krill-computer-use/SKILL.md"));
+    let body = fs::read_to_string(&path).unwrap();
+    assert!(body.starts_with("---\nname: krill-computer-use\n"));
+    assert!(body.contains("agent-desktop snapshot"));
+    assert!(body.contains("agent-desktop skills get desktop"));
+    assert!(!stale_refs.exists());
+    fs::remove_dir_all(home).unwrap();
+}
