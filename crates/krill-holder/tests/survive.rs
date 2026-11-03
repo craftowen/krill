@@ -231,6 +231,9 @@ fn role_krilld() {
     if std::env::var("MKH_MODE").as_deref() == Ok("log-io") {
         return upgrade::blocked_log(&mut link, &dir);
     }
+    if let Ok(mode @ "dup") = std::env::var("MKH_MODE").as_deref() {
+        return lifecycle(mode, &mut link, &dir, &masters);
+    }
     if dir.join("restore-listener").exists() {
         let l = UnixListener::from(listener.expect("exec 뒤 listener 복원"));
         assert_eq!(
@@ -324,6 +327,44 @@ fn role_krilld() {
         put(&dir.join("handoffs"), &log);
     }
     while next(&mut link, &dir).is_some() {}
+}
+
+/// krilld 수명 시나리오. 기동마다 `starts`에 `x`, 끝내기 직전 `.`을 적는다.
+/// - `dup`: 처음에 세션 하나를 띄우고 [`KRILLD_DUPLICATE`]로 끝난다(건강한 데몬이 소켓을 쥔 경우).
+#[expect(clippy::exit, reason = "holder가 보는 종료 코드가 시나리오다")]
+fn lifecycle(mode: &str, link: &mut Link, dir: &Path, masters: &[(SessionId, OwnedFd)]) {
+    let starts = dir.join("starts");
+    let append = |s: &str| {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&starts)
+            .unwrap();
+        f.write_all(s.as_bytes()).unwrap();
+    };
+    append("x");
+    if masters.is_empty() {
+        let m = ToHolder::Spawn {
+            req: 1,
+            id: SessionId(1),
+            argv: vec![b"/bin/sleep".to_vec(), b"60".to_vec()],
+            env: vec![],
+            cwd: vec![],
+            size: WinSize { cols: 80, rows: 24 },
+        };
+        send(link, &m, &[]);
+        let (FromHolder::Spawned { pid, .. }, _) = reply(link, dir) else {
+            panic!("Spawn 실패")
+        };
+        put(&dir.join("session"), &pid.to_string());
+    }
+    append(".");
+    let code = if mode == "dup" {
+        krill_proto::daemon::KRILLD_DUPLICATE
+    } else {
+        1
+    };
+    std::process::exit(i32::from(code));
 }
 
 fn spawn_gens(link: &mut Link, dir: &Path) -> Vec<(SessionId, OwnedFd)> {
@@ -841,4 +882,37 @@ fn holder_crash_adopt() {
     rig.holder = holder(&rig.dir, &env);
     let r = wait_for("재결합 3단계", 30, || get(&rig.dir.join("result")));
     assert_eq!(r, "ok");
+}
+
+fn exited(rig: &mut Rig, what: &str, secs: u64) -> std::process::ExitStatus {
+    wait_for(what, secs, || rig.holder.try_wait().unwrap())
+}
+
+/// A-01: 세션을 쥔 holder 아래 krilld가 중복 기동(`KRILLD_DUPLICATE`)으로 끝나면 30초마다 영구 재기동하지 않는다.
+/// master는 계속 쥐어 세션이 살아 있고, 세션이 끝나면 holder도 끝난다.
+#[test]
+fn duplicate_with_sessions_stops_restarting_and_keeps_masters() {
+    let mut rig = Rig::start("dup", &[("MKH_MODE", "dup".into())]);
+    let session = pid(&wait_for("세션 spawn", 30, || {
+        get(&rig.dir.join("session"))
+    }));
+    wait_for("중복 종료", 30, || {
+        (get(&rig.dir.join("starts"))? == "x.").then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        get(&rig.dir.join("starts")).unwrap(),
+        "x.",
+        "중복 기동 뒤 krilld를 다시 띄웠다"
+    );
+    assert!(
+        rig.holder.try_wait().unwrap().is_none(),
+        "세션을 쥔 holder가 끝났다"
+    );
+    assert!(
+        rustix::process::test_kill_process(session).is_ok(),
+        "세션 소실"
+    );
+    rustix::process::kill_process(session, Signal::KILL).unwrap();
+    assert!(exited(&mut rig, "세션이 끝난 뒤 holder 종료", 10).success());
 }

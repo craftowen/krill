@@ -127,10 +127,14 @@ impl Holder {
             })
             .into();
         let mut events = Vec::with_capacity(8);
-        if self.reap() {
-            return Ok(()); // 중복 기동: 건강한 데몬이 있어 끝낸다
-        }
+        self.reap();
         loop {
+            if self.krilld.is_none()
+                && self.restart_at.is_none()
+                && self.sessions.iter().all(|s| s.status.is_some())
+            {
+                return Ok(()); // 재기동을 멈췄고 쥔 세션도 모두 끝났다
+            }
             // 종료 신호(기동 직후·대기 중 모두 루프 맨 앞에서 본다): 사유를 남기고 끝낸다. 세션은 master fd를 쥔 krilld가 고아로 이어 받는다(rejoin). SIGKILL은 못 남긴다.
             let stop = sys::STOPPED.load(std::sync::atomic::Ordering::Relaxed);
             if stop != 0 {
@@ -176,9 +180,8 @@ impl Holder {
             if events
                 .iter()
                 .any(|e| matches!(e.filter(), EventFilter::Signal { .. }))
-                && self.reap()
             {
-                return Ok(()); // 중복 기동: 건강한 데몬이 있어 끝낸다
+                self.reap();
             }
             for e in &events {
                 if let EventFilter::Proc { pid, .. } = e.filter() {
@@ -345,18 +348,15 @@ impl Holder {
     }
 
     /// 끝난 자식을 모두 거둔다. `waitpid(-1)`: rustix `waitpid(None)`은 같은 프로세스 그룹만 본다(MK-004 결정 4).
-    /// 중복 기동(세션 없이 떴는데 krilld가 [`KRILLD_DUPLICATE`]로 끝남)이면 `true` — 호출자는 재기동하지 않고 끝낸다.
-    fn reap(&mut self) -> bool {
-        let mut duplicate = false;
+    fn reap(&mut self) {
         while let Ok(Some((pid, st))) = rustix::process::wait(WaitOptions::NOHANG) {
             let status = st.as_raw();
             if self.krilld.as_ref().is_some_and(|k| k.pid == pid) {
-                if st.exit_status() == Some(i32::from(KRILLD_DUPLICATE)) && self.sessions.is_empty()
-                {
-                    // 건강한 데몬이 소켓을 쥐고 있다. 세션이 없어 잃을 것이 없으니 재기동하지 않고 끝낸다.
+                if st.exit_status() == Some(i32::from(KRILLD_DUPLICATE)) {
+                    // 다른 데몬이 소켓을 쥐어 다시 띄워도 같다(30초마다 영구 재기동, A-01). master는 세션이 끝날 때까지 쥔다.
+                    tracing::warn!(sessions = self.sessions.len(), "daemon duplicate");
                     self.krilld = None;
                     self.restart_at = None;
-                    duplicate = true;
                 } else {
                     self.on_krilld_exit();
                 }
@@ -367,7 +367,6 @@ impl Holder {
                 self.teardowns.iter_mut().for_each(|t| t.exited(pid));
             }
         }
-        duplicate
     }
 
     /// `pid`의 `NOTE_EXIT`를 지금 등록한다. `EV_RECEIPT`라 대기 중인 이벤트를 꺼내지 않고 등록 결과만
