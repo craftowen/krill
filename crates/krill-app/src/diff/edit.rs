@@ -859,6 +859,7 @@ pub(super) struct State {
     pub note: String,
     task: Option<Task<()>>,
     sync_task: Option<Task<()>>,
+    pr_task: Option<Task<()>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -881,6 +882,7 @@ impl Default for State {
             note: String::new(),
             task: None,
             sync_task: None,
+            pr_task: None,
         }
     }
 }
@@ -915,6 +917,24 @@ impl State {
             ..Self::default()
         };
     }
+}
+
+/// The branch a PR would be opened from, or why it cannot be. Runs git, so call it off the UI thread.
+fn pr_branch(repo: &Path, custom: Option<&str>) -> Result<String, crate::i18n::Message> {
+    use crate::i18n::catalog::pull_request as pr;
+    let usable = |name: &str| !name.is_empty() && name != "HEAD";
+    let branch = match custom.map(str::trim).filter(|name| usable(name)) {
+        Some(name) => name.to_owned(),
+        None => crate::pull_request::git_output(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .ok()
+            .map(|out| out.trim().to_owned())
+            .filter(|name| usable(name))
+            .ok_or(pr::DETACHED_HEAD_DESC)?,
+    };
+    if crate::pull_request::is_default_branch(repo, &branch) {
+        return Err(pr::DEFAULT_BRANCH_DESC);
+    }
+    Ok(branch)
 }
 
 impl Panel {
@@ -1392,32 +1412,31 @@ impl Panel {
             cx.notify();
             return;
         }
-        let branch = if let Some(custom) = self.checks.branch_override.as_deref()
-            && !custom.trim().is_empty()
-            && custom.trim() != "HEAD"
-        {
-            custom.trim().to_owned()
-        } else if let Ok(out) =
-            crate::pull_request::git_output(&self.repo, &["rev-parse", "--abbrev-ref", "HEAD"])
-            && let trimmed = out.trim()
-            && !trimmed.is_empty()
-            && trimmed != "HEAD"
-        {
-            trimmed.to_owned()
-        } else {
-            self.editing.note = crate::i18n::catalog::pull_request::DETACHED_HEAD_DESC
-                .get()
-                .into();
-            cx.notify();
-            return;
-        };
-        if crate::pull_request::is_default_branch(&self.repo, &branch) {
-            self.editing.note = crate::i18n::catalog::pull_request::DEFAULT_BRANCH_DESC
-                .get()
-                .into();
-            cx.notify();
-            return;
-        }
+        let repo = self.repo.clone();
+        let custom = self.checks.branch_override.clone();
+        self.editing.pr_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let probe = repo.clone();
+            let branch = cx
+                .background_executor()
+                .spawn(async move { pr_branch(&probe, custom.as_deref()) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if this.repo != repo {
+                    return;
+                }
+                match branch {
+                    Ok(branch) => this.show_pr_dialog(branch, window, cx),
+                    Err(note) => {
+                        this.editing.note = note.get().into();
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn show_pr_dialog(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
         let repo = self.repo.clone();
         let service = Arc::clone(&self.editing.pr_service);
         let dialog =
