@@ -9,7 +9,10 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function until(fn,what){const end=Date.now()+15000;let last;while(Date.now()<end){try{const value=await fn();if(value)return value;}catch(e){last=e;}await sleep(50);}throw Error(`timed out: ${what}${last?' ('+last.message+')':''}`);}
 
 async function browser(){
- const profile=fs.mkdtempSync(path.join(os.tmpdir(),'krill-chrome-')),chrome=spawn(CHROME,['--headless=new','--remote-debugging-port=0',`--user-data-dir=${profile}`,'--no-first-run','--no-default-browser-check','about:blank'],{stdio:['ignore','ignore','pipe']});
+ // Without --use-mock-keychain the first HTTP request waits forever for the login Keychain, which a test HOME does not have.
+ const profile=fs.mkdtempSync(path.join(os.tmpdir(),'krill-chrome-')),chrome=spawn(CHROME,['--headless=new','--remote-debugging-port=0',`--user-data-dir=${profile}`,'--use-mock-keychain','--no-first-run','--no-default-browser-check','about:blank'],{stdio:['ignore','ignore','pipe']});
+ // The E2E deadline ends with process.exit, which skips close(). Chrome's helpers exit with the browser process.
+ const orphan=()=>chrome.kill('SIGKILL');process.once('exit',orphan);
  const endpoint=await new Promise((resolve,reject)=>{let text='';chrome.stderr.on('data',b=>{text+=b;const m=/DevTools listening on (ws:\S+)/.exec(text);if(m)resolve(m[1]);});chrome.once('exit',()=>reject(Error('Chrome exited: '+text.slice(-500))));});
  const socket=new WebSocket(endpoint);await new Promise((resolve,reject)=>{socket.onopen=resolve;socket.onerror=reject;});
  let id=0;const pending=new Map(),handlers=[];
@@ -42,7 +45,7 @@ async function browser(){
   // Browser.close는 렌더러·프로필 쓰기까지 정리한다. 부모만 SIGKILL하면 남은 자식과 rmdir가 경쟁한다.
   const forced=setTimeout(()=>{chrome.kill('SIGKILL');socket.close();},5000);
   try{if(socket.readyState===WebSocket.OPEN)await Promise.race([send('Browser.close'),exited]);else chrome.kill('SIGTERM');await exited;}
-  finally{clearTimeout(forced);socket.close();fs.rmSync(profile,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
+  finally{clearTimeout(forced);process.off('exit',orphan);socket.close();fs.rmSync(profile,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
  }};
 }
 
