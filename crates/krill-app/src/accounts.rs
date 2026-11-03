@@ -505,7 +505,9 @@ pub fn consume_reset_credit_target(
             outcome,
             windows_reset,
         }),
-        UsageReply::Failed(e) => Err(failure_text(e)),
+        UsageReply::Failed(e) => Err(reset_failure_text(
+            krill_proto::usage::ResetConsumeError::from_failure(e),
+        )),
         _ => Err("unexpected account reply".to_owned()),
     }
 }
@@ -528,6 +530,22 @@ pub fn orphans_target(
         | UsageReply::Provisioning(_)
         | UsageReply::ResetConsumed { .. } => Ok(Vec::new()),
     }
+}
+
+fn reset_failure_text(err: krill_proto::usage::ResetConsumeError) -> String {
+    use crate::i18n::catalog::status;
+    use krill_proto::usage::ResetConsumeError;
+    let entry = match err {
+        ResetConsumeError::AuthRequired => status::PROVIDER_RESET_USAGE_AUTH_REQUIRED,
+        ResetConsumeError::RateLimited => status::PROVIDER_RESET_USAGE_RATE_LIMITED,
+        ResetConsumeError::TimedOut => status::PROVIDER_RESET_USAGE_TIMED_OUT,
+        ResetConsumeError::Transport => status::PROVIDER_RESET_USAGE_NETWORK_FAILED,
+        ResetConsumeError::UpstreamRejected => status::PROVIDER_RESET_USAGE_REJECTED,
+        ResetConsumeError::AccountNotFound => status::PROVIDER_RESET_USAGE_ACCOUNT_MISSING,
+        ResetConsumeError::InvalidTarget => status::PROVIDER_RESET_USAGE_UNSUPPORTED,
+        ResetConsumeError::PermissionDenied => status::PROVIDER_RESET_USAGE_DENIED,
+    };
+    entry.get().to_owned()
 }
 
 /// 사용 중 세션 때문에 거부된 삭제(`EBUSY`)는 사용자 문구로 바꾼다(OWE-704).
@@ -586,7 +604,7 @@ fn exchange_target_with_features(
     if conn.negotiated.features & required != required {
         return Err("daemon does not support this account extension; restart daemon".to_owned());
     }
-    let timeout = Some(Duration::from_secs(5));
+    let timeout = Some(req.ipc_timeout(Duration::from_secs(5)));
     conn.stream.set_read_timeout(timeout).ok();
     conn.stream.set_write_timeout(timeout).ok();
     let encoded = req.encode().map_err(|e| e.to_string())?;
@@ -599,6 +617,16 @@ fn exchange_target_with_features(
         Ok(None) => return Err("daemon closed usage stream".to_owned()),
         Err(err) => {
             target.record_outcome(false, Some(&err));
+            if matches!(req, UsageRequest::ConsumeResetCredit { .. })
+                && matches!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                )
+            {
+                return Err(reset_failure_text(
+                    krill_proto::usage::ResetConsumeError::TimedOut,
+                ));
+            }
             return Err(err.to_string());
         }
     };

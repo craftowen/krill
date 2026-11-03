@@ -2727,7 +2727,7 @@ impl Registry {
                     outcome,
                     windows_reset,
                 },
-                Err(e) => UsageReply::Failed(os(&e)),
+                Err(e) => UsageReply::Failed(e.to_failure()),
             },
             UsageRequest::SetAutoSwitch(policy) => {
                 match accounts::set_auto_switch(&home, state_ref, &policy) {

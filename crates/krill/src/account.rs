@@ -595,7 +595,7 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
     if conn.negotiated.features & required != required {
         return Err("daemon does not support this account extension; restart daemon".to_owned());
     }
-    let timeout = Some(Duration::from_secs(15));
+    let timeout = Some(req.ipc_timeout(Duration::from_secs(15)));
     conn.stream
         .set_read_timeout(timeout)
         .map_err(|e| e.to_string())?;
@@ -605,10 +605,25 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
     conn.stream
         .write_all(&req.encode().map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-    let (kind, body) = ipc::read_frame(&mut conn.stream)
-        .map_err(|e| e.to_string())?
-        .ok_or("krilld disconnected")?;
+    let (kind, body) = match ipc::read_frame(&mut conn.stream) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return Err("krilld disconnected".to_owned()),
+        Err(err) => {
+            if matches!(req, UsageRequest::ConsumeResetCredit { .. })
+                && matches!(
+                    err.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            {
+                return Err(krill_proto::usage::ResetConsumeError::TimedOut.to_string());
+            }
+            return Err(err.to_string());
+        }
+    };
     match UsageReply::decode(kind, &body).map_err(|e| e.to_string())? {
+        UsageReply::Failed(e) if matches!(req, UsageRequest::ConsumeResetCredit { .. }) => {
+            Err(krill_proto::usage::ResetConsumeError::from_failure(e).to_string())
+        }
         UsageReply::Failed(e) => Err(e.to_string()),
         reply => Ok(reply),
     }

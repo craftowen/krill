@@ -1719,12 +1719,10 @@ pub fn consume_reset_credit(
     state_dir: Option<&Path>,
     provider: ProviderKind,
     account_id: &str,
-) -> io::Result<(AccountsSnapshot, ResetConsumeOutcome, u64)> {
+) -> Result<(AccountsSnapshot, ResetConsumeOutcome, u64), krill_proto::usage::ResetConsumeError> {
+    use krill_proto::usage::ResetConsumeError;
     if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "reset credits are only available for codex and claude",
-        ));
+        return Err(ResetConsumeError::InvalidTarget);
     }
     let snap = refresh_accounts_with(home, state_dir, false);
     let Some(target) = snap
@@ -1732,16 +1730,10 @@ pub fn consume_reset_credit(
         .iter()
         .find(|a| a.provider == provider && a.id == account_id)
     else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("account not found: {account_id}"),
-        ));
+        return Err(ResetConsumeError::AccountNotFound);
     };
     if !runnable(target) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("account has no krill profile dir: {account_id}"),
-        ));
+        return Err(ResetConsumeError::InvalidTarget);
     }
     let dir = PathBuf::from(&target.profile_dir);
     let outcome_windows = if provider == ProviderKind::Codex {
@@ -1749,8 +1741,15 @@ pub fn consume_reset_credit(
     } else {
         consume_claude_reset(home, state_dir, &dir, target.host_default)
     };
-    let Some((outcome, windows)) = outcome_windows else {
-        return Err(io::Error::other("사용량 초기화 실패(크레딧부터 다시 확인)"));
+    let (outcome, windows) = match outcome_windows {
+        Ok(res) => res,
+        Err(err) => {
+            if err == ResetConsumeError::TimedOut {
+                super::direct::evict_profile(home, provider, &dir);
+                super::direct::refresh_on_request(home, state_dir);
+            }
+            return Err(err);
+        }
     };
     if matches!(
         outcome,
@@ -1762,22 +1761,13 @@ pub fn consume_reset_credit(
     Ok((refresh_accounts(home, state_dir), outcome, windows))
 }
 
-/// Claude 소진 한 걸음: 조직 조회 → 제공 프로그램 확인 → 소진. 제공 없음은 `NoCredit`으로,
-/// 단계 실패는 `Err`로 돌려준다(재시도 유도).
 fn consume_claude_reset(
     home: &Path,
     state_dir: Option<&Path>,
     dir: &Path,
     host: bool,
-) -> Option<(ResetConsumeOutcome, u64)> {
-    let token = super::direct::claude_token(dir, host, home, state_dir)?;
-    let org = super::direct::claude_org_uuid(&token, super::direct::get_text)?;
-    match super::direct::claude_offered_program(&token, super::direct::get_text)? {
-        Some(program) => {
-            super::direct::claude_claim_reset(&token, &org, program, super::direct::curl_status)
-        }
-        None => Some((ResetConsumeOutcome::NoCredit, 0)),
-    }
+) -> Result<(ResetConsumeOutcome, u64), krill_proto::usage::ResetConsumeError> {
+    super::direct::consume_claude_reset_credit(dir, host, home, state_dir)
 }
 
 /// 새 계정 프로필 등록(MK-107). `profile_dir`이 비어 있으면 기본 프로필 경로를 자동 생성한다.
@@ -2217,26 +2207,21 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn consume_reset_credit_rejects_without_network() {
-    use std::io::ErrorKind;
+    use krill_proto::usage::ResetConsumeError;
     let root = std::env::temp_dir().join(format!("reset-credit-{}", std::process::id()));
     std::fs::remove_dir_all(&root).ok();
     let home = root.join("home");
     let state = root.join("state");
     let profile = home.join("codex-a");
     std::fs::create_dir_all(&profile).unwrap();
-    // 프로바이더 제한·계정 확인은 네트워크 전에 일어난다.
     assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Antigravity, "x")
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidInput
+        consume_reset_credit(&home, Some(&state), ProviderKind::Antigravity, "x").unwrap_err(),
+        ResetConsumeError::InvalidTarget
     );
     for provider in [ProviderKind::Codex, ProviderKind::Claude] {
         assert_eq!(
-            consume_reset_credit(&home, Some(&state), provider, "missing")
-                .unwrap_err()
-                .kind(),
-            ErrorKind::NotFound
+            consume_reset_credit(&home, Some(&state), provider, "missing").unwrap_err(),
+            ResetConsumeError::AccountNotFound
         );
     }
     std::fs::create_dir_all(&state).unwrap();
@@ -2248,12 +2233,9 @@ fn consume_reset_credit_rejects_without_network() {
         ),
     )
     .unwrap();
-    // 자격증명이 없으면 소진 요청을 보내지 않고 실패한다(네트워크 금지).
     assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "codex-a")
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Other
+        consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "codex-a").unwrap_err(),
+        ResetConsumeError::AuthRequired
     );
     std::fs::write(
         state.join("accounts.toml"),
@@ -2264,10 +2246,8 @@ fn consume_reset_credit_rejects_without_network() {
     )
     .unwrap();
     assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Claude, "claude-a")
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Other
+        consume_reset_credit(&home, Some(&state), ProviderKind::Claude, "claude-a").unwrap_err(),
+        ResetConsumeError::AuthRequired
     );
     std::fs::remove_dir_all(&root).ok();
 }
