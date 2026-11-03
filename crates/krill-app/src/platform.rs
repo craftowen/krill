@@ -19,7 +19,6 @@ mod locale;
 #[cfg(windows)]
 pub(crate) use locale::preferred_locale;
 
-pub mod computer;
 #[cfg_attr(
     windows,
     expect(
