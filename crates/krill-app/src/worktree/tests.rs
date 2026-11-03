@@ -247,6 +247,26 @@ fn preparation_only_while_dialog_open_base_change_and_explicit_cancel(cx: &mut T
 }
 
 #[gpui::test]
+fn ready_preparation_stops_fast_polling(cx: &mut TestAppContext) {
+    let fake = Arc::new(Fake::default());
+    fake.prep_supported.store(true, Ordering::Release);
+    cx.update(gpui_component::init);
+    let (dialog, cx) =
+        cx.add_window_view(|window, cx| Dialog::new("/repo".into(), fake.clone(), window, cx));
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| dialog.read(cx).preparation_ready));
+    let ready = fake.preparations.lock().unwrap().len();
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(
+        fake.preparations.lock().unwrap().len(),
+        ready,
+        "a ready checkout is not re-polled every 250ms"
+    );
+}
+
+#[gpui::test]
 fn closing_dialog_cancels_its_preparation(cx: &mut TestAppContext) {
     let fake = Arc::new(Fake::default());
     fake.prep_supported.store(true, Ordering::Release);

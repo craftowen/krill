@@ -2837,3 +2837,28 @@ fn loaded_file_body_is_dropped_when_pane_host_changes(cx: &mut TestAppContext) {
         assert_eq!(s.files.tabs[&pane].host, HostId::Local);
     });
 }
+
+/// 원격 목록 조회가 실패하면 100ms마다 무한 재시도하지 않고 멈춘 뒤 알린다.
+#[gpui::test]
+fn quick_open_stops_and_reports_remote_failure(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("files-quick-remote"));
+    view.update(cx, |s, _| {
+        let pane = s.layout.focused().unwrap();
+        s.layout.set_host(
+            pane,
+            krill_app::hosts::HostId::Remote("quick-offline".into()),
+        );
+    });
+    cx.simulate_keystrokes("cmd-p");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(s.files.quick_open.is_some(), "the palette stays open");
+        assert!(!s.files.quick_loading, "remote failure must end loading");
+        assert_eq!(
+            s.notice.as_deref(),
+            Some(krill_app::i18n::catalog::editor::QUICK_OPEN_FAILED.get())
+        );
+    });
+}

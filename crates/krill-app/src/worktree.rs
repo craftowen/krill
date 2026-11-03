@@ -755,6 +755,7 @@ impl Dialog {
                         Some(result)
                     })
                     .await;
+                let mut wait = Duration::from_millis(250);
                 match reply {
                     Some(Ok(Reply::WorktreePreparation(
                         WorktreePreparation::Preparing | WorktreePreparation::Busy,
@@ -765,15 +766,15 @@ impl Dialog {
                             cx.notify();
                         })
                         .ok();
+                        // A ready checkout only needs to notice its five-minute lease expiring.
+                        wait = Duration::from_secs(5);
                     }
                     _ => {
                         this.update(cx, Dialog::cancel_preparation).ok();
                         return;
                     }
                 }
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
+                cx.background_executor().timer(wait).await;
             }
         }));
     }

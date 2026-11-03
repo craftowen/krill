@@ -471,6 +471,88 @@ fn running_close_dont_ask_persists(cx: &mut TestAppContext) {
     );
 }
 
+/// D-01: 닫기 확인창이 떠 있는 사이 앞쪽 탭이 정리돼 번호가 당겨져도 확인은 원래 고른 탭만 닫는다.
+#[gpui::test]
+fn close_confirm_survives_earlier_tab_pruned(cx: &mut TestAppContext) {
+    use krill_proto::control::{AgentState, AgentStatus, Source as StatusSource};
+    use std::sync::Arc;
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let session = |id, state, source| sidebar::Session {
+        id: SessionId(id),
+        status: AgentStatus {
+            state,
+            source,
+            agent: "claude".into(),
+            ..AgentStatus::UNKNOWN
+        },
+        worktree: None,
+        cwd: None,
+        account: None,
+    };
+    let (view, cx) = open(cx, state_path("close-confirm-prune"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    let panes: Vec<PaneId> = layout_of(&view, cx)
+        .tabs()
+        .iter()
+        .map(|t| t.focused)
+        .collect();
+    assert_eq!(panes.len(), 3);
+    let connect = |cx: &mut VisualTestContext, first: AgentState, source| {
+        let snapshot = sidebar::Snapshot {
+            sessions: vec![
+                session(31, first, source),
+                session(32, AgentState::Working, None),
+                session(33, AgentState::Working, None),
+            ],
+            trees: std::collections::BTreeMap::default(),
+        };
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                s.sidebar
+                    .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+            });
+        });
+        cx.run_until_parked();
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            for (pane, sid) in panes.iter().zip([31, 32, 33]) {
+                s.layout.set_session(*pane, SessionId(sid));
+            }
+        });
+    });
+    connect(cx, AgentState::Working, None);
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+
+    connect(cx, AgentState::Exited, Some(StatusSource::Process));
+    assert_eq!(
+        layout_of(&view, cx).tabs().len(),
+        2,
+        "exited session's tab is pruned while the dialog is open"
+    );
+    click(cx, "confirm-running-close");
+    cx.run_until_parked();
+
+    let layout = layout_of(&view, cx);
+    assert_eq!(layout.tabs().len(), 1);
+    assert_eq!(
+        layout.session(layout.tabs()[0].focused),
+        Some(SessionId(33))
+    );
+    let closed = cx.update(|_, cx| view.read(cx).closed_sessions.clone());
+    assert!(closed.contains(&SessionId(32)), "{closed:?}");
+    assert!(!closed.contains(&SessionId(33)), "{closed:?}");
+}
+
 /// OWE-872 테스트용: 일반 셸(`AgentState::Unknown`)에 전경 프로세스 이름만 있는 스냅샷을 연결한다.
 fn attach_foreground(
     view: &Entity<Shell>,
@@ -10132,8 +10214,9 @@ fn recent_tabs_reveal_last_selection_in_small_viewport(cx: &mut TestAppContext) 
 #[gpui::test]
 fn tab_close_modals_enter_scope_and_restore_terminal_focus(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("tab-close-focus"));
+    let pane = layout_of(&view, cx).tabs()[0].focused;
     view.update(cx, |s, cx| {
-        s.confirm_close_tab = Some(0);
+        s.confirm_close_tab = Some(pane);
         cx.notify();
     });
     cx.run_until_parked();
@@ -10145,7 +10228,7 @@ fn tab_close_modals_enter_scope_and_restore_terminal_focus(cx: &mut TestAppConte
         assert!(view.read(cx).focus.is_focused(window));
     });
     view.update(cx, |s, cx| {
-        s.pending_running_close = Some((PendingRunningClose::Tab(0), false));
+        s.pending_running_close = Some((PendingRunningClose::Tab(pane), false));
         cx.notify();
     });
     cx.run_until_parked();
@@ -11218,7 +11301,7 @@ fn startup_tab_rename_and_close_dialogs_target_kept_early_tabs_after_restore(
             let p3 = shell.layout.focused().unwrap();
 
             shell.request_close_tab(1, cx);
-            assert_eq!(shell.confirm_close_tab, Some(1));
+            assert_eq!(shell.confirm_close_tab, Some(p1));
 
             shell.begin_tab_rename(2, window, cx);
             shell
@@ -11230,7 +11313,7 @@ fn startup_tab_rename_and_close_dialogs_target_kept_early_tabs_after_restore(
                     input.set_value("early-renamed", window, cx);
                 });
             shell.open_tab_context_menu(1, point(px(12.), px(16.)), cx);
-            shell.pending_running_close = Some((PendingRunningClose::Tab(3), false));
+            shell.pending_running_close = Some((PendingRunningClose::Tab(p3), false));
             (p1, p2, p3)
         })
     });
@@ -11243,12 +11326,17 @@ fn startup_tab_rename_and_close_dialogs_target_kept_early_tabs_after_restore(
     view.read_with(cx, |shell, _| {
         assert!(!shell.layout_loading);
         assert_eq!(shell.layout.tabs().len(), 5);
-        assert_eq!(shell.confirm_close_tab, Some(2));
-        assert_eq!(shell.tab_context_menu, Some((2, point(px(12.), px(16.)))));
-        assert!(matches!(
+        assert_eq!(shell.confirm_close_tab, Some(pane_pinned));
+        assert_eq!(shell.layout.tab_of_pane(pane_pinned), Some(2));
+        assert_eq!(
+            shell.tab_context_menu,
+            Some((pane_pinned, point(px(12.), px(16.))))
+        );
+        assert_eq!(
             shell.pending_running_close,
-            Some((PendingRunningClose::Tab(4), false))
-        ));
+            Some((PendingRunningClose::Tab(pane_running), false))
+        );
+        assert_eq!(shell.layout.tab_of_pane(pane_running), Some(4));
         assert_eq!(
             shell.tab_rename.as_ref().map(|r| r.pane),
             Some(pane_renamed)

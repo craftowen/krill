@@ -1201,3 +1201,37 @@ fn lossy_hunk_does_not_block_clean_hunks_of_the_same_file() {
     assert!(build_line_patch(&raw, false, 10, 10, true).is_some());
     assert!(build_line_patch(&raw, false, 1, 1, true).is_none());
 }
+
+#[gpui::test]
+fn create_pr_click_runs_git_off_the_ui_thread(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-pr-dialog-test-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q", "-b", "feature-x"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    let repo = dir.clone();
+    let (panel, cx) = cx.add_window_view(|_, cx| Panel::unconnected(repo, cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| panel.update(cx, |p, cx| p.open_pr_dialog(window, cx)));
+    assert!(
+        cx.update(|_, cx| panel.read(cx).editing.pr_dialog.is_none()),
+        "the click handler must not wait for git"
+    );
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| panel.read(cx).editing.pr_dialog.is_some()));
+    std::fs::remove_dir_all(dir).ok();
+}
