@@ -53,7 +53,7 @@ impl Clients {
     ) -> io::Result<()> {
         let size = self.owner().map(|e| e.size).or(self.mobile_fallback);
         if let Some(size) = size
-            && self.applied != Some(size)
+            && (self.applied != Some(size) || tap.size().ok() != Some(size))
         {
             // 오류가 OS 변경 뒤에 올 수도 있다. 다음 소유자는 실제 크기를 다시 적용해야 한다.
             self.applied = None;

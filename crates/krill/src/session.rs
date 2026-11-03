@@ -1265,7 +1265,7 @@ pub(crate) fn send_session_line(
     session_id: u64,
     line: &str,
 ) -> std::result::Result<(), String> {
-    send(target, &session_line_args(session_id, line, false)).map_err(|e| e.text)
+    send(target, &session_line_args(session_id, line, true)).map_err(|e| e.text)
 }
 
 fn session_line_args(session_id: u64, line: &str, wait_submit: bool) -> Vec<OsString> {
