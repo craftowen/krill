@@ -140,6 +140,13 @@ impl Holder {
             // 종료 신호(기동 직후·대기 중 모두 루프 맨 앞에서 본다): 사유를 남기고 끝낸다. 세션은 master fd를 쥔 krilld가 고아로 이어 받는다(rejoin). SIGKILL은 못 남긴다.
             let stop = sys::STOPPED.load(std::sync::atomic::Ordering::Relaxed);
             if stop != 0 {
+                // krilld가 없으면(재기동 대기·링크 끊김) master 사본은 우리 것뿐이라 새 krilld에 넘기고 끝낸다(C-5).
+                self.reap();
+                if !self.sessions.is_empty()
+                    && self.krilld.as_ref().is_none_or(|k| k.link.is_none())
+                {
+                    self.spawn_krilld();
+                }
                 let (signal, from, sessions) =
                     (stop >> 32, stop & 0xffff_ffff, self.sessions.len());
                 tracing::warn!(signal, from, sessions, "holder stopping");
