@@ -170,8 +170,14 @@ impl Remote {
         }
     }
 
+    /// `ssh -G`는 접속하지 않고 설정만 읽으므로(호스트 키 정책 확인) 접속 기록에서 뺀다.
     fn ssh_argv(&self) -> String {
-        fs::read_to_string(self.ssh_log()).unwrap_or_default()
+        fs::read_to_string(self.ssh_log())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.starts_with("-G "))
+            .map(|line| format!("{line}\n"))
+            .collect()
     }
 }
 
