@@ -341,6 +341,10 @@ fn main() -> ExitCode {
                         if rejected.replace(error.kind()) != Some(error.kind()) {
                             tracing::warn!(kind = ?error.kind(), "connection closed before hello");
                         }
+                        // 피어 UID 거부는 연결 하나의 일이다. EMFILE 같은 오류는 바로 다시 받아도 같아 쉬지 않고 돈다(C-4).
+                        if error.kind() != io::ErrorKind::PermissionDenied {
+                            thread::sleep(rejoin::ACCEPT_RETRY);
+                        }
                         continue;
                     }
                 };
