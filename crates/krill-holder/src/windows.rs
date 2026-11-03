@@ -95,6 +95,8 @@ struct Holder {
     previous: Option<OsString>,
     upgrading: bool,
     listener: Option<OwnedSocket>,
+    /// 재기동을 멈췄다. 쥔 세션이 모두 끝나면 나간다.
+    parked: bool,
 }
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let path = args.next().ok_or(io::ErrorKind::InvalidInput)?;
@@ -113,6 +115,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
         previous: None,
         upgrading: false,
         listener: None,
+        parked: false,
     };
     if let Some((metadata, handles, mut ack, listener)) = sys::take_handoff()? {
         let req = h.restore(&metadata, handles)?;
@@ -193,7 +196,7 @@ impl Holder {
             )
     }
     fn poll(&mut self) -> bool {
-        if self.daemon.is_none() && Instant::now() >= self.restart {
+        if self.daemon.is_none() && !self.parked && Instant::now() >= self.restart {
             match self.start() {
                 Ok(d) => self.daemon = Some(d),
                 Err(error) => {
@@ -261,12 +264,18 @@ impl Holder {
         for m in events {
             self.send(&m, None).ok();
         }
-        false
+        self.idle()
+    }
+    fn idle(&self) -> bool {
+        self.parked && self.sessions.iter().all(|s| s.status.is_some())
     }
     fn daemon_exited(&mut self, status: i32, uptime: Duration) -> bool {
-        if status == i32::from(KRILLD_DUPLICATE) && self.sessions.is_empty() {
+        if status == i32::from(KRILLD_DUPLICATE) {
+            // Another daemon owns the socket, so a restart only repeats this every 30 seconds
+            // (A-01). Keep each session's console until it ends.
             self.daemon = None;
-            return true;
+            self.parked = true;
+            return self.idle();
         }
         let upgrading = std::mem::take(&mut self.upgrading);
         if uptime >= Duration::from_secs(1) && !upgrading {
@@ -282,10 +291,12 @@ impl Holder {
         } else {
             self.failed();
         }
-        false
+        self.idle()
     }
     fn failed(&mut self) {
         self.streak = self.streak.saturating_add(1);
+        // A daemon that keeps dying at start with no sessions (a bind permission error) never recovers.
+        self.parked |= self.sessions.is_empty() && self.streak >= 5;
         if self.streak >= 3
             && let Some(path) = self.previous.take()
         {
@@ -675,6 +686,7 @@ mod tests {
             previous: None,
             upgrading: false,
             listener: None,
+            parked: false,
         }
     }
 
@@ -823,6 +835,16 @@ mod tests {
         ));
     }
 
+    /// A-05: 세션 없이 뜨자마자 계속 끝나는 krilld는 다섯 번째에 포기하고 holder가 나간다.
+    #[test]
+    fn empty_holder_gives_up_after_repeated_start_failures() {
+        let mut h = holder();
+        for _ in 0..4 {
+            assert!(!h.daemon_exited(1, Duration::ZERO));
+        }
+        assert!(h.daemon_exited(1, Duration::ZERO));
+    }
+
     #[test]
     fn queued_listener_is_kept_before_reaping_dead_daemon() {
         use std::os::windows::process::CommandExt as _;
@@ -907,6 +929,7 @@ mod tests {
             previous: None,
             upgrading: false,
             listener: None,
+            parked: false,
         };
         let mut frames = ToHolder::UpgradeHolder {
             req: 1,

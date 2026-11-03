@@ -3,9 +3,11 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -36,6 +38,8 @@ const NOFILE: u64 = 10_240;
 /// `UpgradeKrilld`로 바꾼 krilld가 뜨자마자 죽기를 이 횟수 연속으로 반복하면 바꾸기 전 경로로 되돌린다(OWE-589).
 /// 백오프 1번째(즉시)·2번째(즉시)·3번째(250ms) 뒤라 롤백까지 1초 안에 끝난다.
 const ROLLBACK_AFTER: u32 = 3;
+/// 세션 없는 holder의 krilld가 이만큼 연속으로 뜨자마자 끝나면(bind 권한 오류 등) 다시 띄우지 않고 끝낸다(약 2초).
+const GIVE_UP: u32 = 5;
 
 #[derive(Debug)]
 pub(crate) struct Session {
@@ -61,6 +65,8 @@ struct Holder {
     krilld_args: Vec<OsString>,
     sessions: Vec<Session>,
     listener: Option<OwnedFd>,
+    /// 맡은 listen 소켓의 소유 락([`own_socket`]).
+    owner: Option<File>,
     krilld: Option<Krilld>,
     restart_at: Option<Instant>,
     /// 짧게 살고 죽은 연속 횟수(첫 크래시 = 1).
@@ -90,6 +96,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
         krilld_args: args.collect(),
         sessions: Vec::new(),
         listener: None,
+        owner: None,
         krilld: None,
         restart_at: Some(Instant::now()),
         streak: 0,
@@ -127,13 +134,24 @@ impl Holder {
             })
             .into();
         let mut events = Vec::with_capacity(8);
-        if self.reap() {
-            return Ok(()); // 중복 기동: 건강한 데몬이 있어 끝낸다
-        }
+        self.reap();
         loop {
+            if self.krilld.is_none()
+                && self.restart_at.is_none()
+                && self.sessions.iter().all(|s| s.status.is_some())
+            {
+                return Ok(()); // 재기동을 멈췄고(중복 기동·포기) 쥔 세션도 모두 끝났다
+            }
             // 종료 신호(기동 직후·대기 중 모두 루프 맨 앞에서 본다): 사유를 남기고 끝낸다. 세션은 master fd를 쥔 krilld가 고아로 이어 받는다(rejoin). SIGKILL은 못 남긴다.
             let stop = sys::STOPPED.load(std::sync::atomic::Ordering::Relaxed);
             if stop != 0 {
+                // krilld가 없으면(재기동 대기·링크 끊김) master 사본은 우리 것뿐이라 새 krilld에 넘기고 끝낸다(C-5).
+                self.reap();
+                if !self.sessions.is_empty()
+                    && self.krilld.as_ref().is_none_or(|k| k.link.is_none())
+                {
+                    self.spawn_krilld();
+                }
                 let (signal, from, sessions) =
                     (stop >> 32, stop & 0xffff_ffff, self.sessions.len());
                 tracing::warn!(signal, from, sessions, "holder stopping");
@@ -176,9 +194,8 @@ impl Holder {
             if events
                 .iter()
                 .any(|e| matches!(e.filter(), EventFilter::Signal { .. }))
-                && self.reap()
             {
-                return Ok(()); // 중복 기동: 건강한 데몬이 있어 끝낸다
+                self.reap();
             }
             for e in &events {
                 if let EventFilter::Proc { pid, .. } = e.filter() {
@@ -295,7 +312,11 @@ impl Holder {
                     return Err(Errno::SRCH.into());
                 }
             }
-            ToHolder::HoldListener { .. } => self.listener = fds.pop(),
+            ToHolder::HoldListener { .. } => {
+                self.owner = None; // 같은 파일을 새로 잠그기 전에 놓는다
+                self.listener = fds.pop();
+                self.owner = self.listener.as_ref().and_then(own_socket);
+            }
             ToHolder::UpgradeKrilld { path, .. } => {
                 let next = OsStr::from_bytes(&path).to_os_string();
                 if next != self.krilld_path {
@@ -345,18 +366,15 @@ impl Holder {
     }
 
     /// 끝난 자식을 모두 거둔다. `waitpid(-1)`: rustix `waitpid(None)`은 같은 프로세스 그룹만 본다(MK-004 결정 4).
-    /// 중복 기동(세션 없이 떴는데 krilld가 [`KRILLD_DUPLICATE`]로 끝남)이면 `true` — 호출자는 재기동하지 않고 끝낸다.
-    fn reap(&mut self) -> bool {
-        let mut duplicate = false;
+    fn reap(&mut self) {
         while let Ok(Some((pid, st))) = rustix::process::wait(WaitOptions::NOHANG) {
             let status = st.as_raw();
             if self.krilld.as_ref().is_some_and(|k| k.pid == pid) {
-                if st.exit_status() == Some(i32::from(KRILLD_DUPLICATE)) && self.sessions.is_empty()
-                {
-                    // 건강한 데몬이 소켓을 쥐고 있다. 세션이 없어 잃을 것이 없으니 재기동하지 않고 끝낸다.
+                if st.exit_status() == Some(i32::from(KRILLD_DUPLICATE)) {
+                    // 다른 데몬이 소켓을 쥐어 다시 띄워도 같다(30초마다 영구 재기동, A-01). master는 세션이 끝날 때까지 쥔다.
+                    tracing::warn!(sessions = self.sessions.len(), "daemon duplicate");
                     self.krilld = None;
                     self.restart_at = None;
-                    duplicate = true;
                 } else {
                     self.on_krilld_exit();
                 }
@@ -367,7 +385,6 @@ impl Holder {
                 self.teardowns.iter_mut().for_each(|t| t.exited(pid));
             }
         }
-        duplicate
     }
 
     /// `pid`의 `NOTE_EXIT`를 지금 등록한다. `EV_RECEIPT`라 대기 중인 이벤트를 꺼내지 않고 등록 결과만
@@ -425,8 +442,13 @@ impl Holder {
                 self.note_unstable();
             }
         }
-        tracing::warn!(streak = self.streak, "daemon restart scheduled");
-        self.restart_at = Some(Instant::now() + backoff(self.streak));
+        self.schedule();
+    }
+
+    fn schedule(&mut self) {
+        let give_up = self.sessions.is_empty() && self.streak >= GIVE_UP;
+        tracing::warn!(streak = self.streak, give_up, "daemon restart scheduled");
+        self.restart_at = (!give_up).then(|| Instant::now() + backoff(self.streak));
     }
 
     /// 현 krilld 경로가 한 번 실패했다(뜨자마자 죽거나 뜨지 못함). `UpgradeKrilld` 뒤 연속 실패가
@@ -469,7 +491,7 @@ impl Holder {
             self.streak = self.streak.saturating_add(1);
             // 뜨지 못한 것도 실패로 센다(업그레이드 preflight를 피한 교체 등).
             self.note_unstable();
-            self.restart_at = Some(Instant::now() + backoff(self.streak));
+            self.schedule();
             return;
         };
         let link = Link::new(sock);
@@ -552,6 +574,7 @@ impl Holder {
     fn restore(&mut self, h: sys::Handoff) {
         self.sessions = h.sessions;
         self.listener = h.listener;
+        self.owner = self.listener.as_ref().and_then(own_socket);
         self.krilld = Some(Krilld {
             pid: h.krilld,
             link: Some(Link::new(h.link)),
@@ -575,6 +598,22 @@ impl Holder {
             }
         }
     }
+}
+
+/// krilld가 게시한 listen 소켓(`<소켓>.tmp`에 bind한 뒤 rename)을 맡으면 `<소켓>.holder.lock` flock을 잡는다.
+/// krilld가 재기동을 기다려 소켓 락이 비어도 다른 holder의 krilld는 이 락을 보고 살아 있는 소켓을 덮어쓰지 않는다
+/// (krilld `Listener::bind`). 덮어쓰면 이 holder의 세션에 아무도 붙지 못한다. exec 핸드오프 뒤 다시 잡는다.
+fn own_socket(listener: &OwnedFd) -> Option<File> {
+    let l = std::os::unix::net::UnixListener::from(listener.try_clone().ok()?);
+    let addr = l.local_addr().ok()?;
+    let bound = addr.as_pathname()?.as_os_str().as_bytes();
+    let sock = bound.strip_suffix(b".tmp")?;
+    let path = OsStr::from_bytes(&[sock, b".holder.lock"].concat()).to_os_string();
+    let mut open = File::options();
+    let f = open.read(true).write(true).create(true).truncate(false);
+    let f = f.mode(0o600).open(path).ok()?;
+    f.try_lock().ok()?;
+    Some(f)
 }
 
 fn hello() -> FromHolder {
@@ -601,8 +640,9 @@ fn send_to(link: &Link, m: &FromHolder, fd: Option<BorrowedFd<'_>>) -> io::Resul
 
 /// 링크가 깨진 krilld는 쓸모가 없다. 죽여서 재기동 경로로 보낸다.
 fn drop_link(k: &mut Krilld) {
-    k.link = None;
+    // 죽인 뒤 닫는다: 먼저 닫으면 krilld가 EOF를 holder의 죽음으로 보고 고아가 될 틈이 생긴다.
     rustix::process::kill_process(k.pid, Signal::KILL).ok();
+    k.link = None;
 }
 
 /// 연속 k번째 크래시의 재기동 지연: 1번째 0, 이후 base·2^(k-2), 상한 cap.

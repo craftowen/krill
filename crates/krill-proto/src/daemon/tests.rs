@@ -254,6 +254,63 @@ fn holder_that_dies_is_reported() {
     std::fs::remove_dir_all(&d).ok();
 }
 
+/// A-05: 띄운 뒤 핸드셰이크가 다시 해도 안 되는 오류로 끝나면 띄운 holder를 남기지 않는다. 남기면 그 holder가
+/// krilld를 30초마다 영구 재기동한다.
+#[cfg(unix)]
+#[test]
+fn launched_holder_is_killed_when_connect_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let d = dir("launch-fails");
+    std::fs::create_dir_all(d.join("run")).unwrap();
+    let pid_file = d.join("holder.pid");
+    let holder = d.join("holder.sh");
+    std::fs::write(
+        &holder,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let p = Paths {
+        socket: d.join("run/krilld.sock"),
+        holder: holder.clone(),
+        krilld: holder,
+    };
+    let socket = p.socket.clone();
+    let pid_wait = pid_file.clone();
+    // 띄운 holder가 뜬 뒤에야 소켓이 생기고, 붙으면 깨진 프레임을 보낸다(InvalidData: absent·transition 아님).
+    let server = thread::spawn(move || {
+        while !pid_wait.exists() {
+            thread::sleep(POLL);
+        }
+        let listener = crate::os::net::UnixListener::bind(&socket).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(&[0, 0, 0, 0]).unwrap();
+        thread::sleep(Duration::from_millis(200));
+    });
+    let e = connect(&p, &hello()).unwrap_err();
+    assert!(matches!(e, Error::Io(_)), "{e}");
+    server.join().unwrap();
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success();
+    Command::new("/bin/kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .ok();
+    assert!(!alive, "connect left the launched holder running");
+    std::fs::remove_dir_all(&d).ok();
+}
+
 #[test]
 fn long_socket_path_is_rejected() {
     let d = dir(&"x".repeat(100));

@@ -57,6 +57,8 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 const HALT_TIMEOUT: Duration = Duration::from_secs(2);
 /// krilld#1이 끝나 소켓 락이 풀리기를 기다리는 최대 시간.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+/// accept 오류 뒤 다시 받기 전 쉬는 시간(모바일 게이트웨이와 같은 값).
+pub const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 
 #[cfg(all(test, unix))]
 mod tests;
@@ -68,6 +70,7 @@ fn handoff_path(sock: &Path) -> PathBuf {
 /// holder 링크가 끊긴 뒤(리더 스레드에서) 부른다. 세션 종료 감시를 걸고 다음 krilld를 기다린다. 세션을 넘겼으면
 /// `Ok` — 호출자는 프로세스를 끝낸다. 인계 소켓을 열지 못하면 오류(고아 운영만 계속한다).
 pub fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
+    tracing::warn!("holder lost; serving sessions as orphan");
     watch_exits(reg);
     let path = handoff_path(sock);
     // 소켓 락을 쥔 이 krilld만 이 이름을 쓴다. 남은 파일은 고아인 채 죽은 이전 krilld의 것이다.
@@ -81,7 +84,10 @@ pub fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
     reg.holder_lost();
     let uid = crate::os::euid();
     loop {
-        let Ok((s, _)) = lis.accept() else { continue };
+        let Ok((s, _)) = lis.accept() else {
+            thread::sleep(ACCEPT_RETRY); // EMFILE 같은 오류가 이어지면 쉬지 않고 돈다(C-4)
+            continue;
+        };
         if sys::peer_uid(s.as_fd()).ok() != Some(uid) {
             continue;
         }

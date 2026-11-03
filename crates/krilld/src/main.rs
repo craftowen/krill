@@ -28,7 +28,7 @@ use krill_proto::ipc::{FEATURES, PROTO_MAX, PROTO_MIN, ServerHello};
 use krilld::holder::Holder;
 use krilld::ipc::Listener;
 use krilld::registry::Registry;
-use krilld::rejoin::{self, Handover};
+use krilld::rejoin::{self, Handover, TakeError};
 #[cfg(unix)]
 use rustix::fs::{FileType, fstat};
 
@@ -111,7 +111,16 @@ fn main() -> ExitCode {
                 Some(Ok(h)) => Err(h),
                 // 중복 기동: 건강한 데몬이 소켓을 쥐고 있고 인계 상대도 없다. holder가 재기동하지
                 // 않게 전용 코드로 끝낸다. 직접 실행은 MK-022대로 조용히 0으로 끝낸다.
-                Some(Err(_)) => return ExitCode::from(daemon::KRILLD_DUPLICATE),
+                Some(Err(TakeError::Unavailable(_))) => {
+                    tracing::warn!("socket owned by a healthy daemon; exiting as duplicate");
+                    return ExitCode::from(daemon::KRILLD_DUPLICATE);
+                }
+                // 고아 krilld는 있는데 전송이 끊겼다. holder가 다시 띄워 재시도한다(중복으로 끝내면 고아의
+                // 멈춘 리더가 다음 접속까지 출력을 못 읽는다).
+                Some(Err(TakeError::Transfer(error))) => {
+                    tracing::warn!(kind = ?error.kind(), "handover transfer failed");
+                    return ExitCode::FAILURE;
+                }
                 None => return ExitCode::SUCCESS,
             }
         }
@@ -331,6 +340,10 @@ fn main() -> ExitCode {
                     Err(error) => {
                         if rejected.replace(error.kind()) != Some(error.kind()) {
                             tracing::warn!(kind = ?error.kind(), "connection closed before hello");
+                        }
+                        // 피어 UID 거부는 연결 하나의 일이다. EMFILE 같은 오류는 바로 다시 받아도 같아 쉬지 않고 돈다(C-4).
+                        if error.kind() != io::ErrorKind::PermissionDenied {
+                            thread::sleep(rejoin::ACCEPT_RETRY);
                         }
                         continue;
                     }
