@@ -155,10 +155,6 @@ pub const DASHBOARD_SIZE: gpui::Size<Pixels> = gpui::Size {
 /// 좁은 창에서도 대시보드 카드를 읽을 수 있게 유지하는 레인 최소 폭.
 pub const DASHBOARD_LANE_MIN_WIDTH: Pixels = px(240.);
 
-/// 왼쪽 사이드바 기본 폭(pt).
-pub const SIDEBAR_DEFAULT_WIDTH: f32 = 240.0;
-/// 오른쪽 패널 기본 폭(pt).
-pub const PANEL_DEFAULT_WIDTH: f32 = 280.0;
 /// 분할선 마우스 드래그 잡는 폭(pt). 시각적 선은 1pt로 그린다.
 pub const DIVIDER_HIT_PX: Pixels = px(5.);
 
@@ -1021,14 +1017,6 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
     #[cfg(windows)]
     crate::platform::sync_windows(cx);
 }
-
-/// 현재 `cx.theme().mode`를 유지한 채 Orca 토큰을 [`Theme`]에 동기화한다.
-pub fn sync(cx: &mut App) {
-    apply(cx.theme().mode, cx);
-}
-
-pub const AGENT_HISTORY_WIDTH: Pixels = px(520.);
-pub const AGENT_HISTORY_MAX_HEIGHT: Pixels = px(360.);
 
 #[cfg(test)]
 mod tests {

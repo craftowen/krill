@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
+use gpui::{Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
 use gpui_component::button::ButtonVariants as _;
 use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable as _, Sizable as _};
@@ -388,16 +388,6 @@ impl Panel {
     }
 
     #[must_use]
-    pub fn scope(&self) -> VaultScope {
-        self.scope
-    }
-
-    #[must_use]
-    pub fn agent_filter(&self) -> Option<VaultAgent> {
-        self.agent_filter
-    }
-
-    #[must_use]
     pub fn query(&self) -> &str {
         &self.query
     }
@@ -597,16 +587,6 @@ impl Panel {
                 crate::ui::tooltip_view("agent-history-toggle", tooltip_text.clone(), window, cx)
             })
             .on_click(cx.listener(|_, _, _, cx| cx.emit(Toggle)))
-    }
-
-    /// OWE-857: 열린 패널의 검색창에 포커스를 둔다. 입력 엔티티가 아직
-    /// 없으면 다음 렌더의 `focus_on_open` 소비가 대신 수행한다.
-    pub fn focus_search(&self, window: &mut Window, cx: &mut App) {
-        if self.open
-            && let Some(input) = &self.input
-        {
-            input.update(cx, |s, cx| s.focus(window, cx));
-        }
     }
 
     /// OWE-652: 열림 상태(셸·테스트에서 읽는다).

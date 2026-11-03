@@ -3695,14 +3695,6 @@ impl Sidebar {
         self.status_summary.clone()
     }
 
-    pub fn session_states(&self) -> Vec<krill_proto::control::AgentState> {
-        self.snapshot
-            .sessions
-            .iter()
-            .map(|s| s.status.state)
-            .collect()
-    }
-
     pub fn row_count(&self) -> usize {
         self.rows.len()
     }
@@ -4424,51 +4416,6 @@ impl Sidebar {
         entries.into_iter().map(|(_, wt)| wt).collect()
     }
 
-    /// OWE-865: Jump 팔레트용 워크트리 목록(세션 유무와 무관, 로컬만).
-    /// 세션이 있는 워크트리는 열기로, 없는 워크트리·폴더는 새 세션 만들기로 이어진다.
-    /// 순서는 저장소 경로순(결정적)이며, 원격 호스트 워크트리는 포함하지 않는다.
-    pub fn worktree_entries(&self) -> Vec<crate::jump::WorktreeEntry> {
-        let mut seen = BTreeSet::new();
-        let mut out = Vec::new();
-        for (repo, trees) in &self.snapshot.trees {
-            let repo_name = basename(repo);
-            for tree in trees {
-                seen.insert(tree.clone());
-                let session = self
-                    .snapshot
-                    .sessions
-                    .iter()
-                    .find(|s| s.worktree.as_deref() == Some(tree.as_path()))
-                    .map(|s| s.id);
-                out.push(crate::jump::WorktreeEntry::new(
-                    tree.clone(),
-                    self.name(tree),
-                    Some(repo_name.clone()),
-                    session,
-                ));
-            }
-        }
-        // git 밖 폴더(세션 작업 디렉터리): 세션이 있으므로 열기로 이어진다.
-        for s in self
-            .snapshot
-            .sessions
-            .iter()
-            .filter(|s| s.worktree.is_none())
-        {
-            if let Some(cwd) = &s.cwd
-                && seen.insert(cwd.clone())
-            {
-                out.push(crate::jump::WorktreeEntry::new(
-                    cwd.clone(),
-                    self.name(cwd),
-                    None,
-                    Some(s.id),
-                ));
-            }
-        }
-        out
-    }
-
     fn rename_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.cursor_worktree() {
             self.rename(path, window, cx);
@@ -4877,15 +4824,6 @@ impl Sidebar {
             name = format!("[orchestration] {name}");
         }
         (name, detail)
-    }
-
-    /// 로컬 세션의 최근 프롬프트 턴 히스토리를 돌려준다.
-    #[must_use]
-    pub fn session_prompt_history(
-        &self,
-        id: SessionId,
-    ) -> Option<&krill_proto::git::SessionPromptHistory> {
-        self.prompt_histories.get(&id)
     }
 
     /// 호스트 구분을 포함해 세션의 최근 프롬프트 턴 히스토리를 돌려준다.

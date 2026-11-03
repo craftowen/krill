@@ -6,13 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::Hsla;
 use krill_proto::theme::{Rgb, Theme as TerminalTheme};
 use serde::{Deserialize, Serialize};
 
 use super::theme::{
     TERMINAL_DARK, TERMINAL_DEEP, TERMINAL_GHOSTTY_DARK, TERMINAL_LIGHT, TERMINAL_TANGO_LIGHT,
-    rgba_bytes, term_rgb,
+    term_rgb,
 };
 
 /// 기본 다크 터미널 테마 이름(`Tokyo Night`, 데몬 기본 테마 [`TERMINAL_DARK`]와 같다).
@@ -1155,12 +1154,6 @@ pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
         ],
     ),
 ];
-
-/// 터미널 [`Rgb`] 색상을 UI 스와치·미리보기용 불투명 [`Hsla`]로 바꾼다.
-#[must_use]
-pub const fn terminal_rgb_hsla(c: Rgb) -> Hsla {
-    rgba_bytes(c.r, c.g, c.b, 0xff)
-}
 
 /// `#rrggbb`·`rrggbb`·`#rgb`·`rgb` 문자열을 [`Rgb`]로 파싱한다.
 #[must_use]

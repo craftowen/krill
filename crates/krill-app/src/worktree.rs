@@ -265,16 +265,6 @@ impl Dialog {
         Self::new_with_options(repo, None, None, Vec::new(), source, window, cx)
     }
 
-    pub fn new_with_parent(
-        repo: PathBuf,
-        parent: Option<PathBuf>,
-        source: Arc<dyn Source>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_with_options(repo, parent, None, Vec::new(), source, window, cx)
-    }
-
     pub fn new_with_options(
         repo: PathBuf,
         parent: Option<PathBuf>,
@@ -625,11 +615,6 @@ impl Dialog {
     #[must_use]
     pub fn parent(&self) -> Option<&std::path::Path> {
         self.parent.as_deref()
-    }
-
-    #[must_use]
-    pub fn selected_agents(&self) -> &[String] {
-        &self.selected_agents
     }
 
     pub fn toggle_agent(&mut self, agent_id: &str, cx: &mut Context<Self>) {

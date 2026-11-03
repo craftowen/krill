@@ -1181,10 +1181,6 @@ impl Shell {
                 return Some(false);
             }
             Some(entity.update(cx, |this, cx| match cmd {
-                krill_app::settings::HostCommand::Login { session } => {
-                    this.open_session(session, cx);
-                    true
-                }
                 krill_app::settings::HostCommand::Open { tab, window } => {
                     if window.is_some_and(|w| this.window != Some(w)) {
                         return false;

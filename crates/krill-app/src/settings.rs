@@ -2002,9 +2002,6 @@ fn open_file(name: &str, template: &str, cx: &mut App) {
 /// 메인 워크스페이스 창(`Shell`)이 설정 페이지를 인앱 뷰로 열거나 닫을 때 쓰는 명령(Orca `activeView === 'settings'` 패리티).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostCommand {
-    Login {
-        session: krill_proto::SessionId,
-    },
     Open {
         tab: AdminTab,
         window: Option<gpui::AnyWindowHandle>,
@@ -2493,24 +2490,6 @@ pub fn format_account_usage(usage: &krill_proto::usage::Snapshot) -> String {
     out
 }
 
-/// Claude `settings.json`에 Krill 상태 감지 훅을 병합 설치한다. 머지 규칙은
-/// CLI(`krill hook install claude`)와 같은 공용 함수이며, 같은 입력이면 바이트 단위로
-/// 같은 결과가 나온다. 파싱 실패·비UTF8·예상 밖 타입이면 쓰지 않고 오류를 돌려준다.
-pub fn install_claude_hook(settings_path: &Path) -> std::io::Result<PathBuf> {
-    install_hook_file(
-        settings_path,
-        krill_proto::hook_install::TargetAgent::Claude,
-    )
-}
-
-/// Antigravity 훅도 CLI와 같은 설치 잠금·영수증·백업을 사용한다.
-pub fn install_agy_hook(hooks_path: &Path) -> std::io::Result<PathBuf> {
-    install_hook_file(
-        hooks_path,
-        krill_proto::hook_install::TargetAgent::Other(krill_proto::agent::hooks::Agent::Agy),
-    )
-}
-
 /// 에이전트 ID별 상태 감지 훅 설정 파일 경로와 설치 대상을 돌려준다.
 #[must_use]
 pub fn agent_hook_target_path(
@@ -2646,15 +2625,7 @@ pub fn agent_install_command(agent_id: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-fn install_hook_file(
-    path: &Path,
-    target: krill_proto::hook_install::TargetAgent,
-) -> std::io::Result<PathBuf> {
-    let state = krill_proto::daemon::state_dir()
-        .ok_or_else(|| std::io::Error::other("state directory unavailable"))?;
-    install_hook_file_at(path, target, &state)
-}
-
+#[cfg(test)]
 fn install_hook_file_at(
     path: &Path,
     target: krill_proto::hook_install::TargetAgent,
@@ -3774,17 +3745,6 @@ impl SettingsView {
         &self.account_host
     }
 
-    #[must_use]
-    pub fn account_hosts(
-        &self,
-    ) -> &[(
-        crate::hosts::HostId,
-        String,
-        Option<crate::hosts::HostTarget>,
-    )] {
-        &self.account_hosts
-    }
-
     fn selected_account_target(&self) -> Option<crate::hosts::HostTarget> {
         self.account_hosts
             .iter()
@@ -3867,14 +3827,6 @@ impl SettingsView {
         self.accounts_refresh_pending = false;
         self.refresh_accounts_async(cx);
         cx.notify();
-    }
-
-    pub fn update_accounts_snapshot(
-        &mut self,
-        snapshot: krill_proto::usage::AccountsSnapshot,
-        cx: &mut Context<Self>,
-    ) {
-        self.update_accounts_snapshot_for_host(&crate::hosts::HostId::Local, snapshot, cx);
     }
 
     pub fn update_accounts_snapshot_for_host(

@@ -77,10 +77,6 @@ impl RealLinkBackend {
             .insert(id.to_owned(), build.clone());
         Some(build)
     }
-
-    pub fn state_dir(&self) -> &std::path::Path {
-        &self.state_dir
-    }
 }
 
 fn run<T>(

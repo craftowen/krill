@@ -7,8 +7,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, ElementId, Image, ImageFormat, ObjectFit, SharedString,
-    UniformListScrollHandle, Window, div, img, prelude::*, px, uniform_list,
+    AnyElement, App, Context, ElementId, Image, ObjectFit, SharedString, UniformListScrollHandle,
+    Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::text::TextView;
@@ -49,15 +49,6 @@ impl ImageView {
         Self {
             source: ImageSource::Path(path),
             dims,
-            zoom: Zoom::Fit,
-        }
-    }
-
-    /// SVG 미리보기용: 디스크가 아니라 지금 에디터 버퍼로 그린다(OWE-874 — 미저장 수정 반영).
-    pub fn new_svg_bytes(svg: Vec<u8>) -> Self {
-        Self {
-            source: ImageSource::SvgBytes(Arc::new(Image::from_bytes(ImageFormat::Svg, svg))),
-            dims: None,
             zoom: Zoom::Fit,
         }
     }
@@ -638,17 +629,6 @@ pub fn notebook(
         .into_any_element()
 }
 
-/// HTML 파일 미리보기 화면: 문서 `<title>`·파일 크기와 "브라우저로 열기"·"코드 편집"·"Finder에서 보기".
-pub fn html_preview(
-    path: &Path,
-    title: Option<&str>,
-    len: u64,
-    on_edit: impl Fn(&mut Window, &mut App) + 'static,
-    cx: &App,
-) -> AnyElement {
-    html_preview_on(path, None, title, len, on_edit, cx)
-}
-
 /// HTML metadata preview with host-scoped external actions.
 pub fn html_preview_on(
     path: &Path,
@@ -851,11 +831,6 @@ pub(crate) fn size_label(len: u64) -> String {
         KIB..0x10_0000 => format!("{} KB", len.div_ceil(KIB)),
         _ => crate::resources::mb(len),
     }
-}
-
-/// `open`은 Launch Services 응답을 기다리므로 UI 스레드 밖에서 실행한다. 로그에 경로는 남기지 않는다(A8).
-pub fn spawn_open(path: PathBuf, command: fn(&Path) -> Command, cx: &App) {
-    spawn_open_on(path, None, command, cx);
 }
 
 /// 원격 파일이면 로컬 캐시로 먼저 내려받은 뒤 `command`를 실행한다.
