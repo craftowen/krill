@@ -2771,3 +2771,60 @@ fn failed_kept_engine_start_is_not_evidence_that_a_replacement_process_ended() {
     drop(reg);
     fs::remove_dir_all(root).unwrap();
 }
+
+// A registry without its own state folder must not overwrite or obey the recovery records of the
+// daemon that owns the process-default folder (`KRILL_STATE_DIR` is the operational one in a session).
+#[test]
+fn stateless_registry_leaves_the_default_folder_account_records_alone() {
+    const ROLE: &str = "KRILL_TEST_STATELESS_ACCOUNT_RECORDS";
+    if std::env::var_os(ROLE).is_some() {
+        let reg = Registry::new(None, None);
+        lock(&reg.account_handoffs).insert(
+            SessionId(1),
+            SessionHandoff {
+                from: SessionId(1),
+                to: None,
+                account_id: "stateless".into(),
+                error: None,
+            },
+        );
+        reg.save_account_handoffs().unwrap();
+        assert!(
+            reg.ensure_no_unresolved_account_replacement(SessionId(8))
+                .is_ok(),
+            "another daemon's replacement journal blocked this registry"
+        );
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("kas-stateless-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("account-replacements")).unwrap();
+    let handoffs = br#"[{"from":40332,"to":40351,"account_id":"operational","error":null}]"#;
+    fs::write(root.join(FILE), handoffs).unwrap();
+    fs::write(
+        root.join("account-replacements/8.json"),
+        br#"{"from":7,"to":8,"account_id":"operational"}"#,
+    )
+    .unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "registry::account_switch::tests::stateless_registry_leaves_the_default_folder_account_records_alone",
+            "--nocapture",
+        ])
+        .env(ROLE, "1")
+        .env("KRILL_STATE_DIR", &root)
+        .env("HOME", root.join("home"))
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .status()
+        .unwrap();
+    let after = fs::read(root.join(FILE)).unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&after),
+        String::from_utf8_lossy(handoffs),
+        "the default folder's handoff records were overwritten"
+    );
+    assert!(status.success());
+}
