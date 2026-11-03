@@ -753,3 +753,16 @@ fn short_socket_override_keeps_long_state_and_isolates_installations() {
     assert!(socket_path_in(&a, Some("relative".as_ref())).is_err());
     assert!(socket_path_in(&a, Some(format!(r"C:\{}", "long".repeat(30)).as_ref())).is_err());
 }
+
+#[test]
+fn session_exported_default_state_dir_is_not_isolation() {
+    let default = Path::new("/Users/u/Library/Application Support/dev.krill.app");
+    let exported = OsStr::new("/Users/u/Library/Application Support/dev.krill.app/");
+    assert!(!is_isolated(Some(exported), Some(default)));
+    assert!(!is_isolated(None, Some(default)));
+    assert!(is_isolated(
+        Some(OsStr::new("/tmp/mk-1/state")),
+        Some(default)
+    ));
+    assert!(is_isolated(Some(exported), None));
+}
