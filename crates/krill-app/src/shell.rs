@@ -1967,7 +1967,6 @@ impl Shell {
         }
         let view = if let Some(existing) = &self.settings {
             existing.update(cx, |v, cx| {
-                v.set_automations_page(false, cx);
                 v.set_tab(tab, cx);
                 v.set_mobile_page(mobile_page, cx);
             });
@@ -2014,12 +2013,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.open_automations(window, cx);
-    }
-
-    pub(super) fn automations_page_open(&self, cx: &App) -> bool {
-        self.settings
-            .as_ref()
-            .is_some_and(|s| s.read(cx).automations_page())
     }
 
     pub(super) fn open_mobile_page(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
@@ -7718,9 +7711,7 @@ impl Render for Shell {
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
         // 플로팅 창 제목은 Floating::render가 소유하므로 건드리지 않는다.
         if self.role == WindowRole::Main {
-            if self.settings.is_some()
-                && !(self.mobile_page_open(cx) || self.automations_page_open(cx))
-            {
+            if self.settings.is_some() && !self.mobile_page_open(cx) {
                 window.set_window_title(krill_app::i18n::catalog::settings::TITLE.get());
             } else {
                 window.set_window_title(&self.main_window_title(cx));
@@ -7833,7 +7824,7 @@ impl Render for Shell {
             window.is_window_active() && !self.page_open() && self.dashboard.is_none();
         self.resources
             .update(cx, |view, cx| view.set_visible(resources_visible, cx));
-        let sub_page = self.mobile_page_open(cx) || self.automations_page_open(cx);
+        let sub_page = self.mobile_page_open(cx);
         let (settings_view, mobile_view) = if sub_page {
             (None, self.settings.clone())
         } else {

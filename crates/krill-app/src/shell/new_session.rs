@@ -485,13 +485,10 @@ impl Shell {
                         sb_text::NAV_AUTOMATIONS.get(),
                     )
                     .debug_selector(|| "nav-automations".into())
-                    .when(
-                        self.automations.is_some() || self.automations_page_open(cx),
-                        |d| {
-                            d.bg(p.sidebar_accent)
-                                .text_color(p.sidebar_accent_foreground)
-                        },
-                    )
+                    .when(self.automations.is_some(), |d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_automations_page(Some(window), cx);
                     }))

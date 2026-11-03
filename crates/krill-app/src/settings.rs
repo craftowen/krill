@@ -2793,8 +2793,6 @@ pub struct SettingsView {
     mobile: mobile::Panel,
     /// 사이드바 'Krill 모바일'에서 연 단독 페이지 모드. 설정 내비 없이 페어링 화면만 그린다.
     mobile_page: bool,
-    automations_page: bool,
-    automations: schedules::SchedulesState,
     remote_krill: Option<gpui::Entity<crate::link_ui::PairingView>>,
     machine_page: crate::machines::MachinePage,
     machine_add_focus: Option<crate::machines::AddMethod>,
@@ -2936,8 +2934,6 @@ struct ServiceCache {
     aliases: std::collections::BTreeMap<String, String>,
     schedules: Vec<krill_proto::schedule::Schedule>,
     runs: Vec<krill_proto::schedule::ScheduleRun>,
-    schedules_error: Option<String>,
-    runs_error: Option<String>,
 }
 
 impl ServiceCache {
@@ -3224,8 +3220,6 @@ impl SettingsView {
             account_file_stamp: Vec::new(),
             mobile: mobile::Panel::default(),
             mobile_page: false,
-            automations_page: false,
-            automations: schedules::SchedulesState::default(),
             remote_krill: None,
             machine_page: crate::machines::MachinePage::default(),
             machine_add_focus: None,
@@ -3494,8 +3488,6 @@ impl SettingsView {
                     }
                     let schedules = krill_proto::schedule::Schedules::load(&dir);
                     let runs = krill_proto::schedule::load_coalesced_runs(&dir);
-                    let schedules_error = schedules.as_ref().err().map(ToString::to_string);
-                    let runs_error = runs.as_ref().err().map(ToString::to_string);
                     (
                         Some(stamp),
                         Some(ServiceCache {
@@ -3517,8 +3509,6 @@ impl SettingsView {
                                 .collect(),
                             schedules: schedules.unwrap_or_default().schedule,
                             runs: runs.unwrap_or_default(),
-                            schedules_error,
-                            runs_error,
                         }),
                     )
                 })
@@ -3564,22 +3554,6 @@ impl SettingsView {
 
     pub fn tab(&self) -> AdminTab {
         self.tab
-    }
-
-    pub fn automations_page(&self) -> bool {
-        self.automations_page
-    }
-
-    pub fn set_automations_page(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.automations_page == on {
-            return;
-        }
-        self.automations_page = on;
-        if on {
-            self.mobile_page = false;
-            self.refresh_service_cache(cx);
-        }
-        cx.notify();
     }
 
     pub fn mobile_page(&self) -> bool {
@@ -10924,9 +10898,6 @@ impl Render for SettingsView {
             }
         } else if !has_modal && let Some(focus) = self.modal_return_focus.take() {
             window.focus(&focus, cx);
-        }
-        if self.automations_page {
-            return self.render_automations_page(window, cx).into_any_element();
         }
         window.set_window_title(text::TITLE.get());
         let (s, error) = cx.try_global::<Config>().map_or_else(
