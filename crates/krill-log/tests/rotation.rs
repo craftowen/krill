@@ -92,11 +92,29 @@ fn startup_repairs_oversize() -> io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn open_creates_only_the_lock_file() -> io::Result<()> {
+    let dir = Directory::new()?;
+    let log = RollingLog::open(&dir.0, Component::Daemon)?;
+    let names = || -> io::Result<Vec<String>> {
+        let mut names = fs::read_dir(&dir.0)?
+            .map(|e| Ok(e?.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    };
+    assert_eq!(names()?, ["krilld.lock"]);
+    log.append("first")?;
+    assert_eq!(names()?, ["krilld.lock", "krilld.log"]);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn refuses_file_symlinks() -> io::Result<()> {
     let dir = Directory::new()?;
     let log = RollingLog::open(&dir.0, Component::App)?;
+    log.append("before")?;
     let victim = dir.0.join("unrelated");
     fs::write(&victim, "preserve")?;
     fs::remove_file(dir.0.join("krill-app.log"))?;
