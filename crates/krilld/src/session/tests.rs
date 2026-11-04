@@ -289,6 +289,7 @@ fn guarded_rebuilds_engine_after_panic() {
             generation: 0,
         }),
         changed: Condvar::new(),
+        shown: Condvar::new(),
         paused: AtomicBool::new(false),
         store: None,
         reader: Mutex::new(None),
