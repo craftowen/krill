@@ -18,7 +18,7 @@ fn recorder_keyframes_survive_predecessor_gc_in_plain_and_encrypted_segments() {
             Limits::default(),
             true,
             encrypted,
-            key.clone(),
+            key.clone().map(crypto::Keyring::ready),
         );
         let id = SessionId(77);
         let look = no_theme();
@@ -40,7 +40,12 @@ fn recorder_keyframes_survive_predecessor_gc_in_plain_and_encrypted_segments() {
         assert_eq!(paths.len(), 2);
         let disk = fs::read(&paths[1]).unwrap();
         assert_eq!(disk[7], segment::KEYFRAME_V1);
-        let parsed = segment::read(&paths[1], key.as_deref()).unwrap().unwrap();
+        let parsed = segment::read(
+            &paths[1],
+            key.clone().map(crypto::Keyring::ready).as_deref(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(parsed.keyframe_bytes, snapshot);
         assert_eq!(parsed.records, vec![Record::Data(suffix.to_vec())]);
         assert!(parsed.sealed);
