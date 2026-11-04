@@ -1056,7 +1056,15 @@ impl View {
     }
 
     fn render_top_bar(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
-        let mut breadcrumbs = div().flex().items_center().gap_1p5().min_w_0();
+        let mut breadcrumbs = div()
+            .id("automations-breadcrumbs")
+            .flex_1()
+            .min_w_0()
+            .overflow_x_scroll()
+            .whitespace_nowrap()
+            .flex()
+            .items_center()
+            .gap_1p5();
 
         let is_root = matches!(self.screen, PageView::List);
         breadcrumbs = breadcrumbs.child(
@@ -1173,6 +1181,7 @@ impl View {
         div()
             .flex_none()
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_4()
@@ -1181,6 +1190,8 @@ impl View {
             .pb_3()
             .child(
                 div()
+                    .flex_1()
+                    .flex_basis(ui::DIALOG_WIDTH / 2.)
                     .min_w_0()
                     .flex()
                     .items_center()
@@ -1948,16 +1959,39 @@ impl View {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
                     .rounded(ui::RADIUS_MD)
                     .border_1()
                     .border_color(p.border)
                     .bg(p.muted.opacity(0.2))
-                    .child(header)
-                    .child(list_body),
+                    .child(
+                        div()
+                            .id("automations-table-scroll")
+                            .debug_selector(|| "automations-table-scroll".into())
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .overflow_x_scroll()
+                            .flex()
+                            .child(
+                                div()
+                                    .debug_selector(|| "automations-table".into())
+                                    .flex_1()
+                                    // Column widths + seven gaps + horizontal padding.
+                                    .min_w(
+                                        px(140. + 136. + 108. + 116. + 124. + 84. + 88. + 196.)
+                                            + ui::SPACE_3 * 9.,
+                                    )
+                                    .h_full()
+                                    .min_h_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(header)
+                                    .child(list_body),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -2790,58 +2824,72 @@ impl View {
             )
             .child(
                 div()
+                    .id("automations-runs-scroll")
+                    .debug_selector(|| "automations-runs-scroll".into())
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
-                    .rounded(ui::RADIUS_MD)
-                    .border_1()
-                    .border_color(p.border)
-                    .bg(p.muted.opacity(0.2))
-                    .overflow_hidden()
+                    .overflow_x_scroll()
                     .flex()
-                    .flex_col()
                     .child(
                         div()
-                            .h(px(32.))
-                            .w_full()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .border_b_1()
+                            .debug_selector(|| "automations-runs-columns".into())
+                            .flex_1()
+                            // Four columns + three gaps + horizontal padding.
+                            .min_w(px(140. + 160. + 180. + 120.) + ui::SPACE_3 * 5.)
+                            .h_full()
+                            .min_h_0()
+                            .rounded(ui::RADIUS_MD)
+                            .border_1()
                             .border_color(p.border)
-                            .bg(p.muted.opacity(0.4))
-                            .text_size(ui::TEXT_XS)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(p.muted_foreground)
+                            .bg(p.muted.opacity(0.2))
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w(px(140.))
-                                    .child(text::COL_AUTOMATION.get()),
-                            )
-                            .child(
-                                div()
-                                    .w(px(160.))
-                                    .flex_none()
-                                    .child(text::COL_TRIGGERED.get()),
-                            )
-                            .child(
-                                div()
-                                    .w(px(180.))
-                                    .flex_none()
-                                    .child(text::COL_WORKSPACE.get()),
-                            )
-                            .child(
-                                div()
-                                    .w(px(120.))
+                                    .h(px(32.))
+                                    .w_full()
                                     .flex_none()
                                     .flex()
-                                    .justify_end()
-                                    .child(text::COL_STATUS.get()),
-                            ),
-                    )
-                    .child(rows),
+                                    .items_center()
+                                    .gap_3()
+                                    .px_3()
+                                    .border_b_1()
+                                    .border_color(p.border)
+                                    .bg(p.muted.opacity(0.4))
+                                    .text_size(ui::TEXT_XS)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.muted_foreground)
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(140.))
+                                            .child(text::COL_AUTOMATION.get()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(160.))
+                                            .flex_none()
+                                            .child(text::COL_TRIGGERED.get()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(180.))
+                                            .flex_none()
+                                            .child(text::COL_WORKSPACE.get()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(120.))
+                                            .flex_none()
+                                            .flex()
+                                            .justify_end()
+                                            .child(text::COL_STATUS.get()),
+                                    ),
+                            )
+                            .child(rows),
+                    ),
             )
             .into_any_element()
     }
@@ -2977,6 +3025,8 @@ impl View {
         };
 
         let reuse_active = modal.workspace_mode == WorkspaceMode::Reuse;
+        // Keep both form sections usable when the modal cannot fit two columns.
+        let stacked = window.viewport_size().width < px(960.) + ui::SPACE_4 * 2.;
 
         let dialog = div()
             .id("automations-editor-modal")
@@ -2985,8 +3035,8 @@ impl View {
             .role(gpui::Role::Dialog)
             .aria_label(heading)
             .w(px(960.))
-            .max_w(window.viewport_size().width - ui::SPACE_4 * 2.)
-            .max_h(window.viewport_size().height - ui::SPACE_4 * 2.)
+            .max_w((window.viewport_size().width - ui::SPACE_4 * 2.).max(px(0.)))
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(px(0.)))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_modal(cx)))
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
@@ -3002,6 +3052,7 @@ impl View {
                 div()
                     .flex_none()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .px_5()
@@ -3066,20 +3117,28 @@ impl View {
             .child(
                 // 2-Column Body (AutomationEditorPromptSection + AutomationEditorSettingsSidebar)
                 div()
+                    .id("automations-modal-body")
+                    .debug_selector(|| "automations-modal-body".into())
                     .flex_1()
                     .min_h_0()
                     .flex()
+                    .when(stacked, |d| d.flex_col().overflow_y_scroll())
                     .child(
                         // Left Column: Name + Prompt
                         div()
                             .id("automations-modal-left-scroll")
+                            .debug_selector(|| "automations-modal-left-scroll".into())
                             .flex_1()
+                            .when(stacked, |d| d.flex_none().w_full())
                             .min_w_0()
                             .p_5()
                             .flex()
                             .flex_col()
                             .gap_4()
-                            .overflow_y_scroll()
+                            .when(
+                                !stacked,
+                                gpui::StatefulInteractiveElement::overflow_y_scroll,
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -3124,13 +3183,19 @@ impl View {
                         // Right Column: Settings Sidebar (320px)
                         div()
                             .id("automations-modal-right-scroll")
+                            .debug_selector(|| "automations-modal-right-scroll".into())
                             .w(px(320.))
+                            .when(stacked, gpui::Styled::w_full)
                             .flex_none()
-                            .border_l_1()
+                            .when(!stacked, gpui::Styled::border_l_1)
+                            .when(stacked, gpui::Styled::border_t_1)
                             .border_color(p.border)
                             .bg(p.muted.opacity(0.2))
                             .p_4()
-                            .overflow_y_scroll()
+                            .when(
+                                !stacked,
+                                gpui::StatefulInteractiveElement::overflow_y_scroll,
+                            )
                             .flex()
                             .flex_col()
                             .gap_3p5()
@@ -3531,6 +3596,76 @@ mod tests {
             std::io::ErrorKind::AlreadyExists
         );
         assert_eq!(schedules, before);
+    }
+
+    #[gpui::test]
+    fn narrow_automation_editor_stacks_sections_and_keeps_save_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (view, visual) = cx.add_window_view(|_, cx| View::new(None, None, cx));
+        visual.simulate_resize(gpui::size(px(640.), px(480.)));
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_editor_modal(None, window, cx));
+        });
+        visual.run_until_parked();
+        let dialog = visual.debug_bounds("automations-editor-modal").unwrap();
+        let left = visual
+            .debug_bounds("automations-modal-left-scroll")
+            .unwrap();
+        let right = visual
+            .debug_bounds("automations-modal-right-scroll")
+            .unwrap();
+        let save = visual.debug_bounds("automations-modal-save").unwrap();
+        assert!(left.size.width > px(0.));
+        assert!(right.top() >= left.bottom());
+        assert_eq!(left.left(), right.left());
+        assert_eq!(left.size.width, right.size.width);
+        assert!(save.top() >= dialog.top());
+        assert!(save.bottom() <= dialog.bottom());
+        assert!(dialog.bottom() <= px(480.) - ui::SPACE_4);
+    }
+
+    #[gpui::test]
+    fn narrow_automation_tables_scroll_columns_together(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, visual) = cx.add_window_view(|_, cx| View::new(None, None, cx));
+        view.update(visual, |view, cx| {
+            view.schedules.push(Schedule {
+                id: "daily".into(),
+                ..Schedule::default()
+            });
+            cx.notify();
+        });
+        visual.simulate_resize(gpui::size(px(640.), px(480.)));
+        visual.run_until_parked();
+        for (viewport_id, columns_id) in [
+            ("automations-table-scroll", "automations-table"),
+            ("automations-runs-scroll", "automations-runs-columns"),
+        ] {
+            if viewport_id == "automations-runs-scroll" {
+                view.update(visual, View::open_runs_dashboard);
+                visual.run_until_parked();
+            }
+            let viewport = visual.debug_bounds(viewport_id).unwrap();
+            let before = visual.debug_bounds(columns_id).unwrap();
+            assert!(viewport.size.width > px(0.));
+            assert!(viewport.size.height > px(0.));
+            assert!(before.size.width > viewport.size.width);
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: viewport.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(-2000.), px(0.))),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            visual.run_until_parked();
+            let after = visual.debug_bounds(columns_id).unwrap();
+            assert!(after.left() < before.left());
+            assert!(
+                after.right() <= viewport.right(),
+                "{viewport_id}: viewport={viewport:?}, before={before:?}, after={after:?}"
+            );
+        }
     }
 
     #[gpui::test]

@@ -331,6 +331,7 @@ impl Shell {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .flex_none()
                     .items_center()
                     .gap_2()
@@ -339,6 +340,8 @@ impl Shell {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_size(krill_app::ui::TEXT_XS)
                             .child(etext::COMPARE_READONLY.get()),
                     )

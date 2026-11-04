@@ -985,12 +985,14 @@ impl SettingsView {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .flex_basis(gpui::relative(0.5))
                             .flex()
                             .flex_col()
                             .gap_1()
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap_2()
                                     .child(
@@ -1000,7 +1002,10 @@ impl SettingsView {
                                             .text_color(p.foreground)
                                             .child(summary_text),
                                     )
-                                    .child(crate::ui::badge(p, BadgeTone::Muted, os_badge)),
+                                    .child(
+                                        crate::ui::badge(p, BadgeTone::Muted, os_badge)
+                                            .max_w_full(),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1265,7 +1270,7 @@ impl SettingsView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .min_w(px(180.))
+                            .flex_basis(gpui::relative(0.5))
                             .flex()
                             .items_center()
                             .gap_2p5()
@@ -1291,12 +1296,20 @@ impl SettingsView {
                                         div()
                                             .min_w_0()
                                             .flex()
+                                            .flex_wrap()
                                             .items_center()
                                             .gap_1p5()
                                             .child(
                                                 div()
+                                                    .id(gpui::SharedString::from(format!(
+                                                        "admin-install-name-{tool_id}"
+                                                    )))
+                                                    .debug_selector(move || {
+                                                        format!("admin-install-name-{tool_id}")
+                                                    })
+                                                    .flex_none()
                                                     .min_w_0()
-                                                    .truncate()
+                                                    .max_w_full()
                                                     .text_size(crate::ui::TEXT_SM)
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(p.foreground)
@@ -1304,6 +1317,9 @@ impl SettingsView {
                                             )
                                             .child(
                                                 crate::ui::badge(p, badge_tone, badge_text)
+                                                    .min_w_0()
+                                                    .max_w_full()
+                                                    .overflow_hidden()
                                                     .id(gpui::ElementId::Name(
                                                         badge_id.clone().into(),
                                                     ))
@@ -1511,6 +1527,7 @@ impl SettingsView {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .flex_basis(gpui::relative(0.5))
                             .flex()
                             .items_center()
                             .gap_2p5()

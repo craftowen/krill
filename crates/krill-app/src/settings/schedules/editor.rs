@@ -211,7 +211,8 @@ impl SettingsView {
                     }
                 }))
         });
-        let narrow = window.viewport_size().width < gpui::px(720.);
+        // Keep the two form columns readable when UI text and spacing are zoomed.
+        let narrow = window.viewport_size().width < window.rem_size() * 45.;
         let mut right = div()
             .min_w_0()
             .flex()

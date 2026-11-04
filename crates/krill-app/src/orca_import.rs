@@ -1186,6 +1186,8 @@ pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>>
     };
 
     let banner_id: SharedString = format!("{id_prefix}-orca-import-card").into();
+    let copy_selector = format!("{id_prefix}-orca-import-copy");
+    let actions_selector = format!("{id_prefix}-orca-import-actions");
     let choose_id: SharedString = format!("{id_prefix}-orca-choose-btn").into();
     let choose_sel = choose_id.to_string();
     let import_all_id: SharedString = format!("{id_prefix}-orca-import-all-btn").into();
@@ -1200,13 +1202,17 @@ pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>>
             .gap_2p5()
             .child(
                 div()
+                    .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_start()
                     .justify_between()
                     .gap_3()
                     .child(
                         div()
+                            .debug_selector(move || copy_selector.clone())
                             .flex_1()
+                            .flex_basis(DIALOG_WIDTH / 2.)
                             .min_w_0()
                             .flex()
                             .flex_col()
@@ -1219,6 +1225,9 @@ pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>>
                                     .flex_wrap()
                                     .child(
                                         div()
+                                            .min_w_0()
+                                            .max_w_full()
+                                            .whitespace_normal()
                                             .text_size(TEXT_SM)
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(p.foreground)
@@ -1248,6 +1257,9 @@ pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>>
                     )
                     .child(
                         ui::controls()
+                            .debug_selector(move || actions_selector.clone())
+                            .max_w_full()
+                            .flex_wrap()
                             .child(
                                 ui::secondary(choose_id, text::OPEN_MODAL.get())
                                     .debug_selector(move || choose_sel.clone())
@@ -2411,6 +2423,57 @@ mod tests {
         let proj_desc = ImportDomain::Projects.description(Some(&proj_report));
         assert!(proj_desc.contains("코멘트 3"), "{proj_desc}");
         assert!(!proj_desc.contains("코멘트 5"), "{proj_desc}");
+    }
+
+    #[gpui::test]
+    fn narrow_orca_banner_wraps_actions_below_readable_copy(cx: &mut TestAppContext) {
+        struct Banner;
+        impl gpui::Render for Banner {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                div().p_4().children(render_banner("layout", cx))
+            }
+        }
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let mut preview = OrcaImportReport::default();
+            preview.ssh.hosts_added = 12;
+            preview.projects.projects_added = 19;
+            cx.set_global(OrcaImportState {
+                detected_orca_dir: Some(PathBuf::from("/fixture/orca")),
+                daemon_available: Some(true),
+                preview: Some(preview),
+                ..OrcaImportState::default()
+            });
+        });
+        let (_, visual) = cx.add_window_view(|_, _| Banner);
+        for language in [crate::i18n::Language::Ko, crate::i18n::Language::En] {
+            visual.update(|_, cx| crate::i18n::set_language(language, cx));
+            for width in [360., 560.] {
+                visual.simulate_resize(gpui::size(gpui::px(width), gpui::px(600.)));
+                visual.run_until_parked();
+                let card = visual.debug_bounds("layout-orca-import-card").unwrap();
+                let copy = visual.debug_bounds("layout-orca-import-copy").unwrap();
+                let actions = visual.debug_bounds("layout-orca-import-actions").unwrap();
+                assert!(copy.size.width >= gpui::px(200.));
+                assert!(
+                    copy.bottom() <= actions.top() || copy.right() <= actions.left(),
+                    "copy={copy:?}, actions={actions:?}"
+                );
+                if width < 400. {
+                    assert!(copy.bottom() <= actions.top());
+                }
+                for selector in ["layout-orca-choose-btn", "layout-orca-import-all-btn"] {
+                    let button = visual.debug_bounds(selector).unwrap();
+                    assert!(button.left() >= card.left());
+                    assert!(button.right() <= card.right());
+                    assert!(button.bottom() <= card.bottom());
+                }
+            }
+        }
     }
 
     #[gpui::test]

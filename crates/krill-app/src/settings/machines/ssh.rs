@@ -621,10 +621,12 @@ impl SettingsView {
                 .small(),
             );
 
-        layout::row(p)
+        layout::card(p)
             .id(gpui::ElementId::Name(card_id.clone().into()))
             .debug_selector(move || card_id.clone())
+            .flex()
             .flex_col()
+            .gap_3()
             .items_start()
             .child(
                 div()

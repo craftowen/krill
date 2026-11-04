@@ -914,10 +914,12 @@ impl SettingsView {
 
                 let row_id = format!("sc-row-{action}");
                 group_rows.push(
-                    layout::row(p)
+                    layout::card(p)
                         .id(SharedString::from(row_id.clone()))
                         .debug_selector(move || row_id.clone())
+                        .flex()
                         .flex_col()
+                        .gap_3()
                         .items_start()
                         .py_2()
                         .child(left)

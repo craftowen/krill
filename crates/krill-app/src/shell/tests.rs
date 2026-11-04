@@ -12169,3 +12169,72 @@ fn settled_attempt_fencing_drops_stale_completion_after_pane_rebind(cx: &mut Tes
         });
     });
 }
+
+#[test]
+fn column_widths_fit_resized_windows_without_changing_preferences() {
+    assert_eq!(fitted_column_widths(px(1200.), 240., 280.), (240., 280.));
+    for width in [360., 640., 800.] {
+        for (sidebar, panel) in [(240., 280.), (1200., 800.), (0., 800.), (1200., 0.)] {
+            let (left, right) = fitted_column_widths(px(width), sidebar, panel);
+            let dividers = f32::from(u8::from(sidebar > 0.) + u8::from(panel > 0.));
+            assert!(left <= sidebar && right <= panel);
+            assert!(
+                width - left - right - f32::from(DIVIDER_GRAB) * dividers
+                    >= layout::MIN_PANE_PX - 0.001
+            );
+        }
+    }
+}
+
+#[gpui::test]
+fn resized_shell_keeps_center_between_visible_columns(cx: &mut TestAppContext) {
+    let (view, visual) = open(cx, state_path("resized-layout-columns"));
+    view.update(visual, |shell, cx| {
+        shell.layout.sidebar_width = 800.;
+        shell.layout.panel_width = 800.;
+        shell.sidebar_collapsed = false;
+        shell.panel_collapsed = false;
+        cx.notify();
+    });
+    visual.simulate_resize(gpui::size(px(640.), px(480.)));
+    visual.run_until_parked();
+    let sidebar = visual.debug_bounds("sidebar-column").unwrap();
+    let center = visual.debug_bounds("terminal-surface").unwrap();
+    let panel = visual.debug_bounds("panel-column").unwrap();
+    assert!(center.size.width >= px(layout::MIN_PANE_PX) - px(0.001));
+    assert!(center.left() >= sidebar.right());
+    assert!(panel.left() >= center.right());
+    assert!(panel.right() <= px(640.));
+    view.read_with(visual, |shell, _| {
+        assert_eq!(shell.layout.sidebar_width.to_bits(), 800_f32.to_bits());
+        assert_eq!(shell.layout.panel_width.to_bits(), 800_f32.to_bits());
+    });
+}
+
+#[gpui::test]
+fn narrow_mobile_page_temporarily_hides_sidebar_without_losing_preferences(
+    cx: &mut TestAppContext,
+) {
+    let (view, visual) = open(cx, state_path("mobile-page-sidebar-budget"));
+    view.update(visual, |shell, cx| {
+        shell.layout.sidebar_width = 260.;
+        shell.sidebar_collapsed = false;
+        shell.open_mobile_page(None, cx);
+    });
+    for width in [360., 480., 800.] {
+        visual.simulate_resize(gpui::size(px(width), px(900.)));
+        visual.run_until_parked();
+        let page = visual.debug_bounds("mobile-page").unwrap();
+        let qr = visual.debug_bounds("mobile-page-qr-empty").unwrap();
+        assert!(page.size.width >= px(layout::MIN_WINDOW_WIDTH));
+        assert!(qr.left() >= page.left() && qr.right() <= page.right());
+        assert_eq!(
+            visual.debug_bounds("sidebar-column").is_some(),
+            width > 700.
+        );
+        view.read_with(visual, |shell, _| {
+            assert!(!shell.sidebar_collapsed);
+            assert_eq!(shell.layout.sidebar_width.to_bits(), 260_f32.to_bits());
+        });
+    }
+}

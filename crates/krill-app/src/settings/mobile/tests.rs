@@ -435,7 +435,7 @@ fn mobile_qr_cards_fit_without_clipping_at_supported_widths(cx: &mut gpui::TestA
     }
     {
         let (_view, vcx) = offer_view(cx, false);
-        // 설정은 왼쪽 탐색 248px가 고정이라 360px 창에서는 본문 열이 48px뿐이다(기존부터, 측정만 한다).
+        // 좁은 설정 창은 상단 탐색으로 전환해 QR이 들어갈 본문 폭을 확보한다.
         for width in [360., 560., 580., 598., 800., 1100.] {
             for scale in [1., 1.25, 1.5, 2.] {
                 redraw(vcx, width, scale);
@@ -452,9 +452,6 @@ fn mobile_qr_cards_fit_without_clipping_at_supported_widths(cx: &mut gpui::TestA
                     content.1 - content.0 >= 220.,
                     span(copy)
                 );
-                if width < 598. {
-                    continue;
-                }
                 let view = (0., width);
                 for (name, b) in [("qr", qr), ("copy", span(copy))] {
                     if !inside(b, content) || !inside(b, view) {
@@ -489,6 +486,96 @@ fn mobile_copy_buttons_copy_the_url_encoded_in_the_qr(cx: &mut gpui::TestAppCont
             assert_eq!(qr, &Qr::encode(&copied).unwrap(), "{selector}");
             assert_eq!(mobile.copied_url.as_deref(), Some(FIXTURE_TICKET));
         });
+    }
+}
+
+/// 긴 설명·주소·기기 상태가 QR이나 옆 열과 겹치지 않고, QR 상자가 정사각형을 유지한다.
+#[gpui::test]
+fn mobile_page_long_details_stay_in_their_columns(cx: &mut gpui::TestAppContext) {
+    let (view, vcx) = offer_view(cx, true);
+    view.update(vcx, |view, _| {
+        view.mobile.backup_address = Some("100.113.52.255:65535".into());
+        view.mobile.account.email = Some("very-long-account-address@example.test".into());
+        view.mobile.devices = (0..12)
+            .map(|index| PairedMobileDevice {
+                device_id: format!("device-{index}"),
+                label: "긴 이름의 휴대폰 · Mobile browser iPhone / iPad (Safari)".into(),
+                key_fingerprint: "fixture-fingerprint".into(),
+                ..device(1, 0)
+            })
+            .collect();
+    });
+    for language in [crate::i18n::Language::Ko, crate::i18n::Language::En] {
+        vcx.update(|_, cx| crate::i18n::set_language(language, cx));
+        for width in [360., 480., 720., 959., 1100.] {
+            for scale in [1., 1.25, 1.5, 2.] {
+                redraw(vcx, width, scale);
+                let card = vcx.debug_bounds("mobile-page-card").unwrap();
+                let description = vcx.debug_bounds("mobile-page-description").unwrap();
+                let address = vcx.debug_bounds("mobile-page-address").unwrap();
+                let qr = vcx.debug_bounds("mobile-page-qr").unwrap();
+                let phone = vcx.debug_bounds("mobile-page-phone").unwrap();
+                let item = vcx.debug_bounds("mobile-page-device-0").unwrap();
+                let status = vcx.debug_bounds("mobile-page-device-status-0").unwrap();
+                assert!(
+                    inside(span(description), span(card)),
+                    "description {width} @{scale}"
+                );
+                assert!(
+                    inside(span(address), span(description)),
+                    "address {width} @{scale}"
+                );
+                assert!(inside(span(qr), span(card)), "QR box {width} @{scale}");
+                assert!(
+                    (f32::from(qr.size.width - qr.size.height)).abs() < 0.01,
+                    "QR stretched {qr:?}"
+                );
+                assert!(
+                    description.right() <= qr.left() || qr.top() >= description.bottom(),
+                    "columns overlap {width} @{scale}"
+                );
+                assert!(inside(span(status), span(item)) && inside(span(item), span(phone)));
+                assert!(
+                    status.bottom() <= item.bottom(),
+                    "status clipped {width} @{scale}"
+                );
+                assert!(f32::from(status.size.height) > 20., "long status must wrap");
+            }
+        }
+    }
+    vcx.update(|_, cx| crate::i18n::set_language(crate::i18n::Language::Ko, cx));
+}
+
+#[gpui::test]
+fn mobile_qr_fits_small_windows_at_maximum_ui_zoom(cx: &mut gpui::TestAppContext) {
+    for page in [true, false] {
+        let (view, vcx) = offer_view(cx, page);
+        vcx.simulate_scale_factor_change(1.);
+        vcx.simulate_resize(gpui::size(px(360.), px(900.)));
+        vcx.update(|window, cx| {
+            window.set_rem_size(px(32.));
+            view.update(cx, |_, cx| cx.notify());
+        });
+        vcx.run_until_parked();
+        if page {
+            let qr = vcx.debug_bounds("mobile-page-qr").unwrap();
+            let card = vcx.debug_bounds("mobile-page-card").unwrap();
+            assert!(
+                inside(span(qr), span(card)) && inside(span(qr), (0., 360.)),
+                "page QR {qr:?} card {card:?}"
+            );
+        } else {
+            let card = vcx.debug_bounds("mobile-qr-card").unwrap();
+            let side = qr_side(px(220.), 1.);
+            let qr = (
+                f32::from(card.center().x - side / 2.),
+                f32::from(card.center().x + side / 2.),
+            );
+            assert!(
+                inside(qr, span(card)) && inside(qr, (0., 360.)),
+                "settings QR {qr:?} card {card:?}"
+            );
+        }
     }
 }
 

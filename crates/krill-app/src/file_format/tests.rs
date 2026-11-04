@@ -598,3 +598,31 @@ fn open_default_judges_symlinks_by_target() {
     assert!(!revealed("doc.txt"));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[gpui::test]
+fn narrow_image_preview_keeps_zoom_controls_inside_toolbar(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (_, visual) = cx.add_window_view(|_, _| {
+        view::ImageView::new(
+            "/tmp/missing.png".into(),
+            Some(Dimensions {
+                width: 10,
+                height: 10,
+            }),
+        )
+    });
+    visual.simulate_resize(gpui::size(gpui::px(160.), gpui::px(300.)));
+    visual.run_until_parked();
+    let toolbar = visual.debug_bounds("image-toolbar").unwrap();
+    for selector in [
+        "image-fit-button",
+        "image-actual-button",
+        "image-zoom-out",
+        "image-zoom-in",
+    ] {
+        let control = visual.debug_bounds(selector).unwrap();
+        assert!(control.left() >= toolbar.left());
+        assert!(control.right() <= toolbar.right());
+        assert!(control.bottom() <= toolbar.bottom());
+    }
+}

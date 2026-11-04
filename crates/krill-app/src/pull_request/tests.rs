@@ -1186,3 +1186,34 @@ fn windows_command_output_status_and_timeout_are_bounded() {
         io::ErrorKind::TimedOut
     );
 }
+
+#[gpui::test]
+fn short_pr_dialog_keeps_footer_inside_viewport(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let service = Arc::new(Service::new(Arc::new(Fake(AtomicUsize::new(0)))));
+    let (dialog, visual) = cx.add_window_view(|window, cx| {
+        Dialog::new(
+            PathBuf::from("/repo"),
+            "long-branch/".repeat(20),
+            service,
+            window,
+            cx,
+        )
+    });
+    visual.simulate_resize(gpui::size(px(540.), px(320.)));
+    dialog.update(visual, |dialog, cx| {
+        dialog.error = Some("A server rejected the pull request. ".repeat(30));
+        cx.notify();
+    });
+    visual.run_until_parked();
+    let card = visual.debug_bounds("pr-dialog").unwrap();
+    assert!(card.top() >= crate::ui::SPACE_4);
+    assert!(card.bottom() <= px(320.) - crate::ui::SPACE_4);
+    for selector in ["pr-dialog-close", "pr-dialog-submit"] {
+        let button = visual.debug_bounds(selector).unwrap();
+        assert!(button.top() >= card.top());
+        assert!(button.bottom() <= card.bottom());
+        assert!(button.left() >= card.left());
+        assert!(button.right() <= card.right());
+    }
+}

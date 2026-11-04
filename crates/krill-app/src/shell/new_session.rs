@@ -332,6 +332,7 @@ impl Shell {
         .dropdown_menu(move |mut menu, window, cx| {
             menu = menu
                 .action_context(focus.clone())
+                .scrollable(true)
                 .min_w(gpui::px(220.))
                 .item(
                     PopupMenuItem::new(text::NEW_TERMINAL.get())

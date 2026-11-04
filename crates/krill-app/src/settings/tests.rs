@@ -2295,7 +2295,7 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
 
 /// OWE-858: `#admin-content`는 뷰포트 높이로 제한(`min_h_0`)되어 짧은 창에서도
 /// 스크롤 컨테이너로 동작해야 한다. 단축키 탭(50행) 본문이 창 밖으로 새지 않고,
-/// 탭 전환 시 스크롤 id가 바뀌어 최상단부터 다시 보인다.
+/// 실제로 아래로 스크롤한 뒤 탭을 바꾸면 공유 스크롤 핸들도 최상단으로 돌아온다.
 #[gpui::test]
 fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &mut TestAppContext) {
     let d = dir("owe858-content-scroll");
@@ -2326,7 +2326,16 @@ fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &m
         content.origin
     );
 
-    // 다른 탭으로 갔다가 돌아와도 본문 높이는 계속 창 안에 머문다.
+    vcx.simulate_event(gpui::ScrollWheelEvent {
+        position: content.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-2000.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-page-header").unwrap().top() < content.top());
+
+    // 다른 탭으로 갔다가 돌아와도 본문 높이와 시작 위치는 창 안에 머문다.
     vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Appearance, cx)));
     vcx.run_until_parked();
     vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx)));
@@ -2339,7 +2348,8 @@ fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &m
         "admin-content height {:?} escapes the viewport after tab switch",
         content.size.height
     );
-    assert!(vcx.debug_bounds("admin-page-header").is_some());
+    let header = vcx.debug_bounds("admin-page-header").unwrap();
+    assert!(header.top() >= content.top() && header.bottom() <= content.bottom());
 
     fs::remove_dir_all(d).ok();
 }
@@ -5893,6 +5903,49 @@ fn owe729_resources_space_scan_and_artifact_breakdown(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
+#[gpui::test]
+fn resource_worktree_names_survive_long_branch_badges(cx: &mut TestAppContext) {
+    use krill_proto::worktree_space::{SpaceReport, WorktreeSpaceEntry};
+    let d = dir("space-long-branch-layout");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(360.), px(900.)));
+    for rem in [16., 32.] {
+        vcx.update(|window, cx| {
+            window.set_rem_size(px(rem));
+            view.update(cx, |v, cx| {
+                v.space.report = Some(SpaceReport {
+                    worktrees: vec![WorktreeSpaceEntry {
+                        name: "insurance-editor-variants".into(),
+                        branch: Some(
+                            "craftowen/insurance-editor-variants-with-a-very-long-branch-name"
+                                .into(),
+                        ),
+                        total_bytes: 1_234_567,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+                v.set_tab(AdminTab::Disk, cx);
+            });
+        });
+        vcx.run_until_parked();
+        let name = vcx
+            .debug_bounds("admin-space-name-insurance-editor-variants")
+            .unwrap();
+        let row = vcx
+            .debug_bounds("admin-space-wt-insurance-editor-variants")
+            .unwrap();
+        assert!(
+            name.size.width >= px(100.),
+            "name collapsed at rem{rem}: {name:?}"
+        );
+        assert!(name.left() >= row.left() && name.right() <= row.right());
+        assert!(row.left() >= px(0.) && row.right() <= px(360.));
+    }
+    fs::remove_dir_all(d).ok();
+}
+
 /// OWE-729 (MK-175): 워크트리 일괄 클린업(`Cleanup`) 모달의 필터(PR 상태, 경과 일수, dirty 제외)와
 /// 선택 실행이 `krill worktree cleanup --worktree ... --json`으로 전달되고 요약·후보가 갱신되는지 검증.
 #[gpui::test]
@@ -9361,6 +9414,51 @@ fn install_tab_renders_tools_runs_inline_install_and_saves_shell_aliases(cx: &mu
     fs::remove_dir_all(d).ok();
 }
 
+#[gpui::test]
+fn install_names_remain_readable_beside_long_versions(cx: &mut TestAppContext) {
+    let d = dir("install-long-version-layout");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(360.), px(900.)));
+    for rem in [16., 32.] {
+        vcx.update(|window, cx| {
+            window.set_rem_size(px(rem));
+            view.update(cx, |v, cx| {
+                v.set_tab(AdminTab::Install, cx);
+                for tool in ["claude", "codex", "gh", "uv"] {
+                    v.install.statuses.insert(tool, install::ToolStatus {
+                        installed: true,
+                        version: Some("version 123.456.789 (2026-11-04 alpha build arm64 release candidate)".into()),
+                        ..Default::default()
+                    });
+                }
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        for tool in ["claude", "codex", "gh", "uv"] {
+            let selector: &'static str = format!("admin-install-name-{tool}").leak();
+            let name = vcx.debug_bounds(selector).expect("tool name");
+            let badge_selector: &'static str = format!("admin-install-badge-{tool}").leak();
+            let badge = vcx.debug_bounds(badge_selector).expect("version badge");
+            assert!(
+                name.size.width >= px(rem / 2.),
+                "{tool} name collapsed: {name:?}"
+            );
+            assert!(
+                name.right() <= badge.left() || name.bottom() <= badge.top(),
+                "{tool} name and version overlap"
+            );
+            assert!(inside_install_view(name) && inside_install_view(badge));
+        }
+    }
+    fs::remove_dir_all(d).ok();
+}
+
+fn inside_install_view(bounds: gpui::Bounds<gpui::Pixels>) -> bool {
+    bounds.left() >= px(0.) && bounds.right() <= px(360.)
+}
+
 /// 읽지 못한 셸 프로필(UTF-8 아님)을 빈 파일로 보고 에일리어스 블록만 남겨 덮어쓰면 사용자 설정이 사라진다.
 #[gpui::test]
 fn saving_shell_aliases_never_overwrites_an_unreadable_rc(cx: &mut TestAppContext) {
@@ -9455,6 +9553,96 @@ fn ui_audit_settings_rename_focus_and_escape_preserve_account(cx: &mut TestAppCo
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
     vcx.update(|_, cx| assert!(view.read(cx).rename.is_none()));
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn settings_schedule_columns_stack_when_ui_is_zoomed(cx: &mut TestAppContext) {
+    let d = dir("schedule-zoom-layout");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(900.), px(900.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.open_schedule_modal(None, window, cx));
+    });
+    for rem in [16., 32.] {
+        vcx.update(|window, cx| {
+            window.set_rem_size(px(rem));
+            view.update(cx, |_, cx| cx.notify());
+        });
+        vcx.run_until_parked();
+        let name = vcx.debug_bounds("admin-schedule-name").expect("name field");
+        let command = vcx
+            .debug_bounds("admin-schedule-command")
+            .expect("command field");
+        if rem < 20. {
+            assert!(command.left() > name.right());
+        } else {
+            assert!(command.top() > name.bottom());
+            assert!(
+                (command.left() - name.left()).abs() < px(1.),
+                "name={name:?}, command={command:?}"
+            );
+        }
+    }
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn settings_compact_navigation_preserves_content_width_and_tabs(cx: &mut TestAppContext) {
+    let d = dir("compact-settings-layout");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(360.), px(900.)));
+    for language in [Language::Ko, Language::En] {
+        vcx.update(|_, cx| crate::i18n::set_language(language, cx));
+        for rem in [16., 32.] {
+            for tab in [
+                AdminTab::Appearance,
+                AdminTab::Agents,
+                AdminTab::Accounts,
+                AdminTab::Machines,
+                AdminTab::Mobile,
+                AdminTab::Shortcuts,
+                AdminTab::Updates,
+                AdminTab::System,
+                AdminTab::Install,
+                AdminTab::QuickCommands,
+                AdminTab::Disk,
+            ] {
+                eprintln!("compact fixture language={language:?} rem={rem} tab={tab:?}");
+                vcx.update(|window, cx| {
+                    window.set_rem_size(px(rem));
+                    view.update(cx, |v, cx| v.set_tab(tab, cx));
+                });
+                vcx.run_until_parked();
+                assert!(vcx.debug_bounds("admin-sidebar").is_none());
+                assert!(vcx.debug_bounds("admin-compact-tabs").is_some());
+                let column = vcx.debug_bounds("admin-content-column").expect("content");
+                assert!(
+                    column.size.width >= px(280.),
+                    "{language:?} {tab:?} {rem}: {column:?}"
+                );
+                assert!(column.left() >= px(0.) && column.right() <= px(360.));
+                if tab == AdminTab::QuickCommands {
+                    let input = vcx.debug_bounds("admin-qc-text-input").expect("qc input");
+                    assert!(input.size.width >= px(100.), "{input:?}");
+                    assert!(input.left() >= column.left() && input.right() <= column.right());
+                }
+            }
+        }
+    }
+    vcx.simulate_resize(size(px(1400.), px(900.)));
+    vcx.update(|window, cx| {
+        window.set_rem_size(px(16.));
+        view.update(cx, |_, cx| cx.notify());
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-compact-tabs").is_none());
+    let sidebar = vcx
+        .debug_bounds("admin-sidebar")
+        .expect("desktop navigation");
+    assert_eq!(sidebar.size.width, crate::ui::SETTINGS_NAV_WIDTH);
     fs::remove_dir_all(d).ok();
 }
 

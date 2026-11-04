@@ -937,7 +937,7 @@ impl SettingsView {
         let p = crate::ui::palette(cx);
         let busy = self.mobile.pending || self.mobile.pairing_pending();
 
-        let mut modes = div().flex().gap_1p5();
+        let mut modes = div().flex().flex_wrap().gap_1p5();
         for (mode, id, label) in [
             (
                 ConnectMode::Tailscale,
@@ -969,7 +969,8 @@ impl SettingsView {
                 .id("mobile-page-qr")
                 .debug_selector(|| "mobile-page-qr".into())
                 .flex_none()
-                .p_2()
+                .size(qr_size + px(16.))
+                .p(crate::ui::SPACE_2)
                 .rounded(crate::ui::RADIUS_LG)
                 .bg(crate::ui::theme::QR_LIGHT)
                 .child(qr_canvas(qr.clone()).size(qr_size))
@@ -1056,9 +1057,10 @@ impl SettingsView {
         let card = layout::card(p)
             .id("mobile-page-card")
             .debug_selector(|| "mobile-page-card".into())
+            .flex_none()
             .w(card_width)
             .max_w_full()
-            .p_5()
+            .p(crate::ui::SPACE_4)
             .flex()
             .flex_col()
             .gap_4()
@@ -1066,11 +1068,15 @@ impl SettingsView {
                 div()
                     .flex()
                     .flex_wrap()
+                    .items_start()
                     .gap_5()
                     .child(
                         div()
+                            .id("mobile-page-description")
+                            .debug_selector(|| "mobile-page-description".into())
                             .flex_1()
                             .min_w(px(200.))
+                            .max_w_full()
                             .flex()
                             .flex_col()
                             .gap_3()
@@ -1088,11 +1094,13 @@ impl SettingsView {
                             )
                             .child(modes)
                             .children(self.mobile.backup_address.as_ref().map(|address| {
-                                layout::label(
-                                    p,
-                                    format!("{} · {address}", text::TAILSCALE.get()),
-                                    None,
-                                )
+                                div()
+                                    .id("mobile-page-address")
+                                    .debug_selector(|| "mobile-page-address".into())
+                                    .w_full()
+                                    .min_w_0()
+                                    .text_size(crate::ui::TEXT_SM)
+                                    .child(format!("{} · {address}", text::TAILSCALE.get()))
                             }))
                             .child(
                                 div()
@@ -1133,16 +1141,19 @@ impl SettingsView {
             .flex_col()
             .gap_2();
         let mut any = false;
-        for device in self
+        for (index, device) in self
             .mobile
             .devices
             .iter()
             .filter(|d| d.revoked_at_ms.is_none())
+            .enumerate()
         {
             any = true;
             let connected = self.mobile.connected.contains(&device.device_id);
             devices = devices.child(
                 div()
+                    .id(("mobile-page-device", index))
+                    .debug_selector(move || format!("mobile-page-device-{index}"))
                     .flex_none()
                     .p_3()
                     .rounded(crate::ui::RADIUS_MD)
@@ -1168,13 +1179,18 @@ impl SettingsView {
                                 div()
                                     .text_size(crate::ui::TEXT_SM)
                                     .font_weight(FontWeight::MEDIUM)
-                                    .truncate()
                                     .child(device.label.clone()),
                             )
                             .child(
                                 div()
+                                    .id(("mobile-page-device-status", index))
+                                    .debug_selector(move || {
+                                        format!("mobile-page-device-status-{index}")
+                                    })
+                                    .w_full()
+                                    .min_w_0()
                                     .flex()
-                                    .items_center()
+                                    .items_baseline()
                                     .gap_1p5()
                                     .text_size(crate::ui::TEXT_XS)
                                     .text_color(p.muted_foreground)
@@ -1193,7 +1209,6 @@ impl SettingsView {
                                         div()
                                             .flex_1()
                                             .min_w_0()
-                                            .truncate()
                                             .child(device_line(device, connected, now)),
                                     ),
                             ),
@@ -1277,7 +1292,8 @@ impl SettingsView {
             .child(
                 div()
                     .min_h_full()
-                    .p_8()
+                    .px(crate::ui::SPACE_4)
+                    .py_8()
                     .flex()
                     .flex_wrap()
                     .items_center()
