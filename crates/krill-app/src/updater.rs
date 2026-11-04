@@ -18,6 +18,7 @@
 
 pub mod ed25519;
 mod relaunch;
+pub mod release_notes;
 mod rename;
 mod restart;
 
@@ -113,16 +114,6 @@ impl StagedUpdate {
             Some(std::process::id()),
             DEFAULT_HEALTH_TIMEOUT,
         )
-    }
-
-    /// 매니페스트 URL이 GitHub Releases 자산 URL이면 해당 버전의 릴리스 노트 페이지 URL을 돌려준다.
-    #[must_use]
-    pub fn release_notes_url(&self) -> Option<String> {
-        let (repo, _, _) = parse_github_release_asset(&self.manifest_url)?;
-        Some(format!(
-            "https://github.com/{repo}/releases/tag/v{}",
-            self.to_version
-        ))
     }
 }
 

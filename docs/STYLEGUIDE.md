@@ -245,6 +245,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 - **섹션 머리글**: `ui::section_title(p, id, title)` — `TEXT_SM` + `SEMIBOLD` + `p.muted_foreground` + 하단 1px 구분선.
 - **2열 설정 행**: `ui::row(p)` 안에 왼쪽 `ui::label(p, title, desc)`과 오른쪽 `ui::controls()`를 배치한다.
   - **불변식**: `ui::card`와 `ui::row`는 항상 `w_full().min_w_0()`을 가져 부모 열을 채우면서 내부 긴 텍스트·자식 요소 때문에 부모 폭 밖으로 넘치지 않게 한다. `ui::label`은 반드시 `flex_1().min_w_0()`을 갖고, 오른쪽 컨트롤 묶음(`ui::controls`)은 `flex_none()`을 갖는다. `justify_between` 행 안에서 `flex_1()` 없이 `min_w_0()`만 주면 gpui flex 레이아웃에서 텍스트 열 폭이 0px로 무너져 한 글자씩 세로 줄바꿈되는 결함이 발생하며(OWE-651), 반대로 `flex_1().min_w_0()` 없이 긴 설명문을 넣으면 우측 버튼이 카드 테두리 밖으로 밀려 나간다(OWE-793).
+- **업데이트 페이지**: 앱 버전 행과 릴리스별 변경 사항을 카드 없이 하단 1px 구분선만 있는 행으로 그린다(`settings/updates.rs`). 변경 사항은 줄글 목록이며 받는 동안 문구를 띄우지 않는다(§7.0).
 - **불리언 토글 스위치**: `ui::switch(p, id, checked, disabled, on_toggle)` — 켜기/끄기 불리언 설정은 2버튼 나열 대신 단일 알약 트랙(`SWITCH_WIDTH` × `SWITCH_HEIGHT`)과 원형 썸(`SWITCH_THUMB`) 스위치로 일관되게 표현한다.
 - **세그먼트 컨트롤**: `ui::segmented_control(p, items)` + `ui::segment(id, label, active)` — 2~4개 선택지(테마·언어·커서 모양·캐시 TTL·임계값 프리셋 등)는 개별 버튼으로 흩어 놓지 않고 테두리 있는 트랙 안에 묶는다. Orca `SettingsSegmentedControl`과 같게 트랙은 `background` 50% + `border` + `RADIUS_SM`, 활성 항목은 `accent` 바탕 + `accent_foreground` + `MEDIUM`, 비활성 항목은 바탕 없이 `muted_foreground` 글자다. 활성 항목을 `primary`(다크 모드 흰 채움)로 그리면 같은 화면의 주 동작 버튼과 무게가 겹치므로 금지한다. 선택지 라벨에 영어 괄호 병기(`끄기 (Off)`)를 붙이지 않는다.
 - **모달 입력 필드 라벨**: `ui::field_label(name, optional_suffix, p)` — `<Input>` 바로 위에 `gap_1`로 쌓는다.

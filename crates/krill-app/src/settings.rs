@@ -2178,6 +2178,7 @@ pub enum AdminTab {
     Machines,
     Mobile,
     Shortcuts,
+    Updates,
     System,
     /// 내비에 없는 하위 페이지. 프로젝트 메뉴·에이전트 탭에서 연다.
     Project,
@@ -2192,7 +2193,9 @@ pub enum AdminTab {
 // 기본 번들 밖 탭 아이콘. 지정한 SVG만 바이너리에 싣는다.
 gpui_kit_assets::icon_assets!(
     TabIcons,
-    [Keyboard, Server, Smartphone, Monitor, Package, Palette]
+    [
+        Keyboard, Server, Smartphone, Monitor, Package, Palette, RefreshCw
+    ]
 );
 
 fn settings_nav_tab(tab: AdminTab, selected: bool) -> gpui::Stateful<gpui::Div> {
@@ -2207,13 +2210,14 @@ fn settings_nav_tab(tab: AdminTab, selected: bool) -> gpui::Stateful<gpui::Div> 
 }
 
 impl AdminTab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Appearance,
         Self::Agents,
         Self::Accounts,
         Self::Machines,
         Self::Mobile,
         Self::Shortcuts,
+        Self::Updates,
         Self::System,
     ];
 
@@ -2246,6 +2250,7 @@ impl AdminTab {
             Self::QuickCommands => "admin-tab-quick-commands",
             Self::Shortcuts => "admin-tab-shortcuts",
             Self::System => "admin-tab-system",
+            Self::Updates => "admin-tab-updates",
             Self::Disk => "admin-tab-disk",
             Self::Mobile => "admin-tab-mobile",
         }
@@ -2266,6 +2271,7 @@ impl AdminTab {
             Self::QuickCommands => text::TAB_QUICK_COMMANDS,
             Self::Shortcuts => text::TAB_SHORTCUTS,
             Self::System => text::TAB_SYSTEM,
+            Self::Updates => text::TAB_UPDATES,
             Self::Disk => text::TAB_DISK,
             Self::Mobile => crate::i18n::catalog::mobile::TAB,
         }
@@ -2282,6 +2288,7 @@ impl AdminTab {
             Self::QuickCommands => text::TAB_QUICK_COMMANDS_DESC,
             Self::Shortcuts => text::SHORTCUTS_DESC,
             Self::System => text::TAB_SYSTEM_DESC,
+            Self::Updates => text::TAB_UPDATES_DESC,
             Self::Disk => text::TAB_DISK_DESC,
             Self::Mobile => text::TAB_MOBILE_DESC,
         }
@@ -2303,6 +2310,7 @@ impl AdminTab {
             Self::Project | Self::QuickCommands => IconName::Cpu,
             Self::Shortcuts => IconName::Keyboard,
             Self::System => IconName::Settings,
+            Self::Updates => IconName::RefreshCw,
             Self::Disk => IconName::CircleCheck,
             Self::Mobile => IconName::Smartphone,
         }
@@ -2820,6 +2828,8 @@ pub struct SettingsView {
     account_probe_pending: bool,
     account_file_stamp: Vec<Option<AdminFileStamp>>,
     mobile: mobile::Panel,
+    release_notes: updates::Panel,
+    _update_state: Subscription,
     /// 사이드바 'Krill 모바일'에서 연 단독 페이지 모드. 설정 내비 없이 페어링 화면만 그린다.
     mobile_page: bool,
     automations_page: bool,
@@ -3252,6 +3262,13 @@ impl SettingsView {
             account_probe_pending: false,
             account_file_stamp: Vec::new(),
             mobile: mobile::Panel::default(),
+            release_notes: updates::Panel::default(),
+            // 새 버전이 준비되면 열려 있는 페이지에도 그 버전의 변경 사항을 채운다.
+            _update_state: cx.observe_global::<crate::updater::UpdateState>(|this, cx| {
+                if this.tab == AdminTab::Updates {
+                    this.refresh_release_notes(cx);
+                }
+            }),
             mobile_page: false,
             automations_page: false,
             automations: schedules::SchedulesState::default(),
@@ -3681,6 +3698,9 @@ impl SettingsView {
             if self.tab == AdminTab::Project {
                 self.refresh_service_cache(cx);
             }
+            if self.tab == AdminTab::Updates {
+                self.refresh_release_notes(cx);
+            }
         }
     }
 
@@ -3711,6 +3731,9 @@ impl SettingsView {
         }
         if tab == AdminTab::System {
             self.refresh_error_reporting(cx);
+        }
+        if tab == AdminTab::Updates {
+            self.refresh_release_notes(cx);
         }
         cx.notify();
     }
@@ -6330,7 +6353,7 @@ impl SettingsView {
             .child(layout::section_title(
                 p,
                 "general-section-files",
-                text::SECTION_FILES_UPDATES.get(),
+                text::SECTION_FILES.get(),
             ))
             .child(
                 row()
@@ -6395,129 +6418,8 @@ impl SettingsView {
                         ),
                     ),
             )
-            // 자체 업데이터는 macOS 번들 전용이라 다른 OS에서는 숨긴다(규칙 10).
-            .when(cfg!(target_os = "macos"), |el| {
-                el.children(Self::render_update_rows(s, cx))
-            })
     }
 
-    fn render_update_rows(s: &Settings, cx: &mut Context<Self>) -> [gpui::Div; 2] {
-        use gpui_component::Sizable as _;
-
-        use crate::updater::{CheckStatus, UpdateState};
-        let p = crate::ui::palette(cx);
-        let row = || layout::row(p);
-        let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
-        let update_state = cx.try_global::<UpdateState>().cloned().unwrap_or_default();
-        let is_checking = matches!(update_state.status, CheckStatus::Checking);
-        let status_label = if update_state.restart.is_starting() {
-            crate::i18n::catalog::updater_relaunch::CARD_RESTARTING_BTN
-                .get()
-                .to_owned()
-        } else if let Some(error) = update_state.restart.error() {
-            error.to_owned()
-        } else {
-            match &update_state.status {
-                CheckStatus::Idle => match &update_state.staged {
-                    Some(staged) => text::UPDATES_READY.format(&[("version", &staged.to_version)]),
-                    None => format!("v{}", env!("CARGO_PKG_VERSION")),
-                },
-                CheckStatus::Checking => text::UPDATES_CHECKING.get().to_owned(),
-                CheckStatus::UpToDate { version } => {
-                    text::UPDATES_UP_TO_DATE.format(&[("version", version)])
-                }
-                CheckStatus::ChannelMismatch {
-                    configured,
-                    offered,
-                } => text::UPDATES_CHANNEL_MISMATCH.format(&[
-                    ("configured", configured.as_str()),
-                    ("offered", offered.as_str()),
-                ]),
-                CheckStatus::Ready(staged) => {
-                    text::UPDATES_READY.format(&[("version", &staged.to_version)])
-                }
-                CheckStatus::Error(err) => err.clone(),
-            }
-        };
-        let staged_for_btn = update_state.staged.clone().or_else(|| {
-            if let CheckStatus::Ready(staged) = &update_state.status {
-                Some(staged.clone())
-            } else {
-                None
-            }
-        });
-        let check_btn = crate::ui::button_with_reserved_label(
-            "settings-update-check",
-            text::UPDATES_CHECK.get(),
-            text::UPDATES_CHECKING.get(),
-            is_checking,
-        )
-        .small()
-        .outline()
-        .disabled(update_state.restart.is_starting() || is_checking)
-        .debug_selector(|| "settings-update-check".into())
-        .on_click(|_, _, cx| {
-            trigger_manual_update_check(cx);
-        });
-        let status = div()
-            .min_w_0()
-            .text_size(crate::ui::TEXT_SM)
-            .text_color(p.muted_foreground)
-            .debug_selector(|| "settings-update-status".into())
-            .child(status_label);
-        let mut controls = layout::controls().flex_wrap().flex_shrink_1();
-        if let Some(staged) = staged_for_btn {
-            let restart_label = if update_state.restart.error().is_some() {
-                crate::i18n::catalog::updater_relaunch::CARD_RETRY_BTN
-                    .get()
-                    .to_owned()
-            } else {
-                text::UPDATES_RESTART.format(&[("version", &staged.to_version)])
-            };
-            controls = controls.child(
-                crate::ui::button_with_reserved_label(
-                    "settings-update-restart",
-                    restart_label,
-                    crate::i18n::catalog::updater_relaunch::CARD_RESTARTING_BTN.get(),
-                    update_state.restart.is_starting(),
-                )
-                .small()
-                .primary()
-                .disabled(update_state.restart.is_starting() || is_checking)
-                .debug_selector(|| "settings-update-restart".into())
-                .on_click(move |_, _, cx| {
-                    restart_staged_update(staged.clone(), cx);
-                }),
-            );
-        }
-        controls = controls.child(check_btn);
-
-        [
-            row()
-                .flex_col()
-                .items_start()
-                .child(label(text::UPDATES_TITLE.get(), text::UPDATES_DESC.get()))
-                .child(status)
-                .child(controls),
-            row()
-                .child(label(
-                    text::UPDATES_AUTO_RESTART.get(),
-                    text::UPDATES_AUTO_RESTART_DESC.get(),
-                ))
-                .child(
-                    layout::controls().child(
-                        layout::switch(
-                            p,
-                            "update-auto-restart-toggle",
-                            s.auto_restart_update,
-                            false,
-                            |next, _, cx| edit(cx, move |s| s.auto_restart_update = next),
-                        )
-                        .aria_label(text::UPDATES_AUTO_RESTART.get()),
-                    ),
-                ),
-        ]
-    }
     /// 모양 탭의 터미널 글꼴·크기(OWE-658, OWE-798).
     fn render_terminal_tab(&mut self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -10988,6 +10890,7 @@ impl Render for SettingsView {
                             | AdminTab::Project
                             | AdminTab::QuickCommands
                             | AdminTab::System
+                            | AdminTab::Updates
                     ) {
                         c.settings.clone()
                     } else {
@@ -11106,6 +11009,9 @@ impl Render for SettingsView {
         }
 
         {
+            let update_waiting = cx
+                .try_global::<crate::updater::UpdateState>()
+                .is_some_and(|u| u.staged.is_some());
             let mut group_col = div().flex_none().flex().flex_col().gap_1();
             for tab in matches.iter().copied() {
                 let selected = tab == current_tab.page();
@@ -11137,7 +11043,17 @@ impl Render for SettingsView {
                             this.set_tab(search::search_target(&query, tab), cx);
                         }))
                         .child(tab.icon_element().small())
-                        .child(div().flex_1().min_w_0().truncate().child(tab.label())),
+                        .child(div().flex_1().min_w_0().truncate().child(tab.label()))
+                        .when(tab == AdminTab::Updates && update_waiting, |d| {
+                            d.child(
+                                div()
+                                    .debug_selector(|| "admin-tab-updates-dot".into())
+                                    .flex_none()
+                                    .size(crate::ui::STATE_DOT)
+                                    .rounded_full()
+                                    .bg(p.primary),
+                            )
+                        }),
                 );
             }
             nav = nav.child(group_col);
@@ -11251,6 +11167,7 @@ impl Render for SettingsView {
                     .child(self.render_system_rows(&s, cx))
                     .child(self.render_resources_tab(&s, cx)),
                 AdminTab::Disk => div().child(self.render_space_section(cx)),
+                AdminTab::Updates => self.render_updates_tab(&s, cx),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
             };
             let body = div()
@@ -11514,6 +11431,7 @@ pub mod space;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+mod updates;
 
 pub fn usage_color(pct: u8, normal: gpui::Hsla, p: &crate::ui::Palette) -> gpui::Hsla {
     match usage_tone(pct) {
