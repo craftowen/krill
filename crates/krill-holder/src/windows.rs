@@ -250,14 +250,22 @@ impl Holder {
             }
         }
         let mut events = Vec::new();
-        for s in &mut self.sessions {
-            if s.status.is_none() && s.job.empty().unwrap_or(false) {
-                let status = s.process.status().ok().flatten().unwrap_or(STATUS_UNKNOWN);
-                s.status = Some(status);
-                s.console.stop_host().ok();
-                s.console.close();
-                events.push(FromHolder::Exited { id: s.id, status });
-            }
+        for s in self.sessions.iter_mut().filter(|s| s.status.is_none()) {
+            // Also drains the Job's IOCP notifications so they never pile up.
+            let empty = s.job.empty().unwrap_or(false);
+            // As on Unix the session ends with its leader (shell). Apps it launched (GUI,
+            // new console) keep running, as in Windows Terminal. A teardown waits for the
+            // rest of the Job or its deadline.
+            let status = match s.process.status() {
+                Ok(Some(status)) if s.deadline.is_none() || empty => status,
+                Err(_) if empty => STATUS_UNKNOWN,
+                _ => continue,
+            };
+            s.status = Some(status);
+            s.deadline = None;
+            s.console.stop_host().ok();
+            s.console.close();
+            events.push(FromHolder::Exited { id: s.id, status });
         }
         for m in events {
             self.send(&m, None).ok();
