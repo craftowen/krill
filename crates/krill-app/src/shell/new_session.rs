@@ -470,10 +470,13 @@ impl Shell {
                     icons::FILES_SVG,
                     krill_app::i18n::catalog::artifacts::TITLE.get(),
                 )
-                .when(self.artifacts.is_some(), |d| {
-                    d.bg(p.sidebar_accent)
-                        .text_color(p.sidebar_accent_foreground)
-                })
+                .when(
+                    matches!(self.modal, Some(super::Modal::Artifacts(_))),
+                    |d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    },
+                )
                 .on_click(cx.listener(|this, _, window, cx| this.open_artifacts(Some(window), cx))),
             )
             .when(show_automations, |d| {
@@ -485,12 +488,15 @@ impl Shell {
                         sb_text::NAV_AUTOMATIONS.get(),
                     )
                     .debug_selector(|| "nav-automations".into())
-                    .when(self.automations.is_some(), |d| {
-                        d.bg(p.sidebar_accent)
-                            .text_color(p.sidebar_accent_foreground)
-                    })
+                    .when(
+                        matches!(self.modal, Some(super::Modal::Automations(_))),
+                        |d| {
+                            d.bg(p.sidebar_accent)
+                                .text_color(p.sidebar_accent_foreground)
+                        },
+                    )
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_automations_page(Some(window), cx);
+                        this.open_automations(Some(window), cx);
                     }))
                     .context_menu(|menu, _, _| {
                         menu.item(

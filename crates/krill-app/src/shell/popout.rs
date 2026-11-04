@@ -1586,7 +1586,7 @@ impl Shell {
                         );
                         open_weak
                             .update(cx, |shell, cx| {
-                                if let Some(settings) = &shell.settings {
+                                if let Some(settings) = shell.settings() {
                                     settings.update(cx, |view, cx| {
                                         view.show_machine_add(
                                             krill_app::machines::AddMethod::Ssh,

@@ -297,11 +297,8 @@ impl Shell {
                 self.cancel_pending_paste_for(pane, cx);
             }
         }
-        if let Some(settings) = &self.settings {
-            let visible = active
-                && self.dashboard.is_none()
-                && self.artifacts.is_none()
-                && self.automations.is_none();
+        if let Some(settings) = self.settings() {
+            let visible = active && self.dashboard.is_none();
             settings.update(cx, |view, cx| view.set_visible(visible, cx));
         }
         let resources_visible = active && !self.page_open() && self.dashboard.is_none();

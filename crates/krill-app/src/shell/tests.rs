@@ -6693,16 +6693,18 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.debug_bounds("nav-automations").is_some());
 
-    // 'Krill 모바일'은 사이드바를 둔 채 본문에 모바일 페이지를 연다.
+    // 'Krill 모바일'은 터미널 화면 위 모달로 모바일 페이지를 연다.
     let mobile = cx.debug_bounds("nav-mobile").unwrap();
     cx.simulate_click(mobile.center(), Modifiers::default());
     cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-modal").is_some());
     assert!(cx.debug_bounds("mobile-page").is_some());
     assert!(cx.debug_bounds("mobile-page-phone").is_some());
     assert!(cx.debug_bounds("sidebar-column").is_some());
+    assert!(cx.debug_bounds("terminal-surface").is_some());
     assert!(cx.debug_bounds("admin-sidebar").is_none());
     cx.update(|_, cx| {
-        let settings = view.read(cx).settings.clone().unwrap();
+        let settings = view.read(cx).settings().cloned().unwrap();
         assert_eq!(
             settings.read(cx).tab(),
             krill_app::settings::AdminTab::Mobile
@@ -6717,7 +6719,7 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
             assert!(!s.mobile_page_open(cx));
             assert!(s.navigate_back(None, cx));
             assert!(s.mobile_page_open(cx));
-            let settings = s.settings.as_ref().unwrap().read(cx);
+            let settings = s.settings().unwrap().read(cx);
             assert_eq!(settings.tab(), krill_app::settings::AdminTab::Mobile);
             assert!(settings.mobile_page());
         });
@@ -6739,7 +6741,7 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     cx.simulate_click(close.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("mobile-page").is_none());
-    cx.update(|_, cx| assert!(view.read(cx).settings.is_none()));
+    cx.update(|_, cx| assert!(view.read(cx).settings().is_none()));
 }
 
 #[gpui::test]
@@ -6750,12 +6752,13 @@ fn artifacts_open_the_library_by_default_and_back_preserves_the_workspace(cx: &m
     let nav = cx.debug_bounds("nav-artifacts").unwrap();
     cx.simulate_click(nav.center(), Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds("artifacts-page").is_some());
+    assert!(cx.debug_bounds("artifacts-modal").is_some());
     assert!(cx.debug_bounds("artifact-list").is_some());
+    assert!(cx.debug_bounds("admin-modal").is_none());
+    assert!(cx.debug_bounds("terminal-surface").is_some());
+    assert!(cx.debug_bounds("session-tab-0").is_some());
     cx.update(|_, cx| {
         let shell = view.read(cx);
-        assert!(shell.settings.is_none());
-        assert!(shell.artifacts.is_some());
         assert!(shell.focused_local_session().is_none());
         assert_eq!(shell.layout, before);
         assert_eq!(shell.nav_history.entries.last(), Some(&NavEntry::Artifacts));
@@ -6764,29 +6767,31 @@ fn artifacts_open_the_library_by_default_and_back_preserves_the_workspace(cx: &m
     assert_eq!(
         layout_of(&view, cx),
         before,
-        "library shortcuts must not split a hidden terminal"
+        "library shortcuts must not split the terminal under the modal"
     );
     let back = cx.debug_bounds("artifacts-back").unwrap();
     cx.simulate_click(back.center(), Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds("artifacts-page").is_none());
+    assert!(cx.debug_bounds("artifacts-modal").is_none());
     assert_eq!(layout_of(&view, cx), before);
 
-    // Navigation history and normal Settings remain separate destinations.
+    // Opening Settings replaces the artifacts modal; Back returns to it.
     cx.update(|window, cx| {
         view.update(cx, |s, cx| {
             s.open_artifacts(Some(window), cx);
             s.open_settings(krill_app::settings::AdminTab::Appearance, None, cx);
-            assert!(s.artifacts.is_none());
-            s.navigate_back(None, cx);
-            assert!(s.artifacts.is_some());
-            assert!(s.settings.is_none());
         });
     });
     cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-modal").is_some());
+    assert!(cx.debug_bounds("artifacts-modal").is_none());
+    cx.update(|_, cx| view.update(cx, |s, cx| assert!(s.navigate_back(None, cx))));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("artifacts-modal").is_some());
+    assert!(cx.debug_bounds("admin-modal").is_none());
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
-    assert!(cx.debug_bounds("artifacts-page").is_none());
+    assert!(cx.debug_bounds("artifacts-modal").is_none());
     assert_eq!(layout_of(&view, cx), before);
 }
 
@@ -6798,13 +6803,23 @@ fn automations_open_from_sidebar_and_back_preserves_the_workspace(cx: &mut TestA
     let nav = cx.debug_bounds("nav-automations").unwrap();
     cx.simulate_click(nav.center(), Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds("automations-page").is_some());
+    assert!(cx.debug_bounds("automations-modal").is_some());
     assert!(cx.debug_bounds("automations-empty").is_some());
+    assert!(cx.debug_bounds("terminal-surface").is_some());
+    assert!(cx.debug_bounds("session-tab-0").is_some());
+    let new = cx.debug_bounds("automations-new-btn").unwrap();
+    cx.simulate_click(new.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("automations-editor-modal").is_some(),
+        "the editor dialog opens on top of the automations modal"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("automations-editor-modal").is_none());
+    assert!(cx.debug_bounds("automations-modal").is_some());
     cx.update(|_, cx| {
         let shell = view.read(cx);
-        assert!(shell.settings.is_none());
-        assert!(shell.artifacts.is_none());
-        assert!(shell.automations.is_some());
         assert_eq!(shell.layout, before);
         assert_eq!(
             shell.nav_history.entries.last(),
@@ -6818,7 +6833,7 @@ fn automations_open_from_sidebar_and_back_preserves_the_workspace(cx: &mut TestA
     assert_eq!(layout_of(&view, cx), before);
 
     cx.update(|window, cx| {
-        view.update(cx, |s, cx| s.open_automations_page(Some(window), cx));
+        view.update(cx, |s, cx| s.open_automations(Some(window), cx));
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("automations-page").is_some());
@@ -6827,6 +6842,29 @@ fn automations_open_from_sidebar_and_back_preserves_the_workspace(cx: &mut TestA
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("automations-page").is_none());
+
+    let nav = cx.debug_bounds("nav-automations").unwrap();
+    cx.simulate_click(nav.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("automations-modal").is_some());
+    cx.update(|window, cx| view.update(cx, |s, cx| s.open_artifacts(Some(window), cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("artifacts-modal").is_some());
+    assert!(
+        cx.debug_bounds("automations-modal").is_none(),
+        "opening one modal replaces the other"
+    );
+    let modal = cx.debug_bounds("artifacts-modal").unwrap();
+    cx.simulate_click(
+        point(modal.left() / 2., modal.center().y),
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("artifacts-modal").is_none(),
+        "a backdrop click closes the modal"
+    );
+    assert_eq!(layout_of(&view, cx), before);
 }
 
 /// 여러 `Shell` 창이 열려 있을 때 한 창에서 인앱 설정을 닫으면 해당 창의 설정만 닫히고,
@@ -6856,8 +6894,8 @@ fn multi_window_settings_close_targets_matching_shell_host(cx: &mut TestAppConte
     cx.simulate_click(btn.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("admin-center").is_some());
-    assert!(cx.update(|_, cx| view_a.read(cx).settings.is_some()));
-    assert!(cx.update(|_, cx| view_b.read(cx).settings.is_none()));
+    assert!(cx.update(|_, cx| view_a.read(cx).settings().is_some()));
+    assert!(cx.update(|_, cx| view_b.read(cx).settings().is_none()));
 
     // Clicking "Back to app" in window A must close window A's settings (not be swallowed by window B).
     let back = cx
@@ -6866,7 +6904,7 @@ fn multi_window_settings_close_targets_matching_shell_host(cx: &mut TestAppConte
     cx.simulate_click(back.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("admin-center").is_none());
-    assert!(cx.update(|_, cx| view_a.read(cx).settings.is_none()));
+    assert!(cx.update(|_, cx| view_a.read(cx).settings().is_none()));
 
     // 2. Open settings in both window A and window B, then press Escape in window A:
     //    only window A's settings should close, leaving window B's settings open.
@@ -6880,15 +6918,15 @@ fn multi_window_settings_close_targets_matching_shell_host(cx: &mut TestAppConte
         });
     });
     cx.run_until_parked();
-    assert!(cx.update(|_, cx| view_a.read(cx).settings.is_some()));
-    assert!(cx.update(|_, cx| view_b.read(cx).settings.is_some()));
+    assert!(cx.update(|_, cx| view_a.read(cx).settings().is_some()));
+    assert!(cx.update(|_, cx| view_b.read(cx).settings().is_some()));
 
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     assert!(cx.debug_bounds("admin-center").is_none());
-    assert!(cx.update(|_, cx| view_a.read(cx).settings.is_none()));
+    assert!(cx.update(|_, cx| view_a.read(cx).settings().is_none()));
     assert!(
-        cx.update(|_, cx| view_b.read(cx).settings.is_some()),
+        cx.update(|_, cx| view_b.read(cx).settings().is_some()),
         "closing settings in window A must not close settings in window B"
     );
 
@@ -6905,23 +6943,23 @@ fn multi_window_settings_close_targets_matching_shell_host(cx: &mut TestAppConte
         unrendered
     });
     cx.run_until_parked();
-    assert!(cx.update(|_, cx| view_a.read(cx).settings.is_some()));
+    assert!(cx.update(|_, cx| view_a.read(cx).settings().is_some()));
     assert!(cx.update(|_, cx| unrendered.read(cx).window.is_none()));
-    assert!(cx.update(|_, cx| unrendered.read(cx).settings.is_some()));
+    assert!(cx.update(|_, cx| unrendered.read(cx).settings().is_some()));
     cx.update(|window, cx| {
         krill_app::settings::close_settings_page(window, cx);
     });
     cx.run_until_parked();
     assert!(
-        cx.update(|_, cx| view_a.read(cx).settings.is_none()),
+        cx.update(|_, cx| view_a.read(cx).settings().is_none()),
         "close_settings_page on window A must close window A's settings, not be hijacked by unrendered or view_b"
     );
     assert!(
-        cx.update(|_, cx| view_b.read(cx).settings.is_some()),
+        cx.update(|_, cx| view_b.read(cx).settings().is_some()),
         "view_b's settings must remain untouched"
     );
     assert!(
-        cx.update(|_, cx| unrendered.read(cx).settings.is_some()),
+        cx.update(|_, cx| unrendered.read(cx).settings().is_some()),
         "unrendered host's settings must remain untouched"
     );
     cx.update(|_, cx| {
@@ -6943,14 +6981,14 @@ fn multi_window_settings_close_targets_matching_shell_host(cx: &mut TestAppConte
             s.open_settings(krill_app::settings::AdminTab::Machines, None, cx);
         });
         assert!(
-            floating.read(cx).settings.is_none(),
+            floating.read(cx).settings().is_none(),
             "floating terminal window must never host SettingsView in-place"
         );
     });
     cx.run_until_parked();
     assert!(
         cx.update(|_, cx| {
-            view_a.read(cx).settings.is_some() || view_b.read(cx).settings.is_some()
+            view_a.read(cx).settings().is_some() || view_b.read(cx).settings().is_some()
         }),
         "Settings must open in a Main Shell host when triggered from a Floating terminal"
     );
@@ -7168,13 +7206,13 @@ fn navigation_history_back_forward_shortcuts_and_buttons(cx: &mut TestAppContext
         });
     });
     cx.run_until_parked();
-    cx.update(|_, cx| assert!(view.read(cx).settings.is_some()));
+    cx.update(|_, cx| assert!(view.read(cx).settings().is_some()));
 
     // ⌘⌥← (NavigateBack): 설정 뷰에서 직전 탭(탭 2)으로 복귀한다.
     cx.simulate_keystrokes("cmd-alt-left");
     cx.run_until_parked();
     cx.update(|_, cx| {
-        assert!(view.read(cx).settings.is_none());
+        assert!(view.read(cx).settings().is_none());
         assert_eq!(view.read(cx).layout.active(), 2);
         assert!(view.read(cx).can_navigate_back(cx));
         assert!(view.read(cx).can_navigate_forward(cx));
@@ -8455,7 +8493,7 @@ fn command_palette_digit_runs_settings_action(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("cmd-1");
     cx.run_until_parked();
     assert!(cx.update(|_, cx| view.read(cx).jump.is_none()));
-    assert!(cx.update(|_, cx| view.read(cx).settings.is_some()));
+    assert!(cx.update(|_, cx| view.read(cx).settings().is_some()));
     assert_eq!(layout_of(&view, cx).tabs().len(), tabs_before);
 }
 
@@ -8851,7 +8889,7 @@ fn pairing_opens_machines_invite_page(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("link-client-input-link").is_some());
     assert!(cx.debug_bounds("link-server-panel").is_none());
     cx.update(|_, cx| {
-        let settings = view.read(cx).settings.as_ref().unwrap();
+        let settings = view.read(cx).settings().unwrap();
         assert_eq!(
             settings.read(cx).tab(),
             krill_app::settings::AdminTab::Machines
