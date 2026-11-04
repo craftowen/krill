@@ -113,9 +113,15 @@ pub fn run_probe(pid: u32) -> ExitCode {
 }
 
 fn console_members(pid: u32) -> io::Result<Vec<u32>> {
-    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, GetConsoleProcessList};
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, FreeConsole, GetConsoleProcessList, SetConsoleCtrlHandler,
+    };
     // SAFETY: this dedicated helper owns no sessions and may detach its own console.
     unsafe { FreeConsole() };
+    // The holder no longer passes down an ignored Ctrl+C. A user's Ctrl+C in the session
+    // must not end this probe while it is attached there.
+    // SAFETY: a NULL handler only sets this helper's own Ctrl+C ignore flag.
+    unsafe { SetConsoleCtrlHandler(None, 1) };
     // SAFETY: attaches only this short-lived helper, never the daemon or holder.
     if unsafe { AttachConsole(pid) } == 0 {
         return Err(io::Error::last_os_error());

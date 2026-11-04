@@ -961,6 +961,15 @@ pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
     spawn_detached(std::env::current_exe()?.as_os_str(), args, true).map(|_| ())
 }
 
+/// `CREATE_NEW_PROCESS_GROUP`(bootstrap)이 켠 Ctrl+C 무시 표시는 krilld와 세션 셸까지 상속돼 `ping -t`가
+/// Ctrl+C로 멈추지 않았다. 콘솔이 없는 holder에는 Ctrl+C가 오지 않으므로 끄기만 한다.
+pub fn enable_ctrl_c() {
+    // SAFETY: a NULL handler only clears this process's inheritable Ctrl+C ignore flag.
+    if unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) } == 0 {
+        tracing::warn!(error = %io::Error::last_os_error(), "Ctrl+C stays ignored in new sessions");
+    }
+}
+
 /// Start without inheriting any handles, including captured stdout in ancestors.
 /// Only the holder bootstrap needs to escape a caller's Job.
 pub fn spawn_detached(path: &OsStr, args: &[OsString], break_away: bool) -> io::Result<Process> {

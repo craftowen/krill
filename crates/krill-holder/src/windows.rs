@@ -102,6 +102,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
         return sys::bootstrap(&args.collect::<Vec<_>>());
     }
     krill_log::init(krill_log::Component::Holder).ok();
+    sys::enable_ctrl_c();
     let mut h = Holder {
         path,
         args: args.collect(),
