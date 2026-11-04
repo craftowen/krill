@@ -2623,6 +2623,10 @@ impl Shell {
                 {
                     return;
                 }
+                if conn.launched {
+                    // 앱 기동 밖에서 찍히면 krilld가 holder 상실을 알린 것이다(고아 재결합).
+                    tracing::info!("daemon connection launched a new holder");
+                }
                 let features = conn.negotiated.features;
                 let mut stream = conn.stream;
                 if bg

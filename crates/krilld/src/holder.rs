@@ -272,8 +272,26 @@ impl Holder {
     }
 
     fn read(&self, link: &mut Link, mut exited: impl FnMut(SessionId, i32)) {
-        while let Ok(Some(p)) = link.recv() {
-            let Ok(m) = decode(p) else { break }; // 프로토콜 위반: 끊긴 것으로 본다
+        loop {
+            let p = match link.recv() {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    tracing::info!("holder link closed");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(kind = ?e.kind(), error = %e, "holder link receive failed");
+                    return;
+                }
+            };
+            // 프로토콜 위반: 끊긴 것으로 본다
+            let m = match decode(p) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(kind = ?e.kind(), error = %e, "holder link frame undecodable");
+                    return;
+                }
+            };
             match m {
                 Some((FromHolder::Exited { id, status }, _)) => exited(id, status),
                 Some((
