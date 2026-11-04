@@ -849,8 +849,12 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
             Some((id, process, replacement_process))
         });
 
-        let wal = from_agy.join("conversations").join(format!("{sid}.db-wal"));
-        fs::write(&wal, b"active writer").unwrap();
+        // The live original keeps its WAL; only an open rollback journal means a write.
+        let conversation = from_agy.join("conversations");
+        fs::write(conversation.join(format!("{sid}.db-wal")), b"frames").unwrap();
+        fs::write(conversation.join(format!("{sid}.db-shm")), b"index").unwrap();
+        let journal = conversation.join(format!("{sid}.db-journal"));
+        fs::write(&journal, b"active writer").unwrap();
         reg.queue_account_switch(ProviderKind::Antigravity, &target);
         reg.process_account_work_in(&home);
         let pending = load(Some(&state));
@@ -865,7 +869,7 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
                 ProviderKind::Antigravity
             ))
         );
-        fs::remove_file(wal).unwrap();
+        fs::remove_file(journal).unwrap();
         lock(&reg.account_work.pending)
             .get_mut(&SwitchScope::Session(
                 SessionId(11),
@@ -896,6 +900,10 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
         assert_eq!(
             fs::read(to_agy.join("conversations").join(format!("{sid}.db"))).unwrap(),
             b"SQLite format 3\0fixture-conversation"
+        );
+        assert_eq!(
+            fs::read(to_agy.join("conversations").join(format!("{sid}.db-wal"))).unwrap(),
+            b"frames"
         );
         assert_eq!(
             fs::read(to_agy.join("annotations").join(format!("{sid}.pbtxt"))).unwrap(),
