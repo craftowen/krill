@@ -2561,10 +2561,15 @@ pub fn install_agent_hook_at(
     let (target_path, target_agent) = agent_hook_target_path(agent_id, home)
         .ok_or_else(|| std::io::Error::other(format!("unsupported agent: {agent_id}")))?;
     let staged = crate::onboarding::staged_krill(home);
-    let exe = if staged.is_file() {
-        staged.as_path()
-    } else {
-        Path::new("krill")
+    // Windows 설치본은 사본을 만들지 않는다(onboarding `stage_binaries`). 번들의 krill을 그대로 쓴다.
+    let bundled = krill_proto::daemon::sibling_exe("krill")
+        .ok()
+        .filter(|krill| crate::onboarding::in_app_bundle(krill))
+        .map(|krill| krill_proto::os::shell_path(&krill));
+    let exe = match &bundled {
+        Some(krill) => krill.as_path(),
+        None if staged.is_file() => staged.as_path(),
+        None => Path::new("krill"),
     };
     install_hook_file_with_exe(&target_path, target_agent, state, exe)
 }
