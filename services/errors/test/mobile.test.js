@@ -164,8 +164,7 @@ test('mobile reuses transactional conflicts, shared native quotas, and 30-day qu
 test('mobile preflight admits only canonical PWA, loopback and Tailscale origins, never credentials', async t => {
   const env = environment(t);
   for (const origin of [ORIGIN, 'http://localhost:3000', 'https://localhost', 'http://127.0.0.1:9123',
-    'http://127.9.8.7:8080', 'http://[::1]:9123', 'https://100.64.0.0:9123', 'http://100.127.255.255:9123',
-    'https://a.trycloudflare.com', 'https://example-random-123.trycloudflare.com']) {
+    'http://127.9.8.7:8080', 'http://[::1]:9123', 'https://100.64.0.0:9123', 'http://100.127.255.255:9123']) {
     const response = await worker.fetch(new Request('https://errors.test/v1/mobile-events', {method: 'OPTIONS', headers: {
       origin, 'access-control-request-method': 'POST', 'access-control-request-headers': 'Content-Type',
     }}), env);
@@ -178,10 +177,7 @@ test('mobile preflight admits only canonical PWA, loopback and Tailscale origins
     'http://localhost.evil.test', 'http://100.63.255.255:9123', 'http://100.128.0.0:9123',
     'http://192.168.1.2:9123', 'https://user:secret@localhost:3000', 'http://127.1:3000', 'http://0x7f000001:3000',
     'ftp://localhost', 'https://krill-mobile.pages.dev:444', 'http://[::ffff:7f00:1]:9123',
-    'http://example.trycloudflare.com', 'https://example.trycloudflare.com:444',
-    'https://example.trycloudflare.com:443', 'https://sub.example.trycloudflare.com',
-    'https://example.trycloudflare.com.evil.test', 'https://-bad.trycloudflare.com',
-    'https://bad-.trycloudflare.com', 'https://bad_name.trycloudflare.com', 'https://secret@example.trycloudflare.com']) {
+    'https://a.trycloudflare.com', 'https://example-random-123.trycloudflare.com']) {
     const response = await send(env, [event()], {headers: {origin}});
     assert.equal(response.status, 403, origin); assert.equal(response.headers.get('access-control-allow-origin'), null);
     assert.equal((await response.text()).includes(origin), false);

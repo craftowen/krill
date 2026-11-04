@@ -341,7 +341,6 @@ test("replacement cancellation restores saved destination and credential togethe
       device_id: "a".repeat(64),
       credential: "b".repeat(64),
       rid: "c".repeat(32),
-      url: "https://saved.trycloudflare.com",
     },
     h = harness(
       saved,
@@ -526,7 +525,6 @@ for (const delayed of ["fetch", "json"])
         device_id: "a".repeat(64),
         credential: "b".repeat(64),
         rid: "c".repeat(32),
-        url: "https://saved.trycloudflare.com",
         hash: "0123456789abcdef",
       },
       h = harness(saved, undefined, true),
@@ -569,8 +567,7 @@ for (const delayed of ["fetch", "json"])
       events = h.events.length;
     jsonResult.resolve({
       hash: "fedcba9876543210",
-      url: "https://stale.trycloudflare.com",
-      relay: false,
+      relay: true,
     });
     fetchResult.resolve(response);
     await pending;
@@ -612,7 +609,7 @@ test("closing a connection cancels pending discovery before a late JSON redirect
   h.transport.close();
   jsonResult.resolve({
     hash: "fedcba9876543210",
-    url: "https://stale.trycloudflare.com",
+    relay: true,
   });
   await pending;
   assert.equal(h.store.get("krill-mobile-v2"), stored);
@@ -626,7 +623,6 @@ test("pairing a second desktop keeps the first credential and switching restores
       device_id: "first",
       credential: "11".repeat(32),
       rid: "a".repeat(32),
-      url: "https://first.trycloudflare.com",
       hash: "0123456789abcdef",
     },
     h = harness(saved, undefined, true),
@@ -903,7 +899,7 @@ test("switching while discovery is pending aborts the old route update", async (
     ok: true,
     json: async () => ({
       hash: "fedcba9876543210",
-      url: "https://stale.trycloudflare.com",
+      relay: true,
     }),
   });
   await pending;
@@ -1038,7 +1034,7 @@ test("background discovery/auth cannot replace the active desktop or revive remo
     ok: true,
     json: async () => ({
       hash: "fedcba9876543210",
-      url: "https://firstnew.trycloudflare.com",
+      relay: true,
     }),
   });
   await peer.locate();
@@ -1047,7 +1043,7 @@ test("background discovery/auth cannot replace the active desktop or revive remo
   assert.equal(e.profiles().find((p) => p.active).id, second);
   assert.equal(JSON.parse(h.store.get("krill-mobile-v2")).device_id, "second");
   assert.equal(h.redirects.length, 0);
-  assert.match(peer.socketUrl(), /firstnew/);
+  assert.match(peer.socketUrl(), /\/r\/aaaa/);
   assert.equal(e.profiles().find((p) => p.id === first).name, "First renamed");
   assert.throws(() => peer.authenticated({ device_id: "second" }), /identity/);
   e.forgetHost(first);
@@ -1200,70 +1196,6 @@ test("only the selected host prewarms one reusable terminal connection and demot
   t.close();
   assert.equal(h.sockets.at(-1).closed, true);
   taken.socket.close();
-});
-
-test("relay has priority after reload and host switch while the alternate remains available", () => {
-  const saved = {
-      device_id: "first",
-      credential: "11".repeat(32),
-      rid: "a".repeat(32),
-      url: "https://stale.trycloudflare.com",
-      hash: "0123456789abcdef",
-    },
-    h = harness(saved, undefined, true),
-    e = h.endpoint,
-    id = e.profiles()[0].id,
-    peer = e.forHost(id);
-  assert.match(peer.socketUrl(), /\/r\/aaaa/);
-  peer.fallback(peer.socketUrl());
-  assert.match(peer.socketUrl(), /stale/);
-  peer.fallback(peer.socketUrl());
-  peer.authenticated({});
-  const stored = JSON.parse(h.store.get("krill-mobile-v2"));
-  assert.equal(stored.preferred_route, "relay");
-  assert.equal(stored.url, saved.url, "alternate remains available");
-  const reload = h.context.KrillMobile.transport.bootstrap();
-  assert.match(reload.socketUrl(), /\/r\/aaaa/);
-  reload.selectHost(id);
-  assert.match(reload.socketUrl(), /\/r\/aaaa/);
-  assert.match(reload.forHost(id).socketUrl(), /\/r\/aaaa/);
-  const again = reload.forHost(id);
-  again.fallback(again.socketUrl());
-  again.authenticated({});
-  assert.equal(
-    JSON.parse(h.store.get("krill-mobile-v2")).preferred_route,
-    "tunnel",
-  );
-  assert.match(
-    h.context.KrillMobile.transport.bootstrap().socketUrl(),
-    /\/r\/aaaa/,
-  );
-  h.transport.close();
-});
-
-test("successful discovery route is attempted directly instead of being toggled back to relay", async () => {
-  const saved = {
-      device_id: "first",
-      credential: "11".repeat(32),
-      rid: "a".repeat(32),
-      url: "https://stale.trycloudflare.com",
-      hash: "0123456789abcdef",
-    },
-    h = harness(saved, undefined, true);
-  h.context.fetch = async () => ({
-    ok: true,
-    json: async () => ({
-      hash: saved.hash,
-      url: "https://fresh.trycloudflare.com",
-    }),
-  });
-  const { pending, socket } = await h.start();
-  socket.emit("error");
-  await pending;
-  assert.match(h.endpoint.socketUrl(), /fresh/);
-  await h.tick(0);
-  assert.match(h.sockets.at(-1).url, /fresh/);
-  h.transport.close();
 });
 
 test("a previously healthy connection redials without the one-second delay and still backs off repeated failures", async () => {
@@ -1953,7 +1885,7 @@ test("explicit retry after authentication rejection restores the cleared desktop
 test("relay attachment saves the authenticated connection origin instead of its QR wrapper", async () => {
   const saved = { device_id: "phone", credential: "11".repeat(32), rid: "a".repeat(32) },
     h = harness(saved, undefined, true), e = h.endpoint, id = e.profiles()[0].id,
-    next = e.adopt("https://elsewhere.trycloudflare.com/m/0123456789abcdef/#pair=ab&key=secret&r=" + saved.rid);
+    next = e.adopt("https://elsewhere.example/m/0123456789abcdef/#pair=ab&key=secret&r=" + saved.rid);
   const attaching = next.attach(),
     probe = await candidateReply(h, { device_id: "phone", credential: null, desktop: desktopManifest() });
   await attaching;

@@ -360,9 +360,9 @@ fn supervise_loop(
     registry: &Weak<Registry>,
     hello: &ServerHello,
 ) {
-    // 고정 출처에 이 앱 버전이 없으면 새 QR만 404가 된다(게이트웨이가 터널 QR로 낸다). 릴레이는 그래도 붙는다:
+    // 고정 출처에 이 앱 버전이 없으면 새 QR만 404가 된다(게이트웨이가 새 페어링을 거부한다). 릴레이는 그래도 붙는다:
     // 이미 짝지은 PWA(이전 해시)는 릴레이로 계속 접속해야 하고, 해시는 UI 식별용이지 프로토콜이 아니다.
-    // 첫 확인은 연결 전에 끝내 배포된 버전에서 터널을 괜히 띄우지 않게 한다.
+    // 첫 확인은 연결 전에 끝내, 연결 직후의 페어링 판정이 배포 여부를 이미 알게 한다.
     if super::tunnel::publication_available(publication) {
         assets.store(true, Ordering::Release);
     } else {
@@ -458,18 +458,7 @@ fn run_once(
     } else {
         Transport::Plain(tcp)
     };
-    let tunnel_query = lock(&shared.state)
-        .tunnel
-        .as_ref()
-        .and_then(|t| t.ready_url())
-        .filter(|u| super::tunnel::parse_url(u).is_some())
-        .map(|u| format!("&url={u}"))
-        .unwrap_or_default();
-    let path = format!(
-        "/r/{}?hash={}{tunnel_query}",
-        publication.rid,
-        super::pwa::asset_hash()
-    );
+    let path = format!("/r/{}?hash={}", publication.rid, super::pwa::asset_hash());
     let session = lock(&shared.state)
         .account
         .session

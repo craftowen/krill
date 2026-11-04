@@ -128,8 +128,6 @@
     }
     const direct = secureDirect(host.routes?.tailscale?.origin);
     if (direct) routes.push({ kind: "tailscale", url: directSocket(direct) });
-    if (host.url && /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(host.url))
-      routes.push({ kind: "tunnel", url: `wss://${host.url.slice(8)}/ws?v=${hash}` });
     if (!host.fixed && !direct) routes.push({ kind: "direct", url: directSocket(host.origin || location.origin) });
     return routes;
   }
@@ -233,7 +231,7 @@
           ? { ticket, secret }
           : null,
       auth = parameters.get("auth"),
-      sensitive = ["p", "pair", "key", "t", "r", "d", "h", "install"],
+      sensitive = ["p", "pair", "key", "r", "d", "h", "install"],
       consumed = sensitive.some((key) => fragment.has(key));
     for (const key of [...sensitive, "auth"]) parameters.delete(key);
     history.replaceState(
@@ -250,11 +248,7 @@
       pairingPending = !!pair,
       replacementId = null;
     const hostId = (c) =>
-      c.rid
-        ? "relay:" + c.rid
-        : c.url
-          ? "tunnel:" + c.url
-          : "direct:" + (c.origin || location.origin);
+      c.rid ? "relay:" + c.rid : "direct:" + (c.origin || location.origin);
     let updateHandler = null,
       updatePending = !1;
     const hostListeners = new Set();
@@ -316,7 +310,6 @@
             null),
           (saved = credentials = active),
           (rid = active?.rid),
-          (url = active?.url),
           (directOrigin = active?.origin || location.origin),
           (destinationFixed = active?.fixed ?? fixed),
           (useRelay = validRid(rid)));
@@ -345,22 +338,14 @@
       credentials = {
         device_id: seed[1],
         credential: seed[2],
-        ...(fixed && { rid: seed[3], url: null, hash }),
+        ...(fixed && { rid: seed[3], hash }),
       };
       try {
         localStorage.setItem(STORE, JSON.stringify(credentials));
       } catch {}
     }
-    let rid = pair ? fragment.get("r") : credentials?.rid,
-      url = pair
-        ? fragment.get("t")
-          ? "https://" + fragment.get("t")
-          : null
-        : credentials?.url;
-    const validUrl = (value) =>
-        typeof value == "string" &&
-        /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(value),
-      validRid = (value) =>
+    let rid = pair ? fragment.get("r") : credentials?.rid;
+    const validRid = (value) =>
         typeof value == "string" && /^[0-9a-f]{32}$/.test(value);
     let pairingDirect = pair ? secureDirect(fragment.get("d")) : null;
     let useRelay = validRid(rid);
@@ -384,8 +369,6 @@
           if (!found) throw Error("Desktop is no longer saved.");
           const source = { ...found };
           let auth2 = { ...source },
-            peerUrl = source.url,
-            relay = validRid(source.rid),
             selectedRoute = null;
           const current = () => hosts.find((h) => h.id === id && stillSaved(h)),
             peerFixed = source.fixed ?? fixed,
@@ -503,12 +486,8 @@
                 if (controller.signal.aborted || !isCurrent()) return !1;
                 typeof found2.hash == "string" &&
                   /^[0-9a-f]{16}$/.test(found2.hash) &&
-                  (validUrl(found2.url) || found2.url === "" || found2.relay) &&
-                  ((peerUrl = validUrl(found2.url) ? found2.url : null),
-                  (relay = !peerUrl),
-                  (selectedRoute = null),
-                  (source.preferred_route = relay ? "relay" : "tunnel"),
-                  save({ url: peerUrl }));
+                  (found2.url === "" || found2.relay) &&
+                  ((selectedRoute = null), (source.preferred_route = "relay"));
               } catch (error) {
                 if (isCurrent() && !signal?.aborted)
                   trace?.report("mobile_discovery_failed", {
@@ -545,7 +524,6 @@
           return (
             (active = saved = credentials = next),
             (rid = next?.rid),
-            (url = next?.url),
             (directOrigin = next?.origin || location.origin),
             (destinationFixed = next?.fixed ?? fixed),
             (useRelay = validRid(rid)),
@@ -563,7 +541,7 @@
               endpoint: h.fixed
                 ? h.rid
                   ? "Relay \xB7 " + h.rid.slice(0, 8)
-                  : h.routes?.tailscale?.origin || h.url
+                  : h.routes?.tailscale?.origin
                 : h.origin,
               active: h.id === active?.id,
             }));
@@ -577,7 +555,6 @@
             (active = host),
             (saved = credentials = host),
             (rid = host.rid),
-            (url = host.url),
             (directOrigin = host.origin || location.origin),
             (destinationFixed = host.fixed ?? fixed),
             (useRelay = validRid(rid)),
@@ -645,7 +622,6 @@
               ((updatePending = !1),
               (active = saved = credentials = next),
               (rid = next?.rid),
-              (url = next?.url),
               (directOrigin = next?.origin || location.origin),
               (destinationFixed = next?.fixed ?? fixed),
               (useRelay = validRid(rid))),
@@ -674,7 +650,6 @@
             (directOrigin = active?.origin || location.origin),
             (destinationFixed = active?.fixed ?? fixed),
             (rid = saved?.rid),
-            (url = saved?.url),
             (useRelay = validRid(rid)),
             fixed &&
               /^[0-9a-f]{16}$/.test(saved?.hash || "") &&
@@ -694,7 +669,6 @@
           }
           if (!destinationFixed) return directSocket(directOrigin);
           if (useRelay && validRid(rid)) return relayUrl();
-          if (validUrl(url)) return `wss://${url.slice(8)}/ws?v=${hash}`;
           if (validRid(rid)) return relayUrl();
           throw Error("Scan a fresh QR code from desktop Settings → Mobile.");
         },
@@ -735,20 +709,16 @@
           if (
             (u.protocol === "https:" &&
               !version &&
-              !f.has("t") &&
               !f.has("r") &&
-              !validUrl(u.origin) &&
               !u.username &&
               !u.password) ||
             (u.origin === location.origin && version && version !== hash)
           )
             return null;
-          const t = f.get("t"),
-            d = secureDirect(f.get("d")),
-            r = f.get("r"),
-            next = t ? "https://" + t : validUrl(u.origin) ? u.origin : null;
+          const d = secureDirect(f.get("d")),
+            r = f.get("r");
           if (f.has("d") && !d) throw Error(NOT);
-          if (!validUrl(next) && !validRid(r) && !d)
+          if (!validRid(r) && !d)
             throw Error(
               u.protocol === "http:"
                 ? "This direct code cannot be opened here. Choose Relay server in desktop Settings \u2192 Mobile, then tap New QR code."
@@ -756,7 +726,7 @@
             );
           const hint = f.get("h") || r,
             existing = hosts.find((host) => host.host_id === hint || host.rid === r || host.routes?.relay?.rid === r);
-          const candidate = { rid: r, fixed: true, url: next, routes: d ? { tailscale: { origin: d } } : null };
+          const candidate = { rid: r, fixed: true, routes: d ? { tailscale: { origin: d } } : null };
           const route = d ? directSocket(d) : routeUrls(candidate, hash)[0]?.url;
           return {
             ticket: ticket2,
@@ -797,7 +767,6 @@
               ((pairingPending = !0),
                 (updatePending = !1),
                 (destinationFixed = !0),
-                (url = validUrl(next) ? next : null),
                 (rid = validRid(r) ? r : null),
                 (useRelay = validRid(rid)));
             },
@@ -811,9 +780,8 @@
               (credentials = {
                 ...credentials,
                 rid,
-                url,
                 hash,
-                preferred_route: useRelay ? "relay" : "tunnel",
+                preferred_route: useRelay ? "relay" : null,
               }),
             !credentials)
           )
@@ -864,9 +832,9 @@
           if (destinationFixed)
             try {
               attempted === this.socketUrl() &&
-                (!useRelay && validRid(rid)
-                  ? (useRelay = !0)
-                  : useRelay && validUrl(url) && (useRelay = !1));
+                !useRelay &&
+                validRid(rid) &&
+                (useRelay = !0);
             } catch {}
         },
         setUpdateHandler(handler) {
@@ -880,7 +848,7 @@
         },
         updateIdentity() {
           return fixed && destinationFixed && credentials && active
-            ? JSON.stringify([active.id, credentials.device_id, rid || url])
+            ? JSON.stringify([active.id, credentials.device_id, rid])
             : null;
         },
         async probeUpdate({ signal } = {}) {
@@ -907,14 +875,9 @@
               identity !== this.updateIdentity() ||
               typeof found.hash != "string" ||
               !/^[0-9a-f]{16}$/.test(found.hash) ||
-              !(validUrl(found.url) || found.url === "" || found.relay)
+              !(found.url === "" || found.relay)
               ? null
-              : {
-                  identity,
-                  hash: found.hash,
-                  rid,
-                  url: validUrl(found.url) ? found.url : null,
-                };
+              : { identity, hash: found.hash, rid };
           } finally {
             (clearTimeout(timeout),
               signal?.removeEventListener("abort", abort));
@@ -942,7 +905,7 @@
               stored?.credential !== credentials.credential
             )
               return !1;
-            const next = { ...latest, hash: found.hash, url: found.url, rid },
+            const next = { ...latest, hash: found.hash, rid },
               nextHosts = book2.hosts.map((h) =>
                 h.id === active.id ? next : h,
               ),
@@ -969,7 +932,6 @@
             return (
               hosts.splice(0, hosts.length, ...nextHosts),
               (active = saved = credentials = next),
-              (url = next.url),
               (useRelay = validRid(rid)),
               (storageFailed = !1),
               !0
@@ -1030,14 +992,10 @@
               if (
                 typeof found.hash == "string" &&
                 /^[0-9a-f]{16}$/.test(found.hash) &&
-                (validUrl(found.url) || found.url === "" || found.relay)
+                (found.url === "" || found.relay)
               ) {
-                if (
-                  (validUrl(found.url)
-                    ? ((url = found.url), (useRelay = !1))
-                    : ((url = null), (useRelay = !0)),
-                  found.hash !== hash && updateHandler)
-                )
+                useRelay = !0;
+                if (found.hash !== hash && updateHandler)
                   return ((updatePending = !0), updateHandler(), !1);
                 if (
                   (credentials &&
@@ -1045,7 +1003,6 @@
                     ((credentials = {
                       ...credentials,
                       rid,
-                      url,
                       hash: found.hash,
                     }),
                     active &&
@@ -1709,11 +1666,7 @@
             (async () => {
               attempted = socketUrl();
               const target = new URL(attempted);
-              timing.route = target.pathname.startsWith("/r/")
-                ? "relay"
-                : target.hostname.endsWith(".trycloudflare.com")
-                  ? "tunnel"
-                  : "direct";
+              timing.route = target.pathname.startsWith("/r/") ? "relay" : "direct";
               const octets = target.hostname.split(".").map(Number);
               if ((octets.length === 4 && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) || target.hostname.endsWith(".ts.net")) timing.route = "tailscale";
               trace?.mark("socket_open", {route: timing.route});

@@ -17,7 +17,7 @@
     "runtime",
     "resource",
   ]);
-  const routes = new Set(["relay", "tunnel", "tailscale", "direct", "unknown"]);
+  const routes = new Set(["relay", "tailscale", "direct", "unknown"]);
   const reasons = new Set([
     "websocket_error",
     "websocket_closed",

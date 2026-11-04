@@ -76,8 +76,6 @@ function allowedOrigin(origin) {
   try {
     const url = new URL(origin);
     if (!['http:', 'https:'].includes(url.protocol) || url.origin !== origin) return false;
-    if (url.protocol === 'https:' && url.port === ''
-      && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.trycloudflare\.com$/.test(url.hostname)) return true;
     if (url.hostname === 'localhost' || url.hostname === '[::1]') return true;
     const parts = url.hostname.split('.');
     if (parts.length !== 4 || parts.some(p => !/^(0|[1-9][0-9]{0,2})$/.test(p) || Number(p) > 255)) return false;

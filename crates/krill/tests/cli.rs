@@ -1799,11 +1799,11 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
     let script = d.dir.join("cloudflared-test");
     fs::write(
         &script,
-        "#!/bin/sh\n: > \"${0%/*}/cloudflared-started\"\nprintf 'https://cli-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 120\n",
+        "#!/bin/sh\n: > \"${0%/*}/cloudflared-started\"\nexec /bin/sleep 120\n",
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    // 로그인 전에는 릴레이 접속을 거부하고, 설치된 퀵터널로 폴백하지 않는다.
+    // 로그인 전에는 릴레이 접속을 거부하고, 설치된 cloudflared로 폴백하지 않는다.
     let out = d.run(&["mobile", "pair", "--tunnel", "--json"]);
     assert!(!out.status.success());
     assert!(

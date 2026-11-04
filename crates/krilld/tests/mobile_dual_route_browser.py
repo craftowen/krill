@@ -33,7 +33,7 @@ const server=http.createServer((req,res)=>{
  const file=u.pathname.replace(/^\/m\/[0-9a-f]{16}\//,'').replace(/^\//,'')||'index.html',resolved=path.resolve(root,file);
  if(!resolved.startsWith(root+path.sep)){res.writeHead(403);res.end();return;}
  try{const data=fs.readFileSync(resolved);res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':file.endsWith('.html')?'text/html':file.endsWith('.png')?'image/png':file.endsWith('.svg')?'image/svg+xml':'application/json');
- if(file==='index.html')res.setHeader('Content-Security-Policy',"default-src 'self'; connect-src 'self' wss://*.trycloudflare.com wss://*.ts.net:* https://errors.krill.page; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'");
+ if(file==='index.html')res.setHeader('Content-Security-Policy',"default-src 'self'; connect-src 'self' wss://*.ts.net:* https://errors.krill.page; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'");
  res.end(data);}catch{res.writeHead(404);res.end();}
 });
 server.on('upgrade',(req,socket,head)=>{
