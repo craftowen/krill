@@ -817,6 +817,20 @@ fn raw(target: &Target, session: SessionId, from: Seq) -> Result<Connection> {
     Ok(c)
 }
 
+/// Windows pipes end lines with CRLF; a terminal reads CR as Enter. Send the LF a Unix pipe
+/// would carry so `--stdin` never submits early (submission stays with `--enter`).
+fn lf_lines(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut it = bytes.iter().peekable();
+    while let Some(&byte) = it.next() {
+        if byte == b'\r' && it.peek() == Some(&&b'\n') {
+            continue;
+        }
+        out.push(byte);
+    }
+    out
+}
+
 fn send(target: &Target, args: &[OsString]) -> Result<()> {
     let (session, args) = args.split_first().ok_or_else(usage)?;
     let session = id(session)?;
@@ -859,6 +873,9 @@ fn send(target: &Target, args: &[OsString]) -> Result<()> {
             .take(u64::try_from(MAX_INPUT + 1).map_err(fail)?)
             .read_to_end(&mut text)
             .map_err(fail)?;
+        if cfg!(windows) {
+            text = lf_lines(&text);
+        }
     }
     let total_bytes = text.len().saturating_add(usize::from(enter));
     if total_bytes == 0 || total_bytes > MAX_INPUT {
@@ -1374,6 +1391,16 @@ pub fn resolve_session_cwd(id: u64) -> io::Result<std::path::PathBuf> {
 mod tests {
     use super::*;
     use krill_proto::agent::rules::ScreenRules;
+
+    #[test]
+    fn windows_stdin_crlf_becomes_unix_lf() {
+        assert_eq!(
+            lf_lines(b"line 1\r\n\xed\x95\x9c\r\n"),
+            b"line 1\n\xed\x95\x9c\n"
+        );
+        assert_eq!(lf_lines(b"a\rb\r"), b"a\rb\r");
+        assert_eq!(lf_lines(b"\r\r\n"), b"\r\n");
+    }
 
     #[test]
     fn lone_separator_is_usage_and_create_error_names_program() {
