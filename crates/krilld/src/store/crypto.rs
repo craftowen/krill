@@ -109,10 +109,9 @@ impl Key {
         existing: bool,
         keychain: &SecKeychain,
     ) -> io::Result<Arc<Self>> {
-        let account = format!(
-            "{:x}",
-            Sha256::digest(root.canonicalize()?.as_os_str().as_bytes())
-        );
+        let account = crate::mobile::devices::hex(&Sha256::digest(
+            root.canonicalize()?.as_os_str().as_bytes(),
+        ));
         let found = keychain.find_generic_password(SERVICE, &account);
         match found {
             Ok((bytes, _)) => Self::from_slice(bytes.as_ref()).map(Arc::new),

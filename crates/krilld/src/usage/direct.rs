@@ -273,7 +273,7 @@ impl Retry {
 
 /// Stable diagnostic identifier without paths, account emails or credential material.
 fn profile_id(dir: &Path) -> String {
-    format!("{:x}", Sha256::digest(dir.as_os_str().as_encoded_bytes()))
+    crate::mobile::devices::hex(&Sha256::digest(dir.as_os_str().as_encoded_bytes()))
         .chars()
         .take(12)
         .collect()
@@ -1406,7 +1406,7 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
     };
     #[cfg(not(target_os = "macos"))]
     let normalized = path.as_bytes().to_vec();
-    let digest = format!("{:x}", Sha256::digest(&normalized));
+    let digest = crate::mobile::devices::hex(&Sha256::digest(&normalized));
     Some(format!(
         "Claude Code-credentials-{}",
         digest.chars().take(8).collect::<String>()
@@ -2758,9 +2758,10 @@ mod tests {
             claude_service(None).as_deref(),
             Some("Claude Code-credentials")
         );
-        assert_ne!(
-            claude_service(Some(Path::new("/tmp/a"))),
-            claude_service(None)
+        // 기대값은 Python `hashlib.sha256(b"/tmp/a").hexdigest()[:8]`. Claude Code가 찾는 키체인 이름이다.
+        assert_eq!(
+            claude_service(Some(Path::new("/tmp/a"))).as_deref(),
+            Some("Claude Code-credentials-d9b741ea")
         );
     }
 

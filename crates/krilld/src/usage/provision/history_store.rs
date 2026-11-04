@@ -305,10 +305,8 @@ pub(super) fn archive_root(host: &Path, profile: &Path, backup_name: &str) -> Pa
     let profile = profile
         .canonicalize()
         .unwrap_or_else(|_| profile.to_path_buf());
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(profile.as_os_str().as_encoded_bytes())
-    );
+    let digest =
+        crate::mobile::devices::hex(&Sha256::digest(profile.as_os_str().as_encoded_bytes()));
     let slug = profile.file_name().unwrap_or_default().to_string_lossy();
     host.join(backup_name).join(format!("{slug}-{digest}"))
 }
