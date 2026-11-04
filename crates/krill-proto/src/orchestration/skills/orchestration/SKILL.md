@@ -98,8 +98,12 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    verification and invalidating stale results. Correct drift through follow-ups or a
    new scoped assignment; do not silently expand the requested result.
 7. Resolve every owned dispatch, recording failed/blocked work honestly.
-   `worker_done` settles work but does **not** close its session. After reading
-   the evidence and deciding no follow-up needs that terminal, call
+   `worker_done` settles work but does **not** close its session. Acknowledging
+   a `worker_done` with `check --ack` or `--ack-ids` releases that worker when
+   the dispatch created its session and the agent is idle, exited, or gone;
+   `check` names it in `auto_released` (JSON object) or on stderr. To keep a
+   worker for follow-up, run `worker-retain <dispatch-id>` before acknowledging.
+   For any other settled worker no follow-up needs, call
    `worker-release <dispatch-id>` without asking for a separate cleanup approval.
    Do this throughout the run, rather than leaving completed workers open until
    the end. Release archives bounded output and requires settled work and a

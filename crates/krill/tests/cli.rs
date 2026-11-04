@@ -1009,6 +1009,148 @@ fn run_created_from_a_pane_wakes_its_idle_coordinator() {
 }
 
 #[test]
+fn acknowledged_worker_done_releases_idle_created_workers_only() {
+    let d = Daemon::new("auto-release");
+    // Ready (Stop) at launch; a prompt line containing MAKE-BUSY starts a new turn (Working).
+    let hook = |event: &str| {
+        format!(
+            "printf '%s' '{{\"hook_event_name\":\"{event}\"}}' | KRILL_STATE_DIR='{}' '{MK}' hook claude >/dev/null",
+            d.dir.display()
+        )
+    };
+    let script = format!(
+        "stty -echo; {}; printf 'auto-marker\\n> '; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; \
+         case \"$line\" in *MAKE-BUSY*) {};; esac; done",
+        hook("Stop"),
+        hook("UserPromptSubmit")
+    );
+    fs::write(
+        d.dir.join("agents.toml"),
+        format!(
+            "[agent.auto_fixture]\nname = \"Auto fixture\"\nlaunch = [\"/bin/sh\", \"-c\", {}]\n",
+            serde_json::to_string(&script).unwrap()
+        ),
+    )
+    .unwrap();
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "Auto release",
+        "--json",
+    ]))
+    .unwrap();
+    let run = run["id"].as_str().unwrap();
+    let cwd = d.dir.to_str().unwrap();
+    let mut workers = Vec::new();
+    for (worker, prompt, state, wait_extra) in [
+        ("auto-idle", "Work", "idle", &["--quiet-ms", "0"][..]),
+        ("auto-kept", "Work", "idle", &["--quiet-ms", "0"]),
+        ("auto-busy", "Work MAKE-BUSY", "working", &[]),
+    ] {
+        let started: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run,
+            "--worker",
+            worker,
+            "--agent",
+            "auto_fixture",
+            "--cwd",
+            cwd,
+            "--prompt",
+            prompt,
+            "--json",
+        ]))
+        .unwrap();
+        let dispatch = started["id"].as_str().unwrap().to_owned();
+        let session = started["session_id"].as_u64().unwrap().to_string();
+        d.wait_text(&session, "auto-marker");
+        d.ok(&[
+            &["wait", &session, "--for", state, "--timeout", "5"],
+            wait_extra,
+        ]
+        .concat());
+        d.ok(&[
+            "orchestration",
+            "send",
+            "--from",
+            worker,
+            "--type",
+            "worker_done",
+            "--dispatch",
+            &dispatch,
+            "--summary",
+            "Result summary",
+        ]);
+        workers.push((dispatch, session));
+    }
+    let [
+        (idle, idle_session),
+        (kept, kept_session),
+        (_, busy_session),
+    ] = &workers[..]
+    else {
+        unreachable!()
+    };
+    d.ok(&["orchestration", "worker-retain", kept]);
+    let peek: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "check",
+        "--to",
+        "coordinator",
+        "--run",
+        run,
+        "--unread",
+        "--json",
+    ]))
+    .unwrap();
+    assert!(peek.get("auto_released").is_none(), "{peek}");
+    assert_eq!(peek["messages"].as_array().unwrap().len(), 3);
+    let ls = d.ok(&["ls"]);
+    for (_, session) in &workers {
+        assert!(
+            ls_has_session(&ls, session),
+            "peek must not release {session}"
+        );
+    }
+    let acked: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "check",
+        "--to",
+        "coordinator",
+        "--run",
+        run,
+        "--ack",
+        peek["delivery"]["id"].as_str().unwrap(),
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(acked["auto_released"], serde_json::json!([idle]));
+    assert!(
+        acked["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["acked"] == true)
+    );
+    let ls = d.ok(&["ls"]);
+    assert!(!ls_has_session(&ls, idle_session));
+    assert!(ls_has_session(&ls, kept_session));
+    assert!(ls_has_session(&ls, busy_session));
+    let released: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "worker-show", idle, "--json"])).unwrap();
+    assert_eq!(released["release_state"], "released");
+    assert!(
+        released["archived_output"]
+            .as_str()
+            .unwrap()
+            .contains("auto-marker")
+    );
+}
+
+#[test]
 fn kill_and_close_wait_for_termination_including_signal_escalation() {
     let d = Daemon::new("close-wait");
     for command in ["kill", "close"] {

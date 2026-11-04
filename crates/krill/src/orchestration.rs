@@ -16,10 +16,10 @@ use krill_proto::control::{FEAT_CLI, FEAT_CONTROL, Failure, Reply, Request};
 use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::orchestration::{
-    DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchSessionOrigin, DispatchStatus,
-    FEAT_ORCH_SNAPSHOT_PAGE, FRAME_LIMIT_ERROR, GateStatus, MessageType, OrchAction, OrchResponse,
-    OrchestrationStore, Run, SendParams, TaskStatus, WorkerOperation, WorkerStartSpec,
-    worker_preamble,
+    DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchReleaseState, DispatchSessionOrigin,
+    DispatchStatus, FEAT_ORCH_SNAPSHOT_PAGE, FRAME_LIMIT_ERROR, GateStatus, MessageType,
+    OrchAction, OrchMessage, OrchResponse, OrchestrationStore, Run, SendParams, TaskStatus,
+    WorkerOperation, WorkerStartSpec, worker_preamble,
 };
 use krill_proto::screen::Msg;
 
@@ -1757,11 +1757,23 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             }
         }
     };
+    // Only mail this call acknowledged: a bare `--ack` with nothing new returns acked history.
+    let acked: &[OrchMessage] = if ack_ids_flag || (ack && delivery.is_some()) {
+        &messages
+    } else {
+        &[]
+    };
+    let auto_released = auto_release_acked_workers(ctx, acked);
     if json {
         if ack_ids_flag || (ack && delivery_id.is_none()) {
+            // An array has no room for a new field; the release notices on stderr cover it.
             print_json(&messages)?;
         } else {
-            print_json(&serde_json::json!({ "delivery": delivery, "messages": messages }))?;
+            let mut out = serde_json::json!({ "delivery": delivery, "messages": messages });
+            if !auto_released.is_empty() {
+                out["auto_released"] = serde_json::json!(auto_released);
+            }
+            print_json(&out)?;
         }
     } else {
         if let Some(delivery) = delivery {
@@ -2253,6 +2265,71 @@ fn dispatch_owns_session(all_dispatches: &[Dispatch], disp: &Dispatch) -> bool {
     owner.is_some_and(|o| o.id == disp.id)
 }
 
+/// Dispatches `check` releases after acknowledging `acked`: a created worker whose `worker_done`
+/// is among them, whose dispatch settled without a retain or release decision, and whose session
+/// is idle, exited, or gone. A worker still mid-turn waits for the final `worker-list` sweep.
+fn auto_release_targets<'a>(
+    dispatches: &'a [Dispatch],
+    acked: &[OrchMessage],
+    observed: &[crate::session::ObservedSession],
+) -> Vec<&'a Dispatch> {
+    use krill_proto::control::AgentState;
+    dispatches
+        .iter()
+        .filter(|d| {
+            acked.iter().any(|m| {
+                m.msg_type == MessageType::WorkerDone && m.dispatch_id.as_deref() == Some(&d.id)
+            }) && !matches!(
+                d.status,
+                DispatchStatus::Active | DispatchStatus::Retained | DispatchStatus::Released
+            ) && d.release_state == DispatchReleaseState::Active
+                && d.session_origin == DispatchSessionOrigin::Created
+                && dispatch_owns_session(dispatches, d)
+                && d.session_id.is_some_and(|sid| {
+                    observed.iter().find(|s| s.id == sid).is_none_or(|s| {
+                        s.exit_code.is_some()
+                            || matches!(s.agent_state, Some(AgentState::Done | AgentState::Exited))
+                    })
+                })
+        })
+        .collect()
+}
+
+/// Best effort: a failed release leaves the mail acknowledged and the worker for `worker-list`.
+fn auto_release_acked_workers(ctx: &OrchCtx<'_>, acked: &[OrchMessage]) -> Vec<String> {
+    if !acked.iter().any(|m| m.msg_type == MessageType::WorkerDone) {
+        return Vec::new();
+    }
+    let store = match ctx.load_store() {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("orchestration: warning: skipped worker auto-release: {e}");
+            return Vec::new();
+        }
+    };
+    // Unknown session state (no daemon) is not idle.
+    let Some(observed) = observe_daemon_sessions(ctx) else {
+        return Vec::new();
+    };
+    let mut released = Vec::new();
+    for d in auto_release_targets(&store.dispatches, acked, &observed) {
+        match stop_dispatch(ctx, &store.dispatches, d, true) {
+            Ok(_) => {
+                eprintln!(
+                    "orchestration: released {} ({}) after acknowledging its worker_done",
+                    d.id, d.worker_name
+                );
+                released.push(d.id.clone());
+            }
+            Err(e) => eprintln!(
+                "orchestration: warning: could not auto-release {} ({}): {e}",
+                d.id, d.worker_name
+            ),
+        }
+    }
+    released
+}
+
 fn build_worker_report(
     disp: &Dispatch,
     all_dispatches: &[Dispatch],
@@ -2688,6 +2765,28 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
                 format!("worker not found: {target_name}"),
             )
         })?;
+    let disp = stop_dispatch(ctx, &store.dispatches, selected, release)?;
+    if json {
+        print_json(&disp)?;
+    } else {
+        println!(
+            "{}\t{}\t{}",
+            disp.id,
+            disp.worker_name,
+            disp.status.as_str()
+        );
+    }
+    Ok(())
+}
+
+/// Stops or releases one dispatch: archives its owned session's output, closes that session, and
+/// records the outcome. `worker-stop`, `worker-release`, and `check`'s auto-release share it.
+fn stop_dispatch(
+    ctx: &OrchCtx<'_>,
+    dispatches: &[Dispatch],
+    selected: &Dispatch,
+    release: bool,
+) -> io::Result<Dispatch> {
     if release {
         selected.validate_release()?;
     }
@@ -2701,7 +2800,7 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
             "cannot close a borrowed session; use {action}; neither stops the existing process"
         )));
     }
-    let owns_session = dispatch_owns_session(&store.dispatches, selected);
+    let owns_session = dispatch_owns_session(dispatches, selected);
     let target = ctx.effective_target()?;
     let captured = match selected.session_id {
         Some(sid) if owns_session && !selected.is_released() => {
@@ -2734,7 +2833,7 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
             Ok(())
         })?;
     }
-    let disp = complete_worker_stop_ctx(ctx, &selected.id, release, captured, || {
+    complete_worker_stop_ctx(ctx, &selected.id, release, captured, || {
         if owns_session
             && !selected.is_released()
             && let Some(sid) = selected.session_id
@@ -2745,18 +2844,7 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
             crate::session::close_session_on_target(&target, sid).map_err(io::Error::other)?;
         }
         Ok(())
-    })?;
-    if json {
-        print_json(&disp)?;
-    } else {
-        println!(
-            "{}\t{}\t{}",
-            disp.id,
-            disp.worker_name,
-            disp.status.as_str()
-        );
-    }
-    Ok(())
+    })
 }
 
 fn cmd_worker_retain_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
@@ -4655,6 +4743,78 @@ mod delivery_and_launch_cli_tests {
         assert_eq!(fenced.session_id, Some(1234));
         assert_eq!(fenced.status, DispatchStatus::Abandoned);
         std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn acked_worker_done_targets_only_settled_created_workers_that_stopped_working()
+    -> io::Result<()> {
+        use crate::session::ObservedSession;
+        use krill_proto::control::AgentState;
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("auto release", None)?;
+        let mut done = Vec::new();
+        let mut ids = std::collections::BTreeMap::new();
+        for (worker, sid) in [
+            ("idle", 1),
+            ("gone", 2),
+            ("exited", 3),
+            ("working", 4),
+            ("retained", 5),
+            ("borrowed", 6),
+            ("unknown", 7),
+        ] {
+            let d = store.start_worker(&run.id, None, worker, "codex", Some(sid), "/tmp", "p")?;
+            done.extend(store.send_message(&SendParams {
+                from: worker.into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                summary: "finished".into(),
+                body: String::new(),
+                run_id: Some(run.id.clone()),
+                task_id: None,
+                dispatch_id: Some(d.id.clone()),
+                outcome: None,
+                reply_to: None,
+            })?);
+            ids.insert(worker, d.id);
+        }
+        store.retain_worker(&ids["retained"])?;
+        for d in &mut store.dispatches {
+            if d.worker_name == "borrowed" {
+                d.session_origin = DispatchSessionOrigin::Borrowed;
+            }
+        }
+        let live = |id, agent_state| ObservedSession {
+            id,
+            exit_code: None,
+            agent_state,
+        };
+        let observed = [
+            live(1, Some(AgentState::Done)),
+            ObservedSession {
+                id: 3,
+                exit_code: Some(0),
+                agent_state: None,
+            },
+            live(4, Some(AgentState::Working)),
+            live(5, Some(AgentState::Done)),
+            live(6, Some(AgentState::Done)),
+            live(7, None),
+        ];
+        let targets = |acked: &[OrchMessage]| -> Vec<String> {
+            auto_release_targets(&store.dispatches, acked, &observed)
+                .into_iter()
+                .map(|d| d.worker_name.clone())
+                .collect()
+        };
+        assert_eq!(targets(&done), ["idle", "gone", "exited"]);
+        assert!(targets(&[]).is_empty());
+        let mut not_done = done.clone();
+        for m in &mut not_done {
+            m.msg_type = MessageType::Status;
+        }
+        assert!(targets(&not_done).is_empty());
+        Ok(())
     }
 }
 
