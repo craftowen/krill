@@ -77,6 +77,56 @@ fn cursor_blink_stops_when_hidden_or_inactive_and_restarts_visible(cx: &mut Test
     });
 }
 
+#[gpui::test]
+fn cursor_blink_keeps_blinking_after_four_seconds(cx: &mut TestAppContext) {
+    use krill_proto::screen::{CursorShape, CursorStyle, Op, Revision, Seq, encode_update};
+    let (view, cx) = open(cx, state_path("cursor-blink-forever"));
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, SessionId(42), ours, cx);
+            s.layout.set_session(pane, SessionId(42));
+            let update = encode_update(
+                Revision(1),
+                Seq(0),
+                vec![
+                    Op::Reset { cols: 8, lines: 2 },
+                    Op::CursorStyle(CursorStyle {
+                        shape: CursorShape::Bar,
+                        blink: true,
+                    }),
+                ],
+            )
+            .unwrap();
+            let (kind, body) = ipc::read_frame(&mut &update[0][..]).unwrap().unwrap();
+            assert!(s.on_frame(pane, kind, &body, cx));
+            s.sync_cursor_blink(true, cx);
+        });
+    });
+    let hidden = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .cursor_blink
+                .as_ref()
+                .map(|(_, hidden)| *hidden)
+        })
+    };
+    assert_eq!(hidden(cx), Some(false));
+    for tick in 1..=20 {
+        cx.executor().advance_clock(CURSOR_BLINK);
+        cx.run_until_parked();
+        assert_eq!(
+            hidden(cx),
+            Some(tick % 2 == 1),
+            "cursor must still blink at tick {tick} ({}ms)",
+            CURSOR_BLINK.as_millis() * tick
+        );
+    }
+}
+
 use krill_proto::control::Program;
 
 pub(super) fn state_path(name: &str) -> PathBuf {

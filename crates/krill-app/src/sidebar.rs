@@ -885,6 +885,14 @@ pub struct ReconnectHost(pub HostId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relisted(pub usize);
 
+/// Whether `snapshot.sessions` came from the local daemon at least once.
+/// Before that, an empty list means "not known yet", not "no sessions".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalList {
+    Pending,
+    Received,
+}
+
 /// 셸이 알려 주는 로컬 데몬 감시 연결의 재연결 단계.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Relink {
@@ -903,6 +911,7 @@ enum DeleteFocus {
 
 pub struct Sidebar {
     snapshot: Snapshot,
+    local_list: LocalList,
     meta: Meta,
     local_status: HostStatus,
     relink: Relink,
@@ -1287,7 +1296,20 @@ fn load_prompt_histories_from_sidebar_path(
     krill_proto::git::load_session_prompt_histories(dir)
 }
 
+/// Local polling, disk snapshots and the Shell sync all store session records
+/// through this one filter. Any difference makes them overwrite each other and
+/// rebuild forever while idle. `None` (list not received yet) drops nothing.
+fn retain_live<V>(sessions: Option<&[Session]>, records: &mut BTreeMap<SessionId, V>) {
+    if let Some(sessions) = sessions {
+        records.retain(|id, _| sessions.iter().any(|s| s.id == *id));
+    }
+}
+
 impl Sidebar {
+    fn listed_sessions(&self) -> Option<&[Session]> {
+        (self.local_list == LocalList::Received).then_some(self.snapshot.sessions.as_slice())
+    }
+
     pub fn new(path: Option<PathBuf>) -> Self {
         // Construction runs inside cx.new: all persisted state is loaded later on the executor.
         let (prefs, options, lin, ui) = (
@@ -1298,6 +1320,7 @@ impl Sidebar {
         );
         Self {
             snapshot: Snapshot::default(),
+            local_list: LocalList::Pending,
             meta: Meta::new(),
             local_status: HostStatus::Connected,
             relink: Relink::Steady,
@@ -3351,8 +3374,8 @@ impl Sidebar {
         &mut self,
         result: io::Result<(Snapshot, Meta)>,
         comments: BTreeMap<PathBuf, String>,
-        auto_titles: BTreeMap<SessionId, String>,
-        prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
+        mut auto_titles: BTreeMap<SessionId, String>,
+        mut prompt_histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
         mut closed_sessions: krill_proto::control::ClosedSessionRanges,
         cx: &mut Context<Self>,
     ) {
@@ -3361,6 +3384,9 @@ impl Sidebar {
                 for session in &snapshot.sessions {
                     closed_sessions.remove(session.id);
                 }
+                self.local_list = LocalList::Received;
+                retain_live(Some(&snapshot.sessions), &mut auto_titles);
+                retain_live(Some(&snapshot.sessions), &mut prompt_histories);
                 let profiles_changed = self.profiles.observe(&HostId::Local, &snapshot);
                 if self.relink == Relink::AwaitingList {
                     self.relink = Relink::Steady;
@@ -3406,10 +3432,6 @@ impl Sidebar {
                     self.poll_error = None;
                     let live = &self.snapshot.sessions;
                     self.titles.retain(|id, _| live.iter().any(|s| s.id == *id));
-                    self.auto_titles
-                        .retain(|id, _| live.iter().any(|s| s.id == *id));
-                    self.prompt_histories
-                        .retain(|id, _| live.iter().any(|s| s.id == *id));
                     // OWE-898: 사라진 워크트리의 파생 상태가 폴링마다 누적되지 않게
                     // 라이브 집합에 없는 키를 정리한다(사용자 접힘·핀·부모 설정은 유지).
                     self.prune_stale_worktree_state();
@@ -4939,10 +4961,7 @@ impl Sidebar {
         mut histories: BTreeMap<SessionId, krill_proto::git::SessionPromptHistory>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.snapshot.sessions.is_empty() {
-            let live = &self.snapshot.sessions;
-            histories.retain(|id, _| live.iter().any(|s| s.id == *id));
-        }
+        retain_live(self.listed_sessions(), &mut histories);
         if self.prompt_histories == histories {
             return false;
         }

@@ -306,6 +306,84 @@ fn virtualized_500_rows_scroll_and_idle(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn ended_session_records_on_disk_cause_no_idle_renders(cx: &mut TestAppContext) {
+    struct Memory(Snapshot);
+    impl Source for Memory {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "krill-sidebar-ended-records-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let live = SessionId(1);
+    let ended = SessionId(99);
+    krill_proto::git::record_session_prompt(&dir, live, "live prompt", 1).unwrap();
+    krill_proto::git::record_session_prompt(&dir, ended, "ended prompt", 1).unwrap();
+    fs::write(
+        dir.join(krill_proto::git::SESSION_TITLES_FILE),
+        r#"{"1":"live auto title","99":"ended auto title"}"#,
+    )
+    .unwrap();
+    let tree = PathBuf::from("/repo/a");
+    let session = Session {
+        id: live,
+        status: AgentStatus::UNKNOWN,
+        worktree: Some(tree.clone()),
+        cwd: Some(tree.clone()),
+        account: None,
+    };
+    let snapshot = Snapshot {
+        sessions: vec![session.clone()],
+        trees: BTreeMap::from([(PathBuf::from("/repo"), vec![tree])]),
+    };
+    cx.update(gpui_component::init);
+    let path = dir.join("sidebar.bin");
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(path)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.connect_source(Arc::new(Memory(snapshot)), cx));
+    });
+    let idle = |cx: &mut gpui::VisualTestContext, seconds: u32| {
+        let mut shell_notifies = 0;
+        for _ in 0..seconds {
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            let prompts = krill_proto::git::load_session_prompt_histories(&dir);
+            if cx.update(|_, cx| view.update(cx, |s, cx| s.sync_prompt_histories(prompts, cx))) {
+                shell_notifies += 1;
+            }
+        }
+        shell_notifies
+    };
+    idle(cx, 4);
+    let before = cx.update(|_, cx| view.read(cx).renders);
+    let shell_notifies = idle(cx, 10);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).renders),
+        before,
+        "ended-session records on disk must cause zero idle renders"
+    );
+    assert_eq!(
+        shell_notifies, 0,
+        "Shell prompt sync must not notify while idle"
+    );
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let turns = &s.session_prompt_history(live).unwrap().turns;
+        assert_eq!(turns[0].text, "live prompt");
+        assert_eq!(
+            s.session_label_on_with_title(&HostId::Local, &session, None)
+                .0,
+            "live auto title"
+        );
+    });
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
 fn rename_pins_persist_and_selection_emits(cx: &mut TestAppContext) {
     use std::cell::Cell;
     use std::rc::Rc;

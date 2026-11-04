@@ -439,9 +439,11 @@ impl Sidebar {
     fn accept_disk_snapshot(
         &mut self,
         generation: u64,
-        data: DiskSnapshot,
+        mut data: DiskSnapshot,
         cx: &mut Context<Self>,
     ) {
+        retain_live(self.listed_sessions(), &mut data.auto_titles);
+        retain_live(self.listed_sessions(), &mut data.prompt_histories);
         // A scan started before an edit/delete/import must never resurrect its state.
         if self.disk.generation == generation
             && self.disk.writes_pending == 0
