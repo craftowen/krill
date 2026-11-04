@@ -193,6 +193,8 @@ pub struct Registry {
     /// 디스크 사용량을 잴 상태 디렉터리(MK-071).
     dir: Option<PathBuf>,
     last_gc: Mutex<Instant>,
+    /// 기동 GC는 첫 감시 바퀴(별도 스레드)에서 돈다. 연결 수락 전 경로에서 세그먼트 수만 개를 stat하지 않는다.
+    startup_gc: std::sync::atomic::AtomicBool,
     app_opened: OnceLock<()>,
     mobile: OnceLock<Arc<crate::mobile::gateway::Gateway>>,
     webhooks: Mutex<crate::webhook::Dispatcher>,
@@ -242,7 +244,6 @@ impl Registry {
                 .into_iter()
                 .flat_map(|(_, kept)| kept.iter().map(|k| k.id)),
         );
-        let ids_ready = ids.ready();
         let at = |name: &str| dir.map_or_else(PathBuf::new, |d| d.join(name));
         // 기록 저장소를 열지 못해도 세션은 띄운다. 조용히 넘기지 않고 경고를 남겨 `krill doctor`가 보인다.
         let store = dir.and_then(|d| match Store::open(d, Limits::default()) {
@@ -263,6 +264,7 @@ impl Registry {
         let reg = Self {
             app_opened: OnceLock::new(),
             last_gc: Mutex::new(Instant::now()),
+            startup_gc: std::sync::atomic::AtomicBool::new(true),
             sidebar: Arc::default(),
             hibernation: Mutex::default(),
             schedule_minute: Mutex::default(),
@@ -334,9 +336,6 @@ impl Registry {
             );
         }
         let live: Vec<_> = st.sessions.keys().copied().collect();
-        if ids_ready && let Some(store) = &reg.store {
-            store.gc(&live, SystemTime::now()).ok();
-        }
         if let Some(d) = dir {
             crate::agent::claude::sweep(d, &live);
         }
@@ -362,15 +361,22 @@ impl Registry {
 
     /// 감시 루프의 가상 시계 입력. 레지스트리 잠금은 live 목록을 복사하는 동안에만 쥔다.
     pub(crate) fn gc_due(&self, now: Instant, wall: SystemTime) {
-        {
+        let due = {
             let mut last = lock(&self.last_gc);
-            if now.saturating_duration_since(*last) < GC_INTERVAL {
-                return;
+            let due = now.saturating_duration_since(*last) >= GC_INTERVAL;
+            if due {
+                *last = now;
             }
-            *last = now;
+            due
+        };
+        let startup = self
+            .startup_gc
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !due && !startup {
+            return;
         }
         let ids_ready = lock(&self.ids).ready();
-        if ids_ready {
+        if due && ids_ready {
             let retired: Vec<_> = {
                 let state = lock(&self.state);
                 state
