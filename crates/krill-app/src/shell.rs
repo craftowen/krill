@@ -5888,7 +5888,7 @@ impl Shell {
         } else if self.cursor_blink.is_none() {
             let task = cx.spawn(async move |this, cx| {
                 let bg = cx.background_executor().clone();
-                for _ in 0..8 {
+                loop {
                     bg.timer(CURSOR_BLINK).await;
                     let flipped = this.update(cx, |t, cx| {
                         if let Some((_, hidden)) = &mut t.cursor_blink {
