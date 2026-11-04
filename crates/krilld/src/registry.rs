@@ -330,7 +330,11 @@ impl Registry {
                 Entry {
                     session,
                     pid: k.pid,
-                    cwd: PathBuf::new(),
+                    cwd: reg
+                        .store
+                        .as_ref()
+                        .and_then(|s| s.launch_cwd(k.id))
+                        .unwrap_or_default(),
                     wrapped: crate::sys::process_args(k.pid).is_ok_and(|a| is_wrapper_argv(&a)),
                 },
             );
@@ -1885,6 +1889,9 @@ impl Registry {
                     self.agents.forget(id);
                     os(&e)
                 })?;
+                if let Some(store) = &self.store {
+                    store.remember_cwd(id, &initial_cwd);
+                }
                 let mut st = lock(&self.state);
                 st.roots.insert(id, pid).ok();
                 st.sessions.insert(

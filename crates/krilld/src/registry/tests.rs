@@ -3615,3 +3615,51 @@ fn kept_session_size_reconciles_only_when_holder_size_diverges() {
         )
     );
 }
+
+/// 셸 보고(OSC 7·9;9)도 프로세스 cwd도 없는 세션(Windows `krill new --cwd X -- powershell.exe`)은
+/// krilld를 바꿔도 띄운 디렉터리를 잃지 않는다.
+#[test]
+fn kept_session_without_shell_reports_keeps_launch_cwd_after_daemon_restart() {
+    use krill_proto::holder::{FromHolder, VERSION};
+    use krill_proto::os::net::UnixStream;
+
+    let dir = std::env::temp_dir().join(format!("krill-launch-cwd-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let work = dir.join("project");
+    fs::create_dir_all(&work).unwrap();
+    let work = krill_proto::os::canonicalize(&work).unwrap();
+    let id = SessionId(7);
+    {
+        let reg = Registry::new(None, Some(&dir));
+        let store = reg.store.as_ref().unwrap();
+        // 녹화기를 연 세션처럼 기록 디렉터리가 있어야 남긴다.
+        drop(store.recorder(id, WinSize { cols: 80, rows: 24 }).unwrap());
+        store.remember_cwd(id, &work);
+    }
+
+    let (krilld_end, mut holder_end) = UnixStream::pair().unwrap();
+    for m in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_end.write_all(&m.encode().unwrap()).unwrap();
+    }
+    let (holder, _link, _, _) = Holder::connect(OwnedFd::from(krilld_end)).unwrap();
+    let (master, _pty) = UnixStream::pair().unwrap();
+    let kept = Kept {
+        id,
+        // 없는 pid: 프로세스 cwd를 못 읽는 Windows와 같다.
+        pid: u32::MAX - 1,
+        status: None,
+        size: None,
+        master: OwnedFd::from(master),
+    };
+    let reg = Registry::new(Some((holder, vec![kept])), Some(&dir));
+    assert_eq!(reg.session_cwd(id), Some(work));
+    drop(reg);
+    fs::remove_dir_all(dir).unwrap();
+}
