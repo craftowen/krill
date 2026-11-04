@@ -194,7 +194,7 @@ struct Out {
     /// 최근 원본. 맨 앞 바이트의 seq는 `end - ring.len()`.
     ring: VecDeque<u8>,
     end: u64,
-    /// 마지막으로 알린 화면 revision.
+    /// 마지막으로 알린 화면 revision. 리더는 디스크 기록 전에 먼저 올리므로(`reveal`) `end`보다 앞설 수 있다.
     revision: u64,
     closed: bool,
     /// publish·wake 세대. 잠금 밖에서 대기 조건을 평가하는 동안 지난 알림을 놓치지 않는다.
@@ -232,15 +232,30 @@ struct Shared {
     look: Arc<Appearance>,
     out: Mutex<Out>,
     changed: Condvar,
+    /// 화면 구독자 전용 알림(revision·종료·wake). 디스크 기록 전 revision 알림이 원본 구독자를 헛깨우지 않는다.
+    shown: Condvar,
     paused: AtomicBool,
     /// 링 밖 원본을 읽을 디스크 저장소(기록하지 않는 세션은 `None`).
     store: Option<Arc<Store>>,
 }
 
 impl Shared {
+    /// 엔진에 반영한 화면을 디스크 기록보다 먼저 화면 구독자에게 알린다. 원본 링·`end`는 [`Self::publish`]가 기록 뒤에 민다.
+    fn reveal(&self, revision: u64) {
+        let mut out = lock(&self.out);
+        if revision <= out.revision {
+            return;
+        }
+        out.revision = revision;
+        out.generation = out.generation.wrapping_add(1);
+        drop(out);
+        self.shown.notify_all();
+    }
+
     /// 엔진 변경을 알린다. `bytes`는 방금 디스크에 넘긴 원본.
     fn publish(&self, bytes: &[u8], revision: u64, closed: bool) {
         let mut out = lock(&self.out);
+        let shown = revision > out.revision || closed;
         let held = out.ring.len();
         let over = (held + bytes.len()).saturating_sub(RING);
         out.ring.drain(..over.min(held));
@@ -255,6 +270,9 @@ impl Shared {
         out.generation = out.generation.wrapping_add(1);
         drop(out);
         self.changed.notify_all();
+        if shown {
+            self.shown.notify_all();
+        }
     }
 
     /// 구독자가 0이 된 지 [`PARK_GRACE`]가 지났다. 그 사이 구독자가 오갔으면(`epoch`가 다르면) 아무것도 안 한다.
@@ -376,6 +394,7 @@ impl Session {
                 generation: 0,
             }),
             changed: Condvar::new(),
+            shown: Condvar::new(),
             paused: AtomicBool::new(false),
             store: rec
                 .as_ref()
@@ -811,7 +830,17 @@ impl Tap {
     }
 
     /// `ready`가 참이 될 때까지 기다린다. 다른 스레드가 `ready`가 보는 값을 바꾸면 [`Tap::wake`]를 불러야 한다.
+    /// 기록 전에 먼저 알린 revision에는 깨지 않는다(원본 발행 때 본다). 화면은 [`Tap::wait_screen`].
     pub fn wait(&self, ready: impl Fn(&Pulse) -> bool) -> Pulse {
+        self.wait_on(&self.0.changed, ready)
+    }
+
+    /// 화면 구독자용 [`Tap::wait`]: revision·종료·[`Tap::wake`]에 깨고, 원본 `end`만 바뀐 발행에는 깨지 않는다.
+    pub(crate) fn wait_screen(&self, ready: impl Fn(&Pulse) -> bool) -> Pulse {
+        self.wait_on(&self.0.shown, ready)
+    }
+
+    fn wait_on(&self, changed: &Condvar, ready: impl Fn(&Pulse) -> bool) -> Pulse {
         let mut out = lock(&self.0.out);
         loop {
             let p = Pulse {
@@ -827,11 +856,7 @@ impl Tap {
             }
             out = lock(&self.0.out);
             if out.generation == generation {
-                out = self
-                    .0
-                    .changed
-                    .wait(out)
-                    .unwrap_or_else(PoisonError::into_inner);
+                out = changed.wait(out).unwrap_or_else(PoisonError::into_inner);
             }
         }
     }
@@ -873,6 +898,12 @@ impl Tap {
         out.generation = out.generation.wrapping_add(1);
         drop(out);
         self.0.changed.notify_all();
+        self.0.shown.notify_all();
+    }
+
+    /// 엔진이 받은 원본 끝. 기록 중인 묶음만큼 [`Pulse::end`]보다 앞설 수 있다.
+    pub(crate) fn fed(&self) -> u64 {
+        self.0.live().seq
     }
 
     /// 원본 `pos`부터 최대 `max`바이트를 링에서 꺼낸다.
@@ -1112,10 +1143,13 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
             }
             e.feed(bytes, Feed::Live, look)
         });
+        shared.reveal(rev);
         // 엔진 호출은 `guarded`가 잡지만 기록·발행 panic은 여기서 잡는다. 이 묶음은
         // Gap으로 남기고 다음 묶음부터 계속 읽는다. 리더가 죽으면 PTY를 읽는 쪽이
         // 없어 세션 출력이 영구 정지한다(K-05).
         let recorded = publish_batch(shared, seq, bytes, rev, || {
+            #[cfg(test)]
+            publish_tests::before_record(shared.id);
             if !ok {
                 lock(&shared.gaps).push(Gap {
                     start: seq,
@@ -1153,7 +1187,7 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
     }
 }
 
-/// 기록(zstd·암호화·write)이 이보다 오래 걸리면 경고한다. 발행은 기록이 끝난 뒤라 그만큼 화면이 늦는다.
+/// 기록(zstd·암호화·write)이 이보다 오래 걸리면 경고한다. 화면은 먼저 알리지만 원본 발행·다음 PTY 읽기는 그만큼 늦는다.
 const SLOW_RECORD: Duration = Duration::from_millis(100);
 /// 느린 기록 경고의 마지막 시각. 세션이 많아도 프로세스 전체에서 초당 한 줄만 남긴다.
 static SLOW_RECORD_WARNED: Mutex<Option<Instant>> = Mutex::new(None);
@@ -1178,7 +1212,7 @@ fn publish_batch(shared: &Shared, seq: u64, bytes: &[u8], rev: u64, record: impl
         tracing::warn!(
             took_ms,
             bytes = bytes.len(),
-            "pty recording slow; screen publish waited"
+            "pty recording slow; raw publish waited"
         );
     }
     if !recorded {
@@ -1293,3 +1327,6 @@ mod tests;
 
 #[cfg(test)]
 mod pause_tests;
+
+#[cfg(test)]
+mod publish_tests;

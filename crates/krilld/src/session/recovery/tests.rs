@@ -46,6 +46,7 @@ fn fixture() -> (OwnedFd, Tap) {
             generation: 0,
         }),
         changed: Condvar::new(),
+        shown: Condvar::new(),
         paused: AtomicBool::new(false),
         store: None,
         reader: Mutex::new(None),

@@ -524,7 +524,8 @@ fn screen_loop(
     }
     let mut closed_sent = false;
     loop {
-        let p = tap.wait(|p| p.revision > seen || (p.closed && !closed_sent) || conn.flagged());
+        let p =
+            tap.wait_screen(|p| p.revision > seen || (p.closed && !closed_sent) || conn.flagged());
         if conn.gone() {
             return Ok(());
         }
@@ -571,7 +572,8 @@ fn screen_loop(
 fn raw_loop(tap: &Tap, conn: &Conn, from: Seq) -> io::Result<()> {
     let end = tap.pulse().end;
     let mut pos = from.0;
-    if pos > end {
+    // 화면 seq는 기록 중인 묶음까지 담으므로 `end`가 아니라 엔진이 받은 끝과 비교한다. 그 사이는 기다리면 온다.
+    if pos > tap.fed() {
         // krilld가 크래시해 디스크에 못 쓴 원본이 있었다: 그 뒤 seq는 디스크 끝에서 다시 매겨졌다.
         conn.send(
             &GapMsg {
