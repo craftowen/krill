@@ -295,8 +295,9 @@ pub fn create_with_pool(
     let dir =
         compat::project_destination(&top, trust.parent())?.unwrap_or_else(|| root.join(repo_name));
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    // git이 기록하는 경로와 비교하려고 실제 경로로(`/tmp` → `/private/tmp`).
-    let dir = fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // git이 기록하는 경로와 비교하려고 실제 경로로(`/tmp` → `/private/tmp`). Windows 접두 `\\?\`는
+    // 뗀다: git은 그 경로를 `//?/C:/...`로 바꿔 `.git` 파일을 쓰지 못한다.
+    let dir = krill_proto::os::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (branch, path) = free_name(q, &top, &dir, &leaf)?;
 
     let promoted = match pool
