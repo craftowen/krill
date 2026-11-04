@@ -926,7 +926,7 @@ fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext)
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
 
-    // Cycle through all 7 Admin tabs and verify rendering succeeds without panic.
+    // Cycle through all Admin tabs and verify rendering succeeds without panic.
     for tab in AdminTab::ALL {
         vcx.update(|window, cx| {
             view.update(cx, |v, cx| v.set_tab(tab, cx));
@@ -2107,10 +2107,10 @@ fn shortcuts_and_sidebar_use_readable_labels() {
 }
 
 #[gpui::test]
-fn settings_nav_shows_six_tabs_and_subpages_keep_their_parent(cx: &mut TestAppContext) {
+fn settings_nav_shows_every_tab_and_subpages_keep_their_parent(cx: &mut TestAppContext) {
     let d = dir("six-tabs");
     init(cx, &d);
-    assert_eq!(AdminTab::ALL.len(), 7);
+    assert_eq!(AdminTab::ALL.len(), 8);
     assert!(
         AdminTab::SUBPAGES
             .iter()
@@ -2127,6 +2127,7 @@ fn settings_nav_shows_six_tabs_and_subpages_keep_their_parent(cx: &mut TestAppCo
         "admin-tab-machines",
         "admin-tab-mobile",
         "admin-tab-shortcuts",
+        "admin-tab-updates",
         "admin-tab-system",
     ] {
         assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
@@ -5024,16 +5025,16 @@ fn connection_tail_drives_login_action_without_usage_setting(cx: &mut TestAppCon
     fs::remove_dir_all(d).ok();
 }
 
-/// MK-156: 설정 General 탭에서 업데이트 확인 버튼·자동 재시작 토글·준비 완료 시 재시작 버튼이 동작한다.
+/// MK-156: 업데이트 탭에서 업데이트 확인 버튼·자동 재시작 토글·준비 완료 시 재시작 버튼이 동작한다.
 #[gpui::test]
-fn general_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppContext) {
+fn updates_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppContext) {
     use crate::updater::{CheckStatus, StagedUpdate, UpdateState};
 
     let d = dir("mk156-general-updates");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Updates, cx));
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
@@ -5079,9 +5080,39 @@ fn general_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppCont
     });
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("settings-update-restart").is_some());
+    assert!(vcx.debug_bounds("admin-tab-updates-dot").is_some());
 
     let reloaded = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
     assert!(reloaded.auto_restart_update);
+    fs::remove_dir_all(d).ok();
+}
+
+/// 업데이트 탭은 캐시한 릴리스별 변경 사항을 보여 주고, 시스템 탭에는 업데이트 행이 없다.
+#[gpui::test]
+fn updates_tab_lists_changes_per_release(cx: &mut TestAppContext) {
+    let d = dir("updates-release-notes");
+    init(cx, &d);
+    fs::write(
+        d.join("release-notes.json"),
+        r#"[{"version":"99.0.0","date":"2099-01-02","items":["Newer"]},
+            {"version":"0.0.1","date":"2020-01-02","items":[]}]"#,
+    )
+    .unwrap();
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(3000.)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("settings-update-check").is_none());
+    assert!(vcx.debug_bounds("admin-tab-updates-dot").is_none());
+
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Updates, cx)));
+    vcx.run_until_parked();
+    let newer = vcx.debug_bounds("release-note-99.0.0").unwrap();
+    let older = vcx.debug_bounds("release-note-0.0.1").unwrap();
+    assert!(newer.origin.y < older.origin.y);
+    assert!(vcx.debug_bounds("release-notes-failed").is_none());
+    assert_eq!(search::search_tabs("what's new"), [AdminTab::Updates]);
+    assert_eq!(search::search_tabs("릴리스"), [AdminTab::Updates]);
     fs::remove_dir_all(d).ok();
 }
 
@@ -7019,13 +7050,7 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
     assert_eq!(sidebar.size.width, crate::ui::SETTINGS_NAV_WIDTH);
     assert!(column.size.width <= crate::ui::SETTINGS_CONTENT_MAX_WIDTH);
 
-    for sel in [
-        "notif-toggle",
-        "notif-toggle-thumb",
-        "sound-toggle",
-        "update-auto-restart-toggle",
-        "settings-update-check",
-    ] {
+    for sel in ["notif-toggle", "notif-toggle-thumb", "sound-toggle"] {
         let b = bounds(vcx, sel);
         assert!(
             b.right() <= column.right() + px(0.5),

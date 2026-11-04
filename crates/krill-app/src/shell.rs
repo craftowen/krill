@@ -8679,7 +8679,6 @@ impl Shell {
         };
         let body = utext::CARD_READY_BODY.format(&[("version", &staged.to_version)]);
         let subtitle = utext::CARD_READY_SUBTITLE.get();
-        let release_notes_url = staged.release_notes_url();
 
         Some(
             div()
@@ -8760,18 +8759,27 @@ impl Shell {
                                 .text_color(p.muted_foreground)
                                 .child(subtitle),
                         )
-                        .children(release_notes_url.map(|url| {
+                        .child(
                             div().flex().items_center().child(
                                 Button::new("update-card-release-notes")
                                     .label(utext::CARD_RELEASE_NOTES.get())
                                     .debug_selector(|| "update-card-release-notes".into())
                                     .ghost()
                                     .xsmall()
-                                    .on_click(move |_, _, cx| {
-                                        cx.open_url(&url);
+                                    .on_click(|_, _, cx| {
+                                        let mut u = cx
+                                            .try_global::<UpdateState>()
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        u.card_collapsed = true;
+                                        cx.set_global(u);
+                                        krill_app::settings::open_window_at_tab(
+                                            krill_app::settings::AdminTab::Updates,
+                                            cx,
+                                        );
                                     }),
-                            )
-                        })),
+                            ),
+                        ),
                 )
                 .children(restart_error.map(|error| {
                     krill_app::ui::error_banner(p, error)
