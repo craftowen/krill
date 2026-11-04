@@ -65,9 +65,11 @@ fn ascii_scan_bypass_matches_raw_parser_across_chunks() {
     }
 }
 
-/// 디스크에 아무것도 없는 상태(테마를 한 번도 받지 않음). 테스트는 `set_theme`을 부르지 않는다.
+/// 디스크에 아무것도 없는 상태(테마를 한 번도 받지 않음). `set_theme`을 불러도 저장은 늘 실패한다.
 fn fresh() -> Appearance {
-    Appearance::load(PathBuf::from("/nonexistent/mk020/theme"))
+    // `/nonexistent/..`는 Windows 관리자 계정에서 `C:\nonexistent`로 만들어져, 저장된 테마가
+    // 다른 테스트로 새어 들어갔다. 일반 파일 아래 경로는 어느 OS에서도 만들 수 없다.
+    Appearance::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml/mk020/theme"))
 }
 
 /// MK-008 §2 표의 질의 16종(+ 표 19~21의 캡처 없는 질의). 실제 에이전트처럼 DA1을 맨 끝에 둔다.
