@@ -75,7 +75,7 @@ try {
   const tunnel = 'https://sample-random-123.trycloudflare.com';
   response = await fetch(`${base}/v1/mobile-events`, {method: 'OPTIONS', headers: {origin: tunnel,
     'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type'}});
-  assert.equal(response.status, 204); assert.equal(response.headers.get('access-control-allow-origin'), tunnel);
+  assert.equal(response.status, 403); assert.equal(response.headers.get('access-control-allow-origin'), null);
   const mobilePost = (events, options = {}) => fetch(`${base}/v1/mobile-events`, {method: 'POST',
     headers: {'content-type': 'application/json', origin}, body: JSON.stringify({schema_version: 1, events}), ...options});
   response = await mobilePost([mobile]); assert.equal(response.status, 200); checkCors(response);
