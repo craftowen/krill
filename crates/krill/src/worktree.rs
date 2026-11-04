@@ -474,7 +474,7 @@ fn run_list(args: &[OsString]) -> ExitCode {
                     "comment": cp.comment,
                     "pr": cp.pr,
                     "issue": cp.issue,
-                    "parent": cp.parent,
+                    "parent": cp.parent.as_deref().map(shown),
                     "unread": cp.unread,
                 })
             })
@@ -559,6 +559,13 @@ fn run_show(args: &[OsString]) -> ExitCode {
     show_worktree_info(&root, json)
 }
 
+/// Stored keys keep the Windows `\\?\` prefix for compatibility; output shows the ordinary path.
+fn shown(key: &str) -> String {
+    krill_proto::os::shell_path(std::path::Path::new(key))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
     let key = krill_proto::orchestration::worktree_key(root);
     let branch = std::process::Command::new("git")
@@ -578,13 +585,13 @@ fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
     let cp = store.checkpoint(&key);
     if json {
         let payload = serde_json::json!({
-            "worktree": key,
+            "worktree": shown(&key),
             "branch": branch,
             "workspace_status": cp.workspace_status,
             "comment": cp.comment,
             "pr": cp.pr,
             "issue": cp.issue,
-            "parent": cp.parent,
+            "parent": cp.parent.as_deref().map(shown),
             "references": cp.references,
             "unread": cp.unread,
             "updated_at_ms": cp.updated_at_ms,
@@ -597,7 +604,7 @@ fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
             }
         }
     } else {
-        println!("worktree:   {key}");
+        println!("worktree:   {}", shown(&key));
         println!("branch:     {branch}");
         println!(
             "status:     {}",
@@ -609,7 +616,10 @@ fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
             cp.pr.map_or_else(|| "-".to_owned(), |n| format!("#{n}"))
         );
         println!("issue:      {}", cp.issue.as_deref().unwrap_or("-"));
-        println!("parent:     {}", cp.parent.as_deref().unwrap_or("-"));
+        println!(
+            "parent:     {}",
+            cp.parent.as_deref().map_or_else(|| "-".to_owned(), shown)
+        );
     }
     ExitCode::SUCCESS
 }
