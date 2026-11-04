@@ -51,6 +51,8 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    `run-use <run-id>`, `run-current --json`. After interruption, inspect the existing
    Run before creating another. Pass `--run <run-id>` on subsequent commands that
    support it; the current Run is shared state, not private coordinator memory.
+   Run `run-create` or `run-use` from your own Krill session: that session becomes
+   the Run's coordinator, which Krill wakes when coordinator mail arrives.
 3. Define tasks before dispatch with `task-create --run <run-id> --title "<unit>"
    --desc "<self-contained assignment>" [--deps <task-id,...>] --json`.
    For delivery work needing independent verification, create implementation,
@@ -78,7 +80,10 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    <request-id> --json` or `worker-show <dispatch-id> --json` before retrying.
 5. Inspect `task-list --run <run-id> --json`, `worker-list --run <run-id> --json`
    (which includes live `session_state`, `terminal_state`, and `next_action` hints),
-   and bounded `worker-read <dispatch-id> --lines 60 --json`. Wait with
+   and bounded `worker-read <dispatch-id> --lines 60 --json`. After starting the
+   ready wave you may end your turn: Krill types a mail pointer into the idle
+   coordinator session, and you read the mail with the `check` command it names.
+   A coordinator outside a Krill session waits with
    `check --to coordinator --run <run-id> --unread --wait --timeout-ms 60000 --json`
    (plain `--wait` defaults to 60s, max 300s).
    See [messaging-and-gates](references/messaging-and-gates.md) before acknowledging mail
@@ -93,8 +98,12 @@ needed references with `--reference references/<file>.md` (`--references` lists 
    verification and invalidating stale results. Correct drift through follow-ups or a
    new scoped assignment; do not silently expand the requested result.
 7. Resolve every owned dispatch, recording failed/blocked work honestly.
-   `worker_done` settles work but does **not** close its session. After reading
-   the evidence and deciding no follow-up needs that terminal, call
+   `worker_done` settles work but does **not** close its session. Acknowledging
+   a `worker_done` with `check --ack` or `--ack-ids` releases that worker when
+   the dispatch created its session and the agent is idle, exited, or gone;
+   `check` names it in `auto_released` (JSON object) or on stderr. To keep a
+   worker for follow-up, run `worker-retain <dispatch-id>` before acknowledging.
+   For any other settled worker no follow-up needs, call
    `worker-release <dispatch-id>` without asking for a separate cleanup approval.
    Do this throughout the run, rather than leaving completed workers open until
    the end. Release archives bounded output and requires settled work and a
