@@ -3461,7 +3461,7 @@ fn linked_worktree_registers_and_groups_under_main_repo() {
     fs::create_dir_all(&wt).unwrap();
     fs::write(gitdir.join("commondir"), "../..\n").unwrap();
     fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
-    let canon = |p: &Path| fs::canonicalize(p).unwrap();
+    let canon = |p: &Path| krill_proto::os::canonicalize(p).unwrap();
 
     assert_eq!(main_worktree(&wt), Some(canon(&demo)));
     assert_eq!(main_worktree(&demo), None);
@@ -3515,7 +3515,7 @@ fn owe852_register_project_persists_and_dedupes() {
     let value: toml::Value = toml::from_str(&body).unwrap();
     let projects = value["projects"].as_array().unwrap();
     assert_eq!(projects.len(), 1);
-    let expected = fs::canonicalize(&repo)
+    let expected = krill_proto::os::canonicalize(&repo)
         .unwrap_or_else(|_| repo.clone())
         .to_string_lossy()
         .trim()
@@ -3651,7 +3651,7 @@ fn workspace_suffix_and_missing_worktrees_are_repaired_and_filtered() {
     let drive = base.join("내 드라이브");
     fs::create_dir_all(&state_dir).unwrap();
     fs::create_dir_all(&drive).unwrap();
-    let drive_canon = fs::canonicalize(&drive).unwrap();
+    let drive_canon = krill_proto::os::canonicalize(&drive).unwrap();
     let polluted = format!(
         "{}::workspace:2de7222e-4069-4b91-bb07-3e05a9808a9f",
         drive_canon.display()
