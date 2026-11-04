@@ -51,7 +51,6 @@ pub(super) fn provider_icon(provider: ProviderKind) -> Option<Icon> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest as _, Sha256};
 
     #[test]
     fn bundled_brand_files_match_the_orca_asset_hashes() {
@@ -71,7 +70,7 @@ mod tests {
             let source = sources.iter().find(|s| s["file"] == name).unwrap();
             assert_eq!(
                 source["sha256"],
-                format!("{:x}", Sha256::digest(bytes)),
+                crate::updater::ed25519::sha256_hex(bytes),
                 "modified Orca asset: {name}"
             );
         }

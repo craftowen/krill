@@ -17,12 +17,12 @@ use gpui::{
     WindowOptions, div, point, prelude::*, px, size,
 };
 use krill_app::terminal::{Highlight, Preedit, RowPlanCache, TerminalElement};
+use krill_app::updater::ed25519::sha256_hex;
 use krill_proto::screen::Link;
 use krill_proto::theme::{DEFAULT, Theme};
 use krill_term::grid::{Cell, Color, Flags, Screen};
 use krill_term::ime::CellPoint;
 use krill_term::select::{Point, Selection};
-use sha2::{Digest as _, Sha256};
 
 const FRAMES: usize = 12;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -366,7 +366,7 @@ fn native(output: PathBuf) -> ExitCode {
                                 if colors.len() >= 32 { break; }
                             }
                             if colors.len() < 32 { return Err("renderer produced an empty or trivial image".into()); }
-                            first_hash = format!("{:x}", Sha256::digest(&cached.bytes));
+                            first_hash = sha256_hex(&cached.bytes);
                             if inject_mismatch && let Some(byte) = direct.bytes.first_mut() { *byte ^= 1; }
                         }
                         if cached.dimensions != direct.dimensions || cached.bytes != direct.bytes {
@@ -377,7 +377,7 @@ fn native(output: PathBuf) -> ExitCode {
                             direct_draw.push(direct.draw_us);
                             readbacks.push(cached.readback_us);
                         }
-                        if index == FRAMES - 1 { last_hash = format!("{:x}", Sha256::digest(&cached.bytes)); }
+                        if index == FRAMES - 1 { last_hash = sha256_hex(&cached.bytes); }
                         cx.background_executor().timer(Duration::from_millis(2)).await;
                     }
                     if first_hash == last_hash { return Err(format!("workload did not change the rendered image: {workload}").into()); }

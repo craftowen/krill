@@ -53,8 +53,9 @@ tikv-jemallocator = "0.7.0"
 tikv-jemalloc-ctl = "0.7.0"
 # krill-term IME 오버레이 셀 폭. alacritty_terminal과 같은 크레이트라 그리드 폭 판정과 일치한다.
 unicode-width = "0.2.2"
-# krilld setup 스크립트 신뢰 해시(MK-042). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
-sha2 = "0.10.9"
+# krilld setup 스크립트 신뢰 해시(MK-042)·콜드 스크롤백 세그먼트 해시. iroh(ed25519-dalek)·rust-embed가 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
+# 0.11은 기능 플래그 없이 aarch64 SHA2 명령을 쓴다. 0.10은 `asm` 기능 없이는 소프트웨어 구현으로 돈다.
+sha2 = "0.11.1"
 # 앱 날짜 표시는 gpui 의존성에 이미 잠긴 chrono로 시스템 시간대(DST 포함)를 따른다.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 # MK-063: 자체 업데이터 latest.json Ed25519 서명 검증(T4-D14). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
