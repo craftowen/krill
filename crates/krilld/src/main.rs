@@ -157,10 +157,9 @@ fn main() -> ExitCode {
             .stack_size(256 * 1024)
             .spawn(move || {
                 krilld::alloc::mobile_thread().ok();
+                let holder = rejoin::holder_pid();
                 r.run_holder(link);
-                if rejoin::orphan(&r, &path).is_ok() {
-                    done.send(()).ok();
-                }
+                rejoin::link_lost(&r, &path, holder, &done);
             });
         if reader.is_err() {
             return ExitCode::FAILURE; // 답을 나눠 줄 리더가 없으면 holder 요청이 끝나지 않는다

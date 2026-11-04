@@ -12,16 +12,18 @@
     reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"
 )]
 
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
+use krill_holder::link::Link;
 use krill_proto::SessionId;
 use krill_proto::control::{Create, Failure, Info, Program, Reply, Request};
 use krill_proto::daemon::{self, HolderStatus, client_hello};
-use krill_proto::holder::STATUS_UNKNOWN;
+use krill_proto::holder::{FromHolder, STATUS_UNKNOWN, VERSION};
 use krill_proto::input::{Input, InputAck, InputId, InputResult};
 use krill_proto::ipc::{self, ClientRole, ServerHello};
 use krill_proto::screen::{Attach, Attached, Msg, Seq, Stream, decode_output, kind};
@@ -238,6 +240,59 @@ fn tmp(name: &str) -> PathBuf {
     fs::remove_dir_all(&dir).ok();
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// 링크만 끊기고 holder(이 테스트 프로세스)가 살아 있으면 krilld는 고아를 선언하지 않고 끝난다. 고아를 선언하면
+/// 클라이언트가 holder를 하나 더 띄워 같은 PTY를 쥔 holder 둘이 남는다(2026-11-04 운영 사례).
+#[test]
+fn link_loss_with_live_holder_exits_instead_of_orphaning() {
+    let dir = tmp("live-holder");
+    let run = dir.join("run");
+    fs::create_dir(&run).unwrap();
+    fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let sock = run.join("krilld.sock");
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let link = Link::new(OwnedFd::from(ours));
+    for m in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: std::process::id(),
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    let mut krilld = fixture_command(KRILLD, &dir)
+        .arg(&sock)
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut kids = Kids::default();
+    kids.pids.push(krilld.id());
+    wait_until("krilld accepting", || connect(&sock).is_some());
+    link.send(&[0xff; 16], &[]).unwrap();
+    let handoff = run.join("krilld.sock.hnd");
+    let deadline = Instant::now() + WAIT;
+    let status = loop {
+        assert!(!handoff.exists(), "krilld declared itself an orphan");
+        if let Some(status) = krilld.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "krilld kept running without a holder link"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.code().is_some(),
+        "krilld exited on its own, not by signal: {status}"
+    );
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
 }
 
 #[test]
