@@ -311,9 +311,15 @@ try {
         }
     }
     if ($AddToPath) {
-        $path = [Environment]::GetEnvironmentVariable('Path', 'User')
+        # Read and write the raw registry value: [Environment]::SetEnvironmentVariable would store
+        # REG_SZ and expand entries such as %USERPROFILE%\...\WindowsApps for good.
+        $envKey = Get-Item 'HKCU:\Environment'
+        $path = [string]$envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
         if (($path -split ';') -notcontains $Dest) {
-            [Environment]::SetEnvironmentVariable('Path', ((@("$path".TrimEnd(';'), $Dest) | Where-Object { $_ }) -join ';'), 'User')
+            New-ItemProperty -Path 'HKCU:\Environment' -Name Path -PropertyType ExpandString -Force `
+                -Value ((@($path.TrimEnd(';'), $Dest) | Where-Object { $_ }) -join ';') | Out-Null
+            # An empty set broadcasts WM_SETTINGCHANGE so new Explorer windows see the new PATH.
+            [Environment]::SetEnvironmentVariable('KRILL_PATH_REFRESH', $null, 'User')
         }
         if (($env:Path -split ';') -notcontains $Dest) { $env:Path += ";$Dest" }
     }
