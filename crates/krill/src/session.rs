@@ -182,6 +182,14 @@ fn request(c: &mut UnixStream, r: &Request) -> Result<Reply> {
     Ok(reply)
 }
 
+/// `ls`의 WORKTREE 값. 저장 키(`worktree_key`)는 Windows에서 `\\?\C:\...`지만 daemon이 알려 주는
+/// 저장소·CWD는 보통 경로라, 보여 주고 비교할 때는 접두를 뗀다.
+fn shown_worktree(path: &std::path::Path) -> String {
+    krill_proto::os::shell_path(&crate::set::resolve_worktree(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// OWE-684: 세션 목록에 붙는 holder 상실 경고. 정상이면 `None`(기본 출력 그대로).
 fn holder_loss_warning(orphan: bool) -> Option<&'static str> {
     orphan.then_some(
@@ -228,9 +236,7 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
                 let resolved = if target.is_remote() {
                     raw.to_owned()
                 } else {
-                    crate::set::resolve_worktree(std::path::Path::new(raw))
-                        .to_string_lossy()
-                        .into_owned()
+                    shown_worktree(std::path::Path::new(raw))
                 };
                 worktree_filter = Some(resolved);
             }
@@ -285,9 +291,7 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
             })
             .unwrap_or_default();
         if worktree.is_empty() && !cwd.is_empty() && !target.is_remote() {
-            worktree = crate::set::resolve_worktree(std::path::Path::new(&cwd))
-                .to_string_lossy()
-                .into_owned();
+            worktree = shown_worktree(std::path::Path::new(&cwd));
         }
         if let Some(filter) = &worktree_filter {
             let matches_wt = worktree == *filter || crate::remote::is_path_within(&cwd, filter);
@@ -1391,6 +1395,19 @@ pub fn resolve_session_cwd(id: u64) -> io::Result<std::path::PathBuf> {
 mod tests {
     use super::*;
     use krill_proto::agent::rules::ScreenRules;
+
+    #[cfg(windows)]
+    #[test]
+    fn ls_worktree_has_no_verbatim_prefix() {
+        let dir = std::env::temp_dir().join(format!("krill-ls-wt-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let key = crate::set::resolve_worktree(&dir);
+        let shown = shown_worktree(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(key.to_string_lossy().starts_with(r"\\?\"), "{key:?}");
+        assert_eq!(shown, krill_proto::os::shell_path(&key).to_string_lossy());
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+    }
 
     #[test]
     fn windows_stdin_crlf_becomes_unix_lf() {
