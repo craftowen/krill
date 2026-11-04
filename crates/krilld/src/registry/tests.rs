@@ -866,6 +866,40 @@ fn daemon_startup_collects_expired_orphan_launch_metadata() {
 }
 
 #[test]
+fn startup_history_gc_waits_for_first_monitor_tick() {
+    let dir = std::env::temp_dir().join(format!("startup-history-gc-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let store = Store::open(&dir, crate::store::Limits::default()).unwrap();
+    let mut rec = store.recorder(SessionId(42), FALLBACK_SIZE).unwrap();
+    rec.append(b"expired");
+    rec.seal();
+    drop(rec);
+    let session = store.session_dir(SessionId(42));
+    drop(store);
+    let old = SystemTime::now() - Duration::from_hours(8 * 24);
+    for segment in fs::read_dir(&session).unwrap() {
+        fs::File::options()
+            .write(true)
+            .open(segment.unwrap().path())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+    let reg = Registry::new(None, Some(&dir));
+    assert!(
+        session.exists(),
+        "startup must not scan history before accepting clients"
+    );
+    let last = *lock(&reg.last_gc);
+    reg.gc_due(last, SystemTime::now());
+    assert!(
+        !session.exists(),
+        "the first monitor tick collects expired history"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn monitor_tick_collects_history_on_interval_without_restart() {
     let dir = std::env::temp_dir().join(format!("mk587-gc-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
@@ -875,6 +909,8 @@ fn monitor_tick_collects_history_on_interval_without_restart() {
     rec.append(b"expired");
     rec.seal();
     let last = *lock(&reg.last_gc);
+    reg.gc_due(last, SystemTime::now());
+    assert!(store.session_dir(SessionId(42)).exists());
     let later = SystemTime::now() + Duration::from_hours(8 * 24);
     reg.gc_due(last + GC_INTERVAL / 2, later);
     assert!(store.session_dir(SessionId(42)).exists());
