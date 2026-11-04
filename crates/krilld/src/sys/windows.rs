@@ -69,6 +69,24 @@ const SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// 종료 감시 폴링 간격.
 const EXIT_POLL: Duration = Duration::from_millis(100);
 
+/// Children inherit the error mode, and a process that fails while loading cannot suppress its own
+/// dialog. The daemon turns dialogs off even under an older holder that stays alive across updates;
+/// session trampolines turn them back on so the user's programs keep Windows' default.
+pub fn set_hard_error_dialogs(show: bool) {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        GetErrorMode, SEM_FAILCRITICALERRORS, SetErrorMode,
+    };
+    // SAFETY: no pointers; only reads this process's error mode.
+    let mode = unsafe { GetErrorMode() };
+    let mode = if show {
+        mode & !SEM_FAILCRITICALERRORS
+    } else {
+        mode | SEM_FAILCRITICALERRORS
+    };
+    // SAFETY: no pointers; only changes this process's error mode.
+    unsafe { SetErrorMode(mode) };
+}
+
 /// Keep the waiting agent launcher alive on Ctrl+C/Break; the agent handles its own console events.
 /// Use a callback rather than the inheritable NULL-handler ignore flag, so children still receive Ctrl+C.
 pub(crate) fn protect_agent_launcher() -> io::Result<()> {

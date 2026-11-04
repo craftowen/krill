@@ -190,6 +190,9 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsHandle;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::System::Console::{self as winconsole, COORD, HPCON};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    GetErrorMode, SEM_FAILCRITICALERRORS, SetErrorMode,
+};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
@@ -199,12 +202,12 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_DUP_HANDLE, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    CREATE_DEFAULT_ERROR_MODE, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+    DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcess,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_DUP_HANDLE,
+    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 type Create = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
@@ -504,6 +507,29 @@ impl Drop for Attributes {
         }
     }
 }
+/// A process that fails while loading (`0xC000012D` at the commit limit) cannot suppress its own
+/// dialog, so the parent must: children inherit this mode. Background helpers stop blocking on an
+/// unattended modal and fail with an exit status instead.
+pub fn suppress_hard_error_dialogs() {
+    // SAFETY: no pointers; only reads this process's error mode.
+    let mode = unsafe { GetErrorMode() };
+    // SAFETY: no pointers; only changes this process's error mode.
+    unsafe { SetErrorMode(mode | SEM_FAILCRITICALERRORS) };
+}
+
+/// Programs in a session keep Windows' default. The krilld trampoline stays silent itself and
+/// clears the bit before starting the real program.
+fn error_mode_flag(args: &[OsString], session: bool) -> u32 {
+    let trampoline = args.first().is_some_and(|arg| {
+        arg == "--agent-exec" || arg == "--agent-exec-then-shell" || arg == "--shell-exec"
+    });
+    if session && !trampoline {
+        CREATE_DEFAULT_ERROR_MODE
+    } else {
+        0
+    }
+}
+
 pub fn spawn(
     path: &OsStr,
     args: &[OsString],
@@ -592,7 +618,8 @@ pub fn spawn(
             DETACHED_PROCESS
         } else {
             0
-        };
+        }
+        | error_mode_flag(args, console.is_some());
     // SAFETY: all buffers and attribute storage remain live, inheritance is limited by HANDLE_LIST.
     cvt(unsafe {
         CreateProcessW(
@@ -1043,6 +1070,60 @@ pub fn spawn_detached(path: &OsStr, args: &[OsString], break_away: bool) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_session_programs_get_the_default_error_mode() {
+        let flag = |args: &[&str], session| {
+            let args: Vec<_> = args.iter().map(OsString::from).collect();
+            error_mode_flag(&args, session)
+        };
+        assert_eq!(flag(&["daemon.sock"], false), 0);
+        for trampoline in ["--agent-exec", "--agent-exec-then-shell", "--shell-exec"] {
+            assert_eq!(flag(&[trampoline, "claude"], true), 0);
+        }
+        assert_eq!(flag(&["-NoLogo"], true), CREATE_DEFAULT_ERROR_MODE);
+        assert_eq!(flag(&[], true), CREATE_DEFAULT_ERROR_MODE);
+    }
+    /// Re-runs this test as the spawned child, which reports the error mode it actually inherited.
+    #[test]
+    #[expect(clippy::exit, reason = "the child reports through its exit code")]
+    fn spawned_daemon_inherits_the_suppressed_error_mode() -> io::Result<()> {
+        const PROBE: &str = "KRILL_TEST_REPORT_ERROR_MODE";
+        if std::env::var_os(PROBE).is_some() {
+            // SAFETY: no pointers; only reads this process's error mode.
+            std::process::exit(unsafe { GetErrorMode() }.cast_signed());
+        }
+        let test = module_path!().split_once("::").unwrap().1;
+        let args = [
+            format!("{test}::spawned_daemon_inherits_the_suppressed_error_mode"),
+            "--exact".to_owned(),
+        ]
+        .map(OsString::from);
+        let env: Vec<_> = std::env::vars_os()
+            .chain([(PROBE.into(), "1".into())])
+            .collect();
+        let exe = std::env::current_exe()?;
+        let child_mode = || -> io::Result<u32> {
+            let child = spawn(exe.as_os_str(), &args, &env, None, None, &[], None)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.status()? {
+                    return Ok(status.cast_unsigned());
+                }
+                assert!(std::time::Instant::now() < deadline, "child did not exit");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        // SAFETY: no pointers; test binary runs this process-wide change on its own.
+        let original = unsafe { SetErrorMode(0) };
+        let control = child_mode()?;
+        suppress_hard_error_dialogs();
+        let treated = child_mode()?;
+        // SAFETY: no pointers; restores the mode saved above.
+        unsafe { SetErrorMode(original) };
+        assert_eq!(control & SEM_FAILCRITICALERRORS, 0);
+        assert_ne!(treated & SEM_FAILCRITICALERRORS, 0);
+        Ok(())
+    }
     #[test]
     fn new_inbox_session_is_rejected_before_calling_an_opaque_backend() {
         static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

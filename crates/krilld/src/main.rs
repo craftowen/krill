@@ -72,6 +72,8 @@ fn main() -> ExitCode {
             .and_then(|pid| pid.parse().ok())
             .map_or(ExitCode::from(2), krilld::run_console_probe);
     }
+    #[cfg(windows)]
+    krilld::set_hard_error_dialogs(false);
     let path = PathBuf::from(argument);
     krill_log::init(krill_log::Component::Daemon).ok();
     tracing::info!("daemon starting");

@@ -103,6 +103,7 @@ struct Holder {
     listener: Option<OwnedSocket>,
 }
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
+    sys::suppress_hard_error_dialogs();
     let path = args.next().ok_or(io::ErrorKind::InvalidInput)?;
     if path == "--bootstrap" {
         let result = sys::bootstrap(&args.collect::<Vec<_>>());
@@ -293,6 +294,7 @@ impl Holder {
             self.daemon = None;
             return true;
         }
+        tracing::warn!(status = %format_args!("{status:#010x}"), ?uptime, "krilld exited");
         let upgrading = std::mem::take(&mut self.upgrading);
         if uptime >= Duration::from_secs(1) && !upgrading {
             self.streak = 0;

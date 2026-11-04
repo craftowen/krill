@@ -31,6 +31,7 @@ pub fn run_windows_shell(
     mut args: impl Iterator<Item = std::ffi::OsString>,
 ) -> std::process::ExitCode {
     use std::io::Write as _;
+    sys::set_hard_error_dialogs(true);
     let Some(program) = args.next() else {
         return std::process::ExitCode::from(2);
     };

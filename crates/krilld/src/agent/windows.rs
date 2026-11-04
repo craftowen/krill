@@ -61,6 +61,7 @@ pub const AGENT_THEN_SHELL: &[u8] = b"--agent-exec-then-shell";
 /// `then_shell`이면 에이전트가 끝난 뒤(설치 안 됨 127은 제외) 로그인 셸을 띄우고 그 종료 코드를 돌려준다.
 #[cfg(windows)]
 pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCode {
+    crate::sys::set_hard_error_dialogs(true);
     let Some(hint) = args.next() else {
         return ExitCode::from(2);
     };

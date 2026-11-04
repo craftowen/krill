@@ -46,4 +46,6 @@ pub use store::{Recorder, Store};
 pub use sys::notify_on_stop_signal;
 #[cfg(windows)]
 pub use sys::run_console_probe;
+#[cfg(windows)]
+pub use sys::set_hard_error_dialogs;
 pub use term::HOT_LINES;
