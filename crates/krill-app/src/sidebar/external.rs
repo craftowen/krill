@@ -2874,7 +2874,7 @@ pub fn parent_map() -> Option<BTreeMap<u32, u32>> {
     {
         return Some(map.clone());
     }
-    let out = std::process::Command::new("ps")
+    let out = crate::platform::background_command("ps")
         .args(["-eo", "pid,ppid"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

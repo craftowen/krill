@@ -437,7 +437,7 @@ fn opencode_with_exe(
     cwd: &[u8],
 ) -> io::Result<()> {
     let command = |dir: Option<&Path>| {
-        let mut command = Command::new(exe);
+        let mut command = krill_proto::os::background_command(exe);
         command
             .env("PATH", path)
             .env_remove("OPENCODE_CONFIG_DIR")

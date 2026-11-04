@@ -648,7 +648,7 @@ fn create_command(folder: &Path, branch: &str, title: &str, body: &str) -> Comma
 
 pub fn merge_command(folder: &Path, branch: &str, method: PrMergeMethod) -> Command {
     let executable = find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
-    let mut cmd = Command::new(executable);
+    let mut cmd = crate::platform::background_command(executable);
     cmd.current_dir(folder)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -683,7 +683,7 @@ pub fn confirmed_merge_command(
 
 pub fn ready_command(folder: &Path, branch: &str, to_draft: bool) -> Command {
     let executable = find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
-    let mut cmd = Command::new(executable);
+    let mut cmd = crate::platform::background_command(executable);
     cmd.current_dir(folder)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")

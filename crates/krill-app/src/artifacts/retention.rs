@@ -8,7 +8,12 @@ pub(super) type RetentionCall = Arc<dyn Fn(String, u16) -> Result<Item, String> 
 pub(super) fn cli_retention_call(state: Option<PathBuf>) -> RetentionCall {
     Arc::new(move |slug, days| {
         let exe = krill_proto::daemon::sibling_exe("krill").map_err(|e| e.to_string())?;
-        retention_command(&mut Command::new(exe), state.as_deref(), &slug, days)
+        retention_command(
+            &mut crate::platform::background_command(exe),
+            state.as_deref(),
+            &slug,
+            days,
+        )
     })
 }
 
