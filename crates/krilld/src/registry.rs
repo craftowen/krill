@@ -1843,6 +1843,7 @@ impl Registry {
         let size = crate::term::clamp_size(WinSize { cols, rows });
         let mut initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
         env.extend(crate::git::worktree::environment(&initial_cwd));
+        crate::shell::dedupe_env(&mut env);
         // 자식은 Spawned 응답보다 먼저 hook을 보낼 수 있다. 루트·세션을 모두 등록하기 전에는
         // socket hook 적용과 spool 소거를 막아 최초 이벤트가 미귀속 상태로 ACK/폐기되지 않게 한다.
         // holder 응답 리더는 on_exited 워커와 분리돼 있어 이 잠금을 기다리지 않는다.

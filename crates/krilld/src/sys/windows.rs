@@ -416,6 +416,67 @@ pub fn user() -> io::Result<User> {
     })
 }
 
+/// 레지스트리 기준의 새 사용자 환경(시스템·사용자 변수, `REG_EXPAND_SZ` 확장, `Path`는 시스템;사용자).
+/// Windows Terminal의 새 탭처럼 이 프로세스가 물려받은 env와 무관하다. 키·값은 OS 인코딩 바이트다.
+pub(crate) fn user_environment() -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_IMPERSONATE};
+    use windows_sys::Win32::System::Environment::{
+        CreateEnvironmentBlock, DestroyEnvironmentBlock,
+    };
+    let mut raw = ptr::null_mut();
+    // SAFETY: 인자 없는 의사 핸들 조회다.
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: 현재 프로세스 의사 핸들과 쓰기 위치만 넘긴다.
+    if unsafe {
+        OpenProcessToken(
+            process,
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
+            &raw mut raw,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let token = owned(raw)?;
+    let mut block: *mut core::ffi::c_void = ptr::null_mut();
+    // SAFETY: token은 살아 있는 토큰이고 block은 쓰기 위치다. bInherit=FALSE라 이 프로세스 env를 섞지 않는다.
+    if unsafe { CreateEnvironmentBlock(&raw mut block, token.as_raw_handle(), 0) } == 0
+        || block.is_null()
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut env = Vec::new();
+    let mut at = block.cast::<u16>().cast_const();
+    loop {
+        let mut len = 0_usize;
+        // SAFETY: 블록은 NUL로 끝나는 UTF-16 문자열의 나열이고 빈 문자열(이중 NUL)로 끝난다.
+        // 그래서 NUL을 만나기 전의 위치는 모두 블록 안이다.
+        while unsafe { *at.wrapping_add(len) } != 0 {
+            len = len.saturating_add(1);
+        }
+        if len == 0 {
+            break;
+        }
+        // SAFETY: at..at+len은 위에서 NUL 전까지 읽은 같은 블록 안의 범위다.
+        let entry = unsafe { std::slice::from_raw_parts(at, len) };
+        // 첫 글자의 `=`는 이름의 일부다(`=C:` 같은 숨은 변수).
+        if let Some(eq) = entry.iter().skip(1).position(|&c| c == u16::from(b'=')) {
+            let (key, value) = entry.split_at(eq.saturating_add(1));
+            env.push((
+                std::ffi::OsString::from_wide(key).into_encoded_bytes(),
+                std::ffi::OsString::from_wide(value.get(1..).unwrap_or_default())
+                    .into_encoded_bytes(),
+            ));
+        }
+        // SAFETY: 다음 문자열은 이 문자열의 NUL 바로 뒤에서 시작한다.
+        at = unsafe { at.add(len.saturating_add(1)) };
+    }
+    // SAFETY: CreateEnvironmentBlock이 준 블록을 한 번만 해제한다. 위 슬라이스는 더 쓰지 않는다.
+    unsafe { DestroyEnvironmentBlock(block) };
+    Ok(env)
+}
+
 /// IPv4 주소·한글을 포함한 표시 이름·기본 게이트웨이 유무를 같은 네이티브 스냅샷에서 읽는다.
 pub(crate) fn ipv4_interfaces() -> io::Result<Vec<(String, std::net::Ipv4Addr, bool)>> {
     let mut size = 15_000_u32;

@@ -12,8 +12,10 @@
 //! Windows(OWE-833, windows-spike-OWE-830.md)는 로그인 셸이 없다.
 //! - 기본 셸은 `PATH`의 [`SHELL_CANDIDATES`](pwsh → powershell) → `%COMSPEC%` → `cmd.exe`. `SHELL`은 보지 않는다
 //!   (Git Bash가 남긴 `/usr/bin/bash` 같은 POSIX 경로라 `CreateProcess`가 못 띄운다).
-//! - 환경은 탐색기가 준 사용자 환경 중 [`KEEP_WINDOWS`]와 `PATH`를 그대로 물려준다(로그인 셸 `PATH` 탐침 없음).
-//!   변수 이름은 대소문자를 가리지 않는다(`Path`).
+//! - 환경은 Windows Terminal의 새 탭처럼 Spawn마다 레지스트리에서 새로 만든 사용자 환경([`sys::user_environment`])이
+//!   바탕이다. 그 위에 krilld가 물려받은 [`KEEP_WINDOWS`]를 덮고, `PATH`는 새 값 뒤에 물려받은 PATH에만 있는 폴더를
+//!   붙인다. 그래서 시스템 속성에 넣은 변수와 Krill보다 나중에 설치한 도구가 보인다. 새 환경을 못 만들면 물려받은
+//!   env의 [`KEEP_WINDOWS`]와 `PATH`만 쓴다. 변수 이름은 대소문자를 가리지 않는다(`Path`).
 //! - 사용자 지정 프로그램은 `PATH`에서 `.exe`·`.cmd` 등을 붙여 절대 경로로 고정한다(`claude` → `claude.cmd`).
 //!   `CreateProcess`는 확장자 없는 이름으로 `.cmd`를 찾지 못한다(실측).
 
@@ -169,16 +171,46 @@ impl std::fmt::Debug for Launch {
 }
 
 /// 실패한 PATH 탐색을 다시 시도하기까지의 대기. 그동안은 기본값을 즉시 쓴다.
+#[cfg(unix)]
 const PATH_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 로그인 셸(`-l -i -c`)이 만든 `PATH`의 성공값만 캐시한다. 실패·타임아웃이면 기본값을 쓰고
 /// [`PATH_RETRY`] 뒤에 다시 시도한다(git 호출마다 최대 5초씩 재탐색하지 않는다).
+#[cfg(unix)]
 pub(crate) fn login_path() -> &'static [u8] {
     static PATH: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     static FAILED_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     cached_path(&PATH, &FAILED_AT, PATH_RETRY, || Shell::Login.launch())
 }
 
+/// Windows는 탐침이 레지스트리 읽기라 싸다. [`PATH_REFRESH`]마다 다시 만들어 krilld 수명 내내 낡지 않는다.
+#[cfg(windows)]
+pub(crate) fn login_path() -> &'static [u8] {
+    // ponytail: 값이 바뀔 때만 새 PATH를 leak한다(도구 설치·제거 횟수만큼 수 KB). 호출부가 소유 값을 받으면 없앤다.
+    static PATH: std::sync::Mutex<Option<(std::time::Instant, &'static [u8])>> =
+        std::sync::Mutex::new(None);
+    let mut cached = PATH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, path)) = *cached
+        && at.elapsed() < PATH_REFRESH
+    {
+        return path;
+    }
+    let fresh = probe_path(&Shell::Login.launch()).unwrap_or_else(|| LAUNCHD_PATH.to_vec());
+    let path = match *cached {
+        Some((_, old)) if old == fresh.as_slice() => old,
+        _ => Box::leak(fresh.into_boxed_slice()),
+    };
+    *cached = Some((std::time::Instant::now(), path));
+    path
+}
+
+/// Windows [`login_path`] 재생성 주기.
+#[cfg(windows)]
+const PATH_REFRESH: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(unix)]
 fn cached_path<'a>(
     cache: &'a std::sync::OnceLock<Vec<u8>>,
     failed_at: &std::sync::Mutex<Option<std::time::Instant>>,
@@ -214,7 +246,13 @@ impl Shell {
     #[must_use]
     pub fn launch(&self) -> Launch {
         let inherited = std::env::vars_os().map(|(k, v)| (k.into_vec(), v.into_vec()));
-        let mut launch = self.launch_with_lang(sys::user().ok().as_ref(), inherited, system_lang());
+        #[cfg(unix)]
+        let base = Vec::new();
+        // 실패하면 빈 바탕, 곧 물려받은 env만 거르는 이전 동작이다.
+        #[cfg(windows)]
+        let base = sys::user_environment().unwrap_or_default();
+        let mut launch =
+            self.launch_from(sys::user().ok().as_ref(), base, inherited, system_lang());
         if matches!(self, Self::Custom { .. }) {
             set_path(&mut launch, login_path());
         }
@@ -244,9 +282,21 @@ impl Shell {
     }
 
     /// 테스트용. `system_lang`이 `None`이면 [`FALLBACK_LANG`]을 쓴다.
+    #[cfg(test)]
     pub(crate) fn launch_with_lang(
         &self,
         user: Option<&User>,
+        inherited: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+        system_lang: Option<Vec<u8>>,
+    ) -> Launch {
+        self.launch_from(user, Vec::new(), inherited, system_lang)
+    }
+
+    /// `base`(Windows 레지스트리 사용자 환경)는 거르지 않고 맨 아래에 깐다. 같은 이름은 뒤의 값이 이긴다.
+    fn launch_from(
+        &self,
+        user: Option<&User>,
+        base: Vec<(Vec<u8>, Vec<u8>)>,
         inherited: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
         system_lang: Option<Vec<u8>>,
     ) -> Launch {
@@ -264,7 +314,11 @@ impl Shell {
                 .or_else(|| from_env(key))
         };
         let windows_path = if cfg!(windows) {
-            let base = from_env(b"PATH");
+            let fresh = base
+                .iter()
+                .find(|(k, _)| same_key(k, b"PATH"))
+                .map(|(_, v)| v.clone());
+            let base = join_path(fresh, from_env(b"PATH"));
             krill_proto::os::augment_windows_path(base.as_deref().map(std::ffi::OsStr::from_bytes))
                 .map(OsStringExt::into_vec)
                 .or(base)
@@ -277,8 +331,8 @@ impl Shell {
             pick(user.map(|u| u.shell.as_slice()), b"SHELL").unwrap_or_else(|| fallback_shell(None))
         };
 
-        let mut env: Vec<(Vec<u8>, Vec<u8>)> =
-            inherited.iter().filter(|(k, _)| keep(k)).cloned().collect();
+        let mut env = base;
+        env.extend(inherited.iter().filter(|(k, _)| keep(k)).cloned());
         let has_locale = env
             .iter()
             .any(|(k, _)| matches!(k.as_slice(), b"LANG" | b"LC_ALL" | b"LC_CTYPE"));
@@ -321,6 +375,7 @@ impl Shell {
                     .collect()
             }
         };
+        dedupe_env(&mut env);
         #[cfg(windows)]
         let argv = windows_interactive(argv, &mut env);
         Launch { argv, env }
@@ -374,6 +429,43 @@ fn windows_interactive(mut argv: Vec<Vec<u8>>, env: &mut Vec<(Vec<u8>, Vec<u8>)>
         _ => {}
     }
     argv
+}
+
+/// 같은 이름(Windows는 대소문자 무시)이 여럿이면 마지막 것만 남긴다. Windows env 블록에서는 중복 중 아무거나
+/// 이길 수 있어, 덮어쓴 값(`PATH`, 계정 env)이 레지스트리 값에 지지 않게 한다.
+pub(crate) fn dedupe_env(env: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    let mut seen = std::collections::HashSet::new();
+    env.reverse();
+    env.retain(|(k, _)| {
+        seen.insert(if cfg!(windows) {
+            k.to_ascii_uppercase()
+        } else {
+            k.clone()
+        })
+    });
+    env.reverse();
+}
+
+/// 레지스트리 `PATH` 뒤에 물려받은 PATH에만 있는 폴더를 붙인다(krilld를 띄운 쪽이 더한 폴더를 잃지 않게).
+/// 레지스트리 값이 없으면 물려받은 값 그대로다.
+fn join_path(fresh: Option<Vec<u8>>, inherited: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    let Some(mut path) = fresh.filter(|p| !p.is_empty()) else {
+        return inherited;
+    };
+    for dir in inherited.iter().flat_map(|p| p.split(|&b| b == b';')) {
+        if dir.is_empty()
+            || path
+                .split(|&b| b == b';')
+                .any(|d| d.eq_ignore_ascii_case(dir))
+        {
+            continue;
+        }
+        if !path.ends_with(b";") {
+            path.push(b';');
+        }
+        path.extend_from_slice(dir);
+    }
+    Some(path)
 }
 
 /// 환경 변수 이름 비교. Windows는 대소문자를 가리지 않는다.
@@ -742,6 +834,66 @@ mod windows_tests {
         .launch_with_lang(None, env, None);
         assert_eq!(missing.argv[0], b"no-such-agent");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 시스템 속성에서 krilld보다 나중에 넣은 사용자 변수(화이트리스트 밖)도 새 세션에 보인다.
+    #[test]
+    fn session_env_reads_user_variables_added_after_start() {
+        struct Remove<'a>(&'a str);
+        impl Drop for Remove<'_> {
+            fn drop(&mut self) {
+                std::process::Command::new("reg.exe")
+                    .args(["delete", r"HKCU\Environment", "/v", self.0, "/f"])
+                    .stdout(Stdio::null())
+                    .status()
+                    .ok();
+            }
+        }
+        let name = format!("KRILL_TEST_FRESH_{}", std::process::id());
+        assert!(std::env::var_os(&name).is_none());
+        let reg = |args: &[&str]| {
+            let status = std::process::Command::new("reg.exe")
+                .args(args)
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "reg {args:?}");
+        };
+        reg(&[
+            "add",
+            r"HKCU\Environment",
+            "/v",
+            &name,
+            "/t",
+            "REG_EXPAND_SZ",
+            "/d",
+            r"%USERPROFILE%\fresh",
+            "/f",
+        ]);
+        let _remove = Remove(&name);
+        let launch = Shell::Login.launch();
+        let all = |k: &[u8]| {
+            launch
+                .env
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(k))
+                .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+                .collect::<Vec<_>>()
+        };
+        let profile = sys::user_environment()
+            .unwrap()
+            .into_iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(b"USERPROFILE"))
+            .map(|(_, v)| String::from_utf8(v).unwrap())
+            .unwrap();
+        assert_eq!(all(name.as_bytes()), [format!(r"{profile}\fresh")]);
+        let path = all(b"PATH");
+        assert_eq!(path.len(), 1, "one PATH entry wins: {path:?}");
+        assert!(
+            path[0].to_ascii_lowercase().contains(r"\system32"),
+            "{path:?}"
+        );
+        assert_eq!(all(b"TERM"), ["xterm-256color"]);
     }
 }
 
