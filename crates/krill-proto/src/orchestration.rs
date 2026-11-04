@@ -1264,6 +1264,14 @@ impl OrchestrationStore {
         if let Some(sid) = session_id {
             if let Some(ref id) = selected {
                 self.session_runs.insert(sid, id.clone());
+                // A worker selecting its own Run must not redirect coordinator mail to itself.
+                let worker = self
+                    .dispatches
+                    .iter()
+                    .any(|d| &d.run_id == id && d.session_id == Some(u64::from(sid)));
+                if !worker && let Some(run) = self.runs.iter_mut().find(|r| &r.id == id) {
+                    run.coordinator_session_id = Some(u64::from(sid));
+                }
             } else {
                 self.session_runs.remove(&sid);
             }
@@ -5558,6 +5566,32 @@ mod mailbox_and_worker_safety_tests {
             outcome: None,
             reply_to: None,
         }
+    }
+
+    #[test]
+    fn selecting_a_run_claims_its_coordinator_except_from_its_own_worker() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("claimed later", None)?;
+        let other = store.create_run("other", None)?;
+        let coordinator = |s: &OrchestrationStore, id: &str| {
+            s.runs
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.coordinator_session_id)
+        };
+        store.set_session_run(Some(5), Some(&run.id))?;
+        assert_eq!(coordinator(&store, &run.id), Some(5));
+        store.set_session_run(Some(6), Some(&run.id))?;
+        assert_eq!(coordinator(&store, &run.id), Some(6));
+        store.start_worker(&run.id, None, "w", "codex", Some(7), "/tmp", "p")?;
+        store.set_session_run(Some(7), Some(&run.id))?;
+        assert_eq!(coordinator(&store, &run.id), Some(6));
+        // A worker of one Run may still coordinate another (nested supervision).
+        store.set_session_run(Some(7), Some(&other.id))?;
+        assert_eq!(coordinator(&store, &other.id), Some(7));
+        store.set_session_run(Some(6), None)?;
+        assert_eq!(coordinator(&store, &run.id), Some(6));
+        Ok(())
     }
 
     #[test]

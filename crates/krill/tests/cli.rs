@@ -107,7 +107,11 @@ impl Daemon {
         }
     }
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(MK)
+        self.command(args).output().unwrap()
+    }
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(MK);
+        command
             .args(args)
             .env("KRILL_STATE_DIR", &self.dir)
             .env_remove("KRILL_SESSION_ID")
@@ -119,12 +123,18 @@ impl Daemon {
             .env_remove("KRILL_ORCH_MAX_DEPTH")
             .env_remove("MK_MAX_WORKER_DEPTH")
             .env_remove("KRILL_WORKTREES_DIR")
-            .env_remove("KRILL_ORCA_DIR")
-            .output()
-            .unwrap()
+            .env_remove("KRILL_ORCA_DIR");
+        command
     }
     fn ok(&self, args: &[&str]) -> String {
-        let out = self.run(args);
+        Self::ok_output(self.run(args), args)
+    }
+    /// Runs the CLI as an agent inside session `pane` would (`MK_PANE_ID`).
+    fn ok_in(&self, pane: &str, args: &[&str]) -> String {
+        let out = self.command(args).env("MK_PANE_ID", pane).output().unwrap();
+        Self::ok_output(out, args)
+    }
+    fn ok_output(out: Output, args: &[&str]) -> String {
         assert!(
             out.status.success(),
             "{args:?}: {}",
@@ -939,6 +949,63 @@ fn session_checkpoint_references_and_release_preserve_the_selected_worktree_and_
         before
     );
     d.ok(&["kill", &borrowed_id]);
+}
+
+/// A session whose agent finished its turn (`Stop` hook) and echoes whatever is typed into it.
+fn idle_echo_session(d: &Daemon, ready: &str) -> String {
+    let script = format!(
+        "printf '%s' '{{\"hook_event_name\":\"Stop\"}}' | KRILL_STATE_DIR='{}' '{MK}' hook claude >/dev/null; \
+         printf '{ready}\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+        d.dir.display()
+    );
+    let id = d
+        .ok(&["new", "--", "/bin/sh", "-c", &script])
+        .trim()
+        .to_owned();
+    d.wait_text(&id, ready);
+    d.ok(&[
+        "wait",
+        &id,
+        "--for",
+        "idle",
+        "--quiet-ms",
+        "0",
+        "--timeout",
+        "5",
+    ]);
+    id
+}
+
+#[test]
+fn run_created_from_a_pane_wakes_its_idle_coordinator() {
+    let d = Daemon::new("coordinator-wake");
+    let coordinator = idle_echo_session(&d, "coordinator-ready");
+    let run: serde_json::Value = serde_json::from_str(&d.ok_in(
+        &coordinator,
+        &["orchestration", "run-create", "--title", "Wake", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(
+        run["coordinator_session_id"]
+            .as_u64()
+            .map(|n| n.to_string()),
+        Some(coordinator.clone())
+    );
+    let run = run["id"].as_str().unwrap();
+    d.ok(&[
+        "orchestration",
+        "send",
+        "--from",
+        "reporter",
+        "--to",
+        "coordinator",
+        "--run",
+        run,
+        "--summary",
+        "progress",
+    ]);
+    let screen = d.wait_text(&coordinator, "got:[Krill orchestration] Unread mail.");
+    assert!(screen.contains(&format!("--run '{run}'")), "{screen}");
 }
 
 #[test]

@@ -89,6 +89,17 @@ impl<'a> OrchCtx<'a> {
         self.target.is_some_and(Target::is_remote)
     }
 
+    /// The caller's pane, which only names a session in the local daemon. A remote store must not
+    /// record it as a coordinator: the remote daemon would type mail pointers into its own session
+    /// with the same number.
+    fn caller_session(&self) -> Option<u32> {
+        if self.is_remote() {
+            None
+        } else {
+            caller_session_id()
+        }
+    }
+
     fn can_query_daemon(&self) -> bool {
         self.is_remote() || daemon::state_dir().as_deref() == Some(self.state_dir)
     }
@@ -406,6 +417,7 @@ fn cmd_run_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         }
     }
     let title = title.ok_or_else(|| bad_arg("missing --title"))?;
+    let coordinator = coordinator.or_else(|| ctx.caller_session().map(u64::from));
     let created = match ctx.try_ipc(
         &OrchAction::CreateRun {
             title: title.clone(),
@@ -499,10 +511,11 @@ fn cmd_run_use_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     }
     let run_id = target_run
         .ok_or_else(|| bad_arg("usage: krill orchestration run-use <run-id|--clear> [--json]"))?;
+    let session_id = ctx.caller_session();
     let cur_id = match ctx.try_ipc(
         &OrchAction::SetCurrentRun {
             run_id: run_id.clone(),
-            session_id: caller_session_id(),
+            session_id,
         },
         Duration::from_secs(2),
     )? {
@@ -510,7 +523,7 @@ fn cmd_run_use_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         Some(OrchResponse::Error(error)) => return Err(bad_arg(error)),
         Some(_) => return Err(io::Error::other("unexpected run selection reply")),
         None => OrchestrationStore::mutate(ctx.state_dir, |s| {
-            s.set_session_run(caller_session_id(), run_id.as_deref())
+            s.set_session_run(session_id, run_id.as_deref())
         })?,
     };
     let active: Option<Run> =
