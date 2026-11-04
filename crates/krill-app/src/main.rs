@@ -309,6 +309,10 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
         );
     let options = WindowOptions {
         window_bounds: Some(window_bounds),
+        window_min_size: Some(size(
+            px(krill_app::layout::MIN_WINDOW_WIDTH),
+            px(krill_app::layout::MIN_WINDOW_HEIGHT),
+        )),
         titlebar: Some(krill_app::ui::titlebar(
             krill_app::i18n::catalog::security::APP_MENU.get(),
         )),

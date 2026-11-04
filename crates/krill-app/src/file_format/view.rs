@@ -117,7 +117,9 @@ impl Render for ImageView {
                 .accessibility_label(label)
         };
         let toolbar = div()
+            .debug_selector(|| "image-toolbar".into())
             .flex()
+            .flex_wrap()
             .flex_none()
             .items_center()
             .gap_1()
@@ -127,11 +129,13 @@ impl Render for ImageView {
             .border_color(pal.border)
             .child(
                 tool("image-fit", text::FIT.get())
+                    .debug_selector(|| "image-fit-button".into())
                     .selected(self.zoom == Zoom::Fit)
                     .on_click(cx.listener(|v, _, _, cx| v.set_zoom(Zoom::Fit, cx))),
             )
             .child(
                 tool("image-actual", text::ACTUAL_SIZE.get())
+                    .debug_selector(|| "image-actual-button".into())
                     .selected(self.zoom == Zoom::Scale(1.))
                     .disabled(fixed)
                     .on_click(cx.listener(|v, _, _, cx| v.set_zoom(Zoom::Scale(1.), cx))),

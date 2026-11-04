@@ -569,7 +569,13 @@ impl SettingsView {
             .clamp(4, 100);
         let bar_ratio = u8::try_from(pct_ratio).map_or(1.0_f32, f32::from) / 100.0_f32;
 
-        let mut badges = div().flex().items_center().gap_1p5().flex_wrap();
+        let mut badges = div()
+            .min_w_0()
+            .max_w_full()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .flex_wrap();
         if wt.is_main {
             badges = badges.child(crate::ui::badge(
                 p,
@@ -578,7 +584,12 @@ impl SettingsView {
             ));
         }
         if let Some(branch) = &wt.branch {
-            badges = badges.child(crate::ui::badge(p, BadgeTone::Muted, branch.clone()));
+            badges = badges.child(
+                crate::ui::badge(p, BadgeTone::Muted, branch.clone())
+                    .min_w_0()
+                    .max_w_full()
+                    .overflow_hidden(),
+            );
         }
 
         let mut art_row = div().flex().items_center().gap_1p5().flex_wrap();
@@ -613,21 +624,30 @@ impl SettingsView {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_2()
                     .child(
                         div()
+                            .flex_1()
+                            .flex_basis(gpui::relative(0.5))
+                            .min_w_0()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
-                            .min_w_0()
                             .child(
                                 div()
+                                    .debug_selector({
+                                        let name = wt.name.clone();
+                                        move || format!("admin-space-name-{name}")
+                                    })
+                                    .flex_none()
                                     .min_w_0()
+                                    .max_w_full()
                                     .text_size(crate::ui::TEXT_SM)
                                     .font_weight(FontWeight::MEDIUM)
-                                    .truncate()
                                     .child(wt.name.clone()),
                             )
                             .child(badges),

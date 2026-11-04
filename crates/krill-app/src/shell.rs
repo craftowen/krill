@@ -7640,6 +7640,21 @@ fn traffic_light_pad(window: &Window) -> Pixels {
     }
 }
 
+/// Fit visible side columns to the current window without overwriting the user's
+/// preferred widths. A smaller window must still leave room for the center pane.
+fn fitted_column_widths(width: Pixels, sidebar: f32, panel: f32) -> (f32, f32) {
+    let dividers = f32::from(u8::from(sidebar > 0.) + u8::from(panel > 0.));
+    let available =
+        (f32::from(width) - layout::MIN_PANE_PX - f32::from(DIVIDER_GRAB) * dividers).max(0.);
+    let requested = sidebar + panel;
+    let scale = if requested > available {
+        available / requested
+    } else {
+        1.
+    };
+    (sidebar * scale, panel * scale)
+}
+
 /// 분할선. 더블클릭하면 분할은 50:50, 사이드바·우측 패널은 기본 너비로 되돌린다.
 fn divider(id: ElementId, drag: Drag, axis: Axis, cx: &mut Context<Shell>) -> impl IntoElement {
     let p = krill_app::ui::palette(cx);
@@ -7902,6 +7917,30 @@ impl Render for Shell {
         } else {
             self.render_center_diff(window, cx)
         };
+        let show_panel = !self.panel_collapsed
+            && artifacts_view.is_none()
+            && automations_view.is_none()
+            && !sub_page;
+        // Full pages need the same usable width as a minimum-size window. Hide
+        // the navigation rail temporarily rather than squeezing a QR/form into
+        // the terminal's much smaller minimum pane; keep saved preferences.
+        let show_sidebar = !self.sidebar_collapsed
+            && (!surface_replaced
+                || window.viewport_size().width
+                    >= px(self.layout.sidebar_width + layout::MIN_WINDOW_WIDTH) + DIVIDER_GRAB);
+        let (sidebar_width, panel_width) = fitted_column_widths(
+            window.viewport_size().width,
+            if show_sidebar {
+                self.layout.sidebar_width
+            } else {
+                0.
+            },
+            if show_panel {
+                self.layout.panel_width
+            } else {
+                0.
+            },
+        );
         let p = krill_app::ui::palette(cx);
         let (sidebar_bg, bg, fg) = (p.sidebar, p.background, p.foreground);
 
@@ -8366,13 +8405,13 @@ impl Render for Shell {
                     .min_h_0()
                     .w_full()
                     .flex()
-                    .when(!self.sidebar_collapsed, |d| {
+                    .when(show_sidebar, |d| {
                         d.child(
                             div()
                                 .id("sidebar-column")
                                 .debug_selector(|| "sidebar-column".into())
                                 .flex_none()
-                                .w(px(self.layout.sidebar_width))
+                                .w(px(sidebar_width))
                                 .h_full()
                                 .bg(sidebar_bg)
                                 .flex()
@@ -8431,32 +8470,26 @@ impl Render for Shell {
                                     .children(self.search.as_ref().map(|(bar, _)| bar.clone())),
                             ),
                     )
-                    .when(
-                        !self.panel_collapsed
-                            && artifacts_view.is_none()
-                            && automations_view.is_none()
-                            && !sub_page,
-                        |d| {
-                            d.child(divider(
-                                "divider-panel".into(),
-                                Drag::Panel,
-                                Axis::Horizontal,
-                                cx,
-                            ))
-                            .child(
-                                div()
-                                    .id("panel-column")
-                                    .debug_selector(|| "panel-column".into())
-                                    .flex_none()
-                                    .w(px(self.layout.panel_width))
-                                    .h_full()
-                                    .flex()
-                                    .flex_col()
-                                    .bg(sidebar_bg)
-                                    .child(div().flex_1().min_h_0().child(self.diff.clone())),
-                            )
-                        },
-                    ),
+                    .when(show_panel, |d| {
+                        d.child(divider(
+                            "divider-panel".into(),
+                            Drag::Panel,
+                            Axis::Horizontal,
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .id("panel-column")
+                                .debug_selector(|| "panel-column".into())
+                                .flex_none()
+                                .w(px(panel_width))
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .bg(sidebar_bg)
+                                .child(div().flex_1().min_h_0().child(self.diff.clone())),
+                        )
+                    }),
             )
             .child(self.render_status_bar(window, cx))
             .children(settings_view.map(|settings| {

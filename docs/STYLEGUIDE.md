@@ -197,7 +197,8 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
   - 상태 요약 아이콘: `STATUS_GROUP_ICON = 15px`, 아이콘 사이 간격 `STATUS_GROUP_GAP = 2px` (`ui::status::summary_element` 전용)
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
-  - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지)
+  - 메인 사이드바와 본문 페이지가 함께 있을 때는 본문에 최소 창 폭(`MIN_WINDOW_WIDTH`)을 남길 수 없는 창에서 메인 사이드바를 임시로 숨긴다. 저장한 너비·접힘 선호는 유지하고 창을 넓히면 복원한다.
+  - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지). 창 폭이 `48rem` 미만이면 탐색 열 대신 상단 뒤로 가기·탭 선택 드롭다운·검색을 표시하고 본문 좌우 여백을 `SPACE_4`로 줄인다. UI 줌을 포함해 좁은 창에서도 본문 작업 공간을 확보한다.
   - 채팅 대화와 입력창은 `CHAT_CONTENT_MAX_WIDTH = 46rem`(줌 100%에서 736px)의 같은 중앙 열에 정렬한다. 좁은 칸에서는 가용 폭을 채우며 가로로 넘치지 않는다(Orca `--chat-content-max-width`).
   - 토글 스위치(`ui::switch`) 치수: 트랙 `SWITCH_WIDTH = 36px` × `SWITCH_HEIGHT = 20px`, 썸 지름 `SWITCH_THUMB = 14px`
   - 상단 커맨드/Jump 팔레트 너비: `COMMAND_PALETTE_WIDTH = 900px`
@@ -244,6 +245,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 - **섹션 머리글**: `ui::section_title(p, id, title)` — `TEXT_SM` + `SEMIBOLD` + `p.muted_foreground` + 하단 1px 구분선.
 - **2열 설정 행**: `ui::row(p)` 안에 왼쪽 `ui::label(p, title, desc)`과 오른쪽 `ui::controls()`를 배치한다.
+  - 좁은 폭에서는 행·컨트롤·세그먼트 트랙을 줄바꿈하고 컨트롤 묶음 폭을 부모 안으로 제한한다. 설정 전용 `settings::layout::label`은 행의 절반을 기준 폭으로 선호해 컨트롤 때문에 라벨이 0폭으로 무너지기 전에 다음 줄로 보낸다. 높이가 자동인 세로 카드에서는 상대 기준 폭이 자연 콘텐츠 높이로 해석된다. 공용 `ui::label`에 고정 픽셀 `flex_basis`를 넣지 않는다. 세로로 쌓는 카드는 `ui::card`에 `flex_col`을 적용한다. 줄바꿈하는 가로 행인 `ui::row`의 방향만 세로로 바꾸면 자식이 새 열로 밀릴 수 있으므로 사용하지 않는다.
   - **불변식**: `ui::card`와 `ui::row`는 항상 `w_full().min_w_0()`을 가져 부모 열을 채우면서 내부 긴 텍스트·자식 요소 때문에 부모 폭 밖으로 넘치지 않게 한다. `ui::label`은 반드시 `flex_1().min_w_0()`을 갖고, 오른쪽 컨트롤 묶음(`ui::controls`)은 `flex_none()`을 갖는다. `justify_between` 행 안에서 `flex_1()` 없이 `min_w_0()`만 주면 gpui flex 레이아웃에서 텍스트 열 폭이 0px로 무너져 한 글자씩 세로 줄바꿈되는 결함이 발생하며(OWE-651), 반대로 `flex_1().min_w_0()` 없이 긴 설명문을 넣으면 우측 버튼이 카드 테두리 밖으로 밀려 나간다(OWE-793).
 - **업데이트 페이지**: 앱 버전 행과 릴리스별 변경 사항을 카드 없이 하단 1px 구분선만 있는 행으로 그린다(`settings/updates.rs`). 변경 사항은 줄글 목록이며 받는 동안 문구를 띄우지 않는다(§7.0).
 - **불리언 토글 스위치**: `ui::switch(p, id, checked, disabled, on_toggle)` — 켜기/끄기 불리언 설정은 2버튼 나열 대신 단일 알약 트랙(`SWITCH_WIDTH` × `SWITCH_HEIGHT`)과 원형 썸(`SWITCH_THUMB`) 스위치로 일관되게 표현한다.

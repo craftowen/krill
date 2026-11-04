@@ -1786,7 +1786,7 @@ fn build_options_menu(
         .min_w(px(284.))
         .max_w(px(296.))
         .scrollable(true)
-        .max_h(px(540.))
+        .max_h(px(540.).min((window.viewport_size().height - ui::SPACE_4 * 2.).max(px(0.))))
         .item(
             PopupMenuItem::element(|_, cx| {
                 div()
@@ -1861,7 +1861,7 @@ fn add_options_submenu(
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let sb = sidebar.clone();
-    let submenu = PopupMenu::build(window, cx, move |menu, _, cx| {
+    let submenu = PopupMenu::build(window, cx, move |menu, window, cx| {
         if let Some(sidebar) = sb.upgrade() {
             cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
         }
@@ -1870,7 +1870,7 @@ fn add_options_submenu(
         menu.min_w(px(260.))
             .max_w(px(296.))
             .scrollable(true)
-            .max_h(px(360.))
+            .max_h(px(360.).min((window.viewport_size().height - ui::SPACE_4 * 2.).max(px(0.))))
             .item(
                 PopupMenuItem::element(move |_, cx| render_options_submenu(target, &sb, &mn, cx))
                     .disabled(true),

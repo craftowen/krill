@@ -284,3 +284,53 @@ fn escape_clears_query_then_closes_drawer_then_emits_close_and_delete_removes_it
     view.update(cx, |v, cx| v.handle_escape(None, cx));
     assert_eq!(*closed.lock().unwrap(), 1);
 }
+
+#[gpui::test]
+fn narrow_library_keeps_table_actions_reachable_with_horizontal_scroll(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (_, visual) =
+        cx.add_window_view(|_, cx| View::with_call(Arc::new(|_| Ok(page("one", None))), cx));
+    visual.simulate_resize(gpui::size(px(640.), px(480.)));
+    visual.run_until_parked();
+    let viewport = visual.debug_bounds("artifacts-table-scroll").unwrap();
+    let table = visual.debug_bounds("artifacts-table").unwrap();
+    assert!(viewport.size.width > px(0.));
+    assert!(table.size.width > viewport.size.width);
+    let action_before = visual.debug_bounds("artifact-copy-0").unwrap();
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: viewport.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(-2000.), px(0.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    let action_after = visual.debug_bounds("artifact-copy-0").unwrap();
+    assert!(action_after.left() < action_before.left());
+    assert!(action_after.left() >= viewport.left());
+    assert!(action_after.right() <= viewport.right());
+}
+
+#[gpui::test]
+fn narrow_artifact_drawer_keeps_actions_inside_page(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, visual) =
+        cx.add_window_view(|_, cx| View::with_call(Arc::new(|_| Ok(page("one", None))), cx));
+    visual.simulate_resize(gpui::size(px(360.), px(600.)));
+    visual.run_until_parked();
+    view.update(visual, |view, cx| view.select_slug(Some("one".into()), cx));
+    visual.run_until_parked();
+    let drawer = visual.debug_bounds("artifact-detail-drawer").unwrap();
+    assert!(drawer.size.width > px(180.));
+    assert!(drawer.left() >= px(0.));
+    assert!(drawer.right() <= px(360.));
+    for selector in [
+        "artifact-detail-copy",
+        "artifact-detail-open",
+        "artifact-detail-delete",
+        "artifact-detail-close",
+    ] {
+        let action = visual.debug_bounds(selector).unwrap();
+        assert!(action.left() >= drawer.left());
+        assert!(action.right() <= drawer.right());
+    }
+}

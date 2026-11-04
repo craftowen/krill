@@ -741,6 +741,7 @@ impl View {
     fn render_detail_drawer(
         &self,
         item: &Item,
+        compact: bool,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -768,6 +769,7 @@ impl View {
             .debug_selector(|| "artifact-detail-drawer".into())
             .w(px(440.))
             .max_w(relative(0.5))
+            .when(compact, |d| d.absolute().top_0().right_0().max_w_full())
             .h_full()
             .flex_none()
             .border_l_1()
@@ -1084,7 +1086,9 @@ impl Render for View {
             .gap_2()
             .child(
                 div()
+                    .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .children(self.input.as_ref().map(|input| {
@@ -1092,10 +1096,12 @@ impl Render for View {
                             .id("artifacts-search")
                             .debug_selector(|| "artifacts-search".into())
                             .w(px(224.))
+                            .max_w_full()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(div().flex_1().child(Input::new(input).small()))
+                            .child(div().flex_1().min_w_0().child(Input::new(input).small()))
                             .when(!self.query.is_empty(), |d| {
                                 d.child(
                                     ui::ghost("artifacts-search-clear", "")
@@ -1349,19 +1355,40 @@ impl Render for View {
                 })
                 .child(
                     div()
-                        .id("artifacts-table-scroll")
                         .flex_1()
-                        .min_h_0()
                         .min_w_0()
+                        .min_h_0()
                         .flex()
-                        .flex_col()
-                        .overflow_x_scroll()
                         .rounded(ui::RADIUS_MD)
                         .border_1()
                         .border_color(p.border)
                         .bg(p.muted.opacity(0.2))
-                        .child(Self::render_table_header(p))
-                        .child(rows),
+                        .child(
+                            div()
+                                .id("artifacts-table-scroll")
+                                .debug_selector(|| "artifacts-table-scroll".into())
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .overflow_x_scroll()
+                                .flex()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "artifacts-table".into())
+                                        .flex_1()
+                                        // Column widths + five gaps + horizontal padding.
+                                        .min_w(
+                                            px(160. + 84. + 72. + 116. + 116. + 184.)
+                                                + ui::SPACE_3 * 7.,
+                                        )
+                                        .h_full()
+                                        .min_h_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(Self::render_table_header(p))
+                                        .child(rows),
+                                ),
+                        ),
                 )
                 .when(self.next.is_some(), |d| {
                     d.child(
@@ -1378,6 +1405,7 @@ impl Render for View {
 
         div()
             .id("artifacts-page")
+            .relative()
             .debug_selector(|| "artifacts-page".into())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1442,11 +1470,14 @@ impl Render for View {
                     .children(self.render_error_banner(p, cx))
                     .child(main_body),
             )
-            .children(
-                selected_item
-                    .as_ref()
-                    .map(|item| self.render_detail_drawer(item, p, cx)),
-            )
+            .children(selected_item.as_ref().map(|item| {
+                self.render_detail_drawer(
+                    item,
+                    window.viewport_size().width < ui::DIALOG_WIDTH * 2.,
+                    p,
+                    cx,
+                )
+            }))
     }
 }
 

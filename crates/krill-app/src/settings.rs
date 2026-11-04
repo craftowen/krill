@@ -3705,6 +3705,13 @@ impl SettingsView {
     }
 
     pub fn set_tab(&mut self, tab: AdminTab, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            // The tracked handle survives tab IDs; reset it before a new page
+            // lays out. A pending search can still scroll to its setting below.
+            self.search_focus
+                .scroll
+                .set_offset(gpui::point(px(0.), px(0.)));
+        }
         self.tab = tab;
         self.search_focus.title = search::first_setting(&self.search_query(cx), tab);
         self.search_pending = !self.search_query(cx).trim().is_empty();
@@ -6568,7 +6575,9 @@ impl SettingsView {
                 .text_size(crate::ui::TEXT_2XS)
         };
         div()
+            .max_w_full()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_1p5()
             .child(
@@ -7021,6 +7030,7 @@ impl SettingsView {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .child(layout::label(
@@ -7037,14 +7047,19 @@ impl SettingsView {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .child(
-                        div().flex_1().min_w_0().child(
-                            gpui_component::input::Input::new(&input)
-                                .content_type(gpui_component::input::InputContentType::Password)
-                                .small(),
-                        ),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex_basis(gpui::relative(0.5))
+                            .child(
+                                gpui_component::input::Input::new(&input)
+                                    .content_type(gpui_component::input::InputContentType::Password)
+                                    .small(),
+                            ),
                     )
                     .child(
                         layout::controls()
@@ -7235,6 +7250,7 @@ impl SettingsView {
             !needs_login && usage.status == krill_proto::usage::AccountStatus::RateLimited;
         let name_line = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_2()
             .min_w_0()
@@ -7247,6 +7263,8 @@ impl SettingsView {
                 Some(input) => d.child(Self::render_rename_row(acc, &input, cx)),
                 None => d.child(
                     div()
+                        .flex_1()
+                        .flex_basis(gpui::relative(0.5))
                         .min_w_0()
                         .truncate()
                         .text_size(crate::ui::TEXT_SM)
@@ -7324,6 +7342,7 @@ impl SettingsView {
                 crate::ui::tooltip_view(usage_tip_id.clone(), usage_tip.clone(), window, cx)
             })
             .flex_none()
+            .max_w_full()
             .flex()
             .flex_col()
             .gap_0p5();
@@ -7378,7 +7397,9 @@ impl SettingsView {
         // 로그인 대기 중이면 진행 표시 대신 [링크 복사]·[로그인 취소]만 둔다(OWE-881).
         let mut actions = div()
             .flex_none()
+            .max_w_full()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_1()
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation());
@@ -7624,6 +7645,7 @@ impl SettingsView {
             .w_full()
             .min_w_0()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .px_3()
@@ -7659,6 +7681,7 @@ impl SettingsView {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .flex_basis(px(160.))
                     .flex()
                     .flex_col()
                     .gap_0p5()
@@ -7955,6 +7978,8 @@ impl SettingsView {
             let status_bar_toggle_id = format!("admin-provider-status-bar-{}", provider.as_str());
 
             let header = div()
+                .w_full()
+                .min_w_0()
                 .flex()
                 .flex_wrap()
                 .items_center()
@@ -7964,13 +7989,14 @@ impl SettingsView {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .min_w(px(180.))
+                        .flex_basis(gpui::relative(0.5))
                         .flex()
                         .flex_col()
                         .gap_1()
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap_2()
                                 .child(crate::ui::icons::provider_icon(
@@ -7998,10 +8024,7 @@ impl SettingsView {
                         ),
                 )
                 .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_center()
+                    layout::controls()
                         .gap_2()
                         .child(
                             div()
@@ -8323,6 +8346,7 @@ impl SettingsView {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
                             .gap_3()
@@ -8383,6 +8407,7 @@ impl SettingsView {
         .aria_label(text::AUTO_SWITCH_RATE_LIMIT.get());
         let rate_limit_row = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_2()
@@ -8431,6 +8456,7 @@ impl SettingsView {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_2()
@@ -8503,6 +8529,7 @@ impl SettingsView {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap_2()
@@ -8516,6 +8543,7 @@ impl SettingsView {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap_2()
@@ -9032,6 +9060,7 @@ impl SettingsView {
                     .border_b_1()
                     .border_color(p.border)
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_3()
@@ -10049,6 +10078,7 @@ impl SettingsView {
                             .id("admin-qc-name-input")
                             .debug_selector(|| "admin-qc-name-input".into())
                             .w(px(180.))
+                            .max_w_full()
                             .flex_none()
                             .child(gpui_component::input::Input::new(&qc_name_input).small()),
                     )
@@ -10058,6 +10088,7 @@ impl SettingsView {
                             .debug_selector(|| "admin-qc-text-input".into())
                             .flex_1()
                             .min_w_0()
+                            .flex_basis(gpui::relative(0.5))
                             .child(gpui_component::input::Input::new(&qc_text_input).small()),
                     )
                     .child(qc_controls),
@@ -10312,6 +10343,7 @@ impl SettingsView {
                         .w_full()
                         .min_w_0()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap_3()
                         .child(
@@ -10327,6 +10359,7 @@ impl SettingsView {
                                 .debug_selector(|| "admin-workflow-repo-input".into())
                                 .flex_1()
                                 .min_w_0()
+                                .flex_basis(gpui::relative(0.5))
                                 .child(gpui_component::input::Input::new(&repo_input).small()),
                         )
                         .child(layout::controls().child(repo_dropdown)),
@@ -10346,6 +10379,7 @@ impl SettingsView {
                         .w_full()
                         .min_w_0()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap_2()
                         .child(
@@ -10354,6 +10388,7 @@ impl SettingsView {
                                 .debug_selector(|| "admin-worktree-symlink-input".into())
                                 .flex_1()
                                 .min_w_0()
+                                .flex_basis(gpui::relative(0.5))
                                 .child(gpui_component::input::Input::new(&symlink_input).small()),
                         )
                         .child(
@@ -10798,6 +10833,7 @@ impl SettingsView {
             .w_full()
             .min_w_0()
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_3()
@@ -10822,6 +10858,9 @@ impl SettingsView {
                                 div()
                                     .id("admin-page-title")
                                     .debug_selector(|| "admin-page-title".into())
+                                    .min_w_0()
+                                    .flex_shrink_1()
+                                    .overflow_hidden()
                                     .text_size(crate::ui::TEXT_LG)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(tab.label()),
@@ -10843,7 +10882,9 @@ impl SettingsView {
                     .id("admin-page-header-actions")
                     .debug_selector(|| "admin-page-header-actions".into())
                     .flex_none()
+                    .max_w_full()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .children(action),
@@ -10902,6 +10943,8 @@ impl Render for SettingsView {
         );
         let p = crate::ui::palette(cx);
         let current_tab = self.tab;
+
+        let compact_navigation = window.viewport_size().width < window.rem_size() * 48.;
 
         let search_input = self.search_input(window, cx);
         let search_value = search_input.read(cx).value().to_string();
@@ -11058,6 +11101,99 @@ impl Render for SettingsView {
             }
             nav = nav.child(group_col);
         }
+
+        let compact_nav = div()
+            .id("admin-compact-navigation")
+            .debug_selector(|| "admin-compact-navigation".into())
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .px_4()
+            .py_2()
+            .bg(p.worktree_sidebar)
+            .border_b_1()
+            .border_color(p.border)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("admin-compact-back")
+                            .small()
+                            .ghost()
+                            .icon(IconName::ChevronLeft)
+                            .accessibility_label(text::BACK_TO_APP.get())
+                            .debug_selector(|| "admin-compact-back".into())
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                close_settings_page_for(Some(cx.entity_id()), window, cx);
+                            })),
+                    )
+                    .child({
+                        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+                        let view = cx.entity();
+                        div().flex_1().min_w_0().child(
+                            layout::secondary("admin-compact-tabs", current_tab.label())
+                                .w_full()
+                                .max_w_full()
+                                .dropdown_caret(true)
+                                .debug_selector(|| "admin-compact-tabs".into())
+                                .dropdown_menu(move |mut menu, window, _| {
+                                    menu = menu
+                                        .scrollable(true)
+                                        .max_h(window.viewport_size().height * 0.6);
+                                    for tab in AdminTab::ALL {
+                                        let view = view.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(tab.label())
+                                                .checked(tab == current_tab)
+                                                .on_click(move |_, window, cx| {
+                                                    view.update(cx, |this, cx| {
+                                                        this.clear_search(window, cx);
+                                                        this.set_tab(tab, cx);
+                                                    });
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                }),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("admin-compact-search")
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_component::input::Escape, window, cx| {
+                            cx.stop_propagation();
+                            if this.search_query(cx).is_empty() {
+                                close_settings_page_for(Some(cx.entity_id()), window, cx);
+                            } else {
+                                this.clear_search(window, cx);
+                            }
+                        },
+                    ))
+                    .capture_action(
+                        cx.listener(|this, _: &gpui_component::input::Enter, _, cx| {
+                            let query = this.search_query(cx);
+                            if let Some(&tab) = search::search_tabs(&query)
+                                .first()
+                                .filter(|_| !query.trim().is_empty())
+                            {
+                                cx.stop_propagation();
+                                this.set_tab(tab, cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        gpui_component::input::Input::new(&search_input)
+                            .small()
+                            .prefix(Icon::new(IconName::Search).xsmall()),
+                    ),
+            );
 
         // 투명 제목 표시줄 또는 중앙 모달 상단에 그리는 테마 색 제목 띠(우측 닫기 ✕ 버튼 포함).
         let titlebar = div()
@@ -11398,23 +11534,31 @@ impl Render for SettingsView {
             .children(self.render_schedule_modal(window, cx))
             .children(crate::orca_import::render_modal(window, cx))
             .child(titlebar)
+            .children(compact_navigation.then_some(compact_nav))
             .child(
-                div().flex_1().min_h_0().w_full().flex().child(nav).child(
-                    div().flex_1().min_w_0().h_full().flex().flex_col().child(
-                        div()
-                            // 탭별 스크롤 id: 탭 전환 시 스크롤 위치를 최상단으로 되돌린다(OWE-858).
-                            .id(("admin-content", current_tab as usize))
-                            .debug_selector(|| "admin-content".into())
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.search_focus.scroll)
-                            .px_8()
-                            .py_6()
-                            .child(content_column),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .children((!compact_navigation).then_some(nav))
+                    .child(
+                        div().flex_1().min_w_0().h_full().flex().flex_col().child(
+                            div()
+                                // 탭별 스크롤 id: 탭 전환 시 스크롤 위치를 최상단으로 되돌린다(OWE-858).
+                                .id(("admin-content", current_tab as usize))
+                                .debug_selector(|| "admin-content".into())
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.search_focus.scroll)
+                                .when(compact_navigation, |d| d.px(crate::ui::SPACE_4))
+                                .when(!compact_navigation, gpui::Styled::px_8)
+                                .py_6()
+                                .child(content_column),
+                        ),
                     ),
-                ),
             )
             .into_any_element()
     }

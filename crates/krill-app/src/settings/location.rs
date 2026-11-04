@@ -64,6 +64,7 @@ impl SettingsView {
                             .debug_selector(|| "admin-worktree-location-input".into())
                             .flex_1()
                             .min_w_0()
+                            .flex_basis(gpui::relative(0.5))
                             .child(gpui_component::input::Input::new(&input).small()),
                     )
                     .child(

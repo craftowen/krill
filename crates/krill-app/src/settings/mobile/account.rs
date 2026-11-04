@@ -208,13 +208,13 @@ impl SettingsView {
                         div()
                             .text_size(crate::ui::TEXT_XS)
                             .text_color(p.muted_foreground)
-                            .truncate()
                             .child(text::ACCOUNT_LOCAL.get()),
                     ),
             )
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         layout::primary("mobile-relay-login", text::ACCOUNT_LOGIN.get())
