@@ -1646,7 +1646,7 @@ fn resolve_or_fetch_remote_icon(
                 .is_ok_and(|mut set| set.insert(clean_url.clone()));
         if should_spawn {
             std::thread::spawn(move || {
-                let out = std::process::Command::new("/usr/bin/curl")
+                let out = crate::platform::background_command(crate::updater::system_tool("curl"))
                     .args([
                         "-fsSL",
                         "--max-time",
@@ -2352,7 +2352,7 @@ fn fetch_remote_icon_sync(url: &str, cache_dir: &Path) -> Option<crate::ui::icon
             failed.contains_key(&clean_url)
         });
         if !recently_failed {
-            let out = std::process::Command::new("/usr/bin/curl")
+            let out = crate::platform::background_command(crate::updater::system_tool("curl"))
                 .args([
                     "-fsSL",
                     "--max-time",
