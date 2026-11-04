@@ -2560,7 +2560,7 @@ pub fn install_agent_hook_at(
 ) -> std::io::Result<PathBuf> {
     let (target_path, target_agent) = agent_hook_target_path(agent_id, home)
         .ok_or_else(|| std::io::Error::other(format!("unsupported agent: {agent_id}")))?;
-    let staged = krill_proto::user_dirs::share_dir(home).join("bin/krill");
+    let staged = crate::onboarding::staged_krill(home);
     let exe = if staged.is_file() {
         staged.as_path()
     } else {

@@ -266,10 +266,15 @@ pub(super) fn stable_mk_path(krill: &Path, home: &Path) -> PathBuf {
     if in_app_bundle(krill) {
         krill.to_path_buf()
     } else {
-        krill_proto::user_dirs::share_dir(home)
-            .join("bin")
-            .join(format!("krill{}", std::env::consts::EXE_SUFFIX))
+        staged_krill(home)
     }
+}
+
+/// `~/.local/share/krill/bin/krill` (`krill.exe` on Windows), where builds outside an app bundle are staged.
+pub(crate) fn staged_krill(home: &Path) -> PathBuf {
+    krill_proto::user_dirs::share_dir(home)
+        .join("bin")
+        .join(format!("krill{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn is_broken_symlink(path: &Path) -> bool {
