@@ -86,8 +86,10 @@ pub fn shell_quote(text: &str) -> String {
 pub fn command(exe: &Path, agent: Agent) -> Option<String> {
     let exe = exe.to_str()?;
     #[cfg(windows)]
-    if agent == Agent::Codex {
-        return Some(windows_codex_command(exe));
+    match agent {
+        Agent::Codex => return Some(windows_codex_command(exe)),
+        Agent::Cursor => return Some(windows_cursor_command(exe)),
+        _ => {}
     }
     Some(format!(
         "if [ -n \"${{MK_PANE_ID:-}}\" ]; then exec {} hook {}; else printf '{{}}\\n'; fi",
@@ -96,11 +98,36 @@ pub fn command(exe: &Path, agent: Agent) -> Option<String> {
     ))
 }
 
+/// Codex runs Windows hooks as `cmd.exe /C "<command>"`, and npm's `codex.cmd` passes every
+/// session `-c` flag through one cmd.exe line (8191 characters). Run krill directly: its
+/// Windows hook answers and exits outside a Krill pane. cmd.exe expands `%NAME%` even inside
+/// quotes, so only such rare paths keep the encoded PowerShell wrapper.
 #[cfg(any(windows, test))]
 fn windows_codex_command(exe: &str) -> String {
+    if exe.contains('%') {
+        windows_powershell_codex_command(exe)
+    } else {
+        format!("\"{exe}\" hook codex")
+    }
+}
+
+/// Cursor runs Windows hooks through PowerShell and pipes the event JSON to stdin
+/// (<https://cursor.com/docs/hooks>). The call operator keeps the path a literal string.
+#[cfg(any(windows, test))]
+fn windows_cursor_command(exe: &str) -> String {
+    format!("& '{}' hook cursor", exe.replace('\'', "''"))
+}
+
+/// Prefix of the Windows Codex wrapper used before the direct command. Older receipts
+/// store it; npm's `codex.cmd` cannot start with it (cmd.exe line limit).
+pub const POWERSHELL_CODEX_PREFIX: &str =
+    "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ";
+
+#[cfg(any(windows, test))]
+fn windows_powershell_codex_command(exe: &str) -> String {
     use base64::Engine as _;
-    // Codex starts this through cmd.exe. Encoding protects the literal path;
-    // ProcessStartInfo forwards raw stdin without PowerShell's object pipeline.
+    // Encoding protects the literal path; ProcessStartInfo forwards raw stdin
+    // without PowerShell's object pipeline.
     let script = format!(
         "$ErrorActionPreference='Stop'; \
          if (-not $env:MK_PANE_ID) {{ [Console]::WriteLine('{{}}'); exit 0 }}; \
@@ -115,7 +142,7 @@ fn windows_codex_command(exe: &str) -> String {
     );
     let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}")
+    format!("{POWERSHELL_CODEX_PREFIX}{encoded}")
 }
 
 #[cfg(all(windows, test))]
@@ -378,7 +405,19 @@ mod tests {
     #[test]
     fn windows_codex_command_encodes_literal_path_and_raw_stdin() {
         use base64::Engine as _;
-        let command = windows_codex_command(r"C:\한글 '$ & %USERNAME%\krill.exe");
+        let command = windows_powershell_codex_command(r"C:\한글 '$ & %USERNAME%\krill.exe");
+        assert_eq!(
+            windows_codex_command(r"C:\한글 '$ & %USERNAME%\krill.exe"),
+            command
+        );
+        assert_eq!(
+            windows_codex_command(r"C:\Users\홍 길동\krill.exe"),
+            r#""C:\Users\홍 길동\krill.exe" hook codex"#
+        );
+        assert_eq!(
+            windows_cursor_command(r"C:\Users\O'wen\krill.exe"),
+            r"& 'C:\Users\O''wen\krill.exe' hook cursor"
+        );
         let encoded = command.split_whitespace().last().unwrap();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)

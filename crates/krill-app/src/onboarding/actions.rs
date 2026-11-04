@@ -608,7 +608,16 @@ fn hook_installed(state: &Path, agent: &str) -> bool {
     std::fs::read(state.join("hooks").join(format!("{agent}.json")))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<krill_proto::hook_install::Receipt>(&bytes).ok())
-        .is_some_and(|receipt| receipt.complete && receipt.agent == agent)
+        .is_some_and(|receipt| {
+            // An old Windows Codex PowerShell command is reinstalled (see `hook_install`).
+            receipt.complete
+                && receipt.agent == agent
+                && !receipt.codex.is_some_and(|codex| {
+                    codex
+                        .command
+                        .starts_with(krill_proto::agent::hooks::POWERSHELL_CODEX_PREFIX)
+                })
+        })
 }
 
 #[derive(Default)]

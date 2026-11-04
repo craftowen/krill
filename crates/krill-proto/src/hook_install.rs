@@ -153,14 +153,13 @@ impl Plan {
             TargetAgent::Other(a) => hooks::receipt(state, a),
         };
         let previous = store::read(&receipt_path)?;
-        if action == Action::Install && previous.is_some() {
-            let existing: Receipt = serde_json::from_str(previous.as_deref().unwrap_or(""))?;
-            if !existing.complete {
-                return Err(error(
-                    "interrupted hook installation; uninstall to recover first",
-                ));
-            }
-            return Ok(None);
+        #[cfg(windows)]
+        if action == Action::Install && agent == TargetAgent::Other(Agent::Agy) {
+            // Antigravity's Windows hook shell is undocumented; its POSIX command cannot run there.
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Antigravity status hooks are not supported on Windows",
+            ));
         }
         let command = match agent {
             TargetAgent::Claude => {
@@ -183,11 +182,39 @@ impl Plan {
                 hooks::command(exe, a).ok_or_else(|| error("krill executable path is not UTF-8"))?
             }
         };
+        // A complete receipt is kept, except an old Windows Codex PowerShell command that npm's
+        // codex.cmd cannot start; that one is replaced in place (its trust hashes are ours).
+        let mut superseded = None;
+        if action == Action::Install && previous.is_some() {
+            let existing: Receipt = serde_json::from_str(previous.as_deref().unwrap_or(""))?;
+            if !existing.complete {
+                return Err(error(
+                    "interrupted hook installation; uninstall to recover first",
+                ));
+            }
+            superseded = existing.codex.filter(|record| {
+                record.path == path
+                    && record.command != command
+                    && record.command.starts_with(hooks::POWERSHELL_CODEX_PREFIX)
+            });
+            if superseded.is_none() {
+                return Ok(None);
+            }
+        }
+        let trust = if superseded.is_some() {
+            CodexTrust::Refresh
+        } else {
+            trust
+        };
         let mut codex_plan = None;
         let receipt = if action == Action::Install {
             let changes = if agent == TargetAgent::Other(Agent::Codex) {
                 let codex_home = path.parent().ok_or_else(|| error("missing Codex home"))?;
-                codex_plan = Some(codex::Plan::install(codex_home, &command, search, trust)?);
+                let mut plan = codex::Plan::install(codex_home, &command, search, trust)?;
+                if let Some(old) = &superseded {
+                    plan.record.supersede(old);
+                }
+                codex_plan = Some(plan);
                 Vec::new()
             } else {
                 let path = path.to_path_buf();

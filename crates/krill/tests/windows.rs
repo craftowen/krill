@@ -296,26 +296,111 @@ fn statusline_install_chains_user_command_through_git_bash_and_records_usage() {
     fs::remove_dir_all(&home).ok();
 }
 
+/// Each agent's own Windows hook shell: Codex runs `cmd.exe /C "<command>"` (codex-rs
+/// hooks `command_runner.rs`), Cursor runs PowerShell (cursor.com/docs/hooks). Outside a pane
+/// krill answers `{}`; inside one the event's raw stdin reaches krill (spooled, no daemon).
 #[test]
-fn codex_command_hook_preserves_windows_executable_metacharacters() {
+fn agent_hook_commands_keep_paths_and_stdin_through_each_agent_shell() {
+    use krill_proto::agent::hooks::{self, Agent};
     use std::os::windows::process::CommandExt as _;
-    let home = temp_home("codex-hook-command");
-    let dir = home.join("한글 O'wen %PATH% $cash & safe");
-    fs::create_dir_all(&dir).unwrap();
-    let exe = dir.join("krill.exe");
-    fs::copy(KRILL, &exe).unwrap();
-    let command =
-        krill_proto::agent::hooks::command(&exe, krill_proto::agent::hooks::Agent::Codex).unwrap();
-    let out = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c"])
-        .raw_arg(format!("\"{command}\""))
-        .env_remove("MK_PANE_ID")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{out:?}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
-    assert!(out.stderr.is_empty(), "{out:?}");
+    let home = temp_home("agent-hook-shells");
+    for (name, agent) in [
+        ("한글 O'wen $cash & (safe)", Agent::Codex),
+        ("한글 O'wen %PATH% $cash & safe", Agent::Codex),
+        ("한글 O'wen $cash & (safe)", Agent::Cursor),
+    ] {
+        let dir = home.join(agent.id()).join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("krill.exe");
+        fs::copy(KRILL, &exe).unwrap();
+        let command = hooks::command(&exe, agent).unwrap();
+        let shell = || {
+            let mut shell = if agent == Agent::Codex {
+                let mut shell = Command::new("cmd.exe");
+                shell.arg("/C").raw_arg(format!("\"{command}\""));
+                shell
+            } else {
+                let mut shell = Command::new("powershell.exe");
+                shell.args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &command,
+                ]);
+                shell
+            };
+            shell
+                .env("KRILL_STATE_DIR", dir.join("state"))
+                .env_remove("MK_PANE_ID")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            shell
+        };
+        let out = shell().stdin(Stdio::null()).output().unwrap();
+        assert!(out.status.success(), "{name}: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}", "{name}");
+        assert!(out.stderr.is_empty(), "{name}: {out:?}");
+        assert!(!dir.join("state").exists(), "{name}");
+
+        let mut child = shell()
+            .env("MK_PANE_ID", "fixture-pane")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook_event_name":"Stop","session_id":"shell-fixture"}"#)
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{name}: {out:?}");
+        let spool = fs::read(dir.join("state").join(krill_proto::hook::SPOOL_FILE)).unwrap();
+        assert!(
+            spool.windows(13).any(|w| w == b"shell-fixture"),
+            "{name}: {}",
+            String::from_utf8_lossy(&spool)
+        );
+    }
+    fs::remove_dir_all(home).ok();
+}
+
+/// Antigravity's Windows hook shell is undocumented: installing is refused without writing,
+/// and an older POSIX install is reported by doctor with its uninstall command.
+#[test]
+fn agy_hook_install_is_unsupported_and_old_posix_install_warns() {
+    let home = temp_home("agy-unsupported");
+    let out = krill(
+        Path::new(KRILL),
+        &home,
+        &["hook", "install", "agy", "--yes"],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not supported on Windows"),
+        "{out:?}"
+    );
+    assert!(!home.join(".gemini").exists());
+    let receipt = home.join("state").join("hooks").join("agy.json");
+    fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+    fs::write(
+        &receipt,
+        json!({"agent": "agy", "complete": true, "changes": [{"path": "x", "before": null,
+            "after": "/bin/sh -c 'if [ -n \"${MK_PANE_ID:-}\" ]; then exec krill hook agy; fi'"}],
+            "codex": null})
+        .to_string(),
+    )
+    .unwrap();
+    let out = krill(Path::new(KRILL), &home, &["doctor", "--json", "--no-start"]);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "hook.agy.shell")
+        .unwrap_or_else(|| panic!("{report}"));
+    assert_eq!(check["status"], "warn", "{check}");
     fs::remove_dir_all(home).ok();
 }
 

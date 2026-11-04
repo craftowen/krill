@@ -2186,6 +2186,12 @@ fn codex_hooks(
     else {
         return Ok(None);
     };
+    if command.starts_with(hooks::POWERSHELL_CODEX_PREFIX) && batch_launcher(profile, env) {
+        // Receipts from before the direct Windows command: npm's codex.cmd cannot carry its eight
+        // flags through cmd.exe (8191 characters). Launch without hooks until it is reinstalled.
+        tracing::warn!("codex hooks skipped: reinstall them with `krill hook install codex`");
+        return Ok(None);
+    }
     codex::ensure_trust(
         profile.program(),
         receipt
@@ -2228,6 +2234,25 @@ fn codex_hooks(
     let mut profile = profile.clone();
     profile.launch.splice(1..1, args);
     Ok(Some(profile))
+}
+
+/// Whether Windows starts this profile's program through cmd.exe (an npm `.cmd`/`.bat` shim).
+fn batch_launcher(profile: &Profile, env: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let path = env
+        .iter()
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case(b"PATH"))
+        .map(|(_, value)| std::ffi::OsStr::from_bytes(value).to_owned())
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    profile
+        .program()
+        .and_then(|program| krill_proto::agent::which(program, &path))
+        .and_then(|exe| exe.extension().map(std::ffi::OsStr::to_ascii_lowercase))
+        .is_some_and(|ext| ext == "cmd" || ext == "bat")
 }
 
 /// 로그인 셸 실행([`Shell::Login`])을 에이전트 실행으로 바꾼다. env는 건드리지 않는다.
@@ -2309,6 +2334,31 @@ mod executable_account_regressions {
                 Some(recorded.clone())
             );
         }
+    }
+
+    /// An old Windows PowerShell hook receipt would push npm's codex.cmd past cmd.exe's line
+    /// limit; launch it without hooks. A native codex.exe keeps them.
+    #[cfg(windows)]
+    #[test]
+    fn codex_hooks_skip_legacy_powershell_command_for_batch_shim() {
+        let dir = std::env::temp_dir().join(format!("krill-codex-shim-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let agents = krill_proto::agent::Agents::load(None).unwrap();
+        let codex = &agents.profiles["codex"];
+        let legacy = format!("{}AAAA", hooks::POWERSHELL_CODEX_PREFIX);
+        let r = serde_json::json!({"agent": "codex", "complete": true, "changes": [],
+            "codex": {"path": "C:/x/config.toml", "command": legacy, "added": {}}});
+        std::fs::write(hooks::receipt(&dir, Agent::Codex), r.to_string()).unwrap();
+        let env = [(b"PATH".to_vec(), bin.to_str().unwrap().as_bytes().to_vec())];
+        std::fs::write(bin.join("codex.exe"), b"").unwrap();
+        assert!(codex_hooks(codex, Some(&dir), &env).unwrap().is_some());
+        std::fs::remove_file(bin.join("codex.exe")).unwrap();
+        std::fs::write(bin.join("codex.cmd"), b"@echo off\r\n").unwrap();
+        assert!(codex_hooks(codex, Some(&dir), &env).unwrap().is_none());
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 
