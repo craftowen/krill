@@ -251,7 +251,21 @@ fn holder_that_dies_is_reported() {
     };
     let e = connect(&p, &hello()).unwrap_err();
     assert!(matches!(e, Error::HolderExited(s) if !s.success()), "{e}");
+    // 바로 다시 붙으면 holder를 또 띄우지 않고 직전 실패를 보고한다.
+    let again = connect(&p, &hello()).unwrap_err();
+    assert!(
+        matches!(&again, Error::Backoff(last) if *last == e.to_string()),
+        "{again}"
+    );
     std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn launch_backoff_grows_to_a_minute() {
+    let secs: Vec<_> = [1, 2, 3, 7, 8, 100]
+        .map(|n| launch_backoff(n).as_secs())
+        .into();
+    assert_eq!(secs, [1, 2, 4, 60, 60, 60]);
 }
 
 #[test]

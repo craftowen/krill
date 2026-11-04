@@ -551,6 +551,9 @@ pub enum Error {
     Timeout,
     /// 다른 기동자가 [`LOCK_TIMEOUT`] 넘게 `<소켓>.launch` 락을 쥐고 있다.
     LockTimeout,
+    /// 이 프로세스의 직전 holder 기동이 실패해 [`launch_backoff`]가 끝날 때까지 다시 띄우지 않는다.
+    /// 직전 실패 문구를 담는다.
+    Backoff(String),
     /// 연결·협상 실패(버전 불일치는 `InvalidData`).
     Io(io::Error),
 }
@@ -581,6 +584,7 @@ impl fmt::Display for Error {
                 "another launcher held the launch lock for over {}s",
                 LOCK_TIMEOUT.as_secs()
             ),
+            Self::Backoff(last) => write!(f, "{last}"),
             Self::Io(e) => write!(f, "cannot talk to krilld: {e}"),
         }
     }
@@ -788,8 +792,54 @@ pub fn reconnect_until(paths: &Paths, hello: &ClientHello) -> Connection {
     }
 }
 
+/// 소켓별 연속 holder 기동 실패: (소켓, 횟수, 마지막 실패 시각, 문구). 앱의 여러 연결(감시·칸·사이드바)이
+/// 각자 재시도해도 실패한 holder를 1분에 수백 번 다시 띄우지 않게 프로세스 전역으로 둔다.
+static LAUNCH_FAILURE: std::sync::Mutex<Option<(PathBuf, u32, Instant, String)>> =
+    std::sync::Mutex::new(None);
+
+/// `failures`번 연속 기동에 실패한 뒤 다음 기동까지 기다릴 시간: 1초에서 두 배씩, 상한 60초.
+fn launch_backoff(failures: u32) -> Duration {
+    Duration::from_secs(1)
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(6))
+        .min(Duration::from_secs(60))
+}
+
 /// krilld에 붙는다. 소켓이 없거나 죽어 있거나 고아 상태면 holder를 띄우고 재결합까지 기다린다.
+/// 직전 기동이 실패했으면 [`launch_backoff`] 동안은 띄우지 않고 [`Error::Backoff`]를 돌려준다.
 pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> {
+    let result = connect_or_launch(paths, hello);
+    let mut failure = LAUNCH_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let same = failure.as_ref().is_some_and(|(s, ..)| *s == paths.socket);
+    match &result {
+        Ok(_) if same => *failure = None,
+        Err(e @ (Error::Spawn(_) | Error::HolderExited(_) | Error::Timeout)) => {
+            let count = failure
+                .as_ref()
+                .filter(|_| same)
+                .map_or(0, |(_, n, ..)| *n)
+                .saturating_add(1);
+            *failure = Some((paths.socket.clone(), count, Instant::now(), e.to_string()));
+        }
+        _ => {}
+    }
+    result
+}
+
+fn launch_gate(socket: &Path) -> Result<(), Error> {
+    let failure = LAUNCH_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match failure.as_ref() {
+        Some((s, n, at, last)) if s == socket && at.elapsed() < launch_backoff(*n) => {
+            Err(Error::Backoff(last.clone()))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn connect_or_launch(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> {
     // krilld는 `<소켓>.tmp`에 bind한다.
     let mut tmp = paths.socket.clone().into_os_string();
     tmp.push(".tmp");
@@ -820,6 +870,7 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
         }
         Err(e) => return Err(Error::Io(e)),
     }
+    launch_gate(&paths.socket)?;
     let mut command = Command::new(&paths.holder);
     #[cfg(unix)]
     command.arg(DETACH_ARG);
