@@ -8,7 +8,7 @@ Krill = 어떤 AI 코딩 에이전트든 끊기지 않게 병렬로 돌리는 �
 
 ## 디자인 시스템 (`docs/STYLEGUIDE.md`)
 
-모든 UI/UX 작업(레이아웃, 색, 타이포그래피, 간격·반경, 컴포넌트 선택, 화면 전환, UX 동작)은 [docs/STYLEGUIDE.md](docs/STYLEGUIDE.md)와 [`crates/krill-app/src/ui/`](crates/krill-app/src/ui/mod.rs)(`theme`·`primitives`·`icons`·`status`)를 따른다. `ui/`와 `terminal.rs` 밖에서 생 색상(`gpui::rgb`/`hsla`/`black`/`white`, `ui::hex`/`hexa`)이나 임의 픽셀 글자 크기(`.text_size(px(..))`)를 하드코딩하지 않는다(`cargo nextest`가 차단). Orca UI를 참고하더라도 **Krill에 실제 구현된 기능만 표기**하며, 관리자/설정 페이지는 새 창이 아니라 메인 창 안 페이지 전환으로 연다.
+모든 UI/UX 작업(레이아웃, 색, 타이포그래피, 간격·반경, 컴포넌트 선택, 화면 전환, UX 동작)은 [docs/STYLEGUIDE.md](docs/STYLEGUIDE.md)와 [`crates/krill-app/src/ui/`](crates/krill-app/src/ui/mod.rs)(`theme`·`primitives`·`icons`·`status`)를 따른다. `ui/`와 `terminal.rs` 밖에서 생 색상(`gpui::rgb`/`hsla`/`black`/`white`, `ui::hex`/`hexa`)이나 임의 픽셀 글자 크기(`.text_size(px(..))`)를 하드코딩하지 않는다(`cargo nextest`가 차단). Orca UI를 참고하더라도 **Krill에 실제 구현된 기능만 표기**하며, 설정·모바일·아티팩트·자동화는 페이지 전환이 아니라 메인 창 위 모달로 연다.
 
 ## 명령
 
