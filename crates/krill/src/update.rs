@@ -135,7 +135,23 @@ fn upgrade_daemon(check: bool, json: bool) -> ExitCode {
 #[cfg(not(target_os = "linux"))]
 fn delegate_to_app(raw: &[OsString], app_bundle: Option<&Path>) -> ExitCode {
     let exe = resolve_krill_app_exe(app_bundle);
-    let status = match Command::new(&exe).arg("--update-cli").args(raw).status() {
+    let mut command = Command::new(&exe);
+    command.arg("--update-cli").args(raw);
+    #[cfg(windows)]
+    let status = match command.output() {
+        Ok(output) => {
+            use std::io::Write as _;
+            std::io::stdout().write_all(&output.stdout).ok();
+            std::io::stderr().write_all(&output.stderr).ok();
+            output.status
+        }
+        Err(e) => {
+            eprintln!("krill update: failed to launch {}: {e}", exe.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(not(windows))]
+    let status = match command.status() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("krill update: failed to launch {}: {e}", exe.display());
