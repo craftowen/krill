@@ -959,36 +959,9 @@ fn ws_closes_when_registry_ends_before_first_request() {
 }
 
 #[test]
-fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
+fn tunnel_offer_deep_link_and_stale_fallback_use_the_tunnel_url() {
     let (_registry, gateway) = start();
-    let (port, ticket) = offer(&gateway);
-    {
-        let mut state = lock(&gateway.shared.state);
-        state.tunnel = Some(super::super::tunnel::Tunnel::fixed_fixture(port).unwrap());
-        state.publication.origin = "https://stage.test".into();
-    }
-    let state = lock(&gateway.shared.state);
-    let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
-        panic!("페어링 응답 없음");
-    };
-    assert_eq!(
-        url,
-        format!(
-            "https://stage.test/m/{}/#pair={}&key={}&t=fixture-mobile.trycloudflare.com&r={}",
-            super::super::pwa::asset_hash(),
-            hex(&ticket.token),
-            ws::base64(&ticket.secret, true),
-            state.publication.rid
-        )
-    );
-    drop(state);
-    assert_eq!(
-        gateway.deep_link(krill_proto::SessionId(7)).unwrap(),
-        format!(
-            "https://stage.test/m/{}/?session=7",
-            super::super::pwa::asset_hash()
-        )
-    );
+    let (port, _ticket) = offer(&gateway);
     let mut state = lock(&gateway.shared.state);
     state.tunnel = Some(super::super::tunnel::Tunnel::fixture(port).unwrap());
     for mode in [ConnectMode::Tunnel, ConnectMode::Lan] {
@@ -1007,12 +980,18 @@ fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
         "never advertise localhost as a tailnet backup"
     );
     state.mode = ConnectMode::Tunnel;
-    // 준비 확인 전 터널은 고정 출처를 쓰지 않고 찍힌 터널 URL로 강등한다.
+    drop(state);
+    assert_eq!(
+        gateway.deep_link(krill_proto::SessionId(7)).unwrap(),
+        "https://fixture.krill.example/?session=7"
+    );
+    let mut state = lock(&gateway.shared.state);
+    // 준비 확인 전 터널도 Named Tunnel URL로 QR을 낸다.
     state.tunnel = Some(super::super::tunnel::Tunnel::stale(port).unwrap());
     let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
         panic!("페어링 응답 없음");
     };
-    assert!(url.starts_with("https://fixture-mobile.trycloudflare.com/#pair="));
+    assert!(url.starts_with("https://fixture.krill.example/#pair="));
     state.tunnel = None;
     assert!(pairing_offer(&state, now_ms()).is_err());
 }
@@ -1562,7 +1541,7 @@ fn daemon_restart_readopts_loopback_port_and_live_cloudflared_pid_in_zero_ms() {
     }) else {
         panic!("expected tunnel offer");
     };
-    assert!(url.starts_with("https://fixture-mobile.trycloudflare.com/#pair="));
+    assert!(url.starts_with("https://fixture.krill.example/#pair="));
     let (ticket, pid) = {
         let s = lock(&g.shared.state);
         assert_eq!(s.tunnel_token.as_deref(), Some("eyJ-named-token"));
@@ -1588,7 +1567,7 @@ fn daemon_restart_readopts_loopback_port_and_live_cloudflared_pid_in_zero_ms() {
     assert_eq!(saved.tunnel_pid, Some(pid));
     assert_eq!(
         saved.tunnel_url.as_deref(),
-        Some("https://fixture-mobile.trycloudflare.com")
+        Some("https://fixture.krill.example")
     );
     assert_eq!(saved.tunnel_token.as_deref(), Some("eyJ-named-token"));
     assert_eq!(saved.tunnel_hostname.as_deref(), Some("krill.example.com"));
@@ -1606,7 +1585,7 @@ fn daemon_restart_readopts_loopback_port_and_live_cloudflared_pid_in_zero_ms() {
         assert_eq!(s.tunnel.as_ref().unwrap().pid(), Some(pid));
         assert_eq!(
             s.tunnel.as_ref().unwrap().ready_url(),
-            Some("https://fixture-mobile.trycloudflare.com")
+            Some("https://fixture.krill.example")
         );
     }
     let mut reconnected = Client::reconnect(port, &device, &credential);
@@ -1628,9 +1607,9 @@ fn daemon_restart_readopts_loopback_port_and_live_cloudflared_pid_in_zero_ms() {
 }
 
 #[test]
-fn missing_relay_pwa_fails_fast_without_quick_tunnel_fallback() {
+fn missing_relay_pwa_fails_fast_without_tunnel_fallback() {
     fn must_not_start_tunnel(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
-        panic!("relay failure must not start a quick tunnel")
+        panic!("relay failure must not start a tunnel")
     }
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let (_registry, gateway) = start();
