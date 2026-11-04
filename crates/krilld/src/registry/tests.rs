@@ -107,7 +107,10 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
     drop(reg);
 
     // With no cwd evidence, leave the session unclassified rather than selecting another project.
-    let reg = Registry::new(None, None);
+    // A fresh state dir, not `None`: that falls back to the real Krill state dir and evicts its prompts.
+    let empty = dir.join("no-evidence");
+    fs::create_dir_all(&empty).unwrap();
+    let reg = Registry::new(None, Some(&empty));
     let writer = insert(&reg, PathBuf::new());
     check(&reg, b"");
     drop(writer);
