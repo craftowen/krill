@@ -313,7 +313,7 @@ try {
     if ($AddToPath) {
         $path = [Environment]::GetEnvironmentVariable('Path', 'User')
         if (($path -split ';') -notcontains $Dest) {
-            [Environment]::SetEnvironmentVariable('Path', ((@($path, $Dest) | Where-Object { $_ }) -join ';'), 'User')
+            [Environment]::SetEnvironmentVariable('Path', ((@("$path".TrimEnd(';'), $Dest) | Where-Object { $_ }) -join ';'), 'User')
         }
         if (($env:Path -split ';') -notcontains $Dest) { $env:Path += ";$Dest" }
     }
