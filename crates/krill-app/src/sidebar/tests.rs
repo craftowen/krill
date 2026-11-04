@@ -5558,6 +5558,13 @@ fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppCont
                 "Windows PowerShell",
                 "a shell without an identified agent retains its title"
             );
+            generic.status.title = Some(r"C:\Program Files\PowerShell\7\pwsh.exe".into());
+            assert_eq!(
+                s.session_label(&generic).0,
+                "pwsh",
+                "ConPTY's default title"
+            );
+            generic.status.title = Some("Windows PowerShell".into());
             generic.status.agent = "claude".into();
             assert_eq!(s.session_label(&generic).0, "fix-login-timeout");
             s.auto_titles.remove(&generic.id);

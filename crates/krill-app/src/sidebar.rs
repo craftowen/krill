@@ -414,6 +414,7 @@ pub fn session_label(session: &Session, title: Option<&str>) -> (String, String)
         .or(session.worktree.as_deref())
         .map(basename);
     let name = title
+        .map(|t| windows_shell_leaf(t).unwrap_or(t))
         .or(agent)
         .map(str::to_owned)
         .or_else(|| place.clone())
@@ -455,12 +456,22 @@ fn is_windows_shell_title(title: &str) -> bool {
     {
         return true;
     }
-    matches!(title.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
-        && title.rsplit(['\\', '/']).next().is_some_and(|leaf| {
-            ["powershell.exe", "pwsh.exe", "cmd.exe"]
-                .iter()
-                .any(|shell| leaf.eq_ignore_ascii_case(shell))
-        })
+    windows_shell_leaf(title).is_some()
+}
+
+/// `ConPTY` reports the console title, which defaults to the shell's full
+/// executable path (`C:\Program Files\PowerShell\7\pwsh.exe`). Returns the
+/// shell name (`pwsh`) for such a drive-absolute shell path.
+fn windows_shell_leaf(title: &str) -> Option<&str> {
+    if !matches!(title.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()) {
+        return None;
+    }
+    let leaf = title.rsplit(['\\', '/']).next()?;
+    ["powershell.exe", "pwsh.exe", "cmd.exe"]
+        .iter()
+        .any(|shell| leaf.eq_ignore_ascii_case(shell))
+        .then(|| leaf.rsplit_once('.').map(|(stem, _)| stem))
+        .flatten()
 }
 
 #[cfg(test)]
