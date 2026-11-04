@@ -822,6 +822,15 @@ fn socket_pending(sock: BorrowedSocket<'_>) -> io::Result<u32> {
 
 pub(crate) fn release_malloc_cache() {}
 
+/// 이 로그온에 사용자 DPAPI 자격이 없으면 `true`. SSH 공개키 인증은 비밀번호 없는 NETWORK 로그온이라
+/// 사용자 마스터 키를 풀지 못해 `CryptProtectData`가 `ERROR_ACCESS_DENIED`로 실패한다(대화형 로그온은 된다).
+/// 다른 오류는 `false`로 두어 테스트가 그대로 실패하게 한다.
+#[cfg(test)]
+pub(crate) fn user_dpapi_unavailable() -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    protect(b"krill-dpapi-probe").is_err_and(|e| e.raw_os_error() == Some(ERROR_ACCESS_DENIED))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +906,14 @@ mod tests {
     #[test]
     fn dpapi_round_trip_and_tamper() {
         let key = [7_u8; 32];
+        if user_dpapi_unavailable() {
+            // 봉인할 수 없는 로그온에서도 아무 blob이나 풀어 주면 안 된다.
+            assert!(unprotect(&key).is_err());
+            eprintln!(
+                "user DPAPI unavailable in this logon (SSH key auth?): round trip not exercised"
+            );
+            return;
+        }
         let sealed = protect(&key).unwrap();
         assert_ne!(sealed.as_slice(), key.as_slice());
         assert_eq!(unprotect(&sealed).unwrap().as_slice(), key.as_slice());
