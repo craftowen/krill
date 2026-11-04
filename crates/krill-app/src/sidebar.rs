@@ -216,6 +216,8 @@ pub trait Source: Send + Sync {
     }
     /// 사이드바 가시성·창 활성 여부가 바뀔 때 git 감시를 켜거나 끈다(N19).
     fn set_visible(&self, _visible: bool) {}
+    /// 강제 읽기가 방금 만든 세션을 놓치지 않게 짧게 재사용하는 스냅샷을 버린다.
+    fn forget_snapshot(&self) {}
     /// OWE-496 `Request::NewWorktree` 한 번. 생성이 끝난 뒤에 답한다.
     fn new_worktree(&self, _req: NewWorktree) -> io::Result<Reply> {
         Err(io::ErrorKind::Unsupported.into())
@@ -3561,8 +3563,12 @@ impl Sidebar {
                     return;
                 };
                 let sp = sidebar_path.clone();
+                let fresh = forced;
                 let (result, comments, auto_titles, prompt_histories, closed_sessions, fallback) =
                     bg.spawn(async move {
+                        if fresh {
+                            source.forget_snapshot();
+                        }
                         let mut comments = source.comments();
                         if comments.is_empty() {
                             comments = external::load_comments_from_sidebar_path(sp.as_deref());

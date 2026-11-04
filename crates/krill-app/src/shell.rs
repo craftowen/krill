@@ -4963,19 +4963,21 @@ impl Shell {
                 self.layout.set_session(pane, session);
                 self.sync_sidebar_tab_state(cx);
                 self.sync_focused_session(cx);
-                if self.layout.host(pane).is_local()
-                    && self
-                        .sidebar
-                        .read(cx)
-                        .session_on(&krill_app::hosts::HostId::Local, session)
-                        .is_none()
-                {
-                    self.sidebar.update(cx, sidebar::Sidebar::refresh);
-                }
                 self.record_workspace_nav(cx);
                 self.save();
                 self.refresh_detached(cx);
                 self.reconcile_workspace_sessions(cx);
+            }
+            // 새 탭은 예약한 ID로 칸에 먼저 묶여 `fresh`가 아니다. 탭 이름은 사이드바 스냅샷에서 오므로
+            // 모르는 세션이면 접혀 있어도 한 번 읽는다.
+            if self.layout.host(pane).is_local()
+                && self
+                    .sidebar
+                    .read(cx)
+                    .session_on(&krill_app::hosts::HostId::Local, session)
+                    .is_none()
+            {
+                self.sidebar.update(cx, sidebar::Sidebar::refresh);
             }
             linked.map(|l| (session, l))
         });

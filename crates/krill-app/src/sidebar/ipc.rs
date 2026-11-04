@@ -512,6 +512,12 @@ impl Source for Socket {
         self.shared.fetch_identified()
     }
 
+    fn forget_snapshot(&self) {
+        if let Ok(mut cached) = self.shared.snapshot.lock() {
+            *cached = None;
+        }
+    }
+
     fn prompt_histories(&self) -> super::PromptHistories {
         self.shared
             .snapshot
