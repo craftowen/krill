@@ -205,10 +205,20 @@ pub enum OwnCommand {
     Foreign,
 }
 
+/// Executable word. Without Git Bash, Claude Code runs the Windows status line in PowerShell,
+/// so Windows uses a form both shells read ([`crate::agent::hooks::windows_shell_word`]).
+fn exe_word(exe: &str) -> String {
+    if cfg!(windows) {
+        crate::agent::hooks::windows_shell_word(exe)
+    } else {
+        shell_quote(exe)
+    }
+}
+
 /// 설치 명령(체인 없음).
 #[must_use]
 pub fn install_command(exe: &str) -> String {
-    format!("{} {SUBCOMMAND}", shell_quote(exe))
+    format!("{} {SUBCOMMAND}", exe_word(exe))
 }
 
 /// 설치 명령(사용자 원본을 체인으로 보존).
@@ -216,23 +226,26 @@ pub fn install_command(exe: &str) -> String {
 pub fn chain_command(exe: &str, user_command: &str) -> String {
     format!(
         "{} {SUBCOMMAND} --chain {}",
-        shell_quote(exe),
+        exe_word(exe),
         shell_quote(user_command)
     )
 }
 
 /// Krill 설치 명령을 구조로 판별한다. 엄격한 형식 일치만 우리 것으로 본다.
+/// Windows에서 예전에 설치한 POSIX 인용 모양(`'C:\…\krill.exe' statusline`)도 우리 것이다.
 #[must_use]
 pub fn classify_command(cmd: &str, exe: &str) -> OwnCommand {
-    let quoted = shell_quote(exe);
-    if cmd.trim() == format!("{quoted} {SUBCOMMAND}") {
-        return OwnCommand::Bare;
-    }
-    let chained_prefix = format!("{quoted} {SUBCOMMAND} --chain ");
-    if let Some(rest) = cmd.trim().strip_prefix(chained_prefix.as_str())
-        && let Some(original) = decode_shell_arg(rest)
-    {
-        return OwnCommand::Chained(original);
+    let cmd = cmd.trim();
+    for word in [exe_word(exe), shell_quote(exe)] {
+        if cmd == format!("{word} {SUBCOMMAND}") {
+            return OwnCommand::Bare;
+        }
+        let chained_prefix = format!("{word} {SUBCOMMAND} --chain ");
+        if let Some(rest) = cmd.strip_prefix(chained_prefix.as_str())
+            && let Some(original) = decode_shell_arg(rest)
+        {
+            return OwnCommand::Chained(original);
+        }
     }
     OwnCommand::Foreign
 }

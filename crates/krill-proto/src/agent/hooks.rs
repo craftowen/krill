@@ -286,16 +286,40 @@ pub fn encode_hook_json(value: &serde_json::Value) -> io::Result<String> {
         .map_err(io::Error::other)
 }
 
+/// A Windows executable path as one word for Claude Code's hook and statusLine shell:
+/// Git Bash, or PowerShell when Git Bash is missing (code.claude.com/docs/en/hooks,
+/// /statusline). A plain path is written unquoted with `/` separators, which both shells
+/// run as-is. Other paths keep POSIX quoting, which only Git Bash runs.
+#[must_use]
+pub fn windows_shell_word(exe: &str) -> String {
+    let slashed = exe.replace('\\', "/");
+    if !slashed.is_empty()
+        && slashed
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '/' | ':' | '.' | '_' | '-'))
+    {
+        slashed
+    } else {
+        shell_quote(exe)
+    }
+}
+
 /// Claude command handler. Windows uses the documented exec form so executable
-/// paths with spaces, quotes or shell metacharacters never pass through a shell.
+/// paths with spaces, quotes or shell metacharacters never pass through a shell;
+/// Claude Code before `args` support (2.1.139) gets the shell form instead.
 /// Its CLI checks `MK_PANE_ID` before collecting or delivering an event.
-pub fn claude_hook(command: &str) -> serde_json::Value {
+pub fn claude_hook(command: &str, version: Option<&str>) -> serde_json::Value {
     #[cfg(windows)]
     {
-        json!({"type": "command", "command": command, "args": ["hook", "claude"]})
+        if super::claude::supports_exec_hooks(version) {
+            json!({"type": "command", "command": command, "args": ["hook", "claude"]})
+        } else {
+            json!({"type": "command", "command": format!("{} hook claude", windows_shell_word(command))})
+        }
     }
     #[cfg(not(windows))]
     {
+        let _ = version;
         json!({"type": "command", "command": command})
     }
 }
@@ -318,7 +342,7 @@ pub fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<St
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| merge_error(format!("hooks.{event} must be an array")))?;
-        let mut handler = claude_hook(command);
+        let mut handler = claude_hook(command, None);
         handler
             .as_object_mut()
             .ok_or_else(|| merge_error("Claude hook handler must be an object"))?
@@ -500,13 +524,36 @@ mod claude_platform_tests {
     #[test]
     fn windows_claude_exec_form_keeps_executable_metacharacters_literal() {
         let command = r"C:\한글 '$` & dir\krill.exe";
-        let handler = super::claude_hook(command);
+        let handler = super::claude_hook(command, None);
         assert_eq!(handler["command"], command);
         if cfg!(windows) {
             assert_eq!(handler["args"], serde_json::json!(["hook", "claude"]));
             assert!(handler.get("shell").is_none());
+            assert_eq!(
+                super::claude_hook(command, Some("2.1.139 (Claude Code)")),
+                handler
+            );
+            let old = super::claude_hook(r"C:\Users\홍길동\krill.exe", Some("2.1.138"));
+            assert_eq!(old["command"], "C:/Users/홍길동/krill.exe hook claude");
+            assert!(old.get("args").is_none());
         } else {
             assert!(handler.get("args").is_none());
         }
+    }
+
+    #[test]
+    fn windows_shell_word_is_unquoted_only_for_plain_paths() {
+        assert_eq!(
+            super::windows_shell_word(r"C:\Users\홍길동\AppData\Local\Programs\Krill\krill.exe"),
+            "C:/Users/홍길동/AppData/Local/Programs/Krill/krill.exe"
+        );
+        assert_eq!(
+            super::windows_shell_word(r"C:\Users\John Smith\krill.exe"),
+            r"'C:\Users\John Smith\krill.exe'"
+        );
+        assert_eq!(
+            super::windows_shell_word(r"C:\$x\krill.exe"),
+            r"'C:\$x\krill.exe'"
+        );
     }
 }
