@@ -568,6 +568,7 @@ fn run(scenario: &str) -> String {
 #[ignore = "requires packaged conpty.dll and x64/OpenConsole.exe; set KRILL_TEST_CONPTY_DIR"]
 fn ctrl_c_stops_a_console_command_in_cmd_and_powershell() {
     let report = run("ctrl_c");
+    println!("{report}");
     for id in [10, 11] {
         assert!(
             report.contains(&format!(
@@ -582,6 +583,7 @@ fn ctrl_c_stops_a_console_command_in_cmd_and_powershell() {
 #[ignore = "requires packaged conpty.dll and x64/OpenConsole.exe; set KRILL_TEST_CONPTY_DIR"]
 fn shell_exit_ends_session_and_leaves_launched_apps_running() {
     let report = run("leader_exit");
+    println!("{report}");
     assert!(
         report
             .contains("leader_exit status=Some(3) leader_alive=false left=2 survived=[true, true]"),
@@ -593,6 +595,7 @@ fn shell_exit_ends_session_and_leaves_launched_apps_running() {
 #[ignore = "requires packaged conpty.dll and x64/OpenConsole.exe; set KRILL_TEST_CONPTY_DIR"]
 fn terminate_hangs_up_first_and_kills_the_rest_at_the_deadline() {
     let report = run("terminate");
+    println!("{report}");
     let field = |line: &str, key: &str| -> Option<u128> {
         let rest = report.lines().find(|l| l.starts_with(line))?;
         let v = rest.split(&format!("{key}=Some(")).nth(1)?;
@@ -620,6 +623,7 @@ fn terminate_hangs_up_first_and_kills_the_rest_at_the_deadline() {
 #[ignore = "requires packaged conpty.dll and x64/OpenConsole.exe; set KRILL_TEST_CONPTY_DIR"]
 fn short_session_keeps_its_last_output() {
     let report = run("short");
+    println!("{report}");
     assert!(report.contains("short lost=[]"), "{report}");
 }
 
@@ -627,6 +631,7 @@ fn short_session_keeps_its_last_output() {
 #[ignore = "requires packaged conpty.dll and x64/OpenConsole.exe; set KRILL_TEST_CONPTY_DIR"]
 fn bootstrap_refused_by_its_job_exits_with_the_win32_error() {
     let report = run("bootstrap_in_job");
+    println!("{report}");
     assert!(
         report.contains("bootstrap_in_job status=Some(5)"),
         "{report}"
