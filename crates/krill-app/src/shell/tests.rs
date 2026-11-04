@@ -6050,7 +6050,7 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     assert!(cx.debug_bounds("titlebar").is_some());
 
     // 4. open_window_at_tab(AdminTab::Accounts) switches to in-app Settings on the Accounts tab,
-    //    and clicking "Back to app" returns to the workspace with the live terminal intact.
+    //    and clicking the modal close button returns to the workspace with the live terminal intact.
     cx.update(|_, cx| {
         krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Accounts, cx);
     });
@@ -6060,27 +6060,13 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     assert!(cx.debug_bounds("admin-accounts-refresh").is_some());
 
     let back = cx
-        .debug_bounds("admin-back-to-app")
-        .expect("admin-back-to-app button");
+        .debug_bounds("admin-modal-close")
+        .expect("admin-modal-close button");
     cx.simulate_click(back.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("admin-center").is_none());
     assert!(cx.debug_bounds("titlebar").is_some());
     assert!(cx.update(|_, cx| view.read(cx).live.contains_key(&pane)));
-
-    // 4b. Modal close button (✕) in the modal header also closes the centered Settings modal.
-    cx.update(|_, cx| {
-        krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Machines, cx);
-    });
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("admin-modal").is_some());
-    let modal_close = cx
-        .debug_bounds("admin-modal-close")
-        .expect("admin-modal-close button");
-    cx.simulate_click(modal_close.center(), Modifiers::default());
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("admin-modal").is_none());
-    assert!(cx.debug_bounds("admin-center").is_none());
 
     // 5. After returning from Settings, typing in the workspace reaches the live PTY again.
     cx.simulate_keystrokes("x");
@@ -6669,7 +6655,7 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.debug_bounds("automations-page").is_some());
     assert!(cx.debug_bounds("sidebar-column").is_some());
-    let close = cx.debug_bounds("automations-back").unwrap();
+    let close = cx.debug_bounds("automations-close").unwrap();
     cx.simulate_click(close.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("automations-page").is_none());
@@ -6769,7 +6755,7 @@ fn artifacts_open_the_library_by_default_and_back_preserves_the_workspace(cx: &m
         before,
         "library shortcuts must not split the terminal under the modal"
     );
-    let back = cx.debug_bounds("artifacts-back").unwrap();
+    let back = cx.debug_bounds("artifacts-close").unwrap();
     cx.simulate_click(back.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("artifacts-modal").is_none());
@@ -6826,7 +6812,7 @@ fn automations_open_from_sidebar_and_back_preserves_the_workspace(cx: &mut TestA
             Some(&NavEntry::Automations)
         );
     });
-    let back = cx.debug_bounds("automations-back").unwrap();
+    let back = cx.debug_bounds("automations-close").unwrap();
     cx.simulate_click(back.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("automations-page").is_none());
@@ -6897,10 +6883,10 @@ fn multi_window_settings_close_targets_matching_shell_host(cx: &mut TestAppConte
     assert!(cx.update(|_, cx| view_a.read(cx).settings().is_some()));
     assert!(cx.update(|_, cx| view_b.read(cx).settings().is_none()));
 
-    // Clicking "Back to app" in window A must close window A's settings (not be swallowed by window B).
+    // Clicking the close button in window A must close window A's settings (not be swallowed by window B).
     let back = cx
-        .debug_bounds("admin-back-to-app")
-        .expect("admin-back-to-app button");
+        .debug_bounds("admin-modal-close")
+        .expect("admin-modal-close button");
     cx.simulate_click(back.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("admin-center").is_none());

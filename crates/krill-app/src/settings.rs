@@ -10825,19 +10825,6 @@ impl Render for SettingsView {
             .flex_col()
             .gap_2p5()
             .child(
-                div().flex().items_center().child(
-                    Button::new("admin-back-to-app")
-                        .icon(IconName::ChevronLeft)
-                        .label(text::BACK_TO_APP.get())
-                        .small()
-                        .ghost()
-                        .debug_selector(|| "admin-back-to-app".into())
-                        .on_click(cx.listener(|_, _, window, cx| {
-                            close_settings_page_for(Some(cx.entity_id()), window, cx);
-                        })),
-                ),
-            )
-            .child(
                 div()
                     .id("admin-search-pill")
                     .debug_selector(|| "admin-search-pill".into())

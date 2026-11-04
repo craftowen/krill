@@ -139,7 +139,7 @@ catalog! {
     artifacts {
         TITLE => ("아티팩트", "Artifacts"),
         DESCRIPTION => ("문서와 시각 자료는 기본으로 Krill 아티팩트로 만들어집니다. 발행한 링크를 여기서 확인하세요.", "Documents and visual deliverables use Krill artifacts by default. Find published links here."),
-        BACK => ("뒤로", "Back"),
+        CLOSE => ("닫기", "Close"),
         SEARCH => ("아티팩트 검색…", "Search artifacts…"),
         REFRESH => ("새로고침", "Refresh"),
         LOADING => ("아티팩트를 불러오는 중…", "Loading artifacts…"),
@@ -196,7 +196,7 @@ catalog! {
     }
     automations {
         TITLE => ("자동화", "Automations"),
-        BACK => ("뒤로", "Back"),
+        CLOSE => ("닫기", "Close"),
         SEARCH => ("자동화 검색…", "Search automations…"),
         SEARCH_RUNS => ("실행 기록 검색…", "Search runs…"),
         FILTERS => ("필터", "Filters"),
@@ -1211,7 +1211,6 @@ catalog! {
         MACHINES_ADD_DESC => ("머신에 연결할 방법을 선택하세요.", "Choose how to connect to the machine."),
         TAB_REMOTE_KRILL => ("원격 Krill", "Remote Krill"),
         TAB_SHORTCUTS => ("단축키", "Shortcuts"),
-        BACK_TO_APP => ("앱으로 돌아가기", "Back to app"),
         SEARCH_SETTINGS => ("설정 검색", "Search settings"),
         SEARCH_EMPTY => ("일치하는 설정이 없습니다", "No matching settings"),
         SEARCH_EMPTY_TITLE => ("검색 결과 없음", "No matching settings"),

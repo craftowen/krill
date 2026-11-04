@@ -1433,7 +1433,6 @@ impl Render for View {
                     .flex()
                     .flex_col()
                     .child(
-                        // Top Header (Orca ArtifactsPage header + Krill Back button)
                         div()
                             .flex_none()
                             .flex()
@@ -1446,30 +1445,34 @@ impl Render for View {
                             .child(
                                 div()
                                     .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        ui::ghost("artifacts-back", text::BACK.get())
-                                            .debug_selector(|| "artifacts-back".into())
-                                            .icon(IconName::ArrowLeft)
-                                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Close))),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(ui::TEXT_LG)
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(p.foreground)
-                                            .child(text::TITLE.get()),
-                                    ),
+                                    .text_size(ui::TEXT_LG)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.foreground)
+                                    .child(text::TITLE.get()),
                             )
                             .child(
                                 div()
                                     .min_w_0()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .truncate()
-                                    .child(text::DESCRIPTION.get()),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .truncate()
+                                            .child(text::DESCRIPTION.get()),
+                                    )
+                                    .child(
+                                        Button::new("artifacts-close")
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .small()
+                                            .tooltip(text::CLOSE.get())
+                                            .debug_selector(|| "artifacts-close".into())
+                                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Close))),
+                                    ),
                             ),
                     )
                     .children(self.render_error_banner(p, cx))
