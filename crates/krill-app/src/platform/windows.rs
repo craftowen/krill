@@ -212,7 +212,8 @@ mod win {
         );
         let command = std::env::var_os("SystemRoot").unwrap();
         let mut child = crate::platform::background_command(
-            std::path::Path::new(&command).join("System32/cmd.exe"),
+            // cmd.exe는 argv[0]까지 스위치로 훑는다. `/`가 섞인 경로면 "The syntax of the command is incorrect"로 끝난다.
+            std::path::Path::new(&command).join(r"System32\cmd.exe"),
         )
         .args(["/D", "/C", "exit /b 0"])
         .spawn()
