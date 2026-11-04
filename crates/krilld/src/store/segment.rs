@@ -27,7 +27,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use super::crypto::{Key, SALT_LEN, Stream};
+use super::crypto::{Key, Keyring, SALT_LEN, Stream, key_unavailable};
 use krill_proto::SessionId;
 use krill_proto::holder::WinSize;
 use zstd::stream::raw::Operation as _;
@@ -298,19 +298,25 @@ impl Segment {
 
 /// 세그먼트 파일을 읽는다. 헤더가 깨졌거나 모르는 버전이면 `Ok(None)`.
 /// 크기 상한 초과는 오류이며, 복구 호출자가 원본을 잘라 내지 않게 한다.
-pub(super) fn read(path: &Path, key: Option<&Key>) -> io::Result<Option<Segment>> {
+pub(super) fn read(path: &Path, keys: Option<&Keyring>) -> io::Result<Option<Segment>> {
     let file = fs::File::open(path)?;
     let file_len = file.metadata()?.len();
     if file_len > MAX_FILE {
         return Err(size_error());
     }
-    read_from(io::BufReader::with_capacity(64 * 1024, file), file_len, key)
+    read_from(
+        io::BufReader::with_capacity(64 * 1024, file),
+        file_len,
+        || keys.ok_or_else(key_unavailable)?.get(),
+    )
 }
 
 #[cfg(test)]
 #[cfg(unix)]
 pub(super) fn decode(bytes: &[u8], key: Option<&Key>) -> io::Result<Option<Segment>> {
-    read_from(bytes, bytes.len() as u64, key)
+    read_from(bytes, bytes.len() as u64, || {
+        key.ok_or_else(key_unavailable)
+    })
 }
 
 fn size_error() -> io::Error {
@@ -329,7 +335,11 @@ fn read_full(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<bool> {
     }
 }
 
-fn read_from(reader: impl Read, file_len: u64, key: Option<&Key>) -> io::Result<Option<Segment>> {
+fn read_from<'k>(
+    reader: impl Read,
+    file_len: u64,
+    key: impl FnOnce() -> io::Result<&'k Key>,
+) -> io::Result<Option<Segment>> {
     // 읽는 중 파일이 자라도 시작 시점의 범위 밖은 읽거나 할당하지 않는다.
     let mut reader = reader.take(file_len);
     let mut prefix = [0; HEADER_LEN];
@@ -340,9 +350,7 @@ fn read_from(reader: impl Read, file_len: u64, key: Option<&Key>) -> io::Result<
         return Ok(None);
     };
     let mut crypto = if header.encrypted {
-        let key = key.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::PermissionDenied, "segment key unavailable")
-        })?;
+        let key = key()?;
         let mut salt = [0; SALT_LEN];
         if !read_full(&mut reader, &mut salt)? {
             return Ok(None);
