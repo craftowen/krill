@@ -406,6 +406,19 @@ fn short(k: &mut Krilld) {
     k.note(&format!("short lost={lost:?}"));
 }
 
+/// breakaway를 막는 Job(작업 스케줄러 같은) 안의 `--bootstrap`은 holder를 그 Job에 가두지 않고 실패하되, 원인을
+/// 종료 코드(Win32 오류, `ERROR_ACCESS_DENIED` = 5)로 알린다. 세션 Job이 바로 그런 Job이다.
+fn bootstrap_in_job(k: &mut Krilld) {
+    let holder = k.dir.join(r"install\krill-holder.exe");
+    let krilld = k.dir.join("missing-krilld.exe");
+    let socket = k.dir.join("bootstrap.sock");
+    let argv = [&holder, &krilld, &socket].map(|p| p.to_str().unwrap().to_owned());
+    k.spawn(40, &[&argv[0], "--bootstrap", &argv[1], &argv[2]]);
+    let exit = k.wait_exit(40, WAIT);
+    k.note(&format!("bootstrap_in_job status={:?}", exit.map(|e| e.0)));
+    k.finish(40);
+}
+
 #[test]
 fn role_krilld() {
     let Some(dir) = std::env::var_os("MKT_DIR").map(PathBuf::from) else {
@@ -439,6 +452,7 @@ fn role_krilld() {
             "leader_exit" => leader_exit(&mut k),
             "terminate" => terminate(&mut k),
             "short" => short(&mut k),
+            "bootstrap_in_job" => bootstrap_in_job(&mut k),
             other => panic!("unknown scenario {other}"),
         }
         put(&dir.join("done"), "");
@@ -492,6 +506,15 @@ struct Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         taskkill(self.holder, true);
+        // 트리 밖으로 빠져나간 것(Job을 벗어난 holder 등)도 명령줄의 이 폴더로 찾아 끝낸다.
+        let sweep = format!(
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{}*' -and $_.ProcessId -ne $PID }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}",
+            self.dir.display()
+        );
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &sweep])
+            .output()
+            .ok();
         std::thread::sleep(Duration::from_millis(500));
         fs::remove_dir_all(&self.dir).ok();
     }
@@ -598,4 +621,14 @@ fn terminate_hangs_up_first_and_kills_the_rest_at_the_deadline() {
 fn short_session_keeps_its_last_output() {
     let report = run("short");
     assert!(report.contains("short lost=[]"), "{report}");
+}
+
+#[test]
+#[ignore = "requires packaged conpty.dll and x64/OpenConsole.exe; set KRILL_TEST_CONPTY_DIR"]
+fn bootstrap_refused_by_its_job_exits_with_the_win32_error() {
+    let report = run("bootstrap_in_job");
+    assert!(
+        report.contains("bootstrap_in_job status=Some(5)"),
+        "{report}"
+    );
 }

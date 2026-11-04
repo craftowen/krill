@@ -107,7 +107,17 @@ struct Holder {
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let path = args.next().ok_or(io::ErrorKind::InvalidInput)?;
     if path == "--bootstrap" {
-        return sys::bootstrap(&args.collect::<Vec<_>>());
+        let result = sys::bootstrap(&args.collect::<Vec<_>>());
+        // A Job that forbids breakaway (Task Scheduler) refuses the holder with ERROR_ACCESS_DENIED.
+        // Staying in it would tie every session to that Job, so exit with the Win32 code instead.
+        if let Some(code) = result.as_ref().err().and_then(io::Error::raw_os_error) {
+            #[expect(
+                clippy::exit,
+                reason = "the caller reads the Win32 error from the exit status"
+            )]
+            std::process::exit(code);
+        }
+        return result;
     }
     krill_log::init(krill_log::Component::Holder).ok();
     sys::enable_ctrl_c();
