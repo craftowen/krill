@@ -1344,6 +1344,14 @@ impl Shell {
             Link::Connecting => (p.warning, text::DAEMON_CONNECTING.get().to_owned()),
             // 세션은 krill-holder가 쥐고 있어 끊김이 아니라 보존 중이다(STYLEGUIDE §3.3).
             Link::Down => (p.preserve, text::DAEMON_CONNECTING.get().to_owned()),
+            Link::Restricted => (
+                p.destructive,
+                format!(
+                    "{}: {}",
+                    text::DAEMON_FAILED.get(),
+                    krill_app::i18n::catalog::link::JOB_RESTRICTED.get()
+                ),
+            ),
             Link::Failed(err) => (
                 p.destructive,
                 if err.is_empty() {

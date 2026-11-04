@@ -909,6 +909,7 @@ catalog! {
         RECONNECTED => ("세션 {n}개에 다시 연결했습니다", "Reconnected to {n} sessions"),
         FAILED => ("세션 데몬에 연결하지 못했습니다", "Could not connect to the session daemon"),
         RETRYING => ("다시 시도하는 중", "Retrying"),
+        JOB_RESTRICTED => ("작업 스케줄러 같은 제한된 환경에서 실행돼 세션 데몬을 띄울 수 없습니다. 시작 메뉴나 시작프로그램 폴더에서 Krill을 실행하세요", "Krill was started in a restricted environment such as Task Scheduler and cannot start the session daemon. Start Krill from the Start menu or the Startup folder"),
         UNCERTAIN => ("전달됐는지 알 수 없는 입력(다시 보내지 않음)", "Input delivery uncertain (not resent)"),
         EXPIRED => ("5분이 지나 보내지 않은 입력", "Input not sent after five minutes"),
         NEW_SESSION => ("새 셸이라 보내지 않은 입력", "Input not sent to the new shell"),

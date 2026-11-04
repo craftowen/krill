@@ -19,6 +19,8 @@ pub enum Link {
     Down,
     /// 처음부터 붙지 못했다(이유). 계속 다시 시도한다.
     Failed(String),
+    /// Windows Job 제한(작업 스케줄러 등) 안에서 실행돼 세션 데몬을 띄울 수 없다. 다시 띄우지 않는다.
+    Restricted,
 }
 
 impl Link {
@@ -26,6 +28,7 @@ impl Link {
     pub fn connect_failure(error: &krill_proto::daemon::Error) -> Self {
         use std::io::ErrorKind;
         match error {
+            error if error.is_job_restricted() => Self::Restricted,
             krill_proto::daemon::Error::LockTimeout => Self::Down,
             krill_proto::daemon::Error::Io(error)
                 if matches!(
@@ -56,6 +59,11 @@ impl Link {
                 text::FAILED.get(),
                 text::RETRYING.get()
             )),
+            Self::Restricted => Some(format!(
+                "{}: {}",
+                text::FAILED.get(),
+                text::JOB_RESTRICTED.get()
+            )),
         }
     }
 }
@@ -73,7 +81,7 @@ impl Link {
     pub const fn banner_tone(&self) -> BannerTone {
         match self {
             Self::Down => BannerTone::Preserve,
-            Self::Connecting | Self::Up | Self::Failed(_) => BannerTone::Warning,
+            Self::Connecting | Self::Up | Self::Failed(_) | Self::Restricted => BannerTone::Warning,
         }
     }
 }
@@ -135,6 +143,14 @@ mod tests {
         ] {
             assert!(matches!(Link::connect_failure(&error), Link::Failed(_)));
         }
+        let denied = Error::Backoff {
+            last: "krill-holder exited before krilld was ready (exit code: 5)".into(),
+            code: Some(krill_proto::daemon::HOLDER_JOB_DENIED),
+        };
+        let link = Link::connect_failure(&denied);
+        assert_eq!(link == Link::Restricted, cfg!(windows), "{link:?}");
+        let banner = Link::Restricted.banner().unwrap();
+        assert!(!banner.contains(text::RETRYING.get()), "{banner}");
     }
 
     #[test]

@@ -2974,7 +2974,7 @@ impl Shell {
         match self.link {
             Link::Up => krill_app::hosts::HostStatus::Connected,
             Link::Connecting | Link::Down => krill_app::hosts::HostStatus::Connecting,
-            Link::Failed(_) => krill_app::hosts::HostStatus::Disconnected,
+            Link::Failed(_) | Link::Restricted => krill_app::hosts::HostStatus::Disconnected,
         }
     }
 
