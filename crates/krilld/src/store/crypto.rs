@@ -5,10 +5,10 @@ use std::fmt;
 use std::io;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 
 use ring::{
     aead, hkdf,
@@ -44,7 +44,10 @@ impl fmt::Debug for Key {
 
 impl Key {
     #[cfg(target_os = "macos")]
-    pub(super) fn load(root: &Path, existing: bool) -> io::Result<Arc<Self>> {
+    pub(super) fn load(
+        root: &Path,
+        existing: impl FnOnce() -> io::Result<bool>,
+    ) -> io::Result<Arc<Self>> {
         let _gate = crate::session::lock(&KEYCHAIN_GATE);
         let _ui = if SecKeychain::user_interaction_allowed().map_err(keychain_error)? {
             Some(SecKeychain::disable_user_interaction().map_err(keychain_error)?)
@@ -59,13 +62,16 @@ impl Key {
     /// Windows는 같은 파일에 DPAPI(현재 사용자 범위)로 봉인한 blob을 둔다. 다른 사용자·다른 기기에서는 풀리지 않는다.
     /// 임시 파일을 다 쓴 뒤 `link`로 자리에 놓아, 경쟁하는 생성자가 반쯤 쓴 키를 읽거나 기존 키를 덮어쓰지 않는다.
     #[cfg(any(target_os = "linux", windows))]
-    pub(super) fn load(root: &Path, existing: bool) -> io::Result<Arc<Self>> {
+    pub(super) fn load(
+        root: &Path,
+        existing: impl FnOnce() -> io::Result<bool>,
+    ) -> io::Result<Arc<Self>> {
         use krill_proto::os::fs::OpenOptionsExt as _;
         use std::io::Write as _;
         let path = root.join(KEY_FILE);
         match std::fs::read(&path) {
             Ok(bytes) => return Self::unseal(bytes).map(Arc::new),
-            Err(e) if e.kind() == io::ErrorKind::NotFound && !existing => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !existing()? => {}
             Err(e) => return Err(unavailable(&e)),
         }
         let mut bytes = Zeroizing::new([0; 32]);
@@ -106,7 +112,7 @@ impl Key {
     #[cfg(target_os = "macos")]
     pub(super) fn load_from(
         root: &Path,
-        existing: bool,
+        existing: impl FnOnce() -> io::Result<bool>,
         keychain: &SecKeychain,
     ) -> io::Result<Arc<Self>> {
         let account = crate::mobile::devices::hex(&Sha256::digest(
@@ -115,7 +121,7 @@ impl Key {
         let found = keychain.find_generic_password(SERVICE, &account);
         match found {
             Ok((bytes, _)) => Self::from_slice(bytes.as_ref()).map(Arc::new),
-            Err(e) if e.code() == NOT_FOUND && !existing => {
+            Err(e) if e.code() == NOT_FOUND && !existing()? => {
                 let mut bytes = Zeroizing::new([0; 32]);
                 SystemRandom::new()
                     .fill(bytes.as_mut())
@@ -179,6 +185,48 @@ fn seal(key: &[u8]) -> io::Result<Vec<u8>> {
 #[cfg(windows)]
 fn seal(key: &[u8]) -> io::Result<Vec<u8>> {
     crate::sys::protect(key)
+}
+
+/// 세그먼트 키. 암호화가 꺼진 기록기는 기동 때 `sessions/`를 전수로 열어 v2를 찾지 않고,
+/// v2 세그먼트를 처음 읽을 때 기존 키만 찾는다(새로 만들지 않는다). 찾지 못한 결과도 기억해
+/// 읽을 때마다 키체인을 다시 부르지 않는다.
+#[derive(Debug)]
+pub(super) struct Keyring {
+    root: PathBuf,
+    key: OnceLock<Option<Arc<Key>>>,
+}
+
+impl Keyring {
+    pub(super) fn ready(key: Arc<Key>) -> Arc<Self> {
+        Arc::new(Self {
+            root: PathBuf::new(),
+            key: OnceLock::from(Some(key)),
+        })
+    }
+
+    pub(super) fn existing(root: &Path) -> Arc<Self> {
+        Arc::new(Self {
+            root: root.to_path_buf(),
+            key: OnceLock::new(),
+        })
+    }
+
+    pub(super) fn get(&self) -> io::Result<&Key> {
+        self.key
+            .get_or_init(|| {
+                Key::load(&self.root, || Ok(true))
+                    .inspect_err(|e| {
+                        tracing::warn!(kind = ?e.kind(), "encrypted history found without a segment key");
+                    })
+                    .ok()
+            })
+            .as_deref()
+            .ok_or_else(key_unavailable)
+    }
+}
+
+pub(super) fn key_unavailable() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "segment key unavailable")
 }
 
 fn crypto_error(_: ring::error::Unspecified) -> io::Error {
@@ -249,21 +297,21 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
         assert!(
-            Key::load(&root, true).is_err(),
+            Key::load(&root, || Ok(true)).is_err(),
             "데이터가 있는데 키가 없으면 새로 만들지 않는다"
         );
-        let first = Key::load(&root, false).unwrap();
+        let first = Key::load(&root, || Ok(false)).unwrap();
         let sealed = std::fs::read(root.join(KEY_FILE)).unwrap();
         assert!(sealed.len() > 32, "평문 32바이트가 아니라 DPAPI blob이다");
         assert!(!sealed.windows(32).any(|w| w == first.0.as_ref()));
-        let second = Key::load(&root, true).unwrap();
+        let second = Key::load(&root, || Ok(true)).unwrap();
         assert_eq!(first.0.as_ref(), second.0.as_ref());
         let mut bad = sealed;
         if let Some(b) = bad.get_mut(40) {
             *b ^= 1;
         }
         std::fs::write(root.join(KEY_FILE), bad).unwrap();
-        let err = Key::load(&root, true).unwrap_err();
+        let err = Key::load(&root, || Ok(true)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -135,7 +135,7 @@ pub struct Store {
     sessions: PathBuf,
     recording: bool,
     encryption: bool,
-    key: Option<Arc<crypto::Key>>,
+    key: Option<Arc<crypto::Keyring>>,
     generation: AtomicU64,
     /// 생성·rename만 직렬화한다. 압축·열린 파일 쓰기·재귀 삭제는 이 잠금 밖이다.
     gate: Mutex<()>,
@@ -180,11 +180,14 @@ impl Store {
         if recording {
             privacy::prepare(&sessions)?;
         }
-        let existing = recording && segment::has_encrypted(&sessions)?;
-        let key = if recording && (config.encryption || existing) {
-            Some(crypto::Key::load(root, existing)?)
-        } else {
+        // 키가 있으면 전수 검사(`.krs`마다 open)를 건너뛴다. 키가 없을 때만 이전 암호문 유무로 새 키 생성 여부를 정한다.
+        let key = if !recording {
             None
+        } else if config.encryption {
+            let key = crypto::Key::load(root, || segment::has_encrypted(&sessions))?;
+            Some(crypto::Keyring::ready(key))
+        } else {
+            Some(crypto::Keyring::existing(root))
         };
         let store = Self::with_key(sessions, limits, recording, config.encryption, key);
         store.set_paused(privacy::initial_pause(root)?);
@@ -196,7 +199,7 @@ impl Store {
         limits: Limits,
         recording: bool,
         encryption: bool,
-        key: Option<Arc<crypto::Key>>,
+        key: Option<Arc<crypto::Keyring>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             sessions,
@@ -716,7 +719,7 @@ pub struct History {
     segs: Vec<PathBuf>,
     first_page: usize,
     cleared_seq: u64,
-    key: Option<Arc<crypto::Key>>,
+    key: Option<Arc<crypto::Keyring>>,
 }
 
 /// A search consumes harvested batches immediately; no full page of cells is retained.
