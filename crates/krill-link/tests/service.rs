@@ -176,6 +176,12 @@ fn incoming_server_pairs_and_forwards_to_local_socket() {
         .unwrap();
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(20), async {
+            assert_eq!(
+                krill_link::serve::serve_build_command(&fixture.dir)
+                    .await
+                    .as_deref(),
+                Some(krill_proto::BUILD)
+            );
             let local = Listener::bind(fixture.dir.join("run/krilld.sock")).unwrap();
             let client = fixture.dir.join("client");
             LinkConfig {
@@ -224,6 +230,13 @@ fn windows_default_server_starts_reuses_and_remembers_off() {
     assert!(krill_link::service::incoming_enabled(&fixture.dir).unwrap());
     krill_link::service::ensure_default_server(executable, &fixture.dir).unwrap();
     assert!(is_serve_running(&fixture.dir));
+    // 앱은 이 빌드로 업데이트 뒤 남은 구 서버를 알아보고 교체한다.
+    let build = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(krill_link::serve::serve_build_command(&fixture.dir));
+    assert_eq!(build.as_deref(), Some(krill_proto::BUILD));
     let ticket = fs::read(fixture.dir.join("link/serve.ticket")).unwrap();
     krill_link::service::enable_server(executable, &fixture.dir).unwrap();
     assert_eq!(

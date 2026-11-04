@@ -338,6 +338,9 @@ enum ControlResponse {
         node_id: String,
         allowed_count: usize,
         active_peers: usize,
+        /// 서버 실행 파일의 `krill_proto::BUILD`. 이 필드가 없던 구 서버는 빈 값이다.
+        #[serde(default)]
+        build: String,
     },
     Err {
         message: String,
@@ -699,6 +702,7 @@ async fn handle_ctl_stream(
                 node_id: node_id.to_owned(),
                 allowed_count,
                 active_peers: active_count,
+                build: krill_proto::BUILD.to_owned(),
             }
         }
         ControlRequest::Shutdown => {
@@ -866,6 +870,27 @@ pub async fn revoke_device_command(state_dir: &Path, target: &str) -> Result<All
 pub fn is_serve_running(state_dir: &Path) -> bool {
     let ctl_path = state_dir.join(SERVE_CTL_SOCK_REL_PATH);
     krill_proto::os::net::UnixStream::connect(ctl_path).is_ok()
+}
+
+/// 실행 중인 수신 서버의 빌드 식별자. 꺼져 있거나 응답이 없으면 `None`, 빌드를 알리지 않는 구 서버는 빈 문자열.
+pub async fn serve_build_command(state_dir: &Path) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = Stream::connect(state_dir.join(SERVE_CTL_SOCK_REL_PATH))
+            .await
+            .ok()?;
+        let request = serde_json::to_vec(&ControlRequest::Status).ok()?;
+        stream.write_all(&request).await.ok()?;
+        stream.shutdown().await.ok()?;
+        let mut reply = Vec::new();
+        stream.take(4097).read_to_end(&mut reply).await.ok()?;
+        match serde_json::from_slice::<ControlResponse>(&reply).ok()? {
+            ControlResponse::Status { build, .. } => Some(build),
+            _ => None,
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// 로컬 제어 소켓으로 수신 서버를 정상 종료한다. 이미 꺼져 있으면 성공한다.
