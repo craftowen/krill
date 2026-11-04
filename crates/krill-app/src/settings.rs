@@ -7681,7 +7681,7 @@ impl SettingsView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex_basis(gpui::relative(0.5))
+                    .flex_basis(px(160.))
                     .flex()
                     .flex_col()
                     .gap_0p5()
