@@ -1067,6 +1067,32 @@ fn sidebar_stops_polling_and_hides_git_watch_when_hidden_or_inactive(cx: &mut Te
         after_hide,
         "hidden sidebar must not poll"
     );
+    // 탭 이름은 이 스냅샷에서 온다. 접힌 채로 모르는 세션이 탭에 붙으면 한 번만 읽고, 아는 세션만이면 읽지 않는다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_session_order(vec![(HostId::Local, SessionId(1))], cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(source.fetches.load(Ordering::SeqCst), after_hide);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_session_order(
+                vec![(HostId::Local, SessionId(1)), (HostId::Local, SessionId(9))],
+                cx,
+            );
+        });
+    });
+    for _ in 0..20 {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+    }
+    let after_hide = after_hide + 1;
+    assert_eq!(
+        source.fetches.load(Ordering::SeqCst),
+        after_hide,
+        "an unknown tab session is read once while hidden"
+    );
 
     // 다시 펼치면 폴링이 재개된다.
     cx.update(|_, cx| view.update(cx, |s, cx| s.set_visible(true, cx)));
@@ -5570,9 +5596,17 @@ fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppCont
             s.auto_titles.remove(&generic.id);
             assert_eq!(
                 s.session_label(&generic).0,
-                "Windows PowerShell",
-                "an agent without a known prompt must not invent a title"
+                "claude",
+                "an agent's launcher shell title yields to the agent name"
             );
+            generic.status.title = Some(r"C:\WINDOWS\system32\cmd.exe".into());
+            generic.status.agent = "codex".into();
+            assert_eq!(
+                s.session_label(&generic).0,
+                "codex",
+                "npm codex.cmd leaves cmd.exe as the console title"
+            );
+            generic.status.agent = "claude".into();
             s.set_auto_title(generic.id, "fix-login-timeout", cx);
 
             // The pane's cached generic OSC label must not hide a newer title
@@ -5599,7 +5633,7 @@ fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppCont
             assert_eq!(
                 s.session_label_on_with_title(&remote, &remote_session, Some("Windows PowerShell"))
                     .0,
-                "Windows PowerShell",
+                "claude",
                 "a remote ID never borrows the local prompt title"
             );
         });
@@ -7324,4 +7358,36 @@ fn machine_observations_follow_accepted_remote_snapshots(cx: &mut TestAppContext
         assert_eq!(s.remote_hosts[0].snapshot.sessions[0].id, SessionId(2));
         assert_eq!(s.remote_hosts[0].status, HostStatus::Connected);
     });
+}
+
+/// 접힌 채 시작한 창도 탭 이름에 쓸 첫 스냅샷을 한 번 읽고, 그 뒤로는 폴링하지 않는다.
+#[gpui::test]
+fn hidden_sidebar_reads_one_snapshot_for_tab_labels(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Once(AtomicUsize);
+    impl Source for Once {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Snapshot {
+                sessions: vec![session(1, AgentState::Working, Some("/repo/wt"))],
+                trees: BTreeMap::new(),
+            })
+        }
+    }
+    cx.update(gpui_component::init);
+    let source = Arc::new(Once(AtomicUsize::new(0)));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_visible(false, cx);
+            s.connect_source(source.clone(), cx);
+        });
+    });
+    for _ in 0..10 {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+    }
+    assert_eq!(source.0.load(Ordering::SeqCst), 1);
+    assert!(cx.update(|_, cx| view.read(cx).session(SessionId(1)).is_some()));
 }

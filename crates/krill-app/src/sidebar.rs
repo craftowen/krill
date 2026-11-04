@@ -2245,12 +2245,13 @@ impl Sidebar {
 
     fn sync_polling(&mut self, cx: &mut Context<Self>) {
         if self.is_visible() {
-            if self.task.is_none()
-                && let Some(source) = self.source.clone()
-            {
+            // 접힌 동안 한 번 읽은 작업은 끝났어도 남아 있다. 폴링 재개를 막지 않게 버린다.
+            self.task = None;
+            self.remote_task = None;
+            if let Some(source) = self.source.clone() {
                 self.connect_source(source, cx);
             }
-            if self.remote_task.is_none() && !self.remote_hosts.is_empty() {
+            if !self.remote_hosts.is_empty() {
                 self.ensure_remote_sources(cx);
                 self.start_remote_polling(cx);
             }
@@ -3538,7 +3539,8 @@ impl Sidebar {
         self.task = None;
         self.source = Some(source);
         crate::alert::listen(&cx.weak_entity(), cx);
-        self.spawn_local_polling(false, cx);
+        // 접힌 채 시작해도 탭 이름에 쓸 첫 스냅샷은 읽는다.
+        self.spawn_local_polling(true, cx);
     }
 
     fn spawn_local_polling(&mut self, force_once: bool, cx: &mut Context<Self>) {
@@ -4873,29 +4875,32 @@ impl Sidebar {
             .then(|| self.titles.get(&session.id))
             .flatten()
             .map(String::as_str);
+        // Windows 콘솔 제목은 에이전트를 띄운 셸(npm `codex.cmd`의 `cmd.exe`)로 남는다. 에이전트가 확인되면 그 이름을 쓴다.
+        let has_agent = !session.status.agent.trim().is_empty();
+        let names_session = |title: &&str| !(has_agent && is_windows_shell_title(title));
         let live_title = pane_title
             .or(cached_title)
-            .and_then(krill_proto::control::display_title);
+            .and_then(krill_proto::control::display_title)
+            .filter(|title| names_session(&title.as_str()));
+        let status_title = session.status.title.as_deref().filter(names_session);
         let auto_title = local
             .then(|| self.auto_titles.get(&session.id))
             .flatten()
             .map(String::as_str)
             .filter(|title| !title.trim().is_empty());
-        let has_agent_prompt = !session.status.agent.trim().is_empty() && auto_title.is_some();
         let specific = |title: &&str| {
             !(krill_proto::git::is_default_branch_or_worktree_name(title)
-                || title.eq_ignore_ascii_case("claude code")
-                || has_agent_prompt && is_windows_shell_title(title))
+                || title.eq_ignore_ascii_case("claude code"))
         };
         let explicit_title = live_title
             .as_deref()
             .filter(specific)
-            .or_else(|| session.status.title.as_deref().filter(specific));
+            .or_else(|| status_title.filter(specific));
         let title = custom_title
             .or(explicit_title)
             .or(auto_title)
             .or(live_title.as_deref())
-            .or(session.status.title.as_deref());
+            .or(status_title);
         let (mut name, detail) = session_label(session, title);
         // Derive provenance from dispatch metadata so OSC/custom title changes and
         // already-settled workers keep the marker. Session IDs are host-local.

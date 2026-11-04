@@ -25,8 +25,17 @@ impl Sidebar {
                 .or_insert(rank);
         }
         if self.session_order != order {
+            // 접힌 사이드바는 폴링하지 않지만 탭 이름은 이 스냅샷에서 온다. 모르는 세션이 탭에 붙으면 한 번 읽는다.
+            let unknown = order.iter().any(|(host, sessions)| {
+                sessions
+                    .keys()
+                    .any(|&session| self.session_on(host, session).is_none())
+            });
             self.session_order = order;
             self.rebuild(cx);
+            if unknown && !self.is_visible() {
+                self.refresh(cx);
+            }
         }
     }
 
