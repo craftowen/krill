@@ -426,6 +426,18 @@ fn optional_fields_validate_and_legacy_defaults_roundtrip() {
     assert_eq!(entry.effective_precheck_timeout_secs(), 60);
     assert_eq!(entry.display_name(), "job");
     assert_eq!(entry.resolved_agent(), Some("claude"));
+    for (program, agent) in [
+        (r"C:\Users\u\AppData\Roaming\npm\claude.cmd", Some("claude")),
+        (r"C:\Tools\Codex.EXE", Some("codex")),
+        ("/opt/bin/cursor-agent", Some("cursor")),
+        ("claude.exe.backup", None),
+    ] {
+        let entry = Schedule {
+            command: vec![program.into()],
+            ..entry.clone()
+        };
+        assert_eq!(entry.resolved_agent(), agent, "{program}");
+    }
     let entry = Schedule {
         cwd: TEST_CWD.into(),
         ..entry
