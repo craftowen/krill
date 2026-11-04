@@ -274,7 +274,7 @@ pub fn config_path(state_dir: Option<&Path>) -> PathBuf {
     } else if let Some(dir) = krill_proto::daemon::state_dir() {
         dir.join(HOSTS_FILE)
     } else {
-        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let home = krill_proto::os::home_dir().unwrap_or_else(std::env::temp_dir);
         krill_proto::user_dirs::config_dir(&home).join(HOSTS_FILE)
     }
 }
@@ -573,8 +573,8 @@ pub fn import_from_ssh_config(
     state_dir: Option<&Path>,
     ssh_config_path: Option<&Path>,
 ) -> io::Result<Vec<SshHost>> {
-    let default_path = std::env::var_os("HOME")
-        .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+    let default_path = krill_proto::os::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
         .join(".ssh")
         .join("config");
     let path = ssh_config_path.unwrap_or(&default_path);
@@ -780,7 +780,7 @@ pub fn classify_ssh_error(stderr: &str) -> SshTestFailureKind {
 #[must_use]
 pub fn default_ssh_key_path(home: Option<&Path>) -> PathBuf {
     let base = home.map_or_else(
-        || std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from),
+        || krill_proto::os::home_dir().unwrap_or_else(std::env::temp_dir),
         Path::to_path_buf,
     );
     base.join(".ssh").join("id_ed25519")
