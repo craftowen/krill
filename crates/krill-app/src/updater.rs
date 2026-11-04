@@ -2222,7 +2222,28 @@ fn unpack_with_ditto(zip_path: &Path, unpack_tmp: &Path, staging: &Path) -> Resu
     fs::create_dir_all(unpack_tmp)?;
     let mut cmd = if cfg!(windows) {
         let mut c = crate::platform::background_command(system_tool("tar"));
-        c.arg("-xf").arg(zip_path).arg("-C").arg(unpack_tmp);
+        let relative =
+            zip_path
+                .parent()
+                .zip(unpack_tmp.parent())
+                .and_then(|(parent, dest_parent)| {
+                    let archive = zip_path.file_name()?;
+                    let dest = unpack_tmp.file_name()?;
+                    (parent == dest_parent
+                        && !parent.as_os_str().is_empty()
+                        && archive.to_str().is_some_and(str::is_ascii)
+                        && dest.to_str().is_some_and(str::is_ascii))
+                    .then_some((parent, archive, dest))
+                });
+        if let Some((parent, archive, dest)) = relative {
+            c.current_dir(parent)
+                .arg("-xf")
+                .arg(archive)
+                .arg("-C")
+                .arg(dest);
+        } else {
+            c.arg("-xf").arg(zip_path).arg("-C").arg(unpack_tmp);
+        }
         c
     } else {
         let mut c = crate::platform::background_command(system_tool("ditto"));
@@ -2440,4 +2461,27 @@ fn system_curl_is_available_for_icon_fetches() {
         .output()
         .unwrap();
     assert!(output.status.success());
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_unpack_zip_in_unicode_directory() {
+    let root = std::env::temp_dir().join(format!("krill 한글 경로 zip {}", std::process::id()));
+    let source = root.join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join(BUNDLE_INFO), b"{}").unwrap();
+    let status = std::process::Command::new(system_tool("tar"))
+        .current_dir(&root)
+        .args(["-a", "-cf", "archive.zip", "-C", "source", BUNDLE_INFO])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    unpack_with_ditto(
+        &root.join("archive.zip"),
+        &root.join("unpack"),
+        &root.join("staging"),
+    )
+    .unwrap();
+    assert!(root.join("staging").join(BUNDLE_INFO).is_file());
+    fs::remove_dir_all(root).unwrap();
 }
