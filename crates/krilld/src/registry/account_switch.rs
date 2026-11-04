@@ -1449,8 +1449,6 @@ impl Registry {
             size.cols,
             size.rows,
         )?;
-        // A spawned CLI may still be at login or trust. Keep the original and held
-        // input until this process has reopened the exact conversation.
         let (tap, new_pid) = {
             let state = lock(&self.state);
             let entry = state.sessions.get(&new).ok_or(Failure::NoSession)?;
@@ -1526,9 +1524,10 @@ impl Registry {
                     self.agents.observe_account_resume(new, &session_id);
                 }
             }
-            // Preserve a short preflight interval to observe immediate exits, but do not
-            // restart it on every output byte: a verified resume may already be working.
-            if self.agents.account_resume_observed(new, &session_id) && tap.pulse().end > 0 {
+            // Like Orca, swap as soon as the resumed agent is up. An idle Codex resume keeps no
+            // rollout open and Claude may skip its hook, so identity binds but never gates.
+            // The short preflight still catches immediate exits.
+            if tap.pulse().end > 0 {
                 if confirmed_at.get_or_insert_with(Instant::now).elapsed()
                     >= Duration::from_millis(150)
                 {
@@ -1548,7 +1547,7 @@ impl Registry {
                 identity_confirmed = self.agents.account_resume_observed(new, &session_id),
                 output_observed = tap.pulse().end > 0,
                 stage = "resume_confirmation",
-                "account handoff timed out without a confirmed conversation"
+                "account handoff timed out before the replacement started"
             );
             return Err(Failure::Os(libc::ETIMEDOUT));
         }

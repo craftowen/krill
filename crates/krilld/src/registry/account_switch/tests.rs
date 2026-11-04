@@ -178,7 +178,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             };
             assert_eq!(
                 old,
-                if cancel || unconfirmed || became_busy {
+                if cancel || became_busy {
                     id
                 } else {
                     SessionId(7)
@@ -260,7 +260,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 lock(&reg.account_work.pending)
                     .contains_key(&SwitchScope::Session(SessionId(7), ProviderKind::Codex))
             );
-        } else if fail || close_fail || unconfirmed {
+        } else if fail || close_fail {
             let result = saved.get(&SessionId(7)).unwrap();
             assert!(result.to.is_none());
             assert!(result.error.is_some());
@@ -841,7 +841,7 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
             else {
                 panic!("expected old process retirement after agy output settles");
             };
-            assert_eq!(old, if confirmed { SessionId(11) } else { id });
+            assert_eq!(old, SessionId(11));
             holder_link
                 .send(&FromHolder::Done { req }.encode().unwrap(), &[])
                 .unwrap();
@@ -876,21 +876,16 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
         reg.process_account_work_in(&home);
         let saved = load(Some(&state));
         let result = saved.get(&SessionId(11)).unwrap();
-        if confirmed {
-            assert!(
-                result.error.is_none(),
-                "unexpected error: {:?}",
-                result.error
-            );
-            let new = result.to.expect("durable replacement for agy");
-            assert_eq!(
-                reg.agents.stored(new).unwrap().unwrap().account.unwrap().id,
-                target
-            );
-        } else {
-            assert!(result.to.is_none() && result.error.is_some());
-            assert!(!lock(&reg.state).closing.contains(&SessionId(11)));
-        }
+        assert!(
+            result.error.is_none(),
+            "unexpected error: {:?}",
+            result.error
+        );
+        let new = result.to.expect("durable replacement for agy");
+        assert_eq!(
+            reg.agents.stored(new).unwrap().unwrap().account.unwrap().id,
+            target
+        );
         assert!(
             to_agy
                 .join("brain")
@@ -1152,7 +1147,7 @@ fn switch_waits_for_working_turn_and_never_injects_continuation() {
 }
 
 #[test]
-fn unconfirmed_replacement_preserves_original_withholds_input_and_can_retry() {
+fn unconfirmed_replacement_retires_original_immediately_without_input() {
     use std::io::Read as _;
 
     let root = Path::new("/tmp").join(format!("kas-unconfirmed-{}", std::process::id()));
@@ -1161,31 +1156,26 @@ fn unconfirmed_replacement_preserves_original_withholds_input_and_can_retry() {
     let home = root.join("home");
     let from = root.join("from");
     let to = root.join("to");
-    let back = root.join("back");
     fs::create_dir_all(&state).unwrap();
     fs::create_dir_all(from.join("sessions/2026/10/28")).unwrap();
-    let mut target_ids = Vec::new();
-    for (dir, label) in [(&to, "Selected"), (&back, "Back")] {
-        fs::create_dir_all(dir).unwrap();
-        fs::write(dir.join("auth.json"), "fixture credentials").unwrap();
-        let snap = accounts::add_account(
-            &home,
-            Some(&state),
-            ProviderKind::Codex,
-            label,
-            None,
-            dir.to_str().unwrap(),
-        )
-        .unwrap();
-        target_ids.push(
-            snap.accounts
-                .iter()
-                .find(|a| a.label == label)
-                .unwrap()
-                .id
-                .clone(),
-        );
-    }
+    fs::create_dir_all(&to).unwrap();
+    fs::write(to.join("auth.json"), "fixture credentials").unwrap();
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Selected",
+        None,
+        to.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id
+        .clone();
     let sid = "cccccccc-dddd-eeee-ffff-000000000000";
     fs::write(
         from.join(format!("sessions/2026/10/28/rollout-date-{sid}.jsonl")),
@@ -1235,89 +1225,62 @@ fn unconfirmed_replacement_preserves_original_withholds_input_and_can_retry() {
             }),
         )
         .unwrap();
-    // A rate-limited original would normally be told to continue after the switch.
     reg.agents.mark_rate_limited(SessionId(31));
     let reader = Arc::clone(&reg);
     let reader_worker =
         std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
     let hook_reg = Arc::clone(&reg);
     let mock = std::thread::spawn(move || {
-        let mut replacements = Vec::new();
-        for round in 0..2 {
-            let packet = holder_link.recv().unwrap().unwrap();
-            let ToHolder::Spawn { req, id, argv, .. } = ToHolder::decode(packet.frame()).unwrap()
-            else {
-                panic!("expected replacement spawn");
-            };
-            assert!(argv.iter().any(|arg| arg == sid.as_bytes()));
-            let (master, mut process) = UnixStream::pair().unwrap();
-            holder_link
-                .send(
-                    &FromHolder::Spawned {
-                        req,
-                        id,
-                        pid: 831 + round,
-                    }
-                    .encode()
-                    .unwrap(),
-                    &[master.as_fd()],
-                )
-                .unwrap();
-            // Like a login screen: output, but no hook and no open conversation.
-            process.write_all(b"Sign in with ChatGPT").unwrap();
-            if round == 1 {
-                hook_reg.agents.record_hook_session(
-                    id,
-                    format!("{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{sid}\"}}")
-                        .as_bytes(),
-                );
-            }
-            let packet = holder_link.recv().unwrap().unwrap();
-            let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap()
-            else {
-                panic!("expected verified retirement or failed replacement cleanup");
-            };
-            let expected = if round == 0 { id } else { SessionId(31) };
-            assert_eq!(old, expected);
-            holder_link
-                .send(&FromHolder::Done { req }.encode().unwrap(), &[])
-                .unwrap();
-            lock(&hook_reg.state).exited.insert(old, 0);
-            replacements.push(id);
-            if round == 0 {
-                process
-                    .set_read_timeout(Some(Duration::from_millis(1500)))
-                    .unwrap();
-                let mut byte = [0_u8; 1];
-                assert!(
-                    process.read(&mut byte).is_err(),
-                    "an unconfirmed replacement must not receive the continuation prompt"
-                );
-            }
-        }
-        replacements
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn { req, id, argv, .. } = ToHolder::decode(packet.frame()).unwrap()
+        else {
+            panic!("expected replacement spawn");
+        };
+        assert!(argv.iter().any(|arg| arg == sid.as_bytes()));
+        let (master, mut process) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned { req, id, pid: 831 }.encode().unwrap(),
+                &[master.as_fd()],
+            )
+            .unwrap();
+        // An idle Codex resume: output, but no hook and no open rollout file.
+        process.write_all(b"Resuming session").unwrap();
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap() else {
+            panic!("expected immediate retirement of the original");
+        };
+        assert_eq!(old, SessionId(31));
+        holder_link
+            .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+            .unwrap();
+        lock(&hook_reg.state).exited.insert(old, 0);
+        process
+            .set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            process.read(&mut byte).is_err(),
+            "the replacement must not receive injected input"
+        );
+        (id, process)
     });
 
-    reg.queue_account_switch(ProviderKind::Codex, &target_ids[0]);
+    reg.queue_account_switch(ProviderKind::Codex, &target);
     reg.process_account_work_in(&home);
-    let failed = load(Some(&state));
-    let failed = failed.get(&SessionId(31)).unwrap();
-    assert!(failed.to.is_none() && failed.error.is_some());
-    assert!(!lock(&reg.state).closing.contains(&SessionId(31)));
-    let snapshot = accounts::refresh_accounts_with(&home, Some(&state), false);
-    reg.queue_session_account_switch(
-        SessionId(31),
-        ProviderKind::Codex,
-        &target_ids[1],
-        &snapshot,
-    )
-    .expect("the original conversation remains switchable after a failed resume");
-    reg.process_account_work_in(&home);
-    let replacements = mock.join().unwrap();
-    assert_ne!(replacements[0], replacements[1]);
+    let (replacement, _process) = mock.join().unwrap();
+    let saved = load(Some(&state)).get(&SessionId(31)).cloned().unwrap();
+    assert!(saved.error.is_none(), "unexpected error: {:?}", saved.error);
+    assert_eq!(saved.to, Some(replacement));
     assert_eq!(
-        load(Some(&state)).get(&SessionId(31)).and_then(|h| h.to),
-        Some(replacements[1])
+        reg.agents
+            .stored(replacement)
+            .unwrap()
+            .unwrap()
+            .account
+            .unwrap()
+            .id,
+        target
     );
     reader_worker.join().unwrap();
     drop(reg);
