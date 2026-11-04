@@ -367,6 +367,61 @@ class SnapshotTests(unittest.TestCase):
             self.assertIn("existing v0.1.2 release owner", waiting.state["reason"])
 
 
+    def test_squash_merged_dev_already_in_the_release_creates_no_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, origin = root / "source", root / "origin.git"
+
+            def git(cwd, *args):
+                return subprocess.check_output(["git", *args], cwd=cwd, stderr=subprocess.DEVNULL).decode().strip()
+
+            def commit(message, **files):
+                for name, text in files.items():
+                    (source / name).write_text(text)
+                git(source, "add", ".")
+                git(source, "commit", "-m", message)
+
+            git(root, "init", "--bare", "--initial-branch=main", str(origin))
+            git(root, "init", "--initial-branch=main", str(source))
+            git(source, "config", "user.name", "nightly test")
+            git(source, "config", "user.email", "nightly@example.invalid")
+            git(source, "remote", "add", "origin", str(origin))
+            commit("base", **{"Cargo.toml": '[workspace.package]\nversion = "0.1.1"\n', "Cargo.lock": "lock\n",
+                              "THIRD_PARTY_NOTICES.md": "notices\n"})
+            git(source, "checkout", "-b", "dev")
+            commit("fix on dev", fix="fixed\n")
+            git(source, "checkout", "main")
+            commit("same fix, squashed into the release", fix="fixed\n")
+            commit("Release v0.1.2", **{"Cargo.toml": '[workspace.package]\nversion = "0.1.2"\n'})
+            git(source, "tag", "v0.1.2")
+            git(source, "push", "origin", "main", "dev", "--tags")
+            config = {"source": str(source), "branch": "dev", "repo": "o/r", "run_root": str(root / "nightly"),
+                      "target_dir": str(nightly.TARGETS / "nightly"), "key_file": "/unused",
+                      "user.name": "nightly test", "user.email": "nightly@example.invalid"}
+            assets = [{"name": n} for n in ("Krill-0.1.2.dmg", "Krill-0.1.2-windows-x64.zip",
+                                            "latest.json", "latest-windows.json")]
+            real_command = nightly.command
+
+            def local_command(args, **kwargs):
+                args = list(map(str, args))
+                if args[:4] == ["git", "remote", "add", "origin"]:
+                    args[-1] = str(origin)
+                if args[:3] == ["gh", "release", "view"]:
+                    return json.dumps({"tagName": "v0.1.2", "assets": assets})
+                if args[0] in ("cargo", "python3"):
+                    raise AssertionError(f"no candidate may be built: {args}")
+                return real_command(args, **kwargs)
+
+            squashed = subprocess.run(["git", "merge-base", "--is-ancestor", "dev", "v0.1.2"], cwd=source)
+            self.assertEqual(squashed.returncode, 1, "dev must not be an ancestor of the release")
+            release = nightly.Release(config, root / "state")
+            with patch.object(nightly, "command", side_effect=local_command):
+                self.assertIsNone(release.prepare())
+            self.assertEqual(release.state["status"], "skipped")
+            self.assertIn("no committed changes", release.state["reason"])
+            self.assertFalse((root / "state/pending.json").exists())
+
+
 class ArtifactTests(unittest.TestCase):
     def test_artifact_is_bound_to_attempt_id_head_and_github_digest(self):
         with tempfile.TemporaryDirectory() as temporary:

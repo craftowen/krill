@@ -263,11 +263,14 @@ class Release:
             self.update(status="published", tag=latest, publication=proof, readback_recovered=True)
             pending_file.unlink()
             return None
-        if all(self.ancestor(sha, published) for sha in (remote, main)):
+        def skip_unchanged():
             required = {f"Krill-{latest[1:]}.dmg", f"Krill-{latest[1:]}-windows-x64.zip", "latest.json", "latest-windows.json"}
             if not required.issubset({asset["name"] for asset in published_release.get("assets", [])}):
                 raise NightlyError("latest release is incomplete; refusing a no-change success")
             self.update(status="skipped", reason="no committed changes since the last published release")
+
+        if all(self.ancestor(sha, published) for sha in (remote, main)):
+            skip_unchanged()
             return None
         branch = CANDIDATE_BRANCH
         created = datetime.fromisoformat(pending["created_at"]) if pending.get("created_at") else None
@@ -285,6 +288,10 @@ class Release:
             self.git("config", field, self.config[field])
         self.git("config", "core.hooksPath", "scripts/hooks")
         self.git("merge", "--no-edit", remote)
+        # Squash-merged dev commits never become ancestors of the release, so compare content.
+        if self.git("rev-parse", "HEAD^{tree}") == self.git("rev-parse", f"{published}^{{tree}}"):
+            skip_unchanged()
+            return None
         manifest = self.work / "Cargo.toml"
         text = manifest.read_text()
         pattern = r'(?ms)(^\[workspace\.package\]\n.*?^version = ")([^"\n]+)(")'
