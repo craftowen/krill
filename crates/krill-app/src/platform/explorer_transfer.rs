@@ -476,6 +476,27 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
+    fn junction_and_network_paths_explain_why_transfer_is_denied() {
+        let (_temp, root, external) = fixture();
+        fs::create_dir(root.join("junction")).unwrap();
+        windows::attach_junction(&root.join("junction"), &external).unwrap();
+        fs::write(root.join("source"), "original").unwrap();
+        let error = transfer(
+            &root,
+            &root.join("source"),
+            &root.join("junction"),
+            false,
+            100,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("junctions"), "{error}");
+        let error =
+            transfer(&root, Path::new(r"\\server\share\source"), &root, true, 100).unwrap_err();
+        assert!(error.to_string().contains("network or device"), "{error}");
+        assert_eq!(fs::read_to_string(root.join("source")).unwrap(), "original");
+    }
+    #[cfg(windows)]
+    #[test]
     fn in_place_destination_junction_retarget_never_writes_into_target() {
         let (_temp, root, external) = fixture();
         fs::write(external.join("source"), "original").unwrap();
