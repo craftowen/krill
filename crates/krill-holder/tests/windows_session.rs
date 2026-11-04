@@ -29,6 +29,7 @@ use krill_proto::holder::{FromHolder, ToHolder, WinSize};
 const HOLDER: &str = env!("CARGO_BIN_EXE_krill-holder");
 const CMD: &str = r"C:\Windows\System32\cmd.exe";
 const PWSH: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+const PWSH7: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
 const WAIT: Duration = Duration::from_secs(30);
 
 fn put(p: &Path, s: &str) {
@@ -320,56 +321,33 @@ fn leader_exit(k: &mut Krilld) {
     }
 }
 
-/// `Terminate`는 콘솔을 먼저 끊어(hangup) 셸이 스스로 끝날 기회를 주고, 남은 것은 5초 뒤 Job째 끝낸다.
+/// `Terminate`와 Kill 9는 세션 트리를 바로 Job째 끝낸다(Job 종료 코드 1). 콘솔을 먼저 끊으면 pwsh 7이
+/// 콘솔 오류로 .NET 미처리 예외(이벤트 0xE0434352, 종료 코드 0x80131623)를 내며 죽고 WER 보고를 남긴다. pwsh 7이 없으면 그 줄은 건너뛴다.
 fn terminate(k: &mut Krilld) {
     let node = node();
     let node = node.to_str().unwrap();
-    // 셸: 콘솔이 끊기면 스스로 0으로 끝난다(Job 강제 종료면 1).
-    let shell = k.spawn(30, &[CMD]);
-    shell.wait_text(">", WAIT);
-    let sent = Instant::now();
-    k.signal(30, None);
-    let exit = k.wait_exit(30, Duration::from_secs(10));
-    k.note(&format!(
-        "terminate shell status={:?} ms={:?}",
-        exit.map(|e| e.0),
-        exit.map(|e| millis(sent, e.1))
-    ));
-    k.finish(30);
-    // node: 콘솔 입력이 끊기면 정리 표시를 남기고 5로 끝난다.
-    let bye = k.dir.join("bye");
-    let js = "const f=process.argv[1],bye=()=>{require('fs').writeFileSync(f,'bye');process.exit(5)};process.stdin.on('end',bye);process.stdin.on('error',bye);process.stdin.resume();console.log('tidy-ready');setInterval(()=>{},1000)";
-    let tidy = k.spawn(31, &[node, "-e", js, bye.to_str().unwrap()]);
-    tidy.wait_text("tidy-ready", WAIT);
-    let sent = Instant::now();
-    k.signal(31, None);
-    let exit = k.wait_exit(31, Duration::from_secs(10));
-    k.note(&format!(
-        "terminate tidy status={:?} ms={:?} bye={}",
-        exit.map(|e| e.0),
-        exit.map(|e| millis(sent, e.1)),
-        bye.exists()
-    ));
-    k.finish(31);
-    // 콘솔을 보지 않는 프로세스는 deadline(5초)에 Job째 끝난다. Kill 9는 바로 끝낸다.
-    for (id, signal) in [(32, None), (33, Some(9))] {
-        let deaf = k.spawn(
-            id,
-            &[
-                node,
-                "-e",
-                "console.log('deaf-ready');setInterval(()=>{},1000)",
-            ],
-        );
-        deaf.wait_text("deaf-ready", WAIT);
+    let deaf = "console.log('deaf-ready');setInterval(()=>{},1000)";
+    let mut cases: Vec<(&str, Vec<&str>, &str, Option<i32>)> = vec![
+        ("cmd", vec![CMD], ">", None),
+        ("deaf", vec![node, "-e", deaf], "deaf-ready", None),
+        ("deaf9", vec![node, "-e", deaf], "deaf-ready", Some(9)),
+    ];
+    if Path::new(PWSH7).exists() {
+        cases.push(("pwsh7", vec![PWSH7, "-NoLogo", "-NoProfile"], "PS ", None));
+    } else {
+        k.note("terminate pwsh7 missing");
+    }
+    for (id, (name, argv, ready, signal)) in (30..).zip(cases) {
+        let s = k.spawn(id, &argv);
+        s.wait_text(ready, WAIT);
         let sent = Instant::now();
         k.signal(id, signal);
         let exit = k.wait_exit(id, Duration::from_secs(12));
         k.note(&format!(
-            "terminate deaf {signal:?} status={:?} ms={:?} alive={}",
+            "terminate {name} status={:?} ms={:?} alive={}",
             exit.map(|e| e.0),
             exit.map(|e| millis(sent, e.1)),
-            alive(deaf.pid)
+            alive(s.pid)
         ));
         k.finish(id);
     }
@@ -593,30 +571,30 @@ fn shell_exit_ends_session_and_leaves_launched_apps_running() {
 
 #[test]
 #[ignore = "requires packaged conpty.dll and x64/OpenConsole.exe; set KRILL_TEST_CONPTY_DIR"]
-fn terminate_hangs_up_first_and_kills_the_rest_at_the_deadline() {
+fn terminate_kills_the_session_tree_at_once() {
     let report = run("terminate");
     println!("{report}");
-    let field = |line: &str, key: &str| -> Option<u128> {
-        let rest = report.lines().find(|l| l.starts_with(line))?;
-        let v = rest.split(&format!("{key}=Some(")).nth(1)?;
-        v.split(')').next()?.parse().ok()
-    };
-    // 셸은 콘솔이 끊기자 스스로(코드 0) 끝난다. 강제 종료였다면 1이다.
-    assert_eq!(field("terminate shell", "status"), Some(0), "{report}");
-    assert!(
-        field("terminate shell", "ms").is_some_and(|ms| ms < 3_000),
-        "{report}"
-    );
-    assert!(report.contains("bye=true"), "{report}");
-    assert_eq!(field("terminate tidy", "status"), Some(5), "{report}");
-    // 콘솔을 보지 않으면 deadline에, Kill 9는 바로.
-    let deaf = field("terminate deaf None", "ms").unwrap_or_default();
-    assert!((4_500..9_000).contains(&deaf), "{report}");
-    assert!(
-        field("terminate deaf Some(9)", "ms").is_some_and(|ms| ms < 1_500),
-        "{report}"
-    );
-    assert!(!report.contains("alive=true"), "{report}");
+    for name in ["cmd", "deaf", "deaf9", "pwsh7"] {
+        let Some(line) = report
+            .lines()
+            .find(|l| l.starts_with(&format!("terminate {name} ")))
+        else {
+            panic!("terminate {name} missing:\n{report}");
+        };
+        if line.ends_with("missing") {
+            continue;
+        }
+        // Job 종료 코드 1. pwsh 7이 콘솔을 잃고 스스로 죽었다면 0x80131623(-2146232797)이다.
+        assert!(line.contains("status=Some(1) "), "{report}");
+        let ms: u128 = line
+            .split("ms=Some(")
+            .nth(1)
+            .and_then(|v| v.split(')').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(u128::MAX);
+        assert!(ms < 1_500, "{report}");
+        assert!(line.ends_with("alive=false"), "{report}");
+    }
 }
 
 #[test]

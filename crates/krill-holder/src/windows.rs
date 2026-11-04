@@ -77,9 +77,7 @@ impl Session {
             deadline: None,
         })
     }
-    /// Unix 종료 단계(SIGHUP → 5초 뒤 SIGKILL)에 대응한다. `OpenConsole`을 끝내 콘솔을 끊으면 셸과 콘솔을
-    /// 읽는 앱은 스스로 끝나고, 남은 트리는 deadline에 Job째 끝낸다. krilld도 signal 사본을 쥐고 있어
-    /// `ClosePseudoConsole`로는 `CTRL_CLOSE_EVENT`가 나가지 않는다.
+    /// `OpenConsole`을 끝내 콘솔을 끊고, 남은 트리는 deadline에 Job째 끝낸다. 반복 요청은 첫 deadline을 유지한다.
     fn hang_up(&mut self) {
         self.console.stop_host().ok();
         self.deadline
@@ -463,13 +461,19 @@ impl Holder {
                 s.console.resize(size)?;
                 s.size = Some(size);
             }
-            ToHolder::Terminate { id, .. } => self.live(id)?.hang_up(),
+            ToHolder::Terminate { id, .. } => {
+                // Job을 먼저 끝낸다. 콘솔부터 끊으면 pwsh 7이 콘솔 오류를 처리하지 못하고
+                // .NET 미처리 예외(0xE0434352)로 죽어 WER 보고를 남긴다(v0.2.51과 같은 즉시 종료).
+                let s = self.live(id)?;
+                s.job.terminate().ok();
+                s.hang_up();
+            }
             ToHolder::Kill { id, signal, .. } => {
                 let s = self.live(id)?;
-                s.hang_up();
                 if signal == 9 {
                     s.job.terminate().ok();
                 }
+                s.hang_up();
             }
             ToHolder::Release { id, .. } => {
                 if self
