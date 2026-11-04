@@ -831,6 +831,12 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
         command
             .arg("--bootstrap")
             .creation_flags(0x0000_0008 | 0x0000_0200);
+        // holder와 그 krilld는 이 cwd를 물려받아 세션 내내 쥔다. Windows는 프로세스의 현재 폴더를
+        // 지우거나 이름을 바꾸지 못하게 하므로, 띄운 곳(워크트리·설치 폴더) 대신 소켓 폴더를 쥔다.
+        // `launch_lock`이 이 폴더를 이미 만들었다.
+        if let Some(dir) = paths.socket.parent().filter(|d| !d.as_os_str().is_empty()) {
+            command.current_dir(dir);
+        }
     }
     let mut holder = command
         .arg(&paths.krilld)
