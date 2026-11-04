@@ -421,49 +421,6 @@ test("discovery timeout has no invented HTTP status; cancellation sends no disco
   await settle(h);
   assert.equal(h.events().length, count);
 });
-test("successful discovery fallback is reflected in the next socket route", async () => {
-  const h = harness();
-  h.diagnostics.setEnabled(true);
-  h.store.set(
-    "krill-mobile-v2",
-    JSON.stringify({
-      device_id: "a",
-      credential: "b",
-      rid: "c".repeat(32),
-      hash: "0123456789abcdef",
-    }),
-  );
-  h.setDiscovery(async () => ({
-    ok: true,
-    status: 200,
-    json: async () => ({
-      hash: "0123456789abcdef",
-      url: "https://private.trycloudflare.com",
-    }),
-  }));
-  const endpoint = h.context.KrillMobile.transport.bootstrap(),
-    t = h.transport({ endpoint }),
-    first = await h.start(t);
-  first.socket.emit("error");
-  await first.pending;
-  await h.tick();
-  await h.tick();
-  const next = h.sockets.at(-1);
-  assert.match(next.url, /private.trycloudflare.com/);
-  next.emit("close", { code: 1006 });
-  await flush();
-  await settle(h);
-  assert.equal(h.events().length, 1);
-  assert(
-    h
-      .events()
-      .some(
-        (e) =>
-          e.diagnostics.route === "tunnel" && e.diagnostics.ws_code === 1006,
-      ),
-  );
-  t.close();
-});
 for (const code of [1008, 4009])
   test(`auth close ${code} records authentication rejection`, async () => {
     const h = harness();
