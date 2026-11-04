@@ -429,10 +429,16 @@ pub fn wide(s: &OsStr) -> io::Result<Vec<u16>> {
     v.push(0);
     Ok(v)
 }
+/// CommandLineToArgvW/CRT 규칙으로 인수 하나를 인용한다. 공백·탭·개행·따옴표가 없으면 그대로 둔다.
+/// cmd.exe는 CRT 규칙으로 파싱하지 않아 `"/c"`처럼 불필요한 따옴표가 `/c` 뒤 명령을 깨뜨린다.
 fn quote(s: &OsStr) -> Vec<u16> {
+    let raw: Vec<u16> = s.encode_wide().collect();
+    if !raw.is_empty() && !raw.iter().any(|c| matches!(c, 9 | 10 | 11 | 32 | 34)) {
+        return raw;
+    }
     let mut out = vec![34];
     let mut slash = 0;
-    for ch in s.encode_wide() {
+    for ch in raw {
         if ch == 92 {
             slash += 1;
             continue;
@@ -1084,6 +1090,32 @@ mod tests {
         Ok(())
     }
 
+    fn quoted(s: &str) -> String {
+        String::from_utf16_lossy(&quote(OsStr::new(s)))
+    }
+    #[test]
+    fn quote_leaves_plain_args_and_escapes_the_rest() {
+        assert_eq!(quoted("/c"), "/c");
+        assert_eq!(quoted(r"C:\dir\x.exe"), r"C:\dir\x.exe");
+        assert_eq!(quoted(""), "\"\"");
+        assert_eq!(quoted("a b"), "\"a b\"");
+        assert_eq!(quoted(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quoted(r"a b\"), r#""a b\\""#);
+        assert_eq!(quoted(r#"a\"b c"#), r#""a\\\"b c""#);
+    }
+    #[test]
+    fn cmd_c_runs_the_quoted_command() -> io::Result<()> {
+        let cmd =
+            std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
+        let env: Vec<_> = std::env::vars_os().collect();
+        let args = ["/d", "/c", "ver >nul & exit 7"].map(OsString::from);
+        let child = spawn(&cmd, &args, &env, None, None, &[], None)?;
+        // SAFETY: owned live process handle, bounded wait.
+        let waited = unsafe { WaitForSingleObject(child.handle.as_raw_handle(), 10_000) };
+        assert_eq!(waited, 0);
+        assert_eq!(child.status()?, Some(7));
+        Ok(())
+    }
     #[test]
     fn empty_job_stays_empty_without_iocp_transition() -> io::Result<()> {
         let job = Job::new()?;
