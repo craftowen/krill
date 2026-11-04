@@ -51,6 +51,106 @@ try {
     Install (Join-Path $root 'offline') @{ Zip = $state.Fixture }
     Assert (Test-Path (Join-Path $root 'offline/krill-app.exe')) 'Offline installation failed'
 
+    # Dot-source the ASCII-only installer just as irm | iex does, then create
+    # both the shortcut and its target under a Unicode path with spaces.
+    $unicode = [regex]::Unescape('\uD64D \uAE38\uB3D9')
+    $unicodeDest = Join-Path (Join-Path $root $unicode) 'Programs/Krill'
+    . $installer -Zip $state.Fixture -Dest $unicodeDest -NoShortcut -NoOpen | Out-Null
+    $link = Join-Path (Join-Path $root $unicode) 'Krill link.lnk'
+    $target = Join-Path $unicodeDest 'krill-app.exe'
+    New-KrillShortcut $link $target (Join-Path $root $unicode)
+    # Read via IShellLinkW as well: WScript's reader uses the ANSI interface.
+    if (-not ('KrillTest.LinkReader' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+namespace KrillTest {
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    class LinkObject { }
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
+    interface ILink {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count, IntPtr data, uint flags);
+        void GetIDList(out IntPtr id);
+        void SetIDList(IntPtr id);
+        void GetDescription(IntPtr description, int count);
+        void SetDescription(IntPtr description);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count);
+    }
+    public static class LinkReader {
+        public static string[] Read(string file) {
+            object obj = new LinkObject();
+            try {
+                ((IPersistFile)obj).Load(file, 0);
+                var link = (ILink)obj;
+                var target = new StringBuilder(32768);
+                var working = new StringBuilder(32768);
+                link.GetPath(target, target.Capacity, IntPtr.Zero, 4);
+                link.GetWorkingDirectory(working, working.Capacity);
+                return new string[] {target.ToString(), working.ToString()};
+            } finally { Marshal.FinalReleaseComObject(obj); }
+        }
+    }
+}
+'@
+    }
+    $readLink = [KrillTest.LinkReader]::Read($link)
+    Assert ($readLink[0] -eq $target) 'Unicode shortcut target did not round-trip'
+    Assert ($readLink[1] -eq (Join-Path $root $unicode)) 'Unicode shortcut working directory did not round-trip'
+    New-KrillShortcut $link $target (Join-Path $root $unicode)
+    Assert (Test-Path -LiteralPath $link) 'Unicode shortcut repair failed'
+
+    # Run the complete installer with an isolated Start Menu, including retry.
+    $script:testPrograms = Join-Path $root $unicode
+    $source = [IO.File]::ReadAllText($installer)
+    $source = $source.Replace("[Environment]::GetFolderPath('Programs')", '$script:testPrograms')
+    $isolatedInstaller = [scriptblock]::Create($source)
+    & $isolatedInstaller -Dest $unicodeDest -NoOpen | Out-Null
+    $menuLink = Join-Path $script:testPrograms 'Krill.lnk'
+    Assert ([KrillTest.LinkReader]::Read($menuLink)[0] -eq $target) 'Installer shortcut target is wrong'
+    & $isolatedInstaller -Dest $unicodeDest -NoOpen | Out-Null
+    Assert ([KrillTest.LinkReader]::Read($menuLink)[0] -eq $target) 'Installer shortcut retry failed'
+
+    # Make creation fail without touching the real Start Menu or user PATH.
+    $script:testPrograms = Join-Path $root 'missing-programs'
+    $state.PathWritten = $false
+    $script:opened = $false
+    $savedPath = $env:Path
+    function Start-Process { param($FilePath) $script:opened = ($FilePath -eq $target) }
+    $source = $source.Replace("[Environment]::GetEnvironmentVariable('Path', 'User')", '$null')
+    $source = $source.Replace("[Environment]::SetEnvironmentVariable('Path', ((@(`$path, `$Dest) | Where-Object { `$_ }) -join ';'), 'User')", '$state.PathWritten = $true')
+    try {
+        $warning = @(& ([scriptblock]::Create($source)) -Dest $unicodeDest -AddToPath 3>&1)
+        Assert (@($warning | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count -gt 0) 'Shortcut failure did not warn'
+        Assert $state.PathWritten 'Shortcut failure prevented user PATH registration'
+        Assert (($env:Path -split ';') -contains $unicodeDest) 'Shortcut failure prevented process PATH registration'
+        Assert $script:opened 'Shortcut failure prevented app launch'
+    } finally {
+        $env:Path = $savedPath
+        Remove-Item Function:Start-Process
+    }
+
+    # Exercise the documented irm | iex shape with a Unicode LOCALAPPDATA.
+    $savedLocalAppData = $env:LOCALAPPDATA
+    $savedPath = $env:Path
+    $env:LOCALAPPDATA = Join-Path $root $unicode
+    $script:testPrograms = $env:LOCALAPPDATA
+    $state.Launched = ''
+    function Start-Process { param($FilePath) $state.Launched = $FilePath }
+    try {
+        Assert (-not $source.Contains("[Environment]::SetEnvironmentVariable('Path'")) 'User PATH mock was not applied'
+        & { $source | Invoke-Expression } | Out-Null
+        $iexTarget = Join-Path $env:LOCALAPPDATA 'Programs/Krill/krill-app.exe'
+        Assert (Test-Path -LiteralPath $iexTarget) 'irm | iex did not install to Unicode LOCALAPPDATA'
+        Assert ([KrillTest.LinkReader]::Read($menuLink)[0] -eq $iexTarget) 'irm | iex shortcut target is wrong'
+        Assert ($state.Launched -eq $iexTarget) 'irm | iex did not launch the app'
+    } finally {
+        $env:LOCALAPPDATA = $savedLocalAppData
+        $env:Path = $savedPath
+        Remove-Item Function:Start-Process
+    }
+
     $before = $state.Requests
     Set-Content -LiteralPath (Join-Path $root 'downloaded/user-data.txt') -Value 'preserve me'
     Install (Join-Path $root 'downloaded')
