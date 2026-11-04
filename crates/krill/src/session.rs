@@ -11,7 +11,7 @@ use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::os::net::UnixStream;
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal as _, Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -356,28 +356,63 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
         }
         return Ok(());
     }
-    println!("ID\tPID\tPROCESS\tSTATE\tAGENT\tACCOUNT\tWORKTREE\tCWD");
+    let dash = |v: String| if v.is_empty() { "-".to_owned() } else { v };
+    let mut rows = vec![
+        [
+            "ID", "PID", "PROCESS", "STATE", "AGENT", "ACCOUNT", "WORKTREE", "CWD",
+        ]
+        .map(str::to_owned),
+    ];
     for s in enriched {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            s.id,
-            s.pid,
-            s.process,
-            s.state,
-            s.agent.as_deref().unwrap_or("-"),
-            s.account.as_deref().unwrap_or("-"),
-            if s.worktree.is_empty() {
-                "-"
-            } else {
-                &s.worktree
-            },
-            if s.cwd.is_empty() { "-" } else { &s.cwd },
-        );
+        rows.push([
+            s.id.to_string(),
+            s.pid.to_string(),
+            s.process.to_owned(),
+            s.state.to_owned(),
+            s.agent.unwrap_or_else(|| "-".to_owned()),
+            s.account.unwrap_or_else(|| "-".to_owned()),
+            dash(s.worktree),
+            dash(s.cwd),
+        ]);
     }
+    print!("{}", table(&rows, io::stdout().is_terminal()));
     if let Some(warning) = holder_loss_warning(orphan) {
         eprintln!("{warning}");
     }
     Ok(())
+}
+
+/// `ls` 표. 파이프에는 탭 구분(스크립트가 `split('\t')`로 읽는다), 터미널에는 표시 폭(한글 2칸)으로 맞춘 공백 정렬.
+fn table<const N: usize>(rows: &[[String; N]], aligned: bool) -> String {
+    use unicode_width::UnicodeWidthStr as _;
+    let mut widths = [0; N];
+    for row in rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.width());
+        }
+    }
+    let mut out = String::new();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            out.push_str(cell);
+            if i + 1 == N {
+                break;
+            }
+            if aligned {
+                let pad = widths
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(cell.width())
+                    + 2;
+                out.extend(std::iter::repeat_n(' ', pad));
+            } else {
+                out.push('\t');
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn create(target: &Target, args: &[OsString]) -> Result<()> {
@@ -1393,6 +1428,24 @@ pub fn resolve_session_cwd(id: u64) -> io::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ls_table_aligns_by_display_width_only_on_a_terminal() {
+        let rows = [
+            ["ID", "CWD", "X"].map(str::to_owned),
+            ["1", "C:\\Users\\홍길동", "a"].map(str::to_owned),
+            ["12", "C:\\Users\\tester", "b"].map(str::to_owned),
+        ];
+        assert_eq!(
+            super::table(&rows, false),
+            "ID\tCWD\tX\n1\tC:\\Users\\홍길동\ta\n12\tC:\\Users\\tester\tb\n"
+        );
+        // 홍길동은 6칸, tester와 같다.
+        assert_eq!(
+            super::table(&rows, true),
+            "ID  CWD              X\n1   C:\\Users\\홍길동  a\n12  C:\\Users\\tester  b\n"
+        );
+    }
+
     use super::*;
     use krill_proto::agent::rules::ScreenRules;
 
