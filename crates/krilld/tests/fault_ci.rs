@@ -228,12 +228,18 @@ impl Drop for Rig {
         for &p in &self.pids {
             kill_process(pid(p), Signal::KILL).ok();
         }
-        for p in daemons(&self.sock) {
-            kill_process(pid(p), Signal::KILL).ok();
-        }
-        // holder가 죽었으므로 재기동은 없다. 남아 있으면 다음 폴링에서 잡힌다.
+        // `self.sock`만이 아니라 run 폴더 전체: 앱은 기본 소켓에 자기 holder를 띄운다. 끝의 `/`는 pid 앞자리가 같은 다른
+        // 실행의 폴더를 잡지 않게 한다. holder와 krilld가 순서 없이 잡히므로 재기동된 krilld까지 빌 때까지 반복한다.
+        let run = self.dir.join("run/");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !daemons(&self.sock).is_empty() && Instant::now() < deadline {
+        loop {
+            let left = daemons(&run);
+            for &p in &left {
+                kill_process(pid(p), Signal::KILL).ok();
+            }
+            if left.is_empty() || Instant::now() >= deadline {
+                break;
+            }
             thread::sleep(Duration::from_millis(20));
         }
         fs::remove_dir_all(&self.dir).ok();
@@ -1189,6 +1195,32 @@ fn fault_injection_accelerated_24h_memory_soak() {
     let sock = rig.sock.clone();
     drop(rig);
     assert_no_holders(&sock);
+}
+
+/// GUI 게이트의 앱은 `KRILL_STATE_DIR`의 기본 소켓(`run/krilld.sock`)에 자기 holder를 detach로 띄운다. `Rig`이 자기 소켓
+/// (`run/k.sock`)만 치워서 릴리스 게이트마다 holder·krilld 6개가 `/tmp/mk064-gui-*`에 남았다(2026-11-05).
+#[test]
+fn rig_reaps_a_detached_holder_on_another_socket_in_its_dir() {
+    let rig = Rig::new("reap-detached");
+    let target = Path::new(KRILLD).parent().unwrap();
+    let sock = rig.dir.join("run/krilld.sock");
+    // 띄운 쪽이 먼저 끝나 앱이 띄운 holder처럼 launchd 아래로 간다.
+    let launched = Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#""$0" --detach "$1" "$2" </dev/null >/dev/null 2>&1 &"#,
+        ])
+        .arg(target.join("krill-holder"))
+        .arg(target.join("krilld"))
+        .arg(&sock)
+        .env("KRILL_STATE_DIR", &rig.dir)
+        .env("HOME", &rig.dir)
+        .status()
+        .unwrap();
+    assert!(launched.success());
+    wait_daemon(&sock, 0);
+    drop(rig);
+    assert_eq!(daemons(&sock), Vec::<u32>::new());
 }
 
 /// 실제 release `krill-app` GUI를 띄워 생존 e2e ②(데몬 업그레이드 vN→vN+1)와
