@@ -242,6 +242,30 @@ fn tmp(name: &str) -> PathBuf {
     dir
 }
 
+/// 소켓을 게시하지 못한 이유가 로그에 남는다. `PermissionDenied`만으로는 폴더 권한·OS 거부를 가릴 수 없었다
+/// (2026-11-03 운영 로그 629건).
+#[test]
+fn listener_failure_logs_the_reason() {
+    let dir = tmp("listener-reason");
+    let run = dir.join("run");
+    fs::create_dir(&run).unwrap();
+    fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let status = fixture_command(KRILLD, &dir)
+        .arg(run.join("krilld.sock"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+    let log = fs::read_to_string(dir.join("logs/krilld.log")).unwrap();
+    assert!(
+        log.contains("socket directory must be a 0700 directory"),
+        "{log}"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
 /// 링크만 끊기고 holder(이 테스트 프로세스)가 살아 있으면 krilld는 고아를 선언하지 않고 끝난다. 고아를 선언하면
 /// 클라이언트가 holder를 하나 더 띄워 같은 PTY를 쥔 holder 둘이 남는다(2026-11-04 운영 사례).
 #[test]
