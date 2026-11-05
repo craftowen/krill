@@ -384,8 +384,20 @@ impl Shell {
                         if !pane::supports_resume_history(&target)? {
                             return Ok(None);
                         }
-                        let (session, created) =
-                            pane::ensure_live_session_in(&target, Some(old), &launch)?;
+                        let (session, created) = pane::ensure_live_session_in(
+                            &target,
+                            Some(old),
+                            &launch,
+                        )
+                        .inspect_err(|error| {
+                            let attempt = pane::StartAttempt {
+                                pane: pane_id.get(),
+                                wanted_session: Some(old),
+                                attempt: 0,
+                                remote: false,
+                            };
+                            pane::record_start_failure("restore_hidden", error, Some(attempt));
+                        })?;
                         if created && !close::Creation::publish(&creation, session) {
                             close::send(
                                 &krill_app::resources::daemon_call_for(Some(target)),
