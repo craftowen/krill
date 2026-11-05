@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+build = "../../packaging/windows/resources.rs"
 
 [dependencies]
 krill-hosts = { workspace = true }
@@ -19,6 +20,8 @@ unicode-width = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 sysinfo = { workspace = true }
+winapi-util = { workspace = true }
+windows-sys = { workspace = true, features = ["Win32_System_Console"] }
 ring = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -30,6 +33,9 @@ rustix-openpty = { workspace = true }
 [dev-dependencies]
 same-file = { workspace = true }
 proptest = { workspace = true }
+
+[build-dependencies]
+embed-resource = { workspace = true }
 
 [lints]
 workspace = true

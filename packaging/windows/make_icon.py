@@ -1,7 +1,7 @@
 """packaging/macos/AppIcon.icns에서 Windows exe 아이콘 krill.ico(16·32·48·256, PNG 항목)를 만든다.
 
 macOS 전용(iconutil·sips). 실행: python3 packaging/windows/make_icon.py
-krill-app/build.rs가 Windows 타깃에서 이 파일을 리소스 ID 1로 임베드한다(gpui가 창 클래스 아이콘으로 읽는다).
+packaging/windows/resources.rs가 Windows 타깃에서 이 파일을 리소스 ID 1로 임베드한다(gpui가 창 클래스 아이콘으로 읽는다).
 """
 
 import pathlib

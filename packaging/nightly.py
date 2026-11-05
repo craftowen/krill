@@ -335,7 +335,7 @@ class Release:
             # 새 사이클의 재개 시에만 실패한 전체 workflow를 한 번 재시작한다.
             # --failed는 이전 attempt의 성공 잡을 생략하므로 전체 증거를 만들지 못한다.
             evidence = Evidence(self.config["repo"])
-            for workflow in ("ci.yml", "ci-macos.yml"):
+            for workflow in ("ci.yml", "ci-macos.yml", "ci-windows.yml"):
                 try:
                     evidence.proof(workflow, sha, branch)
                 except FailedRun as failed:
@@ -367,7 +367,7 @@ class Release:
             self.run("/usr/bin/python3", "packaging/release_check.py", "validate", "--head", sha,
                      "--directory", receipt.parent, "--key-file", self.config["key_file"], timeout=21600)
         self.update(step="wait-native-builds-and-ci", validation_receipt=str(receipt))
-        results = self.wait_ci(sha, branch, {"ci.yml", "ci-macos.yml", "release.yml"})
+        results = self.wait_ci(sha, branch, {"ci.yml", "ci-macos.yml", "ci-windows.yml", "release.yml"})
         build_id = results["release.yml"]["run_id"]
         assets = self.root / "assets" / sha
         if assets.exists():
@@ -392,7 +392,7 @@ class Release:
             raise NightlyError("candidate changed after validation")
         if current_main != sha:
             self.git("push", "origin", "HEAD:refs/heads/main")
-        self.wait_ci(sha, "main", {"ci.yml", "ci-macos.yml"})
+        self.wait_ci(sha, "main", {"ci.yml", "ci-macos.yml", "ci-windows.yml"})
         self.update(step="publish")
         self.env["KRILL_RELEASE_ASSET_DIR"] = str(verified)
         self.env["KRILL_PUBLICATION_AUDIT_DIR"] = str(self.root / "publications" / sha)

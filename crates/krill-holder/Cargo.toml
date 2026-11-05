@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+build = "../../packaging/windows/resources.rs"
 
 [dependencies]
 krill-log = { workspace = true }
@@ -19,6 +20,9 @@ libc = { workspace = true }
 # ConPTY(Windows 홀더, M11). 기능 목록은 ConPTY 구현 작업이 확정한다.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_Networking_WinSock"] }
+
+[build-dependencies]
+embed-resource = { workspace = true }
 
 [lints]
 workspace = true

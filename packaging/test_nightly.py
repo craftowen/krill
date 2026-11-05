@@ -222,7 +222,7 @@ class PublicationTests(unittest.TestCase):
         self.release.git = lambda *args: (SHA + "\trefs/heads/release/nightly-test" if args[:1] == ("ls-remote",) else original(*args))
         failed = nightly.FailedRun({"id": 12, "conclusion": "failure"})
         with patch.object(nightly, "Evidence") as evidence:
-            evidence.return_value.proof.side_effect = [failed, nightly.Pending("running"), {"run_id": 123, "attempt": 2}]
+            evidence.return_value.proof.side_effect = [failed, nightly.Pending("running"), nightly.Pending("running"), {"run_id": 123, "attempt": 2}]
             self.release.publish()
         reruns = [call for call in self.calls if call[:3] == ("gh", "run", "rerun")]
         self.assertEqual(len(reruns), 1)

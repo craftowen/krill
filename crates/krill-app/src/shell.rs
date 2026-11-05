@@ -2594,9 +2594,10 @@ impl Shell {
                 }
             };
             // MK-062: 앱이 새 빌드면 구 krilld를 교체한다. 구 krilld가 끝나며 감시 연결이 EOF가 되고 아래 루프가 다시 붙는다.
+            // 칸의 세션 생성·복원 요청과는 직렬화한다(교체 순간 끊긴 요청은 결과를 알 수 없다).
             let (t, h) = (target.clone(), hello.clone());
             bg.spawn(async move {
-                if let Err(error) = t.upgrade(&h) {
+                if let Err(error) = pane::upgrade_daemon(&t, &h) {
                     tracing::warn!(kind = ?error.kind(), "daemon upgrade failed");
                 }
             })

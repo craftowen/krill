@@ -84,6 +84,32 @@ fn reconnect(target: &HostTarget, need: u64) -> io::Result<(UnixStream, u64)> {
     Ok((c.stream, c.negotiated.features))
 }
 
+/// 앱이 요청한 krilld 교체(MK-062)와 세션을 만드는 요청(연결부터 답까지)을 직렬화한다. 교체가 끝나는 구 krilld에
+/// 닿은 Create·Resume는 답 없이 끊겨 결과를 알 수 없고, 칸은 같은 요청을 다시 보내지 않는다(Windows 실기:
+/// 앱 시작 직후 `resume_cold`가 `ConnectionReset` 10054, `outcome_unknown`).
+static DAEMON_UPGRADE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn creating() -> std::sync::RwLockReadGuard<'static, ()> {
+    DAEMON_UPGRADE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `target`의 krilld가 이 빌드보다 오래됐으면 교체한다([`HostTarget::upgrade`]). 진행 중인 세션 생성 요청이 끝난 뒤
+/// 시작하고, 새 krilld가 받을 때까지 새 생성 요청을 붙든다.
+///
+/// # Errors
+/// [`HostTarget::upgrade`]와 같다.
+pub fn upgrade_daemon(
+    target: &HostTarget,
+    hello: &ipc::ClientHello,
+) -> io::Result<Option<ipc::ServerHello>> {
+    let _gate = DAEMON_UPGRADE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    target.upgrade(hello)
+}
+
 /// 프레임 하나를 기다린다. 닫혔으면 `UnexpectedEof`.
 fn read(s: &mut UnixStream) -> io::Result<(u8, Vec<u8>)> {
     ipc::read_frame(s)?.ok_or_else(|| io::ErrorKind::UnexpectedEof.into())
@@ -333,6 +359,7 @@ pub fn resolve_observed_session_in(
     create: &Create,
 ) -> io::Result<Found> {
     let target = target.into();
+    let _upgrade = creating();
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     if let Some(woken) = hibernation::wake(&mut |req| call(&mut s, req), features, session, create)?
@@ -441,6 +468,7 @@ fn ensure_session_attempt(
     allow_cold: bool,
 ) -> io::Result<Found> {
     prepare_status_hook(target, &create.program);
+    let _upgrade = creating();
     let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     let mut effective_want = want;
@@ -579,6 +607,7 @@ pub fn resume_session_in(
 ) -> io::Result<SessionId> {
     let target = target.into();
     prepare_status_hook(&target, &create.program);
+    let _upgrade = creating();
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {
@@ -2358,3 +2387,6 @@ fn after_overlap(page: &[Vec<Cell>], hot: &[Vec<Cell>]) -> usize {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+mod upgrade_gate_tests;

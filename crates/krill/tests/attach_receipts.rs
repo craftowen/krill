@@ -1,14 +1,10 @@
 //! A successful detach settles the input already sent on that connection.
-#![cfg_attr(
-    unix,
-    expect(clippy::unwrap_used, reason = "isolated CLI protocol fixture")
-)]
-#![cfg(unix)]
+#![expect(clippy::unwrap_used, reason = "isolated CLI protocol fixture")]
 
-use std::fs;
+use krill_proto::os::net::{UnixListener, UnixStream};
+use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
 use std::net::Shutdown;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -31,7 +27,11 @@ struct Peer {
 
 impl Peer {
     fn new(tag: &str) -> Self {
-        let dir = PathBuf::from("/tmp").join(format!("ka-{}-{tag}", std::process::id()));
+        #[cfg(unix)]
+        let root = PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let root = std::env::temp_dir();
+        let dir = root.join(format!("ka-{}-{tag}", std::process::id()));
         fs::create_dir_all(dir.join("run")).unwrap();
         let listener = UnixListener::bind(dir.join("run/krilld.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -40,7 +40,7 @@ impl Peer {
             .env("KRILL_STATE_DIR", &dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(File::create(dir.join("stderr.txt")).unwrap())
             .spawn()
             .unwrap();
         let mut fixture = Self {
@@ -48,7 +48,7 @@ impl Peer {
             child: Some(child),
             stream: None,
         };
-        let (mut control, kind, body) = Self::request(&listener);
+        let (mut control, kind, body) = Self::request(&listener, &fixture.dir);
         assert!(matches!(
             Request::decode(kind, &body).unwrap(),
             Request::Capture {
@@ -66,7 +66,7 @@ impl Peer {
                 .unwrap(),
             )
             .unwrap();
-        let (mut raw, kind, body) = Self::request(&listener);
+        let (mut raw, kind, body) = Self::request(&listener, &fixture.dir);
         assert_eq!(Attach::decode(kind, &body).unwrap().session, SessionId(1));
         raw.write_all(
             &Attached {
@@ -81,7 +81,7 @@ impl Peer {
         fixture
     }
 
-    fn request(listener: &UnixListener) -> (UnixStream, u8, Vec<u8>) {
+    fn request(listener: &UnixListener, dir: &std::path::Path) -> (UnixStream, u8, Vec<u8>) {
         let deadline = Instant::now() + WAIT;
         loop {
             let (mut stream, _) = loop {
@@ -118,8 +118,20 @@ impl Peer {
                 )
                 .unwrap();
             let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
-            ClientHello::decode(kind, &body).unwrap();
-            if let Some((kind, body)) = ipc::read_frame(&mut stream).unwrap() {
+            let hello = ClientHello::decode(kind, &body).unwrap();
+            // The readiness probe has no control feature and sends no request.
+            // Do not wait for Windows AF_UNIX to surface its peer's close.
+            if hello.features & FEAT_CONTROL == 0 {
+                continue;
+            }
+            let frame = ipc::read_frame(&mut stream);
+            assert!(
+                frame.is_ok(),
+                "attach request: {:?}; stderr: {}",
+                frame.as_ref().err(),
+                fs::read_to_string(dir.join("stderr.txt")).unwrap_or_default()
+            );
+            if let Some((kind, body)) = frame.unwrap() {
                 return (stream, kind, body);
             }
         }
@@ -176,7 +188,8 @@ impl Peer {
             assert!(Instant::now() < deadline, "attach did not finish");
             thread::sleep(Duration::from_millis(5));
         }
-        let output = self.child.take().unwrap().wait_with_output().unwrap();
+        let mut output = self.child.take().unwrap().wait_with_output().unwrap();
+        output.stderr = fs::read(self.dir.join("stderr.txt")).unwrap();
         let mut remaining = Vec::new();
         if let Some(stream) = &mut self.stream {
             stream.read_to_end(&mut remaining).unwrap();
@@ -213,6 +226,7 @@ fn ctrl_detach_and_stdin_eof_wait_for_applied_input() {
 }
 
 #[test]
+#[cfg(unix)]
 fn applied_receipt_remains_valid_when_peer_closes_immediately() {
     let mut peer = Peer::new("applied-close");
     let input = peer.input(true);
@@ -340,4 +354,29 @@ fn missing_or_partial_receipt_obeys_existing_input_probe() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("delivery uncertain"));
         assert!(started.elapsed() < input::PROBE + Duration::from_secs(1));
     }
+}
+
+#[test]
+fn applied_receipt_split_across_idle_intervals_is_preserved() {
+    let mut peer = Peer::new("fragmented-applied");
+    let input = peer.input(true);
+    let ack = InputAck {
+        id: input.id,
+        result: InputResult::Applied,
+    }
+    .encode()
+    .unwrap();
+    // Each gap exceeds Windows' cancellable read timeout. Neither a partial
+    // frame header nor a partial body may be discarded or treated as failure.
+    peer.stream.as_mut().unwrap().write_all(&ack[..2]).unwrap();
+    peer.still_attached();
+    peer.stream.as_mut().unwrap().write_all(&ack[2..5]).unwrap();
+    peer.still_attached();
+    peer.stream.as_mut().unwrap().write_all(&ack[5..]).unwrap();
+    let output = peer.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

@@ -12,8 +12,400 @@ pub fn wait_process_exit(pid: u32, timeout: std::time::Duration) -> io::Result<(
     win::wait_process_exit(pid, timeout)
 }
 
+/// 실행 중인 Explorer에게 프로그램을 대신 띄우게 한다(`IShellDispatch2::ShellExecute`). 새 프로세스는 Explorer의 자식이라
+/// 이 앱이 갇힌 Job(작업 스케줄러 등 breakaway 금지)을 물려받지 않는다.
+#[cfg(windows)]
+#[expect(unsafe_code, reason = "Shell COM FFI in the platform boundary (U1)")]
+mod explorer {
+    use std::ffi::{OsStr, OsString, c_void};
+    use std::io;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::path::Path;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{RPC_E_CHANGED_MODE, SysAllocString, SysFreeString};
+    use windows_sys::Win32::System::Com::{
+        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        CSIDL_DESKTOP, SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
+        ShellWindows,
+    };
+    use windows_sys::core::{BSTR, GUID, HRESULT};
+
+    const IID_SHELL_WINDOWS: GUID = GUID::from_u128(0x85cb6900_4d95_11cf_960c_0080c7f4ee85);
+    const IID_SERVICE_PROVIDER: GUID = GUID::from_u128(0x6d5140c1_7436_11ce_8034_00aa006009fa);
+    const IID_SHELL_BROWSER: GUID = GUID::from_u128(0x000214e2_0000_0000_c000_000000000046);
+    const IID_DISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
+    const IID_FOLDER_VIEW_DUAL: GUID = GUID::from_u128(0xe7a1af80_4d96_11cf_960c_0080c7f4ee85);
+    const IID_SHELL_DISPATCH2: GUID = GUID::from_u128(0xa4c6892c_3ba9_11d2_9dea_00c04fb16162);
+
+    // vtable 번호(Windows SDK shobjidl.h·shldisp.h·servprov.h 순서). IUnknown 0-2, IDispatch 3-6, IOleWindow 3-4.
+    const QUERY_INTERFACE: usize = 0;
+    const RELEASE: usize = 2;
+    const SHELL_WINDOWS_FIND_WINDOW_SW: usize = 15;
+    const SERVICE_PROVIDER_QUERY_SERVICE: usize = 3;
+    const SHELL_BROWSER_QUERY_ACTIVE_SHELL_VIEW: usize = 15;
+    const SHELL_VIEW_GET_ITEM_OBJECT: usize = 15;
+    const FOLDER_VIEW_DUAL_APPLICATION: usize = 7;
+    const SHELL_DISPATCH2_SHELL_EXECUTE: usize = 31;
+
+    // vtable 메서드 서명.
+    type Execute =
+        unsafe extern "system" fn(*mut c_void, BSTR, Variant, Variant, Variant, Variant) -> HRESULT;
+    type Find = unsafe extern "system" fn(
+        *mut c_void,
+        *const Variant,
+        *const Variant,
+        i32,
+        *mut i32,
+        i32,
+        *mut *mut c_void,
+    ) -> HRESULT;
+    type Service = unsafe extern "system" fn(
+        *mut c_void,
+        *const GUID,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT;
+    type Item =
+        unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> HRESULT;
+    type Getter = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+    type Query = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+    type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+
+    const VT_EMPTY: u16 = 0;
+    const VT_I4: u16 = 3;
+    const VT_BSTR: u16 = 8;
+    const SW_HIDE: usize = 0;
+
+    /// `VARIANT` 배치(머리 8바이트 + 포인터 두 개 자리, x64 24바이트). 값으로 넘기는 인수라 크기가 ABI다.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Variant {
+        vt: u16,
+        reserved: [u16; 3],
+        value: [usize; 2],
+    }
+    const _: () = assert!(size_of::<Variant>() == 8 + 2 * size_of::<usize>());
+
+    impl Variant {
+        const EMPTY: Self = Self::new(VT_EMPTY, 0);
+        const fn new(vt: u16, value: usize) -> Self {
+            Self {
+                vt,
+                reserved: [0; 3],
+                value: [value, 0],
+            }
+        }
+    }
+
+    /// 소유한 COM 인터페이스 포인터(Drop에서 Release).
+    struct Com(*mut c_void);
+
+    impl Com {
+        /// `slot`번 메서드 주소.
+        fn method(&self, slot: usize) -> *const c_void {
+            // SAFETY: self.0 is a live COM interface whose first field is the vtable pointer.
+            let vtable = unsafe { *self.0.cast::<*const *const c_void>() };
+            // SAFETY: callers only use slot numbers inside that interface's SDK-defined vtable.
+            unsafe { *vtable.wrapping_add(slot) }
+        }
+
+        fn query(&self, iid: &GUID) -> io::Result<Self> {
+            // SAFETY: slot 0 of every COM vtable is IUnknown::QueryInterface with this signature.
+            let query: Query = unsafe { std::mem::transmute(self.method(QUERY_INTERFACE)) };
+            let mut out = ptr::null_mut();
+            // SAFETY: iid and out are live for the call.
+            out_param(unsafe { query(self.0, iid, &raw mut out) }, out)
+        }
+    }
+
+    impl Drop for Com {
+        fn drop(&mut self) {
+            // SAFETY: slot 2 is IUnknown::Release; this releases the one reference Com owns.
+            let release: Release = unsafe { std::mem::transmute(self.method(RELEASE)) };
+            // SAFETY: self.0 is live and owned.
+            unsafe { release(self.0) };
+        }
+    }
+
+    fn out_param(hr: HRESULT, out: *mut c_void) -> io::Result<Com> {
+        if hr < 0 || out.is_null() {
+            return Err(io::Error::from_raw_os_error(hr));
+        }
+        Ok(Com(out))
+    }
+
+    /// 실패한 COM 단계 이름을 오류 앞에 붙인다(로그에서 어느 단계인지 보이게).
+    fn step(name: &'static str) -> impl Fn(io::Error) -> io::Error {
+        move |e| io::Error::new(e.kind(), format!("{name}: {e}"))
+    }
+
+    fn hresult(hr: HRESULT) -> io::Result<()> {
+        if hr < 0 {
+            return Err(io::Error::from_raw_os_error(hr));
+        }
+        Ok(())
+    }
+
+    /// `SysAllocString` 소유자.
+    struct Bstr(BSTR);
+
+    impl Bstr {
+        fn new(text: &OsStr) -> io::Result<Self> {
+            let wide: Vec<u16> = text.encode_wide().chain(Some(0)).collect();
+            if wide.iter().rev().skip(1).any(|&c| c == 0) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            // SAFETY: wide is a NUL-terminated UTF-16 buffer that lives through the call.
+            let raw = unsafe { SysAllocString(wide.as_ptr()) };
+            if raw.is_null() {
+                return Err(io::ErrorKind::OutOfMemory.into());
+            }
+            Ok(Self(raw))
+        }
+
+        fn variant(&self) -> Variant {
+            Variant::new(VT_BSTR, self.0 as usize)
+        }
+    }
+
+    impl Drop for Bstr {
+        fn drop(&mut self) {
+            // SAFETY: self.0 came from SysAllocString and is freed once.
+            unsafe { SysFreeString(self.0) };
+        }
+    }
+
+    /// `program args`를 `dir`에서 Explorer가 창 없이 띄우게 요청한다. 요청이 받아들여지면 `Ok`(프로세스 결과는 모른다).
+    /// Explorer의 환경을 물려받으므로 이 프로세스의 `KRILL_*`(상태·소켓 폴더 등)은 cmd로 감싸 넘긴다.
+    pub fn launch(program: &Path, args: &[&OsStr], dir: Option<&Path>) -> io::Result<()> {
+        let env: Vec<_> = std::env::vars_os()
+            .filter(|(key, _)| key.to_string_lossy().starts_with("KRILL_"))
+            .collect();
+        let line = cmd_line(program, args, &env)?;
+        let cmd = Path::new(&std::env::var_os("SystemRoot").ok_or(io::ErrorKind::NotFound)?)
+            .join(r"System32\cmd.exe");
+        // SAFETY: initializes COM for this thread; a successful call is balanced below.
+        let init = unsafe { CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        if init < 0 && init != RPC_E_CHANGED_MODE {
+            return Err(io::Error::from_raw_os_error(init));
+        }
+        let result = shell_execute(&cmd, &line, dir);
+        if init >= 0 {
+            // SAFETY: balances this function's successful CoInitializeEx.
+            unsafe { CoUninitialize() };
+        }
+        result
+    }
+
+    fn shell_execute(program: &Path, args: &OsStr, dir: Option<&Path>) -> io::Result<()> {
+        let shell = desktop_shell()?;
+        let file = Bstr::new(program.as_os_str())?;
+        let args = Bstr::new(args)?;
+        let dir = dir.map(|d| Bstr::new(d.as_os_str())).transpose()?;
+        // SAFETY: shell is IShellDispatch2; slot 31 is ShellExecute(BSTR, VARIANT×4) in shldisp.h.
+        let execute: Execute =
+            unsafe { std::mem::transmute(shell.method(SHELL_DISPATCH2_SHELL_EXECUTE)) };
+        // SAFETY: the BSTRs outlive the call; VARIANTs are passed by value as the ABI requires.
+        hresult(unsafe {
+            execute(
+                shell.0,
+                file.0,
+                args.variant(),
+                dir.as_ref().map_or(Variant::EMPTY, Bstr::variant),
+                Variant::EMPTY,
+                Variant::new(VT_I4, SW_HIDE),
+            )
+        })
+    }
+
+    /// 바탕화면 창의 `IShellDispatch2`(Raymond Chen, "How can I launch an unelevated process from my elevated process").
+    fn desktop_shell() -> io::Result<Com> {
+        let mut out = ptr::null_mut();
+        // SAFETY: SDK CLSID/IID constants and a writable output pointer.
+        let windows = out_param(
+            unsafe {
+                CoCreateInstance(
+                    &ShellWindows,
+                    ptr::null_mut(),
+                    CLSCTX_LOCAL_SERVER,
+                    &IID_SHELL_WINDOWS,
+                    &raw mut out,
+                )
+            },
+            out,
+        )
+        .map_err(step("CoCreateInstance(ShellWindows)"))?;
+        // SAFETY: windows is IShellWindows; slot 15 is FindWindowSW.
+        let find: Find =
+            unsafe { std::mem::transmute(windows.method(SHELL_WINDOWS_FIND_WINDOW_SW)) };
+        let location = Variant::new(VT_I4, CSIDL_DESKTOP as usize);
+        let (mut hwnd, mut out) = (0, ptr::null_mut());
+        // SAFETY: VARIANT inputs and output pointers are live. No desktop window (Explorer not
+        // running) returns S_FALSE with a null dispatch, which out_param rejects.
+        let desktop = out_param(
+            unsafe {
+                find(
+                    windows.0,
+                    &raw const location,
+                    &Variant::EMPTY,
+                    SWC_DESKTOP,
+                    &raw mut hwnd,
+                    SWFO_NEEDDISPATCH,
+                    &raw mut out,
+                )
+            },
+            out,
+        )
+        .map_err(step("FindWindowSW"))?;
+        let provider = desktop
+            .query(&IID_SERVICE_PROVIDER)
+            .map_err(step("IServiceProvider"))?;
+        // SAFETY: provider is IServiceProvider; slot 3 is QueryService.
+        let service: Service =
+            unsafe { std::mem::transmute(provider.method(SERVICE_PROVIDER_QUERY_SERVICE)) };
+        let mut out = ptr::null_mut();
+        // SAFETY: GUID inputs and output pointer are live.
+        let browser = out_param(
+            unsafe {
+                service(
+                    provider.0,
+                    &SID_STopLevelBrowser,
+                    &IID_SHELL_BROWSER,
+                    &raw mut out,
+                )
+            },
+            out,
+        )
+        .map_err(step("QueryService"))?;
+        // SAFETY: browser is IShellBrowser; slot 15 is QueryActiveShellView.
+        let active: Getter =
+            unsafe { std::mem::transmute(browser.method(SHELL_BROWSER_QUERY_ACTIVE_SHELL_VIEW)) };
+        let mut out = ptr::null_mut();
+        // SAFETY: output pointer is live.
+        let view = out_param(unsafe { active(browser.0, &raw mut out) }, out)
+            .map_err(step("QueryActiveShellView"))?;
+        // SAFETY: view is IShellView; slot 15 is GetItemObject.
+        let item: Item = unsafe { std::mem::transmute(view.method(SHELL_VIEW_GET_ITEM_OBJECT)) };
+        let mut out = ptr::null_mut();
+        // SAFETY: IID input and output pointer are live.
+        let folder = out_param(
+            unsafe { item(view.0, SVGIO_BACKGROUND as u32, &IID_DISPATCH, &raw mut out) },
+            out,
+        )
+        .map_err(step("GetItemObject"))?
+        .query(&IID_FOLDER_VIEW_DUAL)
+        .map_err(step("IShellFolderViewDual"))?;
+        // SAFETY: folder is IShellFolderViewDual; slot 7 is get_Application.
+        let application: Getter =
+            unsafe { std::mem::transmute(folder.method(FOLDER_VIEW_DUAL_APPLICATION)) };
+        let mut out = ptr::null_mut();
+        // SAFETY: output pointer is live.
+        let dispatch = out_param(unsafe { application(folder.0, &raw mut out) }, out)
+            .map_err(step("get_Application"))?;
+        dispatch
+            .query(&IID_SHELL_DISPATCH2)
+            .map_err(step("IShellDispatch2"))
+    }
+
+    /// `cmd /s /c "set "K=V"&…&"program" "arg"…"`의 cmd 인수. 모든 단어를 CRT 규칙으로 따옴표에 넣어 cmd가
+    /// `&`·`(` 같은 글자를 해석하지 않게 한다. 따옴표 안에서도 펼쳐지는 `%`와 줄바꿈·따옴표가 있으면 거부한다.
+    fn cmd_line(
+        program: &Path,
+        args: &[&OsStr],
+        env: &[(OsString, OsString)],
+    ) -> io::Result<OsString> {
+        let words = std::iter::once(program.as_os_str()).chain(args.iter().copied());
+        let unsafe_char = |c: u16| [b'%', b'"', b'\r', b'\n', 0].map(u16::from).contains(&c);
+        if words
+            .clone()
+            .chain(env.iter().flat_map(|(k, v)| [&**k, &**v]))
+            .any(|w| w.encode_wide().any(unsafe_char))
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut line: Vec<u16> = "/d /v:off /s /c \"".encode_utf16().collect();
+        for (key, value) in env {
+            line.extend("set \"".encode_utf16());
+            line.extend(key.encode_wide());
+            line.push(u16::from(b'='));
+            line.extend(value.encode_wide());
+            line.extend("\"&".encode_utf16());
+        }
+        for (i, word) in words.enumerate() {
+            if i > 0 {
+                line.push(u16::from(b' '));
+            }
+            // 따옴표가 없으므로 CRT 규칙에서 남는 것은 닫는 따옴표 앞 역슬래시를 두 배로 하는 것뿐이다.
+            let word: Vec<u16> = word.encode_wide().collect();
+            let trailing = word
+                .iter()
+                .rev()
+                .take_while(|&&c| c == u16::from(b'\\'))
+                .count();
+            line.push(u16::from(b'"'));
+            line.extend(word);
+            line.extend(std::iter::repeat_n(u16::from(b'\\'), trailing));
+            line.push(u16::from(b'"'));
+        }
+        line.push(u16::from(b'"'));
+        Ok(OsString::from_wide(&line))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cmd_line_quotes_every_word_and_forwards_env() {
+            let env = [(
+                OsString::from("KRILL_STATE_DIR"),
+                OsString::from(r"C:\e2e\r2 & x\state"),
+            )];
+            let line = cmd_line(
+                Path::new(r"C:\Users\John Smith\krill-holder.exe"),
+                &[
+                    OsStr::new("--bootstrap"),
+                    OsStr::new(r"C:\a(b)\krilld.exe"),
+                    OsStr::new(r"C:\s\"),
+                ],
+                &env,
+            )
+            .unwrap();
+            assert_eq!(
+                line.to_str().unwrap(),
+                r#"/d /v:off /s /c "set "KRILL_STATE_DIR=C:\e2e\r2 & x\state"&"C:\Users\John Smith\krill-holder.exe" "--bootstrap" "C:\a(b)\krilld.exe" "C:\s\\"""#
+            );
+            assert!(cmd_line(Path::new(r"C:\%PATH%\x.exe"), &[], &[]).is_err());
+            assert!(
+                cmd_line(
+                    Path::new("x.exe"),
+                    &[],
+                    &[(OsString::from("KRILL_A"), OsString::from("a\"b"))]
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 mod shell;
+
+/// 이 앱이 갇힌 Job(작업 스케줄러 등) 밖에서 프로그램을 띄우도록 Explorer에 요청한다. 세션 데몬 bootstrap이
+/// Job 거부로 끝났을 때 `krill_proto::daemon`이 부른다(`set_job_escape`). Explorer가 없거나 실패하면 오류.
+#[cfg(windows)]
+pub fn launch_outside_job(
+    program: &std::path::Path,
+    args: &[&OsStr],
+    dir: Option<&std::path::Path>,
+) -> io::Result<()> {
+    explorer::launch(program, args, dir)
+        .inspect_err(|error| tracing::warn!(%error, "Explorer could not start the session daemon"))
+}
 
 /// Apply native title-bar appearance and the current attention overlay.
 pub fn sync_window(window: &Window, dark: bool) {

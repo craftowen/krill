@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+build = "../../packaging/windows/resources.rs"
 
 [lib]
 name = "krill_link"
@@ -35,6 +36,9 @@ krill-holder = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+[build-dependencies]
+embed-resource = { workspace = true }
 
 [lints]
 workspace = true

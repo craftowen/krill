@@ -69,6 +69,26 @@ VM 접속 폴더에는 `up.sh`·`ssh.sh`·`down.sh`·`ip`·`id_ed25519`·`known_
 서명 비밀키는 저장소 시크릿 `KRILL_RELEASE_SIGNING_KEY`(macOS 업데이트 키와 같은 64hex 시드, `ed25519_manifest.py`가 읽는 환경 변수 이름)다.
 시크릿이 없으면 공개키 없는 zip(업데이터 꺼짐)만 올리고 매니페스트는 건너뛴다. Authenticode 서명 자리는 주석으로만 남겼다(OWE-838).
 
+## 게시 전 Defender 검사
+
+CI와 `build-vm.sh`는 완성된 ZIP을 `defender-scan.ps1 -Zip <zip>`으로 검사한 뒤에만 게시 단계로 넘긴다.
+수동 패키지도 게시 전에 같은 명령을 실행한다. 관리자 PowerShell과 Normal 모드의 실행 중인 Defender Antivirus가 필요하다.
+스크립트는 `MpCmdRun -SignatureUpdate` 성공 후 ZIP 안의 모든 EXE·DLL(하위 폴더 포함)에
+`-Scan -ScanType 3 -File <파일> -DisableRemediation`을 실행한다. 탐지·검사 오류·서명 갱신 실패·비활성 엔진·빈 패키지는 실패한다.
+ZIP과 각 바이너리의 SHA-256, 엔진·서명 버전, 검사 결과는 빌드 로그에 남는다. 실시간 격리로 파일이 사라져도 실패한다.
+
+GitHub 호스팅 러너는 실시간 보호와 C:/D: 검사를 기본적으로 제외하지만,
+[Microsoft의 사용자 지정 검사 옵션](https://learn.microsoft.com/en-us/defender-endpoint/command-line-arguments-microsoft-defender-antivirus)은
+`-DisableRemediation`에서 제외 경로를 무시한다. 엔진이 비활성/Passive 모드인 러너는 통과할 수 없다.
+이 경우 보안 정책을 우회하지 말고 Normal 모드의 Windows VM에서 같은 ZIP을 검사한다.
+한 시점의 검사는 이후 클라우드 판정이나 SmartScreen 평판까지 보장하지 않는다.
+오탐은 [Microsoft 제출 포털](https://www.microsoft.com/wdsi/filesubmission)에 Software developer로 제출하고,
+판정·서명 갱신 뒤 동일 ZIP을 다시 검사한다. 검사를 통과시키려고 바이너리를 임의로 바꾸거나 제외 경로를 추가하지 않는다.
+
+자체 EXE 5개는 `resources.rs`·`krill.rc`를 통해 Cargo 버전과 제품·제작자·설명·원본 파일명 VERSIONINFO를 공유한다.
+ConPTY의 서명·메타데이터는 수정하지 않는다. `test_resources.ps1 -TargetDir <바이너리 폴더> -Version <버전>`으로 실제 PE를 확인한다.
+`test_defender-scan.ps1`은 가짜 검사기로 실패 경로를 검증하며 실제 Defender 검사와는 별개다.
+
 ## 설치·업데이트·제거
 
 Windows 릴리스 ZIP과 `.sha256`이 공개된 뒤에는 PowerShell에서 한 줄로 설치한다.

@@ -1070,3 +1070,20 @@ fn narrowing_keeps_wrapped_rows_on_screen_while_blank_rows_remain() {
     assert_eq!(full.history_len(), 1);
     assert_eq!(screen(&full), ["==========", "==========", "prompt"]);
 }
+
+/// `PSReadLine`(`ConPTY`)은 키를 칠 때마다 입력 줄 전체를 같은 자리에 다시 쓴다. 줄 끝에 한 칸이 남아 넓은 글자가
+/// 다음 줄로 넘어갈 때 다시 쓰기가 앞 줄 끝의 자리 채움 표시를 지워, 넓히면 글자 사이에 빈칸이 남았다
+/// (Windows 실기 `줄  바꿈확인`). 번들 `ConPTY` 1.25는 크기를 바꿔도 다시 그리지 않으므로 리플로우 결과가 그대로 보인다.
+#[test]
+fn rewritten_wide_char_wrap_reflows_without_a_gap() {
+    let look = fresh();
+    let mut engine = Engine::new(WinSize { cols: 6, rows: 3 });
+    for _ in 0..2 {
+        engine.feed("\x1b[1;1Habcde한글".as_bytes(), Feed::Live, &look);
+    }
+    engine.resize(WinSize { cols: 20, rows: 3 });
+    assert_eq!(
+        engine.screen_text().lines().next().map(str::trim_end),
+        Some("abcde한글")
+    );
+}

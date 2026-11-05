@@ -237,6 +237,15 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked -p krill-app -p krill -p krilld -p krill-holder -p krill-link
 
+      - name: Verify Windows PE identities and Defender gate contracts
+        shell: powershell
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\packaging\windows\test_resources.ps1 -TargetDir target\release -Version $env:VERSION
+          & .\packaging\windows\test_defender-scan.ps1
+
       - name: Verify native Windows audit regressions
         shell: powershell
         timeout-minutes: 25
@@ -318,6 +327,18 @@ jobs:
           $line
 
       # TODO(OWE-838): Authenticode 서명(signtool)은 여기서 zip 전에 exe에 한다. 인증서·비밀은 사람이 정한다.
+
+      # Hosted images disable real-time protection and exclude C:/D:. Custom scans with
+      # -DisableRemediation ignore exclusions. Require a live Normal-mode engine; no bypass.
+      - name: Scan release ZIP with Microsoft Defender
+        shell: powershell
+        timeout-minutes: 15
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Start-Service WinDefend
+          & .\packaging\windows\defender-scan.ps1 -Zip "packaging\dist\Krill-$env:VERSION-windows-x64.zip"
 
       - name: Sign latest-windows.json
         if: ${{ !inputs.build_only && steps.key.outputs.public_key != '' }}
