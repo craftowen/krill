@@ -117,6 +117,9 @@ if [ "${ZDOTDIR:-$HOME}" != "$_krill_self_zdotdir" ] && [ -f "${ZDOTDIR:-$HOME}/
   . "${ZDOTDIR:-$HOME}/.zshenv"
 fi
 unset _krill_self_zdotdir
+if [ -n "${MK_PANE_ID-}" ]; then
+  export HERDR_ENV=1
+fi
 if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
   # OpenCode 격리 프로필만 XDG_DATA_HOME·XDG_STATE_HOME을 덮어쓴다. 처음 덮어쓰기 전 값(미설정 포함)을 기억했다가
   # 호스트 계정·항목 제거 때 되돌린다. 그 사이 사용자가 직접 바꾼 값은 보존한다(daemon-01).
@@ -141,6 +144,9 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
   __krill_sync_accounts() {
     if (( $+functions[__krill_flush_compdef] )); then
       __krill_flush_compdef
+    fi
+    if [ -n "${MK_PANE_ID-}" ]; then
+      export HERDR_ENV=1
     fi
     local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/krill}/active-accounts.env"
     if [ ! -f "$_krill_env" ] && [ -f "$HOME/Library/Application Support/dev.krill.app/active-accounts.env" ]; then
@@ -2135,7 +2141,12 @@ fn pane_env_with_socket(
     state: Option<&Path>,
     socket_dir: Option<&std::ffi::OsStr>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut env = vec![(b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes())];
+    let mut env = vec![
+        (b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes()),
+        // Codex TUI checks HERDR_ENV=1 to emit OSC 52 even when the host OS pasteboard succeeds,
+        // so remote krill-app clients receive Event::ClipboardStore -> Clipboard frame.
+        (b"HERDR_ENV".to_vec(), b"1".to_vec()),
+    ];
     if let Some(socket_dir) = socket_dir {
         env.push((b"KRILL_SOCKET_DIR".to_vec(), socket_dir.as_bytes().to_vec()));
     }
