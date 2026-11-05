@@ -48,13 +48,29 @@ const DEFAULT_HTTP_TIMEOUT_SECS: &str = "10";
 const CODEX_CONSUME_TIMEOUT_SECS: &str = "30";
 const CLAUDE_CONSUME_TIMEOUT_SECS: &str = "15";
 
-/// 소진 직후 스냅샷이 소진 전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
+/// 소진 직후나 호스트 자격증명 교체 직후 스냅샷이 이전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
 /// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다.
-pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
+pub(crate) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
     let key = (home.to_path_buf(), provider, dir.to_path_buf());
     lock(&CACHE).remove(&key);
     lock(&RETRY).remove(&key);
+    if provider == ProviderKind::Antigravity {
+        agy::evict_profile(home, dir);
+    }
     super::meters::evict_profile(home, provider, dir);
+}
+
+fn credential_fingerprint(provider: ProviderKind, dir: &Path, host: bool) -> Option<Vec<u8>> {
+    let path = match provider {
+        ProviderKind::Antigravity if host => dir.join("antigravity-oauth-token"),
+        ProviderKind::Antigravity => dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+        ProviderKind::Codex => dir.join("auth.json"),
+        ProviderKind::Claude => dir.join(".credentials.json"),
+        ProviderKind::OpenCode if host => dir.join("auth.json"),
+        ProviderKind::OpenCode => dir.join("data/opencode/auth.json"),
+        ProviderKind::Gemini => return None,
+    };
+    read_file(&path).map(|b| b.to_vec())
 }
 
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
@@ -144,9 +160,15 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
     let launched = std::thread::Builder::new()
         .name("account-usage".into())
         .spawn(move || {
+            let before = credential_fingerprint(job.1, &job.2, host);
             let result =
                 std::panic::catch_unwind(|| fetch(job.1, &job.2, host, &job.0, state.as_deref()))
                     .unwrap_or(Fetched::Failed(Failure::Internal));
+            let after = credential_fingerprint(job.1, &job.2, host);
+            if before.is_some() && after.is_some() && before != after {
+                lock(&PENDING).remove(&job);
+                return;
+            }
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
@@ -1487,7 +1509,7 @@ fn pipe_command(
         .then(|| Zeroizing::new(output.stdout))
 }
 
-pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
+pub(super) fn antigravity_auth_file(dir: &Path, host: bool) -> Option<AuthStatus> {
     if !host {
         // 로그인 판정은 krill-proto와 공유한다. 신원은 로그인된 프로필에서만 읽는다.
         let logged_in = krill_proto::account_login::agy_token_logged_in(dir);
@@ -1503,14 +1525,6 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
                 .flatten(),
         });
     }
-    // 호스트(OWE-901): 키체인 파싱 → 토큰 파일 존재 순(코디네이터 결정: 마커 검사 없음).
-    // 로그인은 존재·크기로 판정하고, 표시용 이메일만 상한 있는 읽기로 얻는다. 호스트 `dir`은 이미
-    // `~/.gemini/antigravity-cli`라 토큰 파일명을 직접 붙인다(프로필 헬퍼와 다름).
-    if let Some(raw) = keychain("gemini", "antigravity")
-        && let Some(status) = parse_antigravity_auth(&raw)
-    {
-        return Some(status);
-    }
     let token = dir.join("antigravity-oauth-token");
     if std::fs::symlink_metadata(&token)
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.len() > 0)
@@ -1521,6 +1535,24 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
                 accounts::identity_from_credentials(ProviderKind::Antigravity, &raw)
             }),
         });
+    }
+    None
+}
+
+pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
+    if !host {
+        return antigravity_auth_file(dir, false);
+    }
+    // 호스트(OWE-901): `antigravity-oauth-token` 파일이 있으면 `agy -p /usage`가
+    // `SSH_CONNECTION=krill`로 파일 토큰을 읽으므로 신원 판정도 같은 파일 토큰을 먼저 본다.
+    // 파일이 없을 때만 키체인 로그인을 확인한다.
+    if let Some(status) = antigravity_auth_file(dir, true) {
+        return Some(status);
+    }
+    if let Some(raw) = keychain("gemini", "antigravity")
+        && let Some(status) = parse_antigravity_auth(&raw)
+    {
+        return Some(status);
     }
     None
 }
@@ -1644,6 +1676,12 @@ pub(crate) mod agy {
         lock(&VERSION_TEXT_CACHE).clear();
     }
 
+    pub(super) fn evict_profile(home: &Path, dir: &Path) {
+        let key = (home.to_path_buf(), dir.to_path_buf());
+        lock(&CACHE).remove(&key);
+        lock(&FAILED).remove(&key);
+    }
+
     pub(super) fn cached(home: &Path, dir: &Path) -> Option<ProfileUsage> {
         if latched() {
             return None;
@@ -1740,12 +1778,18 @@ pub(crate) mod agy {
                     lock(&PENDING).remove(&job);
                     return;
                 }
+                let before = super::credential_fingerprint(ProviderKind::Antigravity, &job.1, host);
                 let usage = std::panic::catch_unwind(|| {
                     let exe = super::agy_exe()?;
                     fetch(&exe, &job.1, host)
                 })
                 .ok()
                 .flatten();
+                let after = super::credential_fingerprint(ProviderKind::Antigravity, &job.1, host);
+                if before.is_some() && after.is_some() && before != after {
+                    lock(&PENDING).remove(&job);
+                    return;
+                }
                 if let Some((usage, meters)) = usage {
                     lock(&FAILED).remove(&job);
                     super::super::meters::remember(

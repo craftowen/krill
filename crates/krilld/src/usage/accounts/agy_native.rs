@@ -167,6 +167,9 @@ pub(crate) fn sync_codex_account(
     };
     if current_host.as_ref() != Some(&target_raw) {
         write_atomic_0600(&host_auth_path, &target_raw).ok();
+        let host_dir = super::host_default_dir(home, ProviderKind::Codex);
+        crate::usage::direct::evict_profile(home, ProviderKind::Codex, &host_dir);
+        super::login::evict_profile(ProviderKind::Codex, &host_dir);
     }
 }
 
@@ -183,22 +186,30 @@ pub(crate) fn sync_claude_account(home: &Path, target_dir: Option<&Path>, allow_
     }
     let target_creds = target.join(".credentials.json");
     let host_creds = host_claude.join(".credentials.json");
+    let mut host_changed = false;
     if target_creds != host_creds
         && let Some(raw) = read_token_file(&target_creds)
         && read_token_file(&host_creds).as_ref() != Some(&raw)
     {
         write_atomic_0600(&host_creds, &raw).ok();
+        host_changed = true;
     }
     #[cfg(target_os = "macos")]
     if allow_keychain
         && let (Some(src_service), Some(dst_service)) =
             (claude_service(Some(target)), claude_service(None))
         && src_service != dst_service
+        && super::Keychain.copy(&src_service, &dst_service).is_ok()
     {
-        super::Keychain.copy(&src_service, &dst_service).ok();
+        host_changed = true;
     }
     #[cfg(not(target_os = "macos"))]
     let _ = allow_keychain;
+    if host_changed {
+        let host_dir = super::host_default_dir(home, ProviderKind::Claude);
+        crate::usage::direct::evict_profile(home, ProviderKind::Claude, &host_dir);
+        super::login::evict_profile(ProviderKind::Claude, &host_dir);
+    }
 }
 
 pub(crate) fn sync_opencode_account(home: &Path, target_dir: Option<&Path>) {
@@ -217,6 +228,9 @@ pub(crate) fn sync_opencode_account(home: &Path, target_dir: Option<&Path>) {
         && read_token_file(&host_auth).as_ref() != Some(&raw)
     {
         write_atomic_0600(&host_auth, &raw).ok();
+        let host_dir = super::host_default_dir(home, ProviderKind::OpenCode);
+        crate::usage::direct::evict_profile(home, ProviderKind::OpenCode, &host_dir);
+        super::login::evict_profile(ProviderKind::OpenCode, &host_dir);
     }
 }
 
@@ -234,7 +248,7 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
     let real_keychain = use_real_keychain(home);
     let current_keychain = if real_keychain { read_keychain() } else { None };
     let current_file = read_token_file(&host_token_path);
-    let current_host = current_keychain.as_ref().or(current_file.as_ref());
+    let current_host = current_file.as_ref().or(current_keychain.as_ref());
 
     // 1. 호스트에서 갱신된 토큰이 있으면 같은 이메일을 가진 프로필 슬롯에 먼저 보존한다.
     if let Some(host_raw) = current_host
@@ -275,11 +289,19 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
     let Some(target_raw) = read_token_file(&target_token_path) else {
         return;
     };
+    let mut host_changed = false;
     if current_file.as_ref() != Some(&target_raw) {
         write_atomic_0600(&host_token_path, &target_raw).ok();
+        host_changed = true;
     }
     if real_keychain && current_keychain.as_ref() != Some(&target_raw) {
         write_keychain(&target_raw);
+        host_changed = true;
+    }
+    if host_changed {
+        let host_dir = super::host_default_dir(home, ProviderKind::Antigravity);
+        crate::usage::direct::evict_profile(home, ProviderKind::Antigravity, &host_dir);
+        super::login::evict_profile(ProviderKind::Antigravity, &host_dir);
     }
 }
 
@@ -520,7 +542,29 @@ mod tests {
             tok1_initial
         );
 
-        // 2. 호스트에서 agy가 토큰을 갱신한 뒤 agy-2로 전환하면, 갱신된 토큰이 prof1에 보존되고 호스트는 agy-2가 된다.
+        // 2. 호스트에서 agy가 토큰을 갱신한 뒤 agy-2로 전환하면, 갱신된 토큰이 prof1에 보존되고
+        // 호스트는 agy-2가 되며 이전 계정의 호스트 미터 캐시도 즉시 비워진다.
+        let host_dir = crate::usage::accounts::host_default_dir(&home, ProviderKind::Antigravity);
+        crate::usage::meters::remember(
+            &home,
+            ProviderKind::Antigravity,
+            &host_dir,
+            krill_proto::usage::AccountMeters {
+                account_id: "agy-host".into(),
+                plan: None,
+                meters: vec![krill_proto::usage::UsageMeter {
+                    key: "gemini_weekly".into(),
+                    label: "Gemini · 7d".into(),
+                    value: None,
+                    window: None,
+                }],
+            },
+        );
+        assert!(crate::usage::meters::has_cached(
+            &home,
+            ProviderKind::Antigravity,
+            &host_dir
+        ));
         std::fs::write(
             home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
             tok1_refreshed,
@@ -528,6 +572,11 @@ mod tests {
         .unwrap();
         file.active.insert("agy".into(), "agy-2".into());
         sync_active(&home, &file);
+        assert!(!crate::usage::meters::has_cached(
+            &home,
+            ProviderKind::Antigravity,
+            &host_dir
+        ));
         assert_eq!(
             std::fs::read(prof1.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
             tok1_refreshed

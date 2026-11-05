@@ -129,7 +129,7 @@ impl Runtime {
 
     pub fn observe(&mut self, accounts: &[AccountInfo], stamps: &BTreeMap<String, u64>) {
         self.samples
-            .retain(|id, _| accounts.iter().any(|a| a.id == *id));
+            .retain(|id, _| accounts.iter().any(|a| a.id == *id && !a.usage.is_empty()));
         for a in accounts
             .iter()
             .filter(|a| !a.stale && !a.usage.is_empty())
