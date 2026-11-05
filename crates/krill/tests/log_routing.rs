@@ -67,3 +67,21 @@ fn default_state_path_from_a_session_shell_keeps_the_production_logs() {
     assert!(!state.join("logs").exists());
     fs::remove_dir_all(root).ok();
 }
+
+/// 앱이 60초마다 부르는 `errors flush`와 에이전트가 폴링하는 `read` 같은 명령의 시작 줄이 실제 진단을 회전으로 밀어냈다.
+#[test]
+fn only_rare_commands_log_their_start() {
+    let (root, home) = fixture("start-line");
+    let state = root.join("state");
+    let log = state.join("logs/krill.log");
+    krill(&home, &state, &["errors", "status", "--json"]);
+    let text = fs::read_to_string(&log).unwrap_or_default();
+    assert!(!text.contains("cli starting"), "{text}");
+    krill(&home, &state, &["doctor", "--json", "--no-start"]);
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(
+        text.contains("cli starting") && text.contains("doctor"),
+        "{text}"
+    );
+    fs::remove_dir_all(root).ok();
+}
