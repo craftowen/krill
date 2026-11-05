@@ -289,14 +289,15 @@ pub fn encode_hook_json(value: &serde_json::Value) -> io::Result<String> {
 /// A Windows executable path as one word for Claude Code's hook and statusLine shell:
 /// Git Bash, or PowerShell when Git Bash is missing (code.claude.com/docs/en/hooks,
 /// /statusline). A plain path is written unquoted with `/` separators, which both shells
-/// run as-is. Other paths keep POSIX quoting, which only Git Bash runs.
+/// run as-is. A `~` after the first character (8.3 short names such as `RUNNER~1`) is
+/// literal in both. Other paths keep POSIX quoting, which only Git Bash runs.
 #[must_use]
 pub fn windows_shell_word(exe: &str) -> String {
     let slashed = exe.replace('\\', "/");
     if !slashed.is_empty()
-        && slashed
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '/' | ':' | '.' | '_' | '-'))
+        && slashed.char_indices().all(|(i, c)| {
+            c.is_alphanumeric() || matches!(c, '/' | ':' | '.' | '_' | '-') || (c == '~' && i > 0)
+        })
     {
         slashed
     } else {
@@ -555,5 +556,10 @@ mod claude_platform_tests {
             super::windows_shell_word(r"C:\$x\krill.exe"),
             r"'C:\$x\krill.exe'"
         );
+        assert_eq!(
+            super::windows_shell_word(r"C:\Users\RUNNER~1\AppData\Local\Temp\krill.exe"),
+            "C:/Users/RUNNER~1/AppData/Local/Temp/krill.exe"
+        );
+        assert_eq!(super::windows_shell_word("~/krill.exe"), "'~/krill.exe'");
     }
 }
