@@ -41,9 +41,19 @@ impl Component {
     }
 }
 
+/// `krill_proto::daemon::state_dir_in`의 기본 위치(`base` 기준). krill-log는 krill-proto에 의존하지 않아 값을 따로 둔다.
+/// `crates/krill/tests/log_routing.rs`가 어긋남을 잡는다.
+#[cfg(windows)]
+const DEFAULT_STATE: &str = "Krill";
+#[cfg(target_os = "linux")]
+const DEFAULT_STATE: &str = ".local/share/dev.krill.app";
+#[cfg(not(any(windows, target_os = "linux")))]
+const DEFAULT_STATE: &str = "Library/Application Support/dev.krill.app";
+
 /// Explicit override isolates tests (test processes fall back to a temp directory, see
-/// [`is_test_process`]); production uses `LocalAppData` on Windows and the Console.app-visible
-/// directory on macOS (XDG state on Linux).
+/// [`is_test_process`]); a `KRILL_STATE_DIR` away from the default keeps its logs in `<state>/logs`;
+/// production uses `LocalAppData` on Windows and the Console.app-visible directory on macOS
+/// (XDG state on Linux).
 pub fn directory() -> Option<PathBuf> {
     directory_in(
         |key| std::env::var_os(key),
@@ -77,6 +87,17 @@ fn directory_in(
     let base = get("LOCALAPPDATA").map(PathBuf::from).or_else(home);
     #[cfg(not(windows))]
     let base = home();
+    // 격리 실행(벤치·스모크·임시 앱)이 운영 로그를 회전으로 밀어내지 못하게 상태 폴더 옆에 둔다. Krill 세션 셸은
+    // 기본 경로를 그대로 내보내므로 값이 있다는 것만으로는 격리가 아니다(`krill_proto::daemon::state_dir_isolated`).
+    if let Some(state) = get("KRILL_STATE_DIR").filter(|state| !state.is_empty())
+        && base
+            .as_ref()
+            .map(|base| base.join(DEFAULT_STATE))
+            .as_deref()
+            != Some(Path::new(&state))
+    {
+        return Some(PathBuf::from(state).join("logs"));
+    }
     #[cfg(windows)]
     {
         base.map(|path| path.join("Krill").join("Logs"))
@@ -91,7 +112,7 @@ fn directory_in(
 }
 
 /// 테스트 하네스가 띄운 프로세스(와 그 자식)인가. 테스트에만 있는 표식만 본다 — 일반 `cargo run`·설치본·
-/// 사용자가 고른 `KRILL_STATE_DIR`은 해당하지 않는다.
+/// 사용자가 고른 `KRILL_STATE_DIR`은 해당하지 않는다(이 경우 로그는 숨기지 않고 `<상태 폴더>/logs`에 남는다).
 /// - `NEXTEST`: nextest가 늘 1로 둔다.
 /// - `CARGO_BIN_EXE_<이름>`: `cargo test`가 통합 테스트 프로세스에 런타임으로도 둔다(`cargo run`에는 없다).
 /// - 실행 파일이 `target/<프로필>/deps/<이름>-<해시>`: libtest 바이너리 자신(직접 실행 포함).
@@ -188,6 +209,35 @@ mod tests {
         let installed = Path::new("/Applications/Krill.app/Contents/Helpers/krilld");
         assert!(!is_test_process_in(keys(&["HOME"]), Some(installed)));
         assert!(!is_test_process_in(keys(&[]), None));
+    }
+
+    #[test]
+    fn isolated_state_dir_keeps_its_own_logs() {
+        let home = PathBuf::from("/h");
+        let state = |value: PathBuf| {
+            move |key: &str| {
+                (key == "KRILL_STATE_DIR" || (cfg!(windows) && key == "LOCALAPPDATA"))
+                    .then(|| value.clone().into_os_string())
+            }
+        };
+        assert_eq!(
+            directory_in(state(PathBuf::from("/tmp/x")), false, || Some(home.clone())),
+            Some(PathBuf::from("/tmp/x/logs"))
+        );
+        // 테스트 프로세스는 지금처럼 임시 폴더로 간다.
+        assert_eq!(
+            directory_in(state(PathBuf::from("/tmp/x")), true, || Some(home.clone())),
+            Some(std::env::temp_dir().join("krill-test-logs"))
+        );
+        // 빈 값은 재정의가 아니다.
+        assert_eq!(
+            directory_in(
+                |key| (key == "KRILL_STATE_DIR").then(OsString::new),
+                false,
+                || None
+            ),
+            None
+        );
     }
 
     #[cfg(not(windows))]
