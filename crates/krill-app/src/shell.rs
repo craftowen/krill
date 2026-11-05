@@ -3836,7 +3836,7 @@ impl Shell {
                 .session(*pane)
                 .and_then(|session| snap.details.handoffs.iter().find(|h| h.from == session));
             match handoff {
-                Some(h) if h.to.is_none() && h.error.is_none() => live.pane.pause_account_input(),
+                Some(h) if h.to.is_none() && h.error.is_none() => {} // sync_queued_account_input
                 Some(h) if h.to.is_some() => {} // moved below, retaining unsent input
                 Some(_) => input_notices.extend(live.pane.resume_account_input(true, Now::get())),
                 None => {} // Observations cannot authorize delivery to the original account.

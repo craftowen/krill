@@ -108,7 +108,54 @@ impl Shell {
                 .supports_account_input_recovery(&hold.host)
     }
 
+    /// The daemon starts a queued switch only once the agent is idle, so a busy agent still owns
+    /// its PTY. Holding its input would keep an agent that is waiting on the user busy forever.
+    /// A hidden sidebar stops polling, so its stale status must not be able to hold input either.
+    fn sync_queued_account_input(&mut self, cx: &mut Context<Self>) {
+        use krill_proto::control::AgentState;
+        let sidebar = self.sidebar.read(cx);
+        let queued: Vec<_> = self
+            .live
+            .keys()
+            .filter_map(|pane| {
+                let host = self.layout.host(*pane);
+                let session = self.layout.session(*pane)?;
+                let accounts = self.accounts_for_host(host);
+                accounts
+                    .details
+                    .handoffs
+                    .iter()
+                    .any(|h| h.from == session && h.to.is_none() && h.error.is_none())
+                    .then(|| {
+                        let busy = !sidebar.is_visible()
+                            || sidebar.session_on(host, session).is_some_and(|s| {
+                                matches!(
+                                    s.status.state,
+                                    AgentState::Working | AgentState::Waiting | AgentState::Blocked
+                                )
+                            });
+                        (*pane, busy)
+                    })
+            })
+            .collect();
+        let mut notices = Vec::new();
+        for (pane, busy) in queued {
+            let Some(live) = self.live.get_mut(&pane) else {
+                continue;
+            };
+            if busy {
+                notices.extend(live.pane.resume_account_input(false, Now::get()));
+            } else {
+                live.pane.pause_account_input();
+            }
+        }
+        for notice in &notices {
+            self.show(Some(notice), cx);
+        }
+    }
+
     pub(super) fn recover_account_input(&mut self, cx: &mut Context<Self>) {
+        self.sync_queued_account_input(cx);
         self.account_recovery.attempted.retain(|hold, _| {
             self.account_holds.get(&(hold.host.clone(), hold.session)) == Some(hold)
         });
