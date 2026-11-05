@@ -429,6 +429,73 @@ class SnapshotTests(unittest.TestCase):
             self.assertFalse((root / "state/pending.json").exists())
 
 
+class KoreanNotesTests(unittest.TestCase):
+    def test_titles_keep_user_facing_changes_like_the_app(self):
+        log = "\n".join([
+            "Release v0.2.52", "Merge branch 'dev'", "test(log): widen a timeout",
+            "fix(updater): reopen the app when the relauncher fails (#90)",
+            "feat(app)!: open settings as a modal", "chore: bump", "plain subject",
+            "fix(updater): reopen the app when the relauncher fails"])
+        self.assertEqual(nightly.release_titles(log), [
+            "Reopen the app when the relauncher fails", "Open settings as a modal", "Plain subject"])
+
+    def test_translator_output_must_be_a_short_korean_array(self):
+        self.assertEqual(nightly.korean_items('```json\n["앱을 다시 띄웁니다."]\n```'), ["앱을 다시 띄웁니다."])
+        for bad in ("no array", "[]", '["English only"]', '["가"' + ', "가"' * 12 + "]", '[1]'):
+            with self.assertRaises(ValueError, msg=bad):
+                nightly.korean_items(bad)
+
+    def test_release_commit_gets_korean_notes_and_translation_failure_never_blocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "nightly/repository"
+            work.mkdir(parents=True)
+
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=work, stderr=subprocess.DEVNULL).decode().strip()
+
+            git("init", "--initial-branch=main")
+            git("config", "user.name", "t")
+            git("config", "user.email", "t@example.invalid")
+            notes = work / nightly.KOREAN_NOTES
+            notes.parent.mkdir(parents=True)
+            notes.write_text('{\n  "0.1.1": [\n    "이전 항목입니다."\n  ]\n}\n', encoding="utf-8")
+            git("add", ".")
+            git("commit", "-m", "Release v0.1.1")
+            published = git("rev-parse", "HEAD")
+            git("commit", "--allow-empty", "-m", "fix(app): keep tabs (#7)")
+            config = {"repo": "o/r", "run_root": str(root / "nightly"), "target_dir": str(nightly.TARGETS / "n"),
+                      "key_file": "/unused", "translator": "/fake/claude"}
+            release = nightly.Release(config, root / "state")
+            real = nightly.command
+            prompts = []
+
+            def fake(args, **kwargs):
+                if str(args[0]) != "/fake/claude":
+                    return real(args, **kwargs)
+                prompts.append(str(args[-1]))
+                self.assertNotEqual(Path(kwargs["cwd"]), work)
+                return '["탭을 유지합니다."]'
+
+            with patch.object(nightly, "command", side_effect=fake):
+                release.write_korean_notes("0.1.2", published)
+            data = json.loads(notes.read_text(encoding="utf-8"))
+            self.assertEqual(list(data), ["0.1.2", "0.1.1"])
+            self.assertEqual(data["0.1.2"], ["탭을 유지합니다."])
+            self.assertIn("- Keep tabs", prompts[0])
+            self.assertIn("docs/releases/ko.json", git("diff", "--cached", "--name-only"))
+
+            # 이미 있는 버전은 번역기를 다시 부르지 않는다.
+            with patch.object(nightly, "command", side_effect=AssertionError("translator called")):
+                release.write_korean_notes("0.1.2", published)
+
+            before = notes.read_text(encoding="utf-8")
+            with patch.object(nightly, "command", side_effect=lambda a, **k: real(a, **k) if str(a[0]) == "git" else "not json"):
+                release.write_korean_notes("0.1.3", published)
+            self.assertEqual(notes.read_text(encoding="utf-8"), before)
+            self.assertTrue(release.state["korean_notes"].startswith("skipped:"))
+
+
 class ArtifactTests(unittest.TestCase):
     def test_artifact_is_bound_to_attempt_id_head_and_github_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
