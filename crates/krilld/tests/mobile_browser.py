@@ -83,7 +83,6 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 assert evaluate('KrillMobile.store.snapshot.repositories.length') == 2
                 assert evaluate('document.querySelector(".workspace-row").getBoundingClientRect().bottom<innerHeight')
                 shot('workspaces')
-                browser('find','role','button','click','--name','Search','--exact')
                 browser('fill','input[type=search]','feature-worktree')
                 assert evaluate('document.querySelectorAll(".workspace-row").length') == 1
                 browser('fill','input[type=search]','')

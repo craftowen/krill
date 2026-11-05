@@ -771,7 +771,8 @@ test("disconnected Settings control uses automatic diagnostics directly, with En
             connection: { phase: "disconnected" },
             snapshot: null,
           },
-          route: {},
+          // The control lives on the Settings → Privacy page (Orca-style settings menu).
+          route: { subpage: "privacy" },
           header: () => el("header"),
           t: h.context.KrillMobile.i18n.t,
           button: (label) => el("button", label),
