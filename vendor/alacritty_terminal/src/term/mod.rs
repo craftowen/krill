@@ -1013,7 +1013,12 @@ impl<T> Term<T> {
             }
 
             // Remove leading spacers.
-            if point.column <= 1 && point.line != self.topmost_line() {
+            // Krill patch (bug fix): a wide char rewritten at column 0 still needs the spacer that
+            // `input` has just written before wrapping; keep it so the line reflows without a gap.
+            if point.column <= 1
+                && point.line != self.topmost_line()
+                && (point.column == 1 || !flags.contains(Flags::WIDE_CHAR))
+            {
                 let column = self.last_column();
                 self.grid[point.line - 1i32][column].flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
             }
