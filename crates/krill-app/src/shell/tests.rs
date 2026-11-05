@@ -6686,6 +6686,12 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
 fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("sidebar-nav-items"));
     cx.run_until_parked();
+    // CI(영어 시스템)와 같은 배치로 검사한다.
+    cx.update(|window, cx| {
+        krill_app::settings::set_language(krill_app::i18n::Language::En, cx);
+        window.draw(cx).clear(cx);
+    });
+    cx.run_until_parked();
 
     assert!(
         cx.debug_bounds("nav-agent-dashboard").is_some(),
@@ -6764,7 +6770,26 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("mobile-page").is_some());
 
     // '기기 관리'는 전체 설정의 모바일 탭으로 넘어간다.
-    let manage = cx.debug_bounds("mobile-page-manage").unwrap();
+    // 페이지는 스크롤된다. 영어 라벨은 줄바꿈으로 길어져 버튼이 모달 아래로 밀리므로, 보이게 스크롤한 뒤 누른다.
+    let modal = cx.debug_bounds("admin-modal").unwrap();
+    let mut manage = cx.debug_bounds("mobile-page-manage").unwrap();
+    for _ in 0..20 {
+        if manage.bottom() <= modal.bottom() {
+            break;
+        }
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: modal.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-100.))),
+            modifiers: Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        manage = cx.debug_bounds("mobile-page-manage").unwrap();
+    }
+    assert!(
+        manage.bottom() <= modal.bottom(),
+        "manage button must scroll into the modal: {manage:?} {modal:?}"
+    );
     cx.simulate_click(manage.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("mobile-page").is_none());
