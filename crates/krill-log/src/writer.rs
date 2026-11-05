@@ -84,14 +84,18 @@ impl RollingLog {
         )?;
         // Other processes hold the lock for one append, so wait briefly instead of dropping the
         // event. Only a stuck holder costs the event, never an unbounded stall of the logging thread.
-        // Yield rather than sleep: a hold lasts one append, and Windows rounds a 1ms sleep up to
-        // its ~15ms timer tick, which made two contending processes miss the test timeout.
+        // A hold usually lasts one append, so the first retries only yield: Windows rounds a 1ms
+        // sleep up to its ~15ms tick. A longer hold then sleeps so its holder gets the CPU back.
         let deadline = Instant::now() + LOCK_WAIT;
-        loop {
+        for attempt in 0u32.. {
             match lock.try_lock() {
                 Ok(()) => break,
                 Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    std::thread::yield_now();
+                    if attempt < 32 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                 }
                 Err(TryLockError::WouldBlock) => return Ok(()),
                 Err(TryLockError::Error(e)) => return Err(e),
