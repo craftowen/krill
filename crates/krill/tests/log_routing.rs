@@ -2,6 +2,7 @@
 //! 테스트 표식을 지운 실제 실행처럼 띄워, 격리된 상태 폴더의 로그가 그 폴더에 남는지 본다.
 
 #![cfg(unix)]
+#![expect(clippy::unwrap_used, reason = "integration test helpers")]
 
 use std::fs;
 use std::path::{Path, PathBuf};
