@@ -265,6 +265,7 @@ fn holder_that_dies_is_reported() {
 #[cfg(windows)]
 #[test]
 fn job_denied_holder_is_not_relaunched() {
+    static ESCAPES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let d = dir("job-denied");
     std::fs::create_dir_all(&d).unwrap();
     let holder = d.join("holder.cmd");
@@ -288,6 +289,34 @@ fn job_denied_holder_is_not_relaunched() {
     );
     let starts = std::fs::read_to_string(d.join("starts.txt")).unwrap();
     assert_eq!(starts.lines().count(), 1, "{starts}");
+
+    // 앱이 Job 밖 기동기를 등록하면 같은 bootstrap 인수로 부르고, 실패하면 거부를 그대로 알리며 백오프 뒤 다시 시도한다.
+    set_job_escape(|holder, args, dir| {
+        ESCAPES.lock().unwrap().push(format!(
+            "{} {args:?} {}",
+            holder.display(),
+            dir.unwrap().display()
+        ));
+        Err(io::ErrorKind::NotFound.into())
+    });
+    std::thread::sleep(launch_backoff(2) + Duration::from_millis(200));
+    let e = connect(&p, &hello()).unwrap_err();
+    assert!(e.is_job_restricted(), "{e}");
+    let starts = std::fs::read_to_string(d.join("starts.txt")).unwrap();
+    assert_eq!(starts.lines().count(), 2, "{starts}");
+    assert_eq!(
+        *ESCAPES.lock().unwrap(),
+        [format!(
+            "{} {:?} {}",
+            p.holder.display(),
+            [
+                "--bootstrap",
+                &*p.krilld.to_string_lossy(),
+                &*p.socket.to_string_lossy()
+            ],
+            d.join("run").display()
+        )]
+    );
     std::fs::remove_dir_all(&d).ok();
 }
 
