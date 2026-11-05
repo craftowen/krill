@@ -1296,12 +1296,15 @@ test("unsent RPC and hidden visibilitychange feed disarm file zero mobile_rpc_fa
   h.response(s1.socket, { unchanged: true, etag: "e1", feed: 2500 });
   await flush();
   h.context.document.hidden = true;
+  h.context.document.visibilityState = "hidden";
   h.emitDoc("visibilitychange");
   await flush();
   await h.tick(5000);
   await h.tick(0);
   await establish(h, h.sockets.at(-1));
   h.context.document.hidden = false;
+  h.context.document.visibilityState = "visible";
+  h.emitDoc("visibilitychange");
   await settle(h);
   assert.equal(
     h.events().filter((e) => e.error_code === "mobile_rpc_failed").length,
