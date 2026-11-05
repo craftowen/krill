@@ -99,7 +99,7 @@ irm https://krill.page/install.ps1 | iex
 ```
 
 인자 없이 실행하면 최신 릴리스의 x64 ZIP과 SHA-256을 내려받고 검증한 뒤 설치하며,
-시작 메뉴·사용자 PATH를 등록하고 앱을 연다. ARM64·32비트 Windows는 거부한다.
+시작 메뉴·사용자 PATH를 등록하고 앱을 연다. ARM64 PC는 Windows 11(빌드 22000 이상)의 x64 에뮬레이션으로 같은 x64 패키지를 설치하고, Windows 10 on ARM·32비트 Windows는 거부한다.
 `-Release v<버전>`으로 버전을 선택하고 `-NoOpen`으로 자동 실행을 생략할 수 있다.
 홈페이지 Worker는 이 디렉터리의 `install.ps1` 원본을 직접 번들한다.
 

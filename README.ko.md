@@ -221,7 +221,8 @@ ZIP SHA-256 검사 뒤 `%LOCALAPPDATA%\Programs\Krill`에 설치하고 시작 �
 | **모바일 (iOS / Android)** | QR 코드로 페어링하는 모바일 웹 앱(PWA, Relay·Tailscale + ChaCha20-Poly1305 종단간 암호화) | Mac 앱 **설정 → 모바일**에서 QR 스캔(앱 스토어 앱 아님) |
 | **Intel Mac (`x86_64`)** | 이번 공개 프리뷰에서 미지원 | 지원 번들·소스 설치를 약속하지 않음 |
 | **Linux** | 이번 공개 프리뷰에서 미지원 | 데스크톱·원격 호스트 다운로드를 약속하지 않음 |
-| **Windows ARM64·32비트** | 미지원 | 릴리스 패키지 없음 |
+| **Windows 11 ARM64** | Windows 11 x64 에뮬레이션으로 `x64` 패키지 실행. 네이티브 ARM64 빌드 없음 | 같은 Windows 릴리스 ZIP·PowerShell 설치기 |
+| **Windows 10 on ARM·32비트 Windows** | 미지원 | 릴리스 패키지 없음 |
 
 저장소에 Linux 구현·패키징 실험 코드가 있다고 지원 다운로드가 제공되는 것은 아닙니다. 플랫폼별 장애 보장과 검증 범위는 [ARCHITECTURE §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)을 따릅니다.
 

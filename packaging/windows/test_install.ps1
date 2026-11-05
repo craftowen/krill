@@ -187,8 +187,21 @@ namespace KrillTest {
     Reject 'untrusted-url' 'Unexpected release asset URL'
     $state.Assets = @($package, $shaAsset)
 
+    # ARM64 installs the x64 package on Windows 11 (emulation) and is refused on Windows 10 on ARM.
     $env:PROCESSOR_ARCHITECTURE = 'ARM64'
-    Reject 'wrong-arch' 'require an x64 PC'
+    if ([Environment]::OSVersion.Version.Build -ge 22000) {
+        Install (Join-Path $root 'arm64') @{ Zip = $state.Fixture }
+        Assert (Test-Path (Join-Path $root 'arm64/krill-app.exe')) 'ARM64 Windows 11 installation failed'
+    } else {
+        Reject 'arm64-win10' 'requires Windows 11'
+    }
+    # 32-bit PowerShell reports x86 with the native architecture in PROCESSOR_ARCHITEW6432.
+    $env:PROCESSOR_ARCHITECTURE = 'x86'
+    $env:PROCESSOR_ARCHITEW6432 = 'AMD64'
+    Install (Join-Path $root 'wow64') @{ Zip = $state.Fixture }
+    Assert (Test-Path (Join-Path $root 'wow64/krill-app.exe')) '32-bit PowerShell on x64 installation failed'
+    $env:PROCESSOR_ARCHITEW6432 = ''
+    Reject 'wrong-arch' 'require an x64 PC or Windows 11 on ARM64'
     $env:PROCESSOR_ARCHITECTURE = 'AMD64'
     $env:OS = 'Other'
     Reject 'wrong-os' 'requires Windows'
