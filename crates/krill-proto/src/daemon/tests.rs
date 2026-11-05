@@ -251,7 +251,52 @@ fn holder_that_dies_is_reported() {
     };
     let e = connect(&p, &hello()).unwrap_err();
     assert!(matches!(e, Error::HolderExited(s) if !s.success()), "{e}");
+    // 바로 다시 붙으면 holder를 또 띄우지 않고 직전 실패를 보고한다.
+    let again = connect(&p, &hello()).unwrap_err();
+    assert!(
+        matches!(&again, Error::Backoff { last, .. } if *last == e.to_string()),
+        "{again}"
+    );
+    assert_eq!(again.holder_exit_code(), e.holder_exit_code());
     std::fs::remove_dir_all(&d).ok();
+}
+
+/// A bootstrap that the Job refuses to let break away is not relaunched in this process.
+#[cfg(windows)]
+#[test]
+fn job_denied_holder_is_not_relaunched() {
+    let d = dir("job-denied");
+    std::fs::create_dir_all(&d).unwrap();
+    let holder = d.join("holder.cmd");
+    std::fs::write(&holder, "@echo x>>\"%~dp0starts.txt\"\r\n@exit /b 5\r\n").unwrap();
+    let system = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap()
+        .join("System32");
+    let p = Paths {
+        socket: d.join("run/krilld.sock"),
+        holder,
+        krilld: system.join("cmd.exe"),
+    };
+    let e = connect(&p, &hello()).unwrap_err();
+    assert!(e.is_job_restricted(), "{e}");
+    std::thread::sleep(launch_backoff(1) + Duration::from_millis(200));
+    let again = connect(&p, &hello()).unwrap_err();
+    assert!(
+        matches!(again, Error::Backoff { .. }) && again.is_job_restricted(),
+        "{again}"
+    );
+    let starts = std::fs::read_to_string(d.join("starts.txt")).unwrap();
+    assert_eq!(starts.lines().count(), 1, "{starts}");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn launch_backoff_grows_to_a_minute() {
+    let secs: Vec<_> = [1, 2, 3, 7, 8, 100]
+        .map(|n| launch_backoff(n).as_secs())
+        .into();
+    assert_eq!(secs, [1, 2, 4, 60, 60, 60]);
 }
 
 #[test]
@@ -723,7 +768,11 @@ fn windows_paths_choose_flat_then_exact_version_holder() {
         std::fs::write(path, b"MZ").unwrap();
     }
     let paths = Paths::from_exe(&app, &root.join("state"), &[]).unwrap();
-    assert_eq!(paths.holder, executable_path(&current));
+    // `from_exe` canonicalizes, which expands 8.3 short names in `temp_dir()` (`RUNNER~1`).
+    assert_eq!(
+        paths.holder,
+        executable_path(&std::fs::canonicalize(&current).unwrap())
+    );
     assert!(!paths.holder.to_string_lossy().starts_with(r"\\?\"));
     std::fs::write(&holder, b"MZ").unwrap();
     assert_eq!(exe_near(&root, "krill-holder"), holder);

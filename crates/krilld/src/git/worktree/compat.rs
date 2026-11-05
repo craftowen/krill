@@ -246,7 +246,7 @@ pub(super) fn project_destination(
     let Some(raw) = repo_hook_config(&main, state_dir).and_then(|p| p.worktree_base_path) else {
         return Ok(None);
     };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = krill_proto::os::home_dir();
     krill_proto::worktree_location::resolve(&raw, &main, home.as_deref()).map_err(|e| e.to_string())
 }
 

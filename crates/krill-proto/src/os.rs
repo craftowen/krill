@@ -36,6 +36,31 @@ pub fn configure_background(command: &mut std::process::Command) {
     let _ = command;
 }
 
+/// Stop a timed-out child and reap it. On Windows a `.cmd` shim's `cmd.exe` is the child and
+/// node is its grandchild, so the whole tree is ended first (`taskkill /T /F`, as the app's
+/// install runner does). Unix keeps plain `kill`.
+pub fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    if let Ok(mut task) = background_command("taskkill.exe")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_secs(3));
+        while matches!(task.try_wait(), Ok(None))
+            && deadline.is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        task.kill().ok();
+        task.wait().ok();
+    }
+    child.kill().ok();
+    child.wait().ok();
+}
+
 /// [`std::fs::canonicalize`] without the Win32 verbatim prefix (`\\?\C:\x` → `C:\x`), so it agrees with
 /// shell-reported cwds and stays readable on other hosts' sidebars. Identity wrapper on Unix.
 pub fn canonicalize(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {

@@ -479,6 +479,57 @@ fn automatic_codex_setup_refreshes_verified_trust_and_restores_previous_values()
     assert_eq!(restored["hooks"]["state"].as_table().unwrap().len(), 3);
 }
 
+/// Windows receipts from before the direct command hold a PowerShell wrapper that npm's
+/// codex.cmd cannot start. Installing again replaces it and keeps the user's original trust.
+#[test]
+fn codex_install_replaces_a_legacy_powershell_receipt() {
+    use krill_proto::hook_install::{Action, CodexTrust, Plan, TargetAgent};
+    use std::path::Path;
+    let h = Home::new();
+    let key = "/<session-flags>/config.toml:stop:0:0";
+    h.write(
+        "codex",
+        &format!("[hooks.state.\"{key}\"]\ntrusted_hash = 'user-hash'\n"),
+    );
+    let original = h.read("codex");
+    let bin = h.fake_codex();
+    let state = h.0.join("state");
+    let prepare = |exe: &Path| {
+        Plan::prepare_with_trust(
+            Action::Install,
+            TargetAgent::Other(Agent::Codex),
+            &h.config("codex"),
+            &state,
+            exe,
+            Some(bin.as_os_str()),
+            CodexTrust::Refresh,
+        )
+        .unwrap()
+    };
+    prepare(&h.0.join("old/krill")).unwrap().apply().unwrap();
+    // Mark the recorded command as the old Windows wrapper.
+    let receipt_path = hooks::receipt(&state, Agent::Codex);
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    receipt["codex"]["command"] = json!(format!("{}AAAA", hooks::POWERSHELL_CODEX_PREFIX));
+    fs::write(&receipt_path, receipt.to_string()).unwrap();
+    // A current command is kept as-is.
+    let current = prepare(Path::new(MK)).unwrap().apply().unwrap();
+    let record = current.codex.unwrap();
+    assert_eq!(
+        Some(record.command.as_str()),
+        hooks::command(Path::new(MK), Agent::Codex).as_deref()
+    );
+    assert_eq!(record.added.len(), Agent::Codex.events().len());
+    assert_eq!(record.replaced.len(), 1);
+    assert_eq!(record.replaced[key]["trusted_hash"], "user-hash");
+    assert!(prepare(Path::new(MK)).is_none());
+    success(&h.codex("uninstall", &["--yes"]));
+    assert_eq!(
+        toml::from_str::<toml::Value>(&h.read("codex")).unwrap(),
+        toml::from_str::<toml::Value>(&original).unwrap()
+    );
+}
+
 #[test]
 fn codex_trust_conflicts_are_rejected_and_user_modified_hash_is_preserved() {
     let h = Home::new();

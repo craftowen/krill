@@ -77,6 +77,12 @@ impl Session {
             deadline: None,
         })
     }
+    /// `OpenConsole`을 끝내 콘솔을 끊고, 남은 트리는 deadline에 Job째 끝낸다. 반복 요청은 첫 deadline을 유지한다.
+    fn hang_up(&mut self) {
+        self.console.stop_host().ok();
+        self.deadline
+            .get_or_insert(Instant::now() + Duration::from_secs(5));
+    }
 }
 struct Daemon {
     process: Process,
@@ -97,11 +103,23 @@ struct Holder {
     listener: Option<OwnedSocket>,
 }
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
+    sys::suppress_hard_error_dialogs();
     let path = args.next().ok_or(io::ErrorKind::InvalidInput)?;
     if path == "--bootstrap" {
-        return sys::bootstrap(&args.collect::<Vec<_>>());
+        let result = sys::bootstrap(&args.collect::<Vec<_>>());
+        // A Job that forbids breakaway (Task Scheduler) refuses the holder with ERROR_ACCESS_DENIED.
+        // Staying in it would tie every session to that Job, so exit with the Win32 code instead.
+        if let Some(code) = result.as_ref().err().and_then(io::Error::raw_os_error) {
+            #[expect(
+                clippy::exit,
+                reason = "the caller reads the Win32 error from the exit status"
+            )]
+            std::process::exit(code);
+        }
+        return result;
     }
     krill_log::init(krill_log::Component::Holder).ok();
+    sys::enable_ctrl_c();
     let mut h = Holder {
         path,
         args: args.collect(),
@@ -249,14 +267,22 @@ impl Holder {
             }
         }
         let mut events = Vec::new();
-        for s in &mut self.sessions {
-            if s.status.is_none() && s.job.empty().unwrap_or(false) {
-                let status = s.process.status().ok().flatten().unwrap_or(STATUS_UNKNOWN);
-                s.status = Some(status);
-                s.console.stop_host().ok();
-                s.console.close();
-                events.push(FromHolder::Exited { id: s.id, status });
-            }
+        for s in self.sessions.iter_mut().filter(|s| s.status.is_none()) {
+            // Also drains the Job's IOCP notifications so they never pile up.
+            let empty = s.job.empty().unwrap_or(false);
+            // As on Unix the session ends with its leader (shell). Apps it launched (GUI,
+            // new console) keep running, as in Windows Terminal. A teardown waits for the
+            // rest of the Job or its deadline.
+            let status = match s.process.status() {
+                Ok(Some(status)) if s.deadline.is_none() || empty => status,
+                Err(_) if empty => STATUS_UNKNOWN,
+                _ => continue,
+            };
+            s.status = Some(status);
+            s.deadline = None;
+            s.console.stop_host().ok();
+            s.console.close();
+            events.push(FromHolder::Exited { id: s.id, status });
         }
         for m in events {
             self.send(&m, None).ok();
@@ -268,6 +294,7 @@ impl Holder {
             self.daemon = None;
             return true;
         }
+        tracing::warn!(status = %format_args!("{status:#010x}"), ?uptime, "krilld exited");
         let upgrading = std::mem::take(&mut self.upgrading);
         if uptime >= Duration::from_secs(1) && !upgrading {
             self.streak = 0;
@@ -437,19 +464,18 @@ impl Holder {
                 s.size = Some(size);
             }
             ToHolder::Terminate { id, .. } => {
+                // Job을 먼저 끝낸다. 콘솔부터 끊으면 pwsh 7이 콘솔 오류를 처리하지 못하고
+                // .NET 미처리 예외(0xE0434352)로 죽어 WER 보고를 남긴다(v0.2.51과 같은 즉시 종료).
                 let s = self.live(id)?;
-                s.console.stop_host().ok();
                 s.job.terminate().ok();
-                s.deadline = Some(Instant::now() + Duration::from_secs(5));
+                s.hang_up();
             }
             ToHolder::Kill { id, signal, .. } => {
                 let s = self.live(id)?;
-                s.console.stop_host().ok();
                 if signal == 9 {
                     s.job.terminate().ok();
-                } else {
-                    s.deadline = Some(Instant::now() + Duration::from_secs(5));
                 }
+                s.hang_up();
             }
             ToHolder::Release { id, .. } => {
                 if self

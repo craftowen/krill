@@ -100,6 +100,8 @@ pub struct Facts {
     pub agent_install_hint: String,
     /// 영수증이 있는 hook ID(`codex` 등).
     pub hook_receipts: Vec<String>,
+    /// Windows에 POSIX `sh` 명령으로 설치된 hook ID(Windows hook 지원 전 설치분).
+    pub posix_hooks: Vec<String>,
     /// 이 `krill` 실행 파일.
     pub krill_exe: PathBuf,
     pub cli: CliPath,
@@ -146,6 +148,16 @@ pub fn decide(facts: &Facts) -> Vec<Check> {
     }
     for id in HOOK_IDS {
         out.push(hook(facts, id));
+    }
+    for id in &facts.posix_hooks {
+        out.push(check(
+            &format!("hook.{id}.shell"),
+            Level::Recommended,
+            Status::Warn,
+            &format!("{id} hook uses a POSIX sh command that Windows cannot run"),
+            "installed before Windows hook support",
+            fix(FixKind::Command, &format!("krill hook uninstall {id}")),
+        ));
     }
     out.push(cli_path(facts));
     out

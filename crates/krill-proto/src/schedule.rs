@@ -184,7 +184,7 @@ impl Schedule {
         {
             return Some(agent);
         }
-        match self.command.first()?.rsplit('/').next()? {
+        match crate::agent::executable_id(self.command.first()?) {
             "claude" => Some("claude"),
             "codex" => Some("codex"),
             "agy" | "antigravity" => Some("agy"),

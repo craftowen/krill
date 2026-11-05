@@ -622,10 +622,14 @@ fn discard_worktree_file_restores_tracked_changes_and_trashes_untracked_files() 
     )
     .unwrap();
     assert!(!repo.join("untracked.txt").exists());
+    // macOS는 `~/.Trash`로 옮기고, Windows는 시스템 휴지통(Recycle Bin)으로 보낸다(`move_path_to_trash`).
+    #[cfg(not(windows))]
     assert_eq!(
         std::fs::read_to_string(home.join(".Trash/untracked.txt")).unwrap(),
         "scratch\n"
     );
+    #[cfg(windows)]
+    assert!(!home.join(".Trash").exists());
 
     std::fs::remove_dir_all(&dir).ok();
 }

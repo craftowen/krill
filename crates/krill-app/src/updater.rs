@@ -426,8 +426,18 @@ impl Clone for Error {
             Self::Unpack(v) => Self::Unpack(v.clone()),
             Self::NoBackup(v) => Self::NoBackup(v.clone()),
             Self::NoJournal => Self::NoJournal,
-            Self::Io(v) => Self::Io(io::Error::new(v.kind(), v.to_string())),
+            Self::Io(v) => Self::Io(v.raw_os_error().map_or_else(
+                || io::Error::new(v.kind(), v.to_string()),
+                io::Error::from_raw_os_error,
+            )),
         }
+    }
+}
+
+impl Error {
+    /// Disk exhaustion should not cause rapid automatic retries.
+    pub fn is_disk_full(&self) -> bool {
+        matches!(self, Self::Io(error) if error.kind() == io::ErrorKind::StorageFull)
     }
 }
 
@@ -1018,15 +1028,30 @@ pub fn stage_verified_archive(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)?
-        .write_all(archive_bytes)?;
-    let result = stage_verified_file(manifest, public_key, &path, app_bundle, verifier);
-    fs::remove_file(path).ok();
+    let result = (|| {
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?
+            .write_all(archive_bytes)?;
+        stage_verified_file(manifest, public_key, &path, app_bundle, verifier)
+    })();
+    remove_update_temp(&path, false);
     result
+}
+
+fn remove_update_temp(path: &Path, directory: bool) {
+    let result = if directory {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    if let Err(error) = result
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, "updater temporary file cleanup failed");
+    }
 }
 
 fn unique_update_path(bundle: &Path, suffix: &str) -> PathBuf {
@@ -1100,10 +1125,13 @@ fn stage_verified_file(
         fs::remove_file(append_ext(app_bundle, "stage-publish"))?;
         sync_stage_parent(app_bundle)?;
         fs::remove_dir_all(&backup).ok();
+        let marker = serde_json::to_vec(&(manifest.version.as_str(), manifest.sha256.as_str()))
+            .map_err(|error| Error::Json(error.to_string()))?;
+        write_private_file(&append_ext(app_bundle, "staging.verified"), &marker)?;
         Ok(staging)
     })();
-    fs::remove_dir_all(&unpack).ok();
-    fs::remove_dir_all(&candidate).ok();
+    remove_update_temp(&unpack, true);
+    remove_update_temp(&candidate, true);
     result
 }
 
@@ -1196,17 +1224,90 @@ fn recover_stage_publish_locked(app_bundle: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Only old, precisely named files belonging to absent processes are candidates.
+fn cleanup_update_orphans(bundle: &Path) -> io::Result<()> {
+    let parent = bundle
+        .parent()
+        .ok_or_else(|| io::Error::other("bundle has no parent"))?;
+    let Some(name) = bundle.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    let prefix = format!("{name}.");
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        sysinfo::ProcessRefreshKind::new(),
+    );
+    if system
+        .process(sysinfo::Pid::from_u32(std::process::id()))
+        .is_none()
+    {
+        return Err(io::Error::other("cannot inspect updater processes"));
+    }
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let Some((pid, tail)) = rest.split_once('-') else {
+            continue;
+        };
+        let Some((serial, suffix)) = tail.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if serial.parse::<u64>().is_err()
+            || !matches!(suffix, "download.zip" | "unpack.tmp" | "candidate")
+            || pid == std::process::id()
+            || system.process(sysinfo::Pid::from_u32(pid)).is_some()
+        {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(%error, "updater temporary file metadata failed");
+                continue;
+            }
+        };
+        if metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.elapsed().ok())
+            .is_none_or(|age| age < Duration::from_hours(24))
+        {
+            continue;
+        }
+        let result = if metadata.is_dir() {
+            fs::remove_dir_all(entry.path())
+        } else {
+            fs::remove_file(entry.path())
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, "updater temporary file cleanup failed");
+        }
+    }
+    Ok(())
+}
+
 /// Recover interrupted staging publication off the event loop before normal update rollback recovery.
 pub fn on_startup(state_dir: PathBuf, window: &mut gpui::Window, cx: &mut gpui::App) {
     let handle = window.window_handle();
     let work = cx.background_spawn(async move {
         if let Ok(exe) = std::env::current_exe() {
             let configured = std::env::var("KRILL_UPDATE_BUNDLE_PATH").ok();
-            if let Some(bundle) = current_app_bundle_in(configured.as_deref(), &exe)
-                && append_ext(&bundle, "stage-publish").exists()
-                && let Ok(_lock) = staging_lock(&bundle)
-            {
-                recover_stage_publish_locked(&bundle).ok();
+            if let Some(bundle) = current_app_bundle_in(configured.as_deref(), &exe) {
+                if let Err(error) = cleanup_update_orphans(&bundle) {
+                    tracing::warn!(%error, "updater temporary file scan failed");
+                }
+                if append_ext(&bundle, "stage-publish").exists()
+                    && let Ok(_lock) = staging_lock(&bundle)
+                {
+                    recover_stage_publish_locked(&bundle).ok();
+                }
             }
         }
     });
@@ -1354,8 +1455,9 @@ fn fetch_archive(url: &str, bundle: &Path) -> Result<PathBuf, Error> {
     match stream_download(&mut curl, &path) {
         Ok(()) => Ok(path),
         Err(error) => {
-            fs::remove_file(&path).ok();
-            if let Some((repo, tag, asset)) = parse_github_release_asset(url)
+            remove_update_temp(&path, false);
+            if !error.is_disk_full()
+                && let Some((repo, tag, asset)) = parse_github_release_asset(url)
                 && let Some(gh) = find_gh_binary()
             {
                 let mut cmd = crate::platform::background_command(gh);
@@ -1364,10 +1466,16 @@ fn fetch_archive(url: &str, bundle: &Path) -> Result<PathBuf, Error> {
                     cmd.arg(tag);
                 }
                 cmd.args(["--repo", &repo, "--pattern", &asset, "--output", "-"]);
-                if stream_download(&mut cmd, &path).is_ok() {
+                let fallback = stream_download(&mut cmd, &path);
+                if fallback.is_ok() {
                     return Ok(path);
                 }
-                fs::remove_file(&path).ok();
+                remove_update_temp(&path, false);
+                if let Err(fallback_error) = fallback
+                    && fallback_error.is_disk_full()
+                {
+                    return Err(fallback_error);
+                }
             }
             Err(error)
         }
@@ -1407,9 +1515,31 @@ pub fn download_and_stage(
     if decision != Decision::Available {
         return Ok(None);
     }
+    // The marker records an already authenticated archive; it is not a security boundary
+    // against a user who can modify the installation and the marker together.
+    {
+        let _lock = staging_lock(app_bundle)?;
+        recover_stage_publish_locked(app_bundle)?;
+        let staged = staging_path(app_bundle);
+        let marker = fs::File::open(append_ext(app_bundle, "staging.verified"))
+            .ok()
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(1024).read_to_end(&mut bytes).ok()?;
+                serde_json::from_slice::<(String, String)>(&bytes).ok()
+            });
+        if marker.as_ref().is_some_and(|(version, sha)| {
+            version == &manifest.version && sha.eq_ignore_ascii_case(&manifest.sha256)
+        }) && bundle_short_version(&staged)
+            .is_some_and(|version| same_version(&version, &manifest.version))
+            && verifier.verify(&staged).is_ok()
+        {
+            return Ok(Some(staged));
+        }
+    }
     let archive = fetch_archive(&manifest.url, app_bundle)?;
     let staged = stage_verified_file(manifest, public_key, &archive, app_bundle, verifier);
-    fs::remove_file(archive).ok();
+    remove_update_temp(&archive, false);
     staged.map(Some)
 }
 
@@ -1471,28 +1601,42 @@ fn decide_and_stage(
                 .format(&[("version", &manifest.version)]),
         ));
     }
-    let verifier = CodesignVerifier::from_config(cfg);
-    let staged = download_and_stage(
-        manifest,
-        &pk,
-        &from_version,
-        cfg.channel,
-        app_bundle,
-        &verifier,
-        bucket,
-    )?;
-    Ok(match staged {
-        Some(_) => CheckStatus::Ready(StagedUpdate {
-            state_dir: state_dir.to_path_buf(),
-            app_bundle: app_bundle.to_path_buf(),
-            from_version,
-            to_version: manifest.version.clone(),
-            manifest_url: cfg.url.clone(),
-            relaunched: false,
-        }),
-        None => CheckStatus::UpToDate {
-            version: from_version,
-        },
+    let bundle = app_bundle
+        .canonicalize()
+        .unwrap_or_else(|_| app_bundle.to_owned());
+    #[expect(
+        clippy::unnecessary_debug_formatting,
+        reason = "Escaped paths keep staging-flight keys unambiguous"
+    )]
+    let key = format!(
+        "stage|{bundle:?}|{state_dir:?}|{}|{}|{}|{}|{:?}",
+        manifest.version, manifest.sha256, cfg.public_key, cfg.url, cfg.designated_requirement
+    );
+    // Rollback policy is checked above per caller; only the actual download is shared.
+    single_flight(&key, || {
+        let verifier = CodesignVerifier::from_config(cfg);
+        let staged = download_and_stage(
+            manifest,
+            &pk,
+            &from_version,
+            cfg.channel,
+            app_bundle,
+            &verifier,
+            bucket,
+        )?;
+        Ok(match staged {
+            Some(_) => CheckStatus::Ready(StagedUpdate {
+                state_dir: state_dir.to_path_buf(),
+                app_bundle: app_bundle.to_path_buf(),
+                from_version,
+                to_version: manifest.version.clone(),
+                manifest_url: cfg.url.clone(),
+                relaunched: false,
+            }),
+            None => CheckStatus::UpToDate {
+                version: from_version,
+            },
+        })
     })
 }
 
@@ -2062,7 +2206,7 @@ pub fn current_app_bundle_in(bundle_path: Option<&str>, exe: &Path) -> Option<Pa
 }
 
 /// OS 기본 도구의 절대 경로(PATH 가로채기 방지). Windows 10 1803+는 `System32`에 `curl.exe`·`tar.exe`가 있다.
-fn system_tool(name: &str) -> PathBuf {
+pub(crate) fn system_tool(name: &str) -> PathBuf {
     if cfg!(windows) {
         std::env::var_os("SystemRoot")
             .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
@@ -2078,7 +2222,28 @@ fn unpack_with_ditto(zip_path: &Path, unpack_tmp: &Path, staging: &Path) -> Resu
     fs::create_dir_all(unpack_tmp)?;
     let mut cmd = if cfg!(windows) {
         let mut c = crate::platform::background_command(system_tool("tar"));
-        c.arg("-xf").arg(zip_path).arg("-C").arg(unpack_tmp);
+        let relative =
+            zip_path
+                .parent()
+                .zip(unpack_tmp.parent())
+                .and_then(|(parent, dest_parent)| {
+                    let archive = zip_path.file_name()?;
+                    let dest = unpack_tmp.file_name()?;
+                    (parent == dest_parent
+                        && !parent.as_os_str().is_empty()
+                        && archive.to_str().is_some_and(str::is_ascii)
+                        && dest.to_str().is_some_and(str::is_ascii))
+                    .then_some((parent, archive, dest))
+                });
+        if let Some((parent, archive, dest)) = relative {
+            c.current_dir(parent)
+                .arg("-xf")
+                .arg(archive)
+                .arg("-C")
+                .arg(dest);
+        } else {
+            c.arg("-xf").arg(zip_path).arg("-C").arg(unpack_tmp);
+        }
         c
     } else {
         let mut c = crate::platform::background_command(system_tool("ditto"));
@@ -2180,5 +2345,143 @@ fn windows_bundle_without_update_url_uses_windows_manifest() {
         "https://github.com/craftowen/krill/releases/latest/download/latest-windows.json"
     );
     assert_eq!(effective_version(Some(&bundle)), "0.2.6");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn disk_full_survives_single_flight_error_cloning() {
+    let error = Error::Io(io::Error::from_raw_os_error(112));
+    assert!(error.is_disk_full());
+    assert!(error.clone().is_disk_full());
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn verified_staging_is_reused_only_for_matching_signed_manifest() {
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    #[derive(Debug)]
+    struct Accept;
+    impl CodeVerifier for Accept {
+        fn verify(&self, _: &Path) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let root = std::env::temp_dir().join(format!("krill-reuse-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let bundle = root.join("Krill");
+    let staging = staging_path(&bundle);
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(
+        staging.join("Krill.json"),
+        r#"{"CFBundleShortVersionString":"0.2.0"}"#,
+    )
+    .unwrap();
+    let key = Ed25519KeyPair::from_seed_unchecked(&[42; 32]).unwrap();
+    let public_key: PublicKey = key.public_key().as_ref().try_into().unwrap();
+    let mut manifest = Manifest {
+        version: "0.2.0".into(),
+        url: "http://127.0.0.1:1/missing.zip".into(),
+        sha256: "a".repeat(64),
+        ed25519_sig: String::new(),
+        min_daemon_protocol: 1,
+        channel: Channel::Stable,
+        rollout_pct: 100,
+    };
+    manifest.ed25519_sig = ed25519::encode_hex(key.sign(&manifest.signing_payload()).as_ref());
+    fs::write(
+        append_ext(&bundle, "staging.verified"),
+        serde_json::to_vec(&(&manifest.version, &manifest.sha256)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        download_and_stage(
+            &manifest,
+            &public_key,
+            "0.1.0",
+            Channel::Stable,
+            &bundle,
+            &Accept,
+            0
+        )
+        .unwrap(),
+        Some(staging)
+    );
+    fs::write(append_ext(&bundle, "staging.verified"), b"invalid").unwrap();
+    assert!(
+        download_and_stage(
+            &manifest,
+            &public_key,
+            "0.1.0",
+            Channel::Stable,
+            &bundle,
+            &Accept,
+            0
+        )
+        .is_err()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn orphan_cleanup_preserves_live_fresh_and_unrelated_paths() {
+    let root = std::env::temp_dir().join(format!("krill-clean-orphans-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let bundle = root.join("Krill");
+    let orphan = root.join("Krill.4294967295-1-download.zip");
+    let current = root.join(format!("Krill.{}-1-download.zip", std::process::id()));
+    let fresh = root.join("Krill.4294967295-2-download.zip");
+    let other = root.join("Krill.4294967295-1-other");
+    for path in [&orphan, &current, &fresh, &other] {
+        fs::write(path, b"test").unwrap();
+    }
+    for path in [&orphan, &current, &other] {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_hours(25)),
+            )
+            .unwrap();
+    }
+    cleanup_update_orphans(&bundle).unwrap();
+    assert!(!orphan.exists());
+    assert!(current.exists() && fresh.exists() && other.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn system_curl_is_available_for_icon_fetches() {
+    let output = crate::platform::background_command(system_tool("curl"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_unpack_zip_in_unicode_directory() {
+    let root = std::env::temp_dir().join(format!("krill 한글 경로 zip {}", std::process::id()));
+    let source = root.join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join(BUNDLE_INFO), b"{}").unwrap();
+    let status = std::process::Command::new(system_tool("tar"))
+        .current_dir(&root)
+        .args(["-a", "-cf", "archive.zip", "-C", "source", BUNDLE_INFO])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    unpack_with_ditto(
+        &root.join("archive.zip"),
+        &root.join("unpack"),
+        &root.join("staging"),
+    )
+    .unwrap();
+    assert!(root.join("staging").join(BUNDLE_INFO).is_file());
     fs::remove_dir_all(root).unwrap();
 }

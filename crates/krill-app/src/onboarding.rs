@@ -254,7 +254,13 @@ pub fn survey(env: &Env) -> Survey {
     }
 }
 
-fn in_app_bundle(krill: &Path) -> bool {
+/// 앱 번들(Windows는 `Krill.json`이 있는 설치 폴더) 안의 실행 파일인가.
+pub(crate) fn in_app_bundle(krill: &Path) -> bool {
+    if cfg!(windows) {
+        return krill
+            .parent()
+            .is_some_and(|dir| dir.join("Krill.json").is_file());
+    }
     krill
         .ancestors()
         .any(|p| p.extension().is_some_and(|ext| ext == "app"))
@@ -264,12 +270,18 @@ fn in_app_bundle(krill: &Path) -> bool {
 /// 워크트리·임시 빌드면 워크트리가 지워져도 끊기지 않게 `~/.local/share/krill/bin/krill`를 쓴다.
 pub(super) fn stable_mk_path(krill: &Path, home: &Path) -> PathBuf {
     if in_app_bundle(krill) {
-        krill.to_path_buf()
+        // Windows `sibling_exe`는 `\\?\` 접두 경로다. PATH·훅 명령에는 보통 경로를 쓴다.
+        krill_proto::os::shell_path(krill)
     } else {
-        krill_proto::user_dirs::share_dir(home)
-            .join("bin")
-            .join(format!("krill{}", std::env::consts::EXE_SUFFIX))
+        staged_krill(home)
     }
+}
+
+/// `~/.local/share/krill/bin/krill` (`krill.exe` on Windows), where builds outside an app bundle are staged.
+pub(crate) fn staged_krill(home: &Path) -> PathBuf {
+    krill_proto::user_dirs::share_dir(home)
+        .join("bin")
+        .join(format!("krill{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn is_broken_symlink(path: &Path) -> bool {
@@ -301,6 +313,14 @@ fn cli(krill: &Path, path: &OsStr, home: &Path) -> Cli {
         if is_broken_symlink(&candidate) {
             return Cli::Conflict(candidate);
         }
+    }
+    // Windows에는 symlink 대신 설치 폴더를 사용자 PATH에 넣는다(`Offer`는 그 폴더의 krill.exe).
+    if cfg!(windows) {
+        return if in_app_bundle(krill) {
+            Cli::Offer(stable)
+        } else {
+            Cli::Manual
+        };
     }
     // 사용자가 소유하는 흔한 PATH 디렉터리만 고른다. 시스템 디렉터리에 쓰려고 권한을 올리지 않는다.
     let preferred = [
@@ -1103,10 +1123,11 @@ pub(crate) fn stage_binaries(krill: &Path, home: &Path) -> Result<PathBuf, Strin
             .get()
             .replace("{path}", &krill.display().to_string()));
     }
-    let target = stable_mk_path(krill, home);
-    if !in_app_bundle(krill) {
-        stage_executable(krill, &target).map_err(|e| format!("krill: {e}"))?;
-        if let (Some(src_dir), Some(dst_dir)) = (krill.parent(), target.parent()) {
+    let staged = staged_krill(home);
+    // 예전 Windows 빌드가 만든 사본을 이미 설치된 훅이 가리킨다(훅은 다시 쓰지 않는다). 있으면 계속 갱신한다.
+    if !in_app_bundle(krill) || (cfg!(windows) && staged.is_file()) {
+        stage_executable(krill, &staged).map_err(|e| format!("krill: {e}"))?;
+        if let (Some(src_dir), Some(dst_dir)) = (krill.parent(), staged.parent()) {
             for helper in ["krill-holder", "krilld"] {
                 let src = krill_proto::daemon::exe_near(src_dir, helper);
                 if src.is_file() {
@@ -1120,7 +1141,7 @@ pub(crate) fn stage_binaries(krill: &Path, home: &Path) -> Result<PathBuf, Strin
         }
     }
     krill_proto::orchestration::stage_agent_desktop(Some(krill), home).ok();
-    Ok(target)
+    Ok(stable_mk_path(krill, home))
 }
 
 fn install_cli_link(krill: &Path, home: &Path, link: &Path) -> io::Result<()> {
@@ -1134,10 +1155,49 @@ fn install_cli_link(krill: &Path, home: &Path, link: &Path) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("symlink {}", target.display()),
-        ))
+        let dir = link.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        if link != target {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("symlink {}", target.display()),
+            ));
+        }
+        add_user_path(dir)
+    }
+}
+
+/// 사용자 PATH(`HKCU\Environment`)에 `dir`가 없으면 끝에 붙인다. `%VAR%` 항목은 펼치지 않고 그대로 두며,
+/// 빈 `SetEnvironmentVariable`로 `WM_SETTINGCHANGE`를 알려 새로 뜨는 프로그램이 바뀐 PATH를 보게 한다.
+#[cfg(windows)]
+const ADD_USER_PATH: &str = "$d=$env:KRILL_PATH_DIR; $k=Get-Item 'HKCU:\\Environment'; \
+    $p=[string]$k.GetValue('Path','','DoNotExpandEnvironmentNames'); \
+    if (@($p -split ';' | ForEach-Object { $_.TrimEnd('\\') }) -contains $d.TrimEnd('\\')) { exit 0 }; \
+    New-ItemProperty -Path 'HKCU:\\Environment' -Name Path -PropertyType ExpandString -Force \
+    -Value ((@($p.TrimEnd(';'), $d) | Where-Object { $_ }) -join ';') | Out-Null; \
+    [Environment]::SetEnvironmentVariable('KRILL_PATH_REFRESH', $null, 'User')";
+
+#[cfg(windows)]
+fn add_user_path(dir: &Path) -> io::Result<()> {
+    let status = crate::platform::background_command("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            ADD_USER_PATH,
+        ])
+        .env("KRILL_PATH_DIR", dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "PATH {}: {status}",
+            dir.display()
+        )))
     }
 }
 
@@ -1208,6 +1268,92 @@ mod path_tests {
         let path = std::env::join_paths([&root]).unwrap();
         assert!(matches!(cli(&executable, &path, &root), Cli::Installed));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_folder_is_a_bundle_and_offers_the_user_path() {
+        let root = std::env::temp_dir().join(format!("krill-win-bundle-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let install = root.join("Programs").join("Krill");
+        let home = root.join("home");
+        std::fs::create_dir_all(&install).unwrap();
+        let krill = install.join("krill.exe");
+        for name in ["krill.exe", "krill-holder.exe", "krilld.exe"] {
+            std::fs::write(install.join(name), b"fixture-only").unwrap();
+        }
+        let path = std::env::join_paths([home.join(".local").join("bin")]).unwrap();
+        assert_eq!(cli(&krill, &path, &home), Cli::Manual, "dev build");
+        std::fs::write(install.join("Krill.json"), b"{}").unwrap();
+        assert_eq!(cli(&krill, &path, &home), Cli::Offer(krill.clone()));
+        // `sibling_exe` canonicalizes to `\\?\C:\...`; PATH and hooks get the ordinary path.
+        let verbatim = std::fs::canonicalize(&krill).unwrap();
+        assert!(
+            matches!(cli(&verbatim, &path, &home), Cli::Offer(p) if !p.to_string_lossy().starts_with(r"\\?\")),
+            "{verbatim:?}"
+        );
+        assert_eq!(stage_binaries(&krill, &home).unwrap(), krill);
+        assert!(
+            !krill_proto::user_dirs::share_dir(&home)
+                .join("bin")
+                .exists()
+        );
+        // A copy left by an older build stays current for hooks that already point at it.
+        let staged = staged_krill(&home);
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"old").unwrap();
+        assert_eq!(stage_binaries(&krill, &home).unwrap(), krill);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"fixture-only");
+
+        // Same script against a scratch key instead of the real HKCU\Environment.
+        let key = format!(r"HKCU:\Software\KrillPathTest{}", std::process::id());
+        let script = ADD_USER_PATH.replace(r"HKCU:\Environment", &key);
+        let run = || {
+            crate::platform::background_command("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ])
+                .env("KRILL_PATH_DIR", &install)
+                .status()
+                .unwrap()
+        };
+        let read = format!(
+            "(Get-Item '{key}').GetValue('Path','','DoNotExpandEnvironmentNames'); \
+             (Get-Item '{key}').GetValueKind('Path')"
+        );
+        let seed = format!(
+            r"New-Item '{key}' -Force | Out-Null; New-ItemProperty '{key}' -Name Path -Value 'C:\a;%USERPROFILE%\b;' -PropertyType ExpandString | Out-Null"
+        );
+        let ps = |command: &str| {
+            let out = crate::platform::background_command("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    command,
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        ps(&seed);
+        assert!(run().success());
+        assert!(run().success(), "second run is a no-op");
+        let value = ps(&read);
+        ps(&format!("Remove-Item '{key}' -Recurse -Force"));
+        assert_eq!(
+            value,
+            format!(
+                "C:\\a;%USERPROFILE%\\b;{}\r\nExpandString",
+                install.display()
+            )
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

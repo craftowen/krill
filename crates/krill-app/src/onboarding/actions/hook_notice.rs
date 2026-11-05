@@ -54,7 +54,7 @@ pub(super) fn install_enabled(
     let login_path = (search.is_none() && agent.id() == "codex")
         .then(|| super::super::login_path(&env.shell))
         .flatten();
-    let plan = Plan::prepare_with_trust(
+    let plan = match Plan::prepare_with_trust(
         Action::Install,
         agent,
         &path,
@@ -62,8 +62,11 @@ pub(super) fn install_enabled(
         &executable,
         search.or(login_path.as_deref()),
         CodexTrust::Refresh,
-    )
-    .map_err(|error| super::hook_prepare_error(agent, &error))?;
+    ) {
+        // Not available on this platform (Antigravity on Windows); nothing for the user to fix.
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => return Ok(()),
+        plan => plan.map_err(|error| super::hook_prepare_error(agent, &error))?,
+    };
     if let Some(plan) = plan {
         super::apply_hook(plan)?;
     }

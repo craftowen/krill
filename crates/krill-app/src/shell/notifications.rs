@@ -83,7 +83,7 @@ impl Shell {
         for (kind, message) in [
             (
                 Kind::Link,
-                matches!(self.link, Link::Failed(_))
+                matches!(self.link, Link::Failed(_) | Link::Restricted)
                     .then(|| self.link.banner())
                     .flatten(),
             ),
@@ -165,7 +165,7 @@ impl Shell {
                         Kind::SidebarPreferenceError => {
                             Notification::new().with_type(NotificationType::Error)
                         }
-                        Kind::Link if matches!(self.link, Link::Failed(_)) => {
+                        Kind::Link if matches!(self.link, Link::Failed(_) | Link::Restricted) => {
                             Notification::new().with_type(NotificationType::Error)
                         }
                         _ => Notification::new().icon(

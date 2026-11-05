@@ -78,7 +78,7 @@ impl Settings {
             .to_str()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hook path is not utf-8"))?
             .to_owned();
-        let handler = krill_proto::agent::hooks::claude_hook(&command);
+        let handler = krill_proto::agent::hooks::claude_hook(&command, version);
         let hooks: serde_json::Map<String, serde_json::Value> = claude::events(version)
             .into_iter()
             .map(|event| {

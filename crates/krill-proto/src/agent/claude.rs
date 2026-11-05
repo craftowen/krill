@@ -26,6 +26,12 @@ fn version(text: &str) -> Option<(u32, u32, u32)> {
     parts.next().is_none().then_some(v)
 }
 
+/// Hook `args` (exec form) arrived in Claude Code 2.1.139 (CHANGELOG). Unknown versions use it.
+#[must_use]
+pub fn supports_exec_hooks(text: Option<&str>) -> bool {
+    text.and_then(version).is_none_or(|v| v >= (2, 1, 139))
+}
+
 /// 지원되는 이벤트만 순서대로 반환한다. 1.0.62 미만은 hook 없이 보조 감지를 쓴다.
 /// 버전 미확인은 MK-011 결정의 {`PreToolUse`, `PostToolUse`, `Stop`, `SessionStart`}에
 /// `UserPromptSubmit`을 더한다. `SessionStart`(1.0.62)보다 먼저 나온 이벤트라 위험이 늘지 않고,

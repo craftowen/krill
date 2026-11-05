@@ -190,6 +190,9 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsHandle;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::System::Console::{self as winconsole, COORD, HPCON};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    GetErrorMode, SEM_FAILCRITICALERRORS, SetErrorMode,
+};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
@@ -199,12 +202,12 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_DUP_HANDLE, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    CREATE_DEFAULT_ERROR_MODE, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+    DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcess,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_DUP_HANDLE,
+    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 type Create = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
@@ -429,10 +432,16 @@ pub fn wide(s: &OsStr) -> io::Result<Vec<u16>> {
     v.push(0);
     Ok(v)
 }
+/// CommandLineToArgvW/CRT 규칙으로 인수 하나를 인용한다. 공백·탭·개행·따옴표가 없으면 그대로 둔다.
+/// cmd.exe는 CRT 규칙으로 파싱하지 않아 `"/c"`처럼 불필요한 따옴표가 `/c` 뒤 명령을 깨뜨린다.
 fn quote(s: &OsStr) -> Vec<u16> {
+    let raw: Vec<u16> = s.encode_wide().collect();
+    if !raw.is_empty() && !raw.iter().any(|c| matches!(c, 9 | 10 | 11 | 32 | 34)) {
+        return raw;
+    }
     let mut out = vec![34];
     let mut slash = 0;
-    for ch in s.encode_wide() {
+    for ch in raw {
         if ch == 92 {
             slash += 1;
             continue;
@@ -498,6 +507,29 @@ impl Drop for Attributes {
         }
     }
 }
+/// A process that fails while loading (`0xC000012D` at the commit limit) cannot suppress its own
+/// dialog, so the parent must: children inherit this mode. Background helpers stop blocking on an
+/// unattended modal and fail with an exit status instead.
+pub fn suppress_hard_error_dialogs() {
+    // SAFETY: no pointers; only reads this process's error mode.
+    let mode = unsafe { GetErrorMode() };
+    // SAFETY: no pointers; only changes this process's error mode.
+    unsafe { SetErrorMode(mode | SEM_FAILCRITICALERRORS) };
+}
+
+/// Programs in a session keep Windows' default. The krilld trampoline stays silent itself and
+/// clears the bit before starting the real program.
+fn error_mode_flag(args: &[OsString], session: bool) -> u32 {
+    let trampoline = args.first().is_some_and(|arg| {
+        arg == "--agent-exec" || arg == "--agent-exec-then-shell" || arg == "--shell-exec"
+    });
+    if session && !trampoline {
+        CREATE_DEFAULT_ERROR_MODE
+    } else {
+        0
+    }
+}
+
 pub fn spawn(
     path: &OsStr,
     args: &[OsString],
@@ -586,7 +618,8 @@ pub fn spawn(
             DETACHED_PROCESS
         } else {
             0
-        };
+        }
+        | error_mode_flag(args, console.is_some());
     // SAFETY: all buffers and attribute storage remain live, inheritance is limited by HANDLE_LIST.
     cvt(unsafe {
         CreateProcessW(
@@ -961,6 +994,15 @@ pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
     spawn_detached(std::env::current_exe()?.as_os_str(), args, true).map(|_| ())
 }
 
+/// `CREATE_NEW_PROCESS_GROUP`(bootstrap)이 켠 Ctrl+C 무시 표시는 krilld와 세션 셸까지 상속돼 `ping -t`가
+/// Ctrl+C로 멈추지 않았다. 콘솔이 없는 holder에는 Ctrl+C가 오지 않으므로 끄기만 한다.
+pub fn enable_ctrl_c() {
+    // SAFETY: a NULL handler only clears this process's inheritable Ctrl+C ignore flag.
+    if unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) } == 0 {
+        tracing::warn!(error = %io::Error::last_os_error(), "Ctrl+C stays ignored in new sessions");
+    }
+}
+
 /// Start without inheriting any handles, including captured stdout in ancestors.
 /// Only the holder bootstrap needs to escape a caller's Job.
 pub fn spawn_detached(path: &OsStr, args: &[OsString], break_away: bool) -> io::Result<Process> {
@@ -1029,6 +1071,60 @@ pub fn spawn_detached(path: &OsStr, args: &[OsString], break_away: bool) -> io::
 mod tests {
     use super::*;
     #[test]
+    fn only_session_programs_get_the_default_error_mode() {
+        let flag = |args: &[&str], session| {
+            let args: Vec<_> = args.iter().map(OsString::from).collect();
+            error_mode_flag(&args, session)
+        };
+        assert_eq!(flag(&["daemon.sock"], false), 0);
+        for trampoline in ["--agent-exec", "--agent-exec-then-shell", "--shell-exec"] {
+            assert_eq!(flag(&[trampoline, "claude"], true), 0);
+        }
+        assert_eq!(flag(&["-NoLogo"], true), CREATE_DEFAULT_ERROR_MODE);
+        assert_eq!(flag(&[], true), CREATE_DEFAULT_ERROR_MODE);
+    }
+    /// Re-runs this test as the spawned child, which reports the error mode it actually inherited.
+    #[test]
+    #[expect(clippy::exit, reason = "the child reports through its exit code")]
+    fn spawned_daemon_inherits_the_suppressed_error_mode() -> io::Result<()> {
+        const PROBE: &str = "KRILL_TEST_REPORT_ERROR_MODE";
+        if std::env::var_os(PROBE).is_some() {
+            // SAFETY: no pointers; only reads this process's error mode.
+            std::process::exit(unsafe { GetErrorMode() }.cast_signed());
+        }
+        let test = module_path!().split_once("::").unwrap().1;
+        let args = [
+            format!("{test}::spawned_daemon_inherits_the_suppressed_error_mode"),
+            "--exact".to_owned(),
+        ]
+        .map(OsString::from);
+        let env: Vec<_> = std::env::vars_os()
+            .chain([(PROBE.into(), "1".into())])
+            .collect();
+        let exe = std::env::current_exe()?;
+        let child_mode = || -> io::Result<u32> {
+            let child = spawn(exe.as_os_str(), &args, &env, None, None, &[], None)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.status()? {
+                    return Ok(status.cast_unsigned());
+                }
+                assert!(std::time::Instant::now() < deadline, "child did not exit");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        // SAFETY: no pointers; test binary runs this process-wide change on its own.
+        let original = unsafe { SetErrorMode(0) };
+        let control = child_mode()?;
+        suppress_hard_error_dialogs();
+        let treated = child_mode()?;
+        // SAFETY: no pointers; restores the mode saved above.
+        unsafe { SetErrorMode(original) };
+        assert_eq!(control & SEM_FAILCRITICALERRORS, 0);
+        assert_ne!(treated & SEM_FAILCRITICALERRORS, 0);
+        Ok(())
+    }
+    #[test]
     fn new_inbox_session_is_rejected_before_calling_an_opaque_backend() {
         static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         extern "system" fn forbidden_create(
@@ -1075,6 +1171,32 @@ mod tests {
         Ok(())
     }
 
+    fn quoted(s: &str) -> String {
+        String::from_utf16_lossy(&quote(OsStr::new(s)))
+    }
+    #[test]
+    fn quote_leaves_plain_args_and_escapes_the_rest() {
+        assert_eq!(quoted("/c"), "/c");
+        assert_eq!(quoted(r"C:\dir\x.exe"), r"C:\dir\x.exe");
+        assert_eq!(quoted(""), "\"\"");
+        assert_eq!(quoted("a b"), "\"a b\"");
+        assert_eq!(quoted(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quoted(r"a b\"), r#""a b\\""#);
+        assert_eq!(quoted(r#"a\"b c"#), r#""a\\\"b c""#);
+    }
+    #[test]
+    fn cmd_c_runs_the_quoted_command() -> io::Result<()> {
+        let cmd =
+            std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
+        let env: Vec<_> = std::env::vars_os().collect();
+        let args = ["/d", "/c", "ver >nul & exit 7"].map(OsString::from);
+        let child = spawn(&cmd, &args, &env, None, None, &[], None)?;
+        // SAFETY: owned live process handle, bounded wait.
+        let waited = unsafe { WaitForSingleObject(child.handle.as_raw_handle(), 10_000) };
+        assert_eq!(waited, 0);
+        assert_eq!(child.status()?, Some(7));
+        Ok(())
+    }
     #[test]
     fn empty_job_stays_empty_without_iocp_transition() -> io::Result<()> {
         let job = Job::new()?;

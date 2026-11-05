@@ -220,6 +220,12 @@ fn render_checks(checks: &[Check]) {
             println!("{id:<10} ok: {} {}", c.summary, c.detail);
         }
     }
+    for c in checks
+        .iter()
+        .filter(|c| c.id.starts_with("hook.") && c.id.split('.').nth(2) == Some("shell"))
+    {
+        println!("{:<10} WARN: {} ({})", c.id, c.summary, c.fix.value);
+    }
     for id in HOOK_IDS {
         if let Some(c) = find(checks, &format!("hook.{id}")) {
             match c.status {
@@ -291,6 +297,24 @@ fn collect(no_start: bool) -> Collected {
         })
         .map(str::to_owned)
         .collect();
+    // The Unix guard command (`if [ -n "${MK_PANE_ID:-}" ]`) cannot run in a Windows hook shell.
+    let posix_hooks = ["agy", "cursor"]
+        .into_iter()
+        .filter(|id| {
+            cfg!(windows)
+                && state_dir.as_deref().is_some_and(|state| {
+                    krill_proto::agent::hooks::Agent::parse(id)
+                        .and_then(|agent| {
+                            std::fs::read_to_string(krill_proto::agent::hooks::receipt(
+                                state, agent,
+                            ))
+                            .ok()
+                        })
+                        .is_some_and(|receipt| receipt.contains("if [ -n "))
+                })
+        })
+        .map(str::to_owned)
+        .collect();
     let krill_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("krill"));
     let home: Option<PathBuf> = crate::hook_install::home_dir().map(PathBuf::from);
     let facts = Facts {
@@ -318,6 +342,7 @@ fn collect(no_start: bool) -> Collected {
         agents,
         agent_install_hint: builtin_install_hint(),
         hook_receipts,
+        posix_hooks,
         krill_exe: krill_exe.clone(),
         cli: cli_path(&krill_exe, &path, home.as_deref()),
     };

@@ -124,7 +124,7 @@ pub fn remove_with_state(
                 args.push("--force".into());
             }
             args.push("--".into());
-            args.push(path.as_os_str().to_owned());
+            args.push(krill_proto::os::shell_path(&path).into_os_string());
             if let Err(first_err) =
                 git(q, repo, args).and_then(|out| text(out, "git worktree remove failed"))
             {
@@ -141,7 +141,7 @@ pub fn remove_with_state(
                         OsString::from("remove"),
                         OsString::from("--force"),
                         OsString::from("--"),
-                        path.as_os_str().to_owned(),
+                        krill_proto::os::shell_path(&path).into_os_string(),
                     ];
                     if let Err(retry_err) =
                         git(q, repo, retry_args).and_then(|out| text(out, &first_err))

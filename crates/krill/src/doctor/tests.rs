@@ -106,6 +106,7 @@ fn ok_facts() -> Facts {
             "opencode".to_owned(),
             "cursor".to_owned(),
         ],
+        posix_hooks: Vec::new(),
         krill_exe: PathBuf::from("/tmp/bin/krill"),
         cli: CliPath::Installed,
     }
@@ -318,6 +319,16 @@ fn missing_hook_warns_with_install_command() {
     let c = checks.iter().find(|c| c.id == "hook.cursor").unwrap();
     assert_eq!(c.status, Status::Warn);
     assert_eq!(c.fix.value, "krill hook install cursor");
+}
+
+#[test]
+fn posix_hook_on_windows_warns_with_uninstall_command() {
+    let mut f = ok_facts();
+    f.posix_hooks.push("agy".to_owned());
+    let checks = super::checks::decide(&f);
+    let c = checks.iter().find(|c| c.id == "hook.agy.shell").unwrap();
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(c.fix.value, "krill hook uninstall agy");
 }
 
 #[test]

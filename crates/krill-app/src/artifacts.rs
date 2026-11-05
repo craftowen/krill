@@ -166,14 +166,22 @@ pub type DeleteCall = Arc<dyn Fn(String) -> Result<(), String> + Send + Sync>;
 fn cli_call(state: Option<PathBuf>) -> Call {
     Arc::new(move |cursor| {
         let exe = krill_proto::daemon::sibling_exe("krill").map_err(|e| e.to_string())?;
-        list_command(&mut Command::new(exe), state.as_deref(), cursor)
+        list_command(
+            &mut crate::platform::background_command(exe),
+            state.as_deref(),
+            cursor,
+        )
     })
 }
 
 fn cli_delete_call(state: Option<PathBuf>) -> DeleteCall {
     Arc::new(move |slug| {
         let exe = krill_proto::daemon::sibling_exe("krill").map_err(|e| e.to_string())?;
-        delete_command(&mut Command::new(exe), state.as_deref(), &slug)
+        delete_command(
+            &mut crate::platform::background_command(exe),
+            state.as_deref(),
+            &slug,
+        )
     })
 }
 

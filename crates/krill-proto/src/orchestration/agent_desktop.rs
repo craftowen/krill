@@ -961,13 +961,23 @@ fn extract_and_stage_archive(
     let archive_path = work_dir.join(archive_name);
     let result = (|| {
         fs::write(&archive_path, archive_bytes)?;
-        let out = crate::os::background_command("tar")
-            .arg("-xzf")
-            .arg(&archive_path)
-            .arg("-C")
-            .arg(&work_dir)
-            .stdin(Stdio::null())
-            .output()?;
+        let mut tar = crate::os::background_command("tar");
+        if cfg!(windows)
+            && archive_path.parent() == Some(work_dir.as_path())
+            && archive_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(str::is_ascii)
+        {
+            tar.current_dir(&work_dir)
+                .arg("-xzf")
+                .arg(archive_path.file_name().unwrap_or_default())
+                .arg("-C")
+                .arg(".");
+        } else {
+            tar.arg("-xzf").arg(&archive_path).arg("-C").arg(&work_dir);
+        }
+        let out = tar.stdin(Stdio::null()).output()?;
         if !out.status.success() {
             return Err(io::Error::other(format!(
                 "tar extraction failed: {}",
@@ -1278,4 +1288,29 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_extract_archive_in_unicode_directory() {
+    let root = std::env::temp_dir().join(format!("krill 한글 경로 tar {}", std::process::id()));
+    let source = root.join("source");
+    let bin = root.join("bin");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let asset = current_agent_desktop_asset().unwrap();
+    fs::write(source.join(asset.main_binary), b"test executable").unwrap();
+    let status = std::process::Command::new("tar")
+        .current_dir(&root)
+        .args(["-czf", "archive.tar.gz", "-C", "source", asset.main_binary])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let bytes = fs::read(root.join("archive.tar.gz")).unwrap();
+    extract_and_stage_archive(&bytes, &bin, asset, asset.archive_name, asset.version).unwrap();
+    assert_eq!(
+        fs::read(bin.join(asset.main_binary)).unwrap(),
+        b"test executable"
+    );
+    fs::remove_dir_all(root).unwrap();
 }

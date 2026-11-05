@@ -206,6 +206,7 @@ pub(super) fn swap_with(
         }
         // 교체는 끝났다. 남은 스테이징을 못 지웠다고 완료된 업데이트를 되돌리지 않는다(다음 스테이징이 치운다).
         fs::remove_dir_all(&staging).ok();
+        fs::remove_file(verified_marker(app_bundle)).ok();
         journal.stage = Stage::VerifyingLaunch;
         journal.save(state_dir)
     })();
@@ -345,6 +346,7 @@ pub(super) fn recover_with(mode: Mode, state_dir: &Path) -> Result<Option<Journa
             if staging.exists() {
                 rename::move_tree(&staging, &journal.bundle, &trash)?;
                 fs::remove_dir_all(&staging)?;
+                fs::remove_file(verified_marker(&journal.bundle)).ok();
             }
             journal.stage = Stage::VerifyingLaunch;
             journal.save(state_dir)?;
@@ -753,6 +755,11 @@ pub(super) fn run_relauncher_args(
 
 /// 앱이 창과 데몬 연결을 준비한 직후 호출해 relauncher에 정상 기동 신호(`ready`)를 보낸다.
 pub fn mark_ready(state_dir: &Path, current_version: &str) {
+    // ready를 쓰기 전에 본다: 이 실행이 확정한 업데이트는 아직 Healthy가 아니다(relauncher도 ready를 보고서야 바꾼다).
+    let confirmed = Journal::load(state_dir)
+        .ok()
+        .flatten()
+        .filter(|j| j.stage == Stage::Healthy);
     if let Some(path) = std::env::var_os(READY_ENV) {
         write_private_file(&PathBuf::from(path), b"ok\n").ok();
     }
@@ -773,6 +780,49 @@ pub fn mark_ready(state_dir: &Path, current_version: &str) {
     {
         journal.stage = Stage::Healthy;
         journal.save(state_dir).ok();
+    }
+    if let Some(journal) = confirmed {
+        discard_confirmed_backup(MODE, state_dir, &journal);
+    }
+}
+
+fn verified_marker(app_bundle: &Path) -> PathBuf {
+    append_ext(app_bundle, "staging.verified")
+}
+
+/// 앞선 실행에서 확정(Healthy)된 업데이트의 `.prev` 백업과 소비된 스테이징의 검증 표식을 치운다.
+/// Healthy 뒤로 `.prev`는 롤백 원천이 아니다. 확정한 그 실행에서는 구 krilld·krill-link가 `.prev`의 이미지로
+/// 아직 돌 수 있어 다음 실행까지 둔다. 못 지운 것(Windows 실행 중 파일)은 `.trash`로 옮기거나 다음 실행에 다시 본다.
+pub(super) fn discard_confirmed_backup(mode: Mode, state_dir: &Path, confirmed: &Journal) {
+    let bundle = &confirmed.bundle;
+    let prev = prev_path(bundle);
+    let marker = verified_marker(bundle);
+    let staging = staging_path(bundle);
+    if !prev.exists() && (staging.exists() || !marker.exists()) {
+        return;
+    }
+    let Ok(_lock) = staging_lock(bundle) else {
+        return;
+    };
+    // 잠금을 기다리는 사이 새 교체가 시작됐으면 `.prev`는 그 교체의 백업이다.
+    if Journal::load(state_dir).ok().flatten().as_ref() != Some(confirmed) {
+        return;
+    }
+    if !staging.exists() {
+        fs::remove_file(&marker).ok();
+    }
+    let result = match mode {
+        Mode::InPlace => fs::remove_dir_all(&prev),
+        Mode::Rename => {
+            let trash = trash_path(bundle);
+            rename::purge(&trash);
+            rename::clear(&prev, &trash).and_then(|()| fs::remove_dir(&prev))
+        }
+    };
+    if let Err(error) = result
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, "confirmed update backup cleanup deferred");
     }
 }
 
@@ -977,5 +1027,65 @@ mod tests {
         assert_eq!(Command::new(&app_exe).status().unwrap().code(), Some(11));
 
         fs::remove_dir_all(dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod backup_cleanup_tests {
+    use super::*;
+
+    /// 업데이트를 확정한 실행은 `.prev`를 남기고, 그다음 실행이 `.prev`와 소비된 스테이징의 표식을 치운다.
+    /// Windows에서는 못 지우는 파일이 있으면 미뤘다가 다음 실행에 마저 지운다.
+    #[test]
+    fn next_run_after_healthy_discards_prev_and_stale_marker() {
+        let root = std::env::temp_dir().join(format!("krill-prev-cleanup-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let bundle = root.join("Krill");
+        let state = root.join("state");
+        let prev = prev_path(&bundle);
+        fs::create_dir_all(prev.join("sub")).unwrap();
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(prev.join("sub").join("krilld.exe"), b"old").unwrap();
+        fs::write(prev.join("krill-link.exe"), b"old").unwrap();
+        fs::write(verified_marker(&bundle), b"[]").unwrap();
+        Journal {
+            bundle: bundle.clone(),
+            from_version: "0.1.0".to_owned(),
+            to_version: "0.2.0".to_owned(),
+            health_timeout_ms: 1,
+            stage: Stage::VerifyingLaunch,
+        }
+        .save(&state)
+        .unwrap();
+
+        mark_ready(&state, "0.2.0");
+        assert_eq!(
+            Journal::load(&state).unwrap().unwrap().stage,
+            Stage::Healthy
+        );
+        assert!(
+            prev.join("krill-link.exe").exists(),
+            "confirming run keeps .prev"
+        );
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // FILE_SHARE_READ만: 지우기·이름 바꾸기를 막는 사용 중 파일.
+            let busy = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(prev.join("krill-link.exe"))
+                .unwrap();
+            mark_ready(&state, "0.2.0");
+            assert!(prev.join("krill-link.exe").exists());
+            drop(busy);
+        }
+
+        mark_ready(&state, "0.2.0");
+        assert!(!prev.exists());
+        assert!(!verified_marker(&bundle).exists());
+        assert!(bundle.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

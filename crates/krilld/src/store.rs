@@ -65,6 +65,8 @@ const REPLAY_STEP: usize = 256;
 const CLEARED_FILE: &str = "cleared";
 /// 명시적 `Request::Close`로 닫힌 세션을 표시하는 파일 이름. 재부팅 소실 세션과 구분해 부활을 막는다.
 const CLOSED_FILE: &str = "closed";
+/// 세션을 띄운 디렉터리. 셸 보고(OSC 7·9;9)가 없는 세션도 krilld 교체 뒤 cwd를 안다(Windows는 남의 cwd를 못 읽는다).
+const CWD_FILE: &str = "cwd";
 
 /// 저장소 상한. 기본값이 ARCHITECTURE §4의 값이다(MB = 10⁶B).
 #[derive(Debug, Clone)]
@@ -250,6 +252,24 @@ impl Store {
             lock(&self.closed).insert(id);
         }
         closed
+    }
+
+    /// 세션을 띄운 디렉터리를 세션 기록 옆에 남긴다. 최선형이라 실패해도 세션은 그대로다.
+    pub(crate) fn remember_cwd(&self, id: SessionId, cwd: &Path) {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let _gate = lock(&self.gate);
+        let dir = self.session_dir(id);
+        if self.recording && !cwd.as_os_str().is_empty() && dir.is_dir() {
+            write_private(&dir.join(CWD_FILE), cwd.as_os_str().as_bytes());
+        }
+    }
+
+    /// [`Self::remember_cwd`]가 남긴 디렉터리.
+    pub(crate) fn launch_cwd(&self, id: SessionId) -> Option<PathBuf> {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let bytes = fs::read(self.session_dir(id).join(CWD_FILE)).ok()?;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+        path.is_absolute().then_some(path)
     }
 
     pub(crate) fn recording(&self) -> bool {
@@ -678,14 +698,21 @@ fn read_cleared(dir: &Path) -> Option<u64> {
 }
 
 fn write_closed(dir: &Path) {
+    write_private(&dir.join(CLOSED_FILE), b"");
+}
+
+fn write_private(path: &Path, bytes: &[u8]) {
     use krill_proto::os::fs::OpenOptionsExt as _;
-    fs::OpenOptions::new()
+    use std::io::Write as _;
+    if let Ok(mut file) = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(dir.join(CLOSED_FILE))
-        .ok();
+        .open(path)
+    {
+        file.write_all(bytes).ok();
+    }
 }
 
 /// [`Store::raw`]가 넘기는 원본 구간 조각.

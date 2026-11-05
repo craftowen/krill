@@ -7,7 +7,7 @@ use std::hash::{Hash as _, Hasher as _};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -536,8 +536,8 @@ fn query_git_ignored(repo: &Path, relative_paths: &[String]) -> Vec<String> {
     if relative_paths.is_empty() || !repo.join(".git").exists() {
         return Vec::new();
     }
-    let Ok(mut child) = Command::new("git")
-        .current_dir(repo)
+    let Ok(mut child) = krill_proto::os::background_command("git")
+        .current_dir(krill_proto::os::shell_path(repo))
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args([
@@ -869,7 +869,7 @@ fn git_ls_files(root: &Path, deadline: Instant) -> Option<Vec<PathBuf>> {
     if !root.join(".git").exists() {
         return None;
     }
-    let mut child = Command::new("git")
+    let mut child = krill_proto::os::background_command("git")
         .current_dir(krill_proto::os::shell_path(root))
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")

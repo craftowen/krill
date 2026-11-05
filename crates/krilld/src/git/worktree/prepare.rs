@@ -89,7 +89,8 @@ impl Pool {
         }
         let pool = Arc::new(Self {
             q,
-            dir: fs::canonicalize(dir).map_err(|e| e.to_string())?,
+            // No Windows `\\?\` prefix: git rewrites it to `//?/C:/...` and cannot write the tree.
+            dir: krill_proto::os::canonicalize(&dir).map_err(|e| e.to_string())?,
             state: Mutex::default(),
             changed: Condvar::new(),
             ttl,
@@ -370,7 +371,8 @@ impl Pool {
             .stdout
             .split(|b| *b == 0)
             .filter_map(|record| record.strip_prefix(b"worktree "))
-            .any(|registered| registered == path.as_os_str().as_bytes());
+            // Path equality: Windows git reports `C:/x` for `C:\x`.
+            .any(|registered| Path::new(OsStr::from_bytes(registered)) == path);
         if registered {
             text(
                 git(

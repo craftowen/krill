@@ -3800,6 +3800,7 @@ dependencies = [
  "sysinfo",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
+ "unicode-width",
 ]
 
 [[package]]
@@ -3832,6 +3833,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "sysinfo",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",

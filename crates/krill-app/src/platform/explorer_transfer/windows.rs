@@ -57,9 +57,13 @@ fn final_path(file: &File) -> io::Result<PathBuf> {
 
 fn validate(file: &File) -> io::Result<()> {
     let meta = file.metadata()?;
-    if meta.file_attributes() & win::FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || (!meta.is_file() && !meta.is_dir())
-    {
+    if meta.file_attributes() & win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "File transfers cannot traverse junctions or other reparse points for safety",
+        ));
+    }
+    if !meta.is_file() && !meta.is_dir() {
         return Err(denied());
     }
     // Normalized handle names include long names, so .git short-name aliases
@@ -155,7 +159,10 @@ impl Directory {
         if !matches!(prefix, Component::Prefix(p) if matches!(p.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)))
             || !matches!(parts.next(), Some(Component::RootDir))
         {
-            return Err(io::ErrorKind::Unsupported.into());
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "File transfers do not support network or device paths",
+            ));
         }
         let mut root = PathBuf::from(prefix.as_os_str());
         root.push("\\");

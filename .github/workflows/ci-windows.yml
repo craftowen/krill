@@ -1,7 +1,12 @@
-# Windows 네이티브 검사. WIN-23 통합 검증 전까지 수동 실행만 허용한다.
+# Windows 네이티브 검사: check, 릴리스 앱 빌드, 워크스페이스 nextest.
+# 2026-11-04 Windows 실기에서 처음 돌린 nextest가 8건 실패했다(그 전까지 Windows 테스트를 한 번도 돌리지 않음).
+# 같은 회귀가 쌓이지 않게 PR·main·release push마다 실행한다(공개 저장소라 러너 비용 없음).
 name: ci-windows
 
 on:
+  push:
+    branches: [main, 'release/**']
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -54,3 +59,42 @@ jobs:
 
       - name: Build app and release shaders
         run: cargo build -p krill-app --release --locked
+
+  test:
+    name: nextest (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Preserve LF before checkout
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust 1.98
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.98"
+
+      - name: Restore test dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-windows-test
+          cache-bin: 'false'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest
+
+      # 통합 테스트가 krill·krill-holder·krilld 실행 파일을 찾는다.
+      - name: Build binaries
+        run: cargo build --workspace --bins --locked
+
+      - name: nextest
+        env:
+          KRILL_TELEMETRY_DISABLED: '1'
+          KRILL_ERROR_REPORTING_DISABLED: '1'
+        run: cargo nextest run --profile ci --workspace --locked --no-tests=pass

@@ -596,7 +596,7 @@ fn main_worktree(path: &Path) -> Option<PathBuf> {
     let link = fs::read_to_string(path.join(".git")).ok()?;
     let gitdir = path.join(link.strip_prefix("gitdir:")?.trim());
     let common = fs::read_to_string(gitdir.join("commondir")).ok()?;
-    let common = fs::canonicalize(gitdir.join(common.trim())).ok()?;
+    let common = krill_proto::os::canonicalize(&gitdir.join(common.trim())).ok()?;
     if common.file_name()? != ".git" {
         return None;
     }
@@ -607,8 +607,16 @@ fn normalize_project_path(path: &Path) -> String {
     if path.as_os_str().is_empty() {
         return String::new();
     }
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = krill_proto::os::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     canonical.to_string_lossy().trim().to_owned()
+}
+
+/// 저장된 경로를 정리한다. 예전 Windows 앱은 `\\?\C:\…`로 등록해 셸이 알린 cwd(`C:\…`)와 맞지 않았다.
+fn clean_stored_path(raw: &str) -> String {
+    let clean = krill_proto::orchestration::clean_workspace_path_str(raw);
+    krill_proto::os::shell_path(Path::new(&clean))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn strip_private_prefix(s: &str) -> &str {
@@ -800,7 +808,7 @@ fn sanitize_imported_projects(file: &mut ImportedProjectsFile) -> bool {
     let mut cleaned_projects: Vec<ImportedProject> = Vec::with_capacity(file.projects.len());
     for mut proj in std::mem::take(&mut file.projects) {
         if proj.host_id.is_none() {
-            let clean_path = krill_proto::orchestration::clean_workspace_path_str(&proj.path);
+            let clean_path = clean_stored_path(&proj.path);
             if clean_path != proj.path.trim() {
                 changed = true;
                 if krill_proto::orchestration::strip_workspace_instance(&proj.display_name)
@@ -828,7 +836,7 @@ fn sanitize_imported_projects(file: &mut ImportedProjectsFile) -> bool {
 
     let mut worktrees = BTreeMap::new();
     for (k, v) in std::mem::take(&mut file.worktrees) {
-        let clean_k = krill_proto::orchestration::clean_workspace_path_str(&k);
+        let clean_k = clean_stored_path(&k);
         if clean_k != k.trim() {
             changed = true;
         }
@@ -838,8 +846,8 @@ fn sanitize_imported_projects(file: &mut ImportedProjectsFile) -> bool {
 
     let mut lineage = BTreeMap::new();
     for (k, mut v) in std::mem::take(&mut file.lineage) {
-        let clean_k = krill_proto::orchestration::clean_workspace_path_str(&k);
-        let clean_wt = krill_proto::orchestration::clean_workspace_path_str(&v.worktree_path);
+        let clean_k = clean_stored_path(&k);
+        let clean_wt = clean_stored_path(&v.worktree_path);
         if clean_k != k.trim() || clean_wt != v.worktree_path.trim() {
             changed = true;
         }
@@ -899,7 +907,7 @@ fn repair_projects_file_on_disk(state_dir: &Path, raw: &str) {
                 .and_then(toml::Value::as_str)
                 .unwrap_or("")
                 .to_owned();
-            let clean_p = krill_proto::orchestration::clean_workspace_path_str(&p);
+            let clean_p = clean_stored_path(&p);
             if clean_p != p.trim() {
                 changed = true;
                 if canonical_id_by_path
@@ -935,7 +943,7 @@ fn repair_projects_file_on_disk(state_dir: &Path, raw: &str) {
         if let Some(toml::Value::Table(tbl)) = root.get_mut(table_name) {
             let mut next = toml::map::Map::new();
             for (k, mut v) in std::mem::take(tbl) {
-                let clean_k = krill_proto::orchestration::clean_workspace_path_str(&k);
+                let clean_k = clean_stored_path(&k);
                 if clean_k != k.trim() {
                     changed = true;
                 }
@@ -946,7 +954,7 @@ fn repair_projects_file_on_disk(state_dir: &Path, raw: &str) {
                         .and_then(toml::Value::as_str)
                         .map(str::to_owned)
                 {
-                    let clean_wp = krill_proto::orchestration::clean_workspace_path_str(&wp);
+                    let clean_wp = clean_stored_path(&wp);
                     if clean_wp != wp.trim() {
                         changed = true;
                         vt.insert("worktree_path".to_owned(), toml::Value::String(clean_wp));
@@ -1646,7 +1654,7 @@ fn resolve_or_fetch_remote_icon(
                 .is_ok_and(|mut set| set.insert(clean_url.clone()));
         if should_spawn {
             std::thread::spawn(move || {
-                let out = std::process::Command::new("/usr/bin/curl")
+                let out = crate::platform::background_command(crate::updater::system_tool("curl"))
                     .args([
                         "-fsSL",
                         "--max-time",
@@ -2352,7 +2360,7 @@ fn fetch_remote_icon_sync(url: &str, cache_dir: &Path) -> Option<crate::ui::icon
             failed.contains_key(&clean_url)
         });
         if !recently_failed {
-            let out = std::process::Command::new("/usr/bin/curl")
+            let out = crate::platform::background_command(crate::updater::system_tool("curl"))
                 .args([
                     "-fsSL",
                     "--max-time",
@@ -2874,7 +2882,7 @@ pub fn parent_map() -> Option<BTreeMap<u32, u32>> {
     {
         return Some(map.clone());
     }
-    let out = std::process::Command::new("ps")
+    let out = crate::platform::background_command("ps")
         .args(["-eo", "pid,ppid"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -3453,7 +3461,7 @@ fn linked_worktree_registers_and_groups_under_main_repo() {
     fs::create_dir_all(&wt).unwrap();
     fs::write(gitdir.join("commondir"), "../..\n").unwrap();
     fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
-    let canon = |p: &Path| fs::canonicalize(p).unwrap();
+    let canon = |p: &Path| krill_proto::os::canonicalize(p).unwrap();
 
     assert_eq!(main_worktree(&wt), Some(canon(&demo)));
     assert_eq!(main_worktree(&demo), None);
@@ -3507,7 +3515,7 @@ fn owe852_register_project_persists_and_dedupes() {
     let value: toml::Value = toml::from_str(&body).unwrap();
     let projects = value["projects"].as_array().unwrap();
     assert_eq!(projects.len(), 1);
-    let expected = fs::canonicalize(&repo)
+    let expected = krill_proto::os::canonicalize(&repo)
         .unwrap_or_else(|_| repo.clone())
         .to_string_lossy()
         .trim()
@@ -3643,7 +3651,7 @@ fn workspace_suffix_and_missing_worktrees_are_repaired_and_filtered() {
     let drive = base.join("내 드라이브");
     fs::create_dir_all(&state_dir).unwrap();
     fs::create_dir_all(&drive).unwrap();
-    let drive_canon = fs::canonicalize(&drive).unwrap();
+    let drive_canon = krill_proto::os::canonicalize(&drive).unwrap();
     let polluted = format!(
         "{}::workspace:2de7222e-4069-4b91-bb07-3e05a9808a9f",
         drive_canon.display()
@@ -3721,4 +3729,40 @@ fn projects_repair_preserves_edits_newer_than_its_snapshot() {
     repair_projects_file_on_disk(&dir, stale);
     assert_eq!(fs::read_to_string(&path).unwrap(), newer);
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// Windows `fs::canonicalize`는 `\\?\C:\…`를 돌려준다. 그대로 저장하면 셸 cwd(`C:\…`)와 다른 프로젝트가 되어
+/// 그 아래 세션이 사이드바·탭 이름에서 빠졌다. 새 등록은 접두 없이 쓰고, 예전 파일은 읽을 때 고친다.
+#[cfg(test)]
+#[cfg(windows)]
+#[test]
+fn windows_projects_are_stored_without_the_verbatim_prefix() {
+    let state =
+        std::env::temp_dir().join(format!("krill-verbatim-projects-{}", std::process::id()));
+    let project = state.join("proj");
+    fs::create_dir_all(&project).unwrap();
+    let plain = krill_proto::os::canonicalize(&project)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(!plain.starts_with(r"\\?\"));
+
+    assert!(register_project(&state, &project).unwrap());
+    let stored = fs::read_to_string(state.join(PROJECTS_FILE)).unwrap();
+    assert!(!stored.contains(r"\\?\"), "{stored}");
+
+    let old = format!(
+        "[[projects]]\nid = \"proj\"\ndisplay_name = \"proj\"\nkind = \"folder\"\npath = '\\\\?\\{plain}'\n"
+    );
+    fs::write(state.join(PROJECTS_FILE), &old).unwrap();
+    let loaded = load_imported_projects(&state).unwrap();
+    assert_eq!(loaded.projects[0].path, plain);
+    assert!(
+        !fs::read_to_string(state.join(PROJECTS_FILE))
+            .unwrap()
+            .contains(r"\\?\")
+    );
+    // 이미 정리된 경로로 다시 등록해도 중복이 생기지 않는다.
+    assert!(!register_project(&state, &project).unwrap());
+    fs::remove_dir_all(&state).ok();
 }

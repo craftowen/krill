@@ -6409,7 +6409,7 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
     // 2. "모두 자동 설정" 버튼 클릭 시 에이전트 훅과 모든 내장 스킬이 한 번에 설치된다.
     //    스테이징된 `.local/share/krill/bin/krill`이 있으면 그 절대경로를 훅 설정에 기록한다.
     let d2 = dir("one-click-setup-all-btn");
-    let staged_krill = d2.join(".local/share/krill/bin/krill");
+    let staged_krill = crate::onboarding::staged_krill(&d2);
     fs::create_dir_all(staged_krill.parent().unwrap()).unwrap();
     fs::write(&staged_krill, "#!/bin/sh\nexit 0\n").unwrap();
     vcx.update(|window, cx| {

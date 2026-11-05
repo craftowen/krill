@@ -178,3 +178,13 @@ proptest::proptest! {
         read_spool(&bytes);
     }
 }
+
+#[test]
+fn strip_utf8_bom_drops_only_a_leading_bom() {
+    assert_eq!(strip_utf8_bom(b"\xEF\xBB\xBF{}".to_vec()), b"{}");
+    assert_eq!(
+        strip_utf8_bom(b"{}\xEF\xBB\xBF".to_vec()),
+        b"{}\xEF\xBB\xBF"
+    );
+    assert_eq!(strip_utf8_bom(Vec::new()), b"");
+}

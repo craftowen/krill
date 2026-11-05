@@ -95,9 +95,12 @@ fn root_in(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
     if let Some(d) = get("KRILL_WORKTREES_DIR") {
         return Ok(PathBuf::from(d));
     }
-    get("HOME")
+    // Windows 기본 환경에는 HOME이 없다. 에이전트와 같은 홈(`krill_proto::os::home_dir`)을 쓴다.
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    get(key)
+        .filter(|h| !h.is_empty())
         .map(|h| krill_proto::user_dirs::worktrees_root(Path::new(&h)))
-        .ok_or_else(|| "HOME is not set".to_owned())
+        .ok_or_else(|| format!("{key} is not set"))
 }
 
 /// setup 세션을 띄울 기본 크기. 요청한 세션 크기를 알 수 없을 때만 쓴다.
@@ -292,8 +295,9 @@ pub fn create_with_pool(
     let dir =
         compat::project_destination(&top, trust.parent())?.unwrap_or_else(|| root.join(repo_name));
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    // git이 기록하는 경로와 비교하려고 실제 경로로(`/tmp` → `/private/tmp`).
-    let dir = fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // git이 기록하는 경로와 비교하려고 실제 경로로(`/tmp` → `/private/tmp`). Windows 접두 `\\?\`는
+    // 뗀다: git은 그 경로를 `//?/C:/...`로 바꿔 `.git` 파일을 쓰지 못한다.
+    let dir = krill_proto::os::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (branch, path) = free_name(q, &top, &dir, &leaf)?;
 
     let promoted = match pool
@@ -1026,4 +1030,15 @@ pub fn recover_preparation() {
     if let Err(error) = prepare::recover() {
         tracing::warn!(%error, "cannot recover speculative worktree");
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn worktree_root_uses_the_profile_when_home_is_unset() {
+    // 탐색기에서 띄운 Krill에는 HOME이 없다.
+    let profile = |k: &str| (k == "USERPROFILE").then(|| OsString::from(r"C:\Users\u"));
+    assert_eq!(
+        root_in(profile),
+        Ok(PathBuf::from(r"C:\Users\u").join("Krill/worktrees"))
+    );
 }

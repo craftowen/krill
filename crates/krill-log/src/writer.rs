@@ -39,12 +39,14 @@ impl RollingLog {
         log.with_lock(|| {
             for index in 0..FILES {
                 let path = log.path(index);
+                // Repair only existing files: creating them here left empty `.log.1`..`.log.4` behind.
                 match open_file_with_access(&path, false) {
                     Ok(file) => {
                         if file.metadata()?.len() > FILE_BYTES {
                             file.set_len(FILE_BYTES)?;
                         }
                     }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
                 }
             }
@@ -111,11 +113,12 @@ fn open_file(path: &Path) -> io::Result<File> {
     open_file_with_access(path, true)
 }
 
+/// `append` is the event path; otherwise this is the startup repair, which never creates files.
 fn open_file_with_access(path: &Path, append: bool) -> io::Result<File> {
     let mut options = OpenOptions::new();
     // Windows append-only handles lack FILE_WRITE_DATA, which set_len needs
     // when repairing an oversized log. Normal events keep append semantics.
-    options.create(true).write(true).append(append).read(true);
+    options.create(append).write(true).append(append).read(true);
     // Windows has no equivalent private-mode or no-follow guarantee yet; OWE-833
     // restores these with explicit ACLs and reparse-point handling.
     #[cfg(unix)]

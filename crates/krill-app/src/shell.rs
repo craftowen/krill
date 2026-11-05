@@ -2974,7 +2974,7 @@ impl Shell {
         match self.link {
             Link::Up => krill_app::hosts::HostStatus::Connected,
             Link::Connecting | Link::Down => krill_app::hosts::HostStatus::Connecting,
-            Link::Failed(_) => krill_app::hosts::HostStatus::Disconnected,
+            Link::Failed(_) | Link::Restricted => krill_app::hosts::HostStatus::Disconnected,
         }
     }
 
@@ -3526,6 +3526,7 @@ impl Shell {
     fn poll_updates(state_dir: PathBuf, cx: &mut Context<Self>) -> Task<()> {
         // 4시간이면 앱을 켠 뒤 낸 릴리스가 반나절 가까이 안 보였다(사용자 지적). 매니페스트 한 번 받는 일이라 30분마다 본다.
         const UPDATE_POLL_INTERVAL: Duration = Duration::from_mins(30);
+        const DISK_FULL_RETRY_INTERVAL: Duration = Duration::from_hours(6);
         cx.spawn(async move |this, cx| {
             loop {
                 let dir = state_dir.clone();
@@ -3533,6 +3534,14 @@ impl Shell {
                     .background_executor()
                     .spawn(async move { krill_app::updater::poll_env_update(&dir) })
                     .await;
+                let retry_interval = if res
+                    .as_ref()
+                    .is_err_and(krill_app::updater::Error::is_disk_full)
+                {
+                    DISK_FULL_RETRY_INTERVAL
+                } else {
+                    UPDATE_POLL_INTERVAL
+                };
                 if let Ok(Some(staged)) = res {
                     let automatic = this
                         .read_with(cx, |_, cx| {
@@ -3570,7 +3579,7 @@ impl Shell {
                         break;
                     }
                 }
-                cx.background_executor().timer(UPDATE_POLL_INTERVAL).await;
+                cx.background_executor().timer(retry_interval).await;
             }
         })
     }
@@ -4954,19 +4963,21 @@ impl Shell {
                 self.layout.set_session(pane, session);
                 self.sync_sidebar_tab_state(cx);
                 self.sync_focused_session(cx);
-                if self.layout.host(pane).is_local()
-                    && self
-                        .sidebar
-                        .read(cx)
-                        .session_on(&krill_app::hosts::HostId::Local, session)
-                        .is_none()
-                {
-                    self.sidebar.update(cx, sidebar::Sidebar::refresh);
-                }
                 self.record_workspace_nav(cx);
                 self.save();
                 self.refresh_detached(cx);
                 self.reconcile_workspace_sessions(cx);
+            }
+            // 새 탭은 예약한 ID로 칸에 먼저 묶여 `fresh`가 아니다. 탭 이름은 사이드바 스냅샷에서 오므로
+            // 모르는 세션이면 접혀 있어도 한 번 읽는다.
+            if self.layout.host(pane).is_local()
+                && self
+                    .sidebar
+                    .read(cx)
+                    .session_on(&krill_app::hosts::HostId::Local, session)
+                    .is_none()
+            {
+                self.sidebar.update(cx, sidebar::Sidebar::refresh);
             }
             linked.map(|l| (session, l))
         });

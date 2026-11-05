@@ -8,9 +8,9 @@
 //!
 //! | 피어 | 범위 |
 //! |---|---|
-//! | 체인이 세션 루트에 닿지 않고 launchd(PID 1)까지 감(외부 셸·앱) | [`Scope::Full`] |
+//! | 체인이 세션 루트에 닿지 않고 launchd(PID 1)까지 가거나 확인할 수 없는 부모(종료·PID 재사용·접근 불가)에서 끊김(외부 셸·앱·서비스 아래) | [`Scope::Full`] |
 //! | 세션 X 루트 프로세스 또는 그 후손 | [`Scope::Session`]`(X)` — 전체 권한, 출신 세션 X를 기억 |
-//! | 피어 PID·부모 조회 실패, 체인이 [`MAX_DEPTH`]를 넘음 | [`Scope::Restricted`] — 어떤 세션도 못 다룸 |
+//! | 피어 PID, 체인 위 프로세스 자신의 부모·시작 시각 조회 실패, 체인이 [`MAX_DEPTH`]를 넘음 | [`Scope::Restricted`] — 어떤 세션도 못 다룸 |
 
 use crate::os::AsFd;
 use krill_proto::os::fs::OpenOptionsExt;
@@ -95,6 +95,12 @@ impl Procs for Sys {
 }
 
 /// `pid`에서 ppid를 따라 올라가며 범위를 정한다.
+///
+/// 부모가 자식보다 먼저 시작했음을 확인한 링크만 따른다. 부모 시작 시각을 못 읽거나(이미 끝남, Windows의 다른
+/// 사용자·서비스 프로세스) 자식보다 늦으면(죽은 부모의 PID 재사용) 진짜 부모는 이미 없는 것이라, 고아가
+/// launchd(1)에 입양된 것처럼 세션 밖([`Scope::Full`])으로 끝낸다. 확인 못 한 링크를 따라가면 남의 계보를 돌다
+/// 순환해 [`MAX_DEPTH`]에 걸린다(재부팅한 Windows에서 services 아래 svchost가 wininit의 죽은 부모 PID를 재사용).
+/// 이 규칙은 걸음을 일찍 끝낼 뿐 늘리지 않으므로 [`Scope::Session`] 판정이 새로 생기지 않는다.
 fn walk(mut pid: u32, roots: &Roots, procs: &impl Procs) -> Scope {
     for _ in 0..MAX_DEPTH {
         if pid <= 1 {
@@ -103,9 +109,12 @@ fn walk(mut pid: u32, roots: &Roots, procs: &impl Procs) -> Scope {
         if let Some(id) = roots.session(pid, |p| procs.start_us(p)) {
             return Scope::Session(id);
         }
-        let Ok(ppid) = procs.parent(pid) else {
+        let (Ok(ppid), Ok(start)) = (procs.parent(pid), procs.start_us(pid)) else {
             return Scope::Restricted;
         };
+        if !procs.start_us(ppid).is_ok_and(|p| p <= start) {
+            return Scope::Full;
+        }
         pid = ppid;
     }
     Scope::Restricted
@@ -312,6 +321,8 @@ impl Audit {
     }
 }
 
+#[cfg(test)]
+mod lineage_tests;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;

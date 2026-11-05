@@ -296,14 +296,15 @@ pub(super) fn install_managed_cli(env: &Env) -> FixOutcome {
 }
 
 fn install_managed_cli_at(env: &Env, path: &std::ffi::OsStr) -> FixOutcome {
-    // The Windows installer already exposes the native CLI. Do not try to
-    // replace it with a Unix-only managed symlink during automatic preparation.
-    #[cfg(windows)]
-    if matches!(
-        super::cli(&env.krill, path, &env.home),
-        super::Cli::Installed
-    ) {
-        return Ok(());
+    // Windows has no managed symlink: put the install folder on the user PATH
+    // when the CLI is missing, and leave an installed or foreign krill alone.
+    if cfg!(windows) {
+        return match super::cli(&env.krill, path, &env.home) {
+            super::Cli::Offer(exe) => {
+                super::install_cli_link(&env.krill, &env.home, &exe).map_err(|e| e.to_string())
+            }
+            super::Cli::Installed | super::Cli::Conflict(_) | super::Cli::Manual => Ok(()),
+        };
     }
     let managed = [
         env.home.join(".local/bin"),
@@ -608,7 +609,16 @@ fn hook_installed(state: &Path, agent: &str) -> bool {
     std::fs::read(state.join("hooks").join(format!("{agent}.json")))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<krill_proto::hook_install::Receipt>(&bytes).ok())
-        .is_some_and(|receipt| receipt.complete && receipt.agent == agent)
+        .is_some_and(|receipt| {
+            // An old Windows Codex PowerShell command is reinstalled (see `hook_install`).
+            receipt.complete
+                && receipt.agent == agent
+                && !receipt.codex.is_some_and(|codex| {
+                    codex
+                        .command
+                        .starts_with(krill_proto::agent::hooks::POWERSHELL_CODEX_PREFIX)
+                })
+        })
 }
 
 #[derive(Default)]

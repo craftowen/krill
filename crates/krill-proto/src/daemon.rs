@@ -551,6 +551,9 @@ pub enum Error {
     Timeout,
     /// 다른 기동자가 [`LOCK_TIMEOUT`] 넘게 `<소켓>.launch` 락을 쥐고 있다.
     LockTimeout,
+    /// 이 프로세스의 직전 holder 기동이 실패해 [`launch_backoff`]가 끝날 때까지 다시 띄우지 않는다.
+    /// 직전 실패 문구와 holder 종료 코드를 담는다.
+    Backoff { last: String, code: Option<i32> },
     /// 연결·협상 실패(버전 불일치는 `InvalidData`).
     Io(io::Error),
 }
@@ -581,12 +584,35 @@ impl fmt::Display for Error {
                 "another launcher held the launch lock for over {}s",
                 LOCK_TIMEOUT.as_secs()
             ),
+            Self::Backoff { last, .. } => write!(f, "{last}"),
             Self::Io(e) => write!(f, "cannot talk to krilld: {e}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// Windows holder bootstrap이 Job 밖으로 나가지 못해(breakaway 거부, 작업 스케줄러 등) 끝날 때의 종료 코드
+/// (`ERROR_ACCESS_DENIED`). 같은 프로세스에서는 다시 띄워도 소용없다. krill-holder bootstrap과 같은 값이어야 한다.
+pub const HOLDER_JOB_DENIED: i32 = 5;
+
+impl Error {
+    /// holder가 krilld 전에 끝난 종료 코드(직전 실패로 기동을 미룬 경우 포함).
+    #[must_use]
+    pub fn holder_exit_code(&self) -> Option<i32> {
+        match self {
+            Self::HolderExited(status) => status.code(),
+            Self::Backoff { code, .. } => *code,
+            _ => None,
+        }
+    }
+
+    /// Windows에서 Job 제한 때문에 세션 데몬을 띄울 수 없다([`HOLDER_JOB_DENIED`]).
+    #[must_use]
+    pub fn is_job_restricted(&self) -> bool {
+        cfg!(windows) && self.holder_exit_code() == Some(HOLDER_JOB_DENIED)
+    }
+}
 
 /// 이 빌드의 프로토콜 범위로 만든 [`ClientHello`].
 pub fn client_hello(role: ClientRole, name: &str) -> ClientHello {
@@ -788,8 +814,68 @@ pub fn reconnect_until(paths: &Paths, hello: &ClientHello) -> Connection {
     }
 }
 
+/// 소켓별 연속 holder 기동 실패. 앱의 여러 연결(감시·칸·사이드바)이 각자 재시도해도 실패한 holder를
+/// 1분에 수백 번 다시 띄우지 않게 프로세스 전역으로 둔다.
+struct LaunchFailure {
+    socket: PathBuf,
+    count: u32,
+    at: Instant,
+    last: String,
+    code: Option<i32>,
+}
+
+static LAUNCH_FAILURE: std::sync::Mutex<Option<LaunchFailure>> = std::sync::Mutex::new(None);
+
+/// `failures`번 연속 기동에 실패한 뒤 다음 기동까지 기다릴 시간: 1초에서 두 배씩, 상한 60초.
+fn launch_backoff(failures: u32) -> Duration {
+    Duration::from_secs(1)
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(6))
+        .min(Duration::from_secs(60))
+}
+
 /// krilld에 붙는다. 소켓이 없거나 죽어 있거나 고아 상태면 holder를 띄우고 재결합까지 기다린다.
+/// 직전 기동이 실패했으면 [`launch_backoff`] 동안(Job 제한이면 계속) 띄우지 않고 [`Error::Backoff`]를 돌려준다.
 pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> {
+    let result = connect_or_launch(paths, hello);
+    let mut failure = LAUNCH_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = failure.as_ref().filter(|f| f.socket == paths.socket);
+    match &result {
+        Ok(_) if previous.is_some() => *failure = None,
+        Err(e @ (Error::Spawn(_) | Error::HolderExited(_) | Error::Timeout)) => {
+            *failure = Some(LaunchFailure {
+                socket: paths.socket.clone(),
+                count: previous.map_or(0, |f| f.count).saturating_add(1),
+                at: Instant::now(),
+                last: e.to_string(),
+                code: e.holder_exit_code(),
+            });
+        }
+        _ => {}
+    }
+    result
+}
+
+fn launch_gate(socket: &Path) -> Result<(), Error> {
+    let failure = LAUNCH_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match failure.as_ref().filter(|f| f.socket == socket) {
+        Some(f)
+            if (cfg!(windows) && f.code == Some(HOLDER_JOB_DENIED))
+                || f.at.elapsed() < launch_backoff(f.count) =>
+        {
+            Err(Error::Backoff {
+                last: f.last.clone(),
+                code: f.code,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+fn connect_or_launch(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> {
     // krilld는 `<소켓>.tmp`에 bind한다.
     let mut tmp = paths.socket.clone().into_os_string();
     tmp.push(".tmp");
@@ -820,6 +906,7 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
         }
         Err(e) => return Err(Error::Io(e)),
     }
+    launch_gate(&paths.socket)?;
     let mut command = Command::new(&paths.holder);
     #[cfg(unix)]
     command.arg(DETACH_ARG);
@@ -831,6 +918,12 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
         command
             .arg("--bootstrap")
             .creation_flags(0x0000_0008 | 0x0000_0200);
+        // holder와 그 krilld는 이 cwd를 물려받아 세션 내내 쥔다. Windows는 프로세스의 현재 폴더를
+        // 지우거나 이름을 바꾸지 못하게 하므로, 띄운 곳(워크트리·설치 폴더) 대신 소켓 폴더를 쥔다.
+        // `launch_lock`이 이 폴더를 이미 만들었다.
+        if let Some(dir) = paths.socket.parent().filter(|d| !d.as_os_str().is_empty()) {
+            command.current_dir(dir);
+        }
     }
     let mut holder = command
         .arg(&paths.krilld)

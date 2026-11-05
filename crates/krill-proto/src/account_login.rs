@@ -170,8 +170,7 @@ pub fn probe_with_environment(
             Ok(Some(status)) => break Some(status),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
-                child.kill().ok();
-                child.wait().ok();
+                crate::os::kill_tree(&mut child);
                 break None;
             }
         }

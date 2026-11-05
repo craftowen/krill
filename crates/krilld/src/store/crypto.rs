@@ -78,6 +78,8 @@ impl Key {
         SystemRandom::new()
             .fill(bytes.as_mut())
             .map_err(crypto_error)?;
+        // 봉인부터 한다. DPAPI가 없는 로그온(SSH 키 인증 등)에서 실패해도 빈 임시 파일을 남기지 않는다.
+        let sealed = seal(bytes.as_ref())?;
         let tmp = root.join(format!(".{KEY_FILE}.{}", std::process::id()));
         std::fs::remove_file(&tmp).ok();
         let mut file = std::fs::OpenOptions::new()
@@ -85,7 +87,7 @@ impl Key {
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.write_all(&seal(bytes.as_ref())?)?;
+        file.write_all(&sealed)?;
         file.sync_all()?;
         drop(file);
         let placed = std::fs::hard_link(&tmp, &path);
@@ -300,6 +302,16 @@ mod tests {
             Key::load(&root, || Ok(true)).is_err(),
             "데이터가 있는데 키가 없으면 새로 만들지 않는다"
         );
+        if crate::sys::user_dpapi_unavailable() {
+            // DPAPI가 없는 로그온(SSH 키 인증 등): 키 생성은 실패하고, 평문 키·빈 임시 파일을 남기지 않는다.
+            assert!(Key::load(&root, || Ok(false)).is_err());
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            eprintln!(
+                "user DPAPI unavailable in this logon (SSH key auth?): sealed key path not exercised"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
         let first = Key::load(&root, || Ok(false)).unwrap();
         let sealed = std::fs::read(root.join(KEY_FILE)).unwrap();
         assert!(sealed.len() > 32, "평문 32바이트가 아니라 DPAPI blob이다");

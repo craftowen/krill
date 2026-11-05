@@ -92,16 +92,30 @@ pub fn disable_server(state_dir: &Path) -> Result<(), Error> {
     save_preference(state_dir, false)?;
     #[cfg(target_os = "macos")]
     crate::disable_launch_agent(state_dir)?;
+    block_on(crate::serve::shutdown_server_command(state_dir))?
+}
+
+fn block_on<T>(future: impl Future<Output = T>) -> Result<T, Error> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(Error::Io)?;
-    runtime.block_on(crate::serve::shutdown_server_command(state_dir))
+    Ok(runtime.block_on(future))
+}
+
+/// 서버 빌드가 이 빌드보다 오래됐는지. 업데이트 뒤에도 구 서버가 남아 Windows에서는 `Krill.prev`의 실행 파일을 쥐고 있다.
+/// 빌드를 알리지 않는 구 서버(빈 값)도 오래된 것으로 본다. 응답이 없으면 교체하지 않는다.
+fn is_stale_build(running: &str) -> bool {
+    running.is_empty() || krill_proto::control::is_newer(krill_proto::BUILD, running) == Some(true)
 }
 
 fn start(executable: &Path, state_dir: &Path) -> Result<(), Error> {
     if is_serve_running(state_dir) {
-        return Ok(());
+        let running = block_on(crate::serve::serve_build_command(state_dir))?;
+        if !running.as_deref().is_some_and(is_stale_build) {
+            return Ok(());
+        }
+        block_on(crate::serve::shutdown_server_command(state_dir))??;
     }
     #[cfg(target_os = "macos")]
     {
@@ -168,5 +182,13 @@ mod tests {
         fs::write(dir.join(PREFERENCE), "invalid").unwrap();
         assert!(incoming_enabled(&dir).is_err());
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replaces_older_or_unannounced_server_builds_only() {
+        assert!(is_stale_build(""));
+        assert!(is_stale_build("0.0.1"));
+        assert!(!is_stale_build(krill_proto::BUILD));
+        assert!(!is_stale_build("999.0.0"));
     }
 }

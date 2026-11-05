@@ -670,14 +670,54 @@ pub fn capture(mut cmd: Command, timeout: Duration) -> Option<String> {
         tx.send(stdout.read_to_string(&mut text).map(|_| text)).ok();
     });
     let out = rx.recv_timeout(timeout);
-    // 이미 끝났으면 좀비라 kill은 무해하다.
-    child.kill().ok();
-    child.wait().ok();
+    if out.is_err() {
+        // 시간 초과: Windows `.cmd` shim의 손자(node)까지 끝낸다.
+        crate::os::kill_tree(&mut child);
+    } else {
+        // 이미 끝났으면 좀비라 kill은 무해하다.
+        child.kill().ok();
+        child.wait().ok();
+    }
     out.ok()?.ok()
 }
 
 #[cfg(test)]
 mod tests;
+
+/// A `.cmd` shim's cmd.exe is the child; its grandchild holds stdout. Timing out must end both.
+#[cfg(all(test, windows))]
+mod capture_tree_tests {
+    #[test]
+    fn capture_timeout_ends_batch_shim_grandchild() {
+        let root = std::env::temp_dir().join(format!("krill-capture-tree-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("grandchild.pid");
+        let shim = root.join("agent.cmd");
+        std::fs::write(
+            &shim,
+            format!(
+                "@echo off\r\npowershell.exe -NoProfile -Command \"Set-Content -LiteralPath '{}' $PID; Start-Sleep 60\"\r\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let out = super::capture(
+            std::process::Command::new(&shim),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(out.is_none());
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid.trim();
+        let list = std::process::Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .unwrap();
+        let list = String::from_utf8_lossy(&list.stdout);
+        assert!(!list.contains(&format!("\"{pid}\"")), "{list}");
+        std::fs::remove_dir_all(root).ok();
+    }
+}
 
 #[cfg(test)]
 mod executable_identity_tests {

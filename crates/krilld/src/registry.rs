@@ -330,7 +330,11 @@ impl Registry {
                 Entry {
                     session,
                     pid: k.pid,
-                    cwd: PathBuf::new(),
+                    cwd: reg
+                        .store
+                        .as_ref()
+                        .and_then(|s| s.launch_cwd(k.id))
+                        .unwrap_or_default(),
                     wrapped: crate::sys::process_args(k.pid).is_ok_and(|a| is_wrapper_argv(&a)),
                 },
             );
@@ -1843,6 +1847,7 @@ impl Registry {
         let size = crate::term::clamp_size(WinSize { cols, rows });
         let mut initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
         env.extend(crate::git::worktree::environment(&initial_cwd));
+        crate::shell::dedupe_env(&mut env);
         // 자식은 Spawned 응답보다 먼저 hook을 보낼 수 있다. 루트·세션을 모두 등록하기 전에는
         // socket hook 적용과 spool 소거를 막아 최초 이벤트가 미귀속 상태로 ACK/폐기되지 않게 한다.
         // holder 응답 리더는 on_exited 워커와 분리돼 있어 이 잠금을 기다리지 않는다.
@@ -1860,7 +1865,7 @@ impl Registry {
         if matches!(
             reply,
             (FromHolder::Failed { errno, .. }, _)
-                if Failure::from_holder_errno(errno) == Failure::Os(libc::ENOENT)
+                if missing_path_errno(errno)
         ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &env)
         {
             initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
@@ -1884,6 +1889,9 @@ impl Registry {
                     self.agents.forget(id);
                     os(&e)
                 })?;
+                if let Some(store) = &self.store {
+                    store.remember_cwd(id, &initial_cwd);
+                }
                 let mut st = lock(&self.state);
                 st.roots.insert(id, pid).ok();
                 st.sessions.insert(
@@ -4115,6 +4123,13 @@ fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
 /// - 로그인 셸(`-l`) 실행 파일이 삭제된 경우(`/opt/homebrew/bin/fish` 등) 시스템 기본 셸로 폴백한다.
 ///
 /// 사용자 지정 실행 파일(`Program::Custom`) 자체가 없는 경우는 건드리지 않고 ENOENT를 그대로 돌려준다.
+/// holder `Spawn` 실패가 "경로 없음"인가. Windows holder는 Win32 코드를 그대로 보낸다: 지워진 cwd는
+/// `ERROR_DIRECTORY`(267), 중간 폴더까지 없으면 `ERROR_PATH_NOT_FOUND`(3), 파일은 `ERROR_FILE_NOT_FOUND`(2=ENOENT).
+fn missing_path_errno(errno: i32) -> bool {
+    Failure::from_holder_errno(errno) == Failure::Os(libc::ENOENT)
+        || cfg!(windows) && matches!(errno, 3 | 267)
+}
+
 fn fallback_spawn_on_enoent(
     #[cfg_attr(
         not(unix),
@@ -4883,5 +4898,24 @@ mod orchestration_delivery_tests {
         drop(reg);
         drop(terminal);
         std::fs::remove_dir_all(dir)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_spawn_tests {
+    /// 지워진 cwd로 `CreateProcessW`가 내는 실제 코드가 폴백 대상이어야 한다(holder는 이 코드를 그대로 보낸다).
+    #[test]
+    fn deleted_cwd_spawn_errors_fall_back() {
+        let root = std::env::temp_dir().join(format!("krilld-gone-cwd-{}", std::process::id()));
+        for cwd in [root.clone(), root.join("a").join("b")] {
+            let error = std::process::Command::new("cmd.exe")
+                .args(["/c", "exit"])
+                .current_dir(&cwd)
+                .spawn()
+                .unwrap_err();
+            let code = error.raw_os_error().unwrap();
+            assert!(super::missing_path_errno(code), "{cwd:?}: {error} ({code})");
+        }
+        assert!(!super::missing_path_errno(5));
     }
 }

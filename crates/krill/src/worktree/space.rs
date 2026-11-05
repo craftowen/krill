@@ -325,8 +325,7 @@ pub fn discover_repositories(state_dir: Option<&Path>) -> Vec<PathBuf> {
             if state_dir.is_some() && state_dir != daemon::state_dir().as_deref() {
                 None
             } else {
-                std::env::var_os("HOME")
-                    .map(|h| krill_proto::user_dirs::worktrees_root(Path::new(&h)))
+                krill_proto::os::home_dir().map(|h| krill_proto::user_dirs::worktrees_root(&h))
             }
         })
         && let Ok(repos_dir) = fs::read_dir(wt_root)
