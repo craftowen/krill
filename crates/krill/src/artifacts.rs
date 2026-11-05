@@ -37,6 +37,9 @@ const MAX_BYTES: u64 = schema::MAX_CONTENT_BYTES;
 const TOKEN_FILE: &str = "artifact-token";
 const SHARES_FILE: &str = "artifact-shares.json";
 const PENDING_FILE: &str = "artifact-pending.json";
+/// krilld가 Google 로그인 뒤 저장하는 기기 세션(`crates/krilld/src/mobile/relay_auth.rs`).
+const ACCOUNT_SESSION_FILE: &str = "mobile-relay-session.json";
+const ACCOUNT_ORIGIN: &str = "https://krill-mobile.pages.dev";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Record {
@@ -689,6 +692,29 @@ fn owner_token(dir: &Path) -> Result<String, Error> {
     Ok(token)
 }
 
+/// 로그인한 Krill 계정의 기기 세션. 있으면 서버가 아티팩트를 기기 토큰 대신 계정에 묶는다.
+/// 이 세션은 릴레이 인증에도 쓰이므로 공식 공유 서버로만 보낸다.
+fn account_session(dir: &Path, url: &str) -> Option<String> {
+    if !url.starts_with(&format!("{DEFAULT_API_URL}/")) {
+        return None;
+    }
+    let value: Value =
+        serde_json::from_slice(&fs::read(dir.join(ACCOUNT_SESSION_FILE)).ok()?).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let token = value["token"].as_str()?;
+    (value["origin"] == ACCOUNT_ORIGIN
+        && value["expires_at_ms"]
+            .as_u64()
+            .is_some_and(|t| u128::from(t) > now)
+        && !token.is_empty()
+        && token.len() <= 4096
+        && token.bytes().all(|b| b.is_ascii_graphic()))
+    .then(|| token.to_owned())
+}
+
 fn random_token() -> Result<String, Error> {
     let mut bytes = [0u8; 32];
     #[cfg(not(windows))]
@@ -779,6 +805,9 @@ fn request_with_idempotency(
     idempotency: Option<&str>,
 ) -> Result<(u16, String), Error> {
     let mut headers = format!("Authorization: Bearer {token}\n");
+    if let Some(session) = account_session(&ctx.state_dir, url) {
+        writeln!(headers, "x-krill-session: {session}").ok();
+    }
     if let Some(key) = idempotency {
         writeln!(headers, "Idempotency-Key: {key}").ok();
     }
@@ -1461,6 +1490,33 @@ printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-01"},"shareUrl":"http://lo
             panic!("bad flag");
         };
         assert_eq!(e.detail().code, "invalid_argument");
+    }
+
+    #[test]
+    fn account_session_only_goes_to_the_official_server() {
+        let env = Env::new("acctsession");
+        let dir = &env.ctx.state_dir;
+        let official = "https://share.krill.page/v1/artifacts";
+        assert_eq!(account_session(dir, official), None);
+        let write = |origin: &str, expires: u64| {
+            let body =
+                json!({"token": "tok", "expires_at_ms": expires, "email": "a@b", "origin": origin});
+            fs::write(dir.join(ACCOUNT_SESSION_FILE), body.to_string()).unwrap();
+        };
+        write(ACCOUNT_ORIGIN, u64::MAX);
+        assert_eq!(account_session(dir, official).as_deref(), Some("tok"));
+        assert_eq!(
+            account_session(dir, "https://share.krill.page.evil/v1/artifacts"),
+            None
+        );
+        assert_eq!(
+            account_session(dir, "http://127.0.0.1:9/v1/artifacts"),
+            None
+        );
+        write(ACCOUNT_ORIGIN, 1);
+        assert_eq!(account_session(dir, official), None);
+        write("http://127.0.0.1:9", u64::MAX);
+        assert_eq!(account_session(dir, official), None);
     }
 }
 
