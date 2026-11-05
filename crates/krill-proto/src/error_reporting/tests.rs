@@ -1929,3 +1929,26 @@ fn default_consent_install_hash_is_randomly_salted_and_rotates_on_reset() {
     let h3 = read_hash(&second_ids[0]);
     assert_ne!(h1, h3, "철회 후 솔트가 바뀌면 install_hash도 회전한다");
 }
+
+#[test]
+fn sanitize_detail_redacts_cross_platform_homes_and_caps_utf8_expansion() {
+    let detail = sanitize_detail(
+        r"unpack C:\Users\alice\AppData\Local\Programs\Krill.6296-0-download.zip /home/alice/.krill crates/krill-app/src/home/mod.rs",
+    )
+    .unwrap();
+    assert_eq!(
+        detail,
+        r"unpack C:\Users\[USER]\AppData\Local\Programs\Krill.6296-0-download.zip /home/[USER]/.krill crates/krill-app/src/home/mod.rs"
+    );
+    assert!(super::types::valid_detail(&detail));
+
+    let near_limit = format!(r"C:\Users\a\AppData\Local\Temp\{}", "가".repeat(75));
+    assert_eq!(near_limit.len(), 255);
+    let expanded = sanitize_detail(&near_limit).unwrap();
+    assert_eq!(
+        expanded,
+        format!(r"C:\Users\[USER]\AppData\Local\Temp\{}", "가".repeat(73))
+    );
+    assert!(expanded.len() <= MAX_DETAIL_LEN);
+    assert!(super::types::valid_detail(&expanded));
+}
