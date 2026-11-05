@@ -699,6 +699,8 @@ pub fn maybe_run_relauncher_cli() -> Option<ExitCode> {
     if args.next().is_none_or(|a| a != RELAUNCH_ARG) {
         return None;
     }
+    // The old app has already quit, so this log is the only place a failure reason can surface.
+    krill_log::init(krill_log::Component::App).ok();
     let code = match run_relauncher_args(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -738,19 +740,52 @@ pub(super) fn run_relauncher_args(
         .and_then(|s| s.into_string().ok())
         .and_then(|s| s.parse().ok());
 
-    let cfg = Config::load_for_bundle(&state_dir, Some(&bundle))?;
-    let _ = cfg.public_key_bytes()?;
-    let verifier = CodesignVerifier::from_config(&cfg);
-    let _outcome = relaunch_and_verify(
-        &bundle,
-        &state_dir,
-        &from,
-        &to,
-        wait_pid,
-        Duration::from_millis(timeout_ms),
-        &verifier,
-    )?;
-    Ok(())
+    let before = Journal::load(&state_dir).ok().flatten();
+    let result = Config::load_for_bundle(&state_dir, Some(&bundle)).and_then(|cfg| {
+        cfg.public_key_bytes()?;
+        relaunch_and_verify(
+            &bundle,
+            &state_dir,
+            &from,
+            &to,
+            wait_pid,
+            Duration::from_millis(timeout_ms),
+            &CodesignVerifier::from_config(&cfg),
+        )
+    });
+    if let Err(error) = &result {
+        let failed = Journal {
+            bundle: bundle.clone(),
+            from_version: from,
+            to_version: to,
+            health_timeout_ms: timeout_ms,
+            stage: Stage::RolledBack {
+                reason: error.to_string(),
+            },
+        };
+        recover_failed_relaunch(&state_dir, &failed, before.as_ref(), wait_pid);
+    }
+    result.map(|_| ())
+}
+
+/// The update button quits the app before this helper runs, so a failure here
+/// must never leave the user with no app and no explanation. When the swap never
+/// started, the bundle is untouched: record the failure as a rollback so the next
+/// launch explains it and stops re-offering this version, then reopen the old app
+/// unless it is still alive.
+fn recover_failed_relaunch(
+    state_dir: &Path,
+    failed: &Journal,
+    before: Option<&Journal>,
+    old_pid: Option<u32>,
+) {
+    if Journal::load(state_dir).ok().flatten().as_ref() == before {
+        failed.save(state_dir).ok();
+    }
+    let old_app_alive = old_pid.is_some_and(|pid| wait_process_exit(pid, Duration::ZERO).is_err());
+    if !old_app_alive && let Err(error) = spawn_bundle_app(&failed.bundle, state_dir, None) {
+        tracing::error!(%error, "could not reopen the app after a failed update");
+    }
 }
 
 /// 앱이 창과 데몬 연결을 준비한 직후 호출해 relauncher에 정상 기동 신호(`ready`)를 보낸다.
