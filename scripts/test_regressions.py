@@ -37,9 +37,15 @@ class RegressionTests(unittest.TestCase):
             root = Path(directory)
             tests = root / "crates/krilld/tests"
             tests.mkdir(parents=True)
-            for name in ["mobile_" + n + ".cjs" for n in runner.MOBILE] + list(runner.MOBILE_INTEGRATION):
+            for name in (["mobile_" + n + ".cjs" for n in runner.MOBILE] + list(runner.MOBILE_INTEGRATION)
+                         + sorted(runner.release_browser_tests())):
                 (tests / name).touch()
             self.assertEqual(len(runner.commands(root, ["mobile"])), len(runner.MOBILE))
+            for orphan in ("chat_new_browser.cjs", "mobile_new_browser.py"):
+                (tests / orphan).write_text("")
+                with self.assertRaisesRegex(ValueError, "unregistered=.*" + orphan):
+                    runner.commands(root, ["mobile"])
+                (tests / orphan).unlink()
             extra = tests / "mobile_new_regression.cjs"
             extra.touch()
             with self.assertRaisesRegex(ValueError, "unregistered=.*mobile_new_regression"):
@@ -219,20 +225,39 @@ class RegressionTests(unittest.TestCase):
                 child.communicate(timeout=3)
 
     def test_main_propagates_failure_after_running_remaining_checks(self):
+        codes = {"first": 7, "second": 0}
         with patch.object(sys, "argv", ["check-regressions.py"]), \
              patch.object(runner, "commands", return_value=[["first"], ["second"]]), \
-             patch.object(runner, "run", side_effect=[7, 0]) as run, \
-             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+             patch.object(runner, "run", side_effect=lambda command, *_: codes[command[0]]) as run, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(runner.main(), 1)
             self.assertEqual(run.call_count, 2)
+        self.assertIn("FAILED: first", errors.getvalue())
+        self.assertNotIn("FAILED: second", errors.getvalue())
 
     def test_missing_executable_is_a_failure_and_does_not_skip_later_checks(self):
         with patch.object(sys, "argv", ["check-regressions.py"]), \
-             patch.object(runner, "commands", return_value=[["missing"], ["second"]]), \
-             patch.object(runner, "run", side_effect=[FileNotFoundError("fixture"), 0]) as run, \
-             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+             patch.object(runner, "commands", return_value=[["/nonexistent/krill-missing"], [sys.executable, "-c", "pass"]]), \
+             contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(runner.main(), 1)
-            self.assertEqual(run.call_count, 2)
+        self.assertIn("could not execute /nonexistent/krill-missing", out.getvalue())
+        self.assertIn("regression: 2 programs, 1 failed", out.getvalue())
+        self.assertIn("FAILED: /nonexistent/krill-missing", errors.getvalue())
+
+    def test_parallel_output_is_printed_whole_in_command_order(self):
+        # The first program is the slowest; its output must still come first and unbroken.
+        slow = [sys.executable, "-c", "import time;print('slow-a');time.sleep(.6);print('slow-b')"]
+        fast = [sys.executable, "-c", "print('fast')"]
+        with patch.object(sys, "argv", ["check-regressions.py"]), \
+             patch.object(runner, "commands", return_value=[slow, fast, fast]), \
+             contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            started = time.monotonic()
+            self.assertEqual(runner.main(), 0)
+            self.assertLess(time.monotonic() - started, 3)
+        text = out.getvalue()
+        self.assertLess(text.index("slow-a"), text.index("slow-b"))
+        self.assertLess(text.index("slow-b"), text.index("fast"))
+        self.assertEqual(text.count("regression: "), 4)
 
     def test_listing_does_not_execute_anything(self):
         with patch.object(sys, "argv", ["check-regressions.py", "--list"]), \

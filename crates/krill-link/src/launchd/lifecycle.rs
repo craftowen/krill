@@ -144,7 +144,7 @@ pub(crate) fn cleanup_orphans_in_background() {
             .name("link-agent-cleanup".into())
             .spawn(|| cleanup_orphans(&mut run_launchctl))
         {
-            tracing::debug!(%error, "원격 연결 고아 작업 정리 스레드 시작 실패");
+            tracing::debug!(%error, "failed to start the orphan link job cleanup thread");
         }
     });
 }
@@ -244,7 +244,7 @@ fn cleanup_orphans(run: &mut impl FnMut(&[String]) -> io::Result<Output>) {
             }))
             && let Err(error) = run(&["bootout".into(), target])
         {
-            tracing::debug!(%error, "원격 연결 고아 작업 bootout 실패");
+            tracing::debug!(%error, "failed to boot out an orphan link job");
         }
     }
 }
@@ -320,7 +320,7 @@ impl ManagedAgent {
         match run(&["bootout".into(), self.target.clone()]) {
             Ok(out) => out.status.success(),
             Err(error) => {
-                tracing::debug!(%error, "원격 연결 자기 작업 bootout 실패");
+                tracing::debug!(%error, "failed to boot out this link job");
                 false
             }
         }

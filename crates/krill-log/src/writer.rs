@@ -5,11 +5,20 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::{Component, FILES, RECORD_BYTES};
 
 /// Decimal bytes: 4 components × 5 files × 1,000,000 = 20,000,000.
 pub const FILE_BYTES: u64 = 1_000_000;
+
+/// Longest wait for another writer before an event is dropped.
+pub const LOCK_WAIT: Duration = Duration::from_millis(200);
+
+/// Serializes this process's writers so they never contend on flock, which macOS applies per
+/// open file description: polling threads could each wait past `LOCK_WAIT` and drop events.
+/// ponytail: one lock for every family; key it by directory and component if appends get slow.
+static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Stateless file writer: every append and rotation takes the same cross-process family lock.
 /// The lock file is permanently empty and is never renamed/deleted.
@@ -65,22 +74,38 @@ impl RollingLog {
     }
 
     fn with_lock(&self, action: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let _serialized = IN_PROCESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let lock = open_file(
             &self
                 .directory
                 .join(format!("{}.lock", self.component.name())),
         )?;
-        match lock.try_lock() {
-            Ok(()) => {
-                let result = action();
-                // Explicit unlock also releases a lock briefly inherited by another
-                // thread's fork before exec; relying only on close can prolong it.
-                lock.unlock()?;
-                result
+        // Other processes hold the lock for one append, so wait briefly instead of dropping the
+        // event. Only a stuck holder costs the event, never an unbounded stall of the logging thread.
+        // A hold usually lasts one append, so the first retries only yield: Windows rounds a 1ms
+        // sleep up to its ~15ms tick. A longer hold then sleeps so its holder gets the CPU back.
+        let deadline = Instant::now() + LOCK_WAIT;
+        for attempt in 0u32.. {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    if attempt < 32 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(TryLockError::WouldBlock) => return Ok(()),
+                Err(TryLockError::Error(e)) => return Err(e),
             }
-            Err(TryLockError::WouldBlock) => Ok(()),
-            Err(TryLockError::Error(e)) => Err(e),
         }
+        let result = action();
+        // Explicit unlock also releases a lock briefly inherited by another
+        // thread's fork before exec; relying only on close can prolong it.
+        lock.unlock()?;
+        result
     }
 
     /// One bounded UTF-8 event. Too-long records end at a character boundary.

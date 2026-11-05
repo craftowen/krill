@@ -95,7 +95,7 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
                 status
             }
             _ if provider == ProviderKind::Antigravity => {
-                let status = super::super::direct::antigravity_auth(&dir, false);
+                let status = super::super::direct::antigravity_auth_file(&dir, host);
                 if !host || status.as_ref().is_some_and(|s| s.logged_in) {
                     lock(&STATES).insert(
                         key.clone(),
@@ -153,6 +153,10 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
 
 /// 같은 프로필은 한 번에 하나만 조회한다.
 static PROBING: Mutex<BTreeSet<CacheKey>> = Mutex::new(BTreeSet::new());
+
+pub(super) fn evict_profile(provider: ProviderKind, dir: &Path) {
+    lock(&CACHE).remove(&(provider, dir.to_path_buf()));
+}
 
 fn spawn_probe(
     exe: PathBuf,
@@ -320,7 +324,8 @@ mod tests {
             )
             .unwrap();
         };
-        // Host credentials must never fill an unauthenticated isolated profile.
+        // Host credentials must never fill an unauthenticated isolated profile,
+        // while the host account itself resolves its email from the host token file synchronously.
         let host = host_default_dir(&home, ProviderKind::Antigravity);
         std::fs::create_dir_all(&host).unwrap();
         std::fs::write(
@@ -329,6 +334,13 @@ mod tests {
         )
         .unwrap();
         assert!(emails().values().all(Option::is_none));
+        assert_eq!(
+            statuses(&home, Some(&state))
+                .get(&(ProviderKind::Antigravity, host.clone()))
+                .and_then(|s| s.identity.as_ref())
+                .map(|i| i.email.as_str()),
+            Some("host@example.test")
+        );
         write_token(&one, "one@example.test");
         write_token(&two, "two@example.test");
         assert_eq!(

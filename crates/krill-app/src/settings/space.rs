@@ -42,6 +42,30 @@ pub struct CliRunner(Arc<RunFn>);
 
 type RunFn = dyn Fn(&[OsString]) -> io::Result<Vec<u8>> + Send + Sync;
 
+/// 함께 설치된 `krill` CLI: 번들·설치 경로의 형제 실행 파일, 테스트 실행 파일이면 한 단계 위
+/// (`target/debug/deps` → `target/debug`), 그다음 `CARGO_TARGET_DIR/{debug,release}`.
+#[must_use]
+pub fn krill_bin() -> Option<std::path::PathBuf> {
+    if let Ok(sib) = krill_proto::daemon::sibling_exe("krill") {
+        if sib.is_file() {
+            return Some(sib);
+        }
+        if let Some(parent_bin) = sib
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|p| p.join("krill"))
+            .filter(|p| p.is_file())
+        {
+            return Some(parent_bin);
+        }
+    }
+    let target_dir = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR")?);
+    ["debug", "release"]
+        .into_iter()
+        .map(|profile| target_dir.join(profile).join("krill"))
+        .find(|candidate| candidate.is_file())
+}
+
 impl CliRunner {
     pub fn new(f: impl Fn(&[OsString]) -> io::Result<Vec<u8>> + Send + Sync + 'static) -> Self {
         Self(Arc::new(f))
@@ -224,14 +248,14 @@ impl SettingsView {
         if let Some(run) = self.space.runner_override.clone() {
             return Some(run);
         }
-        if let Some(bin) = crate::orca_import::resolve_krill_bin(cx) {
+        if let Some(bin) = krill_bin() {
             return Some(CliRunner::process(bin, state_dir(cx)));
         }
         self.space.error = Some(
             text::SPACE_ERROR
                 .format(&[(
                     "error",
-                    crate::i18n::catalog::orca_import::ERR_CLI_MISSING.get(),
+                    crate::i18n::catalog::general::ERR_CLI_MISSING.get(),
                 )])
                 .into(),
         );

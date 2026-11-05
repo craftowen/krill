@@ -334,3 +334,46 @@ fn narrow_artifact_drawer_keeps_actions_inside_page(cx: &mut TestAppContext) {
         assert!(action.right() <= drawer.right());
     }
 }
+
+#[gpui::test]
+fn detail_drawer_reads_local_source_once_per_selection(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-artifact-local-source-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    krill_proto::artifacts::enable_sharing(&dir).unwrap();
+    let source = dir.join("plan.md");
+    let body = format!("line {}\n", "x".repeat(40)).repeat(5_000);
+    std::fs::write(&source, body).unwrap();
+    let shares = dir.join("artifact-shares.json");
+    std::fs::write(
+        &shares,
+        serde_json::json!({"files": {source.to_string_lossy(): {"slug": "one"}}}).to_string(),
+    )
+    .unwrap();
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        View::with_calls(
+            Arc::new(|_| Ok(page("one", None))),
+            Arc::new(|_| Ok(())),
+            Some(dir.clone()),
+            cx,
+        )
+    });
+    vcx.simulate_resize(gpui::size(px(900.), px(900.)));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| v.select_slug(Some("one".into()), cx));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("artifact-local-source").is_some());
+
+    std::fs::remove_file(&source).unwrap();
+    std::fs::remove_file(&shares).unwrap();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("artifact-local-source").is_some(),
+        "a redraw must not read the source again"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -3308,17 +3308,6 @@ impl Render for Sidebar {
 
         self.ensure_external_polling(cx);
         self.ensure_setup_prompt_polling(cx);
-        if self.orca_import_subscription.is_none() {
-            self.orca_import_subscription = Some(
-                cx.observe_global::<crate::orca_import::OrcaImportState>(|this, cx| {
-                    if crate::orca_import::state(cx)
-                        .is_some_and(|st| !st.importing && st.last_result.is_some())
-                    {
-                        this.reload_external(cx);
-                    }
-                }),
-            );
-        }
         #[cfg(test)]
         {
             self.renders += 1;

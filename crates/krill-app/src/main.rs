@@ -56,16 +56,6 @@ fn main() -> std::process::ExitCode {
     if let Some(code) = krill_app::updater::maybe_run_update_cli() {
         return std::process::ExitCode::from(u8::try_from(code).unwrap_or(1));
     }
-    if let Some(mode) =
-        std::env::args().find_map(|a| a.strip_prefix("--popout-bench=").map(str::to_owned))
-    {
-        return shell::popout::bench::run(mode);
-    }
-    if let Some(dir) =
-        std::env::args().find_map(|a| a.strip_prefix("--files-bench=").map(PathBuf::from))
-    {
-        return shell::files::bench::run(&dir);
-    }
     // Windows는 X로 닫아도 트레이에 남고 재실행해도 OS가 기존 앱을 깨우지 않는다(on_reopen 미호출).
     // 같은 상태 폴더의 앱이 있으면 그 앱에 창 열기를 넘기고 끝낸다. 업데이트 health 확인 실행은
     // 넘기지 않는다(넘기면 새 버전이 바로 끝나 롤백된다).

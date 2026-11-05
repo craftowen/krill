@@ -167,7 +167,7 @@ pub fn account(info: &AccountInfo, status: Option<&AccountStatusInfo>, now: u64)
             .and_then(|s| s.detail.as_deref())
             .map(str::trim)
             .filter(|detail| !detail.is_empty())
-            .map(str::to_owned),
+            .map(crate::i18n::cached_notice),
     }
 }
 

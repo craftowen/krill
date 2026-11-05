@@ -297,11 +297,8 @@ impl Shell {
                 self.cancel_pending_paste_for(pane, cx);
             }
         }
-        if let Some(settings) = &self.settings {
-            let visible = active
-                && self.dashboard.is_none()
-                && self.artifacts.is_none()
-                && self.automations.is_none();
+        if let Some(settings) = self.settings() {
+            let visible = active && self.dashboard.is_none();
             settings.update(cx, |view, cx| view.set_visible(visible, cx));
         }
         let resources_visible = active && !self.page_open() && self.dashboard.is_none();
@@ -2035,8 +2032,7 @@ fn upload_bytes_via_windows_target(
         return None;
     }
     let path = format!("{dir}\\{filename}");
-    krill_app::remote_fs::save_atomic_bytes(target, std::path::Path::new(&path), bytes, None)
-        .ok()?;
+    krill_app::remote_fs::save_atomic_bytes(target, std::path::Path::new(&path), bytes).ok()?;
     Some(path)
 }
 
@@ -2071,16 +2067,12 @@ fn upload_bytes_with_program(
         return None;
     }
     let destination = host.destination.trim();
-    if destination.is_empty() || destination.starts_with('-') {
+    if !krill_hosts::ssh::valid_host(destination) {
         return None;
     }
     let filename = sanitize_remote_filename(filename);
-    let mut args = host.common_ssh_args(10);
+    let mut args = host.to_ssh_options().common_args(10);
     args.extend([
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
-        "StrictHostKeyChecking=accept-new".to_owned(),
         destination.to_owned(),
         // A private, unique directory prevents collisions and follows the remote TMPDIR.
         format!(

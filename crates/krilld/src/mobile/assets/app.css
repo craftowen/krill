@@ -728,3 +728,83 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 /* Extends down to the screen edge and up to the input card, never over either row. */
 #mobile-app .composer-pill::after{content:"";position:absolute;inset:-6px 0 -10px}
 #mobile-app .chat-status-row>.composer-icon::after{content:"";position:absolute;inset:-6px -8px -10px}
+/* Orca mobile v0.0.64 parity (measured on a 412dp Android screen, 2026-11-05): bottom tabs, large page titles,
+   titled inset groups and a floating New workspace button. Colors stay Krill tokens (STYLEGUIDE §1). */
+.tab-bar{flex:none;display:flex;border-top:1px solid var(--border);background:var(--surface-base);padding:0 max(8px,env(safe-area-inset-right)) env(safe-area-inset-bottom) max(8px,env(safe-area-inset-left))}
+.tab-bar-item{flex:1;min-width:0;min-height:56px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:var(--text-muted);font-size:calc(11px * var(--ui-scale,1));font-weight:500}
+.tab-bar-item svg{width:24px;height:24px;stroke-width:1.7}.tab-bar-item[aria-current=page]{color:var(--foreground);font-weight:600}.tab-bar-item:active{opacity:.6}
+.home-topbar,.page-header.title-header{display:flex;align-items:center;gap:8px;min-height:56px;padding:8px 20px 4px;border:0;background:transparent;flex:none}
+.page-title,.page-header.title-header h1{font-size:calc(28px * var(--ui-scale,1));font-weight:700;letter-spacing:-.4px;line-height:1.2;margin:0}
+.page-header.title-header .header-copy{flex:1}.page-header.title-header>.icon-button:first-child{display:none}
+.section-title{font-size:calc(17px * var(--ui-scale,1));font-weight:600;color:var(--foreground);margin:0;text-transform:none;letter-spacing:0}
+.home-list{padding:0 16px calc(96px + env(safe-area-inset-bottom))}.home-list>.recent-session{margin-top:16px}.home-list>.recent-session>.section-title,.home-section-heading{padding:0 4px 10px}
+.home-section-heading{display:flex;align-items:baseline;justify-content:space-between;margin:24px 0 0}
+.inset-group{display:flex;flex-direction:column;border-radius:16px;background:var(--surface-panel);overflow:hidden}
+.inset-group>*+*,.inset-group>.home-desktops>*+*,.inset-group>.home-desktops+*{background-image:linear-gradient(var(--border),var(--border));background-size:calc(100% - 56px) 1px;background-position:right top;background-repeat:no-repeat}
+.recent-session-list.inset-group>.recent-session-row{border:0;border-radius:0;padding:12px 16px;min-height:64px}
+.home-desktop-group .home-desktops{gap:0}.home-desktop-group .host-card{border:0;border-radius:0;background-color:transparent}.home-desktop-group .host-main{padding:12px 4px 12px 16px}
+.home-desktop-group .host-icon{width:40px;height:40px;border-radius:10px}
+.pair-desktop-row{display:flex;align-items:center;gap:14px;width:100%;min-height:52px;padding:0 16px;color:var(--accent);font-size:calc(16px * var(--ui-scale,1));text-align:left}.pair-desktop-row svg{width:20px;height:20px;flex:none}
+.home-fab{bottom:calc(72px + env(safe-area-inset-bottom));width:56px;height:56px;border-radius:28px;border:0;background:var(--accent);color:var(--on-accent)}.home-fab svg{width:26px;height:26px}.home-fab:disabled{opacity:.45}
+.home-hero .krill-logo{width:72px;height:72px;border-radius:18px;align-self:center}
+.inset-group>.recent-session-row+.recent-session-row{background:linear-gradient(var(--border),var(--border)) right top/calc(100% - 56px) 1px no-repeat}
+.home-list>.home-section-heading{padding:0 4px 10px}.home-section-heading>.section-title{padding:0;margin:0}
+.inset-group .needs-copy>strong,.home-desktop-group .host-identity>strong{font-size:calc(16px * var(--ui-scale,1));font-weight:500;line-height:1.35}
+.inset-group .needs-copy>small,.home-desktop-group .host-status,.home-desktop-group .session-summary{font-size:calc(13px * var(--ui-scale,1));line-height:1.45;color:var(--muted-foreground)}
+.home-desktop-group .host-main{align-items:flex-start}.home-desktop-group .host-main>svg{align-self:center}
+/* Orca host page: circular back control over a large host title, light project headers, and options/search/new in a bottom bar. */
+.circle-button,.page-header.host-header>.icon-button:first-child{width:44px;height:44px;min-width:44px;min-height:44px;border-radius:22px;background:var(--surface-raised);display:grid;place-items:center}
+.page-header.host-header{flex-wrap:wrap;border:0;background:transparent;padding:8px 16px 4px;gap:8px}
+.page-header.host-header .header-copy{order:3;flex-basis:100%;padding:6px 4px 0}.page-header.host-header>.reconnect-chip{margin-left:auto}
+.page-header.host-header h1{font-size:calc(28px * var(--ui-scale,1));font-weight:700;letter-spacing:-.4px;line-height:1.2}
+.host-subtitle{display:flex;align-items:center;gap:6px;margin-top:4px;min-width:0}.host-subtitle>.session-summary{font-size:calc(14px * var(--ui-scale,1));color:var(--muted-foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.workspaces .repo-group{border:0}.workspaces .repo-toggle{min-height:44px;padding:10px 8px;gap:8px;color:var(--muted-foreground);font-weight:500}.workspaces .repo-toggle.open{background:transparent}
+.workspaces .repo-toggle>svg:last-child{order:-1;width:16px;height:16px}.workspaces .repo-toggle.open>svg:last-child{transform:rotate(90deg)}
+.workspaces .project-icon{width:20px;height:20px;border:0;background:transparent}.workspaces .project-icon svg{width:18px;height:18px}
+.workspaces .repo-copy{flex:0 1 auto;min-width:0}.workspaces .repo-label{font-size:calc(15px * var(--ui-scale,1));color:var(--foreground)}.workspaces .repo-summary{display:none}
+.workspaces .repo-toggle>.terminal-count{font-family:inherit;color:var(--text-muted)}
+.workspaces .workspace-row{min-height:56px;padding:10px 4px 10px 16px;gap:14px}.workspaces .workspace-row:after{left:46px}
+.workspaces .workspace-main>strong{font-size:calc(16px * var(--ui-scale,1));font-weight:600}.workspaces .workspace-main>small.mono{font-size:calc(13px * var(--ui-scale,1))}
+.workspace-bottom-bar{order:99;display:flex;align-items:center;gap:10px;padding:8px 16px calc(10px + env(safe-area-inset-bottom));border:0;background:var(--surface-base)}
+.workspace-bottom-bar>.filter-chip{position:relative;width:52px;height:52px;min-width:52px;border-radius:26px;padding:0;justify-content:center;border:0;background:var(--surface-raised)}
+.workspace-bottom-bar>.filter-chip>span:not(.chip-badge){display:none}.workspace-bottom-bar>.filter-chip>svg{width:20px;height:20px}.workspace-bottom-bar .chip-badge{position:absolute;top:4px;right:4px}
+.workspace-bottom-bar>.workspace-search{position:relative;flex:1;min-width:0;padding:0 8px 0 0;border:1px solid var(--border);border-radius:26px;background:var(--surface-panel);min-height:52px}
+.workspace-bottom-bar>.workspace-search:before{content:"";width:18px;height:18px;margin-left:16px;flex:none;background:var(--text-muted);-webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='m21 21-4.3-4.3M19 11a8 8 0 1 1-16 0 8 8 0 0 1 16 0'/%3E%3C/svg%3E") center/contain no-repeat;mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='m21 21-4.3-4.3M19 11a8 8 0 1 1-16 0 8 8 0 0 1 16 0'/%3E%3C/svg%3E") center/contain no-repeat}
+.workspace-bottom-bar>.workspace-search input{border:0;background:transparent;font-size:calc(16px * var(--ui-scale,1));padding:0 4px;min-height:50px}
+.workspace-bottom-bar>.new-workspace-fab{position:static;width:52px;height:52px;min-width:52px;border-radius:26px;border:0;box-shadow:none;background:var(--foreground);color:var(--surface-base)}.workspace-bottom-bar>.new-workspace-fab svg{width:22px;height:22px}
+.page-header.host-header>.icon-button:first-child{color:var(--foreground)}.page-header.host-header h1{font-size:calc(26px * var(--ui-scale,1))}
+.workspaces .repo-group>.tree-children{margin-left:0;border-left:0}
+/* Orca session screen (header height stays 44px so terminal rows keep priority): circular header controls around a centered title, raised tab strip controls and sans key chips. */
+#mobile-app .session.screen>.page-header{gap:8px;padding-left:8px;padding-right:8px;border-bottom:0;background:var(--surface-base)}
+#mobile-app .session.screen>.page-header>.icon-button:not(.tablet-sidebar-toggle){width:36px;height:36px;min-width:36px;min-height:36px;margin:0;border-radius:18px;background:var(--surface-raised);color:var(--foreground);display:grid;place-items:center}
+#mobile-app .session.screen>.page-header>.mode-toggle{min-height:36px;height:36px;padding:0 14px;border-radius:18px;background:var(--surface-raised);border:0}
+#mobile-app .session.screen>.page-header .header-copy{text-align:center;display:flex;align-items:center;justify-content:center;gap:6px}#mobile-app .session.screen>.page-header h1{font-size:calc(17px * var(--ui-scale,1));font-weight:700}
+#mobile-app .session.screen .session-summary{justify-content:center}
+#mobile-app .session-tabs{background:var(--surface-base)}#mobile-app .session-tab{font-size:calc(14px * var(--ui-scale,1))}#mobile-app .session-tab[aria-selected=true]{border-bottom-color:var(--foreground);background:var(--surface-panel)}
+#mobile-app .session-tabs .tab-add{align-self:center;width:36px;height:36px;min-width:36px;min-height:36px;margin:0 8px 0 4px;border-radius:20px;background:var(--surface-raised);border:0;color:var(--foreground)}
+#mobile-app .session .command-dock .keybar{gap:6px}
+#mobile-app .session .command-dock :is(.accessory-key,.dismiss-keyboard){padding:0 12px;border-radius:10px;font-family:inherit;font-size:calc(14px * var(--ui-scale,1));color:var(--foreground);background:var(--surface-raised)}
+#mobile-app .session .accessory-row{border-top:0}#mobile-app .session .accessory-row>.photo-attach{border-radius:22px;color:var(--foreground)}
+#mobile-app .session.screen>.page-header>.icon-button svg{stroke-width:2.4}#mobile-app .session .command-dock .accessory-key:has(svg){padding:0 10px}
+/* Orca settings menu and Usage tab: one-line icon rows inside rounded groups. */
+.settings-list{padding:8px 16px calc(24px + env(safe-area-inset-bottom))}.settings-menu{margin-bottom:16px;padding:0}
+.settings-menu>.setting-link{min-height:52px;margin:0;padding:0 16px;gap:16px;border:0;border-radius:0;background-color:transparent}
+.settings-menu>*+*:before{left:52px;right:0}.settings-group.settings-menu{border-radius:16px}
+.settings-menu>.setting-link strong{font-size:calc(16px * var(--ui-scale,1));font-weight:400}.settings-menu>.setting-link small{display:none}
+.settings-menu>.setting-link>svg:first-child{width:20px;height:20px;color:var(--muted-foreground)}
+.page-header.large.title-header{padding:8px 20px 4px}.page-header.title-header .header-sub{font-size:calc(13px * var(--ui-scale,1))}
+/* Orca settings subpages: circular back over a centered title; choices are checkmarked rows in a rounded group under a small label. */
+#mobile-app :is(.settings,.details).screen>.page-header:not(.title-header){min-height:60px;padding:8px 12px;gap:8px;background:var(--surface-base)}
+#mobile-app :is(.settings,.details).screen>.page-header:not(.title-header)>.icon-button:first-child{width:44px;height:44px;min-width:44px;min-height:44px;border-radius:22px;background:var(--surface-raised);color:var(--foreground)}
+#mobile-app :is(.settings,.details).screen>.page-header:not(.title-header) .header-copy{text-align:center;padding-right:52px}#mobile-app :is(.settings,.details).screen>.page-header:not(.title-header) h1{font-size:calc(17px * var(--ui-scale,1));font-weight:700}
+.settings-choices>.setting-block{padding:8px 0 16px}.settings-choices .setting-label{margin:0 4px 8px;font-size:calc(12px * var(--ui-scale,1));font-weight:500;letter-spacing:.5px;text-transform:uppercase;color:var(--text-muted)}
+.settings-choices .segmented{flex-direction:column;gap:0;padding:0;border:0;border-radius:16px;background:var(--surface-panel);overflow:hidden}
+.settings-choices .segment{display:flex;align-items:center;justify-content:space-between;min-height:52px;padding:0 16px;border-radius:0;font-size:calc(16px * var(--ui-scale,1));color:var(--foreground);text-align:left}
+.settings-choices .segment+.segment{background:linear-gradient(var(--border),var(--border)) right top/calc(100% - 16px) 1px no-repeat}
+.settings-choices .segment[aria-pressed=true]{background-color:transparent;font-weight:400}.settings-choices .segment[aria-pressed=true]:after{content:"✓";font-size:calc(17px * var(--ui-scale,1));color:var(--foreground)}
+.settings-choices>.setting-block>.setting-row{min-height:52px;padding:0 16px;border-radius:16px;background:var(--surface-panel)}.settings-choices>.setting-block>p,.settings-choices>.setting-block>a{margin:8px 4px 0}
+.settings-choices a.setting-link{display:inline;min-height:0;padding:0;border:0;background:transparent;color:var(--accent)}
+/* Rounded groups need a lifted surface: light panels equal the white canvas, so light themes use the raised surface. */
+:root{--group-surface:var(--surface-panel)}:root[data-theme=light]{--group-surface:var(--surface-raised)}@media(prefers-color-scheme:light){:root:not([data-theme=dark]):not([data-theme=light]){--group-surface:var(--surface-raised)}}
+.inset-group,.settings-group.settings-menu,.settings-choices .segmented,.settings-choices>.setting-block>.setting-row{background-color:var(--group-surface)}
+.workspace-bottom-bar>.workspace-search{background:var(--group-surface)}

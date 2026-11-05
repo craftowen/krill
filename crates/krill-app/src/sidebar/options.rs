@@ -34,13 +34,6 @@ pub enum GroupBy {
 }
 
 impl GroupBy {
-    pub const ALL: [Self; 4] = [
-        Self::Repo,
-        Self::WorkspaceStatus,
-        Self::PrStatus,
-        Self::None,
-    ];
-
     /// Orca `SidebarGroupByToggle` 세그먼트 순서(없음 · 상태 · PR · 프로젝트).
     pub const SEGMENT_ORDER: [Self; 4] = [
         Self::None,
@@ -48,16 +41,6 @@ impl GroupBy {
         Self::PrStatus,
         Self::Repo,
     ];
-
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Repo => text::GROUP_BY_REPO.get(),
-            Self::WorkspaceStatus => text::GROUP_BY_STATUS.get(),
-            Self::PrStatus => text::GROUP_BY_PR.get(),
-            Self::None => text::GROUP_BY_NONE.get(),
-        }
-    }
 
     #[must_use]
     pub fn short_label(self) -> &'static str {
@@ -263,11 +246,6 @@ impl CardProperties {
 
     pub const fn toggle(&mut self, prop: CardProperty) {
         self.set(prop, !self.get(prop));
-    }
-
-    #[must_use]
-    pub const fn all_enabled(self) -> bool {
-        self.issue && self.pr && self.comment && self.ports && self.branch && self.host
     }
 
     #[must_use]

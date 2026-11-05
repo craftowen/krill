@@ -695,7 +695,7 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         report.accounts = import_accounts_domain(opts, &domains_map, &mut warnings);
     } else {
         report.accounts.skipped = true;
-        report.accounts.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.accounts.skipped_reason = Some("excluded by --only".to_owned());
     }
     if selected.contains(&ImportDomain::Ssh) {
         report.ssh = retry_on_conflict("ssh", &mut warnings, |w| {
@@ -703,7 +703,7 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         })?;
     } else {
         report.ssh.skipped = true;
-        report.ssh.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.ssh.skipped_reason = Some("excluded by --only".to_owned());
     }
     if selected.contains(&ImportDomain::Projects) {
         report.projects = retry_on_conflict("projects", &mut warnings, |w| {
@@ -711,7 +711,7 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         })?;
     } else {
         report.projects.skipped = true;
-        report.projects.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.projects.skipped_reason = Some("excluded by --only".to_owned());
     }
     if selected.contains(&ImportDomain::Settings) {
         report.settings = retry_on_conflict("settings", &mut warnings, |w| {
@@ -719,13 +719,13 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         })?;
     } else {
         report.settings.skipped = true;
-        report.settings.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.settings.skipped_reason = Some("excluded by --only".to_owned());
     }
     if selected.contains(&ImportDomain::Sessions) {
         report.sessions = import_sessions_domain(opts, &domains_map, &mut warnings);
     } else {
         report.sessions.skipped = true;
-        report.sessions.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.sessions.skipped_reason = Some("excluded by --only".to_owned());
     }
 
     report.warnings = warnings;
@@ -754,7 +754,7 @@ pub fn format_report_human(report: &OrcaImportReport) -> String {
             writeln!(
                 out,
                 "  accounts: skipped ({})",
-                a.skipped_reason.as_deref().unwrap_or("데몬 필요")
+                a.skipped_reason.as_deref().unwrap_or("daemon required")
             )
             .ok();
         } else {
@@ -822,7 +822,7 @@ pub fn format_report_human(report: &OrcaImportReport) -> String {
             writeln!(
                 out,
                 "  sessions: skipped ({})",
-                se.skipped_reason.as_deref().unwrap_or("데몬 필요")
+                se.skipped_reason.as_deref().unwrap_or("daemon required")
             )
             .ok();
         } else {
@@ -1068,8 +1068,8 @@ fn import_accounts_domain(
     {
         summary.agy_detected = true;
         summary.agy_note = Some(
-            "Orca 암호화 vault 감지 — agy 개별 이관 불가(OWE-896·OWE-721). \
-             Krill은 호스트 agy 로그인을 공유해 사용한다"
+            "Orca encrypted vault found: agy accounts can't be imported one by one. \
+             Krill shares the host's agy login"
                 .to_owned(),
         );
     }
@@ -1305,7 +1305,7 @@ fn import_accounts_domain_inner(
             // '데몬 필요' 사유로 accounts 도메인을 스킵한 뒤 다른 도메인만 진행한다.
             summary.skipped = true;
             summary.skipped_reason = Some(format!(
-                "데몬 필요: krilld에 연결할 수 없어 계정 이관을 건너뜀 ({e})"
+                "Daemon required: couldn't reach krilld, skipped importing accounts ({e})"
             ));
             for cand in planned {
                 summary.items.push(ImportedAccountSummary {
@@ -1320,7 +1320,7 @@ fn import_accounts_domain_inner(
                     connection: "unknown".to_owned(),
                 });
             }
-            warnings.push(format!("accounts skipped (데몬 필요): {e}"));
+            warnings.push(format!("accounts skipped (daemon required): {e}"));
             return summary;
         }
         Err(_) => {
@@ -1434,9 +1434,10 @@ fn import_accounts_domain_inner(
                     Ok(updated) => snap = updated,
                     Err(e) => {
                         summary.skipped = true;
-                        summary.skipped_reason =
-                            Some(format!("데몬 필요: krilld 계정 추가 실패 ({e})"));
-                        warnings.push(format!("accounts skipped (데몬 필요): {e}"));
+                        summary.skipped_reason = Some(format!(
+                            "Daemon required: adding the account to krilld failed ({e})"
+                        ));
+                        warnings.push(format!("accounts skipped (daemon required): {e}"));
                         return summary;
                     }
                 }
@@ -1596,7 +1597,7 @@ fn detect_agy_import_note(
     }
     (count > 0).then(|| {
         format!(
-            "agy 계정 {count}개 감지: 이관 불가(Orca 암호화 저장소) — Krill에서 새로 로그인하십시오"
+            "agy accounts found: {count}. They can't be imported (Orca encrypted store); sign in again in Krill"
         )
     })
 }
@@ -2006,7 +2007,7 @@ fn import_sessions_domain(
             Err(e) => {
                 summary.skipped = true;
                 summary.skipped_reason = Some(format!(
-                    "데몬 필요: krilld에 연결할 수 없어 세션 이관을 건너뜀 ({e})"
+                    "Daemon required: couldn't reach krilld, skipped importing sessions ({e})"
                 ));
             }
         }
@@ -3563,12 +3564,12 @@ pub fn terminal_font_skip_reason(family: &str) -> String {
     let family = family.trim();
     if family.eq_ignore_ascii_case("sf mono") {
         format!(
-            "터미널 글꼴 '{family}' 가져오기 건너뜀: macOS 숨김 시스템 글꼴이라 \
-             Krill에서 고정폭으로 해석되지 않아 기존 글꼴을 유지합니다"
+            "Skipped importing terminal font '{family}': it is a hidden macOS system font \
+             that Krill can't resolve as monospaced, keeping the current font"
         )
     } else {
         format!(
-            "터미널 글꼴 '{family}' 가져오기 건너뜀: 고정폭 확인이 안 돼 기존 글꼴을 유지합니다"
+            "Skipped importing terminal font '{family}': couldn't confirm it is monospaced, keeping the current font"
         )
     }
 }
@@ -5233,7 +5234,7 @@ mod tests {
                 .accounts
                 .skipped_reason
                 .as_deref()
-                .is_some_and(|r| r.starts_with("데몬 필요"))
+                .is_some_and(|r| r.starts_with("Daemon required"))
         );
         assert_eq!(no_daemon_acc.accounts.claude_added, 0);
         assert_eq!(no_daemon_acc.accounts.codex_added, 0);
@@ -5794,15 +5795,18 @@ mod tests {
             }),
         )]);
         let note = detect_agy_import_note(&opts, &domains).unwrap();
-        assert!(note.contains("3개"), "{note}");
-        assert!(note.contains("이관 불가(Orca 암호화 저장소)"), "{note}");
-        assert!(note.contains("새로 로그인"), "{note}");
+        assert!(note.contains("found: 3"), "{note}");
+        assert!(
+            note.contains("can't be imported (Orca encrypted store)"),
+            "{note}"
+        );
+        assert!(note.contains("sign in again"), "{note}");
         // 디스크 흔적만 있어도 안내한다.
         fs::create_dir_all(orca_dir.join("antigravity-accounts").join("a1")).unwrap();
         let disk_only: BTreeMap<String, Json> =
             BTreeMap::from([("settings".to_owned(), serde_json::json!({}))]);
         let note = detect_agy_import_note(&opts, &disk_only).unwrap();
-        assert!(note.contains("1개"), "{note}");
+        assert!(note.contains("found: 1"), "{note}");
         fs::remove_dir_all(&root).ok();
     }
 

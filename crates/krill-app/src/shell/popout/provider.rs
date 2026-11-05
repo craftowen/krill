@@ -80,12 +80,12 @@ impl AccountGroup {
         self.profiles
             .iter()
             .find(|a| a.active)
-            .or_else(|| self.profiles.iter().find(|a| a.host_default))
+            .or_else(|| self.profiles.iter().find(|a| !a.host_default))
             .or_else(|| self.profiles.first())
     }
 }
 
-/// 이메일이 없는 프로필은 합치지 않는다. 대표는 활성 → 시스템 기본 → 첫 프로필 순이다.
+/// 이메일이 없는 프로필은 합치지 않는다. 대표는 활성 → 등록 프로필 → 첫 프로필 순이다.
 fn account_groups(snap: &AccountsSnapshot, provider: ProviderKind) -> Vec<AccountGroup> {
     let mut groups: Vec<AccountGroup> = Vec::new();
     for account in snap

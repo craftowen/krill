@@ -48,13 +48,29 @@ const DEFAULT_HTTP_TIMEOUT_SECS: &str = "10";
 const CODEX_CONSUME_TIMEOUT_SECS: &str = "30";
 const CLAUDE_CONSUME_TIMEOUT_SECS: &str = "15";
 
-/// 소진 직후 스냅샷이 소진 전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
+/// 소진 직후나 호스트 자격증명 교체 직후 스냅샷이 이전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
 /// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다.
-pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
+pub(crate) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
     let key = (home.to_path_buf(), provider, dir.to_path_buf());
     lock(&CACHE).remove(&key);
     lock(&RETRY).remove(&key);
+    if provider == ProviderKind::Antigravity {
+        agy::evict_profile(home, dir);
+    }
     super::meters::evict_profile(home, provider, dir);
+}
+
+fn credential_fingerprint(provider: ProviderKind, dir: &Path, host: bool) -> Option<Vec<u8>> {
+    let path = match provider {
+        ProviderKind::Antigravity if host => dir.join("antigravity-oauth-token"),
+        ProviderKind::Antigravity => dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+        ProviderKind::Codex => dir.join("auth.json"),
+        ProviderKind::Claude => dir.join(".credentials.json"),
+        ProviderKind::OpenCode if host => dir.join("auth.json"),
+        ProviderKind::OpenCode => dir.join("data/opencode/auth.json"),
+        ProviderKind::Gemini => return None,
+    };
+    read_file(&path).map(|b| b.to_vec())
 }
 
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
@@ -144,9 +160,15 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
     let launched = std::thread::Builder::new()
         .name("account-usage".into())
         .spawn(move || {
+            let before = credential_fingerprint(job.1, &job.2, host);
             let result =
                 std::panic::catch_unwind(|| fetch(job.1, &job.2, host, &job.0, state.as_deref()))
                     .unwrap_or(Fetched::Failed(Failure::Internal));
+            let after = credential_fingerprint(job.1, &job.2, host);
+            if before.is_some() && after.is_some() && before != after {
+                lock(&PENDING).remove(&job);
+                return;
+            }
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
@@ -227,17 +249,20 @@ enum Failure {
 impl Failure {
     fn detail(self) -> String {
         match self {
-            Self::Credentials => "사용량 자격증명 읽기 실패".into(),
+            Self::Credentials => "Failed to read usage credentials".into(),
             Self::Expired => {
-                "사용량 자격증명 만료 — 해당 계정 CLI에서 갱신하거나 다시 로그인하세요".into()
+                "Usage credentials expired. Refresh them in that account's CLI or sign in again"
+                    .into()
             }
-            Self::Request => "사용량 요청 구성 실패".into(),
-            Self::Transport => "사용량 API 연결·전송 실패".into(),
-            Self::Http(401) => "사용량 API 인증 거절(HTTP 401) — 계정 로그인을 확인하세요".into(),
-            Self::Http(403) => "사용량 API 접근 거절(HTTP 403)".into(),
-            Self::Http(code) => format!("사용량 API 응답 오류(HTTP {code})"),
-            Self::Response => "사용량 API 응답 해석 실패".into(),
-            Self::Internal => "사용량 조회 작업 실패".into(),
+            Self::Request => "Failed to build the usage request".into(),
+            Self::Transport => "Usage API connection failed".into(),
+            Self::Http(401) => {
+                "Usage API rejected the sign-in (HTTP 401). Check the account login".into()
+            }
+            Self::Http(403) => "Usage API denied access (HTTP 403)".into(),
+            Self::Http(code) => format!("Usage API error (HTTP {code})"),
+            Self::Response => "Failed to read the usage API response".into(),
+            Self::Internal => "Usage lookup failed".into(),
         }
     }
 }
@@ -310,7 +335,7 @@ fn mark_rate_limited(
         Some((at, u)) if alive(*at, u) && !u.usage.is_empty() => {
             u.stale = true;
             u.error = None;
-            u.detail = Some("사용량 API 요청 제한(429) — 마지막 성공 값".into());
+            u.detail = Some("Usage API rate limited (429) — last successful value".into());
         }
         _ => {
             cache.insert(
@@ -318,8 +343,8 @@ fn mark_rate_limited(
                 (
                     Instant::now(),
                     ProfileUsage {
-                        error: Some("요청 제한".into()),
-                        detail: Some("사용량 API 요청 제한(429)".into()),
+                        error: Some("Rate limited".into()),
+                        detail: Some("Usage API rate limited (429)".into()),
                         updated_at: now,
                         ..ProfileUsage::default()
                     },
@@ -343,8 +368,8 @@ fn mark_failed(
         && !usage.usage.is_empty()
     {
         usage.stale = true;
-        usage.error = Some("갱신 실패".into());
-        usage.detail = Some(format!("{} — 마지막 성공 값", reason.detail()));
+        usage.error = Some("Refresh failed".into());
+        usage.detail = Some(format!("{} — last successful value", reason.detail()));
         return;
     }
     cache.insert(
@@ -352,7 +377,7 @@ fn mark_failed(
         (
             Instant::now(),
             ProfileUsage {
-                error: Some("갱신 실패".into()),
+                error: Some("Refresh failed".into()),
                 detail: Some(reason.detail()),
                 updated_at: now,
                 ..ProfileUsage::default()
@@ -1484,7 +1509,7 @@ fn pipe_command(
         .then(|| Zeroizing::new(output.stdout))
 }
 
-pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
+pub(super) fn antigravity_auth_file(dir: &Path, host: bool) -> Option<AuthStatus> {
     if !host {
         // 로그인 판정은 krill-proto와 공유한다. 신원은 로그인된 프로필에서만 읽는다.
         let logged_in = krill_proto::account_login::agy_token_logged_in(dir);
@@ -1500,14 +1525,6 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
                 .flatten(),
         });
     }
-    // 호스트(OWE-901): 키체인 파싱 → 토큰 파일 존재 순(코디네이터 결정: 마커 검사 없음).
-    // 로그인은 존재·크기로 판정하고, 표시용 이메일만 상한 있는 읽기로 얻는다. 호스트 `dir`은 이미
-    // `~/.gemini/antigravity-cli`라 토큰 파일명을 직접 붙인다(프로필 헬퍼와 다름).
-    if let Some(raw) = keychain("gemini", "antigravity")
-        && let Some(status) = parse_antigravity_auth(&raw)
-    {
-        return Some(status);
-    }
     let token = dir.join("antigravity-oauth-token");
     if std::fs::symlink_metadata(&token)
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.len() > 0)
@@ -1518,6 +1535,24 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
                 accounts::identity_from_credentials(ProviderKind::Antigravity, &raw)
             }),
         });
+    }
+    None
+}
+
+pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
+    if !host {
+        return antigravity_auth_file(dir, false);
+    }
+    // 호스트(OWE-901): `antigravity-oauth-token` 파일이 있으면 `agy -p /usage`가
+    // `SSH_CONNECTION=krill`로 파일 토큰을 읽으므로 신원 판정도 같은 파일 토큰을 먼저 본다.
+    // 파일이 없을 때만 키체인 로그인을 확인한다.
+    if let Some(status) = antigravity_auth_file(dir, true) {
+        return Some(status);
+    }
+    if let Some(raw) = keychain("gemini", "antigravity")
+        && let Some(status) = parse_antigravity_auth(&raw)
+    {
+        return Some(status);
     }
     None
 }
@@ -1641,6 +1676,12 @@ pub(crate) mod agy {
         lock(&VERSION_TEXT_CACHE).clear();
     }
 
+    pub(super) fn evict_profile(home: &Path, dir: &Path) {
+        let key = (home.to_path_buf(), dir.to_path_buf());
+        lock(&CACHE).remove(&key);
+        lock(&FAILED).remove(&key);
+    }
+
     pub(super) fn cached(home: &Path, dir: &Path) -> Option<ProfileUsage> {
         if latched() {
             return None;
@@ -1737,12 +1778,18 @@ pub(crate) mod agy {
                     lock(&PENDING).remove(&job);
                     return;
                 }
+                let before = super::credential_fingerprint(ProviderKind::Antigravity, &job.1, host);
                 let usage = std::panic::catch_unwind(|| {
                     let exe = super::agy_exe()?;
                     fetch(&exe, &job.1, host)
                 })
                 .ok()
                 .flatten();
+                let after = super::credential_fingerprint(ProviderKind::Antigravity, &job.1, host);
+                if before.is_some() && after.is_some() && before != after {
+                    lock(&PENDING).remove(&job);
+                    return;
+                }
                 if let Some((usage, meters)) = usage {
                     lock(&FAILED).remove(&job);
                     super::super::meters::remember(
@@ -2407,7 +2454,7 @@ pub(crate) mod agy {
             assert_eq!(
                 std::fs::read(&token).unwrap(),
                 b"fixture-only-exists",
-                "판정은 내용을 읽지 않는다"
+                "the check must not read the contents"
             );
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -2428,7 +2475,7 @@ pub(crate) fn agy_exe() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod failure_tests;
+pub(crate) mod failure_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2585,7 +2632,7 @@ mod tests {
             assert_eq!(kept.usage, good.usage);
             assert_eq!(kept.updated_at, Some(100));
             assert!(kept.stale);
-            assert_eq!(kept.error.as_deref(), Some("갱신 실패"));
+            assert_eq!(kept.error.as_deref(), Some("Refresh failed"));
         }
         // 반복 실패는 마지막 성공 시각을 갱신하거나 정상 TTL을 하루로 늘리지 않는다.
         let expired_at = at.checked_sub(CACHE_TTL + Duration::from_secs(1)).unwrap();
@@ -2594,7 +2641,7 @@ mod tests {
         mark_failed(&mut cache, &key, Some(400), Failure::Internal);
         assert!(cache[&key].1.usage.is_empty());
         assert_eq!(cache[&key].1.updated_at, Some(400));
-        assert_eq!(cache[&key].1.error.as_deref(), Some("갱신 실패"));
+        assert_eq!(cache[&key].1.error.as_deref(), Some("Refresh failed"));
     }
 
     #[test]
@@ -2614,7 +2661,10 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(lock(&CACHE)[&key].1.error.as_deref(), Some("갱신 실패"));
+        assert_eq!(
+            lock(&CACHE)[&key].1.error.as_deref(),
+            Some("Refresh failed")
+        );
         assert!(lock(&RETRY).contains_key(&key));
         lock(&CACHE).remove(&key);
         lock(&RETRY).remove(&key);
@@ -3382,10 +3432,10 @@ mod tests {
         // 정상 값이 없으면 지어낸 값 없이 요청 제한 오류(조회 오류 표시)로 남는다.
         let (_, limited) = &cache[&key];
         assert!(limited.usage.is_empty() && limited.updated_at == Some(203));
-        assert_eq!(limited.error.as_deref(), Some("요청 제한"));
+        assert_eq!(limited.error.as_deref(), Some("Rate limited"));
         cache.clear();
         mark_rate_limited(&mut cache, &key, None);
-        assert_eq!(cache[&key].1.error.as_deref(), Some("요청 제한"));
+        assert_eq!(cache[&key].1.error.as_deref(), Some("Rate limited"));
     }
 
     /// Orca 패리티: 방금 쓴 statusline 값이 있으면 자동 조회를 건너뛰고, 직접 조회 값보다 새롭거나
@@ -3430,7 +3480,7 @@ mod tests {
         lock(&CACHE).insert(key.clone(), (Instant::now(), direct(2, now + 600)));
         assert_eq!(five_hour(), Some(2));
         let failed = ProfileUsage {
-            error: Some("갱신 실패".into()),
+            error: Some("Refresh failed".into()),
             updated_at: Some(now + 600),
             ..ProfileUsage::default()
         };

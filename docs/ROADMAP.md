@@ -14,11 +14,11 @@
 | M6 v2 | 원격·orchestration·자동화·엔진 재평가 | 미정 | — |
 | M7 Orca 패리티 | 관리자 페이지(7탭)·프로바이더 다계정/자동전환·Orca 단축키·이미지 붙여넣기·PC-to-PC SSH·실화면 QA | 2026-10-18 | MK-107~113 전부 통과 및 실화면 검증 완료 |
 | M8 오케스트레이션·핵심 고도화 | 멀티 에이전트 오케스트레이션(`krill orchestration`)·스킬 레지스트리(`krill skills`)·세션 핸드오프(`krill handoff`)·워크스페이스 체크포인트/레퍼런스·리스닝 포트 감지(`krill ports`)·에디터·GUI 통합 | 2026-10-19 | MK-114~121 전부 통과 및 실화면 검증 완료 |
-| M9 모바일 원격 제어 | `krilld` 모바일 기기 레지스트리·`ring` E2EE v2·지연 바인딩 게이트웨이(Tailscale/릴레이 우선·`cloudflared` 폴백)·1-스캔 QR 페어링(관리자 `Mobile` 8번째 탭 + `krill mobile`)·내장 모바일 PWA·라이브 터미널 뷰 | 2026-10-20 | MK-122~126 전부 통과, 데몬 ≤ 60MB, 실화면 검증 완료 |
-| M10 Orca 이관·워크벤치 확장 | Orca 설정·다계정·원격 SSH·등록 프로젝트/워크트리 원클릭 이관(`krill import orca`)·공유 심볼릭 링크·디스크 클린업·사이드바 계보/필터·우측 파일 탐색기/전문검색·탭 고정/색상/MRU·AI Vault 검색·세션 포크·Git/PR AI 복구·Precheck 스케줄러·`krill computer` | 2026-10-25 | MK-172~187 전부 통과, 앱 ≤ 120MB·데몬 ≤ 60MB, `scripts/check.sh` 0 |
+| M9 모바일 원격 제어 | `krilld` 모바일 기기 레지스트리·`ring` E2EE v2·지연 바인딩 게이트웨이(릴레이·Tailscale, `cloudflared` 폴백은 0.3에서 제거)·1-스캔 QR 페어링(관리자 `Mobile` 8번째 탭 + `krill mobile`)·내장 모바일 PWA·라이브 터미널 뷰 | 2026-10-20 | MK-122~126 전부 통과, 데몬 ≤ 60MB, 실화면 검증 완료 |
+| M10 Orca 이관·워크벤치 확장 | Orca 설정·다계정·원격 SSH·등록 프로젝트/워크트리 원클릭 이관(`krill import orca`)·공유 심볼릭 링크·디스크 클린업·사이드바 계보/필터·우측 파일 탐색기/전문검색·탭 고정/색상/MRU·AI Vault 검색·세션 포크·Git/PR AI 복구·Precheck 스케줄러·`krill computer`(2026-11-03 삭제, vercel-labs/agent-desktop으로 대체) | 2026-10-25 | MK-172~187 전부 통과, 앱 ≤ 120MB·데몬 ≤ 60MB, `scripts/check.sh` 0 |
 | M11 Windows 포팅 | Windows(주 타깃 `x86_64-pc-windows-msvc`) 지원: 공통 컴파일 계층(Mac에서 Windows 타깃 `cargo check` 0) → GCP Windows VM 네이티브 ConPTY 실기 스파이크(S-W1~S-W5) → 합격 시 네이티브 본구현·배포. WSL2·앱만 원격은 보류(PRD 플랫폼 절) | 미정 | MK-205 Windows check 0, 스파이크 결과표로 본구현 여부 결정, 본구현 시 MK-217 Windows 생존 e2e 손실 0, macOS `scripts/check.sh` 0 유지 |
 | M12 Orca 심층 패리티 | 서브모듈·심링크·`.worktreeinclude` 글롭·Codex `SUN_LEN` 격리·훅 서브에이전트 보호·재귀 자식 워크트리 안전 삭제·스케줄 실행 상세/취소·오케스트레이션 `--question-id`/`--preamble`·AI Vault 증분 인덱싱·멀티 에이전트 Fan-Out 생성·Hunk/Line 스테이징·인앱 PR 머지 | 2026-10-19 | MK-223~229 전부 통과, `scripts/check.sh` 0 |
-| M13 Computer-use 신뢰성·격리·효율 | 대상 동일성·실행 결과·전역 입력 잠금·데드라인/취소·격리 네이티브 실행기·압축 관찰·짧은 배치 | 미정 | MK-244~251 관련 자동 테스트·실제 macOS 검증, 네이티브 TCC/장애 격리/메모리/지연 게이트 판정, 미통과 시 개선 JXA 유지 |
+| M13 Computer-use 신뢰성·격리·효율 | **중단(2026-11-03)**: computer use는 Krill이 직접 만들지 않고 vercel-labs/agent-desktop을 번들 스킬로 쓴다(`computer-use` 스킬, `krill-proto/src/orchestration/agent_desktop.rs`). 내장 `krill computer` CLI·워커는 삭제(5af5d174) | — | MK-244~251 진행 안 함 |
 
 ## 이슈 (우선순위 → 선행 순으로 진행)
 
@@ -104,12 +104,12 @@
 | MK-078 | 최소 접근성(VoiceOver 이름·역할) | M4 | P2 | VoiceOver로 세션 목록 탐색과 새 세션 생성 | MK-046 | T3#24, T1#27 | OWE-443 |
 | MK-079 | holder 드레인 모드 | M5 | P2 | krilld 30초 SIGSTOP 중 에이전트 블록 없음, 링 범위 손실 0 | MK-018 | T2#26 | OWE-444 |
 | MK-080 | .worktreeinclude(APFS clonefile) + orca.yaml setup 호환 + ORCA·CONDUCTOR 환경 변수 | M5 | P2 | Orca 설정 레포에서 .env 복사와 setup 자동 실행 | MK-042 | T1#28, T4-D9 | OWE-445 |
-| MK-081 | Hibernation(Orca 안전 조건 8가지) | M5 | P2 | done 30분 지난 백그라운드 에이전트 종료·열면 자동 resume, 대기·입력 중은 절대 종료 안 함 | MK-052 | T1#29 | OWE-446 |
+| MK-081 | Hibernation(Orca 안전 조건 8가지; 자동 종료 제거됨, 2026-11-03 0.3 필수 기능 정리, 기존 표식 재개만 유지) | M5 | P2 | done 30분 지난 백그라운드 에이전트 종료·열면 자동 resume, 대기·입력 중은 절대 종료 안 함 | MK-052 | T1#29 | OWE-446 |
 | MK-082 | 에이전트 세션 히스토리(요청 시 스캔) | M5 | P2 | 과거 세션 목록에서 Resume, 상주 프로세스 없음 | MK-052 | T1#30 | OWE-447 |
 | MK-083 | `claude agents --json` 연동 | M5 | P2 | agent view 백그라운드 세션이 사이드바에 상태와 함께 표시 | MK-039 | T1#31 | OWE-448 |
 | MK-084 | 사용량·레이트리밋 표시(Claude·Codex 로컬 파일) | M5 | P2 | 상태바에 5시간·주간 사용률, 80% 경고 | MK-039 | T1#32 | OWE-449 |
 | MK-085 | diff 줄 주석 → 에이전트에 보내기 | M5 | P2 | 주석을 모아 프롬프트 1개로 주입 | MK-054 | T1#33, T3#28 | OWE-450 |
-| MK-086 | 알림 웹훅(ntfy·Telegram·Discord, 본문 제외) | M5 | P2 | 완료 이벤트 POST, 재시도 1회, 출력 본문 미포함 | MK-044 | T1#34 | OWE-451 |
+| MK-086 | 알림 웹훅(ntfy·Telegram·Discord, 본문 제외; 제거됨, 2026-11-03 0.3 필수 기능 정리) | M5 | P2 | 완료 이벤트 POST, 재시도 1회, 출력 본문 미포함 | MK-044 | T1#34 | OWE-451 |
 | MK-087 | 메뉴바 아이콘 + 앱 꺼진 상태 알림 | M5 | P2 | 창을 닫아도 working·대기 수 표시, 앱 종료 상태에서 권한 요청 알림 | MK-044 | T1#35, T4-38 | OWE-452 |
 | MK-088 | Git 변경 패널·커밋 UI | M5 | P2 | 스테이징·언스테이징·커밋이 UI에서 끝남 | MK-054 | T3#21 | OWE-453 |
 | MK-089 | 사용 통계 기본 활성(2026-10-27 사용자 지시로 opt-in 변경, DO_NOT_TRACK 유지) | M5 | P2 | 설치·실행·일별 입력 활동의 닫힌 스키마, 상한 큐·백그라운드 전송, 비활성화 시 수집 중단, 인증된 운영 조회. 수집기 배포·새 앱 배포는 별도 | MK-077 | T4-34 | OWE-454 |
@@ -142,12 +142,12 @@
 | MK-116 | 워크스페이스 체크포인트·상태 카드(`--workspace-status`, `--unread`, `--pr`, `--issue`) 및 `krill reference` CLI | M8 | P0 | `krill set` 확장 플래그 및 `krill reference list/add/remove/find` 동작, 테스트 통과 | MK-093 | M8 | OWE-626 |
 | MK-117 | 로컬 개발 서버 포트·URL 자동 감지(`krill ports`) 및 브라우저 열기 연동 | M8 | P1 | 세션 출력 URL/포트 감지, `krill ports [--json]` 동작 및 단위 테스트 통과 | MK-045 | M8 | OWE-627 |
 | MK-118 | GUI 오케스트레이션 팝오버·포트 팝오버·사이드바 체크포인트 배지·관리자 스킬 설치 통합 및 실화면 QA | M8 | P0 | 상태바 오케스트레이션/포트 팝오버, 사이드바 배지, 관리자 페이지 연동, 실화면 검증 완료, `scripts/check.sh` 0 | MK-114, MK-115, MK-116, MK-117 | M8 | OWE-628 |
-| MK-119 | 가운데 에디터 탭 코어(세션 영역 파일 탭, 코드 편집·⌘S 원자적 저장·dirty·외부 변경 재로드, 변경 패널·⌘P·터미널 링크 열기) | M8 | P0 | 파일 탭 열기·편집·저장·외부 변경 상태기계 테스트 통과, 실화면 캡처, `scripts/check.sh` 0 | MK-054 | M8 | OWE-663 |
+| MK-119 | 가운데 에디터 탭 코어(세션 영역 파일 탭, 코드 편집·⌘S 원자적 저장·dirty·외부 변경 재로드, 변경 패널·⌘P·터미널 링크 열기; 편집·저장은 제거됨, 2026-11-03 0.3 필수 기능 정리, 읽기 전용 보기 + Open in) | M8 | P0 | 파일 탭 열기·편집·저장·외부 변경 상태기계 테스트 통과, 실화면 캡처, `scripts/check.sh` 0 | MK-054 | M8 | OWE-663 |
 | MK-120 | 에디터 지원 포맷(파일 종류 분류, 이미지·마크다운 미리보기·CSV 표·ipynb·바이너리/미디어/PDF 자리표시자) | M8 | P0 | 분류·NUL 검사·크기 한도·CSV·ipynb 파싱 테스트 통과, `scripts/check.sh` 0 | — | M8 | OWE-664 |
 | MK-121 | 에디터 포맷 뷰어 통합 + 실화면 QA | M8 | P0 | 포맷별 실화면 검증 완료, 앱 ≤ 120MB, `scripts/check.sh` 0 | MK-119, MK-120 | — | OWE-665 |
 | MK-122 | 모바일 기기 레지스트리(`mobile-devices.json`)·`ring` 기반 E2EE v2 핸드셰이크·크기 비소유 `Role::Interactive` 확장 | M9 | P0 | `FEAT_MOBILE`(`1<<56`)·`0x45`/`0x65` 등록, E2EE(`CHACHA20_POLY1305`·`HKDF_SHA256`) 핸드셰이크·재전송 거부·기기 등록/회수·크기 비소유 Interactive 단위·통합 테스트 통과, `scripts/check.sh` 0 | MK-050 | M9 | OWE-678 |
 | MK-123 | `krilld` 모바일 HTTP/WS 게이트웨이(Tailscale 감지·기존 LAN 설정 Relay 이행, 지연 바인딩 `Lazy Exposure`, `UnixStream::pair` 브리지) | M9 | P0 | 인터페이스 우선순위 선택·지연 바인딩 개폐·WS↔UnixStream 브리지·회수 시 즉시 연결 종료 통합 테스트 통과, 데몬 ≤ 60MB, `scripts/check.sh` 0 | MK-122 | M9 | OWE-679 |
-| MK-124 | 1-스캔 QR 페어링: 관리자 페이지 `Mobile` 전용 탭(8번째 탭) + `krill mobile` CLI + E2EE 릴레이(`--tunnel`, Quick Tunnel 폴백은 v0.1.37에서 제거) | M9 | P0 | `Mobile` 8번째 설정 탭 UI 동작, QR 생성·만료·모드 전환 시 무효화/갱신, `krill mobile pair/devices/revoke/serve` CLI 및 `--tunnel` URL 파싱 단위·통합 테스트 통과, `scripts/check.sh` 0 | MK-123, MK-109 | M9 | OWE-680 |
+| MK-124 | 1-스캔 QR 페어링: 관리자 페이지 `Mobile` 전용 탭(8번째 탭) + `krill mobile` CLI + E2EE 릴레이(`--tunnel`, Quick Tunnel 폴백은 v0.1.37, Named Tunnel 폴백은 0.3에서 제거) | M9 | P0 | `Mobile` 8번째 설정 탭 UI 동작, QR 생성·만료·모드 전환 시 무효화/갱신, `krill mobile pair/devices/revoke/serve` CLI 및 `--tunnel` URL 파싱 단위·통합 테스트 통과, `scripts/check.sh` 0 | MK-123, MK-109 | M9 | OWE-680 |
 | MK-125 | 내장 모바일 PWA 클라이언트 코어(`Needs You` 최상단·세션 카드·현재 터미널에서 권한 확인·프롬프트/사진 첨부·오케스트레이션·계정 스위처·Git 변경) | M9 | P0 | 모바일 PWA 정적 에셋 내장 서빙(비보안 HTTP 컨텍스트 호환), 세션 목록·과거 질문 review_in_term 및 현재 터미널 직접 입력·프롬프트/이미지 첨부·오케스트레이션/계정 전환 E2E 테스트 통과, `scripts/check.sh` 0 | MK-123, MK-124 | M9 | OWE-681 |
 | MK-126 | 모바일 라이브 터미널 그리드 뷰(화면 델타·핫/콜드 스크롤백·특수키 바·`Fit to Phone`) + 딥링크 웹훅 알림 및 실화면 QA | M9 | P1 | 라이브 그리드 델타·콜드 스크롤백·보조 키바·Fit to Phone·웹훅 딥링크 테스트 통과, 실화면 검증 완료, `scripts/check.sh` 0 | MK-125, MK-086 | M9 | OWE-682 |
 | MK-127 | 설치 후 온보딩 v2(상위): macOS 권한 점검·필수 요소 체크리스트(동의 화면 제거됨, 2026-10-18 OWE-904) | M4 | P1 | 새 계정 첫 실행에 모달 없이 완료·자동 준비, 필수 설치 안내는 조치 배너·빠른 점검(상태바)·점검 모달로, `scripts/check.sh` 0 | MK-073 | crates/krill-app/src/onboarding.rs | OWE-688 |
@@ -167,7 +167,7 @@
 | MK-133 | `krill-link`: iroh P2P 터널 + 기기 페어링(초대 링크·QR·근처 기기)·기기 회수, 앱 연동 | M9 | P1 | 오프라인 통합 테스트(페어링·만료 토큰·미허용 거부·revoke·krilld 터널·재연결), krill-link ≤ 20MB(별도 예산, 켤 때만), `scripts/check.sh` 0 | MK-130, MK-131 | M9 | OWE-669 |
 | MK-134 | 끊김 복구: 입력 정확히 한 번·순서 보장, 연결 상태 칩, 세션 목록 캐시, 자동 재연결 | M9 | P1 | 네트워크 단절 중 입력이 재연결 후 1회·순서대로 도착, 상태 칩 전환 테스트, `scripts/check.sh` 0 | MK-131, MK-133 | — | OWE-670 |
 | MK-172 | Orca 데이터 스캐너 & 원클릭 전체 이관 엔진(`krill import orca` + 다계정·원격 SSH·등록 프로젝트·워크트리·설정 이관) | M10 | P0 | `profile-state.db`/`orca-data.json`·`claude-profiles`·`codex-accounts`·`sshTargets`·`repos`·`worktreeMeta` 멱등 이관 및 이관된 계정 즉시 기동 테스트 통과, `scripts/check.sh` 0 | MK-107, MK-112 | M10 | OWE-726 |
-| MK-173 | GUI Orca 마이그레이션 마법사 & Settings `Import from Orca` 카드(설정 연동; 첫 실행 온보딩 카드는 제거됨, 2026-10-18 OWE-904) | M10 | P0 | Settings에서 Orca 데이터 감지·카테고리 선택·원클릭 이관 후 재시작 없이 사이드바·계정·SSH 즉시 반영, `scripts/check.sh` 0 | MK-172 | M10 | OWE-727 |
+| MK-173 | GUI Orca 마이그레이션 마법사 & Settings `Import from Orca` 카드(앱 UI 전체 제거됨, 2026-11-03 0.3 필수 기능 정리; `krill import orca` CLI는 유지) | M10 | P0 | Settings에서 Orca 데이터 감지·카테고리 선택·원클릭 이관 후 재시작 없이 사이드바·계정·SSH 즉시 반영, `scripts/check.sh` 0 | MK-172 | M10 | OWE-727 |
 | MK-174 | 워크트리 공유 심볼릭 링크(`Worktree Symlinks`) & 저장소별 `setup`/`archive` 훅 고도화 | M10 | P1 | 새 워크트리 생성 시 등록된 공유 경로(`.env` 등) 자동 심볼릭 링크 생성 및 `setup`/`archive` 훅 동작 테스트 통과, `scripts/check.sh` 0 | MK-080 | M10 | OWE-728 |
 | MK-175 | 워크스페이스 디스크 용량 분석(`Space`) & 머지된 워크트리 일괄 클린업(`Cleanup`) | M10 | P1 | 워크트리별 용량 측정 및 PR 머지·경과일·clean 조건별 일괄 정리 CLI/GUI 테스트 통과, `scripts/check.sh` 0 | MK-043, MK-090 | M10 | OWE-729 |
 | MK-176 | 부모-자식 워크트리 계보 트리(`Worktree Lineage`) & 워크트리 탐색 히스토리(`Back`/`Forward` `⌘⌥←/→`) | M10 | P1 | 부모-자식 워크트리 계층 접기/펼치기 및 `⌘⌥←`/`⌘⌥→` 탐색 히스토리 이동 테스트 통과, `scripts/check.sh` 0 | MK-046 | M10 | OWE-730 |
@@ -181,7 +181,7 @@
 | MK-184 | Git 패널 `Push`/`Pull`/`Sync` 액션 + AI 커밋 메시지·PR 본문 자동 생성 + Git 실패 AI 복구 배너 | M10 | P0 | Git 패널 Push/Pull/Sync 동작, AI 커밋/PR 문구 생성, Git 실패 시 에러 배너→에이전트 프롬프트 주입 테스트 통과, `scripts/check.sh` 0 | MK-088, MK-090 | M10 | OWE-738 |
 | MK-185 | PR CI Checks 실패 로그 조회 & "AI로 CI 실패 / PR 리뷰 코멘트 수정" 원클릭 큐 | M10 | P1 | PR CI 체크 상태·실패 로그·리뷰 코멘트 파싱 및 선택 항목 에이전트 프롬프트 일괄 전송 테스트 통과, `scripts/check.sh` 0 | MK-085, MK-090 | M10 | OWE-739 |
 | MK-186 | 스케줄 자동화 Precheck 셸 게이트 & 새 워크트리 격리 실행 · 실행 상세 로그 뷰어 | M10 | P1 | `precheck` 비-0 종료 시 에이전트 실행 생략(`skipped`), 새 워크트리 격리 실행, Workflows 탭 실행 로그 조회 및 `Run Now` 테스트 통과, `scripts/check.sh` 0 | MK-101 | M10 | OWE-740 |
-| MK-187 | macOS 네이티브 Computer Use (`krill computer` CLI + `computer-use` 내장 스킬) | M10 | P1 | `krill computer` 서브커맨드(앱/창 목록, AX 스냅샷, 클릭/키 입력 합성) 및 `computer-use` 내장 스킬 설치·조회 테스트 통과, `scripts/check.sh` 0 | MK-115 | M10 | OWE-741 |
+| MK-187 | macOS 네이티브 Computer Use (`krill computer` CLI + `computer-use` 내장 스킬). **2026-11-03 대체**: CLI·워커 삭제, `computer-use` 스킬이 vercel-labs/agent-desktop을 설치·사용 | M10 | P1 | `krill computer` 서브커맨드(앱/창 목록, AX 스냅샷, 클릭/키 입력 합성) 및 `computer-use` 내장 스킬 설치·조회 테스트 통과, `scripts/check.sh` 0 | MK-115 | M10 | OWE-741 |
 | MK-188 | Windows 포팅 기획·전략(상위) | M11 | P1 | 하위 MK-189~222 진행, Phase별 결정 기록 | — | boost-2026-10-18 | OWE-807 |
 | MK-189 | 문서: PRD·ROADMAP M11·MK 행 신설, ARCHITECTURE §4.1 Windows 열(미확정) 추가 | M11 | P1 | 문서 diff 리뷰, `scripts/check.sh` 0 | — | boost WIN-D1 | OWE-808 |
 | MK-190 | 하네스 문구: AGENTS 규칙 5·CONVENTIONS Windows 조항·holder 상한 해석 | M11 | P1 | 문서 diff, `scripts/check.sh` 0 | — | boost WIN-D2 | OWE-809 |

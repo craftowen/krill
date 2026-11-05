@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Cache corruption, source identity and experiment comparability regressions."""
+"""Cache corruption and source identity regressions."""
 
-import copy
-import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
 
-from vendor_cache import CASES, HELPERS, STAGES, cargo_messages, compare, digest_tree, normalized_graph, prepare, stage, verify_stage
+from vendor_cache import digest_tree, stage, verify_stage
 
 
 class StagingTests(unittest.TestCase):
@@ -66,7 +64,7 @@ class StagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differ"):
             self.run_stage()
         with self.assertRaisesRegex(ValueError, "restored vendor"):
-            prepare(self.root / "evidence")
+            verify_stage(self.root / "evidence")
 
     def test_symlink_input_is_rejected(self):
         (self.project / "vendor/link").symlink_to(self.project / "Cargo.lock")
@@ -78,135 +76,6 @@ class StagingTests(unittest.TestCase):
         (self.root / "home/config.toml").write_text("different config\n")
         with self.assertRaisesRegex(ValueError, "configuration changed"):
             verify_stage(self.root / "evidence")
-
-
-class GraphTests(unittest.TestCase):
-    def test_path_relocation_preserves_graph_but_feature_change_does_not(self):
-        a = {"packages": [{"id": "a", "name": "app", "version": "1", "source": None},
-                          {"id": "b", "name": "dep", "version": "1", "source": None}],
-             "workspace_members": ["a"], "resolve": {"nodes": [
-                 {"id": "a", "features": [], "deps": [{"name": "dep", "pkg": "b", "dep_kinds": []}]},
-                 {"id": "b", "features": ["native"], "deps": []}]}}
-        b = json.loads(json.dumps(a).replace('"b"', '"external"'))
-        self.assertEqual(normalized_graph(a), normalized_graph(b))
-        b["resolve"]["nodes"][1]["features"] = []
-        self.assertNotEqual(normalized_graph(a), normalized_graph(b))
-
-
-class ComparisonTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.jobs = {"jobs": []}
-        for case in CASES:
-            folder = self.root / case
-            folder.mkdir()
-            self.write(case, "metadata.json", dict(case=case, sha="a" * 40, tree="b" * 40,
-                run_id="10", attempt="1", rustc="1.98.1", cargo="1.98.1", nextest="same",
-                system=["arm64", "14", 3, "7GB"], sdk="14.5", image=["macos14", "same"],
-                test_profile=["2", "line-tables-only"], cache=["true", 1, "seed"],
-                vendor_hash="v", graph_sha256="g", vendor_cache_hit="true" if case == "consumer" else "false"))
-            self.write(case, "vendor.json", {"patches": {"dep": "dep"}})
-            self.write(case, "test-list.json", {"test-count": 2, "rust-suites": {"app": {
-                "status": "listed", "package-name": "app", "testcases": {
-                    "works": {"ignored": False, "filter-match": {"status": "matches"}},
-                    "ignored": {"ignored": True, "filter-match": {"status": "mismatch", "reason": "ignored"}}}}}})
-            (folder / "source-status.txt").write_text("")
-            (folder / "junit.xml").write_text('<testsuites><testsuite name="app"><testcase classname="app" name="works"/></testsuite></testsuites>')
-            profile = {"opt_level": "2", "debuginfo": "line-tables-only", "debug_assertions": True,
-                       "overflow_checks": True, "test": False}
-            artifact = {"package": ["dep", "1", "path"], "target": ["dep", ["lib"]],
-                        "features": [], "profile": profile, "fresh": case == "consumer", "executable": None}
-            app = copy.deepcopy(artifact)
-            app["package"][0] = "krill-app"
-            app["target"][0] = "krill_app"
-            self.write(case, "compilation.json", {"artifacts": [artifact, app], "clippy_artifacts": [copy.deepcopy(artifact)], "build": "same+dev.id", "helpers": sorted(HELPERS)})
-            (folder / "cargo-timing.html").write_text('const UNIT_DATA = [{"start":1,"duration":100}];')
-            self.jobs["jobs"].append(dict(name=f"{case} / vendor-cache-{case} (macos-15)", head_sha="a" * 40,
-                run_id=10, run_attempt=1, conclusion="success", created_at="2026-10-26T00:00:00Z",
-                started_at="2026-10-26T00:00:05Z", completed_at="2026-10-26T00:05:00Z",
-                steps=[{"name": s, "conclusion": "success"} for s in STAGES]))
-
-    def write(self, case, name, value):
-        (self.root / case / name).write_text(json.dumps(value))
-
-    def change(self, case, name, update):
-        path = self.root / case / name
-        value = json.loads(path.read_text())
-        update(value)
-        path.write_text(json.dumps(value))
-
-    def test_complete_matching_comparison_includes_queue_and_post(self):
-        rows, report = compare(self.root, self.jobs)
-        self.assertEqual(rows[0]["job_seconds"], 295)
-        self.assertEqual(rows[0]["gate_seconds"], 300)
-        self.assertIn("does not adopt", report)
-
-    def test_broken_json_and_equal_count_wrong_test_ids_are_rejected(self):
-        with self.assertRaises(ValueError):
-            list(cargo_messages('[krill-proto 0.2.4] cargo:rerun-if-changed=build.rs\n'))
-        with self.assertRaises(ValueError):
-            list(cargo_messages('{"reason":"compiler-artifact"}\nbroken JSON\n'))
-        path = self.root / "consumer/junit.xml"
-        path.write_text(path.read_text().replace('name="works"', 'name="different"'))
-        with self.assertRaisesRegex(ValueError, "listing"):
-            compare(self.root, self.jobs)
-
-    def test_app_build_script_keeps_its_unoptimized_build_override(self):
-        for case in CASES:
-            def add_build_script(value):
-                script = copy.deepcopy(value["artifacts"][1])
-                script["target"] = ["build-script-build", ["custom-build"]]
-                script["profile"].update(opt_level="0", debuginfo="none", test=False)
-                value["artifacts"].append(script)
-            self.change(case, "compilation.json", add_build_script)
-        rows, _ = compare(self.root, self.jobs)
-        self.assertEqual(len(rows), 3)
-
-    def test_corrupt_test_identity_ignored_reason_features_profile_and_build_are_rejected(self):
-        edits = [
-            ("test-list.json", lambda v: v["rust-suites"]["app"]["testcases"]["ignored"]["filter-match"].update(reason="other")),
-            ("compilation.json", lambda v: v["artifacts"][0].update(features=["different"])),
-            ("compilation.json", lambda v: v.update(build="different")),
-            ("compilation.json", lambda v: v["artifacts"][1]["profile"].update(opt_level="0")),
-            ("compilation.json", lambda v: v["artifacts"][1]["profile"].update(debuginfo="none")),
-            ("metadata.json", lambda v: v.update(graph_sha256="different")),
-            ("metadata.json", lambda v: v.update(sha="c" * 40)),
-        ]
-        for name, edit in edits:
-            with self.subTest(name=name, edit=edit):
-                original = (self.root / "consumer" / name).read_text()
-                self.change("consumer", name, edit)
-                with self.assertRaises(ValueError):
-                    compare(self.root, self.jobs)
-                (self.root / "consumer" / name).write_text(original)
-
-    def test_cache_miss_dirty_vendor_different_seed_and_missing_helper_are_rejected(self):
-        edits = [("metadata.json", lambda v: v.update(vendor_cache_hit="false")),
-                 ("compilation.json", lambda v: v["artifacts"][0].update(fresh=False)),
-                 ("compilation.json", lambda v: v["clippy_artifacts"][0].update(fresh=False)),
-                 ("compilation.json", lambda v: v.update(helpers=["krill"]))]
-        for name, edit in edits:
-            with self.subTest(edit=edit):
-                original = (self.root / "consumer" / name).read_text()
-                self.change("consumer", name, edit)
-                with self.assertRaises(ValueError):
-                    compare(self.root, self.jobs)
-                (self.root / "consumer" / name).write_text(original)
-        self.change("producer", "metadata.json", lambda v: v.update(cache=["true", 2, "other"]))
-        with self.assertRaisesRegex(ValueError, "seed"):
-            compare(self.root, self.jobs)
-
-    def test_missing_failed_or_wrong_job_and_stage_are_rejected(self):
-        for edit in (lambda v: v["jobs"][1].update(conclusion="failure"),
-                     lambda v: v["jobs"][1].update(head_sha="c" * 40),
-                     lambda v: v["jobs"][1]["steps"][0].update(conclusion="skipped"),
-                     lambda v: v["jobs"].pop()):
-            jobs = copy.deepcopy(self.jobs)
-            edit(jobs)
-            with self.assertRaises(ValueError):
-                compare(self.root, jobs)
 
 
 if __name__ == "__main__":

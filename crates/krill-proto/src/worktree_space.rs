@@ -220,16 +220,6 @@ impl IdleDaysPreset {
             Self::Days30 => 30,
         }
     }
-
-    #[must_use]
-    pub fn from_days(days: u64) -> Self {
-        match days {
-            7 => Self::Days7,
-            14 => Self::Days14,
-            30 => Self::Days30,
-            _ => Self::Any,
-        }
-    }
 }
 
 /// 워크트리 일괄 클린업 필터 설정.

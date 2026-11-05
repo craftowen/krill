@@ -358,3 +358,50 @@ fn composer_meta_reads_the_statusline_record_from_any_profile_scope() {
     assert_eq!(meta.effort.as_deref(), Some("high"));
     assert_eq!(meta.context_percent, Some(14));
 }
+
+#[cfg(unix)]
+#[gpui::test]
+fn closing_chat_pane_drops_its_chat_state(cx: &mut TestAppContext) {
+    use crate::shell::tests::{open, state_path};
+    let (shell, cx) = open(cx, state_path("chat-close-prune"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    shell.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, SessionId(445));
+        shell.layout.set_chat_view(pane, true);
+        shell.apply_chat_poll(
+            SessionId(445),
+            ChatPollSnapshot {
+                bound: true,
+                reset: true,
+                items: vec![ChatItem {
+                    kind: ChatItemKind::Assistant,
+                    text: "hello".into(),
+                    ..ChatItem::default()
+                }],
+                ..ChatPollSnapshot::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let key = local_key(SessionId(445));
+    shell.update(cx, |shell, _| {
+        assert!(shell.chat.logs.contains_key(&key));
+        assert!(shell.chat.inputs.contains_key(&key));
+    });
+    shell.update(cx, |shell, cx| shell.request_close_tab(1, cx));
+    cx.run_until_parked();
+    shell.update(cx, |shell, _| {
+        assert_eq!(shell.layout.tabs().len(), 1);
+        assert!(
+            !shell.chat.logs.contains_key(&key),
+            "closed pane keeps chat log"
+        );
+        assert!(
+            !shell.chat.inputs.contains_key(&key),
+            "closed pane keeps composer"
+        );
+    });
+}

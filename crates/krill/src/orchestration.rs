@@ -54,7 +54,7 @@ usage: krill [--host <user@host>] orchestration <subcommand> [options]
   worker-retain <worker-or-dispatch> [--json]
   worker-release <worker-or-dispatch> [--json]
   worker-abandon <worker-or-dispatch> [--json]
-  reset (--run <run-id> | --yes) [--json]   (--yes는 모든 run 초기화)";
+  reset (--run <run-id> | --yes) [--json]   (--yes resets every run)";
 
 enum TargetRef<'a> {
     Borrowed(&'a Target),

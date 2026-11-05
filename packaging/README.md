@@ -255,12 +255,7 @@ ad-hoc 서명에는 TeamIdentifier가 없다. 같은 팀의 Developer ID 서명�
 
 ## CI
 
-`.github/workflows/package-macos.yml`은 `workflow_dispatch`로만 실행한다.
-Rust 1.98.1을 선택하고 회귀 검사(`test_pipeline.py`·`homebrew/test_release.py`·`test_publish.py`) 후 같은 로컬 진입점으로 빌드한다.
-프로필은 `release`(기본) 또는 `dev`를 선택한다. ZIP과 체크섬만 Actions artifact로 보관하며 릴리스를 발행하지 않는다.
-이 작업에서는 워크플로를 원격 실행하지 않았다.
-액션 설정 근거: [checkout 공식 문서](https://github.com/actions/checkout),
-[upload-artifact 공식 문서](https://github.com/actions/upload-artifact).
+패키징 회귀(`macos/test_pipeline.py`·`homebrew/test_release.py`)는 `ci-macos.yml`의 packaging 잡에서 돈다. 출고 빌드는 `release.yml`이 맡는다.
 
 ## Developer ID·공증 전환 지점 (미구현·미실행)
 

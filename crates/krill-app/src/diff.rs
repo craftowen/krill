@@ -227,38 +227,6 @@ impl Source for TestHubSource {
     }
 }
 
-/// Query MK-053 without spawning a daemon: the shell owns daemon lifecycle.
-pub fn changes(target: impl Into<HostTarget>, repo: &Path) -> io::Result<Changes> {
-    let target = target.into();
-    let hello = daemon::client_hello(ClientRole::App, "krill-app-diff");
-    let conn = target.connect(&hello).map_err(io::Error::other)?;
-    let need = FEAT_CONTROL | FEAT_GIT_CHANGES;
-    if conn.negotiated.features & need != need {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "git changes unavailable",
-        ));
-    }
-    let mut sock = conn.stream;
-    sock.set_read_timeout(Some(TIMEOUT))?;
-    sock.set_write_timeout(Some(TIMEOUT))?;
-    sock.write_all(
-        &Request::GitChanges {
-            repo: repo.as_os_str().as_bytes().to_vec(),
-        }
-        .encode()?,
-    )?;
-    let (kind, bytes) = ipc::read_frame(&mut sock)?.ok_or(io::ErrorKind::UnexpectedEof)?;
-    match Reply::decode(kind, &bytes)? {
-        Reply::GitChanges(changes) => Ok(changes),
-        Reply::GitChangesFailed(e) => Err(io::Error::other(e)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unexpected git changes reply",
-        )),
-    }
-}
-
 struct Reap(Child);
 impl Drop for Reap {
     fn drop(&mut self) {
@@ -705,12 +673,6 @@ impl Panel {
         };
         cx.notify();
         is_viewed
-    }
-
-    /// 직전 `OpenFile` 이벤트가 단일 클릭 미리보기(preview) 열기인지 반환한다.
-    #[must_use]
-    pub fn last_open_file_preview(&self) -> bool {
-        self.open_file_preview
     }
 
     /// 직전 `OpenFile` 이벤트의 미리보기(preview) 플래그를 꺼내고 `false`로 초기화한다.
@@ -1392,11 +1354,6 @@ impl Panel {
     }
 
     #[must_use]
-    pub fn active_hunk(&self) -> usize {
-        self.active_hunk
-    }
-
-    #[must_use]
     pub fn resolved_hunk_index(&self, cx: &gpui::App) -> usize {
         let count = self.hunk_count();
         if let Some(range) = self.state.read(cx).selected_lines() {
@@ -1406,14 +1363,6 @@ impl Panel {
             }
         }
         self.active_hunk.min(count.saturating_sub(1))
-    }
-
-    pub fn set_active_hunk(&mut self, hunk: usize, cx: &mut Context<Self>) {
-        let count = self.hunk_count();
-        if count > 0 {
-            self.active_hunk = hunk.min(count - 1);
-            cx.notify();
-        }
     }
 
     pub(crate) fn matches_comparison(file: &ChangedFile, comparison: Comparison) -> bool {

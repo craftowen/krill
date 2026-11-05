@@ -123,6 +123,7 @@ fn contrast_ratio_lum(l1: f32, l2: f32) -> f32 {
 
 /// 두 RGB 색의 WCAG 명암비(1.0..=21.0).
 #[must_use]
+#[cfg(test)]
 pub fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
     contrast_ratio_lum(relative_luminance(a), relative_luminance(b))
 }

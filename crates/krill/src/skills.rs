@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use krill_proto::daemon;
 use krill_proto::orchestration::{
-    PortEntry, WorktreeStore, builtin_skills, canonical_skill_name, ensure_agent_desktop_latest,
+    PortEntry, WorktreeStore, builtin_skills, canonical_skill_name, ensure_agent_desktop_installed,
     extract_local_urls, install_skill, skill_references,
 };
 
@@ -246,7 +246,7 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
                 let home = krill_proto::os::home_dir()
                     .ok_or_else(|| io::Error::other("home directory unavailable"))?;
                 if canonical_skill_name(name) == "computer-use" {
-                    ensure_agent_desktop_latest(&home, None)?;
+                    ensure_agent_desktop_installed(&home, None)?;
                 }
                 krill_proto::orchestration::skill_directories(&home, &target)
             };

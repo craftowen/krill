@@ -247,6 +247,9 @@ pub struct View {
     items: Vec<Item>,
     next: Option<String>,
     selected_slug: Option<String>,
+    /// Drawer source preview for one slug, read off the UI thread when it is selected.
+    local_source: Option<(String, Option<LocalSource>)>,
+    local_source_task: Option<Task<()>>,
     copied_slug: Option<String>,
     deleting_slug: Option<String>,
     retention_slug: Option<String>,
@@ -317,6 +320,8 @@ impl View {
             items: Vec::new(),
             next: None,
             selected_slug: None,
+            local_source: None,
+            local_source_task: None,
             copied_slug: None,
             deleting_slug: None,
             error: None,
@@ -344,6 +349,20 @@ impl View {
     }
 
     pub fn select_slug(&mut self, slug: Option<String>, cx: &mut Context<Self>) {
+        if let (Some(slug), Some(dir)) = (slug.clone(), self.state_dir.clone()) {
+            self.local_source_task = Some(cx.spawn(async move |this, cx| {
+                let read = slug.clone();
+                let found = cx
+                    .background_executor()
+                    .spawn(async move { local_source_for_slug(&dir, &read) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.local_source = Some((slug, found));
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
         self.selected_slug = slug;
         cx.notify();
     }
@@ -494,27 +513,6 @@ impl View {
             .ok();
         }));
         cx.notify();
-    }
-
-    fn local_source_for_slug(&self, slug: &str) -> Option<(String, Option<String>)> {
-        #[derive(Deserialize)]
-        struct LocalShareEntry {
-            slug: String,
-        }
-        #[derive(Default, Deserialize)]
-        struct LocalSharesFile {
-            #[serde(default)]
-            files: std::collections::BTreeMap<String, LocalShareEntry>,
-        }
-        let dir = self.state_dir.as_deref()?;
-        let raw = std::fs::read(dir.join("artifact-shares.json")).ok()?;
-        let shares: LocalSharesFile = serde_json::from_slice(&raw).ok()?;
-        let (path, _) = shares.files.into_iter().find(|(_, s)| s.slug == slug)?;
-        let preview = std::fs::read_to_string(&path).ok().map(|content| {
-            let lines: Vec<&str> = content.lines().take(28).collect();
-            lines.join("\n")
-        });
-        Some((path, preview))
     }
 
     fn render_error_banner(&self, p: &ui::Palette, cx: &mut Context<Self>) -> Option<gpui::Div> {
@@ -770,7 +768,11 @@ impl View {
             text::COL_UPDATED.get(),
             text::COL_EXPIRES.get()
         );
-        let local_source = self.local_source_for_slug(&slug);
+        let local_source = self
+            .local_source
+            .as_ref()
+            .filter(|(cached, _)| *cached == slug)
+            .and_then(|(_, source)| source.clone());
 
         div()
             .id("artifact-detail-drawer")
@@ -1009,6 +1011,7 @@ impl View {
                     )
                     .children(local_source.map(|(source_path, preview_text)| {
                         div()
+                            .debug_selector(|| "artifact-local-source".into())
                             .rounded(ui::RADIUS_MD)
                             .border_1()
                             .border_color(p.border)
@@ -1049,6 +1052,36 @@ impl View {
                     })),
             )
     }
+}
+
+/// A shared file's path and its first lines.
+type LocalSource = (String, Option<String>);
+
+/// The shared source path for `slug` and its first lines. Only the head of the file is read.
+fn local_source_for_slug(dir: &Path, slug: &str) -> Option<LocalSource> {
+    use std::io::Read as _;
+    #[derive(Deserialize)]
+    struct LocalShareEntry {
+        slug: String,
+    }
+    #[derive(Default, Deserialize)]
+    struct LocalSharesFile {
+        #[serde(default)]
+        files: std::collections::BTreeMap<String, LocalShareEntry>,
+    }
+    let raw = std::fs::read(dir.join("artifact-shares.json")).ok()?;
+    let shares: LocalSharesFile = serde_json::from_slice(&raw).ok()?;
+    let (path, _) = shares.files.into_iter().find(|(_, s)| s.slug == slug)?;
+    let mut head = Vec::new();
+    let preview = std::fs::File::open(&path)
+        .and_then(|file| file.take(64 * 1024).read_to_end(&mut head))
+        .ok()
+        .map(|_| {
+            let content = String::from_utf8_lossy(&head);
+            let lines: Vec<&str> = content.lines().take(28).collect();
+            lines.join("\n")
+        });
+    Some((path, preview))
 }
 
 impl Render for View {
@@ -1436,7 +1469,6 @@ impl Render for View {
                     .flex()
                     .flex_col()
                     .child(
-                        // Top Header (Orca ArtifactsPage header + Krill Back button)
                         div()
                             .flex_none()
                             .flex()
@@ -1449,30 +1481,34 @@ impl Render for View {
                             .child(
                                 div()
                                     .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        ui::ghost("artifacts-back", text::BACK.get())
-                                            .debug_selector(|| "artifacts-back".into())
-                                            .icon(IconName::ArrowLeft)
-                                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Close))),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(ui::TEXT_LG)
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(p.foreground)
-                                            .child(text::TITLE.get()),
-                                    ),
+                                    .text_size(ui::TEXT_LG)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.foreground)
+                                    .child(text::TITLE.get()),
                             )
                             .child(
                                 div()
                                     .min_w_0()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .truncate()
-                                    .child(text::DESCRIPTION.get()),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .truncate()
+                                            .child(text::DESCRIPTION.get()),
+                                    )
+                                    .child(
+                                        Button::new("artifacts-close")
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .small()
+                                            .tooltip(text::CLOSE.get())
+                                            .debug_selector(|| "artifacts-close".into())
+                                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Close))),
+                                    ),
                             ),
                     )
                     .children(self.render_error_banner(p, cx))

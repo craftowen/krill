@@ -975,7 +975,7 @@ fn dashboard_card_click_closes_settings_unzooms_pane_and_routes_remote_host(
     cx.run_until_parked();
     main.read_with(cx, |shell, cx| {
         assert!(shell.dashboard.is_none());
-        assert!(shell.settings.is_none(), "설정 화면이 닫힌다");
+        assert!(shell.settings().is_none(), "설정 화면이 닫힌다");
         assert!(
             shell.layout.zoomed_pane().is_none(),
             "다른 칸이 확대되어 있었으면 확대를 풀어 선택한 세션을 보이게 한다"

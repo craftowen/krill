@@ -1,4 +1,4 @@
-//! 원격 호스트(`HostId::Remote`) 파일 탐색·열기·원자적 저장·빠른 열기·로컬호스트 URL 포트포워딩 클라이언트.
+//! 원격 호스트(`HostId::Remote`) 파일 탐색·열기·첨부 업로드·빠른 열기·로컬호스트 URL 포트포워딩 클라이언트.
 //!
 //! 모든 요청은 기존 [`HostTarget`] 제어 소켓(`FEAT_CONTROL | FEAT_REMOTE_FS`) 위에서 동작하며
 //! 별도의 SSH/SFTP 프로세스를 띄우지 않는다.
@@ -27,7 +27,7 @@ use krill_proto::remote_fs::{
 };
 use krill_proto::screen::Msg as _;
 
-use crate::editor::{self, Opened, SaveError, Stamp, Unopenable};
+use crate::editor::{self, Opened, Stamp, Unopenable};
 use crate::file_format::{self, ImageFormat, Kind, csv, raster};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
@@ -349,26 +349,10 @@ pub fn open(
     }
 }
 
-/// 원격 텍스트 파일을 원자적으로 저장한다(`expected` 지문이 다르면 [`SaveError::Conflict`]).
-pub fn save_atomic(
-    target: &HostTarget,
-    path: &Path,
-    text: &str,
-    expected: Option<Stamp>,
-) -> Result<Stamp, SaveError> {
-    save_atomic_bytes(target, path, text.as_bytes(), expected)
-}
-
-/// [`save_atomic`]의 바이트판(클립보드 이미지 등 원격 첨부 업로드).
-pub fn save_atomic_bytes(
-    target: &HostTarget,
-    path: &Path,
-    data: &[u8],
-    expected: Option<Stamp>,
-) -> Result<Stamp, SaveError> {
+/// 바이트를 원격 파일로 원자적으로 올린다(클립보드 이미지 등 원격 첨부 업로드).
+pub fn save_atomic_bytes(target: &HostTarget, path: &Path, data: &[u8]) -> io::Result<()> {
     static STAGE_SEQ: AtomicU64 = AtomicU64::new(1);
     let chunk_limit = MAX_REMOTE_CHUNK;
-    let expected_wire = expected.map(Stamp::to_wire);
 
     if data.len() <= chunk_limit {
         let reply = request(
@@ -376,20 +360,22 @@ pub fn save_atomic_bytes(
             RemoteFsRequest::WriteAtomic {
                 path: path_to_wire(path),
                 bytes: data.to_vec(),
-                expected: expected_wire,
+                expected: None,
                 stage_id: 0,
                 offset: 0,
                 commit: true,
             },
         )?;
         return match reply {
-            RemoteFsReply::Written(WireWriteOutcome::Saved(w)) => Ok(Stamp::from_wire(w)),
-            RemoteFsReply::Written(WireWriteOutcome::Conflict { .. }) => Err(SaveError::Conflict),
-            RemoteFsReply::Written(WireWriteOutcome::StageAck) => {
-                Err(io::Error::other("unexpected staged reply on single-chunk write").into())
+            RemoteFsReply::Written(WireWriteOutcome::Saved(_)) => Ok(()),
+            RemoteFsReply::Written(WireWriteOutcome::Failed(e)) => Err(io::Error::other(e)),
+            RemoteFsReply::Written(_) => {
+                Err(io::Error::other("unexpected single-chunk write reply"))
             }
-            RemoteFsReply::Written(WireWriteOutcome::Failed(e)) => Err(io::Error::other(e).into()),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected write reply").into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected write reply",
+            )),
         };
     }
 
@@ -408,7 +394,7 @@ pub fn save_atomic_bytes(
             RemoteFsRequest::WriteAtomic {
                 path: path_to_wire(path),
                 bytes: data[offset..end].to_vec(),
-                expected: if commit { expected_wire } else { None },
+                expected: None,
                 stage_id,
                 offset: u64::try_from(offset).unwrap_or(u64::MAX),
                 commit,
@@ -418,26 +404,22 @@ pub fn save_atomic_bytes(
             RemoteFsReply::Written(WireWriteOutcome::StageAck) if !commit => {
                 offset = end;
             }
-            RemoteFsReply::Written(WireWriteOutcome::Saved(w)) if commit => {
-                return Ok(Stamp::from_wire(w));
-            }
-            RemoteFsReply::Written(WireWriteOutcome::Conflict { .. }) => {
-                return Err(SaveError::Conflict);
-            }
+            RemoteFsReply::Written(WireWriteOutcome::Saved(_)) if commit => return Ok(()),
             RemoteFsReply::Written(WireWriteOutcome::Failed(e)) => {
-                return Err(io::Error::other(e).into());
+                return Err(io::Error::other(e));
             }
             RemoteFsReply::Written(_) => {
-                return Err(io::Error::other("unexpected multi-chunk write state").into());
+                return Err(io::Error::other("unexpected multi-chunk write state"));
             }
             _ => {
-                return Err(
-                    io::Error::new(io::ErrorKind::InvalidData, "unexpected write reply").into(),
-                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected write reply",
+                ));
             }
         }
     }
-    Err(io::Error::other("unreachable multi-chunk write end").into())
+    Err(io::Error::other("unreachable multi-chunk write end"))
 }
 
 /// 원격 디렉터리 1단계를 읽는다(우측 파일 탐색기용).
@@ -972,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_open_and_save_atomic_over_ipc() {
+    fn remote_open_over_ipc() {
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let sock_dir = std::env::temp_dir().join(format!(
             "krill-rfs-test-{}-{}",
@@ -987,49 +969,28 @@ mod tests {
             modified_unix_ns: Some(1_700_000_000_000_000_000),
             len: 6,
         };
-        let stamp2 = WireStamp {
-            modified_unix_ns: Some(1_700_000_001_000_000_000),
-            len: 8,
-        };
-
         let daemon_thread = thread::spawn(move || {
-            for step in 0..2 {
-                let (mut stream, _) = ipc_listener.accept().unwrap();
-                let mut writer = stream.try_clone().unwrap();
-                accept_test_handshake(&mut stream, &mut writer);
-                let (kind, payload) = ipc::read_frame(&mut stream).unwrap().unwrap();
-                let req = Request::decode(kind, &payload).unwrap();
-                let reply = match (step, req) {
-                    (0, Request::RemoteFs(RemoteFsRequest::ReadFile { .. })) => {
-                        Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
-                            stat: WireStat {
-                                exists: true,
-                                is_file: true,
-                                is_dir: false,
-                                is_symlink: false,
-                                stamp: Some(stamp1),
-                            },
-                            bytes: b"hello\n".to_vec(),
-                            eof: true,
-                        })))
-                    }
-                    (
-                        1,
-                        Request::RemoteFs(RemoteFsRequest::WriteAtomic {
-                            bytes,
-                            expected,
-                            commit: true,
-                            ..
-                        }),
-                    ) => {
-                        assert_eq!(bytes, b"updated\n");
-                        assert_eq!(expected, Some(stamp1));
-                        Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(stamp2)))
-                    }
-                    other => panic!("unexpected step/request: {other:?}"),
-                };
-                stream.write_all(&reply.encode().unwrap()).unwrap();
-            }
+            let (mut stream, _) = ipc_listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            accept_test_handshake(&mut stream, &mut writer);
+            let (kind, payload) = ipc::read_frame(&mut stream).unwrap().unwrap();
+            let req = Request::decode(kind, &payload).unwrap();
+            assert!(matches!(
+                req,
+                Request::RemoteFs(RemoteFsRequest::ReadFile { .. })
+            ));
+            let reply = Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
+                stat: WireStat {
+                    exists: true,
+                    is_file: true,
+                    is_dir: false,
+                    is_symlink: false,
+                    stamp: Some(stamp1),
+                },
+                bytes: b"hello\n".to_vec(),
+                eof: true,
+            })));
+            stream.write_all(&reply.encode().unwrap()).unwrap();
         });
 
         let host = HostId::Remote("box".into());
@@ -1039,15 +1000,6 @@ mod tests {
         assert!(staged.is_none());
         assert_eq!(loaded_stamp, Stamp::from_wire(stamp1));
         assert!(matches!(opened, Opened::Text(_, ref s) if s == "hello\n"));
-
-        let saved_stamp = save_atomic(
-            &target,
-            Path::new("/remote/repo/note.txt"),
-            "updated\n",
-            Some(loaded_stamp),
-        )
-        .unwrap();
-        assert_eq!(saved_stamp, Stamp::from_wire(stamp2));
 
         daemon_thread.join().unwrap();
         fs::remove_dir_all(&sock_dir).ok();

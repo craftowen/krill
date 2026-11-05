@@ -1,9 +1,46 @@
 use super::*;
 
 impl Shell {
-    /// In-app document libraries and settings suspend terminal input without closing sessions.
+    /// An open modal suspends terminal input without closing sessions.
     pub(super) fn page_open(&self) -> bool {
-        self.settings.is_some() || self.artifacts.is_some() || self.automations.is_some()
+        self.modal.is_some()
+    }
+
+    pub(super) fn settings(&self) -> Option<&gpui::Entity<krill_app::settings::SettingsView>> {
+        match &self.modal {
+            Some(Modal::Settings(view)) => Some(view),
+            _ => None,
+        }
+    }
+
+    pub(super) fn replace_modal(&mut self, next: Option<Modal>, cx: &mut Context<Self>) -> bool {
+        let previous = std::mem::replace(&mut self.modal, next);
+        if let Some(Modal::Settings(settings)) = &previous {
+            let settings = settings.clone();
+            // Back/Escape can invoke this host while SettingsView itself is
+            // borrowed by its handler; stop hidden polling after that borrow ends.
+            cx.defer(move |cx| settings.update(cx, |view, cx| view.set_visible(false, cx)));
+        }
+        previous.is_some()
+    }
+
+    pub(super) fn focus_modal_or_workspace(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(window) = window {
+            let focus = self
+                .modal
+                .as_ref()
+                .map_or_else(|| self.focus.clone(), |modal| modal.focus_handle(cx));
+            window.focus(&focus, cx);
+            self.pending_focus = PendingFocus::None;
+        } else if self.modal.is_some() {
+            self.pending_focus = PendingFocus::Modal;
+        } else {
+            self.pending_focus = PendingFocus::Workspace;
+        }
     }
 
     pub(super) fn open_artifacts(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
@@ -15,10 +52,6 @@ impl Shell {
             self.commit_ime(pane, window.as_deref(), cx);
         }
         self.record_workspace_nav(cx);
-        if let Some(settings) = self.settings.take() {
-            cx.defer(move |cx| settings.update(cx, |v, cx| v.set_visible(false, cx)));
-        }
-        self.automations = None;
         self.jump = None;
         self.continue_session = None;
         self.dashboard = None;
@@ -29,7 +62,7 @@ impl Shell {
         {
             live.pane.clear_search();
         }
-        if self.artifacts.is_none() {
+        if !matches!(self.modal, Some(Modal::Artifacts(_))) {
             #[cfg(not(test))]
             let state = self.state_dir(cx);
             #[cfg(not(test))]
@@ -45,18 +78,11 @@ impl Shell {
                 this.close_settings(None, cx);
             })
             .detach();
-            self.artifacts = Some(view);
+            self.replace_modal(Some(Modal::Artifacts(view)), cx);
         }
         self.nav_history.push(NavEntry::Artifacts);
         self.sync_focused_session(cx);
-        if let Some(window) = window {
-            if let Some(view) = &self.artifacts {
-                window.focus(&view.read(cx).focus_handle(), cx);
-            }
-            self.pending_focus = PendingFocus::None;
-        } else {
-            self.pending_focus = PendingFocus::Artifacts;
-        }
+        self.focus_modal_or_workspace(window, cx);
         cx.notify();
     }
 
@@ -69,10 +95,6 @@ impl Shell {
             self.commit_ime(pane, window.as_deref(), cx);
         }
         self.record_workspace_nav(cx);
-        if let Some(settings) = self.settings.take() {
-            cx.defer(move |cx| settings.update(cx, |v, cx| v.set_visible(false, cx)));
-        }
-        self.artifacts = None;
         self.jump = None;
         self.continue_session = None;
         self.dashboard = None;
@@ -83,7 +105,9 @@ impl Shell {
         {
             live.pane.clear_search();
         }
-        if self.automations.is_none() {
+        if let Some(Modal::Automations(view)) = &self.modal {
+            view.update(cx, krill_app::automations::View::reload);
+        } else {
             let state = self.state_dir(cx);
             let default_cwd = self
                 .sidebar
@@ -100,20 +124,11 @@ impl Shell {
                 this.close_settings(None, cx);
             })
             .detach();
-            self.automations = Some(view);
-        } else if let Some(view) = &self.automations {
-            view.update(cx, krill_app::automations::View::reload);
+            self.replace_modal(Some(Modal::Automations(view)), cx);
         }
         self.nav_history.push(NavEntry::Automations);
         self.sync_focused_session(cx);
-        if let Some(window) = window {
-            if let Some(view) = &self.automations {
-                window.focus(&view.read(cx).focus_handle(), cx);
-            }
-            self.pending_focus = PendingFocus::None;
-        } else {
-            self.pending_focus = PendingFocus::Automations;
-        }
+        self.focus_modal_or_workspace(window, cx);
         cx.notify();
     }
 }

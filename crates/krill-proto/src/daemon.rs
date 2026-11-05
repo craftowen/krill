@@ -32,7 +32,7 @@
 
 use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use crate::os::net::UnixStream;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
@@ -53,6 +53,10 @@ pub const FEAT_HOLDER_WATCH: u64 = 1 << 7;
 /// 이미 건강한 데몬이 떠 있는 중복 기동이다. 정상(0)·실패(1)·인자 오류(2)와 구별해 holder가 재기동 없이
 /// 끝낸다. 직접 실행한 krilld는 MK-022대로 0으로 끝낸다.
 pub const KRILLD_DUPLICATE: u8 = 3;
+/// holder 아래에서 뜬 krilld가 고아 krilld에게서 세션을 넘겨받지 못하고 끝날 때의 종료 코드. 상대를 기다리느라 1초
+/// 넘게 살았어도 holder는 뜨자마자 죽은 것으로 세어 백오프한다. 바로 다시 띄우면 시도마다 고아의 리더가 멈추고
+/// 세션 없는 holder는 포기하지 못한다. 이 코드를 모르는 holder는 일반 실패로 본다.
+pub const KRILLD_HANDOVER_FAILED: u8 = 4;
 /// EOF 없이 멈춘 데몬을 감지하는 감시 연결 확장(OWE-586, ARCHITECTURE §4.3).
 pub const FEAT_HEARTBEAT: u64 = 1 << 45;
 /// 데몬→클라이언트 holder 상태 프레임(ARCHITECTURE §4.3).
@@ -238,6 +242,9 @@ pub const SUN_PATH_MAX: usize = 108;
 const NOFILE: u32 = 10_240;
 /// 띄운 뒤 소켓이 생길 때까지 기다리는 최대 시간.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// 실패한 기동의 holder가 SIGTERM으로 끝나기를 기다리는 최대 시간(세션을 새 krilld에 넘기는 시간 포함).
+#[cfg(unix)]
+const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
 /// 붙은 뒤 `ServerHello`를 기다리는 최대 시간. krilld가 멈춰 있어도 앱·CLI가 붙잡히지 않게 한다.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -276,6 +283,19 @@ pub const LINUX_STATE_PARENT: &str = ".local/share";
 /// 상태 디렉터리 재정의 환경변수(`KRILL_STATE_DIR`, 개발·테스트 격리). 상태 디렉터리 재정의 여부는 모두 이 함수로 판단한다.
 pub fn state_dir_override() -> Option<OsString> {
     std::env::var_os("KRILL_STATE_DIR")
+}
+
+/// 상태 디렉터리가 기본 위치 밖으로 격리됐는지(테스트·임시 실행). Krill 세션 셸은 기본 경로를 그대로
+/// `KRILL_STATE_DIR`로 내보내므로 값이 있다는 것만으로는 격리가 아니다.
+pub fn state_dir_isolated() -> bool {
+    is_isolated(
+        state_dir_override().as_deref(),
+        default_state_dir().as_deref(),
+    )
+}
+
+fn is_isolated(state_override: Option<&OsStr>, default: Option<&Path>) -> bool {
+    state_override.is_some_and(|dir| Some(Path::new(dir)) != default)
 }
 
 /// 상태 디렉터리. [`state_dir_override`]가 있으면 그것, 없으면 `~/Library/Application Support/<번들 id>`
@@ -431,7 +451,7 @@ fn is_temp_home(home: &Path) -> bool {
 /// 임시 `HOME`(`HOME=/tmp/...` 등)에서는 호스트에 설치된 운영 `/Applications/Krill.app`의 헬퍼를
 /// 띄워 고아 holder·krilld를 남기지 않도록 제외한다.
 fn allow_installed_apps(exe: &Path, home: Option<&Path>) -> bool {
-    if cfg!(test) || state_dir_override().is_some() {
+    if cfg!(test) || state_dir_isolated() {
         return false;
     }
     if !allow_installed_apps_for_paths(exe, home) {
@@ -963,46 +983,68 @@ fn connect_or_launch(paths: &Paths, hello: &ClientHello) -> Result<Connection, E
         .ok_or(Error::Timeout)?;
     #[cfg(windows)]
     let mut escaped = false;
-    loop {
+    let ready = loop {
         match ready_handshake(&paths.socket, hello) {
-            Ok(Some(c)) => {
-                // ponytail: holder는 띄운 프로세스의 자식으로 남는다(앱이 먼저 끝나면 launchd가 거둔다).
-                // 앱보다 먼저 죽으면 앱이 끝날 때까지 좀비 하나가 남는다. 거슬리면 앱에서 waitpid 스레드.
-                return Ok(Connection {
-                    launched: true,
-                    ..c
-                });
-            }
+            Ok(Some(c)) => break Ok(c),
             Ok(None) => {}
             Err(e) if is_absent(&e) || is_transition(&e) => {}
-            Err(e) => return Err(Error::Io(e)),
+            Err(e) => break Err(Error::Io(e)),
         }
-        if let Some(status) = holder.try_wait().map_err(Error::Io)? {
+        match holder.try_wait() {
             #[cfg(unix)]
-            return Err(Error::HolderExited(status));
+            Ok(Some(status)) => break Err(Error::HolderExited(status)),
             #[cfg(windows)]
-            if !status.success() && !escaped {
+            Ok(Some(status)) if !status.success() && !escaped => {
                 escaped = status.code() == Some(HOLDER_JOB_DENIED) && escape_job(paths);
                 if !escaped {
-                    return Err(Error::HolderExited(status));
+                    break Err(Error::HolderExited(status));
                 }
-                deadline = Instant::now()
-                    .checked_add(LAUNCH_TIMEOUT)
-                    .ok_or(Error::Timeout)?;
+                match Instant::now().checked_add(LAUNCH_TIMEOUT) {
+                    Some(d) => deadline = d,
+                    None => break Err(Error::Timeout),
+                }
             }
+            Err(e) => break Err(Error::Io(e)),
+            _ => {}
         }
         if Instant::now() >= deadline {
             // Job 밖 기동도 제때 붙지 않았으면 처음 거부를 그대로 돌려준다(백오프 뒤 다시 시도).
-            if let Some(status) = holder.try_wait().map_err(Error::Io)?
+            #[cfg(windows)]
+            if let Ok(Some(status)) = holder.try_wait()
                 && !status.success()
             {
-                return Err(Error::HolderExited(status));
+                break Err(Error::HolderExited(status));
             }
-            // 백오프로 krilld를 계속 다시 띄우는 holder를 남기지 않는다.
-            holder.kill().ok();
-            holder.wait().ok();
-            return Err(Error::Timeout);
+            break Err(Error::Timeout);
         }
+        thread::sleep(POLL);
+    };
+    // 실패한 기동의 holder를 남기면 krilld를 백오프로 영구 재기동한다(A-05). Windows에서 띄운 것은 곧바로 끝나는
+    // bootstrap이라 실제 holder에 닿지 않는다. 그 holder는 세션이 없으면 스스로 포기한다.
+    #[cfg(unix)]
+    if ready.is_err() {
+        stop_launched(&mut holder);
+    }
+    // ponytail: 붙으면 holder는 띄운 프로세스의 자식으로 남는다(앱이 먼저 끝나면 launchd가 거둔다).
+    // 앱보다 먼저 죽으면 앱이 끝날 때까지 좀비 하나가 남는다. 거슬리면 앱에서 waitpid 스레드.
+    ready.map(|c| Connection {
+        launched: true,
+        ..c
+    })
+}
+
+/// 띄운 holder를 SIGTERM으로 끝낸다. 그 holder는 고아 krilld에게서 세션을 넘겨받아 master 마지막 사본을 쥐고 있을 수
+/// 있어 SIGKILL하지 않는다. SIGTERM이면 holder가 세션을 krilld에 넘기고 끝난다. [`STOP_TIMEOUT`] 안에 끝나지 않는
+/// holder는 세션이 있는지 알 수 없어 그대로 둔다.
+#[cfg(unix)]
+fn stop_launched(holder: &mut std::process::Child) {
+    use rustix::process::{Pid, Signal, kill_process};
+    // 아직 거두지 않은 자식이라 pid가 재사용되지 않았다.
+    if let Some(pid) = i32::try_from(holder.id()).ok().and_then(Pid::from_raw) {
+        kill_process(pid, Signal::TERM).ok();
+    }
+    let deadline = Instant::now().checked_add(STOP_TIMEOUT);
+    while matches!(holder.try_wait(), Ok(None)) && deadline.is_some_and(|d| Instant::now() < d) {
         thread::sleep(POLL);
     }
 }

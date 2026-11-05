@@ -197,7 +197,6 @@ pub struct Registry {
     startup_gc: std::sync::atomic::AtomicBool,
     app_opened: OnceLock<()>,
     mobile: OnceLock<Arc<crate::mobile::gateway::Gateway>>,
-    webhooks: Mutex<crate::webhook::Dispatcher>,
     orch_signal: (Mutex<u64>, std::sync::Condvar),
     orch_cache: Mutex<orch_cache::Cache>,
     orch_mail_notified_done: Mutex<BTreeMap<IdleMailScope, MailEpochState>>,
@@ -226,10 +225,13 @@ impl Registry {
     /// 다시 넘긴 세션은 바로 다시 띄운다. 기록을 열지 못해도 세션은 띄운다(그 세션만 디스크 기록이 없다).
     pub fn new(holder: Option<(Holder, Vec<Kept>)>, dir: Option<&Path>) -> Self {
         let started = Instant::now();
+        // Only the daemon that owns a state folder upgrades account registrations. `cfg!(test)` does
+        // not cover other crates' tests that link krilld.
         if !cfg!(test)
+            && let Some(dir) = dir
             && let Err(error) = crate::usage::accounts::codex_home::migrate(
                 &crate::usage::accounts::default_home(),
-                dir,
+                Some(dir),
             )
         {
             tracing::warn!(kind = ?error.kind(), "Codex account home migration failed");
@@ -283,7 +285,6 @@ impl Registry {
             exit: OnceLock::new(),
             dir: dir.map(Path::to_path_buf),
             mobile: OnceLock::new(),
-            webhooks: Mutex::new(crate::webhook::Dispatcher::new(dir)),
             orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
             orch_cache: Mutex::default(),
             orch_mail_notified_done: Mutex::default(),
@@ -426,17 +427,17 @@ impl Registry {
             };
             for (id, cwd, tap, e) in found {
                 if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
-                    self.auto_switch_from_hook(id, e);
-                    hooked.push((id, e.payload.clone(), e.id));
+                    hooked.push((id, e.clone()));
                 }
             }
             Ok(())
         })
         .ok();
         drop(commit);
-        for (id, payload, event_id) in &hooked {
-            self.maybe_rename_from_hook(*id, payload, *event_id);
-            if status::is_turn_stop(payload)
+        for (id, e) in &hooked {
+            self.auto_switch_from_hook(*id, e);
+            self.maybe_rename_from_hook(*id, &e.payload, e.id);
+            if status::is_turn_stop(&e.payload)
                 && let Some(dir) = self.state_dir()
                 && let Err(error) = self.notify_idle_orchestration_mail_for(&dir, Some(*id))
             {
@@ -467,19 +468,6 @@ impl Registry {
             st.sessions.contains_key(&id) && !st.exited.contains_key(&id)
         };
         allowed.then(|| f(&self.status))
-    }
-
-    /// 프로세스·제목·화면 보조 감시. PTY 읽기와 별도 스레드에서 호출한다.
-    pub(crate) fn observe_webhook(&self, id: SessionId) {
-        let state = self.status.get(id).state;
-        let link = self
-            .mobile_gateway()
-            .and_then(|gateway| gateway.deep_link(id));
-        lock(&self.webhooks).observe(id, state, link);
-    }
-
-    pub(crate) fn retain_webhooks(&self, ids: &[SessionId]) {
-        lock(&self.webhooks).retain(ids);
     }
 
     pub fn monitor_status(&self) {
@@ -774,6 +762,7 @@ impl Registry {
             let ack = s.write_all(&hook::ack());
             drop(s);
             if let Some(id) = session {
+                self.auto_switch_from_hook(id, &e);
                 self.maybe_rename_from_hook(id, &e.payload, e.id);
                 if status::is_turn_stop(&e.payload)
                     && let Some(dir) = self.state_dir()
@@ -1202,11 +1191,14 @@ impl Registry {
                     .map(|id| (id, self.session_cwd(id)))
                     .collect();
                 sidebar::snapshot(&self.sidebar, &entries).map(|mut data| {
+                    let state = self.state_dir();
                     if peer.scope.full() {
-                        sidebar::include_projects(&mut data);
+                        if let Some(dir) = &state {
+                            sidebar::include_projects(&mut data, dir);
+                        }
                         data.closed_sessions = self.closed_sidebar_ranges();
                     }
-                    if let Some(dir) = self.state_dir() {
+                    if let Some(dir) = state {
                         data.prompt_histories =
                             krill_proto::git::load_session_prompt_histories(&dir)
                                 .into_iter()
@@ -2172,7 +2164,6 @@ impl Registry {
         };
         if let Some((id, cwd, tap)) = target {
             if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
-                self.auto_switch_from_hook(id, e);
                 Ok(Some(id))
             } else {
                 Ok(None)
@@ -2304,11 +2295,9 @@ impl Registry {
             }
         }
         self.status.subagent_hook(id, e, !is_subagent_or_foreign);
-        self.observe_webhook(id);
         let allow_status_hook = !is_subagent_or_foreign
             || crate::agent::control::Control::is_explicit_subagent_hook(&e.payload);
         if allow_status_hook && self.status.hook(&[(id, e)])? > 0 {
-            self.observe_webhook(id);
             let status = self.status.get(id);
             if status.state != control::AgentState::Done {
                 lock(&self.orch_mail_notified_done).retain(|(sid, _, _), _| *sid != id.0);
@@ -2347,8 +2336,13 @@ impl Registry {
     }
 
     // Account evaluation wakes the session worker. Release `state` first: the worker's
-    // final handoff holds its queue lock while retiring the old session.
+    // final handoff holds its queue lock while retiring the old session. This also runs account
+    // CLIs and the keychain without a deadline, so callers must not hold `hook_commit` or the spool lock.
     fn auto_switch_from_hook(&self, id: SessionId, e: &HookEvent) {
+        #[cfg(all(test, unix))]
+        if let Some(probe) = tests::AUTO_SWITCH_PROBE.take() {
+            return probe(self);
+        }
         if let Some(switched) = status::auto_switch_on_rate_limit(
             &crate::usage::accounts::default_home(),
             self.state_dir().as_deref(),
@@ -2516,8 +2510,9 @@ impl Registry {
         self.remove(id);
     }
 
+    /// 자기 상태 폴더만 쓴다. 폴더 없는 레지스트리(단독 테스트)가 운영 폴더로 넘어가지 않게 기본값으로 폴백하지 않는다.
     fn state_dir(&self) -> Option<PathBuf> {
-        self.dir.clone().or_else(krill_proto::daemon::state_dir)
+        self.dir.clone()
     }
 
     /// 상태 디렉터리가 있으면 세션 `id`의 Claude 주입 settings를 지운다.

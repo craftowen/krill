@@ -7,8 +7,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, ElementId, Image, ImageFormat, ObjectFit, SharedString,
-    UniformListScrollHandle, Window, div, img, prelude::*, px, uniform_list,
+    AnyElement, App, Context, ElementId, Image, ObjectFit, SharedString, UniformListScrollHandle,
+    Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::text::TextView;
@@ -37,7 +37,7 @@ pub struct ImageView {
     zoom: Zoom,
 }
 
-/// 이미지 출처: 디스크 경로(래스터·저장된 파일) 또는 미리보기용 메모리 버퍼(SVG 편집 중 내용).
+/// 이미지 출처: 디스크 경로(래스터·저장된 파일) 또는 미리보기용 메모리 버퍼(SVG 원본 내용).
 #[derive(Debug, Clone)]
 enum ImageSource {
     Path(PathBuf),
@@ -49,15 +49,6 @@ impl ImageView {
         Self {
             source: ImageSource::Path(path),
             dims,
-            zoom: Zoom::Fit,
-        }
-    }
-
-    /// SVG 미리보기용: 디스크가 아니라 지금 에디터 버퍼로 그린다(OWE-874 — 미저장 수정 반영).
-    pub fn new_svg_bytes(svg: Vec<u8>) -> Self {
-        Self {
-            source: ImageSource::SvgBytes(Arc::new(Image::from_bytes(ImageFormat::Svg, svg))),
-            dims: None,
             zoom: Zoom::Fit,
         }
     }
@@ -227,7 +218,7 @@ impl Render for ImageView {
 }
 
 /// 경로 이미지의 디코드 캐시와 GPU 텍스처를 놓는다. gpui는 경로별로 영구 캐시하므로 디스크 내용이 바뀌었거나
-/// (재로드·저장) 탭이 닫히면 불러야 다음 그리기에서 새로 읽고, 닫힌 이미지가 메모리에 남지 않는다.
+/// (재로드) 탭이 닫히면 불러야 다음 그리기에서 새로 읽고, 닫힌 이미지가 메모리에 남지 않는다.
 pub fn release_image(path: &Path, window: &mut Window, cx: &mut App) {
     let resource = gpui::Resource::Path(path.into());
     if let Some(Ok(image)) = window.get_asset::<gpui::ImgResourceLoader>(&resource, cx) {
@@ -254,7 +245,7 @@ pub fn image_error(error: RasterError) -> String {
     }
 }
 
-/// 마크다운 미리보기(gpui-component `TextView`). 편집↔미리보기 토글은 에디터 쪽(OWE-663/665)에서.
+/// 마크다운 미리보기(gpui-component `TextView`). 원본↔미리보기 토글은 파일 탭 쪽(OWE-663/665)에서.
 pub fn markdown(id: impl Into<ElementId>, source: impl Into<SharedString>, cx: &App) -> AnyElement {
     let pal = crate::ui::palette(cx);
     let id = id.into();
@@ -642,29 +633,18 @@ pub fn notebook(
         .into_any_element()
 }
 
-/// HTML 파일 미리보기 화면: 문서 `<title>`·파일 크기와 "브라우저로 열기"·"코드 편집"·"Finder에서 보기".
-pub fn html_preview(
-    path: &Path,
-    title: Option<&str>,
-    len: u64,
-    on_edit: impl Fn(&mut Window, &mut App) + 'static,
-    cx: &App,
-) -> AnyElement {
-    html_preview_on(path, None, title, len, on_edit, cx)
-}
-
 /// HTML metadata preview with host-scoped external actions.
 pub fn html_preview_on(
     path: &Path,
     remote: Option<(krill_hosts::HostId, crate::hosts::HostTarget)>,
     title: Option<&str>,
     len: u64,
-    on_edit: impl Fn(&mut Window, &mut App) + 'static,
+    on_source: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
     let pal = crate::ui::palette(cx);
     let open_label = crate::i18n::catalog::editor::OPEN_BROWSER.get();
-    let edit_label = crate::i18n::catalog::editor::EDIT_CODE.get();
+    let source_label = crate::i18n::catalog::editor::SOURCE.get();
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -683,9 +663,9 @@ pub fn html_preview_on(
                 );
             })
     };
-    let edit_code = crate::ui::secondary("file-html-edit", edit_label)
+    let show_source = crate::ui::secondary("file-html-edit", source_label)
         .debug_selector(|| "file-html-edit".into())
-        .on_click(move |_, window, cx| on_edit(window, cx));
+        .on_click(move |_, window, cx| on_source(window, cx));
     let reveal_action = {
         let path = path.to_path_buf();
         crate::ui::secondary(
@@ -745,7 +725,7 @@ pub fn html_preview_on(
                 .justify_center()
                 .gap_2()
                 .child(open_browser)
-                .child(edit_code)
+                .child(show_source)
                 .child(reveal_action),
         )
         .into_any_element()
@@ -855,11 +835,6 @@ pub(crate) fn size_label(len: u64) -> String {
         KIB..0x10_0000 => format!("{} KB", len.div_ceil(KIB)),
         _ => crate::resources::mb(len),
     }
-}
-
-/// `open`은 Launch Services 응답을 기다리므로 UI 스레드 밖에서 실행한다. 로그에 경로는 남기지 않는다(A8).
-pub fn spawn_open(path: PathBuf, command: fn(&Path) -> Command, cx: &App) {
-    spawn_open_on(path, None, command, cx);
 }
 
 /// 원격 파일이면 로컬 캐시로 먼저 내려받은 뒤 `command`를 실행한다.

@@ -250,3 +250,50 @@ fn prepended_rows_keep_the_rows_on_screen_in_place(cx: &mut gpui::TestAppContext
     assert_eq!(state.logical_scroll_top().item_ix, 50);
     assert_eq!(state.item_count(), 110);
 }
+
+#[gpui::test]
+fn chat_poll_reads_composer_meta_from_the_transcript(cx: &mut gpui::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("krill-chat-meta-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let transcript = dir.join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"message\":{\"model\":\"claude-meta-test\",\"usage\":{\"input_tokens\":1}}}\n",
+    )
+    .unwrap();
+    let transcript = transcript.to_string_lossy().into_owned();
+    let (view, cx) = open(cx, state_path("chat-poll-meta"));
+    view.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, SessionId(993));
+        shell.paths = Some(krill_proto::daemon::Paths {
+            socket: "/unused".into(),
+            holder: "/unused".into(),
+            krilld: "/unused".into(),
+        });
+        shell.chat.poll_call = Some(Arc::new(move |_| {
+            Ok(Reply::AgentHistory(Response::ChatPolled(
+                ChatPollSnapshot {
+                    agent: "claude".into(),
+                    session_id: "meta-session".into(),
+                    transcript_path: transcript.clone(),
+                    bound: true,
+                    next_offset: 64,
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "hi".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )))
+        }));
+        shell.toggle_chat_view(cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        let log = &shell.chat.logs[&local_key(SessionId(993))];
+        assert_eq!(log.meta.model.as_deref(), Some("claude-meta-test"));
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}

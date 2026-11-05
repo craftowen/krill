@@ -221,9 +221,25 @@ globalThis.handle=null;mountCase();
             assert evaluate('sentInputs()') == ['once\r']
             evaluate('socket.frame(0x27,MkTerminalCodec.v(1),MkTerminalCodec.v(0));true')
             wait('document.querySelector(".command-input").value===""')
+
+            # A PC browser has no software keyboard: clicking the terminal with
+            # a mouse must arm direct input, while a touch tap must not.
+            browser('set', 'viewport', '1440', '900')
+            evaluate('visualViewport.height=innerHeight;visualViewport.dispatchEvent(new Event("resize"));mountCase(1440);true')
+            wait('document.querySelector(".terminal-mount").dataset.phase==="ready"')
+            evaluate('(()=>{const p=document.querySelector(".terminal-scroll");p.dispatchEvent(new PointerEvent("pointerdown",{pointerType:"touch",bubbles:true}));p.click();})();true')
+            assert evaluate('document.activeElement!==capture')
+            x, y = evaluate('(()=>{const r=document.querySelector(".terminal-scroll").getBoundingClientRect();return [Math.round(r.left+r.width/2),Math.round(r.top+r.height/3)]})()')
+            browser('mouse', 'move', str(x), str(y))
+            browser('mouse', 'down')
+            browser('mouse', 'up')
+            browser('keyboard', 'type', 'desk')
+            browser('press', 'Enter')
+            wait('sentInputs().join("")==="desk\\r"')
+            shot('1440-desktop-click')
             (evidence / 'measurements.json').write_text(json.dumps(measurements, indent=2) + '\n')
             print('PASS Chromium: dock mode clicks, Orca key order/icon, English, Hangul composition, backspace, Enter, '
-                  'stable delayed-ACK geometry, simulated keyboard, reconnect/no replay, duplicate submit')
+                  'stable delayed-ACK geometry, simulated keyboard, reconnect/no replay, duplicate submit, desktop mouse click input')
         except Exception:
             state = evaluate('({inputs:sentInputs().slice(0,30),inputCount:sentInputs().length,events:inputEvents,capture:capture.value,active:document.activeElement?.className,phase:document.querySelector(".terminal-mount").dataset.phase,body:document.body.innerText})')
             (evidence / 'failure.json').write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n')

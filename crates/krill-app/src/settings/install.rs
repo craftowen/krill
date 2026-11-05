@@ -240,7 +240,6 @@ pub struct AliasPreset {
     pub agent_id: &'static str,
     pub label: &'static str,
     pub default_alias: &'static str,
-    pub default_yolo_alias: &'static str,
     pub command: &'static str,
     pub yolo_command: &'static str,
 }
@@ -250,7 +249,6 @@ pub const ALIAS_PRESETS: &[AliasPreset] = &[
         agent_id: "claude",
         label: "Claude Code",
         default_alias: "cc",
-        default_yolo_alias: "ccy",
         command: "claude",
         yolo_command: "claude --dangerously-skip-permissions",
     },
@@ -258,7 +256,6 @@ pub const ALIAS_PRESETS: &[AliasPreset] = &[
         agent_id: "codex",
         label: "Codex CLI",
         default_alias: "cx",
-        default_yolo_alias: "cxy",
         command: "codex",
         yolo_command: "codex --dangerously-bypass-approvals-and-sandbox",
     },
@@ -266,7 +263,6 @@ pub const ALIAS_PRESETS: &[AliasPreset] = &[
         agent_id: "agy",
         label: "Antigravity CLI",
         default_alias: "ag",
-        default_yolo_alias: "agy-yolo",
         command: "agy",
         yolo_command: "agy --dangerously-skip-permissions",
     },
@@ -478,6 +474,39 @@ pub fn render_alias_block(entries: &[AliasEntry], is_powershell: bool) -> String
     }
     lines.push(ALIAS_BLOCK_END.to_owned());
     lines.join("\n")
+}
+
+/// Rewrites the shell profile through its real path so a dotfile manager's symlink survives, and
+/// atomically so a crash or full disk never truncates it. `edit` gets `None` for a missing profile
+/// and returns `None` to leave the file untouched.
+pub(crate) fn rewrite_shell_rc(
+    rc_path: &Path,
+    edit: impl FnOnce(Option<&str>) -> Option<String>,
+) -> std::io::Result<()> {
+    let target =
+        std::fs::canonicalize(rc_path).unwrap_or_else(|_| match std::fs::read_link(rc_path) {
+            Ok(link) => rc_path
+                .parent()
+                .map_or_else(|| link.clone(), |dir| dir.join(&link)),
+            Err(_) => rc_path.to_path_buf(),
+        });
+    let existing = match std::fs::read_to_string(&target) {
+        Ok(existing) => Some(existing),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // 읽지 못한 프로필(UTF-8 아님·권한)을 빈 파일로 보면 사용자 설정 전체를 블록만으로 덮어쓴다.
+        Err(e) => return Err(e),
+    };
+    let Some(updated) = edit(existing.as_deref()) else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(&target).map_or(0o644, |m| m.permissions().mode() & 0o7777)
+    };
+    #[cfg(not(unix))]
+    let mode = 0o644;
+    krill_proto::os::write_atomic(&target, updated.as_bytes(), mode)
 }
 
 /// 기존 셸 프로필 내용에서 관리 블록을 교체하거나 끝에 추가한다.
@@ -846,80 +875,69 @@ impl SettingsView {
             });
         }
 
-        let home = Self::install_home_dir(cx);
-        let rc_path = shell_rc_path(&home);
+        let rc_path = shell_rc_path(&Self::install_home_dir(cx));
         let is_ps = cfg!(windows);
-        // 읽지 못한 프로필(UTF-8 아님·권한)을 빈 파일로 보면 사용자 설정 전체를 블록만으로 덮어쓴다.
-        let existing = match std::fs::read_to_string(&rc_path) {
-            Ok(existing) => existing,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => {
-                self.install.alias_status = Some((e.to_string().into(), true));
-                cx.notify();
-                return;
-            }
-        };
-        let updated = upsert_alias_block(&existing, &entries, is_ps);
-
-        if let Some(parent) = rc_path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            self.install.alias_status = Some((e.to_string().into(), true));
-            cx.notify();
-            return;
-        }
-        if let Err(e) = std::fs::write(&rc_path, updated) {
-            self.install.alias_status = Some((e.to_string().into(), true));
-            cx.notify();
-            return;
-        }
-
-        if self.install.alias_sync_quick_commands {
-            let entries_clone = entries.clone();
-            edit(cx, move |s| {
-                for entry in &entries_clone {
-                    let cmd_text = entry.target_command().to_owned();
-                    if let Some(existing_qc) = s
-                        .quick_commands
-                        .iter_mut()
-                        .find(|q| q.name == entry.alias_name)
-                    {
-                        existing_qc.text = cmd_text;
-                    } else {
-                        s.quick_commands.push(crate::commands::QuickCommand {
-                            name: entry.alias_name.clone(),
-                            text: cmd_text,
-                        });
+        let written = entries.clone();
+        self.file_job(
+            "shell-alias",
+            move || {
+                rewrite_shell_rc(&rc_path, |existing| {
+                    Some(upsert_alias_block(existing.unwrap_or(""), &written, is_ps))
+                })
+                .map(|()| rc_path)
+            },
+            move |this, result, cx| {
+                let rc_path = match result {
+                    Ok(rc_path) => rc_path,
+                    Err(e) => {
+                        this.install.alias_status = Some((e.to_string().into(), true));
+                        return;
                     }
+                };
+                if this.install.alias_sync_quick_commands {
+                    edit(cx, move |s| {
+                        for entry in &entries {
+                            let cmd_text = entry.target_command().to_owned();
+                            if let Some(existing_qc) = s
+                                .quick_commands
+                                .iter_mut()
+                                .find(|q| q.name == entry.alias_name)
+                            {
+                                existing_qc.text = cmd_text;
+                            } else {
+                                s.quick_commands.push(crate::commands::QuickCommand {
+                                    name: entry.alias_name.clone(),
+                                    text: cmd_text,
+                                });
+                            }
+                        }
+                    });
                 }
-            });
-        }
-
-        self.install.alias_status = Some((
-            text::INSTALL_ALIAS_SAVED
-                .format(&[("path", &rc_path.display().to_string())])
-                .into(),
-            false,
-        ));
-        cx.notify();
+                this.install.alias_status = Some((
+                    text::INSTALL_ALIAS_SAVED
+                        .format(&[("path", &rc_path.display().to_string())])
+                        .into(),
+                    false,
+                ));
+            },
+            cx,
+        );
     }
 
     /// 셸 설정 파일에서 Krill이 등록한 에일리어스 블록을 제거한다.
     pub fn remove_shell_aliases(&mut self, cx: &mut Context<Self>) {
-        let home = Self::install_home_dir(cx);
-        let rc_path = shell_rc_path(&home);
-        let Ok(existing) = std::fs::read_to_string(&rc_path) else {
-            self.install.alias_status = Some((text::INSTALL_ALIAS_REMOVED.get().into(), false));
-            cx.notify();
-            return;
-        };
-        let cleaned = remove_alias_block(&existing);
-        if let Err(e) = std::fs::write(&rc_path, cleaned) {
-            self.install.alias_status = Some((e.to_string().into(), true));
-        } else {
-            self.install.alias_status = Some((text::INSTALL_ALIAS_REMOVED.get().into(), false));
-        }
-        cx.notify();
+        let rc_path = shell_rc_path(&Self::install_home_dir(cx));
+        self.file_job(
+            "shell-alias",
+            move || rewrite_shell_rc(&rc_path, |existing| existing.map(remove_alias_block)),
+            |this, result, _| {
+                this.install.alias_status = Some(match result {
+                    Ok(()) => (text::INSTALL_ALIAS_REMOVED.get().into(), false),
+                    Err(e) => (e.to_string().into(), true),
+                });
+            },
+            cx,
+        );
     }
 
     /// 설치 탭 전체 렌더링.
@@ -1674,6 +1692,64 @@ impl SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_rc_rewrite_keeps_dotfile_symlink_and_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("krill-rc-link-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let dotfiles = root.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("zshrc");
+        std::fs::write(&real, "export A=1\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let rc = root.join(".zshrc");
+        std::os::unix::fs::symlink("dotfiles/zshrc", &rc).unwrap();
+        let entries = [AliasEntry {
+            agent_id: "claude",
+            alias_name: "cc".into(),
+            use_yolo: false,
+        }];
+
+        rewrite_shell_rc(&rc, |existing| {
+            Some(upsert_alias_block(existing.unwrap_or(""), &entries, false))
+        })
+        .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&rc)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let saved = std::fs::read_to_string(&real).unwrap();
+        assert!(saved.starts_with("export A=1\n"));
+        assert!(saved.contains(ALIAS_BLOCK_START));
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+
+        rewrite_shell_rc(&rc, |existing| existing.map(remove_alias_block)).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&rc)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "export A=1\n");
+        assert_eq!(
+            std::fs::read_dir(&dotfiles).unwrap().count(),
+            1,
+            "temp file left behind"
+        );
+
+        let missing = root.join(".bashrc");
+        rewrite_shell_rc(&missing, |existing| existing.map(remove_alias_block)).unwrap();
+        assert!(
+            !missing.exists(),
+            "removing from a missing profile created it"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn alias_block_upsert_and_remove_preserves_surrounding_rc_lines() {

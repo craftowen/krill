@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use krill_log::{Component, FILE_BYTES, RECORD_BYTES, RollingLog, TOTAL_BYTES};
+use krill_log::{Component, FILE_BYTES, LOCK_WAIT, RECORD_BYTES, RollingLog, TOTAL_BYTES};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -67,7 +67,7 @@ fn rotates_before_limit_and_retains_latest_after_restart() -> io::Result<()> {
 }
 
 #[test]
-fn lock_contention_drops_event_and_recovers() -> io::Result<()> {
+fn lock_contention_waits_for_the_writer_and_drops_only_a_stuck_one() -> io::Result<()> {
     let dir = Directory::new()?;
     let log = RollingLog::open(&dir.0, Component::Cli)?;
     let lock = File::options()
@@ -77,9 +77,38 @@ fn lock_contention_drops_event_and_recovers() -> io::Result<()> {
     lock.lock()?;
     log.append("dropped")?;
     assert_eq!(total(&dir)?, 0);
-    lock.unlock()?;
-    log.append("recovered")?;
-    assert_eq!(fs::read_to_string(dir.0.join("krill.log"))?, "recovered\n");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(LOCK_WAIT / 20);
+        lock.unlock()
+    });
+    log.append("waited")?;
+    release.join().unwrap()?;
+    assert_eq!(fs::read_to_string(dir.0.join("krill.log"))?, "waited\n");
+    Ok(())
+}
+
+#[test]
+fn concurrent_threads_in_one_process_keep_every_event() -> io::Result<()> {
+    let dir = Directory::new()?;
+    let writers: Vec<_> = (0..4)
+        .map(|thread| {
+            let path = dir.0.clone();
+            std::thread::spawn(move || -> io::Result<()> {
+                let log = RollingLog::open(path, Component::App)?;
+                for line in 0..500 {
+                    log.append(&format!("thread {thread} line {line}"))?;
+                }
+                Ok(())
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap()?;
+    }
+    let lines = fs::read_to_string(dir.0.join("krill-app.log"))?
+        .lines()
+        .count();
+    assert_eq!(lines, 4 * 500);
     Ok(())
 }
 
@@ -165,15 +194,20 @@ fn subprocess_writer() -> io::Result<()> {
         let dir =
             std::env::var_os("KRILL_LOG_DIR").ok_or_else(|| io::Error::other("missing log dir"))?;
         let log = RollingLog::open(PathBuf::from(dir), component)?;
-        // Exercise maximum record pressure even when the nonblocking family
-        // lock drops most competing attempts on a slower filesystem.
+        // Exercise maximum record pressure: writers now wait for the family lock, so every
+        // attempt is written.
         let record = "load".repeat(RECORD_BYTES / 4);
-        for _ in 0..21_600 {
+        for _ in 0..ATTEMPTS_PER_PROCESS {
             log.append(&record)?;
         }
     }
     Ok(())
 }
+
+/// 21,600 × 2 processes × 2 phases = 86,400 attempts per family. Windows CI file I/O already took
+/// 131s here when contended attempts were dropped, so it writes an eighth: still ~88 MB per family,
+/// far past the 5 MB family budget, so rotation and the byte cap are exercised the same way.
+const ATTEMPTS_PER_PROCESS: usize = if cfg!(windows) { 2_700 } else { 21_600 };
 
 #[test]
 fn accelerated_day_with_concurrent_processes_and_restart() -> io::Result<()> {
@@ -219,7 +253,8 @@ fn accelerated_day_with_concurrent_processes_and_restart() -> io::Result<()> {
         assert!(entry?.metadata()?.len() <= FILE_BYTES);
     }
     eprintln!(
-        "MK-069 accelerated day: 345600 attempts, 16 child processes, {bytes} retained bytes (limit {TOTAL_BYTES})"
+        "MK-069 accelerated day: {} attempts, 16 child processes, {bytes} retained bytes (limit {TOTAL_BYTES})",
+        ATTEMPTS_PER_PROCESS * 16
     );
     Ok(())
 }

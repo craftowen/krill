@@ -372,7 +372,10 @@ fn ended_session_records_on_disk_cause_no_idle_renders(cx: &mut TestAppContext) 
     );
     cx.update(|_, cx| {
         let s = view.read(cx);
-        let turns = &s.session_prompt_history(live).unwrap().turns;
+        let turns = &s
+            .session_prompt_history_on(&HostId::Local, live)
+            .unwrap()
+            .turns;
         assert_eq!(turns[0].text, "live prompt");
         assert_eq!(
             s.session_label_on_with_title(&HostId::Local, &session, None)

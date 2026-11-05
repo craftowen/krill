@@ -343,7 +343,7 @@ pub fn create_with_pool(
     let (inc_copied, inc_warnings) = copy_includes(q, &top, &path, &include_entries);
     copied.extend(inc_copied);
     warnings.extend(inc_warnings);
-    crate::agent::pre_trust_all_agents(&path);
+    crate::agent::pre_trust_all_agents(trust.parent(), &path);
     Ok(Outcome::Created {
         worktree: Worktree {
             path: path.into_os_string().into_vec(),
@@ -389,7 +389,7 @@ fn create_folder_workspace(
     };
 
     let branch = leaf(&req.name)?;
-    crate::agent::pre_trust_all_agents(&top);
+    crate::agent::pre_trust_all_agents(trust.parent(), &top);
     Ok(Outcome::Created {
         worktree: Worktree {
             path: top.into_os_string().into_vec(),

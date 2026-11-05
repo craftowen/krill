@@ -5,10 +5,7 @@
 //! 라이트/다크는 터미널 팔레트도 바꾸며 셸이 krilld에 전달한다(OWE-590). 줌은 rem 기반 UI 크기에 적용한다.
 
 // Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
-use krill_proto::os::fs::OpenOptionsExt as _;
 use std::io::Write as _;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -95,8 +92,6 @@ pub struct Settings {
     /// 하단 상태바 사용량에서 숨길 프로바이더 목록(기본 빈 목록 = 모두 표시).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_status_providers: Vec<String>,
-    /// 완료 웹훅 opt-in. 기본은 빈 목록이며 URL에 비밀 토큰이 들어갈 수 있다.
-    pub webhooks: Vec<crate::webhook::Endpoint>,
     /// Copy Context의 최근 출력 행 수(1..=1000으로 제한).
     pub copy_context_lines: u16,
     /// 저장 명령·프롬프트(MK-092). 클릭하면 실행 키 없이 붙여넣는다.
@@ -150,9 +145,6 @@ pub struct Settings {
     /// 새 에이전트 세션 YOLO 권한 우회 모드(기본 true).
     #[serde(default = "default_true")]
     pub yolo_mode: bool,
-    /// 유휴 세션 하이버네이션 opt-in(기본 false, docs/agents/hibernation.md).
-    #[serde(default)]
-    pub hibernation_enabled: bool,
     /// 설치된 에이전트의 상태 감지 훅을 앱 시작 때 자동 설치(기본 켬). 끄면 Krill이 설치한 훅을 되돌린다.
     #[serde(default = "default_true")]
     pub agent_status_hooks: bool,
@@ -275,7 +267,6 @@ impl Default for Settings {
             notifications: true,
             keep_awake: KeepAwake::Off,
             hidden_status_providers: Vec::new(),
-            webhooks: Vec::new(),
             copy_context_lines: 100,
             quick_commands: Vec::new(),
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
@@ -294,7 +285,6 @@ impl Default for Settings {
             default_agent: "claude".to_owned(),
             default_view_mode: DefaultViewMode::Terminal,
             yolo_mode: true,
-            hibernation_enabled: false,
             agent_status_hooks: true,
             recording_paused: false,
             secure_keyboard_entry: false,
@@ -1246,7 +1236,7 @@ fn read_config(dir: Option<&Path>, mut settings: Settings) -> LoadedConfig {
                     }
                     settings = parsed;
                 }
-                // TOML 원문 진단에는 웹훅 토큰이 섞일 수 있어 원문을 표시하지 않는다.
+                // TOML 원문 진단에는 비밀 토큰이 섞일 수 있어 원문을 표시하지 않는다.
                 Err(_) => {
                     errors.push(format!("{SETTINGS_FILE}: {}", text::INVALID_SETTINGS.get()));
                 }
@@ -1274,9 +1264,7 @@ fn read_config(dir: Option<&Path>, mut settings: Settings) -> LoadedConfig {
             }
         }
     }
-    settings.hibernation_enabled |= dir.is_some_and(|d| d.join(HIBERNATION_FLAG).is_file());
     if !settings_read_failed {
-        sync_hibernation_file(dir, settings.hibernation_enabled);
         sync_auto_rename_file(dir, settings.auto_rename_branch_from_work);
         sync_workspace_trust_file(dir, settings.workspace_trust_preset_enabled);
     }
@@ -1563,28 +1551,6 @@ fn restart_staged_update(staged: crate::updater::StagedUpdate, cx: &mut App) {
     crate::updater::restart_staged_update(staged, cx);
 }
 
-/// 동면 opt-in 표식 파일명(krilld `hibernate_idle`이 존재 여부로 읽는다).
-pub const HIBERNATION_FLAG: &str = "hibernation.enabled";
-
-/// `hibernation_enabled` 값을 상태 디렉터리의 opt-in 파일에 반영한다(OWE-655).
-/// 켜면 빈 파일을 만들고(있으면 두드리지 않는다) 끄면 지운다(없으면 무시).
-/// 데몬은 다음 검사 주기부터 따른다. 디스크 오류는 조용히 둔다(표시·동작은 설정값 기준).
-pub fn sync_hibernation_file(dir: Option<&Path>, enabled: bool) {
-    let Some(dir) = dir else { return };
-    let path = dir.join(HIBERNATION_FLAG);
-    if enabled {
-        if path.is_file() {
-            return;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(&path, "").ok();
-    } else {
-        std::fs::remove_file(&path).ok();
-    }
-}
-
 /// `auto_rename_branch_from_work` 값을 상태 디렉터리의 비활성화 표식(`auto-rename-branch.disabled`)에 반영한다(OWE-737).
 /// 기본값이 `true`이므로 켜져 있으면 파일을 지우고, 꺼져 있을 때만 빈 파일을 남긴다.
 pub fn sync_auto_rename_file(dir: Option<&Path>, enabled: bool) {
@@ -1763,7 +1729,6 @@ fn persist_settings_edit(
         .unwrap_or_default();
     edit(&mut settings);
     save_settings(&path, &settings, base.as_deref()).map_err(|error| error.to_string())?;
-    sync_hibernation_file(Some(dir), settings.hibernation_enabled);
     sync_auto_rename_file(Some(dir), settings.auto_rename_branch_from_work);
     sync_workspace_trust_file(Some(dir), settings.workspace_trust_preset_enabled);
     Ok((settings, modified(&path)))
@@ -1843,10 +1808,7 @@ pub fn set_language(language: Language, cx: &mut App) {
 /// `base`는 [`edit`]이 읽은 디스크 원문이다. 저장 직전 다시 읽은 원문과 다르면
 /// 외부 편집이 낀 것이므로 덮어쓰지 않고 오류를 낸다(AS-07 lost-update 방지).
 fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::io::Result<()> {
-    use krill_proto::os::fs::OpenOptionsExt as _;
-    use std::io::{self, Write as _};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+    use std::io;
     let _document_lock = krill_proto::config_document::lock_toml(path)?;
 
     let body = match std::fs::read_to_string(path) {
@@ -1884,64 +1846,7 @@ fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::i
         }
         Err(e) => return Err(e),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!(
-        "toml.{}-{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    let result = (|| {
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        std::fs::remove_file(tmp).ok();
-    }
-    result
-}
-
-/// 웹훅 비밀 토큰을 담을 수 있으므로 0600으로 쓴다. 기존 파일을 `set_len(0)`으로
-/// 비우던 방식은 중간 크래시에 0바이트 파일을 남기므로, 고유 임시 파일에 다 쓰고
-/// 같은 디렉터리에서 바꿔 다는 원자 교체로 통일한다(AS-08).
-fn write_settings(path: &Path, body: &str) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!(
-        "toml.{}-{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    #[cfg(unix)]
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    let result = (|| {
-        use std::io::Write as _;
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        std::fs::remove_file(&tmp).ok();
-    }
-    result
+    krill_proto::os::write_atomic_0600(path, body.as_bytes())
 }
 
 /// 에이전트 카드의 추가 인자·환경변수를 `agents.toml`의 `[agent.<id>]`에 쓴다(OWE-657). 인자는 공백으로
@@ -1970,7 +1875,7 @@ fn save_agent_profile(dir: &Path, id: &str, args: &str, env: &str) -> Result<(),
     let body = krill_proto::agent::set_user_profile(user.as_deref(), id, &profile)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // krilld가 읽는 도중 반쯤 쓴 파일을 보지 않게 원자 교체한다(AS-08).
-    write_settings(&path, &body).map_err(|e| e.to_string())
+    krill_proto::os::write_atomic_0600(&path, body.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// 파일을 시스템 편집기로 연다. 없으면 `template`로 만든다.
@@ -1985,7 +1890,7 @@ fn open_file(name: &str, template: &str, cx: &mut App) {
         if !path.exists() {
             std::fs::create_dir_all(&dir).ok();
             if name == SETTINGS_FILE {
-                write_settings(&path, &template).ok();
+                krill_proto::os::write_atomic_0600(&path, template.as_bytes()).ok();
             } else {
                 std::fs::write(&path, template).ok();
             }
@@ -2002,9 +1907,6 @@ fn open_file(name: &str, template: &str, cx: &mut App) {
 /// 메인 워크스페이스 창(`Shell`)이 설정 페이지를 인앱 뷰로 열거나 닫을 때 쓰는 명령(Orca `activeView === 'settings'` 패리티).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostCommand {
-    Login {
-        session: krill_proto::SessionId,
-    },
     Open {
         tab: AdminTab,
         window: Option<gpui::AnyWindowHandle>,
@@ -2501,24 +2403,6 @@ pub fn format_account_usage(usage: &krill_proto::usage::Snapshot) -> String {
     out
 }
 
-/// Claude `settings.json`에 Krill 상태 감지 훅을 병합 설치한다. 머지 규칙은
-/// CLI(`krill hook install claude`)와 같은 공용 함수이며, 같은 입력이면 바이트 단위로
-/// 같은 결과가 나온다. 파싱 실패·비UTF8·예상 밖 타입이면 쓰지 않고 오류를 돌려준다.
-pub fn install_claude_hook(settings_path: &Path) -> std::io::Result<PathBuf> {
-    install_hook_file(
-        settings_path,
-        krill_proto::hook_install::TargetAgent::Claude,
-    )
-}
-
-/// Antigravity 훅도 CLI와 같은 설치 잠금·영수증·백업을 사용한다.
-pub fn install_agy_hook(hooks_path: &Path) -> std::io::Result<PathBuf> {
-    install_hook_file(
-        hooks_path,
-        krill_proto::hook_install::TargetAgent::Other(krill_proto::agent::hooks::Agent::Agy),
-    )
-}
-
 /// 에이전트 ID별 상태 감지 훅 설정 파일 경로와 설치 대상을 돌려준다.
 #[must_use]
 pub fn agent_hook_target_path(
@@ -2659,15 +2543,7 @@ pub fn agent_install_command(agent_id: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-fn install_hook_file(
-    path: &Path,
-    target: krill_proto::hook_install::TargetAgent,
-) -> std::io::Result<PathBuf> {
-    let state = krill_proto::daemon::state_dir()
-        .ok_or_else(|| std::io::Error::other("state directory unavailable"))?;
-    install_hook_file_at(path, target, &state)
-}
-
+#[cfg(all(test, unix))]
 fn install_hook_file_at(
     path: &Path,
     target: krill_proto::hook_install::TargetAgent,
@@ -2837,8 +2713,6 @@ pub struct SettingsView {
     _update_state: Subscription,
     /// 사이드바 'Krill 모바일'에서 연 단독 페이지 모드. 설정 내비 없이 페어링 화면만 그린다.
     mobile_page: bool,
-    automations_page: bool,
-    automations: schedules::SchedulesState,
     remote_krill: Option<gpui::Entity<crate::link_ui::PairingView>>,
     machine_page: crate::machines::MachinePage,
     machine_add_focus: Option<crate::machines::AddMethod>,
@@ -2980,8 +2854,6 @@ struct ServiceCache {
     aliases: std::collections::BTreeMap<String, String>,
     schedules: Vec<krill_proto::schedule::Schedule>,
     runs: Vec<krill_proto::schedule::ScheduleRun>,
-    schedules_error: Option<String>,
-    runs_error: Option<String>,
 }
 
 impl ServiceCache {
@@ -3256,7 +3128,6 @@ impl std::fmt::Debug for SettingsView {
 impl SettingsView {
     /// 계정·호스트는 UI 스레드에서 읽지 않는다(AS-06·OWE-697). 첫 스냅샷은 백그라운드 갱신이 채운다.
     pub fn new(cx: &mut Context<Self>) -> Self {
-        crate::orca_import::ensure_scanned(cx);
         let mut view = Self {
             _observe: cx.observe_global::<Config>(|this, cx| {
                 this.refresh_accounts_if_changed(cx);
@@ -3275,8 +3146,6 @@ impl SettingsView {
                 }
             }),
             mobile_page: false,
-            automations_page: false,
-            automations: schedules::SchedulesState::default(),
             remote_krill: None,
             machine_page: crate::machines::MachinePage::default(),
             machine_add_focus: None,
@@ -3386,16 +3255,6 @@ impl SettingsView {
             .detach();
         cx.observe_global::<crate::accounts::installed::Installed>(|_, cx| cx.notify())
             .detach();
-        cx.observe_global::<crate::orca_import::OrcaImportState>(|this, cx| {
-            if crate::orca_import::state(cx)
-                .is_some_and(|st| !st.importing && st.last_result.is_some())
-            {
-                this.accounts_refresh_pending = false;
-                this.refresh_accounts_async(cx);
-            }
-            cx.notify();
-        })
-        .detach();
         view
     }
 
@@ -3545,8 +3404,6 @@ impl SettingsView {
                     }
                     let schedules = krill_proto::schedule::Schedules::load(&dir);
                     let runs = krill_proto::schedule::load_coalesced_runs(&dir);
-                    let schedules_error = schedules.as_ref().err().map(ToString::to_string);
-                    let runs_error = runs.as_ref().err().map(ToString::to_string);
                     (
                         Some(stamp),
                         Some(ServiceCache {
@@ -3568,8 +3425,6 @@ impl SettingsView {
                                 .collect(),
                             schedules: schedules.unwrap_or_default().schedule,
                             runs: runs.unwrap_or_default(),
-                            schedules_error,
-                            runs_error,
                         }),
                     )
                 })
@@ -3615,22 +3470,6 @@ impl SettingsView {
 
     pub fn tab(&self) -> AdminTab {
         self.tab
-    }
-
-    pub fn automations_page(&self) -> bool {
-        self.automations_page
-    }
-
-    pub fn set_automations_page(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.automations_page == on {
-            return;
-        }
-        self.automations_page = on;
-        if on {
-            self.mobile_page = false;
-            self.refresh_service_cache(cx);
-        }
-        cx.notify();
     }
 
     pub fn mobile_page(&self) -> bool {
@@ -3809,17 +3648,6 @@ impl SettingsView {
         &self.account_host
     }
 
-    #[must_use]
-    pub fn account_hosts(
-        &self,
-    ) -> &[(
-        crate::hosts::HostId,
-        String,
-        Option<crate::hosts::HostTarget>,
-    )] {
-        &self.account_hosts
-    }
-
     fn selected_account_target(&self) -> Option<crate::hosts::HostTarget> {
         self.account_hosts
             .iter()
@@ -3902,14 +3730,6 @@ impl SettingsView {
         self.accounts_refresh_pending = false;
         self.refresh_accounts_async(cx);
         cx.notify();
-    }
-
-    pub fn update_accounts_snapshot(
-        &mut self,
-        snapshot: krill_proto::usage::AccountsSnapshot,
-        cx: &mut Context<Self>,
-    ) {
-        self.update_accounts_snapshot_for_host(&crate::hosts::HostId::Local, snapshot, cx);
     }
 
     pub fn update_accounts_snapshot_for_host(
@@ -4208,9 +4028,7 @@ impl SettingsView {
         let file_revision = self.file_revision;
         cx.notify();
         let before = (self.accounts_snapshot.clone(), self.account_error.clone());
-        let home = crate::orca_import::state(cx)
-            .and_then(|s| s.home_override.clone())
-            .unwrap_or_else(crate::accounts::default_home);
+        let home = crate::accounts::default_home();
         let dir = state_dir(cx);
         let daemon = is_daemon_state_dir(dir.as_deref());
         cx.spawn(async move |this, cx| {
@@ -4776,13 +4594,9 @@ impl SettingsView {
         let dir = state_dir(cx);
         let daemon = is_daemon_state_dir(dir.as_deref());
         let n = self.added_counter;
-        let home = crate::orca_import::state(cx)
-            .and_then(|s| s.home_override.clone())
-            .or_else(|| {
-                cfg!(test)
-                    .then(|| dir.as_ref().map(|d| d.join("test-home")))
-                    .flatten()
-            })
+        let home = cfg!(test)
+            .then(|| dir.as_ref().map(|d| d.join("test-home")))
+            .flatten()
             .unwrap_or_else(crate::accounts::default_home);
         self.added_counter = n.saturating_add(1);
         let request = move || {
@@ -4868,13 +4682,9 @@ impl SettingsView {
 
     fn opencode_home_and_state(cx: &App) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
         let dir = state_dir(cx);
-        let home = crate::orca_import::state(cx)
-            .and_then(|s| s.home_override.clone())
-            .or_else(|| {
-                cfg!(test)
-                    .then(|| dir.as_ref().map(|d| d.join("test-home")))
-                    .flatten()
-            })
+        let home = cfg!(test)
+            .then(|| dir.as_ref().map(|d| d.join("test-home")))
+            .flatten()
             .unwrap_or_else(crate::accounts::default_home);
         (home, dir)
     }
@@ -6293,7 +6103,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_3()
-            .children(crate::orca_import::render_banner("settings-general", cx))
             .child(layout::section_title(
                 p,
                 "general-section-notifications",
@@ -7846,7 +7655,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_8()
-            .children(crate::orca_import::render_banner("settings-accounts", cx))
             .when(self.accounts_offline, |d| {
                 d.child(
                     div()
@@ -8786,8 +8594,6 @@ impl SettingsView {
                 ),
             );
 
-        // 유휴 동면은 `settings.toml` + 상태 디렉터리의 `hibernation.enabled` 표식으로 데몬에
-        // 전달한다(OWE-655). 표식 동기화는 `edit`·`reload`가 맡는다.
         let hooks_row = layout::row(p)
             .child(self.search_focus.label(
                 p,
@@ -10921,9 +10727,6 @@ impl Render for SettingsView {
         } else if !has_modal && let Some(focus) = self.modal_return_focus.take() {
             window.focus(&focus, cx);
         }
-        if self.automations_page {
-            return self.render_automations_page(window, cx).into_any_element();
-        }
         window.set_window_title(text::TITLE.get());
         let (s, error) = cx.try_global::<Config>().map_or_else(
             || (Settings::default(), None),
@@ -10972,19 +10775,6 @@ impl Render for SettingsView {
             .flex()
             .flex_col()
             .gap_2p5()
-            .child(
-                div().flex().items_center().child(
-                    Button::new("admin-back-to-app")
-                        .icon(IconName::ChevronLeft)
-                        .label(text::BACK_TO_APP.get())
-                        .small()
-                        .ghost()
-                        .debug_selector(|| "admin-back-to-app".into())
-                        .on_click(cx.listener(|_, _, window, cx| {
-                            close_settings_page_for(Some(cx.entity_id()), window, cx);
-                        })),
-                ),
-            )
             .child(
                 div()
                     .id("admin-search-pill")
@@ -11121,53 +10911,36 @@ impl Render for SettingsView {
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("admin-compact-back")
-                            .small()
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .accessibility_label(text::BACK_TO_APP.get())
-                            .debug_selector(|| "admin-compact-back".into())
-                            .on_click(cx.listener(|_, _, window, cx| {
-                                close_settings_page_for(Some(cx.entity_id()), window, cx);
-                            })),
-                    )
-                    .child({
-                        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-                        let view = cx.entity();
-                        div().flex_1().min_w_0().child(
-                            layout::secondary("admin-compact-tabs", current_tab.label())
-                                .w_full()
-                                .max_w_full()
-                                .dropdown_caret(true)
-                                .debug_selector(|| "admin-compact-tabs".into())
-                                .dropdown_menu(move |mut menu, window, _| {
-                                    menu = menu
-                                        .scrollable(true)
-                                        .max_h(window.viewport_size().height * 0.6);
-                                    for tab in AdminTab::ALL {
-                                        let view = view.clone();
-                                        menu = menu.item(
-                                            PopupMenuItem::new(tab.label())
-                                                .checked(tab == current_tab)
-                                                .on_click(move |_, window, cx| {
-                                                    view.update(cx, |this, cx| {
-                                                        this.clear_search(window, cx);
-                                                        this.set_tab(tab, cx);
-                                                    });
-                                                }),
-                                        );
-                                    }
-                                    menu
-                                }),
-                        )
-                    }),
-            )
+            .child(div().flex().items_center().gap_2().child({
+                use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+                let view = cx.entity();
+                div().flex_1().min_w_0().child(
+                    layout::secondary("admin-compact-tabs", current_tab.label())
+                        .w_full()
+                        .max_w_full()
+                        .dropdown_caret(true)
+                        .debug_selector(|| "admin-compact-tabs".into())
+                        .dropdown_menu(move |mut menu, window, _| {
+                            menu = menu
+                                .scrollable(true)
+                                .max_h(window.viewport_size().height * 0.6);
+                            for tab in AdminTab::ALL {
+                                let view = view.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(tab.label())
+                                        .checked(tab == current_tab)
+                                        .on_click(move |_, window, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.clear_search(window, cx);
+                                                this.set_tab(tab, cx);
+                                            });
+                                        }),
+                                );
+                            }
+                            menu
+                        }),
+                )
+            }))
             .child(
                 div()
                     .id("admin-compact-search")
@@ -11364,11 +11137,6 @@ impl Render for SettingsView {
             .key_context(SEARCH_CONTEXT)
             .capture_action(
                 cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
-                    if crate::orca_import::state(cx).is_some_and(|st| st.modal_open) {
-                        crate::orca_import::close_modal(cx);
-                        cx.stop_propagation();
-                        return;
-                    }
                     if this.schedule_modal.is_some() {
                         this.close_schedule_modal(cx);
                         cx.stop_propagation();
@@ -11451,15 +11219,6 @@ impl Render for SettingsView {
                         return;
                     }
                 }
-                if ev.keystroke.key == "escape"
-                    && crate::orca_import::state(cx).is_some_and(|st| st.modal_open)
-                {
-                    if !crate::orca_import::state(cx).is_some_and(|st| st.importing) {
-                        crate::orca_import::close_modal(cx);
-                    }
-                    cx.stop_propagation();
-                    return;
-                }
                 if this.schedule_modal.is_some() && ev.keystroke.key == "escape" {
                     this.close_schedule_modal(cx);
                     window.focus(&this.focus, cx);
@@ -11537,7 +11296,6 @@ impl Render for SettingsView {
             .children(self.render_remove_dialog(window, cx))
             .children(self.render_cleanup_modal(window, cx))
             .children(self.render_schedule_modal(window, cx))
-            .children(crate::orca_import::render_modal(window, cx))
             .child(titlebar)
             .children(compact_navigation.then_some(compact_nav))
             .child(

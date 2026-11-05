@@ -168,6 +168,16 @@ sys.exit(int(os.environ.get('FAKE_STATUS', '0')))
         self.assertFalse((self.root / "apps").exists())
 
 
+class InstallerLanguageTests(unittest.TestCase):
+    def test_korean_text_only_goes_through_the_locale_switch(self):
+        lines = (PACKAGING / "install.sh").read_text(encoding="utf-8").splitlines()
+        for number, line in enumerate(lines, 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if any("\uac00" <= char <= "\ud7a3" for char in line):
+                self.assertIn("msg ", line, f"install.sh:{number}")
+
+
 class VerificationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="krill-verify-contract ")
@@ -292,7 +302,7 @@ if '--force' in sys.argv:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             app = output / "Krill.app"
             plist = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-            self.assertEqual(plist["CFBundleDevelopmentRegion"], "ko")
+            self.assertEqual(plist["CFBundleDevelopmentRegion"], "en")
             self.assertEqual(plist["CFBundleLocalizations"], ["en", "ko"])
             self.assertEqual(plist["KrillUpdatePublicKey"], "b" * 64)
             self.assertEqual(plist["KrillUpdateDesignatedRequirement"],
@@ -305,13 +315,14 @@ if '--force' in sys.argv:
                 self.assertEqual((app / relative).read_bytes(), (unpacked / "Krill.app" / relative).read_bytes())
                 contents = subprocess.check_output(["/usr/bin/plutil", "-convert", "xml1", "-o", "-", str(app / relative)])
                 localized = plistlib.loads(contents)
-                self.assertEqual(set(localized), {"NSDocumentsFolderUsageDescription", "NSDesktopFolderUsageDescription", "NSDownloadsFolderUsageDescription"})
+                self.assertEqual(set(localized), {"NSDocumentsFolderUsageDescription", "NSDesktopFolderUsageDescription", "NSDownloadsFolderUsageDescription",
+                                                  "NSMicrophoneUsageDescription", "NSCameraUsageDescription", "NSAppleEventsUsageDescription"})
                 for key, value in localized.items():
                     self.assertTrue(value)
-                    if language == "ko":
+                    if language == "en":
                         self.assertEqual(value, plist[key])
                     else:
-                        self.assertTrue(value.isascii())
+                        self.assertFalse(value.isascii())
                         self.assertNotEqual(value, plist[key])
 
 

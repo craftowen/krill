@@ -27,14 +27,15 @@ const STACK: usize = 128 * 1024;
 /// 연결당 2개(`mobile-ipc` + `mobile-rpc`)에만 적용한다(수락·WS 루프·전달 스레드는 128KiB 유지).
 pub(super) const RPC_STACK: usize = 512 * 1024;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
-/// 수락 스레드가 일이 없어도 깨어 reconcile(터널 감시·백오프)하는 최대 간격.
+/// 수락 스레드가 일이 없어도 깨어 reconcile(릴레이·Tailscale 감시)하는 최대 간격.
 const RECONCILE: Duration = Duration::from_secs(1);
 const NETWORK_RECHECK: Duration = Duration::from_secs(10);
-/// Cloudflare는 양방향 무전송 WS를 끊는다(Cloudflare 터널 실측 약 125초). 이 주기로 ping하고,
+/// Cloudflare는 양방향 무전송 WS를 끊는다(Quick Tunnel 실측 약 125초). 이 주기로 ping하고,
 /// 응답 없는 주기가 `IDLE_PINGS`번 이어지면(LTE 전환 등으로 죽은 연결) 닫는다.
 const PING: Duration = Duration::from_secs(30);
 const IDLE_PINGS: u8 = 3;
-/// 페어링 요청이 릴레이·Named Tunnel 준비를 기다리는 최대 시간. 모바일 IPC 클라이언트 읽기 타임아웃(60초)보다 짧다.
+/// 페어링 요청이 릴레이 연결·Tailscale HTTPS 준비를 기다리는 최대 시간. 모바일 IPC 클라이언트 읽기
+/// 타임아웃(60초)보다 짧다.
 const MINT_WAIT: Duration = Duration::from_secs(45);
 /// 사용자가 고른 연결 모드. 데몬을 재시작해도 Tunnel 기기가 다시 붙을 수 있게 남긴다.
 const INTENT_FILE: &str = "mobile-gateway.json";
@@ -168,21 +169,10 @@ pub(super) struct State {
     pub(super) connections: HashMap<u64, Connection>,
     pub(super) next: u64,
     pub(super) stopped: bool,
-    pub(super) tunnel: Option<super::tunnel::Tunnel>,
-    tunnel_start: Option<fn(u16) -> io::Result<super::tunnel::Tunnel>>,
     relay: Option<super::relay::RelayClient>,
-    relay_enabled: bool,
     relay_ctx: Option<RelayContext>,
     saved_port: Option<u16>,
-    saved_tunnel_pid: Option<u32>,
-    saved_tunnel_url: Option<String>,
-    tunnel_token: Option<String>,
-    tunnel_hostname: Option<String>,
-    resolver: super::cloudflared::Resolver,
-    pub(super) publication: super::tunnel::Publication,
-    tunnel_failures: u32,
-    tunnel_retry_at: Option<Instant>,
-    tunnel_error: Option<io::Error>,
+    pub(super) publication: super::relay::Publication,
     dir: Option<PathBuf>,
     pub(super) account: super::relay_auth::Account,
     relay_owner: Option<String>,
@@ -207,39 +197,24 @@ struct Intent {
     relay_owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tunnel_pid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tunnel_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tunnel_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tunnel_hostname: Option<String>,
 }
 impl Intent {
     fn load(dir: Option<&Path>) -> io::Result<Self> {
-        let mut intent = dir
-            .and_then(|d| {
-                super::devices::read_private(&d.join(INTENT_FILE))
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
-            .unwrap_or_else(|| Self {
-                mode: ConnectMode::Tunnel,
-                custom: None,
-                tailscale_address: None,
-                rid: String::new(),
-                host_id: String::new(),
-                tailscale_enabled: false,
-                key: String::new(),
-                relay_owner: None,
-                port: None,
-                tunnel_pid: None,
-                tunnel_url: None,
-                tunnel_token: None,
-                tunnel_hostname: None,
-            });
+        let saved = match dir {
+            Some(d) => Self::read(&d.join(INTENT_FILE))?,
+            None => None,
+        };
+        let mut intent = saved.unwrap_or_else(|| Self {
+            mode: ConnectMode::Tunnel,
+            custom: None,
+            tailscale_address: None,
+            rid: String::new(),
+            host_id: String::new(),
+            tailscale_enabled: false,
+            key: String::new(),
+            relay_owner: None,
+            port: None,
+        });
         // Retire LAN exposure without deleting any paired-device credential or PTY.
         // Explicit loopback remains available to isolated QA fixtures only.
         let loopback = intent
@@ -266,6 +241,19 @@ impl Intent {
         }
         Ok(intent)
     }
+    /// 없으면 `None`. 읽을 수 없는 파일을 새 신원으로 덮어쓰면 모든 폰의 페어링을 잃으므로,
+    /// 해석할 수 없는 파일은 옆에 보존하고 오류를 낸다. 권한·입출력 오류는 파일을 건드리지 않는다.
+    fn read(path: &Path) -> io::Result<Option<Self>> {
+        let Some(bytes) = super::devices::read_private(path)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            let backup = path.with_extension(format!("json.corrupt-{}", now_ms()));
+            let kept = std::fs::rename(path, &backup).is_ok();
+            tracing::error!(%error, kept, "mobile-gateway.json is unreadable; moved aside");
+            io::Error::new(io::ErrorKind::InvalidData, error)
+        })
+    }
     fn save(&self, dir: &Path) -> io::Result<()> {
         super::devices::write_private(
             &dir.join(INTENT_FILE),
@@ -287,33 +275,8 @@ fn save_intent(s: &State) -> io::Result<()> {
         key: s.publication.key.clone(),
         relay_owner: s.relay_owner.clone(),
         port: s.saved_port,
-        tunnel_pid: s.saved_tunnel_pid,
-        tunnel_url: s.saved_tunnel_url.clone(),
-        tunnel_token: s.tunnel_token.clone(),
-        tunnel_hostname: s.tunnel_hostname.clone(),
     };
     intent.save(dir)
-}
-fn sync_tunnel_intent(s: &mut State) {
-    if s.dir.is_none() || s.mode != ConnectMode::Tunnel {
-        return;
-    }
-    let Some(port) = s.selected.map(|a| a.port()) else {
-        return;
-    };
-    let Some(tunnel) = s.tunnel.as_ref() else {
-        return;
-    };
-    let cur_pid = tunnel.pid();
-    let next_url = Some(tunnel.url().to_owned());
-    tunnel.set_persist(true);
-    if s.saved_port != Some(port) || s.saved_tunnel_pid != cur_pid || s.saved_tunnel_url != next_url
-    {
-        s.saved_port = Some(port);
-        s.saved_tunnel_pid = cur_pid;
-        s.saved_tunnel_url = next_url;
-        save_intent(s).ok();
-    }
 }
 #[derive(Debug)]
 pub(super) enum ShutdownHandle {
@@ -423,7 +386,7 @@ impl Gateway {
         hello: ServerHello,
     ) -> io::Result<Arc<Self>> {
         let intent = Intent::load(dir)?;
-        let mut publication = super::tunnel::Publication {
+        let mut publication = super::relay::Publication {
             origin: mobile_origin(),
             rid: intent.rid,
             key: intent.key,
@@ -455,21 +418,10 @@ impl Gateway {
                 connections: HashMap::new(),
                 next: 0,
                 stopped: false,
-                tunnel: None,
-                tunnel_start: None,
                 relay: None,
-                relay_enabled: false,
                 relay_ctx: None,
                 saved_port: intent.port,
-                saved_tunnel_pid: intent.tunnel_pid,
-                saved_tunnel_url: intent.tunnel_url,
-                tunnel_token: intent.tunnel_token,
-                tunnel_hostname: intent.tunnel_hostname,
-                resolver: super::cloudflared::Resolver::default(),
                 publication,
-                tunnel_failures: 0,
-                tunnel_retry_at: None,
-                tunnel_error: None,
                 dir: dir.map(Path::to_path_buf),
                 account,
                 relay_owner: intent.relay_owner,
@@ -505,7 +457,7 @@ impl Gateway {
         let base = if relay_pairing(&state) {
             fixed_base(&state)
         } else if state.mode == ConnectMode::Tunnel {
-            state.tunnel.as_ref()?.ready_url()?.to_owned()
+            return None;
         } else if state.mode == ConnectMode::Tailscale {
             state.tailscale_serve.as_ref()?.ready()?;
             fixed_base(&state)
@@ -589,8 +541,6 @@ impl Gateway {
             } => {
                 reject_retired_mode(mode, custom_address.as_deref())?;
                 if mode == ConnectMode::Tunnel
-                    && relay_on(&state)
-                    && !named_tunnel_requested(&state, custom_address.as_deref())
                     && !state
                         .account
                         .session
@@ -607,17 +557,16 @@ impl Gateway {
                     request_tailscale(&mut state, true)?;
                 }
                 let ticket = state.devices.mint(now, rotate)?;
-                state.tunnel_retry_at = None;
                 reconcile(&mut state, now)?;
                 if matches!(mode, ConnectMode::Tunnel | ConnectMode::Tailscale) {
-                    // 설치·터널 준비·고정 출처 판정을 모두 락 밖에서 기다린다.
+                    // 릴레이 연결·Tailscale HTTPS 준비를 락 밖에서 기다린다.
                     drop(state);
                     self.shared.wake();
                     let deadline = Instant::now() + MINT_WAIT;
                     loop {
-                        let mut state = lock(&self.shared.state);
+                        let state = lock(&self.shared.state);
                         if state.stopped || state.mode != mode {
-                            return Err(io::Error::other("모바일 연결 모드가 변경되었습니다"));
+                            return Err(io::Error::other("Mobile connection mode changed"));
                         }
                         if state
                             .devices
@@ -625,7 +574,7 @@ impl Gateway {
                             .is_none_or(|current| current.token != ticket.token)
                         {
                             return Err(io::Error::other(
-                                "페어링 요청이 취소되었거나 만료되었습니다",
+                                "The pairing request was cancelled or expired",
                             ));
                         }
                         if mode == ConnectMode::Tailscale {
@@ -661,40 +610,17 @@ impl Gateway {
                         if relay_pairing(&state) {
                             return pairing_offer(&state, now_ms());
                         }
-                        // Named Tunnel 없이 릴레이 첫 시도가 실패했거나 고정 출처에 이 버전 PWA가 없으면 바로 알린다.
+                        // 릴레이 첫 시도가 실패했거나 고정 출처에 이 버전 PWA가 없으면 바로 알린다.
                         // 릴레이는 뒤에서 계속 재시도한다.
-                        if relay_only(&state)
-                            && state
+                        if Instant::now() >= deadline
+                            || state
                                 .relay
                                 .as_ref()
                                 .is_some_and(|r| r.settled() && !r.pairing())
                         {
-                            return Err(tunnel_unavailable(&state));
+                            return Err(relay_unavailable(&state));
                         }
-                        // 기한이 지나도 준비되지 않으면 Named Tunnel URL로 낸다. 몇 초 뒤 새로고침하면 열린다.
-                        let timed_out = Instant::now() >= deadline;
-                        if state
-                            .tunnel
-                            .as_ref()
-                            .is_some_and(|t| timed_out || t.ready_url().is_some())
-                        {
-                            sync_tunnel_intent(&mut state);
-                            return pairing_offer(&state, now_ms());
-                        }
-                        let fatal_tunnel_err = state.tunnel.is_none()
-                            && !state.resolver.downloading()
-                            && state
-                                .tunnel_error
-                                .as_ref()
-                                .is_some_and(|e| e.kind() != io::ErrorKind::WouldBlock);
-                        let relay_failed = state
-                            .relay
-                            .as_ref()
-                            .is_none_or(|r| r.settled() && !r.pairing());
-                        if timed_out || (fatal_tunnel_err && relay_failed) {
-                            return Err(tunnel_unavailable(&state));
-                        }
-                        // 상태 변경은 바로, 백그라운드 프로브의 준비 표시는 50ms 안에 본다.
+                        // 상태 변경은 바로, 백그라운드 준비 표시는 50ms 안에 본다.
                         drop(
                             self.shared
                                 .changed
@@ -712,8 +638,6 @@ impl Gateway {
             } => {
                 reject_retired_mode(mode, custom_address.as_deref())?;
                 if mode == ConnectMode::Tunnel
-                    && relay_on(&state)
-                    && !named_tunnel_requested(&state, custom_address.as_deref())
                     && !state
                         .account
                         .session
@@ -781,11 +705,6 @@ impl Drop for Gateway {
             && state.mode != ConnectMode::Lan
             && (state.devices.active_count() > 0 || state.devices.ticket(now).is_some());
         if keep_gateway {
-            sync_tunnel_intent(&mut state);
-            if let Some(tunnel) = state.tunnel.as_ref() {
-                tunnel.set_persist(true);
-            }
-            state.tunnel = None;
             state.relay = None;
             state.listeners.clear();
             state.waker.quiesce();
@@ -812,42 +731,11 @@ fn reject_retired_mode(mode: ConnectMode, custom: Option<&str>) -> io::Result<()
 }
 // Lan discriminant is retained only for decoding and explicit loopback QA.
 fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64) -> io::Result<()> {
-    let mut next_custom = custom;
-    let mut named_changed = false;
-    if mode == ConnectMode::Tunnel
-        && let Some(raw) = next_custom.as_deref()
-    {
-        if raw.trim().is_empty() {
-            if s.tunnel_token.is_some() || s.tunnel_hostname.is_some() {
-                s.tunnel_token = None;
-                s.tunnel_hostname = None;
-                named_changed = true;
-            }
-            next_custom = None;
-        } else if let Some((token, hostname)) = raw.split_once('@') {
-            let token = token.trim();
-            let hostname = hostname.trim();
-            if token.is_empty() || super::tunnel::normalize_named_url(hostname).is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "유효하지 않은 Named Tunnel 설정(token@hostname)",
-                ));
-            }
-            let next_token = Some(token.to_owned());
-            let next_host = Some(hostname.to_owned());
-            if s.tunnel_token != next_token || s.tunnel_hostname != next_host {
-                s.tunnel_token = next_token;
-                s.tunnel_hostname = next_host;
-                named_changed = true;
-            }
-            next_custom = None;
-        }
-    }
     // Validate before mutating live transports: an unavailable backup must never
     // tear down an authenticated relay session.
     let interfaces = net::detect()?;
     s.network_checked = Instant::now();
-    let selected = match net::select(&interfaces, mode, next_custom.as_deref()) {
+    let selected = match net::select(&interfaces, mode, custom.as_deref()) {
         Ok(selected) => selected,
         Err(error) => {
             s.interfaces = interfaces;
@@ -855,18 +743,7 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
         }
     };
     let reissue = s.devices.ticket(now).is_some();
-    let intent_changed = s.mode != mode || s.custom != next_custom || named_changed;
-    if named_changed {
-        if let Some(mut tunnel) = s.tunnel.take() {
-            tunnel.terminate();
-        } else if let Some(pid) = s.saved_tunnel_pid {
-            super::tunnel::kill_pid(pid);
-        }
-        s.saved_tunnel_pid = None;
-        s.saved_tunnel_url = None;
-        s.tunnel_retry_at = None;
-        s.tunnel_failures = 0;
-    }
+    let intent_changed = s.mode != mode || s.custom != custom;
     // The enum selects which QR to show. Relay and the tailnet listener have
     // independent lifetimes; switching QR must not close accepted sockets.
     if intent_changed || s.selected.is_some_and(|a| a.ip() != selected.ip()) {
@@ -883,18 +760,15 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
     let port = if selected.port() != 0 && current_port != Some(selected.port()) {
         s.listeners.clear();
         s.waker.quiesce();
-        if let Some(mut tunnel) = s.tunnel.take() {
-            tunnel.terminate();
-        }
         selected.port()
     } else {
         current_port.unwrap_or(selected.port())
     };
     if mode == ConnectMode::Tailscale {
-        s.tailscale_address.clone_from(&next_custom);
+        s.tailscale_address.clone_from(&custom);
     }
     s.mode = mode;
-    s.custom = next_custom;
+    s.custom = custom;
     s.interfaces = interfaces;
     s.selected = Some(SocketAddrV4::new(*selected.ip(), port));
     if intent_changed {
@@ -928,21 +802,14 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     {
         return Err(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
-            "Tailscale 백업 주소를 열 수 없습니다 — Tailscale 연결을 확인하세요",
+            "Can't open the Tailscale backup address. Check your Tailscale connection",
         ));
     }
-    let relay_only = state.mode == ConnectMode::Tunnel && relay_pairing(state);
     let base = if state.mode == ConnectMode::Tunnel {
-        if relay_only {
-            fixed_base(state)
-        } else {
-            state
-                .tunnel
-                .as_ref()
-                .ok_or_else(|| tunnel_unavailable(state))?
-                .url()
-                .to_owned()
+        if !relay_pairing(state) {
+            return Err(relay_unavailable(state));
         }
+        fixed_base(state)
     } else if state.mode == ConnectMode::Tailscale {
         fixed_base(state)
     } else {
@@ -1012,24 +879,15 @@ fn fixed_base(state: &State) -> String {
         super::pwa::asset_hash()
     )
 }
-fn tunnel_unavailable(state: &State) -> io::Error {
-    let message = if relay_only(state) {
-        if state
-            .relay
-            .as_ref()
-            .is_some_and(super::relay::RelayClient::connected)
-        {
-            "이 버전의 모바일 웹앱이 아직 배포되지 않아 새 기기를 연결할 수 없습니다".to_owned()
-        } else {
-            "모바일 릴레이에 연결하지 못했습니다 — 네트워크 확인 후 다시 시도".to_owned()
-        }
-    } else if state.resolver.downloading() {
-        "cloudflared 내려받는 중 — 잠시 후 다시 시도".to_owned()
+fn relay_unavailable(state: &State) -> io::Error {
+    let message = if state
+        .relay
+        .as_ref()
+        .is_some_and(super::relay::RelayClient::connected)
+    {
+        "This version's mobile web app isn't deployed yet, so new devices can't connect"
     } else {
-        state.tunnel_error.as_ref().map_or_else(
-            || "모바일 터널 준비 중 — 잠시 후 다시 시도".into(),
-            ToString::to_string,
-        )
+        "Couldn't connect to the mobile relay. Check your network and try again"
     };
     io::Error::new(io::ErrorKind::WouldBlock, message)
 }
@@ -1043,25 +901,15 @@ fn status(s: &State, now: u64) -> MobileReply {
             .filter_map(|l| l.local_addr().ok().map(|a| a.to_string()))
             .collect(),
         mode: s.mode,
-        tunnel_url: s.tunnel.as_ref().map(|t| t.url().to_owned()),
+        tunnel_url: None,
         active_offer: s.devices.ticket(now).is_some(),
         devices: s.devices.list(),
     }
 }
 fn close(s: &mut State) {
     s.tailscale_serve = None;
-    if let Some(mut tunnel) = s.tunnel.take() {
-        tunnel.terminate();
-    } else if let Some(pid) = s.saved_tunnel_pid.take() {
-        super::tunnel::kill_pid(pid);
-    }
     s.relay = None;
-    s.tunnel_failures = 0;
-    s.tunnel_retry_at = None;
-    if s.saved_port.is_some() || s.saved_tunnel_pid.is_some() || s.saved_tunnel_url.is_some() {
-        s.saved_port = None;
-        s.saved_tunnel_pid = None;
-        s.saved_tunnel_url = None;
+    if s.saved_port.take().is_some() {
         save_intent(s).ok();
     }
     s.listeners.clear();
@@ -1096,7 +944,7 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
     }
     if !s.listeners.is_empty() {
         sync_direct_listener(s);
-        supervise_tunnel(s);
+        supervise_relay(s);
         request_tailscale(s, false)?;
         return Ok(());
     }
@@ -1116,11 +964,7 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
         if let Ok(l) = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, saved_port)) {
             l
         } else {
-            if let Some(pid) = s.saved_tunnel_pid.take() {
-                super::tunnel::kill_pid(pid);
-            }
             s.saved_port = None;
-            s.saved_tunnel_url = None;
             save_intent(s).ok();
             TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?
         }
@@ -1134,7 +978,7 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
     s.saved_port = Some(port);
     save_intent(s)?;
     sync_direct_listener(s);
-    supervise_tunnel(s);
+    supervise_relay(s);
     request_tailscale(s, false)?;
     Ok(())
 }
@@ -1216,76 +1060,13 @@ fn sync_direct_listener(s: &mut State) {
         s.listeners.push(listener);
     }
 }
-fn named_tunnel(s: &State) -> Option<super::tunnel::NamedTunnel> {
-    if let (Some(token), Some(hostname)) = (&s.tunnel_token, &s.tunnel_hostname)
-        && !token.is_empty()
-        && !hostname.is_empty()
-    {
-        return Some(super::tunnel::NamedTunnel {
-            token: token.clone(),
-            url: hostname.clone(),
-        });
-    }
-    if let Some((token, hostname)) = s.custom.as_deref().and_then(|c| c.split_once('@'))
-        && !token.trim().is_empty()
-        && !hostname.trim().is_empty()
-    {
-        return Some(super::tunnel::NamedTunnel {
-            token: token.trim().to_owned(),
-            url: hostname.trim().to_owned(),
-        });
-    }
-    environment_named_tunnel()
-}
-fn environment_named_tunnel() -> Option<super::tunnel::NamedTunnel> {
-    let token = std::env::var("KRILL_MOBILE_TUNNEL_TOKEN").ok()?;
-    let hostname = std::env::var("KRILL_MOBILE_TUNNEL_HOSTNAME").ok()?;
-    if token.trim().is_empty() || hostname.trim().is_empty() {
-        return None;
-    }
-    Some(super::tunnel::NamedTunnel {
-        token: token.trim().to_owned(),
-        url: hostname.trim().to_owned(),
-    })
-}
-/// Match configure's prospective named settings before allowing a hosted relay QR.
-fn named_tunnel_requested(s: &State, custom: Option<&str>) -> bool {
-    if let Some(raw) = custom {
-        if raw.trim().is_empty() {
-            return environment_named_tunnel().is_some();
-        }
-        // configure validates token@hostname before changing state or exposing any route.
-        if raw.contains('@') {
-            return true;
-        }
-    }
-    (s.tunnel_token
-        .as_ref()
-        .is_some_and(|token| !token.is_empty())
-        && s.tunnel_hostname
-            .as_ref()
-            .is_some_and(|hostname| !hostname.is_empty()))
-        || environment_named_tunnel().is_some()
-}
-/// 운영 빌드는 늘 릴레이를 쓴다. 테스트 고정 터널(`tunnel_start`)만 릴레이 없이 돈다.
-fn relay_on(s: &State) -> bool {
-    s.tunnel_start.is_none() || s.relay_enabled
-}
-/// 릴레이만으로 외부 접속한다(Named Tunnel 없음).
-fn relay_only(s: &State) -> bool {
-    s.mode == ConnectMode::Tunnel && relay_on(s) && named_tunnel(s).is_none()
-}
-/// 외부 접속은 릴레이로 한다. 명시적 Named Tunnel만 터널을 띄우고, 터널 실패는 지수 백오프로 재시도한다.
-fn supervise_tunnel(s: &mut State) {
+/// 로그인 세션이 유효한 동안 릴레이 연결을 유지한다. 연결 모드는 QR 경로만 고른다.
+fn supervise_relay(s: &mut State) {
     if s.mode == ConnectMode::Lan {
-        if let Some(mut tunnel) = s.tunnel.take() {
-            tunnel.terminate();
-        }
         s.relay = None;
         return;
     }
-    let named = named_tunnel(s);
-    if s.account.session.is_none() && relay_on(s) {
+    if s.account.session.is_none() {
         s.relay = None;
     }
     if s.account
@@ -1298,11 +1079,10 @@ fn supervise_tunnel(s: &mut State) {
         s.publication.session = None;
         super::relay_auth::Session::remove(s.dir.as_deref()).ok();
     }
-    if relay_on(s)
-        && s.account
-            .session
-            .as_ref()
-            .is_some_and(|session| session.valid(&s.publication.origin, now_ms()))
+    if s.account
+        .session
+        .as_ref()
+        .is_some_and(|session| session.valid(&s.publication.origin, now_ms()))
         && s.relay.is_none()
         && let Some(ctx) = s.relay_ctx.as_ref()
         && let Some(shared) = ctx.shared.upgrade()
@@ -1315,96 +1095,6 @@ fn supervise_tunnel(s: &mut State) {
         )
         .ok();
     }
-    if s.mode != ConnectMode::Tunnel {
-        return;
-    }
-    if named.is_none() && relay_on(s) {
-        // Named Tunnel 설정을 지웠거나 이전 버전이 띄워 둔 터널(입양 대기 PID 포함)을 정리한다.
-        if let Some(mut tunnel) = s.tunnel.take() {
-            tunnel.terminate();
-        }
-        let pid = s.saved_tunnel_pid.take();
-        let url = s.saved_tunnel_url.take();
-        if let Some(pid) = pid {
-            super::tunnel::kill_pid(pid);
-        }
-        if pid.is_some() || url.is_some() {
-            save_intent(s).ok();
-        }
-        s.tunnel_error = None;
-        return;
-    }
-    let Some(port) = s.selected.map(|a| a.port()) else {
-        return;
-    };
-    if let Some(tunnel) = s.tunnel.as_mut() {
-        if tunnel.ready_url().is_some() {
-            s.tunnel_failures = 0;
-        }
-        if tunnel.healthy() {
-            sync_tunnel_intent(s);
-            return;
-        }
-        tracing::warn!("mobile tunnel exited or never became reachable; restarting");
-        if let Some(mut old) = s.tunnel.take() {
-            old.terminate();
-        }
-        s.saved_tunnel_pid = None;
-        s.saved_tunnel_url = None;
-        save_intent(s).ok();
-        backoff(s);
-    }
-    if let Some(pid) = s.saved_tunnel_pid {
-        if s.saved_port == Some(port)
-            && let Some(url) = s.saved_tunnel_url.clone()
-            && let Some(tunnel) = super::tunnel::Tunnel::adopt(pid, url)
-        {
-            if s.dir.is_some() {
-                tunnel.set_persist(true);
-            }
-            s.tunnel = Some(tunnel);
-            s.tunnel_failures = 0;
-            s.tunnel_retry_at = None;
-            s.tunnel_error = None;
-            return;
-        }
-        super::tunnel::kill_pid(pid);
-        s.saved_tunnel_pid = None;
-        s.saved_tunnel_url = None;
-        save_intent(s).ok();
-    }
-    if s.tunnel_retry_at.is_some_and(|at| Instant::now() < at) {
-        return;
-    }
-    let result = match (s.tunnel_start, named) {
-        (Some(start), _) => start(port),
-        (None, Some(named)) => s
-            .resolver
-            .resolve(s.dir.as_deref())
-            .and_then(|binary| super::tunnel::Tunnel::start(binary.as_os_str(), port, &named)),
-        (None, None) => return,
-    };
-    match result {
-        Ok(tunnel) => {
-            s.tunnel = Some(tunnel);
-            s.tunnel_retry_at = None;
-            s.tunnel_error = None;
-            sync_tunnel_intent(s);
-        }
-        Err(error) => {
-            tracing::warn!(kind=?error.kind(), "mobile tunnel start failed");
-            let pending = error.kind() == io::ErrorKind::WouldBlock;
-            s.tunnel_error = Some(error);
-            if !pending {
-                backoff(s);
-            }
-        }
-    }
-}
-fn backoff(s: &mut State) {
-    s.tunnel_failures = s.tunnel_failures.saturating_add(1);
-    let delay = Duration::from_secs(1 << s.tunnel_failures.min(6)).min(Duration::from_secs(60));
-    s.tunnel_retry_at = Some(Instant::now() + delay);
 }
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -1626,8 +1316,8 @@ pub(super) fn auth_close_code(error: &io::Error) -> Option<u16> {
 }
 
 fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Result<Channel> {
-    // 주소와 무관한 실패 예산. 미인증 연결은 최대 4개·5초로 제한한다.
-    lock(&shared.state).devices.check_cooldown(now_ms())?;
+    // 실패 예산은 주소가 아니라 주장한 인증 주체별이다(`Devices::attempt`). 미인증 연결은 최대 4개·5초로 제한한다.
+    let mut principal = None;
     let result = (|| {
         let challenge = random()?;
         ws::write(
@@ -1647,8 +1337,10 @@ fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Re
         let auth: AuthHello = serde_json::from_slice(&body).map_err(|_| invalid())?;
         let client_nonce = decode_hex::<32>(&auth.client_nonce)?;
         let token = auth.token.as_deref().map(decode_hex::<32>).transpose()?;
+        principal.clone_from(&auth.device_id);
         let secret = {
-            let s = lock(&shared.state);
+            let mut s = lock(&shared.state);
+            s.devices.check_cooldown(now_ms(), principal.as_deref())?;
             match (&token, &auth.device_id) {
                 (Some(t), None) => s.devices.pairing_secret(t, now_ms())?,
                 (None, Some(d)) => s.devices.device_secret(d)?,
@@ -1698,7 +1390,10 @@ fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Re
         .as_ref()
         .is_err_and(|error: &io::Error| error.kind() == io::ErrorKind::InvalidData)
     {
-        lock(&shared.state).devices.attempt(now_ms()).ok();
+        lock(&shared.state)
+            .devices
+            .attempt(now_ms(), principal.as_deref())
+            .ok();
     }
     result
 }
