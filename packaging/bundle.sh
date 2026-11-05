@@ -212,7 +212,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleName</key><string>Krill</string>
     <key>CFBundleDisplayName</key><string>Krill</string>
-    <key>CFBundleDevelopmentRegion</key><string>ko</string>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleLocalizations</key><array><string>en</string><string>ko</string></array>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
@@ -221,9 +221,9 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>KrillUpdateURL</key><string>$update_url</string>
     <key>KrillUpdateDesignatedRequirement</key><string>identifier &quot;dev.krill.app&quot; and certificate root = H&quot;$cert_sha1&quot;</string>
     <key>NSHighResolutionCapable</key><true/>
-    <key>NSDocumentsFolderUsageDescription</key><string>Krill이 워크스페이스 및 에이전트 세션의 문서 폴더 파일에 접근합니다.</string>
-    <key>NSDesktopFolderUsageDescription</key><string>Krill이 워크스페이스 및 에이전트 세션의 데스크톱 폴더 파일에 접근합니다.</string>
-    <key>NSDownloadsFolderUsageDescription</key><string>Krill이 워크스페이스 및 에이전트 세션의 다운로드 폴더 파일에 접근합니다.</string>
+    <key>NSDocumentsFolderUsageDescription</key><string>Krill accesses files in your Documents folder for workspaces and agent sessions.</string>
+    <key>NSDesktopFolderUsageDescription</key><string>Krill accesses files on your Desktop for workspaces and agent sessions.</string>
+    <key>NSDownloadsFolderUsageDescription</key><string>Krill accesses files in your Downloads folder for workspaces and agent sessions.</string>
 </dict></plist>
 PLIST
 /usr/bin/plutil -lint "$app/Contents/Info.plist"

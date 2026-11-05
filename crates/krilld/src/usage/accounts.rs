@@ -1551,7 +1551,7 @@ mod login_regression_tests {
         );
         assert_eq!(classify_error("token lookup failed"), AccountStatus::Error);
         // 사용량 API 429(값 없음)는 로그인 요청이 아니라 조회 오류다.
-        assert_eq!(classify_error("요청 제한"), AccountStatus::Error);
+        assert_eq!(classify_error("Rate limited"), AccountStatus::Error);
         assert_eq!(classify_error("not logged in"), AccountStatus::NeedsLogin);
     }
 

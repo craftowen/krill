@@ -617,7 +617,7 @@ impl Gateway {
                     loop {
                         let mut state = lock(&self.shared.state);
                         if state.stopped || state.mode != mode {
-                            return Err(io::Error::other("모바일 연결 모드가 변경되었습니다"));
+                            return Err(io::Error::other("Mobile connection mode changed"));
                         }
                         if state
                             .devices
@@ -625,7 +625,7 @@ impl Gateway {
                             .is_none_or(|current| current.token != ticket.token)
                         {
                             return Err(io::Error::other(
-                                "페어링 요청이 취소되었거나 만료되었습니다",
+                                "The pairing request was cancelled or expired",
                             ));
                         }
                         if mode == ConnectMode::Tailscale {
@@ -830,7 +830,7 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
             if token.is_empty() || super::tunnel::normalize_named_url(hostname).is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "유효하지 않은 Named Tunnel 설정(token@hostname)",
+                    "Invalid Named Tunnel setting (token@hostname)",
                 ));
             }
             let next_token = Some(token.to_owned());
@@ -928,7 +928,7 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     {
         return Err(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
-            "Tailscale 백업 주소를 열 수 없습니다 — Tailscale 연결을 확인하세요",
+            "Can't open the Tailscale backup address. Check your Tailscale connection",
         ));
     }
     let relay_only = state.mode == ConnectMode::Tunnel && relay_pairing(state);
@@ -1019,15 +1019,16 @@ fn tunnel_unavailable(state: &State) -> io::Error {
             .as_ref()
             .is_some_and(super::relay::RelayClient::connected)
         {
-            "이 버전의 모바일 웹앱이 아직 배포되지 않아 새 기기를 연결할 수 없습니다".to_owned()
+            "This version's mobile web app isn't deployed yet, so new devices can't connect"
+                .to_owned()
         } else {
-            "모바일 릴레이에 연결하지 못했습니다 — 네트워크 확인 후 다시 시도".to_owned()
+            "Couldn't connect to the mobile relay. Check your network and try again".to_owned()
         }
     } else if state.resolver.downloading() {
-        "cloudflared 내려받는 중 — 잠시 후 다시 시도".to_owned()
+        "Downloading cloudflared. Try again shortly".to_owned()
     } else {
         state.tunnel_error.as_ref().map_or_else(
-            || "모바일 터널 준비 중 — 잠시 후 다시 시도".into(),
+            || "Preparing the mobile tunnel. Try again shortly".into(),
             ToString::to_string,
         )
     };

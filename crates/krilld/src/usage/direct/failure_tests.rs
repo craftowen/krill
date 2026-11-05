@@ -49,7 +49,7 @@ fn reports_each_profile_and_reason_streak_once_and_recovers_once() {
         for count in 1..=3 {
             assert!(apply_result(&first, Fetched::Failed(Failure::Http(401)), Some(42)).is_none());
             let usage = lock(&CACHE)[&first].1.clone();
-            assert_eq!(usage.error.as_deref(), Some("갱신 실패"));
+            assert_eq!(usage.error.as_deref(), Some("Refresh failed"));
             assert_eq!(usage.detail, Some(Failure::Http(401).detail()));
             assert_eq!(lock(&RETRY)[&first].failures, count);
         }

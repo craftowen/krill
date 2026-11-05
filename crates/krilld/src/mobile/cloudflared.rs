@@ -31,8 +31,8 @@ impl Resolver {
         if let Some(binary) = find_binary(override_bin.as_deref(), path.as_deref(), dir) {
             return Ok(binary);
         }
-        let dir = dir
-            .ok_or_else(|| io::Error::other("cloudflared 자동 설치용 상태 디렉터리가 없습니다"))?;
+        let dir =
+            dir.ok_or_else(|| io::Error::other("No state directory for installing cloudflared"))?;
         self.acquire(dir, install)
     }
     fn acquire(&self, dir: &Path, installer: Installer) -> io::Result<PathBuf> {
@@ -54,7 +54,7 @@ impl Resolver {
             .stack_size(128 * 1024)
             .spawn(move || {
                 let result = installer(&dir).map_err(|e| {
-                    io::Error::new(e.kind(), format!("cloudflared 내려받기 실패: {e}"))
+                    io::Error::new(e.kind(), format!("Failed to download cloudflared: {e}"))
                 });
                 *lock(&shared) = Download::Done(result);
             })
@@ -71,7 +71,7 @@ impl Resolver {
 fn downloading() -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,
-        "cloudflared 내려받는 중 — 잠시 후 다시 시도",
+        "Downloading cloudflared. Try again shortly",
     )
 }
 fn executable(path: &Path) -> bool {
@@ -133,7 +133,7 @@ fn release(os: &str, arch: &str) -> io::Result<(&'static str, &'static str)> {
         )),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "cloudflared 자동 설치를 지원하지 않는 플랫폼",
+            "Automatic cloudflared install isn't supported on this platform",
         )),
     }
 }
@@ -150,14 +150,14 @@ fn verify(path: &Path, expected: &str) -> io::Result<()> {
         context.update(
             buffer
                 .get(..n)
-                .ok_or_else(|| io::Error::other("해시 버퍼 범위 오류"))?,
+                .ok_or_else(|| io::Error::other("Hash buffer range error"))?,
         );
     }
     if super::devices::hex(context.finish().as_ref()) != expected {
         fs::remove_file(path)?;
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "cloudflared SHA-256 불일치",
+            "cloudflared SHA-256 mismatch",
         ));
     }
     Ok(())
@@ -179,7 +179,7 @@ fn install(dir: &Path) -> io::Result<PathBuf> {
             Ok(())
         } else {
             Err(io::Error::other(format!(
-                "공식 릴리스 요청 종료 코드 {status}"
+                "Official release request exited with code {status}"
             )))
         }
     })
@@ -218,7 +218,7 @@ fn install_with(
                 .stderr(Stdio::null())
                 .status()?;
             if !status.success() {
-                return Err(io::Error::other("cloudflared 압축 해제 실패"));
+                return Err(io::Error::other("Failed to extract cloudflared"));
             }
             tmp.join("cloudflared")
         } else {

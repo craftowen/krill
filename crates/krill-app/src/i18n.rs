@@ -2389,24 +2389,63 @@ catalog! {
         ERR_CLI_MISSING => ("krill CLI 실행 파일을 찾을 수 없습니다", "Could not find the krill CLI binary"),
         ERR_IMPORT_FAILED => ("Orca 가져오기 실패: {error}", "Orca import failed: {error}"),
     }
+    // krilld가 영어로 보내는 알림. 앱이 `cached_notice`로 언어에 맞춘다. 한글은 예전 버전이 남긴 값도 맞춘다.
+    daemon_notice {
+        MOBILE_MODE_CHANGED => ("모바일 연결 모드가 변경되었습니다", "Mobile connection mode changed"),
+        PAIRING_CANCELLED => ("페어링 요청이 취소되었거나 만료되었습니다", "The pairing request was cancelled or expired"),
+        NAMED_TUNNEL_INVALID => ("유효하지 않은 Named Tunnel 설정(token@hostname)", "Invalid Named Tunnel setting (token@hostname)"),
+        NAMED_TUNNEL_HOST_INVALID => ("유효하지 않은 Named Tunnel 호스트명", "Invalid Named Tunnel hostname"),
+        TAILSCALE_BACKUP => ("Tailscale 백업 주소를 열 수 없습니다 — Tailscale 연결을 확인하세요", "Can't open the Tailscale backup address. Check your Tailscale connection"),
+        MOBILE_WEB_NOT_DEPLOYED => ("이 버전의 모바일 웹앱이 아직 배포되지 않아 새 기기를 연결할 수 없습니다", "This version's mobile web app isn't deployed yet, so new devices can't connect"),
+        RELAY_FAILED => ("모바일 릴레이에 연결하지 못했습니다 — 네트워크 확인 후 다시 시도", "Couldn't connect to the mobile relay. Check your network and try again"),
+        CLOUDFLARED_DOWNLOADING => ("cloudflared 내려받는 중 — 잠시 후 다시 시도", "Downloading cloudflared. Try again shortly"),
+        TUNNEL_PREPARING => ("모바일 터널 준비 중 — 잠시 후 다시 시도", "Preparing the mobile tunnel. Try again shortly"),
+        CLOUDFLARED_NO_STATE => ("cloudflared 자동 설치용 상태 디렉터리가 없습니다", "No state directory for installing cloudflared"),
+        CLOUDFLARED_DOWNLOAD_FAILED => ("cloudflared 내려받기 실패", "Failed to download cloudflared"),
+        CLOUDFLARED_UNSUPPORTED => ("cloudflared 자동 설치를 지원하지 않는 플랫폼", "Automatic cloudflared install isn't supported on this platform"),
+        CLOUDFLARED_HASH_MISMATCH => ("cloudflared SHA-256 불일치", "cloudflared SHA-256 mismatch"),
+        CLOUDFLARED_EXTRACT_FAILED => ("cloudflared 압축 해제 실패", "Failed to extract cloudflared"),
+        CLOUDFLARED_RUN_FAILED => ("cloudflared 실행 실패", "Failed to run cloudflared"),
+        USAGE_CREDENTIALS => ("사용량 자격증명 읽기 실패", "Failed to read usage credentials"),
+        USAGE_EXPIRED => ("사용량 자격증명 만료 — 해당 계정 CLI에서 갱신하거나 다시 로그인하세요", "Usage credentials expired. Refresh them in that account's CLI or sign in again"),
+        USAGE_REQUEST => ("사용량 요청 구성 실패", "Failed to build the usage request"),
+        USAGE_TRANSPORT => ("사용량 API 연결·전송 실패", "Usage API connection failed"),
+        USAGE_HTTP_401 => ("사용량 API 인증 거절(HTTP 401) — 계정 로그인을 확인하세요", "Usage API rejected the sign-in (HTTP 401). Check the account login"),
+        USAGE_HTTP_403 => ("사용량 API 접근 거절(HTTP 403)", "Usage API denied access (HTTP 403)"),
+        USAGE_RESPONSE => ("사용량 API 응답 해석 실패", "Failed to read the usage API response"),
+        USAGE_INTERNAL => ("사용량 조회 작업 실패", "Usage lookup failed"),
+        USAGE_RATE_LIMITED => ("사용량 API 요청 제한(429)", "Usage API rate limited (429)"),
+        USAGE_LAST_VALUE => ("마지막 성공 값", "last successful value"),
+    }
 }
 
 fn cached_notice_line(value: &str) -> String {
     if let Some(key) = ALL.iter().find(|key| key.ko == value || key.en == value) {
         return key.get().to_owned();
     }
-    if let Some((label, detail)) = value.split_once(": ") {
-        if let Some(app) = label
+    if let Some((label, detail)) = value.split_once(": ")
+        && let Some(app) = label
             .strip_suffix(" 열기 실패")
             .or_else(|| label.strip_prefix("Failed to open "))
-        {
-            return catalog::open_in::FAILED.format(&[("app", app), ("error", detail)]);
-        }
+    {
+        return catalog::open_in::FAILED.format(&[("app", app), ("error", detail)]);
+    }
+    let parts = value
+        .split_once(": ")
+        .map(|(label, detail)| (label, detail, ": "))
+        .into_iter()
+        // 데몬 알림의 "<이유> — <상태>". 이유 안에도 줄표가 있을 수 있어 마지막에서 나눈다.
+        .chain(
+            value
+                .rsplit_once(" — ")
+                .map(|(label, detail)| (label, detail, " — ")),
+        );
+    for (label, detail, separator) in parts {
         let label_key = ALL.iter().find(|key| key.ko == label || key.en == label);
         let detail_key = ALL.iter().find(|key| key.ko == detail || key.en == detail);
         if label_key.is_some() || detail_key.is_some() {
             return format!(
-                "{}: {}",
+                "{}{separator}{}",
                 label_key.map_or(label, |k| k.get()),
                 detail_key.map_or(detail, |k| k.get()),
             );

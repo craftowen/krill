@@ -696,7 +696,7 @@ fn print_snapshot(snap: &AccountsSnapshot) {
             h5,
             d7,
             a.profile_dir,
-            snap.connection_for(&a.id).label_ko(),
+            snap.connection_for(&a.id).label(),
             a.email
                 .as_deref()
                 .filter(|email| !email.trim().is_empty())
@@ -954,7 +954,7 @@ fn parse_advanced_policy(
 
 fn format_history(history: &[krill_proto::usage::SwitchRecord]) -> String {
     if history.is_empty() {
-        return "자동전환 이력 없음".into();
+        return "No automatic switches yet".into();
     }
     history
         .iter()
@@ -967,9 +967,9 @@ fn format_history(history: &[krill_proto::usage::SwitchRecord]) -> String {
                 r.event.to_label,
                 r.event.reason_percent,
                 if r.predicted {
-                    "소진 예측"
+                    "predicted exhaustion"
                 } else {
-                    "임계치/한도"
+                    "threshold or limit"
                 }
             )
         })
@@ -1004,6 +1004,6 @@ mod policy_tests {
         assert!(p.predict_exhaustion);
         assert!(parse_advanced_policy("cooldown", &u64::MAX.to_string(), old.clone()).is_err());
         assert!(parse_advanced_policy("predict", "maybe", old).is_err());
-        assert!(format_history(&[]).contains("없음"));
+        assert!(format_history(&[]).contains("No automatic switches"));
     }
 }

@@ -2049,7 +2049,7 @@ mod tests {
         }
 
         // Step A: Click submit with all domains while krilld is NOT running.
-        // Accounts must be skipped with "데몬 필요", while SSH, Projects, and Settings apply immediately!
+        // Accounts must be skipped with "Daemon required", while SSH, Projects, and Settings apply immediately!
         let submit_center = settings_vcx
             .debug_bounds("orca-modal-submit")
             .expect("submit button")
@@ -2072,8 +2072,8 @@ mod tests {
                 res.accounts
                     .skipped_reason
                     .as_deref()
-                    .is_some_and(|r| r.starts_with("데몬 필요")),
-                "expected 데몬 필요 reason, got {:?}",
+                    .is_some_and(|r| r.starts_with("Daemon required")),
+                "expected Daemon required reason, got {:?}",
                 res.accounts.skipped_reason
             );
             assert_eq!(res.ssh.hosts_added, 2);

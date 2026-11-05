@@ -106,10 +106,7 @@ impl Tunnel {
         named: &NamedTunnel,
     ) -> io::Result<Self> {
         let target_url = normalize_named_url(&named.url).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "유효하지 않은 Named Tunnel 호스트명",
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, "Invalid Named Tunnel hostname")
         })?;
         let (stderr_stdio, log_path) = detached_stderr(port)?;
         let mut command = Command::new(binary);
@@ -138,7 +135,7 @@ impl Tunnel {
                 std::fs::remove_file(&log_path).ok();
                 return Err(io::Error::new(
                     e.kind(),
-                    format!("cloudflared 실행 실패: {e}"),
+                    format!("Failed to run cloudflared: {e}"),
                 ));
             }
         };

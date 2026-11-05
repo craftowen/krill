@@ -114,7 +114,7 @@ impl RemotePlatform {
             RemoteOs::Windows => "Windows".to_owned(),
             RemoteOs::Other(raw) => {
                 if raw.is_empty() {
-                    "알 수 없는 OS".to_owned()
+                    "Unknown OS".to_owned()
                 } else {
                     raw.clone()
                 }

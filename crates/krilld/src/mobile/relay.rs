@@ -263,7 +263,7 @@ fn tls_config() -> io::Result<Arc<rustls::ClientConfig>> {
             Some(Arc::new(cfg))
         })
         .clone()
-        .ok_or_else(|| io::Error::other("rustls ClientConfig 초기화 실패"))
+        .ok_or_else(|| io::Error::other("Failed to initialize rustls ClientConfig"))
 }
 
 fn parse_origin(origin: &str) -> io::Result<(bool, String, String, u16)> {

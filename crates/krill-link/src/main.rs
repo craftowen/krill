@@ -18,7 +18,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            writeln!(io::stderr(), "오류 (Error): {e}").ok();
+            writeln!(io::stderr(), "Error: {e}").ok();
             ExitCode::FAILURE
         }
     }
@@ -66,14 +66,14 @@ async fn run() -> Result<(), String> {
 
 fn usage() -> String {
     [
-        "사용법 (Usage):",
+        "Usage:",
         "  krill-link serve [--socket <krilld.sock>] [--state-dir <dir>]",
         "  krill-link enable | disable",
         "  krill-link invite [--ttl-secs <secs>] [--no-qr] [--json]",
-        "  krill-link pair <krill://pair?...> --name <기기 이름 / device name> [--json]",
+        "  krill-link pair <krill://pair?...> --name <device name> [--json]",
         "  krill-link devices [--json]",
-        "  krill-link revoke <기기 ID 또는 이름 / device id or name> [--json]",
-        "  krill-link connect <호스트 ID / host id>",
+        "  krill-link revoke <device id or name> [--json]",
+        "  krill-link connect <host id>",
         "  krill-link status [--host <id>] [--json]",
         "  krill-link config [--relay <n0|off|https://...>] [--server-name <name>] [--bind-port <port>] [--resume-grace-ms <ms>] [--replay-buffer-bytes <bytes>] [--json]",
     ]
@@ -149,7 +149,7 @@ async fn cmd_serve(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     let mut handle = start_server(opts).await?;
     writeln!(
         io::stdout(),
-        "원격 연결 서버 실행 중 (Remote link server listening): node_id={}",
+        "Remote link server listening: node_id={}",
         handle.node_id()
     )
     .ok();
@@ -175,7 +175,7 @@ fn cmd_enable(state_dir: &Path) -> Result<(), Error> {
     krill_link::service::enable_server(&exe, state_dir)?;
     writeln!(
         io::stdout(),
-        "원격 연결 백그라운드 서비스 켜짐 (Remote link server enabled): {}",
+        "Remote link server enabled: {}",
         state_dir.display()
     )
     .ok();
@@ -186,7 +186,7 @@ fn cmd_disable(state_dir: &Path) -> Result<(), Error> {
     krill_link::service::disable_server(state_dir)?;
     writeln!(
         io::stdout(),
-        "원격 연결 백그라운드 서비스 꺼짐 (Remote link server disabled): {}",
+        "Remote link server disabled: {}",
         state_dir.display()
     )
     .ok();
@@ -235,7 +235,7 @@ async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "초대 링크 (10분간 1회 유효 — 다른 컴퓨터에서 붙여넣으세요 / Invite link, valid once for 10m):\n{}",
+            "Invite link, valid once for 10m. Paste it on the other computer:\n{}",
             out.link
         )
         .ok();
@@ -287,7 +287,7 @@ async fn cmd_pair(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "페어링 완료 (Paired successfully): id={} name={} node_id={}",
+            "Paired successfully: id={} name={} node_id={}",
             host.id,
             host.name,
             host.node_id
@@ -305,11 +305,7 @@ fn cmd_devices(state_dir: &Path, args: &[String]) -> Result<(), Error> {
             .map_err(|e| Error::InvalidConfig(e.to_string()))?;
         writeln!(io::stdout(), "{s}").ok();
     } else if devices.is_empty() {
-        writeln!(
-            io::stdout(),
-            "등록된 허용 기기가 없습니다 (No paired devices)."
-        )
-        .ok();
+        writeln!(io::stdout(), "No paired devices.").ok();
     } else {
         writeln!(io::stdout(), "ID\tNAME\tADDED_AT\tNODE_ID").ok();
         for d in devices {
@@ -351,7 +347,7 @@ async fn cmd_revoke(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "기기 연결 권한 해제됨 (Device revoked): id={} name={}",
+            "Device revoked: id={} name={}",
             removed.id,
             removed.name
         )
@@ -373,7 +369,7 @@ async fn cmd_connect(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     .await?;
     writeln!(
         io::stdout(),
-        "원격 호스트 터널 준비됨 (Remote host tunnel listening): {}",
+        "Remote host tunnel listening: {}",
         handle.socket_path().display()
     )
     .ok();
@@ -416,7 +412,7 @@ fn cmd_status(state_dir: &Path, args: &[String]) -> Result<(), Error> {
         } else {
             writeln!(
                 io::stdout(),
-                "호스트 (Host): {} ({})\n상태 (State): {:?}\n경로 (Route): {:?}\nRTT: {:?} ms\n소켓 (Socket): {}",
+                "Host: {} ({})\nState: {:?}\nRoute: {:?}\nRTT: {:?} ms\nSocket: {}",
                 st.host_name,
                 st.host_id,
                 st.state,
@@ -437,7 +433,7 @@ fn cmd_status(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "내 기기 ID (Node ID): {}\n중계 설정 (Relay mode): {}\n서버 실행 중 (Server running): {}\n허용 기기 수 (Allowed devices): {}",
+            "Node ID: {}\nRelay mode: {}\nServer running: {}\nAllowed devices: {}",
             report.node_id,
             report.relay_mode,
             report.serve_running,
@@ -511,17 +507,11 @@ fn cmd_config(state_dir: &Path, args: &[String]) -> Result<(), Error> {
                 })?;
                 if field == "--resume-grace-ms" {
                     cfg.resume_grace_ms = value.parse().map_err(|_| {
-                        Error::InvalidConfig(
-                            "유예 시간은 밀리초 숫자로 입력하세요 (invalid grace period)"
-                                .to_owned(),
-                        )
+                        Error::InvalidConfig("invalid grace period: enter milliseconds".to_owned())
                     })?;
                 } else {
                     cfg.replay_buffer_bytes = value.parse().map_err(|_| {
-                        Error::InvalidConfig(
-                            "보관 용량은 바이트 숫자로 입력하세요 (invalid buffer limit)"
-                                .to_owned(),
-                        )
+                        Error::InvalidConfig("invalid buffer limit: enter bytes".to_owned())
                     })?;
                 }
                 modified = true;

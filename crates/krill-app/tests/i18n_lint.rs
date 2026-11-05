@@ -172,6 +172,65 @@ fn check_dir(path: &Path, failures: &mut Vec<String>) {
     }
 }
 
+/// CLI와 데몬 알림은 언어 설정을 모르므로 영어로 쓴다. 앱에 보이는 데몬 알림은 앱이 카탈로그로 번역한다.
+#[test]
+fn cli_and_daemon_messages_are_english() {
+    fn scan(path: &Path, failures: &mut Vec<String>) {
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                scan(&entry.unwrap().path(), failures);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs")
+            && !path.to_string_lossy().contains("tests")
+        {
+            let source = fs::read_to_string(path).unwrap();
+            // 처음 나오는 테스트 모듈 앞까지가 제품 코드다. `#[cfg(test)]` 항목은 파일 중간에도 있어 기준으로 삼지 않는다.
+            let end = source
+                .match_indices("\nmod ")
+                .find(|(at, _)| {
+                    source
+                        .get(at + 1..)
+                        .and_then(|rest| rest.lines().next())
+                        .is_some_and(|line| line.contains("tests"))
+                })
+                .map_or(source.len(), |(at, _)| at);
+            let production = source.get(..end).unwrap();
+            let code = tokens(production);
+            for (i, token) in code.iter().enumerate().filter(|(_, t)| t.literal) {
+                let previous: Vec<_> = code[..i].iter().rev().take(2).map(|t| t.value).collect();
+                let hangul = token
+                    .value
+                    .chars()
+                    .any(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c));
+                if hangul && !previous.starts_with(&["=", "reason"]) {
+                    let line = production.get(..token.offset).unwrap().lines().count();
+                    failures.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+    }
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut failures = Vec::new();
+    for path in [
+        "krill/src",
+        "krill-link/src",
+        "krill-proto/src/statusline.rs",
+        "krill-proto/src/usage/connections.rs",
+        "krilld/src/usage/direct.rs",
+        "krilld/src/mobile/gateway.rs",
+        "krilld/src/mobile/tunnel.rs",
+        "krilld/src/mobile/cloudflared.rs",
+        "krilld/src/mobile/relay.rs",
+    ] {
+        scan(&crates.join(path), &mut failures);
+    }
+    assert!(
+        failures.is_empty(),
+        "Korean message literals:\n{}",
+        failures.join("\n")
+    );
+}
+
 #[test]
 fn app_ui_copy_uses_the_catalog() {
     let mut failures = Vec::new();

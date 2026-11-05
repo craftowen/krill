@@ -1039,7 +1039,7 @@ fn mint_waits_for_pending_download_without_holding_state_lock() {
     fn downloading(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
         Err(io::Error::new(
             io::ErrorKind::WouldBlock,
-            "cloudflared 내려받는 중",
+            "Downloading cloudflared",
         ))
     }
     let (_registry, gateway) = start();
@@ -1649,7 +1649,7 @@ fn missing_relay_pwa_fails_fast_without_tunnel_fallback() {
         panic!("expected relay error")
     };
     assert!(
-        message.contains("릴레이") || message.contains("배포"),
+        message.contains("relay") || message.contains("deployed"),
         "{message}"
     );
     assert!(started.elapsed() < MINT_WAIT);
