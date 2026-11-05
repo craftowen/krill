@@ -446,6 +446,7 @@ fn ensure_session_inner(
     match &result {
         Err(error) => tracing::warn!(
             kind = ?error.kind(),
+            failure = diagnostics::failure_code(error),
             agent = matches!(create.program, Program::Agent { .. }),
             resume = want.is_some(),
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
