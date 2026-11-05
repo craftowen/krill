@@ -100,8 +100,9 @@ class Fixture {
         "{}",
         String::from_utf8_lossy(&active.stderr)
     );
+    // PowerShell may prepend a UTF-8 BOM (UTF-8 console code page); `krill hook` drops it.
     assert_eq!(
-        std::fs::read(&capture).unwrap(),
+        crate::hook::strip_utf8_bom(std::fs::read(&capture).unwrap()),
         br#"{"hook_event_name":"Stop","session_id":"fixture"}"#
     );
     std::fs::remove_file(&capture).unwrap();

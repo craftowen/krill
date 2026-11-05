@@ -34,6 +34,15 @@ use crate::ipc::{self, Error, NAME_MAX};
 pub const FEAT_HOOK: u64 = 1 << 3;
 /// [`HookEvent::payload`] 최대 바이트. 넘는 stdin은 앞부분만 보내고 [`Input::Truncated`]로 표시한다.
 pub const MAX_PAYLOAD: usize = 256 * 1024;
+/// Drops a leading UTF-8 BOM. PowerShell adds one when it pipes to a native program with
+/// a UTF-8 `$OutputEncoding` or console code page (Cursor hooks, the Codex `%` wrapper).
+pub fn strip_utf8_bom(mut payload: Vec<u8>) -> Vec<u8> {
+    if payload.starts_with(b"\xEF\xBB\xBF") {
+        payload.drain(..3);
+    }
+    payload
+}
+
 /// 상태 디렉터리 안 spool 파일 이름.
 pub const SPOOL_FILE: &str = "hook.spool";
 /// spool 파일이 이 크기 이상이면 새 이벤트를 버린다.
