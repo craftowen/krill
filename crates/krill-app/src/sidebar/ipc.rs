@@ -942,6 +942,19 @@ fn fetch_from(
         .collect();
     let external_states = external;
     let mut states: BTreeMap<_, _> = states.into_iter().map(|s| (s.session, s.status)).collect();
+    // 데몬의 `Exited`+`Process`는 PTY 종료와 "에이전트만 끝나고 로그인 셸이 남음"을 함께 뜻한다.
+    // PTY가 살아 있으면 일반 터미널이다. 전경 프로세스·제목·셸 정보는 터미널의 것이라 남긴다.
+    for s in sessions.iter().filter(|s| s.status.is_none()) {
+        if let Some(status) = states.get_mut(&s.session)
+            && status.state == AgentState::Exited
+            && status.source == Some(krill_proto::control::Source::Process)
+        {
+            status.state = AgentState::Unknown;
+            status.confidence = krill_proto::control::Confidence::Low;
+            status.agent.clear();
+            status.subagents.clear();
+        }
+    }
     // AS-08: 외부 pid가 있는 후보가 있을 때만 프로세스 표를 한 번 읽는다.
     let want_parents = sessions.iter().any(|s| {
         s.status.is_none()
@@ -981,7 +994,7 @@ fn fetch_from(
                     .max_by_key(|p| p.as_os_str().len())
                     .cloned()
             });
-            Session {
+            let mut session = Session {
                 id: s.session,
                 status,
                 worktree,
@@ -990,7 +1003,11 @@ fn fetch_from(
                     .filter(|p| !p.as_os_str().is_empty())
                     .cloned(),
                 account: accounts.get(&s.session).cloned(),
+            };
+            if session.agent_ended() {
+                session.account = None;
             }
+            session
         })
         .collect();
     sessions.sort_by_key(|s| s.id);

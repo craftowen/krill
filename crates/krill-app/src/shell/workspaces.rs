@@ -25,6 +25,34 @@ impl PartialEq for Workspace {
 impl Shell {
     /// Reconcile daemon IDs, never launches. Appending inactive tabs preserves
     /// existing indices, split trees, focused panes and custom tab properties.
+    /// 에이전트가 끝나고 셸이 남은 칸은 이제 일반 터미널이다. 탭 이름·아이콘과 복원이 에이전트를 따르지 않게 한다.
+    fn forget_ended_agent_launches(&mut self, cx: &App) {
+        let ended: Vec<PaneId> = (0..self.layout.tabs().len())
+            .flat_map(|i| self.layout.tab_panes(i))
+            .filter(|&pane| {
+                matches!(
+                    self.layout.launch(pane).map(|launch| &launch.program),
+                    Some(Program::Agent { .. })
+                ) && self.layout.session(pane).is_some_and(|session| {
+                    self.sidebar
+                        .read(cx)
+                        .session_on(self.layout.host(pane), session)
+                        .is_some_and(sidebar::Session::agent_ended)
+                })
+            })
+            .collect();
+        for &pane in &ended {
+            if let Some(mut launch) = self.layout.launch(pane).cloned() {
+                launch.program = Program::Login;
+                launch.account = None;
+                self.layout.set_launch(pane, launch);
+            }
+        }
+        if !ended.is_empty() {
+            self.save();
+        }
+    }
+
     pub(super) fn reconcile_workspace_sessions(&mut self, cx: &mut Context<Self>) {
         if self.layout_loading || self.role != WindowRole::Main {
             return;
@@ -33,6 +61,7 @@ impl Shell {
         for (host, session) in connected {
             self.observed_sessions.insert((host, session));
         }
+        self.forget_ended_agent_launches(cx);
         let stale_panes: Vec<PaneId> = (0..self.layout.tabs().len())
             .flat_map(|i| self.layout.tab_panes(i))
             .filter(|&pane| {
