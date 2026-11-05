@@ -15,6 +15,11 @@ pub const FILE_BYTES: u64 = 1_000_000;
 /// Longest wait for another writer before an event is dropped.
 pub const LOCK_WAIT: Duration = Duration::from_millis(50);
 
+/// Serializes this process's writers so they never contend on flock, which macOS applies per
+/// open file description: polling threads could each wait past `LOCK_WAIT` and drop events.
+/// ponytail: one lock for every family; key it by directory and component if appends get slow.
+static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Stateless file writer: every append and rotation takes the same cross-process family lock.
 /// The lock file is permanently empty and is never renamed/deleted.
 #[derive(Debug)]
@@ -69,20 +74,24 @@ impl RollingLog {
     }
 
     fn with_lock(&self, action: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let _serialized = IN_PROCESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let lock = open_file(
             &self
                 .directory
                 .join(format!("{}.lock", self.component.name())),
         )?;
-        // Writers hold the lock for one append, and macOS flock also contends between this
-        // process's own threads, so wait briefly instead of dropping the event. Only a stuck
-        // holder costs the event, never an unbounded stall of the logging thread.
+        // Other processes hold the lock for one append, so wait briefly instead of dropping the
+        // event. Only a stuck holder costs the event, never an unbounded stall of the logging thread.
+        // Yield rather than sleep: a hold lasts one append, and Windows rounds a 1ms sleep up to
+        // its ~15ms timer tick, which made two contending processes miss the test timeout.
         let deadline = Instant::now() + LOCK_WAIT;
         loop {
             match lock.try_lock() {
                 Ok(()) => break,
                 Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(1));
+                    std::thread::yield_now();
                 }
                 Err(TryLockError::WouldBlock) => return Ok(()),
                 Err(TryLockError::Error(e)) => return Err(e),
