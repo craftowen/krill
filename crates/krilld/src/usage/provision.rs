@@ -221,8 +221,8 @@ fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
     }
 }
 
-/// Kept entries are a lasting user choice, and account status polls re-provision every minute, so
-/// each profile's conflict set is reported only when it changes.
+/// Entries stay until the profile is idle or for good if the user kept them, and account status
+/// polls re-provision every minute, so each profile's conflict set is reported only when it changes.
 fn report_conflicts(profile_dir: &str, conflicts: Vec<&'static str>) {
     static REPORTED: std::sync::Mutex<BTreeMap<String, Vec<&'static str>>> =
         std::sync::Mutex::new(BTreeMap::new());

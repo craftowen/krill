@@ -28,6 +28,20 @@ fn store<'a>(host: &'a Path, profile: &'a Path) -> Store<'a> {
     }
 }
 
+/// 이행이 옮기거나 게시하는 경로만 유휴 조회한다. 살아 있는 agy는 프로세스 조회가 따로 막는다.
+/// 로그까지 포함한 저장소 전체를 훑으면 조회 시간 상한을 넘겨 이행이 영영 보류될 수 있다.
+pub(super) fn probe_paths(store: &Path) -> Vec<PathBuf> {
+    let summary = store.join(SUMMARY);
+    let mut paths = vec![store.join("conversations")];
+    paths.extend(SUFFIXES.iter().map(|suffix| sidecar(&summary, suffix)));
+    // 링크는 기본 저장소 조회가 대상을 본다. 없는 경로는 lsof 오류라 사용 중으로 판정된다.
+    paths.retain(|path| {
+        path.symlink_metadata()
+            .is_ok_and(|meta| !meta.file_type().is_symlink())
+    });
+    paths
+}
+
 pub(super) fn needs_merge(home: &Path, profile: &Path) -> bool {
     let local = profile.join(".gemini/antigravity-cli");
     store(&home.join(".gemini/antigravity-cli"), &local).needs_merge()

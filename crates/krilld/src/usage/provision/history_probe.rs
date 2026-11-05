@@ -1,7 +1,7 @@
 //! 프로필별 이행 전 읽기 전용 프로세스 조회. 호출은 백그라운드 작업에서만 한다.
 
 use std::io::{self, Read as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -10,10 +10,10 @@ const LIMIT: u64 = 16 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn quiescent(profile: &Path, env_key: &str) -> bool {
-    quiescent_at(profile, profile, env_key)
+    quiescent_at(&[profile.to_path_buf()], profile, env_key)
 }
 
-pub(super) fn quiescent_at(files: &Path, profile: &Path, env_key: &str) -> bool {
+pub(super) fn quiescent_at(files: &[PathBuf], profile: &Path, env_key: &str) -> bool {
     let mut ps = Command::new("/bin/ps");
     ps.args([
         "eww",
@@ -31,13 +31,26 @@ pub(super) fn quiescent_at(files: &Path, profile: &Path, env_key: &str) -> bool 
     {
         return false;
     }
+    paths_closed(files)
+}
+
+pub(super) fn paths_closed(paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
     #[cfg(target_os = "macos")]
     let lsof = "/usr/sbin/lsof";
     #[cfg(not(target_os = "macos"))]
     let lsof = "lsof";
-    // +D는 디렉터리 아래 열린 fd/cwd를 조회한다. 링크 대상은 따라가지 않는다.
     let mut command = Command::new(lsof);
-    command.args(["-t", "+D"]).arg(files);
+    command.arg("-t");
+    for path in paths {
+        // +D는 디렉터리 아래 열린 fd/cwd를 조회한다. 링크 대상은 따라가지 않는다.
+        if path.is_dir() {
+            command.arg("+D");
+        }
+        command.arg(path);
+    }
     capture(&mut command, TIMEOUT)
         .is_ok_and(|result| no_open_files(result.status.code(), &result.stdout, &result.stderr))
 }
