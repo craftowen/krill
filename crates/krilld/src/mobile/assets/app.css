@@ -778,7 +778,7 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 #mobile-app .session.screen>.page-header{gap:8px;padding-left:8px;padding-right:8px;border-bottom:0;background:var(--surface-base)}
 #mobile-app .session.screen>.page-header>.icon-button:not(.tablet-sidebar-toggle){width:36px;height:36px;min-width:36px;min-height:36px;margin:0;border-radius:18px;background:var(--surface-raised);color:var(--foreground);display:grid;place-items:center}
 #mobile-app .session.screen>.page-header>.mode-toggle{min-height:36px;height:36px;padding:0 14px;border-radius:18px;background:var(--surface-raised);border:0}
-#mobile-app .session.screen>.page-header .header-copy{text-align:center;display:flex;flex-direction:column;align-items:center}#mobile-app .session.screen>.page-header h1{font-size:calc(17px * var(--ui-scale,1));font-weight:700}
+#mobile-app .session.screen>.page-header .header-copy{text-align:center;display:flex;align-items:center;justify-content:center;gap:6px}#mobile-app .session.screen>.page-header h1{font-size:calc(17px * var(--ui-scale,1));font-weight:700}
 #mobile-app .session.screen .session-summary{justify-content:center}
 #mobile-app .session-tabs{background:var(--surface-base)}#mobile-app .session-tab{font-size:calc(14px * var(--ui-scale,1))}#mobile-app .session-tab[aria-selected=true]{border-bottom-color:var(--foreground);background:var(--surface-panel)}
 #mobile-app .session-tabs .tab-add{align-self:center;width:36px;height:36px;min-width:36px;min-height:36px;margin:0 8px 0 4px;border-radius:20px;background:var(--surface-raised);border:0;color:var(--foreground)}
