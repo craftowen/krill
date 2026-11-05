@@ -232,11 +232,22 @@ pub fn chain_command(exe: &str, user_command: &str) -> String {
 }
 
 /// Krill 설치 명령을 구조로 판별한다. 엄격한 형식 일치만 우리 것으로 본다.
-/// Windows에서 예전에 설치한 POSIX 인용 모양(`'C:\…\krill.exe' statusline`)도 우리 것이다.
+/// Windows에서 예전에 설치한 POSIX 인용 모양(`'C:\…\krill.exe' statusline`)과 8.3 짧은 경로 모양도 우리 것이다.
 #[must_use]
 pub fn classify_command(cmd: &str, exe: &str) -> OwnCommand {
     let cmd = cmd.trim();
-    for word in [exe_word(exe), shell_quote(exe)] {
+    let mut words = vec![shell_quote(exe)];
+    if cfg!(windows) {
+        words.extend(crate::agent::hooks::plain_word(exe));
+        // 8.3 짧은 경로로 설치한 단어는 같은 파일인지로 확인한다(짧은 경로를 다시 구하지 않는다).
+        if let Some((first, _)) = cmd.split_once(' ')
+            && !words.iter().any(|w| w == first)
+            && crate::agent::hooks::same_file(first, exe)
+        {
+            words.push(first.to_owned());
+        }
+    }
+    for word in words {
         if cmd == format!("{word} {SUBCOMMAND}") {
             return OwnCommand::Bare;
         }

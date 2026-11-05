@@ -289,19 +289,67 @@ pub fn encode_hook_json(value: &serde_json::Value) -> io::Result<String> {
 /// A Windows executable path as one word for Claude Code's hook and statusLine shell:
 /// Git Bash, or PowerShell when Git Bash is missing (code.claude.com/docs/en/hooks,
 /// /statusline). A plain path is written unquoted with `/` separators, which both shells
-/// run as-is. A `~` after the first character (8.3 short names such as `RUNNER~1`) is
-/// literal in both. Other paths keep POSIX quoting, which only Git Bash runs.
+/// run as-is. A path with spaces or shell characters uses its 8.3 short name when the
+/// volume has one (`C:/Users/JOHNSM~1/...`). Otherwise POSIX quoting, which only Git Bash runs.
 #[must_use]
 pub fn windows_shell_word(exe: &str) -> String {
+    plain_word(exe)
+        .or_else(|| short_path(exe).as_deref().and_then(plain_word))
+        .unwrap_or_else(|| shell_quote(exe))
+}
+
+/// `exe`를 `/` 구분자로 바꿔 bash와 `PowerShell`이 따옴표 없이 읽을 수 있으면 그 단어.
+/// `~`는 단어 첫 글자만 bash가 홈으로 펼친다.
+pub(crate) fn plain_word(exe: &str) -> Option<String> {
     let slashed = exe.replace('\\', "/");
-    if !slashed.is_empty()
-        && slashed.char_indices().all(|(i, c)| {
-            c.is_alphanumeric() || matches!(c, '/' | ':' | '.' | '_' | '-') || (c == '~' && i > 0)
-        })
-    {
-        slashed
-    } else {
-        shell_quote(exe)
+    (!slashed.is_empty()
+        && !slashed.starts_with('~')
+        && slashed
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '/' | ':' | '.' | '_' | '-' | '~')))
+    .then_some(slashed)
+}
+
+/// 8.3 짧은 경로. cmd의 `%~sI`가 `GetShortPathNameW`를 부른다(이 크레이트는 unsafe 금지).
+/// 같은 파일로 열리지 않거나(8.3이 꺼진 볼륨은 긴 이름 그대로) 실패하면 `None`.
+#[cfg(windows)]
+fn short_path(exe: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt as _;
+    // `%`는 따옴표 안에서도 환경 변수로 펼쳐진다.
+    if exe.contains(['"', '%', '\r', '\n']) {
+        return None;
+    }
+    let cmd = Path::new(&std::env::var_os("SystemRoot")?).join(r"System32\cmd.exe");
+    let output = std::process::Command::new(cmd)
+        .raw_arg(format!(
+            r#"/d /v:off /u /c for %I in ("{exe}") do @echo %~sI"#
+        ))
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let utf16: Vec<u16> = output
+        .stdout
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| u16::from_le_bytes(b))
+        .collect();
+    let short = String::from_utf16(&utf16).ok()?.trim().to_owned();
+    same_file(&short, exe).then_some(short)
+}
+
+#[cfg(not(windows))]
+fn short_path(_exe: &str) -> Option<String> {
+    None
+}
+
+/// 두 경로가 같은 파일로 열린다(짧은 이름·`/` 구분자도 긴 경로로 풀린다).
+pub(crate) fn same_file(a: &str, b: &str) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -557,9 +605,9 @@ mod claude_platform_tests {
             r"'C:\$x\krill.exe'"
         );
         assert_eq!(
-            super::windows_shell_word(r"C:\Users\RUNNER~1\AppData\Local\Temp\krill.exe"),
-            "C:/Users/RUNNER~1/AppData/Local/Temp/krill.exe"
+            super::windows_shell_word(r"C:\Users\JOHNSM~1\krill.exe"),
+            "C:/Users/JOHNSM~1/krill.exe"
         );
-        assert_eq!(super::windows_shell_word("~/krill.exe"), "'~/krill.exe'");
+        assert_eq!(super::plain_word("~/krill.exe"), None);
     }
 }

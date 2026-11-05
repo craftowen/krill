@@ -405,43 +405,61 @@ fn agy_hook_install_is_unsupported_and_old_posix_install_warns() {
 }
 
 /// Without Git Bash, Claude Code runs shell-form hooks and the statusLine in PowerShell.
-/// The statusLine and the pre-`args` (before 2.1.139) hook command must run in both shells.
+/// The statusLine and the pre-`args` (before 2.1.139) hook command must run in both shells,
+/// also under a user folder with a space when the volume keeps 8.3 short names.
+/// `KRILL_TEST_REQUIRE_8DOT3=1` fails instead of falling back to Git Bash only.
 #[test]
 fn claude_shell_commands_run_in_powershell_and_git_bash() {
     let home = temp_home("claude-shells");
-    let dir = home.join("한글_bin");
-    fs::create_dir_all(&dir).unwrap();
-    let exe = dir.join("krill.exe");
-    fs::copy(KRILL, &exe).unwrap();
-    let exe = exe.to_str().unwrap();
-    let hook = krill_proto::agent::hooks::claude_hook(exe, Some("2.1.0"));
-    assert!(hook.get("args").is_none());
-    let commands = [
-        hook["command"].as_str().unwrap().to_owned(),
-        krill_proto::statusline::install_command(exe),
-    ];
+    let require_short = std::env::var_os("KRILL_TEST_REQUIRE_8DOT3").is_some();
     let mut shells = vec![(
         PathBuf::from("powershell.exe"),
         vec!["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
     )];
     shells.extend(git_bash().map(|bash| (bash, vec!["-c"])));
-    for (shell, args) in &shells {
-        for command in &commands {
-            let out = Command::new(shell)
-                .args(args)
-                .arg(command)
-                .env("USERPROFILE", &home)
-                .env("KRILL_STATE_DIR", home.join("state"))
-                .env_remove("MK_PANE_ID")
-                .env_remove("CLAUDE_CONFIG_DIR")
-                .stdin(Stdio::null())
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success() && out.stderr.is_empty(),
-                "{} {command}: {out:?}",
-                shell.display()
-            );
+    for name in ["한글_bin", "John Smith"] {
+        let dir = home.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("krill.exe");
+        fs::copy(KRILL, &exe).unwrap();
+        let exe = exe.to_str().unwrap();
+        let hook = krill_proto::agent::hooks::claude_hook(exe, Some("2.1.0"));
+        assert!(hook.get("args").is_none());
+        let status_line = krill_proto::statusline::install_command(exe);
+        assert_eq!(
+            krill_proto::statusline::classify_command(&status_line, exe),
+            krill_proto::statusline::OwnCommand::Bare,
+            "{status_line}"
+        );
+        let commands = [hook["command"].as_str().unwrap().to_owned(), status_line];
+        // 8.3 이름이 없는 볼륨은 POSIX 인용으로 남아 Git Bash에서만 돈다.
+        let quoted = commands[1].starts_with('\'');
+        eprintln!("{name}: {commands:?}");
+        assert!(
+            !(quoted && require_short),
+            "no 8.3 short name: {commands:?}"
+        );
+        for (shell, args) in &shells {
+            if quoted && shell.as_os_str() == "powershell.exe" {
+                continue;
+            }
+            for command in &commands {
+                let out = Command::new(shell)
+                    .args(args)
+                    .arg(command)
+                    .env("USERPROFILE", &home)
+                    .env("KRILL_STATE_DIR", home.join("state"))
+                    .env_remove("MK_PANE_ID")
+                    .env_remove("CLAUDE_CONFIG_DIR")
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success() && out.stderr.is_empty(),
+                    "{} {command}: {out:?}",
+                    shell.display()
+                );
+            }
         }
     }
     fs::remove_dir_all(home).ok();
