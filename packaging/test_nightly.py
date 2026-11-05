@@ -410,6 +410,69 @@ class SnapshotTests(unittest.TestCase):
             self.assertIn("existing v0.1.2 release owner", waiting.state["reason"])
 
 
+    def test_promoted_candidate_resumes_after_dev_moved_with_it_or_past_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, origin = root / "source", root / "origin.git"
+
+            def git(cwd, *args):
+                return subprocess.check_output(["git", *args], cwd=cwd, stderr=subprocess.DEVNULL).decode().strip()
+
+            git(root, "init", "--bare", "--initial-branch=main", str(origin))
+            git(root, "init", "--initial-branch=main", str(source))
+            git(source, "config", "user.name", "nightly test")
+            git(source, "config", "user.email", "nightly@example.invalid")
+            (source / "Cargo.toml").write_text('[workspace.package]\nversion = "0.1.1"\n')
+            (source / "Cargo.lock").write_text("lock\n")
+            (source / "THIRD_PARTY_NOTICES.md").write_text("notices\n")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "published")
+            git(source, "tag", "v0.1.1")
+            git(source, "remote", "add", "origin", str(origin))
+            git(source, "push", "origin", "main", "--tags")
+            git(source, "checkout", "-b", "dev")
+            (source / "dev-change").write_text("committed dev\n")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "dev work")
+            git(source, "push", "origin", "dev")
+            config = {"source": str(source), "branch": "dev", "repo": "o/r", "run_root": str(root / "nightly"),
+                      "target_dir": str(nightly.TARGETS / "nightly"), "key_file": "/unused",
+                      "user.name": "nightly test", "user.email": "nightly@example.invalid"}
+            real_command = nightly.command
+
+            def local_command(args, **kwargs):
+                args = list(map(str, args))
+                if args[:4] == ["git", "remote", "add", "origin"]:
+                    args[-1] = str(origin)
+                if args[:3] == ["gh", "release", "view"]:
+                    return json.dumps({"tagName": "v0.1.1"})
+                if args[0] in ("cargo", "python3"):
+                    return ""
+                return real_command(args, **kwargs)
+
+            def prepare():
+                release = nightly.Release(config, root / "state")
+                return release, release.prepare()
+
+            with patch.object(nightly, "command", side_effect=local_command):
+                release, (sha, _branch, version, base) = prepare()
+                self.assertEqual(version, "0.1.2")
+                # 게시 전 멈춤: 후보가 main과 dev에 이미 올라갔다.
+                git(release.work, "push", "origin", f"{sha}:refs/heads/main", f"{sha}:refs/heads/dev")
+                release, again = prepare()
+                self.assertEqual(again, (sha, nightly.CANDIDATE_BRANCH, "0.1.2", base))
+                self.assertTrue(release.state["resumed"])
+                # 그 뒤 dev에 새 PR이 들어와도 main에 올라간 후보를 먼저 끝낸다.
+                git(source, "fetch", "origin", "dev")
+                git(source, "checkout", "-B", "dev", "origin/dev")
+                (source / "later").write_text("later\n")
+                git(source, "add", ".")
+                git(source, "commit", "-m", "later work")
+                git(source, "push", "origin", "dev")
+                release, again = prepare()
+                self.assertEqual(again[0], sha)
+                self.assertTrue(release.state["resumed"])
+
     def test_dev_that_merged_the_release_back_creates_no_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
