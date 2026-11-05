@@ -227,6 +227,14 @@ fn windows_default_server_starts_reuses_and_remembers_off() {
     let fixture = Fixture::new("default");
     let program = fixture.program();
     let executable = program.as_path();
+    assert!(!krill_link::service::incoming_enabled(&fixture.dir).unwrap());
+    krill_link::service::ensure_default_server(executable, &fixture.dir).unwrap();
+    assert!(
+        !is_serve_running(&fixture.dir),
+        "no paired device: no listener"
+    );
+    let device = iroh::SecretKey::generate().public();
+    krill_link::upsert_device(&fixture.dir, device, "phone", 1).unwrap();
     assert!(krill_link::service::incoming_enabled(&fixture.dir).unwrap());
     krill_link::service::ensure_default_server(executable, &fixture.dir).unwrap();
     assert!(is_serve_running(&fixture.dir));
