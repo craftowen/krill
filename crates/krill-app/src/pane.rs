@@ -1330,7 +1330,8 @@ impl<W: Write> Pane<W> {
         self.journal.delivery(receipt)
     }
 
-    /// Only an acknowledged cancellation may deliver held input to the original account.
+    /// Held input reaches the original account only after an acknowledged cancellation or when
+    /// the switch is still queued behind a busy agent.
     /// Failed switches keep their journal paused for an explicit recovery decision.
     pub fn resume_account_input(&mut self, failed: bool, now: Now) -> Vec<Notice> {
         if failed {
