@@ -139,6 +139,12 @@ impl Session {
         self.status.state == AgentState::Exited
             && self.status.source == Some(krill_proto::control::Source::Process)
     }
+
+    /// 에이전트만 끝나고 PTY에는 로그인 셸이 남은 세션.
+    #[must_use]
+    pub fn agent_ended(&self) -> bool {
+        false
+    }
 }
 
 /// 워크트리 행에 붙는 git 정보. 모르면 `None`(UI가 숨긴다).
