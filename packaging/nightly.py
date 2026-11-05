@@ -352,6 +352,10 @@ class Release:
         if all(self.ancestor(sha, published) for sha in (remote, main)):
             skip_unchanged()
             return None
+        # 출고 재료는 dev 하나다. main은 출고된 커밋만 fast-forward로 따라가므로 dev에 없는 main 커밋은 없어야 한다.
+        if not self.ancestor(main, remote):
+            raise NightlyError(f"origin/main has commits missing from origin/{self.config['branch']}; "
+                               "merge main into it first (releases are cut from that branch only)")
         branch = CANDIDATE_BRANCH
         created = datetime.fromisoformat(pending["created_at"]) if pending.get("created_at") else None
         age = (datetime.now().astimezone() - created).total_seconds() if created else float("inf")
@@ -363,12 +367,11 @@ class Release:
                 self.git("checkout", "-B", branch, candidate)
                 self.update(**pending, resumed=True)
                 return candidate, branch, pending["version"], pending["base_main"]
-        self.git("checkout", "-B", branch, main)
+        self.git("checkout", "-B", branch, remote)
         for field in ("user.name", "user.email"):
             self.git("config", field, self.config[field])
         self.git("config", "core.hooksPath", "scripts/hooks")
-        self.git("merge", "--no-edit", remote)
-        # Squash-merged dev commits never become ancestors of the release, so compare content.
+        # dev가 출고 커밋을 병합 커밋으로 받았으면 조상은 아니어도 내용은 같을 수 있다.
         if self.git("rev-parse", "HEAD^{tree}") == self.git("rev-parse", f"{published}^{{tree}}"):
             skip_unchanged()
             return None
@@ -391,6 +394,35 @@ class Release:
         write_json(self.state_dir / "pending.json", {key: self.state.get(key) for key in (
             "source_head", "base_main", "previous_release", "candidate_head", "candidate_branch", "version", "created_at", "validation_context")})
         return sha, branch, version, main
+
+    def sync_dev(self, sha):
+        """main에 올린 출고 커밋을 dev에도 넣어 다음 후보가 dev에서 바로 나오게 한다.
+
+        출고는 이미 main에 올라갔으므로 실패해도 게시를 막지 않고 기록만 남긴다. 다음 실행의 prepare가
+        main이 dev에 없다며 멈추므로 놓치지 않는다.
+        """
+        branch = self.config["branch"]
+        try:
+            self.git("fetch", "origin", branch)
+            dev = self.git("rev-parse", f"origin/{branch}")
+            if self.ancestor(sha, dev):
+                result = "already contained"
+            elif self.ancestor(dev, sha):
+                self.git("push", "origin", f"{sha}:refs/heads/{branch}")
+                result = "fast-forwarded"
+            else:
+                # 검사하는 동안 dev가 움직였다. 출고 커밋은 버전 파일만 바꾸므로 병합 커밋으로 넣는다.
+                self.git("checkout", "-B", "nightly-dev-sync", dev)
+                try:
+                    self.git("merge", "--no-edit", sha)
+                    self.git("push", "origin", f"HEAD:refs/heads/{branch}")
+                finally:
+                    subprocess.run(["git", "merge", "--abort"], cwd=self.work, env=self.env, capture_output=True)
+                    self.git("checkout", "-f", CANDIDATE_BRANCH)
+                result = "merged"
+        except NightlyError as error:
+            result = f"failed: {error}"
+        self.update(dev_sync=result)
 
     def publish(self):
         public_key = preflight(self.config)
@@ -473,6 +505,7 @@ class Release:
             raise NightlyError("candidate changed after validation")
         if current_main != sha:
             self.git("push", "origin", "HEAD:refs/heads/main")
+        self.sync_dev(sha)
         self.wait_ci(sha, "main", {"ci.yml", "ci-macos.yml", "ci-windows.yml"})
         self.update(step="publish")
         self.env["KRILL_RELEASE_ASSET_DIR"] = str(verified)
