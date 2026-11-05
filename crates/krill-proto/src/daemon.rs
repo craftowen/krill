@@ -596,6 +596,27 @@ impl std::error::Error for Error {}
 /// (`ERROR_ACCESS_DENIED`). 같은 프로세스에서는 다시 띄워도 소용없다. krill-holder bootstrap과 같은 값이어야 한다.
 pub const HOLDER_JOB_DENIED: i32 = 5;
 
+/// Windows: [`HOLDER_JOB_DENIED`]로 끝난 bootstrap을 호출자 Job 밖에서 다시 띄우는 기동기
+/// (`holder`, 인수, 작업 폴더). 요청만 하고 돌아온다. 앱이 Explorer로 등록하고, 등록이 없으면 지금처럼 안내로 끝난다.
+#[cfg(windows)]
+pub type JobEscape = fn(&Path, &[&std::ffi::OsStr], Option<&Path>) -> io::Result<()>;
+
+#[cfg(windows)]
+static JOB_ESCAPE: std::sync::OnceLock<JobEscape> = std::sync::OnceLock::new();
+
+/// [`JobEscape`]를 프로세스에 한 번 등록한다(두 번째부터는 무시).
+#[cfg(windows)]
+pub fn set_job_escape(escape: JobEscape) {
+    JOB_ESCAPE.set(escape).ok();
+}
+
+fn can_escape_job() -> bool {
+    #[cfg(windows)]
+    return JOB_ESCAPE.get().is_some();
+    #[cfg(not(windows))]
+    false
+}
+
 impl Error {
     /// holder가 krilld 전에 끝난 종료 코드(직전 실패로 기동을 미룬 경우 포함).
     #[must_use]
@@ -863,7 +884,7 @@ fn launch_gate(socket: &Path) -> Result<(), Error> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match failure.as_ref().filter(|f| f.socket == socket) {
         Some(f)
-            if (cfg!(windows) && f.code == Some(HOLDER_JOB_DENIED))
+            if (cfg!(windows) && f.code == Some(HOLDER_JOB_DENIED) && !can_escape_job())
                 || f.at.elapsed() < launch_backoff(f.count) =>
         {
             Err(Error::Backoff {
@@ -933,9 +954,15 @@ fn connect_or_launch(paths: &Paths, hello: &ClientHello) -> Result<Connection, E
         .stderr(Stdio::null())
         .spawn()
         .map_err(Error::Spawn)?;
-    let deadline = Instant::now()
+    #[cfg_attr(
+        not(windows),
+        expect(unused_mut, reason = "Job 밖 기동은 Windows만 기한을 늘린다")
+    )]
+    let mut deadline = Instant::now()
         .checked_add(LAUNCH_TIMEOUT)
         .ok_or(Error::Timeout)?;
+    #[cfg(windows)]
+    let mut escaped = false;
     loop {
         match ready_handshake(&paths.socket, hello) {
             Ok(Some(c)) => {
@@ -954,11 +981,23 @@ fn connect_or_launch(paths: &Paths, hello: &ClientHello) -> Result<Connection, E
             #[cfg(unix)]
             return Err(Error::HolderExited(status));
             #[cfg(windows)]
-            if !status.success() {
-                return Err(Error::HolderExited(status));
+            if !status.success() && !escaped {
+                escaped = status.code() == Some(HOLDER_JOB_DENIED) && escape_job(paths);
+                if !escaped {
+                    return Err(Error::HolderExited(status));
+                }
+                deadline = Instant::now()
+                    .checked_add(LAUNCH_TIMEOUT)
+                    .ok_or(Error::Timeout)?;
             }
         }
         if Instant::now() >= deadline {
+            // Job 밖 기동도 제때 붙지 않았으면 처음 거부를 그대로 돌려준다(백오프 뒤 다시 시도).
+            if let Some(status) = holder.try_wait().map_err(Error::Io)?
+                && !status.success()
+            {
+                return Err(Error::HolderExited(status));
+            }
             // 백오프로 krilld를 계속 다시 띄우는 holder를 남기지 않는다.
             holder.kill().ok();
             holder.wait().ok();
@@ -966,6 +1005,21 @@ fn connect_or_launch(paths: &Paths, hello: &ClientHello) -> Result<Connection, E
         }
         thread::sleep(POLL);
     }
+}
+
+/// 등록된 [`JobEscape`]로 같은 bootstrap을 Job 밖에서 띄운다. 요청했으면 `true`.
+#[cfg(windows)]
+fn escape_job(paths: &Paths) -> bool {
+    let Some(escape) = JOB_ESCAPE.get() else {
+        return false;
+    };
+    let args = [
+        std::ffi::OsStr::new("--bootstrap"),
+        paths.krilld.as_os_str(),
+        paths.socket.as_os_str(),
+    ];
+    let dir = paths.socket.parent().filter(|d| !d.as_os_str().is_empty());
+    escape(&paths.holder, &args, dir).is_ok()
 }
 
 /// 소켓은 살아 있는데 Hello 전에 닫혔다(업그레이드로 끝나는 구 krilld, 재결합 중 닫힌 구 krilld, 막 뜬 뒤 죽은
