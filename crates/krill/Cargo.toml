@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+build = "../../packaging/windows/resources.rs"
 
 [dependencies]
 krill-hosts = { workspace = true }
@@ -32,6 +33,9 @@ rustix-openpty = { workspace = true }
 [dev-dependencies]
 same-file = { workspace = true }
 proptest = { workspace = true }
+
+[build-dependencies]
+embed-resource = { workspace = true }
 
 [lints]
 workspace = true

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+build = "../../packaging/windows/resources.rs"
 
 [dependencies]
 sysinfo = { workspace = true }
