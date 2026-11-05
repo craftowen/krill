@@ -133,6 +133,7 @@ fn start_with(
         .name("ui-watchdog".into())
         .spawn(move || {
             let mut watch = Watch::default();
+            let mut gate = StallGate::default();
             let state = state();
             let mut want_sample = false;
             let mut sampled_at: Option<Instant> = None;
@@ -157,62 +158,84 @@ fn start_with(
                 }
                 let now = millis(epoch.elapsed());
                 let seen = Seen::unpack(observed_seen.load(Ordering::Acquire));
-                match watch.observe(now, observed.load(Ordering::Acquire), seen, display_asleep) {
-                    Some(Report::Stalled {
-                        delay_ms,
-                        late_ms,
-                        observer_gap_ms,
-                        whole_process,
-                    }) => {
-                        tracing::warn!(
+                if let Some(report) =
+                    watch.observe(now, observed.load(Ordering::Acquire), seen, display_asleep)
+                {
+                    match &report {
+                        Report::Stalled {
                             delay_ms,
                             late_ms,
                             observer_gap_ms,
                             whole_process,
-                            app_active = seen.app_active,
-                            "UI heartbeat stalled"
-                        );
-                        want_sample = sampled_at.is_none_or(|at| at.elapsed() >= SAMPLE_EVERY);
-                    }
-                    Some(Report::Recovered {
-                        delay_ms,
-                        observer_gap_ms,
-                        whole_process,
-                    }) => {
-                        want_sample = false;
-                        tracing::info!(
+                        } => {
+                            tracing::warn!(
+                                delay_ms,
+                                late_ms,
+                                observer_gap_ms,
+                                whole_process,
+                                app_active = seen.app_active,
+                                "UI heartbeat stalled"
+                            );
+                        }
+                        Report::Recovered {
                             delay_ms,
                             observer_gap_ms,
                             whole_process,
-                            "UI heartbeat recovered"
-                        );
-                        if let Some(state) = &state {
-                            use krill_proto::error_reporting::{self, Code, Event, Process};
-                            if let Ok(mut event) = Event::new(
-                                Process::App,
-                                Code::UiStall,
-                                error_reporting::source_location(file!(), line!()),
+                        } => {
+                            want_sample = false;
+                            tracing::info!(
+                                delay_ms,
+                                observer_gap_ms,
+                                whole_process,
+                                "UI heartbeat recovered"
+                            );
+                        }
+                        Report::ObserverLate { observer_gap_ms } => {
+                            tracing::warn!(
+                                observer_gap_ms,
+                                app_active = seen.app_active,
+                                "UI watchdog woke late"
+                            );
+                        }
+                    }
+                    match gate.on_report(&report, seen) {
+                        StallAction::None => {
+                            if matches!(
+                                report,
+                                Report::Stalled { .. } | Report::ObserverLate { .. }
                             ) {
-                                event.hang_bucket_ms = Some(match delay_ms {
-                                    0..=1_499 => 500,
-                                    1_500..=4_999 => 1_500,
-                                    5_000..=29_999 => 5_000,
-                                    _ => 30_000,
-                                });
-                                error_reporting::record_at(state, event).ok();
+                                want_sample = false;
+                            }
+                        }
+                        StallAction::ArmSample => {
+                            want_sample = sampled_at.is_none_or(|at| at.elapsed() >= SAMPLE_EVERY);
+                        }
+                        StallAction::RecordRecovery { delay_ms } => {
+                            want_sample = false;
+                            if let Some(state) = &state {
+                                use krill_proto::error_reporting::{self, Code, Event, Process};
+                                if let Ok(mut event) = Event::new(
+                                    Process::App,
+                                    Code::UiStall,
+                                    error_reporting::source_location(file!(), line!()),
+                                ) {
+                                    event.hang_bucket_ms = Some(match delay_ms {
+                                        0..=1_499 => 500,
+                                        1_500..=4_999 => 1_500,
+                                        5_000..=29_999 => 5_000,
+                                        _ => 30_000,
+                                    });
+                                    error_reporting::record_at(state, event).ok();
+                                }
                             }
                         }
                     }
-                    Some(Report::ObserverLate { observer_gap_ms }) => {
-                        tracing::warn!(
-                            observer_gap_ms,
-                            app_active = seen.app_active,
-                            "UI watchdog woke late"
-                        );
-                    }
-                    None => {}
                 }
                 if !want_sample || watch.monitor.stalled_for(now) < SAMPLE_AFTER_MS {
+                    continue;
+                }
+                if !gate.allow_sample(seen) {
+                    want_sample = false;
                     continue;
                 }
                 want_sample = false;
@@ -317,6 +340,68 @@ enum Report {
     },
     /// The observer overslept while the UI heartbeat kept up (or was already stalled).
     ObserverLate { observer_gap_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallAction {
+    None,
+    ArmSample,
+    RecordRecovery { delay_ms: u64 },
+}
+
+#[derive(Debug, Default)]
+struct StallGate {
+    in_stall: bool,
+    suppressed: bool,
+}
+
+impl StallGate {
+    fn on_report(&mut self, report: &Report, seen: Seen) -> StallAction {
+        match report {
+            Report::Stalled { whole_process, .. } => {
+                self.in_stall = true;
+                self.suppressed = !seen.app_active || *whole_process;
+                if self.suppressed {
+                    StallAction::None
+                } else {
+                    StallAction::ArmSample
+                }
+            }
+            Report::ObserverLate { .. } => {
+                if self.in_stall {
+                    self.suppressed = true;
+                }
+                StallAction::None
+            }
+            Report::Recovered {
+                delay_ms,
+                whole_process,
+                ..
+            } => {
+                let was_in_stall = mem::replace(&mut self.in_stall, false);
+                let was_suppressed = mem::take(&mut self.suppressed);
+                let drop = !was_in_stall || was_suppressed || !seen.app_active || *whole_process;
+                if drop {
+                    StallAction::None
+                } else {
+                    StallAction::RecordRecovery {
+                        delay_ms: *delay_ms,
+                    }
+                }
+            }
+        }
+    }
+
+    fn allow_sample(&mut self, seen: Seen) -> bool {
+        if !self.in_stall {
+            return false;
+        }
+        if !seen.app_active {
+            self.suppressed = true;
+            return false;
+        }
+        !self.suppressed
+    }
 }
 
 #[derive(Default)]
@@ -611,5 +696,82 @@ mod tests {
         }
         cx.update(App::remove_global::<Watchdog>);
         std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn stall_gate_suppresses_background_and_suspended_stalls() {
+        let background = Seen {
+            app_active: false,
+            window_visible: true,
+        };
+        let stalled_fg = Report::Stalled {
+            delay_ms: 600,
+            late_ms: 100,
+            observer_gap_ms: 100,
+            whole_process: false,
+        };
+        let recovered_fg = Report::Recovered {
+            delay_ms: 1_800,
+            observer_gap_ms: 100,
+            whole_process: false,
+        };
+
+        let mut gate = StallGate::default();
+        assert_eq!(gate.on_report(&stalled_fg, background), StallAction::None);
+        assert!(!gate.allow_sample(background));
+        assert_eq!(gate.on_report(&recovered_fg, SHOWN), StallAction::None);
+
+        let mut gate = StallGate::default();
+        let suspended = Report::Stalled {
+            delay_ms: 2_700,
+            late_ms: 2_200,
+            observer_gap_ms: 2_700,
+            whole_process: true,
+        };
+        assert_eq!(gate.on_report(&suspended, SHOWN), StallAction::None);
+        assert!(!gate.allow_sample(SHOWN));
+        assert_eq!(gate.on_report(&recovered_fg, SHOWN), StallAction::None);
+
+        let mut gate = StallGate::default();
+        assert_eq!(gate.on_report(&stalled_fg, SHOWN), StallAction::ArmSample);
+        assert!(gate.allow_sample(SHOWN));
+        assert_eq!(
+            gate.on_report(
+                &Report::ObserverLate {
+                    observer_gap_ms: 900
+                },
+                SHOWN
+            ),
+            StallAction::None
+        );
+        assert!(!gate.allow_sample(SHOWN));
+        assert_eq!(gate.on_report(&recovered_fg, SHOWN), StallAction::None);
+
+        let mut gate = StallGate::default();
+        assert_eq!(gate.on_report(&stalled_fg, SHOWN), StallAction::ArmSample);
+        assert!(!gate.allow_sample(background));
+        assert_eq!(gate.on_report(&recovered_fg, SHOWN), StallAction::None);
+
+        let mut gate = StallGate::default();
+        assert_eq!(gate.on_report(&stalled_fg, SHOWN), StallAction::ArmSample);
+        assert!(gate.allow_sample(SHOWN));
+        assert_eq!(
+            gate.on_report(
+                &Report::Recovered {
+                    delay_ms: 2_500,
+                    observer_gap_ms: 900,
+                    whole_process: true,
+                },
+                SHOWN
+            ),
+            StallAction::None
+        );
+        assert_eq!(gate.on_report(&stalled_fg, SHOWN), StallAction::ArmSample);
+        assert!(gate.allow_sample(SHOWN));
+        assert_eq!(
+            gate.on_report(&recovered_fg, SHOWN),
+            StallAction::RecordRecovery { delay_ms: 1_800 }
+        );
+        assert!(!gate.allow_sample(SHOWN));
     }
 }
