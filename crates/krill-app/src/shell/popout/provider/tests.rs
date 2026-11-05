@@ -73,6 +73,53 @@ fn grouping_preserves_profiles_and_uses_active_profile_without_combining_usage()
 }
 
 #[test]
+fn inactive_group_prefers_registered_profile_over_mirrored_host_default() {
+    let mut host = profile("agy-host", Some("first@example.com"));
+    host.provider = ProviderKind::Antigravity;
+    host.host_default = true;
+    host.usage.seven_day = Some(UsageWindow {
+        percent: 61,
+        resets_at: None,
+    });
+    let mut first = profile("agy-profile-1", Some("first@example.com"));
+    first.provider = ProviderKind::Antigravity;
+    first.usage.seven_day = Some(UsageWindow {
+        percent: 89,
+        resets_at: None,
+    });
+    let mut second = profile("agy-profile-2", Some("second@example.com"));
+    second.provider = ProviderKind::Antigravity;
+    second.active = true;
+    second.usage.seven_day = Some(UsageWindow {
+        percent: 61,
+        resets_at: None,
+    });
+    let snap = AccountsSnapshot {
+        accounts: vec![host, first, second],
+        ..Default::default()
+    };
+    let groups = account_groups(&snap, ProviderKind::Antigravity);
+    assert_eq!(groups.len(), 2);
+    let inactive_selected = groups[0].selected().unwrap();
+    assert_eq!(inactive_selected.id, "agy-profile-1");
+    assert!(!inactive_selected.host_default);
+    assert_eq!(
+        comparison_window(&snap, inactive_selected, "7d")
+            .unwrap()
+            .percent,
+        89
+    );
+    let active_selected = groups[1].selected().unwrap();
+    assert_eq!(active_selected.id, "agy-profile-2");
+    assert_eq!(
+        comparison_window(&snap, active_selected, "7d")
+            .unwrap()
+            .percent,
+        61
+    );
+}
+
+#[test]
 fn comparison_keeps_missing_windows_unknown_and_preserves_provider_specific_pools() {
     let mut a = profile("a", Some("a@example.com"));
     a.usage.five_hour = Some(UsageWindow {
