@@ -1135,6 +1135,68 @@ mod tests {
     }
 
     #[test]
+    fn agent_exit_on_a_live_pty_is_a_plain_terminal() {
+        use krill_proto::SessionId;
+        use krill_proto::control::{AgentStatus, Info, SessionAccount, SessionStatus, Source};
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let ended = AgentStatus {
+                state: AgentState::Exited,
+                source: Some(Source::Process),
+                agent: "claude".into(),
+                title: Some("~/repo".into()),
+                ..AgentStatus::UNKNOWN
+            };
+            let replies = [
+                Reply::Sessions(vec![
+                    Info {
+                        session: SessionId(7),
+                        pid: 1,
+                        status: None,
+                    },
+                    Info {
+                        session: SessionId(8),
+                        pid: 2,
+                        status: Some(0),
+                    },
+                ]),
+                Reply::States(vec![
+                    SessionStatus {
+                        session: SessionId(7),
+                        status: ended.clone(),
+                    },
+                    SessionStatus {
+                        session: SessionId(8),
+                        status: ended,
+                    },
+                ]),
+                Reply::Sidebar(krill_proto::control::SidebarData::default()),
+                Reply::SessionAccounts(vec![SessionAccount {
+                    session: SessionId(7),
+                    account_id: "claude-work".into(),
+                    label: "work".into(),
+                }]),
+            ];
+            for reply in replies {
+                krill_proto::ipc::read_frame(&mut server).unwrap().unwrap();
+                server.write_all(&reply.encode().unwrap()).unwrap();
+            }
+        });
+        let (snapshot, ..) = fetch_from(&mut client, &BTreeMap::new(), false).unwrap();
+        worker.join().unwrap();
+        let shell = &snapshot.sessions[0];
+        assert!(!shell.is_exited(), "{shell:?}");
+        assert!(shell.agent_ended(), "{shell:?}");
+        assert_eq!(shell.status.state, AgentState::Unknown);
+        assert_eq!(shell.status.agent, "");
+        assert_eq!(shell.status.title.as_deref(), Some("~/repo"));
+        assert_eq!(shell.account, None);
+        let closed = &snapshot.sessions[1];
+        assert!(closed.is_exited(), "{closed:?}");
+        assert!(!closed.agent_ended(), "{closed:?}");
+    }
+
+    #[test]
     fn worktree_refs_source_roundtrips_through_real_registry() {
         use krill_proto::ipc::{self, ServerHello};
         use std::os::unix::net::UnixListener;
