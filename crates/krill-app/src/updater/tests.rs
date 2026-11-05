@@ -2727,3 +2727,240 @@ fn restart_swap_rejects_changed_staging_version_before_mutation() {
     assert_eq!(bundle_short_version(&app).as_deref(), Some("0.1.0"));
     assert!(!prev_path(&app).exists());
 }
+
+fn drained_outbox_events(state: &Path) -> Vec<krill_proto::error_reporting::Event> {
+    use krill_proto::error_reporting::{self, Ack, Env, Reply, Request, UploadLock};
+    let consent = error_reporting::consent_with(state, &Env::stub(&[]))
+        .unwrap()
+        .unwrap();
+    let lock = UploadLock::try_acquire(state).unwrap().unwrap();
+    let mut events = Vec::new();
+    error_reporting::flush(state, &consent, &lock, |body| {
+        let req: Request = serde_json::from_slice(body).unwrap();
+        let ack = Ack {
+            schema_version: error_reporting::SCHEMA_VERSION,
+            accepted_ids: req.events.iter().map(|e| e.event_id.clone()).collect(),
+            duplicate_ids: Vec::new(),
+        };
+        events.extend(req.events);
+        Reply::Http {
+            status: 200,
+            retry_after_secs: None,
+            body: serde_json::to_vec(&ack).unwrap(),
+        }
+    })
+    .unwrap();
+    events
+}
+
+#[test]
+fn disk_full_preflight_and_error_reporting_suppression() {
+    use krill_proto::error_reporting::{self, Code, Env, Process};
+
+    let low = ensure_free_disk_space_with(
+        Path::new("/Applications/Krill.app"),
+        MIN_DOWNLOAD_FREE_BYTES,
+        |_| Ok(MIN_DOWNLOAD_FREE_BYTES - 1),
+    )
+    .unwrap_err();
+    assert!(low.is_disk_full(), "{low:?}");
+    assert!(!low.to_string().contains("/Applications/Krill.app"));
+    assert!(
+        ensure_free_disk_space_with(
+            Path::new("/Applications/Krill.app"),
+            MIN_DOWNLOAD_FREE_BYTES,
+            |_| Err(io::Error::other("virtual mount"))
+        )
+        .is_ok()
+    );
+    assert!(Error::Unpack("ditto: write failed: No space left on device".into()).is_disk_full());
+    assert!(Error::Io(io::Error::other("디스크 공간이 부족합니다. (os error 112)")).is_disk_full());
+    assert!(Error::Io(io::Error::from_raw_os_error(112)).is_disk_full());
+    assert!(Error::Io(io::Error::from_raw_os_error(28)).is_disk_full());
+    assert!(Error::Io(io::Error::from_raw_os_error(39)).is_disk_full());
+    assert!(!Error::BadSignature.is_disk_full());
+
+    let d = TempGuard(temp_dir("disk-full-telemetry"));
+    let state = d.0.join("state");
+    fs::create_dir_all(&state).unwrap();
+    error_reporting::enable(&state).unwrap();
+    let app = d.0.join("Krill.app");
+    build_test_app_bundle(&app, "0.1.0", "exit 0", true);
+
+    let (kp, pk) = fresh_key();
+    fs::write(
+        state.join(CONFIG_FILE),
+        format!("public_key = \"{}\"\n", encode_hex(&pk)),
+    )
+    .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let bad_zip = b"corrupted-zip-payload".to_vec();
+    let mut manifest = Manifest {
+        version: "0.2.0".to_owned(),
+        url: format!("{base_url}/Krill-0.2.0.zip"),
+        sha256: "aa".repeat(32),
+        ed25519_sig: String::new(),
+        min_daemon_protocol: 1,
+        channel: Channel::Stable,
+        rollout_pct: 100,
+    };
+    sign_manifest_with(&kp, &mut manifest);
+    let manifest_json = serde_json::to_vec(&manifest).unwrap();
+
+    let server = thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let body: &[u8] = match path {
+                "/latest.json" => &manifest_json,
+                "/Krill-0.2.0.zip" => &bad_zip,
+                "/stop" => break,
+                _ => b"not found",
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).ok();
+            stream.write_all(body).ok();
+        }
+    });
+
+    let disk_err = check_and_stage_with_probe(
+        Some(&format!("{base_url}/latest.json")),
+        &app,
+        &state,
+        false,
+        |_| Ok(16 * 1024 * 1024),
+        &Env::stub(&[]),
+    )
+    .unwrap_err();
+    assert!(disk_err.is_disk_full(), "{disk_err:?}");
+    assert!(
+        drained_outbox_events(&state).is_empty(),
+        "disk-full must not record UpdateFailed telemetry"
+    );
+
+    let sha_err = check_and_stage_with_probe(
+        Some(&format!("{base_url}/latest.json")),
+        &app,
+        &state,
+        false,
+        |_| Ok(16 * 1024 * 1024 * 1024),
+        &Env::stub(&[]),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(sha_err, Error::Sha256Mismatch { .. }),
+        "{sha_err:?}"
+    );
+    let events = drained_outbox_events(&state);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].process, Process::App);
+    assert_eq!(events[0].error_code, Code::UpdateFailed);
+
+    fetch_bytes(&format!("{base_url}/stop"), 64).ok();
+    server.join().ok();
+}
+
+#[test]
+fn stage_publish_tmp_and_non_ascii_bundle_temp_cleanup() {
+    let dir = TempGuard(temp_dir("temp-cleanup-unicode"));
+    let ascii_bundle = dir.0.join("Krill.app");
+    let unicode_bundle = dir.0.join("크릴.app");
+
+    let ascii_prefix = temp_leaf_prefix(&ascii_bundle).unwrap();
+    assert_eq!(ascii_prefix, "Krill.app.");
+    let unicode_prefix = temp_leaf_prefix(&unicode_bundle).unwrap();
+    assert!(unicode_prefix.is_ascii(), "{unicode_prefix}");
+    assert!(
+        unicode_prefix.starts_with(".krill-upd-"),
+        "{unicode_prefix}"
+    );
+
+    let old_time =
+        fs::FileTimes::new().set_modified(std::time::SystemTime::now() - Duration::from_hours(25));
+    let stage_orphan = dir
+        .0
+        .join(format!("{ascii_prefix}4294967295-7-stage-publish.tmp"));
+    let unicode_orphan = dir
+        .0
+        .join(format!("{unicode_prefix}4294967295-8-unpack.tmp"));
+    fs::write(&stage_orphan, b"stale").unwrap();
+    fs::write(&unicode_orphan, b"stale").unwrap();
+    for path in [&stage_orphan, &unicode_orphan] {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(old_time)
+            .unwrap();
+    }
+
+    cleanup_update_orphans(&ascii_bundle).unwrap();
+    cleanup_update_orphans(&unicode_bundle).unwrap();
+    assert!(
+        !stage_orphan.exists(),
+        "stale stage-publish.tmp must be reaped"
+    );
+    assert!(
+        !unicode_orphan.exists(),
+        "stale non-ASCII bundle temp must be reaped"
+    );
+
+    let blocked_bundle = dir.0.join("Blocked.app");
+    let obstructing_marker = append_ext(&blocked_bundle, "stage-publish");
+    fs::create_dir_all(&obstructing_marker).unwrap();
+    fs::write(obstructing_marker.join("obstruct"), b"x").unwrap();
+    assert!(write_stage_marker(&blocked_bundle).is_err());
+    let leaked: Vec<_> = fs::read_dir(&dir.0)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with("-stage-publish.tmp"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "failed write_stage_marker leaked temporary files: {leaked:?}"
+    );
+
+    let (kp, pk) = fresh_key();
+    let src_bundle = dir.0.join("src/Krill.app");
+    build_test_app_bundle(&src_bundle, "0.2.0", "exit 0", true);
+    let valid_zip = zip_bundle(&src_bundle, &dir.0.join("valid.zip"));
+    let mut manifest = Manifest {
+        version: "0.2.0".to_owned(),
+        url: "https://example.com/Krill-0.2.0.zip".to_owned(),
+        sha256: sha256_hex(&valid_zip),
+        ed25519_sig: String::new(),
+        min_daemon_protocol: 1,
+        channel: Channel::Stable,
+        rollout_pct: 100,
+    };
+    sign_manifest_with(&kp, &mut manifest);
+    assert!(
+        stage_verified_archive(
+            &manifest,
+            &pk,
+            &valid_zip,
+            &blocked_bundle,
+            &CodesignVerifier::adhoc(),
+        )
+        .is_err()
+    );
+    assert!(
+        !append_ext(&blocked_bundle, "staging.incoming").exists(),
+        "failed write_stage_marker must remove staging.incoming"
+    );
+}

@@ -84,6 +84,80 @@ const BUNDLE_INFO: &str = if cfg!(windows) {
 const JOURNAL_FILE: &str = "journal.json";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
+const MIN_DOWNLOAD_FREE_BYTES: u64 = 256 * 1024 * 1024;
+const MIN_UNPACK_FREE_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TempKind {
+    DownloadZip,
+    UnpackTmp,
+    Candidate,
+    StagePublishTmp,
+}
+
+impl TempKind {
+    const ALL: [Self; 4] = [
+        Self::DownloadZip,
+        Self::UnpackTmp,
+        Self::Candidate,
+        Self::StagePublishTmp,
+    ];
+
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::DownloadZip => "download.zip",
+            Self::UnpackTmp => "unpack.tmp",
+            Self::Candidate => "candidate",
+            Self::StagePublishTmp => "stage-publish.tmp",
+        }
+    }
+
+    fn matches_suffix(s: &str) -> bool {
+        Self::ALL.iter().any(|k| k.suffix() == s)
+    }
+}
+
+fn ensure_free_disk_space_with(
+    target: &Path,
+    required_bytes: u64,
+    probe: impl FnOnce(&Path) -> io::Result<u64>,
+) -> Result<(), Error> {
+    if let Ok(avail) = probe(target)
+        && avail < required_bytes
+    {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::StorageFull,
+            format!(
+                "insufficient disk space ({avail} bytes available, {required_bytes} bytes required)"
+            ),
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_free_disk_space(target: &Path, required_bytes: u64) -> Result<(), Error> {
+    ensure_free_disk_space_with(
+        target,
+        required_bytes,
+        crate::platform::available_disk_bytes,
+    )
+}
+
+fn temp_leaf_prefix(bundle: &Path) -> Option<String> {
+    let name = bundle.file_name()?;
+    if let Some(s) = name.to_str()
+        && !s.is_empty()
+        && s.is_ascii()
+    {
+        return Some(format!("{s}."));
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    Some(format!(".krill-upd-{hash:016x}."))
+}
 
 /// 스테이징 완료된 업데이트 정보(MK-155, MK-156).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,8 +505,34 @@ impl Clone for Error {
 impl Error {
     /// Disk exhaustion should not cause rapid automatic retries.
     pub fn is_disk_full(&self) -> bool {
-        matches!(self, Self::Io(error) if error.kind() == io::ErrorKind::StorageFull)
+        match self {
+            Self::Io(error) => {
+                error.kind() == io::ErrorKind::StorageFull
+                    || matches!(error.raw_os_error(), Some(28 | 39 | 112))
+                    || mentions_disk_full(&error.to_string())
+            }
+            Self::Unpack(msg) => mentions_disk_full(msg),
+            _ => false,
+        }
     }
+}
+
+fn mentions_disk_full(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "no space left on device",
+        "not enough space on the disk",
+        "disk full",
+        "os error 112",
+        "os error 28",
+        "os error 39",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn should_report_update_failure(error: &Error) -> bool {
+    !matches!(error, Error::Http(_)) && !error.is_disk_full()
 }
 
 impl fmt::Display for Error {
@@ -1015,10 +1115,17 @@ pub fn stage_verified_archive(
     verifier: &dyn CodeVerifier,
 ) -> Result<PathBuf, Error> {
     manifest.verify_signature(public_key)?;
-    let path = unique_update_path(app_bundle, "download.zip");
     if archive_bytes.len() > MAX_ARCHIVE_BYTES {
         return Err(Error::Http("archive exceeded size limit".into()));
     }
+    ensure_free_disk_space(
+        app_bundle,
+        u64::try_from(archive_bytes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4)
+            .max(MIN_UNPACK_FREE_BYTES),
+    )?;
+    let path = unique_update_path(app_bundle, TempKind::DownloadZip);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1048,10 +1155,16 @@ fn remove_update_temp(path: &Path, directory: bool) {
     }
 }
 
-fn unique_update_path(bundle: &Path, suffix: &str) -> PathBuf {
+fn unique_update_path(bundle: &Path, kind: TempKind) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    append_ext(bundle, &format!("{}-{serial}-{suffix}", std::process::id()))
+    let pid = std::process::id();
+    let suffix = kind.suffix();
+    if let (Some(parent), Some(prefix)) = (bundle.parent(), temp_leaf_prefix(bundle)) {
+        parent.join(format!("{prefix}{pid}-{serial}-{suffix}"))
+    } else {
+        append_ext(bundle, &format!("{pid}-{serial}-{suffix}"))
+    }
 }
 
 fn archive_sha(path: &Path) -> Result<String, Error> {
@@ -1083,6 +1196,24 @@ fn stage_verified_file(
     app_bundle: &Path,
     verifier: &dyn CodeVerifier,
 ) -> Result<PathBuf, Error> {
+    stage_verified_file_with_probe(
+        manifest,
+        public_key,
+        archive,
+        app_bundle,
+        verifier,
+        crate::platform::available_disk_bytes,
+    )
+}
+
+fn stage_verified_file_with_probe(
+    manifest: &Manifest,
+    public_key: &PublicKey,
+    archive: &Path,
+    app_bundle: &Path,
+    verifier: &dyn CodeVerifier,
+    disk_probe: fn(&Path) -> io::Result<u64>,
+) -> Result<PathBuf, Error> {
     manifest.verify_signature(public_key)?;
     let actual_sha = archive_sha(archive)?;
     if !actual_sha.eq_ignore_ascii_case(&manifest.sha256) {
@@ -1091,23 +1222,32 @@ fn stage_verified_file(
             actual: actual_sha,
         });
     }
+    let archive_len = fs::metadata(archive)?.len();
+    let required = archive_len.saturating_mul(4).max(MIN_UNPACK_FREE_BYTES);
+    ensure_free_disk_space_with(app_bundle, required, disk_probe)?;
     let parent = app_bundle
         .parent()
         .ok_or_else(|| Error::BundleStructure("bundle has no parent".into()))?;
     fs::create_dir_all(parent)?;
     let _lock = staging_lock(app_bundle)?;
     recover_stage_publish_locked(app_bundle)?;
-    let unpack = unique_update_path(app_bundle, "unpack.tmp");
-    let candidate = unique_update_path(app_bundle, "candidate");
+    let unpack = unique_update_path(app_bundle, TempKind::UnpackTmp);
+    let candidate = unique_update_path(app_bundle, TempKind::Candidate);
     let staging = staging_path(app_bundle);
     let incoming = append_ext(app_bundle, "staging.incoming");
     let backup = append_ext(app_bundle, "staging.previous");
     let result = (|| {
-        unpack_with_ditto(archive, &unpack, &candidate)?;
+        if let Err(error) = unpack_with_ditto(archive, &unpack, &candidate) {
+            ensure_free_disk_space_with(app_bundle, required, disk_probe)?;
+            return Err(error);
+        }
         verifier.verify(&candidate)?;
         fs::remove_dir_all(&incoming).ok();
         fs::rename(&candidate, &incoming)?;
-        write_stage_marker(app_bundle)?;
+        if let Err(error) = write_stage_marker(app_bundle) {
+            remove_update_temp(&incoming, true);
+            return Err(error.into());
+        }
         if staging.exists() {
             fs::rename(&staging, &backup)?;
         }
@@ -1167,15 +1307,22 @@ fn sync_stage_parent(app_bundle: &Path) -> io::Result<()> {
 }
 fn write_stage_marker(app_bundle: &Path) -> io::Result<()> {
     let path = append_ext(app_bundle, "stage-publish");
-    let temporary = unique_update_path(app_bundle, "stage-publish.tmp");
+    let temporary = unique_update_path(app_bundle, TempKind::StagePublishTmp);
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&temporary)?;
-    file.write_all(b"krill-stage-publish-v1\n")?;
-    file.sync_all()?;
-    fs::rename(&temporary, &path)?;
+    let publish = (|| {
+        file.write_all(b"krill-stage-publish-v1\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &path)
+    })();
+    if let Err(error) = publish {
+        remove_update_temp(&temporary, false);
+        return Err(error);
+    }
     sync_stage_parent(app_bundle)
 }
 fn recover_stage_publish_locked(app_bundle: &Path) -> io::Result<()> {
@@ -1223,10 +1370,9 @@ fn cleanup_update_orphans(bundle: &Path) -> io::Result<()> {
     let parent = bundle
         .parent()
         .ok_or_else(|| io::Error::other("bundle has no parent"))?;
-    let Some(name) = bundle.file_name().and_then(|name| name.to_str()) else {
+    let Some(prefix) = temp_leaf_prefix(bundle) else {
         return Ok(());
     };
-    let prefix = format!("{name}.");
     let mut system = sysinfo::System::new();
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
@@ -1254,7 +1400,7 @@ fn cleanup_update_orphans(bundle: &Path) -> io::Result<()> {
             continue;
         };
         if serial.parse::<u64>().is_err()
-            || !matches!(suffix, "download.zip" | "unpack.tmp" | "candidate")
+            || !TempKind::matches_suffix(suffix)
             || pid == std::process::id()
             || system.process(sysinfo::Pid::from_u32(pid)).is_some()
         {
@@ -1424,12 +1570,17 @@ fn stream_download(cmd: &mut std::process::Command, path: &Path) -> Result<(), E
     result.map_err(Error::Io)
 }
 
-fn fetch_archive(url: &str, bundle: &Path) -> Result<PathBuf, Error> {
+fn fetch_archive_with_probe(
+    url: &str,
+    bundle: &Path,
+    disk_probe: fn(&Path) -> io::Result<u64>,
+) -> Result<PathBuf, Error> {
     validate_url(url)?;
+    ensure_free_disk_space_with(bundle, MIN_DOWNLOAD_FREE_BYTES, disk_probe)?;
     if let Some(parent) = bundle.parent() {
         fs::create_dir_all(parent)?;
     }
-    let path = unique_update_path(bundle, "download.zip");
+    let path = unique_update_path(bundle, TempKind::DownloadZip);
     let mut curl = crate::platform::background_command(system_tool("curl"));
     curl.args([
         "--fail",
@@ -1499,6 +1650,32 @@ pub fn download_and_stage(
     verifier: &dyn CodeVerifier,
     rollout_bucket: u8,
 ) -> Result<Option<PathBuf>, Error> {
+    download_and_stage_with_probe(
+        manifest,
+        public_key,
+        current_version,
+        channel,
+        app_bundle,
+        verifier,
+        rollout_bucket,
+        crate::platform::available_disk_bytes,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "내부 스테이징 경로가 디스크 여유 공간 프로브를 주입받는다"
+)]
+fn download_and_stage_with_probe(
+    manifest: &Manifest,
+    public_key: &PublicKey,
+    current_version: &str,
+    channel: Channel,
+    app_bundle: &Path,
+    verifier: &dyn CodeVerifier,
+    rollout_bucket: u8,
+    disk_probe: fn(&Path) -> io::Result<u64>,
+) -> Result<Option<PathBuf>, Error> {
     let decision = manifest.evaluate(
         public_key,
         current_version,
@@ -1531,8 +1708,10 @@ pub fn download_and_stage(
             return Ok(Some(staged));
         }
     }
-    let archive = fetch_archive(&manifest.url, app_bundle)?;
-    let staged = stage_verified_file(manifest, public_key, &archive, app_bundle, verifier);
+    let archive = fetch_archive_with_probe(&manifest.url, app_bundle, disk_probe)?;
+    let staged = stage_verified_file_with_probe(
+        manifest, public_key, &archive, app_bundle, verifier, disk_probe,
+    );
     remove_update_temp(&archive, false);
     staged.map(Some)
 }
@@ -1541,12 +1720,31 @@ pub fn download_and_stage(
 /// 채널 불일치는 `None`에 묻히지 않고 [`CheckStatus::ChannelMismatch`]로 돌려준다.
 /// `skip_rolled_back`이면 시작 확인에 실패해 롤백된 버전을 다시 받지 않는다. 자동 점검이 그 버전을
 /// 곧바로 다시 스테이징해 자동 재시작·롤백을 되풀이했다(v0.2.29). 사용자가 직접 점검하면 다시 시도한다.
+#[cfg(all(test, unix))]
 fn decide_and_stage(
     cfg: &Config,
     manifest: &Manifest,
     app_bundle: &Path,
     state_dir: &Path,
     skip_rolled_back: bool,
+) -> Result<CheckStatus, Error> {
+    decide_and_stage_with_probe(
+        cfg,
+        manifest,
+        app_bundle,
+        state_dir,
+        skip_rolled_back,
+        crate::platform::available_disk_bytes,
+    )
+}
+
+fn decide_and_stage_with_probe(
+    cfg: &Config,
+    manifest: &Manifest,
+    app_bundle: &Path,
+    state_dir: &Path,
+    skip_rolled_back: bool,
+    disk_probe: fn(&Path) -> io::Result<u64>,
 ) -> Result<CheckStatus, Error> {
     let pk = cfg.public_key_bytes()?;
     let from_version = effective_version(Some(app_bundle));
@@ -1609,7 +1807,7 @@ fn decide_and_stage(
     // Rollback policy is checked above per caller; only the actual download is shared.
     single_flight(&key, || {
         let verifier = CodesignVerifier::from_config(cfg);
-        let staged = download_and_stage(
+        let staged = download_and_stage_with_probe(
             manifest,
             &pk,
             &from_version,
@@ -1617,6 +1815,7 @@ fn decide_and_stage(
             app_bundle,
             &verifier,
             bucket,
+            disk_probe,
         )?;
         Ok(match staged {
             Some(_) => CheckStatus::Ready(StagedUpdate {
@@ -1735,6 +1934,24 @@ fn check_and_stage_with(
     state_dir: &Path,
     skip_rolled_back: bool,
 ) -> Result<CheckStatus, Error> {
+    check_and_stage_with_probe(
+        manifest_url,
+        app_bundle,
+        state_dir,
+        skip_rolled_back,
+        crate::platform::available_disk_bytes,
+        &krill_proto::error_reporting::Env::live(),
+    )
+}
+
+fn check_and_stage_with_probe(
+    manifest_url: Option<&str>,
+    app_bundle: &Path,
+    state_dir: &Path,
+    skip_rolled_back: bool,
+    disk_probe: fn(&Path) -> io::Result<u64>,
+    error_env: &krill_proto::error_reporting::Env,
+) -> Result<CheckStatus, Error> {
     if append_ext(app_bundle, "stage-publish").exists() {
         let _lock = staging_lock(app_bundle)?;
         recover_stage_publish_locked(app_bundle)?;
@@ -1764,14 +1981,13 @@ fn check_and_stage_with(
         let manifest = match fetch_manifest(&cfg.url) {
             Ok(manifest) => manifest,
             Err(error) => {
-                if !matches!(error, Error::Http(_)) {
+                if should_report_update_failure(&error) {
                     let detail = error.to_string();
-                    krill_proto::error_reporting::capture_detailed_at(
+                    crate::errors::record_app_error_with_env(
                         state_dir,
-                        krill_proto::error_reporting::Process::App,
+                        error_env,
                         krill_proto::error_reporting::Code::UpdateFailed,
-                        Some(&detail),
-                        &[],
+                        &detail,
                         file!(),
                         line!(),
                     );
@@ -1779,20 +1995,27 @@ fn check_and_stage_with(
                 return Err(error);
             }
         };
-        decide_and_stage(&cfg, &manifest, app_bundle, state_dir, skip_rolled_back).inspect_err(
-            |error| {
+        decide_and_stage_with_probe(
+            &cfg,
+            &manifest,
+            app_bundle,
+            state_dir,
+            skip_rolled_back,
+            disk_probe,
+        )
+        .inspect_err(|error| {
+            if should_report_update_failure(error) {
                 let detail = error.to_string();
-                krill_proto::error_reporting::capture_detailed_at(
+                crate::errors::record_app_error_with_env(
                     state_dir,
-                    krill_proto::error_reporting::Process::App,
+                    error_env,
                     krill_proto::error_reporting::Code::UpdateFailed,
-                    Some(&detail),
-                    &[],
+                    &detail,
                     file!(),
                     line!(),
                 );
-            },
-        )
+            }
+        })
     })
 }
 
