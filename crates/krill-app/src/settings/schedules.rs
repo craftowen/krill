@@ -18,14 +18,8 @@ use super::{SettingsView, layout, open_file, state_dir, text};
 
 mod editor;
 pub(super) mod model;
-mod page;
-pub(super) use model::SchedulesState;
 pub use model::run_outcome_badge_spec;
-use model::{
-    AutomationsSubView, DetailTab, OutcomeFilter, RunOutcome, RunsStatusFilter, ScheduleSortField,
-    StatusFilter, TEMPLATES, Template, latest_run, matches_run, matches_schedule, next_run,
-    now_minute, retained_count,
-};
+use model::{TEMPLATES, Template};
 
 /// 스케줄 추가/편집 모달 입력 상태.
 pub(super) struct ScheduleModal {

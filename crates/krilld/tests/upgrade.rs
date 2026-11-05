@@ -426,6 +426,16 @@ fn upgrade_keeps_sessions_lossless_and_one_generation() {
         assert_eq!(daemons(&sock), want);
         assert!(command_of(holder_pid).starts_with(to_holder.to_str().unwrap()));
         assert!(command_of(new_krilld).starts_with(to_krilld.to_str().unwrap()));
+        // exec 뒤 새 holder 이미지가 소켓 소유 락을 다시 잡았다(새 krilld는 그 뒤 이벤트 루프가 띄운다).
+        let mut owner = sock.clone().into_os_string();
+        owner.push(".holder.lock");
+        assert!(
+            matches!(
+                fs::File::open(owner).unwrap().try_lock(),
+                Err(fs::TryLockError::WouldBlock)
+            ),
+            "holder lost the socket owner lock across exec"
+        );
 
         // 같은 세션·pid가 살아 있고 출력은 처음부터 빠짐·중복 없이 이어진다.
         assert!(alive(root), "session died during upgrade");

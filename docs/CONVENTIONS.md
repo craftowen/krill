@@ -63,7 +63,7 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 - **T3 SHOULD** `as_`/`to_`/`into_` 규약, `get_` 접두어 금지, 약어는 한 단어(`Pty`, `Uds`).
 - **T4 SHOULD** 바이너리 크레이트는 `main.rs`를 얇게, 로직은 `lib.rs`.
 - **T5 MUST** `krill-proto`·`krill-term`은 gpui·tokio·nix·objc2에 의존하지 않는다.
-- **MUST** `krill-holder` 줄 수 상한(AGENTS 구조, 결정 12-2, 2026-10-19 개정)은 플랫폼별로 센다: macOS 빌드(공통 코드 + macOS 분기) 1,300줄 이하(2026-10-19 개정: OWE-954 종료 단계 신호 보강 등으로 1,277줄), Linux 전용 `sys/linux.rs` 300줄 이하, Windows 빌드(공통 코드 + Windows 전용 `windows.rs`·`sys/windows.rs`·`link/windows.rs`) 2,000줄 이하(2026-10-18 개정: 1,200은 스파이크 추정치였고 ConPTY·Job/IOCP·핸들 전달·핸드오프 실구현이 약 1,620줄, OWE-832). 다른 OS 전용 파일은 그 플랫폼 몫에만 들어간다.
+- **MUST** `krill-holder` 줄 수 상한(AGENTS 구조, 결정 12-2, 2026-11-03 개정)은 플랫폼별로 센다: macOS 빌드(공통 코드 + macOS 분기) 1,340줄 이하(2026-11-03 개정: 세션 생존 하드닝으로 1,339줄. 중복 기동 뒤 재기동 정지, 종료 신호 때 새 krilld에 fd 인계, 세션 없는 연속 실패 포기, 소켓 소유 락. 2026-10-19 개정 때는 OWE-954 종료 단계 신호 보강 등으로 1,277줄), Linux 전용 `sys/linux.rs` 300줄 이하, Windows 빌드(공통 코드 + Windows 전용 `windows.rs`·`sys/windows.rs`·`link/windows.rs`) 2,000줄 이하(2026-10-18 개정: 1,200은 스파이크 추정치였고 ConPTY·Job/IOCP·핸들 전달·핸드오프 실구현이 약 1,620줄, OWE-832). 다른 OS 전용 파일은 그 플랫폼 몫에만 들어간다.
 - **SHOULD** 파일 하나 800줄 넘으면 나눈다. 모듈은 기능 단위(`session/`, `ipc/`, `store/`), `utils.rs` 같은 잡동사니 모듈 금지.
 - 주석·문서·커밋·로그 메시지는 한국어 또는 영어 중 하나로 일관되게(코드 식별자는 영어). 사용자에게 보이는 문자열은 ko/en 다국어 대비로 한곳에 모은다(MK-094 전까지는 상수로).
 
@@ -108,7 +108,7 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 ## 10. Git·작업
 
 - 한 커밋 = 한 논리 변경, 마지막 줄 Co-Authored-By.
-- 하네스 파일(AGENTS.md, 이 문서, scripts/, .cargo/, lint·deny·fmt·clippy 설정)은 메인테이너 승인 없이 바꾸지 않는다.
+- 하네스 파일(목록: `.github/CODEOWNERS`)은 메인테이너 승인 없이 바꾸지 않는다.
 
 ## 11. 변경 경계별 재발 방지
 
@@ -127,8 +127,8 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 | 메모리·지연·대량 출력 | §6의 실제 측정을 따른다. 상한 초과 시 검사 프로세스가 비0으로 끝나는 실패 fixture도 확인한다. 병렬 부하·실제 회귀·테스트 준비 실패를 분리하고, 기대값·상한·timeout만 늘려 실패를 숨기지 않는다. 계약이 바뀐 경우에는 이유와 검증을 남긴다. |
 | 업데이트·패키징·게시 | 요청 수락과 실제 적용 완료를 구분하고 사후 상태로 성공을 확인한다. 패키징 계약은 `check-regressions.py --scope packaging`으로, 네이티브 서명·DMG는 기존 macOS CI의 `test_pipeline.py`·Homebrew 검사로 확인한다. 릴리스 증거는 최종 SHA·범위·도구 설정·실제 바이너리 hash와 일치해야 한다. 기존 릴리스를 덮어쓰지 않는다. |
 
-**테스트 격리 MUST**: 사용자 설정·계정·launchd·설치 경로에 접근하는 테스트는 쓰기 전에 전용 임시 상태 경로(`KRILL_STATE_DIR`)와 소유한 helper/프로필을 명시한다. 임시 `HOME`만으로 실제 launchd 도메인·설치 앱 helper·상속된 `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/XDG 경로가 격리됐다고 가정하지 않는다. 자식 `Command`에 필요한 환경만 덮어쓰거나 제거하고, 이번 테스트가 만든 프로세스·잡·파일만 종료/정리한다. 모든 테스트의 `HOME`을 전역으로 강제 변경해 실제 경로 계약을 가리지 않는다. 관련 fixture에서는 정상 종료와 실패 뒤 모두 사용자 설정 불변·잔여 자원 없음을 확인한다.
+**테스트 격리 MUST**: 사용자 설정·계정·launchd·설치 경로에 접근하는 테스트는 쓰기 전에 전용 임시 상태 경로(`KRILL_STATE_DIR`)와 소유한 helper/프로필을 명시한다. 임시 `HOME`만으로 실제 launchd 도메인·설치 앱 helper·상속된 `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/XDG 경로가 격리됐다고 가정하지 않는다. 자식 `Command`에 필요한 환경만 덮어쓰거나 제거하고, 이번 테스트가 만든 프로세스·잡·파일만 종료/정리한다. nextest setup 스크립트(`scripts/nextest-isolate-env.sh`)가 모든 테스트의 `HOME`과 상속 경로를 임시 폴더로 바꾸는 것은 실제 사용자 설정 오염을 막는 안전망일 뿐이다(2026-11-03, 테스트가 실제 에이전트 설정에 신뢰 항목 1,965개를 남긴 사고). 테스트는 여전히 위처럼 경로를 명시하고 이 안전망에 기대지 않는다. 관련 fixture에서는 정상 종료와 실패 뒤 모두 사용자 설정 불변·잔여 자원 없음을 확인한다.
 
-**준비·완료 판정 SHOULD**: 고정 sleep만으로 준비/완료를 판정하지 않는다. 조건과 상한 있는 대기로 바꾸고 실패 시 관찰 상태를 남긴다. 재시도 통과는 FLAKY로 기록하며 원인 조사 없이 회귀를 무시하지 않는다. `check.sh`의 fast/latency 필터와 nextest의 latency 그룹은 `scripts/test_harness_contracts.py`가 동일성을 검사한다. 운영 작업·벤치·검사기는 실패 시 비0 종료를 검증하고, 실제 적용/관찰 이전에 성공을 보고하지 않는다.
+**준비·완료 판정 SHOULD**: 고정 sleep만으로 준비/완료를 판정하지 않는다. 조건과 상한 있는 대기로 바꾸고 실패 시 관찰 상태를 남긴다. CI는 `.config/known-flaky.txt`에 없는 FLAKY(재시도 통과)를 실패시킨다. 목록에 넣으려면 원인과 횟수를 적는다. `check.sh`의 fast/latency 필터와 nextest의 latency 그룹은 `scripts/test_harness_contracts.py`가 동일성을 검사한다. 운영 작업·벤치·검사기는 실패 시 비0 종료를 검증하고, 실제 적용/관찰 이전에 성공을 보고하지 않는다.
 
 **회귀 추가 SHOULD**: 버그를 수정하면 관련 경계를 따라 실패 전 재현·수정 후 통과하는 최소 검사를 추가한다. 자동화하기 어려운 실기 조건은 미검증 범위와 재현 절차를 남긴다. Python/Git 훅·패키징 계약·독립 JS·수집기 검사는 `scripts/check-regressions.py`로 로컬 전체 검사와 hygiene CI에서 함께 실행한다. 새 Python 검사 파일은 해당 scope의 `test_*.py`로 추가하고, 모바일 검사는 데몬/브라우저 필요 여부를 구분해 목록에 등록한다. 새로운 사고는 원인·기존 방어·필요한 회귀 검사를 대조한 뒤 해당 규칙/검사 한 곳을 보완한다.

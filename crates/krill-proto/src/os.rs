@@ -67,6 +67,69 @@ pub fn canonicalize(path: &std::path::Path) -> std::io::Result<std::path::PathBu
     std::fs::canonicalize(path).map(|path| shell_path(&path))
 }
 
+/// Replaces `path` with `bytes` (0600) so a crash or power loss leaves either the old or the new
+/// content, never a truncated file. Creates missing parent directories as 0700.
+///
+/// # Errors
+/// Creating the parent, writing or syncing the temporary file, or the rename fails.
+pub fn write_atomic_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic(path, bytes, 0o600)
+}
+
+/// [`write_atomic_0600`] with an explicit Unix mode, for user files whose permissions must survive.
+///
+/// # Errors
+/// Same as [`write_atomic_0600`].
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = parent.join(name);
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
+        // `mode` above is masked by the umask; user files must keep their exact bits.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        std::fs::remove_file(&tmp).ok();
+        return written;
+    }
+    // The rename itself is durable only once the directory entry is flushed. Windows cannot open
+    // directories as files.
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 /// Use ordinary DOS/UNC paths for shell working directories and arguments. A Windows
 /// verbatim prefix from canonicalization makes `cmd.exe` treat a local drive as UNC
 /// and silently change to the Windows directory. Other device namespaces are preserved.
@@ -290,6 +353,45 @@ pub mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_atomic_replaces_content_privately_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("krill-write-atomic-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let path = dir.join("nested").join("state.json");
+        write_atomic_0600(&path, b"old").unwrap();
+        write_atomic_0600(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("state.json")]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn write_atomic_failure_keeps_old_file_and_removes_temp() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-write-atomic-fail-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let target = dir.join("target");
+        std::fs::create_dir_all(target.join("occupied")).unwrap();
+        assert!(write_atomic_0600(&target, b"new").is_err());
+        assert!(target.join("occupied").is_dir());
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("target")]);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn augment_windows_path_appends_existing_cli_dirs_without_duplicating() {

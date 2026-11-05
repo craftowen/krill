@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
 
+use krill_hosts::ssh::valid_host;
 use serde::{Deserialize, Serialize};
 
 const HOSTS_FILE: &str = "hosts.toml";
@@ -48,91 +49,16 @@ impl SshHost {
         self
     }
 
-    /// 안정성 기본 옵션(`ServerAliveInterval=15`, `ServerAliveCountMax=3`, `ConnectTimeout`)과
-    /// 포트(`-p`)·키 파일(`-i`)을 조립하는 공통 argv 빌더.
-    #[must_use]
-    pub fn common_ssh_args(&self, connect_timeout_secs: u16) -> Vec<String> {
-        let mut args = vec![
-            "-o".to_owned(),
-            "ServerAliveInterval=15".to_owned(),
-            "-o".to_owned(),
-            "ServerAliveCountMax=3".to_owned(),
-            "-o".to_owned(),
-            format!("ConnectTimeout={connect_timeout_secs}"),
-        ];
-        if let Some(port) = self.port {
-            args.push("-p".to_owned());
-            args.push(port.to_string());
-        }
-        if let Some(id_file) = &self.identity_file {
-            let trimmed = id_file.trim();
-            if !trimmed.is_empty() {
-                args.push("-i".to_owned());
-                args.push(trimmed.to_owned());
-            }
-        }
-        args
-    }
-
     /// 연결 테스트(`test_connection`)용 ssh 인자 목록.
     #[must_use]
     pub fn test_args(&self) -> Vec<String> {
-        let mut args = self.common_ssh_args(4);
+        let mut args = self.to_ssh_options().common_args(4);
         args.extend([
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            "-o".to_owned(),
-            "StrictHostKeyChecking=accept-new".to_owned(),
             "--".to_owned(),
             self.destination.clone(),
             "uname -sr && ([ -x \"$HOME/.local/bin/krill\" ] || command -v krill >/dev/null 2>&1) && echo 'krill: ready' || echo 'krill: not installed'".to_owned(),
         ]);
         args
-    }
-
-    /// 소켓 포워딩 터널용 ssh 인자 목록.
-    #[must_use]
-    pub fn tunnel_args(&self, local: &Path, remote: &Path) -> Vec<String> {
-        let mut args = self.common_ssh_args(10);
-        let forward = format!("{}:{}", local.display(), remote.display());
-        args.extend([
-            "-o".to_owned(),
-            "ExitOnForwardFailure=yes".to_owned(),
-            "-o".to_owned(),
-            "StreamLocalBindUnlink=yes".to_owned(),
-            "-N".to_owned(),
-            "-L".to_owned(),
-            forward,
-            "--".to_owned(),
-            self.destination.clone(),
-        ]);
-        args
-    }
-
-    /// 원격 `$HOME`·소켓 번들 조회(`krill_hosts::ssh::remote_query`, 새 번들 → 옛 번들)용 ssh 인자 목록.
-    #[must_use]
-    pub fn remote_home_args(&self) -> Vec<String> {
-        let mut args = self.common_ssh_args(5);
-        args.extend([
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            "--".to_owned(),
-            self.destination.clone(),
-            krill_hosts::ssh::remote_query(),
-        ]);
-        args
-    }
-
-    /// `remote_socket` 설정이 있으면 우선 사용하고, 없으면 원격 `HOME` 기준 기본 소켓 경로를 계산한다.
-    #[must_use]
-    pub fn resolve_remote_socket_from_home(&self, remote_home: &str) -> Option<PathBuf> {
-        if let Some(sock) = &self.remote_socket {
-            let trimmed = sock.trim();
-            if !trimmed.is_empty() && valid_remote_socket(trimmed) {
-                return Some(PathBuf::from(trimmed));
-            }
-        }
-        remote_socket_for_home(remote_home)
     }
 
     /// 호스트 카드 부제용 `user@host:port` 및 선택 키 파일 요약(`user@host:port • key_path`, OWE-800).
@@ -150,15 +76,6 @@ impl SshHost {
             None => endpoint,
         }
     }
-}
-
-/// 원격 질의 답(`$HOME`, 있으면 소켓을 찾은 번들 id)으로 원격 krilld 소켓 경로를 계산한다(MK-170, 새 → 옛).
-#[must_use]
-pub fn remote_socket_for_home(remote_home: &str) -> Option<PathBuf> {
-    if remote_home.contains('\0') {
-        return None;
-    }
-    krill_hosts::ssh::remote_socket_for_home(remote_home).ok()
 }
 
 /// 호스트 입력 폼 검증 오류 종류.
@@ -227,37 +144,12 @@ pub fn validate_host_input(
     })
 }
 
-/// `[user@]host` 또는 `~/.ssh/config` 별칭만 허용한다. `-`로 시작하면 `ssh`가 옵션으로
-/// 해석하므로(`-oProxyCommand=...`) 거부한다.
-#[must_use]
-pub fn valid_host(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 253
-        && !s.starts_with('-')
-        && !s.starts_with('@')
-        && !s.ends_with('@')
-        && s.chars().filter(|&c| c == '@').count() <= 1
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@'))
-}
-
 /// 키 파일 경로 검증: 빈 값·`-` 시작(옵션 인젝션)·제어 문자·널 바이트를 거부한다.
 #[must_use]
 pub fn valid_identity_file(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 512
         && !s.starts_with('-')
-        && !s.contains('\0')
-        && !s.chars().any(char::is_control)
-}
-
-/// 원격 소켓 경로 검증: 절대 경로(`/` 시작)여야 하며 `:`(`-L` 구분자)와 제어 문자를 거부한다.
-#[must_use]
-pub fn valid_remote_socket(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 512
-        && s.starts_with('/')
-        && !s.contains(':')
         && !s.contains('\0')
         && !s.chars().any(char::is_control)
 }
@@ -908,12 +800,6 @@ pub fn build_connect_command(host: &SshHost) -> String {
     format!("{}\n", parts.join(" "))
 }
 
-/// `krill --host <dest> ls` 원격 데몬 세션 조회 명령줄을 생성한다.
-#[must_use]
-pub fn build_mk_host_command(host: &SshHost, subcmd: &str) -> String {
-    format!("krill --host {} {subcmd}\n", shell_quote(&host.destination))
-}
-
 fn shell_quote(s: &str) -> String {
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '/' | ':'))
@@ -1282,49 +1168,6 @@ Host dev-box
         // Stopped backend returns empty list quietly.
         let stopped = r#"{"BackendState": "Stopped", "Peer": {}}"#;
         assert!(parse_tailscale_status(stopped).is_empty());
-    }
-
-    #[test]
-    fn shared_argv_builder_and_remote_home_socket_resolution() {
-        let host = SshHost {
-            id: "ssh-studio".into(),
-            label: "Studio".into(),
-            destination: "owen@studio.local".into(),
-            port: Some(2201),
-            identity_file: Some("~/.ssh/id_ed25519".into()),
-            remote_socket: None,
-            imported: false,
-            copy_id_first: false,
-        };
-        let remote_sock = host
-            .resolve_remote_socket_from_home("/Users/remoteowen\n")
-            .unwrap();
-        assert_eq!(
-            remote_sock,
-            PathBuf::from(
-                "/Users/remoteowen/Library/Application Support/dev.krill.app/run/krilld.sock"
-            )
-        );
-        let tunnel = host.tunnel_args(Path::new("/tmp/local.sock"), &remote_sock);
-        assert!(tunnel.windows(2).any(|w| w == ["-p", "2201"]));
-        assert!(tunnel.windows(2).any(|w| w == ["-i", "~/.ssh/id_ed25519"]));
-        assert!(tunnel.contains(&"ServerAliveInterval=15".to_owned()));
-        assert!(tunnel.contains(&"ServerAliveCountMax=3".to_owned()));
-        assert!(tunnel.contains(&"ExitOnForwardFailure=yes".to_owned()));
-        assert!(tunnel.contains(&"StreamLocalBindUnlink=yes".to_owned()));
-
-        let home_args = host.remote_home_args();
-        assert!(home_args.windows(2).any(|w| w == ["-p", "2201"]));
-        assert_eq!(home_args.last().unwrap(), &krill_hosts::ssh::remote_query());
-        assert_eq!(
-            host.resolve_remote_socket_from_home(
-                "/Users/remoteowen\n.local/share/dev.krill.app\n",
-            )
-            .unwrap(),
-            PathBuf::from(
-                "/Users/remoteowen/.local/share/dev.krill.app/run/krilld.sock"
-            )
-        );
     }
 
     #[test]

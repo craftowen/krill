@@ -520,20 +520,6 @@ pub enum Read {
     Idle(Pulse),
 }
 
-/// 묶음 종료 동안 새 attach·입력·출력을 막는다. holder fd는 계속 유지한다.
-#[must_use = "묶음 종료가 끝날 때까지 보관해야 한다"]
-pub(crate) struct HibernationGuard<'a> {
-    _input: MutexGuard<'a, input::State>,
-    clients: MutexGuard<'a, crate::attach::roles::Clients>,
-    _live: MutexGuard<'a, Live>,
-}
-
-impl HibernationGuard<'_> {
-    pub(crate) fn sleeping(&mut self) {
-        self.clients.sleeping = true;
-    }
-}
-
 impl Tap {
     /// 목록 표시용 터미널 제목([`krill_proto::control::display_title`]).
     pub(crate) fn title(&self) -> Option<String> {
@@ -550,32 +536,6 @@ impl Tap {
         let mut live = self.0.live();
         live.done_ns = ns;
         live.input_since_done = live.last_input_ns >= ns;
-    }
-
-    /// 연결·입력·출력과 직렬화한 최종 검사. 묶음 전체의 guard를 모은 뒤 종료를 시작한다.
-    pub(crate) fn hibernation_guard(
-        &self,
-        done_ns: u64,
-        idle: Duration,
-    ) -> Option<HibernationGuard<'_>> {
-        let input = self.0.input.try_lock().ok()?;
-        let clients = self.0.clients.lock().ok()?;
-        let live = self.0.live();
-        if clients.sleeping
-            || !clients.is_empty()
-            || live.viewers != 0
-            || live.done_ns != done_ns
-            || live.input_since_done
-            || live.last_output.elapsed() < idle
-            || clients.last_attached.is_some_and(|t| t.elapsed() < idle)
-        {
-            return None;
-        }
-        Some(HibernationGuard {
-            _input: input,
-            clients,
-            _live: live,
-        })
     }
 
     /// 화면 구독을 시작한다(MK-035). 강등된 세션이면 핫 스크롤백을 다시 쌓기 시작한다. 화면을 뜨기 전에 부른다.

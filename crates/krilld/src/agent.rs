@@ -117,6 +117,9 @@ if [ "${ZDOTDIR:-$HOME}" != "$_krill_self_zdotdir" ] && [ -f "${ZDOTDIR:-$HOME}/
   . "${ZDOTDIR:-$HOME}/.zshenv"
 fi
 unset _krill_self_zdotdir
+if [ -n "${MK_PANE_ID-}" ]; then
+  export HERDR_ENV=1
+fi
 if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
   # OpenCode 격리 프로필만 XDG_DATA_HOME·XDG_STATE_HOME을 덮어쓴다. 처음 덮어쓰기 전 값(미설정 포함)을 기억했다가
   # 호스트 계정·항목 제거 때 되돌린다. 그 사이 사용자가 직접 바꾼 값은 보존한다(daemon-01).
@@ -141,6 +144,9 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
   __krill_sync_accounts() {
     if (( $+functions[__krill_flush_compdef] )); then
       __krill_flush_compdef
+    fi
+    if [ -n "${MK_PANE_ID-}" ]; then
+      export HERDR_ENV=1
     fi
     local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/krill}/active-accounts.env"
     if [ ! -f "$_krill_env" ] && [ -f "$HOME/Library/Application Support/dev.krill.app/active-accounts.env" ]; then
@@ -923,8 +929,9 @@ pub(crate) fn pre_trust_workspace(profile: &Profile, cwd: &[u8], account: Option
 }
 
 /// 새 워크트리 생성 시 동의 플래그가 켜져 있으면 Claude·Codex·Cursor·Antigravity 모두에 신뢰를 등록한다(OWE-737).
-pub(crate) fn pre_trust_all_agents(cwd: &Path) {
-    let state_dir = krill_proto::daemon::state_dir();
+/// 동의는 워크트리를 만든 레지스트리의 상태 폴더에서 읽는다. 프로세스 환경의 `KRILL_STATE_DIR`는
+/// 같은 프로세스 안의 다른 레지스트리(테스트)에서는 운영 폴더일 수 있다.
+pub(crate) fn pre_trust_all_agents(state_dir: Option<&Path>, cwd: &Path) {
     let Some(home) = trust_home_for_runtime() else {
         return;
     };
@@ -935,7 +942,7 @@ pub(crate) fn pre_trust_all_agents(cwd: &Path) {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     pre_trust_all_agents_if_enabled(
-        state_dir.as_deref(),
+        state_dir,
         &home,
         claude_dir.as_deref(),
         codex_dir.as_deref(),
@@ -2135,7 +2142,12 @@ fn pane_env_with_socket(
     state: Option<&Path>,
     socket_dir: Option<&std::ffi::OsStr>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut env = vec![(b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes())];
+    let mut env = vec![
+        (b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes()),
+        // Codex TUI checks HERDR_ENV=1 to emit OSC 52 even when the host OS pasteboard succeeds,
+        // so remote krill-app clients receive Event::ClipboardStore -> Clipboard frame.
+        (b"HERDR_ENV".to_vec(), b"1".to_vec()),
+    ];
     if let Some(socket_dir) = socket_dir {
         env.push((b"KRILL_SOCKET_DIR".to_vec(), socket_dir.as_bytes().to_vec()));
     }

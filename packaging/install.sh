@@ -155,6 +155,19 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
+# 터미널 로캘이 한국어일 때만 한글로 안내한다. 그 밖은 영어다.
+case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in
+    ko*|KO*) UI_KO=1 ;;
+    *) UI_KO=0 ;;
+esac
+msg() {
+    if [[ "${UI_KO}" -eq 1 ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
+UI_WORK="$(msg '작업' 'working')"
+UI_FAILED="$(msg '실패' 'failed')"
+UI_ABORTED="$(msg '설치를 중단했습니다' 'Installation stopped')"
+UI_INSTALLED="$(msg '설치했습니다' 'Installed')"
+
 ui_intro() {
     [[ "${UI}" -eq 1 ]] || return 0
     INSTALL_START_CS="$(now_cs)"
@@ -174,7 +187,7 @@ ui_step_start() {
     [[ "${UI}" -eq 1 ]] || return 0
     stop_spin
     if [[ "${ANIM}" -eq 0 ]]; then
-        printf ' %s◜  [%s/%s 작업]%s %s%s%s\n' \
+        printf " %s◜  [%s/%s ${UI_WORK}]%s %s%s%s\n" \
             "${C_WARN}" "${step_id}" "${total}" "${C_RESET}" "${C_FG}" "${label}" "${C_RESET}" >&2
         return 0
     fi
@@ -202,7 +215,7 @@ ui_step_start() {
                     extra=" (${mib_whole}.${mib_frac} MiB)"
                 fi
             fi
-            printf '\r\033[2K %s%s  [%s/%s 작업]%s %s%s%s%s  %s%s%s' \
+            printf "\r\033[2K %s%s  [%s/%s ${UI_WORK}]%s %s%s%s%s  %s%s%s" \
                 "${C_WARN}" "${arc}" "${step_id}" "${total}" "${C_RESET}" \
                 "${C_FG}" "${label}" "${extra}" "${C_RESET}" \
                 "${C_MUTED}" "${elapsed}" "${C_RESET}" >&2
@@ -237,12 +250,12 @@ ui_step_fail() {
     local detail="${4:-}"
     stop_spin
     [[ "${UI}" -eq 1 ]] || return 0
-    printf ' %s×  [%s/%s 실패] %s%s\n' \
+    printf " %s×  [%s/%s ${UI_FAILED}] %s%s\n" \
         "${C_FAIL}" "${step_id}" "${total}" "${label}" "${C_RESET}" >&2
     if [[ -n "${detail}" ]]; then
         printf '%s │  %s%s\n' "${C_MUTED}" "${detail}" "${C_RESET}" >&2
     fi
-    printf ' %s└  설치를 중단했습니다%s\n' "${C_FAIL}" "${C_RESET}" >&2
+    printf " %s└  ${UI_ABORTED}%s\n" "${C_FAIL}" "${C_RESET}" >&2
 }
 
 if [[ "${MODE}" == "release" ]]; then
@@ -263,7 +276,7 @@ if [[ "${MODE}" == "release" ]]; then
     GH_BIN=""
 
     # [01/06] 릴리스 다운로드 경로 확인
-    ui_step_start "01" "06" "릴리스 확인 중"
+    ui_step_start "01" "06" "$(msg "릴리스 확인 중" "Checking the release")"
     if command -v curl >/dev/null && [[ "${VALUE}" == "latest" ]]; then
         MANIFEST_URL="https://github.com/${REPO}/releases/latest/download/latest.json"
         if curl -fsSL --connect-timeout 15 "${MANIFEST_URL}" -o "${WORK}/latest.json" 2>/dev/null; then
@@ -275,7 +288,7 @@ if [[ "${MODE}" == "release" ]]; then
     fi
 
     if [[ -n "${ZIP_URL}" ]]; then
-        ui_step_done "01" "06" "확인" "릴리스 다운로드 경로 확인 (${ZIP_NAME})"
+        ui_step_done "01" "06" "$(msg "확인" "Checked")" "$(msg "릴리스 다운로드 경로 확인 (${ZIP_NAME})" "Release download path found (${ZIP_NAME})")"
     else
         for candidate in "$(command -v gh 2>/dev/null || true)" /opt/homebrew/bin/gh /usr/local/bin/gh; do
             if [[ -n "${candidate}" && -x "${candidate}" ]]; then
@@ -284,15 +297,15 @@ if [[ "${MODE}" == "release" ]]; then
             fi
         done
         if [[ -z "${GH_BIN}" ]]; then
-            ui_step_fail "01" "06" "릴리스 다운로드 경로를 확인하지 못했습니다" "gh CLI가 없습니다 (brew install gh && gh auth login)"
+            ui_step_fail "01" "06" "$(msg "릴리스 다운로드 경로를 확인하지 못했습니다" "Couldn't find the release download path")" "$(msg "gh CLI가 없습니다 (brew install gh && gh auth login)" "gh CLI not found (brew install gh && gh auth login)")"
             echo "error: release download failed and 'gh' CLI was not found (install via 'brew install gh && gh auth login')." >&2
             exit 1
         fi
-        ui_step_done "01" "06" "확인" "릴리스 다운로드 경로 확인 (gh CLI · ${VALUE})"
+        ui_step_done "01" "06" "$(msg "확인" "Checked")" "$(msg "릴리스 다운로드 경로 확인 (gh CLI · ${VALUE})" "Release download path found (gh CLI, ${VALUE})")"
     fi
 
     # [02/06] 번들 다운로드
-    ui_step_start "02" "06" "번들 다운로드 중" "Krill-*"
+    ui_step_start "02" "06" "$(msg "번들 다운로드 중" "Downloading the bundle")" "Krill-*"
     if [[ -n "${ZIP_URL}" ]]; then
         if curl -fsSL --connect-timeout 15 "${ZIP_URL}" -o "${WORK}/${ZIP_NAME}" 2>/dev/null && \
            curl -fsSL --connect-timeout 15 "${ZIP_URL}.sha256" -o "${WORK}/${ZIP_NAME}.sha256" 2>/dev/null; then
@@ -310,7 +323,7 @@ if [[ "${MODE}" == "release" ]]; then
             done
         fi
         if [[ -z "${GH_BIN}" ]]; then
-            ui_step_fail "02" "06" "번들 다운로드에 실패했습니다" "gh CLI를 찾을 수 없습니다"
+            ui_step_fail "02" "06" "$(msg "번들 다운로드에 실패했습니다" "Bundle download failed")" "$(msg "gh CLI를 찾을 수 없습니다" "gh CLI not found")"
             echo "error: release download failed and 'gh' CLI was not found (install via 'brew install gh && gh auth login')." >&2
             exit 1
         fi
@@ -321,7 +334,7 @@ if [[ "${MODE}" == "release" ]]; then
                 --pattern "${SHA_PATTERN}" \
                 --dir "${WORK}" \
                 --clobber; then
-                ui_step_fail "02" "06" "gh release download 실패 (${VALUE})"
+                ui_step_fail "02" "06" "$(msg "gh release download 실패 (${VALUE})" "gh release download failed (${VALUE})")"
                 exit 1
             fi
         else
@@ -331,7 +344,7 @@ if [[ "${MODE}" == "release" ]]; then
                 --pattern "${SHA_PATTERN}" \
                 --dir "${WORK}" \
                 --clobber; then
-                ui_step_fail "02" "06" "gh release download 실패 (latest)"
+                ui_step_fail "02" "06" "$(msg "gh release download 실패 (latest)" "gh release download failed (latest)")"
                 exit 1
             fi
         fi
@@ -339,44 +352,44 @@ if [[ "${MODE}" == "release" ]]; then
 
     ZIP_FILE="$(echo "${WORK}"/Krill-*-"${ARCH}"-adhoc.zip)"
     if [[ ! -f "${ZIP_FILE}" ]]; then
-        ui_step_fail "02" "06" "내려받은 번들 파일을 찾을 수 없습니다"
+        ui_step_fail "02" "06" "$(msg "내려받은 번들 파일을 찾을 수 없습니다" "Downloaded bundle file not found")"
         echo "downloaded zip not found in ${WORK}" >&2
         exit 1
     fi
     ZIP_BYTES="$(/usr/bin/stat -f%z "${ZIP_FILE}" 2>/dev/null || echo 0)"
     ZIP_MIB="$((ZIP_BYTES / 1048576)).$(( (ZIP_BYTES % 1048576) * 10 / 1048576 )) MiB"
-    ui_step_done "02" "06" "수신" "번들 다운로드 완료 (${ZIP_MIB})"
+    ui_step_done "02" "06" "$(msg "수신" "Received")" "$(msg "번들 다운로드 완료 (${ZIP_MIB})" "Bundle downloaded (${ZIP_MIB})")"
 
     # [03/06] SHA-256 비교
-    ui_step_start "03" "06" "SHA-256 비교 중"
+    ui_step_start "03" "06" "$(msg "SHA-256 비교 중" "Comparing SHA-256")"
     if ! (cd "${WORK}" && shasum -a 256 -c ./*.sha256 >/dev/null); then
-        ui_step_fail "03" "06" "SHA-256 체크섬이 일치하지 않습니다"
+        ui_step_fail "03" "06" "$(msg "SHA-256 체크섬이 일치하지 않습니다" "SHA-256 checksum mismatch")"
         exit 1
     fi
-    ui_step_done "03" "06" "일치" "SHA-256 체크섬 일치"
+    ui_step_done "03" "06" "$(msg "일치" "Matched")" "$(msg "SHA-256 체크섬 일치" "SHA-256 checksum matched")"
 
     # [04/06] 번들 해제·서명 검사
-    ui_step_start "04" "06" "번들 해제·서명 검사 중"
+    ui_step_start "04" "06" "$(msg "번들 해제·서명 검사 중" "Unpacking the bundle and checking its signature")"
     mkdir -p "${WORK}/unpacked"
     if ! /usr/bin/ditto -x -k "${ZIP_FILE}" "${WORK}/unpacked"; then
-        ui_step_fail "04" "06" "번들 압축 해제(ditto)에 실패했습니다"
+        ui_step_fail "04" "06" "$(msg "번들 압축 해제(ditto)에 실패했습니다" "Failed to unpack the bundle (ditto)")"
         exit 1
     fi
     APP_SRC="${WORK}/unpacked/Krill.app"
     if [[ ! -d "${APP_SRC}" ]]; then
-        ui_step_fail "04" "06" "아카이브 내부에 Krill.app이 없습니다"
+        ui_step_fail "04" "06" "$(msg "아카이브 내부에 Krill.app이 없습니다" "Krill.app not found in the archive")"
         echo "Krill.app not found in archive" >&2
         exit 1
     fi
     /usr/bin/xattr -dr com.apple.quarantine "${APP_SRC}" 2>/dev/null || true
     if ! /usr/bin/codesign --verify --strict "${APP_SRC}"; then
-        ui_step_fail "04" "06" "원본 번들 코드서명 검증에 실패했습니다"
+        ui_step_fail "04" "06" "$(msg "원본 번들 코드서명 검증에 실패했습니다" "Code signature check failed for the downloaded bundle")"
         exit 1
     fi
-    ui_step_done "04" "06" "검증" "번들 해제 · 원본 서명 검사 통과"
+    ui_step_done "04" "06" "$(msg "검증" "Verified")" "$(msg "번들 해제 · 원본 서명 검사 통과" "Bundle unpacked, signature verified")"
 
     # [05/06] 앱 파일 설치·검사
-    ui_step_start "05" "06" "앱 파일 설치·검사 중"
+    ui_step_start "05" "06" "$(msg "앱 파일 설치·검사 중" "Installing and checking app files")"
     APP_DST="${APP_DIR}/Krill.app"
     # Apple Silicon XNU cs_blob 충돌(SIGKILL -9)을 막기 위해 디렉터리 inode는 보존하고 파일은 .tmp + os.replace로 원자 교체한다.
     if ! python3 -c '
@@ -411,44 +424,44 @@ for root, dirs, files in os.walk(dst, topdown=False):
         if not (src_dir / d).exists():
             (pathlib.Path(root) / d).rmdir()
 ' "${APP_SRC}" "${APP_DST}"; then
-        ui_step_fail "05" "06" "${APP_DST} 파일 교체에 실패했습니다"
+        ui_step_fail "05" "06" "$(msg "${APP_DST} 파일 교체에 실패했습니다" "Failed to replace files in ${APP_DST}")"
         exit 1
     fi
 
     /usr/bin/xattr -dr com.apple.quarantine "${APP_DST}" 2>/dev/null || true
     if ! /usr/bin/codesign --verify --strict "${APP_DST}"; then
-        ui_step_fail "05" "06" "설치된 ${APP_DST} 코드서명 검증에 실패했습니다"
+        ui_step_fail "05" "06" "$(msg "설치된 ${APP_DST} 코드서명 검증에 실패했습니다" "Code signature check failed for installed ${APP_DST}")"
         exit 1
     fi
-    ui_step_done "05" "06" "설치" "${APP_DST} 설치 · 서명 확인"
+    ui_step_done "05" "06" "$(msg "설치" "Installed")" "$(msg "${APP_DST} 설치 · 서명 확인" "${APP_DST} installed, signature verified")"
 
     # [06/06] CLI 연결·앱 열기 요청
-    ui_step_start "06" "06" "CLI 연결·앱 열기 요청 중"
+    ui_step_start "06" "06" "$(msg "CLI 연결·앱 열기 요청 중" "Linking the CLI and opening the app")"
     BIN="${PREFIX}/bin"
     mkdir -p "${BIN}"
     ln -sfn "${APP_DST}/Contents/MacOS/krill" "${BIN}/krill"
 
     VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "${APP_DST}/Contents/Info.plist" 2>/dev/null || echo "latest")"
 
-    OPEN_STATUS="앱 열기 생략(--no-open)"
+    OPEN_STATUS="$(msg "앱 열기 생략(--no-open)" "skipped opening the app (--no-open)")"
     if [[ "${NO_OPEN}" -eq 0 ]]; then
         if open "${APP_DST}"; then
-            OPEN_STATUS="앱 열기 요청 전달"
+            OPEN_STATUS="$(msg "앱 열기 요청 전달" "asked the app to open")"
         else
-            ui_step_fail "06" "06" "CLI는 연결했으나 앱 열기 요청에 실패했습니다"
+            ui_step_fail "06" "06" "$(msg "CLI는 연결했으나 앱 열기 요청에 실패했습니다" "CLI linked, but opening the app failed")"
             exit 1
         fi
     fi
-    ui_step_done "06" "06" "완료" "CLI 연결 · ${OPEN_STATUS}"
+    ui_step_done "06" "06" "$(msg "완료" "Done")" "$(msg "CLI 연결 · ${OPEN_STATUS}" "CLI linked, ${OPEN_STATUS}")"
 
     if [[ "${UI}" -eq 1 ]]; then
         TOTAL_ELAPSED="$(fmt_elapsed_cs "$(now_cs)" "${INSTALL_START_CS}")"
         printf '%s │%s\n' "${C_MUTED}" "${C_RESET}" >&2
-        printf ' %s└  설치했습니다%s  %s/  %s%s\n' \
+        printf " %s└  ${UI_INSTALLED}%s  %s/  %s%s\n" \
             "${C_SUCCESS}" "${C_RESET}" "${C_MUTED}" "${TOTAL_ELAPSED}" "${C_RESET}" >&2
         printf '    %sKrill v%s  → %s%s\n' "${C_FG}" "${VERSION}" "${APP_DST}" "${C_RESET}" >&2
         printf '    %sCLI            → %s/krill%s\n' "${C_MUTED}" "${BIN}" "${C_RESET}" >&2
-        printf '    %s시작           → open "%s"%s\n' "${C_MUTED}" "${APP_DST}" "${C_RESET}" >&2
+        printf '    %s%s → open "%s"%s\n' "${C_MUTED}" "$(msg '시작          ' 'Start         ')" "${APP_DST}" "${C_RESET}" >&2
     fi
 
     echo "Installed Krill v${VERSION} to ${APP_DST} (CLI: ${BIN}/krill)"
@@ -462,14 +475,14 @@ ui_intro "macOS · arm64 · source (${MODE}: ${VALUE})"
 
 SRC=""
 if [[ "${MODE}" == "dir" ]]; then
-    ui_step_start "01" "04" "소스 체크아웃 확인 중"
+    ui_step_start "01" "04" "$(msg "소스 체크아웃 확인 중" "Checking the source checkout")"
     if [[ ! -f "${VALUE}/Cargo.toml" || ! -d "${VALUE}/crates/krill" ]]; then
-        ui_step_fail "01" "04" "유효한 Krill 소스 체크아웃이 아닙니다" "${VALUE}"
+        ui_step_fail "01" "04" "$(msg "유효한 Krill 소스 체크아웃이 아닙니다" "Not a valid Krill source checkout")" "${VALUE}"
         echo "not a krill checkout: ${VALUE}" >&2
         exit 2
     fi
     SRC="${VALUE}"
-    ui_step_done "01" "04" "확인" "로컬 소스 체크아웃 확인"
+    ui_step_done "01" "04" "$(msg "확인" "Checked")" "$(msg "로컬 소스 체크아웃 확인" "Local source checkout found")"
 else
     command -v curl >/dev/null || { echo "curl not found" >&2; exit 2; }
     case "${MODE}" in
@@ -477,14 +490,14 @@ else
         commit) REF="${VALUE}" ;;
     esac
     TARBALL="${WORK}/source.tar.gz"
-    ui_step_start "01" "04" "소스 아카이브 다운로드 중 (${REF})"
+    ui_step_start "01" "04" "$(msg "소스 아카이브 다운로드 중 (${REF})" "Downloading the source archive (${REF})")"
     if ! curl -fsSL --connect-timeout 15 "https://codeload.github.com/${REPO}/tar.gz/${REF}" -o "${TARBALL}"; then
-        ui_step_fail "01" "04" "소스 아카이브 다운로드에 실패했습니다" "${REF}"
+        ui_step_fail "01" "04" "$(msg "소스 아카이브 다운로드에 실패했습니다" "Source archive download failed")" "${REF}"
         exit 1
     fi
     TAR_BYTES="$(wc -c < "${TARBALL}" | tr -d ' ')"
     TAR_SHA="$(shasum -a 256 "${TARBALL}" | cut -d' ' -f1)"
-    ui_step_done "01" "04" "수신" "소스 아카이브 다운로드 완료 (${TAR_BYTES} bytes)"
+    ui_step_done "01" "04" "$(msg "수신" "Received")" "$(msg "소스 아카이브 다운로드 완료 (${TAR_BYTES} bytes)" "Source archive downloaded (${TAR_BYTES} bytes)")"
     echo "downloaded ${TARBALL} (${TAR_BYTES} bytes)"
     echo "sha256: ${TAR_SHA}"
     if [[ -t 0 ]]; then
@@ -496,33 +509,33 @@ else
     SRC="${WORK}/src"
 fi
 
-ui_step_start "02" "04" "워크트리 상태 확인 중"
+ui_step_start "02" "04" "$(msg "워크트리 상태 확인 중" "Checking the worktree")"
 SRC="$(cd "${SRC}" && pwd)"
 if [[ -e "${SRC}/.git" ]]; then
     if ! CHECKOUT_STATUS="$(git -C "${SRC}" status --porcelain)"; then
-        ui_step_fail "02" "04" "git status 확인에 실패했습니다"
+        ui_step_fail "02" "04" "$(msg "git status 확인에 실패했습니다" "git status failed")"
         exit 2
     fi
     if [[ -n "${CHECKOUT_STATUS}" ]]; then
-        ui_step_fail "02" "04" "커밋되지 않은 변경 사항이 있어 빌드를 거부합니다"
+        ui_step_fail "02" "04" "$(msg "커밋되지 않은 변경 사항이 있어 빌드를 거부합니다" "Refusing to build with uncommitted changes")"
         echo "dirty checkout, refusing" >&2
         exit 2
     fi
 fi
-ui_step_done "02" "04" "검사" "클린 소스 상태 확인"
+ui_step_done "02" "04" "$(msg "검사" "Checked")" "$(msg "클린 소스 상태 확인" "Source is clean")"
 
 # Run from the checkout so its Cargo config and relative target-dir apply.
 # Compiler artifacts report the actual paths, including external CARGO_TARGET_DIR.
-ui_step_start "03" "04" "릴리스 바이너리 3종 빌드 중 (krill · krill-holder · krilld)"
+ui_step_start "03" "04" "$(msg "릴리스 바이너리 3종 빌드 중 (krill · krill-holder · krilld)" "Building 3 release binaries (krill, krill-holder, krilld)")"
 if [[ "${UI}" -eq 1 ]]; then
     if ! (cd "${SRC}" && perl -e 'alarm shift; exec @ARGV' 300 cargo build --release --locked \
         --manifest-path "${SRC}/Cargo.toml" -p krill -p krill-holder -p krilld \
         --message-format=json) > "${WORK}/artifacts.jsonl" 2> "${WORK}/cargo.stderr"; then
-        ui_step_fail "03" "04" "Cargo 릴리스 빌드에 실패했습니다"
+        ui_step_fail "03" "04" "$(msg "Cargo 릴리스 빌드에 실패했습니다" "Cargo release build failed")"
         cat "${WORK}/cargo.stderr" >&2 || true
         exit 1
     fi
-    ui_step_done "03" "04" "빌드" "릴리스 바이너리 3종 컴파일 완료"
+    ui_step_done "03" "04" "$(msg "빌드" "Built")" "$(msg "릴리스 바이너리 3종 컴파일 완료" "3 release binaries built")"
     if [[ -s "${WORK}/cargo.stderr" ]]; then
         cat "${WORK}/cargo.stderr" >&2
     fi
@@ -532,7 +545,7 @@ else
         --message-format=json) > "${WORK}/artifacts.jsonl"
 fi
 
-ui_step_start "04" "04" "바이너리 검증 및 설치 중"
+ui_step_start "04" "04" "$(msg "바이너리 검증 및 설치 중" "Verifying and installing binaries")"
 BIN="${PREFIX}/bin"
 if ! python3 - "${WORK}/artifacts.jsonl" "${BIN}" <<'PY'
 import json
@@ -567,17 +580,17 @@ for name in names:
     print(f"installed {target}")
 PY
 then
-    ui_step_fail "04" "04" "바이너리 검증 또는 설치에 실패했습니다"
+    ui_step_fail "04" "04" "$(msg "바이너리 검증 또는 설치에 실패했습니다" "Binary verification or install failed")"
     exit 1
 fi
-ui_step_done "04" "04" "완료" "CLI · krill-holder · krilld 설치 완료"
+ui_step_done "04" "04" "$(msg "완료" "Done")" "$(msg "CLI · krill-holder · krilld 설치 완료" "CLI, krill-holder and krilld installed")"
 
 if [[ "${UI}" -eq 1 ]]; then
     TOTAL_ELAPSED="$(fmt_elapsed_cs "$(now_cs)" "${INSTALL_START_CS}")"
     printf '%s │%s\n' "${C_MUTED}" "${C_RESET}" >&2
-    printf ' %s└  설치했습니다 (CLI-only)%s  %s/  %s%s\n' \
+    printf " %s└  ${UI_INSTALLED} (CLI-only)%s  %s/  %s%s\n" \
         "${C_SUCCESS}" "${C_RESET}" "${C_MUTED}" "${TOTAL_ELAPSED}" "${C_RESET}" >&2
-    printf '    %s경로  → %s/{krill,krill-holder,krilld}%s\n' "${C_FG}" "${BIN}" "${C_RESET}" >&2
+    printf '    %s%s  → %s/{krill,krill-holder,krilld}%s\n' "${C_FG}" "$(msg '경로' 'Path')" "${BIN}" "${C_RESET}" >&2
     printf '    %sPATH  → export PATH="%s:$PATH"%s\n' "${C_MUTED}" "${BIN}" "${C_RESET}" >&2
 fi
 

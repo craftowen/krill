@@ -114,7 +114,7 @@ impl RemotePlatform {
             RemoteOs::Windows => "Windows".to_owned(),
             RemoteOs::Other(raw) => {
                 if raw.is_empty() {
-                    "알 수 없는 OS".to_owned()
+                    "Unknown OS".to_owned()
                 } else {
                     raw.clone()
                 }
@@ -860,11 +860,7 @@ fn install_remote_with_program(
     }
 
     let mut base = opts.common_args(10);
-    base.extend([
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        opts.destination.clone(),
-    ]);
+    base.push(opts.destination.clone());
     let run = |remote_cmd: &str, stdin: Option<&[u8]>, step: &'static str| {
         let mut args = base.clone();
         args.push(remote_cmd.to_owned());

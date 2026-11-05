@@ -144,6 +144,21 @@ type Job = Box<dyn FnOnce() + Send>;
 /// 이보다 오래 걸린 호스트 폴링은 운영 로그에 남긴다.
 const SLOW_POLL: Duration = Duration::from_secs(1);
 
+/// Slow polls are logged, except that an unreachable host, which fails every poll while it is
+/// down, logs only its first slow failure until a poll succeeds again.
+fn slow_poll_logged(
+    failure_logged: &std::sync::atomic::AtomicBool,
+    ok: bool,
+    elapsed: Duration,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if ok {
+        failure_logged.store(false, Relaxed);
+        return elapsed >= SLOW_POLL;
+    }
+    elapsed >= SLOW_POLL && !failure_logged.swap(true, Relaxed)
+}
+
 struct CachedSnapshot {
     at: Instant,
     observed: IdentifiedSnapshot,
@@ -206,6 +221,8 @@ struct Shared {
     branches: Mutex<BTreeMap<PathBuf, String>>,
     external: Mutex<ExternalCache>,
     snapshot: Arc<SharedSnapshot>,
+    /// A slow failure was logged and no poll has succeeded since.
+    failure_logged: std::sync::atomic::AtomicBool,
 }
 
 impl Socket {
@@ -228,6 +245,7 @@ impl Socket {
                 watches: Mutex::new(WatchCache::default()),
                 branches: Mutex::new(BTreeMap::new()),
                 external: Mutex::new(ExternalCache::default()),
+                failure_logged: std::sync::atomic::AtomicBool::new(false),
             }),
             worker: Mutex::new(None),
             threaded: std::sync::atomic::AtomicBool::new(threaded),
@@ -557,7 +575,7 @@ impl Source for Socket {
             let polled = shared.poll();
             // 꺼진 원격 호스트 재시도(ssh) 같은 긴 폴링을 운영 로그에 남겨 UI 멈춤 시각과 대조할 수 있게 한다.
             let elapsed = started.elapsed();
-            if elapsed >= SLOW_POLL {
+            if slow_poll_logged(&shared.failure_logged, polled.is_ok(), elapsed) {
                 tracing::info!(
                     remote = !shared.target.allow_local_launch(),
                     ok = polled.is_ok(),
@@ -992,6 +1010,27 @@ fn fetch_from(
 #[cfg(unix)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreachable_host_logs_one_slow_failure_per_outage() {
+        let logged = std::sync::atomic::AtomicBool::new(false);
+        let slow = SLOW_POLL * 3;
+        let polls = [
+            (false, slow),
+            (false, slow),
+            (false, Duration::ZERO),
+            (false, slow),
+            (true, Duration::ZERO),
+            (false, slow),
+            (true, slow),
+            (true, slow),
+        ];
+        let lines: Vec<_> = polls
+            .into_iter()
+            .map(|(ok, elapsed)| slow_poll_logged(&logged, ok, elapsed))
+            .collect();
+        assert_eq!(lines, [true, false, false, false, false, true, true, true]);
+    }
 
     #[test]
     fn snapshot_is_shared_across_sources_but_git_watch_state_is_independent() {

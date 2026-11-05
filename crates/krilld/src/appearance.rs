@@ -5,9 +5,8 @@
 //!   첫 화면이 0.25~0.7초 늦었다).
 //! - 셀 픽셀 크기는 저장하지 않는다. 받기 전에는 `CSI 14t`에 답하지 않는다(MK-008 §2 8번: 침묵해도 지연 없음).
 
-use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -65,21 +64,9 @@ impl Appearance {
         lock(&self.state).cell
     }
 
-    /// 임시 파일(0600)에 쓰고 rename한다. 중간에 죽어도 이전 파일이나 새 파일 중 하나만 남는다.
     fn save(&self, theme: &Theme) -> io::Result<()> {
-        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        }
         let bytes = theme.encode().map_err(io::Error::other)?;
-        let tmp = self.path.with_extension("tmp");
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?
-            .write_all(&bytes)?;
-        fs::rename(&tmp, &self.path)
+        krill_proto::os::write_atomic_0600(&self.path, &bytes)
     }
 }
 

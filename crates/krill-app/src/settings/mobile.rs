@@ -412,7 +412,6 @@ impl SettingsView {
         if mode == ConnectMode::Tunnel
             && self.mobile.account.required
             && self.mobile.account.email.is_none()
-            && address.as_deref().is_none_or(|raw| !raw.contains('@'))
         {
             self.mobile.mode = mode;
             self.mobile.address = address;
@@ -866,7 +865,7 @@ impl SettingsView {
         }
         if let Some(error) = &self.mobile.error {
             root = root.child(
-                crate::ui::error_banner(p, error.clone())
+                crate::ui::error_banner(p, crate::i18n::cached_notice(error))
                     .id("mobile-error-banner")
                     .debug_selector(|| "mobile-error-banner".into()),
             );
@@ -1115,7 +1114,7 @@ impl SettingsView {
             .child(home_guide(p))
             .child(actions)
             .children(self.mobile.error.clone().map(|error| {
-                crate::ui::error_banner(p, error)
+                crate::ui::error_banner(p, crate::i18n::cached_notice(&error))
                     .id("mobile-page-error")
                     .debug_selector(|| "mobile-page-error".into())
             }))

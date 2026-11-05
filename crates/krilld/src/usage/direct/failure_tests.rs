@@ -2,8 +2,9 @@ use super::*;
 use std::sync::Arc;
 use tracing::{Event, Metadata, Subscriber, field::Visit, span};
 
+/// Captures events as `(level, " field=value" ...)` for log-volume assertions.
 #[derive(Clone, Default)]
-struct Events(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+pub(crate) struct Events(pub(crate) Arc<Mutex<Vec<(tracing::Level, String)>>>);
 
 impl Visit for Events {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -49,7 +50,7 @@ fn reports_each_profile_and_reason_streak_once_and_recovers_once() {
         for count in 1..=3 {
             assert!(apply_result(&first, Fetched::Failed(Failure::Http(401)), Some(42)).is_none());
             let usage = lock(&CACHE)[&first].1.clone();
-            assert_eq!(usage.error.as_deref(), Some("갱신 실패"));
+            assert_eq!(usage.error.as_deref(), Some("Refresh failed"));
             assert_eq!(usage.detail, Some(Failure::Http(401).detail()));
             assert_eq!(lock(&RETRY)[&first].failures, count);
         }

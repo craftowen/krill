@@ -265,16 +265,6 @@ impl Dialog {
         Self::new_with_options(repo, None, None, Vec::new(), source, window, cx)
     }
 
-    pub fn new_with_parent(
-        repo: PathBuf,
-        parent: Option<PathBuf>,
-        source: Arc<dyn Source>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_with_options(repo, parent, None, Vec::new(), source, window, cx)
-    }
-
     pub fn new_with_options(
         repo: PathBuf,
         parent: Option<PathBuf>,
@@ -627,11 +617,6 @@ impl Dialog {
         self.parent.as_deref()
     }
 
-    #[must_use]
-    pub fn selected_agents(&self) -> &[String] {
-        &self.selected_agents
-    }
-
     pub fn toggle_agent(&mut self, agent_id: &str, cx: &mut Context<Self>) {
         let trimmed = agent_id.trim();
         if trimmed.is_empty() {
@@ -755,6 +740,7 @@ impl Dialog {
                         Some(result)
                     })
                     .await;
+                let mut wait = Duration::from_millis(250);
                 match reply {
                     Some(Ok(Reply::WorktreePreparation(
                         WorktreePreparation::Preparing | WorktreePreparation::Busy,
@@ -765,15 +751,15 @@ impl Dialog {
                             cx.notify();
                         })
                         .ok();
+                        // A ready checkout only needs to notice its five-minute lease expiring.
+                        wait = Duration::from_secs(5);
                     }
                     _ => {
                         this.update(cx, Dialog::cancel_preparation).ok();
                         return;
                     }
                 }
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
+                cx.background_executor().timer(wait).await;
             }
         }));
     }

@@ -109,12 +109,6 @@ impl Item {
         }
     }
 
-    #[must_use]
-    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
-        self.agent = agent.into();
-        self
-    }
-
     pub fn rebuild_search_chars(&mut self) {
         self.filename_chars = lower_chars(
             Path::new(&self.label)
@@ -914,37 +908,8 @@ impl Palette {
     }
 
     #[must_use]
-    pub fn worktree(&self, index: usize) -> Option<&WorktreeItem> {
-        self.worktrees.get(index)
-    }
-
-    #[must_use]
     pub fn worktree_entry(&self, index: usize) -> Option<&WorktreeItem> {
         self.worktrees.get(index)
-    }
-
-    /// 지금 필터에 일치하는 빠른 액션.
-    pub fn action_matches(&self) -> impl Iterator<Item = &ActionEntry> {
-        self.action_matches
-            .iter()
-            .filter_map(|&i| self.actions.get(i))
-    }
-
-    /// 지금 필터에 일치하는 빠른 명령.
-    pub fn quick_matches(&self) -> impl Iterator<Item = &crate::commands::QuickCommand> {
-        self.quick_matches
-            .iter()
-            .filter_map(|&i| self.quick_commands.get(i))
-    }
-
-    #[must_use]
-    pub fn scope(&self) -> VaultScope {
-        self.scope
-    }
-
-    #[must_use]
-    pub fn agent_filter(&self) -> Option<VaultAgent> {
-        self.agent_filter
     }
 
     #[must_use]

@@ -245,7 +245,7 @@ def main():
                     until(lambda: 'Waiting for pairing' in (scratch / 'qr.log').read_text() or qr.poll() is not None, 60)
                     photo = shots / 'tailscale-real-qr.png'
                     qr_photo((scratch / 'qr.log').read_text(), photo)
-                    click('Pair Desktop')
+                    click('Pair a desktop')
                     wait('!!document.querySelector("dialog.scanner")')
                     browser('upload', 'dialog.scanner input[type=file]', str(photo))
                     wait('dualProbe.notices.some(text=>text.includes("Desktop backup added"))')
@@ -253,7 +253,7 @@ def main():
                     qr_log.close()
                 else:
                     link = relay_link()
-                    click('Pair Desktop')
+                    click('Pair a desktop')
                     click('Paste link instead')
                     browser('fill', 'input[type=url]', link)
                     click('Continue')

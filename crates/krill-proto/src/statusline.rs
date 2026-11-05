@@ -282,10 +282,10 @@ pub fn read_slot(text: Option<&str>) -> io::Result<Option<serde_json::Value>> {
     let Some(text) = text else {
         return Ok(None);
     };
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| invalid(format!("settings.json 파싱 실패: {e}")))?;
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| invalid(format!("Failed to parse settings.json: {e}")))?;
     if !value.is_object() {
-        return Err(invalid("settings.json은 객체여야 합니다"));
+        return Err(invalid("settings.json must be an object"));
     }
     Ok(value.get("statusLine").cloned())
 }
@@ -404,7 +404,7 @@ pub fn apply_uninstall(
         );
     if !owned {
         return Err(invalid(
-            "statusLine이 Krill 설치 이후 바뀌었습니다; 덮어쓰지 않습니다",
+            "statusLine changed after Krill installed it; not overwriting",
         ));
     }
     let before_slot = match before {

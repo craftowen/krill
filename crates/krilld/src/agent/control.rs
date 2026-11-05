@@ -2,9 +2,9 @@
 //!
 //! 서명 규칙 파일(MK-091)이 있고 서명이 맞으면 프로필·화면 규칙을 겹친다. 없거나
 //! 틀리면 내장 규칙을 유지한다. 전역 권한은 서명 파일로 바꾸지 않는다.
-use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write};
+use krill_proto::os::write_atomic_0600;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -215,7 +215,7 @@ impl Control {
                 ),
             );
             let text = toml::to_string(&table).map_err(io::Error::other)?;
-            save(&dir.join(FILE_NAME), text.as_bytes())?;
+            write_atomic_0600(&dir.join(FILE_NAME), text.as_bytes())?;
             agents.permission = permission;
         }
         let mut profiles: Vec<_> = agents
@@ -275,7 +275,7 @@ impl Control {
             account,
         };
         let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
-        save(&self.launch_path(session)?, &bytes)
+        write_atomic_0600(&self.launch_path(session)?, &bytes)
     }
 
     pub fn stored(&self, session: SessionId) -> io::Result<Option<StoredLaunch>> {
@@ -321,7 +321,7 @@ impl Control {
         }
         if self.read_stored(session)?.as_ref() != Some(&stored) {
             let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
-            save(&self.launch_path(session)?, &bytes)?;
+            write_atomic_0600(&self.launch_path(session)?, &bytes)?;
         }
         Ok(stored)
     }
@@ -501,7 +501,7 @@ impl Control {
                 if let Ok(path) = self.launch_path(session)
                     && let Ok(bytes) = serde_json::to_vec(&bound)
                 {
-                    save(&path, &bytes).ok();
+                    write_atomic_0600(&path, &bytes).ok();
                 }
                 return false;
             }
@@ -561,7 +561,7 @@ impl Control {
             if let Ok(path) = self.launch_path(session)
                 && let Ok(bytes) = serde_json::to_vec(&stored)
             {
-                save(&path, &bytes).ok();
+                write_atomic_0600(&path, &bytes).ok();
             }
             return false;
         }
@@ -634,7 +634,7 @@ impl Control {
         if let Ok(path) = self.launch_path(session)
             && let Ok(bytes) = serde_json::to_vec(&stored)
         {
-            save(&path, &bytes).ok();
+            write_atomic_0600(&path, &bytes).ok();
         }
         is_subagent_or_foreign
     }
@@ -686,7 +686,7 @@ impl Control {
         if let Ok(path) = self.launch_path(session)
             && let Ok(bytes) = serde_json::to_vec(&stored)
         {
-            save(&path, &bytes).ok();
+            write_atomic_0600(&path, &bytes).ok();
         }
     }
 
@@ -758,6 +758,7 @@ impl Control {
         lock(&self.account_retirements).contains(&session)
     }
 
+    #[cfg(all(test, unix))]
     pub fn hibernation_blocked(&self, session: SessionId) -> bool {
         lock(&self.veto).contains(&session)
     }
@@ -809,6 +810,7 @@ impl Control {
     pub fn forget(&self, session: SessionId) {
         self.finish_account_resume(session);
         lock(&self.veto).remove(&session);
+        self.clear_rate_limited(session);
         let _guard = lock(&self.config);
         if let Ok(path) = self.launch_path(session) {
             fs::remove_file(path).ok();
@@ -979,22 +981,6 @@ fn check_limits(agents: &Agents) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    file.write_all(bytes)?;
-    drop(file);
-    fs::rename(tmp, path)
 }
 
 #[cfg(test)]

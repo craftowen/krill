@@ -143,5 +143,39 @@ step "test latency"; slot cargo nextest -E 'test(/#/)' # comment
         self.assertEqual(phases["fast"], "not (" + expected + ")")
 
 
+SESSION_PATHS = ("KRILL_STATE_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME")
+
+
+def unset_before_tests(script):
+    """Names unset at top level before the first test step, and whether any doctest step runs in a temp HOME."""
+    names, doctest_home, before = set(), True, True
+    for line in script.splitlines():
+        before = before and not line.startswith('step "test build"')
+        unset = re.fullmatch(r"unset((?:[ \t]+[A-Za-z_][A-Za-z0-9_]*)+)[ \t]*", line)
+        if before and unset:
+            names.update(unset[1].split())
+        if line.startswith('step "doctest";'):
+            doctest_home = re.search(r"[ \t]HOME=", line.split("#")[0]) is not None
+    return names, doctest_home
+
+
+class IsolationTests(unittest.TestCase):
+    """Tests must not inherit a Krill session's real state or agent config paths (F-01)."""
+
+    def test_check_sh_clears_session_paths_before_tests_and_isolates_doctest_home(self):
+        names, doctest_home = unset_before_tests((ROOT / "scripts/check.sh").read_text())
+        self.assertEqual(set(SESSION_PATHS) - names, set())
+        self.assertTrue(doctest_home)
+
+    def test_unset_after_the_test_steps_does_not_count(self):
+        names, _ = unset_before_tests('step "test build"; run cargo nextest\nunset ' + " ".join(SESSION_PATHS))
+        self.assertEqual(names, set())
+
+    def test_nextest_runs_the_isolation_setup_script_for_every_test(self):
+        config = (ROOT / ".config/nextest.toml").read_text()
+        self.assertIn('command-line = "scripts/nextest-isolate-env.sh"', config)
+        self.assertRegex(config, r"\[\[profile\.default\.scripts\]\]\n(?:.*\n)*?filter = 'all\(\)'\nsetup = 'isolate-env'")
+
+
 if __name__ == "__main__":
     unittest.main()

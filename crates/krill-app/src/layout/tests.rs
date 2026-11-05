@@ -1206,9 +1206,8 @@ fn startup_edits_are_appended_to_the_restored_layout() {
     edited.panel_width = 428.0;
 
     let empty_panes = BTreeSet::new();
-    let empty_tabs = BTreeSet::new();
     let mut merged = saved.clone();
-    let tab_map = merged.absorb_startup_edits(&baseline, &edited, &empty_panes, &empty_tabs);
+    let tab_map = merged.absorb_startup_edits(&baseline, &edited, &empty_panes);
     assert!(merged.is_valid());
     assert_eq!(merged.tabs().len(), expected_tab_count + 2);
     assert_eq!(tab_map.get(&1).copied(), Some(expected_tab_count));
@@ -1271,14 +1270,14 @@ fn startup_edits_are_appended_to_the_restored_layout() {
 
     // 아무것도 하지 않았으면(placeholder 탭만) 저장본이 그대로다.
     let mut untouched = saved.clone();
-    let map = untouched.absorb_startup_edits(&baseline, &baseline, &empty_panes, &empty_tabs);
+    let map = untouched.absorb_startup_edits(&baseline, &baseline, &empty_panes);
     assert!(map.is_empty());
     assert_eq!(untouched, saved);
 
     // placeholder 탭에 초기 입력/런타임 의도가 걸려 있으면 버리지 않고 원래 PaneId(0) 그대로 뒤에 남긴다.
     let retained_panes = BTreeSet::from([PaneId(0)]);
     let mut with_input = saved.clone();
-    let map = with_input.absorb_startup_edits(&baseline, &baseline, &retained_panes, &empty_tabs);
+    let map = with_input.absorb_startup_edits(&baseline, &baseline, &retained_panes);
     assert!(with_input.is_valid());
     assert_eq!(map.get(&0).copied(), Some(expected_tab_count));
     assert_eq!(with_input.tab_panes(expected_tab_count), vec![PaneId(0)]);
@@ -1288,7 +1287,7 @@ fn startup_edits_are_appended_to_the_restored_layout() {
     let mut closed = baseline.clone();
     closed.close_tab(0);
     let mut kept = saved.clone();
-    kept.absorb_startup_edits(&baseline, &closed, &empty_panes, &empty_tabs);
+    kept.absorb_startup_edits(&baseline, &closed, &empty_panes);
     assert_eq!(kept.tabs(), saved.tabs());
     assert_eq!(kept.active(), saved.active());
 }

@@ -576,8 +576,18 @@ fn same_session_number_on_two_hosts_keeps_logs_drafts_and_target_apart(cx: &mut 
             shell.layout.set_session(remote, SESSION);
 
             let local_host = krill_app::hosts::HostId::Local;
-            shell.apply_chat_poll_for_host(SESSION, local_host, snapshot(vec![item("local")]));
-            shell.apply_chat_poll_for_host(SESSION, remote_host, snapshot(vec![item("remote")]));
+            shell.apply_chat_poll_for_host(
+                SESSION,
+                local_host,
+                snapshot(vec![item("local")]),
+                None,
+            );
+            shell.apply_chat_poll_for_host(
+                SESSION,
+                remote_host,
+                snapshot(vec![item("remote")]),
+                None,
+            );
             let local_log = &shell.chat.logs[&local_key(SESSION)];
             assert_eq!(local_log.items.len(), 1);
             assert_eq!(local_log.items[0].text, "local");

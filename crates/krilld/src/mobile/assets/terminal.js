@@ -1062,6 +1062,20 @@ globalThis.MkTerminalCodec = (() => {
         },
         { passive: false },
       );
+      // Touch taps keep the software keyboard closed; a mouse click is a PC
+      // user who expects to type right away.
+      let mouseDown = false;
+      this.listen(this.port, "pointerdown", (e) => {
+        mouseDown = e.pointerType === "mouse" && e.button === 0;
+      });
+      this.listen(this.port, "click", (e) => {
+        if (
+          mouseDown &&
+          !e.target.closest?.("button") &&
+          globalThis.getSelection?.()?.isCollapsed !== false
+        )
+          this.focus();
+      });
       let pinch;
       const distance = (touches) =>
         Math.hypot(
