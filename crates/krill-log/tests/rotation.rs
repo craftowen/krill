@@ -194,15 +194,20 @@ fn subprocess_writer() -> io::Result<()> {
         let dir =
             std::env::var_os("KRILL_LOG_DIR").ok_or_else(|| io::Error::other("missing log dir"))?;
         let log = RollingLog::open(PathBuf::from(dir), component)?;
-        // Exercise maximum record pressure even when the nonblocking family
-        // lock drops most competing attempts on a slower filesystem.
+        // Exercise maximum record pressure: writers now wait for the family lock, so every
+        // attempt is written.
         let record = "load".repeat(RECORD_BYTES / 4);
-        for _ in 0..21_600 {
+        for _ in 0..ATTEMPTS_PER_PROCESS {
             log.append(&record)?;
         }
     }
     Ok(())
 }
+
+/// 21,600 × 2 processes × 2 phases = 86,400 attempts per family. Windows CI file I/O already took
+/// 131s here when contended attempts were dropped, so it writes an eighth: still ~88 MB per family,
+/// far past the 5 MB family budget, so rotation and the byte cap are exercised the same way.
+const ATTEMPTS_PER_PROCESS: usize = if cfg!(windows) { 2_700 } else { 21_600 };
 
 #[test]
 fn accelerated_day_with_concurrent_processes_and_restart() -> io::Result<()> {
@@ -248,7 +253,8 @@ fn accelerated_day_with_concurrent_processes_and_restart() -> io::Result<()> {
         assert!(entry?.metadata()?.len() <= FILE_BYTES);
     }
     eprintln!(
-        "MK-069 accelerated day: 345600 attempts, 16 child processes, {bytes} retained bytes (limit {TOTAL_BYTES})"
+        "MK-069 accelerated day: {} attempts, 16 child processes, {bytes} retained bytes (limit {TOTAL_BYTES})",
+        ATTEMPTS_PER_PROCESS * 16
     );
     Ok(())
 }
