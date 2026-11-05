@@ -168,7 +168,7 @@ impl State {
             if state.is_pending(*id)
                 && let Some(row) = normalized.sessions.iter_mut().find(|s| s.id == *id)
             {
-                if row.is_exited() {
+                if row.is_exited() || row.agent_ended() {
                     *row = fallback.session.clone();
                 }
                 continue;

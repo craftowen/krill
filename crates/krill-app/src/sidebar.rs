@@ -140,10 +140,11 @@ impl Session {
             && self.status.source == Some(krill_proto::control::Source::Process)
     }
 
-    /// 에이전트만 끝나고 PTY에는 로그인 셸이 남은 세션.
+    /// 에이전트만 끝나고 PTY에는 로그인 셸이 남은 세션. [`ipc`]가 데몬 상태에서 구분해 둔다.
     #[must_use]
     pub fn agent_ended(&self) -> bool {
-        false
+        self.status.state == AgentState::Unknown
+            && self.status.source == Some(krill_proto::control::Source::Process)
     }
 }
 
@@ -363,7 +364,7 @@ fn track_unread(
 ) {
     unread.retain(|id| {
         new.iter()
-            .any(|s| s.id == *id && s.status.state != AgentState::Exited)
+            .any(|s| s.id == *id && s.status.state != AgentState::Exited && !s.agent_ended())
     });
     for s in new {
         let before = old.iter().find(|o| o.id == s.id).map(|o| o.status.state);
