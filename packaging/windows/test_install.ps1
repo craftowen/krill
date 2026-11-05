@@ -105,21 +105,28 @@ namespace KrillTest {
     $script:testPrograms = Join-Path $root $unicode
     $source = [IO.File]::ReadAllText($installer)
     $source = $source.Replace("[Environment]::GetFolderPath('Programs')", '$script:testPrograms')
+    # Download mode adds Krill to PATH by default: read an empty user PATH and record the write
+    # instead of changing the real HKCU:\Environment.
+    function Set-KrillTestUserPath { $state.PathWritten = $true }
+    $source = $source.Replace("`$envKey = Get-Item 'HKCU:\Environment'", '$envKey = $null')
+    $source = $source.Replace("[string]`$envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')", "''")
+    $source = $source.Replace("New-ItemProperty -Path 'HKCU:\Environment'", 'Set-KrillTestUserPath')
+    $source = $source.Replace("[Environment]::SetEnvironmentVariable('KRILL_PATH_REFRESH', `$null, 'User')", '$null')
+    Assert (-not $source.Contains('HKCU:') -and -not $source.Contains('KRILL_PATH_REFRESH')) 'User PATH mock was not applied'
+    $savedPath = $env:Path
     $isolatedInstaller = [scriptblock]::Create($source)
     & $isolatedInstaller -Dest $unicodeDest -NoOpen | Out-Null
     $menuLink = Join-Path $script:testPrograms 'Krill.lnk'
     Assert ([KrillTest.LinkReader]::Read($menuLink)[0] -eq $target) 'Installer shortcut target is wrong'
     & $isolatedInstaller -Dest $unicodeDest -NoOpen | Out-Null
     Assert ([KrillTest.LinkReader]::Read($menuLink)[0] -eq $target) 'Installer shortcut retry failed'
+    $env:Path = $savedPath
 
     # Make creation fail without touching the real Start Menu or user PATH.
     $script:testPrograms = Join-Path $root 'missing-programs'
     $state.PathWritten = $false
     $script:opened = $false
-    $savedPath = $env:Path
     function Start-Process { param($FilePath) $script:opened = ($FilePath -eq $target) }
-    $source = $source.Replace("[Environment]::GetEnvironmentVariable('Path', 'User')", '$null')
-    $source = $source.Replace("[Environment]::SetEnvironmentVariable('Path', ((@(`$path, `$Dest) | Where-Object { `$_ }) -join ';'), 'User')", '$state.PathWritten = $true')
     try {
         $warning = @(& ([scriptblock]::Create($source)) -Dest $unicodeDest -AddToPath 3>&1)
         Assert (@($warning | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count -gt 0) 'Shortcut failure did not warn'
@@ -139,7 +146,6 @@ namespace KrillTest {
     $state.Launched = ''
     function Start-Process { param($FilePath) $state.Launched = $FilePath }
     try {
-        Assert (-not $source.Contains("[Environment]::SetEnvironmentVariable('Path'")) 'User PATH mock was not applied'
         & { $source | Invoke-Expression } | Out-Null
         $iexTarget = Join-Path $env:LOCALAPPDATA 'Programs/Krill/krill-app.exe'
         Assert (Test-Path -LiteralPath $iexTarget) 'irm | iex did not install to Unicode LOCALAPPDATA'
