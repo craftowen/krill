@@ -21,6 +21,8 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(600);
 /// Spend that rare sample on a stall long enough to still be running while `sample` looks.
 const SAMPLE_AFTER_MS: u64 = 1_500;
 const SAMPLE_BYTES: u64 = 2 << 20;
+/// CI's first `sample` of a large test binary overruns the app's bound, then the retry takes 1.5 s.
+const SAMPLE_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 90 } else { 10 });
 
 // Aggregate only duration buckets. No query, path, terminal text, or per-frame log.
 static UI_WORK: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -375,7 +377,7 @@ fn capture(dir: &Path) -> io::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + SAMPLE_TIMEOUT;
     let mut child = Command::new("/usr/bin/sample")
         .args([
             std::process::id().to_string(),
@@ -596,7 +598,7 @@ mod tests {
         cx.run_until_parked();
         // Deliberately do not pump either GPUI executor. Only the native observer
         // can collect the blocked foreground's stack during this interval.
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + SAMPLE_TIMEOUT + Duration::from_secs(5);
         loop {
             let ready =
                 std::fs::read_to_string(&sample).is_ok_and(|text| text.contains("Call graph:"));
