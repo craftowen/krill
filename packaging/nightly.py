@@ -35,6 +35,51 @@ class NightlyError(RuntimeError):
     pass
 
 
+# 앱 설정 > 업데이트는 main의 이 파일에서 버전별 한국어 항목을 읽고, 없으면 영어 커밋 제목을 보여 준다.
+KOREAN_NOTES = Path("docs/releases/ko.json")
+# 앱 release_notes.rs의 HIDDEN_KINDS와 같다: 사용자에게 보이는 동작을 바꾸지 않는 커밋 종류.
+HIDDEN_KINDS = ("build", "chore", "ci", "docs", "refactor", "style", "test")
+# launchd PATH에는 ~/.local/bin이 없다.
+TRANSLATOR = Path.home() / ".local/bin/claude"
+KOREAN_PROMPT = """다음은 Krill(AI 코딩 에이전트 세션 관리 앱) 새 버전에 들어간 커밋 제목이다.
+사용자에게 보이는 변화만 골라 한국어 항목 최대 10개로 요약하라. 비슷한 것은 하나로 묶는다.
+각 항목은 '~합니다' 또는 '~했습니다'로 끝나는 한 문장이다. 내부 테스트, CI, 빌드 변경은 뺀다.
+가운뎃점, 대시, 이모지를 쓰지 않는다. 출력은 JSON 문자열 배열 하나뿐이다.
+
+"""
+
+
+def release_titles(log):
+    """`git log --format=%s` 출력에서 사용자에게 보일 커밋 제목만 순서대로 고른다."""
+    titles = []
+    for line in log.splitlines():
+        title = re.sub(r" \(#\d+\)$", "", line.strip())
+        if not title or title.startswith(("Merge ", "Release v", "Revert ")):
+            continue
+        conventional = re.match(r"^(\w+)(\([^)]*\))?!?: (.+)$", title)
+        if conventional:
+            if conventional[1] in HIDDEN_KINDS:
+                continue
+            title = conventional[3]
+        title = title[:1].upper() + title[1:]
+        if title not in titles:
+            titles.append(title)
+    return titles
+
+
+def korean_items(output):
+    """번역기 출력에서 한국어 항목 배열을 꺼낸다. 형식이 어긋나면 ValueError."""
+    start, end = output.find("["), output.rfind("]")
+    if start < 0 or end < start:
+        raise ValueError("translator returned no JSON array")
+    items = json.loads(output[start:end + 1])
+    if (not isinstance(items, list) or not 1 <= len(items) <= 12
+            or not all(isinstance(item, str) and 0 < len(item.strip()) <= 300
+                       and re.search(r"[가-힣]", item) for item in items)):
+        raise ValueError("translator output is not 1-12 Korean sentences")
+    return [item.strip() for item in items]
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
@@ -223,6 +268,33 @@ class Release:
             return results
         raise NightlyError(f"CI timed out at {sha} ({branch})")
 
+    def write_korean_notes(self, version, published):
+        """Release 커밋에 이 버전의 한국어 변경 사항을 넣는다. 번역 실패는 게시를 막지 않는다(앱은 영어로 대신한다)."""
+        path = self.work / KOREAN_NOTES
+        if not path.is_file():
+            return
+        notes = json.loads(path.read_text(encoding="utf-8"))
+        if version in notes:
+            return
+        titles = release_titles(self.git("log", "--no-merges", "--format=%s", f"{published}..HEAD"))[:60]
+        if not titles:
+            return
+        translator = Path(self.config.get("translator", TRANSLATOR))
+        try:
+            with tempfile.TemporaryDirectory() as neutral:
+                # 저장소 밖에서 실행해 저장소 지침·훅을 읽히지 않는다.
+                output = command([translator, "-p", "--model", "haiku",
+                                  KOREAN_PROMPT + "\n".join(f"- {title}" for title in titles)],
+                                 cwd=neutral, env=self.env, timeout=300)
+            items = korean_items(output)
+        except (NightlyError, ValueError, OSError, subprocess.TimeoutExpired) as error:
+            self.update(korean_notes=f"skipped: {error}")
+            print(f"Korean release notes skipped: {error}", flush=True)
+            return
+        path.write_text(json.dumps({version: items, **notes}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.git("add", str(KOREAN_NOTES))
+        self.update(korean_notes=f"added {len(items)} items")
+
     def prepare(self):
         self.root.mkdir(parents=True, exist_ok=True)
         if not self.work.exists():
@@ -310,6 +382,7 @@ class Release:
         manifest.write_text(re.sub(pattern, lambda item: item[1] + version + item[3], text, count=1))
         self.run("cargo", "update", "--workspace", "--offline")
         self.run("python3", "docs/licensing/generate_notices.py", timeout=900)
+        self.write_korean_notes(version, published)
         self.git("add", "Cargo.toml", "Cargo.lock", "THIRD_PARTY_NOTICES.md")
         self.git("commit", "-m", f"Release v{version}\n\nNightly-Source: {remote}\nNightly-Main: {main}\nNightly-Candidate: {datetime.now().astimezone().isoformat()}")
         sha = self.git("rev-parse", "HEAD")
