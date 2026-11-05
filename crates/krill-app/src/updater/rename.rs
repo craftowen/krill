@@ -13,7 +13,7 @@ use std::path::Path;
 
 /// 업데이트가 설치 폴더 최상위에서 옮겨도 되는 이름. 패키지에서 빠진 파일도 지우지 말고 남겨 둔다.
 /// 이 목록에도 새 패키지에도 없는 항목이 있으면 사용자 파일일 수 있어 교체를 거부한다([`check_install_entries`]).
-const KNOWN_ENTRIES: [&str; 9] = [
+const KNOWN_ENTRIES: [&str; 10] = [
     "Krill.json",
     "krill-app.exe",
     "krill.exe",
@@ -22,6 +22,7 @@ const KNOWN_ENTRIES: [&str; 9] = [
     "krill-link.exe",
     "conpty.dll",
     "x64",
+    "arm64",
     "THIRD_PARTY_NOTICES.txt",
 ];
 

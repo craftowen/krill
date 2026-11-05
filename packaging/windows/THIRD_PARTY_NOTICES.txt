@@ -1,6 +1,6 @@
 Krill for Windows bundles the following third-party components.
 
-conpty.dll, x64\OpenConsole.exe
+conpty.dll, x64\OpenConsole.exe, arm64\OpenConsole.exe
   Microsoft.Windows.Console.ConPTY 1.25.260930003 (NuGet), from Windows Terminal
   https://github.com/microsoft/terminal
   License: MIT

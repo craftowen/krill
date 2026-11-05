@@ -29,7 +29,7 @@ cargo build --release --locked -p krill-app -p krill -p krilld -p krill-holder -
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed: $LASTEXITCODE" }
 $targetDir = if ($env:CARGO_TARGET_DIR) { Join-Path $env:CARGO_TARGET_DIR 'release' } else { 'target\release' }
 
-# ConPTY B안 파일(저장소에 넣지 않음). nupkg 해시를 확인하고, 안의 두 파일 해시는 bundle.ps1이 다시 확인한다.
+# ConPTY B안 파일(저장소에 넣지 않음). nupkg 해시를 확인하고, 안의 세 파일 해시는 bundle.ps1이 다시 확인한다.
 $conptyVer = '1.25.260930003'
 $conptyDir = Join-Path $CacheDir "conpty-$conptyVer"
 if (-not (Test-Path $conptyDir)) {

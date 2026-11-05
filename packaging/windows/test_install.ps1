@@ -34,7 +34,8 @@ try {
     $env:PROCESSOR_ARCHITEW6432 = ''
     $env:LOCALAPPDATA = $root
     New-Item -ItemType Directory -Path (Join-Path $root 'source/Krill/x64') -Force | Out-Null
-    foreach ($name in @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64/OpenConsole.exe')) {
+    New-Item -ItemType Directory -Path (Join-Path $root 'source/Krill/arm64') -Force | Out-Null
+    foreach ($name in @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64/OpenConsole.exe', 'arm64/OpenConsole.exe')) {
         Set-Content -LiteralPath (Join-Path $root "source/Krill/$name") -Value 'fixture'
     }
     $state.Fixture = Join-Path $root 'fixture.zip'
@@ -197,7 +198,14 @@ namespace KrillTest {
     $env:PROCESSOR_ARCHITECTURE = 'ARM64'
     if ([Environment]::OSVersion.Version.Build -ge 22000) {
         Install (Join-Path $root 'arm64') @{ Zip = $state.Fixture }
-        Assert (Test-Path (Join-Path $root 'arm64/krill-app.exe')) 'ARM64 Windows 11 installation failed'
+        Assert (Test-Path (Join-Path $root 'arm64/arm64/OpenConsole.exe')) 'ARM64 Windows 11 installation failed'
+        # conpty.dll picks the OS-native console host, so an x64-only package cannot run sessions on ARM64.
+        $console = Join-Path $root 'source/Krill/arm64/OpenConsole.exe'
+        Remove-Item -LiteralPath $console
+        $x64Only = Join-Path $root 'x64-only.zip'
+        Compress-Archive -Path (Join-Path $root 'source/Krill') -DestinationPath $x64Only
+        Set-Content -LiteralPath $console -Value 'fixture'
+        Reject 'arm64-x64-only' 'no ARM64 console host' @{ Zip = $x64Only }
     } else {
         Reject 'arm64-win10' 'requires Windows 11'
     }

@@ -291,6 +291,11 @@ if (-not $alreadyInstalled) {
                 throw "Not a Krill package (missing $file)."
             }
         }
+        # conpty.dll starts <dll folder>\<native OS architecture>\OpenConsole.exe, so an ARM64 PC needs
+        # arm64\OpenConsole.exe even though Krill itself runs as x64; without it sessions fail.
+        if ($arch -eq 'ARM64' -and -not (Test-Path -LiteralPath (Join-Path $unpacked 'Krill\arm64\OpenConsole.exe') -PathType Leaf)) {
+            throw 'This Krill release has no ARM64 console host (arm64\OpenConsole.exe); ARM64 PCs need a newer release.'
+        }
         Complete-KrillStep '04' (Convert-KrillUnicode '\uAC80\uC99D') (Convert-KrillUnicode '\uBC88\uB4E4 \uD574\uC81C \u00B7 \uD544\uC218 \uAD6C\uC131 \uD30C\uC77C 5\uC885 \uD655\uC778')
 
 
