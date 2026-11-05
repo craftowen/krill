@@ -233,12 +233,13 @@ fn rule(pattern: &str) -> Regex {
     Regex::new(pattern).expect("redaction pattern")
 }
 
-/// 비밀로 보이는 것을 `[REDACTED]`로 가린다: PEM 블록(잘린 것 포함), `sk-ant-`·`sk-`·GitHub·Slack·AWS 토큰,
-/// `Authorization:`·`Bearer` 값, 이름에 token·secret·password·key·auth가 들어간 `KEY=VALUE`/`"key": "value"`의 값,
-/// `/Users/<이름>`의 사용자명.
+/// 비밀로 보이는 것을 `[REDACTED]`로 가리고 홈 경로 사용자명을 `[USER]`로 바꾼다: PEM 블록(잘린 것 포함),
+/// `sk-ant-`·`sk-`·GitHub·Slack·AWS 토큰, `Authorization:`·`Bearer` 값, 이름에
+/// token·secret·password·key·auth가 들어간 `KEY=VALUE`/`"key": "value"`의 값,
+/// Windows(`C:\Users\<이름>`)·macOS(`/Users/<이름>`)·Linux(`/home/<이름>`) 홈 경로의 사용자명.
 #[must_use]
 pub fn redact(text: &str) -> String {
-    static RULES: LazyLock<[(Regex, &str); 5]> = LazyLock::new(|| {
+    static RULES: LazyLock<[(Regex, &str); 8]> = LazyLock::new(|| {
         [
             (
                 rule(r"(?s)-----BEGIN [A-Z0-9 ]+-----.*?(?:-----END [A-Z0-9 ]+-----|\z)"),
@@ -260,13 +261,41 @@ pub fn redact(text: &str) -> String {
                 ),
                 "${1}${2}[REDACTED]",
             ),
-            (rule(r"/Users/[^/\s\x22':]+"), "/Users/[USER]"),
+            (
+                rule(
+                    r#"((?:\\{2,4}\?\\{1,2})?\b[A-Za-z]:(?:\\{1,2}|/)[Uu]sers(?:\\{1,2}|/)|/Users/)[^\s/\\:<>|?*"'`\[\]\x00-\x1f\x7f][^/\\:<>|?*"'`\[\]\x00-\x1f\x7f]{0,63}?((?:\\{1,2}|/)(?:AppData|Desktop|Documents|Downloads|OneDrive|Pictures|Music|Videos|Library|Saved Games|NTUSER\.DAT|\.krill|\.config|\.cache|\.local)(?:\\{1,2}|/|$|[\s"'`:,;)\]>]))"#,
+                ),
+                "${1}[USER]${2}",
+            ),
+            (
+                rule(
+                    r#"((?:^|[\s"'`=:(,;\[<]|file://(?:localhost)?)/home/)[^\s/\\:<>|?*"'`\[\]\x00-\x1f\x7f][^/\\:<>|?*"'`\[\]\x00-\x1f\x7f]{0,63}?(/(?:AppData|Desktop|Documents|Downloads|OneDrive|Pictures|Music|Videos|Library|Saved Games|NTUSER\.DAT|\.krill|\.config|\.cache|\.local)(?:/|$|[\s"'`:,;)\]>]))"#,
+                ),
+                "${1}[USER]${2}",
+            ),
+            (
+                rule(
+                    r#"((?:\\{2,4}\?\\{1,2})?\b[A-Za-z]:(?:\\{1,2}|/)[Uu]sers(?:\\{1,2}|/)|/Users/)[^/\\\s"'`:<>|?*,;)\[\]\x00-\x1f\x7f]+"#,
+                ),
+                "${1}[USER]",
+            ),
+            (
+                rule(
+                    r#"((?:^|[\s"'`=:(,;\[<]|file://(?:localhost)?)/home/)[^/\\\s"'`:<>|?*,;)\[\]\x00-\x1f\x7f]+"#,
+                ),
+                "${1}[USER]",
+            ),
         ]
     });
     let mut out = text.to_owned();
-    for (re, with) in RULES.iter() {
-        if let std::borrow::Cow::Owned(s) = re.replace_all(&out, *with) {
-            out = s;
+    for (i, (re, with)) in RULES.iter().enumerate() {
+        let passes = if i == 4 || i == 5 { 2 } else { 1 };
+        for _ in 0..passes {
+            if let std::borrow::Cow::Owned(s) = re.replace_all(&out, *with) {
+                out = s;
+            } else {
+                break;
+            }
         }
     }
     out
