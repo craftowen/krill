@@ -1,9 +1,5 @@
 //! MK-045: direct daemon commands. Text shown by these commands is kept here.
 
-#[cfg(unix)]
-mod terminal;
-#[cfg(windows)]
-#[path = "session/terminal_windows.rs"]
 mod terminal;
 mod wait;
 

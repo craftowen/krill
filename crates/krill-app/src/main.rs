@@ -80,6 +80,9 @@ fn main() -> std::process::ExitCode {
     };
     #[cfg(windows)]
     let opens = instance.take_opens();
+    // 작업 스케줄러처럼 breakaway를 막는 Job에서 실행되면 세션 데몬을 Explorer가 Job 밖에서 띄우게 한다.
+    #[cfg(windows)]
+    krill_proto::daemon::set_job_escape(krill_app::platform::launch_outside_job);
     // OWE-576: gpui-component 아이콘 자산은 재열기·새 창에서도 같은 소스를 쓴다.
     let application = gpui_platform::application().with_assets(krill_app::ui::icons::AppAssets);
     application.on_reopen(|cx| request_open_from_menu(None, cx));
