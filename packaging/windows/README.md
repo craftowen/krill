@@ -12,6 +12,7 @@ Krill-<ver>-windows-x64.zip
   Krill\krill-app.exe  krill.exe  krilld.exe  krill-holder.exe  [krill-link.exe]
   Krill\conpty.dll               ConPTY B안: holder가 자기 exe 옆에서 로드
   Krill\x64\OpenConsole.exe      conpty.dll이 <dll 폴더>\x64\OpenConsole.exe를 띄운다
+  Krill\arm64\OpenConsole.exe    ARM64 PC에서 conpty.dll이 띄운다(OS 네이티브 아키텍처 폴더를 고른다)
   Krill\THIRD_PARTY_NOTICES.txt  ConPTY MIT 고지
 ```
 
@@ -33,9 +34,10 @@ Windows 사용자 프로필·`LOCALAPPDATA`가 길어 AF_UNIX 경로 한도를 �
 | nupkg SHA-256 | `02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee` |
 | `runtimes\win-x64\native\conpty.dll` SHA-256 | `feeef341d891643c62d30b6b07800bc70f0bc148f44cb8c3bee84aa557ae805a` |
 | `build\native\runtimes\x64\OpenConsole.exe` SHA-256 | `3d66b23d0a71bb8eed2b77edc8b9df9bf54ce6c8fb74c863a30e760997f80586` |
+| `build\native\runtimes\arm64\OpenConsole.exe` SHA-256 | `4313825a3ba634d113cc6ed3bc8ce735e3c19d360cecd985794787479469f91f` |
 
 nupkg는 zip이다. `tar -xf conpty.nupkg -C <폴더>`로 풀고 그 폴더를 `-ConptyDir`로 준다.
-`bundle.ps1`은 두 파일의 해시가 위 값과 다르면 묶지 않는다. 버전을 올릴 때는 이 표와 `bundle.ps1`의 `$ConptyPins`를 함께 바꾼다.
+`bundle.ps1`은 세 파일의 해시가 위 값과 다르면 묶지 않는다. 버전을 올릴 때는 이 표와 `bundle.ps1`의 `$ConptyPins`를 함께 바꾼다.
 
 ## 묶기 (Windows, PowerShell)
 
@@ -99,7 +101,7 @@ irm https://krill.page/install.ps1 | iex
 ```
 
 인자 없이 실행하면 최신 릴리스의 x64 ZIP과 SHA-256을 내려받고 검증한 뒤 설치하며,
-시작 메뉴·사용자 PATH를 등록하고 앱을 연다. ARM64·32비트 Windows는 거부한다.
+시작 메뉴·사용자 PATH를 등록하고 앱을 연다. ARM64 PC는 Windows 11(빌드 22000 이상)의 x64 에뮬레이션으로 같은 x64 패키지를 설치하고, Windows 10 on ARM·32비트 Windows는 거부한다.
 `-Release v<버전>`으로 버전을 선택하고 `-NoOpen`으로 자동 실행을 생략할 수 있다.
 홈페이지 Worker는 이 디렉터리의 `install.ps1` 원본을 직접 번들한다.
 

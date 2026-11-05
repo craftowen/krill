@@ -34,7 +34,8 @@ try {
     $env:PROCESSOR_ARCHITEW6432 = ''
     $env:LOCALAPPDATA = $root
     New-Item -ItemType Directory -Path (Join-Path $root 'source/Krill/x64') -Force | Out-Null
-    foreach ($name in @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64/OpenConsole.exe')) {
+    New-Item -ItemType Directory -Path (Join-Path $root 'source/Krill/arm64') -Force | Out-Null
+    foreach ($name in @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64/OpenConsole.exe', 'arm64/OpenConsole.exe')) {
         Set-Content -LiteralPath (Join-Path $root "source/Krill/$name") -Value 'fixture'
     }
     $state.Fixture = Join-Path $root 'fixture.zip'
@@ -105,21 +106,28 @@ namespace KrillTest {
     $script:testPrograms = Join-Path $root $unicode
     $source = [IO.File]::ReadAllText($installer)
     $source = $source.Replace("[Environment]::GetFolderPath('Programs')", '$script:testPrograms')
+    # Download mode adds Krill to PATH by default: read an empty user PATH and record the write
+    # instead of changing the real HKCU:\Environment.
+    function Set-KrillTestUserPath { $state.PathWritten = $true }
+    $source = $source.Replace("`$envKey = Get-Item 'HKCU:\Environment'", '$envKey = $null')
+    $source = $source.Replace("[string]`$envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')", "''")
+    $source = $source.Replace("New-ItemProperty -Path 'HKCU:\Environment'", 'Set-KrillTestUserPath')
+    $source = $source.Replace("[Environment]::SetEnvironmentVariable('KRILL_PATH_REFRESH', `$null, 'User')", '$null')
+    Assert (-not $source.Contains('HKCU:') -and -not $source.Contains('KRILL_PATH_REFRESH')) 'User PATH mock was not applied'
+    $savedPath = $env:Path
     $isolatedInstaller = [scriptblock]::Create($source)
     & $isolatedInstaller -Dest $unicodeDest -NoOpen | Out-Null
     $menuLink = Join-Path $script:testPrograms 'Krill.lnk'
     Assert ([KrillTest.LinkReader]::Read($menuLink)[0] -eq $target) 'Installer shortcut target is wrong'
     & $isolatedInstaller -Dest $unicodeDest -NoOpen | Out-Null
     Assert ([KrillTest.LinkReader]::Read($menuLink)[0] -eq $target) 'Installer shortcut retry failed'
+    $env:Path = $savedPath
 
     # Make creation fail without touching the real Start Menu or user PATH.
     $script:testPrograms = Join-Path $root 'missing-programs'
     $state.PathWritten = $false
     $script:opened = $false
-    $savedPath = $env:Path
     function Start-Process { param($FilePath) $script:opened = ($FilePath -eq $target) }
-    $source = $source.Replace("[Environment]::GetEnvironmentVariable('Path', 'User')", '$null')
-    $source = $source.Replace("[Environment]::SetEnvironmentVariable('Path', ((@(`$path, `$Dest) | Where-Object { `$_ }) -join ';'), 'User')", '$state.PathWritten = $true')
     try {
         $warning = @(& ([scriptblock]::Create($source)) -Dest $unicodeDest -AddToPath 3>&1)
         Assert (@($warning | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count -gt 0) 'Shortcut failure did not warn'
@@ -139,7 +147,6 @@ namespace KrillTest {
     $state.Launched = ''
     function Start-Process { param($FilePath) $state.Launched = $FilePath }
     try {
-        Assert (-not $source.Contains("[Environment]::SetEnvironmentVariable('Path'")) 'User PATH mock was not applied'
         & { $source | Invoke-Expression } | Out-Null
         $iexTarget = Join-Path $env:LOCALAPPDATA 'Programs/Krill/krill-app.exe'
         Assert (Test-Path -LiteralPath $iexTarget) 'irm | iex did not install to Unicode LOCALAPPDATA'
@@ -187,8 +194,28 @@ namespace KrillTest {
     Reject 'untrusted-url' 'Unexpected release asset URL'
     $state.Assets = @($package, $shaAsset)
 
+    # ARM64 installs the x64 package on Windows 11 (emulation) and is refused on Windows 10 on ARM.
     $env:PROCESSOR_ARCHITECTURE = 'ARM64'
-    Reject 'wrong-arch' 'require an x64 PC'
+    if ([Environment]::OSVersion.Version.Build -ge 22000) {
+        Install (Join-Path $root 'arm64') @{ Zip = $state.Fixture }
+        Assert (Test-Path (Join-Path $root 'arm64/arm64/OpenConsole.exe')) 'ARM64 Windows 11 installation failed'
+        # conpty.dll picks the OS-native console host, so an x64-only package cannot run sessions on ARM64.
+        $console = Join-Path $root 'source/Krill/arm64/OpenConsole.exe'
+        Remove-Item -LiteralPath $console
+        $x64Only = Join-Path $root 'x64-only.zip'
+        Compress-Archive -Path (Join-Path $root 'source/Krill') -DestinationPath $x64Only
+        Set-Content -LiteralPath $console -Value 'fixture'
+        Reject 'arm64-x64-only' 'no ARM64 console host' @{ Zip = $x64Only }
+    } else {
+        Reject 'arm64-win10' 'requires Windows 11'
+    }
+    # 32-bit PowerShell reports x86 with the native architecture in PROCESSOR_ARCHITEW6432.
+    $env:PROCESSOR_ARCHITECTURE = 'x86'
+    $env:PROCESSOR_ARCHITEW6432 = 'AMD64'
+    Install (Join-Path $root 'wow64') @{ Zip = $state.Fixture }
+    Assert (Test-Path (Join-Path $root 'wow64/krill-app.exe')) '32-bit PowerShell on x64 installation failed'
+    $env:PROCESSOR_ARCHITEW6432 = ''
+    Reject 'wrong-arch' 'require an x64 PC or Windows 11 on ARM64'
     $env:PROCESSOR_ARCHITECTURE = 'AMD64'
     $env:OS = 'Other'
     Reject 'wrong-os' 'requires Windows'

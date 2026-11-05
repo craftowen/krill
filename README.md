@@ -221,7 +221,8 @@ The installer verifies the ZIP's SHA-256, installs under `%LOCALAPPDATA%\Program
 | **Mobile (iOS / Android)** | Companion web app (PWA) paired via QR code over Relay or Tailscale (ChaCha20-Poly1305 E2EE) | Scan QR from **Settings → Mobile** in the Mac app (no app-store binary) |
 | **macOS, Intel (`x86_64`)** | Not supported for this public preview | No supported release bundle or source-install promise |
 | **Linux** | Not supported for this public preview | No Linux desktop or downloadable remote-host package promised |
-| **Windows, ARM64 / 32-bit** | Not supported | No release package |
+| **Windows 11, ARM64** | Runs the `x64` package through Windows 11 x64 emulation; no native ARM64 build | Same Windows release ZIP and PowerShell installer |
+| **Windows 10 on ARM / 32-bit Windows** | Not supported | No release package |
 
 ---
 
