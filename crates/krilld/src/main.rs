@@ -127,7 +127,7 @@ fn main() -> ExitCode {
             }
         }
         Err(error) => {
-            tracing::error!(kind = ?error.kind(), "listener failed");
+            tracing::error!(kind = ?error.kind(), error = %error, "listener failed");
             krill_proto::error_reporting::capture(
                 krill_proto::error_reporting::Process::Daemon,
                 krill_proto::error_reporting::Code::DaemonListenerFailed,
