@@ -90,7 +90,22 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
             .is_some_and(|s| s == "install" || s == "uninstall");
     if !hook_run && !statusline_run {
         krill_log::init(krill_log::Component::Cli).ok();
-        tracing::info!("cli starting");
+        // 앱의 60초 `errors flush`, 에이전트의 `read` 폴링 같은 호출마다 줄을 남기면 5개 회전 파일이 몇 분 만에 밀려나
+        // 실제 진단이 사라진다(2026-11-05). 사람이 드물게 실행해 되짚을 가치가 있는 명령만 이름과 함께 남긴다.
+        if let Some(command) = [
+            "account",
+            "doctor",
+            "hook",
+            "import",
+            "mobile",
+            "statusline",
+            "update",
+        ]
+        .into_iter()
+        .find(|command| raw.first().is_some_and(|first| first == command))
+        {
+            tracing::info!(command, "cli starting");
+        }
         // Hook/statusline hot paths and isolated runtimes must not mutate the host's skills.
         if !cfg!(test)
             && daemon::state_dir_override().is_none()
