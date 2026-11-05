@@ -1299,9 +1299,29 @@ fn unconfirmed_replacement_retires_original_immediately_without_input() {
 // original still writing shows a lock prompt and opens nothing until the user presses r.
 #[test]
 fn codex_replacement_blocked_by_the_original_writer_takes_over_after_retirement() {
+    check_codex_writer_takeover(false);
+}
+
+// Measured with codex-cli 0.166.0: first output at about 15 ms, lock prompt at about 410 ms. The
+// output gate retires the original first, so the prompt can appear only after retirement began.
+#[test]
+fn codex_lock_prompt_painted_after_retirement_still_gets_the_retry_key() {
+    check_codex_writer_takeover(true);
+}
+
+#[expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::too_many_lines,
+    reason = "test fixture setup requires valid local sockets and files"
+)]
+fn check_codex_writer_takeover(prompt_after_terminate: bool) {
     use std::io::Read as _;
 
-    let root = Path::new("/tmp").join(format!("kas-writer-lock-{}", std::process::id()));
+    let root = Path::new("/tmp").join(format!(
+        "kas-writer-lock-{prompt_after_terminate}-{}",
+        std::process::id()
+    ));
     fs::remove_dir_all(&root).ok();
     let state = root.join("state");
     let home = root.join("home");
@@ -1421,10 +1441,14 @@ fn codex_replacement_blocked_by_the_original_writer_takes_over_after_retirement(
                 &[master.as_fd()],
             )
             .unwrap();
+        let prompt: &[u8] =
+            b"This conversation is open in another app\r\nClose it there and press R to continue here.\r\n";
         process
-            .write_all(
-                b"This conversation is open in another app\r\nClose it there and press R to continue here.\r\n",
-            )
+            .write_all(if prompt_after_terminate {
+                b"Resuming session"
+            } else {
+                prompt
+            })
             .unwrap();
         let packet = holder_link.recv().unwrap().unwrap();
         let ToHolder::Terminate { req, id: retired } = ToHolder::decode(packet.frame()).unwrap()
@@ -1436,6 +1460,9 @@ fn codex_replacement_blocked_by_the_original_writer_takes_over_after_retirement(
             .unwrap();
         lock(&hook_reg.state).exited.insert(retired, 0);
         drop(original_proc);
+        if prompt_after_terminate {
+            process.write_all(prompt).unwrap();
+        }
         process
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
