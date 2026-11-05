@@ -22,9 +22,8 @@ fn timed_out_login_probe_reaps_shell_and_stops_descendants() {
     )
     .unwrap();
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        super::login_path_with(shell.as_os_str(), std::time::Duration::from_millis(500)).is_none()
-    );
+    // 시한 안에 셸이 pid 파일을 써야 아래에서 읽을 수 있다. 부하 중에는 500ms로 모자랐다(2026-11-06).
+    assert!(super::login_path_with(shell.as_os_str(), std::time::Duration::from_secs(2)).is_none());
     let pids: Vec<_> = ["parent", "child"]
         .iter()
         .map(|name| {
