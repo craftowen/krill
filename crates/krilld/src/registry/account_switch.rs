@@ -28,6 +28,9 @@ const FILE: &str = "account-handoffs.json";
 const PREPARED_FILE: &str = "account-replacement.json";
 /// Codex shows this while another process holds the conversation's writer lock, then waits for `r`.
 const CODEX_WRITER_LOCKED: &str = "This conversation is open in another app";
+/// How long a retired original's Codex replacement may take to paint that prompt or open the
+/// conversation. Either outcome ends the wait early.
+const CODEX_LOCK_PROMPT_SETTLE: Duration = Duration::from_secs(2);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Prepared {
@@ -1462,7 +1465,6 @@ impl Registry {
         let mut ready = false;
         let mut confirmed_at = None;
         let mut next_identity_probe = Instant::now();
-        let mut blocked_by_original = false;
         while Instant::now() < deadline {
             if !self.account_selection_current(
                 old,
@@ -1527,24 +1529,11 @@ impl Registry {
                     self.agents
                         .bind_discovered_session(new, &sid, path.as_deref());
                     self.agents.observe_account_resume(new, &session_id);
-                } else if provider == ProviderKind::Codex
-                    && tap.screen_text_and_modes().0.contains(CODEX_WRITER_LOCKED)
-                    && identity::discover(provider, old_pid, old_fg)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|found| found.id == session_id)
-                {
-                    // Profiles share Codex's writer locks, so the replacement can never open
-                    // the conversation while the original runs. Seeing it wait on exactly the
-                    // original's lock is the strongest evidence available before retirement.
-                    blocked_by_original = true;
-                    ready = true;
-                    break;
                 }
             }
-            // Like Orca, swap as soon as the resumed agent is up. An idle Codex resume keeps no
-            // rollout open and Claude may skip its hook, so identity binds but never gates.
-            // The short preflight still catches immediate exits.
+            // Like Orca, swap as soon as the resumed agent is up. Codex cannot open the rollout
+            // while the original holds its writer lock and Claude may skip its hook, so identity
+            // binds but never gates. The short preflight still catches immediate exits.
             if tap.pulse().end > 0 {
                 if confirmed_at.get_or_insert_with(Instant::now).elapsed()
                     >= Duration::from_millis(150)
@@ -1652,22 +1641,36 @@ impl Registry {
             self.agents.finish_account_resume(new);
             return Err(Failure::Os(libc::ETIMEDOUT));
         }
-        if blocked_by_original {
-            tap.write_input(b"r", None).ok();
-            let deadline = Instant::now() + Duration::from_secs(15);
+        if provider == ProviderKind::Codex {
+            // Codex prints before it tries the writer lock, so this prompt can follow retirement
+            // and no pre-retirement check can see it. Held input stays withheld until the guard
+            // drops: it must not reach this prompt, where f forks and q exits.
+            let mut retried = false;
+            let mut deadline = Instant::now() + CODEX_LOCK_PROMPT_SETTLE;
             let took_over = loop {
-                if let Ok(Some(found)) =
-                    resume_identity(|| identity::discover(provider, new_pid, tap.foreground()))
+                let observed =
+                    resume_identity(|| identity::discover(provider, new_pid, tap.foreground()));
+                #[cfg(windows)]
+                let observed = match (observed, &codex_resume) {
+                    (Ok(None), Some(watch)) => watch.observe(new_pid, tap.foreground()),
+                    (observed, _) => observed,
+                };
+                if let Ok(Some(found)) = observed
                     && found.id == session_id
                 {
                     self.agents
                         .bind_discovered_session(new, &found.id, Some(&found.path));
                     break true;
                 }
-                if Instant::now() >= deadline || tap.pulse().closed {
-                    break false;
+                if !retried && tap.screen_text_and_modes().0.contains(CODEX_WRITER_LOCKED) {
+                    tap.write_input(b"r", None).ok();
+                    retried = true;
+                    deadline = Instant::now() + Duration::from_secs(15);
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                if Instant::now() >= deadline || tap.pulse().closed {
+                    break !retried;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             };
             if !took_over {
                 tracing::warn!(
