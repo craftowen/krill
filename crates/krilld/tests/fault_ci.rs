@@ -164,7 +164,8 @@ impl Rig {
         let dir = PathBuf::from(format!("/tmp/mk064-{tag}-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("run/k.sock");
+        // 앱이 KRILL_STATE_DIR에서 찾는 경로와 같아야 GUI가 이 데몬에 붙는다(krill_proto::daemon).
+        let sock = dir.join("run/krilld.sock");
         Self {
             dir,
             sock,
