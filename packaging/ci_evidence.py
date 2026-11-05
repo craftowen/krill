@@ -19,6 +19,7 @@ CHECKS = {
     "ci.yml": {"hygiene"},
     "ci-macos.yml": {"changes", "ci-macos", "clippy · nextest (macos-15)",
                      "packaging regressions (macos-15)"},
+    "ci-windows.yml": {"check (MSVC)", "nextest (MSVC)", "release app (fxc shaders)"},
     "release.yml": {"build-windows"},
 }
 REUSE_JOBS = {"ci.yml": "reuse-hygiene-ci", "ci-macos.yml": "reuse-macos-ci"}
