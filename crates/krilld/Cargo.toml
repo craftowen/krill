@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+build = "../../packaging/windows/resources.rs"
 
 [dependencies]
 same-file = { workspace = true }
@@ -55,6 +56,9 @@ ring = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix-openpty = { workspace = true }
+
+[build-dependencies]
+embed-resource = { workspace = true }
 
 [lints]
 workspace = true

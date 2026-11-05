@@ -3786,6 +3786,7 @@ dependencies = [
 name = "krill"
 version = "0.2.52"
 dependencies = [
+ "embed-resource",
  "krill-hosts",
  "krill-log",
  "krill-proto",
@@ -3846,6 +3847,7 @@ dependencies = [
 name = "krill-holder"
 version = "0.2.52"
 dependencies = [
+ "embed-resource",
  "krill-log",
  "krill-proto",
  "libc",
@@ -3870,6 +3872,7 @@ dependencies = [
 name = "krill-link"
 version = "0.2.52"
 dependencies = [
+ "embed-resource",
  "iroh",
  "krill-holder",
  "krill-log",
@@ -3931,6 +3934,7 @@ dependencies = [
  "cbc",
  "core-foundation 0.10.1",
  "crc32fast",
+ "embed-resource",
  "krill-holder",
  "krill-log",
  "krill-proto",
