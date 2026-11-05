@@ -819,6 +819,8 @@ impl Registry {
         account_id: &str,
         home: &Path,
     ) {
+        use krill_proto::control::AgentState;
+
         let peer = Peer {
             pid: None,
             scope: Scope::Full,
@@ -827,7 +829,13 @@ impl Registry {
             self.handoff_account(&peer, old, provider, account_id, home)
         }))
         .unwrap_or(Err(Failure::BadRequest));
-        if result == Err(Failure::Os(libc::EBUSY)) {
+        // A pending switch pauses the pane's input, so an agent waiting on its user can never get
+        // the answer and stop being busy. Fail instead; that releases the held answer.
+        let awaits_user = matches!(
+            self.status.get(old).state,
+            AgentState::Waiting | AgentState::Blocked
+        );
+        if result == Err(Failure::Os(libc::EBUSY)) && !awaits_user {
             let mut pending = lock(&self.account_work.pending);
             if !self.account_selection_current(old, provider, account_id, &pending) {
                 return;
@@ -862,6 +870,7 @@ impl Registry {
                                 Failure::Os(libc::EILSEQ) => "conversation transcript identity is mismatched or ambiguous".into(),
                                 Failure::Os(libc::EEXIST) => "selected profile contains a separate or conflicting conversation copy; reconcile its history before retrying".into(),
                                 Failure::Os(libc::ETIMEDOUT) => "conversation preparation or resume confirmation timed out; check that provider hooks are enabled before retrying".into(),
+                                Failure::Os(libc::EBUSY) => "the agent is waiting for your answer; answer it, then select the account again".into(),
                                 _ => error.to_string(),
                             };
                     if handoff.error.is_none() {

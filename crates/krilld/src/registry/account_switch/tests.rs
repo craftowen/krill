@@ -1476,6 +1476,50 @@ fn codex_replacement_blocked_by_the_original_writer_takes_over_after_retirement(
     fs::remove_dir_all(root).unwrap();
 }
 
+// The paused pane holds the user's answer, so waiting for it would never end: the hold is only
+// released once the handoff fails, and pending retries refuse automatic recovery.
+#[test]
+fn switch_of_a_session_waiting_for_the_user_releases_the_held_answer() {
+    use krill_proto::hook::{EventId, HookEvent, Input};
+
+    let root = std::env::temp_dir().join(format!("kas-await-user-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let session = SessionId(51);
+    let (reg, _process) = kept_fixture(&root, session);
+    let question = HookEvent {
+        id: EventId {
+            pid: 800,
+            unix_ns: 1,
+        },
+        ppid: 800,
+        agent: "claude".into(),
+        input: Input::Complete,
+        payload: br#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion"}"#.to_vec(),
+    };
+    reg.status.hook(&[(session, &question)]).unwrap();
+    lock(&reg.account_handoffs).insert(
+        session,
+        SessionHandoff {
+            from: session,
+            to: None,
+            account_id: "selected".into(),
+            error: None,
+        },
+    );
+    reg.process_account_handoff(session, ProviderKind::Claude, "selected", &root);
+    assert!(
+        lock(&reg.account_handoffs)[&session].error.is_some(),
+        "a held answer needs a failure to be released"
+    );
+    reg.recover_failed_account_input(session, "selected")
+        .unwrap();
+    assert!(load(Some(&root)).is_empty());
+    assert!(lock(&reg.state).sessions.contains_key(&session));
+    assert!(lock(&reg.state).closing.is_empty());
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn unmanaged_shell_skips_unidentifiable_daemon_agent_and_switches_open_transcript_agent() {
     use krill_proto::hook::{EventId, HookEvent, Input};
