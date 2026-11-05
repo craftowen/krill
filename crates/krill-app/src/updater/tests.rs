@@ -2037,6 +2037,69 @@ fn info_plist_zero_config_stages_and_loads_without_updater_toml() {
     server.join().ok();
 }
 
+/// The update button quits the app before the relauncher swaps anything. A failure
+/// before the swap must reopen the untouched app and leave a rollback the next launch
+/// explains, instead of silently leaving the user with no app.
+#[test]
+fn relauncher_failure_before_swap_reopens_the_app_and_records_why() {
+    let root = temp_dir("relaunch-strand");
+    let _guard = TempGuard(root.clone());
+    let app = root.join("Krill.app");
+    let state = root.join("state");
+    let reopened = root.join("reopened");
+    build_test_app_bundle(
+        &app,
+        "0.1.0",
+        &format!("touch '{}'", reopened.display()),
+        false,
+    );
+    fs::create_dir_all(&state).unwrap();
+    let (_kp, pk) = fresh_key();
+    fs::write(
+        state.join(CONFIG_FILE),
+        format!("public_key = \"{}\"\n", encode_hex(&pk)),
+    )
+    .unwrap();
+    // A previous update was confirmed; this attempt's payload is gone before the swap.
+    let healthy = Journal {
+        bundle: app.clone(),
+        from_version: "0.0.9".into(),
+        to_version: "0.1.0".into(),
+        health_timeout_ms: 1000,
+        stage: Stage::Healthy,
+    };
+    healthy.save(&state).unwrap();
+
+    let result = relaunch::run_relauncher_args(
+        [
+            app.to_string_lossy().as_ref(),
+            state.to_string_lossy().as_ref(),
+            "0.1.0",
+            "0.2.0",
+            "1000",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from),
+    );
+
+    assert!(result.is_err(), "{result:?}");
+    let journal = Journal::load(&state).unwrap().expect("journal");
+    assert_eq!(
+        (journal.from_version.as_str(), journal.to_version.as_str()),
+        ("0.1.0", "0.2.0")
+    );
+    assert!(
+        matches!(journal.stage, Stage::RolledBack { .. }),
+        "{journal:?}"
+    );
+    assert_eq!(bundle_short_version(&app).as_deref(), Some("0.1.0"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !reopened.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(reopened.exists(), "the old app must be reopened");
+}
+
 #[test]
 fn github_release_asset_url_parsing_and_gh_fallback() {
     assert_eq!(
