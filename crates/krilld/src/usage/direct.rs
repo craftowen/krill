@@ -304,10 +304,10 @@ fn profile_id(dir: &Path) -> String {
         .collect()
 }
 
-/// 실행 중인 Claude 세션이 statusline으로 방금 사용량을 남겼는가. 같은 값을 API로 또 받지 않는다.
+/// 이 프로필의 Claude 세션이 statusline으로 방금 사용량을 남겼는가. 같은 값을 API로 또 받지 않는다.
 fn live_fresh(provider: ProviderKind, dir: &Path) -> bool {
     provider == ProviderKind::Claude
-        && accounts::claude_statusline_usage(dir)
+        && accounts::claude_recorded_usage(dir)
             .and_then(|u| u.updated_at)
             .is_some_and(|at| {
                 SystemTime::now()
@@ -3447,8 +3447,8 @@ mod tests {
         let dir = home.join(".claude");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("statusline_cache.json"),
-            r#"{"five_hour":{"utilization":44,"resets_at":"2026-10-23T10:30:00.000Z"}}"#,
+            dir.join(krill_proto::statusline::CACHE_FILE),
+            r#"{"rate_limits":{"five_hour":{"used_percentage":44,"resets_at":"2026-10-23T10:30:00.000Z"}}}"#,
         )
         .unwrap();
         assert!(live_fresh(ProviderKind::Claude, &dir));

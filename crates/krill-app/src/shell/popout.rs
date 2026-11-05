@@ -855,24 +855,9 @@ fn has_provider_pill(
     }) && (remote || krill_app::accounts::installed::is_installed(cx, provider))
 }
 
-/// Codex banked reset 및 Claude 주간 세션·프로모션 리셋 크레딧 수. 미터가 아직 없으면 `None`.
-pub(in crate::shell) fn reset_credit_count(
-    snap: &AccountsSnapshot,
-    account: &AccountInfo,
-) -> Option<u64> {
-    snap.meters_for(&account.id)?
-        .meters
-        .iter()
-        .find(|m| m.key == krill_proto::usage::RESET_CREDITS_METER_KEY)?
-        .value
-        .as_deref()?
-        .parse::<u64>()
-        .ok()
-}
-
 /// 상태바 사용량 팝업의 "사용량 초기화" 행(Codex·Claude 2단계 확인).
 /// 1단계 행을 누르면 무장하고 메뉴가 닫히고, 다시 열면 안내·실행·취소 행이 보인다.
-/// 미터가 아직 조회되지 않았더라도(`None`) 소진 시점에 실시간 프로브·차감할 수 있게 활성화한다.
+/// 크레딧과 되돌릴 사용량을 확인한 뒤에만 활성화한다.
 fn append_reset_credit_rows(
     mut menu: PopupMenu,
     snap: &AccountsSnapshot,
@@ -888,9 +873,12 @@ fn append_reset_credit_rows(
     let Some(account) = active.filter(|a| !krill_app::accounts::orca_managed(a)) else {
         return menu;
     };
-    let credits = reset_credit_count(snap, account);
+    let meters = snap.meters_for(&account.id);
+    let credits = krill_app::accounts::display::reset_credits(meters);
+    let available =
+        krill_app::accounts::display::reset_available(meters, krill_app::accounts::display::now());
     let account_id = account.id.clone();
-    let armed = reset_armed.is_some_and(|(p, id)| *p == provider && *id == account_id);
+    let armed = available && reset_armed.is_some_and(|(p, id)| *p == provider && *id == account_id);
     if armed {
         let (title, _) = krill_app::settings::account_heading(account);
         let info = provider_text::PROVIDER_RESET_USAGE_INFO.format(&[("account", &title)]);
@@ -952,9 +940,14 @@ fn append_reset_credit_rows(
                     .ok();
             }),
         );
-    } else if credits == Some(0) {
+    } else if !available {
+        let label = if credits == Some(0) {
+            provider_text::PROVIDER_RESET_USAGE_NONE.get()
+        } else {
+            provider_text::PROVIDER_RESET_USAGE.get()
+        };
         menu = menu.item(
-            PopupMenuItem::element(|_, cx| {
+            PopupMenuItem::element(move |_, cx| {
                 let p = ui::palette(cx);
                 div()
                     .id("status-provider-reset-usage")
@@ -963,7 +956,7 @@ fn append_reset_credit_rows(
                     .py_0p5()
                     .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
-                    .child(provider_text::PROVIDER_RESET_USAGE_NONE.get())
+                    .child(label)
             })
             .disabled(true),
         );
