@@ -152,6 +152,10 @@ def preflight(config):
     return public_key
 
 
+SESSION_ENV = ("KRILL_STATE_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "KRILL_CLI", "KRILL_ROOT_PATH",
+               "KRILL_WORKSPACE_NAME", "KRILL_WORKTREE_PATH")
+
+
 class Release:
     def __init__(self, config, state_dir):
         self.config = config
@@ -166,6 +170,10 @@ class Release:
         for key in ("KRILL_GCP_PROJECT", "KRILL_WIN_VM_DIR", "KRILL_PUBLISH_FORCE",
                     "KRILL_RELEASE_SIGNING_KEY", "KRILL_RELEASE_ASSET_DIR", "KRILL_PUBLISH_LOCKED",
                     "KRILL_PUBLICATION_AUDIT_DIR", "KRILL_MOBILE_CLOUD_DIR"):
+            self.env.pop(key, None)
+        # 세션에서 직접 돌리면 운영 Krill 상태 폴더와 실제 에이전트 설정 경로를 물려받는다. 검사·테스트가
+        # 그 경로에 쓰지 않게 CI와 같은 빈 환경으로 시작한다.
+        for key in SESSION_ENV:
             self.env.pop(key, None)
         # 전용 clone에는 저장소 밖 cloud/가 없다. 설치한 체크아웃의 모바일 PWA 배포 도구를 게시 가드에 넘긴다.
         if config.get("mobile_cloud"):

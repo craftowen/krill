@@ -218,8 +218,6 @@ fn cli_and_daemon_messages_are_english() {
         "krill-proto/src/usage/connections.rs",
         "krilld/src/usage/direct.rs",
         "krilld/src/mobile/gateway.rs",
-        "krilld/src/mobile/tunnel.rs",
-        "krilld/src/mobile/cloudflared.rs",
         "krilld/src/mobile/relay.rs",
     ] {
         scan(&crates.join(path), &mut failures);

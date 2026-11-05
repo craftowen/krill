@@ -315,7 +315,8 @@ if '--force' in sys.argv:
                 self.assertEqual((app / relative).read_bytes(), (unpacked / "Krill.app" / relative).read_bytes())
                 contents = subprocess.check_output(["/usr/bin/plutil", "-convert", "xml1", "-o", "-", str(app / relative)])
                 localized = plistlib.loads(contents)
-                self.assertEqual(set(localized), {"NSDocumentsFolderUsageDescription", "NSDesktopFolderUsageDescription", "NSDownloadsFolderUsageDescription"})
+                self.assertEqual(set(localized), {"NSDocumentsFolderUsageDescription", "NSDesktopFolderUsageDescription", "NSDownloadsFolderUsageDescription",
+                                                  "NSMicrophoneUsageDescription", "NSCameraUsageDescription", "NSAppleEventsUsageDescription"})
                 for key, value in localized.items():
                     self.assertTrue(value)
                     if language == "en":

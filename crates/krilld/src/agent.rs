@@ -929,8 +929,9 @@ pub(crate) fn pre_trust_workspace(profile: &Profile, cwd: &[u8], account: Option
 }
 
 /// 새 워크트리 생성 시 동의 플래그가 켜져 있으면 Claude·Codex·Cursor·Antigravity 모두에 신뢰를 등록한다(OWE-737).
-pub(crate) fn pre_trust_all_agents(cwd: &Path) {
-    let state_dir = krill_proto::daemon::state_dir();
+/// 동의는 워크트리를 만든 레지스트리의 상태 폴더에서 읽는다. 프로세스 환경의 `KRILL_STATE_DIR`는
+/// 같은 프로세스 안의 다른 레지스트리(테스트)에서는 운영 폴더일 수 있다.
+pub(crate) fn pre_trust_all_agents(state_dir: Option<&Path>, cwd: &Path) {
     let Some(home) = trust_home_for_runtime() else {
         return;
     };
@@ -941,7 +942,7 @@ pub(crate) fn pre_trust_all_agents(cwd: &Path) {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     pre_trust_all_agents_if_enabled(
-        state_dir.as_deref(),
+        state_dir,
         &home,
         claude_dir.as_deref(),
         codex_dir.as_deref(),

@@ -26,9 +26,9 @@ use crate::pair::{
     generate_invite_for_addr, read_pair_frame, write_pair_frame,
 };
 use crate::store::{
-    AllowedDevice, acquire_instance_lock, compact_endpoint_addr, load_allowed_node_set,
-    now_unix_ms, now_unix_secs, remove_device, sanitize_id_slug, upsert_device,
-    verify_and_consume_invite, write_atomic_0600, write_status_0600,
+    AllowedDevice, DEVICES_REL_PATH, acquire_instance_lock, compact_endpoint_addr,
+    load_allowed_node_set, now_unix_ms, now_unix_secs, remove_device, sanitize_id_slug,
+    upsert_device, verify_and_consume_invite, write_atomic_0600, write_status_0600,
 };
 use crate::{ALPN_LINK, ALPN_PAIR, Error};
 
@@ -356,6 +356,8 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
     let krilld_sock = opts.effective_krilld_socket().map_err(Error::Io)?;
     let cfg = LinkConfig::load(&state_dir)?;
     let identity = DeviceIdentity::load_or_create(&state_dir)?;
+    let devices_path = state_dir.join(DEVICES_REL_PATH);
+    let mut devices_stamp = fs::metadata(&devices_path).and_then(|m| m.modified()).ok();
     let initial_allowed = load_allowed_node_set(&state_dir)?;
     let allowed = Arc::new(RwLock::new(initial_allowed));
     let rate_limiter = opts
@@ -448,6 +450,13 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
             tokio::select! {
                 _ = &mut shutdown_rx => break,
                 _=tick.tick()=> {
+                    // Revocation must not depend on the control socket, which can be absent or unreachable.
+                    let stamp = fs::metadata(&devices_path).and_then(|m| m.modified()).ok();
+                    if stamp != devices_stamp
+                        && reload_allowlist(&state_loop, &allowed_loop, &peers_loop, &streams_loop).await.is_ok()
+                    {
+                        devices_stamp = stamp;
+                    }
                     streams_loop.sweep();
                     let statuses = streams_loop.statuses();
                     if saved_status.as_ref() != Some(&statuses)
@@ -621,6 +630,28 @@ async fn accept_ctl_optional(listener: Option<&Listener>) -> Option<Stream> {
     }
 }
 
+/// `devices.toml`을 다시 읽고, 빠진 기기의 스트림과 연결을 끊는다.
+async fn reload_allowlist(
+    state_dir: &Path,
+    allowed: &Arc<RwLock<BTreeSet<EndpointId>>>,
+    active_peers: &ActivePeersMap,
+    streams: &crate::resume::registry::Registry,
+) -> Result<(), Error> {
+    let fresh = load_allowed_node_set(state_dir)?;
+    let removed_ids: Vec<EndpointId> = allowed
+        .read()
+        .map(|old| old.difference(&fresh).copied().collect())
+        .unwrap_or_default();
+    if let Ok(mut set) = allowed.write() {
+        *set = fresh;
+    }
+    for id in removed_ids {
+        streams.revoke(id);
+        disconnect_peer(active_peers, id).await;
+    }
+    Ok(())
+}
+
 async fn handle_ctl_stream(
     mut stream: Stream,
     state_dir: &Path,
@@ -656,45 +687,24 @@ async fn handle_ctl_stream(
                     message: format!("revoked {peer_id}"),
                 }
             } else {
-                if let Ok(fresh) = load_allowed_node_set(state_dir) {
-                    let removed_ids: Vec<EndpointId> = allowed
-                        .read()
-                        .map(|old| old.difference(&fresh).copied().collect())
-                        .unwrap_or_default();
-                    if let Ok(mut set) = allowed.write() {
-                        *set = fresh;
-                    }
-                    for id in removed_ids {
-                        streams.revoke(id);
-                        disconnect_peer(active_peers, id).await;
-                    }
-                }
+                reload_allowlist(state_dir, allowed, active_peers, streams)
+                    .await
+                    .ok();
                 ControlResponse::Ok {
                     message: "reloaded allowlist".to_owned(),
                 }
             }
         }
-        ControlRequest::Reload => match load_allowed_node_set(state_dir) {
-            Ok(fresh) => {
-                let removed_ids: Vec<EndpointId> = allowed
-                    .read()
-                    .map(|old| old.difference(&fresh).copied().collect())
-                    .unwrap_or_default();
-                if let Ok(mut set) = allowed.write() {
-                    *set = fresh;
-                }
-                for id in removed_ids {
-                    streams.revoke(id);
-                    disconnect_peer(active_peers, id).await;
-                }
-                ControlResponse::Ok {
+        ControlRequest::Reload => {
+            match reload_allowlist(state_dir, allowed, active_peers, streams).await {
+                Ok(()) => ControlResponse::Ok {
                     message: "reloaded".to_owned(),
-                }
+                },
+                Err(e) => ControlResponse::Err {
+                    message: e.to_string(),
+                },
             }
-            Err(e) => ControlResponse::Err {
-                message: e.to_string(),
-            },
-        },
+        }
         ControlRequest::Status => {
             let allowed_count = allowed.read().map_or(0, |s| s.len());
             let active_count = active_peers.lock().await.len();

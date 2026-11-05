@@ -1,0 +1,26 @@
+# Weekly RustSec advisories and yanked crates. PR CI only warns (ci.yml) so an unrelated PR is not blocked
+# by a new advisory; this run and the release check.sh still fail on it. GitHub mails the owner on failure.
+name: advisories
+
+on:
+  schedule:
+    - cron: '17 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: cargo deny advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-deny
+      - name: Advisories
+        run: cargo deny --locked check --hide-inclusion-graph advisories

@@ -258,7 +258,7 @@ impl Shell {
                 } else {
                     description
                 };
-                let file_prefix = self.file_tab_prefix(pane, cx);
+                let file_prefix = self.file_tab_prefix(pane);
                 let rename_input = self
                     .tab_rename
                     .as_ref()
@@ -765,12 +765,13 @@ impl Shell {
 
     /// OWE-734: 탭 닫기 요청. 고정된 탭(`pinned`)이면 확인 모달을 띄우고, 아니면 바로 닫는다.
     pub(super) fn request_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.layout.tabs().len() {
+        let Some(tab) = self.layout.tabs().get(index) else {
             return;
-        }
+        };
+        let anchor = tab.focused;
         self.tab_context_menu = None;
         if self.layout.is_tab_pinned(index) {
-            self.confirm_close_tab = Some(index);
+            self.confirm_close_tab = Some(anchor);
             cx.notify();
             return;
         }
@@ -823,7 +824,10 @@ impl Shell {
             && self.tab_has_running(index, cx)
             && krill_app::settings::confirm_running_close(cx)
         {
-            self.pending_running_close = Some((PendingRunningClose::Tab(index), false));
+            self.pending_running_close = Some((
+                PendingRunningClose::Tab(self.layout.tabs()[index].focused),
+                false,
+            ));
             cx.notify();
             return;
         }
@@ -848,7 +852,10 @@ impl Shell {
             krill_app::settings::set_confirm_running_close(false, cx);
         }
         match pending {
-            PendingRunningClose::Tab(index) => self.do_close_tab(index, cx),
+            PendingRunningClose::Tab(anchor) => match self.layout.tab_of_pane(anchor) {
+                Some(index) => self.do_close_tab(index, cx),
+                None => cx.notify(),
+            },
             PendingRunningClose::Pane(pane) => self.do_close_pane(pane, cx),
         }
     }
@@ -861,10 +868,10 @@ impl Shell {
 
     /// OWE-734: 고정된 탭 닫기 확인 모달에서 '닫기'를 눌렀을 때 실제 탭을 닫는다.
     pub(super) fn confirm_close_pinned_tab(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.confirm_close_tab.take() else {
+        let Some(anchor) = self.confirm_close_tab.take() else {
             return;
         };
-        if index < self.layout.tabs().len() {
+        if let Some(index) = self.layout.tab_of_pane(anchor) {
             // 고정 탭 확인은 실행 중 세션도 포함한 한 번의 확인이다.
             self.do_close_tab(index, cx);
         } else {
@@ -977,6 +984,29 @@ impl Shell {
         self.pending_focus = PendingFocus::Workspace;
     }
 
+    /// 탭 메뉴를 닫고 메뉴를 연 탭의 지금 번호를 돌려준다. 그사이 탭이 사라졌으면 `None`.
+    fn take_tab_menu_target(&mut self, cx: &mut Context<Self>) -> Option<usize> {
+        let (anchor, _) = self.tab_context_menu.take()?;
+        let index = self.layout.tab_of_pane(anchor);
+        if index.is_none() {
+            cx.notify();
+        }
+        index
+    }
+
+    /// 닫힌 칸을 가리키는 탭 메뉴·닫기 확인을 비운다.
+    pub(super) fn forget_closed_tab_targets(&mut self) {
+        let layout = &self.layout;
+        self.confirm_close_tab = self.confirm_close_tab.filter(|p| layout.pane_exists(*p));
+        self.tab_context_menu = self
+            .tab_context_menu
+            .filter(|(p, _)| layout.pane_exists(*p));
+        self.pending_running_close = self.pending_running_close.filter(|(target, _)| {
+            let (PendingRunningClose::Tab(p) | PendingRunningClose::Pane(p)) = target;
+            layout.pane_exists(*p)
+        });
+    }
+
     /// OWE-734: 탭 우클릭 컨텍스트 메뉴를 연다.
     pub(super) fn open_tab_context_menu(
         &mut self,
@@ -984,8 +1014,8 @@ impl Shell {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if index < self.layout.tabs().len() {
-            self.tab_context_menu = Some((index, position));
+        if let Some(tab) = self.layout.tabs().get(index) {
+            self.tab_context_menu = Some((tab.focused, position));
             cx.notify();
         }
     }
@@ -1103,7 +1133,8 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Deferred> {
-        let (index, pos) = self.tab_context_menu?;
+        let (anchor, pos) = self.tab_context_menu?;
+        let index = self.layout.tab_of_pane(anchor)?;
         let tab = self.layout.tabs().get(index)?;
         let is_pinned = tab.pinned;
         let current_color = tab.color;
@@ -1217,7 +1248,9 @@ impl Shell {
                 .justify_center()
                 .child(div().w(px(8.)).h(px(1.)).bg(p.muted_foreground))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.tab_context_menu = None;
+                    let Some(index) = this.take_tab_menu_target(cx) else {
+                        return;
+                    };
                     this.change(true, cx, |l| {
                         l.set_tab_color(index, None);
                     });
@@ -1245,7 +1278,9 @@ impl Shell {
                         .border_color(if selected { p.foreground } else { p.popover })
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.tab_context_menu = None;
+                            let Some(index) = this.take_tab_menu_target(cx) else {
+                                return;
+                            };
                             this.change(true, cx, |l| {
                                 l.set_tab_color(index, Some(color));
                             });
@@ -1392,7 +1427,9 @@ impl Shell {
                         .child(ui::icons::svg_box(pin_svg, 13., p.popover_foreground))
                         .child(pin_label)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.tab_context_menu = None;
+                            let Some(index) = this.take_tab_menu_target(cx) else {
+                                return;
+                            };
                             this.change(true, cx, |l| {
                                 l.toggle_pin_tab(index);
                             });
@@ -1403,7 +1440,9 @@ impl Shell {
                 .child(
                     menu_item("tab-menu-rename", text::RENAME_TAB.get(), true, None).on_click(
                         cx.listener(move |this, _, window, cx| {
-                            this.tab_context_menu = None;
+                            let Some(index) = this.take_tab_menu_target(cx) else {
+                                return;
+                            };
                             this.begin_tab_rename(index, window, cx);
                         }),
                     ),
@@ -1416,7 +1455,9 @@ impl Shell {
                         krill_app::keys::shortcut_label(window, &super::CloseTab),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tab_context_menu = None;
+                        let Some(index) = this.take_tab_menu_target(cx) else {
+                            return;
+                        };
                         if !this.layout.is_tab_pinned(index) {
                             this.request_close_tab(index, cx);
                         }
@@ -1431,7 +1472,9 @@ impl Shell {
                     )
                     .when(has_closable_others, |d| {
                         d.on_click(cx.listener(move |this, _, _, cx| {
-                            this.tab_context_menu = None;
+                            let Some(index) = this.take_tab_menu_target(cx) else {
+                                return;
+                            };
                             this.close_other_tabs(index, cx);
                         }))
                     }),
@@ -1445,7 +1488,9 @@ impl Shell {
                     )
                     .when(has_closable_right, |d| {
                         d.on_click(cx.listener(move |this, _, _, cx| {
-                            this.tab_context_menu = None;
+                            let Some(index) = this.take_tab_menu_target(cx) else {
+                                return;
+                            };
                             this.close_tabs_to_right(index, cx);
                         }))
                     }),
@@ -1460,7 +1505,9 @@ impl Shell {
                     )
                     .when(has_closable_left, |d| {
                         d.on_click(cx.listener(move |this, _, _, cx| {
-                            this.tab_context_menu = None;
+                            let Some(index) = this.take_tab_menu_target(cx) else {
+                                return;
+                            };
                             this.close_tabs_to_left(index, cx);
                         }))
                     }),
@@ -1568,7 +1615,7 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Deferred> {
-        let index = self.confirm_close_tab?;
+        let index = self.layout.tab_of_pane(self.confirm_close_tab?)?;
         let tab = self.layout.tabs().get(index)?;
         let label = self.pane_label(tab.focused, cx);
         let p = ui::palette(cx);
@@ -1667,10 +1714,8 @@ impl Shell {
     pub(super) fn running_close_detail(&self, cx: &App) -> Option<String> {
         let (pending, _) = self.pending_running_close.as_ref()?;
         let (title, process) = match *pending {
-            PendingRunningClose::Tab(index) => {
-                if index >= self.layout.tabs().len() {
-                    return None;
-                }
+            PendingRunningClose::Tab(anchor) => {
+                let index = self.layout.tab_of_pane(anchor)?;
                 let process = self
                     .layout
                     .tab_panes(index)

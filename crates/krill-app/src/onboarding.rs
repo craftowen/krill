@@ -334,21 +334,6 @@ fn cli(krill: &Path, path: &OsStr, home: &Path) -> Cli {
         .map_or(Cli::Manual, |d| Cli::Offer(d.join("krill")))
 }
 
-/// hook 동의를 물을 에이전트: 설치돼 있고 MK-048 대상이며 아직 영수증이 없는 것.
-pub fn pending_hooks(s: &Survey, state: &Path) -> Vec<(Agent, String)> {
-    s.agents
-        .iter()
-        .filter(|a| a.exe.is_some())
-        .filter_map(|a| Agent::parse(&a.id).map(|agent| (agent, a.name.clone())))
-        .filter(|(agent, _)| {
-            !state
-                .join("hooks")
-                .join(format!("{}.json", agent.id()))
-                .exists()
-        })
-        .collect()
-}
-
 /// `krill hook install <agent> <flag>`. 에이전트 CLI(Codex app-server 등)를 찾도록 로그인 PATH를 넘긴다.
 fn mk_hook(krill: &Path, path: &OsStr, agent: Agent, flag: &str) -> Result<String, String> {
     if !krill.is_file() {

@@ -687,6 +687,12 @@ impl Layout {
         self.tabs.iter().any(|t| t.root.contains(pane))
     }
 
+    /// `pane`을 담은 탭의 현재 번호. 탭 번호는 앞 탭이 닫히면 당겨지므로 오래 들고 있는 UI 상태는 칸으로 기억한다.
+    #[must_use]
+    pub fn tab_of_pane(&self, pane: PaneId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.root.contains(pane))
+    }
+
     pub fn is_tab_pinned(&self, index: usize) -> bool {
         self.tabs.get(index).is_some_and(|t| t.pinned)
     }
@@ -1070,13 +1076,11 @@ impl Layout {
 
     fn is_untouched_startup_tab(
         &self,
-        index: usize,
         tab: &Tab,
         baseline: &Self,
         retained_panes: &BTreeSet<PaneId>,
-        retained_tabs: &BTreeSet<usize>,
     ) -> bool {
-        if !baseline.tabs.contains(tab) || retained_tabs.contains(&index) {
+        if !baseline.tabs.contains(tab) {
             return false;
         }
         let mut leaves = Vec::new();
@@ -1103,16 +1107,13 @@ impl Layout {
         baseline: &Self,
         edited: &Self,
         retained_panes: &BTreeSet<PaneId>,
-        retained_tabs: &BTreeSet<usize>,
     ) -> BTreeMap<usize, usize> {
         let saved_no_active = self.active >= self.tabs.len();
         let kept: Vec<(usize, &Tab)> = edited
             .tabs
             .iter()
             .enumerate()
-            .filter(|(idx, tab)| {
-                !edited.is_untouched_startup_tab(*idx, tab, baseline, retained_panes, retained_tabs)
-            })
+            .filter(|(_, tab)| !edited.is_untouched_startup_tab(tab, baseline, retained_panes))
             .collect();
         if !kept.is_empty() {
             let mut next_pane = edited.next_pane;
@@ -2146,12 +2147,7 @@ mod leaf_mru_tests {
         assert_eq!(file_pane, saved_file_pane);
 
         let mut merged = saved;
-        let map = merged.absorb_startup_edits(
-            &baseline,
-            &edited,
-            &BTreeSet::from([file_pane]),
-            &BTreeSet::new(),
-        );
+        let map = merged.absorb_startup_edits(&baseline, &edited, &BTreeSet::from([file_pane]));
         assert!(merged.is_valid());
         assert_eq!(map.get(&1).copied(), Some(2));
         assert_eq!(merged.file(file_pane), Some(Path::new("README.md")));

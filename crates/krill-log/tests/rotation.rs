@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use krill_log::{Component, FILE_BYTES, RECORD_BYTES, RollingLog, TOTAL_BYTES};
+use krill_log::{Component, FILE_BYTES, LOCK_WAIT, RECORD_BYTES, RollingLog, TOTAL_BYTES};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -67,7 +67,7 @@ fn rotates_before_limit_and_retains_latest_after_restart() -> io::Result<()> {
 }
 
 #[test]
-fn lock_contention_drops_event_and_recovers() -> io::Result<()> {
+fn lock_contention_waits_for_the_writer_and_drops_only_a_stuck_one() -> io::Result<()> {
     let dir = Directory::new()?;
     let log = RollingLog::open(&dir.0, Component::Cli)?;
     let lock = File::options()
@@ -77,9 +77,38 @@ fn lock_contention_drops_event_and_recovers() -> io::Result<()> {
     lock.lock()?;
     log.append("dropped")?;
     assert_eq!(total(&dir)?, 0);
-    lock.unlock()?;
-    log.append("recovered")?;
-    assert_eq!(fs::read_to_string(dir.0.join("krill.log"))?, "recovered\n");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(LOCK_WAIT / 5);
+        lock.unlock()
+    });
+    log.append("waited")?;
+    release.join().unwrap()?;
+    assert_eq!(fs::read_to_string(dir.0.join("krill.log"))?, "waited\n");
+    Ok(())
+}
+
+#[test]
+fn concurrent_threads_in_one_process_keep_every_event() -> io::Result<()> {
+    let dir = Directory::new()?;
+    let writers: Vec<_> = (0..4)
+        .map(|thread| {
+            let path = dir.0.clone();
+            std::thread::spawn(move || -> io::Result<()> {
+                let log = RollingLog::open(path, Component::App)?;
+                for line in 0..500 {
+                    log.append(&format!("thread {thread} line {line}"))?;
+                }
+                Ok(())
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap()?;
+    }
+    let lines = fs::read_to_string(dir.0.join("krill-app.log"))?
+        .lines()
+        .count();
+    assert_eq!(lines, 4 * 500);
     Ok(())
 }
 

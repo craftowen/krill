@@ -787,3 +787,80 @@ fn completed_and_unheld_failed_account_handoffs_do_not_pin_closed_tabs(cx: &mut 
         assert!(s.layout.pane_exists(pane_100));
     });
 }
+
+/// 2026-11-03 실사용: 앱이 꺼진 동안 닫힌 세션(묘비)의 칸이 layout.bin에 남아 시작마다 복원에 실패했다.
+/// 데몬 증거가 오기 전에는 칸을 지키고, 묘비를 본 뒤에는 거둔 결과가 디스크에 남아 다음 시작에 돌아오지 않는다.
+#[gpui::test]
+fn tombstoned_session_tab_is_pruned_and_does_not_return_on_next_start(cx: &mut TestAppContext) {
+    use krill_proto::control::{Reply, Request};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::time::Duration;
+
+    let root = PathBuf::from(format!("/tmp/kr-ipc-restart-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let sock = root.join("local.sock");
+    let (_reg, guard) = spawn_ipc_registry_server(&root.join("state"), &sock);
+    let launch = Create {
+        account: None,
+        program: Program::Login,
+        cwd: root.as_os_str().as_bytes().to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+    let create = || match daemon_control_rpc(&sock, &Request::Create(launch.clone())) {
+        Reply::Created { session, .. } => session,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let live = create();
+    let closed = create();
+
+    let path = state_path("tombstone-restart");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut saved = Layout::default();
+    saved.set_launch(saved.active_tab().focused, launch.clone());
+    saved.set_session(saved.active_tab().focused, live);
+    saved.new_tab();
+    saved.set_launch(saved.active_tab().focused, launch.clone());
+    saved.set_session(saved.active_tab().focused, closed);
+    saved.activate(0);
+    saved.save(&path).unwrap();
+    assert_eq!(
+        daemon_control_rpc(&sock, &Request::Close { session: closed }),
+        Reply::Closed
+    );
+
+    let (view, cx) = open(cx, path.clone());
+    view.read_with(cx, |s, _| {
+        assert_eq!(
+            s.layout.sessions_for_host(&HostId::Local),
+            vec![live, closed],
+            "without daemon evidence the tab must stay (the daemon may be restarting)"
+        );
+    });
+    view.update(cx, |s, cx| {
+        let target = krill_app::hosts::HostTarget::local(Paths {
+            socket: sock.clone(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(sidebar::status_source(target), cx);
+        });
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    cx.executor().advance_clock(Duration::from_millis(2500));
+    let layout = layout_of(&view, cx);
+    assert_eq!(layout.sessions_for_host(&HostId::Local), vec![live]);
+    assert_eq!(
+        Layout::load(&path)
+            .unwrap()
+            .sessions_for_host(&HostId::Local),
+        vec![live],
+        "the next start must not try to restore the tombstoned session again"
+    );
+
+    drop(view);
+    drop(guard);
+    std::fs::remove_dir_all(root).ok();
+}

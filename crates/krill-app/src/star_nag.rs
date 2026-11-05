@@ -21,7 +21,6 @@ use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::catalog::star_nag as text;
-use crate::onboarding::state::atomic_write_0600;
 
 /// 상태 파일 이름(상태 디렉터리 바로 아래).
 pub const FILE: &str = "star-nag.toml";
@@ -126,7 +125,7 @@ pub fn load(dir: &Path) -> State {
 /// 원자 쓰기로 저장한다.
 pub fn save(dir: &Path, state: &State) -> std::io::Result<()> {
     let body = toml::to_string(state).map_err(std::io::Error::other)?;
-    atomic_write_0600(&dir.join(FILE), &body)
+    krill_proto::os::write_atomic_0600(&dir.join(FILE), body.as_bytes())
 }
 
 /// 카드 및 버튼의 GitHub 별 동작 방식.
@@ -728,18 +727,6 @@ pub fn dismiss_on_escape(cx: &mut App) -> bool {
     } else {
         false
     }
-}
-
-/// 영구 완료 처리(별 성공·이미 별을 준 상태).
-pub fn never(cx: &mut App) {
-    update(cx, |nag| {
-        nag.state.complete();
-        nag.card = Card::Hidden;
-    });
-    crate::telemetry::record_star_prompt(
-        krill_proto::telemetry::UsageName::StarPromptDismissed,
-        cx,
-    );
 }
 
 /// 카드의 주 버튼 동작:

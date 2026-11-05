@@ -1,4 +1,5 @@
-# Repository hygiene only. Product builds run on macOS ARM and Windows.
+# Repository hygiene: non-Cargo regressions, public surface, fmt, dependency policy and notices.
+# Product builds run on macOS ARM and Windows. Advisories block weekly (advisories.yml) and in check.sh.
 name: ci
 
 on:
@@ -62,6 +63,25 @@ jobs:
           node-version: '>=22.13.0 <23'
       - name: Non-Cargo regressions
         run: python3 scripts/check-regressions.py
+
+      - name: Rust 1.98 + rustfmt
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.98"
+          components: rustfmt
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-deny
+      # deny.toml fixes the target graph to macOS ARM and Windows MSVC, so the Linux result is the same.
+      - name: fmt, dependency policy and notices
+        run: |
+          cargo fmt --all --check
+          cargo deny --locked check --hide-inclusion-graph bans licenses sources
+          python3 docs/licensing/generate_notices.py --check
+      # A new advisory or yanked crate must not fail an unrelated PR; it still shows here as a warning.
+      - name: Advisories (warning only)
+        continue-on-error: true
+        run: cargo deny --locked check --hide-inclusion-graph advisories
 
       - name: Public surface and reachable history
         run: |

@@ -91,18 +91,24 @@ impl Runtime {
             cleanup_orphan_temps(&path, &pids);
         }
         let mut bytes = Vec::new();
-        let Ok(file) = std::fs::File::open(path) else {
+        let Ok(file) = std::fs::File::open(&path) else {
             return Self::default();
         };
         if file
             .take(MAX_FILE_BYTES.saturating_add(1))
             .read_to_end(&mut bytes)
             .is_err()
-            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE_BYTES
         {
             return Self::default();
         }
-        let mut value: Self = serde_json::from_slice(&bytes).unwrap_or_default();
+        let parsed = (u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_FILE_BYTES)
+            .then(|| serde_json::from_slice::<Self>(&bytes).ok())
+            .flatten();
+        let Some(mut value) = parsed else {
+            // The next save replaces the file; keep the unreadable original for diagnosis.
+            std::fs::rename(&path, path.with_extension("json.corrupt")).ok();
+            return Self::default();
+        };
         while value.samples.len() > MAX_ACCOUNTS {
             value.samples.pop_last();
         }
@@ -396,6 +402,22 @@ mod tests {
         assert!(runtime().save(&root, Some(&root)).is_err());
         assert!(destination.is_dir());
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_state_is_preserved_before_defaults_overwrite_it() {
+        let root = std::env::temp_dir().join(format!("policy-corrupt-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let file = path(&root, Some(&root));
+        std::fs::write(&file, b"{\"cooldowns\":").unwrap();
+        assert_eq!(Runtime::load(&root, Some(&root)), Runtime::default());
+        runtime().save(&root, Some(&root)).unwrap();
+        assert_eq!(
+            std::fs::read(file.with_extension("json.corrupt")).unwrap(),
+            b"{\"cooldowns\":"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

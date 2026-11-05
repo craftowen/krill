@@ -412,7 +412,6 @@ impl SettingsView {
         if mode == ConnectMode::Tunnel
             && self.mobile.account.required
             && self.mobile.account.email.is_none()
-            && address.as_deref().is_none_or(|raw| !raw.contains('@'))
         {
             self.mobile.mode = mode;
             self.mobile.address = address;

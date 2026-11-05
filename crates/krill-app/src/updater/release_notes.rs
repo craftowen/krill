@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use super::{Error, fetch_bytes};
 use crate::i18n::Language;
-use crate::onboarding::state::atomic_write_0600;
 
 const API_URL: &str = "https://api.github.com/repos/craftowen/krill/releases?per_page=20";
 const COMMITS_URL: &str =
@@ -224,7 +223,7 @@ pub fn fetch(state_dir: &Path) -> Result<Vec<ReleaseNote>, Error> {
         apply_korean(&mut notes, &korean).ok();
     }
     if let Ok(body) = serde_json::to_string(&notes) {
-        atomic_write_0600(&state_dir.join(CACHE_FILE), &body).ok();
+        krill_proto::os::write_atomic_0600(&state_dir.join(CACHE_FILE), body.as_bytes()).ok();
     }
     Ok(notes)
 }

@@ -26,6 +26,8 @@ const MAX_HANDOFF_WORKERS: usize = 4;
 
 const FILE: &str = "account-handoffs.json";
 const PREPARED_FILE: &str = "account-replacement.json";
+/// Codex shows this while another process holds the conversation's writer lock, then waits for `r`.
+const CODEX_WRITER_LOCKED: &str = "This conversation is open in another app";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Prepared {
@@ -101,6 +103,8 @@ fn read_prepared(path: &Path) -> std::io::Result<Option<Prepared>> {
     Ok(Some(prepared))
 }
 
+/// Handoffs and replacement journals describe this registry's own sessions, so they live only in
+/// its own state folder; a registry without a folder keeps no records.
 pub(super) fn load(dir: Option<&Path>) -> BTreeMap<SessionId, SessionHandoff> {
     dir.and_then(|d| std::fs::read(d.join(FILE)).ok())
         .and_then(|raw| serde_json::from_slice::<Vec<SessionHandoff>>(&raw).ok())
@@ -671,7 +675,7 @@ impl Registry {
         &self,
         handoffs: &BTreeMap<SessionId, SessionHandoff>,
     ) -> std::io::Result<()> {
-        let Some(dir) = self.state_dir() else {
+        let Some(dir) = self.dir.as_deref() else {
             return Ok(());
         };
         let handoffs: Vec<_> = handoffs.values().collect();
@@ -990,10 +994,10 @@ impl Registry {
 
     fn recover_prepared_account(&self) -> RecoveryFence {
         let mut fence = RecoveryFence::default();
-        let Some(dir) = self.state_dir() else {
+        let Some(dir) = self.dir.as_deref() else {
             return fence;
         };
-        let paths = match prepared_paths(&dir) {
+        let paths = match prepared_paths(dir) {
             Ok(paths) => paths,
             Err(error) => {
                 tracing::warn!(kind = ?error.kind(), "replacement inventory is incomplete; retries withheld");
@@ -1019,10 +1023,10 @@ impl Registry {
     }
 
     fn ensure_no_unresolved_account_replacement(&self, session: SessionId) -> Result<(), Failure> {
-        let Some(dir) = self.state_dir() else {
+        let Some(dir) = self.dir.as_deref() else {
             return Ok(());
         };
-        let paths = prepared_paths(&dir).map_err(|_| Failure::BadRequest)?;
+        let paths = prepared_paths(dir).map_err(|_| Failure::BadRequest)?;
         for path in paths {
             if let Some(prepared) = read_prepared(&path).map_err(|_| Failure::BadRequest)?
                 && (prepared.from == session || prepared.to == session)
@@ -1430,7 +1434,7 @@ impl Registry {
                 applied,
             )
             .map_err(|e| prepare_failure(old, "replacement_identity", &e))?;
-        if let Some(dir) = state_dir.as_deref() {
+        if let Some(dir) = self.dir.as_deref() {
             let raw = serde_json::to_vec(&Prepared {
                 from: old,
                 to: new,
@@ -1458,6 +1462,7 @@ impl Registry {
         let mut ready = false;
         let mut confirmed_at = None;
         let mut next_identity_probe = Instant::now();
+        let mut blocked_by_original = false;
         while Instant::now() < deadline {
             if !self.account_selection_current(
                 old,
@@ -1522,6 +1527,19 @@ impl Registry {
                     self.agents
                         .bind_discovered_session(new, &sid, path.as_deref());
                     self.agents.observe_account_resume(new, &session_id);
+                } else if provider == ProviderKind::Codex
+                    && tap.screen_text_and_modes().0.contains(CODEX_WRITER_LOCKED)
+                    && identity::discover(provider, old_pid, old_fg)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|found| found.id == session_id)
+                {
+                    // Profiles share Codex's writer locks, so the replacement can never open
+                    // the conversation while the original runs. Seeing it wait on exactly the
+                    // original's lock is the strongest evidence available before retirement.
+                    blocked_by_original = true;
+                    ready = true;
+                    break;
                 }
             }
             // Like Orca, swap as soon as the resumed agent is up. An idle Codex resume keeps no
@@ -1634,6 +1652,31 @@ impl Registry {
             self.agents.finish_account_resume(new);
             return Err(Failure::Os(libc::ETIMEDOUT));
         }
+        if blocked_by_original {
+            tap.write_input(b"r", None).ok();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let took_over = loop {
+                if let Ok(Some(found)) =
+                    resume_identity(|| identity::discover(provider, new_pid, tap.foreground()))
+                    && found.id == session_id
+                {
+                    self.agents
+                        .bind_discovered_session(new, &found.id, Some(&found.path));
+                    break true;
+                }
+                if Instant::now() >= deadline || tap.pulse().closed {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            if !took_over {
+                tracing::warn!(
+                    original = old.0,
+                    replacement = new.0,
+                    "codex replacement did not reopen the conversation after the original released it"
+                );
+            }
+        }
         // Clients now reconnect and deliver their held prompts. A synthetic continuation
         // could overtake input still in an app journal, so only actual user input is sent.
         self.agents.take_rate_limited(old);
@@ -1730,8 +1773,8 @@ impl Drop for Replacement<'_> {
                 .contains_key(&self.session);
             registered && self.registry.stop_account_replacement(self.session)
         };
-        if resolved && let Some(dir) = self.registry.state_dir() {
-            std::fs::remove_file(replacement_journal(&dir, self.session)).ok();
+        if resolved && let Some(dir) = self.registry.dir.as_deref() {
+            std::fs::remove_file(replacement_journal(dir, self.session)).ok();
         }
     }
 }

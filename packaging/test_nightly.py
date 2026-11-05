@@ -138,6 +138,13 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("agent", args)
             self.assertEqual(json.loads((root / "dispatch.json").read_text())["terminal"], "test-terminal")
 
+    def test_release_commands_do_not_inherit_the_session_state_or_agent_config(self):
+        session = {key: "/Users/u/real" for key in ("KRILL_STATE_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+                                                     "KRILL_CLI", "KRILL_WORKTREE_PATH")}
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, session):
+            release = nightly.Release({"run_root": root, "target_dir": "/t", "key_file": "/k"}, Path(root))
+        self.assertEqual(set(session) & set(release.env), set())
+
     def test_patch_version_is_newer_than_both_workspace_and_latest_release(self):
         self.assertEqual(nightly.bump_version("0.1.2", "0.1.4"), "0.1.5")
         self.assertEqual(nightly.bump_version("0.2.0", "0.1.4"), "0.2.1")

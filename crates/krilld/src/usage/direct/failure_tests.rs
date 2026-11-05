@@ -2,8 +2,9 @@ use super::*;
 use std::sync::Arc;
 use tracing::{Event, Metadata, Subscriber, field::Visit, span};
 
+/// Captures events as `(level, " field=value" ...)` for log-volume assertions.
 #[derive(Clone, Default)]
-struct Events(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+pub(crate) struct Events(pub(crate) Arc<Mutex<Vec<(tracing::Level, String)>>>);
 
 impl Visit for Events {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {

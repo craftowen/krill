@@ -294,7 +294,8 @@ fn temporary_home_prevents_default_autostart_even_without_state_override() {
     }
 }
 
-/// 실제 HOME의 격리 상태 디렉터리는 자동 시작을 유지한다. plist 쓰기만 허용하고 launchctl은 막는다.
+/// 실제 HOME의 격리 상태 디렉터리도 페어링한 기기가 있으면 자동 시작을 유지하고, 없으면 등록된 잡을 내린다.
+/// plist 쓰기만 허용하고 launchctl은 막는다.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_home_keeps_default_autostart_for_custom_state_directory() {
@@ -302,13 +303,24 @@ fn real_home_keeps_default_autostart_for_custom_state_directory() {
     if std::env::var_os(CHILD).is_some() {
         let state = krill_link::resolve_state_dir(None).unwrap();
         let executable = std::path::Path::new(env!("CARGO_BIN_EXE_krill-link"));
-        krill_link::service::ensure_default_server(executable, &state).unwrap();
         let label = krill_link::link_label(Some(&state));
         let plist = krill_link::launch_agent_plist_path(&label).unwrap();
-        let xml = fs::read_to_string(plist).unwrap();
+        krill_link::service::ensure_default_server(executable, &state).unwrap();
+        assert!(!plist.exists(), "no paired device: nothing is registered");
+        let device = iroh::SecretKey::generate().public();
+        krill_link::upsert_device(&state, device, "phone", 1).unwrap();
+        krill_link::service::ensure_default_server(executable, &state).unwrap();
+        let xml = fs::read_to_string(&plist).unwrap();
         assert!(xml.contains("<key>KRILL_LINK_AGENT_PLIST</key>"));
         assert!(xml.contains("<key>RunAtLoad</key>\n\t<true/>"));
         assert!(xml.contains("<key>KeepAlive</key>\n\t<true/>"));
+        let devices = krill_link::load_devices(&state).unwrap();
+        krill_link::remove_device(&state, &devices[0].id).unwrap();
+        krill_link::service::ensure_default_server(executable, &state).unwrap();
+        assert!(
+            !plist.exists(),
+            "a job left from the old always-on default is retired"
+        );
         return;
     }
     let fixture = Fixture::new("real-home");

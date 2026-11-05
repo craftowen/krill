@@ -370,10 +370,10 @@ actions!(
 
 const MAX_NAV_HISTORY: usize = 50;
 
-/// OWE-872: 실행 중인 탭·칸 닫기 확인 대기 대상.
+/// OWE-872: 실행 중인 탭·칸 닫기 확인 대기 대상. 탭은 그 탭 안의 칸으로 기억한다(`Layout::tab_of_pane`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PendingRunningClose {
-    Tab(usize),
+    Tab(PaneId),
     Pane(PaneId),
 }
 
@@ -779,19 +779,16 @@ pub struct Shell {
     /// 상태바 포트 감지 메모(AS-24): 세션별 마지막 화면 텍스트와 감지 결과.
     /// 렌더마다 모든 칸의 화면 텍스트에 정규식을 돌리지 않고 텍스트가 바뀔 때만 다시 감지한다.
     ports_cache: std::cell::RefCell<HashMap<(krill_app::hosts::HostId, u64), popout::PortCache>>,
-    /// 인앱 설정 페이지(`SettingsView`, Orca `activeView === 'settings'` 패리티).
-    pub(super) settings: Option<gpui::Entity<krill_app::settings::SettingsView>>,
-    pub(super) artifacts: Option<gpui::Entity<krill_app::artifacts::View>>,
-    pub(super) automations: Option<gpui::Entity<krill_app::automations::View>>,
+    modal: Option<Modal>,
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
     pub(super) role: WindowRole,
     pending_focus: PendingFocus,
-    /// OWE-734: 탭 우클릭 컨텍스트 메뉴 `(탭 인덱스, 클릭 위치)`.
-    pub(super) tab_context_menu: Option<(usize, Point<Pixels>)>,
+    /// OWE-734: 탭 우클릭 컨텍스트 메뉴 `(탭 안의 칸, 클릭 위치)`.
+    pub(super) tab_context_menu: Option<(PaneId, Point<Pixels>)>,
     tab_menu_focus: FocusHandle,
     tab_menu_previous_focus: Option<FocusHandle>,
-    /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 인덱스.
-    pub(super) confirm_close_tab: Option<usize>,
+    /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 안의 칸.
+    pub(super) confirm_close_tab: Option<PaneId>,
     recent_tab_scroll: gpui::ScrollHandle,
     tab_dialog_focus: FocusHandle,
     tab_dialog_was_open: bool,
@@ -819,10 +816,26 @@ pub(super) enum WindowRole {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingFocus {
     None,
-    Settings,
-    Artifacts,
-    Automations,
+    Modal,
     Workspace,
+}
+
+/// The one large in-window modal. Mobile is `Settings` with its mobile page flag set.
+#[derive(Clone)]
+enum Modal {
+    Settings(gpui::Entity<krill_app::settings::SettingsView>),
+    Artifacts(gpui::Entity<krill_app::artifacts::View>),
+    Automations(gpui::Entity<krill_app::automations::View>),
+}
+
+impl Modal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Settings(v) => v.read(cx).focus_handle(),
+            Self::Artifacts(v) => v.read(cx).focus_handle(),
+            Self::Automations(v) => v.read(cx).focus_handle(),
+        }
+    }
 }
 
 impl Shell {
@@ -881,7 +894,7 @@ impl Shell {
                     }
                 });
             }
-            if let Some(settings) = &this.settings {
+            if let Some(settings) = this.settings() {
                 let identities = sidebar.read(cx).machine_identities();
                 let statuses = sidebar
                     .read(cx)
@@ -1181,10 +1194,6 @@ impl Shell {
                 return Some(false);
             }
             Some(entity.update(cx, |this, cx| match cmd {
-                krill_app::settings::HostCommand::Login { session } => {
-                    this.open_session(session, cx);
-                    true
-                }
                 krill_app::settings::HostCommand::Open { tab, window } => {
                     if window.is_some_and(|w| this.window != Some(w)) {
                         return false;
@@ -1202,7 +1211,7 @@ impl Shell {
                     true
                 }
                 krill_app::settings::HostCommand::Close { window, view } => {
-                    let Some(active_view) = &this.settings else {
+                    let Some(active_view) = this.settings() else {
                         return false;
                     };
                     if let Some(view_id) = view {
@@ -1350,9 +1359,7 @@ impl Shell {
             last_synced_selection: None,
             workspace_closing: std::collections::HashSet::new(),
             ports_cache: std::cell::RefCell::default(),
-            settings: None,
-            artifacts: None,
-            automations: None,
+            modal: None,
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,
             tab_context_menu: None,
@@ -1443,25 +1450,14 @@ impl Shell {
                 if let Some(rename) = &this.tab_rename {
                     retained_panes.insert(rename.pane);
                 }
-                let mut retained_tabs = std::collections::BTreeSet::new();
-                if let Some(idx) = this.confirm_close_tab {
-                    retained_tabs.insert(idx);
+                retained_panes.extend(this.confirm_close_tab);
+                retained_panes.extend(this.tab_context_menu.map(|(pane, _)| pane));
+                if let Some((PendingRunningClose::Tab(pane) | PendingRunningClose::Pane(pane), _)) =
+                    this.pending_running_close
+                {
+                    retained_panes.insert(pane);
                 }
-                if let Some((idx, _)) = this.tab_context_menu {
-                    retained_tabs.insert(idx);
-                }
-                match &this.pending_running_close {
-                    Some((PendingRunningClose::Tab(idx), _)) => {
-                        retained_tabs.insert(*idx);
-                    }
-                    Some((PendingRunningClose::Pane(pane), _)) => {
-                        retained_panes.insert(*pane);
-                    }
-                    None => {}
-                }
-                let edited_while_loading = this.layout != baseline
-                    || !retained_panes.is_empty()
-                    || !retained_tabs.is_empty();
+                let edited_while_loading = this.layout != baseline || !retained_panes.is_empty();
                 match loaded {
                     Ok(mut layout) => {
                         if let Some(bounds) = bounds {
@@ -1473,30 +1469,9 @@ impl Shell {
                         // 초기 칸 번호를 보존한 채 그 위에 합친다(ARCHITECTURE §4.1, APP-RUNTIME-004).
                         if edited_while_loading {
                             let edited = std::mem::replace(&mut this.layout, layout);
-                            let tab_map = this.layout.absorb_startup_edits(
-                                &baseline,
-                                &edited,
-                                &retained_panes,
-                                &retained_tabs,
-                            );
-                            this.confirm_close_tab = this
-                                .confirm_close_tab
-                                .and_then(|idx| tab_map.get(&idx).copied());
-                            this.tab_context_menu = this
-                                .tab_context_menu
-                                .and_then(|(idx, pos)| tab_map.get(&idx).map(|&new| (new, pos)));
-                            this.pending_running_close = this
-                                .pending_running_close
-                                .take()
-                                .and_then(|(target, dont_ask)| match target {
-                                    PendingRunningClose::Tab(idx) => tab_map
-                                        .get(&idx)
-                                        .map(|&new| (PendingRunningClose::Tab(new), dont_ask)),
-                                    PendingRunningClose::Pane(pane) => this
-                                        .layout
-                                        .pane_exists(pane)
-                                        .then_some((PendingRunningClose::Pane(pane), dont_ask)),
-                                });
+                            this.layout
+                                .absorb_startup_edits(&baseline, &edited, &retained_panes);
+                            this.forget_closed_tab_targets();
                             if this
                                 .tab_rename
                                 .as_ref()
@@ -1992,8 +1967,6 @@ impl Shell {
         self.jump = None;
         self.continue_session = None;
         self.dashboard = None;
-        self.artifacts = None;
-        self.automations = None;
         self.sync_sidebar_visibility(cx);
         self.files.close_quick_open();
         if self.search.take().is_some()
@@ -2001,9 +1974,8 @@ impl Shell {
         {
             l.pane.clear_search();
         }
-        let view = if let Some(existing) = &self.settings {
+        let view = if let Some(existing) = self.settings() {
             existing.update(cx, |v, cx| {
-                v.set_automations_page(false, cx);
                 v.set_tab(tab, cx);
                 v.set_mobile_page(mobile_page, cx);
             });
@@ -2018,7 +1990,7 @@ impl Shell {
                 krill_app::settings::SettingsView::sync_recording_paused(cx);
                 v
             });
-            self.settings = Some(created.clone());
+            self.replace_modal(Some(Modal::Settings(created.clone())), cx);
             created
         };
         self.sync_settings_account_hosts(cx);
@@ -2032,30 +2004,11 @@ impl Shell {
         view.update(cx, |view, cx| view.set_visible(visible, cx));
         self.nav_history.push(nav_entry);
         self.sync_focused_session(cx);
-        if let Some(window) = window {
+        if let Some(window) = &window {
             self.window = Some(window.window_handle());
-            let focus = view.read(cx).focus_handle();
-            window.focus(&focus, cx);
-            self.pending_focus = PendingFocus::None;
-        } else {
-            self.pending_focus = PendingFocus::Settings;
         }
+        self.focus_modal_or_workspace(window, cx);
         cx.notify();
-    }
-
-    /// 사이드바를 둔 채 본문에 자동화 페이지를 연다.
-    pub(super) fn open_automations_page(
-        &mut self,
-        window: Option<&mut Window>,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_automations(window, cx);
-    }
-
-    pub(super) fn automations_page_open(&self, cx: &App) -> bool {
-        self.settings
-            .as_ref()
-            .is_some_and(|s| s.read(cx).automations_page())
     }
 
     pub(super) fn open_mobile_page(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
@@ -2070,34 +2023,19 @@ impl Shell {
 
     /// 사이드바 'Krill 모바일' 페이지가 열려 있다.
     pub(super) fn mobile_page_open(&self, cx: &App) -> bool {
-        self.settings
-            .as_ref()
-            .is_some_and(|s| s.read(cx).mobile_page())
+        self.settings().is_some_and(|s| s.read(cx).mobile_page())
     }
 
     /// 인앱 설정 페이지를 닫고 터미널 워크스페이스로 돌아간다.
     pub(super) fn close_settings(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        let settings = self.settings.take();
-        if let Some(settings) = settings.clone() {
-            // Back/Escape can invoke this host while SettingsView itself is
-            // borrowed by its handler; stop hidden polling after that borrow ends.
-            cx.defer(move |cx| settings.update(cx, |view, cx| view.set_visible(false, cx)));
-        }
-        let artifacts = self.artifacts.take();
-        let automations = self.automations.take();
-        if settings.is_none() && artifacts.is_none() && automations.is_none() {
+        if !self.replace_modal(None, cx) {
             return;
         }
         self.record_workspace_nav(cx);
         self.sync_focused_session(cx);
         self.refresh_local_state(cx);
         self.files.refocus = true;
-        if let Some(window) = window {
-            window.focus(&self.focus, cx);
-            self.pending_focus = PendingFocus::None;
-        } else {
-            self.pending_focus = PendingFocus::Workspace;
-        }
+        self.focus_modal_or_workspace(window, cx);
         cx.notify();
     }
 
@@ -2111,25 +2049,7 @@ impl Shell {
         if !self.page_open() {
             self.files.refocus = true;
         }
-        if let Some(window) = window {
-            let focus = self
-                .settings
-                .as_ref()
-                .map(|s| s.read(cx).focus_handle())
-                .or_else(|| self.artifacts.as_ref().map(|a| a.read(cx).focus_handle()))
-                .or_else(|| self.automations.as_ref().map(|a| a.read(cx).focus_handle()))
-                .unwrap_or_else(|| self.focus.clone());
-            window.focus(&focus, cx);
-            self.pending_focus = PendingFocus::None;
-        } else if self.settings.is_some() {
-            self.pending_focus = PendingFocus::Settings;
-        } else if self.artifacts.is_some() {
-            self.pending_focus = PendingFocus::Artifacts;
-        } else if self.automations.is_some() {
-            self.pending_focus = PendingFocus::Automations;
-        } else {
-            self.pending_focus = PendingFocus::Workspace;
-        }
+        self.focus_modal_or_workspace(window, cx);
         cx.notify();
     }
 
@@ -2463,7 +2383,7 @@ impl Shell {
         if self.dashboard.is_some() {
             return;
         }
-        if let Some(settings) = self.settings.clone() {
+        if let Some(settings) = self.settings().cloned() {
             settings.update(cx, |v, cx| v.focus_search(window, cx));
             return;
         }
@@ -2554,7 +2474,6 @@ impl Shell {
                     this.daemon_task = None;
                     this.link = Link::connect_failure(&daemon::Error::Io(e));
                     krill_app::errors::daemon_connection_failed(cx);
-                    krill_app::orca_import::set_daemon_link_up(false, cx);
                     cx.notify();
                 }
             })
@@ -2595,13 +2514,14 @@ impl Shell {
             };
             // MK-062: 앱이 새 빌드면 구 krilld를 교체한다. 구 krilld가 끝나며 감시 연결이 EOF가 되고 아래 루프가 다시 붙는다.
             // 칸의 세션 생성·복원 요청과는 직렬화한다(교체 순간 끊긴 요청은 결과를 알 수 없다).
+            // 칸 복원 요청이 인계 중인 구 krilld에 가서 EOF로 끝나지 않게 교체가 끝난 뒤 링크를 올린다.
             let (t, h) = (target.clone(), hello.clone());
             bg.spawn(async move {
                 if let Err(error) = pane::upgrade_daemon(&t, &h) {
                     tracing::warn!(kind = ?error.kind(), "daemon upgrade failed");
                 }
             })
-            .detach();
+            .await;
             loop {
                 let t = target.clone();
                 let appearance = bg
@@ -2980,7 +2900,7 @@ impl Shell {
     }
 
     pub(super) fn sync_settings_account_hosts(&self, cx: &mut Context<Self>) {
-        let Some(settings) = &self.settings else {
+        let Some(settings) = self.settings() else {
             return;
         };
         let mut hosts: Vec<(
@@ -3199,7 +3119,7 @@ impl Shell {
         if self.terminal_theme != krill_app::ui::terminal_theme(cx) {
             self.push_appearance(cx);
         }
-        if let Some(settings) = &self.settings {
+        if let Some(settings) = self.settings() {
             let (selected_host, selected_snap) = {
                 let view = settings.read(cx);
                 (view.account_host().clone(), view.accounts().clone())
@@ -3281,9 +3201,7 @@ impl Shell {
             self.refresh_ssh_hosts(cx);
             return;
         }
-        let home = krill_app::orca_import::state(cx)
-            .and_then(|s| s.home_override.clone())
-            .unwrap_or_else(krill_app::accounts::default_home);
+        let home = krill_app::accounts::default_home();
         let dir = self.state_dir(cx);
         let Some(stamp) = self.account_read_stamp(&krill_app::hosts::HostId::Local) else {
             return;
@@ -3355,12 +3273,11 @@ impl Shell {
             }
         }
         self.link = link;
-        if let Some(settings) = &self.settings {
+        if let Some(settings) = self.settings() {
             settings.update(cx, |view, cx| {
                 view.sync_machine_local_status(self.machine_local_status(), cx);
             });
         }
-        krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
         if self.link == Link::Up {
             self.load_agents(None, cx);
@@ -3985,7 +3902,7 @@ impl Shell {
             .handoffs
             .iter()
             .any(|h| h.to.is_none() && h.error.is_none());
-        if let Some(settings) = &self.settings {
+        if let Some(settings) = self.settings() {
             let host_clone = host.clone();
             let snap_clone = snap.clone();
             settings.update(cx, |settings, cx| {
@@ -4417,6 +4334,8 @@ impl Shell {
         }
         let visible = self.layout.visible();
         self.restore_hidden_sessions(&visible, cx);
+        self.forget_closed_tab_targets();
+        self.prune_chat_sessions();
         let layout = &self.layout;
         let paste_queue = &self.paste_queue;
         self.creations.retain(|p, _| layout.pane_exists(*p));
@@ -6016,9 +5935,7 @@ impl Shell {
         let focused = self.layout.focused();
         let before = self.layout.clone();
         f(&mut self.layout);
-        if self.hold_dirty_close(&before, policy, cx) {
-            return;
-        }
+        self.forget_closed_file_tabs();
         self.cancel_closed_pastes(cx);
         if policy == close::Policy::Terminate {
             for index in 0..before.tabs().len() {
@@ -7783,9 +7700,7 @@ impl Render for Shell {
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
         // 플로팅 창 제목은 Floating::render가 소유하므로 건드리지 않는다.
         if self.role == WindowRole::Main {
-            if self.settings.is_some()
-                && !(self.mobile_page_open(cx) || self.automations_page_open(cx))
-            {
+            if self.settings().is_some() && !self.mobile_page_open(cx) {
                 window.set_window_title(krill_app::i18n::catalog::settings::TITLE.get());
             } else {
                 window.set_window_title(&self.main_window_title(cx));
@@ -7803,20 +7718,9 @@ impl Render for Shell {
         match std::mem::replace(&mut self.pending_focus, PendingFocus::None) {
             PendingFocus::None => {}
             PendingFocus::Workspace => window.focus(&self.focus, cx),
-            PendingFocus::Settings => {
-                if let Some(settings) = &self.settings {
-                    let focus = settings.read(cx).focus_handle();
-                    window.focus(&focus, cx);
-                }
-            }
-            PendingFocus::Artifacts => {
-                if let Some(artifacts) = &self.artifacts {
-                    window.focus(&artifacts.read(cx).focus_handle(), cx);
-                }
-            }
-            PendingFocus::Automations => {
-                if let Some(automations) = &self.automations {
-                    window.focus(&automations.read(cx).focus_handle(), cx);
+            PendingFocus::Modal => {
+                if let Some(modal) = &self.modal {
+                    window.focus(&modal.focus_handle(cx), cx);
                 }
             }
         }
@@ -7887,59 +7791,32 @@ impl Render for Shell {
         )
         .absolute()
         .size_full();
-        if let Some(settings) = &self.settings {
-            let visible = window.is_window_active()
-                && self.dashboard.is_none()
-                && self.artifacts.is_none()
-                && self.automations.is_none();
+        if let Some(settings) = self.settings() {
+            let visible = window.is_window_active() && self.dashboard.is_none();
             settings.update(cx, |view, cx| view.set_visible(visible, cx));
         }
         let resources_visible =
             window.is_window_active() && !self.page_open() && self.dashboard.is_none();
         self.resources
             .update(cx, |view, cx| view.set_visible(resources_visible, cx));
-        let sub_page = self.mobile_page_open(cx) || self.automations_page_open(cx);
-        let (settings_view, mobile_view) = if sub_page {
-            (None, self.settings.clone())
+        let root = if let Some(zoomed) = self.layout.zoomed_pane() {
+            Some(PaneTree::Leaf(zoomed))
         } else {
-            (self.settings.clone(), None)
+            self.layout.set_zoomed_pane(None);
+            self.layout
+                .tabs()
+                .get(self.layout.active())
+                .map(|t| t.root.clone())
         };
-        let artifacts_view = self.artifacts.clone();
-        let automations_view = self.automations.clone();
-        let surface_replaced = artifacts_view.is_some() || automations_view.is_some() || sub_page;
-        let tree = if surface_replaced {
-            None
-        } else {
-            let root = if let Some(zoomed) = self.layout.zoomed_pane() {
-                Some(PaneTree::Leaf(zoomed))
-            } else {
-                self.layout.set_zoomed_pane(None);
-                self.layout
-                    .tabs()
-                    .get(self.layout.active())
-                    .map(|t| t.root.clone())
-            };
-            Some(match root {
-                Some(r) => self.render_tree(&r, &mut Vec::new(), window, cx),
-                None => self.render_empty_workspace(cx),
-            })
+        let tree = match root {
+            Some(r) => self.render_tree(&r, &mut Vec::new(), window, cx),
+            None => self.render_empty_workspace(cx),
         };
-        let center_diff = if surface_replaced {
-            None
-        } else {
-            self.render_center_diff(window, cx)
-        };
-        let show_panel = !self.panel_collapsed
-            && artifacts_view.is_none()
-            && automations_view.is_none()
-            && !sub_page;
-        // Full pages need the same usable width as a minimum-size window. Hide
-        // the navigation rail temporarily rather than squeezing a QR/form into
-        // the terminal's much smaller minimum pane; keep saved preferences.
-        let show_sidebar = !self.sidebar_collapsed
-            && (!surface_replaced
-                || window.viewport_size().width
-                    >= px(self.layout.sidebar_width + layout::MIN_WINDOW_WIDTH) + DIVIDER_GRAB);
+        let center_diff = self.render_center_diff(window, cx);
+        let show_panel = !self.panel_collapsed;
+        let show_sidebar = !self.sidebar_collapsed;
+        // Shrink visible side columns to keep the center pane usable in a small
+        // window; saved preferred widths stay untouched.
         let (sidebar_width, panel_width) = fitted_column_widths(
             window.viewport_size().width,
             if show_sidebar {
@@ -7967,7 +7844,7 @@ impl Render for Shell {
                 cx.listener(|this, _: &krill_app::settings::OpenSettings, window, cx| {
                     // OWE-860: ⌘,는 설정 토글이다. 이미 열려 있으면 닫고(현재 탭 초기화 없음),
                     // 닫혀 있을 때만 일반 탭으로 연다.
-                    if this.settings.is_some() {
+                    if this.settings().is_some() {
                         this.close_settings(Some(&mut *window), cx);
                     } else {
                         this.open_settings(
@@ -8457,10 +8334,7 @@ impl Render for Shell {
                             .flex()
                             .flex_col()
                             .bg(bg)
-                            .when(
-                                artifacts_view.is_none() && automations_view.is_none() && !sub_page,
-                                |d| d.child(self.render_tab_bar(window, cx)),
-                            )
+                            .child(self.render_tab_bar(window, cx))
                             .child(
                                 div()
                                     .flex_1()
@@ -8471,10 +8345,7 @@ impl Render for Shell {
                                         self.terminal_theme,
                                         krill_app::settings::terminal_opacity_pct(cx),
                                     ))
-                                    .children(artifacts_view.clone())
-                                    .children(automations_view.clone())
-                                    .children(mobile_view)
-                                    .children(tree)
+                                    .child(tree)
                                     .children(center_diff)
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
                                     // 창 루트가 아니라 터미널 컨테이너 자식으로 그려 우측 패널
@@ -8504,7 +8375,34 @@ impl Render for Shell {
                     }),
             )
             .child(self.render_status_bar(window, cx))
-            .children(settings_view.map(|settings| {
+            .children(self.modal.clone().map(|modal| {
+                use krill_app::i18n::catalog;
+                let (backdrop_id, modal_id, label, view): (_, _, _, gpui::AnyView) = match modal {
+                    Modal::Settings(v) if v.read(cx).mobile_page() => (
+                        "admin-modal-backdrop",
+                        "admin-modal",
+                        catalog::sidebar::NAV_MOBILE.get(),
+                        v.into(),
+                    ),
+                    Modal::Settings(v) => (
+                        "admin-modal-backdrop",
+                        "admin-modal",
+                        catalog::settings::TITLE.get(),
+                        v.into(),
+                    ),
+                    Modal::Artifacts(v) => (
+                        "artifacts-modal-backdrop",
+                        "artifacts-modal",
+                        catalog::artifacts::TITLE.get(),
+                        v.into(),
+                    ),
+                    Modal::Automations(v) => (
+                        "automations-modal-backdrop",
+                        "automations-modal",
+                        catalog::sidebar::NAV_AUTOMATIONS.get(),
+                        v.into(),
+                    ),
+                };
                 let viewport = window.viewport_size();
                 let modal_w = (viewport.width - krill_app::ui::SPACE_4 * 4.)
                     .clamp(px(680.), px(1080.))
@@ -8515,8 +8413,8 @@ impl Render for Shell {
                 krill_app::ui::modal_backdrop(
                     viewport,
                     div()
-                        .id("admin-modal-backdrop")
-                        .debug_selector(|| "admin-modal-backdrop".into())
+                        .id(backdrop_id)
+                        .debug_selector(move || backdrop_id.into())
                         .size_full()
                         .flex()
                         .items_center()
@@ -8529,10 +8427,10 @@ impl Render for Shell {
                         )
                         .child(
                             div()
-                                .id("admin-modal")
-                                .debug_selector(|| "admin-modal".into())
+                                .id(modal_id)
+                                .debug_selector(move || modal_id.into())
                                 .role(gpui::Role::Dialog)
-                                .aria_label(krill_app::i18n::catalog::settings::TITLE.get())
+                                .aria_label(label)
                                 .occlude()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
@@ -8547,7 +8445,7 @@ impl Render for Shell {
                                 .overflow_hidden()
                                 .flex()
                                 .flex_col()
-                                .child(settings),
+                                .child(view),
                         ),
                 )
             }))

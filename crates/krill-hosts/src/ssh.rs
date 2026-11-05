@@ -167,17 +167,27 @@ impl SshOptions {
     /// 안정성용 기본 옵션(`ServerAliveInterval=15`, `ServerAliveCountMax=3`, `ConnectTimeout`)과
     /// 포트(`-p`)·키 파일(`-i`)을 조립하는 공통 argv 빌더.
     pub fn common_args(&self, connect_timeout_secs: u16) -> Vec<String> {
-        // 처음 보는 호스트 키는 기록하고 믿는다(연결 테스트와 같은 수준). 바뀐 키는 ssh가 그대로 거부한다.
-        let mut args = vec![
-            "-o".to_owned(),
-            "StrictHostKeyChecking=accept-new".to_owned(),
+        // 모든 호출이 비대화형이다: 비밀번호·ASKPASS 창을 띄우지 않고 바로 실패한다.
+        let mut args = vec!["-o".to_owned(), "BatchMode=yes".to_owned()];
+        // 사용자가 StrictHostKeyChecking을 정하지 않았을 때만 처음 보는 호스트 키를 기록하고 믿는다.
+        // 바뀐 키는 ssh가 그대로 거부한다.
+        if !effective_config(&self.destination, self.port)
+            .as_deref()
+            .is_some_and(user_sets_host_key_checking)
+        {
+            args.extend([
+                "-o".to_owned(),
+                "StrictHostKeyChecking=accept-new".to_owned(),
+            ]);
+        }
+        args.extend([
             "-o".to_owned(),
             "ServerAliveInterval=15".to_owned(),
             "-o".to_owned(),
             "ServerAliveCountMax=3".to_owned(),
             "-o".to_owned(),
             format!("ConnectTimeout={connect_timeout_secs}"),
-        ];
+        ]);
         if let Some(port) = self.port {
             args.push("-p".to_owned());
             args.push(port.to_string());
@@ -215,24 +225,14 @@ impl SshOptions {
     /// 원격 `$HOME`·소켓 번들 조회([`remote_query`])용 ssh 인자 목록.
     pub fn remote_home_args(&self) -> Vec<String> {
         let mut args = self.common_args(5);
-        args.extend([
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            self.destination.clone(),
-            remote_query(),
-        ]);
+        args.extend([self.destination.clone(), remote_query()]);
         args
     }
 
     /// 관리형 원격 프로브(OS·아키·홈·버전·소켓 번들, OWE-897)용 ssh 인자 목록.
     pub fn probe_args(&self) -> Vec<String> {
         let mut args = self.common_args(5);
-        args.extend([
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            self.destination.clone(),
-            crate::managed::probe_command(),
-        ]);
+        args.extend([self.destination.clone(), crate::managed::probe_command()]);
         args
     }
 
@@ -241,8 +241,6 @@ impl SshOptions {
     pub fn test_args(&self) -> Vec<String> {
         let mut args = self.common_args(4);
         args.extend([
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
             self.destination.clone(),
             "uname -sr && ([ -x \"$HOME/.local/bin/krill\" ] || command -v krill >/dev/null 2>&1) && echo 'krill: ready' || echo 'krill: not installed'".to_owned(),
         ]);
@@ -475,16 +473,16 @@ fn explicit_remote_socket(opts: &SshOptions) -> io::Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// [`machine_key`] 결과를 다시 쓰는 시간. 앱은 호스트 동기화마다(1초 주기) 호스트별로 부르므로, 캐시가 없으면 그때마다
+/// `ssh -G` 결과를 다시 쓰는 시간. 앱은 호스트 동기화마다(1초 주기) 호스트별로 부르므로, 캐시가 없으면 그때마다
 /// `ssh` 프로세스를 띄운다. `~/.ssh/config` 수정 시각이 바뀌면 기한 전이라도 다시 묻는다. `Include`된 파일이나
 /// `/etc/ssh/ssh_config` 변경은 최대 이 시간만큼 늦게 반영된다.
 const MACHINE_KEY_TTL: Duration = Duration::from_secs(60);
 
-type MachineKeyCacheKey = (OsString, String, Option<u16>);
-type MachineKeyCacheEntry = (Instant, Option<std::time::SystemTime>, String);
+type SshConfigCacheKey = (OsString, String, Option<u16>);
+type SshConfigCacheEntry = (Instant, Option<std::time::SystemTime>, Option<String>);
 
-static MACHINE_KEYS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::BTreeMap<MachineKeyCacheKey, MachineKeyCacheEntry>>,
+static SSH_CONFIGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<SshConfigCacheKey, SshConfigCacheEntry>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
 fn ssh_config_mtime() -> Option<std::time::SystemTime> {
@@ -494,38 +492,33 @@ fn ssh_config_mtime() -> Option<std::time::SystemTime> {
         .ok()
 }
 
-/// 접속 대상이 실제로 가리키는 기기(`user@hostname:port`, `ssh -G` 기준). `~/.ssh/config` 별칭과 IP로 따로 등록한
-/// 같은 기기를 하나로 묶는 데 쓴다. 네트워크에 붙지 않는다. `ssh -G`가 실패하면 입력을 그대로 쓴다.
+/// 접속 대상에 실제로 적용되는 설정(`ssh -G` 출력). 네트워크에 붙지 않는다. 실패하면 `None`.
 /// 결과는 [`MACHINE_KEY_TTL`] 동안 캐시한다.
-pub fn machine_key(destination: &str, port: Option<u16>) -> String {
+fn effective_config(destination: &str, port: Option<u16>) -> Option<String> {
     let key = (ssh_program(), destination.to_owned(), port);
     let mtime = ssh_config_mtime();
-    if let Ok(cache) = MACHINE_KEYS.lock()
+    if let Ok(cache) = SSH_CONFIGS.lock()
         && let Some((at, seen, value)) = cache.get(&key)
         && at.elapsed() < MACHINE_KEY_TTL
         && *seen == mtime
     {
         return value.clone();
     }
-    let value = machine_key_with_program(destination, port, &ssh_program());
-    if let Ok(mut cache) = MACHINE_KEYS.lock() {
+    let value = effective_config_with_program(destination, port, &ssh_program());
+    if let Ok(mut cache) = SSH_CONFIGS.lock() {
         cache.retain(|_, (at, _, _)| at.elapsed() < MACHINE_KEY_TTL);
         cache.insert(key, (Instant::now(), mtime, value.clone()));
     }
     value
 }
 
-fn machine_key_with_program(
+fn effective_config_with_program(
     destination: &str,
     port: Option<u16>,
     program: &std::ffi::OsStr,
-) -> String {
-    let fallback = || match port {
-        Some(p) => format!("{}:{p}", destination.to_ascii_lowercase()),
-        None => destination.to_ascii_lowercase(),
-    };
+) -> Option<String> {
     if !valid_host(destination) {
-        return fallback();
+        return None;
     }
     let mut args = vec!["-G".to_owned()];
     if let Some(p) = port {
@@ -538,11 +531,49 @@ fn machine_key_with_program(
     let out =
         crate::managed::run_piped_ssh_with_timeout(program, &args, None, Duration::from_secs(5));
     match out {
-        Ok(o) if o.status.success() => {
-            machine_key_from_config(&String::from_utf8_lossy(&o.stdout)).unwrap_or_else(fallback)
-        }
-        _ => fallback(),
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        _ => None,
     }
+}
+
+/// 접속 대상이 실제로 가리키는 기기(`user@hostname:port`, `ssh -G` 기준). `~/.ssh/config` 별칭과 IP로 따로 등록한
+/// 같은 기기를 하나로 묶는 데 쓴다. `ssh -G`가 실패하면 입력을 그대로 쓴다.
+pub fn machine_key(destination: &str, port: Option<u16>) -> String {
+    machine_key_or_input(
+        effective_config(destination, port).as_deref(),
+        destination,
+        port,
+    )
+}
+
+#[cfg(all(test, unix))]
+fn machine_key_with_program(
+    destination: &str,
+    port: Option<u16>,
+    program: &std::ffi::OsStr,
+) -> String {
+    let config = effective_config_with_program(destination, port, program);
+    machine_key_or_input(config.as_deref(), destination, port)
+}
+
+fn machine_key_or_input(config: Option<&str>, destination: &str, port: Option<u16>) -> String {
+    config
+        .and_then(machine_key_from_config)
+        .unwrap_or_else(|| match port {
+            Some(p) => format!("{}:{p}", destination.to_ascii_lowercase()),
+            None => destination.to_ascii_lowercase(),
+        })
+}
+
+/// 사용자 ssh 설정이 `StrictHostKeyChecking`을 정했는지. `ssh -G`는 `yes`·`no`를 `true`·`false`로,
+/// 설정이 없으면 기본값 `ask`로 보여 준다.
+fn user_sets_host_key_checking(config: &str) -> bool {
+    config.lines().any(|l| {
+        l.split_once(' ').is_some_and(|(k, v)| {
+            k == "stricthostkeychecking"
+                && matches!(v.trim(), "true" | "false" | "yes" | "no" | "off")
+        })
+    })
 }
 
 /// `ssh -G` 출력에서 `user`·`hostname`·`port`를 뽑아 [`machine_key`] 형태로 만든다.
@@ -561,14 +592,20 @@ fn machine_key_from_config(config: &str) -> Option<String> {
     ))
 }
 
-/// 호스트 문자열 검사. ssh 마지막 인자로 그대로 가므로 플래그·경로·공백을 거부한다.
+/// 호스트 문자열 검사: `[user@]host`, 각 부분은 `[A-Za-z0-9._-]`이고 `-`로 시작하지 않는다.
+/// ssh 마지막 인자로 그대로 가고 사용자 `ProxyCommand`의 `%h`·`%r`로 셸에 들어갈 수 있으므로
+/// 셸 메타문자와 `%`를 거부하고, `-`로 시작하는 옵션 주입을 막는다.
 pub fn valid_host(host: &str) -> bool {
-    !host.is_empty()
-        && !host.starts_with('-')
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b':' | b'@' | b'\\'))
-        || valid_user_at_host(host)
+    let part = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    match host.split_once('@') {
+        Some((user, h)) => part(user) && part(h),
+        None => part(host),
+    }
 }
 
 /// 키 파일 경로 검사. 플래그 인젝션(`-`로 시작)과 제어문자를 거부한다.
@@ -581,25 +618,6 @@ pub fn valid_identity_file(path: &str) -> bool {
 pub fn valid_remote_socket(path: &str) -> bool {
     let s = path.trim();
     s.starts_with('/') && !s.contains(':') && !s.chars().any(char::is_control)
-}
-
-/// `user@host` 형태. `@`는 정확히 하나, user·host는 그래픽 문자.
-fn valid_user_at_host(host: &str) -> bool {
-    let mut parts = host.split('@');
-    let (Some(user), Some(h), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    for s in [user, h] {
-        if s.is_empty()
-            || s.starts_with('-')
-            || !s
-                .bytes()
-                .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b':' | b'\\'))
-        {
-            return false;
-        }
-    }
-    true
 }
 
 /// 파일명에 쓸 호스트 별명. `@`는 살리고 나머지는 영숫자·`.-`_ 로 바꾼다.

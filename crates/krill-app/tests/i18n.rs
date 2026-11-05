@@ -172,10 +172,10 @@ fn ko_en_ko_switch_refreshes_existing_inputs_results_and_saved_settings(cx: &mut
                 )
             );
             assert_eq!(
-                i18n::cached_notice("Failed to download cloudflared: timeout"),
+                i18n::cached_notice("Failed to read usage credentials: timeout"),
                 format!(
                     "{}: timeout",
-                    catalog::daemon_notice::CLOUDFLARED_DOWNLOAD_FAILED.get()
+                    catalog::daemon_notice::USAGE_CREDENTIALS.get()
                 )
             );
             assert_eq!(

@@ -26,6 +26,8 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[3]
     target = Path(os.environ.get('CARGO_TARGET_DIR', root / 'target'))
+    krilld = Path(os.environ.get('KRILLD_BIN', str(target / 'debug/krilld')))
+    krill = Path(os.environ.get('KRILL_BIN', str(krilld.with_name('krill'))))
     shots = Path(args.screenshots).resolve()
     shots.mkdir(parents=True, exist_ok=True)
     session = f'mobile-shell-{os.getpid()}'
@@ -34,7 +36,7 @@ def main():
         metadata = Path(scratch) / 'fixture.json'
         env = dict(os.environ, M9_UI_QA='1', M9_BROWSER_ADDRESS=address, M9_BROWSER_METADATA=str(metadata), KRILL_TELEMETRY_DISABLED='1', KRILL_ERROR_REPORTING_DISABLED='1')
         with (Path(scratch) / 'fixture.log').open('w+') as log:
-            fixture = subprocess.Popen(['node', str(Path(__file__).with_name('mobile_pwa.cjs')), str(target / 'debug/krilld'), '--keep'], env=env, stdout=log, stderr=log)
+            fixture = subprocess.Popen(['node', str(Path(__file__).with_name('mobile_pwa.cjs')), str(krilld), '--keep'], env=env, stdout=log, stderr=log)
             try:
                 until(metadata.exists, 90)
                 cfg = json.loads(metadata.read_text())
@@ -47,7 +49,7 @@ def main():
                 def wait(script):
                     browser('wait', '--fn', script)
                 def cli(*command):
-                    return subprocess.check_output([str(target/'debug/krill'), *command], env=dict(os.environ, KRILL_STATE_DIR=cfg['dir'], KRILL_TELEMETRY_DISABLED='1', KRILL_ERROR_REPORTING_DISABLED='1'), text=True)
+                    return subprocess.check_output([str(krill), *command], env=dict(os.environ, KRILL_STATE_DIR=cfg['dir'], KRILL_TELEMETRY_DISABLED='1', KRILL_ERROR_REPORTING_DISABLED='1'), text=True)
                 def navigate(route):
                     evaluate(f'KrillMobile.app.navigate({json.dumps(route)});true')
                 def shot(name):

@@ -403,7 +403,7 @@ pub(super) fn edit_keys(dir: &Path, f: impl FnOnce(&mut Keys)) -> Result<(), Str
     let body = rewrite(&original, &keys)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // 1초 폴링이 반쯤 쓴 파일을 읽지 않게 고유 임시 파일에 쓰고 바꿔 단다(AS-08).
-    super::write_settings(&path, &body).map_err(|e| e.to_string())
+    krill_proto::os::write_atomic_0600(&path, body.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// 키를 키캡 문구로(OWE-651 형식: `⇧⌘W`, `⌥⌘←`, `⇧⌘Enter`).

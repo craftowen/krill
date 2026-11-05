@@ -224,6 +224,9 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>NSDocumentsFolderUsageDescription</key><string>Krill accesses files in your Documents folder for workspaces and agent sessions.</string>
     <key>NSDesktopFolderUsageDescription</key><string>Krill accesses files on your Desktop for workspaces and agent sessions.</string>
     <key>NSDownloadsFolderUsageDescription</key><string>Krill accesses files in your Downloads folder for workspaces and agent sessions.</string>
+    <key>NSMicrophoneUsageDescription</key><string>A program running in a Krill terminal wants to use the microphone.</string>
+    <key>NSCameraUsageDescription</key><string>A program running in a Krill terminal wants to use the camera.</string>
+    <key>NSAppleEventsUsageDescription</key><string>A program running in a Krill terminal wants to control another app.</string>
 </dict></plist>
 PLIST
 /usr/bin/plutil -lint "$app/Contents/Info.plist"

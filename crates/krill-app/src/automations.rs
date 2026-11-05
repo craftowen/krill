@@ -1193,28 +1193,33 @@ impl View {
                     .flex_1()
                     .flex_basis(ui::DIALOG_WIDTH / 2.)
                     .min_w_0()
+                    .child(breadcrumbs),
+            )
+            .child(
+                div()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(
-                        ui::ghost("automations-back", text::BACK.get())
-                            .debug_selector(|| "automations-back".into())
-                            .icon(IconName::ArrowLeft)
-                            .on_click(cx.listener(|this, _, _, cx| this.handle_escape(cx))),
+                        ui::ghost("automations-open-toml", stext::SCHEDULE_OPEN_TOML.get())
+                            .debug_selector(|| "automations-open-toml".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(dir) = &this.state_dir {
+                                    let path = dir.join(krill_proto::schedule::FILE);
+                                    cx.open_with_system(&path);
+                                }
+                            })),
                     )
-                    .child(breadcrumbs),
-            )
-            .child(
-                div().flex_none().child(
-                    ui::ghost("automations-open-toml", stext::SCHEDULE_OPEN_TOML.get())
-                        .debug_selector(|| "automations-open-toml".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(dir) = &this.state_dir {
-                                let path = dir.join(krill_proto::schedule::FILE);
-                                cx.open_with_system(&path);
-                            }
-                        })),
-                ),
+                    .child(
+                        Button::new("automations-close")
+                            .icon(IconName::Close)
+                            .ghost()
+                            .small()
+                            .tooltip(text::CLOSE.get())
+                            .debug_selector(|| "automations-close".into())
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Close))),
+                    ),
             )
     }
 

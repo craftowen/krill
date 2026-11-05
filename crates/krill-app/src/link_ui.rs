@@ -268,11 +268,6 @@ impl ServerPanel {
         self.confirm_revoke.as_ref()
     }
 
-    #[must_use]
-    pub const fn now_secs(&self) -> u64 {
-        self.now_secs
-    }
-
     /// 현재 기준 시각(Unix epoch 초)을 갱신한다(초대 링크 만료 카운트다운 및 테스트용).
     pub fn set_now_secs(&mut self, now_secs: u64, cx: &mut Context<Self>) {
         self.now_secs = now_secs;
@@ -366,11 +361,6 @@ impl ServerPanel {
             })
             .ok();
         }));
-    }
-
-    /// 현재 서버 접속 허용 상태를 반전시킨다.
-    pub fn toggle_server(&mut self, cx: &mut Context<Self>) {
-        self.set_server_enabled(!self.status.enabled, cx);
     }
 
     /// 새 1회용 초대 링크와 QR 코드 행렬을 백그라운드 실행기에서 생성한다.
@@ -1456,20 +1446,6 @@ impl ClientDialog {
         cx.notify();
     }
 
-    /// 이 기기 이름 입력칸 값을 설정한다.
-    pub fn set_device_name_value(
-        &mut self,
-        value: impl Into<SharedString>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let val = value.into();
-        self.device_name_input.update(cx, |input, cx| {
-            input.set_value(val, window, cx);
-        });
-        cx.notify();
-    }
-
     /// 시스템 클립보드를 다시 확인해 `krill://pair` 링크가 있으면 자동 채움 제안을 갱신한다.
     pub fn refresh_clipboard_suggestion(&mut self, cx: &mut Context<Self>) {
         self.clipboard_generation = self.clipboard_generation.wrapping_add(1);
@@ -1562,13 +1538,6 @@ impl ClientDialog {
                 .ok();
             }
         }));
-    }
-
-    /// 근처 Mac 항목을 선택해 초대 링크 입력칸에 채운다.
-    pub fn select_nearby(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(mac) = self.nearby.get(index).cloned() {
-            self.set_link_value(mac.invite_link, window, cx);
-        }
     }
 
     /// 근처 Mac 항목을 선택해 초대 링크를 채우고 즉시 페어링를 시작한다.

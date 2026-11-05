@@ -1,3 +1,6 @@
 "NSDocumentsFolderUsageDescription" = "Krill accesses files in your Documents folder for workspaces and agent sessions.";
 "NSDesktopFolderUsageDescription" = "Krill accesses files on your Desktop for workspaces and agent sessions.";
 "NSDownloadsFolderUsageDescription" = "Krill accesses files in your Downloads folder for workspaces and agent sessions.";
+"NSMicrophoneUsageDescription" = "A program running in a Krill terminal wants to use the microphone.";
+"NSCameraUsageDescription" = "A program running in a Krill terminal wants to use the camera.";
+"NSAppleEventsUsageDescription" = "A program running in a Krill terminal wants to control another app.";

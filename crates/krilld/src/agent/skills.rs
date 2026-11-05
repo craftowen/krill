@@ -9,7 +9,7 @@ use super::{Launch, LaunchAccount};
 
 /// Match app/CLI isolation: an explicit state directory never prepares host skills.
 pub(super) fn prepare(profile: Option<&Profile>, launch: &Launch, account: Option<&LaunchAccount>) {
-    if cfg!(test) || krill_proto::daemon::state_dir_override().is_some() {
+    if cfg!(test) || krill_proto::daemon::state_dir_isolated() {
         return;
     }
     let home = super::accounts::default_home();

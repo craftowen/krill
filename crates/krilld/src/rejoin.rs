@@ -61,6 +61,8 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 링크가 끊긴 뒤 holder가 정말 끝났는지 보는 시간. holder가 끝나면 링크 EOF가 재부모화(Unix ppid 1,
 /// Windows 부모 pid 0)보다 먼저 보일 수 있다. Windows 프로세스 스냅숏 캐시(500ms)보다 길다.
 const HOLDER_EXIT_GRACE: Duration = Duration::from_secs(1);
+/// accept 오류 뒤 다시 받기 전 쉬는 시간(모바일 게이트웨이와 같은 값).
+pub const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 
 #[cfg(all(test, unix))]
 mod tests;
@@ -131,7 +133,10 @@ fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
     reg.holder_lost();
     let uid = crate::os::euid();
     loop {
-        let Ok((s, _)) = lis.accept() else { continue };
+        let Ok((s, _)) = lis.accept() else {
+            thread::sleep(ACCEPT_RETRY); // EMFILE 같은 오류가 이어지면 쉬지 않고 돈다(C-4)
+            continue;
+        };
         if sys::peer_uid(s.as_fd()).ok() != Some(uid) {
             continue;
         }

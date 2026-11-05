@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub use writer::{FILE_BYTES, RollingLog};
+pub use writer::{FILE_BYTES, LOCK_WAIT, RollingLog};
 
 /// Total payload bytes across all four families, including their active files.
 pub const TOTAL_BYTES: u64 = 20_000_000;

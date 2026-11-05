@@ -1470,12 +1470,6 @@ impl Panel {
         cx.notify();
     }
 
-    /// 파일 탐색기 파일명 필터를 설정한다.
-    pub fn set_explorer_filter(&mut self, query: impl Into<String>, cx: &mut Context<Self>) {
-        self.ensure_explorer_loaded_async(cx);
-        self.apply_explorer_filter_now(query.into(), cx);
-    }
-
     /// 파일 탐색기 숨김 파일(`.dotfiles`) 표시를 토글한다.
     pub fn toggle_explorer_dotfiles(&mut self, cx: &mut Context<Self>) {
         self.ensure_explorer_loaded_async(cx);

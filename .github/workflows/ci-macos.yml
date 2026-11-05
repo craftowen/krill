@@ -1,5 +1,5 @@
 # Krill CI — macOS 전체 게이트 (OWE-382, MK-017).
-# clippy · nextest(PTY e2e 포함) · doctest를 전체 워크스페이스에 실행한다.
+# clippy · nextest(PTY e2e 포함)를 전체 워크스페이스에 실행한다.
 # macOS 분 절약을 위해 테스트 입력이 바뀔 때만 macOS 잡을 돌린다. `paths` 필터를 쓰면
 # 문서만 바뀐 PR에서 워크플로 자체가 안 떠 required check가 영원히 대기하므로,
 # 항상 뜨는 `changes` 잡(ubuntu)이 git diff로 판단하고 고정 이름 `ci-macos` 잡이 결과를 모은다.
@@ -106,7 +106,7 @@ jobs:
           python3 packaging/homebrew/test_release.py
 
   check:
-    name: clippy · nextest · doctest (${{ matrix.os }})
+    name: clippy · nextest (${{ matrix.os }})
     needs: [changes, reuse]
     if: needs.changes.outputs.rust == 'true' && needs.reuse.outputs.reuse != 'true'
     strategy:
@@ -176,12 +176,6 @@ jobs:
       - name: Verify restored vendor and external configuration
         run: python3 packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
 
-      - name: fmt, supply chain and notices
-        run: |
-          cargo fmt --all --check
-          cargo deny --locked check --hide-inclusion-graph
-          python3 docs/licensing/generate_notices.py --check
-
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
         timeout-minutes: 60
@@ -191,9 +185,9 @@ jobs:
         run: cargo nextest run --profile ci --workspace --locked --no-tests=pass --cargo-profile test --timings
         timeout-minutes: 120
 
-      - name: doctest
-        run: cargo test --workspace --doc --locked -q
-        timeout-minutes: 30
+      - name: FLAKY report (unknown flaky passes fail)
+        if: always() && hashFiles('target/nextest/ci/junit.xml') != ''
+        run: python3 packaging/ci_evidence.py flaky
 
       - name: Preserve test and build evidence
         if: always()

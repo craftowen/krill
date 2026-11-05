@@ -64,7 +64,8 @@ impl Listener {
     /// 100바이트 미만이어야 한다.
     ///
     /// # Errors
-    /// 다른 krilld가 같은 `path`의 락을 쥐고 있으면 `AddrInUse`(호출자는 조용히 끝낸다). 그 밖의 IO 오류.
+    /// 다른 krilld가 같은 `path`의 락을 쥐고 있거나 이 소켓을 맡은 holder가 살아 있으면 `AddrInUse`(호출자는 조용히
+    /// 끝낸다). 그 밖의 IO 오류.
     pub fn bind(path: &Path) -> io::Result<Self> {
         let tmp = with_suffix(path, ".tmp");
         if tmp.as_os_str().len() >= SUN_PATH_MAX {
@@ -87,6 +88,16 @@ impl Listener {
             ));
         }
         let lock = lock(path)?;
+        // 이 소켓을 맡은 holder가 살아 있으면(그 krilld가 재기동 대기 중이라 소켓 락이 비었다) 덮어쓰지 않는다.
+        // 덮어쓰면 그 holder의 세션에 아무도 붙지 못한다(경로 B). 파일은 holder만 만든다.
+        if let Ok(owner) = File::open(with_suffix(path, ".holder.lock"))
+            && matches!(owner.try_lock(), Err(TryLockError::WouldBlock))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a live holder owns the socket",
+            ));
+        }
         // 락을 쥔 프로세스만 여기 온다. 남은 `.tmp`는 bind와 rename 사이에 죽은 이전 소유자의 것이다.
         match fs::remove_file(&tmp) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),

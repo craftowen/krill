@@ -417,26 +417,6 @@ pub struct AccountStatusInfo {
 /// 갱신 시각이 이보다 오래되면 흐리게 표시한다(2단계 UI 기준, 30분).
 pub const STATUS_UPDATED_STALE_SECS: u64 = 30 * 60;
 
-/// 갱신 시각 한글 상대 표기(2단계 UI용 공개 API). 모르면 "갱신 없음".
-#[must_use]
-pub fn format_updated_ago_ko(updated_at_secs: Option<u64>, now_secs: u64) -> String {
-    let Some(updated) = updated_at_secs else {
-        return "갱신 없음".to_owned();
-    };
-    let ago = now_secs.saturating_sub(updated);
-    if ago < 10 {
-        "방금 전".to_owned()
-    } else if ago < 60 {
-        format!("{ago}초 전")
-    } else if ago < 3_600 {
-        format!("{}분 전", ago / 60)
-    } else if ago < 86_400 {
-        format!("{}시간 전", ago / 3_600)
-    } else {
-        format!("{}일 전", ago / 86_400)
-    }
-}
-
 /// 갱신 시각이 오래됐는지(모름 포함). 2단계 UI 흐리게 표시 기준.
 #[must_use]
 pub fn is_updated_stale(updated_at_secs: Option<u64>, now_secs: u64) -> bool {
@@ -714,13 +694,6 @@ impl AutoSwitchPolicy {
         } else {
             self.rules.push(rule);
         }
-    }
-
-    pub fn remove_rule(&mut self, provider: ProviderKind, from_account_id: &str) -> bool {
-        let before = self.rules.len();
-        self.rules
-            .retain(|r| r.provider != provider || r.from_account_id != from_account_id);
-        self.rules.len() != before
     }
 }
 

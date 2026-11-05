@@ -231,6 +231,9 @@ fn role_krilld() {
     if std::env::var("MKH_MODE").as_deref() == Ok("log-io") {
         return upgrade::blocked_log(&mut link, &dir);
     }
+    if let Ok(mode @ ("dup" | "backoff" | "fail")) = std::env::var("MKH_MODE").as_deref() {
+        return lifecycle(mode, &mut link, &dir, &masters);
+    }
     if dir.join("restore-listener").exists() {
         let l = UnixListener::from(listener.expect("exec 뒤 listener 복원"));
         assert_eq!(
@@ -324,6 +327,52 @@ fn role_krilld() {
         put(&dir.join("handoffs"), &log);
     }
     while next(&mut link, &dir).is_some() {}
+}
+
+/// krilld 수명 시나리오. 기동마다 `starts`에 `x`, 끝내기 직전 `.`을 적는다.
+/// - `dup`: 처음에 세션 하나를 띄우고 [`KRILLD_DUPLICATE`]로 끝난다(건강한 데몬이 소켓을 쥔 경우).
+/// - `backoff`: 처음에 세션 하나를 띄우고 매번 바로 실패한다. `hold`가 있으면 받은 master를 쥐고 머문다.
+/// - `fail`: 세션 없이 매번 바로 실패한다.
+#[expect(clippy::exit, reason = "holder가 보는 종료 코드가 시나리오다")]
+fn lifecycle(mode: &str, link: &mut Link, dir: &Path, masters: &[(SessionId, OwnedFd)]) {
+    let starts = dir.join("starts");
+    let append = |s: &str| {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&starts)
+            .unwrap();
+        f.write_all(s.as_bytes()).unwrap();
+    };
+    append("x");
+    if masters.is_empty() && mode != "fail" {
+        let m = ToHolder::Spawn {
+            req: 1,
+            id: SessionId(1),
+            argv: vec![b"/bin/sleep".to_vec(), b"60".to_vec()],
+            env: vec![],
+            cwd: vec![],
+            size: WinSize { cols: 80, rows: 24 },
+        };
+        send(link, &m, &[]);
+        let (FromHolder::Spawned { pid, .. }, _) = reply(link, dir) else {
+            panic!("Spawn 실패")
+        };
+        put(&dir.join("session"), &pid.to_string());
+    }
+    if mode == "backoff" && dir.join("hold").exists() {
+        put(&dir.join("krilld"), &format!("{} 0", std::process::id()));
+        while link.recv().unwrap().is_some() {}
+        wait_for("정리", 60, || dir.join("stop").exists().then_some(()));
+        return; // 받은 master는 호출자가 돌아올 때까지 쥔다
+    }
+    append(".");
+    let code = if mode == "dup" {
+        krill_proto::daemon::KRILLD_DUPLICATE
+    } else {
+        1
+    };
+    std::process::exit(i32::from(code));
 }
 
 fn spawn_gens(link: &mut Link, dir: &Path) -> Vec<(SessionId, OwnedFd)> {
@@ -841,4 +890,67 @@ fn holder_crash_adopt() {
     rig.holder = holder(&rig.dir, &env);
     let r = wait_for("재결합 3단계", 30, || get(&rig.dir.join("result")));
     assert_eq!(r, "ok");
+}
+
+fn exited(rig: &mut Rig, what: &str, secs: u64) -> std::process::ExitStatus {
+    wait_for(what, secs, || rig.holder.try_wait().unwrap())
+}
+
+/// A-01: 세션을 쥔 holder 아래 krilld가 중복 기동(`KRILLD_DUPLICATE`)으로 끝나면 30초마다 영구 재기동하지 않는다.
+/// master는 계속 쥐어 세션이 살아 있고, 세션이 끝나면 holder도 끝난다.
+#[test]
+fn duplicate_with_sessions_stops_restarting_and_keeps_masters() {
+    let mut rig = Rig::start("dup", &[("MKH_MODE", "dup".into())]);
+    let session = pid(&wait_for("세션 spawn", 30, || {
+        get(&rig.dir.join("session"))
+    }));
+    wait_for("중복 종료", 30, || {
+        (get(&rig.dir.join("starts"))? == "x.").then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        get(&rig.dir.join("starts")).unwrap(),
+        "x.",
+        "중복 기동 뒤 krilld를 다시 띄웠다"
+    );
+    assert!(
+        rig.holder.try_wait().unwrap().is_none(),
+        "세션을 쥔 holder가 끝났다"
+    );
+    assert!(
+        rustix::process::test_kill_process(session).is_ok(),
+        "세션 소실"
+    );
+    rustix::process::kill_process(session, Signal::KILL).unwrap();
+    assert!(exited(&mut rig, "세션이 끝난 뒤 holder 종료", 10).success());
+}
+
+/// C-5: krilld 재기동 대기 중(백오프) holder가 SIGTERM을 받아도 세션은 hangup되지 않는다. 끝나기 전 새 krilld에
+/// master를 넘긴다.
+#[test]
+fn stop_signal_during_restart_backoff_keeps_sessions() {
+    let mut rig = Rig::start("backoff", &[("MKH_MODE", "backoff".into())]);
+    let session = pid(&wait_for("세션 spawn", 30, || {
+        get(&rig.dir.join("session"))
+    }));
+    // 네 번째 실패 뒤 다음 기동까지 1초 백오프다.
+    wait_for("백오프 진입", 30, || {
+        (get(&rig.dir.join("starts"))?.matches('.').count() >= 4).then_some(())
+    });
+    put(&rig.dir.join("hold"), "");
+    std::thread::sleep(Duration::from_millis(100)); // holder가 네 번째 krilld를 거둘 틈(백오프는 1초)
+    rustix::process::kill_process(Pid::from_child(&rig.holder), Signal::TERM).unwrap();
+    exited(&mut rig, "SIGTERM 뒤 holder 종료", 10);
+    std::thread::sleep(Duration::from_millis(500));
+    let alive = rustix::process::test_kill_process(session).is_ok();
+    rustix::process::kill_process(session, Signal::KILL).ok();
+    assert!(alive, "백오프 중 SIGTERM으로 세션이 hangup됐다");
+}
+
+/// A-05: 세션 없는 holder의 krilld가 뜨자마자 계속 끝나면(bind 권한 오류 등) 30초마다 영구 재기동하지 않고 끝낸다.
+#[test]
+fn empty_holder_gives_up_on_repeated_start_failures() {
+    let mut rig = Rig::start("giveup", &[("MKH_MODE", "fail".into())]);
+    assert!(exited(&mut rig, "포기 뒤 holder 종료", 15).success());
+    assert_eq!(get(&rig.dir.join("starts")).unwrap(), "x.".repeat(5));
 }

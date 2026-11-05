@@ -304,13 +304,7 @@ fn repository_key(cwd: &Path) -> PathBuf {
 
 /// 앱에 등록된 프로젝트(`<state>/projects.toml`)를 루트 경로만 덧붙인다. 원격 앱이 세션 없는
 /// 프로젝트까지 볼 수 있게 하려는 것이다(로컬 앱은 같은 파일을 이미 합치므로 결과가 같다). git 호출 없음.
-pub(super) fn include_projects(data: &mut SidebarData) {
-    if let Some(dir) = krill_proto::daemon::state_dir() {
-        merge_projects(data, &dir);
-    }
-}
-
-fn merge_projects(data: &mut SidebarData, state_dir: &Path) {
+pub(super) fn include_projects(data: &mut SidebarData, state_dir: &Path) {
     #[derive(Default, serde::Deserialize)]
     #[serde(default)]
     struct File {
@@ -511,7 +505,7 @@ mod tests {
             prompt_histories: Vec::new(),
             closed_sessions: krill_proto::control::ClosedSessionRanges::default(),
         };
-        merge_projects(&mut data, &dir);
+        include_projects(&mut data, &dir);
         let git_repo_bytes = git_repo.as_os_str().as_bytes().to_vec();
         std::fs::remove_dir_all(&dir).ok();
         let repos: Vec<_> = data

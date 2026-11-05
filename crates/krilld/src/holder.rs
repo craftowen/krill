@@ -238,8 +238,11 @@ impl Holder {
 
     /// 리더: 답을 기다리는 요청에 나눠 주고 `Exited` 처리는 별도 큐로 넘긴다. 그 큐의 `Release` 송신이
     /// exec 핸드오프의 송신 잠금을 기다려도 리더는 `Done`을 받아 잠금을 풀 수 있다. 링크가 끊기면 기다리던
-    /// 요청을 모두 `NotConnected`로 끝낸 뒤 종료 이벤트 큐를 비운다.
+    /// 요청을 모두 `NotConnected`로 끝낸 뒤 종료 이벤트 큐를 비운다. holder가 닫은 것이 아니면 소켓을 닫아
+    /// 살아 있는 holder가 바로 krilld를 다시 띄우게 한다. 고아 선언 여부는 호출자가 holder 생존으로 정한다
+    /// ([`crate::rejoin::link_lost`], A-01).
     pub fn run(&self, mut link: Link, mut exited: impl FnMut(SessionId, i32) + Send) {
+        let mut closed = false;
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::channel();
             let worker = std::thread::Builder::new()
@@ -257,7 +260,7 @@ impl Holder {
                 // `decode`·송신 panic에도 `pending` 정리가 실행되게 격리한다.
                 // 정리 없이 죽으면 holder 요청이 영원히 걸린다(K-06).
                 if panic::catch_unwind(AssertUnwindSafe(|| {
-                    self.read(&mut link, |id, status| {
+                    closed = self.read(&mut link, |id, status| {
                         tx.send((id, status)).ok();
                     });
                 }))
@@ -266,22 +269,29 @@ impl Holder {
                     tracing::warn!("holder link reader panicked; treating link as down");
                 }
             }
+            if !closed {
+                tracing::warn!("holder link broken");
+                // `out`이 같은 소켓을 쥐고 있어 닫지 않으면 holder는 끊김을 모른다.
+                #[cfg(unix)]
+                rustix::net::shutdown(&link, rustix::net::Shutdown::Both).ok();
+            }
             *lock(&self.pending) = None;
             drop(tx);
         });
     }
 
-    fn read(&self, link: &mut Link, mut exited: impl FnMut(SessionId, i32)) {
+    /// holder가 링크를 닫았으면(EOF) `true`. 수신 오류·프로토콜 위반이면 `false`: holder는 살아 있을 수 있다.
+    fn read(&self, link: &mut Link, mut exited: impl FnMut(SessionId, i32)) -> bool {
         loop {
             let p = match link.recv() {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     tracing::info!("holder link closed");
-                    return;
+                    return true;
                 }
                 Err(e) => {
                     tracing::warn!(kind = ?e.kind(), error = %e, "holder link receive failed");
-                    return;
+                    return false;
                 }
             };
             // 프로토콜 위반: 끊긴 것으로 본다
@@ -289,7 +299,7 @@ impl Holder {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(kind = ?e.kind(), error = %e, "holder link frame undecodable");
-                    return;
+                    return false;
                 }
             };
             match m {

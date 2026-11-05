@@ -15,10 +15,9 @@
 //! `[u8 버전 = 1][postcard Vec<(SessionId, Record)>]`. 읽지 못하면(다른 버전·손상) 빈 저장소로 시작한다(상태가
 //! unknown이 될 뿐 세션에는 영향 없음). 필드는 끝에만 붙이고 버전을 올린다.
 
-use krill_proto::os::fs::OpenOptionsExt as _;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,7 +28,6 @@ use krill_proto::hook::{self, EventId, HookEvent};
 use krill_proto::usage::{AutoSwitchEvent, ProviderKind};
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::with_suffix;
 use crate::session::lock;
 use crate::usage::accounts;
 
@@ -255,7 +253,7 @@ impl Statuses {
 
     fn save(&self, map: &BTreeMap<SessionId, Record>) -> io::Result<()> {
         if let Some(p) = &self.path {
-            write_atomic(p, &encode(map)?)?;
+            krill_proto::os::write_atomic_0600(p, &encode(map)?)?;
         }
         Ok(())
     }
@@ -274,18 +272,6 @@ fn decode(b: &[u8]) -> Option<BTreeMap<SessionId, Record>> {
     };
     let rows: Vec<(SessionId, Record)> = postcard::from_bytes(rest).ok()?;
     Some(rows.into_iter().collect())
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = with_suffix(path, ".tmp");
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?
-        .write_all(bytes)?;
-    fs::rename(&tmp, path)
 }
 
 pub(crate) fn now_ns() -> u64 {

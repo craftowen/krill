@@ -5,11 +5,15 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::{Component, FILES, RECORD_BYTES};
 
 /// Decimal bytes: 4 components × 5 files × 1,000,000 = 20,000,000.
 pub const FILE_BYTES: u64 = 1_000_000;
+
+/// Longest wait for another writer before an event is dropped.
+pub const LOCK_WAIT: Duration = Duration::from_millis(50);
 
 /// Stateless file writer: every append and rotation takes the same cross-process family lock.
 /// The lock file is permanently empty and is never renamed/deleted.
@@ -70,17 +74,25 @@ impl RollingLog {
                 .directory
                 .join(format!("{}.lock", self.component.name())),
         )?;
-        match lock.try_lock() {
-            Ok(()) => {
-                let result = action();
-                // Explicit unlock also releases a lock briefly inherited by another
-                // thread's fork before exec; relying only on close can prolong it.
-                lock.unlock()?;
-                result
+        // Writers hold the lock for one append, and macOS flock also contends between this
+        // process's own threads, so wait briefly instead of dropping the event. Only a stuck
+        // holder costs the event, never an unbounded stall of the logging thread.
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TryLockError::WouldBlock) => return Ok(()),
+                Err(TryLockError::Error(e)) => return Err(e),
             }
-            Err(TryLockError::WouldBlock) => Ok(()),
-            Err(TryLockError::Error(e)) => Err(e),
         }
+        let result = action();
+        // Explicit unlock also releases a lock briefly inherited by another
+        // thread's fork before exec; relying only on close can prolong it.
+        lock.unlock()?;
+        result
     }
 
     /// One bounded UTF-8 event. Too-long records end at a character boundary.
