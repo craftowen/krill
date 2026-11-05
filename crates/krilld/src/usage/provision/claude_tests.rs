@@ -531,6 +531,39 @@ fn real_home_is_never_provisioned_from_a_test_process() {
 }
 
 #[test]
+fn repeated_claude_status_polls_warn_once_for_a_kept_settings_link() {
+    let home = root("claude-conflict-poll");
+    host_fixture(&home);
+    let profile = home.join("profile");
+    std::fs::create_dir(&profile).unwrap();
+    std::os::unix::fs::symlink(home.join("elsewhere"), profile.join("commands")).unwrap();
+    let state = home.join("state");
+    std::fs::create_dir(&state).unwrap();
+    let dir = profile.to_str().unwrap();
+    std::fs::write(
+        state.join("accounts.toml"),
+        format!("[[accounts]]\nid = \"a\"\nprovider = \"claude\"\nlabel = \"a\"\nprofile_dir = \"{dir}\"\n"),
+    )
+    .unwrap();
+    let events = crate::usage::direct::failure_tests::Events::default();
+    tracing::subscriber::with_default(events.clone(), || {
+        for _ in 0..3 {
+            provision_if_enabled(&home, Some(&state), ProviderKind::Claude, dir);
+        }
+    });
+    let warned: Vec<_> = crate::session::lock(&events.0)
+        .iter()
+        .filter(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, fields)| fields.clone())
+        .collect();
+    assert_eq!(
+        warned,
+        [r#" message=profile provisioning left existing entries conflicts=["commands"]"#]
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn unchanged_provisioning_conflicts_warn_once_per_change() {
     let events = crate::usage::direct::failure_tests::Events::default();
     tracing::subscriber::with_default(events.clone(), || {

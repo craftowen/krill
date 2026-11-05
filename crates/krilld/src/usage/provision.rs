@@ -179,6 +179,7 @@ fn sharing_enabled(file: &super::accounts::AccountsFile, provider: ProviderKind)
 }
 
 /// 기록 이행 작업이 잠금을 쥐고 있으면 그 작업이 먼저 같은 공유를 끝낸다.
+/// 충돌은 뒤이은 `provision_now`가 같은 공유를 다시 돌려 `report_conflicts`로 알린다.
 #[cfg(unix)]
 fn share_claude_config(home: &Path, profile: &Path) -> io::Result<()> {
     let _guard = match LOCK.try_lock() {
@@ -187,12 +188,7 @@ fn share_claude_config(home: &Path, profile: &Path) -> io::Result<()> {
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
     };
     let (host, profile) = claude_roots(home, profile)?;
-    let mut report = Report::default();
-    claude_config::share(&host, &profile, &mut report)?;
-    if !report.conflicts.is_empty() {
-        tracing::warn!(conflicts = ?report.conflicts, "shared Claude settings left existing entries");
-    }
-    Ok(())
+    claude_config::share(&host, &profile, &mut Report::default())
 }
 
 fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
