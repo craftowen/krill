@@ -1,6 +1,8 @@
 //! Harness canary (F-01): tests run by nextest never see the real HOME or a Krill session's
 //! state and agent config paths. Fails when the `isolate-env` setup script in
 //! `.config/nextest.toml` is removed or stops covering these variables.
+//! That script runs only on `cfg(unix)` (see the profile's `platform`), so this canary does too.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 
