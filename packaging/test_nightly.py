@@ -158,12 +158,16 @@ class PublicationTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         self.config = {"source": str(root / "source"), "run_root": str(root),
-                       "target_dir": "/Volumes/krill-build/targets/nightly", "key_file": "/unused", "repo": "o/r"}
+                       "target_dir": "/Volumes/krill-build/targets/nightly", "key_file": "/unused", "repo": "o/r",
+                       "branch": "dev"}
         self.release = nightly.Release(self.config, root / "state")
         self.release.work.mkdir()
         self.calls = []
         self.failure = None
         self.main = BASE
+        self.dev = BASE
+        self.ancestry = {(BASE, SHA)}
+        self.release.ancestor = lambda older, newer: older == newer or (older, newer) in self.ancestry
         self.current = SHA
         self.dirty = ""
         self.release.prepare = lambda: (SHA, "release/nightly-test", "0.1.2", BASE)
@@ -186,6 +190,8 @@ class PublicationTests(unittest.TestCase):
             raise nightly.NightlyError("injected failure")
         if args == ("git", "rev-parse", "origin/main"):
             return self.main
+        if args == ("git", "rev-parse", "origin/dev"):
+            return self.dev
         if args == ("git", "rev-parse", "HEAD"):
             return self.current
         if args == ("git", "status", "--porcelain"):
@@ -223,6 +229,26 @@ class PublicationTests(unittest.TestCase):
         self.assertTrue(any(any(arg.startswith("--force-with-lease=") for arg in call) for call in self.calls if call[:1] == ("git",) and len(call) > 1))
         self.assertEqual(self.downloader.call_count, 1)
         self.assertTrue(all(call.args[3].endswith("-attempt-2") for call in self.downloader.call_args_list))
+
+    def test_promotion_fast_forwards_dev_to_the_release_commit(self):
+        self.release.publish()
+        self.assertIn(("git", "push", "origin", f"{SHA}:refs/heads/dev"), self.calls)
+        self.assertLess(self.calls.index(("git", "push", "origin", f"{SHA}:refs/heads/dev")),
+                        self.calls.index(("wait-ci", "main")))
+        self.assertEqual(self.release.state["dev_sync"], "fast-forwarded")
+
+    def test_moved_dev_gets_a_merge_and_a_failed_sync_does_not_block_publication(self):
+        self.dev = "d" * 40
+        self.release.publish()
+        self.assertIn(("git", "merge", "--no-edit", SHA), self.calls)
+        self.assertIn(("git", "push", "origin", "HEAD:refs/heads/dev"), self.calls)
+        self.assertEqual(self.release.state["dev_sync"], "merged")
+        self.calls.clear()
+        self.failure = "--no-edit"
+        self.release.publish()
+        self.assertTrue(self.published())
+        self.assertNotIn(("git", "push", "origin", "HEAD:refs/heads/dev"), self.calls)
+        self.assertTrue(self.release.state["dev_sync"].startswith("failed:"))
 
     def test_resumed_failed_ci_is_restarted_once_without_failed_job_filter(self):
         original = self.release.git
@@ -286,7 +312,7 @@ class PublicationTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
-    def test_prepare_integrates_committed_dev_and_main_without_touching_dirty_source(self):
+    def test_prepare_cuts_from_committed_dev_containing_main_without_touching_dirty_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, origin = root / "source", root / "origin.git"
@@ -338,9 +364,19 @@ class SnapshotTests(unittest.TestCase):
                 return real_command(args, **kwargs)
 
             with patch.object(nightly, "command", side_effect=local_command):
+                with self.assertRaisesRegex(nightly.NightlyError, "missing from origin/dev"):
+                    release.prepare()
+            git(source, "stash", "--include-untracked")
+            git(source, "merge", "--no-edit", "main")
+            frozen = git(source, "rev-parse", "HEAD")
+            git(source, "push", "origin", "dev")
+            git(source, "stash", "pop")
+            release = nightly.Release(config, root / "state")
+            with patch.object(nightly, "command", side_effect=local_command):
                 sha, _branch, version, _main = release.prepare()
             self.assertEqual(version, "0.1.2")
             self.assertEqual(release.state["source_head"], frozen)
+            self.assertEqual(git(release.work, "rev-parse", "HEAD^"), frozen)
             self.assertEqual(git(source, "rev-parse", "HEAD"), frozen)
             self.assertEqual(git(source, "status", "--porcelain"), status)
             self.assertEqual((release.work / "dev-change").read_text(), "committed dev\n")
@@ -374,7 +410,7 @@ class SnapshotTests(unittest.TestCase):
             self.assertIn("existing v0.1.2 release owner", waiting.state["reason"])
 
 
-    def test_squash_merged_dev_already_in_the_release_creates_no_candidate(self):
+    def test_dev_that_merged_the_release_back_creates_no_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, origin = root / "source", root / "origin.git"
@@ -398,9 +434,11 @@ class SnapshotTests(unittest.TestCase):
             git(source, "checkout", "-b", "dev")
             commit("fix on dev", fix="fixed\n")
             git(source, "checkout", "main")
-            commit("same fix, squashed into the release", fix="fixed\n")
+            git(source, "merge", "--ff-only", "dev")
             commit("Release v0.1.2", **{"Cargo.toml": '[workspace.package]\nversion = "0.1.2"\n'})
             git(source, "tag", "v0.1.2")
+            git(source, "checkout", "dev")
+            git(source, "merge", "--no-ff", "--no-edit", "main")
             git(source, "push", "origin", "main", "dev", "--tags")
             config = {"source": str(source), "branch": "dev", "repo": "o/r", "run_root": str(root / "nightly"),
                       "target_dir": str(nightly.TARGETS / "nightly"), "key_file": "/unused",
@@ -419,8 +457,8 @@ class SnapshotTests(unittest.TestCase):
                     raise AssertionError(f"no candidate may be built: {args}")
                 return real_command(args, **kwargs)
 
-            squashed = subprocess.run(["git", "merge-base", "--is-ancestor", "dev", "v0.1.2"], cwd=source)
-            self.assertEqual(squashed.returncode, 1, "dev must not be an ancestor of the release")
+            merged = subprocess.run(["git", "merge-base", "--is-ancestor", "dev", "v0.1.2"], cwd=source)
+            self.assertEqual(merged.returncode, 1, "dev must not be an ancestor of the release")
             release = nightly.Release(config, root / "state")
             with patch.object(nightly, "command", side_effect=local_command):
                 self.assertIsNone(release.prepare())
