@@ -359,11 +359,13 @@ class Release:
         branch = CANDIDATE_BRANCH
         created = datetime.fromisoformat(pending["created_at"]) if pending.get("created_at") else None
         age = (datetime.now().astimezone() - created).total_seconds() if created else float("inf")
+        # main까지 올라갔는데 main CI 등으로 게시 전에 멈췄으면 sync_dev가 dev도 이미 옮겼다. 그 커밋을 끝까지 게시한다.
+        promoted = main == pending.get("candidate_head")
         if (0 <= age < 23 * 3600 and pending.get("validation_context") == self.state.get("validation_context")
-                and pending.get("source_head") == remote and pending.get("previous_release") == latest
-                and main in (pending.get("base_main"), pending.get("candidate_head"))):
+                and pending.get("previous_release") == latest
+                and (promoted or (pending.get("source_head") == remote and main == pending.get("base_main")))):
             candidate = pending["candidate_head"]
-            if self.ancestor(remote, candidate) and self.ancestor(main, candidate):
+            if promoted or (self.ancestor(remote, candidate) and self.ancestor(main, candidate)):
                 self.git("checkout", "-B", branch, candidate)
                 self.update(**pending, resumed=True)
                 return candidate, branch, pending["version"], pending["base_main"]
