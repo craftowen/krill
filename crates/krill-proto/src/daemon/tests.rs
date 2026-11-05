@@ -768,7 +768,11 @@ fn windows_paths_choose_flat_then_exact_version_holder() {
         std::fs::write(path, b"MZ").unwrap();
     }
     let paths = Paths::from_exe(&app, &root.join("state"), &[]).unwrap();
-    assert_eq!(paths.holder, executable_path(&current));
+    // `from_exe` canonicalizes, which expands 8.3 short names in `temp_dir()` (`RUNNER~1`).
+    assert_eq!(
+        paths.holder,
+        executable_path(&std::fs::canonicalize(&current).unwrap())
+    );
     assert!(!paths.holder.to_string_lossy().starts_with(r"\\?\"));
     std::fs::write(&holder, b"MZ").unwrap();
     assert_eq!(exe_near(&root, "krill-holder"), holder);
