@@ -120,7 +120,8 @@ fn is_test_process_in(keys: impl IntoIterator<Item = OsString>, exe: Option<&Pat
 }
 
 /// Install INFO/WARN/ERROR events from Krill targets. No spans are retained.
-/// File locks are nonblocking; contention and IO errors drop logs, never fail a session.
+/// A writer waits at most `LOCK_WAIT` for its family lock; a stuck holder and IO errors drop logs,
+/// never fail a session.
 /// Files are opened per event so other processes cannot write into a renamed/unlinked archive.
 /// This deliberately uses no thread in the fd-owning holder.
 pub use forward::forward_log_warnings;

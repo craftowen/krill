@@ -78,7 +78,7 @@ fn lock_contention_waits_for_the_writer_and_drops_only_a_stuck_one() -> io::Resu
     log.append("dropped")?;
     assert_eq!(total(&dir)?, 0);
     let release = std::thread::spawn(move || {
-        std::thread::sleep(LOCK_WAIT / 5);
+        std::thread::sleep(LOCK_WAIT / 20);
         lock.unlock()
     });
     log.append("waited")?;

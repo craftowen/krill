@@ -13,7 +13,7 @@ use crate::{Component, FILES, RECORD_BYTES};
 pub const FILE_BYTES: u64 = 1_000_000;
 
 /// Longest wait for another writer before an event is dropped.
-pub const LOCK_WAIT: Duration = Duration::from_millis(50);
+pub const LOCK_WAIT: Duration = Duration::from_millis(200);
 
 /// Serializes this process's writers so they never contend on flock, which macOS applies per
 /// open file description: polling threads could each wait past `LOCK_WAIT` and drop events.
