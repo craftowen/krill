@@ -132,7 +132,10 @@ fn a_busy_skill_lock_never_blocks_startup_and_retries_after_release() {
     let (send, receive) = std::sync::mpsc::channel();
     let dirs = vec![locked.clone(), other.clone()];
     let worker = std::thread::spawn(move || send.send(sync_builtin_skills(&dirs)).unwrap());
-    let report = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    // The lock stays held until `drop(guard)` below, so a sync that waited on it would
+    // never return. The budget only bounds that hang; installing every skill into
+    // `other` took over 2s on Windows CI runners.
+    let report = receive.recv_timeout(Duration::from_secs(30)).unwrap();
     worker.join().unwrap();
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(report.busy, std::slice::from_ref(&locked));
