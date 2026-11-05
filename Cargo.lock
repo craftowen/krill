@@ -3784,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "krill"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "krill-hosts",
  "krill-log",
@@ -3805,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "krill-app"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "block2 0.6.2",
  "chrono",
@@ -3842,7 +3842,7 @@ dependencies = [
 
 [[package]]
 name = "krill-holder"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "krill-log",
  "krill-proto",
@@ -3855,7 +3855,7 @@ dependencies = [
 
 [[package]]
 name = "krill-hosts"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "krill-proto",
  "postcard",
@@ -3866,7 +3866,7 @@ dependencies = [
 
 [[package]]
 name = "krill-link"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "iroh",
  "krill-holder",
@@ -3886,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "krill-log"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "log",
  "rustix",
@@ -3895,7 +3895,7 @@ dependencies = [
 
 [[package]]
 name = "krill-proto"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "base64 0.22.1",
  "postcard",
@@ -3914,7 +3914,7 @@ dependencies = [
 
 [[package]]
 name = "krill-term"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "krill-proto",
  "unicode-width",
@@ -3922,7 +3922,7 @@ dependencies = [
 
 [[package]]
 name = "krilld"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "aes",
  "alacritty_terminal",
