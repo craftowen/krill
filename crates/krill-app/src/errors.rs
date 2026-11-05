@@ -4,6 +4,7 @@
 use std::io;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,115 @@ use crate::i18n::catalog::settings as text;
 
 const POLL: Duration = Duration::from_secs(60);
 const HELPER_DEADLINE: Duration = Duration::from_secs(45);
+pub const DAEMON_CONNECT_REPORT_GRACE: Duration = Duration::from_secs(10);
+
+#[must_use]
+#[derive(Debug)]
+pub struct PendingConnectFailure {
+    cancelled: Arc<AtomicBool>,
+    _task: Task<()>,
+}
+
+impl Drop for PendingConnectFailure {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) fn record_app_error_with_env(
+    state: &Path,
+    env: &error_reporting::Env,
+    code: Code,
+    detail: &str,
+    file: &str,
+    line: u32,
+) {
+    let Ok(Some(consent)) = error_reporting::consent_with(state, env) else {
+        return;
+    };
+    let loc = error_reporting::source_location(file, line);
+    let Ok(mut event) = Event::new(Process::App, code, loc) else {
+        return;
+    };
+    event.detail = error_reporting::sanitize_detail(detail);
+    error_reporting::record_with_consent(state, event, &consent).ok();
+}
+
+#[track_caller]
+pub fn defer_daemon_connection_failed(
+    cx: &mut App,
+    error: &dyn std::fmt::Display,
+) -> PendingConnectFailure {
+    defer_daemon_connection_failed_with(
+        cx,
+        crate::settings::state_dir(cx),
+        error_reporting::Env::live(),
+        DAEMON_CONNECT_REPORT_GRACE,
+        &error.to_string(),
+        std::panic::Location::caller(),
+    )
+}
+
+#[cfg(test)]
+fn defer_daemon_connection_failed_at(
+    cx: &mut App,
+    state_dir: Option<std::path::PathBuf>,
+    grace: Duration,
+    detail: &str,
+    loc: &'static std::panic::Location<'static>,
+) -> PendingConnectFailure {
+    defer_daemon_connection_failed_with(
+        cx,
+        state_dir,
+        error_reporting::Env::stub(&[]),
+        grace,
+        detail,
+        loc,
+    )
+}
+
+fn defer_daemon_connection_failed_with(
+    cx: &mut App,
+    state_dir: Option<std::path::PathBuf>,
+    env: error_reporting::Env,
+    grace: Duration,
+    detail: &str,
+    loc: &'static std::panic::Location<'static>,
+) -> PendingConnectFailure {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let detail = detail.to_owned();
+    let file = loc.file();
+    let line = loc.line();
+    let task_cancelled = Arc::clone(&cancelled);
+    let task = cx.spawn(async move |cx| {
+        cx.background_executor().timer(grace).await;
+        if task_cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(state) = state_dir else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                if task_cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                record_app_error_with_env(
+                    &state,
+                    &env,
+                    Code::DaemonConnectFailed,
+                    &detail,
+                    file,
+                    line,
+                );
+            })
+            .await;
+    });
+    PendingConnectFailure {
+        cancelled,
+        _task: task,
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct Panel {
@@ -61,18 +171,23 @@ struct Reporter {
 impl Global for Reporter {}
 
 /// Capture the failed connection boundary without running disk work on GPUI.
-pub fn daemon_connection_failed(cx: &mut App) {
+#[track_caller]
+pub fn daemon_connection_failed(cx: &mut App, error: &dyn std::fmt::Display) {
+    let loc = std::panic::Location::caller();
+    let detail = error.to_string();
     let Some(state) = crate::settings::state_dir(cx) else {
         return;
     };
     cx.background_spawn(async move {
-        if let Ok(event) = Event::new(
+        error_reporting::capture_detailed_at(
+            &state,
             Process::App,
             Code::DaemonConnectFailed,
-            error_reporting::source_location(file!(), line!()),
-        ) {
-            error_reporting::record_at(&state, event).ok();
-        }
+            Some(&detail),
+            &[],
+            loc.file(),
+            loc.line(),
+        );
     })
     .detach();
 }
@@ -235,6 +350,91 @@ mod tests {
         let slot = slot.lock().unwrap();
         assert!(slot.guard.is_none());
         assert!(slot.generation.is_none());
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    fn drain_events(state: &Path) -> Vec<Event> {
+        let consent = error_reporting::consent_with(state, &error_reporting::Env::stub(&[]))
+            .unwrap()
+            .unwrap();
+        let lock = error_reporting::UploadLock::try_acquire(state)
+            .unwrap()
+            .unwrap();
+        let mut events = Vec::new();
+        error_reporting::flush(state, &consent, &lock, |body| {
+            let req: error_reporting::Request = serde_json::from_slice(body).unwrap();
+            let ack = error_reporting::Ack {
+                schema_version: error_reporting::SCHEMA_VERSION,
+                accepted_ids: req.events.iter().map(|e| e.event_id.clone()).collect(),
+                duplicate_ids: Vec::new(),
+            };
+            events.extend(req.events);
+            error_reporting::Reply::Http {
+                status: 200,
+                retry_after_secs: None,
+                body: serde_json::to_vec(&ack).unwrap(),
+            }
+        })
+        .unwrap();
+        events
+    }
+
+    #[gpui::test]
+    fn defer_daemon_connect_failure_respects_grace_and_redacts_detail(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state =
+            std::env::temp_dir().join(format!("krill-defer-daemon-err-{}", std::process::id()));
+        std::fs::remove_dir_all(&state).ok();
+        error_reporting::enable(&state).unwrap();
+        let grace = Duration::from_millis(80);
+        let raw_error = "/Users/alice/.krill/krilld.sock: connection refused (os error 61)";
+
+        let pending = cx.update(|cx| {
+            defer_daemon_connection_failed_at(
+                cx,
+                Some(state.clone()),
+                grace,
+                raw_error,
+                std::panic::Location::caller(),
+            )
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(40));
+        cx.run_until_parked();
+        drop(pending);
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(
+            drain_events(&state).is_empty(),
+            "connect failure recovered within grace must record 0 events"
+        );
+
+        let pending = cx.update(|cx| {
+            defer_daemon_connection_failed_at(
+                cx,
+                Some(state.clone()),
+                grace,
+                raw_error,
+                std::panic::Location::caller(),
+            )
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(grace);
+        cx.run_until_parked();
+        let events = drain_events(&state);
+        drop(pending);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].process, Process::App);
+        assert_eq!(events[0].error_code, Code::DaemonConnectFailed);
+        let detail = events[0].detail.as_deref().expect("redacted detail");
+        assert!(detail.contains("[USER]"), "{detail}");
+        assert!(!detail.contains("alice"), "{detail}");
+        let source_loc = events[0].source_loc.as_deref().expect("source_loc");
+        assert!(
+            source_loc.starts_with("crates/krill-app/src/"),
+            "{source_loc}"
+        );
         std::fs::remove_dir_all(state).unwrap();
     }
 }
