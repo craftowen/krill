@@ -8404,12 +8404,7 @@ impl Render for Shell {
                     ),
                 };
                 let viewport = window.viewport_size();
-                let modal_w = (viewport.width - krill_app::ui::SPACE_4 * 4.)
-                    .clamp(px(680.), px(1080.))
-                    .min(viewport.width - krill_app::ui::SPACE_2 * 2.);
-                let modal_h = (viewport.height - krill_app::ui::SPACE_4 * 4.)
-                    .clamp(px(480.), px(760.))
-                    .min(viewport.height - krill_app::ui::SPACE_2 * 2.);
+                let modal = krill_app::ui::page_modal_size(viewport);
                 krill_app::ui::modal_backdrop(
                     viewport,
                     div()
@@ -8435,8 +8430,8 @@ impl Render for Shell {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
-                                .w(modal_w)
-                                .h(modal_h)
+                                .w(modal.width)
+                                .h(modal.height)
                                 .rounded(krill_app::ui::RADIUS_XL)
                                 .bg(p.background)
                                 .border_1()

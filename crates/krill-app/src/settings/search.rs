@@ -1,36 +1,107 @@
-//! 설정 검색(OWE-656). 항목별 제목(i18n 한·영 둘 다)·키워드 정적 색인으로 좌측 내비 탭을 거른다.
+//! 설정 검색(OWE-656). 항목별 제목(i18n 한·영 둘 다)·키워드 정적 색인에서 본문 결과 목록을 만든다.
 //! UI 언어와 상관없이 한글·영어 검색어가 모두 맞는다(Orca `settings-search.ts`와 같은 방식).
 
 use super::AdminTab;
 use crate::i18n::{Language, Message, SETTINGS_SEARCH_INDEX as INDEX};
 
-/// 검색어와 맞는 탭([`AdminTab::ALL`] 순). 빈 검색어면 전부. 대소문자는 가리지 않는다.
-pub(super) fn search_tabs(query: &str) -> Vec<AdminTab> {
+/// 검색어와 맞는 설정. 색인 행, 그리고 색인 행이 안 맞은 페이지는 이름이나 부제가 맞을 때 페이지 자체.
+/// 내비 탭 순서이며 부모 탭의 항목이 하위 페이지보다 앞이다. 빈 검색어면 비어 있다.
+pub(super) fn search_hits(query: &str) -> Vec<(AdminTab, Message)> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
-        return AdminTab::ALL.to_vec();
+        return Vec::new();
     }
     let hit = |s: &str| s.to_lowercase().contains(&query);
     let both = |m: Message| [Language::Ko, Language::En].map(|l| m.in_language(l));
+    let mut hits: Vec<_> = INDEX
+        .iter()
+        .filter(|(_, title, words)| {
+            both(*title).into_iter().any(hit) || words.iter().copied().any(hit)
+        })
+        .map(|(tab, title, _)| (*tab, *title))
+        .collect();
+    for tab in AdminTab::ALL.into_iter().chain(AdminTab::SUBPAGES) {
+        if !hits.iter().any(|(t, _)| *t == tab)
+            && (both(tab.title_message()).into_iter().any(hit)
+                || both(tab.subtitle_message()).into_iter().any(hit))
+        {
+            hits.push((tab, tab.title_message()));
+        }
+    }
+    hits.sort_by_key(|(tab, _)| (tab.page() as usize, *tab as usize));
+    hits
+}
+
+/// 결과가 하나라도 있는 내비 탭. 빈 검색어면 전부.
+#[cfg(test)]
+pub(super) fn search_tabs(query: &str) -> Vec<AdminTab> {
+    if query.trim().is_empty() {
+        return AdminTab::ALL.to_vec();
+    }
+    let hits = search_hits(query);
     AdminTab::ALL
         .into_iter()
-        .filter(|&tab| {
-            AdminTab::SUBPAGES
-                .into_iter()
-                .chain([tab])
-                .filter(|sub| sub.page() == tab)
-                .any(|sub| {
-                    both(sub.title_message()).into_iter().any(hit)
-                        || both(sub.subtitle_message()).into_iter().any(hit)
-                })
-                || INDEX
-                    .iter()
-                    .filter(|(t, ..)| t.page() == tab)
-                    .any(|(_, title, words)| {
-                        both(*title).into_iter().any(hit) || words.iter().copied().any(hit)
-                    })
-        })
+        .filter(|tab| hits.iter().any(|(hit, _)| hit.page() == *tab))
         .collect()
+}
+
+/// 일치하는 라벨에 네이티브 포커스와 중첩 스크롤 앵커를 연결한다.
+#[derive(Clone)]
+pub(super) struct SearchFocus {
+    pub title: Option<Message>,
+    pub scroll: gpui::ScrollHandle,
+    pub anchor: gpui::ScrollAnchor,
+    pub focus: gpui::FocusHandle,
+    pub rendered: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl SearchFocus {
+    pub fn new(cx: &gpui::App) -> Self {
+        let scroll = gpui::ScrollHandle::default();
+        Self {
+            title: None,
+            anchor: gpui::ScrollAnchor::for_handle(scroll.clone()),
+            scroll,
+            focus: cx.focus_handle(),
+            rendered: std::rc::Rc::default(),
+        }
+    }
+
+    pub fn label(
+        &self,
+        p: &crate::ui::Palette,
+        title: &'static str,
+        desc: impl crate::ui::primitives::LabelDesc,
+    ) -> gpui::Stateful<gpui::Div> {
+        use gpui::InteractiveElement as _;
+        self.anchored(
+            p,
+            title,
+            super::layout::label(p, title, desc)
+                .id(gpui::SharedString::from(format!("settings-label-{title}"))),
+        )
+    }
+
+    /// `title`이 검색 대상이면 `element`를 포커스와 스크롤 앵커로 삼는다.
+    pub fn anchored(
+        &self,
+        p: &crate::ui::Palette,
+        title: &'static str,
+        element: gpui::Stateful<gpui::Div>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use gpui::prelude::FluentBuilder as _;
+        use gpui::{InteractiveElement as _, StatefulInteractiveElement as _, Styled as _};
+        let matched = self.title.is_some_and(|target| target.get() == title);
+        if matched {
+            self.rendered.set(true);
+        }
+        element.when(matched, |d| {
+            d.track_focus(&self.focus)
+                .tab_index(0)
+                .anchor_scroll(Some(self.anchor.clone()))
+                .focus_visible(|d| d.bg(p.accent).rounded(crate::ui::RADIUS_SM))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -64,117 +135,58 @@ mod tests {
 
     #[test]
     fn search_reaches_segments_and_subpages() {
-        assert_eq!(search_target("qr", AdminTab::Mobile), AdminTab::Mobile);
+        let first_in = |query: &str, page: AdminTab| {
+            search_hits(query)
+                .into_iter()
+                .find(|(tab, _)| tab.page() == page)
+                .map(|(tab, _)| tab)
+        };
+        for (query, page, target) in [
+            ("qr", AdminTab::Mobile, AdminTab::Mobile),
+            ("초대", AdminTab::Machines, AdminTab::Machines),
+            ("스마트폰", AdminTab::Mobile, AdminTab::Mobile),
+            ("ssh", AdminTab::Machines, AdminTab::Machines),
+            ("빠른 명령", AdminTab::Agents, AdminTab::QuickCommands),
+            ("심링크", AdminTab::Agents, AdminTab::Project),
+            ("디스크", AdminTab::System, AdminTab::Disk),
+        ] {
+            assert_eq!(first_in(query, page), Some(target), "{query}");
+        }
+    }
+
+    #[test]
+    fn hits_follow_nav_order_and_name_pages_without_index_rows() {
+        let hits = search_hits("글꼴");
         assert_eq!(
-            search_target("초대", AdminTab::Machines),
-            AdminTab::Machines
+            hits,
+            [
+                (AdminTab::Appearance, super::super::text::TERMINAL_FONT),
+                (AdminTab::Appearance, super::super::text::FONT_SIZE),
+            ]
         );
+        // 부모 탭의 행이 먼저, 그다음 하위 페이지.
+        let order: Vec<_> = search_hits("워크트리").into_iter().map(|h| h.0).collect();
+        assert!(order.windows(2).all(|w| {
+            (w[0].page() as usize, w[0] as usize) <= (w[1].page() as usize, w[1] as usize)
+        }));
+        // 색인 행이 안 맞은 페이지는 이름으로 나오되, 같은 페이지를 두 번 내지 않는다.
         assert_eq!(
-            search_target("스마트폰", AdminTab::Mobile),
-            AdminTab::Mobile
+            search_hits("shortcuts")
+                .into_iter()
+                .filter(|h| h.0 == AdminTab::Shortcuts)
+                .count(),
+            1
         );
-        assert_eq!(search_target("ssh", AdminTab::Machines), AdminTab::Machines);
-        assert_eq!(
-            search_target("빠른 명령", AdminTab::Agents),
-            AdminTab::QuickCommands
-        );
-        assert_eq!(search_target("심링크", AdminTab::Agents), AdminTab::Project);
-        assert_eq!(search_target("디스크", AdminTab::System), AdminTab::Disk);
-        assert_eq!(search_target("", AdminTab::System), AdminTab::System);
+        assert!(search_hits("빠른 명령").contains(&(
+            AdminTab::QuickCommands,
+            AdminTab::QuickCommands.title_message()
+        )));
+        assert!(search_hits("  ").is_empty());
     }
 
     #[test]
     fn empty_query_keeps_every_tab() {
         assert_eq!(search_tabs(""), AdminTab::ALL);
         assert_eq!(search_tabs("   "), AdminTab::ALL);
-    }
-}
-
-/// 내비 탭에서 검색어가 가리키는 실제 페이지. 세그먼트·하위 페이지 항목이면 그 페이지로 간다.
-pub(super) fn search_target(query: &str, tab: AdminTab) -> AdminTab {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return tab;
-    }
-    let hit = |s: &str| s.to_lowercase().contains(&query);
-    let both = |m: Message| [Language::Ko, Language::En].map(|l| m.in_language(l));
-    INDEX
-        .iter()
-        .find(|(t, title, words)| {
-            t.page() == tab && (both(*title).into_iter().any(hit) || words.iter().copied().any(hit))
-        })
-        .map(|(t, ..)| *t)
-        .or_else(|| {
-            AdminTab::SUBPAGES.into_iter().find(|sub| {
-                sub.page() == tab
-                    && (both(sub.title_message()).into_iter().any(hit)
-                        || both(sub.subtitle_message()).into_iter().any(hit))
-            })
-        })
-        .unwrap_or(tab)
-}
-
-/// 탭 제목보다 실제 설정 제목·키워드가 일치하는 행을 우선한다.
-pub(super) fn first_setting(query: &str, tab: AdminTab) -> Option<Message> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return None;
-    }
-    INDEX
-        .iter()
-        .filter(|(t, ..)| *t == tab)
-        .find_map(|(_, title, words)| {
-            ([Language::Ko, Language::En]
-                .iter()
-                .any(|lang| title.in_language(*lang).to_lowercase().contains(&query))
-                || words
-                    .iter()
-                    .any(|word| word.to_lowercase().contains(&query)))
-            .then_some(*title)
-        })
-}
-
-/// 일치하는 라벨에 네이티브 포커스와 중첩 스크롤 앵커를 연결한다.
-#[derive(Clone)]
-pub(super) struct SearchFocus {
-    pub title: Option<Message>,
-    pub scroll: gpui::ScrollHandle,
-    pub anchor: gpui::ScrollAnchor,
-    pub focus: gpui::FocusHandle,
-    pub rendered: std::rc::Rc<std::cell::Cell<bool>>,
-}
-
-impl SearchFocus {
-    pub fn new(cx: &gpui::App) -> Self {
-        let scroll = gpui::ScrollHandle::default();
-        Self {
-            title: None,
-            anchor: gpui::ScrollAnchor::for_handle(scroll.clone()),
-            scroll,
-            focus: cx.focus_handle(),
-            rendered: std::rc::Rc::default(),
-        }
-    }
-
-    pub fn label(
-        &self,
-        p: &crate::ui::Palette,
-        title: &'static str,
-        desc: impl crate::ui::primitives::LabelDesc,
-    ) -> gpui::Stateful<gpui::Div> {
-        use gpui::prelude::FluentBuilder as _;
-        use gpui::{InteractiveElement as _, StatefulInteractiveElement as _, Styled as _};
-        let matched = self.title.is_some_and(|target| target.get() == title);
-        if matched {
-            self.rendered.set(true);
-        }
-        super::layout::label(p, title, desc)
-            .id(gpui::SharedString::from(format!("settings-label-{title}")))
-            .when(matched, |d| {
-                d.track_focus(&self.focus)
-                    .tab_index(0)
-                    .anchor_scroll(Some(self.anchor.clone()))
-                    .focus_visible(|d| d.bg(p.accent).rounded(crate::ui::RADIUS_SM))
-            })
     }
 }
