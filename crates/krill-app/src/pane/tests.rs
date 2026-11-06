@@ -662,6 +662,48 @@ fn fit_sends_resize_and_focus_once_per_size_and_on_relink() {
     assert!(role_requests(out(&mut p)).is_empty());
 }
 
+/// 두 기기의 앱이 한 세션을 서로 다른 크기로 보고 있으면, 다시 그릴 때마다 크기를 뺏어 오지 않는다. 뺏으면 PTY 크기가
+/// 0.1초마다 번갈아 바뀌고 에이전트가 화면을 다시 그려 칸이 위아래로 흔들린다.
+#[test]
+fn two_panes_on_one_session_do_not_take_the_size_from_each_other_on_repaint() {
+    let grids = [(153, 54), (191, 49)];
+    let mut panes = grids.map(|(cols, rows)| {
+        let mut p = Pane::default();
+        assert!(p.fit(cols, rows).is_none());
+        p.link(
+            SessionId(1),
+            1,
+            Vec::new(),
+            input::FEAT_INPUT | FEAT_ROLES,
+            Now::get(),
+        );
+        p
+    });
+    let mut pty = None;
+    let mut changes = 0;
+    for rev in 1..=20 {
+        for p in &mut panes {
+            for request in role_requests(&std::mem::take(out(p))) {
+                if let roles::Request::Resize { cols, rows } = request
+                    && pty != Some((cols, rows))
+                {
+                    pty = Some((cols, rows));
+                    changes += 1;
+                }
+            }
+        }
+        let (cols, lines) = pty.unwrap();
+        for (p, (grid_cols, grid_rows)) in panes.iter_mut().zip(grids) {
+            update(p, rev, vec![Op::Reset { cols, lines }]);
+            assert!(p.fit(grid_cols, grid_rows).is_none());
+        }
+    }
+    assert!(
+        changes <= 2,
+        "PTY size changed {changes} times in 20 repaints"
+    );
+}
+
 /// OWE-579: 쓰기가 실패하면 연결을 닫는다(읽는 쪽이 EOF를 받아 셸이 다시 붙는다). 열어 두면 krilld는 붙은 줄 알고 입력은
 /// 영영 보류된다.
 #[test]
