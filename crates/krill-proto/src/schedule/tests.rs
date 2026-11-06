@@ -252,7 +252,10 @@ fn concurrent_request_run_now_and_take_run_now_never_lose_triggers() {
     let writer = std::thread::spawn(move || {
         writer_barrier.wait();
         for i in 0..count {
-            request_run_now(&writer_dir, &format!("job-{i}")).unwrap();
+            // A slow disk can spend the lock budget. The refused trigger was not recorded.
+            while let Err(error) = request_run_now(&writer_dir, &format!("job-{i}")) {
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+            }
         }
     });
 
@@ -262,8 +265,9 @@ fn concurrent_request_run_now_and_take_run_now_never_lose_triggers() {
         reader_barrier.wait();
         let mut collected = HashSet::new();
         for _ in 0..count.saturating_mul(2) {
-            for id in take_run_now(&reader_dir).unwrap() {
-                collected.insert(id);
+            match take_run_now(&reader_dir) {
+                Ok(ids) => collected.extend(ids),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}"),
             }
         }
         collected

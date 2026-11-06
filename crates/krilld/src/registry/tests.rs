@@ -3396,9 +3396,10 @@ fn kept_session_restart_hidden_tab_preserves_size_without_overprint_or_clipped_r
     holder_link
         .send(&FromHolder::Ready.encode().unwrap(), &[])
         .unwrap();
-    drop(master);
 
     let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    // Only after receipt: macOS can disconnect a socket whose last reference is in flight.
+    drop(master);
     let reg = Registry::new(Some((holder, kept)), Some(&dir));
     let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
 
@@ -3537,9 +3538,10 @@ fn kept_session_restart_active_tab_does_not_reflow_into_two_columns() {
     holder_link
         .send(&FromHolder::Ready.encode().unwrap(), &[])
         .unwrap();
-    drop(master);
 
     let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    // Only after receipt: macOS can disconnect a socket whose last reference is in flight.
+    drop(master);
     let reg = Registry::new(Some((holder, kept)), Some(&dir));
     let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
 
@@ -3642,9 +3644,10 @@ fn kept_quiet_session_wire_size_prevents_two_column_reflow() {
     holder_link
         .send(&FromHolder::Ready.encode().unwrap(), &[])
         .unwrap();
-    drop(master);
 
     let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    // Only after receipt: macOS can disconnect a socket whose last reference is in flight.
+    drop(master);
     let reg = Registry::new(Some((holder, kept)), Some(&dir));
     let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
 
