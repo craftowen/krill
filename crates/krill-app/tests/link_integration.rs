@@ -307,13 +307,17 @@ fn disconnect_remote_mac_stops_owned_tunnel_preserves_ptys_and_blocks_old_target
             .connect(&client_hello(ClientRole::App, "removed"))
             .is_err()
     );
-    assert!(
-        !Command::new("/bin/kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+    // The lease stops its child on a background thread.
+    until(
+        || {
+            !Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        },
+        "owned tunnel stops after disconnect",
     );
     assert!(
         sidebar::status_source(fixture.local("s"))
