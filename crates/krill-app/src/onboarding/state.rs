@@ -4,6 +4,8 @@
 //! 있고 `toml`이 없으면 완료로 간주한다. `toml` 쓰기는 임시 파일+rename 원자 교체다.
 //! 단계(`step`)는 구 4단계 마법사 파일과 호환하려고 남긴 값이다. 첫 실행 동의 단계는
 //! 없어졌으므로(OWE-904) 구 `step = "consent"` 파일은 처음 상태로 읽는다.
+//! `welcome_pending`은 빈 화면 환영 패널을 보일지다. 첫 실행에서만 켜고, 이 값이 없는
+//! 기존 파일은 꺼짐으로 읽어 기존 사용자에게는 보이지 않는다.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -46,6 +48,7 @@ pub struct OnboardingState {
     pub completed: bool,
     pub step: Step,
     pub version: u32,
+    pub welcome_pending: bool,
 }
 
 impl OnboardingState {
@@ -54,6 +57,7 @@ impl OnboardingState {
             completed: false,
             step: Step::Checklist,
             version: STATE_VERSION,
+            welcome_pending: false,
         }
     }
 
@@ -71,6 +75,8 @@ struct FileState {
     completed: bool,
     step: String,
     version: u32,
+    #[serde(default)]
+    welcome_pending: bool,
 }
 
 /// 상태 디렉터리의 상태 파일 경로.
@@ -99,6 +105,7 @@ pub fn load(state_dir: &Path) -> OnboardingState {
         completed: file.completed,
         step,
         version: file.version,
+        welcome_pending: file.welcome_pending,
     }
 }
 
@@ -108,6 +115,7 @@ fn migrate_or_fresh(state_dir: &Path) -> OnboardingState {
             completed: true,
             step: Step::Done,
             version: STATE_VERSION,
+            welcome_pending: false,
         }
     } else {
         OnboardingState::fresh()
@@ -120,6 +128,7 @@ pub fn save(state_dir: &Path, state: &OnboardingState) -> io::Result<()> {
         completed: state.completed,
         step: state.step.as_str().to_owned(),
         version: state.version,
+        welcome_pending: state.welcome_pending,
     };
     let body = toml::to_string(&file).map_err(io::Error::other)?;
     krill_proto::os::write_atomic_0600(&state_path(state_dir), body.as_bytes())
@@ -188,6 +197,7 @@ mod tests {
             completed: false,
             step: Step::Connect,
             version: STATE_VERSION,
+            welcome_pending: true,
         };
         save(&root, &state).unwrap();
         assert_eq!(load(&root), state);
@@ -196,6 +206,21 @@ mod tests {
         let back = load(&root);
         assert!(back.completed);
         assert_eq!(back.step, Step::Done);
+        assert!(back.welcome_pending);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn existing_completed_file_without_welcome_keeps_panel_hidden() {
+        let root = dir("existing-user");
+        std::fs::write(
+            state_path(&root),
+            "completed = true\nstep = \"done\"\nversion = 1\n",
+        )
+        .unwrap();
+        let state = load(&root);
+        assert!(state.completed);
+        assert!(!state.welcome_pending);
         std::fs::remove_dir_all(&root).ok();
     }
 }

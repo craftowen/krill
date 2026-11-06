@@ -592,6 +592,7 @@ fn wizard_completed_state_only_refreshes_staging(cx: &mut TestAppContext) {
             completed: true,
             step: state::Step::Done,
             version: state::STATE_VERSION,
+            welcome_pending: false,
         },
     )
     .unwrap();
@@ -628,6 +629,38 @@ fn wizard_legacy_done_skips_wizard(cx: &mut TestAppContext) {
     let cx = open(cx, &f.env);
     assert!(wizard_window(cx).is_none());
     assert!(state::load(&f.env.state).completed);
+}
+
+#[gpui::test]
+fn welcome_panel_shows_on_first_run_only_until_dismissed(cx: &mut TestAppContext) {
+    let f = fake("welcome-first-run");
+    let cx = open(cx, &f.env);
+    assert!(cx.update(|_, cx| welcome_pending(cx)));
+    assert!(state::load(&f.env.state).welcome_pending);
+
+    cx.update(|_, cx| dismiss_welcome(cx));
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| welcome_pending(cx)));
+    assert!(!state::load(&f.env.state).welcome_pending);
+
+    // 다음 실행에서도 다시 나오지 않는다.
+    cx.update(|_, cx| offer(f.env.clone(), cx));
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| welcome_pending(cx)));
+}
+
+#[gpui::test]
+fn welcome_panel_stays_hidden_for_existing_users(cx: &mut TestAppContext) {
+    let f = fake("welcome-existing");
+    fs::create_dir_all(&f.env.state).unwrap();
+    fs::write(
+        state::state_path(&f.env.state),
+        "completed = true\nstep = \"done\"\nversion = 1\n",
+    )
+    .unwrap();
+    let cx = open(cx, &f.env);
+    assert!(!cx.update(|_, cx| welcome_pending(cx)));
+    assert!(!state::load(&f.env.state).welcome_pending);
 }
 
 #[test]
@@ -981,6 +1014,7 @@ fn wizard_legacy_mid_flow_completes_silently(cx: &mut TestAppContext) {
                 completed: false,
                 step,
                 version: state::STATE_VERSION,
+                welcome_pending: false,
             },
         )
         .unwrap();
@@ -1001,6 +1035,7 @@ fn state_failed_save_preserves_existing() {
         completed: false,
         step: state::Step::Connect,
         version: state::STATE_VERSION,
+        welcome_pending: false,
     };
     state::save(&root, &before).unwrap();
     let body = fs::read_to_string(state::state_path(&root)).unwrap();
@@ -1009,6 +1044,7 @@ fn state_failed_save_preserves_existing() {
         completed: true,
         step: state::Step::Done,
         version: state::STATE_VERSION,
+        welcome_pending: false,
     };
     let result = state::save(&root, &after);
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1033,6 +1069,7 @@ fn state_load_ignores_interrupted_tmp_debris() {
         completed: false,
         step: state::Step::Checklist,
         version: state::STATE_VERSION,
+        welcome_pending: false,
     };
     state::save(&root, &saved).unwrap();
     // 중단된 rename이 남긴 임시 파일 흉내. 다음 저장은 다른 고유 이름이라 덮지 않는다.

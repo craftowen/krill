@@ -5935,6 +5935,9 @@ impl Shell {
         let focused = self.layout.focused();
         let before = self.layout.clone();
         f(&mut self.layout);
+        if !self.layout.tabs().is_empty() {
+            krill_app::onboarding::dismiss_welcome(cx);
+        }
         self.forget_closed_file_tabs();
         self.cancel_closed_pastes(cx);
         if policy == close::Policy::Terminate {
@@ -7810,7 +7813,7 @@ impl Render for Shell {
         };
         let tree = match root {
             Some(r) => self.render_tree(&r, &mut Vec::new(), window, cx),
-            None => self.render_empty_workspace(cx),
+            None => self.render_empty_workspace(window, cx),
         };
         let center_diff = self.render_center_diff(window, cx);
         let show_panel = !self.panel_collapsed;
@@ -8494,9 +8497,182 @@ impl Shell {
         }
     }
 
-    fn render_empty_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// 첫 실행 빈 화면의 환영 패널. 닫거나 첫 탭을 열면 다시 나오지 않는다(OWE-904: 모달 없음).
+    fn render_welcome_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.role != WindowRole::Main || !krill_app::onboarding::welcome_pending(cx) {
+            return None;
+        }
+        let p = krill_app::ui::palette(cx);
+        let row = |id: &'static str,
+                   icon: AnyElement,
+                   title: &'static str,
+                   body: &'static str,
+                   controls: Option<gpui::Div>| {
+            div()
+                .debug_selector(move || id.into())
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_3()
+                .py_3()
+                .border_t_1()
+                .border_color(p.border)
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(28.))
+                        .rounded(krill_app::ui::RADIUS_SM)
+                        .bg(p.muted)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_size(krill_app::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(p.foreground)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(krill_app::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(body),
+                        ),
+                )
+                .children(controls)
+        };
+        let svg = |bytes: &'static [u8]| {
+            krill_app::ui::icons::svg_box(bytes, krill_app::ui::ICON_MD, p.muted_foreground)
+                .into_any_element()
+        };
+        let jump_label = krill_app::keys::shortcut_label(window, &Jump);
+        Some(
+            div()
+                .id("empty-welcome")
+                .debug_selector(|| "empty-welcome".into())
+                .w(px(520.))
+                .max_w_full()
+                .px_4()
+                .pt_3()
+                .pb_1()
+                .rounded(krill_app::ui::RADIUS_MD)
+                .bg(p.card)
+                .border_1()
+                .border_color(p.border)
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .pb_2()
+                        .child(
+                            div()
+                                .text_size(krill_app::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.foreground)
+                                .child(text::WELCOME_TITLE.get()),
+                        )
+                        .child(
+                            krill_app::ui::ghost(
+                                "empty-welcome-dismiss",
+                                text::WELCOME_DISMISS.get(),
+                            )
+                            .debug_selector(|| "empty-welcome-dismiss".into())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                krill_app::onboarding::dismiss_welcome(cx);
+                                cx.notify();
+                            })),
+                        ),
+                )
+                .child(row(
+                    "empty-welcome-alive",
+                    svg(krill_app::ui::icons::HISTORY_SVG),
+                    text::WELCOME_ALIVE_TITLE.get(),
+                    text::WELCOME_ALIVE_BODY.get(),
+                    None,
+                ))
+                .child(row(
+                    "empty-welcome-jump",
+                    gpui_component::Icon::new(IconName::Search)
+                        .with_size(krill_app::ui::ICON_MD)
+                        .text_color(p.muted_foreground)
+                        .into_any_element(),
+                    text::WELCOME_JUMP_TITLE.get(),
+                    text::WELCOME_JUMP_BODY.get(),
+                    jump_label.map(|label| {
+                        krill_app::ui::controls().child(
+                            krill_app::ui::secondary("empty-welcome-jump-open", label)
+                                .debug_selector(|| "empty-welcome-jump-open".into())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_jump(window, cx);
+                                })),
+                        )
+                    }),
+                ))
+                .child(row(
+                    "empty-welcome-remote",
+                    svg(krill_app::ui::icons::SERVER_SVG),
+                    text::WELCOME_REMOTE_TITLE.get(),
+                    text::WELCOME_REMOTE_BODY.get(),
+                    Some(
+                        krill_app::ui::controls()
+                            .child(
+                                krill_app::ui::secondary(
+                                    "empty-welcome-remote-open",
+                                    text::WELCOME_REMOTE_BUTTON.get(),
+                                )
+                                .debug_selector(|| "empty-welcome-remote-open".into())
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.open_settings(
+                                            krill_app::settings::AdminTab::Machines,
+                                            Some(window),
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                krill_app::ui::secondary(
+                                    "empty-welcome-mobile-open",
+                                    text::WELCOME_MOBILE_BUTTON.get(),
+                                )
+                                .debug_selector(|| "empty-welcome-mobile-open".into())
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.open_mobile_page(Some(window), cx);
+                                    },
+                                )),
+                            ),
+                    ),
+                ))
+                .child(row(
+                    "empty-welcome-cli",
+                    svg(krill_app::ui::icons::SQUARE_TERMINAL_SVG),
+                    text::WELCOME_CLI_TITLE.get(),
+                    text::WELCOME_CLI_BODY.get(),
+                    None,
+                ))
+                .into_any_element(),
+        )
+    }
+
+    fn render_empty_workspace(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         krill_app::star_nag::ensure_checked(cx);
         let has_projects = self.sidebar.read(cx).has_projects();
+        let welcome = self.render_welcome_panel(window, cx);
         let p = krill_app::ui::palette(cx);
         let action_row = |id: &'static str, label: &'static str, shortcut: &'static str| {
             div()
@@ -8543,14 +8719,18 @@ impl Shell {
                             .text_color(p.foreground)
                             .child(text::APP_TITLE.get()),
                     )
-                    .child(
-                        div()
-                            .debug_selector(|| "empty-tagline".into())
-                            .text_size(krill_app::ui::TEXT_SM)
-                            .text_color(p.muted_foreground)
-                            .child(text::EMPTY_TAGLINE.get()),
-                    ),
+                    // 환영 패널의 첫 항목이 같은 내용이라 그동안은 한 줄 문구를 숨긴다.
+                    .when(welcome.is_none(), |d| {
+                        d.child(
+                            div()
+                                .debug_selector(|| "empty-tagline".into())
+                                .text_size(krill_app::ui::TEXT_SM)
+                                .text_color(p.muted_foreground)
+                                .child(text::EMPTY_TAGLINE.get()),
+                        )
+                    }),
             )
+            .children(welcome)
             .child(
                 div()
                     .w(px(240.))

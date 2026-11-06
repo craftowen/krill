@@ -9033,6 +9033,80 @@ fn owe903_first_run_offer_inside_shell_update_does_not_panic(cx: &mut TestAppCon
     std::fs::remove_dir_all(&root).ok();
 }
 
+fn first_run_env(name: &str) -> (std::path::PathBuf, krill_app::onboarding::Env) {
+    let root = std::env::temp_dir().join(format!("mk-{name}-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let env = krill_app::onboarding::Env {
+        shell: "/bin/sh".into(),
+        krill: root.join("krill"),
+        state: root.join("state"),
+        default_state: Some(krill_proto::daemon::state_dir_in(&root.join("home"))),
+        home: root.clone(),
+        state_overridden: true,
+    };
+    (root, env)
+}
+
+/// 첫 실행 빈 화면에는 환영 패널이 보이고, 닫으면 한 줄 문구로 돌아간다.
+#[gpui::test]
+fn first_run_empty_workspace_shows_welcome_panel_until_dismissed(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("welcome-dismiss"));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert!(cx.debug_bounds("empty-welcome").is_none());
+
+    let (root, env) = first_run_env("welcome-dismiss");
+    cx.update(|_, cx| krill_app::onboarding::offer(env, cx));
+    cx.run_until_parked();
+    let panel = cx.debug_bounds("empty-welcome").expect("welcome panel");
+    assert!(cx.debug_bounds("empty-tagline").is_none());
+    for row in [
+        "empty-welcome-alive",
+        "empty-welcome-jump-open",
+        "empty-welcome-remote-open",
+        "empty-welcome-mobile-open",
+        "empty-welcome-cli",
+    ] {
+        assert!(cx.debug_bounds(row).is_some(), "{row}");
+    }
+    let shortcuts = cx.debug_bounds("empty-new-terminal").expect("shortcut row");
+    assert!(panel.bottom() <= shortcuts.top());
+
+    let dismiss = cx.debug_bounds("empty-welcome-dismiss").unwrap();
+    cx.simulate_click(dismiss.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("empty-welcome").is_none());
+    assert!(cx.debug_bounds("empty-tagline").is_some());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 첫 탭을 열면 환영 패널은 끝난 것으로 기록되어, 탭을 다 닫아도 다시 나오지 않는다.
+#[gpui::test]
+fn first_tab_retires_welcome_panel(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("welcome-first-tab"));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    let (root, env) = first_run_env("welcome-first-tab");
+    cx.update(|_, cx| krill_app::onboarding::offer(env, cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("empty-welcome").is_some());
+
+    let new_terminal = cx.debug_bounds("empty-new-terminal").unwrap();
+    cx.simulate_click(new_terminal.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!layout_of(&view, cx).tabs().is_empty());
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert!(cx.debug_bounds("empty-welcome").is_none());
+    assert!(cx.debug_bounds("empty-tagline").is_some());
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// 하-3: 사이드바·우측 패널 분할선을 더블클릭하면 기본 너비로 돌아간다.
 #[gpui::test]
 fn column_divider_double_click_resets_width(cx: &mut TestAppContext) {
