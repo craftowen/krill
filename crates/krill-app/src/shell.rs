@@ -7299,6 +7299,12 @@ impl Shell {
             .session(id)
             .or_else(|| self.live.get(&id).and_then(|l| l.pane.session()))?;
         let sidebar_ref = self.sidebar.read(cx);
+        if sidebar_ref
+            .session_on(host, session_id)
+            .is_some_and(sidebar::Session::agent_ended)
+        {
+            return None;
+        }
         let history = sidebar_ref
             .session_prompt_history_on(host, session_id)?
             .clone();

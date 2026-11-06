@@ -581,6 +581,58 @@ fn ended_agent_keeps_its_pane_as_a_plain_terminal(cx: &mut TestAppContext) {
     assert_eq!(launch.cwd, b"/tmp/repo");
 }
 
+#[gpui::test]
+fn ended_agent_hides_the_sticky_prompt_bar(cx: &mut TestAppContext) {
+    use krill_proto::control::{AgentState, AgentStatus, Source as StatusSource};
+    use std::sync::Arc;
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let (view, cx) = open(cx, state_path("ended-agent-hides-prompt-bar"));
+    let pane = layout_of(&view, cx).focused().expect("focused pane");
+    let sid = SessionId(42);
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![sidebar::Session {
+            id: sid,
+            status: AgentStatus {
+                state: AgentState::Unknown,
+                source: Some(StatusSource::Process),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: None,
+        }],
+        trees: std::collections::BTreeMap::default(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.layout.set_session(pane, sid);
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.sidebar
+                .update(cx, |b, cx| b.record_local_prompt(sid, "fix the bug", cx));
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bar: &'static str = Box::leak(format!("sticky-prompt-bar-{}", pane.get()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(bar).is_none(),
+        "a pane back at its shell must not show the agent's last prompt"
+    );
+}
+
 /// D-01: 닫기 확인창이 떠 있는 사이 앞쪽 탭이 정리돼 번호가 당겨져도 확인은 원래 고른 탭만 닫는다.
 #[gpui::test]
 fn close_confirm_survives_earlier_tab_pruned(cx: &mut TestAppContext) {
