@@ -2377,6 +2377,7 @@ impl Registry {
                 // 끝나면 on_exited가 지운다. 잠금 안에서 표시해 그사이 온 Exited를 놓치지 않는다.
                 let first = st.closing.insert(id);
                 drop(st);
+                self.cancel_queued_account_switch(id);
                 let end = |req| {
                     if holder.version() >= TERMINATE_SINCE {
                         ToHolder::Terminate { req, id }

@@ -638,6 +638,22 @@ impl Registry {
         self.cancel_account_switch(session, None)
     }
 
+    /// The user is ending this conversation's session, so nothing may resume it on their behalf.
+    /// An attempt already in flight sees its selection disappear and stops its replacement.
+    pub(super) fn cancel_queued_account_switch(&self, session: SessionId) {
+        let mut pending = lock(&self.account_work.pending);
+        let mut handoffs = lock(&self.account_handoffs);
+        if handoffs
+            .get(&session)
+            .is_some_and(|h| h.to.is_none() && h.error.is_none())
+        {
+            handoffs.remove(&session);
+            self.write_account_handoffs(&handoffs).ok();
+            pending
+                .retain(|scope, _| !matches!(scope, SwitchScope::Session(id, _) if *id == session));
+        }
+    }
+
     pub(super) fn account_switch_snapshot(&self, snapshot: &mut AccountsSnapshot) {
         let handoffs = lock(&self.account_handoffs);
         let replacements = lock(&self.account_replacements);
@@ -1747,9 +1763,11 @@ impl Drop for Replacement<'_> {
             self.registry.agents.finish_account_resume(self.session);
         }
         lock(&self.registry.account_replacements).remove(&self.session);
+        // Without a handoff record the switch was cancelled, so the replacement has no claim to stay.
         let only_remaining = !self.committed
             && self.registry.account_original_ended(self.original)
-            && !self.registry.account_original_ended(self.session);
+            && !self.registry.account_original_ended(self.session)
+            && lock(&self.registry.account_handoffs).contains_key(&self.original);
         let resolved = if only_remaining {
             let retained = if let Some(handoff) =
                 lock(&self.registry.account_handoffs).get_mut(&self.original)
