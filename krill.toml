@@ -1,0 +1,3 @@
+# 새 워크트리는 dev에서 딴다. main은 출고된 커밋만 따라가는 포인터라 거기서 작업하지 않는다.
+[worktree]
+base = "origin/dev"

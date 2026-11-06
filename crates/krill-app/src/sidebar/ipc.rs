@@ -942,6 +942,19 @@ fn fetch_from(
         .collect();
     let external_states = external;
     let mut states: BTreeMap<_, _> = states.into_iter().map(|s| (s.session, s.status)).collect();
+    // 데몬의 `Exited`+`Process`는 PTY 종료와 "에이전트만 끝나고 로그인 셸이 남음"을 함께 뜻한다.
+    // PTY가 살아 있으면 일반 터미널이다. 전경 프로세스·제목·셸 정보는 터미널의 것이라 남긴다.
+    for s in sessions.iter().filter(|s| s.status.is_none()) {
+        if let Some(status) = states.get_mut(&s.session)
+            && status.state == AgentState::Exited
+            && status.source == Some(krill_proto::control::Source::Process)
+        {
+            status.state = AgentState::Unknown;
+            status.confidence = krill_proto::control::Confidence::Low;
+            status.agent.clear();
+            status.subagents.clear();
+        }
+    }
     // AS-08: 외부 pid가 있는 후보가 있을 때만 프로세스 표를 한 번 읽는다.
     let want_parents = sessions.iter().any(|s| {
         s.status.is_none()
@@ -981,7 +994,7 @@ fn fetch_from(
                     .max_by_key(|p| p.as_os_str().len())
                     .cloned()
             });
-            Session {
+            let mut session = Session {
                 id: s.session,
                 status,
                 worktree,
@@ -990,7 +1003,11 @@ fn fetch_from(
                     .filter(|p| !p.as_os_str().is_empty())
                     .cloned(),
                 account: accounts.get(&s.session).cloned(),
+            };
+            if session.agent_ended() {
+                session.account = None;
             }
+            session
         })
         .collect();
     sessions.sort_by_key(|s| s.id);
@@ -1132,6 +1149,68 @@ mod tests {
                 assert_eq!(histories[&krill_proto::SessionId(7)].total_turns, 1);
             }
         }
+    }
+
+    #[test]
+    fn agent_exit_on_a_live_pty_is_a_plain_terminal() {
+        use krill_proto::SessionId;
+        use krill_proto::control::{AgentStatus, Info, SessionAccount, SessionStatus, Source};
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let ended = AgentStatus {
+                state: AgentState::Exited,
+                source: Some(Source::Process),
+                agent: "claude".into(),
+                title: Some("~/repo".into()),
+                ..AgentStatus::UNKNOWN
+            };
+            let replies = [
+                Reply::Sessions(vec![
+                    Info {
+                        session: SessionId(7),
+                        pid: 1,
+                        status: None,
+                    },
+                    Info {
+                        session: SessionId(8),
+                        pid: 2,
+                        status: Some(0),
+                    },
+                ]),
+                Reply::States(vec![
+                    SessionStatus {
+                        session: SessionId(7),
+                        status: ended.clone(),
+                    },
+                    SessionStatus {
+                        session: SessionId(8),
+                        status: ended,
+                    },
+                ]),
+                Reply::Sidebar(krill_proto::control::SidebarData::default()),
+                Reply::SessionAccounts(vec![SessionAccount {
+                    session: SessionId(7),
+                    account_id: "claude-work".into(),
+                    label: "work".into(),
+                }]),
+            ];
+            for reply in replies {
+                krill_proto::ipc::read_frame(&mut server).unwrap().unwrap();
+                server.write_all(&reply.encode().unwrap()).unwrap();
+            }
+        });
+        let (snapshot, ..) = fetch_from(&mut client, &BTreeMap::new(), false).unwrap();
+        worker.join().unwrap();
+        let shell = &snapshot.sessions[0];
+        assert!(!shell.is_exited(), "{shell:?}");
+        assert!(shell.agent_ended(), "{shell:?}");
+        assert_eq!(shell.status.state, AgentState::Unknown);
+        assert_eq!(shell.status.agent, "");
+        assert_eq!(shell.status.title.as_deref(), Some("~/repo"));
+        assert_eq!(shell.account, None);
+        let closed = &snapshot.sessions[1];
+        assert!(closed.is_exited(), "{closed:?}");
+        assert!(!closed.agent_ended(), "{closed:?}");
     }
 
     #[test]

@@ -331,3 +331,95 @@ fn automatic_recovery_keeps_typing_and_enter_then_delivers_once_without_a_toast(
         assert!(s.closed_sessions.is_empty());
     });
 }
+
+#[gpui::test]
+fn queued_switch_leaves_input_open_until_the_agent_goes_idle(cx: &mut TestAppContext) {
+    use krill_proto::control::{AgentState, AgentStatus};
+    let (view, cx) = open(cx, state_path("queued-switch-busy-agent"));
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let session = SessionId(220);
+    let host = HostId::Remote("studio".into());
+    let pane = view.update(cx, |s, cx| {
+        let pane = s.layout.focused().unwrap();
+        s.layout.set_host(pane, host.clone());
+        s.layout.set_session(pane, session);
+        s.attach_test(pane, session, ours, cx);
+        pane
+    });
+    let set_state = |view: &gpui::Entity<Shell>, cx: &mut gpui::VisualTestContext, state| {
+        view.update(cx, |s, cx| {
+            s.sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_remote_snapshot_for_test(
+                    "studio",
+                    krill_app::hosts::HostStatus::Connected,
+                    sidebar::Snapshot {
+                        sessions: vec![sidebar::Session {
+                            id: session,
+                            status: AgentStatus {
+                                state,
+                                ..AgentStatus::UNKNOWN
+                            },
+                            worktree: None,
+                            cwd: None,
+                            account: None,
+                        }],
+                        trees: std::collections::BTreeMap::new(),
+                    },
+                    cx,
+                );
+            });
+            let mut queued = AccountsSnapshot::default();
+            queued.details.supported = true;
+            queued.details.handoffs.push(SessionHandoff {
+                from: session,
+                to: None,
+                account_id: "selected".into(),
+                error: None,
+            });
+            s.apply_accounts_snapshot_for_host(host.clone(), queued, cx);
+        });
+    };
+    let type_bytes =
+        |view: &gpui::Entity<Shell>, cx: &mut gpui::VisualTestContext, bytes: &[u8]| {
+            view.update(cx, |s, _| {
+                s.live.get_mut(&pane).unwrap().pane.input(bytes, Now::get());
+            });
+        };
+    let mut read_input = |len: usize| {
+        let mut bytes = Vec::new();
+        while bytes.len() < len {
+            let (kind, body) = ipc::read_frame(&mut peer).unwrap().unwrap();
+            bytes.extend(Input::decode(kind, &body).unwrap().bytes);
+        }
+        bytes
+    };
+
+    for state in [
+        AgentState::Waiting,
+        AgentState::Blocked,
+        AgentState::Working,
+    ] {
+        set_state(&view, cx, state);
+        assert!(
+            view.read_with(cx, |s, _| !s.live[&pane].pane.account_switching()),
+            "{state:?} agent cannot reach the idle state a queued switch waits for"
+        );
+        type_bytes(&view, cx, b"1");
+        assert_eq!(read_input(1), b"1", "{state:?} agent must receive input");
+    }
+
+    set_state(&view, cx, AgentState::Done);
+    assert!(
+        view.read_with(cx, |s, _| s.live[&pane].pane.account_switching()),
+        "an idle agent is about to be replaced, so new prompts wait for the replacement"
+    );
+    type_bytes(&view, cx, b"x\r");
+
+    set_state(&view, cx, AgentState::Waiting);
+    assert_eq!(
+        read_input(2),
+        b"x\r",
+        "input held for a switch that can no longer start reaches the agent"
+    );
+}

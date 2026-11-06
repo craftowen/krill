@@ -5,6 +5,7 @@
 
 use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 #[cfg(not(windows))]
@@ -15,8 +16,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
 use krill_proto::agent::{Permission, Profile, claude};
@@ -337,8 +338,42 @@ fn uuid() -> io::Result<String> {
     Ok(id)
 }
 
-/// 실제와 같은 login/interactive 셸의 PATH·환경에서 버전을 읽는다. 5초 안에 못 읽으면 보수적 집합.
+type VersionKey = (PathBuf, super::codex::Stamp);
+static VERSIONS: Mutex<BTreeMap<VersionKey, (Instant, String)>> = Mutex::new(BTreeMap::new());
+const VERSION_TTL: Duration = Duration::from_hours(1);
+
+/// 로그인 셸로 `--version`을 묻는 데 세션 생성마다 100ms 넘게 들어, 같은 실행 파일(경로·도장)이면
+/// [`VERSION_TTL`] 동안 다시 묻지 않는다. 경로를 못 찾으면(별칭·함수) 매번 묻는다.
+// ponytail: 파일은 그대로인데 가리키는 버전만 바뀌는 shim(mise·asdf)은 최대 TTL 동안 이전 버전 기준 settings를 받는다.
 pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
+    let program = profile.program()?;
+    let key = krill_proto::agent::which(
+        program,
+        &super::codex::search_path(Some(Path::new(program))),
+    )
+    .map(|exe| {
+        let stamp = super::codex::stamp(&exe);
+        (exe, stamp)
+    });
+    if let Some(key) = &key
+        && let Some((at, version)) = crate::session::lock(&VERSIONS).get(key)
+        && at.elapsed() < VERSION_TTL
+    {
+        return Some(version.clone());
+    }
+    let version = probe_now(profile, login)?;
+    if let Some(key) = key {
+        let mut cache = crate::session::lock(&VERSIONS);
+        if cache.len() >= 64 {
+            cache.pop_first();
+        }
+        cache.insert(key, (Instant::now(), version.clone()));
+    }
+    Some(version)
+}
+
+/// 실제와 같은 login/interactive 셸의 PATH·환경에서 버전을 읽는다. 5초 안에 못 읽으면 보수적 집합.
+fn probe_now(profile: &Profile, login: &Launch) -> Option<String> {
     let mut profile = profile.clone();
     profile.launch = vec![profile.program()?.to_owned(), "--version".into()];
     #[cfg(unix)]

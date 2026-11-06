@@ -30,6 +30,7 @@ function harness({
     next = 0;
   const timers = new Map(),
     listeners = {},
+    docListeners = {},
     requests = [],
     sockets = [],
     context = vm.createContext({
@@ -54,7 +55,14 @@ function harness({
         globalPrivacyControl: gpc,
       },
       location: new URL(href),
-      document: { visibilityState: "visible" },
+      document: {
+        visibilityState: "visible",
+        hidden: false,
+        addEventListener: (n, fn) => (docListeners[n] ||= []).push(fn),
+        removeEventListener: (n, fn) => {
+          docListeners[n] = (docListeners[n] || []).filter((x) => x !== fn);
+        },
+      },
       history: { replaceState() {} },
       localStorage: {
         getItem: (k) => (store.has(k) ? store.get(k) : null),
@@ -210,6 +218,9 @@ function harness({
     timers,
     tick,
     emit,
+    emitDoc: (name, event = {}) => {
+      for (const fn of [...(docListeners[name] || [])]) fn(event);
+    },
     transport,
     start,
     response,
@@ -341,10 +352,9 @@ for (const [stage, phase] of [
     assert(e);
     assert.equal(e.diagnostics.phase, phase);
     assert.equal(e.diagnostics.elapsed_ms, 20000);
-    assert.equal(
-      e.error_code,
-      stage === 2 ? "mobile_auth_failed" : "mobile_connect_failed",
-    );
+    assert.equal(e.error_code, "mobile_connect_failed");
+    assert.equal(t.blocked, false);
+    assert(t.state.retryAt < h.context.Date.now() + 20000);
     t.close();
   });
 for (const status of [401, 403, 503])
@@ -1008,6 +1018,7 @@ test("a drop after a long-lived connection still files one report", async () => 
   assert.equal(events[0].error_code, "mobile_connect_failed");
   assert.equal(events[0].diagnostics.phase, "ipc");
   assert.equal(events[0].diagnostics.ws_code, 1006);
+  assert(events[0].diagnostics.elapsed_ms < 20000);
   t.close();
 });
 test("relay outage with unreachable discovery files one report", async () => {
@@ -1231,4 +1242,230 @@ test("a read whose socket died is retried on the next connection and files no re
   await settle(h);
   assert.equal(h.events().length, 0);
   t.close();
+});
+test("slow challenge at 19980ms completes at 20500ms without timeout report while genuine stage-2 timeout files mobile_connect_failed without lockout", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 1);
+  await h.tick(19980);
+  socket.emit("message", {
+    data: JSON.stringify({ version: 2, challenge: "challenge-secret" }),
+  });
+  await flush();
+  await h.tick(520);
+  socket.emit("message", { data: enc.encode("{}") });
+  await flush();
+  socket.emit("message", { data: Uint8Array.from([0, 0, 0, 0, 1]) });
+  await flush();
+  h.response(socket, { sessions: [] });
+  await pending;
+  assert.equal(t.ready, true);
+  await settle(h);
+  assert.equal(h.events().length, 0);
+  t.close();
+
+  const h2 = harness();
+  h2.diagnostics.setEnabled(true);
+  const t2 = h2.transport(),
+    stalled = await h2.start(t2, 2);
+  await h2.tick(20000);
+  await stalled.pending;
+  await settle(h2);
+  const events = h2.events();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].error_code, "mobile_connect_failed");
+  assert.equal(events[0].diagnostics.phase, "authentication");
+  assert.equal(events[0].diagnostics.reason, "timeout");
+  assert.equal(t2.blocked, false);
+  assert(t2.state.retryAt < h2.context.Date.now() + 20000);
+  t2.close();
+});
+test("unsent RPC and hidden visibilitychange feed disarm file zero mobile_rpc_failed while mid-flight dropped mutation files websocket_closed", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const t1 = h.transport(),
+    s1 = await h.start(t1, 4);
+  h.response(s1.socket, {
+    sessions: [],
+    etag: "e1",
+    capabilities: { change_feed: true },
+  });
+  await s1.pending;
+  await h.tick(2500);
+  h.response(s1.socket, { unchanged: true, etag: "e1", feed: 2500 });
+  await flush();
+  h.context.document.hidden = true;
+  h.context.document.visibilityState = "hidden";
+  h.emitDoc("visibilitychange");
+  await flush();
+  await h.tick(5000);
+  await h.tick(0);
+  await establish(h, h.sockets.at(-1));
+  h.context.document.hidden = false;
+  h.context.document.visibilityState = "visible";
+  h.emitDoc("visibilitychange");
+  await settle(h);
+  assert.equal(
+    h.events().filter((e) => e.error_code === "mobile_rpc_failed").length,
+    0,
+  );
+  t1.close();
+
+  const t2 = h.transport(),
+    s2 = await h.start(t2, 4);
+  h.response(s2.socket, { sessions: [] });
+  await s2.pending;
+  s2.socket.emit("close", { code: 1006 });
+  await flush();
+  let unsentError;
+  await t2.rpc({ action: "input", text: "never-sent" }).catch((e) => {
+    unsentError = e;
+  });
+  assert.equal(unsentError.diagnosticReason, "websocket_closed");
+  await h.tick(0);
+  await establish(h, h.sockets.at(-1));
+  await settle(h);
+  assert.equal(
+    h.events().filter((e) => e.error_code === "mobile_rpc_failed").length,
+    0,
+  );
+  t2.close();
+
+  const t3 = h.transport(),
+    s3 = await h.start(t3, 4);
+  h.response(s3.socket, { sessions: [] });
+  await s3.pending;
+  await h.tick(1000);
+  const sent = t3.rpc({ action: "input", text: "mid-flight" }),
+    queuedUnsent = t3.rpc({ action: "input", text: "queued-behind" });
+  await flush();
+  await h.tick(250);
+  s3.socket.emit("close", { code: 1006 });
+  await assert.rejects(sent);
+  await assert.rejects(queuedUnsent);
+  await h.tick(0);
+  await establish(h, h.sockets.at(-1));
+  await settle(h);
+  const rpcEvents = h
+    .events()
+    .filter((e) => e.error_code === "mobile_rpc_failed");
+  assert.equal(rpcEvents.length, 1);
+  assert.equal(rpcEvents[0].diagnostics.reason, "websocket_closed");
+  assert.equal(rpcEvents[0].diagnostics.elapsed_ms, 250);
+  t3.close();
+
+  const hProto = harness();
+  hProto.diagnostics.setEnabled(true);
+  const t4 = hProto.transport(),
+    s4 = await hProto.start(t4, 4);
+  hProto.response(s4.socket, { sessions: [] });
+  await s4.pending;
+  const bad = t4.rpc({ action: "git" });
+  await flush();
+  s4.socket.emit("message", { data: Uint8Array.from([0, 0, 0, 0, 99]) });
+  await assert.rejects(bad, /Unexpected daemon response/);
+  await settle(hProto);
+  assert.equal(hProto.events().length, 1);
+  assert.equal(hProto.events()[0].error_code, "mobile_rpc_failed");
+  assert.equal(hProto.events()[0].diagnostics.reason, "protocol_error");
+  t4.close();
+});
+test("offline discovery reports network_offline and mark(discovery) http_status never leaks onto socket_open failure", async () => {
+  const h = harness();
+  relayHost(h);
+  h.diagnostics.setEnabled(true);
+  h.context.navigator.onLine = false;
+  h.setDiscovery(async () => {
+    throw new TypeError("Failed to fetch");
+  });
+  const endpoint = h.context.KrillMobile.transport.bootstrap();
+  const traceA = h.diagnostics.attempt();
+  await endpoint.locate({ diagnosticsTrace: traceA });
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].error_code, "mobile_discovery_failed");
+  assert.equal(h.events()[0].diagnostics.reason, "network_offline");
+
+  const peer = endpoint.forHost(endpoint.profiles()[0].id),
+    traceB = h.diagnostics.attempt();
+  await peer.locate({ diagnosticsTrace: traceB });
+  await settle(h);
+  assert.equal(h.events().length, 2);
+  assert.equal(h.events()[1].diagnostics.reason, "network_offline");
+
+  const h2 = harness();
+  h2.diagnostics.setEnabled(true);
+  const trace = h2.diagnostics.attempt();
+  trace.mark("discovery", { route: "relay", http_status: 200 });
+  trace.mark("socket_open", { route: "relay" });
+  trace.report("mobile_connect_failed", { reason: "websocket_error" });
+  await settle(h2);
+  const [leakCheck] = h2.events();
+  assert.equal(leakCheck.error_code, "mobile_connect_failed");
+  assert.equal(leakCheck.diagnostics.phase, "socket_open");
+  assert.equal(leakCheck.diagnostics.http_status, undefined);
+  assert.equal(
+    leakCheck.diagnostics.breadcrumbs.find((c) => c.phase === "discovery")
+      ?.http_status,
+    200,
+  );
+});
+test("extension runtime errors, extension unhandled rejections and empty or base resource URLs emit zero reports", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const base = "https://krill-mobile.pages.dev/m/0123456789abcdef/";
+  h.emit("error", {
+    message: "Script error.",
+    filename: "",
+    lineno: 0,
+    colno: 0,
+    error: null,
+  });
+  h.emit("error", {
+    filename: "chrome-extension://abcdef/inject.js",
+    lineno: 3,
+    colno: 9,
+    error: {
+      name: "TypeError",
+      message: "ext",
+      stack: "TypeError: ext\n at chrome-extension://abcdef/inject.js:3:9",
+    },
+  });
+  h.emit("unhandledrejection", {
+    reason: {
+      name: "TypeError",
+      message: "ext",
+      stack: "TypeError: ext\n at chrome-extension://abcdef/bg.js:11:4",
+    },
+  });
+  h.emit("unhandledrejection", {
+    reason: {
+      name: "Error",
+      message: "ext",
+      stack: "run@moz-extension://abcdef/bg.js:2:1",
+    },
+  });
+  h.emit("error", { target: { src: "" } });
+  h.emit("error", { target: { src: "   " } });
+  h.emit("error", { target: { src: base } });
+  await h.tick();
+  assert.equal(h.events().length, 0);
+
+  h.emit("error", {
+    filename: "",
+    lineno: 0,
+    colno: 0,
+    error: {
+      name: "RangeError",
+      message: "bad",
+      stack: `RangeError: bad\n at fn (${base}client.js:77:8)`,
+    },
+  });
+  await h.tick();
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].error_code, "mobile_runtime_error");
+  assert.equal(h.events()[0].diagnostics.source_file, "client.js");
+  assert.equal(h.events()[0].diagnostics.line, 77);
+  assert.equal(h.events()[0].diagnostics.column, 8);
 });

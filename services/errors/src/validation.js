@@ -37,9 +37,33 @@ function validSource(value) {
     && parts.slice(1).every(p => /^[1-9][0-9]{0,9}$(?![\s\S])/.test(p) && Number(p) <= 4294967295)
     && /^crates\/krill[a-z0-9-]*\/src\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.rs$(?![\s\S])/.test(parts[0]);
 }
+const PROFILE_DIRS = String.raw`(?:AppData|Desktop|Documents|Downloads|OneDrive|Pictures|Music|Videos|Library|Saved Games|NTUSER\.DAT|\.krill|\.config|\.cache|\.local)`;
+const WIN_MAC_PREFIX = String.raw`((?:\\{2,4}\?\\{1,2})?\b[A-Za-z]:(?:\\{1,2}|/)[Uu]sers(?:\\{1,2}|/)|/Users/)`;
+const LINUX_PREFIX = String.raw`((?:^|[\s"'\x60=:(,;\[<]|file://(?:localhost)?)/home/)`;
+const PROFILE_USER = String.raw`[^\s/\\:<>|?*"'\x60\[\]\x00-\x1f\x7f][^/\\:<>|?*"'\x60\[\]\x00-\x1f\x7f]{0,63}?`;
+const SINGLE_USER = String.raw`[^/\\\s"'\x60:<>|?*,;)\[\]\x00-\x1f\x7f]+`;
+const HOME_RULES = [
+  [new RegExp(WIN_MAC_PREFIX + PROFILE_USER + String.raw`(?=(?:\\{1,2}|/)` + PROFILE_DIRS + String.raw`(?:\\{1,2}|/|$|[\s"'\x60:,;)\]>]))`, 'g'), '$1[USER]'],
+  [new RegExp(LINUX_PREFIX + PROFILE_USER + String.raw`(?=/` + PROFILE_DIRS + String.raw`(?:/|$|[\s"'\x60:,;)\]>]))`, 'g'), '$1[USER]'],
+  [new RegExp(WIN_MAC_PREFIX + SINGLE_USER, 'g'), '$1[USER]'],
+  [new RegExp(LINUX_PREFIX + SINGLE_USER, 'g'), '$1[USER]'],
+];
 function validDetail(value) {
-  return typeof value === 'string' && value.length >= 1 && value.length <= 256
+  return typeof value === 'string' && value.length >= 1 && bytes(value) <= 256
     && !/[\x00-\x1f\x7f]/.test(value);
+}
+export function canonicalizeDetail(value) {
+  let redacted = value;
+  for (const [re, replacement] of HOME_RULES) redacted = redacted.replace(re, replacement);
+  if (bytes(redacted) <= 256) return redacted;
+  let out = '', used = 0;
+  for (const ch of redacted) {
+    const chBytes = bytes(ch);
+    if (used + chBytes > 256) break;
+    out += ch;
+    used += chBytes;
+  }
+  return out.trimEnd() || out;
 }
 function validFrames(value) {
   return Array.isArray(value) && value.length <= 16 && value.every(validSource);
@@ -80,7 +104,7 @@ export function validate(value) {
       exception: e.native.exception, signal: e.native.signal,
       frames: e.native.frames.map(f => ({image_uuid: f.image_uuid, offset: f.offset})),
     };
-    if (e.detail != null) canonical.detail = e.detail;
+    if (e.detail != null) canonical.detail = canonicalizeDetail(e.detail);
     if (Array.isArray(e.frames) && e.frames.length > 0) canonical.frames = [...e.frames];
     if (e.install_hash != null) canonical.install_hash = e.install_hash;
     const json = JSON.stringify(canonical);

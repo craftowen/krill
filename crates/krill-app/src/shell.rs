@@ -2472,8 +2472,8 @@ impl Shell {
                 Ok(paths) => this.connect_daemon_with_paths(paths, cx),
                 Err(e) => {
                     this.daemon_task = None;
+                    krill_app::errors::daemon_connection_failed(cx, &e);
                     this.link = Link::connect_failure(&daemon::Error::Io(e));
-                    krill_app::errors::daemon_connection_failed(cx);
                     cx.notify();
                 }
             })
@@ -2504,12 +2504,17 @@ impl Shell {
                 Err(e) => {
                     tracing::warn!(error = %e, "initial daemon connection failed; retrying");
                     let link = Link::connect_failure(&e);
-                    cx.update(krill_app::errors::daemon_connection_failed);
+                    let detail = e.to_string();
+                    let pending_report = cx.update(|cx| {
+                        krill_app::errors::defer_daemon_connection_failed(cx, &detail)
+                    });
                     if this.update(cx, |this, cx| this.set_link(link, cx)).is_err() {
                         return;
                     }
                     let (t, h) = (target.clone(), hello.clone());
-                    bg.spawn(async move { t.reconnect_until(&h) }).await
+                    let conn = bg.spawn(async move { t.reconnect_until(&h) }).await;
+                    drop(pending_report);
+                    conn
                 }
             };
             // MK-062: 앱이 새 빌드면 구 krilld를 교체한다. 구 krilld가 끝나며 감시 연결이 EOF가 되고 아래 루프가 다시 붙는다.
@@ -3836,7 +3841,7 @@ impl Shell {
                 .session(*pane)
                 .and_then(|session| snap.details.handoffs.iter().find(|h| h.from == session));
             match handoff {
-                Some(h) if h.to.is_none() && h.error.is_none() => live.pane.pause_account_input(),
+                Some(h) if h.to.is_none() && h.error.is_none() => {} // sync_queued_account_input
                 Some(h) if h.to.is_some() => {} // moved below, retaining unsent input
                 Some(_) => input_notices.extend(live.pane.resume_account_input(true, Now::get())),
                 None => {} // Observations cannot authorize delivery to the original account.

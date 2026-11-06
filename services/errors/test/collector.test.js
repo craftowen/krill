@@ -314,3 +314,74 @@ test('health checks migrated schema; all routes use restrictive cache/security h
   assert.equal((await send(env, [event()])).status, 503);
   assert.equal(count(env), 0);
 });
+
+test('stats selects modal sample_detail and sample_source_loc and prefers specific detail on ties', async t => {
+  const env = environment(t);
+  await ingest(env.DB, validate({schema_version: 1, events: [
+    event(1, {detail: 'auth_required', source_loc: 'crates/krill-app/src/main.rs:10:2'}),
+    event(2, {detail: 'auth_required', source_loc: 'crates/krill-app/src/main.rs:10:2'}),
+    event(3, {detail: 'auth_required', source_loc: 'crates/krill-app/src/main.rs:10:2'}),
+    event(4, {error_code: 'daemon_connect_failed', detail: 'auth_rejected', source_loc: 'crates/krill-app/src/main.rs:20'}),
+    event(5, {error_code: 'daemon_connect_failed', detail: 'auth_rejected', source_loc: 'crates/krill-app/src/main.rs:20'}),
+    event(6, {error_code: 'update_failed', process: 'krill-cli', source_loc: null}),
+  ]}), NOW - 10);
+  await ingest(env.DB, validate({schema_version: 1, events: [
+    event(7, {detail: 'unknown', source_loc: 'crates/krill-app/src/shell.rs:99:1'}),
+    event(8, {error_code: 'daemon_connect_failed', detail: 'unknown', source_loc: 'crates/krill-app/src/main.rs:30'}),
+    event(9, {error_code: 'daemon_connect_failed', detail: 'unknown', source_loc: 'crates/krill-app/src/main.rs:30'}),
+  ]}), NOW);
+  const stats = await (await get(env, '/api/stats?days=30')).json();
+  const byCode = Object.fromEntries(stats.details.map(g => [g.error_code, g]));
+  assert.equal(byCode.session_start_failed.sample_detail, 'auth_required');
+  assert.equal(byCode.session_start_failed.sample_source_loc, 'crates/krill-app/src/main.rs:10:2');
+  assert.equal(byCode.daemon_connect_failed.sample_detail, 'auth_rejected');
+  assert.equal(byCode.daemon_connect_failed.sample_source_loc, 'crates/krill-app/src/main.rs:30');
+  assert.equal(byCode.update_failed.sample_detail, null);
+  assert.equal(byCode.update_failed.sample_source_loc, null);
+});
+
+test('detail enforces 256 UTF-8 byte cap and canonicalizes cross-platform home paths idempotently', async t => {
+  const env = environment(t);
+  assert.equal((await send(env, [event(1, {detail: '가'.repeat(85) + 'a'})])).status, 200);
+  assert.equal((await send(env, [event(2, {detail: '🦀'.repeat(64)})])).status, 200);
+  assert.equal((await send(env, [event(3, {detail: '가'.repeat(86)})])).status, 400);
+  assert.equal((await send(env, [event(4, {detail: '🦀'.repeat(65)})])).status, 400);
+
+  const cases = [
+    [10, 'unpack C:\\Users\\alice\\AppData\\Local\\Programs\\Krill.6296-0-download.zip',
+      'unpack C:\\Users\\[USER]\\AppData\\Local\\Programs\\Krill.6296-0-download.zip'],
+    [11, 'temp C:\\Users\\John Smith\\AppData\\Local\\Temp\\x',
+      'temp C:\\Users\\[USER]\\AppData\\Local\\Temp\\x'],
+    [12, 'ext \\\\?\\C:\\Users\\alice\\Desktop\\x',
+      'ext \\\\?\\C:\\Users\\[USER]\\Desktop\\x'],
+    [13, 'mac /Users/alice/work linux /home/alice/.krill profile /Users/Kim Minsu/Library/Logs',
+      'mac /Users/[USER]/work linux /home/[USER]/.krill profile /Users/[USER]/Library/Logs'],
+    [14, 'at crates/krill-app/src/home/mod.rs see https://krill.page/home/docs',
+      'at crates/krill-app/src/home/mod.rs see https://krill.page/home/docs'],
+  ];
+  const rawBatch = cases.map(([n, detail]) => event(n, {detail}));
+  const first = await send(env, rawBatch);
+  assert.equal(first.status, 200);
+  assert.deepEqual(await first.json(), {schema_version: 1, accepted_ids: cases.map(([n]) => id(n)), duplicate_ids: []});
+  const retry = await send(env, rawBatch);
+  assert.equal(retry.status, 200);
+  assert.deepEqual(await retry.json(), {schema_version: 1, accepted_ids: [], duplicate_ids: cases.map(([n]) => id(n))});
+
+  const nearLimit = 'C:\\Users\\a\\AppData\\Local\\Temp\\' + '가'.repeat(75);
+  assert.equal(new TextEncoder().encode(nearLimit).byteLength, 255);
+  assert.equal((await send(env, [event(20, {detail: nearLimit})])).status, 200);
+  const nearRetry = await send(env, [event(20, {detail: nearLimit})]);
+  assert.deepEqual(await nearRetry.json(), {schema_version: 1, accepted_ids: [], duplicate_ids: [id(20)]});
+
+  const storedRaw = JSON.stringify(env.DB.sqlite.prepare('SELECT event_json FROM events').all());
+  for (const leaked of ['alice', 'John Smith', 'Kim Minsu', 'Users\\\\a\\\\'])
+    assert.equal(storedRaw.includes(leaked), false, leaked);
+
+  for (const [n, , expected] of cases) {
+    const row = await (await get(env, `/api/events/${id(n)}`)).json();
+    assert.equal(row.event.detail, expected);
+  }
+  const nearStored = (await (await get(env, `/api/events/${id(20)}`)).json()).event.detail;
+  assert.equal(nearStored, 'C:\\Users\\[USER]\\AppData\\Local\\Temp\\' + '가'.repeat(73));
+  assert.ok(new TextEncoder().encode(nearStored).byteLength <= 256);
+});

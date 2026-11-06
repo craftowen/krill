@@ -350,7 +350,7 @@ impl Registry {
 
     /// 셸에서 직접 띄운 에이전트는 Krill이 권한을 모르므로 Manual로 기록된다.
     /// 살아 있는 프로세스 argv에 프로필의 `yolo_args`가 모두 있으면 YOLO로 본다.
-    fn live_agent_has_yolo_args(&self, session: SessionId, profile_id: &str) -> bool {
+    pub(super) fn live_agent_has_yolo_args(&self, session: SessionId, profile_id: &str) -> bool {
         let Some(yolo) = self
             .agents
             .agents()

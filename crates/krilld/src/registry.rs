@@ -2249,6 +2249,17 @@ impl Registry {
         };
         if !is_subagent_or_foreign
             && let Ok(Some(stored)) = self.agents.stored(id)
+            && stored.permission == krill_proto::agent::Permission::Manual
+            && self.live_agent_has_yolo_args(id, &stored.profile)
+        {
+            let yolo = crate::agent::control::StoredLaunch {
+                permission: krill_proto::agent::Permission::Yolo,
+                ..stored
+            };
+            self.agents.bind_switch_identity(id, &yolo).ok();
+        }
+        if !is_subagent_or_foreign
+            && let Ok(Some(stored)) = self.agents.stored(id)
             && (stored.session_id.is_none() || stored.transcript_path.is_none())
         {
             let root_pid = lock(&self.state)

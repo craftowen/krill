@@ -1752,19 +1752,12 @@ pub fn refresh_local(home: &Path, state_dir: Option<&Path>) -> AccountsSnapshot 
 }
 
 pub fn read_profile_usage(_home: &Path, provider: ProviderKind, dir: &Path) -> Snapshot {
-    if let Ok(s) = std::fs::read_to_string(dir.join(CLAUDE_CACHE)) {
-        let snap = parse_claude_json(&s);
-        if !snap.is_empty() {
-            return snap;
-        }
-        let agy = krill_proto::usage::parse_antigravity_usage(&s);
-        if !agy.is_empty() {
-            return agy;
-        }
-    }
+    // `usage_cache.json`은 이 프로필의 세션이 쓴다. `statusline_cache.json`은 외부 스크립트가
+    // 계정과 무관한 경로에 쓸 수 있어 뒤로 둔다.
     for name in [
-        "usage.json",
         "usage_cache.json",
+        CLAUDE_CACHE,
+        "usage.json",
         "quota.json",
         "stats-cache.json",
         "rate_limits.json",

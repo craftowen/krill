@@ -521,6 +521,66 @@ fn running_close_dont_ask_persists(cx: &mut TestAppContext) {
     );
 }
 
+/// 에이전트만 끝나고 PTY에 로그인 셸이 남으면 칸은 그대로 일반 터미널이 된다.
+#[gpui::test]
+fn ended_agent_keeps_its_pane_as_a_plain_terminal(cx: &mut TestAppContext) {
+    use krill_proto::control::{AgentState, AgentStatus, Create, Source as StatusSource};
+    use std::sync::Arc;
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let (view, cx) = open(cx, state_path("ended-agent-keeps-pane"));
+    let pane = layout_of(&view, cx).focused().expect("focused pane");
+    cx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            s.layout.set_session(pane, SessionId(41));
+            s.layout.set_launch(
+                pane,
+                Create {
+                    program: Program::Agent {
+                        id: "claude".into(),
+                    },
+                    cwd: b"/tmp/repo".to_vec(),
+                    cols: 80,
+                    rows: 24,
+                    account: Some("claude-work".into()),
+                },
+            );
+        });
+    });
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![sidebar::Session {
+            id: SessionId(41),
+            status: AgentStatus {
+                state: AgentState::Unknown,
+                source: Some(StatusSource::Process),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: None,
+        }],
+        trees: std::collections::BTreeMap::default(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+        });
+    });
+    cx.run_until_parked();
+
+    let layout = layout_of(&view, cx);
+    assert!(layout.pane_exists(pane), "the shell's pane must stay open");
+    let launch = layout.launch(pane).expect("launch");
+    assert_eq!(launch.program, Program::Login);
+    assert_eq!(launch.account, None);
+    assert_eq!(launch.cwd, b"/tmp/repo");
+}
+
 /// D-01: 닫기 확인창이 떠 있는 사이 앞쪽 탭이 정리돼 번호가 당겨져도 확인은 원래 고른 탭만 닫는다.
 #[gpui::test]
 fn close_confirm_survives_earlier_tab_pruned(cx: &mut TestAppContext) {
@@ -6513,7 +6573,7 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
         cx.debug_bounds("status-provider-reset-usage-confirm")
             .is_none()
     );
-    // 미터가 아직 없더라도(초기 로드/로컬 파일 폴백) 실시간 프로브·차감을 위해 초기화 행이 활성화된다.
+    // 미터가 아직 없으면(초기 로드/로컬 파일 폴백) 가능 여부를 모르므로 누를 수 없다.
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     cx.update(|_, cx| {
@@ -6526,16 +6586,14 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
     });
     cx.run_until_parked();
     open_menu(cx);
-    let arm_unprobed = cx
+    let unprobed = cx
         .debug_bounds("status-provider-reset-usage")
-        .expect("reset row must remain available before meters are fetched");
-    cx.simulate_click(arm_unprobed.center(), Modifiers::default());
+        .expect("unprobed account shows a disabled reset row");
+    cx.simulate_click(unprobed.center(), Modifiers::default());
     cx.run_until_parked();
-    open_menu(cx);
     assert!(
-        cx.debug_bounds("status-provider-reset-usage-confirm")
-            .is_some(),
-        "clicking unprobed reset row must arm confirmation"
+        cx.update(|_, cx| view.read(cx).reset_armed.is_none()),
+        "clicking the unprobed reset row must not arm confirmation"
     );
 }
 
