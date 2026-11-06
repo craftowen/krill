@@ -662,8 +662,14 @@ impl ServerPanel {
 
     fn render_invite_section(&self, p: &crate::ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
         // 서버 카드 안에 또 카드를 얹지 않는다(STYLEGUIDE §8.4). 초대 영역은 카드 안
-        // 구분 구역으로 평탄하게 그린다.
-        let mut section = div().flex().flex_col().gap_2p5();
+        // 구분선으로 나눈 구역으로 평탄하게 그린다.
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .pt_3()
+            .border_t_1()
+            .border_color(p.border);
 
         let create_btn = crate::ui::primary("link-create-invite", text::CREATE_INVITE.get())
             .disabled(self.busy || !self.status.enabled)
@@ -1046,12 +1052,19 @@ impl ServerPanel {
     }
 
     fn render_devices_section(&self, p: &crate::ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
-        let mut section = div().flex().flex_col().gap_2().child(
-            div()
-                .text_size(crate::ui::TEXT_SM)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(text::DEVICES_TITLE.get()),
-        );
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pt_3()
+            .border_t_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_SM)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(text::DEVICES_TITLE.get()),
+            );
 
         if self.devices.is_empty() {
             section = section.child(

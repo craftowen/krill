@@ -106,9 +106,10 @@ impl SettingsView {
         crate::machines::project(routes)
     }
 
+    /// Herdr식 목록: 카드 없이 구분선 행, 왼쪽 상태 점, 이름·한 줄 정보, 오른쪽 작은 버튼.
     #[expect(
         clippy::too_many_lines,
-        reason = "Variant A overview combines local hub card and inline remote machine list with direct actions"
+        reason = "overview keeps the local access row and the remote machine list with direct actions together"
     )]
     fn render_machine_overview(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let p = crate::ui::palette(cx);
@@ -116,20 +117,15 @@ impl SettingsView {
         let local_machine = catalog.iter().find(|m| m.is_local());
         let remote_machines: Vec<&Machine> = catalog.iter().filter(|m| !m.is_local()).collect();
 
-        let mut local_hub = div().flex().flex_col().gap_2().child(layout::section_title(
+        let mut local_hub = div().flex().flex_col().child(layout::section_title(
             p,
             "admin-machines-local-section",
             text::MACHINES_LOCAL_SECTION.get(),
         ));
         if let Some(machine) = local_machine {
             let (color, state) = machine_status(machine.status(), p);
-            let badge_tone = match machine.status() {
-                HostStatus::Connected => crate::ui::BadgeTone::Success,
-                HostStatus::Connecting => crate::ui::BadgeTone::Warning,
-                HostStatus::Disconnected => crate::ui::BadgeTone::Muted,
-            };
             local_hub = local_hub.child(
-                layout::row(p)
+                list_row(p, color)
                     .id("admin-machine-local")
                     .debug_selector(|| "admin-machine-local".into())
                     .role(gpui::Role::Button)
@@ -150,38 +146,10 @@ impl SettingsView {
                         this.disarm(cx);
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .flex_wrap()
-                                    .child(
-                                        div()
-                                            .text_size(crate::ui::TEXT_SM)
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child(machine.label().to_owned()),
-                                    )
-                                    .child(crate::ui::badge(p, badge_tone, state).child(
-                                        div().size(crate::ui::STATE_DOT).rounded_full().bg(color),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(text::MACHINES_LOCAL_HUB_DESC.get()),
-                            ),
-                    )
+                    .child(row_text(
+                        title_line(machine.label().to_owned()).child(state_text(color, state)),
+                        meta_text(p, text::MACHINES_LOCAL_HUB_DESC.get().to_owned(), false),
+                    ))
                     .child(
                         layout::controls().child(
                             layout::secondary(
@@ -204,14 +172,15 @@ impl SettingsView {
             .id("admin-machines-list")
             .debug_selector(|| "admin-machines-list".into())
             .flex()
-            .flex_col()
-            .gap_2();
+            .flex_col();
 
         if remote_machines.is_empty() {
             list = list.child(
-                layout::card(p)
+                div()
                     .id("admin-machines-empty")
                     .debug_selector(|| "admin-machines-empty".into())
+                    .py_3()
+                    .px_2()
                     .text_size(crate::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(text::MACHINES_EMPTY_REMOTE.get()),
@@ -247,50 +216,20 @@ impl SettingsView {
                         .cloned()
                 });
 
-            let address_line = if let Some(host) = &ssh_host {
-                host.format_summary()
-            } else {
-                text::MACHINES_INVITE_ROUTE_DESC.get().to_owned()
-            };
-
-            let mut title_row = div()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .gap_2()
-                .flex_wrap()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(crate::ui::TEXT_SM)
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(machine.label().to_owned()),
-                );
-
-            for route in machine.routes.iter().filter(|r| r.kind != RouteKind::Local) {
-                let tone = match route.kind {
-                    RouteKind::Ssh => crate::ui::BadgeTone::Neutral,
-                    RouteKind::Invite => crate::ui::BadgeTone::Accent,
-                    RouteKind::Local => crate::ui::BadgeTone::Muted,
-                };
-                title_row = title_row.child(crate::ui::badge(p, tone, route_label(route.kind)));
-            }
-
-            title_row = title_row.child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))
-                    .child(
-                        div()
-                            .text_size(crate::ui::TEXT_XS)
-                            .text_color(color)
-                            .child(state),
-                    ),
+            let meta = ssh_host.as_ref().map_or_else(
+                || meta_text(p, text::MACHINES_INVITE_ROUTE_DESC.get().to_owned(), false),
+                |host| meta_text(p, home_relative(&host.format_summary()), true),
             );
+
+            let mut title = title_line(machine.label().to_owned());
+            for route in machine.routes.iter().filter(|r| r.kind != RouteKind::Local) {
+                title = title.child(crate::ui::badge(
+                    p,
+                    crate::ui::BadgeTone::Muted,
+                    route_label(route.kind),
+                ));
+            }
+            title = title.child(state_text(color, state));
 
             let mut row_controls = layout::controls();
             if let Some(host) = ssh_host {
@@ -355,7 +294,7 @@ impl SettingsView {
             );
 
             list = list.child(
-                layout::row(p)
+                list_row(p, color)
                     .id(SharedString::from(selector.clone()))
                     .debug_selector(move || selector.clone())
                     .role(gpui::Role::Button)
@@ -376,77 +315,70 @@ impl SettingsView {
                         this.disarm(cx);
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(title_row)
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(address_line),
-                            ),
-                    )
+                    .child(row_text(title, meta))
                     .child(row_controls),
             );
         }
 
-        div().flex().flex_col().gap_4().child(local_hub).child(
+        div().flex().flex_col().gap_6().child(local_hub).child(
             div()
                 .flex()
                 .flex_col()
-                .gap_2()
+                .gap_3()
                 .child(
                     div()
-                        .w_full()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .pt_2()
-                        .pb_1()
-                        .border_b_1()
-                        .border_color(p.border)
+                        .flex_col()
                         .child(
                             div()
-                                .id("admin-machines-remote-section")
-                                .debug_selector(|| "admin-machines-remote-section".into())
-                                .text_size(crate::ui::TEXT_SM)
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(p.muted_foreground)
-                                .child(text::MACHINES_REMOTE_SECTION.get()),
-                        )
-                        .child(
-                            layout::controls()
+                                .w_full()
+                                .flex()
+                                .items_end()
+                                .justify_between()
+                                .gap_2()
+                                .pb_1()
+                                .border_b_1()
+                                .border_color(p.border)
                                 .child(
-                                    layout::secondary(
-                                        "admin-machines-add-ssh",
-                                        text::MACHINES_ADD_SSH.get(),
-                                    )
-                                    .debug_selector(|| "admin-machines-add-ssh".into())
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.show_machine_add(AddMethod::Ssh, cx);
-                                        },
-                                    )),
+                                    div()
+                                        .id("admin-machines-remote-section")
+                                        .debug_selector(|| "admin-machines-remote-section".into())
+                                        .pt_2()
+                                        .text_size(crate::ui::TEXT_SM)
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(p.muted_foreground)
+                                        .child(text::MACHINES_REMOTE_SECTION.get()),
                                 )
                                 .child(
-                                    layout::primary("admin-machines-add", text::MACHINES_ADD.get())
-                                        .debug_selector(|| "admin-machines-add".into())
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.show_machine_add(AddMethod::Invite, cx);
-                                        })),
+                                    layout::controls()
+                                        .child(
+                                            layout::secondary(
+                                                "admin-machines-add-ssh",
+                                                text::MACHINES_ADD_SSH.get(),
+                                            )
+                                            .debug_selector(|| "admin-machines-add-ssh".into())
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.show_machine_add(AddMethod::Ssh, cx);
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            layout::primary(
+                                                "admin-machines-add",
+                                                text::MACHINES_ADD.get(),
+                                            )
+                                            .debug_selector(|| "admin-machines-add".into())
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.show_machine_add(AddMethod::Invite, cx);
+                                                }),
+                                            ),
+                                        ),
                                 ),
-                        ),
+                        )
+                        .child(list),
                 )
-                .child(list)
                 .child(self.render_ssh_status(cx)),
         )
     }
@@ -458,11 +390,17 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let p = crate::ui::palette(cx);
-        let mut content = div().flex().flex_col().gap_3().child(layout::label(
-            p,
-            machine.label().to_owned(),
-            text::MACHINES_METHODS.get(),
-        ));
+        let desc = if machine.is_local() {
+            text::MACHINES_LOCAL_HUB_DESC.get()
+        } else {
+            text::MACHINES_METHODS.get()
+        };
+        let mut content =
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(page_title(p, machine.label().to_owned(), desc));
         let paired: Vec<String> = machine
             .routes
             .iter()
@@ -505,7 +443,10 @@ impl SettingsView {
                 }
             }
         }
-        content.child(self.render_ssh_status(cx))
+        if machine.routes.iter().any(|r| r.kind == RouteKind::Ssh) {
+            content = content.child(self.render_ssh_status(cx));
+        }
+        content
     }
 
     pub(super) fn render_machines_tab(
@@ -544,20 +485,24 @@ impl SettingsView {
         if page == MachinePage::Overview {
             return self.render_machine_overview(cx);
         }
+        // 버튼이 열 폭으로 늘어나 가운데에 뜨지 않게 내용 폭 행으로 감싼다.
         let mut content = div().flex().flex_col().gap_3().child(
-            layout::ghost("admin-machines-back", text::MACHINES_BACK.get())
-                .debug_selector(|| "admin-machines-back".into())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.machine_page = MachinePage::Overview;
-                    this.disarm(cx);
-                    cx.notify();
-                })),
+            div().flex().child(
+                layout::ghost("admin-machines-back", text::MACHINES_BACK.get())
+                    .icon(gpui_component::Icon::default().data(crate::ui::icons::ARROW_LEFT_SVG))
+                    .debug_selector(|| "admin-machines-back".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.machine_page = MachinePage::Overview;
+                        this.disarm(cx);
+                        cx.notify();
+                    })),
+            ),
         );
         match page {
             MachinePage::Overview => content,
             MachinePage::Add(method) => {
                 content = content
-                    .child(layout::label(
+                    .child(page_title(
                         p,
                         text::MACHINES_ADD.get(),
                         text::MACHINES_ADD_DESC.get(),
@@ -641,4 +586,98 @@ fn machine_status(status: HostStatus, p: &crate::ui::Palette) -> (gpui::Hsla, &'
         HostStatus::Connecting => (p.warning, labels::HOST_CONNECTING.get()),
         HostStatus::Disconnected => (p.muted_foreground, labels::HOST_DISCONNECTED.get()),
     }
+}
+
+/// 구분선만 있는 목록 행. 왼쪽에 상태 점을 둔다.
+fn list_row(p: &crate::ui::Palette, dot: gpui::Hsla) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_3()
+        .px_2()
+        .py_2p5()
+        .border_b_1()
+        .border_color(p.border)
+        .child(
+            div()
+                .flex_none()
+                .size(crate::ui::STATE_DOT)
+                .rounded_full()
+                .bg(dot),
+        )
+}
+
+fn row_text(title: gpui::Div, meta: gpui::Div) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w(px(180.))
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .child(title)
+        .child(meta)
+}
+
+fn title_line(label: String) -> gpui::Div {
+    div().min_w_0().flex().items_center().gap_2().child(
+        div()
+            .min_w_0()
+            .truncate()
+            .text_size(crate::ui::TEXT_SM)
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .child(label),
+    )
+}
+
+fn state_text(color: gpui::Hsla, state: &'static str) -> gpui::Div {
+    div()
+        .flex_none()
+        .text_size(crate::ui::TEXT_XS)
+        .text_color(color)
+        .child(state)
+}
+
+fn meta_text(p: &crate::ui::Palette, text: String, mono: bool) -> gpui::Div {
+    div()
+        .min_w_0()
+        .truncate()
+        .when(mono, |d| d.font_family(crate::ui::FONT_MONO))
+        .text_size(crate::ui::TEXT_XS)
+        .text_color(p.muted_foreground)
+        .child(text)
+}
+
+/// 상세 화면 제목(머신 이름)과 한 줄 설명.
+fn page_title(
+    p: &crate::ui::Palette,
+    title: impl Into<SharedString>,
+    desc: &'static str,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .child(
+            div()
+                .text_size(crate::ui::TEXT_LG)
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(p.muted_foreground)
+                .child(desc),
+        )
+}
+
+/// 표시용으로 홈 폴더 경로를 `~`로 줄인다.
+fn home_relative(summary: &str) -> String {
+    krill_proto::os::home_dir()
+        .and_then(|home| home.to_str().map(str::to_owned))
+        .filter(|home| home.len() > 1)
+        .map_or_else(|| summary.to_owned(), |home| summary.replace(&home, "~"))
 }
