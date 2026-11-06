@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <sub><a href="README.ko.md">한국어</a> · <a href="https://krill.page/en">Website</a> · <a href="https://krill.page/en/docs">CLI Reference</a> · <a href="GETTING_STARTED.md">Getting Started</a> · <a href="https://github.com/craftowen/krill/releases/latest">Releases</a></sub>
+  <sub><a href="README.ko.md">한국어</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="https://krill.page/en">Website</a> · <a href="https://krill.page/en/docs">CLI Reference</a> · <a href="GETTING_STARTED.md">Getting Started</a> · <a href="https://github.com/craftowen/krill/releases/latest">Releases</a></sub>
 </p>
 
 <p align="center">
