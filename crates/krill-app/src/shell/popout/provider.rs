@@ -395,9 +395,12 @@ fn render_detail_reset_controls(
     {
         return None;
     }
-    let credits = super::reset_credit_count(snap, account);
-    let armed =
-        reset_armed.is_some_and(|(prov, id)| *prov == account.provider && *id == account.id);
+    let meters = snap.meters_for(&account.id);
+    let credits = krill_app::accounts::display::reset_credits(meters);
+    let available =
+        krill_app::accounts::display::reset_available(meters, krill_app::accounts::display::now());
+    let armed = available
+        && reset_armed.is_some_and(|(prov, id)| *prov == account.provider && *id == account.id);
     if armed {
         let (title, _) = krill_app::settings::account_heading(account);
         let info = provider_text::PROVIDER_RESET_USAGE_INFO.format(&[("account", &title)]);
@@ -473,14 +476,18 @@ fn render_detail_reset_controls(
     }
     let btn_id = format!("status-provider-detail-reset-{}", account.id);
     let selector = btn_id.clone();
-    if credits == Some(0) {
+    if !available {
         return Some(
             div().pt_1().child(
                 Button::new(gpui::SharedString::from(btn_id))
                     .small()
                     .outline()
                     .disabled(true)
-                    .label(provider_text::PROVIDER_RESET_USAGE_NONE.get())
+                    .label(if credits == Some(0) {
+                        provider_text::PROVIDER_RESET_USAGE_NONE.get()
+                    } else {
+                        provider_text::PROVIDER_RESET_USAGE.get()
+                    })
                     .debug_selector(move || selector.clone()),
             ),
         );

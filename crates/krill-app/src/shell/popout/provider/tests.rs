@@ -253,6 +253,12 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
                             resets_at: None,
                         }),
                     })
+                    .chain(std::iter::once(UsageMeter {
+                        key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
+                        label: "Reset credits".into(),
+                        value: Some("1".into()),
+                        window: None,
+                    }))
                     .collect(),
             });
         cx.notify();
@@ -1401,6 +1407,12 @@ fn short_window_detail_reset_confirmation_stays_reachable(cx: &mut gpui::TestApp
                         resets_at: None,
                     }),
                 })
+                .chain(std::iter::once(UsageMeter {
+                    key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
+                    label: "Reset credits".into(),
+                    value: Some("1".into()),
+                    window: None,
+                }))
                 .collect(),
         }];
         cx.notify();

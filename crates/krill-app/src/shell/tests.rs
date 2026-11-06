@@ -6573,7 +6573,7 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
         cx.debug_bounds("status-provider-reset-usage-confirm")
             .is_none()
     );
-    // 미터가 아직 없더라도(초기 로드/로컬 파일 폴백) 실시간 프로브·차감을 위해 초기화 행이 활성화된다.
+    // 미터가 아직 없으면(초기 로드/로컬 파일 폴백) 가능 여부를 모르므로 누를 수 없다.
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     cx.update(|_, cx| {
@@ -6586,16 +6586,14 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
     });
     cx.run_until_parked();
     open_menu(cx);
-    let arm_unprobed = cx
+    let unprobed = cx
         .debug_bounds("status-provider-reset-usage")
-        .expect("reset row must remain available before meters are fetched");
-    cx.simulate_click(arm_unprobed.center(), Modifiers::default());
+        .expect("unprobed account shows a disabled reset row");
+    cx.simulate_click(unprobed.center(), Modifiers::default());
     cx.run_until_parked();
-    open_menu(cx);
     assert!(
-        cx.debug_bounds("status-provider-reset-usage-confirm")
-            .is_some(),
-        "clicking unprobed reset row must arm confirmation"
+        cx.update(|_, cx| view.read(cx).reset_armed.is_none()),
+        "clicking the unprobed reset row must not arm confirmation"
     );
 }
 

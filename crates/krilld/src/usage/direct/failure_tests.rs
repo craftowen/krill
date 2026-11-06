@@ -191,3 +191,65 @@ fn credential_expiry_handles_files_bom_and_missing_expiry_without_writing() {
     ));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// 외부 스크립트가 다른 계정 값을 쓴 `statusline_cache.json`은 이 프로필의 API 값이나
+/// `krill statusline` 기록을 이기지 못한다.
+#[test]
+fn unattributed_statusline_file_never_beats_profile_usage() {
+    let root = std::env::temp_dir().join(format!("krill-usage-owner-{}", std::process::id()));
+    let dir = root.join("profile");
+    std::fs::create_dir_all(&dir).unwrap();
+    let percent = |u: ProfileUsage| u.usage.seven_day.map(|w| w.percent);
+    let read = || accounts::read_profile_usage(&root, ProviderKind::Claude, &dir, "A", None, false);
+    let write_recorded = |value: u8| {
+        std::fs::write(
+            dir.join(krill_proto::statusline::CACHE_FILE),
+            format!(r#"{{"rate_limits":{{"seven_day":{{"used_percentage":{value}}}}}}}"#),
+        )
+        .unwrap();
+    };
+    std::fs::write(
+        dir.join("statusline_cache.json"),
+        r#"{"seven_day":{"utilization":97}}"#,
+    )
+    .unwrap();
+    assert_eq!(percent(read()), Some(97), "다른 값이 없으면 쓴다");
+    assert!(!live_fresh(ProviderKind::Claude, &dir));
+
+    // 더 오래된 프로필 기록이 먼저 만든 파일보다 우선한다.
+    write_recorded(66);
+    let stale = std::fs::File::options()
+        .write(true)
+        .open(dir.join(krill_proto::statusline::CACHE_FILE))
+        .unwrap();
+    stale
+        .set_modified(SystemTime::now() - Duration::from_hours(3))
+        .unwrap();
+    assert_eq!(percent(read()), Some(66));
+
+    // 직접 조회 값은 방금 쓴 외부 파일보다, 더 새 프로필 기록은 직접 조회보다 우선한다.
+    let direct_at = now_epoch_u64().unwrap() - 60;
+    lock(&CACHE).insert(
+        (root.clone(), ProviderKind::Claude, dir.clone()),
+        (
+            Instant::now(),
+            ProfileUsage {
+                usage: Usage {
+                    seven_day: Some(Window {
+                        percent: 100,
+                        resets_at: None,
+                    }),
+                    ..Usage::default()
+                },
+                updated_at: Some(direct_at),
+                ..ProfileUsage::default()
+            },
+        ),
+    );
+    assert_eq!(percent(read()), Some(100));
+    write_recorded(50);
+    assert_eq!(percent(read()), Some(50));
+
+    evict_profile(&root, ProviderKind::Claude, &dir);
+    std::fs::remove_dir_all(root).unwrap();
+}

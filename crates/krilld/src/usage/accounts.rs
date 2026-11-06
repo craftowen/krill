@@ -33,6 +33,8 @@ use crate::session::lock;
 
 const ACCOUNTS_FILE: &str = "accounts.toml";
 const ACTIVE_ENV_FILE: &str = "active-accounts.env";
+/// 실행 중인 Orca가 갱신하는 캐시 행의 이메일을 현재 로그인으로 믿는 최대 나이(초).
+const ORCA_EMAIL_MAX_AGE: u64 = 3600;
 /// 상태 꼬리 재료: (Orca `error` 원문, `detail` 원문, 갱신 시각 epoch 초).
 type StatusMeta = (Option<String>, Option<String>, Option<u64>);
 /// `StopFailure` `rate_limit` 감지 계정 기록(OWE-703 2단계 지시·OWE-710).
@@ -414,17 +416,20 @@ fn runnable(a: &AccountInfo) -> bool {
     a.host_default || Path::new(&a.profile_dir).is_dir()
 }
 
-/// Claude 프로필의 statusline 캐시 파일 값. 수정 시각이 `updated_at`이다.
-pub(crate) fn claude_statusline_usage(profile_dir: &Path) -> Option<ProfileUsage> {
-    [CLAUDE_CACHE, "usage_cache.json"].iter().find_map(|name| {
-        let path = profile_dir.join(name);
-        let usage = parse_claude(&std::fs::read_to_string(&path).ok()?);
-        (!usage.is_empty()).then(|| ProfileUsage {
-            usage,
-            updated_at: mtime_secs(&path),
-            ..ProfileUsage::default()
-        })
+/// Claude 사용량 파일 값. 수정 시각이 `updated_at`이다.
+fn claude_usage_file(profile_dir: &Path, name: &str) -> Option<ProfileUsage> {
+    let path = profile_dir.join(name);
+    let usage = parse_claude(&std::fs::read_to_string(&path).ok()?);
+    (!usage.is_empty()).then(|| ProfileUsage {
+        usage,
+        updated_at: mtime_secs(&path),
+        ..ProfileUsage::default()
     })
+}
+
+/// `krill statusline`이 세션의 `CLAUDE_CONFIG_DIR`에 기록한 값. 폴더가 곧 계정이다.
+pub(crate) fn claude_recorded_usage(profile_dir: &Path) -> Option<ProfileUsage> {
+    claude_usage_file(profile_dir, krill_proto::statusline::CACHE_FILE)
 }
 
 /// 프로필 디렉터리에서 해당 프로바이더 계정의 5h/7d 사용량·상태 근거를 읽는다.
@@ -439,15 +444,27 @@ pub fn read_profile_usage(
     host_default: bool,
 ) -> ProfileUsage {
     let direct = super::direct::cached(home, provider, profile_dir);
-    // Orca 패리티: 실행 중인 세션의 statusline 값이 직접 조회 값보다 새롭거나 조회가 실패했으면 그것을 쓴다.
-    let live = (provider == ProviderKind::Claude)
-        .then(|| claude_statusline_usage(profile_dir))
+    // 실행 중인 세션이 이 프로필에 기록한 값이 직접 조회보다 새롭거나 조회가 실패했으면 그것을 쓴다.
+    let recorded = (provider == ProviderKind::Claude)
+        .then(|| claude_recorded_usage(profile_dir))
         .flatten();
-    match (direct, live) {
+    // `statusline_cache.json`은 외부 스크립트가 계정과 무관한 경로에 쓸 수 있어(cc-alchemy는
+    // 항상 `~/.claude`) 다른 값이 전혀 없을 때만 쓴다.
+    let legacy = || {
+        (provider == ProviderKind::Claude)
+            .then(|| claude_usage_file(profile_dir, CLAUDE_CACHE))
+            .flatten()
+    };
+    match (direct, recorded) {
         (Some(d), Some(l)) if l.updated_at > d.updated_at || d.usage.is_empty() => return l,
+        (Some(d), None) if d.usage.is_empty() => return legacy().unwrap_or(d),
         (Some(d), _) => return d,
         (None, Some(l)) => return l,
-        (None, None) => {}
+        (None, None) => {
+            if let Some(l) = legacy() {
+                return l;
+            }
+        }
     }
     match provider {
         ProviderKind::Gemini => ProfileUsage::default(),
@@ -1003,7 +1020,11 @@ fn refresh_accounts_authenticated(
                     .iter_mut()
                     .find(|a| a.provider == ProviderKind::Claude && a.host_default)
                 {
-                    if let Some(email) = row_email {
+                    // Orca가 멈춘 뒤의 오래된 행은 지금 로그인을 말해 주지 못한다(이후 프로브가 채운다).
+                    let now = u64::try_from(now_epoch()).unwrap_or_default();
+                    if orca_stamp.is_some_and(|at| now.saturating_sub(at) < ORCA_EMAIL_MAX_AGE)
+                        && let Some(email) = row_email
+                    {
                         host_acc.email = Some(email);
                     }
                     if host_acc.usage.is_empty() && !row.usage.is_empty() {
