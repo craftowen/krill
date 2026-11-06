@@ -129,6 +129,12 @@ pub const DIALOG_WIDTH: Pixels = px(512.);
 pub const SETTINGS_MODAL_WIDTH: Pixels = px(640.);
 /// 설정 화면 왼쪽 탭 탐색 열 고정 너비(248px).
 pub const SETTINGS_NAV_WIDTH: Pixels = px(248.);
+/// 모달이 좁을 때의 설정 왼쪽 탐색 열 너비(줌 100%에서 168px). UI 줌을 따라 탭 이름이 덜 잘린다.
+pub const SETTINGS_NAV_WIDTH_NARROW: Rems = rems(10.5);
+/// 설정 본문 위 머리 띠 높이(44px).
+pub const SETTINGS_BAND_HEIGHT: Pixels = px(44.);
+/// 모달이 좁을 때의 설정 머리 띠 높이(40px).
+pub const SETTINGS_BAND_HEIGHT_NARROW: Pixels = px(40.);
 /// 설정 화면 오른쪽 본문 열 최대 너비(1120px, 창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지, OWE-793).
 pub const SETTINGS_CONTENT_MAX_WIDTH: Pixels = px(1120.);
 
@@ -1644,6 +1650,9 @@ mod tests {
             "DIALOG_WIDTH",
             "SETTINGS_MODAL_WIDTH",
             "SETTINGS_NAV_WIDTH",
+            "SETTINGS_NAV_WIDTH_NARROW",
+            "SETTINGS_BAND_HEIGHT",
+            "SETTINGS_BAND_HEIGHT_NARROW",
             "SETTINGS_CONTENT_MAX_WIDTH",
             "CHAT_CONTENT_MAX_WIDTH",
             "SWITCH_WIDTH",
@@ -1662,6 +1671,8 @@ mod tests {
             "STATUS_GROUP_GAP",
             "ui::card",
             "ui::row",
+            "ui::group",
+            "ui::group_row",
             "ui::label",
             "ui::controls",
             "ui::primary",

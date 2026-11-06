@@ -152,7 +152,7 @@ fn new_agent_sessions_default_to_yolo_unless_manual_is_explicit() {
 }
 
 #[gpui::test]
-fn many_account_hosts_wrap_below_their_description(cx: &mut TestAppContext) {
+fn many_account_hosts_wrap_inside_the_host_bar(cx: &mut TestAppContext) {
     let d = dir("account-host-bar");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
@@ -182,9 +182,10 @@ fn many_account_hosts_wrap_below_their_description(cx: &mut TestAppContext) {
     let bar = vcx.debug_bounds("admin-accounts-host-bar").unwrap();
     assert!(bar.size.height < px(200.), "description collapsed: {bar:?}");
     let first = vcx.debug_bounds("admin-accounts-host-local").unwrap();
+    let label = vcx.debug_bounds("admin-accounts-host-label").unwrap();
     assert!(
-        first.top() > bar.top() + px(24.),
-        "selector is below the text"
+        first.left() >= label.right() || first.top() >= label.bottom(),
+        "selector never overlaps the label: {first:?} {label:?}"
     );
     for selector in [
         "admin-accounts-host-host-0",
@@ -525,7 +526,7 @@ fn regression_settings_edit_preserves_corrupt_file(cx: &mut TestAppContext) {
         cx.update(|cx| {
             assert!(cx.global::<Config>().error.is_some());
             assert_eq!(
-                cx.global::<Config>().settings,
+                *cx.global::<Config>().settings,
                 Settings::parse("theme = \"dark\"").unwrap()
             );
         });
@@ -719,15 +720,21 @@ fn account_rule_controls_toggle_threshold_metric_target_and_reset(cx: &mut TestA
         vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
         vcx.run_until_parked();
     };
-    // OWE-719: 계정별 규칙은 프로바이더 섹션 하단 "고급" 하나 아래에 접혀 있다(Codex 섹션과 별개).
+    // 계정별 규칙은 자동 전환 띠를 펼친 안에 제공자 구분 없이 모여 있고, 행마다 따로 편집을 연다.
+    assert!(vcx.debug_bounds("admin-rule-row-claude-work").is_none());
+    click(vcx, "admin-auto-switch-strip");
+    assert!(vcx.debug_bounds("admin-rule-row-claude-work").is_some());
+    assert!(
+        vcx.debug_bounds("admin-rule-row-codex-other-provider")
+            .is_some()
+    );
     assert!(vcx.debug_bounds("admin-rule-toggle-claude-work").is_none());
     assert!(vcx.debug_bounds("admin-rule-current-claude-work").is_none());
-    assert!(vcx.debug_bounds("admin-accounts-advanced-codex").is_some());
-    click(vcx, "admin-accounts-advanced-claude");
+    click(vcx, "admin-rule-open-claude-work");
     assert!(vcx.debug_bounds("admin-rule-current-claude-work").is_some());
     assert!(
         vcx.debug_bounds("admin-rule-current-claude-backup")
-            .is_some()
+            .is_none()
     );
     assert!(
         vcx.debug_bounds("admin-rule-current-codex-other-provider")
@@ -987,9 +994,7 @@ fn owe897_managed_remote_card_shows_probe_and_confirmed_remove(cx: &mut TestAppC
             v.ssh_hosts =
                 crate::ssh_hosts::add_host(Some(&d), "Studio", "owen@studio.local", None, None)
                     .unwrap();
-            v.machine_page = crate::machines::MachinePage::Details(crate::hosts::HostId::Remote(
-                v.ssh_hosts[0].id.clone(),
-            ));
+            v.machine_open = Some(crate::hosts::HostId::Remote(v.ssh_hosts[0].id.clone()));
         });
         window.draw(cx).clear(cx);
     });
@@ -1270,27 +1275,27 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
         );
     }
 
-    // 설정 검색(OWE-656): ⌘F로 포커스, 입력어로 내비를 거르고, 결과 클릭 시 그 탭으로, Esc로 지운다.
+    // 설정 검색(OWE-656): ⌘F로 포커스, 입력어로 본문이 결과 목록이 되고, 결과 클릭 시 그 탭으로, Esc로 지운다.
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-search-pill").is_some());
     vcx.simulate_keystrokes("cmd-f");
     vcx.simulate_input("ssh");
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-tab-machines").is_some());
-    assert!(vcx.debug_bounds("admin-tab-appearance").is_none());
-    assert!(vcx.debug_bounds("admin-tab-agents").is_none());
-    let ssh = vcx.debug_bounds("admin-tab-machines").unwrap();
+    assert!(vcx.debug_bounds("admin-tab-body").is_none());
+    assert!(vcx.debug_bounds("admin-tab-appearance").is_some());
+    let ssh = vcx.debug_bounds("admin-search-hit-0").unwrap();
     vcx.simulate_click(ssh.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     vcx.update(|_, cx| assert_eq!(view.read(cx).tab(), AdminTab::Machines));
+    assert!(vcx.debug_bounds("admin-tab-body").is_some());
     vcx.simulate_keystrokes("cmd-f");
     vcx.simulate_input("zzz-no-such-setting");
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-search-empty").is_some());
+    assert!(vcx.debug_bounds("admin-content-search-empty").is_some());
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-tab-appearance").is_some());
-    assert!(vcx.debug_bounds("admin-search-empty").is_none());
+    assert!(vcx.debug_bounds("admin-tab-body").is_some());
+    assert!(vcx.debug_bounds("admin-content-search-empty").is_none());
 
     fs::remove_dir_all(d).ok();
 }
@@ -2161,16 +2166,25 @@ fn settings_window_draws_themed_titlebar(cx: &mut TestAppContext) {
     });
     let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.run_until_parked();
-    let bar = vcx
-        .debug_bounds("admin-titlebar")
-        .expect("missing admin-titlebar");
-    assert_eq!(bar.origin.y, px(0.));
-    assert_eq!(bar.size.height, crate::ui::TITLEBAR_HEIGHT);
+    // 제목 띠 없이 "설정"은 왼쪽 기둥 위, 탭 이름과 닫기는 본문 위 띠에 있다.
+    let title = vcx
+        .debug_bounds("admin-nav-title")
+        .expect("missing admin-nav-title");
+    let band = vcx
+        .debug_bounds("admin-page-header")
+        .expect("missing admin-page-header");
+    assert_eq!(title.origin.y, px(0.));
+    assert_eq!(band.origin.y, px(0.));
+    assert_eq!(title.size.height, band.size.height);
+    assert!(title.right() <= band.left());
+    let close = vcx.debug_bounds("admin-modal-close").expect("close");
+    assert!(close.left() >= band.left() && close.bottom() <= band.bottom());
+    assert!(vcx.debug_bounds("admin-titlebar").is_none());
     fs::remove_dir_all(d).ok();
 }
 
 /// OWE-795: 미구현 호스트 범위 가짜 드롭다운(`admin-host-scope-bar`)은 노출하지 않고,
-/// 사이드바 검색 지우기(`X`)·0건 본문 빈 상태·페이지 헤더(제목+1줄 부제+우측 보조 동작 슬롯)를 그린다.
+/// 사이드바 검색 지우기(`X`)·0건 본문 빈 상태·머리 띠(제목)와 본문 첫 줄 부제를 그린다.
 #[gpui::test]
 fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_header(
     cx: &mut TestAppContext,
@@ -2193,7 +2207,6 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
         assert!(vcx.debug_bounds("admin-page-header").is_some());
         assert!(vcx.debug_bounds("admin-page-title").is_some());
         assert!(vcx.debug_bounds("admin-page-subtitle").is_some());
-        assert!(vcx.debug_bounds("admin-page-header-actions").is_some());
         let col = vcx
             .debug_bounds("admin-content-column")
             .expect("missing admin-content-column");
@@ -2215,7 +2228,9 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
     assert!(vcx.debug_bounds("admin-search-clear").is_some());
     assert!(vcx.debug_bounds("admin-search-hint").is_none());
     assert!(vcx.debug_bounds("admin-tab-machines").is_some());
-    assert!(vcx.debug_bounds("admin-tab-appearance").is_none());
+    assert!(vcx.debug_bounds("admin-tab-appearance").is_some());
+    assert!(vcx.debug_bounds("admin-search-hit-0").is_some());
+    assert!(vcx.debug_bounds("admin-page-subtitle").is_none());
 
     let clear_btn = vcx
         .debug_bounds("admin-search-clear")
@@ -2224,15 +2239,16 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-search-clear").is_none());
     assert!(vcx.debug_bounds("admin-search-hint").is_some());
-    assert!(vcx.debug_bounds("admin-tab-appearance").is_some());
+    assert!(vcx.debug_bounds("admin-search-hit-0").is_none());
+    assert!(vcx.debug_bounds("admin-page-subtitle").is_some());
 
-    // 검색 결과가 0건이면 우측 본문 영역에 빈 상태 카드가 표시되고 기존 탭 본문 헤더는 숨겨진다.
+    // 검색 결과가 0건이면 우측 본문 영역에 빈 상태 카드가 표시되고 탭 본문은 숨겨진다.
     vcx.simulate_keystrokes("cmd-f");
     vcx.simulate_input("zzz-no-such-setting");
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-search-empty").is_some());
     assert!(vcx.debug_bounds("admin-content-search-empty").is_some());
-    assert!(vcx.debug_bounds("admin-page-header").is_none());
+    assert!(vcx.debug_bounds("admin-page-subtitle").is_none());
+    assert!(vcx.debug_bounds("admin-tab-body").is_none());
 
     // 본문 빈 상태 카드의 '검색 지우기' 버튼을 누르면 검색어가 비워지고 탭 본문이 복원된다.
     let clear_empty_btn = vcx
@@ -2241,8 +2257,8 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
     vcx.simulate_click(clear_empty_btn.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-content-search-empty").is_none());
-    assert!(vcx.debug_bounds("admin-page-header").is_some());
-    assert!(vcx.debug_bounds("admin-tab-appearance").is_some());
+    assert!(vcx.debug_bounds("admin-page-subtitle").is_some());
+    assert!(vcx.debug_bounds("admin-tab-body").is_some());
 
     fs::remove_dir_all(d).ok();
 }
@@ -2255,8 +2271,8 @@ fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &m
     let d = dir("owe858-content-scroll");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
-    // 짧은 창: 단축키 탭 전체(약 50행)는 460px 안에 다 들어갈 수 없다.
-    vcx.simulate_resize(size(px(1200.), px(500.)));
+    // 테스트 환경의 단축키 목록은 짧고 행도 한 줄이라, 넘치도록 창을 아주 낮게 둔다.
+    vcx.simulate_resize(size(px(1200.), px(200.)));
     vcx.run_until_parked();
     vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx)));
     vcx.run_until_parked();
@@ -2265,20 +2281,22 @@ fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &m
         .debug_bounds("admin-content")
         .expect("missing admin-content");
     assert!(
-        content.size.height <= px(500.),
-        "admin-content height {:?} escapes the 500px viewport (min_h_0 missing?)",
+        content.size.height <= px(200.),
+        "admin-content height {:?} escapes the 200px viewport (min_h_0 missing?)",
         content.size.height
     );
-    // 페이지 헤더는 본문 최상단에 보인다.
+    // 부제는 본문 첫 줄에 보이고, 머리 띠는 스크롤 영역 위에 고정된다.
     let header = vcx
-        .debug_bounds("admin-page-header")
-        .expect("missing admin-page-header");
+        .debug_bounds("admin-page-subtitle")
+        .expect("missing admin-page-subtitle");
     assert!(
         header.origin.y >= content.origin.y,
-        "page header {:?} is clipped above the scroll container {:?}",
+        "page subtitle {:?} is clipped above the scroll container {:?}",
         header.origin,
         content.origin
     );
+    let band = vcx.debug_bounds("admin-page-header").unwrap();
+    assert!(band.bottom() <= content.top());
 
     vcx.simulate_event(gpui::ScrollWheelEvent {
         position: content.center(),
@@ -2287,7 +2305,8 @@ fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &m
         touch_phase: gpui::TouchPhase::Moved,
     });
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-page-header").unwrap().top() < content.top());
+    assert!(vcx.debug_bounds("admin-page-subtitle").unwrap().top() < content.top());
+    assert_eq!(vcx.debug_bounds("admin-page-header").unwrap(), band);
 
     // 다른 탭으로 갔다가 돌아와도 본문 높이와 시작 위치는 창 안에 머문다.
     vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Appearance, cx)));
@@ -2298,11 +2317,11 @@ fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &m
         .debug_bounds("admin-content")
         .expect("missing admin-content after tab switch");
     assert!(
-        content.size.height <= px(500.),
+        content.size.height <= px(200.),
         "admin-content height {:?} escapes the viewport after tab switch",
         content.size.height
     );
-    let header = vcx.debug_bounds("admin-page-header").unwrap();
+    let header = vcx.debug_bounds("admin-page-subtitle").unwrap();
     assert!(header.top() >= content.top() && header.bottom() <= content.bottom());
 
     fs::remove_dir_all(d).ok();
@@ -2537,7 +2556,8 @@ fn exercise_account_rule_transport(cx: &mut TestAppContext, timeout: bool) {
                 cx,
             );
             v.set_account_rule(rule.clone(), cx);
-            v.advanced_open.insert(ProviderKind::Claude);
+            v.auto_switch_open = true;
+            v.rule_open = Some("claude-work".to_owned());
         });
     });
     vcx.run_until_parked();
@@ -2850,7 +2870,14 @@ fn owe660_recorder_records_conflicts_and_resets(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("cmd-0");
     vcx.run_until_parked();
     assert_eq!(keys(), before);
-    assert!(vcx.debug_bounds("sc-conflict").is_some());
+    let note = vcx.debug_bounds("sc-conflict").expect("conflict note");
+    let row = vcx
+        .debug_bounds("sc-row-settings::ZoomIn")
+        .expect("target row");
+    assert!(
+        note.top() >= row.top() && note.bottom() <= row.bottom(),
+        "conflict note {note:?} must sit inside its row {row:?}"
+    );
     click(vcx, "sc-conflict-save");
     vcx.update(|_, cx| {
         // `all_bindings_for_input`은 우선순위 높은 것부터: 나중에 얹힌 재정의가 기본 크기를 이긴다.
@@ -2863,7 +2890,11 @@ fn owe660_recorder_records_conflicts_and_resets(cx: &mut TestAppContext) {
     });
     assert!(vcx.debug_bounds("sc-conflict").is_none());
 
-    // 행 초기화: ZoomIn 항목만 지워 기본 키 ⌘=로 돌아간다.
+    // 행 초기화: ZoomIn 항목만 지워 기본 키 ⌘=로 돌아간다. 동작 버튼은 행을 고를 때만 나온다.
+    assert!(vcx.debug_bounds("sc-reset-settings::ZoomIn").is_none());
+    click(vcx, "sc-line-settings::ZoomIn");
+    assert!(vcx.debug_bounds("sc-tray-settings::ZoomIn").is_some());
+    assert!(vcx.debug_bounds("sc-tray-settings::ZoomOut").is_none());
     click(vcx, "sc-reset-settings::ZoomIn");
     vcx.update(|_, cx| {
         assert_eq!(bound(cx, "cmd-="), Some(ZoomIn.name()));
@@ -2897,6 +2928,17 @@ fn owe799_category_mapping_and_search_matching() {
     assert_eq!(action_category("shell::NewAgentTab"), Category::Agents);
     assert_eq!(action_category("shell::ToggleSidebar"), Category::Panels);
     assert_eq!(action_category("settings::ZoomIn"), Category::General);
+    for action in [
+        "shell::FocusPaneLeft",
+        "shell::FocusPaneRight",
+        "shell::FocusPaneUp",
+        "shell::FocusPaneDown",
+        "shell::FindNext",
+        "shell::FindPrev",
+    ] {
+        assert_eq!(action_category(action), Category::Terminal, "{action}");
+    }
+    assert_eq!(action_category("shell::ToggleChanges"), Category::Panels);
 
     let cur = vec!["cmd-y".to_owned()];
     let def = vec!["cmd-=".to_owned()];
@@ -3184,6 +3226,24 @@ fn owe863_recorder_rejects_plain_keys_and_deletes(cx: &mut TestAppContext) {
         assert!(view.read(cx).shortcuts.target.is_none());
         assert!(view.read(cx).shortcuts.error.is_some());
     });
+    // 오류는 그 행 안에 보이고, 행이 검색으로 숨으면 목록 위로 올라와 사라지지 않는다.
+    let note = vcx.debug_bounds("sc-error").expect("error note");
+    let row = vcx
+        .debug_bounds("sc-row-settings::ZoomIn")
+        .expect("target row");
+    assert!(note.top() >= row.top() && note.bottom() <= row.bottom());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_shortcut_search("zzz-no-such", window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sc-row-settings::ZoomIn").is_none());
+    let note = vcx.debug_bounds("sc-error").expect("error stays visible");
+    let bar = vcx.debug_bounds("sc-filter-bar").expect("filter bar");
+    assert!(note.top() >= bar.bottom());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_shortcut_search("", window, cx));
+    });
+    vcx.run_until_parked();
 
     // 맨몸 일반 키도 마찬가지다.
     click(vcx, "sc-settings::ZoomIn-cmd-=");
@@ -3203,6 +3263,7 @@ fn owe863_recorder_rejects_plain_keys_and_deletes(cx: &mut TestAppContext) {
     });
 
     // 키 추가 후 ×로 그 키만 지운다.
+    click(vcx, "sc-line-settings::ZoomIn");
     click(vcx, "sc-settings::ZoomIn-add");
     vcx.simulate_keystrokes("cmd-u");
     vcx.run_until_parked();
@@ -3573,9 +3634,12 @@ fn owe800_ssh_tab_host_card_status_dot_edit_disconnect_and_two_column_form(
         vcx.debug_bounds("admin-ssh-status-dot-ssh-prod-box")
             .is_some()
     );
-    assert!(vcx.debug_bounds("admin-ssh-connect-ssh-prod-box").is_some());
     assert!(
-        vcx.debug_bounds("admin-ssh-disconnect-ssh-prod-box")
+        vcx.debug_bounds("admin-machine-connect-ssh-prod-box")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-machine-disconnect-ssh-prod-box")
             .is_none()
     );
     assert!(vcx.debug_bounds("admin-ssh-test-ssh-prod-box").is_some());
@@ -3583,7 +3647,7 @@ fn owe800_ssh_tab_host_card_status_dot_edit_disconnect_and_two_column_form(
     assert!(vcx.debug_bounds("admin-ssh-remove-ssh-prod-box").is_some());
 
     // 3. 연결 클릭 → Connected 상태 + 연결 해제 버튼 전환 → 연결 해제 클릭 → Disconnected 복귀
-    click(vcx, "admin-ssh-connect-ssh-prod-box");
+    click(vcx, "admin-machine-connect-ssh-prod-box");
     vcx.update(|window, cx| {
         window.draw(cx).clear(cx);
         assert_eq!(
@@ -3591,13 +3655,16 @@ fn owe800_ssh_tab_host_card_status_dot_edit_disconnect_and_two_column_form(
             SshHostCardStatus::Connected
         );
     });
-    assert!(vcx.debug_bounds("admin-ssh-connect-ssh-prod-box").is_none());
     assert!(
-        vcx.debug_bounds("admin-ssh-disconnect-ssh-prod-box")
+        vcx.debug_bounds("admin-machine-connect-ssh-prod-box")
+            .is_none()
+    );
+    assert!(
+        vcx.debug_bounds("admin-machine-disconnect-ssh-prod-box")
             .is_some()
     );
 
-    click(vcx, "admin-ssh-disconnect-ssh-prod-box");
+    click(vcx, "admin-machine-disconnect-ssh-prod-box");
     vcx.update(|window, cx| {
         window.draw(cx).clear(cx);
         assert_eq!(
@@ -3606,9 +3673,12 @@ fn owe800_ssh_tab_host_card_status_dot_edit_disconnect_and_two_column_form(
         );
         assert!(take_pending_ssh_connect(cx).is_none());
     });
-    assert!(vcx.debug_bounds("admin-ssh-connect-ssh-prod-box").is_some());
     assert!(
-        vcx.debug_bounds("admin-ssh-disconnect-ssh-prod-box")
+        vcx.debug_bounds("admin-machine-connect-ssh-prod-box")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-machine-disconnect-ssh-prod-box")
             .is_none()
     );
 
@@ -4175,6 +4245,10 @@ fn agents_render_defers_file_io(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
+            // 펼치기 전에는 입력 상태를 만들지 않는다.
+            let _ = v.render_agents_tab(&Settings::default(), window, cx);
+            assert!(v.agent_edits.is_empty());
+            v.agent_expanded.insert("claude");
             let _ = v.render_agents_tab(&Settings::default(), window, cx);
             assert_eq!(
                 v.agent_edits["claude"].args.read(cx).value().as_ref(),
@@ -4570,6 +4644,11 @@ fn account_remove_needs_confirm_and_rename_keeps_id(cx: &mut TestAppContext) {
         });
     });
     vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("admin-orphan-profiles").is_none(),
+        "folded"
+    );
+    click(vcx, "admin-orphan-toggle");
     assert!(vcx.debug_bounds("admin-orphan-profiles").is_some());
     click(vcx, "admin-purge-orphans");
     vcx.update(|_, cx| {
@@ -4662,6 +4741,7 @@ fn confirm_button_keeps_bounds_and_disarms_outside_escape_and_timeout(cx: &mut T
                 provider: ProviderKind::OpenCode,
                 dir: "/nonexistent/opencode-profile-2".into(),
             }];
+            v.orphans_open = true;
             cx.notify();
         });
     });
@@ -4793,8 +4873,9 @@ fn owe719_accounts_content_starts_next_to_sidebar_and_rows_fill_column(cx: &mut 
             "{width}: {column:?}"
         );
         let row = bounds(vcx, "admin-account-row-claude-work");
-        assert_eq!(row.origin.x, column.origin.x, "{width}");
-        assert_eq!(row.right(), column.right(), "{width}");
+        // 행은 묶음 카드의 1px 테두리 안쪽을 꽉 채운다.
+        assert_eq!(row.origin.x, column.origin.x + px(1.), "{width}");
+        assert_eq!(row.right(), column.right() - px(1.), "{width}");
         let avatar = bounds(vcx, "admin-account-status-claude-work");
         let usage = bounds(vcx, "admin-account-usage-claude-work");
         let switch = bounds(vcx, "admin-switch-account-claude-work");
@@ -4843,7 +4924,9 @@ fn owe719_single_in_use_marker_moves_with_switch(cx: &mut TestAppContext) {
             .collect::<Vec<_>>()
     });
     assert_eq!(active, ["claude-host"]);
-    assert!(vcx.debug_bounds("admin-accounts-active-claude").is_some());
+    // 활성 계정 줄은 활성 계정이 없을 때만 머리글에 남는다.
+    assert!(vcx.debug_bounds("admin-accounts-active-claude").is_none());
+    assert!(vcx.debug_bounds("admin-accounts-active-hint").is_some());
     assert!(
         vcx.debug_bounds("admin-account-in-use-claude-host")
             .is_some()
@@ -5041,6 +5124,13 @@ fn updates_tab_lists_changes_per_release(cx: &mut TestAppContext) {
     let older = vcx.debug_bounds("release-note-0.0.1").unwrap();
     assert!(newer.origin.y < older.origin.y);
     assert!(vcx.debug_bounds("release-notes-failed").is_none());
+    // 지난 릴리스는 눌러야 본문이 나온다.
+    let folded = older.size.height;
+    let head = vcx.debug_bounds("release-note-head-0.0.1").unwrap();
+    vcx.simulate_click(head.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let opened = vcx.debug_bounds("release-note-0.0.1").unwrap();
+    assert!(opened.size.height > folded);
     assert_eq!(search::search_tabs("what's new"), [AdminTab::Updates]);
     assert_eq!(search::search_tabs("릴리스"), [AdminTab::Updates]);
     fs::remove_dir_all(d).ok();
@@ -5079,7 +5169,7 @@ fn owe719_usage_window_labels_never_wrap(cx: &mut TestAppContext) {
     assert_eq!(five.size.height, seven.size.height, "{five:?} {seven:?}");
     assert_eq!(
         five.size.width, seven.size.width,
-        "labels share a fixed width"
+        "short labels share the minimum width"
     );
     // 테스트 플랫폼 글꼴은 실제 폭을 재지 않는다(전부 반각 취급). 그래서 실화면 기준으로 막는다: 한글은
     // 전각(1em)이라 "5시간"은 1em × 2 + 숫자 반각이 필요하다. 20px(= 2em)에서 접혔다.
@@ -5090,6 +5180,312 @@ fn owe719_usage_window_labels_never_wrap(cx: &mut TestAppContext) {
 
 /// OWE-719 QA D4 + OWE-793: "자동 계정 전환"이 다른 불리언 설정과 같은
 /// `ui::switch` 트랙·썸 스위치로 렌더링되며 클릭할 때마다 상태와 썸 위치가 전환된다.
+/// 계정 A안: 자동 전환은 맨 위 한 줄로 접히고, 행에는 막대 둘만 두며, 사용량 초기화는 메뉴에서 시작해 행에서 확인한다.
+#[gpui::test]
+fn accounts_strip_comes_first_and_rows_fold_extra_meters(cx: &mut TestAppContext) {
+    use krill_proto::usage::{AccountMeters, ProviderKind, UsageMeter, UsageRequest};
+
+    let d = dir("accounts-one-list");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2800.)));
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Accounts, cx);
+            v.apply_account_request(
+                UsageRequest::AddAccount {
+                    provider: ProviderKind::Claude,
+                    label: "Work".into(),
+                    email: None,
+                    profile_dir: d.join("work").display().to_string(),
+                },
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            let bar = |key: &str, label: &str| UsageMeter {
+                key: key.into(),
+                label: label.into(),
+                window: Some(krill_proto::usage::Window {
+                    percent: 40,
+                    resets_at: None,
+                }),
+                value: None,
+            };
+            v.accounts_snapshot.details.accounts = vec![AccountMeters {
+                account_id: "claude-work".into(),
+                plan: None,
+                meters: vec![
+                    bar("five", "5시간"),
+                    bar("seven", "7일"),
+                    bar("long", "A very long meter name"),
+                    UsageMeter {
+                        key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
+                        label: "Credits".into(),
+                        window: None,
+                        value: Some("2".into()),
+                    },
+                ],
+            }];
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+
+    // 자동 전환 띠가 첫 제공자 위에 있고, 펼쳐야 세부 설정이 보인다.
+    let strip = vcx.debug_bounds("admin-auto-switch-strip").unwrap();
+    assert!(
+        strip.bottom()
+            <= vcx
+                .debug_bounds("admin-accounts-subheader-claude")
+                .unwrap()
+                .top()
+    );
+    assert!(vcx.debug_bounds("admin-threshold-85").is_none());
+    assert!(vcx.debug_bounds("admin-accounts-refresh").is_none());
+    click(vcx, "admin-auto-switch-strip");
+    assert!(vcx.debug_bounds("admin-threshold-85").is_some());
+    assert!(vcx.debug_bounds("admin-accounts-refresh").is_some());
+    click(vcx, "admin-auto-switch-strip");
+    assert!(vcx.debug_bounds("admin-threshold-85").is_none());
+
+    // 막대 둘만 행에 있고 나머지는 +숫자로 펼친다. 펼침을 눌러도 계정이 전환되지 않는다.
+    assert!(vcx.debug_bounds("admin-usage-label-five").is_some());
+    assert!(vcx.debug_bounds("admin-usage-label-seven").is_some());
+    assert!(vcx.debug_bounds("admin-usage-label-long").is_none());
+    click(vcx, "admin-account-meters-toggle-claude-work");
+    let long = vcx.debug_bounds("admin-usage-label-long").unwrap();
+    let row = vcx.debug_bounds("admin-account-row-claude-work").unwrap();
+    assert!(long.bottom() <= row.bottom());
+    assert!(
+        long.size.width > px(28.),
+        "long labels take their own width: {long:?}"
+    );
+    click(vcx, "admin-account-meters-claude-work");
+    vcx.update(|_, cx| {
+        assert!(
+            !view
+                .read(cx)
+                .accounts()
+                .accounts
+                .iter()
+                .any(|a| a.id == "claude-work" && a.active)
+        );
+    });
+
+    // 사용량 초기화 버튼은 무장 전에는 행에 없고, 무장하면 나타나며 바깥을 누르면 풀린다.
+    assert!(vcx.debug_bounds("admin-reset-usage-claude-work").is_none());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.arm("admin-reset-usage-claude-work".into(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-reset-usage-claude-work").is_some());
+    click(vcx, "admin-accounts-active-hint");
+    assert!(vcx.debug_bounds("admin-reset-usage-claude-work").is_none());
+
+    // 스위치를 눌러도 띠가 펼쳐지지 않는다.
+    click(vcx, "admin-auto-switch-toggle");
+    assert!(vcx.debug_bounds("admin-threshold-85").is_none());
+    fs::remove_dir_all(d).ok();
+}
+
+/// 원격 호스트를 고르면 빈 안내와 시스템 기본값 설명이 "이 기기" 대신 그 호스트 이름을 쓴다.
+#[gpui::test]
+fn accounts_copy_names_the_selected_remote_host(cx: &mut TestAppContext) {
+    let d = dir("accounts-host-copy");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Accounts, cx)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            let remote = v
+                .accounts_snapshot
+                .accounts
+                .iter()
+                .find(|a| a.host_default)
+                .cloned()
+                .expect("system default account");
+            assert_eq!(v.account_host_label(), text::ACCOUNTS_THIS_DEVICE.get());
+            v.account_hosts = vec![(
+                crate::hosts::HostId::Remote("build".into()),
+                "build-mac".to_owned(),
+                None,
+            )];
+            v.account_host = crate::hosts::HostId::Remote("build".into());
+            assert_eq!(v.account_host_label(), "build-mac");
+            assert!(
+                v.account_detail(&remote, String::new())
+                    .contains("build-mac"),
+                "remote system default names its host"
+            );
+            cx.notify();
+        });
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+/// 시스템 B안: 기록 실패와 삭제 결과는 떨어진 칸이 아니라 그 행 안에 나오고, 오류 보고 설명은 줄이지 않는다.
+#[gpui::test]
+fn system_results_stay_inside_their_rows(cx: &mut TestAppContext) {
+    let d = dir("system-results");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2800.)));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::System, cx);
+            v.history_status = Some(
+                text::RECORDING_CLEAR_FAILED
+                    .format(&[("error", "history: daemon unavailable")])
+                    .into(),
+            );
+            v.history_status_failed = true;
+            v.recording_status = Some("failed".into());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    let danger = vcx.debug_bounds("admin-history-danger").unwrap();
+    let history = vcx.debug_bounds("admin-history-status").unwrap();
+    assert!(danger.top() <= history.top() && history.bottom() <= danger.bottom());
+    let privacy = vcx.debug_bounds("admin-section-resources").unwrap();
+    let recording = vcx.debug_bounds("admin-recording-status").unwrap();
+    assert!(privacy.top() <= recording.top() && recording.bottom() <= privacy.bottom());
+
+    // 구 데몬이면 오른쪽 안내와 같은 말을 행 안에 되풀이하지 않는다.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.history_pause_supported = Some(false);
+            v.recording_status = Some(text::RECORDING_UPDATE_NEEDED.get().into());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-recording-status").is_none());
+
+    for language in [Language::Ko, Language::En] {
+        assert!(text::ERROR_REPORTS_DESC.in_language(language).len() > 100);
+    }
+    fs::remove_dir_all(d).ok();
+}
+
+/// 프로젝트 B안: 구역을 나누고, 저장 하나가 위치와 스크립트를 함께 저장하며, 공유 경로 오류는 입력 옆에 나온다.
+#[gpui::test]
+fn project_sections_and_single_save(cx: &mut TestAppContext) {
+    let d = dir("project-sections");
+    let repo = d.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    crate::sidebar::external::register_project(&d, &repo).unwrap();
+    let repo = fs::canonicalize(repo)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2800.)));
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    let draw = |vcx: &mut gpui::VisualTestContext| {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Project, cx);
+            v.load_repo_hooks_for(&repo, window, cx);
+        });
+    });
+    draw(vcx);
+
+    // 기본은 이 프로젝트. 예약 작업은 눌러야 보이고, 다시 들어오면 기본으로 돌아온다.
+    assert!(vcx.debug_bounds("admin-workflow-repo-input").is_some());
+    assert!(vcx.debug_bounds("admin-schedules-card").is_none());
+    let band = vcx.debug_bounds("admin-project-section-project").unwrap();
+    assert!(band.bottom() <= vcx.debug_bounds("admin-workflow-repo-input").unwrap().top());
+    click(vcx, "admin-project-section-schedules");
+    assert!(vcx.debug_bounds("admin-schedules-card").is_some());
+    assert!(vcx.debug_bounds("admin-workflow-repo-input").is_none());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Agents, cx);
+            v.set_tab(AdminTab::Project, cx);
+        });
+    });
+    draw(vcx);
+    assert!(vcx.debug_bounds("admin-schedules-card").is_none());
+
+    // 검색으로 스케줄에 오면 그 구역이 열리고 다른 항목이면 이 프로젝트로 온다.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.open_search_hit((AdminTab::Project, text::SCHEDULES_TITLE), cx);
+            assert!(v.project_section == ProjectSection::Schedules);
+            v.open_search_hit((AdminTab::Project, text::SYMLINKS_TITLE), cx);
+            assert!(v.project_section == ProjectSection::Project);
+        });
+    });
+    draw(vcx);
+
+    // 바뀐 항목이 없으면 저장이 꺼져 있고, 위치와 스크립트를 함께 바꾸면 한 번에 저장한다.
+    assert!(vcx.debug_bounds("admin-workflow-dirty").is_none());
+    vcx.update(|window, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        let (location, setup) = (form.worktree_location.clone(), form.setup_script.clone());
+        location.update(cx, |input, cx| input.set_value(".worktrees", window, cx));
+        setup.update(cx, |input, cx| {
+            input.set_value("  pnpm install ", window, cx);
+        });
+    });
+    draw(vcx);
+    assert!(vcx.debug_bounds("admin-workflow-dirty").is_some());
+    click(vcx, "admin-repo-hooks-save");
+    draw(vcx);
+    assert_eq!(
+        crate::sidebar::external::project_worktree_locations(&d, None)[&repo],
+        ".worktrees"
+    );
+    let store = krill_proto::orchestration::WorktreeStore::load(&d).unwrap();
+    assert_eq!(
+        store.setup_script_for(&repo).as_deref(),
+        Some("pnpm install")
+    );
+    assert!(
+        vcx.debug_bounds("admin-workflow-dirty").is_none(),
+        "saved values become the new baseline"
+    );
+    assert!(vcx.debug_bounds("admin-workflow-repo-status").is_some());
+
+    // 저장 전 빈 상태에서 공유 경로 오류는 입력 바로 아래에 나오고 저장 결과 자리에는 가지 않는다.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.add_worktree_symlink_for(&repo, "../escape", cx).is_err());
+        });
+    });
+    draw(vcx);
+    let input = vcx.debug_bounds("admin-worktree-symlink-input").unwrap();
+    let status = vcx.debug_bounds("admin-worktree-symlink-status").unwrap();
+    let card = vcx.debug_bounds("admin-worktree-symlinks-card").unwrap();
+    assert!(input.bottom() <= status.top() && status.bottom() <= card.bottom());
+    fs::remove_dir_all(d).ok();
+}
+
 #[gpui::test]
 fn account_auto_switch_uses_switch_primitive(cx: &mut TestAppContext) {
     use krill_proto::usage::ConnectionsSnapshot;
@@ -5290,11 +5686,16 @@ fn owe880_mobile_enter_revoke_confirm_and_copy_feedback(cx: &mut TestAppContext)
     });
     assert!(sent_status(), "tab entry must request Status");
 
-    // 기기가 있으면 전체 해제가 보인다.
+    // 기기가 있으면 전체 해제가 보이고, QR과 경로는 새 기기 연결을 눌러야 펼쳐진다.
     vcx.update(|window, cx| {
         window.draw(cx).clear(cx);
     });
     assert!(vcx.debug_bounds("mobile-revoke-all").is_some());
+    assert!(vcx.debug_bounds("admin-mobile-pair-section").is_none());
+    click(vcx, "mobile-new-device");
+    assert!(vcx.debug_bounds("admin-mobile-pair-section").is_some());
+    click(vcx, "mobile-new-device");
+    assert!(vcx.debug_bounds("admin-mobile-pair-section").is_none());
 
     // Individual revoke follows the same confirmation contract and Escape preserves devices.
     click(vcx, "mobile-revoke-0");
@@ -5396,6 +5797,13 @@ fn owe728_workflows_tab_worktree_symlinks_and_repo_hooks(cx: &mut TestAppContext
                 v.add_worktree_symlink_for(&repo_canonical, "../secret", cx)
                     .is_err()
             );
+            let (status, is_error) = v
+                .workflow_form
+                .as_ref()
+                .and_then(|form| form.symlink_status.clone())
+                .expect("rejected path must show a status");
+            assert!(is_error);
+            assert!(status.contains("traversal"), "{status}");
             v.add_worktree_symlink_for(&repo_canonical, ".env", cx)
                 .unwrap();
             v.add_worktree_symlink_for(&repo_canonical, "node_modules", cx)
@@ -5412,7 +5820,10 @@ fn owe728_workflows_tab_worktree_symlinks_and_repo_hooks(cx: &mut TestAppContext
     });
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-symlink-remove-0").is_some());
-    assert!(vcx.debug_bounds("admin-repo-hook-row-0").is_some());
+    assert!(
+        vcx.debug_bounds("admin-repo-hook-row-0").is_none(),
+        "per-repository summaries moved into the project menu"
+    );
 
     let store = krill_proto::orchestration::WorktreeStore::load(&d).unwrap();
     assert_eq!(
@@ -5488,7 +5899,11 @@ fn project_worktree_location_saves_switches_and_resets(cx: &mut TestAppContext) 
             .clone();
         input.update(cx, |input, cx| input.set_value(".worktrees", window, cx));
     });
-    click(vcx, "admin-worktree-location-save");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-workflow-dirty").is_some());
+    assert!(vcx.debug_bounds("admin-worktree-location-save").is_none());
+    click(vcx, "admin-repo-hooks-save");
     vcx.run_until_parked();
     assert_eq!(
         crate::sidebar::external::project_worktree_locations(&d, None)[&repo_a],
@@ -5793,7 +6208,8 @@ fn owe729_resources_space_scan_and_artifact_breakdown(cx: &mut TestAppContext) {
         "admin-space-section",
         "admin-space-summary",
         "admin-space-scan",
-        "admin-worktree-cleanup-open",
+        "admin-space-scanned-at",
+        "admin-cleanup-execute",
         "admin-space-worktree-list",
         "admin-space-wt-wt-heavy",
         "admin-space-wt-wt-light",
@@ -5805,6 +6221,22 @@ fn owe729_resources_space_scan_and_artifact_breakdown(cx: &mut TestAppContext) {
         assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
     }
     assert!(vcx.debug_bounds("admin-space-error").is_none());
+    // 정리 후보에 없는 행: 기본 워크트리와 잠긴 워크트리는 고를 수 없고 이유를 쓴다.
+    for selector in ["admin-cleanup-reason-repo", "admin-cleanup-reason-wt-heavy"] {
+        assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+    // 경로와 빌드 아티팩트는 행을 눌러야 펼쳐진다.
+    assert!(
+        vcx.debug_bounds("admin-space-wt-art-wt-heavy-target")
+            .is_none()
+    );
+    let toggle = vcx.debug_bounds("admin-space-toggle-wt-heavy").unwrap();
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("admin-space-wt-art-wt-heavy-target")
+            .is_some()
+    );
 
     let calls = calls.lock().unwrap().clone();
     let repo_arg = repo.to_string_lossy().into_owned();
@@ -5866,10 +6298,10 @@ fn resource_worktree_names_survive_long_branch_badges(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-729 (MK-175): 워크트리 일괄 클린업(`Cleanup`) 모달의 필터(PR 상태, 경과 일수, dirty 제외)와
+/// OWE-729 (MK-175): 디스크 표의 필터(PR 상태, 경과 일수, dirty 제외)와
 /// 선택 실행이 `krill worktree cleanup --worktree ... --json`으로 전달되고 요약·후보가 갱신되는지 검증.
 #[gpui::test]
-fn owe729_cleanup_modal_filters_and_bulk_delete_with_branch_safety(cx: &mut TestAppContext) {
+fn owe729_cleanup_table_filters_and_bulk_delete_with_branch_safety(cx: &mut TestAppContext) {
     use krill_proto::worktree_space::{
         CleanupItemOutcome, CleanupPrState, CleanupSummary, SpaceReport,
     };
@@ -5938,8 +6370,7 @@ fn owe729_cleanup_modal_filters_and_bulk_delete_with_branch_safety(cx: &mut Test
     vcx.run_until_parked();
     vcx.update(|window, cx| window.draw(cx).clear(cx));
 
-    click(vcx, "admin-worktree-cleanup-open");
-    assert!(vcx.debug_bounds("admin-cleanup-modal").is_some());
+    // 정리 모달 없이 표와 아래 띠가 바로 보인다.
     assert!(vcx.debug_bounds("admin-cleanup-exclude-dirty").is_some());
     assert!(
         vcx.debug_bounds("admin-cleanup-exclude-dirty-thumb")
@@ -5947,21 +6378,43 @@ fn owe729_cleanup_modal_filters_and_bulk_delete_with_branch_safety(cx: &mut Test
     );
     assert!(vcx.debug_bounds("admin-cleanup-summary").is_some());
 
-    // 기본 필터(MergedOrClosed, 경과 일수 전체, dirty 제외): dirty 1개를 제외한 3개 일치
+    // 기본 필터(MergedOrClosed, 경과 일수 전체, dirty 제외): dirty 1개를 제외한 3개 일치. 자동으로 고르지 않는다.
     vcx.update(|_, cx| {
         let matched = view.read(cx).space.filtered_candidates();
         assert_eq!(matched.len(), 3);
-        assert_eq!(view.read(cx).space.selected.len(), 3);
+        assert!(view.read(cx).space.selected.is_empty());
     });
     // 후보 행 체크박스 토글 동작 확인
     click(vcx, "admin-cleanup-select-wt-merged-old");
     vcx.update(|_, cx| {
-        assert_eq!(view.read(cx).space.selected.len(), 2);
+        assert_eq!(view.read(cx).space.selected.len(), 1);
     });
     click(vcx, "admin-cleanup-select-wt-merged-old");
     vcx.update(|_, cx| {
-        assert_eq!(view.read(cx).space.selected.len(), 3);
+        assert!(view.read(cx).space.selected.is_empty());
     });
+
+    // 안전 필터를 꺼도 미커밋 워크트리가 저절로 선택되지 않는다.
+    assert!(
+        vcx.debug_bounds("admin-cleanup-reason-wt-dirty-merged")
+            .is_some()
+    );
+    assert!(vcx.debug_bounds("admin-cleanup-dirty-hint").is_some());
+    click(vcx, "admin-cleanup-exclude-dirty");
+    vcx.update(|_, cx| {
+        let space = &view.read(cx).space;
+        assert_eq!(space.filtered_candidates().len(), 4);
+        assert!(space.selected.is_empty());
+    });
+    assert!(
+        vcx.debug_bounds("admin-cleanup-reason-wt-dirty-merged")
+            .is_none()
+    );
+    click(vcx, "admin-cleanup-exclude-dirty");
+
+    // 고른 뒤 조건 밖으로 나간 항목만 선택에서 빠진다.
+    click(vcx, "admin-cleanup-select-wt-merged-old");
+    click(vcx, "admin-cleanup-select-wt-recent-merged");
 
     // 7일 이상 필터 클릭 -> wt-merged-old(20d), wt-closed-unmerged(16d) 2개 일치
     click(vcx, "admin-cleanup-days-7");
@@ -5991,13 +6444,33 @@ fn owe729_cleanup_modal_filters_and_bulk_delete_with_branch_safety(cx: &mut Test
     click(vcx, "admin-cleanup-days-30");
     assert!(vcx.debug_bounds("admin-cleanup-empty").is_some());
 
-    // 14일 이상 -> 20일·16일 된 두 워크트리 선택
+    // 14일 이상 -> 20일·16일 된 두 워크트리를 직접 선택
     click(vcx, "admin-cleanup-days-14");
+    vcx.update(|_, cx| {
+        assert!(view.read(cx).space.selected.is_empty());
+    });
+    click(vcx, "admin-cleanup-select-all");
     vcx.update(|_, cx| {
         assert_eq!(view.read(cx).space.selected.len(), 2);
     });
 
-    // 일괄 삭제 실행: 같은 필터와 선택 경로만 CLI로 넘긴다.
+    // 첫 클릭은 무장만 한다. 바깥을 누르면 풀려서 다시 처음부터 눌러야 한다.
+    let executed = |calls: &std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>| {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c[1] == "cleanup" && !c.iter().any(|a| a == "--dry-run"))
+    };
+    click(vcx, "admin-cleanup-execute");
+    assert!(!executed(&calls), "first click must only arm");
+    vcx.update(|_, cx| assert!(view.read(cx).armed.is_some()));
+    click(vcx, "admin-cleanup-days-14");
+    vcx.update(|_, cx| assert!(view.read(cx).armed.is_none()));
+    click(vcx, "admin-cleanup-execute");
+    assert!(!executed(&calls), "disarmed click must only arm again");
+
+    // 두 번째 클릭에 실행: 같은 필터와 선택 경로만 CLI로 넘긴다.
     click(vcx, "admin-cleanup-execute");
     assert!(vcx.debug_bounds("admin-cleanup-status").is_some());
 
@@ -6037,6 +6510,284 @@ fn owe729_cleanup_modal_filters_and_bulk_delete_with_branch_safety(cx: &mut Test
         assert!(space.error.is_none());
     });
 
+    fs::remove_dir_all(d).ok();
+}
+
+/// 세션 때문에 건너뛸 워크트리는 고를 수 없게 이유를 보이고, 실행 결과에 실패 수와 사유를 남긴다.
+#[gpui::test]
+fn cleanup_table_shows_session_skips_and_failures(cx: &mut TestAppContext) {
+    use krill_proto::worktree_space::{
+        CleanupItemOutcome, CleanupPrState, CleanupReport, CleanupSummary, SpaceReport,
+    };
+
+    let d = dir("cleanup-session-skip");
+    init(cx, &d);
+    let idle = fake_candidate(&d, "wt-idle", CleanupPrState::Merged, 20, false);
+    let busy = fake_candidate(&d, "wt-busy", CleanupPrState::Merged, 20, false);
+    let skip = CleanupItemOutcome {
+        path: busy.path.clone(),
+        branch: busy.branch.clone(),
+        removed: false,
+        branch_deleted: false,
+        freed_bytes: 0,
+        warnings: Vec::new(),
+        error: Some("worktree has a running session; close it first".into()),
+    };
+    let (preview, executed) = (
+        CleanupReport {
+            dry_run: true,
+            candidates: vec![idle.clone(), busy.clone()],
+            summary: CleanupSummary {
+                items: vec![skip.clone()],
+                ..CleanupSummary::default()
+            },
+            ..CleanupReport::default()
+        },
+        CleanupReport {
+            summary: CleanupSummary {
+                failed_count: 1,
+                items: vec![CleanupItemOutcome {
+                    path: idle.path.clone(),
+                    error: Some("worktree is busy".into()),
+                    ..skip.clone()
+                }],
+                ..CleanupSummary::default()
+            },
+            ..CleanupReport::default()
+        },
+    );
+    let run = space::CliRunner::new(move |args| {
+        let json = if args[1] == "space" {
+            serde_json::to_vec(&SpaceReport::default())
+        } else if args.iter().any(|a| a == "--dry-run") {
+            serde_json::to_vec(&preview)
+        } else {
+            serde_json::to_vec(&executed)
+        };
+        Ok(json.unwrap())
+    });
+
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2600.)));
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_space_repos(vec![d.join("repo")], Some(run), cx);
+            v.set_tab(AdminTab::Disk, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(vcx.debug_bounds("admin-cleanup-reason-wt-busy").is_some());
+    assert!(vcx.debug_bounds("admin-cleanup-reason-wt-idle").is_none());
+    click(vcx, "admin-cleanup-select-wt-busy");
+    vcx.update(|_, cx| assert!(view.read(cx).space.selected.is_empty()));
+    click(vcx, "admin-cleanup-select-all");
+    vcx.update(|_, cx| {
+        let selected = &view.read(cx).space.selected;
+        assert_eq!(selected.iter().collect::<Vec<_>>(), [&idle.path]);
+    });
+
+    click(vcx, "admin-cleanup-execute");
+    click(vcx, "admin-cleanup-execute");
+    assert!(vcx.debug_bounds("admin-cleanup-failed-wt-idle").is_some());
+    vcx.update(|_, cx| {
+        let summary = view.read(cx).space.last_summary.clone().unwrap();
+        assert_eq!(summary.failed_count, 1);
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+/// 정리 중에는 조건, 체크칸, 스캔을 잠그고 대상 행에 표시한다. 선택은 저절로 되살아나지 않는다.
+#[gpui::test]
+fn disk_table_locks_while_cleaning_and_never_reselects(cx: &mut TestAppContext) {
+    use krill_proto::worktree_space::{CleanupPrState, CleanupSummary, SpaceReport};
+
+    let d = dir("disk-cleaning-lock");
+    init(cx, &d);
+    let a = fake_candidate(&d, "wt-a", CleanupPrState::Merged, 20, false);
+    let b = fake_candidate(&d, "wt-b", CleanupPrState::Merged, 20, false);
+    let (run, calls) = fake_space_cli(
+        SpaceReport::default(),
+        vec![a.clone(), b.clone()],
+        CleanupSummary::default(),
+        vec![b.clone()],
+    );
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2600.)));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_space_repos(vec![d.join("repo")], Some(run), cx);
+            v.set_tab(AdminTab::Disk, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let space = &view.read(cx).space;
+        assert!(space.selected.is_empty(), "선택은 비운 채 시작한다");
+        assert!(!space.scan_slow && !space.scanning);
+    });
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    click(vcx, "admin-cleanup-select-wt-a");
+
+    // 정리 중인 상태를 그대로 그려 잠금을 본다.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.space.cleaning = true;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    let before = calls.lock().unwrap().len();
+    for selector in [
+        "admin-cleanup-days-30",
+        "admin-cleanup-pr-any",
+        "admin-cleanup-exclude-dirty",
+        "admin-cleanup-select-wt-b",
+        "admin-cleanup-select-all",
+        "admin-space-scan",
+        "admin-cleanup-execute",
+    ] {
+        click(vcx, selector);
+    }
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(
+            v.space.filter,
+            krill_proto::worktree_space::CleanupFilter::default()
+        );
+        assert_eq!(v.space.selected.iter().collect::<Vec<_>>(), [&a.path]);
+        assert!(v.armed.is_none(), "정리 중에는 삭제를 무장하지 않는다");
+    });
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        before,
+        "정리 중 CLI를 더 부르지 않는다"
+    );
+
+    // 끝나면 선택은 비고, 재스캔 뒤에도 남은 행을 저절로 고르지 않는다.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.space.cleaning = false;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    click(vcx, "admin-cleanup-execute");
+    click(vcx, "admin-cleanup-execute");
+    vcx.update(|_, cx| {
+        let space = &view.read(cx).space;
+        assert!(space.selected.is_empty());
+        assert_eq!(space.candidates.len(), 1);
+        assert!(space.last_summary.is_some());
+    });
+    // 다시 들어오면 지난 결과도 비운다.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::System, cx);
+            v.set_tab(AdminTab::Disk, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-cleanup-status").is_none());
+    fs::remove_dir_all(d).ok();
+}
+
+/// 첫 스캔은 문구 대신 빈 행을 그린다. 스캔이 빨리 끝나면 늦은 타이머가 진행 문구를 켜지 않는다(§7.0, §7.3).
+#[gpui::test]
+fn disk_first_scan_draws_blank_rows_and_defers_progress_copy(cx: &mut TestAppContext) {
+    use krill_proto::worktree_space::{CleanupSummary, SpaceReport};
+
+    let d = dir("disk-first-scan");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.space.scanning = true;
+            v.set_tab(AdminTab::Disk, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-space-blank").is_some());
+    assert!(vcx.debug_bounds("admin-space-empty").is_none());
+    assert!(vcx.debug_bounds("admin-cleanup-footer").is_none());
+
+    let (run, _) = fake_space_cli(
+        SpaceReport::default(),
+        Vec::new(),
+        CleanupSummary::default(),
+        Vec::new(),
+    );
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_space_repos(vec![d.join("repo")], Some(run), cx);
+            assert!(v.space.scanning && !v.space.scan_slow);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_secs(2));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let space = &view.read(cx).space;
+        assert!(!space.scanning && !space.scan_slow);
+    });
+    assert!(vcx.debug_bounds("admin-space-empty").is_some());
+    fs::remove_dir_all(d).ok();
+}
+
+/// 작은 창에서는 조건이 한 줄로 접히고, 삭제 띠는 본문 스크롤 밖에 고정된다.
+#[gpui::test]
+fn disk_small_window_folds_filters_and_pins_the_delete_bar(cx: &mut TestAppContext) {
+    use krill_proto::worktree_space::{CleanupPrState, SpaceReport};
+
+    let d = dir("disk-small");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(700.), px(500.)));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.space.report = Some(SpaceReport::default());
+            v.space.candidates = (0..12)
+                .map(|i| {
+                    let name: &'static str = format!("wt-{i}").leak();
+                    fake_candidate(&d, name, CleanupPrState::Merged, 20, false)
+                })
+                .collect();
+            v.set_tab(AdminTab::Disk, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-cleanup-days-7").is_none());
+    let toggle = vcx.debug_bounds("admin-cleanup-filters-toggle").unwrap();
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-cleanup-days-7").is_some());
+
+    let content = vcx.debug_bounds("admin-content").unwrap();
+    let footer = vcx.debug_bounds("admin-cleanup-footer").unwrap();
+    let execute = vcx.debug_bounds("admin-cleanup-execute").unwrap();
+    assert!(
+        footer.top() >= content.bottom() - px(0.5),
+        "{footer:?} {content:?}"
+    );
+    assert!(footer.bottom() <= px(500.));
+    assert!(execute.right() <= footer.right() && execute.bottom() <= footer.bottom());
     fs::remove_dir_all(d).ok();
 }
 
@@ -6101,7 +6852,10 @@ fn workflows_schedule_modal_precheck_isolated_worktree_and_log_viewer(cx: &mut T
     vcx.simulate_resize(size(px(1400.), px(4000.)));
 
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Project, cx);
+            v.project_section = ProjectSection::Schedules;
+        });
     });
     vcx.run_until_parked();
 
@@ -6306,7 +7060,14 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
-    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.agent_expanded
+                .extend(["claude", "codex", "agy", "cursor", "opencode"]);
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
 
     // 개별 훅 버튼(cursor·opencode·claude·agy 포함)이 복사만 하지 않고 직접 훅 설정 파일을 설치하며,
     // codex는 터미널 자동 실행 큐에도 들어간다.
@@ -6484,8 +7245,14 @@ fn opencode_go_api_key_card_saves_and_clears_override(cx: &mut TestAppContext) {
         .expect("accounts tab");
     vcx.simulate_click(tab.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-opencode-api-key-card").is_some());
     assert!(vcx.debug_bounds("admin-opencode-api-key-badge").is_some());
+    assert!(vcx.debug_bounds("admin-opencode-api-key-card").is_none());
+    let toggle = vcx
+        .debug_bounds("admin-opencode-api-key-toggle")
+        .expect("toggle");
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-opencode-api-key-card").is_some());
     // 로그인 안내 카드(`admin-opencode-login-guide`)는 터미널 로그인 진행 중에만 뜬다.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
@@ -6509,7 +7276,7 @@ fn opencode_go_api_key_card_saves_and_clears_override(cx: &mut TestAppContext) {
             crate::accounts::opencode_go::read_override(&home, dir.as_deref()).as_deref(),
             Some("test-key-123")
         );
-        assert!(view.read(cx).opencode_api_key_configured);
+        assert_eq!(view.read(cx).opencode_api_key_configured, Some(true));
     });
     assert!(vcx.debug_bounds("admin-opencode-api-key-clear").is_some());
     let clear = vcx
@@ -6520,7 +7287,16 @@ fn opencode_go_api_key_card_saves_and_clears_override(cx: &mut TestAppContext) {
     vcx.update(|_, cx| {
         let (home, dir) = SettingsView::opencode_home_and_state(cx);
         assert!(crate::accounts::opencode_go::read_override(&home, dir.as_deref()).is_none());
+        assert_eq!(view.read(cx).opencode_api_key_configured, Some(false));
     });
+    // 그리는 동안에는 파일을 읽지 않는다. 바깥에서 파일이 바뀌어도 다음 저장, 지우기 전까지 값이 그대로다.
+    vcx.update(|window, cx| {
+        let (home, dir) = SettingsView::opencode_home_and_state(cx);
+        crate::accounts::opencode_go::save_override(&home, dir.as_deref(), "external").unwrap();
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).opencode_api_key_configured, Some(false)));
     fs::remove_dir_all(d).ok();
 }
 
@@ -6545,7 +7321,10 @@ fn owe760_schedule_modal_validates_fields_and_preserves_quoted_command_args(
     vcx.simulate_resize(size(px(1400.), px(4000.)));
 
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Project, cx);
+            v.project_section = ProjectSection::Schedules;
+        });
     });
     vcx.run_until_parked();
 
@@ -6895,7 +7674,10 @@ fn owe776_schedule_modal_allows_empty_optional_prompt_and_localizes_validation_e
     vcx.simulate_resize(size(px(1400.), px(4000.)));
 
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Project, cx);
+            v.project_section = ProjectSection::Schedules;
+        });
     });
     vcx.run_until_parked();
 
@@ -7027,7 +7809,7 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
     // 1) 시스템 탭: 사이드바·본문 폭 토큰 및 스위치·세그먼트 컨트롤 경계 검증
     let sidebar = bounds(vcx, "admin-sidebar");
     let column = bounds(vcx, "admin-content-column");
-    assert_eq!(sidebar.size.width, crate::ui::SETTINGS_NAV_WIDTH);
+    assert_eq!(sidebar.size.width, px(168.));
     assert!(column.size.width <= crate::ui::SETTINGS_CONTENT_MAX_WIDTH);
 
     for sel in ["notif-toggle", "notif-toggle-thumb", "sound-toggle"] {
@@ -7048,7 +7830,14 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
-    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.agent_expanded
+                .extend(["claude", "codex", "agy", "cursor", "opencode"]);
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
     for selector in [
         "admin-skills-card",
         "admin-install-all-skills",
@@ -7135,8 +7924,8 @@ fn owe806_account_detail_does_not_repeat_org_name_when_auto_label_matches_org(
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-796: 에이전트 탭의 알약형 기본 에이전트 선택기(체크 아이콘), Yolo/수동 세그먼트,
-/// 단일 `agents.toml 열기` 헤더와 접이식 에이전트 카탈로그 행을 검증한다.
+/// OWE-796: 에이전트 한 목록의 기본 지정 라디오와 기본 표시, Yolo/수동 세그먼트,
+/// 단일 `agents.toml 열기` 행과 접이식 에이전트 행을 검증한다.
 #[gpui::test]
 fn owe796_agents_tab_collapsible_catalog_and_pill_default(cx: &mut TestAppContext) {
     let d = dir("owe796-agents-tab");
@@ -7156,9 +7945,8 @@ fn owe796_agents_tab_collapsible_catalog_and_pill_default(cx: &mut TestAppContex
             .unwrap_or_else(|| panic!("missing selector {s}"))
     };
 
-    // 1) 기본 에이전트 알약형 선택기: 초기 claude 선택 시 claude에만 체크 아이콘이 표시되고,
-    //    codex 클릭 시 codex로 체크 아이콘과 설정이 이동한다.
-    assert!(vcx.debug_bounds("admin-default-agent-card").is_some());
+    // 1) 기본 지정 라디오: 초기 claude 선택 시 claude에만 기본 표시가 있고,
+    //    codex 클릭 시 codex로 기본 표시와 설정이 이동한다.
     assert!(
         vcx.debug_bounds("admin-default-agent-check-claude")
             .is_some()
@@ -7205,7 +7993,7 @@ fn owe796_agents_tab_collapsible_catalog_and_pill_default(cx: &mut TestAppContex
         );
     });
 
-    // 3) 에이전트 카탈로그 카드: 헤더 우측에 `agents.toml 열기`가 한 번만 배치되고,
+    // 3) 에이전트 목록: `agents.toml 열기`는 한 번만 있고,
     //    5개 에이전트 행은 기본적으로 모두 접혀 있으며 요약·배지가 표시된다.
     let catalog_card = bounds(vcx, "admin-agents-catalog-card");
     let open_toml = bounds(vcx, "admin-agents-open-toml");
@@ -7291,11 +8079,7 @@ fn owe796_agents_tab_collapsible_catalog_and_pill_default(cx: &mut TestAppContex
 
     // 좁은 창(820px)에서도 펼쳐진 에이전트 카드·기본 에이전트 카드·스킬 카드가 컬럼 경계를 넘지 않는다.
     let column = bounds(vcx, "admin-content-column");
-    for sel in [
-        "admin-default-agent-card",
-        "admin-agents-catalog-card",
-        "admin-agent-editor-codex",
-    ] {
+    for sel in ["admin-agents-catalog-card", "admin-agent-editor-codex"] {
         let b = bounds(vcx, sel);
         assert!(
             b.right() <= column.right() + px(0.5),
@@ -7359,11 +8143,16 @@ fn general_terminal_controls_in_language(cx: &mut TestAppContext, language: Lang
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
-    let sec_notif = bounds(vcx, "general-section-notifications");
-    let sec_power = bounds(vcx, "general-section-power");
-    let sec_files = bounds(vcx, "general-section-files");
-    assert!(sec_notif.origin.y < sec_power.origin.y);
-    assert!(sec_power.origin.y < sec_files.origin.y);
+    // 값, 도구, 삭제 순서로 나뉘고 삭제가 맨 아래다.
+    assert!(bounds(vcx, "notif-toggle").origin.y < bounds(vcx, "admin-section-resources").origin.y);
+    assert!(bounds(vcx, "admin-section-resources").bottom() < bounds(vcx, "open-checks").origin.y);
+    assert!(bounds(vcx, "open-checks").bottom() < bounds(vcx, "admin-history-danger").origin.y);
+    assert_eq!(
+        bounds(vcx, "open-checks").origin.y,
+        bounds(vcx, "open-install").origin.y,
+        "tool entries sit in two columns"
+    );
+    assert!(bounds(vcx, "open-checks").right() <= bounds(vcx, "open-install").origin.x);
     assert!(bounds(vcx, "awake-off").origin.x < bounds(vcx, "awake-agent").origin.x);
     assert!(bounds(vcx, "awake-agent").origin.x < bounds(vcx, "awake-on").origin.x);
 
@@ -7474,7 +8263,7 @@ fn general_terminal_controls_in_language(cx: &mut TestAppContext, language: Lang
 }
 
 /// OWE-802: 모바일 리모컨(Mobile) 탭의 연결 경로 라디오 카드·티켓 URL 복사 피드백·기기 해제·오류 배너와
-/// 시스템·보안(Resources) 탭의 스위치·진단 버튼·디스크 용량 카드 헤더 버튼(`admin-worktree-cleanup-open`)
+/// 시스템·보안(Resources) 탭의 스위치·진단 버튼·디스크 용량 머리 줄 버튼(`admin-space-scan`)
 /// 우측 경계(좁은 창 포함)를 검증한다.
 #[gpui::test]
 fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
@@ -7593,8 +8382,16 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
         );
     }
     assert!(
-        bounds(vcx, "mobile-tailscale").top() < bounds(vcx, "mobile-tunnel").top(),
-        "Tailscale must be prioritized above Relay in mobile mode card"
+        bounds(vcx, "mobile-tailscale").left() < bounds(vcx, "mobile-tunnel").left(),
+        "Tailscale must be prioritized before Relay in the path control"
+    );
+    // 기기 목록이 먼저, 페어링 패널이 그다음, 전체 해제가 맨 아래다.
+    assert!(
+        bounds(vcx, "mobile-device-row-1").bottom()
+            <= bounds(vcx, "admin-mobile-pair-section").top()
+    );
+    assert!(
+        bounds(vcx, "admin-mobile-pair-section").bottom() <= bounds(vcx, "mobile-revoke-all").top()
     );
     for sel in [
         "admin-mobile-pair-section",
@@ -7693,7 +8490,7 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
     assert!(vcx.debug_bounds("mobile-error-banner").is_some());
 
     // 2) Resources 탭: 스위치·진단 버튼 및 좁은 창(720px / 820px)·넓은 창(1200px)에서
-    //    디스크 용량 카드 헤더 버튼(`admin-worktree-cleanup-open`) 우측 잘림 없음 검증
+    //    디스크 용량 머리 줄 버튼(`admin-space-scan`) 우측 잘림 없음 검증
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| v.set_tab(AdminTab::System, cx));
         window.draw(cx).clear(cx);
@@ -7732,7 +8529,6 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
         let space_card = bounds(vcx, "admin-space-section");
         let header_row = bounds(vcx, "admin-space-header-row");
         let scan_btn = bounds(vcx, "admin-space-scan");
-        let cleanup_btn = bounds(vcx, "admin-worktree-cleanup-open");
 
         assert!(
             space_card.right() <= column.right() + px(0.5),
@@ -7742,27 +8538,22 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
             header_row.right() <= space_card.right() + px(0.5),
             "width={width}: admin-space-header-row ({header_row:?}) overflowed card ({space_card:?})"
         );
-        for (name, btn) in [
-            ("admin-space-scan", scan_btn),
-            ("admin-worktree-cleanup-open", cleanup_btn),
-        ] {
-            assert!(
-                btn.origin.x >= header_row.origin.x - px(0.5),
-                "width={width}: {name} ({btn:?}) overflowed left of header_row ({header_row:?})"
-            );
-            assert!(
-                btn.right() <= header_row.right() + px(0.5),
-                "width={width}: {name} ({btn:?}) overflowed right of header_row ({header_row:?})"
-            );
-            assert!(
-                btn.bottom() <= header_row.bottom() + px(0.5),
-                "width={width}: {name} ({btn:?}) overflowed bottom of header_row ({header_row:?})"
-            );
-            assert!(
-                btn.right() <= space_card.right() + px(0.5),
-                "width={width}: {name} ({btn:?}) overflowed right of space_card ({space_card:?})"
-            );
-        }
+        assert!(
+            scan_btn.origin.x >= header_row.origin.x - px(0.5),
+            "width={width}: scan ({scan_btn:?}) overflowed left of header_row ({header_row:?})"
+        );
+        assert!(
+            scan_btn.right() <= header_row.right() + px(0.5),
+            "width={width}: scan ({scan_btn:?}) overflowed right of header_row ({header_row:?})"
+        );
+        assert!(
+            scan_btn.bottom() <= header_row.bottom() + px(0.5),
+            "width={width}: scan ({scan_btn:?}) overflowed bottom of header_row ({header_row:?})"
+        );
+        assert!(
+            scan_btn.right() <= space_card.right() + px(0.5),
+            "width={width}: scan ({scan_btn:?}) overflowed right of space_card ({space_card:?})"
+        );
     }
 
     fs::remove_dir_all(d).ok();
@@ -7971,6 +8762,7 @@ fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut Test
     );
 
     // 3) 자동전환 & 고급 정책 스위치(`ui::switch`) 및 쿨다운 세그먼트(`ui::segmented_control`) 검증
+    click(vcx, "admin-auto-switch-strip");
     for switch_sel in [
         "admin-auto-switch-toggle",
         "admin-rate-limit-toggle",
@@ -8081,7 +8873,9 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
     vcx.simulate_resize(size(px(1200.), px(6000.)));
 
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Project, cx);
+        });
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
@@ -8130,8 +8924,6 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
         vcx.debug_bounds("admin-workflow-repo-chips").is_none(),
         "project picker is a single dropdown row, not a chip list"
     );
-    assert!(vcx.debug_bounds("admin-symlinks-repo-badge").is_some());
-    assert!(vcx.debug_bounds("admin-hooks-repo-badge").is_some());
     assert!(vcx.debug_bounds("admin-worktree-symlinks-chips").is_some());
     assert!(vcx.debug_bounds("admin-symlink-chip-0").is_some());
     assert!(vcx.debug_bounds("admin-symlink-chip-1").is_some());
@@ -8176,9 +8968,9 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
     assert!(vcx.debug_bounds("admin-qc-card").is_some());
     assert!(vcx.debug_bounds("admin-qc-empty").is_some());
     vcx.update(|window, cx| {
-        let form = view.read(cx).workflow_form.as_ref().unwrap();
-        let name_inp = form.qc_name.clone();
-        let text_inp = form.qc_text.clone();
+        let form = view.read(cx).quick_form.as_ref().unwrap();
+        let name_inp = form.name.clone();
+        let text_inp = form.command.clone();
         name_inp.update(cx, |inp, cx| inp.set_value("상태 확인", window, cx));
         text_inp.update(cx, |inp, cx| inp.set_value("git status -sb", window, cx));
     });
@@ -8196,10 +8988,10 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
     click_sel(vcx, "admin-qc-edit-0");
     assert!(vcx.debug_bounds("admin-qc-cancel").is_some());
     vcx.update(|window, cx| {
-        let form = view.read(cx).workflow_form.as_ref().unwrap();
-        assert_eq!(form.qc_editing, Some(0));
-        assert_eq!(form.qc_name.read(cx).value().as_str(), "상태 확인");
-        let text_inp = form.qc_text.clone();
+        let form = view.read(cx).quick_form.as_ref().unwrap();
+        assert_eq!(form.editing.as_ref().unwrap().cmd.text, "git status -sb");
+        assert_eq!(form.name.read(cx).value().as_str(), "상태 확인");
+        let text_inp = form.command.clone();
         text_inp.update(cx, |inp, cx| inp.set_value("git status", window, cx));
     });
     click_sel(vcx, "admin-qc-add");
@@ -8210,13 +9002,20 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
         assert_eq!(cmds[0].text, "git status");
     });
 
+    // 제거는 2단계: 첫 클릭은 그대로 두고 두 번째 클릭에 지운다.
+    click_sel(vcx, "admin-qc-remove-0");
+    assert!(vcx.debug_bounds("admin-qc-empty").is_none());
+    vcx.update(|_, cx| assert_eq!(current(cx).quick_commands.len(), 1));
     click_sel(vcx, "admin-qc-remove-0");
     assert!(vcx.debug_bounds("admin-qc-empty").is_some());
     vcx.update(|_, cx| assert!(current(cx).quick_commands.is_empty()));
 
     // 5) 예약 작업 활성/일시정지 Switch 및 좁은 창(820px) 경계 검증
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Project, cx));
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Project, cx);
+            v.project_section = ProjectSection::Schedules;
+        });
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
@@ -8263,11 +9062,13 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
     vcx.update(|window, cx| window.draw(cx).clear(cx));
 
     let col_b = vcx.debug_bounds("admin-content-column").unwrap();
+    let cb = vcx.debug_bounds("admin-schedules-card").unwrap();
+    assert!(cb.right() <= col_b.right() + px(0.5), "{cb:?} {col_b:?}");
+    click_sel(vcx, "admin-project-section-project");
     for card_sel in [
         "admin-workflow-repo-card",
         "admin-worktree-symlinks-card",
         "admin-repo-hooks-card",
-        "admin-schedules-card",
     ] {
         let cb = vcx.debug_bounds(card_sel).unwrap();
         assert!(
@@ -8275,6 +9076,7 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
             "workflow card {card_sel} ({cb:?}) overflowed column ({col_b:?})"
         );
     }
+    click_sel(vcx, "admin-project-section-schedules");
     let sched_row_b = vcx
         .debug_bounds("admin-schedule-row-nightly-check")
         .unwrap();
@@ -8290,6 +9092,12 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_and_schedule_switc
             "schedule control {ctrl_sel} ({b:?}) overflowed row ({sched_row_b:?})"
         );
     }
+
+    // 예약 작업 삭제는 2단계: 첫 클릭은 파일을 건드리지 않는다.
+    click_sel(vcx, "admin-schedule-remove-nightly-check");
+    assert_eq!(Schedules::load(&d).unwrap().schedule.len(), 1);
+    click_sel(vcx, "admin-schedule-remove-nightly-check");
+    assert!(Schedules::load(&d).unwrap().schedule.is_empty());
 
     fs::remove_dir_all(d).ok();
 }
@@ -8401,6 +9209,7 @@ fn general_tab_offers_matching_an_unpaired_terminal_theme(cx: &mut TestAppContex
 
     vcx.update(|window, cx| {
         edit(cx, |s| {
+            s.theme = ThemeChoice::System;
             s.terminal_theme_dark = "custom:warp:cyber-neon".into();
             s.terminal_use_separate_light_theme = false;
         });
@@ -8490,7 +9299,7 @@ fn mobile_pairing_keeps_path_selection_and_other_tabs_available(cx: &mut TestApp
 
 #[gpui::test]
 fn machines_page_owns_add_methods_and_this_computer_access(cx: &mut TestAppContext) {
-    use crate::machines::{AddMethod, MachinePage};
+    use crate::machines::AddMethod;
     let d = dir("machines-navigation");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
@@ -8514,13 +9323,15 @@ fn machines_page_owns_add_methods_and_this_computer_access(cx: &mut TestAppConte
     assert!(vcx.debug_bounds("admin-tab-ssh").is_none());
     assert!(vcx.debug_bounds("admin-tab-remote-krill").is_none());
     assert!(vcx.debug_bounds("admin-machines-list").is_some());
-    assert!(vcx.debug_bounds("link-server-panel").is_none());
+    // 접속 허용 스위치는 첫 화면에 있고, 초대는 접속 관리를 펼쳐야 보인다.
+    assert!(vcx.debug_bounds("link-server-toggle").is_some());
+    assert!(vcx.debug_bounds("link-devices-empty").is_none());
     assert!(vcx.debug_bounds("admin-ssh-form").is_none());
     let add = vcx.debug_bounds("admin-machines-add").unwrap();
     vcx.simulate_click(add.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("link-client-input-link").is_some());
-    assert!(vcx.debug_bounds("link-server-panel").is_none());
+    assert!(vcx.debug_bounds("link-server-toggle").is_some());
     vcx.simulate_input("krill://pair?invite=draft");
     vcx.update(|_, cx| {
         assert_eq!(
@@ -8538,16 +9349,12 @@ fn machines_page_owns_add_methods_and_this_computer_access(cx: &mut TestAppConte
         let input = view.read(cx).ssh_form.as_ref().unwrap().label.clone();
         assert!(input.read(cx).focus_handle(cx).is_focused(window));
     });
-    vcx.update(|_, cx| {
-        view.update(cx, |v, cx| {
-            v.machine_page = MachinePage::ThisComputer;
-            cx.notify();
-        });
-    });
+    // 다시 누르면 접는다.
+    let add = vcx.debug_bounds("admin-machines-add").unwrap();
+    vcx.simulate_click(add.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("link-server-panel").is_some());
-    assert!(vcx.debug_bounds("link-client-input-link").is_none());
     assert!(vcx.debug_bounds("admin-ssh-form").is_none());
+    assert!(vcx.debug_bounds("link-client-input-link").is_none());
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| v.show_machine_add(AddMethod::Invite, cx));
         assert_eq!(view.read(cx).remote_krill.as_ref(), Some(&pairing));
@@ -8859,16 +9666,12 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
     let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(820.), px(5000.)));
     vcx.run_until_parked();
-    let choose = |vcx: &mut gpui::VisualTestContext, selector: &'static str, index: usize| {
+    let choose = |vcx: &mut gpui::VisualTestContext, mode: &'static str, index: usize| {
+        let selector: &'static str = format!("ui-theme-swatch-{mode}-{index}").leak();
         let b = vcx
             .debug_bounds(selector)
             .unwrap_or_else(|| panic!("missing selector {selector}"));
         vcx.simulate_click(b.center(), gpui::Modifiers::default());
-        vcx.run_until_parked();
-        for _ in 0..=index {
-            vcx.simulate_keystrokes("down");
-        }
-        vcx.simulate_keystrokes("enter");
         vcx.run_until_parked();
     };
 
@@ -8876,7 +9679,7 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
         assert_eq!(current(cx).ui_theme_dark, DarkUiTheme::TokyoNight);
         assert_eq!(crate::ui::palette(cx), &crate::ui::TOKYO_NIGHT);
     });
-    choose(vcx, "ui-theme-dark", 12);
+    choose(vcx, "dark", 12);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_dark, DarkUiTheme::Glow);
@@ -8893,7 +9696,7 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
     // 사용자가 고른 터미널 테마는 앱 테마를 바꿔도 그대로 둔다.
     vcx.update(|_, cx| edit(cx, |s| s.terminal_theme_dark = "Dracula".to_owned()));
     vcx.run_until_parked();
-    choose(vcx, "ui-theme-dark", 10);
+    choose(vcx, "dark", 10);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_dark, DarkUiTheme::Abyss);
@@ -8907,7 +9710,7 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
         assert_eq!(current(cx).ui_theme_light, LightUiTheme::Paper);
         assert_eq!(crate::ui::palette(cx), &crate::ui::PAPER);
     });
-    choose(vcx, "ui-theme-light", 1);
+    choose(vcx, "light", 1);
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
@@ -8919,6 +9722,382 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
         assert_eq!(crate::ui::palette(cx), &crate::ui::LIGHT);
     });
     fs::remove_dir_all(&d).ok();
+}
+
+/// 모양 B: 테마 설정에 맞는 견본만 펼치고, 칸은 축소판 높이와 칩 크기를 지키며, 고른 칸에만 체크가 있다.
+#[gpui::test]
+fn appearance_swatch_board_follows_theme_mode_and_keeps_color_area(cx: &mut TestAppContext) {
+    let d = dir("swatch-board");
+    fs::write(d.join(SETTINGS_FILE), "theme = 'dark'\n").unwrap();
+    init(cx, &d);
+    let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    // 창 712에서 모달은 최소 폭 680이고 5열이다.
+    vcx.simulate_resize(size(px(712.), px(2400.)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("ui-theme-dark-board").is_some());
+    assert!(vcx.debug_bounds("ui-theme-light-board").is_none());
+    let cell = |vcx: &mut gpui::VisualTestContext, i: usize| {
+        vcx.debug_bounds(format!("ui-theme-swatch-dark-{i}").leak())
+            .unwrap()
+    };
+    assert_eq!(cell(vcx, 0).origin.y, cell(vcx, 4).origin.y);
+    assert!(cell(vcx, 5).origin.y > cell(vcx, 4).origin.y);
+    for i in 0..DarkUiTheme::ALL.len() {
+        let preview = vcx
+            .debug_bounds(format!("ui-theme-swatch-dark-{i}-preview").leak())
+            .unwrap();
+        assert!(preview.size.height >= px(48.), "{preview:?}");
+        for chip in 0..6 {
+            let chip = vcx
+                .debug_bounds(format!("ui-theme-swatch-dark-{i}-chip-{chip}").leak())
+                .unwrap();
+            assert!(
+                chip.size.width >= px(8.) && chip.size.height >= px(8.),
+                "{chip:?}"
+            );
+            assert!(chip.right() <= preview.right(), "{chip:?} {preview:?}");
+        }
+    }
+    assert!(vcx.debug_bounds("ui-theme-swatch-dark-0-check").is_some());
+    assert!(vcx.debug_bounds("ui-theme-swatch-dark-1-check").is_none());
+
+    // 넓으면 7열.
+    vcx.simulate_resize(size(px(1400.), px(2400.)));
+    vcx.run_until_parked();
+    assert_eq!(cell(vcx, 0).origin.y, cell(vcx, 6).origin.y);
+    assert!(cell(vcx, 7).origin.y > cell(vcx, 6).origin.y);
+
+    vcx.update(|_, cx| edit(cx, |s| s.theme = ThemeChoice::Light));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("ui-theme-dark-board").is_none());
+    assert!(vcx.debug_bounds("ui-theme-light-board").is_some());
+    vcx.update(|_, cx| edit(cx, |s| s.theme = ThemeChoice::System));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("ui-theme-dark-board").is_some());
+    assert!(vcx.debug_bounds("ui-theme-light-board").is_some());
+    fs::remove_dir_all(d).ok();
+}
+
+/// 모양 B: 가져온 터미널 테마를 고르면 터미널 이름이 보이고, 맞추기로 되돌린다. 앱 테마는 그대로다.
+#[gpui::test]
+fn appearance_imported_terminal_theme_shows_name_and_keeps_app_theme(cx: &mut TestAppContext) {
+    let d = dir("swatch-imported");
+    fs::write(d.join(SETTINGS_FILE), "theme = 'dark'\n").unwrap();
+    init(cx, &d);
+    let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(2400.)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("ui-theme-dark-imported").is_none());
+    assert!(vcx.debug_bounds("ui-theme-dark-terminal").is_none());
+    vcx.update(|_, cx| {
+        edit(cx, |s| {
+            s.terminal_custom_themes = vec![crate::ui::CustomTerminalTheme {
+                id: "warp:dune".into(),
+                name: "Dune".into(),
+                source: "warp".into(),
+                mode: "dark".into(),
+                source_label: None,
+                foreground: "#ffffff".into(),
+                background: "#000000".into(),
+                cursor: "#ffffff".into(),
+                ansi: std::array::from_fn(|_| "#808080".into()),
+            }];
+        });
+    });
+    vcx.run_until_parked();
+    let at = vcx.debug_bounds("ui-theme-dark-imported").unwrap().center();
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("down enter");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert_eq!(s.terminal_theme_dark, "custom:warp:dune");
+        assert_eq!(s.unpaired_terminal_theme(ThemeMode::Dark), Some("Dune"));
+        assert_eq!(s.ui_theme_dark, DarkUiTheme::TokyoNight);
+    });
+    assert!(vcx.debug_bounds("ui-theme-dark-terminal").is_some());
+    let at = vcx.debug_bounds("ui-theme-dark-match").unwrap().center();
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("ui-theme-dark-terminal").is_none());
+    fs::remove_dir_all(d).ok();
+}
+
+/// 에이전트 B: 권한이 목록 위에 있고, 터미널에서 설치는 설치 안 된 행에만 보이며, 누르면 결과를 보인다.
+#[gpui::test]
+fn agents_list_keeps_safety_on_top_and_reports_queued_install(cx: &mut TestAppContext) {
+    let d = dir("agents-list");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(3000.)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx)));
+    vcx.run_until_parked();
+    let y =
+        |vcx: &mut gpui::VisualTestContext, s: &'static str| vcx.debug_bounds(s).unwrap().origin.y;
+    assert!(y(vcx, "workspace-trust-preset-toggle") < y(vcx, "admin-agents-catalog-card"));
+    assert!(y(vcx, "admin-agents-catalog-card") < y(vcx, "admin-agents-open-toml"));
+    assert!(vcx.debug_bounds("admin-agent-hook-codex").is_none());
+
+    // 설치 여부를 정해 두고 본다.
+    let set_checks = |vcx: &mut gpui::VisualTestContext, status| {
+        vcx.update(|_, cx| {
+            crate::onboarding::store_snapshot(
+                cx,
+                vec![krill_proto::doctor::Check {
+                    id: "agent.codex".into(),
+                    level: krill_proto::doctor::Level::Optional,
+                    status,
+                    summary: String::new(),
+                    detail: String::new(),
+                    fix: krill_proto::doctor::Fix {
+                        kind: krill_proto::doctor::FixKind::None,
+                        value: String::new(),
+                    },
+                }],
+            );
+        });
+        vcx.run_until_parked();
+    };
+    set_checks(vcx, krill_proto::doctor::Status::Ok);
+    assert!(vcx.debug_bounds("admin-agent-install-codex").is_none());
+    let toggle = vcx
+        .debug_bounds("admin-agent-toggle-codex")
+        .unwrap()
+        .center();
+    vcx.simulate_click(toggle, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let install = vcx
+        .debug_bounds("admin-agent-install-codex")
+        .unwrap()
+        .center();
+    vcx.simulate_click(install, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agent-setup-status").is_some());
+    vcx.update(|_, cx| drop(take_pending_terminal_command(cx)));
+    fs::remove_dir_all(d).ok();
+}
+
+/// 프로필을 읽기 전에는 행 자리를 두고 펼치기만 잠근다. 읽은 뒤에도 행 위치가 그대로다.
+#[gpui::test]
+fn agents_list_locks_expansion_until_profiles_load(cx: &mut TestAppContext) {
+    let d = dir("agents-loading");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(3000.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Agents, cx);
+            v.agent_expanded.insert("codex");
+        });
+        window.draw(cx).clear(cx);
+    });
+    let before = vcx.debug_bounds("admin-agent-card-opencode").unwrap();
+    assert!(vcx.debug_bounds("admin-agent-editor-codex").is_none());
+    vcx.update(|_, cx| assert!(view.read(cx).agent_edits.is_empty()));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |v, _| v.agent_expanded.clear()));
+    vcx.update(|window, cx| {
+        view.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    });
+    assert_eq!(
+        vcx.debug_bounds("admin-agent-card-opencode")
+            .unwrap()
+            .origin,
+        before.origin
+    );
+    fs::remove_dir_all(d).ok();
+}
+
+/// 빠른 명령 A: 행에서 바로 고치고 Enter, Esc가 동작하며, 빈 칸은 저장하지 않는다. 프로젝트 폼을 만들지 않는다.
+#[gpui::test]
+fn quick_commands_edit_in_place_with_enter_and_escape(cx: &mut TestAppContext) {
+    let d = dir("qc-inplace");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(2000.)));
+    vcx.update(|_, cx| {
+        edit(cx, |s| {
+            s.quick_commands = vec![
+                crate::commands::QuickCommand {
+                    name: "하나".into(),
+                    text: "one".into(),
+                },
+                crate::commands::QuickCommand {
+                    name: "둘".into(),
+                    text: "two".into(),
+                },
+            ];
+        });
+        view.update(cx, |v, cx| v.set_tab(AdminTab::QuickCommands, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert!(view.read(cx).workflow_form.is_none()));
+    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        let at = vcx.debug_bounds(s).unwrap().center();
+        vcx.simulate_click(at, gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    let value = |vcx: &mut gpui::VisualTestContext, name: bool| {
+        vcx.update(|_, cx| {
+            let form = view.read(cx).quick_form.as_ref().unwrap();
+            let input = if name { &form.name } else { &form.command };
+            input.read(cx).value().to_string()
+        })
+    };
+
+    // 편집 입력칸은 그 행 자리에 있고 추가 행은 사라진다.
+    let row1 = vcx.debug_bounds("admin-qc-row-1").unwrap();
+    click(vcx, "admin-qc-edit-1");
+    assert!(vcx.debug_bounds("admin-qc-row-1").is_none());
+    assert_eq!(
+        vcx.debug_bounds("admin-qc-add").map(|_| ()),
+        Some(()),
+        "저장 버튼"
+    );
+    let input = vcx.debug_bounds("admin-qc-name-input").unwrap();
+    assert!(input.origin.y >= vcx.debug_bounds("admin-qc-row-0").unwrap().bottom());
+    assert!(input.origin.y <= row1.bottom());
+    assert_eq!(value(vcx, true), "둘");
+
+    // Esc는 편집을 취소한다.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-qc-row-1").is_some());
+    assert_eq!(value(vcx, true), "");
+
+    // Enter로 저장한다. 파일이 바뀌어 행이 밀려도 같은 명령을 고친다.
+    click(vcx, "admin-qc-edit-1");
+    vcx.update(|window, cx| {
+        let form = view.read(cx).quick_form.as_ref().unwrap();
+        let command = form.command.clone();
+        command.update(cx, |input, cx| input.set_value("TWO", window, cx));
+        edit(cx, |s| {
+            s.quick_commands.remove(0);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(
+            current(cx).quick_commands,
+            vec![crate::commands::QuickCommand {
+                name: "둘".into(),
+                text: "TWO".into(),
+            }]
+        );
+    });
+
+    // 빈 칸이면 저장하지 않고 입력을 그대로 둔다.
+    vcx.update(|window, cx| {
+        let name = view.read(cx).quick_form.as_ref().unwrap().name.clone();
+        name.update(cx, |input, cx| {
+            input.set_value("이름만", window, cx);
+            input.focus(window, cx);
+        });
+    });
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(current(cx).quick_commands.len(), 1));
+    assert_eq!(value(vcx, true), "이름만");
+    fs::remove_dir_all(d).ok();
+}
+
+/// 무장한 뒤 파일이 바뀌어 앞 행이 사라져도 같은 번호의 다른 행이 무장되거나 지워지지 않는다.
+#[gpui::test]
+fn quick_command_remove_arm_follows_the_command_not_the_row_number(cx: &mut TestAppContext) {
+    let d = dir("qc-arm");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(2000.)));
+    let cmd = |name: &str| crate::commands::QuickCommand {
+        name: name.into(),
+        text: name.into(),
+    };
+    let (a, b, c) = (cmd("a"), cmd("b"), cmd("c"));
+    let all = vec![a.clone(), b.clone(), c.clone()];
+    vcx.update(|_, cx| {
+        edit(cx, move |s| s.quick_commands.clone_from(&all));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::QuickCommands, cx));
+    });
+    vcx.run_until_parked();
+    // 1번 행(b)을 무장한다.
+    let at = vcx.debug_bounds("admin-qc-remove-1").unwrap().center();
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert!(view.read(cx).armed.as_deref().unwrap().contains("b\0b")));
+    // 파일에서 a가 사라져 c가 1번 행이 된다. 무장은 0번 행의 b를 따라간다.
+    vcx.update(|_, cx| {
+        edit(cx, |s| {
+            s.quick_commands.remove(0);
+        });
+    });
+    vcx.run_until_parked();
+    let at = vcx.debug_bounds("admin-qc-remove-1").unwrap().center();
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).quick_commands, vec![b.clone(), c.clone()]);
+        assert!(view.read(cx).armed.as_deref().unwrap().contains("c\0c"));
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn quick_command_duplicates_edit_and_remove_the_row_that_was_pressed(cx: &mut TestAppContext) {
+    let d = dir("qc-dup");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(2000.)));
+    let cmd = |name: &str| crate::commands::QuickCommand {
+        name: name.into(),
+        text: name.into(),
+    };
+    let (a, b) = (cmd("a"), cmd("b"));
+    let all = vec![a.clone(), b.clone(), a.clone()];
+    vcx.update(|_, cx| {
+        edit(cx, move |s| s.quick_commands.clone_from(&all));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::QuickCommands, cx));
+    });
+    vcx.run_until_parked();
+
+    // 세 번째 행을 편집하면 그 자리만 입력칸이 되고, 저장도 그 행에 들어간다.
+    let at = vcx.debug_bounds("admin-qc-edit-2").unwrap().center();
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-qc-row-0").is_some());
+    assert!(vcx.debug_bounds("admin-qc-row-2").is_none());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            let name = v.quick_form.as_ref().unwrap().name.clone();
+            name.update(cx, |input, cx| input.set_value("x", window, cx));
+            v.submit_quick_command(window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let x = crate::commands::QuickCommand {
+        name: "x".into(),
+        text: "a".into(),
+    };
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).quick_commands, vec![a.clone(), b.clone(), x]);
+    });
+
+    // 같은 값의 세 번째 행을 지우면 그 행만 사라진다.
+    let all = vec![a.clone(), b.clone(), a.clone()];
+    vcx.update(|_, cx| edit(cx, move |s| s.quick_commands.clone_from(&all)));
+    vcx.run_until_parked();
+    for _ in 0..2 {
+        let at = vcx.debug_bounds("admin-qc-remove-2").unwrap().center();
+        vcx.simulate_click(at, gpui::Modifiers::default());
+        vcx.run_until_parked();
+    }
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).quick_commands, vec![a.clone(), b.clone()]);
+    });
+    fs::remove_dir_all(d).ok();
 }
 
 /// 앱 테마 키가 없으면 새 기본값 야광·종이를 쓰고, 저장된 선택값은 계속 읽는다.
@@ -9328,9 +10507,11 @@ fn install_tab_renders_tools_runs_inline_install_and_saves_shell_aliases(cx: &mu
     // Verify shell profile alias block and quick_commands sync
     let rc_path = install::shell_rc_path(&d.join("test-home"));
     let content = fs::read_to_string(&rc_path).expect("shell rc file written");
-    assert!(content.contains("alias cc='claude --dangerously-skip-permissions'"));
-    assert!(content.contains("alias cx='codex --dangerously-bypass-approvals-and-sandbox'"));
-    assert!(content.contains("alias ag='agy --dangerously-skip-permissions'"));
+    // 처음 값은 기본 실행이다. 권한을 건너뛰는 옵션은 사용자가 직접 켠다.
+    assert!(content.contains("alias cc='claude'"));
+    assert!(content.contains("alias cx='codex'"));
+    assert!(content.contains("alias ag='agy'"));
+    assert!(!content.contains("--dangerously"));
 
     vcx.update(|_, cx| {
         let qc = &current(cx).quick_commands;
@@ -9339,6 +10520,37 @@ fn install_tab_renders_tools_runs_inline_install_and_saves_shell_aliases(cx: &mu
         assert!(qc.iter().any(|q| q.name == "ag"));
     });
 
+    fs::remove_dir_all(d).ok();
+}
+
+/// 이미 셸 설정에 저장한 별칭 모드는 처음 값 변경과 상관없이 그대로 둔다.
+#[gpui::test]
+fn install_alias_keeps_saved_yolo_mode(cx: &mut TestAppContext) {
+    let d = dir("install-alias-saved");
+    init(cx, &d);
+    let rc_path = install::shell_rc_path(&d.join("test-home"));
+    fs::create_dir_all(rc_path.parent().unwrap()).unwrap();
+    let saved = install::upsert_alias_block(
+        "",
+        &[install::AliasEntry {
+            agent_id: "claude",
+            alias_name: "cc".into(),
+            use_yolo: true,
+        }],
+        false,
+    );
+    fs::write(&rc_path, saved).unwrap();
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Install, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, SettingsView::save_shell_aliases));
+    vcx.run_until_parked();
+    let content = fs::read_to_string(&rc_path).unwrap();
+    assert!(content.contains("alias cc='claude --dangerously-skip-permissions'"));
+    assert!(content.contains("alias cx='codex'"), "{content}");
     fs::remove_dir_all(d).ok();
 }
 
@@ -9380,6 +10592,102 @@ fn install_names_remain_readable_beside_long_versions(cx: &mut TestAppContext) {
             assert!(inside_install_view(name) && inside_install_view(badge));
         }
     }
+    fs::remove_dir_all(d).ok();
+}
+
+/// 행은 한 줄이고 눌러야 펼쳐진다. 실패한 행은 로그를 접을 수 있고, 첫 점검 전에는 상태를 빈칸으로 둔다.
+#[gpui::test]
+fn install_rows_fold_details_and_stay_blank_before_first_scan(cx: &mut TestAppContext) {
+    let d = dir("install-rows");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(5000.)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Install, cx)));
+    vcx.run_until_parked();
+
+    let row = vcx.debug_bounds("admin-install-row-pnpm").unwrap();
+    assert!(row.size.height <= px(40.), "{row:?}");
+    assert!(vcx.debug_bounds("admin-install-detail-pnpm").is_none());
+    assert!(vcx.debug_bounds("admin-install-all-frontier").is_some());
+
+    // 도구 목록이 별칭보다 위다.
+    let runtime = vcx.debug_bounds("admin-install-cat-runtime").unwrap();
+    let alias = vcx.debug_bounds("admin-install-alias-card").unwrap();
+    assert!(runtime.bottom() <= alias.top());
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.install.results.insert(
+                "pnpm",
+                install::InstallJobResult {
+                    success: false,
+                    output: "boom".into(),
+                },
+            );
+            v.install.expanded.insert("pnpm");
+            v.install.log_expanded.insert("pnpm");
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-install-log-pnpm").is_some());
+    click_install_control(vcx, "admin-install-log-toggle-pnpm");
+    assert!(
+        vcx.debug_bounds("admin-install-log-pnpm").is_none(),
+        "오류 로그는 접힌다"
+    );
+    assert!(vcx.debug_bounds("admin-install-log-toggle-pnpm").is_some());
+
+    // 첫 점검 전: 일괄 설치와 행 버튼을 숨긴다.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.install.scanned = false;
+            v.install.scanning = true;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-install-all-frontier").is_none());
+    assert!(vcx.debug_bounds("admin-install-btn-pnpm").is_none());
+    assert!(vcx.debug_bounds("admin-install-badge-pnpm").is_some());
+    fs::remove_dir_all(d).ok();
+}
+
+/// 별칭은 맨 아래로 옮겼으므로 검색 Enter가 그 카드까지 간다.
+#[test]
+fn install_alias_search_hit_names_the_alias_section() {
+    for query in ["별칭", "alias"] {
+        assert_eq!(
+            search::search_hits(query),
+            [(AdminTab::Install, text::INSTALL_ALIAS_TITLE)],
+            "{query}"
+        );
+    }
+}
+
+/// 저장한 YOLO 별칭이 있으면 경고를 보이고, 기본 실행만 있으면 보이지 않는다.
+#[gpui::test]
+fn install_alias_warns_only_for_yolo_rows(cx: &mut TestAppContext) {
+    let d = dir("install-alias-warning");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(5000.)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Install, cx)));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("admin-install-alias-yolo-warning")
+            .is_none()
+    );
+    click_install_control(vcx, "admin-install-alias-yolo-claude");
+    assert!(
+        vcx.debug_bounds("admin-install-alias-yolo-warning")
+            .is_some()
+    );
+    click_install_control(vcx, "admin-install-alias-normal-claude");
+    assert!(
+        vcx.debug_bounds("admin-install-alias-yolo-warning")
+            .is_none()
+    );
     fs::remove_dir_all(d).ok();
 }
 
@@ -9657,6 +10965,9 @@ fn install_tab_terminal_and_copy_use_detected_package_manager(cx: &mut TestAppCo
         });
         window.draw(cx).clear(cx);
     });
+    // 명령과 터미널 설치는 행을 펼쳐야 보인다.
+    assert!(vcx.debug_bounds("admin-install-copy-codex").is_none());
+    click_install_control(vcx, "admin-install-toggle-codex");
     click_install_control(vcx, "admin-install-copy-codex");
     vcx.update(|_, cx| {
         assert_eq!(
@@ -9988,6 +11299,63 @@ fn settings_search_enter_scrolls_and_focuses_matching_row(cx: &mut TestAppContex
     fs::remove_dir_all(d).ok();
 }
 
+/// 좁은 창의 검색 Enter도 넓은 창과 같이 하위 페이지까지 간다.
+#[gpui::test]
+fn compact_search_enter_reaches_subpage(cx: &mut TestAppContext) {
+    let d = dir("compact-search-enter");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(600.), px(700.)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-compact-tabs").is_some());
+    vcx.update(|window, cx| view.update(cx, |view, cx| view.focus_search(window, cx)));
+    vcx.simulate_input("빠른 명령");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).tab, AdminTab::QuickCommands));
+    fs::remove_dir_all(d).ok();
+}
+
+/// 시스템 탭 개인정보 구역도 검색으로 그 행까지 스크롤하고 포커스한다.
+#[gpui::test]
+fn settings_search_enter_reaches_privacy_rows(cx: &mut TestAppContext) {
+    let d = dir("search-privacy-anchor");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(400.)));
+    vcx.run_until_parked();
+    for (query, title) in [
+        ("오류 보고 보내기", text::ERROR_REPORTS_TITLE),
+        ("recording", text::RECORDING_TITLE),
+        ("개인정보", text::RESOURCES_TITLE),
+    ] {
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.clear_search(window, cx);
+                view.set_tab(AdminTab::Appearance, cx);
+                view.focus_search(window, cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_input(query);
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.tab, AdminTab::System, "{query}");
+            assert_eq!(view.search_focus.title, Some(title), "{query}");
+            assert!(view.search_focus.rendered.get(), "{query}");
+            assert!(view.search_focus.focus.is_focused(window), "{query}");
+            assert!(view.search_focus.scroll.offset().y < px(0.), "{query}");
+        });
+    }
+    fs::remove_dir_all(d).ok();
+}
+
 #[derive(Debug)]
 struct MachinesBackend(crate::link_ui::MockLinkBackend);
 
@@ -10029,7 +11397,6 @@ impl crate::link_ui::LinkBackend for MachinesBackend {
 #[gpui::test]
 fn machines_group_verified_ssh_and_invite_routes_without_losing_controls(cx: &mut TestAppContext) {
     use crate::hosts::HostId;
-    use crate::machines::MachinePage;
     use krill_proto::ipc::MachineIdentity;
     let d = dir("machines-grouped-controls");
     init(cx, &d);
@@ -10076,7 +11443,7 @@ fn machines_group_verified_ssh_and_invite_routes_without_losing_controls(cx: &mu
                     .len(),
                 2
             );
-            v.machine_page = MachinePage::Details(ssh);
+            v.machine_open = Some(ssh);
             cx.notify();
         });
         window.draw(cx).clear(cx);
@@ -10085,15 +11452,21 @@ fn machines_group_verified_ssh_and_invite_routes_without_losing_controls(cx: &mu
     assert!(vcx.debug_bounds("admin-ssh-card-ssh-studio-ssh").is_some());
     assert!(vcx.debug_bounds("link-remote-host-studio-peer").is_some());
     assert!(vcx.debug_bounds("link-remote-rename-studio-peer").is_some());
-    assert!(vcx.debug_bounds("link-server-toggle").is_none());
     assert!(vcx.debug_bounds("link-client-input-link").is_none());
+    // 지우는 동작은 점선 아래에 있고, 결과 문구가 누르기 전부터 보인다.
+    let edit = vcx.debug_bounds("admin-ssh-edit-ssh-studio-ssh").unwrap();
+    let remove = vcx.debug_bounds("admin-ssh-remove-ssh-studio-ssh").unwrap();
+    let disconnect = vcx
+        .debug_bounds("link-remote-disconnect-studio-peer")
+        .unwrap();
+    assert!(edit.bottom() <= remove.top());
+    assert!(remove.bottom() <= disconnect.top());
     fs::remove_dir_all(d).ok();
 }
 
 #[gpui::test]
 fn machine_details_keep_selected_route_when_identity_arrives(cx: &mut TestAppContext) {
     use crate::hosts::HostId;
-    use crate::machines::MachinePage;
     use krill_proto::ipc::MachineIdentity;
     let d = dir("machines-late-identity");
     init(cx, &d);
@@ -10104,7 +11477,7 @@ fn machine_details_keep_selected_route_when_identity_arrives(cx: &mut TestAppCon
             v.ssh_hosts =
                 crate::ssh_hosts::add_host(Some(&d), "Studio", "user@studio", None, None).unwrap();
             let host = HostId::Remote(v.ssh_hosts[0].id.clone());
-            v.machine_page = MachinePage::Details(host.clone());
+            v.machine_open = Some(host.clone());
             v.set_tab(AdminTab::Machines, cx);
             host
         })
@@ -10121,7 +11494,7 @@ fn machine_details_keep_selected_route_when_identity_arrives(cx: &mut TestAppCon
     });
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-ssh-card-ssh-studio").is_some());
-    vcx.update(|_, cx| assert_eq!(view.read(cx).machine_page, MachinePage::Details(selected)));
+    vcx.update(|_, cx| assert_eq!(view.read(cx).machine_open, Some(selected)));
     fs::remove_dir_all(d).ok();
 }
 
@@ -10190,7 +11563,7 @@ fn machines_ssh_overview_waits_for_observed_connection_success(cx: &mut TestAppC
 
 #[gpui::test]
 fn machines_add_same_label_opens_the_submitted_destination(cx: &mut TestAppContext) {
-    use crate::machines::{AddMethod, MachinePage};
+    use crate::machines::AddMethod;
     let d = dir("machines-duplicate-label");
     init(cx, &d);
     let first = crate::ssh_hosts::add_host(Some(&d), "Studio", "user@first", None, None).unwrap();
@@ -10210,8 +11583,8 @@ fn machines_add_same_label_opens_the_submitted_destination(cx: &mut TestAppConte
             .unwrap();
         assert_ne!(new.id, first_id);
         assert_eq!(
-            v.machine_page,
-            MachinePage::Details(crate::hosts::HostId::Remote(new.id.clone()))
+            v.machine_open,
+            Some(crate::hosts::HostId::Remote(new.id.clone()))
         );
     });
     fs::remove_dir_all(d).ok();
@@ -10219,7 +11592,7 @@ fn machines_add_same_label_opens_the_submitted_destination(cx: &mut TestAppConte
 
 #[gpui::test]
 fn machines_overview_renders_local_hub_and_inline_remote_actions(cx: &mut TestAppContext) {
-    use crate::machines::{AddMethod, MachinePage};
+    use crate::machines::AddMethod;
     let d = dir("machines-variant-a-overview");
     init(cx, &d);
     let hosts = crate::ssh_hosts::add_host(Some(&d), "oci-arm", "ubuntu@158.180.72.19", None, None)
@@ -10244,32 +11617,247 @@ fn machines_overview_renders_local_hub_and_inline_remote_actions(cx: &mut TestAp
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-machines-local-section").is_some());
     assert!(vcx.debug_bounds("admin-machine-local").is_some());
+    assert!(vcx.debug_bounds("link-server-toggle").is_some());
+    assert!(vcx.debug_bounds("link-hub-summary").is_some());
     assert!(vcx.debug_bounds("admin-local-open-mobile").is_none());
     assert!(vcx.debug_bounds("admin-local-open-invite").is_some());
     assert!(vcx.debug_bounds("admin-machines-remote-section").is_some());
-    assert!(vcx.debug_bounds("admin-machines-add-ssh").is_some());
+    assert!(vcx.debug_bounds("admin-machines-add-ssh").is_none());
     assert!(vcx.debug_bounds("admin-machines-add").is_some());
 
+    // 행 머리에는 연결만 있고, 나머지 동작은 펼쳐야 나온다.
     let conn_sel: &'static str = format!("admin-machine-connect-{host_id}").leak();
-    let test_sel: &'static str = format!("admin-machine-test-{host_id}").leak();
+    let test_sel: &'static str = format!("admin-ssh-test-{host_id}").leak();
+    let row_sel: &'static str = format!("admin-machine-{host_id}").leak();
     assert!(vcx.debug_bounds(conn_sel).is_some());
+    assert!(vcx.debug_bounds(test_sel).is_none());
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let bounds = vcx.debug_bounds(selector).unwrap();
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    click(vcx, row_sel);
     assert!(vcx.debug_bounds(test_sel).is_some());
+    click(vcx, row_sel);
+    assert!(vcx.debug_bounds(test_sel).is_none());
 
-    // Clicking "접속 관리" opens ThisComputer details.
-    let invite_btn = vcx.debug_bounds("admin-local-open-invite").unwrap();
-    vcx.simulate_click(invite_btn.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    vcx.update(|_, cx| assert_eq!(view.read(cx).machine_page, MachinePage::ThisComputer));
-    assert!(vcx.debug_bounds("link-server-panel").is_some());
+    // 접속 관리를 펼쳐도 머신 행은 그대로 있다.
+    click(vcx, "admin-local-open-invite");
+    vcx.update(|_, cx| assert!(view.read(cx).machine_hub_open));
+    assert!(vcx.debug_bounds("link-devices-empty").is_some());
+    assert!(vcx.debug_bounds(row_sel).is_some());
 
-    // Back to overview, then click "+ SSH 추가" to open SSH form directly.
-    let back_btn = vcx.debug_bounds("admin-machines-back").unwrap();
-    vcx.simulate_click(back_btn.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    let add_ssh_btn = vcx.debug_bounds("admin-machines-add-ssh").unwrap();
-    vcx.simulate_click(add_ssh_btn.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    vcx.update(|_, cx| assert_eq!(view.read(cx).machine_page, MachinePage::Add(AddMethod::Ssh)));
+    // 머신 추가 하나에서 방법을 고른다.
+    click(vcx, "admin-machines-add");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).machine_add, Some(AddMethod::Invite)));
+    click(vcx, "admin-machines-ssh");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).machine_add, Some(AddMethod::Ssh)));
     assert!(vcx.debug_bounds("admin-ssh-form").is_some());
+    fs::remove_dir_all(d).ok();
+}
+
+/// 접힌 곳의 항목을 검색으로 고르면 그 자리를 펼친다.
+#[gpui::test]
+fn search_hits_open_folded_remote_and_mobile_sections(cx: &mut TestAppContext) {
+    use crate::machines::AddMethod;
+    let d = dir("search-hit-reveals");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(1200.)));
+    vcx.run_until_parked();
+    let hit = |vcx: &mut gpui::VisualTestContext, tab, title| {
+        view.update(vcx, |v, cx| v.open_search_hit((tab, title), cx));
+        vcx.run_until_parked();
+    };
+    hit(vcx, AdminTab::Machines, text::SSH_TITLE);
+    assert!(vcx.debug_bounds("admin-ssh-form").is_some());
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.machine_add, Some(AddMethod::Ssh));
+        assert!(v.search_focus.rendered.get());
+    });
+    hit(vcx, AdminTab::Machines, text::TAB_REMOTE_KRILL);
+    view.read_with(vcx, |v, _| {
+        assert!(v.machine_hub_open);
+        assert!(v.search_focus.rendered.get());
+    });
+    hit(
+        vcx,
+        AdminTab::Mobile,
+        crate::i18n::catalog::mobile::PAIR_SECTION,
+    );
+    assert!(vcx.debug_bounds("admin-mobile-pair-section").is_some());
+    fs::remove_dir_all(d).ok();
+}
+
+/// 검색 결과 목록: 치는 순간 본문이 목록이 되고 왼쪽 탭은 자리를 지킨 채 흐려진다.
+/// ↑↓는 끝에서 끝으로 돌고, Enter는 고른 행으로 가며 검색어를 비운다.
+#[gpui::test]
+fn search_results_replace_body_and_arrows_pick_the_enter_target(cx: &mut TestAppContext) {
+    let d = dir("search-results");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(900.)));
+    vcx.run_until_parked();
+    let agents_tab = vcx.debug_bounds("admin-tab-agents").unwrap();
+
+    vcx.update(|window, cx| view.update(cx, |view, cx| view.focus_search(window, cx)));
+    vcx.simulate_input("글꼴");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-tab-body").is_none());
+    assert!(vcx.debug_bounds("admin-search-head").is_some());
+    assert!(vcx.debug_bounds("admin-search-hit-1").is_some());
+    assert!(vcx.debug_bounds("admin-search-hit-2").is_none());
+    assert_eq!(vcx.debug_bounds("admin-tab-agents").unwrap(), agents_tab);
+
+    vcx.simulate_keystrokes("down");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).search_selected, 1));
+    vcx.simulate_keystrokes("down");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).search_selected, 0));
+    vcx.simulate_keystrokes("up");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).search_selected, 1));
+    // 검색어가 바뀌면 선택은 처음으로 돌아간다.
+    vcx.simulate_input("꼴");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).search_selected, 0));
+    vcx.simulate_keystrokes("down");
+
+    vcx.update(|_, cx| view.update(cx, |view, cx| view.set_tab(AdminTab::Accounts, cx)));
+    vcx.run_until_parked();
+    // 다른 경로로 탭을 옮기면 검색은 끝난다.
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).search_query(cx), "");
+        assert_eq!(view.read(cx).search_selected, 0);
+    });
+    assert!(vcx.debug_bounds("admin-tab-body").is_some());
+
+    vcx.update(|window, cx| view.update(cx, |view, cx| view.focus_search(window, cx)));
+    vcx.simulate_input("글꼴");
+    vcx.simulate_keystrokes("down enter");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let view = view.read(cx);
+        assert_eq!(view.tab, AdminTab::Appearance);
+        assert_eq!(view.search_query(cx), "");
+        assert_eq!(view.search_focus.title, Some(text::FONT_SIZE));
+        assert!(view.search_focus.focus.is_focused(window));
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+/// 검색 중 왼쪽 탭을 누르면 검색어를 비우고 그 탭으로 간다. 맞은 항목이 없는 탭도 누를 수 있다.
+#[gpui::test]
+fn search_nav_tab_click_clears_query_and_keeps_scroll_after_clearing(cx: &mut TestAppContext) {
+    let d = dir("search-nav-click");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(500.)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |view, cx| view.set_tab(AdminTab::Shortcuts, cx)));
+    vcx.run_until_parked();
+    let content = vcx.debug_bounds("admin-content").unwrap();
+    vcx.simulate_event(gpui::ScrollWheelEvent {
+        position: content.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-300.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+    let scrolled = vcx.update(|_, cx| view.read(cx).search_focus.scroll.offset());
+    assert!(scrolled.y < px(0.));
+
+    // 검색했다 지우면 보던 위치로 돌아온다.
+    vcx.update(|window, cx| view.update(cx, |view, cx| view.focus_search(window, cx)));
+    vcx.simulate_input("글꼴");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).search_focus.scroll.offset(), scrolled));
+
+    vcx.simulate_input("글꼴");
+    vcx.run_until_parked();
+    let tab = vcx.debug_bounds("admin-tab-mobile").unwrap();
+    vcx.simulate_click(tab.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).tab, AdminTab::Mobile);
+        assert_eq!(view.read(cx).search_query(cx), "");
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+/// 하위 페이지는 머리 띠의 부모 버튼으로 돌아오고, 부모 탭의 스크롤 위치가 복원된다.
+#[gpui::test]
+fn subpage_back_button_restores_parent_scroll(cx: &mut TestAppContext) {
+    let d = dir("subpage-back");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(500.)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |view, cx| view.set_tab(AdminTab::System, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-page-back").is_none());
+    let scroll_down = |vcx: &mut gpui::VisualTestContext| {
+        let content = vcx.debug_bounds("admin-content").unwrap();
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: content.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-2000.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+    };
+    scroll_down(vcx);
+    let scrolled = vcx.update(|_, cx| view.read(cx).search_focus.scroll.offset());
+    assert!(scrolled.y < px(0.));
+
+    // 맨 아래까지 내리면 디스크 입구가 보인다.
+    let open_disk = vcx.debug_bounds("open-disk").unwrap();
+    vcx.simulate_click(open_disk.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).tab, AdminTab::Disk);
+        assert_eq!(view.read(cx).search_focus.scroll.offset().y, px(0.));
+    });
+
+    let back = vcx.debug_bounds("admin-page-back").expect("back button");
+    vcx.simulate_click(back.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).tab, AdminTab::System);
+        assert_eq!(view.read(cx).search_focus.scroll.offset(), scrolled);
+    });
+
+    // 다른 탭을 거쳐 오면 복원하지 않는다.
+    vcx.update(|_, cx| view.update(cx, |view, cx| view.set_tab(AdminTab::Accounts, cx)));
+    vcx.update(|_, cx| view.update(cx, |view, cx| view.set_tab(AdminTab::System, cx)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).search_focus.scroll.offset().y, px(0.)));
+    fs::remove_dir_all(d).ok();
+}
+
+/// 왼쪽 탭 기둥은 모달 폭으로 정한다. 모달 680까지 남고 그 아래에서만 탭 메뉴로 바뀐다.
+#[gpui::test]
+fn navigation_follows_modal_width_not_window_breakpoint(cx: &mut TestAppContext) {
+    let d = dir("modal-width-nav");
+    init(cx, &d);
+    let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    // 창 700: 모달 680. 예전 48rem 기준이면 탭 메뉴였던 폭이다.
+    for (width, nav) in [
+        (700., px(168.)),
+        (1023., px(168.)),
+        (1024., crate::ui::SETTINGS_NAV_WIDTH),
+    ] {
+        vcx.simulate_resize(size(px(width), px(700.)));
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("admin-compact-tabs").is_none(), "{width}");
+        let sidebar = vcx.debug_bounds("admin-sidebar").expect("sidebar");
+        assert_eq!(sidebar.size.width, nav, "{width}");
+        let band = vcx.debug_bounds("admin-page-header").expect("band");
+        assert_eq!(band.left(), sidebar.right(), "{width}");
+    }
+    vcx.simulate_resize(size(px(695.), px(700.)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-sidebar").is_none());
+    assert!(vcx.debug_bounds("admin-compact-tabs").is_some());
+    assert!(vcx.debug_bounds("admin-modal-close").is_some());
     fs::remove_dir_all(d).ok();
 }

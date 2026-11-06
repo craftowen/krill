@@ -71,15 +71,6 @@ pub enum AddMethod {
     Ssh,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum MachinePage {
-    #[default]
-    Overview,
-    Details(HostId),
-    Add(AddMethod),
-    ThisComputer,
-}
-
 #[must_use]
 pub fn project(routes: impl IntoIterator<Item = MachineRoute>) -> Vec<Machine> {
     let mut groups: BTreeMap<MachineKey, Vec<MachineRoute>> = BTreeMap::new();

@@ -329,24 +329,24 @@ impl Settings {
         self.ui_theme_light = theme;
     }
 
+    /// 모드에 적용되는 터미널 테마 선택값.
+    #[must_use]
+    pub fn terminal_selection(&self, mode: ThemeMode) -> &str {
+        if mode == ThemeMode::Light && self.terminal_use_separate_light_theme {
+            &self.terminal_theme_light
+        } else {
+            &self.terminal_theme_dark
+        }
+    }
+
     /// 모드에 적용되는 터미널 테마가 앱 테마의 짝이 아니면 그 표시 이름을 돌려준다.
     #[must_use]
     pub fn unpaired_terminal_theme(&self, mode: ThemeMode) -> Option<&str> {
-        let (selection, paired) = match mode {
-            ThemeMode::Dark => (
-                &self.terminal_theme_dark,
-                self.ui_theme_dark.terminal_theme_name(),
-            ),
-            ThemeMode::Light => (
-                if self.terminal_use_separate_light_theme {
-                    &self.terminal_theme_light
-                } else {
-                    &self.terminal_theme_dark
-                },
-                self.ui_theme_light.terminal_theme_name(),
-            ),
+        let paired = match mode {
+            ThemeMode::Dark => self.ui_theme_dark.terminal_theme_name(),
+            ThemeMode::Light => self.ui_theme_light.terminal_theme_name(),
         };
-        let name = crate::ui::canonical_terminal_theme_name(selection);
+        let name = crate::ui::canonical_terminal_theme_name(self.terminal_selection(mode));
         (name != paired).then(|| {
             name.strip_prefix(crate::ui::terminal_themes::CUSTOM_TERMINAL_THEME_PREFIX)
                 .and_then(|id| {
@@ -649,7 +649,7 @@ const HOSTS_FILE: &str = "hosts.toml";
 /// 앱 전역 설정 상태.
 #[derive(Default)]
 pub struct Config {
-    settings: Settings,
+    settings: std::sync::Arc<Settings>,
     initial_loaded: bool,
     durable: Settings,
     epoch: u64,
@@ -1084,7 +1084,7 @@ fn init_at_with_language(dir: Option<PathBuf>, language: Language, cx: &mut App)
         }
     }
     cx.set_global(Config {
-        settings: settings.clone(),
+        settings: settings.clone().into(),
         initial_loaded: false,
         durable: settings,
         epoch: next_revision(),
@@ -1156,7 +1156,7 @@ fn start_reload(force: bool, cx: &mut App) {
     let c = cx.global::<Config>();
     let epoch = c.epoch;
     let (dir, settings, revision, previous) =
-        (c.dir.clone(), c.settings.clone(), c.revision, c.stamp);
+        (c.dir.clone(), (*c.settings).clone(), c.revision, c.stamp);
     if !cx.has_global::<ReloadState>() {
         cx.set_global(ReloadState::default());
     }
@@ -1199,7 +1199,7 @@ fn start_reload(force: bool, cx: &mut App) {
                 let c = cx.global_mut::<Config>();
                 c.initial_loaded = true;
                 c.durable = settings.clone();
-                c.settings = settings;
+                c.settings = settings.into();
                 c.stamp = stamp;
                 c.error = (!errors.is_empty()).then(|| errors.join("\n").into());
                 crate::alert::sync_settings(cx);
@@ -1290,7 +1290,7 @@ pub fn is_loaded(cx: &App) -> bool {
 /// 현재 적용된 설정. `init` 전(단위 테스트 등)이면 기본값을 돌려준다.
 pub fn current(cx: &App) -> Settings {
     cx.try_global::<Config>()
-        .map_or_else(Settings::default, |c| c.settings.clone())
+        .map_or_else(Settings::default, |c| (*c.settings).clone())
 }
 
 /// 터미널 글꼴 크기(pt, `10..=24`). 매 프레임 렌더에서 부르므로 전체 복제 없이 읽는다.
@@ -1321,7 +1321,9 @@ fn edit_or_in_memory(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
     if cx.global::<Config>().dir.is_some() {
         edit(cx, f);
     } else {
-        f(&mut cx.global_mut::<Config>().settings);
+        f(std::sync::Arc::make_mut(
+            &mut cx.global_mut::<Config>().settings,
+        ));
         cx.defer(apply);
     }
 }
@@ -1667,14 +1669,14 @@ pub fn edit(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
         cx.global_mut::<Config>().error = Some(text::NO_STATE_DIR.get().into());
         return;
     };
-    let before = c.settings.clone();
+    let before = (*c.settings).clone();
     let mut next = before.clone();
     f(&mut next);
     let c = cx.global_mut::<Config>();
     c.revision = next_revision();
     let revision = c.revision;
     let epoch = c.epoch;
-    c.settings = next;
+    c.settings = next.into();
     c.error = None;
     cx.defer(apply);
     let work = background_file_io(cx, move || persist_settings_edit(&dir, f));
@@ -1694,11 +1696,11 @@ pub fn edit(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
             c.initial_loaded = true;
             match result {
                 Ok((settings, stamp)) => {
-                    c.settings = settings;
+                    c.settings = settings.into();
                     c.stamp[0] = stamp;
                 }
                 Err(error) => {
-                    c.settings = c.durable.clone();
+                    c.settings = c.durable.clone().into();
                     c.error = Some(format!("{SETTINGS_FILE}: {error}").into());
                 }
             }
@@ -1734,24 +1736,27 @@ fn persist_settings_edit(
     Ok((settings, modified(&path)))
 }
 
-/// 테마 드롭다운 끝에 가져온 터미널 테마를 붙인다.
+/// 가져온 터미널 테마 메뉴. 고르면 터미널 색만 바꾼다.
 fn imported_theme_items(
     mut menu: gpui_component::menu::PopupMenu,
     themes: &[(String, String)],
+    selected: &str,
     mode: ThemeMode,
 ) -> gpui_component::menu::PopupMenu {
     use gpui_component::menu::PopupMenuItem;
-    if themes.is_empty() {
-        return menu;
-    }
-    menu = menu.separator().label(text::IMPORTED_TERMINAL_THEMES.get());
+    menu = menu.scrollable(true).max_h(px(360.));
     for (name, selection) in themes.iter().cloned() {
-        menu = menu.item(PopupMenuItem::new(name).on_click(move |_, _, cx| {
-            let selection = selection.clone();
-            edit(cx, move |s| {
-                s.select_terminal_theme(mode, selection.clone());
-            });
-        }));
+        let checked = selection == selected;
+        menu = menu.item(
+            PopupMenuItem::new(name)
+                .checked(checked)
+                .on_click(move |_, _, cx| {
+                    let selection = selection.clone();
+                    edit(cx, move |s| {
+                        s.select_terminal_theme(mode, selection.clone());
+                    });
+                }),
+        );
     }
     menu
 }
@@ -2529,17 +2534,19 @@ fn agent_environment_summary(profile: Option<&krill_proto::agent::Profile>) -> S
         .unwrap_or_default()
 }
 
+/// 내장 프로필 문서는 바뀌지 않으니 처음 쓸 때 한 번만 해석한다.
+fn builtin_agents() -> &'static krill_proto::agent::Agents {
+    static BUILTIN: std::sync::OnceLock<krill_proto::agent::Agents> = std::sync::OnceLock::new();
+    BUILTIN.get_or_init(|| krill_proto::agent::Agents::load(None).unwrap_or_default())
+}
+
 #[must_use]
 pub fn agent_install_command(agent_id: &str) -> Option<String> {
     let id = krill_proto::agent::canonical_id(agent_id);
-    krill_proto::agent::Agents::load(None)
-        .ok()
-        .and_then(|agents| {
-            agents
-                .profiles
-                .get(id)
-                .map(|p| p.install_command().to_owned())
-        })
+    builtin_agents()
+        .profiles
+        .get(id)
+        .map(|p| p.install_command().to_owned())
         .filter(|s| !s.trim().is_empty())
 }
 
@@ -2714,7 +2721,11 @@ pub struct SettingsView {
     /// 사이드바 'Krill 모바일'에서 연 단독 페이지 모드. 설정 내비 없이 페어링 화면만 그린다.
     mobile_page: bool,
     remote_krill: Option<gpui::Entity<crate::link_ui::PairingView>>,
-    machine_page: crate::machines::MachinePage,
+    /// 펼친 머신 행. 머신의 경로 중 하나로 가리킨다.
+    machine_open: Option<crate::hosts::HostId>,
+    /// 펼친 머신 추가와 고른 방법.
+    machine_add: Option<crate::machines::AddMethod>,
+    machine_hub_open: bool,
     machine_add_focus: Option<crate::machines::AddMethod>,
     machine_pairing_observe: Option<Subscription>,
     machine_local_status: crate::hosts::HostStatus,
@@ -2747,7 +2758,9 @@ pub struct SettingsView {
     terminal_login_account: Option<krill_proto::usage::AccountInfo>,
     /// `OpenCode` Go API key override (Orca `OpenCodeGoCredentials` parity): input + saved badge + error.
     opencode_api_key_input: Option<gpui::Entity<gpui_component::input::InputState>>,
-    opencode_api_key_configured: bool,
+    opencode_api_key_configured: Option<bool>,
+    opencode_api_key_load_started: bool,
+    opencode_key_open: bool,
     opencode_api_key_pending: bool,
     opencode_api_key_error: Option<SharedString>,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
@@ -2769,6 +2782,7 @@ pub struct SettingsView {
     skill_status: Option<SharedString>,
     error_reporting: crate::errors::Panel,
     history_status: Option<SharedString>,
+    history_status_failed: bool,
     /// 기록 즉시 삭제 IPC 진행 중. UI 스레드를 막지 않고 백그라운드에서 돌린다(AS-01).
     history_clear_pending: bool,
     /// 계정·호스트 새로고침 진행 중. 관찰자·적용 경로의 동기 스캔을 하나로 합친다(AS-06).
@@ -2789,7 +2803,11 @@ pub struct SettingsView {
     /// 무장 자동 해제 타이머. 다시 무장하면 바꿔 끼워 이전 타이머를 취소한다.
     armed_timer: Option<gpui::Task<()>>,
     /// 계정별 자동 전환 규칙 "고급"을 펼친 프로바이더(OWE-719). 기본은 접힘.
-    advanced_open: std::collections::BTreeSet<krill_proto::usage::ProviderKind>,
+    project_section: ProjectSection,
+    auto_switch_open: bool,
+    rule_open: Option<String>,
+    meters_open: Option<String>,
+    orphans_open: bool,
     /// 제거 확인 상자를 연 계정 id(OWE-719).
     removing: Option<String>,
     /// 등록되지 않은 Krill 프로필 폴더(OWE-704). 계정 갱신과 함께 백그라운드에서 채운다.
@@ -2812,6 +2830,13 @@ pub struct SettingsView {
     /// 사이드바 설정 검색 입력(OWE-656). 창이 필요해 처음 그릴 때 만든다.
     search_focus: search::SearchFocus,
     search_pending: bool,
+    /// 결과 목록에서 키보드로 고른 행. 검색어가 바뀌면 처음으로 돌아간다.
+    search_selected: usize,
+    search_results_scroll: gpui::ScrollHandle,
+    /// 다음 렌더에서 검색어를 비운다. 입력 상태를 고치려면 창이 필요한데 [`Self::set_tab`]에는 없다.
+    search_reset: bool,
+    /// 하위 페이지로 들어가기 전 부모 탭의 스크롤 위치. 돌아올 때 복원한다.
+    parent_scroll: Option<(AdminTab, gpui::Point<gpui::Pixels>)>,
     search: Option<(
         gpui::Entity<gpui_component::input::InputState>,
         Subscription,
@@ -2820,6 +2845,7 @@ pub struct SettingsView {
     shortcuts: shortcuts::Recorder,
     /// 프로젝트 페이지의 저장소별 심볼릭 링크·훅 입력 폼(MK-174).
     workflow_form: Option<WorkflowRepoForm>,
+    quick_form: Option<QuickCommandForm>,
     /// 워크스페이스 디스크 용량 분석(Space) 및 워크트리 일괄 클린업 패널(MK-175·OWE-729).
     space: space::Panel,
     /// 프론티어 CLI·개발 도구 설치 및 에일리어스 패널.
@@ -3059,9 +3085,6 @@ struct WorkflowRepoForm {
     symlink_path: gpui::Entity<gpui_component::input::InputState>,
     setup_script: gpui::Entity<gpui_component::input::InputState>,
     archive_script: gpui::Entity<gpui_component::input::InputState>,
-    qc_name: gpui::Entity<gpui_component::input::InputState>,
-    qc_text: gpui::Entity<gpui_component::input::InputState>,
-    qc_editing: Option<usize>,
     pending_repo_path: Option<String>,
     loaded_repo: Option<String>,
     loaded_setup: String,
@@ -3069,9 +3092,60 @@ struct WorkflowRepoForm {
     worktree_location: gpui::Entity<gpui_component::input::InputState>,
     loaded_location: String,
     location_status: Option<(SharedString, bool)>,
+    symlink_status: Option<(SharedString, bool)>,
     refresh_hooks: bool,
     status: Option<(SharedString, bool)>,
     _subs: Vec<Subscription>,
+}
+
+/// 빠른 명령 한 행을 가리킨다. 파일이 바뀌어 행 번호가 밀려도 값으로 따라가고,
+/// 값까지 같은 행은 그중 몇 번째인지로 가른다.
+#[derive(Clone, PartialEq)]
+struct QuickRowRef {
+    cmd: crate::commands::QuickCommand,
+    same_before: usize,
+}
+
+impl QuickRowRef {
+    fn at(commands: &[crate::commands::QuickCommand], idx: usize) -> Self {
+        let cmd = commands[idx].clone();
+        let same_before = commands[..idx].iter().filter(|c| **c == cmd).count();
+        Self { cmd, same_before }
+    }
+
+    fn position(&self, commands: &[crate::commands::QuickCommand]) -> Option<usize> {
+        commands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == self.cmd)
+            .nth(self.same_before)
+            .map(|(idx, _)| idx)
+    }
+}
+
+/// 빠른 명령 페이지의 입력칸 2개. `editing`은 편집 중인 행이다.
+struct QuickCommandForm {
+    name: gpui::Entity<gpui_component::input::InputState>,
+    command: gpui::Entity<gpui_component::input::InputState>,
+    editing: Option<QuickRowRef>,
+    _subs: [Subscription; 2],
+}
+
+/// 에이전트 목록의 행들이 함께 쓰는 값.
+#[derive(Clone, Copy)]
+struct AgentRowContext<'a> {
+    default_agent: &'a str,
+    loaded: bool,
+    effective: &'a krill_proto::agent::Agents,
+    checks: &'a [krill_proto::doctor::Check],
+}
+
+/// 프로젝트 페이지의 두 구역.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ProjectSection {
+    #[default]
+    Project,
+    Schedules,
 }
 
 /// 오케스트레이션 작업 상태의 표시 이름(OWE-883). 내부 영문(`ready` 등)을 그대로 보이지 않는다.
@@ -3141,13 +3215,16 @@ impl SettingsView {
             release_notes: updates::Panel::default(),
             // 새 버전이 준비되면 열려 있는 페이지에도 그 버전의 변경 사항을 채운다.
             _update_state: cx.observe_global::<crate::updater::UpdateState>(|this, cx| {
+                this.track_update_check(cx);
                 if this.tab == AdminTab::Updates {
                     this.refresh_release_notes(cx);
                 }
             }),
             mobile_page: false,
             remote_krill: None,
-            machine_page: crate::machines::MachinePage::default(),
+            machine_open: None,
+            machine_add: None,
+            machine_hub_open: false,
             machine_add_focus: None,
             machine_pairing_observe: None,
             machine_local_status: crate::hosts::HostStatus::Connecting,
@@ -3166,7 +3243,9 @@ impl SettingsView {
             terminal_login_provider: None,
             terminal_login_account: None,
             opencode_api_key_input: None,
-            opencode_api_key_configured: false,
+            opencode_api_key_configured: None,
+            opencode_api_key_load_started: false,
+            opencode_key_open: false,
             opencode_api_key_pending: false,
             opencode_api_key_error: None,
             ssh_hosts: Vec::new(),
@@ -3185,6 +3264,7 @@ impl SettingsView {
             skill_status: None,
             error_reporting: crate::errors::Panel::default(),
             history_status: None,
+            history_status_failed: false,
             history_clear_pending: false,
             accounts_refresh_pending: false,
             agents_file_cache: (None, false),
@@ -3198,7 +3278,11 @@ impl SettingsView {
             added_counter: 1,
             armed: None,
             armed_timer: None,
-            advanced_open: std::collections::BTreeSet::new(),
+            project_section: ProjectSection::Project,
+            auto_switch_open: false,
+            rule_open: None,
+            meters_open: None,
+            orphans_open: false,
             removing: None,
             orphan_profiles: Vec::new(),
             rename: None,
@@ -3209,9 +3293,14 @@ impl SettingsView {
             agent_expanded: std::collections::BTreeSet::new(),
             search_focus: search::SearchFocus::new(cx),
             search_pending: false,
+            search_selected: 0,
+            search_results_scroll: gpui::ScrollHandle::default(),
+            search_reset: false,
+            parent_scroll: None,
             search: None,
             shortcuts: shortcuts::Recorder::default(),
             workflow_form: None,
+            quick_form: None,
             space: space::Panel::default(),
             install: install::Panel::default(),
             schedule_modal: None,
@@ -3509,9 +3598,17 @@ impl SettingsView {
             gpui_component::input::InputState::new(window, cx)
                 .placeholder(text::SEARCH_SETTINGS.get())
         });
-        let sub = cx.subscribe(&input, |_, _, _: &gpui_component::input::InputEvent, cx| {
-            cx.notify();
-        });
+        let sub = cx.subscribe(
+            &input,
+            |this, _, event: &gpui_component::input::InputEvent, cx| {
+                if matches!(event, gpui_component::input::InputEvent::Change) {
+                    this.search_selected = 0;
+                    this.search_results_scroll
+                        .set_offset(gpui::Point::default());
+                }
+                cx.notify();
+            },
+        );
         self.search = Some((input.clone(), sub));
         window.focus(&self.focus, cx);
         input
@@ -3550,15 +3647,22 @@ impl SettingsView {
 
     pub fn set_tab(&mut self, tab: AdminTab, cx: &mut Context<Self>) {
         if self.tab != tab {
+            self.project_section = ProjectSection::default();
             // The tracked handle survives tab IDs; reset it before a new page
-            // lays out. A pending search can still scroll to its setting below.
-            self.search_focus
-                .scroll
-                .set_offset(gpui::point(px(0.), px(0.)));
+            // lays out, except when coming back up to the parent we left.
+            let scroll = &self.search_focus.scroll;
+            let restored = self
+                .parent_scroll
+                .take_if(|(parent, _)| *parent == tab && self.tab.page() == tab);
+            if tab != self.tab && tab.page() == self.tab {
+                self.parent_scroll = Some((self.tab, scroll.offset()));
+            }
+            scroll.set_offset(restored.map_or_else(gpui::Point::default, |(_, offset)| offset));
         }
         self.tab = tab;
-        self.search_focus.title = search::first_setting(&self.search_query(cx), tab);
-        self.search_pending = !self.search_query(cx).trim().is_empty();
+        self.search_focus.title = None;
+        self.search_pending = false;
+        self.search_reset = true;
         if let Some(view) = &self.remote_krill {
             view.update(cx, |view, cx| {
                 view.set_visible(self.visible && tab == AdminTab::Machines, cx);
@@ -3577,8 +3681,8 @@ impl SettingsView {
             // 진입 시 기기 목록·활성 오퍼를 자동 조회한다(수동 새로고침 전 빈 화면 방지, OWE-880).
             self.mobile_enter(cx);
         }
-        if tab == AdminTab::Disk && self.space.report.is_none() && !self.space.scanning {
-            self.scan_workspace_space(cx);
+        if tab == AdminTab::Disk {
+            self.enter_disk_page(cx);
         }
         if tab == AdminTab::System {
             self.refresh_error_reporting(cx);
@@ -3594,42 +3698,65 @@ impl SettingsView {
     fn confirm_button(
         &self,
         id: impl Into<SharedString>,
-        label: &'static str,
+        label: impl Into<SharedString>,
         cx: &mut Context<Self>,
         run: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Button {
+        self.confirm_button_with(id, label, None, cx, move |this, _, cx| run(this, cx))
+    }
+
+    /// [`Self::confirm_button`]에 창 접근을 더한다. `in_flight`가 있으면 무장 문구 자리에 진행 문구를 보인다.
+    fn confirm_button_with(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        in_flight: Option<&'static str>,
+        cx: &mut Context<Self>,
+        run: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Button {
         let id: SharedString = id.into();
         let armed = self.armed.as_ref() == Some(&id);
         let selector = id.to_string();
         let out_id = id.clone();
-        layout::danger(id.clone(), label, text::CONFIRM_AGAIN.get(), armed)
-            .debug_selector(move || selector.clone())
-            .when(armed, |b| {
-                b.on_mouse_down_out(cx.listener(move |this, _, _, cx| {
-                    if this.armed.as_ref() == Some(&out_id) {
-                        this.disarm(cx);
-                    }
-                }))
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.armed.as_ref() == Some(&id) {
+        layout::danger(
+            id.clone(),
+            label,
+            in_flight.unwrap_or_else(|| text::CONFIRM_AGAIN.get()),
+            armed || in_flight.is_some(),
+        )
+        .debug_selector(move || selector.clone())
+        .when(armed, |b| {
+            b.on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                if this.armed.as_ref() == Some(&out_id) {
                     this.disarm(cx);
-                    run(this, cx);
-                } else {
-                    this.armed = Some(id.clone());
-                    // 새 타이머가 이전 타이머(Task)를 버려 취소한다.
-                    this.armed_timer = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor().timer(CONFIRM_TIMEOUT).await;
-                        // disarm()은 자기 Task를 버리므로 여기선 상태만 푼다.
-                        this.update(cx, |this, cx| {
-                            this.armed = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
                 }
-                cx.notify();
             }))
+        })
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if this.armed.as_ref() == Some(&id) {
+                this.disarm(cx);
+                run(this, window, cx);
+            } else {
+                this.arm(id.clone(), cx);
+            }
+            cx.notify();
+        }))
+    }
+
+    /// 2단계 확인을 무장한다. [`CONFIRM_TIMEOUT`]이 지나면 풀린다.
+    fn arm(&mut self, id: SharedString, cx: &mut Context<Self>) {
+        self.armed = Some(id);
+        // 새 타이머가 이전 타이머(Task)를 버려 취소한다.
+        self.armed_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONFIRM_TIMEOUT).await;
+            // disarm()은 자기 Task를 버리므로 여기선 상태만 푼다.
+            this.update(cx, |this, cx| {
+                this.armed = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn disarm(&mut self, cx: &mut Context<Self>) {
@@ -4706,6 +4833,33 @@ impl SettingsView {
         input
     }
 
+    /// 제공자 키가 저장되어 있는지 처음 한 번만 뒤에서 읽는다. 그 뒤로는 저장과 지우기가 값을 갱신하므로
+    /// 그리는 동안 파일을 읽지 않는다.
+    fn load_opencode_api_key_state(&mut self, cx: &mut Context<Self>) {
+        if self.opencode_api_key_load_started || !self.account_host.is_local() {
+            return;
+        }
+        self.opencode_api_key_load_started = true;
+        let (home, dir) = Self::opencode_home_and_state(cx);
+        cx.spawn(async move |this, cx| {
+            let configured =
+                cx.background_executor()
+                    .spawn(async move {
+                        crate::accounts::opencode_go::has_override(&home, dir.as_deref())
+                    })
+                    .await;
+            this.update(cx, |this, cx| {
+                // 읽는 사이 저장이나 지우기가 끝났으면 그 값이 더 새롭다.
+                if this.opencode_api_key_configured.is_none() {
+                    this.opencode_api_key_configured = Some(configured);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn save_opencode_api_key(&mut self, cx: &mut Context<Self>) {
         let key = self
             .opencode_api_key_input
@@ -4732,7 +4886,7 @@ impl SettingsView {
                 this.opencode_api_key_pending = false;
                 match saved {
                     Ok(()) => {
-                        this.opencode_api_key_configured = true;
+                        this.opencode_api_key_configured = Some(true);
                         this.opencode_api_key_error = None;
                         this.opencode_api_key_input = None;
                     }
@@ -4761,7 +4915,7 @@ impl SettingsView {
                 this.opencode_api_key_pending = false;
                 match cleared {
                     Ok(()) => {
-                        this.opencode_api_key_configured = false;
+                        this.opencode_api_key_configured = Some(false);
                         this.opencode_api_key_error = None;
                     }
                     Err(e) => this.opencode_api_key_error = Some(e.to_string().into()),
@@ -5205,7 +5359,6 @@ impl SettingsView {
             ]
         });
         let submitted_edit_id = editing_id.clone();
-        let submitted_page = self.machine_page.clone();
         let label = valid.label.clone();
         let destination = valid.destination.clone();
         let editing = editing_id.is_some();
@@ -5235,19 +5388,14 @@ impl SettingsView {
                 Ok(hosts) => {
                     this.ssh_hosts = hosts;
                     if !editing
-                        && this.machine_page == submitted_page
-                        && matches!(
-                            submitted_page,
-                            crate::machines::MachinePage::Add(crate::machines::AddMethod::Ssh)
-                        )
+                        && this.machine_add == Some(crate::machines::AddMethod::Ssh)
                         && let Some(host) = this
                             .ssh_hosts
                             .iter()
                             .find(|h| h.label == label && h.destination == destination)
                     {
-                        this.machine_page = crate::machines::MachinePage::Details(
-                            crate::hosts::HostId::Remote(host.id.clone()),
-                        );
+                        this.machine_open = Some(crate::hosts::HostId::Remote(host.id.clone()));
+                        this.machine_add = None;
                     }
                     cx.spawn(async move |this, cx| {
                         this.update_in(cx, |this, window, cx| {
@@ -5814,7 +5962,11 @@ impl SettingsView {
                     cx.notify();
                 }
                 Err(PauseError::Failed(message)) => {
-                    this.recording_status = Some(message.into());
+                    this.recording_status = Some(
+                        text::RECORDING_SET_FAILED
+                            .format(&[("error", &message)])
+                            .into(),
+                    );
                     cx.notify();
                 }
             })
@@ -5854,28 +6006,30 @@ impl SettingsView {
         }
         self.history_clear_pending = true;
         self.history_status = Some(text::RECORDING_DELETING.get().into());
+        self.history_status_failed = false;
         cx.notify();
         let dir = state_dir(cx);
         let daemon = is_daemon_state_dir(dir.as_deref());
         cx.spawn(async move |this, cx| {
-            let msg = cx
+            let (msg, failed) = cx
                 .background_executor()
                 .spawn(async move {
                     // 테스트용 임시 상태 디렉터리에서는 실제 데몬 기록을 건드리지 않는다.
                     if daemon {
                         match request_history_clear(krill_proto::daemon::Paths::dev().ok().as_ref())
                         {
-                            Ok(()) => text::RECORDING_DELETED.get().to_owned(),
-                            Err(e) => e,
+                            Ok(()) => (text::RECORDING_DELETED.get().to_owned(), false),
+                            Err(e) => (text::RECORDING_CLEAR_FAILED.format(&[("error", &e)]), true),
                         }
                     } else {
-                        text::RECORDING_DELETE_UNAVAILABLE.get().to_owned()
+                        (text::RECORDING_DELETE_UNAVAILABLE.get().to_owned(), true)
                     }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.history_clear_pending = false;
                 this.history_status = Some(msg.into());
+                this.history_status_failed = failed;
                 cx.notify();
             })
             .ok();
@@ -5883,10 +6037,18 @@ impl SettingsView {
         .detach();
     }
 
-    fn render_general_tab(&self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
-        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+    /// 모양 탭: 테마 견본 판과 나머지 항목 묶음. `terminal_rows`는 [`Self::render_terminal_tab`]의 글꼴 행이다.
+    fn render_general_tab(
+        &self,
+        s: &Settings,
+        terminal_rows: Vec<gpui::AnyElement>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        use gpui_component::menu::DropdownMenu as _;
         let search_focus = self.search_focus.clone();
         let p = crate::ui::palette(cx);
+        let columns = SettingsFrame::new(window).theme_columns();
         let theme_button = |id: &'static str, label: &'static str, choice: ThemeChoice| {
             layout::segment(p, id, label, s.theme == choice)
                 .debug_selector(move || id.into())
@@ -5894,57 +6056,167 @@ impl SettingsView {
                     edit(cx, move |s| s.theme = choice);
                 })
         };
-        let imported: Vec<(String, String)> = s
+        let imported: std::rc::Rc<[(String, String)]> = s
             .terminal_custom_themes
             .iter()
             .map(|theme| (theme.name.clone(), theme.selection_value()))
             .collect();
-        let (dark_imported, light_imported) = (imported.clone(), imported);
-        let selected_dark = s.ui_theme_dark;
-        let dark_themes = layout::secondary("ui-theme-dark", selected_dark.label())
-            .dropdown_caret(true)
-            .debug_selector(|| "ui-theme-dark".into())
-            .dropdown_menu(move |mut menu, _, _| {
-                for theme in DarkUiTheme::ALL {
-                    menu = menu.item(
-                        PopupMenuItem::new(theme.label())
-                            .checked(selected_dark == theme)
-                            .on_click(move |_, _, cx| {
-                                edit(cx, move |s| s.set_ui_theme_dark(theme));
-                            }),
-                    );
-                }
-                imported_theme_items(menu, &dark_imported, ThemeMode::Dark)
-            });
-        let selected_light = s.ui_theme_light;
-        let light_themes = layout::secondary("ui-theme-light", selected_light.label())
-            .dropdown_caret(true)
-            .debug_selector(|| "ui-theme-light".into())
-            .dropdown_menu(move |mut menu, _, _| {
-                for theme in LightUiTheme::ALL {
-                    menu = menu.item(
-                        PopupMenuItem::new(theme.label())
-                            .checked(selected_light == theme)
-                            .on_click(move |_, _, cx| {
-                                edit(cx, move |s| s.set_ui_theme_light(theme));
-                            }),
-                    );
-                }
-                imported_theme_items(menu, &light_imported, ThemeMode::Light)
-            });
-        // 터미널 테마가 앱 테마의 짝이 아니면 드롭다운만 바꿔도 터미널 색이 그대로라 맞추는 버튼을 둔다.
-        let terminal_theme_match = |mode: ThemeMode| {
-            let id = match mode {
-                ThemeMode::Dark => "ui-theme-dark-match",
-                ThemeMode::Light => "ui-theme-light-match",
+        // 터미널 테마가 앱 테마의 짝이 아니면 견본을 눌러도 터미널 색이 그대로라 이름과 맞추는 버튼을 둔다.
+        let theme_section = |mode: ThemeMode, title: &'static str, swatches: Vec<_>| {
+            let (terminal_id, match_id, imported_id, board_id) = match mode {
+                ThemeMode::Dark => (
+                    "ui-theme-dark-terminal",
+                    "ui-theme-dark-match",
+                    "ui-theme-dark-imported",
+                    "ui-theme-dark-board",
+                ),
+                ThemeMode::Light => (
+                    "ui-theme-light-terminal",
+                    "ui-theme-light-match",
+                    "ui-theme-light-imported",
+                    "ui-theme-light-board",
+                ),
             };
-            s.unpaired_terminal_theme(mode).map(|name| {
-                layout::ghost(id, text::THEME_MATCH.get())
-                    .tooltip(text::THEME_MATCH_TOOLTIP.format(&[("name", name)]))
-                    .debug_selector(move || id.into())
-                    .on_click(move |_, _, cx| edit(cx, move |s| s.match_terminal_theme(mode)))
-            })
+            let unpaired = s.unpaired_terminal_theme(mode);
+            let selection = s.terminal_selection(mode).to_owned();
+            let imported = imported.clone();
+            div()
+                .w_full()
+                .min_w_0()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(search_focus.label(p, title, None))
+                        .child(
+                            layout::controls()
+                                .children(unpaired.map(|name| {
+                                    div()
+                                        .debug_selector(move || terminal_id.into())
+                                        .max_w(px(180.))
+                                        .truncate()
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_color(p.muted_foreground)
+                                        .child(text::THEME_TERMINAL_NAME.format(&[("name", name)]))
+                                }))
+                                .children(unpaired.map(|name| {
+                                    layout::ghost(match_id, text::THEME_MATCH.get())
+                                        .tooltip(
+                                            text::THEME_MATCH_TOOLTIP.format(&[("name", name)]),
+                                        )
+                                        .debug_selector(move || match_id.into())
+                                        .on_click(move |_, _, cx| {
+                                            edit(cx, move |s| s.match_terminal_theme(mode));
+                                        })
+                                }))
+                                .when(!imported.is_empty(), |d| {
+                                    d.child(
+                                        layout::secondary(
+                                            imported_id,
+                                            text::IMPORTED_TERMINAL_THEMES.get(),
+                                        )
+                                        .dropdown_caret(true)
+                                        .debug_selector(move || imported_id.into())
+                                        .dropdown_menu(
+                                            move |menu, _, _| {
+                                                imported_theme_items(
+                                                    menu, &imported, &selection, mode,
+                                                )
+                                            },
+                                        ),
+                                    )
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(board_id)
+                        .debug_selector(move || board_id.into())
+                        .role(gpui::Role::RadioGroup)
+                        .aria_label(title)
+                        .w_full()
+                        .min_w_0()
+                        .grid()
+                        .grid_cols(columns)
+                        .gap_2()
+                        .children(swatches),
+                )
         };
+        let mut theme_rows = vec![
+            crate::ui::group_row()
+                .child(
+                    search_focus.label(
+                        p,
+                        text::THEME.get(),
+                        text::THEME_DESC
+                            .mac_or(crate::i18n::catalog::other_os::THEME_DESC)
+                            .get(),
+                    ),
+                )
+                .child(
+                    layout::controls().child(layout::segmented_control(
+                        p,
+                        [
+                            ("theme-dark", text::DARK.get(), ThemeChoice::Dark),
+                            ("theme-light", text::LIGHT.get(), ThemeChoice::Light),
+                            ("theme-system", text::SYSTEM.get(), ThemeChoice::System),
+                        ]
+                        .into_iter()
+                        .map(|(id, l, choice)| theme_button(id, l, choice)),
+                    )),
+                ),
+        ];
+        if s.theme != ThemeChoice::Light {
+            theme_rows.push(theme_section(
+                ThemeMode::Dark,
+                text::DARK_THEME.get(),
+                DarkUiTheme::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, theme)| {
+                        crate::ui::theme_swatch(
+                            p,
+                            format!("ui-theme-swatch-dark-{i}"),
+                            theme.label(),
+                            theme.palette(),
+                            theme.terminal_theme_name(),
+                            s.ui_theme_dark == theme,
+                        )
+                        .on_click(move |_, _, cx| edit(cx, move |s| s.set_ui_theme_dark(theme)))
+                    })
+                    .collect(),
+            ));
+        }
+        if s.theme != ThemeChoice::Dark {
+            theme_rows.push(theme_section(
+                ThemeMode::Light,
+                text::LIGHT_THEME.get(),
+                LightUiTheme::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, theme)| {
+                        crate::ui::theme_swatch(
+                            p,
+                            format!("ui-theme-swatch-light-{i}"),
+                            theme.label(),
+                            theme.palette(),
+                            theme.terminal_theme_name(),
+                            s.ui_theme_light == theme,
+                        )
+                        .on_click(move |_, _, cx| edit(cx, move |s| s.set_ui_theme_light(theme)))
+                    })
+                    .collect(),
+            ));
+        }
         let language_button = |id: &'static str, label: &'static str, language: Language| {
             layout::segment(p, id, label, s.language == language)
                 .debug_selector(move || id.into())
@@ -5957,112 +6229,73 @@ impl SettingsView {
         let zoom_at_min = zoom_val <= ZOOM_MIN + f32::EPSILON;
         let zoom_at_max = zoom_val >= ZOOM_MAX - f32::EPSILON;
         let zoom_at_default = (zoom_val - 1.0).abs() < f32::EPSILON;
-        let row = || layout::row(p);
-        let label =
-            |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
+        let mut rows = vec![
+            crate::ui::group_row()
+                .child(search_focus.label(p, text::LANGUAGE.get(), None))
+                .child(layout::controls().child(layout::segmented_control(
+                    p,
+                    [
+                        language_button("language-ko", text::KO.get(), Language::Ko),
+                        language_button("language-en", text::EN.get(), Language::En),
+                    ],
+                )))
+                .into_any_element(),
+            crate::ui::group_row()
+                .child(search_focus.label(p, text::ZOOM.get(), None))
+                .child(
+                    layout::controls()
+                        .child(
+                            layout::secondary("zoom-out", "−")
+                                .accessibility_label(
+                                    text::STEP_DEC.format(&[("name", text::ZOOM.get())]),
+                                )
+                                .disabled(zoom_at_min)
+                                .debug_selector(|| "zoom-out".into())
+                                .on_click(|_, _, cx| {
+                                    edit(cx, move |s| s.zoom = s.zoom_step(-1));
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("zoom-value")
+                                .debug_selector(|| "zoom-value".into())
+                                .w(px(48.))
+                                .text_center()
+                                .font_family(crate::ui::FONT_MONO)
+                                .text_size(crate::ui::TEXT_SM)
+                                .child(zoom_pct),
+                        )
+                        .child(
+                            layout::secondary("zoom-in", "+")
+                                .accessibility_label(
+                                    text::STEP_INC.format(&[("name", text::ZOOM.get())]),
+                                )
+                                .disabled(zoom_at_max)
+                                .debug_selector(|| "zoom-in".into())
+                                .on_click(|_, _, cx| {
+                                    edit(cx, move |s| s.zoom = s.zoom_step(1));
+                                }),
+                        )
+                        .child(
+                            layout::ghost("zoom-reset", text::RESET.get())
+                                .disabled(zoom_at_default)
+                                .debug_selector(|| "zoom-reset".into())
+                                .on_click(|_, _, cx| edit(cx, move |s| s.zoom = 1.0)),
+                        ),
+                )
+                .into_any_element(),
+        ];
+        rows.extend(terminal_rows);
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .child(layout::section_title(
-                p,
-                "general-section-appearance",
-                text::SECTION_APPEARANCE.get(),
-            ))
             .child(
-                row()
-                    .child(label(text::LANGUAGE.get(), text::LANGUAGE_DESC.get()))
-                    .child(layout::controls().child(layout::segmented_control(
-                        p,
-                        [
-                            language_button("language-ko", text::KO.get(), Language::Ko),
-                            language_button("language-en", text::EN.get(), Language::En),
-                        ],
-                    ))),
+                crate::ui::group(p, theme_rows)
+                    .debug_selector(|| "general-section-appearance".into()),
             )
             .child(
-                row()
-                    .child(label(
-                        text::THEME.get(),
-                        text::THEME_DESC
-                            .mac_or(crate::i18n::catalog::other_os::THEME_DESC)
-                            .get(),
-                    ))
-                    .child(
-                        layout::controls().child(layout::segmented_control(
-                            p,
-                            [
-                                ("theme-dark", text::DARK.get(), ThemeChoice::Dark),
-                                ("theme-light", text::LIGHT.get(), ThemeChoice::Light),
-                                ("theme-system", text::SYSTEM.get(), ThemeChoice::System),
-                            ]
-                            .into_iter()
-                            .map(|(id, l, choice)| theme_button(id, l, choice)),
-                        )),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(text::DARK_THEME.get(), text::DARK_THEME_DESC.get()))
-                    .child(
-                        layout::controls()
-                            .child(dark_themes)
-                            .children(terminal_theme_match(ThemeMode::Dark)),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(text::LIGHT_THEME.get(), text::LIGHT_THEME_DESC.get()))
-                    .child(
-                        layout::controls()
-                            .child(light_themes)
-                            .children(terminal_theme_match(ThemeMode::Light)),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(text::ZOOM.get(), text::ZOOM_DESC.get()))
-                    .child(
-                        layout::controls()
-                            .child(
-                                layout::secondary("zoom-out", "−")
-                                    .accessibility_label(
-                                        text::STEP_DEC.format(&[("name", text::ZOOM.get())]),
-                                    )
-                                    .disabled(zoom_at_min)
-                                    .debug_selector(|| "zoom-out".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| s.zoom = s.zoom_step(-1));
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id("zoom-value")
-                                    .debug_selector(|| "zoom-value".into())
-                                    .w(px(48.))
-                                    .text_center()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .child(zoom_pct),
-                            )
-                            .child(
-                                layout::secondary("zoom-in", "+")
-                                    .accessibility_label(
-                                        text::STEP_INC.format(&[("name", text::ZOOM.get())]),
-                                    )
-                                    .disabled(zoom_at_max)
-                                    .debug_selector(|| "zoom-in".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| s.zoom = s.zoom_step(1));
-                                    }),
-                            )
-                            .child(
-                                layout::ghost("zoom-reset", text::RESET.get())
-                                    .disabled(zoom_at_default)
-                                    .debug_selector(|| "zoom-reset".into())
-                                    .on_click(|_, _, cx| edit(cx, move |s| s.zoom = 1.0)),
-                            ),
-                    ),
+                crate::ui::group(p, rows).debug_selector(|| "terminal-section-appearance".into()),
             )
     }
 
@@ -6078,26 +6311,12 @@ impl SettingsView {
                 })
         };
         let notif_disabled = !s.notifications;
-        let row = || layout::row(p);
-        let sub_notif_row = |id: &'static str| {
-            layout::row(p)
-                .id(id)
-                .debug_selector(move || id.into())
-                .when(notif_disabled, |d| d.opacity(0.5))
-        };
         let label =
             |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(layout::section_title(
-                p,
-                "general-section-notifications",
-                text::SECTION_NOTIFICATIONS.get(),
-            ))
-            .child(
-                row()
+        crate::ui::group(
+            p,
+            [
+                crate::ui::group_row()
                     .child(label(
                         text::NOTIFICATIONS.get(),
                         text::NOTIFICATIONS_DESC
@@ -6115,10 +6334,12 @@ impl SettingsView {
                             )
                             .aria_label(text::NOTIFICATIONS.get()),
                         ),
-                    ),
-            )
-            .child(
-                sub_notif_row("notify-sound-row")
+                    )
+                    .into_any_element(),
+                crate::ui::group_row()
+                    .id("notify-sound-row")
+                    .debug_selector(|| "notify-sound-row".into())
+                    .when(notif_disabled, |d| d.opacity(0.5))
                     .child(label(text::ALERT_SOUND.get(), text::ALERT_SOUND_DESC.get()))
                     .child(
                         layout::controls().child(
@@ -6131,15 +6352,9 @@ impl SettingsView {
                             )
                             .aria_label(text::ALERT_SOUND.get()),
                         ),
-                    ),
-            )
-            .child(layout::section_title(
-                p,
-                "general-section-power",
-                text::SECTION_POWER.get(),
-            ))
-            .child(
-                row()
+                    )
+                    .into_any_element(),
+                crate::ui::group_row()
                     .child(label(
                         text::KEEP_AWAKE.get(),
                         text::KEEP_AWAKE_DESC
@@ -6157,20 +6372,113 @@ impl SettingsView {
                             .into_iter()
                             .map(|(id, l, mode)| awake_button(id, l, mode)),
                         )),
-                    ),
-            )
-            .child(layout::section_title(
-                p,
-                "general-section-files",
-                text::SECTION_FILES.get(),
-            ))
+                    )
+                    .into_any_element(),
+            ],
+        )
+    }
+
+    /// 시스템 탭의 들어가는 도구 칸. 점검, 설치, 디스크는 칸 전체가 입구이고 설정 파일은 버튼으로 연다.
+    fn render_system_tools(&self, cx: &mut Context<Self>) -> gpui::Div {
+        use gpui_component::{Icon, IconName, Sizable as _};
+        let p = crate::ui::palette(cx);
+        let search_focus = self.search_focus.clone();
+        let cell = || {
+            div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .p_2p5()
+                .rounded(crate::ui::RADIUS_MD)
+                .bg(p.card)
+                .border_1()
+                .border_color(p.border)
+        };
+        let desc = |d: gpui::Div| {
+            d.text_size(crate::ui::TEXT_XS)
+                .text_color(p.muted_foreground)
+        };
+        let entry = |id: &'static str, title: &'static str, body: gpui::Div| {
+            cell()
+                .id(id)
+                .debug_selector(move || id.into())
+                .role(gpui::Role::Button)
+                .aria_label(title)
+                .tab_index(0)
+                .cursor_pointer()
+                .hover(|d| d.bg(p.accent))
+                .active(|d| d.bg(p.sidebar_accent))
+                .focus_visible(|d| d.bg(p.accent))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_1p5()
+                        .child(search_focus.label(p, title, None))
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .with_size(crate::ui::ICON_XS)
+                                .text_color(p.muted_foreground),
+                        ),
+                )
+                .child(body)
+        };
+        div()
+            .grid()
+            .grid_cols(2)
+            .gap_2()
             .child(
-                row()
-                    .child(label(text::FILES_TITLE.get(), text::FILES_DESC.get()))
+                entry(
+                    "open-checks",
+                    text::CHECKS_TITLE.get(),
+                    desc(div())
+                        .debug_selector(|| "checks-summary".into())
+                        .child(crate::onboarding::checks_summary_text(
+                            &crate::onboarding::snapshot(cx),
+                        )),
+                )
+                .on_click(|_, _, cx| {
+                    crate::onboarding::open_checks_current(cx);
+                }),
+            )
+            .child(
+                entry(
+                    "open-install",
+                    text::TAB_INSTALL.get(),
+                    desc(div()).child(text::INSTALL_ENTRY_DESC.get()),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.set_tab(AdminTab::Install, cx);
+                })),
+            )
+            .child(
+                entry(
+                    "open-disk",
+                    text::TAB_DISK.get(),
+                    desc(div()).child(text::TAB_DISK_DESC.get()),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.set_tab(AdminTab::Disk, cx);
+                })),
+            )
+            .child(
+                cell()
+                    .child(search_focus.label(
+                        p,
+                        text::FILES_TITLE.get(),
+                        Some(text::FILES_DESC.get()),
+                    ))
                     .child(
-                        layout::controls()
+                        div()
+                            .pt_1p5()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
                             .child(
                                 layout::secondary("open-settings", text::OPEN_SETTINGS.get())
+                                    .xsmall()
                                     .debug_selector(|| "open-settings".into())
                                     .on_click(|_, _, cx| {
                                         let body = current(cx).to_toml();
@@ -6179,6 +6487,7 @@ impl SettingsView {
                             )
                             .child(
                                 layout::secondary("open-keys", text::OPEN_KEYS.get())
+                                    .xsmall()
                                     .debug_selector(|| "open-keys".into())
                                     .on_click(|_, _, cx| {
                                         open_file(KEYS_FILE, text::KEYS_TEMPLATE.get(), cx);
@@ -6186,63 +6495,24 @@ impl SettingsView {
                             ),
                     ),
             )
-            .child(
-                row()
-                    .child(label(text::CHECKS_TITLE.get(), text::CHECKS_DESC.get()))
-                    .child(
-                        layout::controls()
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .text_color(crate::ui::palette(cx).muted_foreground)
-                                    .debug_selector(|| "checks-summary".into())
-                                    .child(crate::onboarding::checks_summary_text(
-                                        &crate::onboarding::snapshot(cx),
-                                    )),
-                            )
-                            .child(
-                                layout::secondary("open-checks", text::CHECKS_OPEN.get())
-                                    .debug_selector(|| "open-checks".into())
-                                    .on_click(|_, _, cx| {
-                                        crate::onboarding::open_checks_current(cx);
-                                    }),
-                            )
-                            .child(
-                                layout::secondary("open-install", text::TAB_INSTALL.get())
-                                    .debug_selector(|| "open-install".into())
-                                    .on_click(|_, _, cx| {
-                                        open_window_at_tab(AdminTab::Install, cx);
-                                    }),
-                            ),
-                    ),
-            )
-            .child(
-                row()
-                    .child(label(text::TAB_DISK.get(), text::TAB_DISK_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary("open-disk", text::DISK_OPEN.get())
-                                .debug_selector(|| "open-disk".into())
-                                .on_click(|_, _, cx| open_window_at_tab(AdminTab::Disk, cx)),
-                        ),
-                    ),
-            )
     }
 
-    /// 모양 탭의 터미널 글꼴·크기(OWE-658, OWE-798).
-    fn render_terminal_tab(&mut self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
+    /// 모양 탭의 터미널 글꼴·크기 행(OWE-658, OWE-798).
+    fn render_terminal_tab(
+        &mut self,
+        s: &Settings,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         let search_focus = self.search_focus.clone();
         let p = crate::ui::palette(cx);
-        let row = || layout::row(p);
-        let label =
-            |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
         let font_size = s.terminal_font_size();
         let font_pt = format!("{font_size}pt");
         self.refresh_font_names(cx);
         let font_names = self.font_names.clone();
         let family = s.terminal_font_family.clone();
         let font_family = layout::secondary("terminal-font-family", family.clone())
+            .dropdown_caret(true)
             .debug_selector(|| "terminal-font-family".into())
             .disabled(self.fonts_pending && self.font_names.is_empty())
             .dropdown_menu(move |mut menu, _, _| {
@@ -6258,94 +6528,98 @@ impl SettingsView {
                 }
                 menu
             });
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(layout::section_title(
-                p,
-                "terminal-section-appearance",
-                text::SECTION_TERMINAL_APPEARANCE.get(),
-            ))
-            .child(
-                row()
-                    .child(label(
-                        text::TERMINAL_FONT.get(),
-                        text::TERMINAL_FONT_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls()
-                            .child(div().max_w(px(240.)).overflow_hidden().child(font_family)),
-                    ),
-            )
-            // 지정 글꼴이 고정폭으로 해석되지 않으면 Menlo로 대신 그리고 사유를 밝힌다(OWE-899).
-            .children(terminal_font_fallback(cx).map(|(requested, effective)| {
-                div()
-                    .id("terminal-font-fallback")
-                    .debug_selector(|| "terminal-font-fallback".into())
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.warning)
-                    .child(text::TERMINAL_FONT_FALLBACK.format(&[
-                        ("requested", requested.as_str()),
-                        ("effective", effective.as_ref()),
-                    ]))
-            }))
-            .child(
-                row()
-                    .child(label(text::FONT_SIZE.get(), text::FONT_SIZE_DESC.get()))
-                    .child(
-                        layout::controls()
-                            .child(
-                                layout::secondary("font-dec", "−")
-                                    .accessibility_label(
-                                        text::STEP_DEC.format(&[("name", text::FONT_SIZE.get())]),
-                                    )
-                                    .disabled(font_size <= 10)
-                                    .debug_selector(|| "font-dec".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.terminal_font_size =
-                                                s.terminal_font_size().saturating_sub(1).max(10);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id("font-size-value")
-                                    .debug_selector(|| "font-size-value".into())
-                                    .w(px(48.))
-                                    .text_center()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .child(font_pt),
-                            )
-                            .child(
-                                layout::secondary("font-inc", "+")
-                                    .accessibility_label(
-                                        text::STEP_INC.format(&[("name", text::FONT_SIZE.get())]),
-                                    )
-                                    .disabled(font_size >= 24)
-                                    .debug_selector(|| "font-inc".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.terminal_font_size =
-                                                s.terminal_font_size().saturating_add(1).min(24);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                layout::ghost("font-reset", text::RESET.get())
-                                    .disabled(font_size == default_terminal_font_size())
-                                    .tooltip(text::FONT_RESET.get())
-                                    .debug_selector(|| "font-reset".into())
-                                    .on_click(|_, _, cx| {
-                                        edit(cx, move |s| {
-                                            s.terminal_font_size = default_terminal_font_size();
-                                        });
-                                    }),
-                            ),
-                    ),
-            )
+        let mut rows = vec![
+            crate::ui::group_row()
+                .child(search_focus.label(
+                    p,
+                    text::TERMINAL_FONT.get(),
+                    text::TERMINAL_FONT_DESC.get(),
+                ))
+                .child(
+                    layout::controls()
+                        .child(div().max_w(px(240.)).overflow_hidden().child(font_family)),
+                )
+                .into_any_element(),
+        ];
+        // 지정 글꼴이 고정폭으로 해석되지 않으면 Menlo로 대신 그리고 사유를 밝힌다(OWE-899).
+        rows.extend(terminal_font_fallback(cx).map(|(requested, effective)| {
+            crate::ui::group_row()
+                .child(
+                    div()
+                        .id("terminal-font-fallback")
+                        .debug_selector(|| "terminal-font-fallback".into())
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.warning)
+                        .child(text::TERMINAL_FONT_FALLBACK.format(&[
+                            ("requested", requested.as_str()),
+                            ("effective", effective.as_ref()),
+                        ])),
+                )
+                .into_any_element()
+        }));
+        rows.push(
+            crate::ui::group_row()
+                .child(search_focus.label(p, text::FONT_SIZE.get(), text::FONT_SIZE_DESC.get()))
+                .child(
+                    layout::controls()
+                        .child(
+                            layout::secondary("font-dec", "−")
+                                .accessibility_label(
+                                    text::STEP_DEC.format(&[("name", text::FONT_SIZE.get())]),
+                                )
+                                .disabled(font_size <= 10)
+                                .debug_selector(|| "font-dec".into())
+                                .on_click(|_, _, cx| {
+                                    edit(cx, move |s| {
+                                        s.terminal_font_size =
+                                            s.terminal_font_size().saturating_sub(1).max(10);
+                                    });
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("font-size-value")
+                                .debug_selector(|| "font-size-value".into())
+                                .w(px(48.))
+                                .text_center()
+                                .font_family(crate::ui::FONT_MONO)
+                                .text_size(crate::ui::TEXT_SM)
+                                .child(font_pt),
+                        )
+                        .child(
+                            layout::secondary("font-inc", "+")
+                                .accessibility_label(
+                                    text::STEP_INC.format(&[("name", text::FONT_SIZE.get())]),
+                                )
+                                .disabled(font_size >= 24)
+                                .debug_selector(|| "font-inc".into())
+                                .on_click(|_, _, cx| {
+                                    edit(cx, move |s| {
+                                        s.terminal_font_size =
+                                            s.terminal_font_size().saturating_add(1).min(24);
+                                    });
+                                }),
+                        )
+                        .child(
+                            layout::ghost("font-reset", text::RESET.get())
+                                .disabled(font_size == default_terminal_font_size())
+                                .tooltip(
+                                    text::FONT_RESET.format(&[(
+                                        "size",
+                                        &default_terminal_font_size().to_string(),
+                                    )]),
+                                )
+                                .debug_selector(|| "font-reset".into())
+                                .on_click(|_, _, cx| {
+                                    edit(cx, move |s| {
+                                        s.terminal_font_size = default_terminal_font_size();
+                                    });
+                                }),
+                        ),
+                )
+                .into_any_element(),
+        );
+        rows
     }
 
     /// 계정 행의 5h·7d 미니 사용량 바(OWE-719, OWE-797). 리셋 시각은 인라인 메타데이터와 묶음 툴팁([`format_account_usage`])에 함께 표시한다.
@@ -6359,11 +6633,6 @@ impl SettingsView {
         const BAR_W: f32 = 44.;
         let label_id = format!("admin-usage-label-{key}");
         let reset_id = format!("admin-usage-reset-{key}");
-        let label_width = if window_label.chars().count() > 5 {
-            164.
-        } else {
-            28.
-        };
         let now_secs = crate::accounts::display::now();
         let display =
             crate::accounts::display::window(win, i64::try_from(now_secs).unwrap_or(i64::MAX));
@@ -6386,8 +6655,8 @@ impl SettingsView {
             .items_center()
             .gap_1p5()
             .child(
-                // 고정폭 + 줄바꿈 금지: 20px에서는 "5시간"이 "5시/간"으로 접혔다(OWE-719 QA D3).
-                mono(div().w(px(label_width)).flex_none().truncate())
+                // 내용 폭 + 줄바꿈 금지: 고정폭이면 "5시간"이 접히고 긴 라벨이 잘렸다(OWE-719 QA D3).
+                mono(div().min_w(px(28.)).flex_none().whitespace_nowrap())
                     .debug_selector(move || label_id.clone())
                     .text_color(p.muted_foreground)
                     .child(window_label.to_owned()),
@@ -6406,12 +6675,18 @@ impl SettingsView {
                     .text_color(p.foreground)
                     .child(display.text),
             )
-            .children(reset.map(|reset| {
-                mono(div().flex_none().whitespace_nowrap())
-                    .debug_selector(move || reset_id.clone())
-                    .text_color(p.muted_foreground)
-                    .child(reset)
-            }))
+            // 리셋 문구가 없는 행도 같은 폭을 잡아 계정 사이 막대 줄이 맞는다.
+            .child(
+                div()
+                    .min_w(px(112.))
+                    .flex_none()
+                    .children(reset.map(|reset| {
+                        mono(div().whitespace_nowrap())
+                            .debug_selector(move || reset_id.clone())
+                            .text_color(p.muted_foreground)
+                            .child(reset)
+                    })),
+            )
     }
 
     fn render_account_rule(
@@ -6445,7 +6720,7 @@ impl SettingsView {
                         this.set_account_rule(next.clone(), cx);
                     }))
             };
-        // OWE-719: 규칙 편집기는 프로바이더 섹션의 "고급" 하나 아래에만 있다. 계정마다 이름과 현재 규칙 요약을 머리로 둔다.
+        // OWE-719: 규칙 편집기는 자동 전환 띠의 계정별 규칙 안에만 있다. 계정 이름과 현재 규칙 요약을 머리로 둔다.
         let summary = existing_rule.as_ref().map_or_else(
             || text::ACCOUNTS_RULE_NONE.get().to_owned(),
             |rule| rule_summary(rule, &snap.accounts),
@@ -6753,8 +7028,25 @@ impl SettingsView {
             )
     }
 
+    /// 지금 보는 호스트의 이름. 호스트 목록을 받기 전에는 이 기기로 부른다.
+    fn account_host_label(&self) -> String {
+        self.account_hosts
+            .iter()
+            .find(|(host, _, _)| *host == self.account_host)
+            .map_or_else(
+                || text::ACCOUNTS_THIS_DEVICE.get().to_owned(),
+                |(_, label, _)| label.clone(),
+            )
+    }
+
     /// 계정 행 아래 보조 줄: 시스템 기본값·Orca 설명, 로그인 필요 안내, 아니면 라벨·조직(없으면 프로필 폴더).
     fn account_detail(&self, acc: &krill_proto::usage::AccountInfo, heading: String) -> String {
+        if acc.host_default && self.account_host.is_remote() {
+            return text::SYSTEM_DEFAULT_DESC_ON_HOST.format(&[
+                ("host", &self.account_host_label()),
+                ("provider", acc.provider.display_name()),
+            ]);
+        }
         if acc.host_default || crate::accounts::orca_managed(acc) {
             return heading;
         }
@@ -6810,45 +7102,21 @@ impl SettingsView {
     ) -> gpui::Stateful<gpui::Div> {
         use gpui_component::{IconName, Sizable as _};
         let p = crate::ui::palette(cx);
-        let (home, dir) = Self::opencode_home_and_state(cx);
-        let configured = crate::accounts::opencode_go::has_override(&home, dir.as_deref());
-        self.opencode_api_key_configured = configured;
+        let configured = self.opencode_api_key_configured == Some(true);
         let input = self.ensure_opencode_api_key_input(window, cx);
         let draft_empty = input.read(cx).value().trim().is_empty();
         let pending = self.opencode_api_key_pending;
-        let tone = if configured {
-            crate::ui::BadgeTone::Success
-        } else {
-            crate::ui::BadgeTone::Muted
-        };
-        let badge_label = if configured {
-            text::OPENCODE_APIKEY_SAVED.get()
-        } else {
-            text::OPENCODE_APIKEY_NOT_SAVED.get()
-        };
         let mut card = layout::card(p)
             .id("admin-opencode-api-key-card")
             .debug_selector(|| "admin-opencode-api-key-card".into())
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(layout::label(
-                        p,
-                        text::OPENCODE_APIKEY_TITLE.get(),
-                        Some(text::OPENCODE_APIKEY_DESC.get()),
-                    ))
-                    .child(
-                        crate::ui::badge(p, tone, badge_label)
-                            .id("admin-opencode-api-key-badge")
-                            .debug_selector(|| "admin-opencode-api-key-badge".into()),
-                    ),
-            )
+            .child(layout::label(
+                p,
+                text::OPENCODE_APIKEY_TITLE.get(),
+                Some(text::OPENCODE_APIKEY_DESC.get()),
+            ))
             .child(
                 div()
                     .flex()
@@ -6919,8 +7187,8 @@ impl SettingsView {
         card
     }
 
-    /// 계정 한 행(OWE-719, Orca accounts-pane 행 밀도): 아바타+상태 점, 이름·보조 줄, 5h·7d 미니 바, 주 동작 하나
-    /// (전환 또는 다시 로그인)와 … 메뉴(다시 로그인·이름 변경·제거). 사용 중 표시는 행 강조와 "사용 중" 하나뿐이다.
+    /// 계정 한 행(OWE-719): 아바타+상태 점, 이름·보조 줄, 미니 막대 둘, 주 동작 하나(전환 또는 다시 로그인)와
+    /// … 메뉴(사용량 초기화·다시 로그인·링크 복사·이름 변경·제거). 사용 중 표시는 행 강조와 "사용 중" 하나뿐이다.
     fn render_account_row(
         &self,
         acc: &krill_proto::usage::AccountInfo,
@@ -7062,17 +7330,10 @@ impl SettingsView {
             .items_center()
             .gap_2()
             .min_w_0()
-            .child(crate::ui::icons::provider_icon(
-                acc.provider,
-                crate::ui::ICON_XS,
-                p.foreground,
-            ))
             .map(|d| match renaming {
                 Some(input) => d.child(Self::render_rename_row(acc, &input, cx)),
                 None => d.child(
                     div()
-                        .flex_1()
-                        .flex_basis(gpui::relative(0.5))
                         .min_w_0()
                         .truncate()
                         .text_size(crate::ui::TEXT_SM)
@@ -7138,11 +7399,44 @@ impl SettingsView {
 
         let usage_id = format!("admin-account-usage-{}", acc.id);
         let usage_tip_id = usage_id.clone();
+        let now = crate::accounts::display::now();
         let meters = snap.meters_for(&acc.id);
         let usage_tip = meters.map_or_else(
             || format_account_usage(&acc.usage),
-            |m| crate::accounts::display::meters_summary(m, crate::accounts::display::now()),
+            |m| crate::accounts::display::meters_summary(m, now),
         );
+        let meter_row = |meter: &krill_proto::usage::UsageMeter| {
+            let label = crate::accounts::display::meter_label(meter);
+            if let Some(value) = crate::accounts::display::meter_value(meter, now) {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(crate::ui::TEXT_2XS)
+                    .text_color(p.muted_foreground)
+                    .child(label)
+                    .child(value)
+            } else {
+                Self::render_usage_bar(&meter.key, &label, meter.window.as_ref(), brand, p)
+            }
+        };
+        // 행에는 막대 둘(막대가 없으면 첫 값 하나)만 두고 나머지는 +숫자로 펼친다.
+        let all_meters = meters.map_or(&[][..], |m| m.meters.as_slice());
+        let bars: Vec<_> = all_meters
+            .iter()
+            .filter(|m| crate::accounts::display::meter_value(m, now).is_none())
+            .take(2)
+            .collect();
+        let shown_meters: Vec<_> = if bars.is_empty() {
+            all_meters.iter().take(1).collect()
+        } else {
+            bars
+        };
+        let more_meters: Vec<_> = all_meters
+            .iter()
+            .filter(|m| !shown_meters.iter().any(|s| std::ptr::eq(*s, *m)))
+            .collect();
+        let meters_open = self.meters_open.as_deref() == Some(acc.id.as_str());
         let mut usage_cluster = div()
             .id(SharedString::from(usage_id.clone()))
             .debug_selector(move || usage_id.clone())
@@ -7154,28 +7448,9 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_0p5();
-        if let Some(meters) = meters {
-            for meter in &meters.meters {
-                let label = crate::accounts::display::meter_label(meter);
-                usage_cluster = usage_cluster.child(
-                    if let Some(value) = crate::accounts::display::meter_value(
-                        meter,
-                        crate::accounts::display::now(),
-                    ) {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_size(crate::ui::TEXT_2XS)
-                            .text_color(p.muted_foreground)
-                            .child(label)
-                            .child(value.clone())
-                    } else {
-                        Self::render_usage_bar(&meter.key, &label, meter.window.as_ref(), brand, p)
-                    },
-                );
-            }
-            if meters.meters.is_empty() {
+        if meters.is_some() {
+            usage_cluster = usage_cluster.children(shown_meters.iter().map(|m| meter_row(m)));
+            if all_meters.is_empty() {
                 usage_cluster = usage_cluster.child(
                     div()
                         .text_size(crate::ui::TEXT_XS)
@@ -7200,15 +7475,33 @@ impl SettingsView {
                     p,
                 ));
         }
+        let meters_expansion = (meters_open && !more_meters.is_empty()).then(|| {
+            let id = format!("admin-account-meters-{}", acc.id);
+            div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id.clone())
+                .w_full()
+                .min_w_0()
+                .pl(px(34.))
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .cursor_default()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(more_meters.iter().map(|m| meter_row(m)))
+        });
 
-        // 주 동작 하나: 로그인이 필요하면 "다시 로그인"(및 브라우저 제공자는 "링크 복사"), 아니면 비활성 계정에만 "전환"(.ghost().small()).
+        // 주 동작 하나: 로그인이 필요하면 "다시 로그인", 아니면 비활성 계정에만 "전환"(.ghost().small()).
         // 로그인 대기 중이면 진행 표시 대신 [링크 복사]·[로그인 취소]만 둔다(OWE-881).
         let mut actions = div()
             .flex_none()
             .max_w_full()
+            .min_w(px(124.))
+            .ml_auto()
             .flex()
             .flex_wrap()
             .items_center()
+            .justify_end()
             .gap_1()
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation());
         if logging_in {
@@ -7268,27 +7561,6 @@ impl SettingsView {
                     this.login_account(provider, Some(login_account.clone()), cx);
                 })),
             );
-            if can_browser_login {
-                let copy_login_account = acc.clone();
-                let copy_login_id = format!("admin-copy-login-account-{}", acc.id);
-                actions = actions.child(
-                    layout::ghost(
-                        gpui::ElementId::Name(copy_login_id.clone().into()),
-                        text::ACCOUNT_LOGIN_COPY_LINK_SHORT.get(),
-                    )
-                    .icon(IconName::Copy)
-                    .disabled(login_disabled)
-                    .debug_selector(move || copy_login_id.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.login_account_with_mode(
-                            provider,
-                            Some(copy_login_account.clone()),
-                            false,
-                            cx,
-                        );
-                    })),
-                );
-            }
         } else if !orca && (!acc.active || switch_failed) && !switching {
             let switch_id = format!("admin-switch-account-{}", acc.id);
             let acc_id = acc.id.clone();
@@ -7309,8 +7581,9 @@ impl SettingsView {
                 })),
             );
         }
-        if !logging_in && can_reset_usage {
-            let reset_id: SharedString = format!("admin-reset-usage-{}", acc.id).into();
+        // 사용량 초기화는 메뉴에서 시작하고, 무장한 동안만 행에 확인 버튼이 나온다(크레딧을 쓰는 2단계 확인).
+        let reset_id: SharedString = format!("admin-reset-usage-{}", acc.id).into();
+        if !logging_in && can_reset_usage && self.armed.as_ref() == Some(&reset_id) {
             let reset_acc_id = acc.id.clone();
             let reset_disabled =
                 self.account_rule_pending || self.login_pending.is_some() || self.accounts_offline;
@@ -7324,6 +7597,41 @@ impl SettingsView {
                     },
                 )
                 .disabled(reset_disabled),
+            );
+        }
+        if !more_meters.is_empty() {
+            let meters_id = format!("admin-account-meters-toggle-{}", acc.id);
+            let toggle_acc = acc.id.clone();
+            let count = more_meters.len().to_string();
+            let tip = if meters_open {
+                text::ACCOUNT_METERS_LESS
+            } else {
+                text::ACCOUNT_METERS_MORE
+            }
+            .format(&[("n", &count)]);
+            actions = actions.child(
+                Button::new(gpui::ElementId::Name(meters_id.clone().into()))
+                    .xsmall()
+                    .ghost()
+                    .map(|b| {
+                        if meters_open {
+                            b.icon(IconName::ChevronDown)
+                        } else {
+                            b.label(format!("+{count}"))
+                        }
+                    })
+                    .tooltip(tip.clone())
+                    .accessibility_label(tip)
+                    .debug_selector(move || meters_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.meters_open =
+                            if this.meters_open.as_deref() == Some(toggle_acc.as_str()) {
+                                None
+                            } else {
+                                Some(toggle_acc.clone())
+                            };
+                        cx.notify();
+                    })),
             );
         }
         if can_login || can_reset_usage || removable {
@@ -7350,19 +7658,10 @@ impl SettingsView {
                                 .disabled(busy)
                                 .on_click(move |_, _, cx| {
                                     view.update(cx, |this, cx| {
-                                        let reset_id: SharedString =
-                                            format!("admin-reset-usage-{}", acc.id).into();
-                                        if this.armed.as_ref() == Some(&reset_id) {
-                                            this.disarm(cx);
-                                            this.consume_reset_credit(
-                                                acc.provider,
-                                                acc.id.clone(),
-                                                cx,
-                                            );
-                                        } else {
-                                            this.armed = Some(reset_id);
-                                            cx.notify();
-                                        }
+                                        this.arm(
+                                            format!("admin-reset-usage-{}", acc.id).into(),
+                                            cx,
+                                        );
                                     })
                                     .ok();
                                 }),
@@ -7455,18 +7754,10 @@ impl SettingsView {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap_3()
-            .px_3()
-            .py_2p5()
-            .rounded(crate::ui::RADIUS_MD)
-            .border_1()
-            .map(|d| {
-                if acc.active {
-                    d.bg(p.accent).border_color(p.ring)
-                } else {
-                    d.bg(p.card).border_color(p.border)
-                }
-            })
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .when(acc.active, |d| d.bg(p.accent))
             .when(can_click_switch, |d| {
                 d.cursor_pointer()
                     .hover(|s| s.bg(p.accent))
@@ -7489,7 +7780,7 @@ impl SettingsView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex_basis(px(160.))
+                    .flex_basis(px(150.))
                     .flex()
                     .flex_col()
                     .gap_0p5()
@@ -7498,6 +7789,7 @@ impl SettingsView {
             )
             .child(usage_cluster)
             .child(actions)
+            .children(meters_expansion)
     }
 
     /// 계정 제거 확인 대화상자(OWE-719, Orca removal dialog 대응). … 메뉴 "제거"가 열고, 창 가운데 모달에서 한 번 더
@@ -7640,15 +7932,15 @@ impl SettingsView {
     }
 
     fn render_accounts_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
-        use gpui_component::IconName;
-        use krill_proto::usage::{ProviderKind, UsageRequest};
+        use gpui_component::{IconName, Sizable as _};
+        use krill_proto::usage::ProviderKind;
+        self.load_opencode_api_key_state(cx);
         let p = crate::ui::palette(cx);
-        let policy = self.accounts_snapshot.auto_switch.clone();
 
         let mut root = div()
             .flex()
             .flex_col()
-            .gap_8()
+            .gap_2p5()
             .when(self.accounts_offline, |d| {
                 d.child(
                     div()
@@ -7663,8 +7955,17 @@ impl SettingsView {
                 crate::ui::error_banner(p, error)
                     .id("admin-account-error")
                     .debug_selector(|| "admin-account-error".into())
-            }));
+            }))
+            .child(self.render_auto_switch_strip(cx));
 
+        let mut host_line = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2();
         if self.account_hosts.len() > 1 {
             let current_host = self.account_host.clone();
             let host_btns = self
@@ -7690,27 +7991,58 @@ impl SettingsView {
                     }))
                 })
                 .collect::<Vec<_>>();
-            // Host count is unbounded, so the selector must never share a row with the text.
-            root = root.child(
-                layout::card(p)
+            // 호스트 수에 상한이 없어 칸이 모자라면 선택 줄이 라벨 아래로 내려간다.
+            host_line = host_line.child(
+                div()
                     .id("admin-accounts-host-bar")
                     .debug_selector(|| "admin-accounts-host-bar".into())
+                    .min_w_0()
+                    .max_w_full()
                     .flex()
-                    .flex_col()
+                    .flex_wrap()
+                    .items_center()
                     .gap_2()
-                    .child(layout::label(
-                        p,
-                        text::ACCOUNTS_HOST_TITLE.get(),
-                        Some(text::ACCOUNTS_HOST_DESC.get()),
-                    ))
+                    .child(
+                        div()
+                            .id("admin-accounts-host-label")
+                            .debug_selector(|| "admin-accounts-host-label".into())
+                            .tooltip(|window, cx| {
+                                crate::ui::tooltip_view(
+                                    "admin-accounts-host-tip",
+                                    text::ACCOUNTS_HOST_DESC.get(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .flex_none()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::ACCOUNTS_HOST_TITLE.get()),
+                    )
                     .child(
                         layout::segmented_control(p, host_btns)
-                            .self_start()
                             .max_w_full()
                             .flex_wrap(),
                     ),
             );
+        } else {
+            host_line = host_line.justify_end();
         }
+        root = root.child(
+            host_line.child(
+                self.search_focus.anchored(
+                    p,
+                    text::ACCOUNTS_SUBHEADER.get(),
+                    div()
+                        .id("admin-accounts-active-hint")
+                        .debug_selector(|| "admin-accounts-active-hint".into())
+                        .min_w_0()
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::ACCOUNTS_ACTIVE_HINT.get()),
+                ),
+            ),
+        );
 
         let providers = [
             (
@@ -7743,6 +8075,8 @@ impl SettingsView {
                 .entry(status.account_id.clone())
                 .or_insert_with(|| status.clone());
         }
+        let host_label = self.account_host_label();
+        let mut not_installed_count = 0;
         let mut not_installed = Vec::new();
         for (provider, title, subtitle) in providers {
             let mut accounts: Vec<_> = self
@@ -7753,14 +8087,21 @@ impl SettingsView {
                 .filter(|a| a.provider == provider && !crate::accounts::orca_managed(a))
                 .cloned()
                 .collect();
-            // 시스템 기본값(호스트) 계정을 맨 위에 둔다(Orca accounts-pane 패리티).
-            accounts.sort_by_key(|a| !a.host_default);
-            let add_id = format!("admin-add-account-{}", provider.as_str());
             let provider_installed = if self.account_host.is_remote() {
                 !accounts.is_empty()
             } else {
                 crate::accounts::installed::is_installed(cx, provider)
             };
+            // OWE-706: 설치되지 않은 프로바이더는 접힌 묶음 아래로 보낸다. 접혀 있으면 만들지 않는다.
+            if !provider_installed {
+                not_installed_count += 1;
+                if !self.not_installed_open {
+                    continue;
+                }
+            }
+            // 시스템 기본값(호스트) 계정을 맨 위에 둔다(Orca accounts-pane 패리티).
+            accounts.sort_by_key(|a| !a.host_default);
+            let add_id = format!("admin-add-account-{}", provider.as_str());
             let active_conn = accounts.iter().find(|a| a.active).and_then(|acc| {
                 let usage = crate::accounts::display::account(
                     acc,
@@ -7783,102 +8124,99 @@ impl SettingsView {
             let provider_status_id = format!("admin-provider-status-{}", provider.as_str());
             let show_in_bar = status_provider_visible(provider, cx);
             let status_bar_toggle_id = format!("admin-provider-status-bar-{}", provider.as_str());
+            let title_id = format!("admin-provider-title-{}", provider.as_str());
+            let title_tip_id = title_id.clone();
+            let sub_id = format!("admin-accounts-subheader-{}", provider.as_str());
+            let active_id = format!("admin-accounts-active-{}", provider.as_str());
 
-            let header = div()
+            // 제공자 머리글 한 줄. 설명은 이름의 말풍선, 활성 계정은 없을 때만 적는다.
+            let mut provider_line = div()
+                .id(SharedString::from(sub_id.clone()))
+                .debug_selector(move || sub_id.clone())
                 .w_full()
                 .min_w_0()
                 .flex()
                 .flex_wrap()
                 .items_center()
-                .justify_between()
-                .gap_3()
+                .gap_1p5()
                 .child(
                     div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex_basis(gpui::relative(0.5))
+                        .id(SharedString::from(title_id))
+                        .tooltip(move |window, cx| {
+                            crate::ui::tooltip_view(title_tip_id.clone(), subtitle, window, cx)
+                        })
+                        .flex_none()
                         .flex()
-                        .flex_col()
-                        .gap_1()
+                        .items_center()
+                        .gap_1p5()
+                        .child(crate::ui::icons::provider_icon(
+                            provider,
+                            crate::ui::ICON_MD,
+                            p.foreground,
+                        ))
                         .child(
                             div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap_2()
-                                .child(crate::ui::icons::provider_icon(
-                                    provider,
-                                    crate::ui::ICON_LG,
-                                    p.foreground,
-                                ))
-                                .child(
-                                    div()
-                                        .text_size(crate::ui::TEXT_SM)
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(title),
-                                )
-                                .child(
-                                    crate::ui::badge(p, status_tone, status_label)
-                                        .id(SharedString::from(provider_status_id.clone()))
-                                        .debug_selector(move || provider_status_id.clone()),
-                                ),
+                                .text_size(crate::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(title),
                         )
                         .child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(subtitle),
+                            crate::ui::badge(p, status_tone, status_label)
+                                .id(SharedString::from(provider_status_id.clone()))
+                                .debug_selector(move || provider_status_id.clone()),
                         ),
                 )
-                .child(
-                    layout::controls()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(text::PROVIDER_SHOW_IN_STATUS_BAR.get()),
-                        )
-                        .child(
-                            layout::switch(
-                                p,
-                                status_bar_toggle_id,
-                                show_in_bar,
-                                false,
-                                move |on, _, cx| {
-                                    set_status_provider_visible(provider, on, cx);
-                                },
-                            )
-                            .aria_label(format!(
-                                "{} · {}",
-                                title,
-                                text::PROVIDER_SHOW_IN_STATUS_BAR.get()
+                .when(!accounts.iter().any(|a| a.active), |d| {
+                    d.child(
+                        div()
+                            .id(SharedString::from(active_id.clone()))
+                            .debug_selector(move || active_id.clone())
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(format!(
+                                "{}: {}",
+                                text::ACCOUNTS_ACTIVE.get(),
+                                text::SYSTEM_DEFAULT.get()
                             )),
-                        ),
+                    )
+                })
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::PROVIDER_SHOW_IN_STATUS_BAR.get()),
+                )
+                .child(
+                    layout::switch(
+                        p,
+                        status_bar_toggle_id,
+                        show_in_bar,
+                        false,
+                        move |on, _, cx| {
+                            set_status_provider_visible(provider, on, cx);
+                        },
+                    )
+                    .aria_label(format!(
+                        "{} · {}",
+                        title,
+                        text::PROVIDER_SHOW_IN_STATUS_BAR.get()
+                    )),
                 );
-
-            let add_btn = layout::secondary(
-                gpui::ElementId::Name(add_id.clone().into()),
-                text::ACCOUNTS_ADD.get(),
-            )
-            .icon(IconName::Plus)
-            // OWE-881: 브라우저 로그인 진행 중에는 중복 시작을 막는다.
-            .disabled(self.login_pending.is_some())
-            .debug_selector(move || add_id.clone())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.login_account(provider, None, cx);
-            }));
-            let mut sub_controls = layout::controls();
             if !provider_installed
                 && let Some(install_cmd) = agent_install_command(provider.as_str())
             {
                 let install_id = format!("admin-install-provider-{}", provider.as_str());
                 let install_host = self.account_host.clone();
-                sub_controls = sub_controls.child(
+                provider_line = provider_line.child(
                     layout::secondary(
                         gpui::ElementId::Name(install_id.clone().into()),
                         text::INSTALL_IN_TERMINAL.get(),
                     )
+                    .xsmall()
                     .icon(IconName::SquareTerminal)
                     .debug_selector(move || install_id.clone())
                     .on_click(move |_, _, cx| {
@@ -7887,84 +8225,47 @@ impl SettingsView {
                     }),
                 );
             }
+            provider_line = provider_line.child(
+                layout::secondary(
+                    gpui::ElementId::Name(add_id.clone().into()),
+                    text::ACCOUNTS_ADD.get(),
+                )
+                .xsmall()
+                .icon(IconName::Plus)
+                // OWE-881: 브라우저 로그인 진행 중에는 중복 시작을 막는다.
+                .disabled(self.login_pending.is_some())
+                .debug_selector(move || add_id.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.login_account(provider, None, cx);
+                })),
+            );
             if !self.account_host.is_remote()
                 && matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
             {
                 let add_copy_id = format!("admin-add-account-copy-link-{}", provider.as_str());
-                sub_controls = sub_controls.child(
-                    layout::secondary(
-                        gpui::ElementId::Name(add_copy_id.clone().into()),
-                        text::ACCOUNTS_ADD_COPY_LINK.get(),
-                    )
-                    .icon(IconName::Copy)
-                    .disabled(self.login_pending.is_some())
-                    .debug_selector(move || add_copy_id.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.login_account_with_mode(provider, None, false, cx);
-                    })),
+                provider_line = provider_line.child(
+                    Button::new(gpui::ElementId::Name(add_copy_id.clone().into()))
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::Copy)
+                        .tooltip(text::ACCOUNTS_ADD_COPY_LINK.get())
+                        .accessibility_label(text::ACCOUNTS_ADD_COPY_LINK.get())
+                        .disabled(self.login_pending.is_some())
+                        .debug_selector(move || add_copy_id.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.login_account_with_mode(provider, None, false, cx);
+                        })),
                 );
             }
-            sub_controls = sub_controls.child(add_btn);
-            let sub_id = format!("admin-accounts-subheader-{}", provider.as_str());
-            let subheader = div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(
-                    layout::label(
-                        p,
-                        text::ACCOUNTS_SUBHEADER.get(),
-                        Some(text::ACCOUNTS_SUBHEADER_DESC.get()),
-                    )
-                    .id(SharedString::from(sub_id.clone()))
-                    .debug_selector(move || sub_id.clone()),
-                )
-                .child(sub_controls);
 
-            // "활성 계정" 한 줄: 새 세션이 어느 로그인으로 뜨는지(시스템 기본값인지 추가 계정인지) 한눈에.
-            let active_name = accounts.iter().find(|a| a.active).map_or_else(
-                || text::SYSTEM_DEFAULT.get().to_owned(),
-                |a| account_heading(a).0,
-            );
-            let active_id = format!("admin-accounts-active-{}", provider.as_str());
-            let active_line = div()
-                .id(SharedString::from(active_id.clone()))
-                .debug_selector(move || active_id.clone())
-                .flex()
-                .items_center()
-                .gap_2()
-                .min_w_0()
-                .text_size(crate::ui::TEXT_XS)
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(p.muted_foreground)
-                        .child(text::ACCOUNTS_ACTIVE.get()),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(active_name),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(p.muted_foreground)
-                        .child(text::ACCOUNTS_ACTIVE_HINT.get()),
-                );
-
-            let mut list = div().flex().flex_col().gap_2();
+            let mut section = div().flex().flex_col().gap_1().child(provider_line);
             // agy·OpenCode 로그인은 터미널에서 진행한다. [+ 계정 추가]를 눌러도
             // 명령을 바로 큐에 넣지 않고, 이 안내 카드의 [터미널에서 실행]을 눌러야 간다.
             if self.terminal_login_provider == Some(provider) {
                 let run_id = format!("admin-{}-login-run", provider.as_str());
                 let dismiss_id = format!("admin-{}-login-dismiss", provider.as_str());
                 let guide_id = format!("admin-{}-login-guide", provider.as_str());
-                list = list.child(
+                section = section.child(
                     layout::card(p)
                         .id(SharedString::from(guide_id.clone()))
                         .debug_selector(move || guide_id.clone())
@@ -8014,88 +8315,82 @@ impl SettingsView {
                         ),
                 );
             }
-            for acc in &accounts {
-                list = list.child(self.render_account_row(
-                    acc,
-                    status_index.get(acc.id.as_str()),
-                    duplicates.get(&acc.id).cloned(),
-                    cx,
-                ));
+            if provider == ProviderKind::OpenCode && self.account_host.is_local() {
+                let open = self.opencode_key_open;
+                let configured = self.opencode_api_key_configured;
+                section = section.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            layout::ghost(
+                                "admin-opencode-api-key-toggle",
+                                text::OPENCODE_APIKEY_TITLE.get(),
+                            )
+                            .icon(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .debug_selector(|| "admin-opencode-api-key-toggle".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.opencode_key_open = !this.opencode_key_open;
+                                cx.notify();
+                            })),
+                        )
+                        // 파일을 읽기 전에는 저장 여부를 단정하지 않는다.
+                        .children(configured.map(|configured| {
+                            crate::ui::badge(
+                                p,
+                                if configured {
+                                    crate::ui::BadgeTone::Success
+                                } else {
+                                    crate::ui::BadgeTone::Muted
+                                },
+                                if configured {
+                                    text::OPENCODE_APIKEY_SAVED.get()
+                                } else {
+                                    text::OPENCODE_APIKEY_NOT_SAVED.get()
+                                },
+                            )
+                            .id("admin-opencode-api-key-badge")
+                            .debug_selector(|| "admin-opencode-api-key-badge".into())
+                        })),
+                );
+                if open {
+                    section = section.child(self.render_opencode_api_key_card(window, cx));
+                }
             }
-            // 이 기기에서 추가한 계정이 없으면 Orca처럼 점선 빈 상태 안내를 보인다.
+            if !accounts.is_empty() {
+                let rows: Vec<_> = accounts
+                    .iter()
+                    .map(|acc| {
+                        self.render_account_row(
+                            acc,
+                            status_index.get(acc.id.as_str()),
+                            duplicates.get(&acc.id).cloned(),
+                            cx,
+                        )
+                    })
+                    .collect();
+                section = section.child(crate::ui::group(p, rows));
+            }
+            // 이 호스트에 추가한 계정이 없으면 한 줄로 안내한다.
             if !accounts
                 .iter()
                 .any(|a| !a.host_default && !crate::accounts::orca_managed(a))
             {
                 let empty_id = format!("admin-accounts-empty-{}", provider.as_str());
-                list = list.child(
+                section = section.child(
                     div()
                         .id(SharedString::from(empty_id.clone()))
                         .debug_selector(move || empty_id.clone())
-                        .flex()
-                        .px_3()
-                        .py_4()
-                        .rounded(crate::ui::RADIUS_MD)
-                        .border_1()
-                        .border_dashed()
-                        .border_color(p.border)
-                        .child(layout::label(
-                            p,
-                            text::ACCOUNTS_EMPTY.get(),
-                            Some(text::ACCOUNTS_EMPTY_DESC.get()),
-                        )),
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::ACCOUNTS_EMPTY_HINT.format(&[("host", &host_label)])),
                 );
-            }
-
-            let mut section = div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(header)
-                .child(subheader)
-                .child(active_line);
-            if provider == ProviderKind::OpenCode && self.account_host.is_local() {
-                section = section.child(self.render_opencode_api_key_card(window, cx));
-            }
-            section = section.child(list);
-
-            // 계정별 자동 전환 규칙은 섹션 하단 "고급" 하나로 접는다(기본 접힘).
-            let ruled: Vec<_> = accounts
-                .iter()
-                .filter(|a| !crate::accounts::orca_managed(a))
-                .collect();
-            if !ruled.is_empty() {
-                let open = self.advanced_open.contains(&provider);
-                let n = policy
-                    .rules
-                    .iter()
-                    .filter(|r| r.provider == provider)
-                    .count();
-                let adv_id = format!("admin-accounts-advanced-{}", provider.as_str());
-                section = section.child(
-                    div().child(
-                        layout::ghost(
-                            gpui::ElementId::Name(adv_id.clone().into()),
-                            text::ACCOUNTS_ADVANCED.format(&[("n", &n.to_string())]),
-                        )
-                        .icon(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .debug_selector(move || adv_id.clone())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.advanced_open.remove(&provider) {
-                                this.advanced_open.insert(provider);
-                            }
-                            cx.notify();
-                        })),
-                    ),
-                );
-                if open {
-                    section = section
-                        .children(ruled.into_iter().map(|a| self.render_account_rule(a, cx)));
-                }
             }
 
             if provider_installed {
@@ -8104,39 +8399,56 @@ impl SettingsView {
                 not_installed.push(section);
             }
         }
-        // OWE-706: 설치되지 않은 프로바이더는 접힌 "설치 안 됨" 묶음 아래로 보낸다.
-        if !not_installed.is_empty() {
-            let open = self.not_installed_open;
-            root = root.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_8()
-                    .child(
-                        div().child(
-                            layout::ghost(
-                                "admin-accounts-not-installed",
-                                text::PROVIDERS_NOT_INSTALLED
-                                    .format(&[("n", &not_installed.len().to_string())]),
-                            )
-                            .icon(if open {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .debug_selector(|| "admin-accounts-not-installed".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.not_installed_open = !this.not_installed_open;
-                                cx.notify();
-                            })),
-                        ),
+
+        let orphans_open = self.orphans_open;
+        let fold_button = |id: &'static str, label: String, open: bool| {
+            layout::ghost(id, label)
+                .icon(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .debug_selector(move || id.into())
+        };
+        root = root.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .when(not_installed_count > 0, |d| {
+                    d.child(
+                        fold_button(
+                            "admin-accounts-not-installed",
+                            text::PROVIDERS_NOT_INSTALLED
+                                .format(&[("n", &not_installed_count.to_string())]),
+                            self.not_installed_open,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.not_installed_open = !this.not_installed_open;
+                            cx.notify();
+                        })),
                     )
-                    .when(open, |d| d.children(not_installed)),
-            );
-        }
+                })
+                .when(!self.orphan_profiles.is_empty(), |d| {
+                    d.child(
+                        fold_button(
+                            "admin-orphan-toggle",
+                            text::ORPHANS_TITLE
+                                .format(&[("count", &self.orphan_profiles.len().to_string())]),
+                            orphans_open,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.orphans_open = !this.orphans_open;
+                            cx.notify();
+                        })),
+                    )
+                }),
+        );
+        root = root.children(not_installed);
 
         // OWE-704: 이전 "제거"가 남긴 프로필 폴더 정리(휴지통 이동, 두 번 눌러 확인).
-        if !self.orphan_profiles.is_empty() {
+        if orphans_open && !self.orphan_profiles.is_empty() {
             let purge = self.confirm_button(
                 "admin-purge-orphans",
                 text::ORPHANS_PURGE.get(),
@@ -8177,6 +8489,49 @@ impl SettingsView {
                     })),
             );
         }
+        root
+    }
+
+    /// 자동 전환 띠의 접힌 한 줄 요약.
+    fn auto_switch_summary(&self) -> String {
+        let policy = &self.accounts_snapshot.auto_switch;
+        let mut parts = Vec::new();
+        if policy.enabled {
+            parts.push(
+                text::AUTO_SWITCH_SUMMARY_EARLY
+                    .format(&[("threshold", &policy.threshold_percent.to_string())]),
+            );
+            parts.push(
+                if policy.switch_on_rate_limit {
+                    text::AUTO_SWITCH_SUMMARY_LIMIT_ON
+                } else {
+                    text::AUTO_SWITCH_SUMMARY_LIMIT_OFF
+                }
+                .get()
+                .to_owned(),
+            );
+            if self.accounts_snapshot.advanced.supported {
+                let minutes = self.accounts_snapshot.advanced.policy.cooldown_secs / 60;
+                parts.push(
+                    text::AUTO_SWITCH_SUMMARY_COOLDOWN.format(&[("minutes", &minutes.to_string())]),
+                );
+            }
+        } else {
+            parts.push(text::AUTO_SWITCH_SUMMARY_OFF.get().to_owned());
+        }
+        parts.push(
+            text::AUTO_SWITCH_SUMMARY_RULES.format(&[("n", &policy.rules.len().to_string())]),
+        );
+        parts.join(", ")
+    }
+
+    /// 계정 탭 맨 위의 자동 전환 띠. 접으면 요약과 스위치 한 줄, 펼치면 전역 설정과 계정별 규칙이 한곳에 있다.
+    fn render_auto_switch_strip(&self, cx: &mut Context<Self>) -> gpui::Div {
+        use gpui_component::{Icon, IconName, Sizable as _};
+        use krill_proto::usage::UsageRequest;
+        let p = crate::ui::palette(cx);
+        let policy = self.accounts_snapshot.auto_switch.clone();
+        let open = self.auto_switch_open;
 
         let view = cx.entity();
         let toggle_btn = layout::switch(
@@ -8195,6 +8550,64 @@ impl SettingsView {
             },
         )
         .aria_label(text::AUTO_SWITCH_TITLE.get());
+        let head = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .pr_2p5()
+            .child(
+                div()
+                    .id("admin-auto-switch-strip")
+                    .debug_selector(|| "admin-auto-switch-strip".into())
+                    .role(gpui::Role::Button)
+                    .aria_label(text::AUTO_SWITCH_TITLE.get())
+                    .aria_expanded(open)
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.accent))
+                    .focus_visible(|d| d.bg(p.accent))
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2p5()
+                    .py_2()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.auto_switch_open = !this.auto_switch_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .with_size(crate::ui::ICON_XS)
+                        .text_color(p.muted_foreground),
+                    )
+                    .child(self.search_focus.label(
+                        p,
+                        text::AUTO_SWITCH_TITLE.get(),
+                        self.auto_switch_summary(),
+                    )),
+            )
+            .child(layout::controls().child(toggle_btn))
+            .into_any_element();
+        if !open {
+            return crate::ui::group(p, [head]);
+        }
+
+        let setting_row = || {
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_2()
+        };
         let view = cx.entity();
         let rl_switch = layout::switch(
             p,
@@ -8212,18 +8625,6 @@ impl SettingsView {
             },
         )
         .aria_label(text::AUTO_SWITCH_RATE_LIMIT.get());
-        let rate_limit_row = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .child(layout::label(
-                p,
-                text::AUTO_SWITCH_RATE_LIMIT.get(),
-                Some(text::AUTO_SWITCH_RATE_LIMIT_DESC.get()),
-            ))
-            .child(layout::controls().child(rl_switch));
         let preset_btns = krill_proto::usage::AUTO_SWITCH_PRESETS
             .into_iter()
             .map(|pct| {
@@ -8243,39 +8644,37 @@ impl SettingsView {
                     this.apply_account_request(UsageRequest::SetAutoSwitch(next), cx);
                 }))
             });
-        let threshold_row = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .child(layout::label(
-                p,
-                text::AUTO_SWITCH_THRESHOLD.get(),
-                Some(text::AUTO_SWITCH_THRESHOLD_DESC.get()),
-            ))
-            .child(layout::controls().child(layout::segmented_control(p, preset_btns)));
-
-        let mut auto_switch_card = layout::card(p)
+        let mut body = div()
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
-            .gap_2p5()
+            .gap_3()
+            .p_2p5()
             .child(
                 div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::AUTO_SWITCH_DESC.get()),
+            )
+            .child(
+                setting_row()
                     .child(layout::label(
                         p,
-                        text::AUTO_SWITCH_TITLE.get(),
-                        Some(text::AUTO_SWITCH_DESC.get()),
+                        text::AUTO_SWITCH_THRESHOLD.get(),
+                        Some(text::AUTO_SWITCH_THRESHOLD_DESC.get()),
                     ))
-                    .child(layout::controls().child(toggle_btn)),
+                    .child(layout::controls().child(layout::segmented_control(p, preset_btns))),
             )
-            .child(threshold_row)
-            .child(rate_limit_row);
+            .child(
+                setting_row()
+                    .child(layout::label(
+                        p,
+                        text::AUTO_SWITCH_RATE_LIMIT.get(),
+                        Some(text::AUTO_SWITCH_RATE_LIMIT_DESC.get()),
+                    ))
+                    .child(layout::controls().child(rl_switch)),
+            );
 
         if self.accounts_snapshot.advanced.supported {
             let adv = self.accounts_snapshot.advanced.policy.clone();
@@ -8332,14 +8731,9 @@ impl SettingsView {
                     this.apply_account_request(UsageRequest::SetAdvancedPolicy(next), cx);
                 }))
             });
-            auto_switch_card = auto_switch_card
+            body = body
                 .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
+                    setting_row()
                         .child(layout::label(
                             p,
                             crate::i18n::catalog::shell::ACCOUNT_PREDICT.get(),
@@ -8348,12 +8742,7 @@ impl SettingsView {
                         .child(layout::controls().child(predict_switch)),
                 )
                 .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
+                    setting_row()
                         .child(layout::label(
                             p,
                             crate::i18n::catalog::shell::ACCOUNT_RESET_FIRST.get(),
@@ -8362,12 +8751,7 @@ impl SettingsView {
                         .child(layout::controls().child(reset_switch)),
                 )
                 .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
+                    setting_row()
                         .child(layout::label(
                             p,
                             crate::i18n::catalog::shell::ACCOUNT_COOLDOWN.get(),
@@ -8379,44 +8763,127 @@ impl SettingsView {
                 );
         }
 
-        auto_switch_card = auto_switch_card.child(
-            div()
-                .flex()
-                .items_center()
+        body = body.child(
+            layout::controls()
                 .justify_end()
-                .gap_2()
-                .flex_wrap()
                 .child(
-                    layout::controls()
-                        .child(
-                            layout::secondary(
-                                "admin-accounts-refresh",
-                                text::ACCOUNTS_REFRESH.get(),
-                            )
-                            .icon(IconName::RefreshCw)
-                            .loading(self.accounts_refresh_pending)
-                            .debug_selector(|| "admin-accounts-refresh".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.refresh_accounts_manually(cx);
-                            })),
+                    layout::secondary("admin-accounts-refresh", text::ACCOUNTS_REFRESH.get())
+                        .icon(IconName::RefreshCw)
+                        .loading(self.accounts_refresh_pending)
+                        .debug_selector(|| "admin-accounts-refresh".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_accounts_manually(cx);
+                        })),
+                )
+                .when(self.account_host.is_local(), |c| {
+                    c.child(
+                        layout::secondary(
+                            "admin-open-accounts-toml",
+                            text::ACCOUNTS_OPEN_TOML.get(),
                         )
-                        .when(self.account_host.is_local(), |c| {
-                            c.child(
-                                layout::secondary(
-                                    "admin-open-accounts-toml",
-                                    text::ACCOUNTS_OPEN_TOML.get(),
-                                )
-                                .icon(IconName::ExternalLink)
-                                .debug_selector(|| "admin-open-accounts-toml".into())
-                                .on_click(|_, _, cx| {
-                                    open_file("accounts.toml", "", cx);
-                                }),
-                            )
+                        .icon(IconName::ExternalLink)
+                        .debug_selector(|| "admin-open-accounts-toml".into())
+                        .on_click(|_, _, cx| {
+                            open_file("accounts.toml", "", cx);
                         }),
-                ),
+                    )
+                }),
         );
 
-        root.child(auto_switch_card)
+        let mut ruled: Vec<_> = self
+            .accounts_snapshot
+            .accounts
+            .iter()
+            .filter(|a| !crate::accounts::orca_managed(a))
+            .collect();
+        ruled.sort_by_key(|a| a.provider);
+        if !ruled.is_empty() {
+            body = body.child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(p.muted_foreground)
+                    .child(text::ACCOUNTS_RULES_TITLE.get()),
+            );
+            let mut rules = div().flex().flex_col();
+            for acc in ruled {
+                let rule_open = self.rule_open.as_deref() == Some(acc.id.as_str());
+                let summary = self
+                    .accounts_snapshot
+                    .auto_switch
+                    .rule_for(acc.provider, &acc.id)
+                    .map_or_else(
+                        || text::ACCOUNTS_RULE_NONE.get().to_owned(),
+                        |rule| rule_summary(rule, &self.accounts_snapshot.accounts),
+                    );
+                let row_id = format!("admin-rule-row-{}", acc.id);
+                let open_id = format!("admin-rule-open-{}", acc.id);
+                let acc_id = acc.id.clone();
+                rules = rules.child(
+                    div()
+                        .id(SharedString::from(row_id.clone()))
+                        .debug_selector(move || row_id.clone())
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .py_1p5()
+                        .border_t_1()
+                        .border_color(p.border)
+                        .child(crate::ui::icons::provider_icon(
+                            acc.provider,
+                            crate::ui::ICON_XS,
+                            p.foreground,
+                        ))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::ui::TEXT_SM)
+                                .child(account_heading(acc).0),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex_basis(px(140.))
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(summary),
+                        )
+                        .child(
+                            layout::ghost(
+                                gpui::ElementId::Name(open_id.clone().into()),
+                                if rule_open {
+                                    text::ACCOUNTS_RULE_COLLAPSE.get()
+                                } else {
+                                    text::ACCOUNTS_RULE_EDIT.get()
+                                },
+                            )
+                            .xsmall()
+                            .debug_selector(move || open_id.clone())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.rule_open =
+                                        if this.rule_open.as_deref() == Some(acc_id.as_str()) {
+                                            None
+                                        } else {
+                                            Some(acc_id.clone())
+                                        };
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                );
+                if rule_open {
+                    rules = rules.child(self.render_account_rule(acc, cx));
+                }
+            }
+            body = body.child(rules);
+        }
+        crate::ui::group(p, [head, body.into_any_element()])
     }
 
     fn render_agents_tab(
@@ -8425,97 +8892,7 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        use gpui_component::Sizable as _;
         let p = crate::ui::palette(cx);
-        let default_agent_btns = [
-            ("claude", "Claude Code"),
-            ("codex", "Codex"),
-            ("agy", "Antigravity"),
-            ("cursor", "Cursor"),
-            ("opencode", "OpenCode"),
-        ]
-        .into_iter()
-        .map(|(agent_id, label)| {
-            let btn_id = format!("admin-default-agent-{agent_id}");
-            let check_id = format!("admin-default-agent-check-{agent_id}");
-            let selected = s.default_agent == agent_id;
-            div()
-                .id(gpui::ElementId::Name(btn_id.clone().into()))
-                .debug_selector(move || btn_id.clone())
-                .role(gpui::Role::RadioButton)
-                .aria_label(label)
-                .aria_toggled(if selected {
-                    gpui::Toggled::True
-                } else {
-                    gpui::Toggled::False
-                })
-                .tab_index(0)
-                .focus_visible(|style| style.border_color(p.ring))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1p5()
-                .rounded(crate::ui::RADIUS_SM)
-                .border_1()
-                .cursor_pointer()
-                .text_size(crate::ui::TEXT_SM)
-                .when(selected, |d| {
-                    d.border_color(p.muted_foreground.opacity(0.4))
-                        .bg(p.accent)
-                        .text_color(p.accent_foreground)
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                })
-                .when(!selected, |d| {
-                    d.border_color(p.border)
-                        .bg(p.background.opacity(0.5))
-                        .text_color(p.muted_foreground)
-                        .hover(|st| {
-                            st.border_color(p.muted_foreground.opacity(0.35))
-                                .bg(p.accent.opacity(0.5))
-                                .text_color(p.foreground)
-                        })
-                        .active(|st| st.bg(p.accent))
-                })
-                .on_click(move |_, _, cx| {
-                    edit(cx, move |s| agent_id.clone_into(&mut s.default_agent));
-                })
-                .child(crate::ui::icons::agent_menu_icon(agent_id))
-                .child(label)
-                .when(selected, |d| {
-                    d.child(
-                        div()
-                            .id(gpui::ElementId::Name(check_id.clone().into()))
-                            .debug_selector(move || check_id.clone())
-                            .flex()
-                            .items_center()
-                            .child(
-                                gpui_component::Icon::new(gpui_component::IconName::Check).xsmall(),
-                            ),
-                    )
-                })
-        });
-        let default_agent_row = layout::card(p)
-            .id("admin-default-agent-card")
-            .debug_selector(|| "admin-default-agent-card".into())
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .child(self.search_focus.label(
-                p,
-                text::DEFAULT_AGENT_TITLE.get(),
-                Some(text::DEFAULT_AGENT_DESC.get()),
-            ))
-            .child(
-                layout::controls()
-                    .w_full()
-                    .min_w_0()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(default_agent_btns),
-            );
-
         let view_mode_term = layout::segment(
             p,
             "admin-view-mode-terminal",
@@ -8536,7 +8913,7 @@ impl SettingsView {
         .on_click(|_, _, cx| {
             edit(cx, move |s| s.default_view_mode = DefaultViewMode::Chat);
         });
-        let default_view_mode_row = layout::row(p)
+        let default_view_mode_row = crate::ui::group_row()
             .child(self.search_focus.label(
                 p,
                 text::DEFAULT_VIEW_MODE_TITLE.get(),
@@ -8575,7 +8952,8 @@ impl SettingsView {
                 Some(krill_proto::agent::Permission::Manual);
             edit(cx, move |s| s.yolo_mode = false);
         });
-        let yolo_row = layout::row(p)
+        let yolo_row = crate::ui::group_row()
+            .py_1p5()
             .child(
                 self.search_focus
                     .label(p, text::YOLO_TITLE.get(), Some(text::YOLO_DESC.get())),
@@ -8588,7 +8966,7 @@ impl SettingsView {
                 ),
             );
 
-        let hooks_row = layout::row(p)
+        let hooks_row = crate::ui::group_row()
             .child(self.search_focus.label(
                 p,
                 text::AGENT_HOOKS_TITLE.get(),
@@ -8616,7 +8994,7 @@ impl SettingsView {
                 ),
             );
 
-        let auto_setup_row = layout::row(p)
+        let auto_setup_row = crate::ui::group_row()
             .child(self.search_focus.label(
                 p,
                 text::AUTO_SETUP_ALL_TITLE.get(),
@@ -8677,112 +9055,133 @@ impl SettingsView {
                 ),
             );
 
-        let mut root = div()
+        let open_toml_row = crate::ui::group_row()
+            .child(self.search_focus.label(
+                p,
+                text::AGENTS_PROFILES_TITLE.get(),
+                Some(text::AGENTS_PROFILES_DESC.get()),
+            ))
+            .child(
+                layout::controls().child(
+                    layout::secondary("admin-agents-open-toml", text::AGENTS_OPEN_TOML.get())
+                        .icon(gpui_component::IconName::ExternalLink)
+                        .debug_selector(|| "admin-agents-open-toml".into())
+                        .on_click(|_, _, cx| {
+                            open_file(krill_proto::agent::FILE_NAME, "", cx);
+                        }),
+                ),
+            );
+        let quick_commands_row = crate::ui::group_row()
+            .child(layout::label(
+                p,
+                text::TAB_QUICK_COMMANDS.get(),
+                Some(text::TAB_QUICK_COMMANDS_DESC.get()),
+            ))
+            .child(
+                layout::controls().child(
+                    layout::secondary("open-quick-commands", text::DISK_OPEN.get())
+                        .debug_selector(|| "open-quick-commands".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_tab(AdminTab::QuickCommands, cx);
+                        })),
+                ),
+            );
+        let project_row = crate::ui::group_row()
+            .child(layout::label(
+                p,
+                text::TAB_PROJECT.get(),
+                Some(text::TAB_PROJECT_DESC.get()),
+            ))
+            .child(
+                layout::controls().child(
+                    layout::secondary("open-project-settings", text::DISK_OPEN.get())
+                        .debug_selector(|| "open-project-settings".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_tab(AdminTab::Project, cx);
+                        })),
+                ),
+            );
+
+        let (trust_row, trust_confirm) = self.render_workspace_trust(s, cx);
+        let dir = state_dir(cx);
+        self.ensure_agents_file(dir.as_deref(), cx);
+        // 초기 읽기가 끝나기 전에는 행 자리만 두고 펼치기를 잠근다. 이때 편집기를 기본값으로 만들면
+        // 사용자 인자가 늦게 도착해도 입력 상태에 반영되지 않는다.
+        let loaded = dir.is_none() || self.agents_file_cache.0.is_some();
+        let list = self.render_agent_list(&s.default_agent, loaded, window, cx);
+        div()
             .flex()
             .flex_col()
             .gap_3()
-            .child(default_agent_row)
-            .child(default_view_mode_row)
-            .child(yolo_row)
-            .child(hooks_row)
-            .child(auto_setup_row)
-            .child(
-                layout::row(p)
-                    .child(layout::label(
-                        p,
-                        text::TAB_QUICK_COMMANDS.get(),
-                        Some(text::TAB_QUICK_COMMANDS_DESC.get()),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary("open-quick-commands", text::DISK_OPEN.get())
-                                .debug_selector(|| "open-quick-commands".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.set_tab(AdminTab::QuickCommands, cx);
-                                })),
-                        ),
-                    ),
-            )
-            .child(
-                layout::row(p)
-                    .child(layout::label(
-                        p,
-                        text::TAB_PROJECT.get(),
-                        Some(text::TAB_PROJECT_DESC.get()),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary("open-project-settings", text::DISK_OPEN.get())
-                                .debug_selector(|| "open-project-settings".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.set_tab(AdminTab::Project, cx);
-                                })),
-                        ),
-                    ),
-            );
-
-        let builtin_agents = krill_proto::agent::Agents::load(None).unwrap_or_default();
-        let dir = state_dir(cx);
-        self.ensure_agents_file(dir.as_deref(), cx);
-        // 초기 읽기가 끝나기 전에 편집기를 기본값으로 만들면 사용자 인자가
-        // 늦게 도착해도 입력 상태에 반영되지 않는다. 로드 후 처음 만든다.
-        if dir.is_some() && self.agents_file_cache.0.is_none() {
-            return root.children(self.render_agent_extra_rows(s, cx));
-        }
-        let effective = self
-            .agents_parsed
-            .clone()
-            .unwrap_or_else(|| std::sync::Arc::new(builtin_agents.clone()));
-        root = root.child(self.render_agent_catalog_card(&builtin_agents, &effective, window, cx));
-        if let Some(status) = &self.skill_status {
-            root = root.child(
+            .child(layout::section_title(
+                p,
+                "agents-section-safety",
+                text::SECTION_AGENT_SAFETY.get(),
+            ))
+            .child(crate::ui::group(p, [yolo_row, trust_row]))
+            .children(trust_confirm)
+            .child(list)
+            .children(self.skill_status.clone().map(|status| {
                 layout::card(p)
                     .debug_selector(|| "admin-agent-setup-status".into())
-                    .child(div().text_size(crate::ui::TEXT_XS).child(status.clone())),
-            );
-        }
-        root.children(self.render_agent_extra_rows(s, cx))
+                    .child(div().text_size(crate::ui::TEXT_XS).child(status))
+            }))
+            .child(crate::ui::group(
+                p,
+                [
+                    open_toml_row,
+                    default_view_mode_row,
+                    hooks_row,
+                    auto_setup_row,
+                    quick_commands_row,
+                    project_row,
+                ],
+            ))
     }
 
+    /// 신뢰 확인 자동 통과 행과, 켤 때 나오는 확인 카드.
     #[inline(never)]
-    fn render_agent_extra_rows(&mut self, s: &Settings, cx: &mut Context<Self>) -> Vec<gpui::Div> {
+    fn render_workspace_trust(
+        &mut self,
+        s: &Settings,
+        cx: &mut Context<Self>,
+    ) -> (gpui::Div, Option<gpui::Stateful<gpui::Div>>) {
         let p = crate::ui::palette(cx);
         let view = cx.entity();
-        let mut workspace_trust_section = div().w_full().min_w_0().flex().flex_col().gap_2().child(
-            layout::row(p)
-                .child(self.search_focus.label(
-                    p,
-                    text::WORKSPACE_TRUST_PRESET.get(),
-                    Some(text::WORKSPACE_TRUST_PRESET_DESC.get()),
-                ))
-                .child(
-                    layout::controls().child(
-                        layout::switch(
-                            p,
-                            "workspace-trust-preset-toggle",
-                            s.workspace_trust_preset_enabled,
-                            false,
-                            move |next, _, cx| {
-                                view.update(cx, |this, cx| {
-                                    if next {
-                                        if !current(cx).workspace_trust_preset_enabled {
-                                            this.workspace_trust_confirm_pending = true;
-                                            cx.notify();
-                                        }
-                                    } else {
-                                        this.workspace_trust_confirm_pending = false;
-                                        edit(cx, move |s| s.workspace_trust_preset_enabled = false);
+        let row = crate::ui::group_row()
+            .py_1p5()
+            .child(self.search_focus.label(
+                p,
+                text::WORKSPACE_TRUST_PRESET.get(),
+                Some(text::WORKSPACE_TRUST_PRESET_DESC.get()),
+            ))
+            .child(
+                layout::controls().child(
+                    layout::switch(
+                        p,
+                        "workspace-trust-preset-toggle",
+                        s.workspace_trust_preset_enabled,
+                        false,
+                        move |next, _, cx| {
+                            view.update(cx, |this, cx| {
+                                if next {
+                                    if !current(cx).workspace_trust_preset_enabled {
+                                        this.workspace_trust_confirm_pending = true;
                                         cx.notify();
                                     }
-                                });
-                            },
-                        )
-                        .aria_label(text::WORKSPACE_TRUST_PRESET.get()),
-                    ),
+                                } else {
+                                    this.workspace_trust_confirm_pending = false;
+                                    edit(cx, move |s| s.workspace_trust_preset_enabled = false);
+                                    cx.notify();
+                                }
+                            });
+                        },
+                    )
+                    .aria_label(text::WORKSPACE_TRUST_PRESET.get()),
                 ),
-        );
-        if self.workspace_trust_confirm_pending && !s.workspace_trust_preset_enabled {
-            workspace_trust_section = workspace_trust_section.child(
+            );
+        let confirm = (self.workspace_trust_confirm_pending && !s.workspace_trust_preset_enabled)
+            .then(|| {
                 layout::card(p)
                     .id("workspace-trust-preset-confirm")
                     .debug_selector(|| "workspace-trust-preset-confirm".into())
@@ -8836,81 +9235,54 @@ impl SettingsView {
                                     },
                                 )),
                             ),
-                    ),
-            );
-        }
-        vec![workspace_trust_section]
+                    )
+            });
+        (row, confirm)
     }
 
+    /// 기본 에이전트 고르기와 실행 프로필을 합친 한 목록. 검색의 "기본 에이전트"는 이 목록으로 온다.
     #[inline(never)]
-    fn render_agent_catalog_card(
+    fn render_agent_list(
         &mut self,
-        builtin_agents: &krill_proto::agent::Agents,
-        effective: &krill_proto::agent::Agents,
+        default_agent: &str,
+        loaded: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
-        let mut card = layout::card(p)
-            .id("admin-agents-catalog-card")
-            .debug_selector(|| "admin-agents-catalog-card".into())
-            .flex()
-            .flex_col()
-            .gap_0()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .pb_2p5()
-                    .border_b_1()
-                    .border_color(p.border)
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(self.search_focus.label(
-                        p,
-                        text::AGENTS_PROFILES_TITLE.get(),
-                        Some(text::AGENTS_PROFILES_DESC.get()),
-                    ))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary(
-                                "admin-agents-open-toml",
-                                text::AGENTS_OPEN_TOML.get(),
-                            )
-                            .icon(gpui_component::IconName::ExternalLink)
-                            .debug_selector(|| "admin-agents-open-toml".into())
-                            .on_click(|_, _, cx| {
-                                open_file(krill_proto::agent::FILE_NAME, "", cx);
-                            }),
-                        ),
-                    ),
-            );
-        for (idx, agent_id) in ["claude", "codex", "agy", "cursor", "opencode"]
-            .into_iter()
-            .enumerate()
-        {
-            card = card.child(self.render_agent_catalog_row(
-                idx,
-                agent_id,
-                builtin_agents,
-                effective,
-                window,
-                cx,
-            ));
+        let parsed = self.agents_parsed.clone();
+        let checks = crate::onboarding::snapshot(cx).checks;
+        let row_context = AgentRowContext {
+            default_agent,
+            loaded,
+            effective: parsed.as_deref().unwrap_or_else(|| builtin_agents()),
+            checks: &checks,
+        };
+        let rows = ["claude", "codex", "agy", "cursor", "opencode"]
+            .map(|agent_id| self.render_agent_catalog_row(agent_id, &row_context, window, cx));
+        self.search_focus.anchored(
+            p,
+            text::DEFAULT_AGENT_TITLE.get(),
+            crate::ui::group(p, rows)
+                .id("admin-agents-catalog-card")
+                .debug_selector(|| "admin-agents-catalog-card".into())
+                .role(gpui::Role::RadioGroup)
+                .aria_label(text::DEFAULT_AGENT_TITLE.get()),
+        )
+    }
+
+    fn toggle_agent_row(&mut self, agent_id: &'static str, cx: &mut Context<Self>) {
+        if !self.agent_expanded.remove(agent_id) {
+            self.agent_expanded.insert(agent_id);
         }
-        card
+        cx.notify();
     }
 
     #[inline(never)]
     fn render_agent_catalog_row(
         &mut self,
-        idx: usize,
         agent_id: &'static str,
-        builtin_agents: &krill_proto::agent::Agents,
-        effective: &krill_proto::agent::Agents,
+        row_context: &AgentRowContext<'_>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -8918,13 +9290,17 @@ impl SettingsView {
         use krill_proto::doctor::Status as DoctorStatus;
         use krill_proto::usage::ProviderKind;
         let p = crate::ui::palette(cx);
-        let display_name = builtin_agents
-            .profiles
-            .get(agent_id)
+        let AgentRowContext {
+            default_agent,
+            loaded,
+            effective,
+            checks,
+        } = *row_context;
+        let builtin_prof = builtin_agents().profiles.get(agent_id);
+        let display_name = builtin_prof
             .map_or(agent_id, |prof| prof.name.as_str())
             .to_owned();
         let provider = ProviderKind::parse(agent_id);
-        let checks = crate::onboarding::snapshot(cx).checks;
         let agent_check_id = format!("agent.{agent_id}");
         let hook_check_id = format!("hook.{agent_id}");
         let doctor_version = checks
@@ -8948,7 +9324,7 @@ impl SettingsView {
         };
         let (badge_tone, badge_text) = if is_installed {
             let text = match &doctor_version {
-                Some(ver) => format!("{} · {ver}", crate::i18n::catalog::onboarding::READY.get()),
+                Some(ver) => format!("{} {ver}", crate::i18n::catalog::onboarding::READY.get()),
                 None => crate::i18n::catalog::onboarding::READY.get().to_owned(),
             };
             (crate::ui::BadgeTone::Success, text)
@@ -8960,25 +9336,6 @@ impl SettingsView {
         };
         let badge_id = format!("admin-agent-installed-badge-{agent_id}");
 
-        let profile_count = provider.map_or(1usize, |prov| {
-            self.accounts_snapshot
-                .accounts
-                .iter()
-                .filter(|a| a.provider == prov)
-                .count()
-                .max(1)
-        });
-        let active = provider.and_then(|prov| {
-            self.accounts_snapshot
-                .accounts
-                .iter()
-                .find(|a| a.provider == prov && a.active)
-        });
-        let profiles = text::PROFILES_COUNT.format(&[("count", &profile_count.to_string())]);
-        let dir_info = match active {
-            Some(a) => format!("{} ({}) · {profiles}", a.label, a.profile_dir),
-            None => format!("{display_name} · {profiles}"),
-        };
         let eff_prof = effective.profiles.get(agent_id);
         let cmd_name = eff_prof
             .and_then(krill_proto::agent::Profile::program)
@@ -8996,151 +9353,322 @@ impl SettingsView {
             launch_summary.push(' ');
             launch_summary.push_str(&eff_env);
         }
-        let summary_text = format!("{launch_summary} · {dir_info}");
         let summary_id = format!("admin-agent-summary-{agent_id}");
 
-        let hook_cmd = format!("krill hook install {agent_id}");
-        let hook_id = format!("admin-agent-hook-{agent_id}");
-        let hook_copy = hook_cmd.clone();
-        let id_owned = agent_id.to_owned();
-        let install_cmd = agent_install_command(agent_id);
-        let install_id = format!("admin-agent-install-{agent_id}");
-        let builtin_prof = builtin_agents.profiles.get(agent_id);
-        let default_args = builtin_prof
-            .map(|p| p.launch.get(1..).unwrap_or_default().join(" "))
-            .unwrap_or_default();
-        let default_env = builtin_prof
-            .map(|p| krill_proto::agent::format_env_lines(&p.env))
-            .unwrap_or_default();
+        let install_button = agent_install_command(agent_id).map(|cmd_str| {
+            let install_id = format!("admin-agent-install-{agent_id}");
+            let sel = install_id.clone();
+            let name = display_name.clone();
+            layout::secondary(
+                gpui::ElementId::Name(install_id.into()),
+                text::INSTALL_IN_TERMINAL.get(),
+            )
+            .xsmall()
+            .debug_selector(move || sel.clone())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(cmd_str.clone()));
+                queue_terminal_command(cmd_str.clone(), cx);
+                this.skill_status =
+                    Some(text::AGENT_INSTALL_QUEUED.format(&[("name", &name)]).into());
+                cx.notify();
+            }))
+        });
+        let (row_install, body_install) = if is_installed {
+            (None, install_button)
+        } else {
+            (install_button, None)
+        };
 
-        let edit_state = self.agent_edits.entry(agent_id).or_insert_with(|| {
-            let prof = effective.profiles.get(agent_id);
-            let args = prof
+        let is_open = loaded && self.agent_expanded.contains(agent_id);
+        let body = if is_open {
+            let profile_count = provider.map_or(1usize, |prov| {
+                self.accounts_snapshot
+                    .accounts
+                    .iter()
+                    .filter(|a| a.provider == prov)
+                    .count()
+                    .max(1)
+            });
+            let active = provider.and_then(|prov| {
+                self.accounts_snapshot
+                    .accounts
+                    .iter()
+                    .find(|a| a.provider == prov && a.active)
+            });
+            let profiles = text::PROFILES_COUNT.format(&[("count", &profile_count.to_string())]);
+            let dir_info = match active {
+                Some(a) => format!("{} ({}), {profiles}", a.label, a.profile_dir),
+                None => format!("{display_name}, {profiles}"),
+            };
+            let summary_text = format!("{launch_summary}, {dir_info}");
+            let hook_cmd = format!("krill hook install {agent_id}");
+            let hook_id = format!("admin-agent-hook-{agent_id}");
+            let hook_copy = hook_cmd.clone();
+            let id_owned = agent_id.to_owned();
+            let default_args = builtin_prof
                 .map(|p| p.launch.get(1..).unwrap_or_default().join(" "))
                 .unwrap_or_default();
-            let env = prof
+            let default_env = builtin_prof
                 .map(|p| krill_proto::agent::format_env_lines(&p.env))
                 .unwrap_or_default();
-            AgentEdit {
-                args: cx.new(|cx| {
-                    gpui_component::input::InputState::new(window, cx).default_value(args)
-                }),
-                env: cx.new(|cx| {
-                    gpui_component::input::TextareaState::new(window, cx)
-                        .auto_grow(2, 6)
-                        .default_value(env)
-                }),
-                status: None,
-            }
-        });
-        let (args_input, env_input) = (edit_state.args.clone(), edit_state.env.clone());
-        let status = edit_state.status.clone();
-        let is_open = self.agent_expanded.contains(agent_id);
-        let toggle_id = format!("admin-agent-toggle-{agent_id}");
-        let header_id = format!("admin-agent-header-{agent_id}");
-        let editor_id = format!("admin-agent-editor-{agent_id}");
-        let save_id = format!("admin-agent-save-{agent_id}");
-        let reset_id = format!("admin-agent-reset-{agent_id}");
-
-        let edit_section = div()
-            .id(gpui::ElementId::Name(editor_id.clone().into()))
-            .debug_selector(move || editor_id.clone())
-            .w_full()
-            .min_w_0()
-            .pl_9()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .text_size(crate::ui::TEXT_XS)
-            .child(
+            // 입력 상태는 처음 펼칠 때 만든다.
+            let edit_state = self.agent_edits.entry(agent_id).or_insert_with(|| {
+                let args = eff_prof
+                    .map(|p| p.launch.get(1..).unwrap_or_default().join(" "))
+                    .unwrap_or_default();
+                let env = eff_prof
+                    .map(|p| krill_proto::agent::format_env_lines(&p.env))
+                    .unwrap_or_default();
+                AgentEdit {
+                    args: cx.new(|cx| {
+                        gpui_component::input::InputState::new(window, cx).default_value(args)
+                    }),
+                    env: cx.new(|cx| {
+                        gpui_component::input::TextareaState::new(window, cx)
+                            .auto_grow(2, 6)
+                            .default_value(env)
+                    }),
+                    status: None,
+                }
+            });
+            let (args_input, env_input) = (edit_state.args.clone(), edit_state.env.clone());
+            let status = edit_state.status.clone();
+            let editor_id = format!("admin-agent-editor-{agent_id}");
+            let save_id = format!("admin-agent-save-{agent_id}");
+            let reset_id = format!("admin-agent-reset-{agent_id}");
+            Some(
                 div()
-                    .text_color(p.muted_foreground)
-                    .child(text::AGENT_ARGS.get()),
-            )
-            .child(gpui_component::input::Input::new(&args_input).small())
-            .child(
-                div()
-                    .text_color(p.muted_foreground)
-                    .child(text::AGENT_ENV.get()),
-            )
-            .child(gpui_component::input::Textarea::new(&env_input).small())
-            .when_some(status, |d, (msg, is_err)| {
-                d.child(
-                    div()
-                        .debug_selector(move || format!("admin-agent-status-{agent_id}"))
-                        .text_color(if is_err {
-                            p.destructive
-                        } else {
-                            p.muted_foreground
-                        })
-                        .child(msg),
-                )
-            })
-            .child(
-                layout::controls()
+                    .id(gpui::ElementId::Name(editor_id.clone().into()))
+                    .debug_selector(move || editor_id.clone())
+                    .w_full()
+                    .min_w_0()
+                    .pl(px(42.))
+                    .pr_2p5()
+                    .pb_2p5()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .text_size(crate::ui::TEXT_XS)
                     .child(
-                        layout::primary(
-                            gpui::ElementId::Name(save_id.clone().into()),
-                            text::AGENT_SAVE.get(),
-                        )
-                        .debug_selector(move || save_id.clone())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let Some(edit) = this.agent_edits.get_mut(agent_id) else {
-                                return;
-                            };
-                            let args = edit.args.read(cx).value();
-                            let env = edit.env.read(cx).value();
-                            this.save_agent_edit(agent_id, args.to_string(), env.to_string(), cx);
-                        })),
+                        div()
+                            .font_family(crate::ui::FONT_MONO)
+                            .text_color(p.muted_foreground)
+                            .child(summary_text),
                     )
                     .child(
-                        layout::ghost(
-                            gpui::ElementId::Name(reset_id.clone().into()),
-                            text::AGENT_RESET.get(),
+                        layout::controls().pb_1().children(body_install).child(
+                            layout::secondary(
+                                gpui::ElementId::Name(hook_id.clone().into()),
+                                text::HOOK_INSTALL.get(),
+                            )
+                            .xsmall()
+                            .debug_selector(move || hook_id.clone())
+                            .tooltip(text::HOOK_INSTALL_TIP.format(&[("cmd", &hook_cmd)]))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        hook_copy.clone(),
+                                    ));
+                                    let base = if cfg!(test) {
+                                        state_dir(cx).unwrap_or_else(crate::accounts::default_home)
+                                    } else {
+                                        crate::accounts::default_home()
+                                    };
+                                    let state = state_dir(cx).unwrap_or_else(|| base.clone());
+                                    if id_owned == "codex" {
+                                        queue_terminal_command(format!("{hook_copy} --yes"), cx);
+                                        this.skill_status = Some(text::HOOK_QUEUED.get().into());
+                                    } else {
+                                        let id = id_owned.clone();
+                                        let fallback = hook_copy.clone();
+                                        this.file_job(
+                                            "hook-install",
+                                            move || install_agent_hook_at(&id, &base, &state),
+                                            move |this, result, cx| {
+                                                this.skill_status = Some(match result {
+                                                    Ok(path) => text::SKILLS_INSTALLED
+                                                        .format(&[(
+                                                            "path",
+                                                            &path.display().to_string(),
+                                                        )])
+                                                        .into(),
+                                                    Err(error) => {
+                                                        queue_terminal_command(
+                                                            format!("{fallback} --yes"),
+                                                            cx,
+                                                        );
+                                                        text::HOOK_INSTALL_FAILED
+                                                            .format(&[(
+                                                                "error",
+                                                                &error.to_string(),
+                                                            )])
+                                                            .into()
+                                                    }
+                                                });
+                                            },
+                                            cx,
+                                        );
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_color(p.muted_foreground)
+                            .child(text::AGENT_ARGS.get()),
+                    )
+                    .child(gpui_component::input::Input::new(&args_input).small())
+                    .child(
+                        div()
+                            .text_color(p.muted_foreground)
+                            .child(text::AGENT_ENV.get()),
+                    )
+                    .child(gpui_component::input::Textarea::new(&env_input).small())
+                    .when_some(status, |d, (msg, is_err)| {
+                        d.child(
+                            div()
+                                .debug_selector(move || format!("admin-agent-status-{agent_id}"))
+                                .text_color(if is_err {
+                                    p.destructive
+                                } else {
+                                    p.muted_foreground
+                                })
+                                .child(msg),
                         )
-                        .debug_selector(move || reset_id.clone())
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                let Some(edit) = this.agent_edits.get(agent_id) else {
-                                    return;
-                                };
-                                let args_entity = edit.args.clone();
-                                let env_entity = edit.env.clone();
-                                let def_args = default_args.clone();
-                                let def_env = default_env.clone();
-                                args_entity.update(cx, |s, cx| {
-                                    s.set_value(def_args.clone(), window, cx);
-                                });
-                                env_entity.update(cx, |s, cx| {
-                                    s.set_value(def_env.clone(), window, cx);
-                                });
-                                this.save_agent_edit(agent_id, def_args, def_env, cx);
-                            },
-                        )),
+                    })
+                    .child(
+                        layout::controls()
+                            .child(
+                                layout::primary(
+                                    gpui::ElementId::Name(save_id.clone().into()),
+                                    text::AGENT_SAVE.get(),
+                                )
+                                .debug_selector(move || save_id.clone())
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        let Some(edit) = this.agent_edits.get_mut(agent_id) else {
+                                            return;
+                                        };
+                                        let args = edit.args.read(cx).value();
+                                        let env = edit.env.read(cx).value();
+                                        this.save_agent_edit(
+                                            agent_id,
+                                            args.to_string(),
+                                            env.to_string(),
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                layout::ghost(
+                                    gpui::ElementId::Name(reset_id.clone().into()),
+                                    text::AGENT_RESET.get(),
+                                )
+                                .debug_selector(move || reset_id.clone())
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        let Some(edit) = this.agent_edits.get(agent_id) else {
+                                            return;
+                                        };
+                                        let args_entity = edit.args.clone();
+                                        let env_entity = edit.env.clone();
+                                        let def_args = default_args.clone();
+                                        let def_env = default_env.clone();
+                                        args_entity.update(cx, |s, cx| {
+                                            s.set_value(def_args.clone(), window, cx);
+                                        });
+                                        env_entity.update(cx, |s, cx| {
+                                            s.set_value(def_env.clone(), window, cx);
+                                        });
+                                        this.save_agent_edit(agent_id, def_args, def_env, cx);
+                                    },
+                                )),
+                            ),
                     ),
-            );
+            )
+        } else {
+            None
+        };
 
+        let is_default = default_agent == agent_id;
+        let radio_id = format!("admin-default-agent-{agent_id}");
+        let default_badge_id = format!("admin-default-agent-check-{agent_id}");
+        let set_default_label: SharedString = text::AGENT_SET_DEFAULT
+            .format(&[("name", &display_name)])
+            .into();
+        let radio_tip = set_default_label.clone();
+        let radio_tip_id = radio_id.clone();
+        let toggle_id = format!("admin-agent-toggle-{agent_id}");
+        let header_id = format!("admin-agent-header-{agent_id}");
         let card_id = format!("admin-agent-card-{agent_id}");
         div()
             .id(gpui::ElementId::Name(card_id.clone().into()))
             .debug_selector(move || card_id.clone())
             .w_full()
             .min_w_0()
-            .py_2p5()
             .flex()
             .flex_col()
-            .gap_2p5()
-            .when(idx > 0, |d| d.border_t_1().border_color(p.border))
-            .when(!is_installed, |d| d.opacity(0.75))
             .child(
                 div()
                     .w_full()
                     .min_w_0()
+                    .min_h(px(34.))
+                    .px_2p5()
+                    .py(px(3.))
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .justify_between()
                     .gap_2()
+                    .hover(|d| d.bg(p.accent.opacity(0.4)))
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(radio_id.clone().into()))
+                            .debug_selector(move || radio_id.clone())
+                            .role(gpui::Role::RadioButton)
+                            .aria_label(set_default_label)
+                            .aria_toggled(if is_default {
+                                gpui::Toggled::True
+                            } else {
+                                gpui::Toggled::False
+                            })
+                            .tab_index(0)
+                            .flex_none()
+                            .size(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(p.accent))
+                            .focus_visible(|d| d.bg(p.accent))
+                            .tooltip(move |window, cx| {
+                                crate::ui::tooltip_view(
+                                    radio_tip_id.clone(),
+                                    radio_tip.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .on_click(move |_, _, cx| {
+                                edit(cx, move |s| agent_id.clone_into(&mut s.default_agent));
+                            })
+                            .child(
+                                div()
+                                    .size(px(16.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(if is_default { p.ring } else { p.input })
+                                    .when(is_default, |d| {
+                                        d.child(div().size(px(8.)).rounded_full().bg(p.ring))
+                                    }),
+                            ),
+                    )
                     .child(
                         div()
                             .id(gpui::ElementId::Name(header_id.clone().into()))
@@ -9150,21 +9678,19 @@ impl SettingsView {
                             .min_w(px(180.))
                             .flex()
                             .items_center()
-                            .gap_2p5()
-                            .rounded(crate::ui::RADIUS_SM)
-                            .cursor_pointer()
-                            .hover(|d| d.opacity(0.85))
-                            .active(|d| d.opacity(0.7))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.agent_expanded.remove(agent_id) {
-                                    this.agent_expanded.insert(agent_id);
-                                }
-                                cx.notify();
-                            }))
+                            .gap_2()
+                            .overflow_hidden()
+                            .when(!is_installed, |d| d.opacity(0.75))
+                            .when(loaded, |d| {
+                                d.cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_agent_row(agent_id, cx);
+                                    }))
+                            })
                             .child(
                                 div()
                                     .flex_none()
-                                    .size(px(28.))
+                                    .size(px(20.))
                                     .rounded(crate::ui::RADIUS_SM)
                                     .bg(p.muted)
                                     .flex()
@@ -9172,158 +9698,71 @@ impl SettingsView {
                                     .justify_center()
                                     .child(crate::ui::icons::agent_brand_icon(
                                         agent_id,
-                                        crate::ui::ICON_XL,
+                                        crate::ui::ICON_MD,
                                         p.foreground,
                                     )),
                             )
                             .child(
                                 div()
-                                    .flex_1()
                                     .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .text_size(crate::ui::TEXT_SM)
-                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                    .child(display_name),
-                                            )
-                                            .child(
-                                                crate::ui::badge(p, badge_tone, badge_text)
-                                                    .id(gpui::ElementId::Name(
-                                                        badge_id.clone().into(),
-                                                    ))
-                                                    .debug_selector(move || badge_id.clone()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(gpui::ElementId::Name(summary_id.clone().into()))
-                                            .debug_selector(move || summary_id.clone())
-                                            .min_w_0()
-                                            .truncate()
-                                            .font_family(crate::ui::FONT_MONO)
-                                            .text_size(crate::ui::TEXT_SM)
-                                            .text_color(p.muted_foreground)
-                                            .child(summary_text),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        layout::controls()
-                            .when_some(install_cmd, |d, cmd_str| {
-                                let sel = install_id.clone();
+                                    .flex_shrink_1()
+                                    .truncate()
+                                    .text_size(crate::ui::TEXT_SM)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(display_name),
+                            )
+                            .when(is_default, |d| {
                                 d.child(
-                                    layout::secondary(
-                                        gpui::ElementId::Name(install_id.clone().into()),
-                                        text::INSTALL_IN_TERMINAL.get(),
+                                    crate::ui::badge(
+                                        p,
+                                        crate::ui::BadgeTone::Accent,
+                                        text::AGENT_DEFAULT_BADGE.get(),
                                     )
-                                    .debug_selector(move || sel.clone())
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                cmd_str.clone(),
-                                            ));
-                                            queue_terminal_command(cmd_str.clone(), cx);
-                                        },
-                                    ),
+                                    .id(gpui::ElementId::Name(default_badge_id.clone().into()))
+                                    .debug_selector(move || default_badge_id.clone()),
                                 )
                             })
                             .child(
-                                layout::secondary(
-                                    gpui::ElementId::Name(hook_id.clone().into()),
-                                    text::HOOK_INSTALL.get(),
-                                )
-                                .debug_selector(move || hook_id.clone())
-                                .tooltip(text::HOOK_INSTALL_TIP.format(&[("cmd", &hook_cmd)]))
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                            hook_copy.clone(),
-                                        ));
-                                        let base = if cfg!(test) {
-                                            state_dir(cx)
-                                                .unwrap_or_else(crate::accounts::default_home)
-                                        } else {
-                                            crate::accounts::default_home()
-                                        };
-                                        let state = state_dir(cx).unwrap_or_else(|| base.clone());
-                                        if id_owned == "codex" {
-                                            queue_terminal_command(
-                                                format!("{hook_copy} --yes"),
-                                                cx,
-                                            );
-                                            this.skill_status =
-                                                Some(text::HOOK_QUEUED.get().into());
-                                        } else {
-                                            let id = id_owned.clone();
-                                            let fallback = hook_copy.clone();
-                                            this.file_job(
-                                                "hook-install",
-                                                move || install_agent_hook_at(&id, &base, &state),
-                                                move |this, result, cx| {
-                                                    this.skill_status = Some(match result {
-                                                        Ok(path) => text::SKILLS_INSTALLED
-                                                            .format(&[(
-                                                                "path",
-                                                                &path.display().to_string(),
-                                                            )])
-                                                            .into(),
-                                                        Err(error) => {
-                                                            queue_terminal_command(
-                                                                format!("{fallback} --yes"),
-                                                                cx,
-                                                            );
-                                                            text::HOOK_INSTALL_FAILED
-                                                                .format(&[(
-                                                                    "error",
-                                                                    &error.to_string(),
-                                                                )])
-                                                                .into()
-                                                        }
-                                                    });
-                                                },
-                                                cx,
-                                            );
-                                        }
-                                        cx.notify();
-                                    },
-                                )),
+                                crate::ui::badge(p, badge_tone, badge_text)
+                                    .id(gpui::ElementId::Name(badge_id.clone().into()))
+                                    .debug_selector(move || badge_id.clone()),
                             )
                             .child(
-                                Button::new(gpui::ElementId::Name(toggle_id.clone().into()))
-                                    .small()
-                                    .ghost()
-                                    .icon(if is_open {
-                                        gpui_component::IconName::ChevronDown
-                                    } else {
-                                        gpui_component::IconName::ChevronRight
-                                    })
-                                    .accessibility_label(if is_open {
-                                        text::AGENT_COLLAPSE.get()
-                                    } else {
-                                        text::AGENT_EXPAND.get()
-                                    })
-                                    .debug_selector(move || toggle_id.clone())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if !this.agent_expanded.remove(agent_id) {
-                                            this.agent_expanded.insert(agent_id);
-                                        }
-                                        cx.notify();
-                                    })),
+                                div()
+                                    .id(gpui::ElementId::Name(summary_id.clone().into()))
+                                    .debug_selector(move || summary_id.clone())
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(crate::ui::FONT_MONO)
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .when(loaded, |d| d.child(launch_summary)),
                             ),
+                    )
+                    .children(row_install)
+                    .child(
+                        Button::new(gpui::ElementId::Name(toggle_id.clone().into()))
+                            .xsmall()
+                            .ghost()
+                            .icon(if is_open {
+                                gpui_component::IconName::ChevronDown
+                            } else {
+                                gpui_component::IconName::ChevronRight
+                            })
+                            .accessibility_label(if is_open {
+                                text::AGENT_COLLAPSE.get()
+                            } else {
+                                text::AGENT_EXPAND.get()
+                            })
+                            .disabled(!loaded)
+                            .debug_selector(move || toggle_id.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_agent_row(agent_id, cx);
+                            })),
                     ),
             )
-            .when(is_open, |d| d.child(edit_section))
+            .children(body)
     }
 
     fn ensure_workflow_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -9393,14 +9832,6 @@ impl SettingsView {
             }
             input
         });
-        let qc_name = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx)
-                .placeholder(text::QC_NAME_PLACEHOLDER.get())
-        });
-        let qc_text = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx)
-                .placeholder(text::QC_TEXT_PLACEHOLDER.get())
-        });
         let repo_obs = cx.observe_in(&repo_path, window, |this, _, window, cx| {
             this.sync_workflow_repo_hooks(window, cx);
         });
@@ -9420,9 +9851,6 @@ impl SettingsView {
             symlink_path,
             setup_script,
             archive_script,
-            qc_name,
-            qc_text,
-            qc_editing: None,
             pending_repo_path: None,
             loaded_repo,
             loaded_setup,
@@ -9430,6 +9858,7 @@ impl SettingsView {
             worktree_location,
             loaded_location,
             location_status: None,
+            symlink_status: None,
             refresh_hooks: false,
             status: None,
             _subs: vec![repo_obs, repo_sub, setup_obs, archive_obs, location_obs],
@@ -9510,6 +9939,7 @@ impl SettingsView {
             form.loaded_location = repo_location;
             if navigating {
                 form.location_status = None;
+                form.symlink_status = None;
             }
             form.refresh_hooks = false;
         }
@@ -9573,6 +10003,7 @@ impl SettingsView {
             form.status = None;
             form.loaded_location.clone_from(&repo_location);
             form.location_status = None;
+            form.symlink_status = None;
         }
         if repo_inp.read(cx).value().as_str() != repo_raw {
             repo_inp.update(cx, |inp, cx| inp.set_value(repo_raw.to_owned(), window, cx));
@@ -9619,14 +10050,39 @@ impl SettingsView {
         if !self.workflow_hooks_ready(cx) {
             return;
         }
-        let Some(form) = &self.workflow_form else {
+        let Some(form) = &mut self.workflow_form else {
             return;
         };
+        form.status = None;
+        form.location_status = None;
         let repo = form.repo_path.read(cx).value().to_string();
         let setup = form.setup_script.read(cx).value().to_string();
         let archive = form.archive_script.read(cx).value().to_string();
-        self.save_repo_hooks_for(&repo, Some(&setup), Some(&archive), cx)
-            .ok();
+        let location = form.worktree_location.read(cx).value().to_string();
+        let location_changed = location.trim() != form.loaded_location.trim();
+        let hooks_changed = setup.trim() != form.loaded_setup.trim()
+            || archive.trim() != form.loaded_archive.trim();
+        if location_changed {
+            self.save_worktree_location(location, cx);
+        }
+        if hooks_changed || !location_changed {
+            self.save_repo_hooks_for(&repo, Some(&setup), Some(&archive), cx)
+                .ok();
+        }
+    }
+
+    /// 저장 버튼 옆에 보일 바뀐 항목 수. 저장 값은 앞뒤 공백을 지우므로 같은 기준으로 잰다.
+    fn workflow_dirty_count(&self, cx: &App) -> usize {
+        self.workflow_form.as_ref().map_or(0, |form| {
+            [
+                (&form.setup_script, &form.loaded_setup),
+                (&form.archive_script, &form.loaded_archive),
+                (&form.worktree_location, &form.loaded_location),
+            ]
+            .into_iter()
+            .filter(|(input, loaded)| input.read(cx).value().trim() != loaded.trim())
+            .count()
+        })
     }
 
     fn normalize_repo_key(raw: &str) -> Option<String> {
@@ -9644,20 +10100,10 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let Some(dir) = state_dir(cx) else {
-            let msg = text::NO_STATE_DIR.get().to_owned();
-            if let Some(form) = &mut self.workflow_form {
-                form.status = Some((msg.clone().into(), true));
-            }
-            cx.notify();
-            return Err(msg);
+            return self.fail_symlink_form(text::NO_STATE_DIR.get().to_owned(), cx);
         };
         let Some(repo_key) = Self::normalize_repo_key(repo_raw) else {
-            let msg = text::HOOKS_REPO_PLACEHOLDER.get().to_owned();
-            if let Some(form) = &mut self.workflow_form {
-                form.status = Some((msg.clone().into(), true));
-            }
-            cx.notify();
-            return Err(msg);
+            return self.fail_symlink_form(text::HOOKS_REPO_PLACEHOLDER.get().to_owned(), cx);
         };
         if let Some(form) = &mut self.workflow_form
             && Self::normalize_repo_key(&form.repo_path.read(cx).value()).as_deref()
@@ -9665,8 +10111,13 @@ impl SettingsView {
         {
             form.pending_repo_path = Some(repo_key.clone());
         }
-        let rel_path = krill_proto::orchestration::validate_symlink_path(rel_path)
-            .map_err(|error| error.to_string())?;
+        let rel_path = match krill_proto::orchestration::validate_symlink_path(rel_path) {
+            Ok(rel_path) => rel_path,
+            Err(error) => {
+                let msg = text::SYMLINK_PATH_INVALID.format(&[("error", &error.to_string())]);
+                return self.fail_symlink_form(msg, cx);
+            }
+        };
         self.file_job(
             "worktree-edit",
             move || {
@@ -9676,10 +10127,18 @@ impl SettingsView {
                 })
                 .map_err(|error| error.to_string())
             },
-            |this, result, cx| this.finish_workflow_write(result.map(|_| ()), cx),
+            |this, result, cx| this.finish_symlink_write(result.map(|_| ()), cx),
             cx,
         );
         Ok(())
+    }
+
+    fn fail_symlink_form(&mut self, msg: String, cx: &mut Context<Self>) -> Result<(), String> {
+        if let Some(form) = &mut self.workflow_form {
+            form.symlink_status = Some((msg.clone().into(), true));
+        }
+        cx.notify();
+        Err(msg)
     }
 
     pub fn remove_worktree_symlink_for(
@@ -9701,15 +10160,15 @@ impl SettingsView {
                     })
                     .map_err(|error| error.to_string())
                 },
-                SettingsView::finish_workflow_write,
+                SettingsView::finish_symlink_write,
                 cx,
             );
         }
     }
 
-    fn finish_workflow_write(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+    fn finish_symlink_write(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.workflow_form {
-            form.status = Some(match result {
+            form.symlink_status = Some(match result {
                 Ok(()) => (text::HOOKS_SAVED.get().into(), false),
                 Err(error) => (error.into(), true),
             });
@@ -9743,6 +10202,9 @@ impl SettingsView {
         };
         let setup_trimmed = setup_cmd.unwrap_or("").trim().to_owned();
         let archive_trimmed = archive_cmd.unwrap_or("").trim().to_owned();
+        let saved_repo = repo_key.clone();
+        let saved_setup = setup_trimmed.clone();
+        let saved_archive = archive_trimmed.clone();
         self.file_job(
             "worktree-edit",
             move || {
@@ -9754,73 +10216,210 @@ impl SettingsView {
                 })
                 .map_err(|error| error.to_string())
             },
-            SettingsView::finish_workflow_write,
+            move |this, result, cx| {
+                if let Some(form) = &mut this.workflow_form {
+                    // 그사이 다른 저장소로 옮겼으면 그쪽 기준과 입력을 건드리지 않는다.
+                    let current = Self::normalize_repo_key(&form.repo_path.read(cx).value());
+                    if current.as_deref() == Some(saved_repo.as_str()) {
+                        if result.is_ok() {
+                            form.loaded_setup = saved_setup;
+                            form.loaded_archive = saved_archive;
+                        }
+                        form.status = Some(match result {
+                            Ok(()) => (text::HOOKS_SAVED.get().into(), false),
+                            Err(error) => (error.into(), true),
+                        });
+                    }
+                }
+                this.refresh_service_cache(cx);
+                cx.defer(notify_external_change);
+            },
             cx,
         );
         Ok(())
     }
 
-    pub fn submit_quick_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ensure_workflow_form(window, cx);
-        let Some(form) = &self.workflow_form else {
-            return;
-        };
-        let name = form.qc_name.read(cx).value().trim().to_owned();
-        let cmd_text = form.qc_text.read(cx).value().trim().to_owned();
-        if name.is_empty() || cmd_text.is_empty() {
+    /// 빠른 명령 입력칸. 프로젝트 폼과 파일 읽기 없이 이 페이지만 쓴다.
+    fn ensure_quick_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_form.is_some() {
             return;
         }
-        let editing_idx = form.qc_editing;
-        let name_inp = form.qc_name.clone();
-        let text_inp = form.qc_text.clone();
+        let name = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(text::QC_NAME_PLACEHOLDER.get())
+        });
+        let command = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(text::QC_TEXT_PLACEHOLDER.get())
+        });
+        let subs = [&name, &command].map(|input| {
+            cx.subscribe_in(
+                input,
+                window,
+                |this, _, event: &gpui_component::input::InputEvent, window, cx| {
+                    if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+                        this.submit_quick_command(window, cx);
+                    }
+                },
+            )
+        });
+        self.quick_form = Some(QuickCommandForm {
+            name,
+            command,
+            editing: None,
+            _subs: subs,
+        });
+    }
+
+    fn clear_quick_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.quick_form else {
+            return;
+        };
+        form.editing = None;
+        let (name, command) = (form.name.clone(), form.command.clone());
+        name.update(cx, |input, cx| input.set_value("", window, cx));
+        command.update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// 빈 칸이 있으면 저장하지 않고 입력 상태를 그대로 둔다.
+    pub fn submit_quick_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &self.quick_form else {
+            return;
+        };
+        let name = form.name.read(cx).value().trim().to_owned();
+        let command = form.command.read(cx).value().trim().to_owned();
+        if name.is_empty() || command.is_empty() {
+            return;
+        }
+        let editing = form.editing.clone();
         edit(cx, move |s| {
             let entry = crate::commands::QuickCommand {
                 name: name.clone(),
-                text: cmd_text.clone(),
+                text: command.clone(),
             };
-            if let Some(idx) = editing_idx
-                && let Some(slot) = s.quick_commands.get_mut(idx)
+            // 편집 중 파일에서 사라진 행이면 입력을 잃지 않게 새 행으로 남긴다.
+            match editing
+                .as_ref()
+                .and_then(|old| old.position(&s.quick_commands))
             {
-                *slot = entry;
-            } else {
-                s.quick_commands.push(entry);
+                Some(idx) => s.quick_commands[idx] = entry,
+                None => s.quick_commands.push(entry),
             }
         });
-        if let Some(form) = &mut self.workflow_form {
-            form.qc_editing = None;
+        self.clear_quick_inputs(window, cx);
+    }
+
+    /// 행의 값을 그 자리 입력칸으로 옮긴다. `focus_command`면 명령 칸에 포커스를 둔다.
+    fn edit_quick_command(
+        &mut self,
+        row: QuickRowRef,
+        focus_command: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(form) = &mut self.quick_form else {
+            return;
+        };
+        let (name, command) = (form.name.clone(), form.command.clone());
+        name.update(cx, |input, cx| {
+            input.set_value(row.cmd.name.clone(), window, cx);
+        });
+        command.update(cx, |input, cx| {
+            input.set_value(row.cmd.text.clone(), window, cx);
+        });
+        form.editing = Some(row);
+        let target = if focus_command { command } else { name };
+        target.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// 편집이나 입력 중이었으면 비우고 `true`를 돌려준다.
+    fn cancel_quick_command_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let active = self.quick_form.as_ref().is_some_and(|form| {
+            form.editing.is_some()
+                || !form.name.read(cx).value().is_empty()
+                || !form.command.read(cx).value().is_empty()
+        });
+        if active {
+            self.clear_quick_inputs(window, cx);
         }
-        name_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
-        text_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
-        cx.notify();
+        active
     }
 
-    pub fn edit_quick_command(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.ensure_workflow_form(window, cx);
-        let s = current(cx);
-        let Some(cmd) = s.quick_commands.get(idx).cloned() else {
-            return;
-        };
-        let Some(form) = &mut self.workflow_form else {
-            return;
-        };
-        form.qc_editing = Some(idx);
-        let name_inp = form.qc_name.clone();
-        let text_inp = form.qc_text.clone();
-        name_inp.update(cx, |inp, cx| inp.set_value(cmd.name, window, cx));
-        text_inp.update(cx, |inp, cx| inp.set_value(cmd.text, window, cx));
-        cx.notify();
+    fn quick_input_focused(&self, window: &Window, cx: &App) -> bool {
+        use gpui::Focusable as _;
+        self.quick_form.as_ref().is_some_and(|form| {
+            [&form.name, &form.command]
+                .into_iter()
+                .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
+        })
     }
 
-    pub fn cancel_quick_command_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(form) = &mut self.workflow_form else {
-            return;
-        };
-        form.qc_editing = None;
-        let name_inp = form.qc_name.clone();
-        let text_inp = form.qc_text.clone();
-        name_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
-        text_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
-        cx.notify();
+    /// 입력칸 한 줄. 편집 중이 아니면 표 맨 위의 추가 행, 편집 중이면 그 행 자리에 그린다.
+    fn render_quick_form_row(&self, is_editing: bool, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        use gpui_component::Sizable as _;
+        let p = crate::ui::palette(cx);
+        let form = self.quick_form.as_ref()?;
+        Some(
+            div()
+                .w_full()
+                .min_w_0()
+                .px_3()
+                .py_2()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .bg(p.accent.opacity(0.4))
+                .child(
+                    div()
+                        .id("admin-qc-name-input")
+                        .debug_selector(|| "admin-qc-name-input".into())
+                        .w(px(130.))
+                        .max_w_full()
+                        .flex_none()
+                        .child(gpui_component::input::Input::new(&form.name).small()),
+                )
+                .child(
+                    div()
+                        .id("admin-qc-text-input")
+                        .debug_selector(|| "admin-qc-text-input".into())
+                        .flex_1()
+                        .min_w(px(120.))
+                        .child(gpui_component::input::Input::new(&form.command).small()),
+                )
+                .child(
+                    layout::controls()
+                        .when(is_editing, |d| {
+                            d.child(
+                                layout::ghost("admin-qc-cancel", text::QC_CANCEL.get())
+                                    .xsmall()
+                                    .debug_selector(|| "admin-qc-cancel".into())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.clear_quick_inputs(window, cx);
+                                    })),
+                            )
+                        })
+                        .child(
+                            layout::primary(
+                                "admin-qc-add",
+                                if is_editing {
+                                    text::QC_SAVE.get()
+                                } else {
+                                    text::QC_ADD.get()
+                                },
+                            )
+                            .xsmall()
+                            .debug_selector(|| "admin-qc-add".into())
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.submit_quick_command(window, cx);
+                                },
+                            )),
+                        ),
+                ),
+        )
     }
 
     /// 빠른 명령 편집 페이지. 메뉴·팔레트에서 바로 온다.
@@ -9831,158 +10430,199 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         use gpui_component::Sizable as _;
-        self.ensure_workflow_form(window, cx);
+        self.ensure_quick_form(window, cx);
         let p = crate::ui::palette(cx);
-        let qc_count =
-            text::QUICK_COMMANDS_COUNT.format(&[("count", &s.quick_commands.len().to_string())]);
-        let mut qc_card = layout::card(p)
-            .id("admin-qc-card")
-            .debug_selector(|| "admin-qc-card".into())
+        let name_width = px(if SettingsFrame::new(window).narrow {
+            86.
+        } else {
+            130.
+        });
+        let commands = &s.quick_commands;
+        // 파일이 바뀌어 행 번호가 밀려도 편집과 2단계 확인은 값으로 그 행을 따라간다.
+        let editing_idx = self
+            .quick_form
+            .as_ref()
+            .and_then(|form| form.editing.as_ref())
+            .and_then(|editing| editing.position(commands));
+        let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(commands.len() + 1);
+        if editing_idx.is_none() {
+            rows.extend(
+                self.render_quick_form_row(false, cx)
+                    .map(IntoElement::into_any_element),
+            );
+        }
+        if commands.is_empty() {
+            rows.push(
+                div()
+                    .id("admin-qc-empty")
+                    .debug_selector(|| "admin-qc-empty".into())
+                    .px_3()
+                    .py_2()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::QC_EMPTY.get())
+                    .into_any_element(),
+            );
+        }
+        for (idx, cmd) in commands.iter().enumerate() {
+            if editing_idx == Some(idx) {
+                rows.extend(
+                    self.render_quick_form_row(true, cx)
+                        .map(IntoElement::into_any_element),
+                );
+                continue;
+            }
+            let row_id = format!("admin-qc-row-{idx}");
+            let edit_id = format!("admin-qc-edit-{idx}");
+            let rm_selector = format!("admin-qc-remove-{idx}");
+            let row = QuickRowRef::at(commands, idx);
+            let rm_id = format!(
+                "admin-qc-remove-{}-{}\0{}",
+                row.same_before, cmd.name, cmd.text
+            );
+            let (name_row, text_row, edit_row, rm_row) =
+                (row.clone(), row.clone(), row.clone(), row);
+            rows.push(
+                div()
+                    .id(gpui::ElementId::Name(row_id.clone().into()))
+                    .debug_selector(move || row_id.clone())
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(34.))
+                    .pl_3()
+                    .pr_1p5()
+                    .py(px(3.))
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .text_size(crate::ui::TEXT_SM)
+                    .hover(|d| d.bg(p.accent.opacity(0.4)))
+                    .child(
+                        div()
+                            .id(("admin-qc-name", idx))
+                            .flex_none()
+                            .w(name_width)
+                            .truncate()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .cursor_text()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_quick_command(name_row.clone(), false, window, cx);
+                            }))
+                            .child(cmd.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(("admin-qc-text", idx))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(crate::ui::FONT_MONO)
+                            .text_color(p.muted_foreground)
+                            .cursor_text()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_quick_command(text_row.clone(), true, window, cx);
+                            }))
+                            .child(cmd.text.clone()),
+                    )
+                    .child(
+                        layout::controls()
+                            .flex_nowrap()
+                            .gap_0p5()
+                            .child(
+                                layout::ghost(
+                                    gpui::ElementId::Name(edit_id.clone().into()),
+                                    text::QC_EDIT.get(),
+                                )
+                                .xsmall()
+                                .debug_selector(move || edit_id.clone())
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.edit_quick_command(
+                                            edit_row.clone(),
+                                            false,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                div().debug_selector(move || rm_selector.clone()).child(
+                                    self.confirm_button_with(
+                                        rm_id.clone(),
+                                        text::ACCOUNT_REMOVE.get(),
+                                        None,
+                                        cx,
+                                        move |this, window, cx| {
+                                            let removed = rm_row.clone();
+                                            let editing = this
+                                                .quick_form
+                                                .as_mut()
+                                                .and_then(|form| form.editing.as_mut());
+                                            match editing {
+                                                Some(row) if *row == removed => {
+                                                    this.clear_quick_inputs(window, cx);
+                                                }
+                                                // 앞의 같은 값 행이 사라지면 편집 중인 행의 순번도 당긴다.
+                                                Some(row)
+                                                    if row.cmd == removed.cmd
+                                                        && row.same_before
+                                                            > removed.same_before =>
+                                                {
+                                                    row.same_before -= 1;
+                                                }
+                                                _ => {}
+                                            }
+                                            edit(cx, move |s| {
+                                                if let Some(pos) =
+                                                    removed.position(&s.quick_commands)
+                                                {
+                                                    s.quick_commands.remove(pos);
+                                                }
+                                            });
+                                        },
+                                    )
+                                    .xsmall()
+                                    // 행마다 위험 색이 늘어서지 않게 무장했을 때만 위험 색을 쓴다.
+                                    .when(self.armed.as_deref() != Some(rm_id.as_str()), |b| {
+                                        b.ghost()
+                                    }),
+                                ),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        div()
             .flex()
             .flex_col()
-            .gap_2p5()
-            .child(layout::label(p, qc_count, Some(text::QC_DESC.get())));
-        if let Some(form) = &self.workflow_form {
-            let qc_name_input = form.qc_name.clone();
-            let qc_text_input = form.qc_text.clone();
-            let is_editing = form.qc_editing.is_some();
-            let mut qc_controls = layout::controls();
-            if is_editing {
-                qc_controls = qc_controls.child(
-                    layout::ghost("admin-qc-cancel", text::QC_CANCEL.get())
-                        .debug_selector(|| "admin-qc-cancel".into())
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.cancel_quick_command_edit(window, cx);
-                        })),
-                );
-            }
-            qc_controls = qc_controls.child(
-                layout::primary(
-                    "admin-qc-add",
-                    if is_editing {
-                        text::QC_SAVE.get()
-                    } else {
-                        text::QC_ADD.get()
-                    },
-                )
-                .debug_selector(|| "admin-qc-add".into())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.submit_quick_command(window, cx);
-                })),
-            );
-            qc_card = qc_card.child(
+            .gap_2()
+            .child(
                 div()
                     .w_full()
                     .min_w_0()
                     .flex()
-                    .flex_wrap()
                     .items_center()
+                    .justify_between()
                     .gap_2()
-                    .child(
-                        div()
-                            .id("admin-qc-name-input")
-                            .debug_selector(|| "admin-qc-name-input".into())
-                            .w(px(180.))
-                            .max_w_full()
-                            .flex_none()
-                            .child(gpui_component::input::Input::new(&qc_name_input).small()),
-                    )
-                    .child(
-                        div()
-                            .id("admin-qc-text-input")
-                            .debug_selector(|| "admin-qc-text-input".into())
-                            .flex_1()
-                            .min_w_0()
-                            .flex_basis(gpui::relative(0.5))
-                            .child(gpui_component::input::Input::new(&qc_text_input).small()),
-                    )
-                    .child(qc_controls),
-            );
-        }
-        if s.quick_commands.is_empty() {
-            qc_card = qc_card.child(
-                div()
-                    .id("admin-qc-empty")
-                    .debug_selector(|| "admin-qc-empty".into())
                     .text_size(crate::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
-                    .child(text::QC_EMPTY.get()),
-            );
-        } else {
-            for (idx, cmd) in s.quick_commands.iter().enumerate() {
-                let row_id = format!("admin-qc-row-{idx}");
-                let edit_id = format!("admin-qc-edit-{idx}");
-                let rm_id = format!("admin-qc-remove-{idx}");
-                let summary = format!("{} → {}", cmd.name, cmd.text);
-                qc_card = qc_card.child(
-                    div()
-                        .id(gpui::ElementId::Name(row_id.clone().into()))
-                        .debug_selector(move || row_id.clone())
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .p_2()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .bg(p.background)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .font_family(crate::ui::FONT_MONO)
-                                .text_size(crate::ui::TEXT_SM)
-                                .truncate()
-                                .child(summary),
-                        )
-                        .child(
-                            layout::controls()
-                                .child(
-                                    layout::ghost(
-                                        gpui::ElementId::Name(edit_id.clone().into()),
-                                        text::QC_EDIT.get(),
-                                    )
-                                    .debug_selector(move || edit_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            this.edit_quick_command(idx, window, cx);
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    layout::secondary(
-                                        gpui::ElementId::Name(rm_id.clone().into()),
-                                        text::ACCOUNT_REMOVE.get(),
-                                    )
-                                    .debug_selector(move || rm_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            if this
-                                                .workflow_form
-                                                .as_ref()
-                                                .is_some_and(|f| f.qc_editing == Some(idx))
-                                            {
-                                                this.cancel_quick_command_edit(window, cx);
-                                            }
-                                            edit(cx, move |s| {
-                                                if idx < s.quick_commands.len() {
-                                                    s.quick_commands.remove(idx);
-                                                }
-                                            });
-                                        },
-                                    )),
-                                ),
+                    .child(div().min_w_0().child(text::QC_DESC.get()))
+                    .child(
+                        div().flex_none().child(
+                            text::QUICK_COMMANDS_COUNT
+                                .format(&[("count", &commands.len().to_string())]),
                         ),
-                );
-            }
-        }
-
-        div().child(qc_card)
+                    ),
+            )
+            .child(
+                crate::ui::group(p, rows)
+                    .id("admin-qc-card")
+                    .debug_selector(|| "admin-qc-card".into()),
+            )
     }
 
-    /// 프로젝트별 설정 페이지. 프로젝트 메뉴가 고른 저장소가 있으면 먼저 불러온다.
+    /// 프로젝트 페이지. 이 프로젝트와 예약 작업 두 구역으로 나뉜다. 프로젝트 메뉴가 고른 저장소가 있으면 먼저 불러온다.
     fn render_project_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         use gpui_component::Sizable as _;
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -9991,11 +10631,45 @@ impl SettingsView {
             .and_then(|pending| pending.0.clone())
         {
             cx.set_global(PendingProject(None));
+            self.project_section = ProjectSection::Project;
             self.load_repo_hooks_for(&repo, window, cx);
         }
         self.ensure_workflow_form(window, cx);
         let p = crate::ui::palette(cx);
         self.refresh_service_cache(cx);
+
+        let section = self.project_section;
+        let schedule_count = self.services.schedules.len().to_string();
+        let section_bar = layout::segmented_control(
+            p,
+            [
+                (
+                    "admin-project-section-project",
+                    text::PROJECT_SECTION_THIS.get().to_owned(),
+                    ProjectSection::Project,
+                ),
+                (
+                    "admin-project-section-schedules",
+                    text::PROJECT_SECTION_SCHEDULES.format(&[("n", &schedule_count)]),
+                    ProjectSection::Schedules,
+                ),
+            ]
+            .into_iter()
+            .map(|(id, label, target)| {
+                layout::segment(p, id, label, section == target)
+                    .debug_selector(move || id.into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.project_section = target;
+                        cx.notify();
+                    }))
+            }),
+        )
+        .self_start();
+        let root = div().flex().flex_col().gap_3().child(section_bar);
+        if section == ProjectSection::Schedules {
+            return root.child(self.render_schedules_section(cx));
+        }
+
         let wt_store = self.services.worktrees.clone();
 
         let active_repo = self
@@ -10022,14 +10696,30 @@ impl SettingsView {
         if let Some(cur) = active_repo.as_ref().filter(|r| Path::new(r).is_absolute()) {
             known_repos.insert(cur.clone());
         }
-        let known_repos_list: Vec<String> = known_repos.into_iter().collect();
+        // 메뉴 항목에 붙일 저장소별 요약: Setup, Archive, 공유 개수.
+        let known_repos_list: Vec<(String, Vec<String>)> = known_repos
+            .into_iter()
+            .map(|repo| {
+                let mut marks = Vec::new();
+                if self.services.setup_script_for(&repo).is_some() {
+                    marks.push("Setup".to_owned());
+                }
+                if self.services.archive_script_for(&repo).is_some() {
+                    marks.push("Archive".to_owned());
+                }
+                let shared = wt_store.symlinks.get(&repo).map_or(0, Vec::len);
+                if shared > 0 {
+                    marks.push(text::PROJECT_MENU_SHARED.format(&[("n", &shared.to_string())]));
+                }
+                (repo, marks)
+            })
+            .collect();
 
-        let mut repo_context_card = layout::card(p)
+        let mut repo_row = div()
             .id("admin-workflow-repo-card")
             .debug_selector(|| "admin-workflow-repo-card".into())
-            .flex()
-            .flex_col()
-            .gap_2p5();
+            .w_full()
+            .min_w_0();
 
         let mut symlinks_card = layout::card(p)
             .id("admin-worktree-symlinks-card")
@@ -10037,61 +10727,18 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_2p5()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(layout::label(
-                        p,
-                        text::SYMLINKS_TITLE.get(),
-                        Some(text::SYMLINKS_DESC.get()),
-                    ))
-                    .child(
-                        crate::ui::badge(
-                            p,
-                            crate::ui::BadgeTone::Neutral,
-                            active_repo_display.clone(),
-                        )
-                        .id("admin-symlinks-repo-badge")
-                        .debug_selector(|| "admin-symlinks-repo-badge".into()),
-                    ),
-            );
+            .child(self.search_focus.label(
+                p,
+                text::SYMLINKS_TITLE.get(),
+                Some(text::SYMLINKS_DESC.get()),
+            ));
 
         let mut hooks_card = layout::card(p)
             .id("admin-repo-hooks-card")
             .debug_selector(|| "admin-repo-hooks-card".into())
             .flex()
             .flex_col()
-            .gap_2p5()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(layout::label(
-                        p,
-                        text::HOOKS_TITLE.get(),
-                        Some(text::HOOKS_DESC.get()),
-                    ))
-                    .child(
-                        crate::ui::badge(
-                            p,
-                            crate::ui::BadgeTone::Neutral,
-                            active_repo_display.clone(),
-                        )
-                        .id("admin-hooks-repo-badge")
-                        .debug_selector(|| "admin-hooks-repo-badge".into()),
-                    ),
-            );
+            .gap_2p5();
 
         if let Some(form) = &self.workflow_form {
             let repo_input = form.repo_path.clone();
@@ -10099,9 +10746,10 @@ impl SettingsView {
             let setup_input = form.setup_script.clone();
             let archive_input = form.archive_script.clone();
             let status = form.status.clone();
+            let symlink_status = form.symlink_status.clone();
 
             let weak = cx.weak_entity();
-            let dropdown_repos = known_repos_list.clone();
+            let dropdown_repos = known_repos_list;
             let dropdown_active = active_repo.clone();
             let repo_dropdown = layout::secondary(
                 "admin-workflow-repo-select",
@@ -10120,7 +10768,7 @@ impl SettingsView {
             .debug_selector(|| "admin-workflow-repo-select".into())
             .dropdown_menu(move |mut menu, _, _| {
                 menu = menu.scrollable(true).max_h(px(360.));
-                for repo_choice in &dropdown_repos {
+                for (repo_choice, marks) in &dropdown_repos {
                     let weak = weak.clone();
                     let repo_choice = repo_choice.clone();
                     let checked = dropdown_active.as_deref() == Some(repo_choice.as_str());
@@ -10128,55 +10776,64 @@ impl SettingsView {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .filter(|s| !s.is_empty())
-                        .unwrap_or(repo_choice.as_str());
-                    let item_label = format!("{name}  {repo_choice}");
-                    menu = menu.item(PopupMenuItem::new(item_label).checked(checked).on_click(
-                        move |_, window, cx| {
+                        .unwrap_or(repo_choice.as_str())
+                        .to_owned();
+                    let path = repo_choice.clone();
+                    let marks = marks.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            let p = crate::ui::palette(cx);
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div().flex().flex_col().child(name.clone()).child(
+                                        div()
+                                            .font_family(crate::ui::FONT_MONO)
+                                            .text_size(crate::ui::TEXT_2XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(path.clone()),
+                                    ),
+                                )
+                                .children(marks.iter().map(|mark| {
+                                    crate::ui::badge(p, crate::ui::BadgeTone::Neutral, mark.clone())
+                                }))
+                        })
+                        .checked(checked)
+                        .on_click(move |_, window, cx| {
                             weak.update(cx, |this, cx| {
                                 this.load_repo_hooks_for(&repo_choice, window, cx);
                             })
                             .ok();
-                        },
-                    ));
+                        }),
+                    );
                 }
                 menu
             });
 
-            repo_context_card = repo_context_card
+            repo_row = repo_row
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
                 .child(
                     div()
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(crate::ui::TEXT_SM)
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(text::WORKFLOW_REPO_TITLE.get()),
-                        )
-                        .child(
-                            div()
-                                .id("admin-workflow-repo-input")
-                                .debug_selector(|| "admin-workflow-repo-input".into())
-                                .flex_1()
-                                .min_w_0()
-                                .flex_basis(gpui::relative(0.5))
-                                .child(gpui_component::input::Input::new(&repo_input).small()),
-                        )
-                        .child(layout::controls().child(repo_dropdown)),
+                        .flex_none()
+                        .text_size(crate::ui::TEXT_SM)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child(text::WORKFLOW_REPO_TITLE.get()),
                 )
                 .child(
                     div()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(p.muted_foreground)
-                        .child(text::WORKFLOW_REPO_DESC.get()),
-                );
-
-            repo_context_card = repo_context_card.child(self.render_worktree_location(cx));
+                        .id("admin-workflow-repo-input")
+                        .debug_selector(|| "admin-workflow-repo-input".into())
+                        .flex_1()
+                        .min_w_0()
+                        .flex_basis(px(120.))
+                        .child(gpui_component::input::Input::new(&repo_input).small()),
+                )
+                .child(layout::controls().child(repo_dropdown));
 
             symlinks_card = symlinks_card
                 .child(
@@ -10198,7 +10855,7 @@ impl SettingsView {
                         )
                         .child(
                             layout::controls().child(
-                                layout::primary(
+                                layout::secondary(
                                     "admin-worktree-symlink-add",
                                     text::SYMLINKS_ADD.get(),
                                 )
@@ -10221,6 +10878,18 @@ impl SettingsView {
                             ),
                         ),
                 )
+                .children(symlink_status.map(|(msg, is_error)| {
+                    div()
+                        .id("admin-worktree-symlink-status")
+                        .debug_selector(|| "admin-worktree-symlink-status".into())
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(if is_error {
+                            p.destructive
+                        } else {
+                            p.muted_foreground
+                        })
+                        .child(msg)
+                }))
                 .child({
                     let mut row = div().flex().flex_wrap().items_center().gap_1p5();
                     for (id, preset) in [
@@ -10326,29 +10995,32 @@ impl SettingsView {
                 symlinks_card = symlinks_card.child(chips_wrap);
             }
 
+            let dirty = self.workflow_dirty_count(cx);
+            let ready = self.workflow_hooks_ready(cx);
+            let saving = self.file_jobs.contains_key("worktree-location-edit");
             hooks_card = hooks_card
+                .child(self.render_worktree_location(cx))
                 .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(crate::ui::field_label(
-                            text::HOOKS_SETUP_LABEL.get(),
-                            None,
-                            p,
-                        ))
-                        .child(
-                            div()
-                                .id("admin-repo-setup-input")
-                                .debug_selector(|| "admin-repo-setup-input".into())
-                                .child(gpui_component::input::Input::new(&setup_input).small()),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(text::HOOKS_SETUP_HINT.get()),
-                        ),
+                    self.search_focus.anchored(
+                        p,
+                        text::HOOKS_TITLE.get(),
+                        div()
+                            .id("admin-repo-setup-field")
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(crate::ui::field_label(
+                                text::HOOKS_SETUP_LABEL.get(),
+                                None,
+                                p,
+                            ))
+                            .child(
+                                div()
+                                    .id("admin-repo-setup-input")
+                                    .debug_selector(|| "admin-repo-setup-input".into())
+                                    .child(gpui_component::input::Input::new(&setup_input).small()),
+                            ),
+                    ),
                 )
                 .child(
                     div()
@@ -10365,24 +11037,19 @@ impl SettingsView {
                                 .id("admin-repo-archive-input")
                                 .debug_selector(|| "admin-repo-archive-input".into())
                                 .child(gpui_component::input::Input::new(&archive_input).small()),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(text::HOOKS_ARCHIVE_HINT.get()),
                         ),
                 )
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_end()
                         .gap_2()
                         .child(
                             layout::ghost("admin-repo-hooks-clear", text::HOOKS_CLEAR.get())
                                 .debug_selector(|| "admin-repo-hooks-clear".into())
-                                .disabled(!self.workflow_hooks_ready(cx))
+                                .disabled(!ready)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     if !this.workflow_hooks_ready(cx) {
                                         return;
@@ -10402,82 +11069,83 @@ impl SettingsView {
                                 })),
                         )
                         .child(
-                            layout::primary("admin-repo-hooks-save", text::HOOKS_SAVE.get())
+                            layout::primary("admin-repo-hooks-save", text::QC_SAVE.get())
                                 .debug_selector(|| "admin-repo-hooks-save".into())
-                                .disabled(!self.workflow_hooks_ready(cx))
+                                .disabled(!ready || dirty == 0 || saving)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.save_workflow_form(window, cx);
                                 })),
+                        )
+                        .when(dirty > 0, |d| {
+                            d.child(
+                                div()
+                                    .id("admin-workflow-dirty")
+                                    .debug_selector(|| "admin-workflow-dirty".into())
+                                    .w_full()
+                                    .flex()
+                                    .justify_end()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(
+                                        text::PROJECT_CHANGED_COUNT
+                                            .format(&[("n", &dirty.to_string())]),
+                                    ),
+                            )
+                        })
+                        // 바뀐 항목이 남아 있어도 실패는 가리지 않는다.
+                        .when_some(
+                            status.filter(|(_, is_error)| *is_error || dirty == 0),
+                            |d, (msg, is_error)| {
+                                d.child(
+                                    div()
+                                        .id("admin-workflow-repo-status")
+                                        .debug_selector(|| "admin-workflow-repo-status".into())
+                                        .w_full()
+                                        .flex()
+                                        .justify_end()
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_color(if is_error {
+                                            p.destructive
+                                        } else {
+                                            p.muted_foreground
+                                        })
+                                        .child(msg),
+                                )
+                            },
                         ),
                 );
-
-            let mut hook_repos: std::collections::BTreeSet<String> =
-                wt_store.setup_scripts.keys().cloned().collect();
-            hook_repos.extend(wt_store.archive_scripts.keys().cloned());
-            for (idx, repo_key) in hook_repos.into_iter().enumerate() {
-                let setup_val = self
-                    .services
-                    .setup_script_for(&repo_key)
-                    .unwrap_or_else(|| "—".to_owned());
-                let archive_val = self
-                    .services
-                    .archive_script_for(&repo_key)
-                    .unwrap_or_else(|| "—".to_owned());
-                let summary = format!("{repo_key} · setup={setup_val} · archive={archive_val}");
-                let row_id = format!("admin-repo-hook-row-{idx}");
-                let repo_for_click = repo_key.clone();
-                hooks_card = hooks_card.child(
-                    div()
-                        .id(gpui::ElementId::Name(row_id.clone().into()))
-                        .debug_selector(move || row_id.clone())
-                        .w_full()
-                        .min_w_0()
-                        .cursor_pointer()
-                        .p_2()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .bg(p.background)
-                        .hover(|d| d.bg(p.accent))
-                        .active(|d| d.bg(p.sidebar_accent))
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_SM)
-                        .truncate()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.load_repo_hooks_for(&repo_for_click, window, cx);
-                        }))
-                        .child(summary),
-                );
-            }
-
-            if let Some((msg, is_error)) = status {
-                hooks_card = hooks_card.child(
-                    div()
-                        .id("admin-workflow-repo-status")
-                        .debug_selector(|| "admin-workflow-repo-status".into())
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(if is_error {
-                            p.destructive
-                        } else {
-                            p.muted_foreground
-                        })
-                        .child(msg),
-                );
-            }
         }
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(self.render_schedules_section(cx))
-            .child(repo_context_card)
-            .child(symlinks_card)
-            .child(hooks_card)
+        root.child(repo_row).child(hooks_card).child(symlinks_card)
     }
 
+    /// 시스템 탭 아래쪽: 개인정보 묶음, 도구 칸, 맨 아래 삭제 칸. 동작의 결과와 오류는 그 행 안에 나온다.
     fn render_resources_tab(&self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
         let p = crate::ui::palette(cx);
-        let row = || layout::row(p);
-        let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
+        let search_focus = self.search_focus.clone();
+        let label =
+            |title: &'static str, desc: &'static str| search_focus.label(p, title, Some(desc));
+        let detail = |label: gpui::Stateful<gpui::Div>, status: Option<gpui::AnyElement>| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex_basis(gpui::relative(0.5))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(label)
+                .children(status)
+        };
+        let status = |id: &'static str, message: SharedString, color: gpui::Hsla| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .min_w_0()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(color)
+                .child(message)
+                .into_any_element()
+        };
         // 구 데몬이면 토글 대신 업데이트 안내만 보인다(요청을 보내지 않는다).
         let recording_controls = if self.history_pause_supported == Some(false) {
             layout::controls().child(
@@ -10512,20 +11180,26 @@ impl SettingsView {
                 Self::clear_history,
             )
             .disabled(self.history_clear_pending);
-        let mut root = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(layout::section_title(
-                p,
-                "admin-section-resources",
-                text::RESOURCES_TITLE.get(),
-            ))
-            .child(
-                row()
-                    .child(label(
-                        text::ERROR_REPORTS_TITLE.get(),
-                        text::ERROR_REPORTS_DESC.get(),
+        let privacy = crate::ui::group(
+            p,
+            [
+                crate::ui::group_row()
+                    .child(detail(
+                        label(
+                            text::ERROR_REPORTS_TITLE.get(),
+                            text::ERROR_REPORTS_DESC.get(),
+                        ),
+                        self.error_reporting.description().map(|message| {
+                            status(
+                                "admin-error-reporting-status",
+                                message.into(),
+                                if self.error_reporting.message.is_some() {
+                                    p.destructive
+                                } else {
+                                    p.muted_foreground
+                                },
+                            )
+                        }),
                     ))
                     .child(
                         layout::controls().child(
@@ -10550,71 +11224,189 @@ impl SettingsView {
                             .aria_label(text::ERROR_REPORTS_TITLE.get()),
                         ),
                     ),
-            )
-            .when_some(self.error_reporting.description(), |el, message| {
-                el.child(
-                    div()
-                        .id("admin-error-reporting-status")
-                        .debug_selector(|| "admin-error-reporting-status".into())
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(p.muted_foreground)
-                        .child(message),
-                )
-            })
-            .child(
-                row()
-                    .child(label(
-                        text::RECORDING_TITLE.get(),
-                        text::RECORDING_DESC.get(),
+                crate::ui::group_row()
+                    .child(detail(
+                        label(text::RECORDING_TITLE.get(), text::RECORDING_DESC.get()),
+                        // 구 데몬이면 오른쪽 안내와 같은 말이라 되풀이하지 않는다.
+                        self.recording_status
+                            .clone()
+                            .filter(|_| self.history_pause_supported != Some(false))
+                            .map(|message| {
+                                status("admin-recording-status", message, p.destructive)
+                            }),
                     ))
                     .child(recording_controls),
-            )
+            ],
+        )
+        .id("admin-section-resources")
+        .debug_selector(|| "admin-section-resources".into());
+        let danger = div()
+            .id("admin-history-danger")
+            .debug_selector(|| "admin-history-danger".into())
+            .w_full()
+            .min_w_0()
+            .rounded(crate::ui::RADIUS_MD)
+            .border_1()
+            .border_color(p.destructive.opacity(0.35))
+            .bg(p.destructive.opacity(0.05))
             .child(
-                row()
-                    .child(label(
-                        text::RECORDING_DELETE_TITLE.get(),
-                        text::RECORDING_DELETE_DESC.get(),
+                crate::ui::group_row()
+                    .child(detail(
+                        label(
+                            text::RECORDING_DELETE_TITLE.get(),
+                            text::RECORDING_DELETE_DESC.get(),
+                        ),
+                        self.history_status.clone().map(|message| {
+                            status(
+                                "admin-history-status",
+                                message,
+                                if self.history_status_failed {
+                                    p.destructive
+                                } else {
+                                    p.muted_foreground
+                                },
+                            )
+                        }),
                     ))
                     .child(layout::controls().child(clear)),
             );
-        if let Some(status) = &self.history_status {
-            root = root.child(
-                div()
-                    .id("admin-history-status")
-                    .debug_selector(|| "admin-history-status".into())
-                    .w_full()
-                    .min_w_0()
-                    .p_2()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.card)
-                    .border_1()
-                    .border_color(p.border)
-                    .text_size(crate::ui::TEXT_XS)
-                    .child(status.clone()),
-            );
-        }
-        if let Some(status) = &self.recording_status {
-            root = root.child(
-                div()
-                    .id("admin-recording-status")
-                    .debug_selector(|| "admin-recording-status".into())
-                    .w_full()
-                    .min_w_0()
-                    .p_2()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.card)
-                    .border_1()
-                    .border_color(p.border)
-                    .text_size(crate::ui::TEXT_XS)
-                    .child(status.clone()),
-            );
-        }
-        root
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                self.search_focus
+                    .anchored(p, text::RESOURCES_TITLE.get(), privacy),
+            )
+            .child(self.render_system_tools(cx))
+            .child(danger)
     }
 }
 
+/// 설정 틀의 치수. 창이 아니라 모달 폭으로 정한다. 기준이 rem이라 UI 줌을 높이면 그만큼 일찍 좁아진다.
+#[derive(Clone, Copy)]
+struct SettingsFrame {
+    /// 왼쪽 탭 대신 탭 메뉴를 쓰는 작은 창.
+    compact: bool,
+    narrow: bool,
+    nav_width: gpui::Pixels,
+    /// 신호등 버튼이 모달 위로 겹칠 때 그것을 피하는 왼쪽 여백.
+    traffic_lights: gpui::Pixels,
+}
+
+impl SettingsFrame {
+    fn new(window: &Window) -> Self {
+        let rem = window.rem_size();
+        let viewport = window.viewport_size();
+        let modal = crate::ui::page_modal_size(viewport);
+        let narrow = modal.width < rem * 60.;
+        // 메인 창이 낮으면 모달이 제목 표시줄까지 올라와 신호등 버튼과 겹친다.
+        let over_title_bar = (viewport.height - modal.height) / 2.
+            < crate::ui::TRAFFIC_LIGHT_INSET.y + crate::ui::SPACE_4;
+        let traffic_lights = if window.root::<SettingsView>().flatten().is_some() {
+            crate::ui::TRAFFIC_LIGHT_PAD
+        } else if over_title_bar {
+            (crate::ui::TRAFFIC_LIGHT_PAD - (viewport.width - modal.width) / 2.).max(px(0.))
+        } else {
+            px(0.)
+        };
+        Self {
+            compact: modal.width < rem * 42.5,
+            narrow,
+            nav_width: if narrow {
+                crate::ui::SETTINGS_NAV_WIDTH_NARROW.to_pixels(rem)
+            } else {
+                crate::ui::SETTINGS_NAV_WIDTH
+            },
+            traffic_lights,
+        }
+    }
+
+    /// 테마 견본 판의 열 수. 어느 판정에서든 칸 안에 색 칩이 8px 이상으로 들어간다.
+    fn theme_columns(self) -> u16 {
+        match (self.compact, self.narrow) {
+            (true, _) => 3,
+            (false, true) => 5,
+            (false, false) => 7,
+        }
+    }
+
+    fn band_height(self) -> gpui::Pixels {
+        if self.narrow {
+            crate::ui::SETTINGS_BAND_HEIGHT_NARROW
+        } else {
+            crate::ui::SETTINGS_BAND_HEIGHT
+        }
+    }
+
+    fn body_inset(self) -> gpui::Point<gpui::Pixels> {
+        match (self.compact, self.narrow) {
+            (true, _) => gpui::point(crate::ui::SPACE_4, crate::ui::SPACE_3),
+            (false, true) => gpui::point(px(20.), crate::ui::SPACE_3),
+            (false, false) => gpui::point(px(32.), crate::ui::SPACE_4),
+        }
+    }
+}
+
+/// 검색으로 맞는 항목이 없는 내비 탭의 투명도.
+const NO_HIT_TAB_OPACITY: f32 = 0.45;
+const BREADCRUMB_SEPARATOR: &str = "›";
+
 impl SettingsView {
-    /// 사이드바 검색 입력을 비우고 전체 탭 목록과 현재 탭 본문을 복원한다(OWE-795).
+    /// 검색 입력의 Enter. 고른 결과로 간다. 창 폭과 상관없이 세그먼트, 하위 페이지까지 같은 곳으로 간다.
+    fn submit_search(&mut self, cx: &mut Context<Self>) {
+        let hits = search::search_hits(&self.search_query(cx));
+        if let Some(&hit) = hits.get(self.search_selected).or(hits.first()) {
+            cx.stop_propagation();
+            self.open_search_hit(hit, cx);
+        }
+    }
+
+    /// 검색 입력의 ↑↓. 결과 목록의 선택을 끝에서 끝으로 돌리고 그 행이 보이게 스크롤한다.
+    fn move_search_selection(&mut self, down: bool, cx: &mut Context<Self>) {
+        let count = search::search_hits(&self.search_query(cx)).len();
+        if count == 0 {
+            return;
+        }
+        cx.stop_propagation();
+        self.search_selected = if down {
+            (self.search_selected + 1) % count
+        } else {
+            (self.search_selected + count - 1) % count
+        };
+        self.search_results_scroll
+            .scroll_to_item(self.search_selected);
+        cx.notify();
+    }
+
+    /// 결과 항목의 페이지로 가서 그 행에 포커스와 스크롤을 맞춘다. 검색어는 비워진다.
+    fn open_search_hit(
+        &mut self,
+        (tab, title): (AdminTab, crate::i18n::Message),
+        cx: &mut Context<Self>,
+    ) {
+        self.set_tab(tab, cx);
+        if title == text::AUTO_SWITCH_TITLE {
+            self.auto_switch_open = true;
+        }
+        if tab == AdminTab::Project {
+            self.project_section = if title == text::SCHEDULES_TITLE {
+                ProjectSection::Schedules
+            } else {
+                ProjectSection::Project
+            };
+        }
+        // 접힌 곳에 있는 항목은 펼쳐 둔다.
+        match tab {
+            AdminTab::Machines => self.reveal_machine_search_hit(title, cx),
+            AdminTab::Mobile => self.mobile.reveal_search_hit(title),
+            _ => {}
+        }
+        self.search_focus.title = Some(title);
+        self.search_pending = true;
+    }
+
+    /// 사이드바 검색 입력을 비우고 현재 탭 본문을 복원한다(OWE-795).
     pub fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_focus.title = None;
         self.search_pending = false;
@@ -10624,87 +11416,439 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// 탭 페이지 헤더(아이콘·제목·배지·1줄 부제 + 우측 보조 동작 슬롯, OWE-795).
-    pub(crate) fn render_page_header(
-        tab: AdminTab,
-        action: Option<gpui::AnyElement>,
-        cx: &App,
+    /// 본문 위 머리 띠: 현재 위치와 닫기. 하위 페이지는 부모로 돌아가는 버튼이 앞에 붙는다.
+    fn render_page_band(
+        &self,
+        frame: SettingsFrame,
+        cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        use gpui_component::Sizable as _;
+        use gpui_component::{IconName, Sizable as _};
         let p = crate::ui::palette(cx);
+        let tab = self.tab;
+        let parent = tab.page();
+        let title = div()
+            .id("admin-page-title")
+            .debug_selector(|| "admin-page-title".into())
+            .min_w_0()
+            .truncate()
+            .text_size(crate::ui::TEXT_LG)
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .child(tab.label());
+        let crumb = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(parent == tab, |d| d.child(tab.icon_element().small()))
+            .when(parent != tab, |d| {
+                d.child(
+                    layout::ghost("admin-page-back", parent.label())
+                        .icon(IconName::ChevronLeft)
+                        .xsmall()
+                        .flex_none()
+                        .debug_selector(|| "admin-page-back".into())
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_tab(parent, cx))),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(p.muted_foreground)
+                        .child(BREADCRUMB_SEPARATOR),
+                )
+            })
+            .child(title);
         div()
             .id("admin-page-header")
             .debug_selector(|| "admin-page-header".into())
+            .h(frame.band_height())
             .w_full()
             .min_w_0()
+            .flex_none()
             .flex()
-            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_3()
-            .pb_3()
+            .pl(frame.body_inset().x.max(if frame.compact {
+                frame.traffic_lights
+            } else {
+                px(0.)
+            }))
+            .pr_3()
             .border_b_1()
             .border_color(p.border)
+            .window_control_area(gpui::WindowControlArea::Drag)
+            .child(crumb)
+            .child(
+                Button::new("admin-modal-close")
+                    .icon(IconName::Close)
+                    .ghost()
+                    .xsmall()
+                    .flex_none()
+                    .debug_selector(|| "admin-modal-close".into())
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        close_settings_page_for(Some(cx.entity_id()), window, cx);
+                    })),
+            )
+    }
+
+    /// 넓은 모양과 좁은 모양이 같이 쓰는 검색 칸.
+    fn render_search_field(
+        input: &gpui::Entity<gpui_component::input::InputState>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use gpui_component::input::{Enter, Escape, MoveDown, MoveUp};
+        use gpui_component::{Icon, IconName, Sizable as _};
+        let p = crate::ui::palette(cx);
+        let has_query = !input.read(cx).value().is_empty();
+        div()
+            .id("admin-search-pill")
+            .debug_selector(|| "admin-search-pill".into())
+            // Esc는 검색어를 지우고, 이미 비어 있으면 설정 페이지를 닫는다. ↑↓와 Enter는 결과 목록을 다룬다.
+            .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                cx.stop_propagation();
+                if !this.search_query(cx).is_empty() {
+                    this.clear_search(window, cx);
+                } else if this.shortcuts.target.is_none() {
+                    close_settings_page_for(Some(cx.entity_id()), window, cx);
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Enter, _, cx| this.submit_search(cx)))
+            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                this.move_search_selection(false, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                this.move_search_selection(true, cx);
+            }))
+            .child(
+                gpui_component::input::Input::new(input)
+                    .small()
+                    .prefix(Icon::new(IconName::Search).xsmall())
+                    .suffix(if has_query {
+                        crate::ui::button_with_tooltip(
+                            Button::new("admin-search-clear")
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .debug_selector(|| "admin-search-clear".into())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.clear_search(window, cx);
+                                })),
+                            "admin-search-clear",
+                            text::SEARCH_CLEAR.get(),
+                        )
+                        .into_any_element()
+                    } else {
+                        div()
+                            .id("admin-search-hint")
+                            .debug_selector(|| "admin-search-hint".into())
+                            .px_1()
+                            .rounded(crate::ui::RADIUS_XS)
+                            .bg(p.muted)
+                            .font_family(crate::ui::FONT_MONO)
+                            .text_size(crate::ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::SEARCH_HINT_CMD_F.get())
+                            .into_any_element()
+                    }),
+            )
+    }
+
+    /// 왼쪽 탭 기둥. 탭 자리는 검색해도 움직이지 않고, 맞은 개수가 붙거나 흐려진다.
+    fn render_settings_nav(
+        &self,
+        search_field: gpui::Stateful<gpui::Div>,
+        hits: Option<&[(AdminTab, crate::i18n::Message)]>,
+        frame: SettingsFrame,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = crate::ui::palette(cx);
+        let update_waiting = cx
+            .try_global::<crate::updater::UpdateState>()
+            .is_some_and(|u| u.staged.is_some());
+        let mut tabs = div().flex_none().flex().flex_col().gap_1();
+        for tab in AdminTab::ALL {
+            let selected = hits.is_none() && tab == self.tab.page();
+            let count = hits.map(|hits| hits.iter().filter(|(hit, _)| hit.page() == tab).count());
+            tabs = tabs.child(
+                settings_nav_tab(tab, selected)
+                    .focus_visible(|style| style.border_color(p.ring))
+                    .min_h(px(30.))
+                    .flex_none()
+                    .py_1()
+                    .px_2()
+                    .rounded(crate::ui::RADIUS_SM)
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(crate::ui::TEXT_SM)
+                    .text_color(if selected {
+                        p.foreground
+                    } else {
+                        p.muted_foreground
+                    })
+                    .when(selected, |d| {
+                        d.bg(p.sidebar_accent).font_weight(gpui::FontWeight::MEDIUM)
+                    })
+                    .when(count == Some(0), |d| d.opacity(NO_HIT_TAB_OPACITY))
+                    .hover(|d| d.bg(p.sidebar_accent).text_color(p.foreground))
+                    .active(|d| d.bg(p.accent).text_color(p.foreground))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
+                    .child(tab.icon_element().small())
+                    .child(div().flex_1().min_w_0().child(tab.label()))
+                    .when(tab == AdminTab::Updates && update_waiting, |d| {
+                        d.child(
+                            div()
+                                .debug_selector(|| "admin-tab-updates-dot".into())
+                                .flex_none()
+                                .size(crate::ui::STATE_DOT)
+                                .rounded_full()
+                                .bg(p.primary),
+                        )
+                    })
+                    .children(count.filter(|count| *count > 0).map(|count| {
+                        div()
+                            .flex_none()
+                            .font_family(crate::ui::FONT_MONO)
+                            .text_size(crate::ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(count.to_string())
+                    })),
+            );
+        }
+        div()
+            .id("admin-sidebar")
+            .debug_selector(|| "admin-sidebar".into())
+            .tab_group()
+            .w(frame.nav_width)
+            .h_full()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex_none()
+            .px_2p5()
+            .pb_3()
+            .bg(p.worktree_sidebar)
+            .border_r_1()
+            .border_color(p.border)
+            .flex()
+            .flex_col()
+            .gap_2p5()
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .debug_selector(|| "admin-nav-title".into())
+                    .h(frame.band_height())
+                    .flex_none()
                     .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(tab.icon_element().small())
-                            .child(
-                                div()
-                                    .id("admin-page-title")
-                                    .debug_selector(|| "admin-page-title".into())
-                                    .min_w_0()
-                                    .flex_shrink_1()
-                                    .overflow_hidden()
-                                    .text_size(crate::ui::TEXT_LG)
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(tab.label()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("admin-page-subtitle")
-                            .debug_selector(|| "admin-page-subtitle".into())
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(tab.subtitle()),
-                    ),
+                    .items_center()
+                    .pl(crate::ui::SPACE_2.max(frame.traffic_lights))
+                    .mb(-crate::ui::SPACE_2)
+                    .window_control_area(gpui::WindowControlArea::Drag)
+                    .text_size(crate::ui::TEXT_SM)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(text::TITLE.get()),
+            )
+            .child(search_field)
+            .child(tabs)
+    }
+
+    /// 작은 창에서 왼쪽 탭 기둥 대신 쓰는 탭 메뉴와 검색 칸.
+    fn render_compact_nav(
+        &self,
+        search_field: gpui::Stateful<gpui::Div>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+        let p = crate::ui::palette(cx);
+        let page = self.tab.page();
+        let view = cx.entity();
+        div()
+            .id("admin-compact-navigation")
+            .debug_selector(|| "admin-compact-navigation".into())
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .px_4()
+            .py_2()
+            .bg(p.worktree_sidebar)
+            .border_b_1()
+            .border_color(p.border)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                layout::secondary("admin-compact-tabs", page.label())
+                    .w_full()
+                    .max_w_full()
+                    .dropdown_caret(true)
+                    .debug_selector(|| "admin-compact-tabs".into())
+                    .dropdown_menu(move |mut menu, window, _| {
+                        menu = menu
+                            .scrollable(true)
+                            .max_h(window.viewport_size().height * 0.6);
+                        for tab in AdminTab::ALL {
+                            let view = view.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(tab.label())
+                                    .checked(tab == page)
+                                    .on_click(move |_, _, cx| {
+                                        view.update(cx, |this, cx| this.set_tab(tab, cx));
+                                    }),
+                            );
+                        }
+                        menu
+                    }),
+            )
+            .child(search_field)
+    }
+
+    /// 검색 중인 본문. 탭 본문을 만들지 않고 맞은 설정 목록만 그린다.
+    /// 탭 본문과 스크롤 핸들을 나눠 검색을 지우면 보던 위치로 돌아간다.
+    fn render_search_results(
+        &self,
+        query: &str,
+        hits: &[(AdminTab, crate::i18n::Message)],
+        frame: SettingsFrame,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let p = crate::ui::palette(cx);
+        let inset = frame.body_inset();
+        let body = div().flex_1().min_h_0().min_w_0().flex().flex_col();
+        if hits.is_empty() {
+            return body.child(
+                div()
+                    .id("admin-search-results")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(inset.x)
+                    .py(inset.y)
+                    .child(Self::render_search_empty(query, cx)),
+            );
+        }
+        let rows = hits.iter().enumerate().map(|(index, &hit)| {
+            let (tab, title) = hit;
+            let path = if tab.page() == tab {
+                tab.label().to_owned()
+            } else {
+                format!(
+                    "{} {} {}",
+                    tab.page().label(),
+                    BREADCRUMB_SEPARATOR,
+                    tab.label()
+                )
+            };
+            let selector = format!("admin-search-hit-{index}");
+            div()
+                .id(("admin-search-hit", index))
+                .debug_selector(move || selector)
+                .role(gpui::Role::ListBoxOption)
+                .aria_label(title.get())
+                .aria_selected(index == self.search_selected)
+                .flex_none()
+                .w_full()
+                .min_h(px(30.))
+                .px_2()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(crate::ui::RADIUS_SM)
+                .cursor_pointer()
+                .text_size(crate::ui::TEXT_SM)
+                .when(index == self.search_selected, |d| d.bg(p.accent))
+                .hover(|d| d.bg(p.accent))
+                .on_click(cx.listener(move |this, _, _, cx| this.open_search_hit(hit, cx)))
+                .child(tab.icon_element().small())
+                .child(div().flex_1().min_w_0().child(title.get()))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(path),
+                )
+        });
+        let count = hits.len().to_string();
+        body.child(
+            div()
+                .debug_selector(|| "admin-search-head".into())
+                .flex_none()
+                .px(inset.x)
+                .pt(inset.y)
+                .pb_1()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(p.muted_foreground)
+                .child(
+                    text::SEARCH_RESULTS
+                        .format(&[("query", query.trim()), ("count", count.as_str())]),
+                ),
+        )
+        .child(
+            div()
+                .id("admin-search-results")
+                .debug_selector(|| "admin-search-results".into())
+                .role(gpui::Role::ListBox)
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.search_results_scroll)
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .px(inset.x)
+                .pb(inset.y)
+                .children(rows),
+        )
+    }
+
+    fn render_search_empty(query: &str, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        use gpui_component::{Icon, IconName, Sizable as _};
+        let p = crate::ui::palette(cx);
+        layout::card(p)
+            .id("admin-content-search-empty")
+            .debug_selector(|| "admin-content-search-empty".into())
+            .py_8()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                Icon::new(IconName::Search)
+                    .small()
+                    .text_color(p.muted_foreground),
             )
             .child(
                 div()
-                    .id("admin-page-header-actions")
-                    .debug_selector(|| "admin-page-header-actions".into())
-                    .flex_none()
-                    .max_w_full()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .children(action),
+                    .text_size(crate::ui::TEXT_SM)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(p.foreground)
+                    .child(text::SEARCH_EMPTY_TITLE.get()),
+            )
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .text_center()
+                    .child(text::SEARCH_EMPTY_DESC.format(&[("query", query)])),
+            )
+            .child(
+                layout::secondary("admin-content-search-clear", text::SEARCH_CLEAR.get())
+                    .debug_selector(|| "admin-content-search-clear".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.clear_search(window, cx);
+                    })),
             )
     }
 }
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_component::{Icon, IconName, Sizable as _};
         if self.mobile_page {
             return self.render_mobile_page(window, cx).into_any_element();
         }
-        let has_modal =
-            self.removing.is_some() || self.schedule_modal.is_some() || self.space.cleanup_open;
+        let has_modal = self.removing.is_some() || self.schedule_modal.is_some();
         if has_modal && self.modal_return_focus.is_none() {
             self.modal_return_focus =
                 Some(window.focused(cx).unwrap_or_else(|| self.focus.clone()));
@@ -10722,360 +11866,62 @@ impl Render for SettingsView {
             window.focus(&focus, cx);
         }
         window.set_window_title(text::TITLE.get());
-        let (s, error) = cx.try_global::<Config>().map_or_else(
-            || (Settings::default(), None),
-            |c| {
-                (
-                    if matches!(
-                        self.tab,
-                        AdminTab::Appearance
-                            | AdminTab::Agents
-                            | AdminTab::Project
-                            | AdminTab::QuickCommands
-                            | AdminTab::System
-                            | AdminTab::Updates
-                    ) {
-                        c.settings.clone()
-                    } else {
-                        Settings::default()
-                    },
-                    c.error.clone(),
-                )
-            },
-        );
+        let error = cx.try_global::<Config>().and_then(|c| c.error.clone());
+        let settings = |cx: &App| {
+            cx.try_global::<Config>()
+                .map_or_else(Default::default, |c| c.settings.clone())
+        };
         let p = crate::ui::palette(cx);
         let current_tab = self.tab;
-
-        let compact_navigation = window.viewport_size().width < window.rem_size() * 48.;
+        let frame = SettingsFrame::new(window);
 
         let search_input = self.search_input(window, cx);
+        if std::mem::take(&mut self.search_reset) && !search_input.read(cx).value().is_empty() {
+            search_input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
         let search_value = search_input.read(cx).value().to_string();
-        let has_search_query = !search_value.is_empty();
-        let matches = search::search_tabs(&search_value);
-        let mut nav = div()
-            .id("admin-sidebar")
-            .debug_selector(|| "admin-sidebar".into())
-            .tab_group()
-            .w(crate::ui::SETTINGS_NAV_WIDTH)
-            .h_full()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex_none()
-            .px_2p5()
-            .py_3()
-            .bg(p.worktree_sidebar)
-            .border_r_1()
-            .border_color(p.border)
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .child(
-                div()
-                    .id("admin-search-pill")
-                    .debug_selector(|| "admin-search-pill".into())
-                    // Esc는 검색어를 지우고, 이미 비어 있으면 설정 페이지를 닫는다. Enter는 첫 결과 탭으로 간다.
-                    .capture_action(cx.listener(
-                        |this, _: &gpui_component::input::Escape, window, cx| {
-                            cx.stop_propagation();
-                            if !this.search_query(cx).is_empty() {
-                                this.clear_search(window, cx);
-                            } else if this.shortcuts.target.is_none() {
-                                close_settings_page_for(Some(cx.entity_id()), window, cx);
-                            }
-                        },
-                    ))
-                    .capture_action(
-                        cx.listener(|this, _: &gpui_component::input::Enter, _, cx| {
-                            let query = this.search_query(cx);
-                            if let Some(&tab) = search::search_tabs(&query)
-                                .first()
-                                .filter(|_| !query.trim().is_empty())
-                            {
-                                cx.stop_propagation();
-                                this.set_tab(search::search_target(&query, tab), cx);
-                            }
-                        }),
-                    )
-                    .child(
-                        gpui_component::input::Input::new(&search_input)
-                            .small()
-                            .prefix(Icon::new(IconName::Search).xsmall())
-                            .suffix(if has_search_query {
-                                crate::ui::button_with_tooltip(
-                                    Button::new("admin-search-clear")
-                                        .icon(IconName::Close)
-                                        .ghost()
-                                        .xsmall()
-                                        .debug_selector(|| "admin-search-clear".into())
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.clear_search(window, cx);
-                                        })),
-                                    "admin-search-clear",
-                                    text::SEARCH_CLEAR.get(),
-                                )
-                                .into_any_element()
-                            } else {
-                                div()
-                                    .id("admin-search-hint")
-                                    .debug_selector(|| "admin-search-hint".into())
-                                    .px_1()
-                                    .rounded(crate::ui::RADIUS_XS)
-                                    .bg(p.muted)
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_2XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(text::SEARCH_HINT_CMD_F.get())
-                                    .into_any_element()
-                            }),
-                    ),
-            );
-        if matches.is_empty() {
-            nav = nav.child(
-                div()
-                    .px_2()
-                    .debug_selector(|| "admin-search-empty".into())
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::SEARCH_EMPTY.get()),
-            );
-        }
-
-        {
-            let update_waiting = cx
-                .try_global::<crate::updater::UpdateState>()
-                .is_some_and(|u| u.staged.is_some());
-            let mut group_col = div().flex_none().flex().flex_col().gap_1();
-            for tab in matches.iter().copied() {
-                let selected = tab == current_tab.page();
-                group_col = group_col.child(
-                    settings_nav_tab(tab, selected)
-                        .focus_visible(|style| style.border_color(p.ring))
-                        .min_h(px(30.))
-                        .flex_none()
-                        .py_1()
-                        .px_2()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .cursor_pointer()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_size(crate::ui::TEXT_SM)
-                        .text_color(if selected {
-                            p.foreground
-                        } else {
-                            p.muted_foreground
-                        })
-                        .when(selected, |d| {
-                            d.bg(p.sidebar_accent).font_weight(gpui::FontWeight::MEDIUM)
-                        })
-                        .hover(|d| d.bg(p.sidebar_accent).text_color(p.foreground))
-                        .active(|d| d.bg(p.accent).text_color(p.foreground))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let query = this.search_query(cx);
-                            this.set_tab(search::search_target(&query, tab), cx);
-                        }))
-                        .child(tab.icon_element().small())
-                        .child(div().flex_1().min_w_0().truncate().child(tab.label()))
-                        .when(tab == AdminTab::Updates && update_waiting, |d| {
-                            d.child(
-                                div()
-                                    .debug_selector(|| "admin-tab-updates-dot".into())
-                                    .flex_none()
-                                    .size(crate::ui::STATE_DOT)
-                                    .rounded_full()
-                                    .bg(p.primary),
-                            )
-                        }),
-                );
-            }
-            nav = nav.child(group_col);
-        }
-
-        let compact_nav = div()
-            .id("admin-compact-navigation")
-            .debug_selector(|| "admin-compact-navigation".into())
-            .flex_none()
-            .w_full()
-            .min_w_0()
-            .px_4()
-            .py_2()
-            .bg(p.worktree_sidebar)
-            .border_b_1()
-            .border_color(p.border)
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(div().flex().items_center().gap_2().child({
-                use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-                let view = cx.entity();
-                div().flex_1().min_w_0().child(
-                    layout::secondary("admin-compact-tabs", current_tab.label())
-                        .w_full()
-                        .max_w_full()
-                        .dropdown_caret(true)
-                        .debug_selector(|| "admin-compact-tabs".into())
-                        .dropdown_menu(move |mut menu, window, _| {
-                            menu = menu
-                                .scrollable(true)
-                                .max_h(window.viewport_size().height * 0.6);
-                            for tab in AdminTab::ALL {
-                                let view = view.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new(tab.label())
-                                        .checked(tab == current_tab)
-                                        .on_click(move |_, window, cx| {
-                                            view.update(cx, |this, cx| {
-                                                this.clear_search(window, cx);
-                                                this.set_tab(tab, cx);
-                                            });
-                                        }),
-                                );
-                            }
-                            menu
-                        }),
-                )
-            }))
-            .child(
-                div()
-                    .id("admin-compact-search")
-                    .capture_action(cx.listener(
-                        |this, _: &gpui_component::input::Escape, window, cx| {
-                            cx.stop_propagation();
-                            if this.search_query(cx).is_empty() {
-                                close_settings_page_for(Some(cx.entity_id()), window, cx);
-                            } else {
-                                this.clear_search(window, cx);
-                            }
-                        },
-                    ))
-                    .capture_action(
-                        cx.listener(|this, _: &gpui_component::input::Enter, _, cx| {
-                            let query = this.search_query(cx);
-                            if let Some(&tab) = search::search_tabs(&query)
-                                .first()
-                                .filter(|_| !query.trim().is_empty())
-                            {
-                                cx.stop_propagation();
-                                this.set_tab(tab, cx);
-                            }
-                        }),
-                    )
-                    .child(
-                        gpui_component::input::Input::new(&search_input)
-                            .small()
-                            .prefix(Icon::new(IconName::Search).xsmall()),
-                    ),
-            );
-
-        // 투명 제목 표시줄 또는 중앙 모달 상단에 그리는 테마 색 제목 띠(우측 닫기 ✕ 버튼 포함).
-        let titlebar = div()
-            .id("admin-titlebar")
-            .debug_selector(|| "admin-titlebar".into())
-            .h(crate::ui::TITLEBAR_HEIGHT)
-            .w_full()
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .bg(p.worktree_sidebar)
-            .border_b_1()
-            .border_color(p.border)
-            .window_control_area(gpui::WindowControlArea::Drag)
-            .text_size(crate::ui::TEXT_XS)
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(p.muted_foreground)
-            .child(div().w(px(24.)))
-            .child(div().child(text::TITLE.get()))
-            .child(
-                Button::new("admin-modal-close")
-                    .icon(IconName::Close)
-                    .ghost()
-                    .xsmall()
-                    .debug_selector(|| "admin-modal-close".into())
-                    .on_click(cx.listener(|_, _, window, cx| {
-                        close_settings_page_for(Some(cx.entity_id()), window, cx);
-                    })),
-            );
+        let searching = !search_value.trim().is_empty();
+        let hits = search::search_hits(&search_value);
+        let search_field = Self::render_search_field(&search_input, cx);
+        let navigation = if frame.compact {
+            self.render_compact_nav(search_field, cx)
+        } else {
+            self.render_settings_nav(search_field, searching.then_some(&*hits), frame, cx)
+        };
+        let band = self.render_page_band(frame, cx);
 
         self.search_focus.rendered.set(false);
-        let content_column = if matches.is_empty() {
-            div()
-                .id("admin-content-column")
-                .debug_selector(|| "admin-content-column".into())
-                .max_w(crate::ui::SETTINGS_CONTENT_MAX_WIDTH)
-                .w_full()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_4()
-                .child(
-                    layout::card(p)
-                        .id("admin-content-search-empty")
-                        .debug_selector(|| "admin-content-search-empty".into())
-                        .py_8()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .child(
-                            Icon::new(IconName::Search)
-                                .small()
-                                .text_color(p.muted_foreground),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::ui::TEXT_SM)
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(p.foreground)
-                                .child(text::SEARCH_EMPTY_TITLE.get()),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .text_center()
-                                .child(
-                                    text::SEARCH_EMPTY_DESC
-                                        .format(&[("query", search_value.as_str())]),
-                                ),
-                        )
-                        .child(
-                            layout::secondary(
-                                "admin-content-search-clear",
-                                text::SEARCH_CLEAR.get(),
-                            )
-                            .debug_selector(|| "admin-content-search-clear".into())
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.clear_search(window, cx);
-                                },
-                            )),
-                        ),
-                )
+        let main = if searching {
+            self.render_search_results(&search_value, &hits, frame, cx)
+                .into_any_element()
         } else {
-            let page_header = Self::render_page_header(current_tab, None, cx);
             let content = match current_tab {
-                AdminTab::Appearance => self
-                    .render_general_tab(&s, cx)
-                    .child(self.render_terminal_tab(&s, cx)),
+                AdminTab::Appearance => {
+                    let s = settings(cx);
+                    let terminal_rows = self.render_terminal_tab(&s, cx);
+                    self.render_general_tab(&s, terminal_rows, window, cx)
+                }
                 AdminTab::Accounts => self.render_accounts_tab(window, cx),
-                AdminTab::Agents => self.render_agents_tab(&s, window, cx),
+                AdminTab::Agents => self.render_agents_tab(&settings(cx), window, cx),
                 AdminTab::Install => self.render_install_tab(window, cx),
                 AdminTab::Machines => self.render_machines_tab(window, cx),
                 AdminTab::Project => self.render_project_page(window, cx),
-                AdminTab::QuickCommands => self.render_quick_commands_page(&s, window, cx),
+                AdminTab::QuickCommands => {
+                    self.render_quick_commands_page(&settings(cx), window, cx)
+                }
                 // OWE-799: 단축키 탭은 카테고리 그룹·로컬 검색·인라인 기록을 위해 window를 받는다.
                 AdminTab::Shortcuts => self.render_shortcuts_tab(window, cx),
-                AdminTab::System => div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(self.render_system_rows(&s, cx))
-                    .child(self.render_resources_tab(&s, cx)),
-                AdminTab::Disk => div().child(self.render_space_section(cx)),
-                AdminTab::Updates => self.render_updates_tab(&s, cx),
+                AdminTab::System => {
+                    let s = settings(cx);
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(self.render_system_rows(&s, cx))
+                        .child(self.render_resources_tab(&s, cx))
+                }
+                AdminTab::Disk => div().child(self.render_space_section(window, cx)),
+                AdminTab::Updates => self.render_updates_tab(&settings(cx), cx),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
             };
             let body = div()
@@ -11086,33 +11932,68 @@ impl Render for SettingsView {
                 .w_full()
                 .min_w_0()
                 .id("admin-tab-body")
+                .debug_selector(|| "admin-tab-body".into())
                 .when(
                     !self.search_focus.rendered.get() && self.search_pending,
                     |body| body.anchor_scroll(Some(self.search_focus.anchor.clone())),
                 );
-
+            let inset = frame.body_inset();
+            // 디스크의 삭제 띠는 스크롤되지 않게 본문 아래에 둔다.
+            let footer = (current_tab == AdminTab::Disk)
+                .then(|| self.render_disk_footer(window, inset.x, cx))
+                .flatten();
+            let scroll = div()
+                // 탭별 스크롤 id: 탭 전환 시 스크롤 위치를 최상단으로 되돌린다(OWE-858).
+                .id(("admin-content", current_tab as usize))
+                .debug_selector(|| "admin-content".into())
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.search_focus.scroll)
+                .px(inset.x)
+                .py(inset.y)
+                .child(
+                    div()
+                        .id("admin-content-column")
+                        .debug_selector(|| "admin-content-column".into())
+                        // OWE-719·OWE-793·OWE-795: 왼쪽 정렬 + 창 폭에 맞춰 유동 확장하되 초대형 화면에서 과도한 행 길이만 제한.
+                        .max_w(crate::ui::SETTINGS_CONTENT_MAX_WIDTH)
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .id("admin-page-subtitle")
+                                .debug_selector(|| "admin-page-subtitle".into())
+                                .min_w_0()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(current_tab.subtitle()),
+                        )
+                        .child(body)
+                        .children(error.map(|e| {
+                            div()
+                                .p_2()
+                                .rounded(crate::ui::RADIUS_SM)
+                                .bg(p.warning)
+                                .text_color(p.warning_foreground)
+                                .font_family(crate::ui::FONT_UI)
+                                .text_size(crate::ui::TEXT_XS)
+                                .child(crate::i18n::cached_notice(&e))
+                        })),
+                );
             div()
-                .id("admin-content-column")
-                .debug_selector(|| "admin-content-column".into())
-                // OWE-719·OWE-793·OWE-795: 왼쪽 정렬 + 창 폭에 맞춰 유동 확장하되 초대형 화면에서 과도한 행 길이만 제한.
-                .max_w(crate::ui::SETTINGS_CONTENT_MAX_WIDTH)
-                .w_full()
+                .flex_1()
+                .min_h_0()
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap_4()
-                .child(page_header)
-                .child(body)
-                .children(error.map(|e| {
-                    div()
-                        .p_2()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .bg(p.warning)
-                        .text_color(p.warning_foreground)
-                        .font_family(crate::ui::FONT_UI)
-                        .text_size(crate::ui::TEXT_XS)
-                        .child(crate::i18n::cached_notice(&e))
-                }))
+                .child(scroll)
+                .children(footer)
+                .into_any_element()
         };
 
         if self.search_pending {
@@ -11141,11 +12022,6 @@ impl Render for SettingsView {
                         cx.notify();
                         return;
                     }
-                    if this.space.cleanup_open {
-                        this.close_cleanup_modal(cx);
-                        cx.stop_propagation();
-                        return;
-                    }
                     if this.armed.is_some() {
                         this.disarm(cx);
                         cx.stop_propagation();
@@ -11166,7 +12042,8 @@ impl Render for SettingsView {
                         window.focus(&this.focus, cx);
                         true
                     } else {
-                        false
+                        this.quick_input_focused(window, cx)
+                            && this.cancel_quick_command_edit(window, cx)
                     };
                     if handled {
                         cx.stop_propagation();
@@ -11226,11 +12103,6 @@ impl Render for SettingsView {
                     cx.notify();
                     return;
                 }
-                if this.space.cleanup_open && ev.keystroke.key == "escape" {
-                    this.close_cleanup_modal(cx);
-                    cx.stop_propagation();
-                    return;
-                }
                 // 포커스 이동(Tab)·Esc는 무장한 파괴적 버튼을 먼저 푼다(Esc는 창을 닫지 않고 해제만).
                 if this.armed.is_some() && matches!(ev.keystroke.key.as_str(), "tab" | "escape") {
                     this.disarm(cx);
@@ -11288,35 +12160,31 @@ impl Render for SettingsView {
             .font_family(crate::ui::FONT_UI)
             .text_size(crate::ui::TEXT_MD)
             .children(self.render_remove_dialog(window, cx))
-            .children(self.render_cleanup_modal(window, cx))
             .children(self.render_schedule_modal(window, cx))
-            .child(titlebar)
-            .children(compact_navigation.then_some(compact_nav))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .flex()
-                    .children((!compact_navigation).then_some(nav))
-                    .child(
-                        div().flex_1().min_w_0().h_full().flex().flex_col().child(
-                            div()
-                                // 탭별 스크롤 id: 탭 전환 시 스크롤 위치를 최상단으로 되돌린다(OWE-858).
-                                .id(("admin-content", current_tab as usize))
-                                .debug_selector(|| "admin-content".into())
-                                .flex_1()
-                                .min_h_0()
-                                .min_w_0()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.search_focus.scroll)
-                                .when(compact_navigation, |d| d.px(crate::ui::SPACE_4))
-                                .when(!compact_navigation, gpui::Styled::px_8)
-                                .py_6()
-                                .child(content_column),
-                        ),
-                    ),
-            )
+            .map(|root| {
+                if frame.compact {
+                    root.child(band).child(navigation).child(main)
+                } else {
+                    root.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .flex()
+                            .child(navigation)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .flex()
+                                    .flex_col()
+                                    .child(band)
+                                    .child(main),
+                            ),
+                    )
+                }
+            })
             .into_any_element()
     }
 }
