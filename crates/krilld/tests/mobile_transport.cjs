@@ -1980,3 +1980,112 @@ test("a read is retried once; a second transport failure surfaces", async () => 
   await assert.rejects(read, /Disconnected. Reconnecting/);
   h.transport.close();
 });
+test("slow challenge at 19980ms resets handshake stage budget while stage-2 timeout neither blocks nor imposes 65s lockout", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(1);
+  await h.tick(19980);
+  socket.emit("message", {
+    data: JSON.stringify({ version: 2, challenge: "aa" }),
+  });
+  await flush();
+  await h.tick(520);
+  assert.equal(socket.closed, undefined);
+  socket.emit("message", { data: enc.encode("{}") });
+  await flush();
+  socket.emit("message", { data: Uint8Array.from([0, 0, 0, 0, 1]) });
+  await flush();
+  h.response(socket, { sessions: [] });
+  await pending;
+  assert.equal(h.transport.ready, true);
+  h.transport.close();
+
+  const stalled = harness();
+  for (let i = 0; i < 3; i++) {
+    if (i === 0) {
+      const { pending: p } = await stalled.start(2);
+      await stalled.tick(20000);
+      await p;
+    } else {
+      await stalled.tick(15000);
+      await stalled.advance(stalled.sockets.at(-1), 2);
+      await stalled.tick(20000);
+    }
+    assert.equal(stalled.transport.blocked, false);
+    assert(stalled.transport.state.retryAt < stalled.context.Date.now() + 20000);
+  }
+  stalled.transport.close();
+});
+test("forHost.locate preserves selected fallback route and decodeImage removes src without empty-src error", async () => {
+  const saved = {
+      device_id: "phone",
+      credential: "11".repeat(32),
+      rid: "a".repeat(32),
+    },
+    h = harness(saved, undefined, true),
+    e = h.endpoint;
+  e.authenticated({ desktop: desktopManifest() });
+  const peer = e.forHost(e.profiles()[0].id);
+  assert.equal(
+    peer.selectRoute("wss://desktop.tail123.ts.net:18449/ws"),
+    true,
+  );
+  h.context.fetch = async () => ({
+    ok: true,
+    json: async () => ({ hash: "0123456789abcdef", url: "", relay: true }),
+  });
+  await peer.locate();
+  assert.equal(peer.socketUrl(), "wss://desktop.tail123.ts.net:18449/ws");
+  h.transport.close();
+
+  const app = fs.readFileSync(
+      path.join(__dirname, "../src/mobile/assets/app.js"),
+      "utf8",
+    ),
+    lines = app
+      .split("\n")
+      .filter(
+        (l) =>
+          l.includes("async function imageSize(") ||
+          l.includes("async function decodeImage("),
+      );
+  let emptyAssigned = false,
+    removedAttr = false,
+    revoked = false;
+  const imgCtx = vm.createContext({
+    Uint8Array,
+    DataView,
+    URL: {
+      createObjectURL: () => "blob:qr",
+      revokeObjectURL: () => {
+        revoked = true;
+      },
+    },
+    Image: class {
+      constructor() {
+        this.naturalWidth = 64;
+        this.naturalHeight = 64;
+      }
+      set src(v) {
+        if (v === "") emptyAssigned = true;
+        this._src = v;
+      }
+      get src() {
+        return this._src;
+      }
+      async decode() {}
+      removeAttribute(name) {
+        if (name === "src") removedAttr = true;
+      }
+    },
+  });
+  vm.runInContext(lines.join("\n") + "\nglobalThis.decode=decodeImage;", imgCtx);
+  const png = Buffer.alloc(24);
+  png.writeUInt32BE(0x89504e47, 0);
+  png.writeUInt32BE(64, 16);
+  png.writeUInt32BE(64, 20);
+  const decoded = await imgCtx.decode(new Blob([png], { type: "image/png" }), 512);
+  decoded.close();
+  assert.equal(emptyAssigned, false);
+  assert.equal(removedAttr, true);
+  assert.equal(revoked, true);
+});

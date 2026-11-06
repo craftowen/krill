@@ -427,12 +427,21 @@
         ? 1
         : 0;
   function attempt(retry = 0, previous) {
-    const started = Date.now(),
+    let started = Date.now(),
       attemptId = id(),
-      episode = previous?.episode.open
-        ? previous.episode
-        : { open: false, held: null, timer: null, away: false, crumbs: [] };
-    let state = { phase: "socket_open", route: "unknown" };
+      established = false,
+      state = { phase: "socket_open", route: "unknown" };
+    const episode = previous?.episode.open
+      ? previous.episode
+      : { open: false, held: null, timer: null, away: false, crumbs: [] };
+    const resetPostOk = () => {
+      if (established && !episode.open) {
+        started = Date.now();
+        attemptId = id();
+        retry = 0;
+        established = false;
+      }
+    };
     const metadata = (extra) => ({
       ...state,
       attempt_id: attemptId,
@@ -461,18 +470,28 @@
     return {
       episode,
       mark(phase, extra = {}) {
-        state = { ...state, ...fields(extra), phase };
-        remember(metadata(extra));
+        resetPostOk();
+        const clean = fields({ ...extra, phase });
+        state = {
+          phase: clean.phase || state.phase,
+          route: clean.route || state.route,
+        };
+        remember(metadata(clean));
       },
       report(code, extra = {}) {
+        resetPostOk();
         const input = metadata(extra);
         remember(input);
         if (episode.open) {
           if (
             episode.held &&
-            weight(code, input) > weight(episode.held.code, episode.held.input)
-          )
+            (weight(code, input) > weight(episode.held.code, episode.held.input) ||
+              (code === "mobile_rpc_failed" &&
+                episode.held.code !== "mobile_auth_failed"))
+          ) {
             episode.held = { code, input };
+            if (code === "mobile_rpc_failed") release();
+          }
           return;
         }
         episode.open = true;
@@ -482,6 +501,8 @@
       },
       ok() {
         clearTimeout(episode.timer);
+        established = true;
+        started = Date.now();
         Object.assign(episode, {
           open: false,
           held: null,
@@ -492,11 +513,12 @@
     };
   }
   function assetFile(value) {
+    if (typeof value !== "string" || !value.trim()) return;
     try {
       const u = new URL(value, location.href),
         base = /^\/m\/[0-9a-f]{16}\//.exec(location.pathname)?.[0] || "/";
       if (u.origin !== location.origin || !u.pathname.startsWith(base)) return;
-      return u.pathname.slice(base.length) || "index.html";
+      return u.pathname.slice(base.length) || undefined;
     } catch {}
   }
   function source(value) {
@@ -558,13 +580,18 @@
             });
           return;
         }
+        const details = exception(event.error),
+          direct = source(event.filename),
+          top = details.stack_frames?.[0],
+          srcFile = direct || top?.source_file;
+        if (!srcFile && !details.stack_frames?.length) return;
         report("mobile_runtime_error", {
           phase: "runtime",
           reason: "runtime_error",
-          ...exception(event.error),
-          source_file: source(event.filename),
-          line: event.lineno,
-          column: event.colno,
+          ...details,
+          source_file: srcFile,
+          line: direct ? event.lineno : top?.line,
+          column: direct ? event.colno : top?.column,
         });
       } catch {}
     },
@@ -572,10 +599,19 @@
   );
   globalThis.addEventListener?.("unhandledrejection", (event) => {
     try {
+      const details = exception(event.reason);
+      if (
+        !details.stack_frames?.length &&
+        typeof event.reason?.stack === "string" &&
+        /(?:https?|chrome-extension|moz-extension|safari-(?:web-)?extension):\/\//i.test(
+          event.reason.stack,
+        )
+      )
+        return;
       report("mobile_unhandled_rejection", {
         phase: "runtime",
         reason: "unhandled_rejection",
-        ...exception(event.reason),
+        ...details,
       });
     } catch {}
   });
