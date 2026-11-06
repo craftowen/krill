@@ -3776,3 +3776,68 @@ fn kept_session_without_shell_reports_keeps_launch_cwd_after_daemon_restart() {
     drop(reg);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn input_sent_after_the_agent_exits_is_not_a_prompt_turn() {
+    let dir = std::env::temp_dir().join(format!("krill-ended-turn-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(78);
+    let (master, _terminal) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    lock(&reg.state).sessions.insert(
+        id,
+        Entry {
+            session,
+            pid: 0,
+            cwd: dir.clone(),
+            wrapped: false,
+        },
+    );
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Session(id),
+    };
+    let send = |text: &str| {
+        let request = Request::SendInput {
+            session: id,
+            bytes: text.as_bytes().to_vec(),
+            submit: true,
+            wait_submit: false,
+        };
+        reg.handle(&peer, request, &mut HashMap::new());
+    };
+    let started = HookEvent {
+        id: hook::EventId {
+            pid: 1,
+            unix_ns: status::now_ns(),
+        },
+        agent: "claude".into(),
+        ppid: 1,
+        input: hook::Input::Complete,
+        payload: br#"{"hook_event_name":"SessionStart","source":"startup"}"#.to_vec(),
+    };
+    reg.with_status(id, |s| s.hook(&[(id, &started)]))
+        .unwrap()
+        .unwrap();
+
+    send("fix the bug");
+    reg.with_status(id, |s| s.exited(id));
+    send("codex");
+
+    let history = krill_proto::git::load_session_prompt_histories(&dir)
+        .remove(&id)
+        .expect("the running agent's prompt is recorded");
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+    assert_eq!(history.total_turns, 1);
+    assert_eq!(history.turns[0].text, "fix the bug");
+}

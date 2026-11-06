@@ -3195,10 +3195,12 @@ impl Registry {
             }
         }
         let before_end = tap.pulse().end;
-        let was_working = self.status.get(session).state == control::AgentState::Working;
+        let status = self.status.get(session);
+        let was_working = status.state == control::AgentState::Working;
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
         if submit
-            && !self.status.get(session).agent.is_empty()
+            && !status.agent.is_empty()
+            && status.state != control::AgentState::Exited
             && let Ok(text) = std::str::from_utf8(bytes)
             && let Some(dir) = self.state_dir()
         {
