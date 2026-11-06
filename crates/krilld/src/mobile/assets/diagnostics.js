@@ -525,15 +525,6 @@
     const file = assetFile(value);
     if (files.has(file)) return file;
   }
-  const resources = new Set([
-    "app.css",
-    "manifest.json",
-    "icon.svg",
-    "icon-192.png",
-    "icon-512.png",
-    "icon-maskable-512.png",
-    "apple-touch-icon.png",
-  ]);
   const exception = (error) => {
     const out = { error_name: names.has(error?.name) ? error.name : "Unknown" },
       frames = [];
@@ -572,7 +563,8 @@
         if (event.target && event.target !== globalThis) {
           const asset = assetFile(event.target.src || event.target.href),
             file = files.has(asset) ? asset : undefined;
-          if (file || resources.has(asset))
+          // Icons and the manifest are decorative: a failed logo breaks nothing.
+          if (file || asset === "app.css")
             report("mobile_asset_failed", {
               phase: "resource",
               reason: "resource_error",

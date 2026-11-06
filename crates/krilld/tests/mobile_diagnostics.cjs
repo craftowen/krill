@@ -1469,3 +1469,26 @@ test("extension runtime errors, extension unhandled rejections and empty or base
   assert.equal(h.events()[0].diagnostics.line, 77);
   assert.equal(h.events()[0].diagnostics.column, 8);
 });
+
+test("decorative icon and manifest load failures file nothing while the stylesheet still reports", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const base = "https://krill-mobile.pages.dev/m/0123456789abcdef/";
+  for (const name of [
+    "icon.svg",
+    "icon-192.png",
+    "icon-512.png",
+    "icon-maskable-512.png",
+    "apple-touch-icon.png",
+    "manifest.json",
+  ])
+    h.emit("error", { target: { src: base + name, href: base + name } });
+  await h.tick();
+  assert.equal(h.events().length, 0);
+  h.emit("error", { target: { href: base + "app.css" } });
+  await h.tick();
+  assert.deepEqual(
+    h.events().map((event) => event.error_code),
+    ["mobile_asset_failed"],
+  );
+});

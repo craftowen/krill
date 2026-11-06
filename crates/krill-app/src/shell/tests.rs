@@ -6167,7 +6167,7 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1);
     assert!(cx.debug_bounds("admin-center").is_some());
-    assert!(cx.debug_bounds("admin-accounts-refresh").is_some());
+    assert!(cx.debug_bounds("admin-auto-switch-strip").is_some());
 
     let back = cx
         .debug_bounds("admin-modal-close")
@@ -6426,7 +6426,7 @@ fn status_provider_usage_menu_renders_comparison_columns_and_opens_in_app_accoun
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1);
     assert!(cx.debug_bounds("admin-center").is_some());
-    assert!(cx.debug_bounds("admin-accounts-refresh").is_some());
+    assert!(cx.debug_bounds("admin-auto-switch-strip").is_some());
 }
 
 /// 상태바 Codex 팝업의 "사용량 초기화" 2단계 확인(무장 → 실행/취소).
@@ -9006,7 +9006,7 @@ fn pairing_opens_machines_invite_page(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("admin-center").is_some());
     assert!(cx.debug_bounds("link-pairing-modal").is_none());
     assert!(cx.debug_bounds("link-client-input-link").is_some());
-    assert!(cx.debug_bounds("link-server-panel").is_none());
+    assert!(cx.debug_bounds("link-server-panel").is_some());
     cx.update(|_, cx| {
         let settings = view.read(cx).settings().unwrap();
         assert_eq!(

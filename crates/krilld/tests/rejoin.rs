@@ -45,7 +45,8 @@ fn alive(p: u32) -> bool {
 #[derive(Default)]
 struct Kids {
     holders: Vec<Child>,
-    detached_holders: Vec<u32>,
+    /// 클라이언트(`krill doctor`)가 이 소켓에 띄우는 holder·krilld. pid를 알아내기 전에 테스트가 실패해도 남기지 않는다.
+    socket: Option<PathBuf>,
     pids: Vec<u32>,
 }
 
@@ -56,37 +57,45 @@ impl Drop for Kids {
             h.kill().ok();
             h.wait().ok();
         }
-        for &p in &self.detached_holders {
-            kill_process(pid(p), Signal::KILL).ok();
-        }
         for &p in &self.pids {
             kill_process(pid(p), Signal::KILL).ok();
         }
-        // holder가 죽었으므로 재기동은 없다. 고아 krilld가 사라질 때까지.
+        // 소켓의 holder와 krilld는 순서 없이 잡히므로 재기동된 krilld까지 빌 때까지 다시 찾아 죽인다.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while self
-            .detached_holders
-            .iter()
-            .chain(&self.pids)
-            .any(|p| alive(*p))
-            && Instant::now() < deadline
-        {
+        loop {
+            let left = self.socket.as_deref().map(on_socket).unwrap_or_default();
+            for &p in &left {
+                kill_process(pid(p), Signal::KILL).ok();
+            }
+            let done = left.is_empty() && !self.pids.iter().any(|p| alive(*p));
+            if done || Instant::now() >= deadline {
+                break;
+            }
             thread::sleep(Duration::from_millis(20));
         }
     }
 }
 
-/// 이 소켓 경로를 인자로 가진 holder 프로세스가 0개인지 확인한다(OWE-604).
-/// `Kids`를 명시 drop한 뒤 부른다(Drop 안에서는 단언하지 않는다).
-fn assert_no_holders(sock: &Path) {
-    let out = Command::new("/usr/bin/pgrep")
+/// 이 소켓 경로를 인자로 가진 프로세스. Drop에서도 부르므로 실패해도 패닉하지 않는다.
+fn on_socket(sock: &Path) -> Vec<u32> {
+    Command::new("/usr/bin/pgrep")
         .arg("-f")
         .arg(sock)
         .output()
-        .unwrap();
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 이 소켓 경로를 인자로 가진 holder 프로세스가 0개인지 확인한다(OWE-604).
+/// `Kids`를 명시 drop한 뒤 부른다(Drop 안에서는 단언하지 않는다).
+fn assert_no_holders(sock: &Path) {
     let mut holders = Vec::new();
-    for line in String::from_utf8(out.stdout).unwrap().lines() {
-        let pid: u32 = line.trim().parse().unwrap();
+    for pid in on_socket(sock) {
         let cmd = Command::new("/bin/ps")
             .args(["-o", "command=", "-p", &pid.to_string()])
             .output()
@@ -242,6 +251,30 @@ fn tmp(name: &str) -> PathBuf {
     dir
 }
 
+/// 소켓을 게시하지 못한 이유가 로그에 남는다. `PermissionDenied`만으로는 폴더 권한·OS 거부를 가릴 수 없었다
+/// (2026-11-03 운영 로그 629건).
+#[test]
+fn listener_failure_logs_the_reason() {
+    let dir = tmp("listener-reason");
+    let run = dir.join("run");
+    fs::create_dir(&run).unwrap();
+    fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let status = fixture_command(KRILLD, &dir)
+        .arg(run.join("krilld.sock"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+    let log = fs::read_to_string(dir.join("logs/krilld.log")).unwrap();
+    assert!(
+        log.contains("socket directory must be a 0700 directory"),
+        "{log}"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
 /// 링크만 끊기고 holder(이 테스트 프로세스)가 살아 있으면 krilld는 고아를 선언하지 않고 끝난다. 고아를 선언하면
 /// 클라이언트가 holder를 하나 더 띄워 같은 PTY를 쥔 holder 둘이 남는다(2026-11-04 운영 사례).
 #[test]
@@ -304,6 +337,22 @@ fn link_loss_with_live_holder_exits_instead_of_orphaning() {
     fs::remove_dir_all(dir).ok();
 }
 
+/// 2026-11-06: `krill doctor`가 띄운 holder의 pid를 등록하기 전에 단언이 실패하면 holder·krilld가 테스트 뒤에도 남았다.
+#[test]
+fn kids_reap_a_holder_launched_before_its_pid_is_known() {
+    let dir = tmp("unregistered");
+    let sock = dir.join("run/krilld.sock");
+    let mut kids = Kids::default();
+    kids.socket = Some(sock.clone());
+    let krill = Path::new(KRILLD).with_file_name("krill");
+    assert!(krill.is_file(), "krill must be built next to krilld");
+    fixture_command(krill, &dir).arg("doctor").output().unwrap();
+    wait_until("client-launched daemon", || connect(&sock).is_some());
+    drop(kids);
+    assert_no_holders(&sock);
+    fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn holder_crash_orphan_then_rejoin() {
     rejoin_round(false);
@@ -326,6 +375,7 @@ fn rejoin_round(failed_receiver: bool) {
     });
     let sock = dir.join("run/krilld.sock");
     let mut kids = Kids::default();
+    kids.socket = Some(sock.clone());
     kids.holders.push(holder(&dir, &sock));
     let (mut c, k1) = wait_daemon(&sock, 0);
     kids.pids.push(k1);
@@ -429,16 +479,6 @@ fn rejoin_round(failed_receiver: bool) {
     let recovered = daemon::handshake(&sock, &watch_hello, WAIT).unwrap();
     assert_eq!(recovered.holder_status, Some(HolderStatus::Linked));
     let k2 = u32::try_from(recovered.server.instance_id).unwrap();
-    let parent = Command::new("/bin/ps")
-        .args(["-o", "ppid=", "-p", &k2.to_string()])
-        .output()
-        .unwrap();
-    let h2 = String::from_utf8(parent.stdout)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    kids.detached_holders.push(h2);
     kids.pids.push(k2);
     let (mut c, _) = wait_daemon(&sock, u64::from(k1));
     wait_until("orphan krilld gone", || !alive(k1));

@@ -84,7 +84,6 @@ fn device_line_avoids_paired_duplication_and_handles_never_seen() {
     let now = 10_000_000_000;
     // 오프라인·접속 기록 없음: 상태는 OFFLINE 1회, 마지막 활동은 NEVER.
     let line = device_line(&device(now - 90_000, 0), false, now);
-    assert!(line.starts_with("○ "), "got {line}");
     assert!(line.contains(text::OFFLINE.get()), "got {line}");
     assert!(line.contains(text::NEVER.get()), "got {line}");
     assert_eq!(
@@ -98,9 +97,34 @@ fn device_line_avoids_paired_duplication_and_handles_never_seen() {
         true,
         now,
     );
-    assert!(line.starts_with("● "), "got {line}");
     assert!(line.contains(text::CONNECTED.get()), "got {line}");
     assert!(!line.contains(text::OFFLINE.get()), "got {line}");
+}
+
+/// 값이 같으면 다시 그리지 않는다. 화면에 있을 때만 카운트다운과 경과 표시가 시간을 따른다.
+#[test]
+fn poll_redraws_only_when_shown_values_change() {
+    let mut panel = Panel::new(Arc::new(|_| Err("unused".into())));
+    let start = 10_000_000_000 - 10_000_000_000 % 60_000;
+    assert!(panel.take_shown_change(start, true));
+    assert!(!panel.take_shown_change(start + 1_000, true));
+    assert!(panel.take_shown_change(start + 60_000, true), "ago text");
+
+    panel.offer = Some(("u".into(), start + 120_000, Qr::encode("u").unwrap()));
+    assert!(panel.take_shown_change(start + 60_100, true));
+    assert!(!panel.take_shown_change(start + 60_900, true));
+    assert!(panel.take_shown_change(start + 61_100, true), "countdown");
+
+    assert!(panel.take_shown_change(start + 61_100, false));
+    assert!(
+        !panel.take_shown_change(start + 200_000, false),
+        "off screen"
+    );
+    panel.devices.push(device(start, 0));
+    assert!(
+        panel.take_shown_change(start + 200_000, false),
+        "real change"
+    );
 }
 
 #[test]
@@ -439,17 +463,21 @@ fn mobile_qr_cards_fit_without_clipping_at_supported_widths(cx: &mut gpui::TestA
         for width in [360., 560., 580., 598., 800., 1100.] {
             for scale in [1., 1.25, 1.5, 2.] {
                 redraw(vcx, width, scale);
-                let card = vcx.debug_bounds("mobile-qr-card").expect("tab qr card");
+                let qr_box = vcx.debug_bounds("mobile-qr-card").expect("tab qr card");
                 let copy = vcx.debug_bounds("mobile-copy-link").expect("tab copy");
-                // QR 캔버스는 선택자가 없다. 카드(p_3 + 테두리 1)가 가운데 정렬하므로 실제 카드 경계와 렌더 크기로 위치를 구한다.
-                let side = f32::from(qr_side(px(220.), scale));
-                let center = f32::from(card.center().x);
-                let qr = (center - side / 2., center + side / 2.);
-                let content = (f32::from(card.left()) + 13., f32::from(card.right()) - 13.);
+                let panel = vcx
+                    .debug_bounds("admin-mobile-pair-section")
+                    .expect("pair panel");
+                // QR 상자는 캔버스 폭 그대로다. 패널의 안쪽 여백은 12이고, 배율에 따라 테두리 픽셀이 반올림된다.
+                let side = f32::from(qr_side(px(148.), scale));
+                let qr = span(qr_box);
+                let content = (
+                    f32::from(panel.left()) + 12.,
+                    f32::from(panel.right()) - 12.,
+                );
+                assert!((qr.1 - qr.0 - side).abs() < 0.01, "{qr:?} side={side}");
                 eprintln!(
-                    "tab w={width} @{scale}x card={:?} content={content:?} qr~{qr:?} side={side} fits_before_220={} copy={:?}",
-                    span(card),
-                    content.1 - content.0 >= 220.,
+                    "tab w={width} @{scale}x content={content:?} qr={qr:?} side={side} copy={:?}",
                     span(copy)
                 );
                 let view = (0., width);

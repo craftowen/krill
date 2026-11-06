@@ -198,7 +198,9 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
   - 메인 사이드바와 본문 페이지가 함께 있을 때는 본문에 최소 창 폭(`MIN_WINDOW_WIDTH`)을 남길 수 없는 창에서 메인 사이드바를 임시로 숨긴다. 저장한 너비·접힘 선호는 유지하고 창을 넓히면 복원한다.
-  - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지). 창 폭이 `48rem` 미만이면 탐색 열 대신 상단 뒤로 가기·탭 선택 드롭다운·검색을 표시하고 본문 좌우 여백을 `SPACE_4`로 줄인다. UI 줌을 포함해 좁은 창에서도 본문 작업 공간을 확보한다.
+  - 큰 모달 크기는 `ui::page_modal_size`(폭 680~1080, 높이 480~760, 창 가장자리 8px 유지) 하나로 계산한다.
+  - 설정 화면 좌측 탐색 열 너비: 모달 폭 `60rem` 이상 `SETTINGS_NAV_WIDTH = 248px`, 그 아래 `SETTINGS_NAV_WIDTH_NARROW = 10.5rem`(줌 100%에서 168px). 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (별도 창에서 초대형 모니터의 과도한 행 길이 방지). 제목 띠는 두지 않는다. "설정"은 탐색 열 위, 탭 이름과 닫기는 본문 위 머리 띠(`SETTINGS_BAND_HEIGHT = 44px`, 좁으면 `SETTINGS_BAND_HEIGHT_NARROW = 40px`)에 두고, 하위 페이지는 머리 띠 앞에 부모로 돌아가는 버튼을 붙인다. 부제는 본문 첫 줄이다. 모달 폭이 `42.5rem` 미만(줌 100%에서 680px)이면 탐색 열 대신 탭 선택 드롭다운과 검색을 머리 띠 아래에 표시하고 본문 좌우 여백을 `SPACE_4`로 줄인다. 기준이 rem이라 UI 줌을 높이면 그만큼 일찍 좁아진다.
+  - 설정 검색: 입력하는 순간 본문이 맞은 설정 목록으로 바뀌고 탭 본문은 만들지 않는다. 탐색 열 탭은 자리를 지키며 맞은 개수를 붙이거나 흐려진다. ↑↓로 고르고 Enter나 클릭으로 그 행까지 간 뒤 검색어를 비운다. Esc는 검색어를 지우고, 비어 있으면 설정을 닫는다.
   - 채팅 대화와 입력창은 `CHAT_CONTENT_MAX_WIDTH = 46rem`(줌 100%에서 736px)의 같은 중앙 열에 정렬한다. 좁은 칸에서는 가용 폭을 채우며 가로로 넘치지 않는다(Orca `--chat-content-max-width`).
   - 토글 스위치(`ui::switch`) 치수: 트랙 `SWITCH_WIDTH = 36px` × `SWITCH_HEIGHT = 20px`, 썸 지름 `SWITCH_THUMB = 14px`
   - 상단 커맨드/Jump 팔레트 너비: `COMMAND_PALETTE_WIDTH = 900px`
@@ -248,6 +250,8 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
   - 좁은 폭에서는 행·컨트롤·세그먼트 트랙을 줄바꿈하고 컨트롤 묶음 폭을 부모 안으로 제한한다. 설정 전용 `settings::layout::label`은 행의 절반을 기준 폭으로 선호해 컨트롤 때문에 라벨이 0폭으로 무너지기 전에 다음 줄로 보낸다. 높이가 자동인 세로 카드에서는 상대 기준 폭이 자연 콘텐츠 높이로 해석된다. 공용 `ui::label`에 고정 픽셀 `flex_basis`를 넣지 않는다. 세로로 쌓는 카드는 `ui::card`에 `flex_col`을 적용한다. 줄바꿈하는 가로 행인 `ui::row`의 방향만 세로로 바꾸면 자식이 새 열로 밀릴 수 있으므로 사용하지 않는다.
   - **불변식**: `ui::card`와 `ui::row`는 항상 `w_full().min_w_0()`을 가져 부모 열을 채우면서 내부 긴 텍스트·자식 요소 때문에 부모 폭 밖으로 넘치지 않게 한다. `ui::label`은 반드시 `flex_1().min_w_0()`을 갖고, 오른쪽 컨트롤 묶음(`ui::controls`)은 `flex_none()`을 갖는다. `justify_between` 행 안에서 `flex_1()` 없이 `min_w_0()`만 주면 gpui flex 레이아웃에서 텍스트 열 폭이 0px로 무너져 한 글자씩 세로 줄바꿈되는 결함이 발생하며(OWE-651), 반대로 `flex_1().min_w_0()` 없이 긴 설명문을 넣으면 우측 버튼이 카드 테두리 밖으로 밀려 나간다(OWE-793).
 - **업데이트 페이지**: 앱 버전 행과 릴리스별 변경 사항을 카드 없이 하단 1px 구분선만 있는 행으로 그린다(`settings/updates.rs`). 변경 사항은 줄글 목록이며 받는 동안 문구를 띄우지 않는다(§7.0).
+- **묶음 행**: `ui::group(p, rows)` 안에 `ui::group_row()`를 넣는다. 한 장의 카드에 행을 잇고 사이 구분선은 `ui::group`이 그린다. 행 안 문법은 2열 설정 행과 같다(`layout::label` + `ui::controls`).
+- **테마 견본**: `ui::theme_swatch`는 테마의 실제 팔레트와 짝 터미널 ANSI 색으로 축소판을 그린다. 높이 52px, 색 칩은 8px 이상, 고른 칸은 `ring` 2px과 체크로 표시한다. 모달 폭에 따라 3, 5, 7열이다(`SettingsFrame::theme_columns`). 메뉴 없이 누르면 바로 적용한다.
 - **불리언 토글 스위치**: `ui::switch(p, id, checked, disabled, on_toggle)` — 켜기/끄기 불리언 설정은 2버튼 나열 대신 단일 알약 트랙(`SWITCH_WIDTH` × `SWITCH_HEIGHT`)과 원형 썸(`SWITCH_THUMB`) 스위치로 일관되게 표현한다.
 - **세그먼트 컨트롤**: `ui::segmented_control(p, items)` + `ui::segment(id, label, active)` — 2~4개 선택지(테마·언어·커서 모양·캐시 TTL·임계값 프리셋 등)는 개별 버튼으로 흩어 놓지 않고 테두리 있는 트랙 안에 묶는다. Orca `SettingsSegmentedControl`과 같게 트랙은 `background` 50% + `border` + `RADIUS_SM`, 활성 항목은 `accent` 바탕 + `accent_foreground` + `MEDIUM`, 비활성 항목은 바탕 없이 `muted_foreground` 글자다. 활성 항목을 `primary`(다크 모드 흰 채움)로 그리면 같은 화면의 주 동작 버튼과 무게가 겹치므로 금지한다. 선택지 라벨에 영어 괄호 병기(`끄기 (Off)`)를 붙이지 않는다.
 - **모달 입력 필드 라벨**: `ui::field_label(name, optional_suffix, p)` — `<Input>` 바로 위에 `gap_1`로 쌓는다.

@@ -21,10 +21,12 @@ pub(super) fn provision(home: &Path, profile: &Path) -> io::Result<Report> {
     #[cfg(unix)]
     {
         history::provision(home, profile, &|| {
-            let local = profile.join(".gemini/antigravity-cli");
-            let host = home.join(".gemini/antigravity-cli");
-            super::history_probe::quiescent_at(&local, profile, "ANTIGRAVITY_CLI_HOME")
-                && super::history_probe::quiescent_at(&host, home, "ANTIGRAVITY_CLI_HOME")
+            let idle = |store: &Path, root: &Path| {
+                let paths = history::probe_paths(store);
+                super::history_probe::quiescent_at(&paths, root, "ANTIGRAVITY_CLI_HOME")
+            };
+            idle(&profile.join(".gemini/antigravity-cli"), profile)
+                && idle(&home.join(".gemini/antigravity-cli"), home)
         })
     }
     #[cfg(not(unix))]
