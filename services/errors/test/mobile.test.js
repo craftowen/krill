@@ -283,3 +283,29 @@ test('sanitized stack frames enforce closed public-file positions, bounded count
   }
   assert.equal(rows(env).length, 2);
 });
+
+test('mobile stats sample_detail picks modal reason and breaks ties away from unknown', async t => {
+  const env = environment(t), now = Math.floor(Date.now() / 1000);
+  await ingest(env.DB, validateMobile({schema_version: 1, events: [
+    event(1, {error_code: 'mobile_connect_failed', diagnostics: {reason: 'websocket_closed'}}),
+    event(2, {error_code: 'mobile_connect_failed', diagnostics: {reason: 'websocket_closed'}}),
+    event(3, {error_code: 'mobile_connect_failed', diagnostics: {reason: 'websocket_closed'}}),
+    event(4, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'auth_required'}}),
+    event(5, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'auth_required'}}),
+    event(6, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'auth_required'}}),
+    event(7, {error_code: 'mobile_rpc_failed', diagnostics: {reason: 'auth_rejected'}}),
+    event(8, {error_code: 'mobile_rpc_failed', diagnostics: {reason: 'auth_rejected'}}),
+  ]}), now - 10);
+  await ingest(env.DB, validateMobile({schema_version: 1, events: [
+    event(9, {error_code: 'mobile_connect_failed', diagnostics: {reason: 'websocket_error'}}),
+    event(10, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'timeout'}}),
+    event(11, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'unknown'}}),
+    event(12, {error_code: 'mobile_rpc_failed', diagnostics: {reason: 'unknown'}}),
+    event(13, {error_code: 'mobile_rpc_failed', diagnostics: {reason: 'unknown'}}),
+  ]}), now);
+  const stats = await (await admin(env, '/api/stats')).json();
+  const byCode = Object.fromEntries(stats.details.map(g => [g.error_code, g.sample_detail]));
+  assert.equal(byCode.mobile_connect_failed, 'websocket_closed');
+  assert.equal(byCode.mobile_auth_failed, 'auth_required');
+  assert.equal(byCode.mobile_rpc_failed, 'auth_rejected');
+});

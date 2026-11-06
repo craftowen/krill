@@ -79,8 +79,8 @@ pub(super) fn read(home: &Path, account: &AccountInfo) -> AccountMeters {
 fn read_local(home: &Path, account: &AccountInfo) -> AccountMeters {
     let dir = Path::new(&account.profile_dir);
     for name in [
+        krill_proto::statusline::CACHE_FILE,
         "statusline_cache.json",
-        "usage_cache.json",
         "usage.json",
         "quota.json",
         "rate_limits.json",
@@ -386,6 +386,36 @@ fn value_meter(out: &mut AccountMeters, key: &str, label: &str, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_recorded_usage_beats_unattributed_statusline_file() {
+        let dir = std::env::temp_dir().join(format!("krill-meters-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("statusline_cache.json"),
+            r#"{"seven_day":{"utilization":97}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(krill_proto::statusline::CACHE_FILE),
+            r#"{"rate_limits":{"seven_day":{"used_percentage":66}}}"#,
+        )
+        .unwrap();
+        let account = AccountInfo {
+            id: "a".into(),
+            provider: ProviderKind::Claude,
+            label: "A".into(),
+            email: None,
+            profile_dir: dir.display().to_string(),
+            active: false,
+            host_default: false,
+            stale: false,
+            usage: krill_proto::usage::Snapshot::default(),
+        };
+        let reading = read(&dir, &account);
+        assert_eq!(reading.meters[0].window.as_ref().unwrap().percent, 66);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn codex_reset_credit_expiry_is_metadata_not_a_usage_pool() {
         for (raw, expected) in [

@@ -468,11 +468,17 @@
                 typeof found2.hash == "string" &&
                   /^[0-9a-f]{16}$/.test(found2.hash) &&
                   (found2.url === "" || found2.relay) &&
-                  ((selectedRoute = null), (source.preferred_route = "relay"));
+                  !current()?.routes?.relay &&
+                  !source.preferred_route &&
+                  (source.preferred_route = "relay");
               } catch (error) {
                 if (isCurrent() && !signal?.aborted)
                   trace?.report("mobile_discovery_failed", {
-                    reason: timedOut ? "timeout" : "unknown",
+                    reason: timedOut
+                      ? "timeout"
+                      : navigator.onLine === false
+                        ? "network_offline"
+                        : "unknown",
                     ...M.diagnostics?.exception(error),
                   });
               } finally {
@@ -1008,7 +1014,11 @@
           } catch (error) {
             if (isCurrent() && !signal?.aborted)
               trace?.report("mobile_discovery_failed", {
-                reason: timedOut ? "timeout" : "unknown",
+                reason: timedOut
+                  ? "timeout"
+                  : navigator.onLine === false
+                    ? "network_offline"
+                    : "unknown",
                 ...M.diagnostics?.exception(error),
               });
           } finally {
@@ -1213,6 +1223,11 @@
         }),
           options.onStatus?.(state));
       };
+      const transportClosed = (message) =>
+        Object.assign(Error(message), {
+          transport: !0,
+          diagnosticReason: "websocket_closed",
+        });
       function deadline(operation, ms, message, current = generation) {
         let timeout;
         return Promise.race([
@@ -1226,6 +1241,34 @@
                 current === generation && disconnect(error));
             }, ms);
           }),
+        ]).finally(() => clearTimeout(timeout));
+      }
+      function connectDeadline(current, run, stageMs = 20000, capMs = 60000) {
+        const startedAt = Date.now();
+        let timeout, rejectDeadline;
+        const expired = new Promise((_, reject) => {
+            rejectDeadline = reject;
+          }),
+          arm = (ms) => {
+            clearTimeout(timeout);
+            timeout = setTimeout(() => {
+              const error = Error(
+                "Connection timed out. Pending actions were not resent.",
+              );
+              error.diagnosticReason = "timeout";
+              ((error.transport = !0),
+                rejectDeadline(error),
+                current === generation && disconnect(error));
+            }, ms);
+          };
+        arm(stageMs);
+        return Promise.race([
+          run(() =>
+            arm(
+              Math.min(stageMs, Math.max(5000, startedAt + capMs - Date.now())),
+            ),
+          ),
+          expired,
         ]).finally(() => clearTimeout(timeout));
       }
       const next = () =>
@@ -1363,7 +1406,7 @@
       async function answer(current) {
         const bytes = await plain();
         if (current !== generation)
-          throw Error("Disconnected. Pending actions were not resent.");
+          throw transportClosed("Disconnected. Pending actions were not resent.");
         if (bytes[4] !== 101) throw Error("Unexpected daemon response");
         const r = reader(bytes.slice(5)),
           kind = Number(r.u());
@@ -1391,14 +1434,22 @@
       }
       function rpc(request, latest, probe = !1, retried = !1) {
         const current = generation,
+          rpcStarted = Date.now(),
+          silent = probe === "silent",
           mutation = !isRead(request);
         pendingRpc++;
         let submitted = !1;
         const surface = (error, report) => {
           report &&
+            submitted &&
+            !silent &&
             !error.definitive &&
             diagnosticsTrace?.report("mobile_rpc_failed", {
               phase: "rpc",
+              elapsed_ms: Math.min(
+                300000,
+                Math.max(0, Date.now() - rpcStarted),
+              ),
               reason:
                 error.diagnosticReason ||
                 (error.transport ? "websocket_closed" : "protocol_error"),
@@ -1410,7 +1461,7 @@
         const operation = deadline(
           serial.then(() => {
             if (!connected || current !== generation)
-              throw Error("Disconnected. The action was not resent.");
+              throw transportClosed("Disconnected. The action was not resent.");
             return (
               latest && ((latest.submitted = !0), (request = latest.request)),
               ask(request),
@@ -1429,6 +1480,7 @@
           operation
             .catch((error) => {
               if (
+                !silent &&
                 !mutation &&
                 !retried &&
                 !error.definitive &&
@@ -1533,14 +1585,14 @@
           });
         return ((refreshing = pending), pending);
       }
-      function refresh(probe = !1) {
+      function refresh(mode = !1) {
         if (refreshing) return refreshing;
         const request = query(),
           current = generation;
         return snapshot(
           current,
-          rpc(request, undefined, probe).catch((e) =>
-            downgrade(request, current, e, () => rpc(query())),
+          rpc(request, undefined, mode).catch((e) =>
+            downgrade(request, current, e, () => rpc(query(), undefined, mode)),
           ),
         );
       }
@@ -1557,7 +1609,7 @@
                 armed > 0 &&
                 armed !== wanted()
               )
-                return refresh();
+                return refresh("silent");
             })
             .catch(() => {});
       }
@@ -1639,11 +1691,10 @@
             if (stopped || current !== generation || failed)
               throw (
                 failed ||
-                Error("Disconnected. Pending actions were not resent.")
+                transportClosed("Disconnected. Pending actions were not resent.")
               );
           };
-          await deadline(
-            (async () => {
+          await connectDeadline(current, async (advanceStage) => {
               attempted = socketUrl();
               const target = new URL(attempted);
               timing.route = target.pathname.startsWith("/r/") ? "relay" : "direct";
@@ -1764,6 +1815,7 @@
                 );
               });
               ensureCurrent();
+              advanceStage();
               mark("socketOpenMs");
               trace?.mark("challenge");
               const challengeBytes = await next();
@@ -1771,6 +1823,7 @@
               const challenge = JSON.parse(challengeBytes),
                 nonce = crypto.getRandomValues(new Uint8Array(32));
               stage = 2;
+              advanceStage();
               mark("challengeMs");
               if (challenge.version !== 2)
                 throw Error("Unsupported desktop protocol");
@@ -1817,6 +1870,7 @@
               ensureCurrent();
               const auth = JSON.parse(decode.decode(authBytes));
               stage = 3;
+              advanceStage();
               mark("authenticatedMs");
               if (auth.credential || options.endpoint) {
                 credentials = options.endpoint
@@ -1829,6 +1883,7 @@
               const hello = await plain();
               ensureCurrent();
               if (hello[4] !== 1) throw Error("Unexpected daemon response");
+              advanceStage();
               mark("helloMs");
               connected = true;
               warmTerminal();
@@ -1864,26 +1919,25 @@
               established = true;
               for (const fn of routeListeners) fn();
               poll();
-            })(),
-            20000,
-            "Connection timed out. Pending actions were not resent.",
-            current,
-          );
+          });
           if (!isCurrent()) return;
         } catch (e) {
           if (!isCurrent()) return;
+          const reason =
+              e.diagnosticReason ||
+              failed?.diagnosticReason ||
+              (navigator.onLine === false
+                ? "network_offline"
+                : "protocol_error"),
+            transientConnect =
+              reason === "timeout" || reason === "network_offline";
           if (!e.diagnosticReported && !failed?.diagnosticReported)
             trace?.report(
-              stage === 2 || authBlocked
+              !transientConnect && (stage === 2 || authBlocked)
                 ? "mobile_auth_failed"
                 : "mobile_connect_failed",
               {
-                reason:
-                  e.diagnosticReason ||
-                  failed?.diagnosticReason ||
-                  (navigator.onLine === false
-                    ? "network_offline"
-                    : "protocol_error"),
+                reason,
                 ...M.diagnostics?.exception(e),
               },
             );
@@ -1901,15 +1955,29 @@
                   options.endpoint?.fallback?.(attempted),
                   (quick = retryDelay <= 1e3 && socketUrl() !== attempted));
               } catch {}
+          } else if (transientConnect && stage === 2 && !authBlocked) {
+            try {
+              (socketUrl() === attempted &&
+                options.endpoint?.fallback?.(attempted),
+                (quick = retryDelay <= 1e3 && socketUrl() !== attempted));
+            } catch {}
           }
-          if (stage === 2 && !pair && !authBlocked && (e?.transport || failed?.transport)) {
+          if (
+            !transientConnect &&
+            stage === 2 &&
+            !pair &&
+            !authBlocked &&
+            (e?.transport || failed?.transport)
+          ) {
             authInterruptedRoutes.add(attempted);
             if (options.endpoint?.fallback?.(attempted) && socketUrl() !== attempted && !authInterruptedRoutes.has(socketUrl())) {
               routeAlternative = true;
               quick = true;
             }
           }
-          (stage === 2 && !routeAlternative &&
+          (!transientConnect &&
+            stage === 2 &&
+            !routeAlternative &&
             ((e?.transport || failed?.transport) && !authBlocked
               ? (authFailures++,
                 (retryNotBefore = Date.now() + 65e3 * authFailures),
@@ -1930,7 +1998,7 @@
         (acknowledge && (uncertainMutation = !1),
           connectController?.abort(),
           disconnect(
-            Error("Reconnecting\u2026 Pending actions were not resent."), false,
+            transportClosed("Reconnecting\u2026 Pending actions were not resent."), false,
           ),
           generation++,
           (connecting = !1),
@@ -2049,7 +2117,7 @@
           clearTimeout(timer);
           clearTimeout(retryTimer);
           clearWarm(true);
-          disconnect(Error("Disconnected"));
+          disconnect(transportClosed("Disconnected"));
           generation++;
           connecting = false;
         },

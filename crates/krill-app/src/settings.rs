@@ -5018,18 +5018,6 @@ impl SettingsView {
         .detach();
     }
 
-    fn reset_credit_count(&self, account_id: &str) -> Option<u64> {
-        self.accounts_snapshot
-            .meters_for(account_id)?
-            .meters
-            .iter()
-            .find(|m| m.key == krill_proto::usage::RESET_CREDITS_METER_KEY)?
-            .value
-            .as_deref()?
-            .parse::<u64>()
-            .ok()
-    }
-
     fn consume_reset_credit(
         &mut self,
         provider: krill_proto::usage::ProviderKind,
@@ -6648,7 +6636,10 @@ impl SettingsView {
         let now_secs = crate::accounts::display::now();
         let display =
             crate::accounts::display::window(win, i64::try_from(now_secs).unwrap_or(i64::MAX));
-        let reset = win
+        // 리셋이 지난 창은 "리셋됨" 하나로 충분하다. 다음 조회가 알아서 값을 채운다.
+        let reset = display
+            .percent
+            .and(win)
             .and_then(|w| has_valid_reset(w.resets_at.as_deref()))
             .and_then(|ts| relative_reset_suffix(Some(ts), now_secs));
         let pct = display.percent.unwrap_or(0);
@@ -7230,7 +7221,10 @@ impl SettingsView {
         let can_reset_usage = !orca
             && !needs_login
             && matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
-            && self.reset_credit_count(&acc.id) != Some(0);
+            && crate::accounts::display::reset_available(
+                snap.meters_for(&acc.id),
+                crate::accounts::display::now(),
+            );
         let manageable = !acc.host_default && !orca;
         // Orca 감지 계정은 실행·이름 변경은 못 해도 Krill 목록에서 지울 수는 있다.
         let removable = !acc.host_default;

@@ -123,6 +123,27 @@ pub fn meter_value(meter: &krill_proto::usage::UsageMeter, now: u64) -> Option<S
     })
 }
 
+/// 남은 리셋 크레딧 수. 미터가 아직 없으면 `None`.
+pub fn reset_credits(meters: Option<&krill_proto::usage::AccountMeters>) -> Option<u64> {
+    meters?
+        .meters
+        .iter()
+        .find(|m| m.key == krill_proto::usage::RESET_CREDITS_METER_KEY)?
+        .value
+        .as_deref()?
+        .parse()
+        .ok()
+}
+
+/// 사용량 초기화를 지금 누를 수 있는가: 크레딧이 남아 있고 되돌릴 사용량이 있어야 한다.
+pub fn reset_available(meters: Option<&krill_proto::usage::AccountMeters>, now: u64) -> bool {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    reset_credits(meters).is_some_and(|credits| credits > 0)
+        && meters
+            .and_then(|m| m.effective_max(now))
+            .is_some_and(|used| used > 0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountDisplay {
     pub status: AccountStatus,
@@ -303,6 +324,47 @@ pub fn render_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reset_requires_a_known_credit_and_usage_to_reset() {
+        use krill_proto::usage::{AccountMeters, UsageMeter};
+        let meters = |credits: Option<&str>, percent: Option<u8>, resets_at: Option<&str>| {
+            let mut meters = Vec::new();
+            if let Some(percent) = percent {
+                meters.push(UsageMeter {
+                    key: "seven_day".into(),
+                    label: "7d".into(),
+                    window: Some(Window {
+                        percent,
+                        resets_at: resets_at.map(str::to_owned),
+                    }),
+                    value: None,
+                });
+            }
+            if let Some(credits) = credits {
+                meters.push(UsageMeter {
+                    key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
+                    label: "Reset credits".into(),
+                    window: None,
+                    value: Some(credits.into()),
+                });
+            }
+            AccountMeters {
+                meters,
+                ..AccountMeters::default()
+            }
+        };
+        let can = |m: &AccountMeters| reset_available(Some(m), 1000);
+        assert!(!reset_available(None, 1000), "미터 조회 전");
+        assert!(!can(&meters(None, Some(50), None)), "크레딧 모름");
+        assert!(!can(&meters(Some("0"), Some(50), None)), "크레딧 없음");
+        assert!(!can(&meters(Some("1"), None, None)), "사용량 모름");
+        assert!(
+            !can(&meters(Some("1"), Some(0), None)),
+            "되돌릴 사용량 없음"
+        );
+        assert!(!can(&meters(Some("1"), Some(50), Some("999"))), "창 리셋됨");
+        assert!(can(&meters(Some("1"), Some(50), Some("2000"))));
+    }
 
     #[test]
     fn reset_credit_expiry_shows_date_timezone_unknown_and_expired() {
