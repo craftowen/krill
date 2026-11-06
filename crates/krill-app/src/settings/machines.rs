@@ -221,7 +221,7 @@ impl SettingsView {
 
         let address_line = ssh_hosts.first().map_or_else(
             || text::MACHINES_INVITE_ROUTE_DESC.get().to_owned(),
-            crate::ssh_hosts::SshHost::format_summary,
+            |host| home_relative(&host.format_summary()),
         );
 
         let mut title_row = div()
@@ -238,26 +238,18 @@ impl SettingsView {
                     .child(machine.label().to_owned()),
             );
         for route in machine.routes.iter().filter(|r| r.kind != RouteKind::Local) {
-            let tone = match route.kind {
-                RouteKind::Ssh => crate::ui::BadgeTone::Neutral,
-                RouteKind::Invite => crate::ui::BadgeTone::Accent,
-                RouteKind::Local => crate::ui::BadgeTone::Muted,
-            };
-            title_row = title_row.child(crate::ui::badge(p, tone, route_label(route.kind)));
+            title_row = title_row.child(crate::ui::badge(
+                p,
+                crate::ui::BadgeTone::Muted,
+                route_label(route.kind),
+            ));
         }
         title_row = title_row.child(
             div()
                 .flex_none()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))
-                .child(
-                    div()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(color)
-                        .child(state),
-                ),
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(color)
+                .child(state),
         );
 
         let quick_connect = ssh_hosts.first().map(|ssh| {
@@ -301,8 +293,8 @@ impl SettingsView {
             .flex_wrap()
             .items_center()
             .gap_2()
-            .px_2p5()
-            .py_2()
+            .px_2()
+            .py_2p5()
             .cursor_pointer()
             .hover(|d| d.bg(p.accent))
             .on_key_down(
@@ -327,6 +319,13 @@ impl SettingsView {
             )
             .child(
                 div()
+                    .flex_none()
+                    .size(crate::ui::STATE_DOT)
+                    .rounded_full()
+                    .bg(color),
+            )
+            .child(
+                div()
                     .flex_1()
                     .min_w(px(170.))
                     .flex()
@@ -345,11 +344,13 @@ impl SettingsView {
             .child(layout::controls().children(quick_connect));
 
         let expand = open.then(|| self.render_machine_expand(machine, &ssh_hosts, window, cx));
-        layout::card(p)
-            .p_0()
-            .overflow_hidden()
+        div()
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
+            .border_b_1()
+            .border_color(p.border)
             .child(head)
             .children(expand)
     }
@@ -514,15 +515,16 @@ impl SettingsView {
             .id("admin-machines-list")
             .debug_selector(|| "admin-machines-list".into())
             .flex()
-            .flex_col()
-            .gap_2();
+            .flex_col();
         let catalog = self.machine_catalog(cx);
         let remote: Vec<&Machine> = catalog.iter().filter(|m| !m.is_local()).collect();
         if remote.is_empty() {
             list = list.child(
-                layout::card(p)
+                div()
                     .id("admin-machines-empty")
                     .debug_selector(|| "admin-machines-empty".into())
+                    .py_3()
+                    .px_2()
                     .text_size(crate::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(text::MACHINES_EMPTY_REMOTE.get()),
@@ -602,4 +604,12 @@ fn machine_status(status: HostStatus, p: &crate::ui::Palette) -> (gpui::Hsla, &'
         HostStatus::Connecting => (p.warning, labels::HOST_CONNECTING.get()),
         HostStatus::Disconnected => (p.muted_foreground, labels::HOST_DISCONNECTED.get()),
     }
+}
+
+/// 표시용으로 홈 폴더 경로를 `~`로 줄인다.
+fn home_relative(summary: &str) -> String {
+    krill_proto::os::home_dir()
+        .and_then(|home| home.to_str().map(str::to_owned))
+        .filter(|home| home.len() > 1)
+        .map_or_else(|| summary.to_owned(), |home| summary.replace(&home, "~"))
 }

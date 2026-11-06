@@ -363,12 +363,13 @@ impl SettingsView {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .p_2p5()
-                .rounded(crate::ui::RADIUS_SM)
-                .bg(p.card)
-                .border_1()
-                .border_color(p.border)
-                .child(div().text_size(crate::ui::TEXT_XS).child(status.clone()));
+                .px_2()
+                .child(
+                    div()
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(status.clone()),
+                );
             if let Some(failed_host) = &self.ssh_auth_failed_host {
                 let host_for_reg = failed_host.clone();
                 status_box = status_box.child(

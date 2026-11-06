@@ -471,26 +471,69 @@ fn dispatch_now(cmd: &HostCommand, cx: &mut App) -> bool {
 pub fn offer(env: Env, cx: &mut App) {
     let dir = env.state.clone();
     let isolated = env.is_isolated_state();
+    let load_dir = dir.clone();
+    // (이번에 처음 완료했는지, 환영 패널을 보일지)
     let saved = crate::settings::background_file_io(cx, move || {
-        let stored = state::load(&dir);
+        let stored = state::load(&load_dir);
         if stored.completed {
-            return false;
+            return (false, stored.welcome_pending);
         }
-        if let Err(error) = state::save(&dir, &stored.completed()) {
+        let mut done = stored.completed();
+        done.welcome_pending = true;
+        if let Err(error) = state::save(&load_dir, &done) {
             tracing::warn!(%error, "onboarding completion save failed");
-            return false;
+            return (false, false);
         }
-        true
+        (true, true)
     });
     cx.spawn(async move |cx| {
-        if saved.await && !isolated {
-            cx.update(crate::star_nag::onboarding_completed);
-        }
+        let (first_run, pending) = saved.await;
+        cx.update(|cx| {
+            cx.set_global(Welcome { pending, dir });
+            if pending {
+                cx.refresh_windows();
+            }
+            if first_run && !isolated {
+                crate::star_nag::onboarding_completed(cx);
+            }
+        });
     })
     .detach();
     if !isolated {
         actions::auto_prepare(env, cx).detach();
     }
+}
+
+/// 빈 화면 환영 패널 상태. 첫 실행에서만 켜진다.
+#[derive(Debug)]
+pub struct Welcome {
+    pending: bool,
+    dir: PathBuf,
+}
+
+impl gpui::Global for Welcome {}
+
+/// 빈 화면에 환영 패널을 보일지.
+#[must_use]
+pub fn welcome_pending(cx: &App) -> bool {
+    cx.try_global::<Welcome>().is_some_and(|w| w.pending)
+}
+
+/// 환영 패널을 닫고 다시 보이지 않게 기록한다(닫기 또는 첫 탭).
+pub fn dismiss_welcome(cx: &mut App) {
+    let Some(welcome) = cx.try_global::<Welcome>().filter(|w| w.pending) else {
+        return;
+    };
+    let dir = welcome.dir.clone();
+    cx.global_mut::<Welcome>().pending = false;
+    crate::settings::background_file_io(cx, move || {
+        let mut stored = state::load(&dir);
+        stored.welcome_pending = false;
+        if let Err(error) = state::save(&dir, &stored) {
+            tracing::warn!(%error, "welcome dismissal save failed");
+        }
+    })
+    .detach();
 }
 
 /// 메뉴·팔레트 액션을 등록한다. 앱 시작 때 한 번 부른다.
