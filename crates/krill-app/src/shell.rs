@@ -4353,7 +4353,7 @@ impl Shell {
                         || live.pane.session().is_none()
                         || paste_queue.has_pending_for(*p))
         });
-        self.fits.0.retain(|p, _| self.live.contains_key(p));
+        self.fits.tasks.retain(|p, _| self.live.contains_key(p));
         let mut notices = Vec::new();
         for (id, live) in &mut self.live {
             if live.target.as_ref().is_some_and(|target| {
@@ -7669,6 +7669,7 @@ fn session_shown(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.fits.next_frame();
         #[cfg(windows)]
         krill_app::platform::sync_window(
             window,

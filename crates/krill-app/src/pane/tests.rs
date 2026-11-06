@@ -613,7 +613,7 @@ fn fit_sends_resize_and_focus_once_per_size_and_on_relink() {
     out(&mut p).clear();
     assert!(p.fit(120, 40).is_none());
     assert!(out(&mut p).is_empty());
-    // 데몬 화면 크기가 어긋나 있으면(재기동·외부 리사이즈 등) 같은 칸 크기라도 다시 보낸다.
+    // 보이는 동안 다른 클라이언트가 크기를 바꾸면 그대로 둔다. 칸이 다시 보이게 되면 한 번 되찾는다.
     update(
         &mut p,
         1,
@@ -623,7 +623,13 @@ fn fit_sends_resize_and_focus_once_per_size_and_on_relink() {
         }],
     );
     assert!(p.fit(120, 40).is_none());
+    assert!(out(&mut p).is_empty());
+    p.show();
+    assert!(p.fit(120, 40).is_none());
     assert_eq!(role_requests(out(&mut p)), [resize, Focus]);
+    out(&mut p).clear();
+    assert!(p.fit(120, 40).is_none());
+    assert!(out(&mut p).is_empty());
     update(
         &mut p,
         2,
@@ -677,6 +683,7 @@ fn two_panes_on_one_session_do_not_take_the_size_from_each_other_on_repaint() {
             input::FEAT_INPUT | FEAT_ROLES,
             Now::get(),
         );
+        p.show();
         p
     });
     let mut pty = None;
@@ -698,8 +705,9 @@ fn two_panes_on_one_session_do_not_take_the_size_from_each_other_on_repaint() {
             assert!(p.fit(grid_cols, grid_rows).is_none());
         }
     }
+    // 붙을 때 둘 다 보내고, 처음 보인 칸이 한 번 되찾는다.
     assert!(
-        changes <= 2,
+        changes <= 3,
         "PTY size changed {changes} times in 20 repaints"
     );
 }
