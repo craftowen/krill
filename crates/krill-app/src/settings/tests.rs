@@ -10255,7 +10255,7 @@ fn machines_overview_renders_local_hub_and_inline_remote_actions(cx: &mut TestAp
     assert!(vcx.debug_bounds(conn_sel).is_some());
     assert!(vcx.debug_bounds(test_sel).is_some());
 
-    // Clicking "초대 링크 · 접속 관리" opens ThisComputer details.
+    // Clicking "접속 관리" opens ThisComputer details.
     let invite_btn = vcx.debug_bounds("admin-local-open-invite").unwrap();
     vcx.simulate_click(invite_btn.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
