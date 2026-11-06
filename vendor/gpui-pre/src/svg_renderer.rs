@@ -1,3 +1,4 @@
+// Krill 변경(Apache-2.0 §4(b)): usvg가 못 읽는 `color(display-p3 ..)`을 파싱 전에 sRGB 값으로 바꾼다(`display_p3_as_srgb`).
 use crate::{
     AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
     swap_rgba_pa_to_bgra,
@@ -6,6 +7,7 @@ use image::Frame;
 use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
 use std::{
+    borrow::Cow,
     hash::Hash,
     sync::{Arc, LazyLock, OnceLock},
 };
@@ -31,6 +33,29 @@ const EMOJI_FONT_FAMILIES: &[&str] = &[
     target_os = "freebsd",
 )))]
 const EMOJI_FONT_FAMILIES: &[&str] = &[];
+
+/// usvg는 `fill:#863bff;fill:color(display-p3 .5252 .23 1)`의 뒤 선언이 앞 선언을 덮은 뒤 못 읽어 검게 칠한다(Vite 기본
+/// 파비콘). CSS라면 못 읽는 선언만 버릴 자리다.
+// ponytail: 수치를 sRGB로 그대로 읽어 P3 채도를 약간 잃는다. 아이콘 크기에선 안 보이고 Vite 파비콘의 sRGB 값과 일치한다.
+// 알파(`/ a`)와 퍼센트 표기는 바꾸지 않는다(기존처럼 검정). 실제 입력이 나오면 추가한다.
+fn display_p3_as_srgb(bytes: &[u8]) -> Cow<'_, [u8]> {
+    static P3_COLOR: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+        regex::bytes::Regex::new(
+            r"color\(\s*display-p3\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\)",
+        )
+        .unwrap()
+    });
+    P3_COLOR.replace_all(bytes, |caps: &regex::bytes::Captures<'_>| {
+        let channel = |i: usize| -> Option<u8> {
+            let value: f32 = std::str::from_utf8(caps.get(i)?.as_bytes()).ok()?.parse().ok()?;
+            Some((value.clamp(0.0, 1.0) * 255.0).round() as u8)
+        };
+        match (channel(1), channel(2), channel(3)) {
+            (Some(r), Some(g), Some(b)) => format!("#{r:02x}{g:02x}{b:02x}").into_bytes(),
+            _ => caps[0].to_vec(),
+        }
+    })
+}
 
 fn is_emoji_presentation(c: char) -> bool {
     static EMOJI_PRESENTATION_REGEX: LazyLock<regex::Regex> =
@@ -188,7 +213,7 @@ impl SvgRenderer {
 
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
-        usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+        usvg::Tree::from_data(&display_p3_as_srgb(bytes), &self.usvg_options).map(ParsedSvg)
     }
 
     /// Rasterizes a previously parsed SVG into an image buffer.
@@ -262,8 +287,7 @@ impl SvgRenderer {
     }
 
     fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
-        let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
-        rasterize_tree(&tree, size)
+        rasterize_tree(&self.parse_svg(bytes)?.0, size)
     }
 }
 
