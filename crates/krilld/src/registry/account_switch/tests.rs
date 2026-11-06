@@ -1295,6 +1295,175 @@ fn unconfirmed_replacement_retires_original_immediately_without_input() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn closing_a_session_cancels_its_queued_switch_and_stops_an_unconfirmed_replacement() {
+    for in_flight in [true, false] {
+        let root = Path::new("/tmp").join(format!(
+            "kas-close-queued-{}-{in_flight}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let home = root.join("home");
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(from.join("sessions/2026/10/28")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(to.join("auth.json"), "fixture credentials").unwrap();
+        let target = accounts::add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            "Selected",
+            None,
+            to.to_str().unwrap(),
+        )
+        .unwrap()
+        .accounts
+        .into_iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id;
+        let sid = "cccccccc-dddd-eeee-ffff-000000000001";
+        fs::write(
+            from.join(format!("sessions/2026/10/28/rollout-date-{sid}.jsonl")),
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
+        )
+        .unwrap();
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (master, _old_process) = UnixStream::pair().unwrap();
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let old = SessionId(31);
+        let reg = Arc::new(Registry::new(
+            Some((
+                holder,
+                vec![Kept {
+                    id: old,
+                    pid: 731,
+                    status: None,
+                    size: None,
+                    master: OwnedFd::from(master),
+                }],
+            )),
+            Some(&state),
+        ));
+        reg.agents
+            .remember_session(
+                old,
+                &AgentLaunch {
+                    profile: "codex".into(),
+                    permission: Permission::Yolo,
+                },
+                Some(sid.into()),
+                root.as_os_str().as_encoded_bytes().to_vec(),
+                Some(LaunchAccount {
+                    id: "codex-old".into(),
+                    env_key: "CODEX_HOME".into(),
+                    dir: from.display().to_string(),
+                }),
+            )
+            .unwrap();
+        reg.agents.mark_rate_limited(old);
+        let reader = Arc::clone(&reg);
+        let reader_worker =
+            std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let close_old = {
+            let reg = Arc::clone(&reg);
+            move || reg.close(&peer, old).unwrap()
+        };
+        let next_terminate = |link: &mut Link| loop {
+            let packet = link.recv().unwrap().unwrap();
+            match ToHolder::decode(packet.frame()).unwrap() {
+                ToHolder::Release { .. } => {}
+                ToHolder::Terminate { req, id } => {
+                    link.send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                        .unwrap();
+                    return id;
+                }
+                other => panic!("unexpected holder request: {other:?}"),
+            }
+        };
+
+        reg.queue_account_switch(ProviderKind::Codex, &target);
+        let mock = if in_flight {
+            let mock_reg = Arc::clone(&reg);
+            std::thread::spawn(move || {
+                let packet = holder_link.recv().unwrap().unwrap();
+                let ToHolder::Spawn { req, id: new, .. } =
+                    ToHolder::decode(packet.frame()).unwrap()
+                else {
+                    panic!("expected replacement spawn");
+                };
+                let (master, mut process) = UnixStream::pair().unwrap();
+                holder_link
+                    .send(
+                        &FromHolder::Spawned {
+                            req,
+                            id: new,
+                            pid: 831,
+                        }
+                        .encode()
+                        .unwrap(),
+                        &[master.as_fd()],
+                    )
+                    .unwrap();
+                let closer = std::thread::spawn(close_old);
+                // Cancelling lets the attempt stop its replacement before the close reaches the holder.
+                let first = next_terminate(&mut holder_link);
+                mock_reg.on_exited(first, 0);
+                process.write_all(b"Resuming session").ok();
+                let second = next_terminate(&mut holder_link);
+                mock_reg.on_exited(second, 0);
+                closer.join().unwrap();
+                let mut ended = [first, second];
+                ended.sort();
+                assert_eq!(ended, [old, new]);
+            })
+        } else {
+            let closer = std::thread::spawn(close_old);
+            assert_eq!(next_terminate(&mut holder_link), old);
+            closer.join().unwrap();
+            std::thread::spawn(move || drop(holder_link))
+        };
+
+        reg.process_account_work_in(&home);
+
+        let saved = load(Some(&state));
+        assert!(
+            !saved.contains_key(&old),
+            "in_flight={in_flight}: closed session keeps a switch record: {:?}",
+            saved.get(&old)
+        );
+        assert!(lock(&reg.account_work.pending).is_empty());
+        assert!(lock(&reg.account_replacements).is_empty());
+        mock.join().unwrap();
+        assert!(
+            !fs::read_dir(state.join("account-replacements"))
+                .is_ok_and(|mut journals| journals.next().is_some()),
+            "in_flight={in_flight}: replacement journal survived"
+        );
+        reader_worker.join().unwrap();
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 // Codex 0.166 shares `thread-writer-locks` across profiles. A resumed TUI that finds the
 // original still writing shows a lock prompt and opens nothing until the user presses r.
 #[test]
