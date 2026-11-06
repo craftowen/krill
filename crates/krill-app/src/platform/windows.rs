@@ -12,6 +12,11 @@ pub fn wait_process_exit(pid: u32, timeout: std::time::Duration) -> io::Result<(
     win::wait_process_exit(pid, timeout)
 }
 
+#[cfg(windows)]
+pub(super) fn available_disk_bytes(path: &std::path::Path) -> io::Result<u64> {
+    win::available_disk_bytes(path)
+}
+
 /// 실행 중인 Explorer에게 프로그램을 대신 띄우게 한다(`IShellDispatch2::ShellExecute`). 새 프로세스는 Explorer의 자식이라
 /// 이 앱이 갇힌 Job(작업 스케줄러 등 breakaway 금지)을 물려받지 않는다.
 #[cfg(windows)]
@@ -706,6 +711,34 @@ mod win {
             Ok(())
         } else {
             Err(io::Error::other(format!("ShellExecuteW failed ({code})")))
+        }
+    }
+
+    pub(super) fn available_disk_bytes(path: &std::path::Path) -> io::Result<u64> {
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        if path.as_os_str().encode_wide().any(|c| c == 0) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let dir = if path.is_file() {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(path)
+        } else {
+            path
+        };
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut free = 0_u64;
+        let wide_ptr = wide.as_ptr();
+        let free_ptr = &raw mut free;
+        // SAFETY: wide_ptr points to a NUL-terminated UTF-16 directory path valid for the call,
+        // free_ptr is a writable u64 out-pointer, and the optional total-byte pointers may be null.
+        let ok =
+            unsafe { GetDiskFreeSpaceExW(wide_ptr, free_ptr, ptr::null_mut(), ptr::null_mut()) };
+        if ok != 0 {
+            Ok(free)
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 }

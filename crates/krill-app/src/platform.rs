@@ -67,6 +67,27 @@ pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process:
     krill_proto::os::background_command(program)
 }
 
+pub fn available_disk_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    let target = path
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .unwrap_or(path);
+    #[cfg(unix)]
+    {
+        let stat = rustix::fs::statvfs(target)?;
+        Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    }
+    #[cfg(windows)]
+    {
+        windows::available_disk_bytes(target)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = target;
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// Refresh existing windows after a theme or attention-count change.
 #[cfg(windows)]
 pub fn sync_windows(cx: &mut gpui::App) {
@@ -96,5 +117,15 @@ mod tests {
             super::instance_key(Some(Path::new(r"C:\Users\a\AppData\Local\Krill-test")))
         );
         assert_ne!(key, super::instance_key(None));
+    }
+
+    #[test]
+    fn available_disk_bytes_resolves_missing_child_under_temp_dir() {
+        let missing = std::env::temp_dir()
+            .join(format!("krill-disk-probe-{}", std::process::id()))
+            .join("missing")
+            .join("child");
+        let bytes = super::available_disk_bytes(&missing).unwrap();
+        assert!(bytes > 0, "expected positive free disk bytes, got {bytes}");
     }
 }
