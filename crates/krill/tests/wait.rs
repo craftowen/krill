@@ -322,8 +322,30 @@ fn quiet_counts_invisible_output_and_reports_timeout_two() {
     let d = Daemon::new("quiet");
     let id = d.session("printf 'stream-ready\\n'; while [ ! -f \"$D/stop\" ]; do printf '\\033[0m'; sleep 0.02; done; touch \"$D/stopped\"");
     d.wait_text(&id, "stream-ready");
-    d.assert_timeout(&id, "quiet:200", &[]);
+    // Stream past the threshold, so output that did not count would already read as quiet from here on.
+    thread::sleep(Duration::from_millis(300));
+    // A stalled shell can read as quiet for a moment, so one active reading is the proof.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let out = d.probe(&id, "quiet:200");
+        if !out.status.success() {
+            assert_eq!(out.status.code(), Some(2), "{out:?}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("wait timed out"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "invisible output did not count as activity"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     fs::write(d.dir.join("stop"), b"").unwrap();
+    // The same stall can read as quiet before `touch`, so end the stream before asking.
+    let deadline = Instant::now() + WAIT;
+    while !d.dir.join("stopped").exists() {
+        assert!(Instant::now() < deadline, "stream did not stop");
+        thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         d.ok(&[
             "wait",
@@ -337,7 +359,6 @@ fn quiet_counts_invisible_output_and_reports_timeout_two() {
         ])
         .contains("quiet")
     );
-    assert!(d.dir.join("stopped").exists());
     assert!(d.probe(&id, "quiet:200").status.success());
 }
 
