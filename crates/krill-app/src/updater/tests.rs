@@ -2269,6 +2269,27 @@ fn owe883_localize_reason_maps_known_english_reasons() {
         relaunch::localize_reason("old app did not exit; replacement aborted"),
         "이전 앱이 종료되지 않아 교체 중단됨"
     );
+    assert_eq!(
+        relaunch::localize_reason("updater I/O error: old app did not exit; replacement aborted"),
+        "이전 앱이 종료되지 않아 교체 중단됨"
+    );
+    let io_err = relaunch::localize_reason("updater I/O error: access is denied");
+    assert!(io_err.contains("access is denied"), "{io_err}");
+    assert!(!io_err.contains("updater I/O error"), "{io_err}");
+    let cfg_err = relaunch::localize_reason("updater config error: bad key");
+    assert!(cfg_err.contains("bad key"), "{cfg_err}");
+    assert!(!cfg_err.contains("updater config error"), "{cfg_err}");
+    let cs_err = relaunch::localize_reason("codesign verification failed: unsigned");
+    assert!(cs_err.contains("unsigned"), "{cs_err}");
+    assert!(!cs_err.contains("codesign verification failed"), "{cs_err}");
+    let bundle_err = relaunch::localize_reason("invalid app bundle structure: missing krill.exe");
+    assert!(bundle_err.contains("missing krill.exe"), "{bundle_err}");
+    assert!(
+        !bundle_err.contains("invalid app bundle structure"),
+        "{bundle_err}"
+    );
+    let sig_err = relaunch::localize_reason("ed25519 signature verification failed");
+    assert!(!sig_err.contains("ed25519"), "{sig_err}");
     let exited = relaunch::localize_reason("new app exited before ready (exit status: 1)");
     assert!(exited.contains("exit status: 1"), "{exited}");
     assert!(!exited.contains("new app exited before ready"), "{exited}");
@@ -2389,18 +2410,107 @@ mod rename_mode {
     }
 
     #[test]
-    fn updater_rename_refuses_unknown_files_in_install_dir() {
-        let d = TempGuard(temp_dir("rename-unknown"));
+    fn updater_rename_preserves_unmanaged_and_backup_files() {
+        let d = TempGuard(temp_dir("rename-unmanaged"));
         let state = d.0.join("state");
         let (install, staging) = layout(&d.0);
+        write(&install, "krill.exe.bak", "manual backup");
         write(&install, "notes.txt", "user data");
+        write(&install, "custom-dir/keep.txt", "keep");
+        write(&install, "THIRD_PARTY_NOTICES.TXT", "old-notice");
+        write(&staging, "future-helper.exe", "new-helper");
 
-        let err = swap(&install, &state).unwrap_err();
-        assert!(err.to_string().contains("notes.txt"), "{err}");
+        let journal = swap(&install, &state).unwrap();
+        assert_eq!(journal.stage, Stage::VerifyingLaunch);
+        assert!(!staging.exists());
+        assert_eq!(
+            read(&install, "krill.exe.bak").as_deref(),
+            Some("manual backup")
+        );
         assert_eq!(read(&install, "notes.txt").as_deref(), Some("user data"));
+        assert_eq!(
+            read(&install, "custom-dir/keep.txt").as_deref(),
+            Some("keep")
+        );
+        assert_eq!(
+            read(&install, "future-helper.exe").as_deref(),
+            Some("new-helper")
+        );
+        assert_eq!(read(&install, "krill-app.exe").as_deref(), Some("new"));
+        assert!(
+            !install.read_dir().unwrap().flatten().any(|e| e
+                .file_name()
+                .eq_ignore_ascii_case("THIRD_PARTY_NOTICES.txt")),
+            "known entry removed from new release must move to .prev even with uppercase name"
+        );
+        assert_eq!(read(&prev_path(&install), "krill.exe.bak"), None);
+        assert_eq!(read(&prev_path(&install), "notes.txt"), None);
+        assert!(!prev_path(&install).join("custom-dir").exists());
+
+        // 롤백 시에도 백업·사용자 파일은 그대로 남고, KNOWN_ENTRIES 밖 신규 스테이징 파일은 지워진다.
+        rollback_with(Mode::Rename, &install, &state, "health").unwrap();
+        assert_eq!(
+            read(&install, "krill.exe.bak").as_deref(),
+            Some("manual backup")
+        );
+        assert_eq!(read(&install, "notes.txt").as_deref(), Some("user data"));
+        assert_eq!(
+            read(&install, "custom-dir/keep.txt").as_deref(),
+            Some("keep")
+        );
+        assert_eq!(
+            read(&install, "future-helper.exe"),
+            None,
+            "staged file outside KNOWN_ENTRIES must be removed on rollback"
+        );
         assert_eq!(read(&install, "krill-app.exe").as_deref(), Some("old"));
-        assert!(staging.exists());
-        assert!(Journal::load(&state).unwrap().is_none());
+        assert_eq!(
+            read(&install, "THIRD_PARTY_NOTICES.TXT").as_deref(),
+            Some("old-notice")
+        );
+        assert!(!prev_path(&install).exists());
+        assert!(!append_ext(&install, "prev.entries").exists());
+
+        // 다시 업데이트해 Healthy 확정 후 백업 정리가 돌아도 백업·사용자 파일은 보존된다.
+        let (_, staging2) = layout(&d.0.join("restage"));
+        rename::move_tree(&staging2, &staging, &trash_path(&install)).unwrap();
+        let mut confirmed = swap(&install, &state).unwrap();
+        confirmed.stage = Stage::Healthy;
+        confirmed.save(&state).unwrap();
+        relaunch::discard_confirmed_backup(Mode::Rename, &state, &confirmed);
+        assert!(!prev_path(&install).exists());
+        assert!(!append_ext(&install, "prev.entries").exists());
+        assert_eq!(
+            read(&install, "krill.exe.bak").as_deref(),
+            Some("manual backup")
+        );
+        assert_eq!(read(&install, "notes.txt").as_deref(), Some("user data"));
+        assert_eq!(
+            read(&install, "custom-dir/keep.txt").as_deref(),
+            Some("keep")
+        );
+        assert_eq!(read(&install, "krill-app.exe").as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn updater_rename_known_entries_cover_windows_bundle_layout() {
+        for expected in [
+            "Krill.json",
+            "krill-app.exe",
+            "krill.exe",
+            "krilld.exe",
+            "krill-holder.exe",
+            "krill-link.exe",
+            "conpty.dll",
+            "x64",
+            "arm64",
+            "THIRD_PARTY_NOTICES.txt",
+        ] {
+            assert!(
+                rename::KNOWN_ENTRIES.contains(&expected),
+                "missing {expected} in KNOWN_ENTRIES"
+            );
+        }
     }
 
     #[test]
