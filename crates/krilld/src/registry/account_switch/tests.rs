@@ -2995,3 +2995,275 @@ fn stateless_registry_leaves_the_default_folder_account_records_alone() {
     );
     assert!(status.success());
 }
+
+#[test]
+fn dead_retained_replacement_handoff_is_hidden_and_pruned_preserving_session_id_floor() {
+    let root = std::env::temp_dir().join(format!("kas-retained-dead-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let retained = SessionHandoff {
+        from: SessionId(40_351),
+        to: None,
+        account_id: "codex-alpha".into(),
+        error: Some(
+            "Original session ended; unconfirmed replacement 40373 was retained. Select it explicitly to continue; held input was not sent"
+                .into(),
+        ),
+    };
+    accounts::write_atomic_0600(&root.join(FILE), &serde_json::to_vec(&[retained]).unwrap())
+        .unwrap();
+    assert!(!root.join("session-id-sequence.json").exists());
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (holder, _reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Registry::new(Some((holder, Vec::new())), Some(&root));
+
+    let mut snapshot = AccountsSnapshot::default();
+    reg.account_switch_snapshot(&mut snapshot);
+    assert!(
+        snapshot.details.handoffs.is_empty(),
+        "dead retained replacement handoff must be hidden: {:?}",
+        snapshot.details.handoffs
+    );
+
+    reg.recover_account_work(&home);
+    assert!(
+        load(Some(&root)).is_empty(),
+        "recover_account_work must prune dead retained handoff from account-handoffs.json"
+    );
+
+    let next = reg.reserve_session_id(None).unwrap();
+    assert!(
+        next >= SessionId(40_374),
+        "expected session ID >= 40374 after reserving retained 40373, got {next:?}"
+    );
+
+    drop(reg);
+    drop(holder_link);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_retained_replacement_clears_on_interactive_selection_replacement_close_or_manual_cancel() {
+    use krill_proto::control::Reply;
+    use krill_proto::ipc::{self, ClientRole, ServerHello};
+    use krill_proto::roles::{self, Role};
+    use krill_proto::screen::{Attach, Msg as _, Stream, kind as screen_kind};
+    use krill_proto::usage::{UsageReply, UsageRequest};
+
+    let attach_screen = |reg: &Arc<Registry>, role: Role, session: SessionId| {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let serving_reg = Arc::clone(reg);
+        let serving = std::thread::spawn(move || {
+            serving_reg.serve(
+                server,
+                &ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features: ipc::FEATURES,
+                    build: "test".into(),
+                    instance_id: 1,
+                },
+            )
+        });
+        ipc::read_frame(&mut client).unwrap().unwrap();
+        let hello = krill_proto::daemon::client_hello(ClientRole::App, "test");
+        client.write_all(&hello.encode().unwrap()).unwrap();
+        client
+            .write_all(&roles::Request::Set(role).encode().unwrap())
+            .unwrap();
+        let (ack_kind, ack_body) = ipc::read_frame(&mut client).unwrap().unwrap();
+        assert_eq!(
+            roles::Ack::decode(ack_kind, &ack_body).unwrap(),
+            roles::Ack::Applied
+        );
+        client
+            .write_all(
+                &Attach {
+                    session,
+                    stream: Stream::Screen { known: None },
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            ipc::read_frame(&mut client).unwrap().unwrap().0,
+            screen_kind::ATTACHED
+        );
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+    };
+
+    for mode in ["interactive_attach", "close_replacement", "manual_cancel"] {
+        let root =
+            std::env::temp_dir().join(format!("kas-retained-live-{}-{mode}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let retained = SessionHandoff {
+            from: SessionId(7),
+            to: None,
+            account_id: "codex-alpha".into(),
+            error: Some(
+                "Original session ended; unconfirmed replacement 8 was retained. Select it explicitly to continue; held input was not sent"
+                    .into(),
+            ),
+        };
+        accounts::write_atomic_0600(&root.join(FILE), &serde_json::to_vec(&[retained]).unwrap())
+            .unwrap();
+
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let pty = rustix_openpty::openpty(None, None).unwrap();
+        let _replacement_process = pty.user;
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let reg = Arc::new(Registry::new(
+            Some((
+                holder,
+                vec![Kept {
+                    id: SessionId(8),
+                    pid: 800,
+                    status: None,
+                    size: None,
+                    master: pty.controller,
+                }],
+            )),
+            Some(&root),
+        ));
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&reg);
+        let reader_worker = std::thread::spawn(move || {
+            reader.holder.as_ref().unwrap().run(link, |id, status| {
+                reader.on_exited(id, status);
+                exited_tx.send(id).ok();
+            });
+        });
+
+        let mut initial = AccountsSnapshot::default();
+        reg.account_switch_snapshot(&mut initial);
+        assert_eq!(initial.details.handoffs.len(), 1, "{mode}");
+        let handoff = initial.details.handoffs.first().unwrap();
+        assert_eq!(handoff.from, SessionId(7), "{mode}");
+        assert_eq!(handoff.to, None, "{mode}");
+        assert!(
+            handoff
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("retained")),
+            "{mode}"
+        );
+
+        attach_screen(&reg, Role::Observer, SessionId(8));
+        let mut after_observer = AccountsSnapshot::default();
+        reg.account_switch_snapshot(&mut after_observer);
+        assert_eq!(
+            after_observer.details.handoffs.len(),
+            1,
+            "observer attach must not clear retained handoff: {mode}"
+        );
+
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        match mode {
+            "interactive_attach" => {
+                attach_screen(&reg, Role::Interactive, SessionId(8));
+            }
+            "close_replacement" => {
+                let mock = std::thread::spawn(move || {
+                    let packet = holder_link.recv().unwrap().unwrap();
+                    let ToHolder::Terminate { req, id } = ToHolder::decode(packet.frame()).unwrap()
+                    else {
+                        panic!("expected Terminate for replacement 8");
+                    };
+                    assert_eq!(id, SessionId(8));
+                    holder_link
+                        .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                        .unwrap();
+                    holder_link
+                        .send(
+                            &FromHolder::Exited {
+                                id: SessionId(8),
+                                status: 0,
+                            }
+                            .encode()
+                            .unwrap(),
+                            &[],
+                        )
+                        .unwrap();
+                    let packet = holder_link.recv().unwrap().unwrap();
+                    let ToHolder::Release { id, .. } = ToHolder::decode(packet.frame()).unwrap()
+                    else {
+                        panic!("expected Release for replacement 8");
+                    };
+                    assert_eq!(id, SessionId(8));
+                    holder_link
+                });
+                assert_eq!(reg.close(&peer, SessionId(8)), Ok(Reply::Closed));
+                holder_link = mock.join().unwrap();
+                assert_eq!(
+                    exited_rx.recv_timeout(Duration::from_secs(3)),
+                    Ok(SessionId(8))
+                );
+            }
+            "manual_cancel" => {
+                let reply = reg.on_usage(
+                    &peer,
+                    Role::Interactive,
+                    UsageRequest::CancelAccountSwitch {
+                        session: SessionId(7),
+                    },
+                );
+                assert!(
+                    matches!(reply, UsageReply::Accounts(_)),
+                    "expected UsageReply::Accounts, got {reply:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        let mut cleared = AccountsSnapshot::default();
+        reg.account_switch_snapshot(&mut cleared);
+        assert!(
+            cleared.details.handoffs.is_empty(),
+            "expected cleared handoffs in snapshot for {mode}, got {:?}",
+            cleared.details.handoffs
+        );
+        assert!(
+            load(Some(&root)).is_empty(),
+            "expected cleared account-handoffs.json for {mode}"
+        );
+
+        drop(holder_link);
+        reader_worker.join().unwrap();
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
