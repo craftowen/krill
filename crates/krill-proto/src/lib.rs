@@ -16,6 +16,7 @@ pub mod control;
 pub mod daemon;
 pub mod diag;
 pub mod doctor;
+pub mod drop;
 pub mod error_reporting;
 pub mod git;
 pub mod history;
