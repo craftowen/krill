@@ -298,7 +298,8 @@ enum Row {
     },
     Worktree(PathBuf),
     HiddenWorktrees(PathBuf, usize, bool),
-    Session(Session, bool),
+    /// Boxed: `Session` carries the full agent status and dwarfs the other rows.
+    Session(Box<Session>, bool),
     /// git 밖 폴더 프로젝트(세션 작업 디렉터리). Orca처럼 폴더 > 세션으로 묶는다(OWE-654).
     Folder(PathBuf),
     /// 작업 디렉터리를 모르는 세션.

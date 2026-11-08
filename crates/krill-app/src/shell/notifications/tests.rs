@@ -505,3 +505,63 @@ fn automatic_reconnect_is_quiet_but_actionable_failure_is_visible(cx: &mut TestA
     settle(cx);
     assert!(cx.debug_bounds("link-banner").is_none());
 }
+
+#[gpui::test]
+fn agent_startup_stall_toast_follows_the_daemon_report(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostStatus};
+    use krill_proto::control::AgentStatus;
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = open(cx, state_path("toast-agent-startup-stall"));
+    let terminal_before = cx.debug_bounds("terminal-surface").unwrap();
+    let report = |stall: Option<&str>, view: &Entity<Shell>, cx: &mut gpui::VisualTestContext| {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            let session = SessionId(777);
+            shell.layout.set_session(pane, session);
+            shell
+                .layout
+                .set_host(pane, HostId::Remote("observed".into()));
+            shell.sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_remote_snapshot_for_test(
+                    "observed",
+                    HostStatus::Connected,
+                    krill_app::sidebar::Snapshot {
+                        sessions: vec![krill_app::sidebar::Session {
+                            id: session,
+                            status: AgentStatus {
+                                startup_stall: stall.map(str::to_owned),
+                                ..AgentStatus::UNKNOWN
+                            },
+                            cwd: None,
+                            worktree: None,
+                            account: None,
+                        }],
+                        trees: std::collections::BTreeMap::default(),
+                    },
+                    cx,
+                );
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        settle(cx);
+    };
+    report(Some("brew shellenv zsh"), &view, cx);
+    assert!(cx.debug_bounds("agent-startup-stall").is_some());
+    assert_eq!(
+        cx.debug_bounds("terminal-surface").unwrap(),
+        terminal_before
+    );
+    assert_eq!(
+        view.update(cx, |s, cx| s.startup_stall_banner(cx))
+            .as_deref(),
+        Some(
+            text::AGENT_STARTUP_STALLED
+                .format(&[("command", "brew shellenv zsh")])
+                .as_str()
+        )
+    );
+    // Once the agent starts the daemon stops reporting and the toast leaves.
+    report(None, &view, cx);
+    assert!(cx.debug_bounds("agent-startup-stall").is_none());
+}

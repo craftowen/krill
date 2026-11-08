@@ -723,7 +723,7 @@ fn push_worktree_and_sessions(
         && let Some(list) = sessions_by_wt.get(tree.as_path())
     {
         for &s in list {
-            out.push(Row::Session(s.clone(), true));
+            out.push(Row::Session(Box::new(s.clone()), true));
         }
     }
 }
@@ -835,7 +835,7 @@ pub(super) fn rows_with_options<'a>(
     if options.group_by != GroupBy::Repo && waiting.peek().is_some() {
         out.push(Row::NeedsYou);
         for s in waiting {
-            out.push(Row::Session(s.clone(), false));
+            out.push(Row::Session(Box::new(s.clone()), false));
         }
     }
     let filters_active = options.filters.active_count() > 0;
@@ -1103,7 +1103,7 @@ pub(super) fn rows_with_options<'a>(
             folders
                 .entry(cwd)
                 .or_default()
-                .push(Row::Session(s.clone(), true));
+                .push(Row::Session(Box::new(s.clone()), true));
         }
     }
     for (folder, sessions) in folders {
@@ -1122,7 +1122,11 @@ pub(super) fn rows_with_options<'a>(
         .collect();
     if !loose.is_empty() {
         out.push(Row::Loose);
-        out.extend(loose.into_iter().map(|s| Row::Session(s.clone(), false)));
+        out.extend(
+            loose
+                .into_iter()
+                .map(|s| Row::Session(Box::new(s.clone()), false)),
+        );
     }
     out
 }

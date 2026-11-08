@@ -115,6 +115,7 @@ fn fixtures_v1() {
                         title: None,
                         subagents: Vec::new(),
                         root_shell: None,
+                        startup_stall: None,
                     },
                 },
             ])),
@@ -1080,6 +1081,7 @@ fn states_foreground_tail_preserves_n_minus_one_in_both_directions() {
                 title: None,
                 subagents: Vec::new(),
                 root_shell: None,
+                startup_stall: None,
             },
         },
     ];
@@ -1641,4 +1643,66 @@ fn sidebar_closed_sessions_tail_roundtrips_and_rejects_non_canonical_wire() {
         forged.extend(postcard::to_stdvec(&bad).unwrap());
         assert!(Reply::decode(kind::REPLY, &forged).is_err());
     }
+}
+
+#[test]
+fn states_startup_stall_tail_round_trips_and_old_decoders_ignore_it() {
+    let base = Reply::States(vec![
+        SessionStatus {
+            session: SessionId(1),
+            status: AgentStatus::UNKNOWN,
+        },
+        SessionStatus {
+            session: SessionId(2),
+            status: AgentStatus::UNKNOWN,
+        },
+    ]);
+    let Reply::States(mut rows) = base.clone() else {
+        unreachable!()
+    };
+    rows[1].status.startup_stall = Some("brew shellenv zsh".into());
+    let reply = Reply::States(rows.clone());
+    let frame = reply.encode().unwrap();
+    assert_eq!(Reply::decode(kind::REPLY, &frame[5..]).unwrap(), reply);
+    // An N-1 decoder reads four extensions and stops; the stall rides after them.
+    let (old_reply, mut tail) = postcard::take_from_bytes::<Reply>(&frame[5..]).unwrap();
+    assert_eq!(old_reply, base);
+    for _ in 0..2 {
+        for _ in 0..2 {
+            tail = postcard::take_from_bytes::<Option<String>>(tail).unwrap().1;
+        }
+    }
+    for _ in 0..2 {
+        tail = postcard::take_from_bytes::<Vec<Subagent>>(tail).unwrap().1;
+    }
+    for _ in 0..2 {
+        tail = postcard::take_from_bytes::<Option<Box<RootShell>>>(tail)
+            .unwrap()
+            .1;
+    }
+    assert_eq!(
+        postcard::from_bytes::<(Option<String>, Option<String>)>(tail).unwrap(),
+        (None, Some("brew shellenv zsh".into()))
+    );
+    // Invalid text is dropped by the encoder and rejected from a raw peer.
+    rows[1].status.startup_stall = Some(String::new());
+    let frame = Reply::States(rows.clone()).encode().unwrap();
+    rows[1].status.startup_stall = None;
+    assert_eq!(
+        Reply::decode(kind::REPLY, &frame[5..]).unwrap(),
+        Reply::States(rows.clone())
+    );
+    let mut body = postcard::to_stdvec(&base).unwrap();
+    for _ in 0..4 {
+        body.extend(postcard::to_stdvec(&Option::<String>::None).unwrap());
+    }
+    for _ in 0..2 {
+        body.extend(postcard::to_stdvec(&Vec::<Subagent>::new()).unwrap());
+    }
+    for _ in 0..2 {
+        body.extend(postcard::to_stdvec(&Option::<Box<RootShell>>::None).unwrap());
+    }
+    body.extend(postcard::to_stdvec(&Option::<String>::None).unwrap());
+    body.extend(postcard::to_stdvec(&Some(String::new())).unwrap());
+    assert!(Reply::decode(kind::REPLY, &body).is_err());
 }

@@ -485,6 +485,10 @@ pub struct AgentStatus {
     /// Observed root shell and host OS; fourth States extension, never inferred by the client.
     #[serde(default, skip)]
     pub root_shell: Option<Box<RootShell>>,
+    /// The launch wrapper is still running shell startup files and the agent has not started.
+    /// Holds the stuck command (`brew shellenv zsh`) or the shell name. Fifth States extension.
+    #[serde(default, skip)]
+    pub startup_stall: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -577,6 +581,7 @@ impl AgentStatus {
         title: None,
         subagents: Vec::new(),
         root_shell: None,
+        startup_stall: None,
     };
 }
 
@@ -1326,7 +1331,8 @@ impl Msg for Reply {
     fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
         if let Self::States(rows) = self {
             let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
-            let has_root = rows.iter().any(|r| r.status.root_shell.is_some());
+            let has_stall = rows.iter().any(|r| r.status.startup_stall.is_some());
+            let has_root = has_stall || rows.iter().any(|r| r.status.root_shell.is_some());
             let has_subagents = has_root || rows.iter().any(|r| !r.status.subagents.is_empty());
             let has_title = has_subagents || rows.iter().any(|r| r.status.title.is_some());
             if has_title || rows.iter().any(|r| r.status.foreground.is_some()) {
@@ -1360,6 +1366,19 @@ impl Msg for Reply {
                                 .root_shell
                                 .as_deref()
                                 .filter(|root| valid_root_program(&root.program)),
+                        )
+                        .map_err(crate::ipc::Error::Codec)?,
+                    );
+                }
+            }
+            if has_stall {
+                for row in rows {
+                    body.extend(
+                        postcard::to_stdvec(
+                            &row.status
+                                .startup_stall
+                                .as_deref()
+                                .filter(|c| !c.is_empty() && c.len() <= MAX_AGENT_TEXT),
                         )
                         .map_err(crate::ipc::Error::Codec)?,
                     );
@@ -1461,6 +1480,22 @@ impl Msg for Reply {
                             ));
                         }
                         row.status.root_shell = root;
+                        tail = next;
+                    }
+                }
+                if !tail.is_empty() {
+                    for row in rows.iter_mut() {
+                        let (stall, next) = postcard::take_from_bytes::<Option<String>>(tail)
+                            .map_err(crate::ipc::Error::Codec)?;
+                        if stall
+                            .as_ref()
+                            .is_some_and(|c| c.is_empty() || c.len() > MAX_AGENT_TEXT)
+                        {
+                            return Err(crate::ipc::Error::Codec(
+                                postcard::Error::DeserializeBadEncoding,
+                            ));
+                        }
+                        row.status.startup_stall = stall;
                         tail = next;
                     }
                 }

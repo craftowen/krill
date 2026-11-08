@@ -651,6 +651,7 @@ catalog! {
         RECENT_TABS_TITLE => ("최근 탭 (Ctrl+Tab)", "Recent Tabs (Ctrl+Tab)"),
         RECENT_ALL_WORKSPACES => ("모든 워크스페이스", "All workspaces"),
         HOST_SESSIONS_RECONNECTING => ("{host}: 세션에 다시 연결하는 중…", "{host}: Reconnecting sessions…"),
+        AGENT_STARTUP_STALLED => ("에이전트가 시작되지 않았습니다. 셸 시작 파일에서 {command} 명령이 멈춰 있습니다.", "The agent has not started. A shell startup file is stuck at {command}."),
         EMPTY_NEW_AGENT => ("새 에이전트", "New agent"),
         EMPTY_TAGLINE => ("앱을 닫거나 업데이트해도 세션은 계속 실행됩니다", "Sessions keep running when you close or update the app"),
         EMPTY_OPEN_FILE => ("파일 열기", "Open file"),

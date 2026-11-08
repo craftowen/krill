@@ -2296,8 +2296,8 @@ fn virtualized_worktree_sessions_share_summary_panel_edges(cx: &mut TestAppConte
             };
             s.rows = vec![
                 Row::Worktree("/repo/a".into()),
-                Row::Session(first, true),
-                Row::Session(second, true),
+                Row::Session(Box::new(first), true),
+                Row::Session(Box::new(second), true),
             ];
             s.rows
                 .extend((0..100).map(|i| Row::Repository(format!("/extra/{i}").into())));
@@ -5865,7 +5865,10 @@ fn card_session_lists_running_subagents_below_it(cx: &mut TestAppContext) {
                 sessions: vec![lead.clone()],
                 trees: BTreeMap::from([(PathBuf::from("/repo"), vec!["/repo/a".into()])]),
             };
-            s.rows = vec![Row::Worktree("/repo/a".into()), Row::Session(lead, true)];
+            s.rows = vec![
+                Row::Worktree("/repo/a".into()),
+                Row::Session(Box::new(lead), true),
+            ];
             s.expanded_cards.insert("/repo/a".into());
             s.sync_viewport();
             cx.notify();

@@ -139,6 +139,20 @@ pub fn start_us(pid: u32) -> io::Result<u64> {
     Ok(ticks.saturating_mul(1_000_000) / hz)
 }
 
+/// 프로세스가 뜬 뒤 지난 시간(`/proc/uptime` − 시작 시각, 둘 다 부팅 기준).
+pub(crate) fn process_age(pid: u32) -> io::Result<std::time::Duration> {
+    let uptime = std::fs::read_to_string("/proc/uptime")?;
+    let secs: f64 = uptime
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    let start = std::time::Duration::from_micros(start_us(pid)?);
+    Ok(std::time::Duration::try_from_secs_f64(secs)
+        .unwrap_or_default()
+        .saturating_sub(start))
+}
+
 /// `/proc/<pid>/stat`의 `n`번째 칸(1부터, man proc). comm(2번째)에 공백·괄호가 올 수 있어 마지막 `)` 뒤부터 센다.
 fn stat_field(pid: u32, n: usize) -> io::Result<u64> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
