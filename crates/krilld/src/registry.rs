@@ -120,7 +120,7 @@ struct Entry {
 }
 
 /// argv가 에이전트 셸 복귀 래퍼(`<shell> -l -i -c PREFLIGHT mk-agent ...`)인가.
-fn is_wrapper_argv<S: AsRef<[u8]>>(argv: &[S]) -> bool {
+pub(crate) fn is_wrapper_argv<S: AsRef<[u8]>>(argv: &[S]) -> bool {
     #[cfg(unix)]
     return argv
         .get(5)
@@ -2030,14 +2030,14 @@ impl Registry {
                     // Reader completion also occurs during daemon handoff. Only the
                     // published EOF flag (or holder exit) proves the terminal ended.
                     let exited = st.exited.contains_key(&session) || tap.pulse().closed;
-                    (session, e.pid, exited, tap)
+                    (session, e.pid, exited, tap, e.wrapped)
                 })
                 .collect()
         };
         Reply::States(
             sessions
                 .into_iter()
-                .map(|(session, root, exited, tap)| {
+                .map(|(session, root, exited, tap, wrapped)| {
                     let mut status = self.status.get(session);
                     // EOF/holder 종료는 저장된 hook보다 우선한다. 종료 콜백이 늦거나
                     // 더 최신 시각의 hook이 도착해도 끝난 세션을 Done으로 되살리지 않는다.
@@ -2057,6 +2057,13 @@ impl Registry {
                     }
                     status.foreground = status::session_foreground(root, tap.foreground(), exited);
                     status.title = tap.title();
+                    // Only a launch with no agent evidence yet can still be in shell startup.
+                    status.startup_stall = (wrapped
+                        && !exited
+                        && status.state == control::AgentState::Unknown
+                        && status.source.is_none())
+                    .then(|| status::startup::startup_stall(root))
+                    .flatten();
                     status.root_shell = (!exited)
                         .then(|| crate::sys::process_name(root).ok())
                         .flatten()

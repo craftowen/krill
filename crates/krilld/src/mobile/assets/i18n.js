@@ -4,6 +4,7 @@
   let language = "en";
   const ko = {
     "Requested {0}": "요청한 설정 {0}",
+    "The agent has not started. A shell startup file is stuck at {0}.": "에이전트가 시작되지 않았습니다. 셸 시작 파일에서 {0} 명령이 멈춰 있습니다.",
     "Context used {0}%": "컨텍스트 {0}% 사용",
     "No model catalog is available. Open the model picker in Term.": "모델 목록을 불러올 수 없습니다. 터미널에서 모델을 선택하세요.",
     "Applying…": "적용 중…",
