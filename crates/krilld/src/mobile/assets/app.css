@@ -246,10 +246,12 @@ button.account-row:disabled{opacity:1}
 .chat-tool-run{border:1px solid var(--border);border-radius:var(--radius-row);color:var(--muted-foreground);background:var(--surface-panel)}
 .chat-tool-summary{padding:8px 10px;font-size:var(--font-meta);cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chat-tool-items{padding:0 8px 8px}
-.chat-tool-items>.chat-card{border:0;border-top:1px solid var(--border);border-radius:0;padding:8px 2px;background:transparent}
+.chat-tool-items>:is(.chat-card,.chat-tool-pair){border:0;border-top:1px solid var(--border);border-radius:0;padding:6px 2px;background:transparent}
+.chat-tool-pair{display:flex;flex-direction:column;gap:4px;min-width:0}
+.chat-tool-pair>.chat-card{border:0;border-radius:0;padding:0;background:transparent}
 .chat-tool-call>summary,.chat-tool-result>summary,.chat-reasoning>summary{cursor:pointer;min-height:28px;font-size:var(--font-meta);align-items:center}
 .chat-tool-call>summary{display:list-item}.chat-tool-head>.badge{margin-right:8px}.chat-tool-title{overflow-wrap:anywhere;white-space:normal}
-.chat-tool-call[open]>*+*,.chat-tool-result[open]>*+*{margin-top:8px}
+.chat-tool-call[open]>*+*,.chat-tool-result[open]>*+*,.chat-reasoning[open]>*+*{margin-top:8px}
 .chat-status>[data-state=Waiting]{color:var(--status-waiting)}.chat-status>[data-state=Blocked]{color:var(--status-blocked)}.chat-status>[data-state=Working]{color:var(--status-working)}.chat-composer button{min-height:32px}
 .chat-composer{padding:6px 8px calc(6px + max(0px, env(safe-area-inset-bottom) - var(--keyboard-inset,0px)));gap:6px}.chat-input{min-height:44px;max-height:140px;resize:none;padding:8px 10px}
 
