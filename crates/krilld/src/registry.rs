@@ -457,6 +457,15 @@ impl Registry {
     }
 
     /// 감시 스냅샷 뒤 세션이 지워졌으면 그 상태를 다시 만들지 않는다.
+    /// 셸이 남은 세션에서 에이전트만 끝났다. 그때까지의 프롬프트를 다음 에이전트에 보여 주지 않는다.
+    pub(crate) fn agent_exited(&self, id: SessionId) {
+        if self.with_status(id, |s| s.exited(id)).is_some()
+            && let Some(dir) = self.state_dir()
+        {
+            krill_proto::git::forget_session_prompts(&dir, id, status::now_ns()).ok();
+        }
+    }
+
     pub(crate) fn with_status<T>(
         &self,
         id: SessionId,

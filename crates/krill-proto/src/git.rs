@@ -948,14 +948,74 @@ fn record_prompt(
     source: PromptRecord,
     event_id: Option<crate::hook::EventId>,
 ) -> std::io::Result<bool> {
-    use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-    use std::collections::BTreeMap;
-    use std::fs::{DirBuilder, OpenOptions};
-    use std::io::Write as _;
-
     if clean_prompt_display(prompt, MAX_PROMPT_DISPLAY_CHARS).is_none() {
         return Ok(false);
     }
+    update_prompts(state_dir, |map| {
+        if !map.contains_key(&session.0) {
+            while map.len() >= 256 {
+                let Some(&first) = map.keys().next() else {
+                    break;
+                };
+                map.remove(&first);
+            }
+        }
+        let entry = map.entry(session.0).or_default();
+        if event_id.is_some_and(|id| entry.hook_ids.contains(&id)) {
+            return None;
+        }
+        let changed = match source {
+            PromptRecord::Submission => entry.history.record_turn(prompt, unix_ns),
+            PromptRecord::Context => {
+                let repaired =
+                    entry.source.is_none() && entry.history.repair_context_duplicates(prompt);
+                entry.history.record_context(prompt, unix_ns) || repaired
+            }
+        };
+        if !changed && event_id.is_none() {
+            return None;
+        }
+        if let Some(id) = event_id {
+            entry.hook_ids.insert(0, id);
+            entry.hook_ids.truncate(32);
+        }
+        entry.source = Some(source);
+        Some(changed)
+    })
+}
+
+/// 에이전트가 끝났다. 그 시각까지의 턴은 같은 세션에서 다음에 시작할 에이전트의 것이 아니다.
+/// 항목은 남겨 재전송된 옛 hook이 지운 턴을 되살리지 못하게 한다.
+pub fn forget_session_prompts(
+    state_dir: &std::path::Path,
+    session: crate::SessionId,
+    until_unix_ns: u64,
+) -> std::io::Result<bool> {
+    update_prompts(state_dir, |map| {
+        let history = &mut map.get_mut(&session.0)?.history;
+        let before = history.turns.len();
+        history.turns.retain(|turn| turn.unix_ns > until_unix_ns);
+        if history.turns.len() == before {
+            return None;
+        }
+        let kept = history.turns.len();
+        for (idx, turn) in history.turns.iter_mut().enumerate() {
+            turn.turn = u32::try_from(kept.saturating_sub(idx)).unwrap_or(u32::MAX);
+        }
+        history.total_turns = u32::try_from(kept).unwrap_or(u32::MAX);
+        Some(true)
+    })
+}
+
+/// `session-prompts.json`을 프로세스 간 잠금 아래 읽고 고친다. `f`가 `None`이면 쓰지 않는다.
+fn update_prompts(
+    state_dir: &std::path::Path,
+    f: impl FnOnce(&mut std::collections::BTreeMap<u64, StoredPromptHistory>) -> Option<bool>,
+) -> std::io::Result<bool> {
+    use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::fs::{DirBuilder, OpenOptions};
+    use std::io::Write as _;
+
     let _guard = SESSION_PROMPTS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -973,38 +1033,13 @@ fn record_prompt(
     lock_file.lock()?;
 
     let path = state_dir.join(SESSION_PROMPTS_FILE);
-    let mut map: BTreeMap<u64, StoredPromptHistory> = std::fs::read_to_string(&path)
+    let mut map = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    if !map.contains_key(&session.0) {
-        while map.len() >= 256 {
-            let Some(&first) = map.keys().next() else {
-                break;
-            };
-            map.remove(&first);
-        }
-    }
-    let entry = map.entry(session.0).or_default();
-    if event_id.is_some_and(|id| entry.hook_ids.contains(&id)) {
+    let Some(changed) = f(&mut map) else {
         return Ok(false);
-    }
-    let changed = match source {
-        PromptRecord::Submission => entry.history.record_turn(prompt, unix_ns),
-        PromptRecord::Context => {
-            let repaired =
-                entry.source.is_none() && entry.history.repair_context_duplicates(prompt);
-            entry.history.record_context(prompt, unix_ns) || repaired
-        }
     };
-    if !changed && event_id.is_none() {
-        return Ok(false);
-    }
-    if let Some(id) = event_id {
-        entry.hook_ids.insert(0, id);
-        entry.hook_ids.truncate(32);
-    }
-    entry.source = Some(source);
     let mut bytes = serde_json::to_vec(&map).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
     let seq = SESSION_PROMPTS_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1211,6 +1246,35 @@ mod slug_tests {
 
     fn prompt_event_id(unix_ns: u64) -> crate::hook::EventId {
         crate::hook::EventId { pid: 1, unix_ns }
+    }
+
+    #[test]
+    fn forgetting_an_ended_agent_leaves_the_next_agent_a_fresh_history() {
+        let dir = std::env::temp_dir().join(format!("prompt-forget-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let sid = crate::SessionId(78);
+        let old = br#"{"hook_event_name":"UserPromptSubmit","prompt":"Fix the old bug"}"#;
+        assert!(record_session_prompt_from_hook(&dir, sid, old, prompt_event_id(1)).unwrap());
+        assert!(record_session_prompt(&dir, sid, "Review the old fix", 2).unwrap());
+        assert!(record_session_prompt(&dir, sid, "Start the new task", 20).unwrap());
+
+        assert!(forget_session_prompts(&dir, sid, 10).unwrap());
+        let history = load_session_prompt_histories(&dir).remove(&sid).unwrap();
+        assert_eq!(history.total_turns, 1);
+        assert_eq!(history.turns.len(), 1);
+        assert_eq!(history.turns[0].text, "Start the new task");
+        assert_eq!(history.turns[0].turn, 1);
+        assert!(
+            !record_session_prompt_from_hook(&dir, sid, old, prompt_event_id(1)).unwrap(),
+            "a re-delivered hook of the ended agent must not come back"
+        );
+        assert!(!forget_session_prompts(&dir, sid, 10).unwrap());
+
+        assert!(forget_session_prompts(&dir, sid, 30).unwrap());
+        assert!(!load_session_prompt_histories(&dir).contains_key(&sid));
+        assert!(record_session_prompt(&dir, sid, "Next agent's first prompt", 40).unwrap());
+        assert_eq!(load_session_prompt_histories(&dir)[&sid].turns[0].turn, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

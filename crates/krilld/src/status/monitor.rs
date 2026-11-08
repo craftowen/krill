@@ -96,7 +96,7 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
     let exits = watch.and_then(|w| w.drain().ok()).unwrap_or_default();
     for (&id, t) in &mut *tracked {
         if t.ended(&exits, Instant::now(), crate::sys::start_us) {
-            reg.with_status(id, |s| s.exited(id));
+            reg.agent_exited(id);
         }
     }
     let mut sessions = Vec::new();
@@ -177,7 +177,7 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
                                 || cfg!(windows) && e.raw_os_error() == Some(87) =>
                         {
                             t.process = None;
-                            reg.with_status(id, |s| s.exited(id));
+                            reg.agent_exited(id);
                         }
                         Ok(()) | Err(_) => {}
                     }
@@ -195,7 +195,7 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
             && crate::sys::process_args(root)
                 .is_ok_and(|args| !args.iter().any(|a| a == crate::agent::WRAPPER_ARG0))
         {
-            reg.with_status(id, |s| s.exited(id));
+            reg.agent_exited(id);
         }
         if let Some(e) = evidence {
             reg.with_status(id, |s| s.inferred(id, e, super::now_ns()));

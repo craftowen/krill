@@ -3844,3 +3844,40 @@ fn input_sent_after_the_agent_exits_is_not_a_prompt_turn() {
     assert_eq!(history.total_turns, 1);
     assert_eq!(history.turns[0].text, "fix the bug");
 }
+
+#[cfg(unix)]
+#[test]
+fn agent_exit_hides_its_prompts_from_the_next_agent() {
+    let dir = std::env::temp_dir().join(format!("krill-agent-exit-prompts-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(79);
+    let (master, _terminal) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    lock(&reg.state).sessions.insert(
+        id,
+        Entry {
+            session,
+            pid: 0,
+            cwd: dir.clone(),
+            wrapped: false,
+        },
+    );
+    krill_proto::git::record_session_prompt(&dir, id, "fix the bug", status::now_ns()).unwrap();
+
+    reg.agent_exited(id);
+
+    let histories = krill_proto::git::load_session_prompt_histories(&dir);
+    let state = reg.status.get(id).state;
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+    assert_eq!(state, control::AgentState::Exited);
+    assert!(!histories.contains_key(&id), "{histories:?}");
+}
