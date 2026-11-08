@@ -1878,6 +1878,18 @@ catalog! {
         EFFORT_XHIGH => ("매우 높음", "Extra high"),
         EFFORT_MAX => ("최대", "Max"),
         CONTEXT_USED => ("컨텍스트 {percent}% 사용", "{percent}% of context used"),
+        RUN_READ => ("파일 {n}개 확인", "Read {n} file(s)"),
+        RUN_EDIT => ("파일 {n}개 수정", "Changed {n} file(s)"),
+        RUN_SEARCH => ("{n}번 검색", "Searched {n} time(s)"),
+        RUN_COMMAND => ("명령 {n}번 실행", "Ran {n} command(s)"),
+        RUN_OTHER => ("기타 작업 {n}건", "Did {n} other step(s)"),
+        RUN_REASONING => ("생각 {n}회", "Thought {n} time(s)"),
+        RUN_ACTIVITY => ("작업 내역", "Tool activity"),
+        RUN_ERROR => ("일부 작업 실패", "Tool error"),
+        RUN_SHOW => ("작업 내역 펼치기", "Show tool activity"),
+        RUN_HIDE => ("작업 내역 접기", "Hide tool activity"),
+        STEP_INPUT => ("실행 입력", "Tool input"),
+        STEP_OUTPUT => ("실행 결과", "Tool output"),
     }
     updater_relaunch {
         ROLLBACK_DONE_TITLE => ("업데이트 실패로 이전 버전으로 롤백했습니다", "Update failed; restored the previous version"),
