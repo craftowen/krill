@@ -1668,6 +1668,19 @@
     );
     primaryPane.insertBefore(primaryHeader, mount);
     primaryPane.dataset.session = selectedId;
+    // The daemon reports a launch whose login shell is stuck before the agent started.
+    const startupStall = el("div", undefined, "connection-banner startup-stall");
+    startupStall.hidden = true;
+    startupStall.setAttribute("role", "status");
+    screen.insertBefore(startupStall, panels);
+    function drawStartupStall() {
+      const command = session?.startup_stall;
+      startupStall.hidden = !command;
+      const text = command
+        ? t("The agent has not started. A shell startup file is stuck at {0}.", command)
+        : "";
+      if (startupStall.textContent !== text) startupStall.textContent = text;
+    }
     function activeSession() {
       return activePane === 1 && splitSession
         ? state.sessions.get(splitSession.id) || session
@@ -1966,6 +1979,7 @@
     function draw() {
       quickHandle?.update?.();
       session = state.sessions.get(selectedId);
+      drawStartupStall();
       group =
         state.groups.get(group.key) ||
         (session && state.groups.get(session.groupKey));

@@ -1258,7 +1258,7 @@ impl Backend {
             let git = git_cwd(cwd_bytes, &group)
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
-            cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+            cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"startup_stall":state.startup_stall,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
                 "profile_id":stored_launch.as_ref().map(|s|s.profile.as_str()),
                 "account_id":stored_launch.as_ref().and_then(|s|s.account.as_ref()).map(|a|a.id.as_str()),
                 "command_context":composer::command_context(stored_launch.as_ref(), &agent_profiles, &agent),

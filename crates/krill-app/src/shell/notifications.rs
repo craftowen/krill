@@ -21,6 +21,7 @@ enum Kind {
     SidebarPollError,
     SidebarPrGuidance,
     Stalled,
+    StartupStall,
     AccountInput,
     Fix(String),
     Paste,
@@ -36,6 +37,7 @@ impl Kind {
             Self::SidebarPollError => "sidebar-poll-error".into(),
             Self::SidebarPrGuidance => "sidebar-pr-guidance".into(),
             Self::Stalled => "stalled".into(),
+            Self::StartupStall => "agent-startup-stall".into(),
             Self::AccountInput => "account-input-recovery".into(),
             Self::Fix(id) => format!("fix-{id}").into(),
             Self::Paste => "multiline-paste-warning".into(),
@@ -93,6 +95,7 @@ impl Shell {
             (Kind::SidebarPollError, sb_poll_err),
             (Kind::SidebarPrGuidance, sb_pr_guidance),
             (Kind::Stalled, self.stalled_banner()),
+            (Kind::StartupStall, self.startup_stall_banner(cx)),
         ] {
             if let Some(message) = message {
                 current.push((kind, Value::Text(message)));
@@ -159,7 +162,8 @@ impl Shell {
                         Kind::Notice
                         | Kind::SidebarNotice
                         | Kind::SidebarPollError
-                        | Kind::Stalled => {
+                        | Kind::Stalled
+                        | Kind::StartupStall => {
                             Notification::new().with_type(NotificationType::Warning)
                         }
                         Kind::SidebarPreferenceError => {
