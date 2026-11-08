@@ -28,7 +28,15 @@ fn identity_persists_and_concurrent_creation_is_single() {
     let jobs: Vec<_> = (0..8)
         .map(|_| {
             let dir = dir.clone();
-            std::thread::spawn(move || record_open(&dir, &env(), 1000).unwrap())
+            // Eight writers can spend the lock budget on a slow disk. A refused open records nothing.
+            std::thread::spawn(move || {
+                loop {
+                    match record_open(&dir, &env(), 1000) {
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        result => break result.unwrap(),
+                    }
+                }
+            })
         })
         .collect();
     for job in jobs {

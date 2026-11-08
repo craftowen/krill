@@ -4353,7 +4353,7 @@ impl Shell {
                         || live.pane.session().is_none()
                         || paste_queue.has_pending_for(*p))
         });
-        self.fits.0.retain(|p, _| self.live.contains_key(p));
+        self.fits.tasks.retain(|p, _| self.live.contains_key(p));
         let mut notices = Vec::new();
         for (id, live) in &mut self.live {
             if live.target.as_ref().is_some_and(|target| {
@@ -7299,6 +7299,12 @@ impl Shell {
             .session(id)
             .or_else(|| self.live.get(&id).and_then(|l| l.pane.session()))?;
         let sidebar_ref = self.sidebar.read(cx);
+        if sidebar_ref
+            .session_on(host, session_id)
+            .is_some_and(sidebar::Session::agent_ended)
+        {
+            return None;
+        }
         let history = sidebar_ref
             .session_prompt_history_on(host, session_id)?
             .clone();
@@ -7669,6 +7675,7 @@ fn session_shown(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.fits.next_frame();
         #[cfg(windows)]
         krill_app::platform::sync_window(
             window,

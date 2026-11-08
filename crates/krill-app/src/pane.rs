@@ -1055,6 +1055,8 @@ pub struct Pane<W> {
     grid: Option<(u16, u16)>,
     /// 이 연결로 보낸 크기.
     sent: Option<(u16, u16)>,
+    /// 칸이 방금 보이게 됐다. 그사이 다른 클라이언트가 바꾼 크기를 한 번만 되찾는다([`Pane::show`]).
+    reclaim: bool,
     /// 이 연결이 `FEAT_ROLES`를 협상했다.
     roles: bool,
     account_input: AccountInput,
@@ -1078,6 +1080,7 @@ impl<W> Default for Pane<W> {
             shown: Rc::default(),
             grid: None,
             sent: None,
+            reclaim: false,
             roles: false,
             account_input: AccountInput::Normal,
         }
@@ -1161,21 +1164,38 @@ impl<W: Write> Pane<W> {
         self.grid
     }
 
+    /// 칸이 방금 보이게 됐다(탭 전환, 덮던 화면이 닫힘). 그사이 다른 클라이언트가 세션 크기를 바꿨으면 다음
+    /// [`Pane::fit`]이 한 번 되찾는다. 계속 보이는 칸은 되찾지 않는다. 두 기기가 서로 다른 크기로 보면 다시 그릴
+    /// 때마다 뺏고 뺏겨 PTY 크기가 번갈아 바뀐다.
+    pub fn show(&mut self) {
+        self.reclaim = true;
+    }
+
+    /// 보이게 된 뒤 세션 크기가 칸과 달라 되찾아야 한다. 이미 같으면 되찾을 일을 끝낸다.
+    pub fn reclaims(&mut self, want: (u16, u16)) -> bool {
+        let s = &self.view.screen;
+        if s.cols == 0 || s.lines == 0 {
+            return false;
+        }
+        if (s.cols, s.lines) == want {
+            self.reclaim = false;
+        }
+        self.reclaim
+    }
+
     /// 칸 크기가 (열, 행)이다. 붙어 있고 보낸 크기와 다르면 `Resize`·`Focus`로 PTY를 맞춘다(MK-050: 이 연결이 크기
     /// 주인이 된다). 끊겨 있으면 다음 [`Pane::link`]에서 보낸다. 쓰기가 실패하면 연결을 끊고 그 알림.
     pub fn fit(&mut self, cols: u16, rows: u16) -> Option<Notice> {
         let want = (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_LINES));
         self.grid = Some(want);
-        let screen_diverged = self.view.screen.cols > 0
-            && self.view.screen.lines > 0
-            && (self.view.screen.cols, self.view.screen.lines) != want;
-        if self.sent == Some(want) && !screen_diverged {
+        if self.sent == Some(want) && !self.reclaims(want) {
             return None;
         }
         if !self.roles || self.out.is_none() {
             return None;
         }
         self.sent = Some(want);
+        self.reclaim = false;
         let failed = self
             .send(&roles::Request::Resize {
                 cols: want.0,
