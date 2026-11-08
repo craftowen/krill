@@ -659,4 +659,115 @@ mod tests {
 
         std::fs::remove_dir_all(root).ok();
     }
+
+    fn encode_b64url(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let (mut bits, mut count) = (0_u32, 0_u32);
+        let mut out = String::new();
+        for &byte in bytes {
+            bits = (bits << 8) | u32::from(byte);
+            count += 8;
+            while count >= 6 {
+                count -= 6;
+                let idx = usize::try_from((bits >> count) & 63).unwrap();
+                out.push(char::from(TABLE[idx]));
+            }
+        }
+        if count > 0 {
+            let idx = usize::try_from((bits << (6 - count)) & 63).unwrap();
+            out.push(char::from(TABLE[idx]));
+        }
+        out
+    }
+
+    fn codex_jwt(payload: &serde_json::Value) -> String {
+        let encoded = encode_b64url(&serde_json::to_vec(payload).unwrap());
+        format!("eyJhbGciOiJub25lIn0.{encoded}.sig")
+    }
+
+    fn codex_auth_payload(
+        last_refresh: &str,
+        access_iat: i64,
+        access_exp: i64,
+        id_iat: i64,
+        id_exp: i64,
+    ) -> String {
+        serde_json::json!({
+            "last_refresh": last_refresh,
+            "tokens": {
+                "access_token": codex_jwt(&serde_json::json!({
+                    "iat": access_iat,
+                    "exp": access_exp,
+                })),
+                "id_token": codex_jwt(&serde_json::json!({
+                    "email": "alpha@example.test",
+                    "iat": id_iat,
+                    "exp": id_exp,
+                })),
+                "account_id": "acc-relogin",
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn codex_relogin_on_profile_is_not_clobbered_by_stale_host_token_and_updates_host() {
+        let root = std::env::temp_dir().join(format!(
+            "krill-codex-relogin-clobber-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let prof = root.join("prof");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(&prof).unwrap();
+
+        let stale_host = codex_auth_payload(
+            "2026-10-28T11:02:37Z",
+            1_793_185_356,
+            1_794_049_356,
+            1_793_185_356,
+            1_793_188_956,
+        );
+        let fresh_relogin = codex_auth_payload(
+            "2026-11-08T14:24:24Z",
+            1_794_147_864,
+            1_795_011_864,
+            1_794_147_864,
+            1_794_151_464,
+        );
+
+        std::fs::write(prof.join("auth.json"), &fresh_relogin).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(home.join(".codex/auth.json"), &stale_host).unwrap();
+
+        let accounts = vec![StoredAccount {
+            id: "codex-alpha".into(),
+            provider: "codex".into(),
+            label: "alpha@example.test".into(),
+            email: Some("alpha@example.test".into()),
+            profile_dir: prof.display().to_string(),
+        }];
+
+        sync_codex_account(&home, &accounts, None);
+        sync_codex_account(&home, &accounts, Some(&prof));
+
+        let prof_after = std::fs::read(prof.join("auth.json")).unwrap();
+        assert_eq!(
+            prof_after,
+            fresh_relogin.as_bytes(),
+            "{}",
+            String::from_utf8_lossy(&prof_after)
+        );
+        let host_after = std::fs::read(home.join(".codex/auth.json")).unwrap();
+        assert_eq!(
+            host_after,
+            fresh_relogin.as_bytes(),
+            "{}",
+            String::from_utf8_lossy(&host_after)
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

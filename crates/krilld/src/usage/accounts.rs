@@ -1631,6 +1631,85 @@ mod login_regression_tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_http_401_marks_needs_login_and_clears_immediately_when_auth_json_changes() {
+        let root =
+            std::env::temp_dir().join(format!("krill-codex-401-relogin-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        let added = add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            "Codex Profile #1",
+            None,
+            "",
+        )
+        .unwrap();
+        let account = added
+            .accounts
+            .iter()
+            .find(|a| a.id == "codex-codex-profile-1")
+            .unwrap();
+        let dir = PathBuf::from(&account.profile_dir);
+
+        std::fs::write(
+            dir.join("auth.json"),
+            br#"{"tokens":{"access_token":"expired-token","account_id":"acc-401"}}"#,
+        )
+        .unwrap();
+        crate::usage::direct::fail_for_tests(&home, ProviderKind::Codex, &dir);
+
+        let auth = BTreeMap::from([(
+            (ProviderKind::Codex, dir.clone()),
+            krill_proto::account_login::AuthStatus {
+                logged_in: true,
+                identity: None,
+            },
+        )]);
+
+        let snap =
+            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let first = snap.status_for("codex-codex-profile-1").unwrap();
+        assert_eq!(first.status, AccountStatus::NeedsLogin, "{first:?}");
+        assert!(
+            first
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("HTTP 401")),
+            "{first:?}"
+        );
+        assert_eq!(
+            snap.connection_for("codex-codex-profile-1"),
+            krill_proto::usage::ConnectionStatus::NeedsLogin
+        );
+
+        std::fs::write(
+            dir.join("auth.json"),
+            br#"{"tokens":{"access_token":"fresh-token","account_id":"acc-401"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(".krill-login-completed"), b"").unwrap();
+
+        let snap2 =
+            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let second = snap2.status_for("codex-codex-profile-1").unwrap();
+        assert_ne!(second.status, AccountStatus::NeedsLogin, "{second:?}");
+        assert!(second.detail.is_none(), "{second:?}");
+        assert_ne!(
+            snap2.connection_for("codex-codex-profile-1"),
+            krill_proto::usage::ConnectionStatus::NeedsLogin
+        );
+
+        crate::usage::direct::evict_profile(&home, ProviderKind::Codex, &dir);
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 /// 대표 사용량(`UsageRequest::Get` 응답용): 활성 Claude 계정 우선, 비었으면 활성 Codex 계정.
