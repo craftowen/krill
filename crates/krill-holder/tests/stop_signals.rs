@@ -2,10 +2,6 @@
 //! 그렇게 떠도 holder와 그 자식은 종료 신호를 받아야 한다.
 
 #![cfg(target_os = "macos")]
-#![expect(
-    unsafe_code,
-    reason = "std에 스레드 신호 마스크 API가 없어 libc를 직접 부른다"
-)]
 #![expect(clippy::unwrap_used, reason = "테스트 헬퍼")]
 
 use std::process::{Child, Command, Stdio};
@@ -17,23 +13,24 @@ use rustix::process::{Pid, Signal, kill_process};
 const HOLDER: &str = env!("CARGO_BIN_EXE_krill-holder");
 const DEADLINE: Duration = Duration::from_secs(5);
 
+/// 막힌 마스크는 exec를 지나도 남는다. perl이 신호를 막고 holder로 exec해 앱의 dispatch 스레드를 흉내 낸다.
 fn spawn_with_signals_blocked(dir: &std::path::Path) -> Child {
-    let dir = dir.to_owned();
-    thread::spawn(move || {
-        // SAFETY: 전부 켠 집합을 읽기만 한다. 이 스레드의 마스크만 바뀌고 스레드는 spawn 뒤 바로 끝난다.
-        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &!0, std::ptr::null_mut()) };
-        Command::new(HOLDER)
-            .args(["/bin/sleep", "60"])
-            .env("KRILL_STATE_DIR", &dir)
-            .env("HOME", &dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap()
-    })
-    .join()
-    .unwrap()
+    Command::new("/usr/bin/perl")
+        .args([
+            "-MPOSIX",
+            "-e",
+            "sigprocmask(SIG_BLOCK, POSIX::SigSet->new(1..31)) or die; exec @ARGV",
+            HOLDER,
+            "/bin/sleep",
+            "60",
+        ])
+        .env("KRILL_STATE_DIR", dir)
+        .env("HOME", dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
 }
 
 fn child_of(holder: u32) -> Option<i32> {
