@@ -14,10 +14,50 @@ struct Prepared {
     to: SessionId,
 }
 
+#[derive(Default)]
+struct RetainedErrorFloor(Option<SessionId>);
+
+impl<'de> serde::Deserialize<'de> for RetainedErrorFloor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ErrorVisitor;
+        impl<'de> Visitor<'de> for ErrorVisitor {
+            type Value = RetainedErrorFloor;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an optional handoff error string")
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(RetainedErrorFloor(None))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(RetainedErrorFloor(None))
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                deserializer.deserialize_str(self)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(RetainedErrorFloor(
+                    krill_proto::usage::SessionHandoff::parse_retained_replacement(v).flatten(),
+                ))
+            }
+        }
+        deserializer.deserialize_option(ErrorVisitor)
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct Reference {
     from: SessionId,
     to: Option<SessionId>,
+    #[serde(default)]
+    error: RetainedErrorFloor,
 }
 
 struct HandoffFloor(u64);
@@ -37,7 +77,8 @@ impl<'de> serde::Deserialize<'de> for HandoffFloor {
                 while let Some(reference) = seq.next_element::<Reference>()? {
                     floor = floor
                         .max(reference.from.0)
-                        .max(reference.to.map_or(0, |to| to.0));
+                        .max(reference.to.map_or(0, |to| to.0))
+                        .max(reference.error.0.map_or(0, |id| id.0));
                 }
                 Ok(HandoffFloor(floor))
             }

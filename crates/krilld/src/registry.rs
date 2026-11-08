@@ -183,7 +183,7 @@ pub struct Registry {
     /// 진행 중인 `Resume`의 `old` id. 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다(K-25).
     resuming: Mutex<HashSet<SessionId>>,
     account_work: Arc<crate::usage::accounts::switch_work::SwitchWork>,
-    account_handoffs: Mutex<BTreeMap<SessionId, krill_proto::usage::SessionHandoff>>,
+    account_handoffs: Mutex<account_switch::ledger::HandoffLedger>,
     account_recovered: std::sync::atomic::AtomicBool,
     account_processing: std::sync::atomic::AtomicBool,
     account_replacements: Mutex<std::collections::BTreeSet<SessionId>>,
@@ -753,6 +753,9 @@ impl Registry {
         if k == screen::kind::ATTACH && n.features & FEAT_SCREEN != 0 {
             let a = Attach::decode(k, &body)?;
             let tap = self.tap(&peer, a.session);
+            if tap.is_some() && role != Role::Observer {
+                self.acknowledge_retained_handoff(a.session);
+            }
             let frame_min = if mobile {
                 attach::MOBILE_FRAME_MIN
             } else {
@@ -2559,7 +2562,7 @@ impl Registry {
         self.status.remove(id);
         lock(&self.orch_mail_notified_done).retain(|(sid, _, _), _| *sid != id.0);
         self.clear_sleeping(id);
-        self.forget_failed_account_handoff(id);
+        self.forget_failed_account_handoff(id, ids_durable);
     }
 
     #[cfg(all(test, unix))]
@@ -3214,6 +3217,7 @@ impl Registry {
         let status = self.status.get(session);
         let was_working = status.state == control::AgentState::Working;
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
+        self.acknowledge_retained_handoff(session);
         if submit
             && !status.agent.is_empty()
             && status.state != control::AgentState::Exited

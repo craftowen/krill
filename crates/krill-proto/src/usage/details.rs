@@ -145,6 +145,97 @@ pub struct SessionHandoff {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffOutcome<'a> {
+    Pending,
+    Completed {
+        replacement: SessionId,
+    },
+    RetryableFailure {
+        message: &'a str,
+    },
+    RetainedReplacement {
+        replacement: Option<SessionId>,
+        message: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "names state that the original session, not the retained replacement, ended or timed out"
+)]
+pub enum RetainedReason {
+    OriginalEnded,
+    OriginalEndedDuringRecovery,
+    OriginalExitUnconfirmed,
+}
+
+impl SessionHandoff {
+    #[must_use]
+    pub fn retained(
+        from: SessionId,
+        replacement: SessionId,
+        account_id: impl Into<String>,
+        reason: RetainedReason,
+    ) -> Self {
+        let id = replacement.0;
+        let error = match reason {
+            RetainedReason::OriginalEnded => format!(
+                "Original session ended; unconfirmed replacement {id} was retained. Select it explicitly to continue; held input was not sent"
+            ),
+            RetainedReason::OriginalEndedDuringRecovery => format!(
+                "Original session ended during recovery; unconfirmed replacement {id} was retained. Select it explicitly to continue; held input was not sent"
+            ),
+            RetainedReason::OriginalExitUnconfirmed => format!(
+                "Original process termination could not be confirmed; replacement {id} was retained for explicit selection. Held input was not sent"
+            ),
+        };
+        Self {
+            from,
+            to: None,
+            account_id: account_id.into(),
+            error: Some(error),
+        }
+    }
+
+    #[must_use]
+    #[expect(
+        clippy::option_option,
+        reason = "outer Option distinguishes retained notices from retryable errors; inner Option carries any parsed replacement ID"
+    )]
+    pub fn parse_retained_replacement(error: &str) -> Option<Option<SessionId>> {
+        for after in error.split("replacement ").skip(1) {
+            if let Some((digits, _)) = after.split_once(" was retained")
+                && !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(id) = digits.parse::<u64>()
+                && id > 0
+            {
+                return Some(Some(SessionId(id)));
+            }
+        }
+        error.contains("retained").then_some(None)
+    }
+
+    #[must_use]
+    pub fn outcome(&self) -> HandoffOutcome<'_> {
+        if let Some(replacement) = self.to {
+            return HandoffOutcome::Completed { replacement };
+        }
+        let Some(message) = self.error.as_deref() else {
+            return HandoffOutcome::Pending;
+        };
+        match Self::parse_retained_replacement(message) {
+            Some(replacement) => HandoffOutcome::RetainedReplacement {
+                replacement,
+                message,
+            },
+            None => HandoffOutcome::RetryableFailure { message },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderDetails {
     pub supported: bool,

@@ -357,6 +357,11 @@ fn account_handoff_ids_remain_reserved_after_terminal_history_is_gone() {
             427,
         ),
         (
+            "account-handoffs.json",
+            r#"[{"from":10,"to":null,"account_id":"selected","error":"Original session ended; unconfirmed replacement 712 was retained. Select it explicitly to continue; held input was not sent"}]"#,
+            712,
+        ),
+        (
             "account-replacement.json",
             r#"{"from":529,"to":12,"account_id":"selected"}"#,
             529,

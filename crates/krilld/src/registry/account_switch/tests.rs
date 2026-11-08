@@ -625,7 +625,7 @@ fn recovery_keeps_only_remaining_unconfirmed_replacement_without_publishing_comp
                 registry: &reg,
                 original: SessionId(7),
                 session: SessionId(8),
-                committed: false,
+                disposition: ReplacementDisposition::Unresolved,
             };
         }
         assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
@@ -661,8 +661,13 @@ fn explicit_cancel_accepts_pending_or_failed_live_original_and_preserves_untrack
     reg.cancel_failed_account_switch(session).unwrap();
     assert!(lock(&reg.account_work.pending).is_empty());
     assert!(lock(&reg.account_handoffs).is_empty());
-    lock(&reg.account_handoffs).insert(session, handoff);
-    lock(&reg.account_handoffs).get_mut(&session).unwrap().error = Some("fixture failed".into());
+    lock(&reg.account_handoffs).insert(
+        session,
+        SessionHandoff {
+            error: Some("fixture failed".into()),
+            ..handoff
+        },
+    );
     let peer = Peer {
         pid: None,
         scope: Scope::Full,
@@ -2557,7 +2562,7 @@ fn replacement_journals_are_independent_and_legacy_record_is_preserved() {
         registry: &reg,
         original: SessionId(7),
         session: SessionId(8),
-        committed: true,
+        disposition: ReplacementDisposition::Committed,
     });
     assert!(!replacement_journal(&root, SessionId(8)).exists());
     assert!(replacement_journal(&root, SessionId(9)).exists());
@@ -2795,7 +2800,7 @@ fn unreadable_replacement_evidence_is_preserved_and_blocks_new_spawns() {
         registry: &reg,
         original: SessionId(7),
         session: SessionId(8),
-        committed: false,
+        disposition: ReplacementDisposition::Unresolved,
     });
     assert!(path.exists());
     fs::remove_file(&path).unwrap();
@@ -3266,4 +3271,38 @@ fn live_retained_replacement_clears_on_interactive_selection_replacement_close_o
         drop(reg);
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn retained_replacement_disposition_unlinks_journal_only_when_persisted_without_stopping_session() {
+    let root = std::env::temp_dir().join(format!("kas-retained-disp-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let (reg, _process) = kept_fixture(&root, SessionId(8));
+    let journal = replacement_journal(&root, SessionId(8));
+    accounts::write_atomic_0600(&journal, b"fixture").unwrap();
+
+    lock(&reg.account_replacements).insert(SessionId(8));
+    drop(Replacement {
+        registry: &reg,
+        original: SessionId(7),
+        session: SessionId(8),
+        disposition: ReplacementDisposition::Retained { persisted: false },
+    });
+    assert!(journal.exists());
+    assert!(lock(&reg.state).sessions.contains_key(&SessionId(8)));
+    assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
+
+    lock(&reg.account_replacements).insert(SessionId(8));
+    drop(Replacement {
+        registry: &reg,
+        original: SessionId(7),
+        session: SessionId(8),
+        disposition: ReplacementDisposition::Retained { persisted: true },
+    });
+    assert!(!journal.exists());
+    assert!(lock(&reg.state).sessions.contains_key(&SessionId(8)));
+    assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
+
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
 }
