@@ -131,3 +131,13 @@ test('view handoff includes Git patch, settings and connection logs',()=>{
  const f=fixture(),selectors=['.git-patch','.settings-list','.connection-log'],nodes=selectors.map((_,i)=>({scrollTop:70+i,scrollLeft:10+i,scrollHeight:1000,clientHeight:100,scrollWidth:500,clientWidth:100})),root=Object.assign(new EventTarget(),{querySelectorAll:s=>selectors.includes(s)?[nodes[selectors.indexOf(s)]]:[]});
  f.context.MutationObserver=class{observe(){}disconnect(){}};const saved=f.context.KrillMobile.updates.captureView(root);assert.equal(saved.length,3);for(const node of nodes)node.scrollTop=node.scrollLeft=0;f.context.KrillMobile.updates.restoreView(root,saved);for(let i=0;i<nodes.length;i++){assert.equal(nodes[i].scrollTop,70+i);assert.equal(nodes[i].scrollLeft,10+i);}
 });
+
+test('initial update probe defers while connection is busy and fires 1s after ready',async()=>{
+ const f=fixture();f.busy=true;f.found={hash:oldHash,relay:true,url:''};
+ f.api.start();await flush();assert.equal(f.requests.length,0);
+ f.events.dispatchEvent(new Event('pageshow'));await flush();assert.equal(f.requests.length,0);
+ await f.advance(2000);assert.equal(f.requests.length,0);
+ f.busy=false;await f.advance(999);assert.equal(f.requests.length,0);
+ await f.advance(1);assert.equal(f.requests.filter(r=>r.url.startsWith('/r/')).length,1);
+ f.api.stop();
+});

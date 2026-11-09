@@ -2089,3 +2089,122 @@ test("forHost.locate preserves selected fallback route and decodeImage removes s
   assert.equal(removedAttr, true);
   assert.equal(revoked, true);
 });
+
+test("blackholed primary route connects via backup route at 250ms stagger without sending auth on hung loser", async () => {
+  const saved = {
+      device_id: "phone",
+      credential: "11".repeat(32),
+      rid: "a".repeat(32),
+    },
+    h = harness(saved, undefined, true);
+  h.endpoint.authenticated({ desktop: desktopManifest() });
+  const pending = h.transport.connect();
+  await flush();
+  assert.equal(h.sockets.length, 1);
+  const relay = h.sockets[0];
+  assert.match(relay.url, /\/r\//);
+  await h.tick(249);
+  assert.equal(h.sockets.length, 1);
+  await h.tick(1);
+  assert.equal(h.sockets.length, 2);
+  const backup = h.sockets[1];
+  assert.equal(backup.url, "wss://desktop.tail123.ts.net:18449/ws");
+  assert.equal(relay.closed, undefined);
+  await h.advance(backup, 2);
+  assert.equal(relay.closed, true);
+  assert.equal(relay.sent.length, 0);
+  backup.emit("message", { data: enc.encode("{}") });
+  await flush();
+  backup.emit("message", { data: Uint8Array.from([0, 0, 0, 0, 1]) });
+  await flush();
+  assert.equal(
+    h.sockets.at(-1).url,
+    "wss://desktop.tail123.ts.net:18449/ws",
+    "warm terminal uses proven winning route",
+  );
+  h.response(backup, { sessions: [] });
+  await pending;
+  assert.equal(h.transport.ready, true);
+  assert.equal(
+    h.endpoint.socketUrl(),
+    "wss://desktop.tail123.ts.net:18449/ws",
+  );
+  const reloaded = h.context.KrillMobile.transport.bootstrap();
+  assert.equal(
+    reloaded.socketUrl(),
+    "wss://desktop.tail123.ts.net:18449/ws",
+  );
+  h.transport.close();
+
+  const hPeer = harness(saved, undefined, true);
+  hPeer.endpoint.authenticated({ desktop: desktopManifest() });
+  const peer = hPeer.endpoint.forHost(hPeer.endpoint.profiles()[0].id),
+    peerTransport = hPeer.context.KrillMobile.transport.create({
+      credentials: peer.credentials,
+      endpoint: peer,
+      warmTerminal: false,
+    }),
+    peerPending = peerTransport.connect();
+  await flush();
+  assert.equal(hPeer.sockets.length, 1);
+  const peerRelay = hPeer.sockets[0];
+  assert.match(peerRelay.url, /\/r\//);
+  await hPeer.tick(250);
+  assert.equal(hPeer.sockets.length, 2);
+  const peerBackup = hPeer.sockets[1];
+  assert.equal(peerBackup.url, "wss://desktop.tail123.ts.net:18449/ws");
+  await hPeer.advance(peerBackup, 2);
+  assert.equal(peerRelay.closed, true);
+  assert.equal(peerRelay.sent.length, 0);
+  peerBackup.emit("message", { data: enc.encode("{}") });
+  await flush();
+  peerBackup.emit("message", { data: Uint8Array.from([0, 0, 0, 0, 1]) });
+  await flush();
+  hPeer.response(peerBackup, { sessions: [] });
+  await peerPending;
+  assert.equal(peerTransport.ready, true);
+  assert.equal(peer.socketUrl(), "wss://desktop.tail123.ts.net:18449/ws");
+  peerTransport.close();
+  hPeer.transport.close();
+});
+
+test("fast pre-challenge error on primary promotes backup immediately without locate stall", async () => {
+  const saved = {
+      device_id: "phone",
+      credential: "11".repeat(32),
+      rid: "a".repeat(32),
+    },
+    h = harness(saved, undefined, true);
+  h.endpoint.authenticated({ desktop: desktopManifest() });
+  let locates = 0;
+  h.context.fetch = async () => {
+    locates++;
+    return {
+      ok: true,
+      json: async () => ({ relay: true, hash: "0123456789abcdef" }),
+    };
+  };
+  const pending = h.transport.connect();
+  await flush();
+  assert.equal(h.sockets.length, 1);
+  assert.match(h.sockets[0].url, /\/r\//);
+  h.sockets[0].emit("error");
+  h.sockets[0].emit("close", { code: 1006 });
+  await flush();
+  assert.equal(h.sockets.length, 2);
+  assert.equal(
+    h.sockets[1].url,
+    "wss://desktop.tail123.ts.net:18449/ws",
+  );
+  assert.equal(locates, 0);
+  await h.advance(h.sockets[1], 4);
+  h.response(h.sockets[1], { sessions: [] });
+  await pending;
+  assert.equal(h.transport.ready, true);
+  assert.equal(locates, 0);
+  assert.equal(
+    h.endpoint.socketUrl(),
+    "wss://desktop.tail123.ts.net:18449/ws",
+  );
+  h.transport.close();
+});
