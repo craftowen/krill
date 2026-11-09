@@ -537,21 +537,24 @@ mod regression_tests {
     #[test]
     fn stable_ids_exclude_mutable_status_but_include_host_and_session_occurrence() {
         let mut item = session(1, "/same");
-        let original = row_id(&HostId::Local, &Row::Session(item.clone(), true));
+        let original = row_id(&HostId::Local, &Row::Session(Box::new(item.clone()), true));
         item.status.title = Some("Renamed".into());
         item.status.state = AgentState::Working;
         assert_eq!(
             original,
-            row_id(&HostId::Local, &Row::Session(item.clone(), true))
+            row_id(&HostId::Local, &Row::Session(Box::new(item.clone()), true))
         );
         assert_ne!(
             original,
             row_id(
                 &HostId::Remote("pc".into()),
-                &Row::Session(item.clone(), true)
+                &Row::Session(Box::new(item.clone()), true)
             )
         );
-        assert_ne!(original, row_id(&HostId::Local, &Row::Session(item, false)));
+        assert_ne!(
+            original,
+            row_id(&HostId::Local, &Row::Session(Box::new(item), false))
+        );
     }
 
     #[test]
@@ -574,7 +577,7 @@ mod regression_tests {
         let row = |id, index| {
             (
                 HostId::Local,
-                Row::Session(session(id, "/tree"), true),
+                Row::Session(Box::new(session(id, "/tree")), true),
                 index,
             )
         };

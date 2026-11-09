@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 mod command_catalog;
 mod composer;
 mod composer_status;
+mod drops;
 pub(super) mod feed;
 mod mention_files;
 mod requests;
@@ -107,6 +108,10 @@ pub(super) struct Backend {
     snapshot_rev: AtomicU64,
     catalog_cache: Mutex<Option<CatalogSnapshot>>,
     settings_lock: Mutex<()>,
+    /// `~/Downloads/Krill Drop`, where finished phone uploads land.
+    drop_inbox: Option<PathBuf>,
+    // ponytail: global drop lock, per-upload locks if concurrent uploads matter
+    drop_lock: Mutex<()>,
 }
 type FileStamp = Option<crate::agent::control::cache::Stamp>;
 type SnapshotDependencies = (Vec<PathBuf>, Vec<FileStamp>);
@@ -274,6 +279,21 @@ enum Action {
         session: u64,
         effort: String,
     },
+    DropPut {
+        upload: String,
+        name: String,
+        size: u64,
+        offset: u64,
+        data: String,
+    },
+    DropList,
+    DropGet {
+        id: String,
+        offset: u64,
+    },
+    DropRemove {
+        id: String,
+    },
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -332,6 +352,8 @@ impl Backend {
             snapshot_rev: AtomicU64::default(),
             catalog_cache: Mutex::default(),
             settings_lock: Mutex::default(),
+            drop_inbox: krill_proto::os::home_dir().map(|home| krill_proto::drop::inbox_dir(&home)),
+            drop_lock: Mutex::default(),
         }
     }
     pub(super) fn request(&self, request: &str) -> String {
@@ -718,7 +740,45 @@ impl Backend {
                 effort,
             } => self.set_composer_model(session, &model, effort.as_deref()),
             Action::SetEffort { session, effort } => self.set_composer_effort(session, &effort),
+            Action::DropPut {
+                upload,
+                name,
+                size,
+                offset,
+                data,
+            } => {
+                let (state, inbox) = self.drop_dirs()?;
+                let _guard = crate::session::lock(&self.drop_lock);
+                drops::put(
+                    state,
+                    inbox,
+                    &drops::Chunk {
+                        upload: &upload,
+                        name: &name,
+                        size,
+                        offset,
+                        data: &data,
+                    },
+                )
+            }
+            Action::DropList => {
+                let (state, inbox) = self.drop_dirs()?;
+                let _guard = crate::session::lock(&self.drop_lock);
+                drops::list(state, inbox)
+            }
+            Action::DropGet { id, offset } => drops::get(self.drop_dirs()?.0, &id, offset),
+            Action::DropRemove { id } => {
+                let (state, _) = self.drop_dirs()?;
+                let _guard = crate::session::lock(&self.drop_lock);
+                drops::remove(state, &id)
+            }
         }
+    }
+    fn drop_dirs(&self) -> io::Result<(&Path, &Path)> {
+        Ok((
+            self.dir.as_deref().ok_or_else(invalid)?,
+            self.drop_inbox.as_deref().ok_or_else(invalid)?,
+        ))
     }
     fn session_bracketed_paste(&self, session: u64) -> bool {
         self.registry
@@ -1198,7 +1258,7 @@ impl Backend {
             let git = git_cwd(cwd_bytes, &group)
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
-            cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+            cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"startup_stall":state.startup_stall,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
                 "profile_id":stored_launch.as_ref().map(|s|s.profile.as_str()),
                 "account_id":stored_launch.as_ref().and_then(|s|s.account.as_ref()).map(|a|a.id.as_str()),
                 "command_context":composer::command_context(stored_launch.as_ref(), &agent_profiles, &agent),
@@ -1210,7 +1270,7 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )

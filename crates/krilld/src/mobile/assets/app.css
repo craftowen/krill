@@ -810,3 +810,4 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 :root{--group-surface:var(--surface-panel)}:root[data-theme=light]{--group-surface:var(--surface-raised)}@media(prefers-color-scheme:light){:root:not([data-theme=dark]):not([data-theme=light]){--group-surface:var(--surface-raised)}}
 .inset-group,.settings-group.settings-menu,.settings-choices .segmented,.settings-choices>.setting-block>.setting-row{background-color:var(--group-surface)}
 .workspace-bottom-bar>.workspace-search{background:var(--group-surface)}
+.startup-stall{color:var(--status-blocked)}

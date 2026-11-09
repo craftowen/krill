@@ -350,6 +350,15 @@ pub fn start_us(pid: u32) -> io::Result<u64> {
         .saturating_add(info.pbi_start_tvusec))
 }
 
+/// 프로세스가 뜬 뒤 지난 시간. 시작 시각이 벽시계보다 늦으면(시계 되감김) 0.
+pub(crate) fn process_age(pid: u32) -> io::Result<std::time::Duration> {
+    let start = std::time::Duration::from_micros(start_us(pid)?);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Ok(now.saturating_sub(start))
+}
+
 /// `sys/proc_info.h`의 `struct proc_fileinfo`와 `struct vnode_fdinfowithpath`(`PROC_PIDFDVNODEPATHINFO = 2`).
 #[repr(C)]
 struct ProcFileInfo {

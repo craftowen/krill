@@ -247,6 +247,7 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("Models");
+                let start = out.meters.len();
                 for raw in group
                     .get("buckets")
                     .and_then(Value::as_array)
@@ -276,6 +277,19 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                         value: None,
                     });
                 }
+                // agy lists the weekly bucket first; show the short window first like every other provider.
+                let group_meters = out.meters.get_mut(start..).unwrap_or_default();
+                group_meters.sort_by_key(|m| {
+                    let window = m.label.rsplit(" · ").next().unwrap_or("");
+                    let hours = |unit: char, mul: u64| {
+                        window
+                            .strip_suffix(unit)?
+                            .parse::<u64>()
+                            .ok()
+                            .map(|n| n * mul)
+                    };
+                    hours('h', 1).or_else(|| hours('d', 24)).unwrap_or(u64::MAX)
+                });
             }
         }
         ProviderKind::OpenCode => {
@@ -437,6 +451,12 @@ mod tests {
             r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini","buckets":[{"id":"g","window":"weekly","remaining_fraction":0.2},{"id":"disabled","window":"5h","disabled":true,"remaining_fraction":0}]},{"name":"Claude and GPT","buckets":[{"id":"c","window":"weekly","remaining_fraction":0.8}]}]}}}"#,
         );
         assert_eq!(agy.meters.len(), 2);
+        let both = parse(
+            ProviderKind::Antigravity,
+            r#"{"groups":[{"name":"Gemini Models","buckets":[{"id":"w","window":"weekly","remaining_fraction":0.9},{"id":"f","window":"5h","remaining_fraction":0.5}]}]}"#,
+        );
+        let labels: Vec<_> = both.meters.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["Gemini Models · 5h", "Gemini Models · 7d"]);
         assert_eq!(agy.meters[0].window.as_ref().unwrap().percent, 80);
         assert_eq!(agy.meters[1].label, "Claude and GPT · 7d");
         let go = parse(

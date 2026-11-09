@@ -1160,7 +1160,7 @@
         denied = -1;
       const latestReads = new Map(),
         isRead = (request) =>
-          ["snapshot", "chat_poll", "git", "accounts"].includes(
+          ["snapshot", "chat_poll", "git", "accounts", "drop_list", "drop_get"].includes(
             request?.action,
           );
       let credentials = options.credentials,
