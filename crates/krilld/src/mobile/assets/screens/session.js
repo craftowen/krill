@@ -1248,6 +1248,8 @@
     }
 
     function newSession() {
+      // 고르는 동안 터미널 소켓 핸드셰이크를 끝내 둔다. 안 쓰면 다음 터미널이 가져간다.
+      ctx.transport?.prewarmTerminal?.();
       const agents =
         state.snapshot?.agents ||
         ["claude", "codex"].map((id) => ({ id, name: agentName(id) }));
