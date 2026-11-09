@@ -303,6 +303,7 @@ fn login(provider: &str, id: &str) -> Result<(), String> {
         .ok();
         println!("{}", identity.email);
     }
+    request(&UsageRequest::RefreshUsage).ok();
     println!("account: login verified");
     Ok(())
 }
