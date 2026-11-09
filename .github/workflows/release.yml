@@ -248,7 +248,8 @@ jobs:
 
       - name: Verify native Windows audit regressions
         shell: powershell
-        timeout-minutes: 25
+        # 19~24분 걸려 25분 제한에 걸린 적 있다(v0.3.5). 잡 전체 90분 안에 들어간다.
+        timeout-minutes: 45
         env:
           KRILL_STATE_DIR: ${{ runner.temp }}/krill-audit-native
           KRILL_LOG_DIR: ${{ runner.temp }}/krill-audit-native/logs
