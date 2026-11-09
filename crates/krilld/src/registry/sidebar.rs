@@ -126,9 +126,12 @@ pub(super) fn snapshot(
             .directories
             .retain(|id, _| entries.iter().any(|(s, _)| s == id));
     }
-    cache
-        .homes
-        .retain(|id, _| entries.iter().any(|(s, _)| s == id));
+    // 범위 제한 요청(빈 `entries`)이 다른 세션의 기억을 지우지 않게 상한을 넘을 때만 정리한다.
+    if cache.homes.len() > krill_proto::holder::MAX_SESSIONS {
+        cache
+            .homes
+            .retain(|id, _| entries.iter().any(|(s, _)| s == id));
+    }
     cache
         .trees
         .retain(|_, (at, _)| at.elapsed() < Duration::from_secs(6));
@@ -538,6 +541,8 @@ mod tests {
                 .contains(&w.as_bytes().to_vec())
         );
 
+        // 범위 제한 연결은 세션 없이 요청한다. 이 요청이 기억을 지우면 안 된다.
+        snapshot(&cache, &[]).unwrap();
         git(&["-C", r, "worktree", "remove", "--force", w]);
         lock(&cache).invalidate();
         // 세션 2는 지워진 폴더가 아닌 다른 곳으로 옮겼다. 기억한 cwd와 달라 저장소에 붙지 않는다.
