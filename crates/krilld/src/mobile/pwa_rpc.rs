@@ -95,15 +95,6 @@ fn format_agents_json(agents: Option<&krill_proto::agent::Agents>) -> Value {
         .collect()
 }
 
-#[cfg(test)]
-fn agents_json(dir: Option<&Path>) -> Value {
-    format_agents_json(
-        crate::agent::control::Control::new(dir)
-            .agents()
-            .ok()
-            .as_ref(),
-    )
-}
 pub(super) struct Backend {
     registry: Weak<Registry>,
     dir: Option<PathBuf>,
@@ -845,7 +836,10 @@ impl Backend {
         Ok(wire)
     }
     fn control(&self, request: &Request) -> io::Result<Reply> {
-        ask(&mut self.wire()?, request)
+        let mut wire = self.wire()?;
+        wire.socket.write_all(&request.encode()?)?;
+        let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
+        Reply::decode(kind, &body).map_err(Into::into)
     }
     fn accounts(&self, request: &UsageRequest) -> io::Result<krill_proto::usage::AccountsSnapshot> {
         let mut wire = self.wire()?;
@@ -1155,13 +1149,7 @@ impl Backend {
         );
         let mut cards = Vec::new();
         let mut workspace_titles = std::collections::BTreeMap::new();
-        let fallback_control;
-        let launch_metadata = if self.dir.as_deref() == registry.state_dir().as_deref() {
-            registry.agent_control()
-        } else {
-            fallback_control = crate::agent::control::Control::new(self.dir.as_deref());
-            &fallback_control
-        };
+        let launch_metadata = registry.agent_control();
         let loaded_agents = launch_metadata.agents().ok();
         let agents_value = format_agents_json(loaded_agents.as_ref());
         let agent_profiles = loaded_agents.unwrap_or_default();
@@ -1209,11 +1197,9 @@ impl Backend {
                     .or_insert_with(|| title.clone());
             }
             let agent = if state.agent.is_empty() {
-                launch_metadata
-                    .launch(info.session)
-                    .ok()
-                    .flatten()
-                    .map(|launch| launch.profile)
+                stored_launch
+                    .as_ref()
+                    .map(|launch| launch.profile.clone())
                     .unwrap_or_default()
             } else {
                 state.agent.clone()
@@ -1510,12 +1496,6 @@ fn host_metadata() -> Value {
         _ => None,
     };
     json!({"display_name":display_name,"platform":platform})
-}
-/// 제어 요청 하나를 보내고 응답을 받는다. 레지스트리 제어 연결은 요청을 여러 개 이어 받는다.
-fn ask(wire: &mut Wire, request: &Request) -> io::Result<Reply> {
-    wire.socket.write_all(&request.encode()?)?;
-    let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
-    Reply::decode(kind, &body).map_err(Into::into)
 }
 struct Wire {
     socket: UnixStream,
@@ -2537,6 +2517,14 @@ mod tests {
 
     #[test]
     fn snapshot_agents_follow_registry_profiles_in_standard_order() {
+        let agents_json = |dir: Option<&Path>| -> Value {
+            format_agents_json(
+                crate::agent::control::Control::new(dir)
+                    .agents()
+                    .ok()
+                    .as_ref(),
+            )
+        };
         let ids = |v: Value| -> Vec<String> {
             v.as_array()
                 .into_iter()

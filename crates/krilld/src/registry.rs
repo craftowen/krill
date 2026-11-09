@@ -2545,7 +2545,7 @@ impl Registry {
     }
 
     /// 자기 상태 폴더만 쓴다. 폴더 없는 레지스트리(단독 테스트)가 운영 폴더로 넘어가지 않게 기본값으로 폴백하지 않는다.
-    pub(crate) fn state_dir(&self) -> Option<PathBuf> {
+    fn state_dir(&self) -> Option<PathBuf> {
         self.dir.clone()
     }
 
@@ -2930,12 +2930,10 @@ impl Registry {
         if !lock(&self.state).sessions.contains_key(&id) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Session not found"));
         }
-        let Some(path) = self.session_cwd(id) else {
-            return Err(io::Error::other("session working directory unavailable"));
-        };
-        if path.as_os_str().is_empty() {
-            return Err(io::Error::other("session working directory unavailable"));
-        }
+        let path = self
+            .session_cwd(id)
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| io::Error::other("session working directory unavailable"))?;
         lock(&self.sidebar).record_directory(id, path.clone());
         Ok(path)
     }

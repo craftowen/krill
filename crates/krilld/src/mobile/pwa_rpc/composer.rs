@@ -184,13 +184,7 @@ impl Backend {
         // Resolve a live session before touching any account/project metadata. Client paths are never accepted.
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
         let cwd = registry.mobile_session_cwd(SessionId(session))?;
-        let fallback_control;
-        let control = if self.dir.as_deref() == registry.state_dir().as_deref() {
-            registry.agent_control()
-        } else {
-            fallback_control = crate::agent::control::Control::new(self.dir.as_deref());
-            &fallback_control
-        };
+        let control = registry.agent_control();
         let stored = control.stored(SessionId(session))?;
         let status = registry.mobile_session_status(SessionId(session));
         let agent = status

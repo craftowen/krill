@@ -1753,8 +1753,6 @@
             };
           try {
             await connectDeadline(current, async (advanceStage) => {
-              // Bound stalled opening handshakes so discovery/fallback can run.
-              // Deadline includes authentication and the first snapshot.
               // 인증 뒤 프레임은 도착 순서대로 바로 연다. 피드 푸시는 응답 대기열을 거치지 않는다.
               const onMessage = (e) => {
                   if (current !== generation) return;
