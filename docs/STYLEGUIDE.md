@@ -55,11 +55,11 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 | `destructive` / `destructive_foreground` | `#e40014` / `#fcf3f3` | `#ff6568` / `#fafafa` | 삭제·초기화·강제 종료 등 되돌릴 수 없는 파괴적 동작, 오류 배너/차단 상태 | 취소(Cancel)·닫기(Close) 버튼 |
 | `border` | `#e4e7ec` | `rgba(255,255,255,0.08)` | 모든 1px 구분선: 카드 테두리, 섹션 구분선, 입력칸 외곽선 | 강한 포커스 강조(`ring` 사용) |
 | `input` | `#e4e7ec` | `rgba(255,255,255,0.15)` | 입력 컨트롤(`Input`) 테두리·배경 | 폼 필드 바깥의 장식 |
-| `ring` | `#9aa3b5` | `#5b6478` | 키보드 포커스 링, 활성 칸 강조 테두리 | 상시 고정 테두리 |
-| `sidebar` / `sidebar_foreground` | `#f6f7f9` / `#0a0a0a` | `#12151d` / `#fafafa` | 좌측 사이드바·통합 타이틀바·탭 바 크롬 표면과 기본 글자 | 메인 캔버스나 모달 내부 |
+| `ring` | `#6b7487` | `#7c869c` | 키보드 포커스 링, 활성 워크스페이스 칸 강조 테두리 | 상시 고정 테두리 |
+| `sidebar` / `sidebar_foreground` | `#f6f7f9` / `#0a0a0a` | `#12151d` / `#fafafa` | 좌측 사이드바·통합 타이틀바·탭 바·워크스페이스 카드 무대 크롬 표면과 기본 글자 | 카드 안쪽 콘텐츠 표면 |
 | `sidebar_primary` / `sidebar_primary_foreground` | `#171717` / `#fafafa` | `#1447e6` / `#fafafa` | 사이드바 주요 강조점, Git 이름 변경(Renamed/Copied) 배지 | 일반 본문 |
 | `sidebar_accent` / `sidebar_accent_foreground` | `#e9ecf1` / `#171717` | `#222836` / `#fafafa` | 사이드바 내비게이션·세션 행 호버/선택 배경 | 사이드바 바깥의 패널 |
-| `sidebar_border` / `sidebar_ring` | `#e4e7ec` / `#9aa3b5` | `rgba(255,255,255,0.07)` / `#4b5366` | 사이드바 내부 구분선 및 포커스 링 | 분할선(`split_divider` 사용) |
+| `sidebar_border` / `sidebar_ring` | `#e4e7ec` / `#6b7487` | `rgba(255,255,255,0.07)` / `#7c869c` | 사이드바 내부 구분선 및 포커스 링 | 분할선(`split_divider` 사용) |
 | `worktree_sidebar` / `worktree_sidebar_foreground` | `#f1f3f6` / `#0a0a0a` | `#232836` / `#fafafa` | 워크트리 카드/그룹 표면(다크 모드에서 `#0b0d13` 캔버스와 구분되는 리프트 표면) | 일반 설정 카드 |
 | `worktree_sidebar_accent` / `worktree_sidebar_border` | `#e6e9ef` / `#e4e7ec` | `#2e3445` / `rgba(255,255,255,0.07)` | 워크트리 행 호버·상태 요약 알약 배경 및 테두리 | 사이드바 외부 |
 | `success` | `#15803d` | `#86efac` | 에이전트 완료(`Done`), Git 추가(`A`/`??`), 정상 연결 상태 | 일반 장식 |
@@ -77,6 +77,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
   - 라이트 `muted_foreground` `#646b78`: background/card/popover 5.36 · sidebar 5.00 · muted 4.88 · worktree_sidebar 4.82 · accent 4.70 · sidebar_accent 4.53. (초안 `#666d7a`는 sidebar_accent 위 4.40이라 한 단계 어둡게 정했다.)
   - `foreground`: 다크 12.61(accent)~18.61(background), 라이트 16.72(sidebar_accent)~19.80(background).
   - `preserve`: 다크 `#7dd3fc` background 위 11.65, 라이트 `#0369a1` 흰 바탕 위 5.93.
+- **포커스 링 비텍스트 대비 테스트 (`focus_ring_meets_non_text_contrast_on_workspace_surfaces`)**: 19개 모든 앱 테마(`DarkUiTheme::ALL` + `LightUiTheme::ALL`)에서 알파 합성된 `ring`이 `background`·`sidebar`·`editor_surface`·`card`·짝 터미널 배경 위에서 WCAG 비텍스트 대비 3.0:1 이상이고, `sidebar` 위에서 합성된 `border`와도 2.25:1 이상인지 단언한다(`LIGHT` `#6b7487`, `PAPER` `#756f63`, `DARK` `#7c869c`, `ABYSS` `#7a7a7a`).
 
 ### 3.2 특수 상태 상수 및 헬퍼 함수
 
@@ -114,7 +115,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - 라이트 모드 기본: `TERMINAL_LIGHT` = **`Krill Paper`** (`DEFAULT_TERMINAL_THEME_LIGHT`, 배경 `#fbf9f4`, 전경 `#24211d`, 커서 `#e5482f`). Orca `Builtin Tango Light`(`TERMINAL_TANGO_LIGHT`, 배경 `#ffffff`, 전경 `#000000`)는 `기본`(`LIGHT`) 앱 테마의 짝으로 내장 카탈로그에 유지한다.
 - 내장 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs): Krill 15종 + Orca 내장 30종)와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
 - 설정 화면의 테마 스와치·미리보기처럼 터미널 `Rgb` 색을 UI 요소에 입힐 때는 생 색상 대신 `ui::terminal_rgb_hsla(rgb)`를 쓴다.
-- 터미널 칸 여백은 셀 배경과 일치하도록 `ui::terminal_surface(theme)` 또는 투명도 설정(`50..=100%`)이 반영된 `ui::terminal_surface_alpha(theme, opacity_pct)`를 쓴다.
+- 터미널 칸 여백은 셀 배경과 일치하도록 `ui::terminal_surface(theme)` 또는 투명도 설정(`50..=100%`)이 반영된 `ui::terminal_surface_alpha(theme, opacity_pct)`를 쓴다. 메인 창의 워크스페이스 카드 무대 배경은 동일한 불투명도 규칙을 `palette.sidebar`에 적용하는 `ui::workspace_surface_alpha(palette, opacity_pct)`를 쓴다.
 
 ### 3.5 앱 테마 (`DarkUiTheme` / `LightUiTheme`)
 
@@ -173,7 +174,8 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 | 상수 | 값 | 용도 |
 |---|---|---|
 | `RADIUS_XS` | `4px` | 단축키 키캡(`ui::keycap`), 상태 요약 칩, 인라인 코드 상자, Jump 팔레트 행 |
-| `RADIUS_SM` | `6px` | 기본 버튼, 입력칸(`theme.radius`), 인라인 오류 배너(`ui::error_banner`), 드래그 탭 프리뷰 |
+| `RADIUS_SM` | `6px` | 기본 버튼, 입력칸(`theme.radius`), 워크스페이스 세션·파일 카드 외곽, 인라인 오류 배너(`ui::error_banner`), 드래그 탭 프리뷰 |
+| `PANE_CARD_INNER_RADIUS` | `5px` | 1px 테두리를 가진 워크스페이스 카드(`RADIUS_SM`) 모서리에 맞닿는 안쪽 불투명 표면 반경 |
 | `RADIUS_MD` | `8px` | 설정 카드·행(`ui::card`, `ui::row`) |
 | `RADIUS_LG` | `10px` | 중앙 모달 대화상자(`worktree::Dialog`), Jump 팔레트 외곽(`theme.radius_lg`) |
 | `RADIUS_XL` | `14px` | 대형 히어로/온보딩 카드 표면 |
@@ -187,7 +189,9 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - **사이드바·패널·상태바**:
   - `SIDEBAR_DEFAULT_WIDTH = 240pt`, `SIDEBAR_HEADER_HEIGHT = 32px`, `SIDEBAR_EMPTY_PY = 24px`
   - `SIDEBAR_ROW_HEIGHT = 32px` (사이드바 세션 행), `PANEL_ROW_HEIGHT = 26px` (우측 패널 파일·검색 행), `PANEL_TAB_HEIGHT = 24px` (우측 패널 탭), `PANE_HEADER_HEIGHT = 26px` (분할 창 헤더)
-  - `PANEL_DEFAULT_WIDTH = 280pt`, `STATUS_BAR_HEIGHT = 20px`, `DIVIDER_HIT_PX = 5pt` (시각적 선은 1pt)
+  - `PANEL_DEFAULT_WIDTH = 280pt`, `STATUS_BAR_HEIGHT = 20px`, `DIVIDER_HIT_PX = 5pt` (사이드바·우측 패널 열 구분선의 시각적 선은 1pt)
+  - **워크스페이스 카드 무대와 포커스 링**: 메인 창에 열린 탭이 있을 때 중앙 `"terminal-surface"`는 `ui::workspace_surface_alpha(p, opacity_pct)`(`p.sidebar` 기반)를 깔고 사방에 `PANE_GAP = 6px` 바깥 여백을 둔다. 보이는 각 세션·파일 칸은 `RADIUS_SM`(`6px`) 모서리와 1px 테두리를 가진 카드로 감싸며, 현재 활성 창에서 방해 오버레이 없이 실제 키보드 입력을 받는 칸만 `p.ring` 1px 테두리를 그리고 나머지 칸(크롬/모달/비활성 창에 의해 보류된 선택 칸 및 비선택 분할 형제 칸)은 `p.border` 1px 테두리를 그린다. 카드 안쪽 모서리에 닿는 불투명 자식 표면은 `PANE_CARD_INNER_RADIUS = 5px`로 맞춘다. 탭이 없는 빈 작업 공간과 `FLOATING_SIZE` 팝아웃 창은 여백과 카드 테두리 없이 꽉 채워 그린다.
+  - **분할 칸 사이 리사이즈 거터**: 분할된 카드 사이 간격은 `PANE_GAP = 6px`이며 평소에는 투명하게 비워 무대 배경이 그대로 드러나게 한다. 마우스를 올리면 중앙에 `SPLIT_GUTTER_PILL_THICKNESS = 2px` x `SPLIT_GUTTER_PILL_LENGTH = 24px` 둥근 알약 핸들(`p.split_divider`)을 보이고, 드래그 중에는 `p.split_divider_strong`으로 강조하며, 더블클릭하면 분할 비율을 `0.5`로 되돌린다.
   - 하단 바 버튼은 `STATUS_BAR_BUTTON_HEIGHT = 18px`로 맞춰 터미널 영역을 넓힌다.
   - 상태바 계정 팝오버는 본문만 스크롤하며 `STATUS_PROVIDER_BODY_MAX_HEIGHT = 320px`로 상한을 둔다. 짧은 내용은 자연 높이를 쓰고, 탭 사이에는 상한을 적용한 높이를 예약한다. 로컬 계정 목록과 상세는 각각 스크롤하며 선택이 바뀌면 상세를 맨 위부터 보여 준다. 작은 창에서는 상태바·여백과 헤더/하단 메뉴 예산 `STATUS_PROVIDER_CHROME_RESERVE = 16rem`(UI 줌 반영)을 먼저 빼 본문을 줄인다.
   - 상태바 사용량은 `STATUS_USAGE_CONTROLS_WIDTH = 480px`를 컨트롤에 예약하고, 프로바이더당 `STATUS_USAGE_PROVIDER_WIDTH = 280px` 여유가 있으면 두 사용량 창을 `0% 1h 31m · 92% 1d 19h`처럼 표시한다. 상태바의 창 이름·리셋 안내 문장 없이 `%`와 남은 시간(`m`·`h`·`d`)만 쓰며 앱 언어와 무관하다. UI 줌도 반영하며, 좁으면 최대 사용률 창의 `% + 남은 시간`으로 축약한다. 만료된 창은 이전 사용률을 재사용하지 않고 `— now`, 시각을 모르면 퍼센트만 표시한다.
@@ -382,5 +386,5 @@ UI 화면·스크린샷·PR을 검토할 때 아래 기준으로 판단한다.
 1. **생 색상 및 임의 픽셀 글자 크기 차단 (`no_raw_colors_or_arbitrary_font_sizes_outside_ui_module`)**: `crates/krill-app/src/` 아래의 모든 `.rs` 파일(`src/ui/` 및 터미널 셀 렌더러 `src/terminal.rs` 제외)을 스캔하여 `gpui::rgb(`, `gpui::hsla(`, `gpui::black(`, `gpui::white(`, `gpui::transparent_black(`, `gpui::red(` / `green(` / `blue(` / `yellow(`, `ui::hex(`, `ui::hexa(`, 비수식 `hex(0x` / `hexa(0x`, 비허용 그림자 단계(`.shadow_xs(` / `.shadow_sm(` / `.shadow_md(` / `.shadow_xl(` / `.shadow_2xl(`), `.text_size(px(` 호출이 발견되면 테스트가 즉시 실패한다.
 2. **문서-코드 토큰 동기화 검증 (`styleguide_doc_stays_in_sync_with_palette_and_tokens`)**: `Palette`의 모든 시맨틱 색 필드와 타이포그래피·반경·간격·프리미티브 식별자가 이 문서(`docs/STYLEGUIDE.md`)에 빠짐없이 문서화되어 있는지 검사한다.
 3. **Orca 패리티 토큰 회귀 검사 (`orca_parity_tokens`, `palettes_distinguish_light_and_dark_surfaces`)**: 라이트·다크 대비와 주요 치수 상수가 흔들리지 않도록 보장한다.
-4. **대비 회귀 검사 (`text_tokens_meet_wcag_aa_on_every_surface`)**: §3.1.1의 글자·표면 조합이 WCAG 4.5:1 미만으로 떨어지면 실패한다.
+4. **대비 회귀 검사 (`text_tokens_meet_wcag_aa_on_every_surface`, `focus_ring_meets_non_text_contrast_on_workspace_surfaces`)**: §3.1.1의 글자·표면 조합이 WCAG 4.5:1 미만으로 떨어지거나 워크스페이스 포커스 링 대비가 3.0:1(또는 `sidebar` 위 `border` 대비 2.25:1) 미만으로 떨어지면 실패한다.
 5. **터미널 기본 테마 일치 (`krill_trench_terminal_matches_daemon_default`)**: 앱 `TERMINAL_DARK`와 데몬 `krill_proto::theme::DEFAULT`가 어긋나면 실패한다.
