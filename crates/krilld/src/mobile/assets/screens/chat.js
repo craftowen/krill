@@ -534,7 +534,9 @@
     box.append(suggestions, input, sendBtn);
     statusRow.append(attachBtn, modelBtn, contextMeter, statusLine);
     composer.append(attachment, box, statusRow, photoPicker);
-    globalThis.MkKeyboard?.keepFocus(composer, ctx.signal);
+    // Like Orca, the send tap takes focus so the IME commits the last syllable first.
+    for (const row of [attachment, statusRow])
+      globalThis.MkKeyboard?.keepFocus(row, ctx.signal);
     // Read-only discovery is scoped to this mount, host cache and current provider/workspace.
     function chatAgent() {
       return (
@@ -1309,9 +1311,7 @@
       e.preventDefault();
       if (
         !active() ||
-        e.isComposing ||
         liveQuestion ||
-        composing ||
         entry.modelPending ||
         !suggestions.hidden ||
         entry.sending ||

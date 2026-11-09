@@ -1306,8 +1306,7 @@
         input.placeholder = t("Write a prompt…");
         input.setAttribute("aria-label", t("Prompt"));
         input.value = state.drafts.get(target.id) || "";
-        let composing = false,
-          pending = false,
+        let pending = false,
           version = 0;
         const versions = promptDraftVersions.get(state.drafts) || new Map();
         promptDraftVersions.set(state.drafts, versions);
@@ -1319,23 +1318,13 @@
             : state.drafts.delete(target.id);
         };
         input.addEventListener("input", edit);
-        input.addEventListener("compositionstart", () => (composing = true));
-        input.addEventListener("compositionend", () => (composing = false));
         const send = el("button", t("Send prompt"), "primary");
         send.type = "submit";
         form.id = "composer";
         form.append(input, send);
-        globalThis.MkKeyboard?.keepFocus(form, ctx.signal);
         form.addEventListener("submit", (e) => {
           e.preventDefault();
-          if (
-            composing ||
-            e.isComposing ||
-            pending ||
-            disposed ||
-            ctx.signal.aborted
-          )
-            return;
+          if (pending || disposed || ctx.signal.aborted) return;
           const text = input.value,
             sentVersion = version,
             draftVersion = versions.get(target.id);

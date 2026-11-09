@@ -244,6 +244,11 @@ impl Files {
         self.quick_loading = false;
     }
 
+    #[must_use]
+    pub(super) const fn has_quick_open(&self) -> bool {
+        self.quick_open.is_some()
+    }
+
     /// 닫히거나 바뀌는 탭의 이미지 캐시를 놓도록 예약한다.
     fn forget(&mut self, tab: &FileTab) {
         if tab.shows_image() {
@@ -273,6 +278,7 @@ enum Body {
     Text {
         state: gpui::Entity<EditorState>,
         _cursor: Subscription,
+        _focus: Subscription,
         /// 원본/미리보기 토글이 있는 종류.
         preview: Option<Preview>,
         /// 미리보기를 보는 중. 들어갈 때 에디터 내용으로 만든 사본이다.
@@ -535,22 +541,42 @@ impl Shell {
     }
 
     pub(super) fn is_editor_focused(&self, window: &Window, cx: &App) -> bool {
-        if self.files.tabs.values().any(|tab| {
+        self.files.tabs.values().any(|tab| {
             tab.focus_editor()
                 .is_some_and(|e| e.read(cx).focus_handle(cx).is_focused(window))
-        }) {
-            return true;
-        }
-        self.layout
-            .focused()
-            .is_some_and(|pane| self.layout.file(pane).is_some())
+        })
+    }
+
+    pub(super) fn file_pane_uses_editor_focus(&self, id: PaneId) -> bool {
+        self.files
+            .tabs
+            .get(&id)
+            .and_then(FileTab::focus_editor)
+            .is_some()
+    }
+
+    pub(super) fn file_editor_has_focus(&self, id: PaneId, window: &Window, cx: &App) -> bool {
+        self.files
+            .tabs
+            .get(&id)
+            .and_then(FileTab::focus_editor)
+            .is_some_and(|e| e.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    fn focused_file_pane_active(&self, window: &Window, cx: &App) -> bool {
+        self.is_editor_focused(window, cx)
+            || (self.focus.is_focused(window)
+                && self
+                    .layout
+                    .focused()
+                    .is_some_and(|pane| self.layout.file(pane).is_some()))
     }
 
     pub(super) fn on_zoom_step(&mut self, dir: i8, window: &mut Window, cx: &mut Context<Self>) {
         if self.page_open() {
             return;
         }
-        if self.is_editor_focused(window, cx) {
+        if self.focused_file_pane_active(window, cx) {
             if let Some(pane) = self.layout.focused()
                 && let Some(tab) = self.files.tabs.get(&pane)
             {
@@ -582,7 +608,7 @@ impl Shell {
         if self.page_open() {
             return;
         }
-        if self.is_editor_focused(window, cx) {
+        if self.focused_file_pane_active(window, cx) {
             if let Some(pane) = self.layout.focused()
                 && let Some(tab) = self.files.tabs.get(&pane)
             {
@@ -1165,6 +1191,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = krill_app::ui::palette(cx);
+        let in_card = self.workspace_stage() == super::pane_frame::WorkspaceStage::CardStage;
+        let focus_state = self.pane_focus_state(id, window, cx);
         let is_split = self.layout.visible().len() > 1;
         let path = self.layout.file(id).map(Path::to_owned).unwrap_or_default();
         let tab = self.files.tabs.get(&id);
@@ -1176,6 +1204,9 @@ impl Shell {
             .flex()
             .items_center()
             .gap_1p5()
+            .when(in_card, |d| {
+                d.rounded_t(krill_app::ui::PANE_CARD_INNER_RADIUS)
+            })
             .bg(p.sidebar)
             .border_b_1()
             .border_color(p.border)
@@ -1297,6 +1328,9 @@ impl Shell {
             },
             Some(Body::Text { state, .. }) => div()
                 .size_full()
+                .when(in_card, |d| {
+                    d.rounded_b(krill_app::ui::PANE_CARD_INNER_RADIUS)
+                })
                 .bg(p.editor_surface)
                 .child(
                     Editor::new(state)
@@ -1316,14 +1350,14 @@ impl Shell {
             Some(Body::Failed(err)) => notice(etext::OPEN_FAILED.format(&[("error", err)])),
             None => notice(String::new()),
         };
-        div()
+        let file_el = div()
             .id(ElementId::Name(format!("file-pane-{}", id.get()).into()))
             .debug_selector(|| "file-pane".into())
             .size_full()
             .overflow_hidden()
             .flex()
             .flex_col()
-            .bg(p.background)
+            .when(!in_card, |d| d.bg(p.background))
             .text_color(p.foreground)
             .child(header)
             .children(disk_banner)
@@ -1332,14 +1366,30 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    this.change(true, cx, |l| l.focus(id));
-                    if !this.is_editor_focused(window, cx) && !this.focus.is_focused(window) {
-                        this.files.refocus = true;
-                        cx.notify();
+                    if this.layout.focused() != Some(id) {
+                        this.change(true, cx, |l| l.focus(id));
+                    }
+                    if let Some(editor) = this.files.tabs.get(&id).and_then(FileTab::focus_editor) {
+                        this.files.refocus = false;
+                        let focused = editor.read(cx).focus_handle(cx).is_focused(window);
+                        if !focused {
+                            let editor = editor.clone();
+                            editor.update(cx, |s, cx| s.focus(window, cx));
+                        }
+                    } else {
+                        this.files.refocus = false;
+                        if !this.focus.is_focused(window) {
+                            window.focus(&this.focus, cx);
+                        }
                     }
                 }),
             )
-            .into_any_element()
+            .into_any_element();
+        if in_card {
+            super::pane_frame::render_pane_card(id, focus_state, p, p.background, file_el)
+        } else {
+            file_el
+        }
     }
 
     #[cfg(test)]
@@ -1803,21 +1853,25 @@ impl Shell {
                 .is_none_or(|p| self.layout.file(p).is_none())
                 && bar.read(cx).is_focused(window, cx)
         });
-        if self.jump.is_none()
-            && self.dashboard.is_none()
+        if !self.has_workspace_focus_blocker(cx)
             && !search_focused
-            && self.tab_rename.is_none()
-            && self.files.quick_open.is_none()
             && std::mem::take(&mut self.files.refocus)
         {
-            let editor = self
-                .layout
-                .focused()
+            let focused = self.layout.focused();
+            let editor = focused
                 .and_then(|p| self.files.tabs.get(&p))
-                .and_then(FileTab::focus_editor);
-            match editor {
-                Some(state) => state.update(cx, |s, cx| s.focus(window, cx)),
-                None => window.focus(&self.focus, cx),
+                .and_then(FileTab::focus_editor)
+                .cloned();
+            if let Some(state) = editor {
+                state.update(cx, |s, cx| s.focus(window, cx));
+            } else if let Some(chat_key) = focused
+                .filter(|p| self.is_pane_chat_view(*p, cx))
+                .and_then(|p| self.chat_key(p))
+            {
+                let input = self.ensure_chat_input(chat_key, window, cx);
+                input.update(cx, |s, cx| s.focus(window, cx));
+            } else {
+                window.focus(&self.focus, cx);
             }
         }
         if !self.files.close_guard {
@@ -2094,6 +2148,27 @@ impl Shell {
                     }
                     this.sync_file_state(pane, cx);
                 });
+                let focus = cx.subscribe_in(
+                    &state,
+                    window,
+                    move |this, _, ev: &gpui_component::input::InputEvent, _, cx| match ev {
+                        gpui_component::input::InputEvent::Focus => {
+                            if this.layout.focused() != Some(pane)
+                                && this.layout.visible().contains(&pane)
+                            {
+                                this.change(false, cx, |l| l.focus(pane));
+                                this.files.refocus = false;
+                            } else {
+                                cx.notify();
+                            }
+                        }
+                        gpui_component::input::InputEvent::Blur => {
+                            cx.notify();
+                        }
+                        gpui_component::input::InputEvent::Change
+                        | gpui_component::input::InputEvent::PressEnter { .. } => {}
+                    },
+                );
                 return FileTab {
                     path: path.clone(),
                     host,
@@ -2105,6 +2180,7 @@ impl Shell {
                     body: Body::Text {
                         state,
                         _cursor: cursor,
+                        _focus: focus,
                         preview,
                         shown,
                     },

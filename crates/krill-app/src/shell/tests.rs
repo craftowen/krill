@@ -213,7 +213,7 @@ fn keys_drag_and_restart_restore(cx: &mut TestAppContext) {
     assert!((ratio - 100. / center).abs() < 0.01, "ratio {ratio}");
 
     // 최소 50px: 왼쪽 끝까지 끌어도 첫 칸은 50px.
-    let line = left + ratio * center + 2.;
+    let line = f32::from(cx.debug_bounds("split-[]").unwrap().center().x);
     drag(cx, point(px(line), px(y)), point(px(0.), px(y)));
     let l = layout_of(&view, cx);
     let PaneTree::Split { ratio, .. } = l.active_tab().root else {
@@ -12552,4 +12552,237 @@ fn narrow_mobile_modal_keeps_qr_inside_without_losing_sidebar_preferences(cx: &m
             assert_eq!(shell.layout.sidebar_width.to_bits(), 260_f32.to_bits());
         });
     }
+}
+
+fn card_bounds(cx: &mut VisualTestContext, id: PaneId, state: &str) -> Option<Bounds<Pixels>> {
+    let sel: &'static str = Box::leak(format!("pane-card-{}-{state}", id.get()).into_boxed_str());
+    cx.debug_bounds(sel)
+}
+
+#[gpui::test]
+fn pane_card_focus_ring_tracks_terminal_file_and_chat_panes(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-pane-focus-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let rs_file = dir.join("sample.rs");
+    std::fs::write(&rs_file, "fn main() {}\n").unwrap();
+
+    let (view, cx) = open(cx, dir.join("layout.bin"));
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    let p0 = layout_of(&view, cx).active_tab().focused;
+    let p0_header: &'static str = Box::leak(format!("pane-header-{}", p0.get()).into_boxed_str());
+    assert!(card_bounds(cx, p0, "active").is_some());
+    assert!(cx.debug_bounds(p0_header).is_none());
+
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let p1 = layout_of(&view, cx).active_tab().focused;
+    assert_ne!(p0, p1);
+    assert!(card_bounds(cx, p1, "active").is_some());
+    assert!(card_bounds(cx, p0, "inactive").is_some());
+
+    let c0 = card_bounds(cx, p0, "inactive").unwrap().center();
+    cx.simulate_click(c0, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).focused(), Some(p0));
+    assert!(card_bounds(cx, p0, "active").is_some());
+    assert!(card_bounds(cx, p1, "inactive").is_some());
+
+    let rs_path = rs_file.clone();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.open_file(rs_path, cx));
+    });
+    cx.run_until_parked();
+    let file_pane = layout_of(&view, cx).active_tab().focused;
+    assert!(cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)));
+    assert!(card_bounds(cx, file_pane, "active").is_some());
+
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let term_pane = layout_of(&view, cx).active_tab().focused;
+    assert_ne!(file_pane, term_pane);
+    assert!(!cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)));
+    assert!(card_bounds(cx, term_pane, "active").is_some());
+    assert!(card_bounds(cx, file_pane, "inactive").is_some());
+
+    let cf = card_bounds(cx, file_pane, "inactive").unwrap().center();
+    cx.simulate_click(cf, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).focused(), Some(file_pane));
+    assert!(cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)));
+    assert!(card_bounds(cx, file_pane, "active").is_some());
+    assert!(card_bounds(cx, term_pane, "inactive").is_some());
+
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(term_pane, SessionId(77), ours, cx);
+            s.layout.set_session(term_pane, SessionId(77));
+            s.layout.set_chat_view(term_pane, true);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, term_pane, "inactive").is_some());
+
+    let chat_center = cx.debug_bounds("desktop-chat-overlay").unwrap().center();
+    cx.simulate_click(chat_center, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).focused(), Some(term_pane));
+    assert!(cx.update(|window, cx| view.read(cx).chat_pane_has_focus(term_pane, window, cx)));
+    assert!(card_bounds(cx, term_pane, "active").is_some());
+    assert!(card_bounds(cx, file_pane, "inactive").is_some());
+
+    cx.update(|_, cx| {
+        view.update(cx, Shell::toggle_chat_view);
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, term_pane, "active").is_some());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+fn pane_card_focus_ring_demotes_to_retained_under_overlays_search_and_inactive_window(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("pane-focus-retained"));
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    let p0 = layout_of(&view, cx).active_tab().focused;
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(p0, SessionId(88), ours, cx);
+            s.layout.set_session(p0, SessionId(88));
+        });
+    });
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let p1 = layout_of(&view, cx).active_tab().focused;
+    let c0 = card_bounds(cx, p0, "inactive").unwrap().center();
+    cx.simulate_click(c0, Modifiers::default());
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+    assert!(card_bounds(cx, p1, "inactive").is_some());
+
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+    assert!(card_bounds(cx, p1, "inactive").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+
+    cx.simulate_keystrokes("cmd-p");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(FocusSidebar), cx);
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+    let c0 = card_bounds(cx, p0, "retained").unwrap().center();
+    cx.simulate_click(c0, Modifiers::default());
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.on_window_active_changed(false, cx));
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.on_window_active_changed(true, cx));
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+}
+
+#[gpui::test]
+fn pane_card_stage_geometry_split_reset_and_flush_guards(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("pane-card-geometry"));
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    let p0 = layout_of(&view, cx).active_tab().focused;
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let p1 = layout_of(&view, cx).active_tab().focused;
+
+    let surface = cx.debug_bounds("terminal-surface").unwrap();
+    let stage = cx.debug_bounds("pane-card-stage").unwrap();
+    let card0 = card_bounds(cx, p0, "inactive").unwrap();
+    let card1 = card_bounds(cx, p1, "active").unwrap();
+    let gutter = cx.debug_bounds("split-[]").unwrap();
+    let gap = f32::from(krill_app::ui::PANE_GAP);
+
+    assert_eq!(stage, surface);
+    assert!((f32::from(card0.left() - surface.left()) - gap).abs() < 0.01);
+    assert!((f32::from(surface.right() - card1.right()) - gap).abs() < 0.01);
+    assert!((f32::from(card0.top() - surface.top()) - gap).abs() < 0.01);
+    assert!((f32::from(surface.bottom() - card0.bottom()) - gap).abs() < 0.01);
+    assert!((f32::from(card1.left() - card0.right()) - gap).abs() < 0.01);
+    assert!((f32::from(gutter.size.width) - gap).abs() < 0.01);
+    assert!((f32::from(card0.size.width - card1.size.width)).abs() < 0.5);
+
+    let target_x = surface.left() + px(180.);
+    drag(cx, gutter.center(), point(target_x, gutter.center().y));
+    let moved = cx.debug_bounds("split-[]").unwrap();
+    assert!((f32::from(moved.center().x - target_x)).abs() < 1.0);
+
+    let center = moved.center();
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: center,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        position: center,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+    });
+    cx.run_until_parked();
+    let PaneTree::Split { ratio, .. } = layout_of(&view, cx).active_tab().root else {
+        panic!("expected split root");
+    };
+    assert!((ratio - 0.5).abs() < 0.001, "ratio {ratio}");
+
+    cx.simulate_keystrokes("cmd-shift-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert!(cx.debug_bounds("pane-card-stage").is_none());
+    let surface = cx.debug_bounds("terminal-surface").unwrap();
+    let empty = cx.debug_bounds("empty-workspace").unwrap();
+    assert_eq!(empty, surface);
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.role = WindowRole::Floating;
+            s.layout.new_tab();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let fp = layout_of(&view, cx).active_tab().focused;
+    assert!(cx.debug_bounds("pane-card-stage").is_none());
+    assert!(card_bounds(cx, fp, "active").is_none());
 }

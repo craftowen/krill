@@ -1266,6 +1266,22 @@ async function quickActions() {
   assert.equal(f.find("chat-input").value, "use /ship-dev pleasenext\nline");
   f.dispose();
 }
+// Like Orca, a send tap sends the field even if the IME still reports a composition.
+async function imeSendTap() {
+  const f = fixture();
+  await flush();
+  const input = f.find("chat-input");
+  f.input("키보드 열린 채로 보내기 ㅎ");
+  input.dispatchEvent(new Event("compositionstart"));
+  f.submit();
+  await flush();
+  assert.equal(
+    f.calls.find((q) => q.action === "prompt")?.text,
+    "키보드 열린 채로 보내기 ㅎ",
+    "send tap during IME composition sends the text",
+  );
+  f.dispose();
+}
 // Same-generation tail refresh is a merge, including open disclosures and reader anchors.
 async function stableLatestRefresh() {
   let now = 10000;
@@ -3157,6 +3173,7 @@ async function main() {
   await composerRaces();
   await composerProgress();
   await quickActions();
+  await imeSendTap();
   await markdownFormatting();
   await orcaComposerAndMeta();
   await hiddenPrefetchAndOldDaemon();

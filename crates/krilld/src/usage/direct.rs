@@ -24,6 +24,8 @@ type Key = (PathBuf, ProviderKind, PathBuf);
 type Credentials = (Zeroizing<String>, Option<String>);
 static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
 static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
+static CREDENTIAL_DIGESTS: Mutex<BTreeMap<Key, Option<[u8; 32]>>> = Mutex::new(BTreeMap::new());
+static AUTH_REJECTED: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
 /// 실패·429 뒤 다음 조회 가능 시각과 연속 실패 수. 이 시각 전에는 같은 프로필을 다시 조회하지 않는다.
 static RETRY: Mutex<BTreeMap<Key, Retry>> = Mutex::new(BTreeMap::new());
 // 아래 값은 Orca(MIT) rate-limits/service/service-types.ts·usage-retry-after.ts를 따른다.
@@ -54,29 +56,73 @@ pub(crate) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
     let key = (home.to_path_buf(), provider, dir.to_path_buf());
     lock(&CACHE).remove(&key);
     lock(&RETRY).remove(&key);
+    lock(&CREDENTIAL_DIGESTS).remove(&key);
+    lock(&AUTH_REJECTED).remove(&key);
     if provider == ProviderKind::Antigravity {
         agy::evict_profile(home, dir);
     }
     super::meters::evict_profile(home, provider, dir);
 }
 
-fn credential_fingerprint(provider: ProviderKind, dir: &Path, host: bool) -> Option<Vec<u8>> {
-    let path = match provider {
-        ProviderKind::Antigravity if host => dir.join("antigravity-oauth-token"),
-        ProviderKind::Antigravity => dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-        ProviderKind::Codex => dir.join("auth.json"),
-        ProviderKind::Claude => dir.join(".credentials.json"),
-        ProviderKind::OpenCode if host => dir.join("auth.json"),
-        ProviderKind::OpenCode => dir.join("data/opencode/auth.json"),
+fn credential_digest(provider: ProviderKind, dir: &Path, host: bool) -> Option<[u8; 32]> {
+    let cred = match provider {
+        ProviderKind::Antigravity if host => read_file(&dir.join("antigravity-oauth-token")),
+        ProviderKind::Antigravity => {
+            read_file(&dir.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+        }
+        ProviderKind::Codex => read_file(&dir.join("auth.json")),
+        ProviderKind::Claude => read_file(&dir.join(".credentials.json"))
+            .or_else(|| read_file(&dir.join("credentials.json"))),
+        ProviderKind::OpenCode if host => read_file(&dir.join("auth.json")),
+        ProviderKind::OpenCode => read_file(&dir.join("data/opencode/auth.json")),
         ProviderKind::Gemini => return None,
     };
-    read_file(&path).map(|b| b.to_vec())
+    let login_ns = std::fs::symlink_metadata(dir.join(".krill-login-completed"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    if cred.is_none() && login_ns.is_none() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    if let Some(bytes) = cred {
+        hasher.update(b"cred\0");
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    if let Some(ns) = login_ns {
+        hasher.update(b"login\0");
+        hasher.update(ns.to_le_bytes());
+    }
+    Some(hasher.finalize().into())
+}
+
+fn evict_if_credentials_changed(home: &Path, provider: ProviderKind, dir: &Path, host: bool) {
+    let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    let recorded = lock(&CREDENTIAL_DIGESTS).get(&key).copied();
+    if let Some(prev) = recorded
+        && credential_digest(provider, dir, host) != prev
+    {
+        evict_profile(home, provider, dir);
+        accounts::evict_login_profile(provider, dir);
+    }
+}
+
+pub(super) fn has_auth_failure(home: &Path, provider: ProviderKind, dir: &Path) -> bool {
+    let host = dir == accounts::host_default_dir(home, provider);
+    evict_if_credentials_changed(home, provider, dir, host);
+    let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    lock(&AUTH_REJECTED).contains(&key)
+        && lock(&CACHE).get(&key).is_some_and(|(at, u)| alive(*at, u))
 }
 
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
     if provider == ProviderKind::Antigravity {
         return agy::cached(home, dir);
     }
+    let host = dir == accounts::host_default_dir(home, provider);
+    evict_if_credentials_changed(home, provider, dir, host);
     lock(&CACHE)
         .get(&(home.to_path_buf(), provider, dir.to_path_buf()))
         .filter(|(at, usage)| alive(*at, usage))
@@ -113,6 +159,7 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
     if cfg!(test) || (cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some()) {
         return;
     } // 실제 자격증명·네트워크는 단위 테스트에서 금지.
+    accounts::agy_native::reconcile_codex_host(home, &file.accounts);
     agy::refresh(home, state, &file, interval);
     let profiles = [
         ProviderKind::Claude,
@@ -136,6 +183,7 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
         {
             continue;
         }
+        evict_if_credentials_changed(home, provider, &dir, host);
         let key = (home.to_path_buf(), provider, dir);
         // 실패·429는 `RETRY` 시각만 보고, 정상 값은 주기(`interval`)만 본다.
         if !force
@@ -160,15 +208,16 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
     let launched = std::thread::Builder::new()
         .name("account-usage".into())
         .spawn(move || {
-            let before = credential_fingerprint(job.1, &job.2, host);
+            let before = credential_digest(job.1, &job.2, host);
             let result =
                 std::panic::catch_unwind(|| fetch(job.1, &job.2, host, &job.0, state.as_deref()))
                     .unwrap_or(Fetched::Failed(Failure::Internal));
-            let after = credential_fingerprint(job.1, &job.2, host);
+            let after = credential_digest(job.1, &job.2, host);
             if before.is_some() && after.is_some() && before != after {
                 lock(&PENDING).remove(&job);
                 return;
             }
+            lock(&CREDENTIAL_DIGESTS).insert(job.clone(), after);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
@@ -177,6 +226,8 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
                 let mut cache = lock(&CACHE);
                 cache.retain(|_, (at, u)| alive(*at, u));
                 cache.insert(job.clone(), (Instant::now(), usage));
+                let mut rejected = lock(&AUTH_REJECTED);
+                rejected.retain(|k| cache.contains_key(k));
             }
             lock(&PENDING).remove(&job);
         });
@@ -188,6 +239,7 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
 fn apply_result(job: &Key, result: Fetched, now: Option<u64>) -> Option<ProfileUsage> {
     match result {
         Fetched::Usage(usage, meters) => {
+            lock(&AUTH_REJECTED).remove(job);
             if lock(&RETRY)
                 .remove(job)
                 .is_some_and(|retry| retry.reason.is_some())
@@ -203,6 +255,7 @@ fn apply_result(job: &Key, result: Fetched, now: Option<u64>) -> Option<ProfileU
         }
         // 429는 오류가 아니다: 서버가 말한 시각까지 쉬고 마지막 정상 값을 오래됨으로 유지한다.
         Fetched::RateLimited(wait) => {
+            lock(&AUTH_REJECTED).remove(job);
             let mut retry = lock(&RETRY);
             let entry = retry.entry(job.clone()).or_insert_with(Retry::new);
             entry.until =
@@ -212,6 +265,11 @@ fn apply_result(job: &Key, result: Fetched, now: Option<u64>) -> Option<ProfileU
             None
         }
         Fetched::Failed(reason) => {
+            if job.1 == ProviderKind::Codex && reason == Failure::Http(401) {
+                lock(&AUTH_REJECTED).insert(job.clone());
+            } else {
+                lock(&AUTH_REJECTED).remove(job);
+            }
             let mut retry = lock(&RETRY);
             if retry
                 .entry(job.clone())
@@ -389,7 +447,10 @@ fn mark_failed(
 /// 테스트용: 직접 조회가 401로 실패한 상태를 만든다(이전 정상값 없음).
 #[cfg(all(test, unix))]
 pub(super) fn fail_for_tests(home: &Path, provider: ProviderKind, dir: &Path) {
+    let host = dir == accounts::host_default_dir(home, provider);
     let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    lock(&CREDENTIAL_DIGESTS).insert(key.clone(), credential_digest(provider, dir, host));
+    lock(&AUTH_REJECTED).insert(key.clone());
     mark_failed(&mut lock(&CACHE), &key, None, Failure::Http(401));
 }
 
@@ -846,6 +907,13 @@ fn now_epoch_u64() -> Option<u64> {
 }
 
 fn record_failure(key: &Key, reason: Failure, now: Option<u64>) {
+    let host = key.2 == accounts::host_default_dir(&key.0, key.1);
+    lock(&CREDENTIAL_DIGESTS).insert(key.clone(), credential_digest(key.1, &key.2, host));
+    if key.1 == ProviderKind::Codex && reason == Failure::Http(401) {
+        lock(&AUTH_REJECTED).insert(key.clone());
+    } else {
+        lock(&AUTH_REJECTED).remove(key);
+    }
     let mut retry = lock(&RETRY);
     retry
         .entry(key.clone())
@@ -1712,7 +1780,6 @@ pub(crate) mod agy {
         interval: Duration,
         mut schedule: impl FnMut(&Key, bool, Option<PathBuf>),
     ) {
-        accounts::agy_native::reconcile_host_to_profiles(home, &file.accounts);
         let mut profiles = vec![(
             accounts::host_default_dir(home, ProviderKind::Antigravity),
             true,
@@ -1778,14 +1845,14 @@ pub(crate) mod agy {
                     lock(&PENDING).remove(&job);
                     return;
                 }
-                let before = super::credential_fingerprint(ProviderKind::Antigravity, &job.1, host);
+                let before = super::credential_digest(ProviderKind::Antigravity, &job.1, host);
                 let usage = std::panic::catch_unwind(|| {
                     let exe = super::agy_exe()?;
                     fetch(&exe, &job.1, host)
                 })
                 .ok()
                 .flatten();
-                let after = super::credential_fingerprint(ProviderKind::Antigravity, &job.1, host);
+                let after = super::credential_digest(ProviderKind::Antigravity, &job.1, host);
                 if before.is_some() && after.is_some() && before != after {
                     lock(&PENDING).remove(&job);
                     return;

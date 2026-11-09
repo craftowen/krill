@@ -1279,6 +1279,7 @@ fn run_browser_login_with_mode(
             )
             .ok();
         }
+        request_ipc(paths, &UsageRequest::RefreshUsage).ok();
         record_login_outcome(&account.id, LoginOutcome::Succeeded);
     } else if cancelled {
         cleanup_failed_login(paths, account, newly_added);
