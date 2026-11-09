@@ -30,6 +30,7 @@ mod liveness;
 mod new_session;
 mod notifications;
 mod overlays;
+mod pane_frame;
 mod persist;
 pub(crate) mod popout;
 mod release;
@@ -629,6 +630,10 @@ pub struct Shell {
     orch_poll: Option<Task<()>>,
     fits: fit::Pending,
     focus: FocusHandle,
+    focus_observed_window: Option<AnyWindowHandle>,
+    focus_subscriptions: Vec<Subscription>,
+    terminal_focus_owned: bool,
+    pub(super) active_split_drag: Option<Vec<Branch>>,
     /// 세션 데몬 감시 연결 상태(MK-025·MK-026). 재연결 상태는 우하단 알림으로 보인다.
     link: Link,
     daemon_task: Option<Task<()>>,
@@ -1261,6 +1266,10 @@ impl Shell {
             orch_poll: None,
             fits: fit::Pending::default(),
             focus: cx.focus_handle(),
+            focus_observed_window: None,
+            focus_subscriptions: Vec::new(),
+            terminal_focus_owned: true,
+            active_split_drag: None,
             link: Link::Connecting,
             daemon_task: None,
             paths: None,
@@ -5802,11 +5811,11 @@ impl Shell {
 
     /// 포커스 칸 커서가 깜박여야 하면(프로그램 지정 또는 설정 기본값, OWE-658) 타이머로 숨김을 뒤집는다.
     /// 깜박일 커서가 없으면 타이머를 버린다.
-    fn sync_cursor_blink(&mut self, active: bool, cx: &mut Context<Self>) {
+    fn sync_cursor_blink(&mut self, terminal_focused: bool, cx: &mut Context<Self>) {
         let default = krill_app::settings::terminal_cursor(cx);
-        let blink = active
-            && !self.page_open()
-            && self.dashboard.is_none()
+        let blink = terminal_focused
+            && self.security.is_window_active()
+            && !self.has_workspace_focus_blocker(cx)
             && !self.is_active_chat_view_in(cx)
             && self
                 .layout
@@ -6554,8 +6563,8 @@ impl Shell {
         let second = self.render_tree(second, path, window, cx);
         path.pop();
 
-        let divider_id = ElementId::Name(format!("split-{mine:?}").into());
-        let drag = Drag::Split(mine.clone());
+        let dragging = self.active_split_drag.as_ref() == Some(&mine);
+        let gutter = pane_frame::split_gutter(mine.clone(), axis, dragging, cx);
         let horizontal = axis == Axis::Horizontal;
         div()
             .flex()
@@ -6565,28 +6574,30 @@ impl Shell {
                 if *e.drag(cx) != Drag::Split(mine.clone()) {
                     return;
                 }
+                this.active_split_drag = Some(mine.clone());
                 let (pos, start, len) = if horizontal {
                     (e.event.position.x, e.bounds.left(), e.bounds.size.width)
                 } else {
                     (e.event.position.y, e.bounds.top(), e.bounds.size.height)
                 };
-                let r = layout::drag_ratio(f32::from(pos), f32::from(start), f32::from(len));
+                let r = pane_frame::split_drag_ratio(pos, start, len);
                 let mine = mine.clone();
                 this.change(false, cx, move |l| l.set_ratio(&mine, r));
             }))
             .child(
                 div()
-                    .flex_basis(relative(ratio))
-                    .flex_shrink_0()
+                    .flex_basis(px(0.))
+                    .flex_grow(ratio)
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
                     .child(first),
             )
-            .child(divider(divider_id, drag, axis, cx))
+            .child(gutter)
             .child(
                 div()
-                    .flex_1()
+                    .flex_basis(px(0.))
+                    .flex_grow(1. - ratio)
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
@@ -6736,6 +6747,9 @@ impl Shell {
             return self.render_file_pane(id, window, cx);
         }
         let focused = self.layout.focused() == Some(id);
+        let in_card = self.workspace_stage() == pane_frame::WorkspaceStage::CardStage;
+        let focus_state = self.pane_focus_state(id, window, cx);
+        let solid_cursor = focus_state.shows_solid_terminal_cursor();
         let is_split = self.layout.visible().len() > 1;
         let show_header = is_split || self.layout.host(id).is_remote();
         let ended = self.live.get(&id).is_some_and(|live| {
@@ -6878,9 +6892,8 @@ impl Shell {
                     el.screen.cursor_explicit,
                     krill_app::settings::terminal_cursor(cx),
                 );
-                el.cursor_hidden = focused && self.cursor_blink.as_ref().is_some_and(|b| b.1);
-                // OWE-871: 비포커스 칸의 블록 커서는 빈 테두리로 그려 포커스 칸과 구별한다.
-                el.cursor_hollow = !focused;
+                el.cursor_hidden = solid_cursor && self.cursor_blink.as_ref().is_some_and(|b| b.1);
+                el.cursor_hollow = !solid_cursor;
                 el.painted = Some(Rc::clone(&l.painted));
                 el.selection = l.shown_selection();
                 el.highlight = l.pane.highlight();
@@ -7015,16 +7028,17 @@ impl Shell {
             self.terminal_theme,
             krill_app::settings::terminal_opacity_pct(cx),
         );
-        let (sticky_bar, sticky_popover) = match self.render_sticky_prompt_bar(id, cx) {
+        let (sticky_bar, sticky_popover) = match self.render_sticky_prompt_bar(id, in_card, cx) {
             Some((bar, pop)) => (Some(bar), pop),
             None => (None, None),
         };
+        let has_sticky_bar = sticky_bar.is_some();
         let pane = div()
             .id(ElementId::Name(format!("pane-{}", id.get()).into()))
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(term_bg)
+            .when(!in_card, |d| d.bg(term_bg))
             .text_color(p.muted_foreground)
             .flex()
             .flex_col()
@@ -7046,7 +7060,7 @@ impl Shell {
                             // 종료·콜드 패인의 헤더는 body가 이미 가져갔다.
                             .children(pane_header.filter(|_| show_header)),
                     )
-                    .children(self.render_pane_chat_overlay(id, window, cx))
+                    .children(self.render_pane_chat_overlay(id, has_sticky_bar, window, cx))
                     .children(sticky_popover),
             )
             .when(self.files.hover.as_ref().is_some_and(|h| h.0 == id), |d| {
@@ -7278,11 +7292,16 @@ impl Shell {
             .get(&id)
             .filter(|_| self.selects(id, window.modifiers()))
             .map(|_| cx.weak_entity());
-        match menu {
+        let pane_el = match menu {
             Some(weak) => pane
                 .context_menu(move |m, window, cx| terminal_menu::build(m, &weak, id, window, cx))
                 .into_any_element(),
             None => pane.into_any_element(),
+        };
+        if in_card {
+            pane_frame::render_pane_card(id, focus_state, p, term_bg, pane_el)
+        } else {
+            pane_el
         }
     }
 
@@ -7291,6 +7310,7 @@ impl Shell {
     fn render_sticky_prompt_bar(
         &self,
         id: PaneId,
+        in_card: bool,
         cx: &mut Context<Self>,
     ) -> Option<(AnyElement, Option<AnyElement>)> {
         let host = self.layout.host(id);
@@ -7337,6 +7357,9 @@ impl Shell {
             .min_w_0()
             .px_2p5()
             .py_1()
+            .when(in_card, |d| {
+                d.rounded_t(krill_app::ui::PANE_CARD_INNER_RADIUS)
+            })
             .bg(p.sidebar)
             .border_b_1()
             .border_color(p.border)
@@ -7730,6 +7753,16 @@ impl Render for Shell {
                 krill_app::settings::system_appearance_changed(window.appearance(), cx);
             }));
         }
+        if self.focus_observed_window != Some(window.window_handle()) {
+            self.focus_observed_window = Some(window.window_handle());
+            self.focus_subscriptions = vec![
+                cx.on_focus(&self.focus, window, |_, _, cx| cx.notify()),
+                cx.on_blur(&self.focus, window, |_, _, cx| cx.notify()),
+            ];
+        }
+        if !cx.has_active_drag() {
+            self.active_split_drag = None;
+        }
         match std::mem::replace(&mut self.pending_focus, PendingFocus::None) {
             PendingFocus::None => {}
             PendingFocus::Workspace => window.focus(&self.focus, cx),
@@ -7739,11 +7772,12 @@ impl Render for Shell {
                 }
             }
         }
-        // 첫 렌더도 실제 창의 활성 상태로 커서 타이머를 결정한다.
-        self.sync_cursor_blink(window.is_window_active(), cx);
         if !self.page_open() {
             self.sync_files(window, cx);
         }
+        self.flush_pending_pane_focus(window, cx);
+        self.terminal_focus_owned = self.focus.is_focused(window);
+        self.sync_cursor_blink(window.is_window_active() && self.terminal_focus_owned, cx);
         let cell = cell_size(window, cx);
         let pixel = |p: Pixels| -> u16 {
             // 글꼴 측정값은 유한한 양수이며 u16 범위로 제한한다.
@@ -7823,9 +7857,23 @@ impl Render for Shell {
                 .get(self.layout.active())
                 .map(|t| t.root.clone())
         };
-        let tree = match root {
-            Some(r) => self.render_tree(&r, &mut Vec::new(), window, cx),
-            None => self.render_empty_workspace(window, cx),
+        let stage = self.workspace_stage();
+        let opacity_pct = krill_app::settings::terminal_opacity_pct(cx);
+        let (surface_bg, tree) = match (stage, root) {
+            (pane_frame::WorkspaceStage::CardStage, Some(r)) => {
+                let stage_bg =
+                    krill_app::ui::workspace_surface_alpha(krill_app::ui::palette(cx), opacity_pct);
+                let rendered = self.render_tree(&r, &mut Vec::new(), window, cx);
+                (stage_bg, pane_frame::render_card_stage(rendered))
+            }
+            (_, Some(r)) => (
+                krill_app::ui::terminal_surface_alpha(self.terminal_theme, opacity_pct),
+                self.render_tree(&r, &mut Vec::new(), window, cx),
+            ),
+            (_, None) => (
+                krill_app::ui::terminal_surface_alpha(self.terminal_theme, opacity_pct),
+                self.render_empty_workspace(window, cx),
+            ),
         };
         let center_diff = self.render_center_diff(window, cx);
         let show_panel = !self.panel_collapsed;
@@ -8294,8 +8342,12 @@ impl Render for Shell {
             .on_drag_move(
                 cx.listener(|this, e: &DragMoveEvent<Drag>, _, cx| this.on_column_drag(e, cx)),
             )
-            // 드래그는 놓을 때 한 번 저장한다(창 전체가 드롭 대상).
-            .on_drop(cx.listener(|this, _: &Drag, _, _| this.save()))
+            .on_drop(cx.listener(|this, _: &Drag, _, cx| {
+                if this.active_split_drag.take().is_some() {
+                    cx.notify();
+                }
+                this.save();
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -8356,10 +8408,7 @@ impl Render for Shell {
                                     .min_h_0()
                                     .relative()
                                     .debug_selector(|| "terminal-surface".into())
-                                    .bg(krill_app::ui::terminal_surface_alpha(
-                                        self.terminal_theme,
-                                        krill_app::settings::terminal_opacity_pct(cx),
-                                    ))
+                                    .bg(surface_bg)
                                     .child(tree)
                                     .children(center_diff)
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).

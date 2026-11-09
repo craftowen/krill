@@ -971,6 +971,7 @@ impl Shell {
     pub(in crate::shell) fn render_pane_chat_overlay(
         &mut self,
         pane: super::super::PaneId,
+        has_sticky_bar: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -1163,6 +1164,7 @@ impl Shell {
             _ => None,
         };
 
+        let in_card = self.workspace_stage() == super::super::pane_frame::WorkspaceStage::CardStage;
         let strip = div()
             .flex_none()
             .w_full()
@@ -1170,6 +1172,7 @@ impl Shell {
             .overflow_hidden()
             .px_3()
             .py_1p5()
+            .when(in_card, |d| d.rounded_b(ui::PANE_CARD_INNER_RADIUS))
             .border_t_1()
             .border_color(border)
             .bg(panel_bg)
@@ -1247,10 +1250,33 @@ impl Shell {
                 .top_0()
                 .left_0()
                 .size_full()
+                .when(in_card && !has_sticky_bar, |d| {
+                    d.rounded(ui::PANE_CARD_INNER_RADIUS)
+                })
+                .when(in_card && has_sticky_bar, |d| {
+                    d.rounded_b(ui::PANE_CARD_INNER_RADIUS)
+                })
                 .occlude()
                 .flex()
                 .flex_col()
                 .bg(bg)
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        if this.layout.focused() != Some(pane) {
+                            this.change(false, cx, |l| l.focus(pane));
+                            this.files.refocus = false;
+                        }
+                        if !this.chat_pane_has_focus(pane, window, cx) {
+                            if let Some(chat_key) = this.chat_key(pane) {
+                                let input = this.ensure_chat_input(chat_key, window, cx);
+                                input.update(cx, |state, cx| state.focus(window, cx));
+                            } else if !this.focus.is_focused(window) {
+                                window.focus(&this.focus, cx);
+                            }
+                        }
+                    }),
+                )
                 .child(feed)
                 .children(self.render_chat_prompt_notices(&key, cx))
                 .child(composer)

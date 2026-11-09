@@ -872,7 +872,7 @@ impl Shell {
         pane.is_some_and(|pane| self.is_pane_chat_view(pane, cx))
     }
 
-    fn is_pane_chat_view(&self, pane: PaneId, cx: &gpui::App) -> bool {
+    pub(super) fn is_pane_chat_view(&self, pane: PaneId, cx: &gpui::App) -> bool {
         if self.layout.session(pane).is_none() {
             return false;
         }
@@ -1619,7 +1619,7 @@ impl Shell {
         notice.is_none()
     }
 
-    fn ensure_chat_input(
+    pub(super) fn ensure_chat_input(
         &mut self,
         key: ChatKey,
         window: &mut Window,
@@ -1641,13 +1641,25 @@ impl Shell {
                 .submit_on_enter(true)
                 .placeholder(ctext::PROMPT_PLACEHOLDER.get())
         });
+        let focus_key = key.clone();
         let sub = cx.subscribe_in(
             &input,
             window,
-            move |_this, _state, ev: &InputEvent, _window, cx| {
-                if matches!(ev, InputEvent::Change) {
+            move |this, _state, ev: &InputEvent, _window, cx| match ev {
+                InputEvent::Focus => {
+                    if let Some(pane) = this.chat_pane(&focus_key)
+                        && this.layout.focused() != Some(pane)
+                    {
+                        this.change(false, cx, |l| l.focus(pane));
+                        this.files.refocus = false;
+                    } else {
+                        cx.notify();
+                    }
+                }
+                InputEvent::Change | InputEvent::Blur => {
                     cx.notify();
                 }
+                InputEvent::PressEnter { .. } => {}
             },
         );
         let active =
@@ -1657,6 +1669,46 @@ impl Shell {
             input.update(cx, |state, cx| state.focus(window, cx));
         }
         input
+    }
+
+    pub(super) fn chat_pane_has_focus(
+        &self,
+        pane: PaneId,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> bool {
+        use gpui::Focusable as _;
+        let Some(key) = self.chat_key(pane) else {
+            return false;
+        };
+        self.chat
+            .inputs
+            .get(&key)
+            .is_some_and(|(input, _)| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    pub(super) fn flush_chat_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(focused) = self.layout.focused() else {
+            return;
+        };
+        let Some(pane_key) = self.chat_key(focused) else {
+            return;
+        };
+        match &self.chat.focus_pending {
+            Some(ChatFocus::Terminal(id)) if *id == pane_key => {
+                self.chat.focus_pending = None;
+                window.focus(&self.focus, cx);
+            }
+            Some(ChatFocus::Composer(id))
+                if *id == pane_key && self.is_pane_chat_view(focused, cx) =>
+            {
+                let key = id.clone();
+                self.chat.focus_pending = None;
+                let input = self.ensure_chat_input(key, window, cx);
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn submit_chat_prompt(
