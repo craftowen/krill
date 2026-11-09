@@ -1297,9 +1297,13 @@ fn session_tab_keeps_focus_after_viewing_file_and_closing_or_reloading(cx: &mut 
         view.read_with(cx, |s, _| s.is_file_preview(file_pane)),
         Some(true)
     );
-    let toggle = cx.debug_bounds("file-preview-toggle").unwrap().center();
+    let toggle = cx.debug_bounds("file-edit").unwrap().center();
     cx.simulate_click(toggle, Modifiers::default());
     cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s.is_file_preview(file_pane)),
+        Some(false)
+    );
     assert!(
         cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)),
         "원본 보기 전환 후에는 에디터가 포커스를 가져야 한다"
@@ -1332,10 +1336,14 @@ fn session_tab_keeps_focus_after_viewing_file_and_closing_or_reloading(cx: &mut 
 
     // 3. 다시 파일을 열어 둔 상태에서 세션 탭으로 돌아오고(검색 바가 열려 있더라도),
     // 백그라운드 감시가 디스크 변경을 자동 리로드할 때 숨겨진 에디터가 세션 포커스를 뺏지 않아야 한다.
-    let _file_pane2 = open_file(&view, &md, cx);
-    let toggle = cx.debug_bounds("file-preview-toggle").unwrap().center();
+    let file_pane2 = open_file(&view, &md, cx);
+    let toggle = cx.debug_bounds("file-edit").unwrap().center();
     cx.simulate_click(toggle, Modifiers::default());
     cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s.is_file_preview(file_pane2)),
+        Some(false)
+    );
 
     cx.update(|window, cx| {
         view.update(cx, |shell, cx| {
