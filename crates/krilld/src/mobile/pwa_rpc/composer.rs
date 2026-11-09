@@ -1,5 +1,5 @@
 //! Session-scoped discovery. Configuration is evidence of available choices, never of a live model.
-use super::{Backend, Reply, Request, SessionId, Value, invalid, json};
+use super::{Backend, SessionId, Value, invalid, json};
 use crate::agent::control::{LaunchAccount, StoredLaunch};
 use crate::session::Tap;
 use krill_proto::agent::{Agents, Profile, canonical_id};
@@ -182,18 +182,22 @@ impl Backend {
 
     pub(super) fn composer_context(&self, session: u64) -> io::Result<Context> {
         // Resolve a live session before touching any account/project metadata. Client paths are never accepted.
-        let cwd = self.cwd(session)?;
-        let control = crate::agent::control::Control::new(self.dir.as_deref());
-        let stored = control.stored(SessionId(session))?;
-        let observed = match self.control(&Request::States)? {
-            Reply::States(states) => states.into_iter().find(|s| s.session.0 == session),
-            _ => None,
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let cwd = registry.mobile_session_cwd(SessionId(session))?;
+        let fallback_control;
+        let control = if self.dir.as_deref() == registry.state_dir().as_deref() {
+            registry.agent_control()
+        } else {
+            fallback_control = crate::agent::control::Control::new(self.dir.as_deref());
+            &fallback_control
         };
-        let status = observed.as_ref().map(|s| &s.status);
+        let stored = control.stored(SessionId(session))?;
+        let status = registry.mobile_session_status(SessionId(session));
         let agent = status
+            .as_ref()
             .map(|s| s.agent.as_str())
             .filter(|s| !s.is_empty())
-            .or_else(|| status.and_then(|s| s.foreground.as_deref()))
+            .or_else(|| status.as_ref().and_then(|s| s.foreground.as_deref()))
             .unwrap_or_default();
         let home = krill_proto::os::home_dir().ok_or_else(invalid)?;
         Ok(resolve(

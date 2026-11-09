@@ -28,6 +28,14 @@ impl Cache {
         self.directories.get(&session).cloned()
     }
 
+    pub(super) fn record_directory(&mut self, session: SessionId, path: PathBuf) {
+        if self.directories.len() < krill_proto::holder::MAX_SESSIONS
+            || self.directories.contains_key(&session)
+        {
+            self.directories.insert(session, path);
+        }
+    }
+
     pub(super) fn invalidate(&mut self) {
         if !self.trees.is_empty() || !self.repositories.is_empty() || !self.last.is_empty() {
             self.revision = self.revision.wrapping_add(1);
@@ -43,10 +51,6 @@ impl Cache {
 /// 한 사이드바 요청이 저장소 조회를 기다리는 최대 시간. 앱 읽기 시한(5초)보다 충분히 짧아야 한다.
 /// 파일 열기가 멈춰도(예: macOS 개인정보 보호 확인 지연) 응답은 이 안에 나간다.
 const LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired by Registry::mobile_repositories in Unit 3")
-)]
 const MOBILE_LOOKUP_BUDGET: Duration = Duration::from_millis(150);
 
 pub(super) fn revision(cache: &Arc<Mutex<Cache>>) -> u64 {
@@ -83,10 +87,6 @@ pub(super) fn snapshot(
     Ok(data)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired by Registry::mobile_repositories in Unit 3")
-)]
 pub(super) fn mobile_repositories(
     cache: &Arc<Mutex<Cache>>,
     entries: &[(SessionId, Option<PathBuf>)],

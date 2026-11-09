@@ -81,18 +81,28 @@ fn quick_commands_json(dir: Option<&Path>) -> Value {
 
 /// `create_terminal`이 받는 에이전트 프로필(`registry` create와 같은 출처) id·이름, 표준 순서. 설정을 못 읽으면 빈 목록.
 /// 미설치 CLI도 싣는다 — 띄우면 로그인 셸 preflight가 설치 안내를 보여 준다.
-fn agents_json(dir: Option<&Path>) -> Value {
-    let mut agents: Vec<_> = crate::agent::control::Control::new(dir)
-        .agents()
-        .map(|a| a.profiles.into_iter().collect())
-        .unwrap_or_default();
-    agents.sort_by(|(a, _), (b, _)| {
-        (krill_proto::agent::profile_rank(a), a).cmp(&(krill_proto::agent::profile_rank(b), b))
+fn format_agents_json(agents: Option<&krill_proto::agent::Agents>) -> Value {
+    let Some(agents) = agents else {
+        return json!([]);
+    };
+    let mut entries: Vec<_> = agents.profiles.iter().collect();
+    entries.sort_by(|(a, _), (b, _)| {
+        (krill_proto::agent::profile_rank(a), *a).cmp(&(krill_proto::agent::profile_rank(b), *b))
     });
-    agents
+    entries
         .into_iter()
         .map(|(id, p)| json!({"id":id,"name":p.name}))
         .collect()
+}
+
+#[cfg(test)]
+fn agents_json(dir: Option<&Path>) -> Value {
+    format_agents_json(
+        crate::agent::control::Control::new(dir)
+            .agents()
+            .ok()
+            .as_ref(),
+    )
 }
 pub(super) struct Backend {
     registry: Weak<Registry>,
@@ -407,12 +417,12 @@ impl Backend {
                 let cwd = match (cwd_session, workspace) {
                     (Some(session), None) => self.cwd(session)?,
                     (None, Some(key)) => {
-                        let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
-                            return Err(invalid());
-                        };
-                        super::workspaces::Catalog::load(self.dir.as_deref(), &sidebar.repositories)
-                            .cwd(&key)
+                        let repositories = self
+                            .registry
+                            .upgrade()
                             .ok_or_else(invalid)?
+                            .mobile_repositories()?;
+                        self.catalog(&repositories).cwd(&key).ok_or_else(invalid)?
                     }
                     _ => return Err(invalid()),
                 };
@@ -454,13 +464,15 @@ impl Backend {
                 {
                     return Err(invalid());
                 }
-                let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
-                    return Err(invalid());
-                };
-                let repo =
-                    super::workspaces::Catalog::load(self.dir.as_deref(), &sidebar.repositories)
-                        .repository(&repository)
-                        .ok_or_else(invalid)?;
+                let repositories = self
+                    .registry
+                    .upgrade()
+                    .ok_or_else(invalid)?
+                    .mobile_repositories()?;
+                let repo = self
+                    .catalog(&repositories)
+                    .repository(&repository)
+                    .ok_or_else(invalid)?;
                 let setup = if skip_setup {
                     control::Setup::Skip
                 } else if let Some(hash) = setup_hash {
@@ -898,18 +910,10 @@ impl Backend {
         Ok(())
     }
     fn cwd(&self, session: u64) -> io::Result<PathBuf> {
-        let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
-            return Err(invalid());
-        };
-        let directory = sidebar
-            .sessions
-            .into_iter()
-            .find(|s| s.session.0 == session)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Session not found"))?;
-        if directory.cwd.is_empty() {
-            return Err(io::Error::other("session working directory unavailable"));
-        }
-        Ok(PathBuf::from(std::ffi::OsString::from_vec(directory.cwd)))
+        self.registry
+            .upgrade()
+            .ok_or_else(invalid)?
+            .mobile_session_cwd(SessionId(session))
     }
     fn save_quick_commands(&self, commands: Vec<QuickCommandEntry>) -> io::Result<Value> {
         if commands.len() > 128 {
@@ -1131,82 +1135,60 @@ impl Backend {
         &self,
         catalog_used: &mut Option<Arc<super::workspaces::Catalog>>,
     ) -> io::Result<Value> {
-        // 세션마다 요청이 2~3개라 요청마다 스레드·소켓·Hello를 새로 만들면 세션 수의 몇 배가 된다. 한 연결로 묶는다.
-        let mut wire = self.wire()?;
-        let mut control = |request: &Request| ask(&mut wire, request);
-        let Reply::Sessions(sessions) = control(&Request::List)? else {
-            return Err(invalid());
-        };
-        let states = match control(&Request::States)? {
-            Reply::States(s) => s,
-            _ => Vec::new(),
-        };
-        let sidebar = match control(&Request::Sidebar)? {
-            Reply::Sidebar(s) => s,
-            _ => control::SidebarData {
-                sessions: Vec::new(),
-                repositories: Vec::new(),
-                branches: Vec::new(),
-                prompt_histories: Vec::new(),
-                closed_sessions: control::ClosedSessionRanges::default(),
-            },
-        };
-        let catalog = self.catalog(&sidebar.repositories);
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let dashboard = registry.mobile_dashboard_inputs()?;
+        let catalog = self.catalog(&dashboard.repositories);
         *catalog_used = Some(Arc::clone(&catalog));
-        let truncated = sessions.len() > 64;
-        let rows: Vec<_> = sessions
+        let truncated = dashboard.sessions.len() > 64;
+        let rows: Vec<_> = dashboard
+            .sessions
             .into_iter()
             .take(64)
-            .map(|info| {
-                let cwd = sidebar
-                    .sessions
-                    .iter()
-                    .find(|s| s.session == info.session)
-                    .map_or(&[][..], |s| s.cwd.as_slice());
-                let group = session_group(info.session, cwd, &catalog.repositories);
-                (info, cwd, group)
+            .map(|row| {
+                let group = session_group(row.info.session, &row.cwd, &catalog.repositories);
+                (row.info, row.cwd, row.status, group)
             })
             .collect();
         let git = self.git_summaries_swr(
             rows.iter()
-                .filter_map(|(_, cwd, group)| git_cwd(cwd, group)),
+                .filter_map(|(_, cwd, _, group)| git_cwd(cwd, group)),
         );
         let mut cards = Vec::new();
         let mut workspace_titles = std::collections::BTreeMap::new();
-        let launch_metadata = crate::agent::control::Control::new(self.dir.as_deref());
-        let agent_profiles = launch_metadata.agents().unwrap_or_default();
+        let fallback_control;
+        let launch_metadata = if self.dir.as_deref() == registry.state_dir().as_deref() {
+            registry.agent_control()
+        } else {
+            fallback_control = crate::agent::control::Control::new(self.dir.as_deref());
+            &fallback_control
+        };
+        let loaded_agents = launch_metadata.agents().ok();
+        let agents_value = format_agents_json(loaded_agents.as_ref());
+        let agent_profiles = loaded_agents.unwrap_or_default();
         // 데스크톱 스마트 정렬과 같은 워크트리 순위(승인대기 0 → 작업 중 2 → 완료 3 → 유휴 4).
         let mut ranks: std::collections::BTreeMap<PathBuf, u8> = std::collections::BTreeMap::new();
         // 데스크톱 "잠든 작업 공간 숨기기"의 깨어 있음 판정: 작업 중·대기·완료이거나 에이전트가 살아 있는 세션.
         let mut awake = std::collections::BTreeSet::new();
-        for (info, _, group) in &rows {
+        for (_, _, status, group) in &rows {
             let Some(path) = group.path.as_deref() else {
                 continue;
             };
-            let status = states
-                .iter()
-                .find(|s| s.session == info.session)
-                .map(|s| &s.status);
-            if status.is_some_and(|s| {
-                matches!(
-                    s.state,
-                    control::AgentState::Working
-                        | control::AgentState::Waiting
-                        | control::AgentState::Blocked
-                        | control::AgentState::Done
-                ) || !s.agent.is_empty() && s.state != control::AgentState::Exited
-            }) {
+            if matches!(
+                status.state,
+                control::AgentState::Working
+                    | control::AgentState::Waiting
+                    | control::AgentState::Blocked
+                    | control::AgentState::Done
+            ) || !status.agent.is_empty() && status.state != control::AgentState::Exited
+            {
                 awake.insert(PathBuf::from(path));
             }
-            let rank = states
-                .iter()
-                .find(|s| s.session == info.session)
-                .map_or(4, |s| match s.status.state {
-                    control::AgentState::Waiting | control::AgentState::Blocked => 0,
-                    control::AgentState::Working => 2,
-                    control::AgentState::Done => 3,
-                    _ => 4,
-                });
+            let rank = match status.state {
+                control::AgentState::Waiting | control::AgentState::Blocked => 0,
+                control::AgentState::Working => 2,
+                control::AgentState::Done => 3,
+                _ => 4,
+            };
             ranks
                 .entry(PathBuf::from(path))
                 .and_modify(|r| *r = (*r).min(rank))
@@ -1217,7 +1199,7 @@ impl Backend {
             .as_deref()
             .map(krill_proto::git::load_session_auto_titles)
             .unwrap_or_default();
-        for (info, cwd_bytes, group) in rows {
+        for (info, cwd_bytes, state, group) in rows {
             let stored_launch = launch_metadata.stored(info.session).ok().flatten();
             if let Some(title) = auto_titles.get(&info.session)
                 && let Some(path) = &group.path
@@ -1226,17 +1208,13 @@ impl Backend {
                     .entry(PathBuf::from(path))
                     .or_insert_with(|| title.clone());
             }
-            let state = states
-                .iter()
-                .find(|s| s.session == info.session)
-                .map_or(control::AgentStatus::UNKNOWN, |s| s.status.clone());
             let agent = if state.agent.is_empty() {
-                match control(&Request::AgentLaunch {
-                    session: info.session,
-                }) {
-                    Ok(Reply::AgentLaunch(Some(launch))) => launch.profile,
-                    _ => String::new(),
-                }
+                launch_metadata
+                    .launch(info.session)
+                    .ok()
+                    .flatten()
+                    .map(|launch| launch.profile)
+                    .unwrap_or_default()
             } else {
                 state.agent.clone()
             };
@@ -1249,13 +1227,9 @@ impl Backend {
                 })
                 .or_else(|| auto_titles.get(&info.session).map(String::as_str))
                 .or(state.title.as_deref());
-            let cwd = String::from_utf8_lossy(cwd_bytes);
-            let lines = self
-                .registry
-                .upgrade()
-                .and_then(|registry| registry.dashboard_tail(info.session))
-                .unwrap_or_default();
-            let git = git_cwd(cwd_bytes, &group)
+            let cwd = String::from_utf8_lossy(&cwd_bytes);
+            let lines = registry.dashboard_tail(info.session).unwrap_or_default();
+            let git = git_cwd(&cwd_bytes, &group)
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
             cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"startup_stall":state.startup_stall,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
@@ -1272,7 +1246,7 @@ impl Backend {
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
             "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
-            "host":self.host,"agents":agents_json(self.dir.as_deref())}),
+            "host":self.host,"agents":agents_value}),
         )
     }
     fn orchestration(&self) -> io::Result<Value> {
@@ -1283,8 +1257,7 @@ impl Backend {
             .orchestration_snapshot()?;
         Ok(requests::snapshot(&store))
     }
-    /// 만료된 값도 즉시 반환하고, cwd별로 하나의 백그라운드 조회만 예약한다.
-    /// 최초 미캐시(cold) cwd는 총 80ms 시한 안에서만 즉시 수확하고 넘치면 백그라운드로 넘긴다.
+    /// 미캐시(cold) cwd는 `Null`을, 만료된 cwd는 직전 값을 즉시(`0ms`) 반환하고 cwd별로 하나의 백그라운드 조회만 예약한다.
     fn git_summaries_swr(
         &self,
         cwds: impl IntoIterator<Item = PathBuf>,
@@ -1310,77 +1283,35 @@ impl Backend {
                 found.insert(cwd, value);
             }
         }
+        cold.extend(stale);
         {
             let mut inflight = crate::session::lock(&self.git_inflight);
             cold.retain(|cwd| inflight.insert(cwd.clone()));
-            stale.retain(|cwd| inflight.insert(cwd.clone()));
         }
-        let mut deferred = Vec::new();
         if !cold.is_empty() {
-            let queue = crate::git::queue().ok();
-            let pending: Vec<_> = cold
-                .into_iter()
-                .map(|cwd| {
-                    let rx = queue.map(|q| {
-                        crate::git::changes::query_with_branch(
-                            q,
-                            cwd.clone(),
-                            Arc::new(AtomicBool::new(false)),
-                        )
-                    });
-                    (cwd, rx)
-                })
-                .collect();
-            let deadline = Instant::now() + Duration::from_millis(80);
-            for (cwd, rx) in pending {
-                let Some(rx) = rx else {
-                    cache_git_summary(&self.git_cache, cwd.clone(), Value::Null);
-                    crate::session::lock(&self.git_inflight).remove(&cwd);
-                    continue;
-                };
-                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(res) => {
-                        let value = res.ok().map_or(Value::Null, |(changes, branch)| {
-                            let (added, deleted) = totals(&changes);
-                            json!({"branch":branch,"added":added,"deleted":deleted})
-                        });
-                        cache_git_summary(&self.git_cache, cwd.clone(), value.clone());
-                        crate::session::lock(&self.git_inflight).remove(&cwd);
-                        found.insert(cwd, value);
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        deferred.push((cwd, Some(rx)));
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        cache_git_summary(&self.git_cache, cwd.clone(), Value::Null);
-                        crate::session::lock(&self.git_inflight).remove(&cwd);
-                    }
-                }
-            }
-        }
-        if !deferred.is_empty() || !stale.is_empty() {
             let cache = Arc::clone(&self.git_cache);
             let inflight = Arc::clone(&self.git_inflight);
             let revision = Arc::clone(&self.git_revision);
-            let mut scheduled: Vec<PathBuf> = deferred.iter().map(|(cwd, _)| cwd.clone()).collect();
-            scheduled.extend(stale.iter().cloned());
+            let scheduled = cold.clone();
             let spawned = thread::Builder::new()
                 .name("mobile-git-swr".into())
                 .stack_size(128 * 1024)
                 .spawn(move || {
                     crate::alloc::mobile_thread().ok();
                     let queue = crate::git::queue().ok();
-                    let mut pending = deferred;
-                    pending.extend(stale.into_iter().map(|cwd| {
-                        let rx = queue.map(|q| {
-                            crate::git::changes::query_with_branch(
-                                q,
-                                cwd.clone(),
-                                Arc::new(AtomicBool::new(false)),
-                            )
-                        });
-                        (cwd, rx)
-                    }));
+                    let pending: Vec<_> = cold
+                        .into_iter()
+                        .map(|cwd| {
+                            let rx = queue.map(|q| {
+                                crate::git::changes::query_with_branch(
+                                    q,
+                                    cwd.clone(),
+                                    Arc::new(AtomicBool::new(false)),
+                                )
+                            });
+                            (cwd, rx)
+                        })
+                        .collect();
                     for (cwd, rx) in pending {
                         let value = rx
                             .and_then(|rx| rx.recv().ok())
@@ -3075,6 +3006,171 @@ mod tests {
 
         drop(backend);
         drop(registry);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_and_session_reads_populate_from_live_registry_in_process() {
+        use crate::holder::{Holder, link::Link};
+        use crate::os::{AsFd as _, OwnedFd};
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+
+        let dir = std::env::temp_dir().join(format!("mk-pwa-live-snap-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let state_dir = dir.join("state");
+        let repo_dir = dir.join("repo");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&repo_dir).unwrap();
+        let canonical_repo = fs::canonicalize(&repo_dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&canonical_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            state_dir.join("projects.toml"),
+            format!(
+                "[[projects]]\nid = \"repo\"\nname = \"Repo\"\npath = {:?}\n",
+                canonical_repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join(krill_proto::agent::FILE_NAME),
+            "[agent.my-bot]\nname = \"My Bot\"\nlaunch = [\"my-bot\"]\n",
+        )
+        .unwrap();
+
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .current_dir(&canonical_repo)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let registry = Arc::new(Registry::new(Some((holder, vec![])), Some(&state_dir)));
+        let reader_reg = Arc::clone(&registry);
+        let reader = std::thread::spawn(move || reader_reg.run_holder(link));
+        let holder_worker = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, cwd, .. } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!("expected Spawn");
+            };
+            let (master, pty) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned {
+                        req,
+                        id,
+                        pid: child_pid,
+                    }
+                    .encode()
+                    .unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            (cwd, pty)
+        });
+
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&state_dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let repo_key = hex(canonical_repo.as_os_str().as_bytes());
+        let create_reply: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "create_terminal",
+                    "workspace": repo_key,
+                    "agent": "my-bot",
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        let (spawned_cwd, _pty) = holder_worker.join().unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(create_reply["ok"], true, "{create_reply}");
+        assert_eq!(spawned_cwd, canonical_repo.as_os_str().as_bytes());
+        let session_id = create_reply["data"]["session"]
+            .as_u64()
+            .expect("session id");
+
+        let snap: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"snapshot"}"#)).unwrap();
+        assert_eq!(snap["ok"], true, "{snap}");
+        let sessions = snap["data"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["id"], session_id);
+        assert_eq!(sessions[0]["exited"], false);
+        assert_eq!(sessions[0]["agent"], "my-bot");
+        assert_eq!(sessions[0]["profile_id"], "my-bot");
+        assert_eq!(
+            sessions[0]["cwd"],
+            canonical_repo.to_string_lossy().as_ref()
+        );
+        assert_eq!(sessions[0]["repo_key"], repo_key);
+
+        let repositories = snap["data"]["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0]["key"], repo_key);
+
+        let workspaces = snap["data"]["workspaces"].as_array().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(
+            workspaces[0]["path"],
+            canonical_repo.to_string_lossy().as_ref()
+        );
+
+        let agents = snap["data"]["agents"].as_array().unwrap();
+        assert_eq!(
+            agents.first(),
+            Some(&json!({"id":"claude","name":"Claude Code"}))
+        );
+        assert_eq!(agents.last(), Some(&json!({"id":"my-bot","name":"My Bot"})));
+
+        assert_eq!(backend.cwd(session_id).unwrap(), canonical_repo);
+        assert_eq!(
+            backend.cwd(session_id + 999).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let context = backend.composer_context(session_id).unwrap();
+        assert_eq!(context.cwd, canonical_repo);
+        assert_eq!(context.agent, "my-bot");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::lock(&backend.git_inflight).is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(backend);
+        drop(registry);
+        child.kill().ok();
+        child.wait().ok();
         fs::remove_dir_all(&dir).ok();
     }
 

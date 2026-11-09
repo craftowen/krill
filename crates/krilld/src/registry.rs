@@ -157,6 +157,19 @@ enum MailEpochState {
     Delivered(u64),
 }
 
+#[derive(Debug)]
+pub(crate) struct MobileSessionRow {
+    pub info: Info,
+    pub cwd: Vec<u8>,
+    pub status: control::AgentStatus,
+}
+
+#[derive(Debug)]
+pub(crate) struct MobileDashboardInputs {
+    pub sessions: Vec<MobileSessionRow>,
+    pub repositories: Vec<control::RepositoryTrees>,
+}
+
 /// krilld 전체에 하나.
 pub struct Registry {
     holder: Option<Arc<Holder>>,
@@ -2046,120 +2059,124 @@ impl Registry {
         Reply::States(
             sessions
                 .into_iter()
-                .map(|(session, root, exited, tap, wrapped)| {
-                    let mut status = self.status.get(session);
-                    // EOF/holder 종료는 저장된 hook보다 우선한다. 종료 콜백이 늦거나
-                    // 더 최신 시각의 hook이 도착해도 끝난 세션을 Done으로 되살리지 않는다.
-                    if exited {
-                        status.state = control::AgentState::Exited;
-                        status.source = Some(control::Source::Process);
-                        status.confidence = control::Confidence::High;
-                        status.subagents.clear();
-                    }
-                    // Pi has no hook identity. Its executable may be reported as `node`,
-                    // and its terminal title can be renamed. Keep the explicit launch identity.
-                    if status.agent.is_empty()
-                        && let Ok(Some(launch)) = self.agents.launch(session)
-                        && launch.profile == "pi"
-                    {
-                        status.agent = launch.profile;
-                    }
-                    status.foreground = status::session_foreground(root, tap.foreground(), exited);
-                    status.title = tap.title();
-                    // Only a launch with no agent evidence yet can still be in shell startup.
-                    status.startup_stall = (wrapped
-                        && !exited
-                        && status.state == control::AgentState::Unknown
-                        && status.source.is_none())
-                    .then(|| status::startup::startup_stall(root))
-                    .flatten();
-                    status.root_shell = (!exited)
-                        .then(|| crate::sys::process_name(root).ok())
-                        .flatten()
-                        .and_then(|program| {
-                            krill_proto::control::RootShell::new(
-                                if cfg!(windows) {
-                                    krill_proto::control::ShellOs::Windows
-                                } else {
-                                    krill_proto::control::ShellOs::Unix
-                                },
-                                program,
-                            )
-                        })
-                        .map(Box::new);
-                    let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
-                        || status.agent.eq_ignore_ascii_case("antigravity")
-                        || status.foreground.as_deref().is_some_and(|fg| {
-                            fg.eq_ignore_ascii_case("agy") || fg.eq_ignore_ascii_case("antigravity")
-                        });
-                    let stored = if is_agy_fg || status.agent.is_empty() {
-                        self.agents.stored(session).ok().flatten()
-                    } else {
-                        None
-                    };
-                    // Hook 실행 전(기동 직후·계정 전환·재개·Pi 등)에도 저장된 런치 프로필이 있으면 에이전트 정체성을 유지한다.
-                    if status.agent.is_empty()
-                        && let Some(s) = &stored
-                        && !s.profile.is_empty()
-                    {
-                        krill_proto::agent::canonical_id(&s.profile).clone_into(&mut status.agent);
-                    }
-                    let is_agy_stored = stored.as_ref().is_some_and(|s| {
-                        s.profile.eq_ignore_ascii_case("agy")
-                            || s.profile.eq_ignore_ascii_case("antigravity")
-                    });
-                    if is_agy_fg || is_agy_stored {
-                        if status.agent.is_empty() {
-                            "agy".clone_into(&mut status.agent);
-                        }
-                        let (title, discovered) =
-                            crate::agent_history::vault::resolve_live_agy_title(
-                                session,
-                                root,
-                                tap.foreground(),
-                                exited,
-                                stored.as_ref(),
-                            );
-                        if let Some((ref conv_id, ref tp)) = discovered {
-                            if tp.is_some() {
-                                self.agents.bind_discovered_session(
-                                    session,
-                                    conv_id,
-                                    tp.as_deref(),
-                                );
-                            } else if let Ok(Some(found)) = account_switch::identity::discover(
-                                krill_proto::usage::ProviderKind::Antigravity,
-                                root,
-                                tap.foreground(),
-                            ) {
-                                self.agents.bind_discovered_session(
-                                    session,
-                                    &found.id,
-                                    Some(&found.path),
-                                );
-                            } else {
-                                self.agents.bind_discovered_session(session, conv_id, None);
-                            }
-                        }
-                        if !exited
-                            && status.state == control::AgentState::Unknown
-                            && (title.is_some()
-                                || discovered.is_some()
-                                || stored.as_ref().is_some_and(|s| s.session_id.is_some()))
-                        {
-                            status.state = control::AgentState::Done;
-                        }
-                        let title = title
-                            .as_deref()
-                            .and_then(krill_proto::control::display_title);
-                        if title.is_some() || status.title.is_none() {
-                            status.title = title;
-                        }
-                    }
-                    SessionStatus { session, status }
+                .map(|(session, root, exited, tap, wrapped)| SessionStatus {
+                    session,
+                    status: self.resolve_session_status(session, root, exited, &tap, wrapped),
                 })
                 .collect(),
         )
+    }
+
+    fn resolve_session_status(
+        &self,
+        session: SessionId,
+        root: u32,
+        exited: bool,
+        tap: &crate::session::Tap,
+        wrapped: bool,
+    ) -> control::AgentStatus {
+        let mut status = self.status.get(session);
+        // EOF/holder 종료는 저장된 hook보다 우선한다. 종료 콜백이 늦거나
+        // 더 최신 시각의 hook이 도착해도 끝난 세션을 Done으로 되살리지 않는다.
+        if exited {
+            status.state = control::AgentState::Exited;
+            status.source = Some(control::Source::Process);
+            status.confidence = control::Confidence::High;
+            status.subagents.clear();
+        }
+        // Pi has no hook identity. Its executable may be reported as `node`,
+        // and its terminal title can be renamed. Keep the explicit launch identity.
+        if status.agent.is_empty()
+            && let Ok(Some(launch)) = self.agents.launch(session)
+            && launch.profile == "pi"
+        {
+            status.agent = launch.profile;
+        }
+        status.foreground = status::session_foreground(root, tap.foreground(), exited);
+        status.title = tap.title();
+        // Only a launch with no agent evidence yet can still be in shell startup.
+        status.startup_stall = (wrapped
+            && !exited
+            && status.state == control::AgentState::Unknown
+            && status.source.is_none())
+        .then(|| status::startup::startup_stall(root))
+        .flatten();
+        status.root_shell = (!exited)
+            .then(|| crate::sys::process_name(root).ok())
+            .flatten()
+            .and_then(|program| {
+                krill_proto::control::RootShell::new(
+                    if cfg!(windows) {
+                        krill_proto::control::ShellOs::Windows
+                    } else {
+                        krill_proto::control::ShellOs::Unix
+                    },
+                    program,
+                )
+            })
+            .map(Box::new);
+        let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
+            || status.agent.eq_ignore_ascii_case("antigravity")
+            || status.foreground.as_deref().is_some_and(|fg| {
+                fg.eq_ignore_ascii_case("agy") || fg.eq_ignore_ascii_case("antigravity")
+            });
+        let stored = if is_agy_fg || status.agent.is_empty() {
+            self.agents.stored(session).ok().flatten()
+        } else {
+            None
+        };
+        // Hook 실행 전(기동 직후·계정 전환·재개·Pi 등)에도 저장된 런치 프로필이 있으면 에이전트 정체성을 유지한다.
+        if status.agent.is_empty()
+            && let Some(s) = &stored
+            && !s.profile.is_empty()
+        {
+            krill_proto::agent::canonical_id(&s.profile).clone_into(&mut status.agent);
+        }
+        let is_agy_stored = stored.as_ref().is_some_and(|s| {
+            s.profile.eq_ignore_ascii_case("agy") || s.profile.eq_ignore_ascii_case("antigravity")
+        });
+        if is_agy_fg || is_agy_stored {
+            if status.agent.is_empty() {
+                "agy".clone_into(&mut status.agent);
+            }
+            let (title, discovered) = crate::agent_history::vault::resolve_live_agy_title(
+                session,
+                root,
+                tap.foreground(),
+                exited,
+                stored.as_ref(),
+            );
+            if let Some((ref conv_id, ref tp)) = discovered {
+                if tp.is_some() {
+                    self.agents
+                        .bind_discovered_session(session, conv_id, tp.as_deref());
+                } else if let Ok(Some(found)) = account_switch::identity::discover(
+                    krill_proto::usage::ProviderKind::Antigravity,
+                    root,
+                    tap.foreground(),
+                ) {
+                    self.agents
+                        .bind_discovered_session(session, &found.id, Some(&found.path));
+                } else {
+                    self.agents.bind_discovered_session(session, conv_id, None);
+                }
+            }
+            if !exited
+                && status.state == control::AgentState::Unknown
+                && (title.is_some()
+                    || discovered.is_some()
+                    || stored.as_ref().is_some_and(|s| s.session_id.is_some()))
+            {
+                status.state = control::AgentState::Done;
+            }
+            let title = title
+                .as_deref()
+                .and_then(krill_proto::control::display_title);
+            if title.is_some() || status.title.is_none() {
+                status.title = title;
+            }
+        }
+        status
     }
 
     /// 소켓으로 온 hook 이벤트. 세션 후손이 보냈으면 그 세션만, 외부에서 왔으면 `ppid` 계보의 세션.
@@ -2528,7 +2545,7 @@ impl Registry {
     }
 
     /// 자기 상태 폴더만 쓴다. 폴더 없는 레지스트리(단독 테스트)가 운영 폴더로 넘어가지 않게 기본값으로 폴백하지 않는다.
-    fn state_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn state_dir(&self) -> Option<PathBuf> {
         self.dir.clone()
     }
 
@@ -2849,6 +2866,89 @@ impl Registry {
     /// 활성 세션 터미널이 현재 Bracketed Paste 모드(`?2004h`)를 켰는지 확인한다(OWE-944 / MK-241).
     pub(crate) fn session_bracketed_paste(&self, id: SessionId) -> bool {
         self.session_screen_and_bracketed_paste(id).1
+    }
+
+    pub(crate) fn agent_control(&self) -> &crate::agent::control::Control {
+        &self.agents
+    }
+
+    pub(crate) fn mobile_repositories(&self) -> io::Result<Vec<control::RepositoryTrees>> {
+        let ids: Vec<_> = lock(&self.state).sessions.keys().copied().collect();
+        let entries: Vec<_> = ids
+            .into_iter()
+            .map(|id| (id, self.session_cwd(id)))
+            .collect();
+        sidebar::mobile_repositories(&self.sidebar, &entries, self.state_dir().as_deref())
+            .map(|(_, repos)| repos)
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    pub(crate) fn mobile_dashboard_inputs(&self) -> io::Result<MobileDashboardInputs> {
+        let raw: Vec<_> = {
+            let st = lock(&self.state);
+            st.sessions
+                .iter()
+                .map(|(&session, e)| {
+                    (
+                        session,
+                        e.pid,
+                        st.exited.get(&session).copied(),
+                        e.session.tap(),
+                        e.wrapped,
+                    )
+                })
+                .collect()
+        };
+        let entries: Vec<_> = raw
+            .iter()
+            .map(|(id, ..)| (*id, self.session_cwd(*id)))
+            .collect();
+        let (dirs, repositories) =
+            sidebar::mobile_repositories(&self.sidebar, &entries, self.state_dir().as_deref())
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut sessions = Vec::with_capacity(raw.len());
+        for ((session, root, exit_code, tap, wrapped), dir) in raw.into_iter().zip(dirs) {
+            let exited = exit_code.is_some() || tap.pulse().closed;
+            let status = self.resolve_session_status(session, root, exited, &tap, wrapped);
+            sessions.push(MobileSessionRow {
+                info: Info {
+                    session,
+                    pid: root,
+                    status: exit_code,
+                },
+                cwd: dir.cwd,
+                status,
+            });
+        }
+        Ok(MobileDashboardInputs {
+            sessions,
+            repositories,
+        })
+    }
+
+    pub(crate) fn mobile_session_cwd(&self, id: SessionId) -> io::Result<PathBuf> {
+        if !lock(&self.state).sessions.contains_key(&id) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Session not found"));
+        }
+        let Some(path) = self.session_cwd(id) else {
+            return Err(io::Error::other("session working directory unavailable"));
+        };
+        if path.as_os_str().is_empty() {
+            return Err(io::Error::other("session working directory unavailable"));
+        }
+        lock(&self.sidebar).record_directory(id, path.clone());
+        Ok(path)
+    }
+
+    pub(crate) fn mobile_session_status(&self, id: SessionId) -> Option<control::AgentStatus> {
+        let (tap, exited, root, wrapped) = {
+            let st = lock(&self.state);
+            let e = st.sessions.get(&id)?;
+            let tap = e.session.tap();
+            let exited = st.exited.contains_key(&id) || tap.pulse().closed;
+            (tap, exited, e.pid, e.wrapped)
+        };
+        Some(self.resolve_session_status(id, root, exited, &tap, wrapped))
     }
 
     /// An existing live tap only; mobile model control must never spawn/resume a replacement.
