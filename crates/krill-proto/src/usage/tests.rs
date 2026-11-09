@@ -1460,3 +1460,96 @@ fn automatic_account_input_recovery_is_appended_and_feature_gated() {
     assert!(!request.is_read());
     assert!(!request.contains_removed_provider());
 }
+
+#[test]
+fn retained_handoff_reasons_round_trip_and_classify_distinct_from_retryable_failures() {
+    let from = crate::SessionId(40_351);
+    let replacement = crate::SessionId(40_373);
+    for reason in [
+        RetainedReason::OriginalEnded,
+        RetainedReason::OriginalEndedDuringRecovery,
+        RetainedReason::OriginalExitUnconfirmed,
+    ] {
+        let handoff = SessionHandoff::retained(from, replacement, "codex-alpha", reason);
+        let message = handoff.error.as_deref().unwrap();
+        assert_eq!(
+            SessionHandoff::parse_retained_replacement(message),
+            Some(Some(replacement))
+        );
+        assert_eq!(
+            handoff.outcome(),
+            HandoffOutcome::RetainedReplacement {
+                replacement: Some(replacement),
+                message,
+            }
+        );
+    }
+
+    for unnumbered in [
+        "unconfirmed replacement retained",
+        "Original session ended; unconfirmed replacement 0 was retained. Select it explicitly to continue; held input was not sent",
+        "Original session ended; unconfirmed replacement 18446744073709551616 was retained. Select it explicitly to continue; held input was not sent",
+    ] {
+        assert_eq!(
+            SessionHandoff::parse_retained_replacement(unnumbered),
+            Some(None),
+            "{unnumbered}"
+        );
+        let handoff = SessionHandoff {
+            from,
+            to: None,
+            account_id: "codex-alpha".into(),
+            error: Some(unnumbered.into()),
+        };
+        assert_eq!(
+            handoff.outcome(),
+            HandoffOutcome::RetainedReplacement {
+                replacement: None,
+                message: unnumbered,
+            }
+        );
+    }
+
+    for retryable in [
+        "Replacement session is unavailable; original session preserved",
+        "Session 7: could not resume with selected account (denied); original session preserved",
+        "Original session has ended; automatic resume cancelled",
+    ] {
+        assert_eq!(
+            SessionHandoff::parse_retained_replacement(retryable),
+            None,
+            "{retryable}"
+        );
+        let handoff = SessionHandoff {
+            from,
+            to: None,
+            account_id: "codex-alpha".into(),
+            error: Some(retryable.into()),
+        };
+        assert_eq!(
+            handoff.outcome(),
+            HandoffOutcome::RetryableFailure { message: retryable }
+        );
+    }
+
+    assert_eq!(
+        SessionHandoff {
+            from,
+            to: None,
+            account_id: "codex-alpha".into(),
+            error: None,
+        }
+        .outcome(),
+        HandoffOutcome::Pending
+    );
+    assert_eq!(
+        SessionHandoff {
+            from,
+            to: Some(replacement),
+            account_id: "codex-alpha".into(),
+            error: None,
+        }
+        .outcome(),
+        HandoffOutcome::Completed { replacement }
+    );
+}

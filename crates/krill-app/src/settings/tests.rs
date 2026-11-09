@@ -11861,3 +11861,111 @@ fn navigation_follows_modal_width_not_window_breakpoint(cx: &mut TestAppContext)
     assert!(vcx.debug_bounds("admin-modal-close").is_some());
     fs::remove_dir_all(d).ok();
 }
+
+#[gpui::test]
+fn retained_handoff_banner_clears_when_snapshot_resolves_and_hides_switch_on_active_account(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::SessionId;
+    use krill_proto::usage::{
+        AccountInfo, AccountsSnapshot, ProviderKind, SessionHandoff, Snapshot,
+    };
+
+    let d = dir("retained-handoff-banner");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
+    vcx.run_until_parked();
+
+    let make_snapshot = |handoffs: Vec<SessionHandoff>| AccountsSnapshot {
+        accounts: vec![AccountInfo {
+            id: "codex-alpha".into(),
+            provider: ProviderKind::Codex,
+            label: "alpha@example.test".into(),
+            email: Some("alpha@example.test".into()),
+            profile_dir: d.join("codex-alpha").display().to_string(),
+            active: true,
+            host_default: false,
+            stale: false,
+            usage: Snapshot::default(),
+        }],
+        details: Box::new(krill_proto::usage::ProviderDetails {
+            handoffs,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let snap_with_retained = make_snapshot(vec![SessionHandoff {
+        from: SessionId(40_351),
+        to: None,
+        account_id: "codex-alpha".into(),
+        error: Some(
+            "Original session ended; unconfirmed replacement 40373 was retained. Select it explicitly to continue; held input was not sent"
+                .into(),
+        ),
+    }]);
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.tab = AdminTab::Accounts;
+            v.not_installed_open = true;
+            v.update_accounts_snapshot_for_host(
+                &crate::hosts::HostId::Local,
+                snap_with_retained,
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-account-row-codex-alpha").is_some());
+    assert!(vcx.debug_bounds("admin-account-error").is_some());
+    assert!(
+        vcx.debug_bounds("admin-switch-account-codex-alpha")
+            .is_none()
+    );
+
+    let snap_with_retryable_failure = make_snapshot(vec![SessionHandoff {
+        from: SessionId(40_351),
+        to: None,
+        account_id: "codex-alpha".into(),
+        error: Some("Replacement session is unavailable; original session preserved".into()),
+    }]);
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.update_accounts_snapshot_for_host(
+                &crate::hosts::HostId::Local,
+                snap_with_retryable_failure,
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("admin-switch-account-codex-alpha")
+            .is_some()
+    );
+
+    let snap_cleared = make_snapshot(Vec::new());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.update_accounts_snapshot_for_host(
+                &crate::hosts::HostId::Local,
+                snap_cleared.clone(),
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-account-error").is_none());
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.finish_account_rule_request(Err("daemon refused request".into()), cx);
+            v.update_accounts_snapshot_for_host(&crate::hosts::HostId::Local, snap_cleared, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-account-error").is_some());
+
+    fs::remove_dir_all(d).ok();
+}

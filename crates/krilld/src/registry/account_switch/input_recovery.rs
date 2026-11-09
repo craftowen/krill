@@ -2,6 +2,8 @@
 //! Recovery policy informed by Orca's terminal-restart-state.ts and pty-input-recovery.ts.
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
 
+use krill_proto::usage::HandoffOutcome;
+
 use super::{Failure, Registry, SessionId, SwitchScope, lock, prepared_paths, read_prepared};
 
 impl Registry {
@@ -19,25 +21,22 @@ impl Registry {
         automatic: Option<&str>,
     ) -> Result<(), Failure> {
         let mut pending = lock(&self.account_work.pending);
-        {
+        let (session_live, session_closing, session_closed_stream) = {
             let state = lock(&self.state);
-            if !state.sessions.contains_key(&session)
-                || state.exited.contains_key(&session)
-                || state.closing.contains(&session)
-            {
-                return Err(Failure::NoSession);
-            }
-            if automatic.is_some()
-                && state
-                    .sessions
-                    .get(&session)
-                    .is_some_and(|entry| entry.session.is_closed())
-            {
-                return Err(Failure::NoSession);
-            }
-        }
-        let mut handoffs = lock(&self.account_handoffs);
+            let closing = state.closing.contains(&session);
+            let live = state.sessions.contains_key(&session)
+                && !state.exited.contains_key(&session)
+                && !closing;
+            let closed_stream = state
+                .sessions
+                .get(&session)
+                .is_some_and(|entry| entry.session.is_closed());
+            (live, closing, closed_stream)
+        };
         if let Some(expected) = automatic {
+            if !session_live || session_closed_stream {
+                return Err(Failure::NoSession);
+            }
             if expected.is_empty() {
                 return Err(Failure::BadRequest);
             }
@@ -53,16 +52,15 @@ impl Registry {
             {
                 return Err(Failure::Os(libc::EBUSY));
             }
+            let mut handoffs = lock(&self.account_handoffs);
             if let Some(handoff) = handoffs.get(&session) {
-                if handoff.account_id != expected || handoff.to.is_some() {
+                if handoff.account_id != expected {
                     return Err(Failure::Os(libc::EBUSY));
                 }
-                if handoff
-                    .error
-                    .as_ref()
-                    .is_some_and(|error| error.contains("retained"))
-                {
-                    return Err(Failure::Denied);
+                match handoff.outcome() {
+                    HandoffOutcome::Completed { .. } => return Err(Failure::Os(libc::EBUSY)),
+                    HandoffOutcome::RetainedReplacement { .. } => return Err(Failure::Denied),
+                    HandoffOutcome::Pending | HandoffOutcome::RetryableFailure { .. } => {}
                 }
             }
             // A prepared replacement can still own the conversation. Never infer rollback
@@ -77,28 +75,133 @@ impl Registry {
                     }
                 }
             }
-        }
-        let handoff = handoffs.get(&session).filter(|h| h.to.is_none()).cloned();
-        if automatic.is_none() && handoff.is_none() {
-            return Err(Failure::BadRequest);
-        }
-        if let Some(handoff) = handoff {
-            handoffs.remove(&session);
-            if let Err(error) = self.write_account_handoffs(&handoffs) {
+            if let Some(handoff) = handoffs.remove(&session)
+                && let Err(error) = self.write_account_handoffs(&handoffs)
+            {
                 handoffs.insert(session, handoff);
                 return Err(super::super::os(&error));
             }
+            drop(handoffs);
+            pending
+                .retain(|scope, _| !matches!(scope, SwitchScope::Session(id, _) if *id == session));
+            if self
+                .agents
+                .stored(session)
+                .ok()
+                .flatten()
+                .is_none_or(|s| s.session_id.is_none() && s.transcript_path.is_none())
+            {
+                lock(&self.account_switch_opt_out).insert(session);
+            }
+            return Ok(());
         }
-        drop(handoffs);
-        pending.retain(|scope, _| !matches!(scope, SwitchScope::Session(id, _) if *id == session));
+
+        if session_live {
+            let mut handoffs = lock(&self.account_handoffs);
+            if let Some(handoff) = handoffs.get(&session).filter(|h| h.to.is_none()).cloned() {
+                handoffs.remove(&session);
+                if let Err(error) = self.write_account_handoffs(&handoffs) {
+                    handoffs.insert(session, handoff);
+                    return Err(super::super::os(&error));
+                }
+                drop(handoffs);
+                pending.retain(
+                    |scope, _| !matches!(scope, SwitchScope::Session(id, _) if *id == session),
+                );
+                if self
+                    .agents
+                    .stored(session)
+                    .ok()
+                    .flatten()
+                    .is_none_or(|s| s.session_id.is_none() && s.transcript_path.is_none())
+                {
+                    lock(&self.account_switch_opt_out).insert(session);
+                }
+                return Ok(());
+            }
+            let Some(from) = handoffs.retained_from(session) else {
+                return Err(Failure::BadRequest);
+            };
+            drop(handoffs);
+            if lock(&self.account_replacements).contains(&session)
+                || !self.account_original_ended(from)
+            {
+                return Err(Failure::BadRequest);
+            }
+            if !lock(&self.ids).ensure_ready() {
+                return Err(Failure::Os(libc::EIO));
+            }
+            self.ensure_no_unresolved_account_replacement(from)?;
+            self.ensure_no_unresolved_account_replacement(session)?;
+            let mut handoffs = lock(&self.account_handoffs);
+            let Some((removed_from, previous)) =
+                handoffs.acknowledge_replacement(session, |id| id == from)
+            else {
+                return Err(Failure::BadRequest);
+            };
+            if let Err(error) = self.write_account_handoffs(&handoffs) {
+                handoffs.insert(removed_from, previous);
+                return Err(super::super::os(&error));
+            }
+            return Ok(());
+        }
+
+        if session_closing || !self.account_original_ended(session) {
+            return Err(Failure::NoSession);
+        }
+        let dismissible = lock(&self.account_handoffs).get(&session).is_some_and(|h| {
+            matches!(
+                h.outcome(),
+                HandoffOutcome::RetryableFailure { .. }
+                    | HandoffOutcome::RetainedReplacement { .. }
+            )
+        });
+        if !dismissible {
+            return Err(Failure::NoSession);
+        }
         if self
-            .agents
-            .stored(session)
-            .ok()
-            .flatten()
-            .is_none_or(|s| s.session_id.is_none() && s.transcript_path.is_none())
+            .account_processing
+            .load(std::sync::atomic::Ordering::Acquire)
+            || pending
+                .keys()
+                .any(|scope| matches!(scope, SwitchScope::Session(id, _) if *id == session))
+            || lock(&self.account_replacements).contains(&session)
         {
-            lock(&self.account_switch_opt_out).insert(session);
+            return Err(Failure::Os(libc::EBUSY));
+        }
+        if !lock(&self.ids).ensure_ready() {
+            return Err(Failure::Os(libc::EIO));
+        }
+        self.ensure_no_unresolved_account_replacement(session)?;
+        let mut handoffs = lock(&self.account_handoffs);
+        let Some(handoff) = handoffs.get(&session).cloned().filter(|h| {
+            matches!(
+                h.outcome(),
+                HandoffOutcome::RetryableFailure { .. }
+                    | HandoffOutcome::RetainedReplacement { .. }
+            )
+        }) else {
+            return Err(Failure::NoSession);
+        };
+        if let HandoffOutcome::RetainedReplacement {
+            replacement: Some(rep),
+            ..
+        } = handoff.outcome()
+        {
+            drop(handoffs);
+            if lock(&self.account_replacements).contains(&rep) {
+                return Err(Failure::Os(libc::EBUSY));
+            }
+            self.ensure_no_unresolved_account_replacement(rep)?;
+            handoffs = lock(&self.account_handoffs);
+            if handoffs.get(&session) != Some(&handoff) {
+                return Err(Failure::NoSession);
+            }
+        }
+        handoffs.remove(&session);
+        if let Err(error) = self.write_account_handoffs(&handoffs) {
+            handoffs.insert(session, handoff);
+            return Err(super::super::os(&error));
         }
         Ok(())
     }

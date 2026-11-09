@@ -119,6 +119,16 @@ function fixture(options = {}) {
     ),
     sandbox,
   );
+  if (options.lang) {
+    vm.runInContext(
+      fs.readFileSync(
+        path.join(__dirname, "../src/mobile/assets/i18n.js"),
+        "utf8",
+      ),
+      sandbox,
+    );
+    sandbox.KrillMobile.i18n.configure(options.lang);
+  }
   const state = {
     sessions: new Map([[7, { id: 7, state: "Waiting", cwd: "/work" }]]),
     connection: { phase: options.phase || "ready" },
@@ -143,6 +153,7 @@ function fixture(options = {}) {
   const ctx = {
     el,
     state,
+    ...(options.lang ? { t: sandbox.KrillMobile.i18n.t } : {}),
     button(label, action, cls) {
       const b = el("button", label, cls);
       b.action = action;
@@ -2739,8 +2750,405 @@ async function liveQuestionSheet() {
 }
 
 
+async function workRunCoalescing() {
+  const ko = fixture({ lang: "ko" });
+  await flush();
+  await ko.poll({
+    generation: "g1",
+    agent: "claude",
+    bound: true,
+    next_offset: 8,
+    items: [
+      { id: "u1", kind: "user", text: "리뷰해줘" },
+      { id: "r1", kind: "reasoning", text: "파일 구조를 먼저 살핀다" },
+      {
+        id: "c1",
+        kind: "tool_call",
+        tool_id: "t1",
+        tool_name: "Read",
+        file_path: "/work/src/lib.rs",
+        text: "/work/src/lib.rs",
+      },
+      { id: "o1", kind: "tool_result", tool_id: "t1", text: "pub fn run() {}" },
+      { id: "r2", kind: "reasoning", text: "테스트를 실행해 확인한다" },
+      {
+        id: "c2",
+        kind: "tool_call",
+        tool_id: "t2",
+        tool_name: "Bash",
+        title: "cargo nextest",
+        text: "cargo nextest run",
+      },
+      { id: "o2", kind: "tool_result", tool_id: "t2", text: "1 passed" },
+      { id: "a1", kind: "assistant", text: "검토를 마쳤습니다." },
+    ],
+  });
+  const koFeed = ko.find("chat-feed"),
+    koRuns = ko.root
+      .descendants()
+      .filter((n) => n.className === "chat-tool-run");
+  assert.equal(
+    koRuns.length,
+    1,
+    "interleaved reasoning and tool items coalesce into one work run",
+  );
+  assert.deepEqual(
+    koFeed.children.map((n) => n.className),
+    ["chat-card chat-user", "chat-tool-run", "chat-card chat-assistant"],
+  );
+  const koRun = koRuns[0];
+  assert.equal(koRun.open, false, "coalesced work run defaults closed");
+  assert.equal(
+    koRun.children[0].textContent,
+    "파일 1개 확인 · 명령 1번 실행 · cargo nextest",
+  );
+  koRun.open = true;
+  koRun.dispatchEvent(new Event("toggle"));
+  assert.deepEqual(
+    koRun.children[1].children.map((n) => n.className),
+    [
+      "chat-card chat-reasoning",
+      "chat-tool-pair",
+      "chat-card chat-reasoning",
+      "chat-tool-pair",
+    ],
+  );
+  assert.deepEqual(
+    koRun.children[1].children[1].children.map((n) => n.className),
+    ["chat-card chat-tool_call", "chat-card chat-tool_result"],
+  );
+  assert.deepEqual(
+    koRun.children[1].children[1].children.map((n) => n.children[0].className),
+    ["chat-tool-call", "chat-tool-result"],
+  );
+  assert.deepEqual(
+    koRun.children[1].children[3].children.map((n) => n.className),
+    ["chat-card chat-tool_call", "chat-card chat-tool_result"],
+  );
+  ko.dispose();
+
+  const thoughtsKo = fixture({ lang: "ko" });
+  await flush();
+  await thoughtsKo.poll({
+    generation: "g1",
+    bound: true,
+    next_offset: 2,
+    items: [
+      { id: "tk1", kind: "reasoning", text: "첫 번째 가설 점검\n세부 내용" },
+      { id: "tk2", kind: "reasoning", text: "두 번째 경계 조건 확인\n세부 내용" },
+    ],
+  });
+  const thoughtRun = thoughtsKo.find("chat-tool-run");
+  assert(thoughtRun, "two contiguous reasoning items coalesce into a work run");
+  assert.equal(thoughtRun.open, false);
+  assert.equal(
+    thoughtRun.children[0].textContent,
+    "생각 2회 · 두 번째 경계 조건 확인",
+  );
+  thoughtsKo.dispose();
+
+  const orphanEn = fixture({ lang: "en" });
+  await flush();
+  await orphanEn.poll({
+    generation: "g1",
+    bound: true,
+    next_offset: 1,
+    items: [
+      { id: "or1", kind: "tool_result", text: "\n  orphan stdout line\nmore" },
+    ],
+  });
+  assert.equal(
+    orphanEn.find("chat-tool-run").children[0].textContent,
+    "Tool activity · orphan stdout line",
+  );
+  orphanEn.dispose();
+
+  const stream = fixture({ lang: "en" });
+  await flush();
+  await stream.poll({
+    generation: "g1",
+    bound: true,
+    page_start: 0,
+    next_offset: 1,
+    items: [{ id: "sr1", kind: "reasoning", text: "Checking config" }],
+  });
+  const streamFeed = stream.find("chat-feed");
+  assert.deepEqual(
+    streamFeed.children.map((n) => n.className),
+    ["chat-card chat-reasoning"],
+  );
+  assert.equal(stream.find("chat-tool-run"), undefined);
+  await stream.poll({
+    generation: "g1",
+    bound: true,
+    page_start: 1,
+    next_offset: 3,
+    items: [
+      {
+        id: "sc1",
+        kind: "tool_call",
+        tool_id: "st1",
+        tool_name: "Read",
+        file_path: "/work/cfg.toml",
+        text: "/work/cfg.toml",
+      },
+      { id: "so1", kind: "tool_result", tool_id: "st1", text: "ok" },
+    ],
+  });
+  assert.deepEqual(
+    streamFeed.children.map((n) => n.className),
+    ["chat-tool-run"],
+    "streaming tool delta promotes preceding solo reasoning into one closed work run",
+  );
+  const promoted = streamFeed.children[0];
+  assert.equal(promoted.open, false);
+  assert.equal(
+    promoted.children[0].textContent,
+    "Read 1 file(s) · /work/cfg.toml",
+  );
+  assert.deepEqual(
+    promoted.children[1].children.map((n) => n.className),
+    ["chat-card chat-reasoning", "chat-tool-pair"],
+  );
+  await stream.poll({
+    generation: "g1",
+    bound: true,
+    page_start: 3,
+    next_offset: 5,
+    items: [
+      { id: "sa1", kind: "assistant", text: "Config looks valid." },
+      { id: "sr2", kind: "reasoning", text: "Standalone follow-up thought" },
+    ],
+  });
+  assert.deepEqual(
+    streamFeed.children.map((n) => n.className),
+    [
+      "chat-tool-run",
+      "chat-card chat-assistant",
+      "chat-card chat-reasoning",
+    ],
+  );
+  stream.dispose();
+
+  const paged = fixture({
+    lang: "en",
+    handler: async (req) =>
+      req.end_offset !== undefined
+        ? {
+            generation: "g1",
+            agent: "claude",
+            bound: true,
+            page_start: 0,
+            next_offset: 100,
+            items: [
+              { id: "u0", kind: "user", text: "Check project" },
+              {
+                id: "c1",
+                kind: "tool_call",
+                tool_id: "p1",
+                tool_name: "Read",
+                file_path: "/work/first.rs",
+                text: "/work/first.rs",
+              },
+              { id: "o1", kind: "tool_result", tool_id: "p1", text: "fn a()" },
+            ],
+          }
+        : {
+            generation: "g1",
+            agent: "claude",
+            bound: true,
+            page_start: 100,
+            next_offset: 200,
+            items: [
+              {
+                id: "c2",
+                kind: "tool_call",
+                tool_id: "p2",
+                tool_name: "Bash",
+                title: "step 2",
+                text: "echo 2",
+              },
+              { id: "o2", kind: "tool_result", tool_id: "p2", text: "2" },
+              { id: "a2", kind: "assistant", text: "Reply 1" },
+              { id: "a3", kind: "assistant", text: "Reply 2" },
+              { id: "a4", kind: "assistant", text: "Reply 3" },
+            ],
+          },
+  });
+  await flush();
+  const pagedFeed = paged.find("chat-feed"),
+    openRun = paged.find("chat-tool-run");
+  openRun.open = true;
+  openRun.dispatchEvent(new Event("toggle"));
+  const holdEarlier = deferred();
+  paged.handler = (req) =>
+    req.end_offset !== undefined
+      ? holdEarlier.promise
+      : Promise.resolve({
+          generation: "g1",
+          bound: true,
+          page_start: 200,
+          next_offset: 200,
+          items: [],
+        });
+  scroll(pagedFeed, 200);
+  scroll(pagedFeed, 25);
+  await flush();
+  const anchorOffset = openRun.offsetTop - pagedFeed.scrollTop;
+  holdEarlier.resolve({
+    generation: "g1",
+    agent: "claude",
+    bound: true,
+    page_start: 0,
+    next_offset: 100,
+    items: [
+      { id: "u0", kind: "user", text: "Check project" },
+      {
+        id: "c1",
+        kind: "tool_call",
+        tool_id: "p1",
+        tool_name: "Read",
+        file_path: "/work/first.rs",
+        text: "/work/first.rs",
+      },
+      { id: "o1", kind: "tool_result", tool_id: "p1", text: "fn a()" },
+    ],
+  });
+  await flush();
+  assert.equal(
+    pagedFeed.children[1],
+    openRun,
+    "loadEarlier prepend into an open work run keeps the exact details DOM node",
+  );
+  assert.equal(openRun.open, true, "open state survives loadEarlier prepend");
+  assert.equal(
+    openRun.offsetTop - pagedFeed.scrollTop,
+    anchorOffset,
+    "readerAnchor keeps the open work run pinned in viewport across prepend",
+  );
+  assert.equal(
+    openRun.children[0].textContent,
+    "Read 1 file(s) · Ran 1 command(s) · step 2",
+  );
+  assert.equal(openRun.children[1].children.length, 2);
+  paged.remount();
+  assert.equal(
+    paged.find("chat-tool-run").open,
+    true,
+    "migrated disclosure key survives remount after loadEarlier",
+  );
+  paged.dispose();
+
+  const trimmed = fixture({ lang: "en" });
+  await flush();
+  await trimmed.poll({
+    generation: "g1",
+    bound: true,
+    page_start: 0,
+    next_offset: 1000,
+    items: [
+      { id: "tc0", kind: "tool_call", tool_name: "Read", file_path: "a.rs" },
+      { id: "tc1", kind: "tool_call", tool_name: "Read", file_path: "b.rs" },
+      ...Array.from({ length: 998 }, (_, i) => ({
+        id: `ta${i}`,
+        kind: "assistant",
+        text: `Msg ${i}`,
+      })),
+    ],
+  });
+  const trimRun = trimmed.find("chat-tool-run");
+  trimRun.open = true;
+  trimRun.dispatchEvent(new Event("toggle"));
+  await trimmed.poll({
+    generation: "g1",
+    bound: true,
+    page_start: 1000,
+    next_offset: 1001,
+    items: [{ id: "ta998", kind: "assistant", text: "Msg 998" }],
+  });
+  assert.equal(
+    trimmed.find("chat-tool-run"),
+    trimRun,
+    "front trim across MAX_RENDERED_ITEMS preserves the surviving work run DOM node",
+  );
+  assert.equal(trimRun.open, true);
+  assert.equal(trimRun.children[0].textContent, "Read 1 file(s) · b.rs");
+  trimmed.dispose();
+
+  const boundaries = fixture({ lang: "en" });
+  await flush();
+  await boundaries.poll({
+    generation: "g1",
+    bound: true,
+    next_offset: 8,
+    items: [
+      { id: "br0", kind: "reasoning", text: "Solo thought" },
+      { id: "ba1", kind: "assistant", text: "Interim message" },
+      { id: "bc1", kind: "tool_call", tool_name: "Read", file_path: "x.rs" },
+      {
+        id: "bq1",
+        kind: "question",
+        text: "Proceed?",
+        options: [{ label: "Yes" }],
+      },
+      { id: "bc2", kind: "tool_call", tool_name: "Bash", text: "ls" },
+      { id: "bp1", kind: "permission", title: "Allow write", text: "Write y" },
+      { id: "br2", kind: "reasoning", text: "Preparing edit" },
+      { id: "bc3", kind: "tool_call", tool_name: "Edit", file_path: "y.rs" },
+    ],
+  });
+  assert.deepEqual(
+    boundaries.find("chat-feed").children.map((n) => n.className),
+    [
+      "chat-card chat-reasoning",
+      "chat-card chat-assistant",
+      "chat-tool-run",
+      "chat-card chat-question",
+      "chat-tool-run",
+      "chat-card chat-permission",
+      "chat-tool-run",
+    ],
+    "solo reasoning stays top-level and question/permission items break runs",
+  );
+  assert.equal(boundaries.find("chat-reasoning").tag, "details");
+  boundaries.dispose();
+
+  const css = fs.readFileSync(
+    path.join(__dirname, "../src/mobile/assets/app.css"),
+    "utf8",
+  );
+  assert(
+    css.includes(
+      ".chat-tool-items>:is(.chat-card,.chat-tool-pair){border:0;border-top:1px solid var(--border);border-radius:0;padding:6px 2px;background:transparent}",
+    ),
+    "work run items use flat hairline dividers",
+  );
+  assert(
+    css.includes(
+      ".chat-tool-pair{display:flex;flex-direction:column;gap:4px;min-width:0}",
+    ),
+  );
+  assert(
+    css.includes(
+      ".chat-tool-pair>.chat-card{border:0;border-radius:0;padding:0;background:transparent}",
+    ),
+    "paired tool cards strip nested card borders",
+  );
+  assert(
+    css.includes(
+      "#mobile-app :is(button,summary){min-width:var(--touch-target);min-height:var(--touch-target)}",
+    ),
+    "44px touch target floor remains intact",
+  );
+  console.log(
+    "PASS work-run coalescing: interleaved thoughts/tools, streaming promotion, loadEarlier/trim DOM & anchor retention, question/permission boundaries and flat CSS",
+  );
+}
+
+
 async function main() {
   await require("./chat_release_ui.cjs")({fixture,flush,deferred,scroll,historyPage});
+  await workRunCoalescing();
   await liveQuestionSheet();
   await recoveryPaint();
   await recoveryOwnership();

@@ -103,6 +103,92 @@ pub fn agy_token_logged_in(dir: &Path) -> bool {
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.len() > 0)
 }
 
+#[must_use]
+pub fn codex_identity_from_credentials(raw: &[u8]) -> Option<Identity> {
+    if raw.is_empty() || raw.len() > 64 * 1024 {
+        return None;
+    }
+    let data: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    if data.get("auth_mode").and_then(serde_json::Value::as_str) == Some("apikey")
+        || data
+            .get("OPENAI_API_KEY")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        return None;
+    }
+    let token = data
+        .pointer("/tokens/id_token")
+        .or_else(|| data.pointer("/tokens/idToken"))?
+        .as_str()?;
+    let claims = jwt_claims(token)?;
+    let email = claims
+        .get("email")
+        .or_else(|| claims.pointer("/https:~1~1api.openai.com~1profile/email"))?
+        .as_str()?
+        .trim();
+    if email.is_empty() || email.len() > 320 || email.chars().any(char::is_control) {
+        return None;
+    }
+    Some(Identity {
+        email: email.to_owned(),
+        org_id: None,
+        org_name: None,
+    })
+}
+
+#[must_use]
+pub fn codex_identity_from_dir(dir: &Path) -> Option<Identity> {
+    let path = dir.join("auth.json");
+    if !std::fs::symlink_metadata(&path).is_ok_and(|m| {
+        m.is_file() && !m.file_type().is_symlink() && m.len() > 0 && m.len() <= 64 * 1024
+    }) {
+        return None;
+    }
+    let mut bytes = std::fs::read(&path).ok()?;
+    let id = codex_identity_from_credentials(&bytes);
+    bytes.fill(0);
+    id
+}
+
+#[must_use]
+pub fn jwt_claims(token: &str) -> Option<serde_json::Value> {
+    let mut parts = token.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() || payload.is_empty() || payload.len() > 16 * 1024 {
+        return None;
+    }
+    let (mut bits, mut count) = (0_u32, 0_u32);
+    let mut decoded = Vec::new();
+    for byte in payload.bytes() {
+        let n = match byte {
+            b'A'..=b'Z' => byte.saturating_sub(b'A'),
+            b'a'..=b'z' => byte.saturating_sub(b'a').saturating_add(26),
+            b'0'..=b'9' => byte.saturating_sub(b'0').saturating_add(52),
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        bits = bits.checked_shl(6)? | u32::from(n);
+        count = count.saturating_add(6);
+        if count >= 8 {
+            count = count.saturating_sub(8);
+            let shifted = bits.checked_shr(count)?;
+            decoded.push(u8::try_from(shifted & 255).ok()?);
+        }
+    }
+    if count >= 6 {
+        return None;
+    }
+    let mask = 1_u32.checked_shl(count)?.checked_sub(1)?;
+    if bits & mask != 0 {
+        return None;
+    }
+    serde_json::from_slice(&decoded).ok()
+}
+
 /// 비밀값을 출력하지 않는 CLI 상태 조회. stdout·stderr를 함께 읽되 결과에는 신원만 남긴다.
 /// Codex는 상태를 stderr에 쓰며 로그아웃이면 비영(非零) 종료한다. `dir`이 `None`이면 호스트 기본 계정([`login_command`]).
 pub fn probe(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> Option<AuthStatus> {
@@ -214,9 +300,19 @@ pub fn probe_with_environment(
     } else {
         return None;
     };
+    let identity = if logged_in && provider == ProviderKind::Codex {
+        let codex_dir = dir.map(Path::to_path_buf).or_else(|| {
+            home.map(Path::to_path_buf)
+                .or_else(crate::os::home_dir)
+                .map(|h| h.join(".codex"))
+        });
+        codex_dir.as_deref().and_then(codex_identity_from_dir)
+    } else {
+        None
+    };
     Some(AuthStatus {
         logged_in,
-        identity: None,
+        identity,
     })
 }
 
@@ -531,6 +627,82 @@ mod tests {
             std::fs::read_to_string(data.join("credentials")).unwrap(),
             "keep"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_identity_extracts_email_and_rejects_apikey_or_symlinks() {
+        let encode = |bytes: &[u8]| {
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let (mut bits, mut count) = (0_u32, 0_u32);
+            let mut out = String::new();
+            for &byte in bytes {
+                bits = bits.checked_shl(8).unwrap() | u32::from(byte);
+                count = count.saturating_add(8);
+                while count >= 6 {
+                    count = count.saturating_sub(6);
+                    let idx = usize::try_from(bits.checked_shr(count).unwrap() & 63).unwrap();
+                    out.push(char::from(*TABLE.get(idx).unwrap()));
+                }
+            }
+            if count > 0 {
+                let rem = 6_u32.saturating_sub(count);
+                let idx = usize::try_from(bits.checked_shl(rem).unwrap() & 63).unwrap();
+                out.push(char::from(*TABLE.get(idx).unwrap()));
+            }
+            out
+        };
+        let jwt = |claims: serde_json::Value| {
+            format!("e30.{}.sig", encode(&serde_json::to_vec(&claims).unwrap()))
+        };
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "tokens": { "id_token": jwt(serde_json::json!({ "email": " user@example.test " })) }
+        }))
+        .unwrap();
+        assert_eq!(
+            codex_identity_from_credentials(&raw),
+            Some(Identity {
+                email: "user@example.test".into(),
+                org_id: None,
+                org_name: None,
+            })
+        );
+        let alt = serde_json::to_vec(&serde_json::json!({
+            "tokens": {
+                "idToken": jwt(serde_json::json!({
+                    "https://api.openai.com/profile": { "email": "profile@example.test" }
+                }))
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            codex_identity_from_credentials(&alt).unwrap().email,
+            "profile@example.test"
+        );
+        let apikey = serde_json::to_vec(&serde_json::json!({
+            "OPENAI_API_KEY": "sk-test",
+            "tokens": { "id_token": jwt(serde_json::json!({ "email": "user@example.test" })) }
+        }))
+        .unwrap();
+        assert_eq!(codex_identity_from_credentials(&apikey), None);
+
+        let root = std::env::temp_dir().join(format!("codex-id-dir-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(codex_identity_from_dir(&root), None);
+        std::fs::write(root.join("auth.json"), &raw).unwrap();
+        assert_eq!(
+            codex_identity_from_dir(&root).unwrap().email,
+            "user@example.test"
+        );
+        #[cfg(unix)]
+        {
+            let linked = root.join("linked");
+            std::fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink(root.join("auth.json"), linked.join("auth.json")).unwrap();
+            assert_eq!(codex_identity_from_dir(&linked), None);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

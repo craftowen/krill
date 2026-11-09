@@ -170,8 +170,36 @@
             ? "Ran {0} command(s)"
             : "Did {0} other step(s)";
   }
+  function firstNonEmptyLine(text) {
+    return (
+      String(text || "")
+        .split("\n")
+        .map((line) => line.trim())
+        .find(Boolean) || ""
+    );
+  }
   function toolDetail(item) {
-    return String(item.title || item.file_path || item.text || "").trim().split("\n", 1)[0];
+    return (
+      firstNonEmptyLine(item.title) ||
+      firstNonEmptyLine(item.file_path) ||
+      firstNonEmptyLine(item.text)
+    );
+  }
+  function isWorkItemKind(kind) {
+    return (
+      kind === "tool_call" || kind === "tool_result" || kind === "reasoning"
+    );
+  }
+  function workRunEnd(items, start) {
+    let tools = 0,
+      thoughts = 0,
+      idx = start;
+    while (idx < items.length && isWorkItemKind(items[idx]?.kind)) {
+      if (items[idx].kind === "reasoning") thoughts++;
+      else tools++;
+      idx++;
+    }
+    return tools >= 1 || thoughts >= 2 ? idx : 0;
   }
   const cacheLimit = 8,
     cacheByteLimit = 8 * 1024 * 1024,
@@ -1728,14 +1756,19 @@
     }
     function renderItems(appendFrom) {
       const anchor = readerAnchor();
+      const prevWasSoloThought =
+        !tailRun && entry.items[appendFrom - 1]?.kind === "reasoning";
+      const nextStartsWork = isWorkItemKind(entry.items[appendFrom]?.kind);
       const incremental =
         appendFrom > 0 &&
         renderedItems === entry.items &&
-        renderedCount === appendFrom;
+        renderedCount === appendFrom &&
+        !(prevWasSoloThought && nextStartsWork);
       const wanted = new Set(),
         wantedRuns = new Set(),
         nodes = [];
-      let run = incremental ? tailRun : null;
+      let run = incremental ? tailRun : null,
+        runEnd = 0;
       // Retain the actual question/details nodes so selection, write-in, focus and expansion survive deltas.
       for (
         let idx = incremental ? appendFrom : 0;
@@ -1755,68 +1788,134 @@
           card.replaceChildren(...Array.from(next.children));
         }
         card._item = item;
-        if (item.kind === "tool_call" || item.kind === "tool_result") {
+        if (!run && idx >= runEnd) runEnd = workRunEnd(entry.items, idx);
+        if (run ? isWorkItemKind(item.kind) : idx < runEnd) {
           if (!run) {
             let group = toolRuns.get(key);
+            if (!group && !incremental) {
+              for (let m = idx; m < runEnd && !group; m++) {
+                const memberKey = itemKey(entry.items[m], m);
+                for (const [oldKey, oldGroup] of toolRuns) {
+                  if (
+                    !wantedRuns.has(oldKey) &&
+                    oldGroup.memberKeys?.has(memberKey)
+                  ) {
+                    const discloseKey = "run:" + key;
+                    toolRuns.delete(oldKey);
+                    toolRuns.set(key, oldGroup);
+                    if (
+                      oldGroup.discloseKey &&
+                      oldGroup.discloseKey !== discloseKey &&
+                      entry.disclosures?.has(oldGroup.discloseKey)
+                    ) {
+                      entry.disclosures.set(
+                        discloseKey,
+                        entry.disclosures.get(oldGroup.discloseKey),
+                      );
+                      entry.disclosures.delete(oldGroup.discloseKey);
+                    }
+                    oldGroup.discloseKey = discloseKey;
+                    group = oldGroup;
+                    break;
+                  }
+                }
+              }
+            }
             if (!group) {
               const details = el("details", undefined, "chat-tool-run"),
                 summary = el("summary", undefined, "chat-tool-summary"),
                 body = el("div", undefined, "chat-tool-items");
-              rememberDetails(details, "run:" + key);
+              group = {
+                details,
+                summary,
+                body,
+                pairs: new Map(),
+                memberKeys: new Set(),
+                discloseKey: "run:" + key,
+              };
+              rememberDetails(details, () => group.discloseKey);
               details.append(summary, body);
-              group = { details, summary, body, pairs: new Map() };
               toolRuns.set(key, group);
+            } else {
+              group.memberKeys.clear();
             }
+            const nodeSet = new Set(),
+              activePairs = new Set();
+            group.activeNodes = nodeSet;
+            group.activePairs = activePairs;
             run = {
               ...group,
               key,
               nodes: [],
-              nodeSet: new Set(),
+              nodeSet,
+              activePairs,
               steps: new Map(),
               calls: new Map(),
               pending: [],
               pairs: group.pairs,
+              memberKeys: group.memberKeys,
               count: 0,
+              tools: 0,
+              thoughts: 0,
               errors: 0,
+              detail: "",
+              thoughtDetail: "",
             };
             wantedRuns.add(key);
             nodes.push(run.details);
           }
-          // Pair results by the wire tool ID, with ordered fallback for older transcripts.
-          const callId = item.call_id || item.tool_use_id || item.tool_id;
-          let pair;
-          if (item.kind === "tool_call") {
-            pair = run.pairs.get(key) || {
-              node: el("div", undefined, "chat-tool-pair"),
-              call: item,
-            };
-            run.pairs.set(key, pair);
-            run.pending.push(pair);
-            if (callId) run.calls.set(String(callId), pair);
-            run.count++;
-            run.detail = toolDetail(item) || run.detail;
-            const step = toolStep(item.tool_name);
-            run.steps.set(step, (run.steps.get(step) || 0) + 1);
+          run.memberKeys.add(key);
+          let node = card;
+          if (item.kind === "reasoning") {
+            run.thoughts++;
+            if (!run.count)
+              run.thoughtDetail =
+                firstNonEmptyLine(item.text) || run.thoughtDetail;
           } else {
-            pair = callId ? run.calls.get(String(callId)) : run.pending[0];
-            if (pair) {
-              const index = run.pending.indexOf(pair);
-              if (index >= 0) run.pending.splice(index, 1);
-              const summary = card.children?.[0]?.children?.[0];
-              if (summary)
-                summary.textContent = [
-                  t(item.is_error ? "Tool error" : "Tool output"),
-                  pair.call.tool_name,
-                  pair.call.title || pair.call.file_path,
-                ]
-                  .filter(Boolean)
-                  .join(" · ");
+            run.tools++;
+            // Pair results by the wire tool ID, with ordered fallback for older transcripts.
+            const callId = item.call_id || item.tool_use_id || item.tool_id;
+            let pair;
+            if (item.kind === "tool_call") {
+              pair = run.pairs.get(key) || {
+                node: el("div", undefined, "chat-tool-pair"),
+                call: item,
+              };
+              pair.call = item;
+              run.pairs.set(key, pair);
+              run.activePairs.add(key);
+              run.pending.push(pair);
+              if (callId) run.calls.set(String(callId), pair);
+              run.count++;
+              run.detail = toolDetail(item) || run.detail;
+              const step = toolStep(item.tool_name);
+              run.steps.set(step, (run.steps.get(step) || 0) + 1);
+            } else {
+              pair = callId ? run.calls.get(String(callId)) : run.pending[0];
+              if (pair) {
+                const index = run.pending.indexOf(pair);
+                if (index >= 0) run.pending.splice(index, 1);
+                const summary = card.children?.[0]?.children?.[0];
+                if (summary)
+                  summary.textContent = [
+                    t(item.is_error ? "Tool error" : "Tool output"),
+                    pair.call.tool_name,
+                    pair.call.title || pair.call.file_path,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ");
+              } else {
+                run.detail =
+                  toolDetail(item) || firstNonEmptyLine(item.text) || run.detail;
+              }
             }
-          }
-          const node = pair?.node || card;
-          if (pair) {
-            const at = pair.node.children?.[item.kind === "tool_call" ? 0 : 1];
-            if (at !== card) pair.node.insertBefore(card, at || null);
+            node = pair?.node || card;
+            if (pair) {
+              const at =
+                pair.node.children?.[item.kind === "tool_call" ? 0 : 1];
+              if (at !== card) pair.node.insertBefore(card, at || null);
+            }
+            if (item.is_error) run.errors++;
           }
           if (!run.nodeSet.has(node)) {
             run.nodeSet.add(node);
@@ -1824,18 +1923,23 @@
             const at = run.body.children?.[run.nodes.length - 1];
             if (at !== node) run.body.insertBefore(node, at || null);
           }
-          if (item.is_error) run.errors++;
           run.summary.textContent = [
-            run.errors || !run.count
-              ? t(run.errors ? "Tool error" : "Tool activity")
-              : "",
+            run.errors
+              ? t("Tool error")
+              : !run.count && run.tools
+                ? t("Tool activity")
+                : "",
             ...[...run.steps].map(([step, n]) => t(step, n)),
-            run.detail,
+            !run.tools && run.thoughts
+              ? t("Thought {0} time(s)", run.thoughts)
+              : "",
+            run.count ? run.detail : run.detail || run.thoughtDetail,
           ]
             .filter(Boolean)
             .join(" · ");
         } else {
           run = null;
+          runEnd = 0;
           nodes.push(card);
         }
       }
@@ -1856,12 +1960,15 @@
             group.details.remove();
             resize?.unobserve(group.details);
             toolRuns.delete(key);
-          } else
+          } else {
             for (const [callKey, pair] of group.pairs)
-              if (!wanted.has(callKey)) {
+              if (!group.activePairs?.has(callKey)) {
                 pair.node.remove();
                 group.pairs.delete(callKey);
               }
+            for (const child of Array.from(group.body.children || []))
+              if (!group.activeNodes?.has(child)) child.remove();
+          }
         }
       for (const [key, card] of cards)
         if (!incremental && !wanted.has(key)) {
@@ -1902,11 +2009,13 @@
       restoreReader(anchor);
     }
     function rememberDetails(node, key) {
-      node.open = entry.disclosures?.get(key) || false;
+      const resolve = () => (typeof key === "function" ? key() : key);
+      node.open = entry.disclosures?.get(resolve()) || false;
       node.addEventListener("toggle", () => {
+        const current = resolve();
         entry.disclosures ||= new Map();
-        if (node.open) entry.disclosures.set(key, true);
-        else entry.disclosures.delete(key);
+        if (node.open) entry.disclosures.set(current, true);
+        else entry.disclosures.delete(current);
       });
     }
     function lazyDetails(details, build) {
@@ -2668,15 +2777,20 @@
           ...previous,
         ];
         trimItems(filling);
-        const anchorKey =
-          anchor?.node.dataset.chatId ||
-          [...toolRuns].find(
-            ([, group]) => group.details === anchor?.node,
-          )?.[0];
+        const anchorGroup = [...toolRuns.values()].find(
+            (group) => group.details === anchor?.node,
+          ),
+          anchorKey = anchor?.node.dataset.chatId;
         // If the reader moved past the retained window, defer the prepend rather than evict their card.
         if (
-          anchorKey &&
-          !entry.items.some((item, index) => itemKey(item, index) === anchorKey)
+          anchorKey
+            ? !entry.items.some(
+                (item, index) => itemKey(item, index) === anchorKey,
+              )
+            : anchorGroup &&
+              !entry.items.some((item, index) =>
+                anchorGroup.memberKeys?.has(itemKey(item, index)),
+              )
         ) {
           entry.items = previous;
           entry.live = live;
