@@ -509,7 +509,8 @@ mod tests {
     fn removed_worktree_stays_under_its_repository() {
         let base = std::env::temp_dir().join(format!("krilld-sidebar-gone-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
-        let base = base.canonicalize().unwrap();
+        // Windows에서 git이 받는 경로가 되도록 `\\?\` 접두사 없는 형태로 맞춘다(parse와 같은 함수).
+        let base = krill_proto::os::canonicalize(&base).unwrap();
         let repo = base.join("repo");
         let wt = base.join("wt");
         let git = |args: &[&str]| {
