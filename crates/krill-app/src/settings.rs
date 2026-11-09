@@ -215,7 +215,9 @@ fn default_terminal_font_family() -> String {
 }
 
 fn default_terminal_theme_dark() -> String {
-    crate::ui::DEFAULT_TERMINAL_THEME_DARK.to_owned()
+    crate::ui::DarkUiTheme::default()
+        .terminal_theme_name()
+        .to_owned()
 }
 
 fn default_terminal_theme_light() -> String {

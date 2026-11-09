@@ -86,9 +86,7 @@ fn chat_switch_moves_focus_and_feed_click_keeps_input_out_of_terminal(
         cx.notify();
     });
     cx.run_until_parked();
-    let toggle = cx.debug_bounds("toggle-chat-view").unwrap().center();
-    cx.simulate_click(toggle, gpui::Modifiers::default());
-    cx.run_until_parked();
+    crate::shell::tests::pick_overflow(cx, "down enter");
     cx.update(|window, cx| {
         view.read_with(cx, |shell, cx| {
             assert!(shell.is_active_chat_view());
@@ -125,8 +123,7 @@ fn chat_switch_moves_focus_and_feed_click_keeps_input_out_of_terminal(
             assert!(shell.focus.is_focused(window));
         });
     });
-    cx.simulate_click(toggle, gpui::Modifiers::default());
-    cx.run_until_parked();
+    crate::shell::tests::pick_overflow(cx, "down enter");
     cx.simulate_keystrokes("space a g a i n");
     view.read_with(cx, |shell, cx| {
         assert_eq!(

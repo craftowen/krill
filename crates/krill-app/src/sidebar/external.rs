@@ -138,11 +138,8 @@ pub fn checkpoint_badge_element(parts: &CheckpointParts, p: &crate::ui::Palette)
         .flex()
         .items_center()
         .gap_1()
-        .px_1()
-        .rounded(crate::ui::RADIUS_XS)
-        .bg(p.worktree_sidebar_accent)
         .font_family(crate::ui::FONT_UI)
-        .text_size(crate::ui::TEXT_2XS)
+        .text_size(crate::ui::TEXT_XS)
         .text_color(p.muted_foreground);
     if parts.unread {
         row = row.child(crate::ui::status::unread_dot());

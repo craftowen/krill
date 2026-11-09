@@ -167,6 +167,15 @@ fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
     cx.run_until_parked();
 }
 
+/// 탭 넘침 메뉴(⌄)를 열고 키보드로 항목을 고른다. 위쪽 항목 순서: 채팅 보기, 상하 분할, 오른쪽 패널, 저장 명령, 맥락 복사.
+pub(super) fn pick_overflow(cx: &mut VisualTestContext, keys: &str) {
+    let menu = cx.debug_bounds("titlebar-more").unwrap();
+    cx.simulate_click(menu.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes(keys);
+    cx.run_until_parked();
+}
+
 pub(super) fn layout_of(view: &Entity<Shell>, cx: &mut VisualTestContext) -> Layout {
     cx.run_until_parked();
     cx.update(|_, cx| {
@@ -2043,10 +2052,7 @@ fn titlebar_collapse_toggles_and_status_bar(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.debug_bounds("sidebar-column").is_some());
 
-    let panel_btn = cx.debug_bounds("toggle-panel").unwrap();
-    cx.simulate_mouse_down(panel_btn.center(), MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_up(panel_btn.center(), MouseButton::Left, Modifiers::default());
-    cx.run_until_parked();
+    pick_overflow(cx, "down down down enter");
     assert!(cx.debug_bounds("panel-column").is_none());
     assert!(!cx.update(|_, cx| view.read(cx).diff.read(cx).is_visible()));
 
@@ -2460,7 +2466,7 @@ fn active_tab_stays_visible_after_keyboard_switch(cx: &mut TestAppContext) {
         let tab = cx
             .debug_bounds(Box::leak(format!("session-tab-{active}").into_boxed_str()))
             .unwrap();
-        let limit = cx.debug_bounds("quick-commands").unwrap();
+        let limit = cx.debug_bounds("new-tab").unwrap();
         (
             active,
             tab.right() <= limit.left() && tab.left() >= gpui::px(0.),
@@ -2495,7 +2501,7 @@ fn new_last_tab_is_revealed_with_motion_in_narrow_window(cx: &mut TestAppContext
         let tab = cx
             .debug_bounds(Box::leak(format!("session-tab-{active}").into_boxed_str()))
             .unwrap();
-        let limit = cx.debug_bounds("quick-commands").unwrap();
+        let limit = cx.debug_bounds("new-tab").unwrap();
         let all: Vec<_> = (0..=active)
             .map(|i| {
                 cx.debug_bounds(Box::leak(format!("session-tab-{i}").into_boxed_str()))
@@ -2628,7 +2634,7 @@ fn tabs_have_padding_min_width_and_separators(cx: &mut TestAppContext) {
     assert!(next.left() >= tab.right(), "tabs must not overlap");
     // 타이틀바 오른쪽 명령 버튼은 탭 줄과 겹치지 않는다.
     let tabs_right = active_tab.right();
-    let commands = cx.debug_bounds("quick-commands").expect("quick-commands");
+    let commands = cx.debug_bounds("new-tab").expect("new-tab");
     let titlebar = cx.debug_bounds("titlebar").expect("titlebar");
     assert!(tabs_right <= commands.left() && commands.right() <= titlebar.right());
 }
@@ -2655,7 +2661,7 @@ fn terminal_palette_push_tracks_theme_and_reconnect(cx: &mut TestAppContext) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
         path.with_file_name("settings.toml"),
-        "theme = \"dark\"\nterminal_use_separate_light_theme = true\n",
+        "theme = \"dark\"\nui_theme_dark = \"tokyo_night\"\nterminal_use_separate_light_theme = true\n",
     )
     .unwrap();
     let (view, cx) = open(cx, path.clone());
@@ -4621,7 +4627,17 @@ fn status_bar_keeps_provider_controls_left_and_session_tools_right(cx: &mut Test
         "float-terminal",
         "dashboard-popout",
     ] {
-        let bounds = cx.debug_bounds(selector).unwrap();
+        // 데몬 점·포트·SSH는 비정상이거나 1 이상일 때만 그린다.
+        let Some(bounds) = cx.debug_bounds(selector) else {
+            assert!(
+                matches!(
+                    selector,
+                    "status-daemon" | "status-ports-menu" | "status-ssh-switcher"
+                ),
+                "{selector} must render"
+            );
+            continue;
+        };
         assert!(providers.right() <= bounds.left(), "{selector}: {bounds:?}");
         assert!(
             bounds.left() >= right.left() && bounds.right() <= right.right(),
@@ -5402,7 +5418,7 @@ fn single_pane_hides_header_and_commands_live_in_titlebar(cx: &mut TestAppContex
         "single pane shows no header row"
     );
     let bar = cx.debug_bounds("titlebar").expect("titlebar");
-    for id in ["quick-commands", "copy-context"] {
+    for id in ["titlebar-more", "new-tab"] {
         let b = cx.debug_bounds(id).expect("command button stays reachable");
         assert!(
             bar.contains(&b.center()),

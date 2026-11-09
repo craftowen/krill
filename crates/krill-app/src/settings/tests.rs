@@ -9108,7 +9108,7 @@ fn terminal_themes_toml_roundtrip_and_mode_resolution() {
     let mut s = Settings::default();
     assert_eq!(
         s.terminal_theme_dark,
-        crate::ui::DEFAULT_TERMINAL_THEME_DARK
+        crate::ui::terminal_themes::KRILL_GRAPHITE
     );
     assert_eq!(
         s.terminal_theme_light,
@@ -9116,10 +9116,11 @@ fn terminal_themes_toml_roundtrip_and_mode_resolution() {
     );
     assert!(s.terminal_use_separate_light_theme);
     assert!(s.terminal_custom_themes.is_empty());
-    // 기본값은 기존 동작과 같다: 다크 → TERMINAL_DARK, 라이트 → TERMINAL_LIGHT.
+    // 기본값은 기본 앱 테마의 짝이다: 다크 → 흑연 터미널, 라이트 → TERMINAL_LIGHT.
     assert_eq!(
-        crate::ui::terminal_theme_for_mode(ThemeMode::Dark, &s),
-        crate::ui::TERMINAL_DARK
+        Some(crate::ui::terminal_theme_for_mode(ThemeMode::Dark, &s)),
+        crate::ui::builtin_terminal_theme(crate::ui::terminal_themes::KRILL_GRAPHITE)
+            .map(|b| b.theme)
     );
     assert_eq!(
         crate::ui::terminal_theme_for_mode(ThemeMode::Light, &s),
@@ -9676,8 +9677,8 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
     };
 
     vcx.update(|_, cx| {
-        assert_eq!(current(cx).ui_theme_dark, DarkUiTheme::TokyoNight);
-        assert_eq!(crate::ui::palette(cx), &crate::ui::TOKYO_NIGHT);
+        assert_eq!(current(cx).ui_theme_dark, DarkUiTheme::Graphite);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::GRAPHITE);
     });
     choose(vcx, "dark", 12);
     vcx.update(|_, cx| {
@@ -9758,8 +9759,9 @@ fn appearance_swatch_board_follows_theme_mode_and_keeps_color_area(cx: &mut Test
             assert!(chip.right() <= preview.right(), "{chip:?} {preview:?}");
         }
     }
-    assert!(vcx.debug_bounds("ui-theme-swatch-dark-0-check").is_some());
-    assert!(vcx.debug_bounds("ui-theme-swatch-dark-1-check").is_none());
+    // 기본 다크 테마 흑연은 ALL의 다섯째(4)다.
+    assert!(vcx.debug_bounds("ui-theme-swatch-dark-4-check").is_some());
+    assert!(vcx.debug_bounds("ui-theme-swatch-dark-0-check").is_none());
 
     // 넓으면 7열.
     vcx.simulate_resize(size(px(1400.), px(2400.)));
@@ -9814,7 +9816,7 @@ fn appearance_imported_terminal_theme_shows_name_and_keeps_app_theme(cx: &mut Te
         let s = current(cx);
         assert_eq!(s.terminal_theme_dark, "custom:warp:dune");
         assert_eq!(s.unpaired_terminal_theme(ThemeMode::Dark), Some("Dune"));
-        assert_eq!(s.ui_theme_dark, DarkUiTheme::TokyoNight);
+        assert_eq!(s.ui_theme_dark, DarkUiTheme::Graphite);
     });
     assert!(vcx.debug_bounds("ui-theme-dark-terminal").is_some());
     let at = vcx.debug_bounds("ui-theme-dark-match").unwrap().center();
@@ -10100,15 +10102,15 @@ fn quick_command_duplicates_edit_and_remove_the_row_that_was_pressed(cx: &mut Te
     fs::remove_dir_all(d).ok();
 }
 
-/// 앱 테마 키가 없으면 새 기본값 야광·종이를 쓰고, 저장된 선택값은 계속 읽는다.
+/// 앱 테마 키가 없으면 새 기본값 흑연·종이를 쓰고, 저장된 선택값은 계속 읽는다.
 #[test]
 fn settings_without_ui_theme_keys_use_default_themes() {
     let s = Settings::parse("theme = \"light\"").unwrap();
-    assert_eq!(s.ui_theme_dark, DarkUiTheme::TokyoNight);
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Graphite);
     assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
     assert_eq!(
         s.terminal_theme_dark,
-        crate::ui::DEFAULT_TERMINAL_THEME_DARK
+        crate::ui::terminal_themes::KRILL_GRAPHITE
     );
     assert_eq!(
         s.terminal_theme_light,

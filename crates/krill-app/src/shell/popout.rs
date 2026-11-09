@@ -58,9 +58,6 @@ fn daemon_status_dot(tip: String, color: gpui::Hsla) -> gpui::Stateful<gpui::Div
         .tooltip(move |window, cx| ui::tooltip_view("status-daemon", tip.clone(), window, cx))
 }
 
-/// 상태바 떼 미터 점 칸 수. 폭은 세션 수와 무관하게 이만큼 예약한다.
-const STATUS_SWARM_DOTS: usize = 8;
-
 /// 화면 객체가 그대로면 평문 변환도 생략한다. Weak로 이전 화면을 붙들지 않는다.
 #[derive(Default)]
 pub(super) struct PortCache {
@@ -133,22 +130,12 @@ pub(super) fn detect_ports(
     (text, entries)
 }
 
-/// OWE-856: 세션 수·알림 수(상태 역할·이름 노출). 세션 수 옆에 세션별 상태 떼 미터.
-fn usage_status(
-    p: &ui::Palette,
-    states: &[AgentState],
-    needs_you: usize,
-    cx: &App,
-) -> gpui::Stateful<gpui::Div> {
-    let sessions = states.len();
+/// OWE-856: 세션 수·알림 수(상태 역할·이름 노출). 알림 종은 확인할 세션이 있을 때만 보인다.
+fn usage_status(p: &ui::Palette, sessions: usize, needs_you: usize) -> gpui::Stateful<gpui::Div> {
     let usage_tip = counts(sessions, needs_you);
     let sessions_count = sessions.to_string();
     let needs_you_count = needs_you.to_string();
-    let needs_you_color = if needs_you > 0 {
-        p.agent_question
-    } else {
-        p.muted_foreground
-    };
+    let needs_you_color = p.agent_question;
     div()
         .id("status-usage")
         .debug_selector(|| "status-usage".into())
@@ -173,29 +160,27 @@ fn usage_status(
                         .data(ui::icons::TERMINAL_SVG)
                         .with_size(gpui_component::Size::XSmall),
                 )
-                .child(sessions_count)
-                .child(
-                    ui::status::swarm_meter(states, STATUS_SWARM_DOTS, cx)
-                        .debug_selector(|| "status-swarm".into()),
-                ),
+                .child(sessions_count),
         )
-        .child(
-            div()
-                .id("status-needs-you")
-                .debug_selector(|| "status-needs-you".into())
-                .flex()
-                .items_center()
-                .gap_1()
-                .font_family(ui::FONT_MONO)
-                .text_color(needs_you_color)
-                .child(
-                    gpui_component::Icon::default()
-                        .data(ui::icons::BELL_SVG)
-                        .with_size(gpui_component::Size::XSmall)
-                        .text_color(needs_you_color),
-                )
-                .child(needs_you_count),
-        )
+        .when(needs_you > 0, |d| {
+            d.child(
+                div()
+                    .id("status-needs-you")
+                    .debug_selector(|| "status-needs-you".into())
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .font_family(ui::FONT_MONO)
+                    .text_color(needs_you_color)
+                    .child(
+                        gpui_component::Icon::default()
+                            .data(ui::icons::BELL_SVG)
+                            .with_size(gpui_component::Size::XSmall)
+                            .text_color(needs_you_color),
+                    )
+                    .child(needs_you_count),
+            )
+        })
         .tooltip(move |window, cx| ui::tooltip_view("status-usage", usage_tip.clone(), window, cx))
 }
 
@@ -1539,6 +1524,7 @@ impl Shell {
             .filter(|h| !self.host_aliases.contains_key(&h.id))
             .cloned()
             .collect();
+        let ssh_shown = !ssh_hosts.is_empty();
         let ssh_count_label = ssh_hosts.len().to_string();
         let ssh_full_label = text::SSH_MENU_BTN.format(&[("count", &ssh_count_label)]);
         let ssh_tooltip = format!("{} — {ssh_full_label}", text::SSH_MENU_TITLE.get());
@@ -1604,6 +1590,8 @@ impl Shell {
         let state_dir = self.state_dir(cx);
         let orch_store = self.orch_snapshot.clone();
         let orch_compact_label = format!("{}·{}", orch_store.runs.len(), orch_store.tasks.len());
+        // 실행·작업이 없으면 숫자 없이 아이콘만 둔다(세션 넘기기 메뉴는 그대로 열린다).
+        let orch_counted = orch_has_content(&orch_store);
         let orch_full_label = text::ORCH_MENU_BTN.format(&[
             ("runs", &orch_store.runs.len().to_string()),
             ("tasks", &orch_store.tasks.len().to_string()),
@@ -1618,7 +1606,7 @@ impl Shell {
         let orch_menu = ui::button_with_tooltip_when(tooltips_on,
             Button::new("status-orchestration-menu")
                 .icon(gpui_component::Icon::default().data(ui::icons::WORKFLOW_SVG))
-                .label(orch_compact_label)
+                .when(orch_counted, |b| b.label(orch_compact_label))
                 .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
@@ -1854,6 +1842,7 @@ impl Shell {
             .on_open_change(track_menu_open(cx.weak_entity()));
         let detected_ports = self.detected_ports();
         let ports_weak = cx.weak_entity();
+        let ports_shown = !detected_ports.is_empty();
         let ports_count_label = detected_ports.len().to_string();
         let ports_full_label = text::PORTS_MENU_BTN.format(&[("count", &ports_count_label)]);
         let ports_tooltip = format!("{} — {ports_full_label}", text::PORTS_MENU_TITLE.get());
@@ -2026,11 +2015,13 @@ impl Shell {
                                 ))
                             }),
                     )
-                    .child(daemon_status_dot(daemon_tooltip, color))
-                    .child(usage_status(p, &states, needs_you, cx))
+                    .when(self.link != Link::Up, |d| {
+                        d.child(daemon_status_dot(daemon_tooltip, color))
+                    })
+                    .child(usage_status(p, states.len(), needs_you))
                     .child(orch_menu)
-                    .child(ports_menu)
-                    .child(ssh_menu)
+                    .when(ports_shown, |d| d.child(ports_menu))
+                    .when(ssh_shown, |d| d.child(ssh_menu))
                     .when(session.is_some(), |d| {
                         let float_tip =
                             format!("{} — {}", text::FLOAT_BUTTON.get(), text::FLOAT_LABEL.get());

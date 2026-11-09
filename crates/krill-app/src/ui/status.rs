@@ -18,7 +18,7 @@ use gpui_kit_assets::IconName;
 use krill_proto::control::AgentState;
 
 use super::{
-    FONT_MONO, RADIUS_XS, STATE_DOT, TEXT_2XS, TEXT_XS, agent_state_color, icons, palette,
+    FONT_MONO, STATE_DOT, TEXT_2XS, agent_state_color, icons, palette,
     theme::{AGENT_UNREAD, STATUS_GROUP_GAP, STATUS_GROUP_ICON},
 };
 
@@ -31,12 +31,6 @@ const BELL_FILLED_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="currentColor" 
 
 /// 1초에 한 바퀴, 12스텝. 모든 스피너가 앱 공용 시계(`repeat_synced`)를 따라 같은 위상으로 돈다.
 const SPIN_STEPS: f32 = 12.;
-
-/// 떼 미터 점 최대 수와 점 지름·간격·`+N` 칸 너비(px). 폭은 늘 이 값으로 예약한다(STYLEGUIDE §7.3).
-pub const SWARM_MAX: usize = 12;
-const SWARM_DOT: f32 = 3.;
-const SWARM_GAP: f32 = 2.;
-const SWARM_MORE_WIDTH: f32 = 22.;
 
 /// 워크트리 행에 보이는 상태 묶음 수와 묶음마다 나란히 그리는 에이전트 아이콘 수.
 pub const MAX_GROUPS: usize = 3;
@@ -424,8 +418,6 @@ pub fn summary_element(summary: &Summary<'_>, slots: Option<&SpinnerSlots>, cx: 
                 .gap_1()
                 .px_1p5()
                 .py_0p5()
-                .rounded(RADIUS_XS)
-                .bg(p.worktree_sidebar_accent.opacity(0.65))
                 .child(glyph_frame(g.state, false, Size::Sm, slots, cx))
                 .child(div().flex().items_center().gap(STATUS_GROUP_GAP).children(
                     g.icons.iter().enumerate().map(|(i, a)| {
@@ -444,64 +436,6 @@ pub fn summary_element(summary: &Summary<'_>, slots: Option<&SpinnerSlots>, cx: 
                 .when(g.more > 0, |d| d.child(more(g.more)))
         }))
         .when(summary.hidden > 0, |d| d.child(more(summary.hidden)))
-}
-
-/// 떼 미터에 그릴 점(상태 우선순위 순, 최대 `max`개, `max`는 [`SWARM_MAX`]로 자른다)과 넘친 세션 수(`+N`).
-/// 순서는 [`summarize`]와 같다: 확인 필요(`Waiting`)·차단 → 작업 중 → 완료 → 유휴(`Exited`·`Unknown`).
-#[must_use]
-pub fn swarm_dots(states: &[AgentState], max: usize) -> (Vec<AgentState>, usize) {
-    let max = max.min(SWARM_MAX);
-    let mut dots: Vec<AgentState> = ORDER
-        .iter()
-        .flat_map(|o| states.iter().copied().filter(move |s| s == o))
-        .collect();
-    let more = dots.len().saturating_sub(max);
-    dots.truncate(max);
-    (dots, more)
-}
-
-/// 떼(swarm) 미터: 세션마다 3px 상태색 점, 넘치면 `+N`(`TEXT_XS` muted). 세션 수가 바뀌어도 폭이 흔들리지 않게
-/// 점 `max`개 칸과 `+N` 칸을 늘 예약한다. 접근성 라벨·툴팁은 호출자가 바깥 `div().id(..)`에 붙인다.
-pub fn swarm_meter(states: &[AgentState], max: usize, cx: &App) -> gpui::Div {
-    let p = palette(cx);
-    let (dots, more) = swarm_dots(states, max);
-    // `SWARM_MAX`(12) 이하라 u8에 늘 들어간다.
-    let slots = f32::from(u8::try_from(max.min(SWARM_MAX)).unwrap_or(u8::MAX));
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(SWARM_GAP))
-        .child(
-            div()
-                .flex_none()
-                .w(px((slots * (SWARM_DOT + SWARM_GAP) - SWARM_GAP).max(0.)))
-                .flex()
-                .items_center()
-                .gap(px(SWARM_GAP))
-                .children(dots.into_iter().map(|state| {
-                    let color = agent_state_color(state, cx);
-                    let color = if glyph(state) == Glyph::Dot {
-                        color.opacity(0.5)
-                    } else {
-                        color
-                    };
-                    div()
-                        .flex_none()
-                        .size(px(SWARM_DOT))
-                        .rounded_full()
-                        .bg(color)
-                })),
-        )
-        .child(
-            div()
-                .flex_none()
-                .w(px(SWARM_MORE_WIDTH))
-                .font_family(FONT_MONO)
-                .text_size(TEXT_XS)
-                .text_color(p.muted_foreground)
-                .when(more > 0, |d| d.child(format!("+{more}"))),
-        )
 }
 
 /// 워크트리 행 왼쪽의 미확인 점(6px 호박색).
@@ -676,25 +610,6 @@ mod tests {
         assert!(full.contains("<circle"));
     }
 
-    #[test]
-    fn swarm_dots_sort_by_attention_and_fold_overflow() {
-        use AgentState::{Blocked, Done, Exited, Unknown, Waiting, Working};
-        let (dots, more) = swarm_dots(&[Done, Unknown, Working, Exited, Blocked, Waiting], 12);
-        assert_eq!(dots, [Waiting, Blocked, Working, Done, Exited, Unknown]);
-        assert_eq!(more, 0);
-        // 15개 → 12점 + 3. 확인 필요가 먼저 남는다.
-        let mut many = vec![Done; 14];
-        many.push(Waiting);
-        let (dots, more) = swarm_dots(&many, 12);
-        assert_eq!(dots.len(), 12);
-        assert_eq!(dots[0], Waiting);
-        assert_eq!(more, 3);
-        // max는 SWARM_MAX로 자른다.
-        let (dots, more) = swarm_dots(&many, 99);
-        assert_eq!((dots.len(), more), (SWARM_MAX, 3));
-        assert_eq!(swarm_dots(&[], 12), (Vec::new(), 0));
-    }
-
     #[gpui::test]
     fn summary_provider_icons_have_space_between_them(cx: &mut gpui::TestAppContext) {
         struct SummaryView;
@@ -727,42 +642,6 @@ mod tests {
             assert_eq!(previous.size.width, STATUS_GROUP_ICON);
             assert_eq!(current.origin.x - previous.right(), STATUS_GROUP_GAP);
         }
-    }
-
-    #[gpui::test]
-    fn swarm_meter_reserves_width_regardless_of_count(cx: &mut gpui::TestAppContext) {
-        use gpui::{InteractiveElement as _, IntoElement as _};
-        struct Meters;
-        impl gpui::Render for Meters {
-            fn render(
-                &mut self,
-                _: &mut gpui::Window,
-                cx: &mut gpui::Context<Self>,
-            ) -> impl gpui::IntoElement {
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .child(
-                        swarm_meter(&[], SWARM_MAX, cx)
-                            .id("swarm-empty")
-                            .debug_selector(|| "swarm-empty".to_owned()),
-                    )
-                    .child(
-                        swarm_meter(&[AgentState::Working; 20], SWARM_MAX, cx)
-                            .id("swarm-full")
-                            .debug_selector(|| "swarm-full".to_owned()),
-                    )
-                    .into_any_element()
-            }
-        }
-        let window = cx.add_window(|_, _| Meters);
-        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
-        vcx.run_until_parked();
-        let empty = vcx.debug_bounds("swarm-empty").map(|b| b.size.width);
-        let full = vcx.debug_bounds("swarm-full").map(|b| b.size.width);
-        assert!(empty.is_some());
-        assert_eq!(empty, full);
     }
 
     #[test]

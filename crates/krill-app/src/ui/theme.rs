@@ -547,11 +547,11 @@ pub const PAPER: Palette = Palette {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DarkUiTheme {
-    #[default]
     TokyoNight,
     Mocha,
     RosePine,
     Trench,
+    #[default]
     Graphite,
     Pine,
     Amethyst,
@@ -839,11 +839,11 @@ pub fn terminal_theme(cx: &App) -> TerminalTheme {
     terminal_theme_for_mode(mode, &crate::settings::current(cx))
 }
 
-/// 주어진 [`ThemeMode`]의 기본 팔레트(야광·[`PAPER`]). 설정 테마는 [`palette`]가 반영한다.
+/// 주어진 [`ThemeMode`]의 기본 팔레트(흑연·[`PAPER`]). 설정 테마는 [`palette`]가 반영한다.
 #[inline]
 pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
     if matches!(mode, ThemeMode::Dark) {
-        &TOKYO_NIGHT
+        &GRAPHITE
     } else {
         &PAPER
     }
@@ -851,7 +851,7 @@ pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
 
 /// [`apply`]가 설정 테마(`ui_theme_dark`·`ui_theme_light`)로 고른 [`Palette`]를 돌려준다. [`apply`] 전에는 활성
 /// [`ThemeMode`]의 기본 팔레트다.
-/// `gpui_component::init`를 부르지 않은 단위 테스트에서도 패닉 없이 야광 팔레트로 동작한다.
+/// `gpui_component::init`를 부르지 않은 단위 테스트에서도 패닉 없이 흑연 팔레트로 동작한다.
 #[inline]
 pub fn palette(cx: &App) -> &'static Palette {
     if let Some(active) = cx.try_global::<ActivePalette>() {
@@ -859,7 +859,7 @@ pub fn palette(cx: &App) -> &'static Palette {
     } else if cx.has_global::<Theme>() {
         palette_for(cx.theme().mode)
     } else {
-        &TOKYO_NIGHT
+        &GRAPHITE
     }
 }
 
@@ -1100,7 +1100,7 @@ mod tests {
         assert!(light.foreground.l < 0.15);
         assert!(dark.foreground.l > 0.90);
         assert_eq!(light, &PAPER);
-        assert_eq!(dark, &TOKYO_NIGHT);
+        assert_eq!(dark, &GRAPHITE);
     }
 
     #[gpui::test]
@@ -1109,8 +1109,8 @@ mod tests {
             gpui_component::init(cx);
             apply(ThemeMode::Dark, cx);
             assert_eq!(cx.theme().mode, ThemeMode::Dark);
-            assert_eq!(cx.theme().background, TOKYO_NIGHT.background);
-            assert_eq!(cx.theme().sidebar, TOKYO_NIGHT.sidebar);
+            assert_eq!(cx.theme().background, GRAPHITE.background);
+            assert_eq!(cx.theme().sidebar, GRAPHITE.sidebar);
             assert_eq!(cx.theme().radius, RADIUS_SM);
             assert_ne!(cx.theme().button, cx.theme().button_hover);
             assert_ne!(cx.theme().button_hover, cx.theme().button_active);
@@ -1285,7 +1285,7 @@ mod tests {
     /// 앱 테마마다 자기 팔레트를 쓰고, 짝 터미널 테마는 같은 밝기(다크·라이트)의 내장 테마다.
     #[test]
     fn ui_themes_map_to_palettes_and_paired_terminal_themes() {
-        assert_eq!(DarkUiTheme::default().palette(), &TOKYO_NIGHT);
+        assert_eq!(DarkUiTheme::default().palette(), &GRAPHITE);
         assert_eq!(LightUiTheme::default().palette(), &PAPER);
         for theme in DarkUiTheme::ALL {
             let p = theme.palette();
