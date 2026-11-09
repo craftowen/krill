@@ -281,6 +281,12 @@
         } catch {}
         return !0;
       };
+    const validRid = (value) =>
+        typeof value == "string" && /^[0-9a-f]{32}$/.test(value),
+      prefersRelay = (host, id = host?.rid) =>
+        host?.preferred_route === "tailscale" && host?.routes?.tailscale
+          ? !1
+          : validRid(id);
     if (
       (globalThis.addEventListener?.("storage", (event) => {
         if (pairingPending || (event.key !== null && event.key !== HOSTS))
@@ -304,7 +310,7 @@
           (rid = active?.rid),
           (directOrigin = active?.origin || location.origin),
           (destinationFixed = active?.fixed ?? fixed),
-          (useRelay = validRid(rid)));
+          (useRelay = prefersRelay(active, rid)));
         for (const fn of hostListeners) fn();
       }),
       saved && !active)
@@ -326,10 +332,8 @@
       (destinationFixed = active.fixed ?? fixed)),
       pair && ((directOrigin = location.origin), (destinationFixed = fixed)));
     let rid = pair ? fragment.get("r") : credentials?.rid;
-    const validRid = (value) =>
-        typeof value == "string" && /^[0-9a-f]{32}$/.test(value);
     let pairingDirect = pair ? secureDirect(fragment.get("d")) : null;
-    let useRelay = validRid(rid);
+    let useRelay = pair ? validRid(rid) : prefersRelay(saved, rid);
     const relayUrl = () =>
       `${new URL(credentials?.routes?.relay?.origin || credentials?.relay_origin || location.origin).origin.replace(/^http/, "ws")}/r/${rid}?v=${hash}`;
     return (
@@ -393,6 +397,11 @@
               if (!selected) throw Error("Desktop address is unavailable.");
               selectedRoute = selected.url;
               return selectedRoute;
+            },
+            socketUrls() {
+              const primary = this.socketUrl(),
+                choices = routeUrls(current() || source, hash).map((r) => r.url);
+              return [primary, ...choices.filter((u) => u !== primary)];
             },
             selectRoute(url) {
               const host = current();
@@ -513,7 +522,7 @@
             (rid = next?.rid),
             (directOrigin = next?.origin || location.origin),
             (destinationFixed = next?.fixed ?? fixed),
-            (useRelay = validRid(rid)),
+            (useRelay = prefersRelay(next, rid)),
             (updatePending = !1),
             !0
           );
@@ -544,7 +553,7 @@
             (rid = host.rid),
             (directOrigin = host.origin || location.origin),
             (destinationFixed = host.fixed ?? fixed),
-            (useRelay = validRid(rid)),
+            (useRelay = prefersRelay(host, rid)),
             persist());
           try {
             localStorage.setItem(STORE, JSON.stringify(host));
@@ -611,7 +620,7 @@
               (rid = next?.rid),
               (directOrigin = next?.origin || location.origin),
               (destinationFixed = next?.fixed ?? fixed),
-              (useRelay = validRid(rid))),
+              (useRelay = prefersRelay(next, rid))),
             next?.id || null
           );
         },
@@ -637,7 +646,7 @@
             (directOrigin = active?.origin || location.origin),
             (destinationFixed = active?.fixed ?? fixed),
             (rid = saved?.rid),
-            (useRelay = validRid(rid)),
+            (useRelay = prefersRelay(saved, rid)),
             fixed &&
               /^[0-9a-f]{16}$/.test(saved?.hash || "") &&
               saved.hash !== hash &&
@@ -658,6 +667,29 @@
           if (useRelay && validRid(rid)) return relayUrl();
           if (validRid(rid)) return relayUrl();
           throw Error("Scan a fresh QR code from desktop Settings → Mobile.");
+        },
+        socketUrls() {
+          const primary = this.socketUrl();
+          if (!pairingPending && credentials?.routes) {
+            const choices = routeUrls(credentials, hash).map((r) => r.url);
+            return [primary, ...choices.filter((u) => u !== primary)];
+          }
+          return [primary];
+        },
+        selectRoute(url) {
+          if (pairingPending || !credentials?.routes) return false;
+          const chosen = routeUrls(credentials, hash).find((r) => r.url === url);
+          if (!chosen) return false;
+          useRelay = chosen.kind === "relay";
+          if (active && stillSaved(active)) {
+            active.preferred_route = chosen.kind;
+            saved = credentials = active;
+            try {
+              persist();
+              localStorage.setItem(STORE, JSON.stringify(credentials));
+            } catch {}
+          }
+          return true;
         },
         adopt(href) {
           const NOT =
@@ -768,7 +800,11 @@
                 ...credentials,
                 rid,
                 hash,
-                preferred_route: useRelay ? "relay" : null,
+                preferred_route: useRelay
+                  ? "relay"
+                  : credentials?.routes?.tailscale
+                    ? "tailscale"
+                    : null,
               }),
             !credentials)
           )
@@ -803,7 +839,10 @@
             removed(active))
           )
             throw Error("Desktop is no longer saved.");
-          ((saved = credentials = active), (rid = active.rid), persist());
+          ((saved = credentials = active),
+            (rid = active.rid),
+            (useRelay = prefersRelay(active, rid)),
+            persist());
           try {
             localStorage.setItem(STORE, JSON.stringify(credentials));
           } catch {
@@ -919,7 +958,7 @@
             return (
               hosts.splice(0, hosts.length, ...nextHosts),
               (active = saved = credentials = next),
-              (useRelay = validRid(rid)),
+              (useRelay = prefersRelay(next, rid)),
               (storageFailed = !1),
               !0
             );
@@ -1681,54 +1720,65 @@
         let stage = 0,
           established = false,
           attempted,
-          quick = !1;
+          quick = !1,
+          cleanupRace = null,
+          allRoutesTried = !1;
         try {
           if (!pair && !credentials)
             throw Error(
               "Scan a fresh QR code from desktop Settings \u2192 Mobile.",
             );
           const ensureCurrent = () => {
-            if (stopped || current !== generation || failed)
-              throw (
-                failed ||
-                transportClosed("Disconnected. Pending actions were not resent.")
-              );
-          };
-          await connectDeadline(current, async (advanceStage) => {
-              attempted = socketUrl();
-              const target = new URL(attempted);
-              timing.route = target.pathname.startsWith("/r/") ? "relay" : "direct";
-              const octets = target.hostname.split(".").map(Number);
-              if ((octets.length === 4 && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) || target.hostname.endsWith(".ts.net")) timing.route = "tailscale";
-              trace?.mark("socket_open", {route: timing.route});
-              const active = (socket = new WebSocket(attempted));
-              active.binaryType = "arraybuffer";
+              if (stopped || current !== generation || failed)
+                throw (
+                  failed ||
+                  transportClosed(
+                    "Disconnected. Pending actions were not resent.",
+                  )
+                );
+            },
+            noop = () => {},
+            classifyRoute = (url) => {
+              const target = new URL(url),
+                octets = target.hostname.split(".").map(Number);
+              return target.pathname.startsWith("/r/")
+                ? "relay"
+                : (octets.length === 4 &&
+                      octets[0] === 100 &&
+                      octets[1] >= 64 &&
+                      octets[1] <= 127) ||
+                    target.hostname.endsWith(".ts.net")
+                  ? "tailscale"
+                  : "direct";
+            };
+          try {
+            await connectDeadline(current, async (advanceStage) => {
               // Bound stalled opening handshakes so discovery/fallback can run.
               // Deadline includes authentication and the first snapshot.
               // 인증 뒤 프레임은 도착 순서대로 바로 연다. 피드 푸시는 응답 대기열을 거치지 않는다.
-              active.addEventListener("message", (e) => {
-                if (current !== generation) return;
-                heard = Date.now();
-                let data = e.data;
-                if (channel && typeof data !== "string") {
-                  try {
-                    data = channel.open(data);
-                  } catch (error) {
-                    disconnect(error);
-                    return;
+              const onMessage = (e) => {
+                  if (current !== generation) return;
+                  heard = Date.now();
+                  let data = e.data;
+                  if (channel && typeof data !== "string") {
+                    try {
+                      data = channel.open(data);
+                    } catch (error) {
+                      disconnect(error);
+                      return;
+                    }
+                    const p = pushed(data);
+                    if (p) {
+                      feedPush(current, p);
+                      return;
+                    }
                   }
-                  const p = pushed(data);
-                  if (p) {
-                    feedPush(current, p);
-                    return;
-                  }
-                }
-                const w = waiters.shift();
-                if (w) w.resolve(data);
-                else queue.push(data);
-              });
-              const end = (e) => {
-                if (current !== generation) return;
+                  const w = waiters.shift();
+                  if (w) w.resolve(data);
+                  else queue.push(data);
+                },
+                end = (e) => {
+                  if (current !== generation) return;
                   const diagnosticReason =
                     e?.code === 1008 || e?.code === 4009
                       ? "auth_rejected"
@@ -1759,74 +1809,340 @@
                           : "ipc",
                       },
                     );
-                const capacity = e?.code === 4009,
-                  cooldown = e?.code === 1013,
-                  denied = e?.code === 1008 || capacity;
-                if (denied && !pair && !capacity) {
-                  rejectedRoutes.add(attempted);
-                  routeAlternative = !!options.endpoint?.fallback?.(attempted) && !rejectedRoutes.has(socketUrl());
-                }
-                if (denied && !routeAlternative) {
-                  authBlocked = true;
-                  clearTimeout(retryTimer);
-                }
-                if (cooldown) retryNotBefore = Date.now() + 65000;
-                const error = Error(
-                  capacity
-                    ? "Desktop device limit reached. Revoke an unused device in desktop Settings → Mobile, then scan a new QR code."
-                    : cooldown
-                      ? "Connection temporarily limited. Wait before reconnecting."
-                      : denied
-                        ? pair
-                          ? "This QR code expired or was already used. Tap New QR code on desktop and scan again."
-                          : "Desktop rejected authentication. Access may have been revoked; scan a fresh QR code."
-                        : "Disconnected. Pending actions were not resent. If desktop access was revoked, scan a fresh QR code.",
-                );
-                error.diagnosticReason = diagnosticReason;
-                error.diagnosticReported = true;
-                error.transport = !denied;
-                if (denied && failed) {
-                  failed = error;
-                  status("disconnected", error.message);
-                  return;
-                }
-                disconnect(error);
-              };
-              active.addEventListener("close", end);
-              active.addEventListener("error", end);
-              await new Promise((resolve, reject) => {
-                active.addEventListener(
-                  "open",
-                  () => {
-                    stage = 1;
-                    resolve();
-                  },
-                  { once: true },
-                );
-                active.addEventListener(
-                  "error",
-                  () => reject(Error("Could not connect to desktop")),
-                  { once: true },
-                );
-                active.addEventListener(
-                  "close",
-                  () => reject(failed || Error("Disconnected")),
-                  { once: true },
-                );
-              });
-              ensureCurrent();
-              advanceStage();
-              mark("socketOpenMs");
-              trace?.mark("challenge");
-              const challengeBytes = await next();
-              ensureCurrent();
-              const challenge = JSON.parse(challengeBytes),
-                nonce = crypto.getRandomValues(new Uint8Array(32));
-              stage = 2;
-              advanceStage();
-              mark("challengeMs");
-              if (challenge.version !== 2)
-                throw Error("Unsupported desktop protocol");
+                  const capacity = e?.code === 4009,
+                    cooldown = e?.code === 1013,
+                    denied = e?.code === 1008 || capacity;
+                  if (denied && !pair && !capacity) {
+                    rejectedRoutes.add(attempted);
+                    routeAlternative =
+                      !!options.endpoint?.fallback?.(attempted) &&
+                      !rejectedRoutes.has(socketUrl());
+                  }
+                  if (denied && !routeAlternative) {
+                    authBlocked = true;
+                    clearTimeout(retryTimer);
+                  }
+                  if (cooldown) retryNotBefore = Date.now() + 65000;
+                  const error = Error(
+                    capacity
+                      ? "Desktop device limit reached. Revoke an unused device in desktop Settings → Mobile, then scan a new QR code."
+                      : cooldown
+                        ? "Connection temporarily limited. Wait before reconnecting."
+                        : denied
+                          ? pair
+                            ? "This QR code expired or was already used. Tap New QR code on desktop and scan again."
+                            : "Desktop rejected authentication. Access may have been revoked; scan a fresh QR code."
+                          : "Disconnected. Pending actions were not resent. If desktop access was revoked, scan a fresh QR code.",
+                  );
+                  error.diagnosticReason = diagnosticReason;
+                  error.diagnosticReported = true;
+                  error.transport = !denied;
+                  if (denied && failed) {
+                    failed = error;
+                    status("disconnected", error.message);
+                    return;
+                  }
+                  disconnect(error);
+                },
+                rawUrls = options.endpoint?.socketUrls?.() || [socketUrl()],
+                urls =
+                  pair || !credentials || rawUrls.length < 2
+                    ? [rawUrls[0]]
+                    : (() => {
+                        const filtered = rawUrls.filter(
+                          (u) =>
+                            !rejectedRoutes.has(u) &&
+                            !authInterruptedRoutes.has(u),
+                        );
+                        return filtered.length ? filtered : rawUrls;
+                      })();
+              let active, challenge;
+              if (urls.length === 1) {
+                attempted = urls[0];
+                timing.route = classifyRoute(attempted);
+                trace?.mark("socket_open", { route: timing.route });
+                active = socket = new WebSocket(attempted);
+                active.binaryType = "arraybuffer";
+                active.addEventListener("message", onMessage);
+                active.addEventListener("close", end);
+                active.addEventListener("error", end);
+                await new Promise((resolve, reject) => {
+                  active.addEventListener(
+                    "open",
+                    () => {
+                      stage = 1;
+                      resolve();
+                    },
+                    { once: true },
+                  );
+                  active.addEventListener(
+                    "error",
+                    () => reject(Error("Could not connect to desktop")),
+                    { once: true },
+                  );
+                  active.addEventListener(
+                    "close",
+                    () => reject(failed || Error("Disconnected")),
+                    { once: true },
+                  );
+                });
+                ensureCurrent();
+                advanceStage();
+                mark("socketOpenMs");
+                trace?.mark("challenge");
+                const challengeBytes = await next();
+                ensureCurrent();
+                challenge = JSON.parse(challengeBytes);
+                stage = 2;
+                advanceStage();
+                mark("challengeMs");
+                if (challenge.version !== 2)
+                  throw Error("Unsupported desktop protocol");
+              } else {
+                challenge = await new Promise((resolve, reject) => {
+                  const legs = [];
+                  let nextIndex = 0,
+                    staggerTimer = null,
+                    settled = false;
+                  const detachAll = (except = null) => {
+                    clearTimeout(staggerTimer);
+                    staggerTimer = null;
+                    controller.signal.removeEventListener("abort", onAbort);
+                    for (const leg of legs) {
+                      leg.detach();
+                      if (leg !== except && leg.socket && !leg.failed) {
+                        leg.socket.addEventListener("error", noop);
+                        try {
+                          leg.socket.close();
+                        } catch {}
+                      }
+                    }
+                  };
+                  cleanupRace = () => {
+                    if (settled) return;
+                    settled = true;
+                    cleanupRace = null;
+                    allRoutesTried = legs.length === urls.length;
+                    detachAll();
+                  };
+                  function onAbort() {
+                    if (settled) return;
+                    cleanupRace?.();
+                    reject(
+                      failed ||
+                        transportClosed(
+                          "Disconnected. Pending actions were not resent.",
+                        ),
+                    );
+                  }
+                  if (controller.signal.aborted) {
+                    onAbort();
+                    return;
+                  }
+                  controller.signal.addEventListener("abort", onAbort, {
+                    once: true,
+                  });
+                  const priority = (leg) => {
+                      const code = leg.closeEvent?.code;
+                      return code === 4009
+                        ? 5
+                        : code === 1013
+                          ? 4
+                          : code === 1008
+                            ? 3
+                            : code
+                              ? 2
+                              : leg.protocolError
+                                ? 0
+                                : 1;
+                    },
+                    finishAllFailed = () => {
+                      if (settled) return;
+                      settled = true;
+                      cleanupRace = null;
+                      allRoutesTried = legs.length === urls.length;
+                      detachAll();
+                      let chosen = legs[0];
+                      for (const leg of legs)
+                        if (priority(leg) > priority(chosen)) chosen = leg;
+                      attempted = chosen.url;
+                      timing.route = chosen.route;
+                      socket = chosen.socket;
+                      if (chosen.protocolError && priority(chosen) === 0) {
+                        reject(chosen.protocolError);
+                        return;
+                      }
+                      if (!chosen.closeEvent && chosen.socket)
+                        chosen.socket.addEventListener(
+                          "close",
+                          (e) => {
+                            attempted = chosen.url;
+                            timing.route = chosen.route;
+                            end(e);
+                          },
+                          { once: true },
+                        );
+                      end(chosen.closeEvent || {});
+                      reject(
+                        failed ||
+                          chosen.error ||
+                          Error("Could not connect to desktop"),
+                      );
+                    },
+                    failLeg = (leg, event, isClose, err) => {
+                      if (settled) return;
+                      if (isClose && event?.code) {
+                        leg.closeEvent = event;
+                        if (event.code === 1008 && !pair)
+                          rejectedRoutes.add(leg.url);
+                      }
+                      if (leg.failed) {
+                        if (
+                          nextIndex >= urls.length &&
+                          legs.length === urls.length &&
+                          legs.every((l) => l.failed)
+                        )
+                          finishAllFailed();
+                        return;
+                      }
+                      leg.failed = true;
+                      leg.error =
+                        err ||
+                        (isClose
+                          ? Error("Disconnected")
+                          : Error("Could not connect to desktop"));
+                      if (nextIndex < urls.length) {
+                        clearTimeout(staggerTimer);
+                        staggerTimer = null;
+                        startLeg(nextIndex);
+                        return;
+                      }
+                      if (
+                        legs.length === urls.length &&
+                        legs.every((l) => l.failed)
+                      )
+                        finishAllFailed();
+                    };
+                  function startLeg(index) {
+                    if (settled || index < nextIndex || index >= urls.length)
+                      return;
+                    nextIndex = index + 1;
+                    const url = urls[index],
+                      route = classifyRoute(url),
+                      leg = {
+                        url,
+                        route,
+                        socket: null,
+                        socketOpenMs: undefined,
+                        failed: false,
+                        closeEvent: null,
+                        protocolError: null,
+                        error: null,
+                        detach: noop,
+                      };
+                    legs.push(leg);
+                    if (
+                      index === 0 ||
+                      legs.slice(0, index).every((l) => l.failed)
+                    ) {
+                      attempted = url;
+                      timing.route = route;
+                      if (stage < 1) trace?.mark("socket_open", { route });
+                    }
+                    if (nextIndex < urls.length) {
+                      clearTimeout(staggerTimer);
+                      staggerTimer = setTimeout(() => {
+                        staggerTimer = null;
+                        startLeg(nextIndex);
+                      }, 250);
+                    }
+                    let ws;
+                    try {
+                      ws = new WebSocket(url);
+                    } catch (err) {
+                      failLeg(leg, null, false, err);
+                      return;
+                    }
+                    ws.binaryType = "arraybuffer";
+                    leg.socket = ws;
+                    if (
+                      index === 0 ||
+                      legs.slice(0, index).every((l) => l.failed)
+                    )
+                      socket = ws;
+                    const onOpen = () => {
+                        if (settled || leg.failed) return;
+                        leg.socketOpenMs = Math.max(
+                          0,
+                          clock() - timing.started,
+                        );
+                        if (stage < 1) {
+                          stage = 1;
+                          advanceStage();
+                          timing.socketOpenMs = leg.socketOpenMs;
+                          trace?.mark("challenge");
+                        }
+                      },
+                      onLegMessage = (e) => {
+                        if (settled || leg.failed) return;
+                        let parsed;
+                        try {
+                          const raw =
+                            typeof e.data === "string"
+                              ? e.data
+                              : decode.decode(e.data);
+                          parsed = JSON.parse(raw);
+                          if (parsed?.version !== 2)
+                            throw Error("Unsupported desktop protocol");
+                        } catch (err) {
+                          leg.protocolError = err;
+                          leg.detach();
+                          ws.addEventListener("error", noop);
+                          try {
+                            ws.close();
+                          } catch {}
+                          failLeg(leg, null, false, err);
+                          return;
+                        }
+                        settled = true;
+                        cleanupRace = null;
+                        leg.detach();
+                        options.endpoint?.selectRoute?.(leg.url);
+                        attempted = leg.url;
+                        active = socket = ws;
+                        timing.route = leg.route;
+                        timing.socketOpenMs =
+                          leg.socketOpenMs ??
+                          Math.max(0, clock() - timing.started);
+                        heard = Date.now();
+                        stage = 2;
+                        ws.addEventListener("message", onMessage);
+                        ws.addEventListener("close", end);
+                        ws.addEventListener("error", end);
+                        detachAll(leg);
+                        advanceStage();
+                        mark("challengeMs");
+                        resolve(parsed);
+                      },
+                      onLegError = (e) => failLeg(leg, e, false),
+                      onLegClose = (e) => failLeg(leg, e, true);
+                    leg.detach = () => {
+                      ws.removeEventListener?.("open", onOpen);
+                      ws.removeEventListener?.("message", onLegMessage);
+                      ws.removeEventListener?.("error", onLegError);
+                      ws.removeEventListener?.("close", onLegClose);
+                      leg.detach = noop;
+                    };
+                    ws.addEventListener("open", onOpen);
+                    ws.addEventListener("message", onLegMessage);
+                    ws.addEventListener("error", onLegError);
+                    ws.addEventListener("close", onLegClose);
+                  }
+                  startLeg(0);
+                });
+                ensureCurrent();
+              }
+              const nonce = crypto.getRandomValues(new Uint8Array(32));
               trace?.mark("authentication");
               const pairing = !!pair,
                 secret = pairing
@@ -1919,7 +2235,10 @@
               established = true;
               for (const fn of routeListeners) fn();
               poll();
-          });
+            });
+          } finally {
+            cleanupRace?.();
+          }
           if (!isCurrent()) return;
         } catch (e) {
           if (!isCurrent()) return;
@@ -1953,7 +2272,10 @@
               try {
                 (socketUrl() === attempted &&
                   options.endpoint?.fallback?.(attempted),
-                  (quick = retryDelay <= 1e3 && socketUrl() !== attempted));
+                  (quick =
+                    !allRoutesTried &&
+                    retryDelay <= 1e3 &&
+                    socketUrl() !== attempted));
               } catch {}
           } else if (transientConnect && stage === 2 && !authBlocked) {
             try {
