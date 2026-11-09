@@ -3336,7 +3336,7 @@ impl Registry {
                 bytes.hash(&mut revision);
             }
         }
-        revision.finish()
+        revision.finish() ^ sidebar::revision(&self.sidebar).wrapping_mul(0xBF58_476D_1CE4_E5B9)
     }
 
     fn notify_orch(&self) {

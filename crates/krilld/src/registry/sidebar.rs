@@ -19,7 +19,8 @@ pub(super) struct Cache {
     /// cwd별 백그라운드 조회. 요청 스레드는 파일·git IO를 직접 하지 않고 시한까지만 기다린다.
     lookups: BTreeMap<PathBuf, Arc<Discovery>>,
     /// 조회가 시한을 넘길 때 돌려줄 cwd별 마지막 결과.
-    last: BTreeMap<PathBuf, RepositoryTrees>,
+    last: BTreeMap<PathBuf, Option<RepositoryTrees>>,
+    revision: u64,
 }
 
 impl Cache {
@@ -28,6 +29,9 @@ impl Cache {
     }
 
     pub(super) fn invalidate(&mut self) {
+        if !self.trees.is_empty() || !self.repositories.is_empty() || !self.last.is_empty() {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.trees.clear();
         self.repositories.clear();
         self.inflight.clear();
@@ -39,6 +43,15 @@ impl Cache {
 /// 한 사이드바 요청이 저장소 조회를 기다리는 최대 시간. 앱 읽기 시한(5초)보다 충분히 짧아야 한다.
 /// 파일 열기가 멈춰도(예: macOS 개인정보 보호 확인 지연) 응답은 이 안에 나간다.
 const LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired by Registry::mobile_repositories in Unit 3")
+)]
+const MOBILE_LOOKUP_BUDGET: Duration = Duration::from_millis(150);
+
+pub(super) fn revision(cache: &Arc<Mutex<Cache>>) -> u64 {
+    lock(cache).revision
+}
 
 #[derive(Default)]
 enum DiscoveryResult {
@@ -58,7 +71,40 @@ pub(super) fn snapshot(
     cache: &Arc<Mutex<Cache>>,
     entries: &[(SessionId, Option<PathBuf>)],
 ) -> Result<SidebarData, Failure> {
-    let deadline = Instant::now() + LOOKUP_BUDGET;
+    let (sessions, repositories) = collect_repositories(cache, entries, LOOKUP_BUDGET)?;
+    let mut data = SidebarData {
+        sessions,
+        repositories,
+        branches: Vec::new(),
+        prompt_histories: Vec::new(),
+        closed_sessions: krill_proto::control::ClosedSessionRanges::default(),
+    };
+    populate_branches(&mut data);
+    Ok(data)
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired by Registry::mobile_repositories in Unit 3")
+)]
+pub(super) fn mobile_repositories(
+    cache: &Arc<Mutex<Cache>>,
+    entries: &[(SessionId, Option<PathBuf>)],
+    state_dir: Option<&Path>,
+) -> Result<(Vec<SessionDirectory>, Vec<RepositoryTrees>), Failure> {
+    let (sessions, mut repositories) = collect_repositories(cache, entries, MOBILE_LOOKUP_BUDGET)?;
+    if let Some(dir) = state_dir {
+        include_project_roots(&mut repositories, dir);
+    }
+    Ok((sessions, repositories))
+}
+
+fn collect_repositories(
+    cache: &Arc<Mutex<Cache>>,
+    entries: &[(SessionId, Option<PathBuf>)],
+    budget: Duration,
+) -> Result<(Vec<SessionDirectory>, Vec<RepositoryTrees>), Failure> {
+    let deadline = Instant::now() + budget;
     let mut sessions = Vec::new();
     let mut repositories: BTreeMap<Vec<u8>, RepositoryTrees> = BTreeMap::new();
     let mut bytes = 0usize;
@@ -116,15 +162,7 @@ pub(super) fn snapshot(
     } = &mut *cache;
     last.retain(|path, _| directories.values().any(|p| p == path));
     drop(cache);
-    let mut data = SidebarData {
-        sessions,
-        repositories: repositories.into_values().collect(),
-        branches: Vec::new(),
-        prompt_histories: Vec::new(),
-        closed_sessions: krill_proto::control::ClosedSessionRanges::default(),
-    };
-    populate_branches(&mut data);
-    Ok(data)
+    Ok((sessions, repositories.into_values().collect()))
 }
 
 /// 3초 안의 캐시가 있으면 IO 없이 돌려준다. 바깥 `None`은 캐시 없음, 안쪽 `None`은 저장소가 아님이다.
@@ -170,23 +208,23 @@ fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<R
                     {
                         let mut state = lock(&shared);
                         state.lookups.remove(&owned);
-                        match &result {
-                            Some(trees) => state.last.insert(owned, trees.clone()),
-                            None => state.last.remove(&owned),
-                        };
+                        if state.last.get(&owned) != Some(&result) {
+                            state.revision = state.revision.wrapping_add(1);
+                        }
+                        state.last.insert(owned, result.clone());
                     }
                     *lock(&done.result) = DiscoveryResult::Ready(result);
                     done.ready.notify_all();
                     crate::alloc::purge();
                 });
             if spawned.is_err() {
-                return state.last.get(path).cloned();
+                return state.last.get(path).cloned().flatten();
             }
             state.lookups.insert(path.to_owned(), Arc::clone(&flight));
             flight
         };
         if let Some(cached) = state.last.get(path).cloned() {
-            return Some(cached);
+            return cached;
         }
         flight
     };
@@ -194,7 +232,7 @@ fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<R
     while matches!(*result, DiscoveryResult::Pending) {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
             drop(result);
-            return lock(cache).last.get(path).cloned();
+            return lock(cache).last.get(path).cloned().flatten();
         };
         result = flight
             .ready
@@ -305,6 +343,11 @@ fn repository_key(cwd: &Path) -> PathBuf {
 /// 앱에 등록된 프로젝트(`<state>/projects.toml`)를 루트 경로만 덧붙인다. 원격 앱이 세션 없는
 /// 프로젝트까지 볼 수 있게 하려는 것이다(로컬 앱은 같은 파일을 이미 합치므로 결과가 같다). git 호출 없음.
 pub(super) fn include_projects(data: &mut SidebarData, state_dir: &Path) {
+    include_project_roots(&mut data.repositories, state_dir);
+    populate_branches(data);
+}
+
+fn include_project_roots(repositories: &mut Vec<RepositoryTrees>, state_dir: &Path) {
     #[derive(Default, serde::Deserialize)]
     #[serde(default)]
     struct File {
@@ -331,25 +374,20 @@ pub(super) fn include_projects(data: &mut SidebarData, state_dir: &Path) {
         }
         let path = path.to_vec();
         // 예전 앱이 연결 워크트리를 프로젝트로 등록했으면 이미 본 저장소 아래에 있다 — 따로 세우지 않는다.
-        if data
-            .repositories
-            .iter()
-            .any(|r| r.worktrees.contains(&path))
-        {
+        if repositories.iter().any(|r| r.worktrees.contains(&path)) {
             continue;
         }
-        if let Some(repo) = data.repositories.iter_mut().find(|r| r.repo == path) {
+        if let Some(repo) = repositories.iter_mut().find(|r| r.repo == path) {
             if !repo.worktrees.contains(&path) && repo.worktrees.len() < 512 {
                 repo.worktrees.push(path);
             }
-        } else if data.repositories.len() < krill_proto::holder::MAX_SESSIONS {
-            data.repositories.push(RepositoryTrees {
+        } else if repositories.len() < krill_proto::holder::MAX_SESSIONS {
+            repositories.push(RepositoryTrees {
                 repo: path.clone(),
                 worktrees: vec![path],
             });
         }
     }
-    populate_branches(data);
 }
 
 fn small_file(path: &Path) -> Option<String> {
@@ -461,10 +499,10 @@ mod tests {
                     .insert(path.clone(), Arc::new(Discovery::default()));
                 state.last.insert(
                     path.clone(),
-                    RepositoryTrees {
+                    Some(RepositoryTrees {
                         repo: repo.clone(),
                         worktrees: vec![repo.clone(); count],
-                    },
+                    }),
                 );
             }
         }
@@ -563,6 +601,81 @@ mod tests {
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
     }
+
+    #[test]
+    fn mobile_repositories_merges_projects_and_tracks_cache_revision() {
+        let dir = std::env::temp_dir().join(format!("krilld-mobile-repos-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let plain_cwd = dir.join("plain-cwd");
+        std::fs::create_dir_all(&plain_cwd).unwrap();
+        let git_repo = dir.join("git-repo");
+        std::fs::create_dir_all(git_repo.join(".git")).unwrap();
+        std::fs::write(git_repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            dir.join("projects.toml"),
+            format!(
+                "[[projects]]\npath = \"/repo\"\n\n[[projects]]\npath = \"/folder\"\n\n\
+                 [[projects]]\npath = \"/repo-wt\"\n\n\
+                 [[projects]]\npath = \"{}\"\n\n\
+                 [[projects]]\npath = \"/old\"\narchived = true\n\n\
+                 [[projects]]\npath = \"/remote\"\nhost_id = \"ssh-x\"\n",
+                git_repo.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        assert_eq!(revision(&cache), 0);
+        lock(&cache).invalidate();
+        assert_eq!(revision(&cache), 0);
+
+        let repo_cwd = PathBuf::from("/repo");
+        {
+            let mut state = lock(&cache);
+            state
+                .lookups
+                .insert(repo_cwd.clone(), Arc::new(Discovery::default()));
+            state.last.insert(
+                repo_cwd.clone(),
+                Some(RepositoryTrees {
+                    repo: b"/repo".to_vec(),
+                    worktrees: vec![b"/repo".to_vec(), b"/repo-wt".to_vec()],
+                }),
+            );
+        }
+
+        let (sessions, repositories) = mobile_repositories(
+            &cache,
+            &[
+                (SessionId(1), Some(plain_cwd.clone())),
+                (SessionId(2), Some(repo_cwd)),
+            ],
+            Some(&dir),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock(&cache).lookups.contains_key(&plain_cwd) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let discovered_rev = revision(&cache);
+        assert_eq!(discovered_rev, 1);
+        assert_eq!(sessions.len(), 2);
+
+        let git_repo_bytes = git_repo.as_os_str().as_bytes().to_vec();
+        let repos: Vec<_> = repositories.iter().map(|r| r.repo.as_slice()).collect();
+        assert_eq!(
+            repos,
+            [&b"/repo"[..], &b"/folder"[..], git_repo_bytes.as_slice()]
+        );
+        assert_eq!(repositories[0].worktrees.len(), 2);
+
+        lock(&cache).invalidate();
+        assert_eq!(revision(&cache), discovered_rev + 1);
+        lock(&cache).invalidate();
+        assert_eq!(revision(&cache), discovered_rev + 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]
@@ -580,13 +693,33 @@ mod concurrency_tests {
         {
             let mut state = lock(&cache);
             state.lookups.insert(path.clone(), Arc::clone(&stuck));
-            state.last.insert(path.clone(), last.clone());
+            state.last.insert(path.clone(), Some(last.clone()));
         }
         let started = Instant::now();
         let got = lookup(&cache, &path, started + LOOKUP_BUDGET);
         assert_eq!(got, Some(last));
         assert!(started.elapsed() < Duration::from_millis(500));
         // 같은 cwd의 다음 요청도 새 조회 스레드를 만들지 않고 기존 조회를 공유한다.
+        assert!(Arc::ptr_eq(
+            lock(&cache).lookups.get(&path).unwrap(),
+            &stuck
+        ));
+    }
+
+    #[test]
+    fn a_stuck_lookup_returns_cached_negative_result_without_waiting() {
+        let path = PathBuf::from("/krill-sidebar-stuck-negative-not-a-repository");
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let stuck = Arc::new(Discovery::default());
+        {
+            let mut state = lock(&cache);
+            state.lookups.insert(path.clone(), Arc::clone(&stuck));
+            state.last.insert(path.clone(), None);
+        }
+        let started = Instant::now();
+        let got = lookup(&cache, &path, started + LOOKUP_BUDGET);
+        assert_eq!(got, None);
+        assert!(started.elapsed() < Duration::from_millis(50));
         assert!(Arc::ptr_eq(
             lock(&cache).lookups.get(&path).unwrap(),
             &stuck

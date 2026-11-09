@@ -2608,6 +2608,7 @@ fn read_agy_first_user_prompt(agy_root: &Path, conv_id: &str) -> Option<String> 
 struct AgyLiveTitleEntry {
     agy_root: Option<PathBuf>,
     conv_id: Option<String>,
+    discovered_tp: Option<PathBuf>,
     title: Option<String>,
     pbtxt_mtime_ns: u128,
     checked_at: Instant,
@@ -2630,14 +2631,22 @@ pub(crate) fn resolve_live_agy_title(
     let cached_snapshot = {
         let cache = lock(cache_mutex);
         if let Some(entry) = cache.get(&session.0) {
-            if !needs_store_binding
-                && entry.checked_at.elapsed() < Duration::from_secs(2)
-                && entry.title.is_some()
-            {
-                return (entry.title.clone(), None);
-            }
-            if !needs_store_binding && entry.checked_at.elapsed() < Duration::from_secs(1) {
-                return (None, None);
+            let ttl = if entry.title.is_some() || entry.conv_id.is_some() {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_secs(1)
+            };
+            if entry.checked_at.elapsed() < ttl {
+                let discovered = if needs_store_binding {
+                    entry.conv_id.as_ref().and_then(|cid| {
+                        (stored.is_some_and(|s| s.session_id.is_none())
+                            || entry.discovered_tp.is_some())
+                        .then(|| (cid.clone(), entry.discovered_tp.clone()))
+                    })
+                } else {
+                    None
+                };
+                return (entry.title.clone(), discovered);
             }
             Some((
                 entry.agy_root.clone(),
@@ -2730,6 +2739,7 @@ pub(crate) fn resolve_live_agy_title(
             AgyLiveTitleEntry {
                 agy_root: None,
                 conv_id: None,
+                discovered_tp: None,
                 title: None,
                 pbtxt_mtime_ns: 0,
                 checked_at: Instant::now(),
@@ -2748,6 +2758,7 @@ pub(crate) fn resolve_live_agy_title(
     {
         let mut cache = lock(cache_mutex);
         if let Some(entry) = cache.get_mut(&session.0) {
+            entry.discovered_tp = discovered_for_store.as_ref().and_then(|(_, tp)| tp.clone());
             entry.checked_at = Instant::now();
         }
         return (Some(prev_title.clone()), discovered_for_store);
@@ -2778,6 +2789,7 @@ pub(crate) fn resolve_live_agy_title(
         AgyLiveTitleEntry {
             agy_root: Some(agy_root),
             conv_id: Some(conv_id),
+            discovered_tp: discovered_for_store.as_ref().and_then(|(_, tp)| tp.clone()),
             title: title.clone(),
             pbtxt_mtime_ns: recorded_mtime,
             checked_at: Instant::now(),
@@ -2958,6 +2970,116 @@ mod agy_title_tests {
                 .expect("decode States must succeed for multibyte agy title");
         assert_eq!(decoded, reply);
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn agy_live_title_cache_applies_cooldowns_when_unbound() {
+        let session = krill_proto::SessionId(u64::MAX - 42);
+        let cache_mutex = AGY_LIVE_TITLE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+        lock(cache_mutex).remove(&session.0);
+
+        let root = std::env::temp_dir().join(format!(
+            "krill-agy-live-title-cooldown-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let agy_root = root.join(".gemini/antigravity-cli");
+        let conv_id = "e7142b83-5c02-49d0-9b7a-112233445566";
+        let log_dir = agy_root
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let transcript = log_dir.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nDisk Title\\n</USER_REQUEST>\"}\n",
+        )
+        .unwrap();
+
+        let unbound = crate::agent::control::StoredLaunch {
+            profile: "agy".into(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: None,
+            transcript_path: None,
+            cwd: Vec::new(),
+            hibernation_blocked: false,
+            account: None,
+        };
+        let missing_transcript = crate::agent::control::StoredLaunch {
+            session_id: Some(conv_id.into()),
+            account: Some(crate::agent::control::LaunchAccount {
+                id: String::new(),
+                env_key: String::new(),
+                dir: root.to_string_lossy().into_owned(),
+            }),
+            ..unbound.clone()
+        };
+
+        assert_eq!(
+            resolve_live_agy_title(session, 0, None, false, Some(&unbound)),
+            (None, None)
+        );
+        assert_eq!(
+            resolve_live_agy_title(session, 0, None, false, Some(&missing_transcript)),
+            (None, None),
+            "1s negative cooldown holds even when transcript_path is unbound"
+        );
+
+        lock(cache_mutex)
+            .get_mut(&session.0)
+            .expect("negative entry recorded")
+            .checked_at = Instant::now()
+            .checked_sub(Duration::from_millis(1100))
+            .expect("backdate 1.1s");
+        assert_eq!(
+            resolve_live_agy_title(session, 0, None, false, Some(&missing_transcript)),
+            (
+                Some("Disk Title".into()),
+                Some((conv_id.into(), Some(transcript.clone())))
+            )
+        );
+
+        let seeded_tp = agy_root.join("sessions").join(format!("{conv_id}.jsonl"));
+        lock(cache_mutex).insert(
+            session.0,
+            AgyLiveTitleEntry {
+                agy_root: Some(agy_root.clone()),
+                conv_id: Some(conv_id.into()),
+                discovered_tp: Some(seeded_tp.clone()),
+                title: Some("Preseeded Live Title".into()),
+                pbtxt_mtime_ns: 0,
+                checked_at: Instant::now()
+                    .checked_sub(Duration::from_millis(1200))
+                    .expect("backdate 1.2s"),
+            },
+        );
+
+        assert_eq!(
+            resolve_live_agy_title(session, 0, None, false, Some(&unbound)),
+            (
+                Some("Preseeded Live Title".into()),
+                Some((conv_id.into(), Some(seeded_tp)))
+            ),
+            "2s positive cooldown serves cached title and discovered binding when unbound"
+        );
+
+        lock(cache_mutex)
+            .get_mut(&session.0)
+            .expect("positive entry retained")
+            .checked_at = Instant::now()
+            .checked_sub(Duration::from_millis(2100))
+            .expect("backdate 2.1s");
+        assert_eq!(
+            resolve_live_agy_title(session, 0, None, false, Some(&unbound)),
+            (
+                Some("Disk Title".into()),
+                Some((conv_id.into(), Some(transcript)))
+            )
+        );
+
+        lock(cache_mutex).remove(&session.0);
         fs::remove_dir_all(&root).ok();
     }
 }
