@@ -823,3 +823,350 @@ fn composer_meta_observation_extracts_codex_and_claude_records() {
         "the context window is unknown here; a 1M model must not read as full"
     );
 }
+
+#[gpui::test]
+fn chat_work_run_collapses_by_default_expands_steps_without_moving_composer_and_survives_remount(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = fixture(
+        cx,
+        "chat-work-run-disclosure",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "Running verification\nChecking warnings".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolCall,
+                tool_id: "call-bash".into(),
+                tool_name: "Bash".into(),
+                title: "Run cargo check".into(),
+                text: "cargo check -p krill-app --locked".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolResult,
+                tool_id: "call-bash".into(),
+                text: "Finished check".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "Inspecting crate root\nChecking exports".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolCall,
+                tool_id: "call-read".into(),
+                tool_name: "Read".into(),
+                file_path: "crates/krill-app/src/lib.rs".into(),
+                text: "crates/krill-app/src/lib.rs".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolResult,
+                tool_id: "call-read".into(),
+                text: "pub mod ui;\n".into(),
+                ..Default::default()
+            },
+        ],
+    );
+
+    let run_row = selector(&shell, cx, "chat-item", 0);
+    assert!(cx.debug_bounds(run_row).is_some());
+    assert!(
+        cx.debug_bounds(selector(&shell, cx, "chat-item", 1))
+            .is_none()
+    );
+    assert!(cx.debug_bounds("chat-work-run-toggle").is_some());
+    assert!(cx.debug_bounds("chat-disclosure").is_none());
+    assert!(cx.debug_bounds("chat-message-body").is_none());
+
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    let toggle = cx.debug_bounds("chat-work-run-toggle").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(cx.debug_bounds("desktop-chat-composer").unwrap(), composer);
+    assert!(cx.debug_bounds("chat-disclosure").is_some());
+    assert!(cx.debug_bounds("chat-message-body").is_none());
+
+    let step_toggle = cx.debug_bounds("chat-disclosure").unwrap();
+    cx.simulate_click(step_toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-message-body").is_some());
+    assert_eq!(cx.debug_bounds("desktop-chat-composer").unwrap(), composer);
+
+    let copy_btn = cx.debug_bounds("chat-copy-item").unwrap();
+    cx.simulate_click(copy_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("pub mod ui;\n")
+    );
+    assert!(
+        cx.debug_bounds("chat-message-body").is_some(),
+        "copy button inside step header must not collapse the step"
+    );
+
+    let term = cx.debug_bounds("chat-switch-terminal").unwrap();
+    cx.simulate_click(term.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
+
+    shell.update(cx, Shell::toggle_chat_view);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-disclosure").is_some());
+    assert!(cx.debug_bounds("chat-message-body").is_some());
+}
+
+#[gpui::test]
+fn chat_solo_reasoning_promotes_cleanly_and_requests_keep_raw_abs_idx_after_work_run(
+    cx: &mut TestAppContext,
+) {
+    struct Memory(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-solo-promote-and-requests",
+        vec![ChatItem {
+            kind: ChatItemKind::Reasoning,
+            text: "Planning safe rollout\nChecking preconditions".into(),
+            ..Default::default()
+        }],
+    );
+
+    assert!(cx.debug_bounds("chat-work-run-toggle").is_none());
+    assert!(cx.debug_bounds("chat-message-body").is_none());
+    let solo_disclosure = cx.debug_bounds("chat-disclosure").unwrap();
+    cx.simulate_click(solo_disclosure.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-message-body").is_some());
+
+    shell.update(cx, |shell, cx| {
+        shell.apply_chat_poll(
+            SESSION,
+            snapshot(vec![
+                ChatItem {
+                    kind: ChatItemKind::ToolCall,
+                    tool_id: "call-1".into(),
+                    tool_name: "Read".into(),
+                    file_path: "deploy.sh".into(),
+                    ..Default::default()
+                },
+                ChatItem {
+                    kind: ChatItemKind::ToolResult,
+                    tool_id: "call-1".into(),
+                    text: "#!/bin/sh\n".into(),
+                    ..Default::default()
+                },
+            ]),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("chat-work-run-toggle").is_some());
+    assert!(cx.debug_bounds("chat-message-body").is_none());
+    let run_toggle = cx.debug_bounds("chat-work-run-toggle").unwrap();
+    cx.simulate_click(run_toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-message-body").is_some(),
+        "step expanded while solo Reasoning must stay expanded when promoted into WorkRun"
+    );
+
+    let sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let captured = Arc::clone(&sent);
+    shell.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        shell.attach_test(pane, SESSION, ours, cx);
+        shell.live.get_mut(&pane).unwrap().sock = Some(theirs);
+        shell.live.get_mut(&pane).unwrap().target = Some(krill_app::hosts::HostTarget::local(
+            krill_proto::daemon::Paths {
+                socket: "/fake/socket".into(),
+                holder: "/fake/holder".into(),
+                krilld: "/fake/krilld".into(),
+            },
+        ));
+        shell.paths = None;
+        shell.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(Memory(krill_app::sidebar::Snapshot {
+                    sessions: vec![krill_app::sidebar::Session {
+                        id: SESSION,
+                        status: krill_proto::control::AgentStatus {
+                            state: krill_proto::control::AgentState::Waiting,
+                            agent: "claude".into(),
+                            ..krill_proto::control::AgentStatus::UNKNOWN
+                        },
+                        worktree: None,
+                        cwd: None,
+                        account: None,
+                    }],
+                    trees: BTreeMap::new(),
+                })),
+                cx,
+            );
+        });
+        shell.chat.send_input = Some(Box::new(move |bytes| {
+            captured.lock().unwrap().push(bytes);
+            true
+        }));
+        shell.apply_chat_poll(
+            SESSION,
+            snapshot(vec![
+                ChatItem {
+                    kind: ChatItemKind::Question,
+                    tool_id: "q-1".into(),
+                    title: "Target".into(),
+                    text: "Select environment".into(),
+                    options: vec![krill_proto::agent_history::ChatQuestionOption {
+                        label: "Staging".into(),
+                        description: String::new(),
+                    }],
+                    ..Default::default()
+                },
+                ChatItem {
+                    kind: ChatItemKind::Permission,
+                    tool_id: "perm-1".into(),
+                    text: "deploy production".into(),
+                    ..Default::default()
+                },
+            ]),
+        );
+        let ops = vec![
+            krill_proto::screen::Op::Reset {
+                cols: 100,
+                lines: 6,
+            },
+            krill_proto::screen::Op::Line {
+                line: 0,
+                cells: "Allow deploy production? (y/n)"
+                    .chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+        ];
+        for frame in krill_proto::screen::encode_update(
+            krill_proto::screen::Revision(1),
+            krill_proto::screen::Seq(0),
+            ops,
+        )
+        .unwrap()
+        {
+            let (kind, body) = krill_proto::ipc::read_frame(&mut frame.as_slice())
+                .unwrap()
+                .unwrap();
+            shell.on_frame(pane, kind, &body, cx);
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds(selector(&shell, cx, "chat-item", 3))
+            .is_some()
+    );
+    assert!(
+        cx.debug_bounds(selector(&shell, cx, "chat-item", 4))
+            .is_some()
+    );
+
+    let approve = cx
+        .debug_bounds("chat-permission-approve")
+        .expect("permission approve button must render outside WorkRun");
+    cx.simulate_click(approve.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(*sent.lock().unwrap(), vec![b"y\r".to_vec()]);
+}
+
+#[gpui::test]
+fn chat_narrow_320px_work_run_stays_inside_pane_collapsed_and_expanded(cx: &mut TestAppContext) {
+    let (shell, cx) = fixture(
+        cx,
+        "chat-work-run-narrow-320",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::ToolCall,
+                tool_id: "c1".into(),
+                tool_name: "Edit".into(),
+                title: "Update deeply nested layout component with long description".into(),
+                file_path: "/very/long/workspace/path/crates/krill-app/src/shell/chat/view.rs"
+                    .into(),
+                text: "diff --git a/view.rs b/view.rs".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolResult,
+                tool_id: "c1".into(),
+                is_error: true,
+                text: format!(
+                    "error summary\n```rust\nlet wide = \"{}\";\n```",
+                    "very_long_identifier_segment_".repeat(16)
+                ),
+                ..Default::default()
+            },
+        ],
+    );
+    cx.simulate_resize(size(px(320.), px(680.)));
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let run_card = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    let run_toggle = cx.debug_bounds("chat-work-run-toggle").unwrap();
+    assert!(run_card.left() >= overlay.left() && run_card.right() <= overlay.right());
+    assert!(run_toggle.left() >= overlay.left() && run_toggle.right() <= overlay.right());
+    assert!(
+        run_toggle.size.height < px(56.),
+        "collapsed 320px header must truncate on one line instead of vertical-wrapping: {run_toggle:?}"
+    );
+
+    cx.simulate_click(run_toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let step_disclosure = cx.debug_bounds("chat-disclosure").unwrap();
+    let open_file = cx.debug_bounds("chat-open-file").unwrap();
+    let copy_item = cx.debug_bounds("chat-copy-item").unwrap();
+    for (name, bounds) in [
+        ("step_disclosure", step_disclosure),
+        ("open_file", open_file),
+        ("copy_item", copy_item),
+    ] {
+        assert!(
+            bounds.left() >= overlay.left() && bounds.right() <= overlay.right(),
+            "{name} overflowed 320px pane: {bounds:?} outside {overlay:?}"
+        );
+    }
+
+    cx.simulate_click(step_disclosure.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let expanded_card = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    let code = cx.debug_bounds("chat-code-content").unwrap();
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    for (name, bounds) in [
+        ("expanded_card", expanded_card),
+        ("code", code),
+        ("composer", composer),
+    ] {
+        assert!(
+            bounds.left() >= overlay.left() && bounds.right() <= overlay.right(),
+            "{name} overflowed 320px pane when expanded: {bounds:?} outside {overlay:?}"
+        );
+    }
+}

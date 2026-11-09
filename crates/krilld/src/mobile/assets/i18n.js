@@ -577,6 +577,7 @@
     "Searched {0} time(s)": "{0}번 검색",
     "Ran {0} command(s)": "명령 {0}번 실행",
     "Did {0} other step(s)": "기타 작업 {0}건",
+    "Thought {0} time(s)": "생각 {0}회",
     Agent: "에이전트",
     "Tool call": "도구 호출",
     Permission: "권한 요청",
