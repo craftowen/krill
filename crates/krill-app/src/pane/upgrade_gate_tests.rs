@@ -19,34 +19,40 @@ fn session_requests_wait_for_a_running_daemon_upgrade() {
     };
     let listener = UnixListener::bind(&paths.socket).unwrap();
     let upgraded = Arc::new(AtomicBool::new(false));
-    let seen = Arc::clone(&upgraded);
-    let server = thread::spawn(move || {
-        let hello = ipc::ServerHello {
-            proto_min: 1,
-            proto_max: 1,
-            features: FEAT_CONTROL | FEAT_RESUME,
-            build: "test".into(),
-            instance_id: 2,
-        };
-        loop {
-            let (mut s, _) = listener.accept().unwrap();
+    let early = Arc::new(AtomicBool::new(false));
+    let (seen, connected_early) = (Arc::clone(&upgraded), Arc::clone(&early));
+    // One thread per connection, like krilld. The client's probe connection closes before the
+    // real one, and Windows can deliver that EOF late. A serial server would never accept the next one.
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { return };
             // 교체가 끝나기 전에 붙으면 구 krilld가 받았을 연결이다.
-            assert!(seen.load(Ordering::SeqCst), "connected during the upgrade");
-            s.write_all(&hello.encode().unwrap()).unwrap();
-            ipc::read_frame(&mut s).unwrap().unwrap();
-            let Ok(Some((k, b))) = ipc::read_frame(&mut s) else {
-                continue;
-            };
-            assert!(matches!(
-                Request::decode(k, &b).unwrap(),
-                Request::Resume { .. }
-            ));
-            let reply = Reply::Resumed {
-                session: SessionId(8),
-                pid: 1,
-            };
-            s.write_all(&reply.encode().unwrap()).unwrap();
-            return;
+            if !seen.load(Ordering::SeqCst) {
+                connected_early.store(true, Ordering::SeqCst);
+            }
+            thread::spawn(move || {
+                let hello = ipc::ServerHello {
+                    proto_min: 1,
+                    proto_max: 1,
+                    features: FEAT_CONTROL | FEAT_RESUME,
+                    build: "test".into(),
+                    instance_id: 2,
+                };
+                s.write_all(&hello.encode().unwrap()).unwrap();
+                ipc::read_frame(&mut s).unwrap().unwrap();
+                let Ok(Some((k, b))) = ipc::read_frame(&mut s) else {
+                    return;
+                };
+                assert!(matches!(
+                    Request::decode(k, &b).unwrap(),
+                    Request::Resume { .. }
+                ));
+                let reply = Reply::Resumed {
+                    session: SessionId(8),
+                    pid: 1,
+                };
+                s.write_all(&reply.encode().unwrap()).unwrap();
+            });
         }
     });
     let (started_tx, started) = mpsc::channel();
@@ -70,6 +76,9 @@ fn session_requests_wait_for_a_running_daemon_upgrade() {
         SessionId(8)
     );
     upgrade.join().unwrap();
-    server.join().unwrap();
+    assert!(
+        !early.load(Ordering::SeqCst),
+        "connected during the upgrade"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
