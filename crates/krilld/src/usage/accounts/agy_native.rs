@@ -46,13 +46,17 @@ pub(crate) fn sync_active(home: &Path, file: &AccountsFile) {
         &file.accounts,
         active_dir_for(file, ProviderKind::Antigravity),
     );
-    if use_real_keychain(home) {
+    if is_real_home(home) {
         sync_codex_account(
             home,
             &file.accounts,
             active_dir_for(file, ProviderKind::Codex),
         );
-        sync_claude_account(home, active_dir_for(file, ProviderKind::Claude), true);
+        sync_claude_account(
+            home,
+            active_dir_for(file, ProviderKind::Claude),
+            use_real_keychain(home),
+        );
         sync_opencode_account(home, active_dir_for(file, ProviderKind::OpenCode));
     }
 }
@@ -94,7 +98,11 @@ pub(crate) fn sync_provider_account_dir(
 /// 호스트 기본 경로(및 macOS 키체인)에서 갱신된 토큰을 동일 신원의 프로필 슬롯으로 되돌린다.
 pub(crate) fn reconcile_host_to_profiles(home: &Path, accounts: &[StoredAccount]) {
     sync_account(home, accounts, None);
-    if use_real_keychain(home) {
+    reconcile_codex_host(home, accounts);
+}
+
+pub(crate) fn reconcile_codex_host(home: &Path, accounts: &[StoredAccount]) {
+    if is_real_home(home) {
         sync_codex_account(home, accounts, None);
     }
 }
@@ -122,38 +130,71 @@ pub(crate) fn sync_codex_account(
     {
         return;
     }
-    let current_host = read_token_file(&host_auth_path);
+    let mut current_host = read_token_file(&host_auth_path);
 
     // 1. 호스트 `~/.codex/auth.json`에서 갱신된 토큰이 있으면 동일 신원의 프로필 슬롯에 보존한다.
-    if let Some(host_raw) = current_host.as_ref() {
-        let host_email = identity_from_credentials(ProviderKind::Codex, host_raw).map(|i| i.email);
-        let host_acc_id = codex_account_id(host_raw);
-        if host_email.is_some() || host_acc_id.is_some() {
-            for acc in accounts {
-                if ProviderKind::parse(&acc.provider) != Some(ProviderKind::Codex)
-                    || acc.profile_dir.is_empty()
-                {
-                    continue;
-                }
-                let prof_dir = Path::new(&acc.profile_dir);
-                if !prof_dir.is_dir() {
-                    continue;
-                }
-                let prof_auth_path = prof_dir.join("auth.json");
-                let prof_raw = read_token_file(&prof_auth_path);
-                let prof_email = prof_raw
-                    .as_deref()
-                    .and_then(|r| identity_from_credentials(ProviderKind::Codex, r))
-                    .map(|i| i.email)
-                    .or_else(|| acc.email.clone());
-                let prof_acc_id = prof_raw.as_deref().and_then(|r| codex_account_id(r));
-                let same_identity = match (&host_email, &prof_email) {
-                    (Some(he), Some(pe)) => he.eq_ignore_ascii_case(pe),
-                    _ => host_acc_id.is_some() && host_acc_id == prof_acc_id,
-                };
-                if same_identity && prof_raw.as_ref() != Some(host_raw) {
-                    write_atomic_0600(&prof_auth_path, host_raw).ok();
-                }
+    if current_host.is_some() {
+        for acc in accounts {
+            if ProviderKind::parse(&acc.provider) != Some(ProviderKind::Codex)
+                || acc.profile_dir.is_empty()
+            {
+                continue;
+            }
+            let prof_dir = Path::new(&acc.profile_dir);
+            if !prof_dir.is_dir() {
+                continue;
+            }
+            let prof_auth_path = prof_dir.join("auth.json");
+            let Some(prof_raw) = read_token_file(&prof_auth_path) else {
+                continue;
+            };
+            let Some(host_raw) = current_host.as_ref() else {
+                break;
+            };
+            let host_email =
+                identity_from_credentials(ProviderKind::Codex, host_raw).map(|i| i.email);
+            let host_acc_id = codex_account_id(host_raw);
+            if host_email.is_none() && host_acc_id.is_none() {
+                break;
+            }
+            let prof_email = identity_from_credentials(ProviderKind::Codex, &prof_raw)
+                .map(|i| i.email)
+                .or_else(|| acc.email.clone());
+            let prof_acc_id = codex_account_id(&prof_raw);
+            let same_identity = match (&host_email, &prof_email) {
+                (Some(he), Some(pe)) => he.eq_ignore_ascii_case(pe),
+                _ => host_acc_id.is_some() && host_acc_id == prof_acc_id,
+            };
+            if !same_identity || &prof_raw == host_raw {
+                continue;
+            }
+            let is_target = target_dir == Some(prof_dir);
+            if token_is_newer(
+                ProviderKind::Codex,
+                host_raw,
+                Some(&host_auth_path),
+                &prof_raw,
+                Some(&prof_auth_path),
+                is_target,
+            ) {
+                write_atomic_0600(&prof_auth_path, host_raw).ok();
+                crate::usage::direct::evict_profile(home, ProviderKind::Codex, prof_dir);
+                super::login::evict_profile(ProviderKind::Codex, prof_dir);
+            } else if (target_dir.is_none() || is_target)
+                && token_is_newer(
+                    ProviderKind::Codex,
+                    &prof_raw,
+                    Some(&prof_auth_path),
+                    host_raw,
+                    Some(&host_auth_path),
+                    false,
+                )
+            {
+                write_atomic_0600(&host_auth_path, &prof_raw).ok();
+                current_host = Some(prof_raw);
+                let host_dir = super::host_default_dir(home, ProviderKind::Codex);
+                crate::usage::direct::evict_profile(home, ProviderKind::Codex, &host_dir);
+                super::login::evict_profile(ProviderKind::Codex, &host_dir);
             }
         }
     }
@@ -246,14 +287,11 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
         return;
     }
     let real_keychain = use_real_keychain(home);
-    let current_keychain = if real_keychain { read_keychain() } else { None };
-    let current_file = read_token_file(&host_token_path);
-    let current_host = current_file.as_ref().or(current_keychain.as_ref());
+    let mut current_keychain = if real_keychain { read_keychain() } else { None };
+    let mut current_file = read_token_file(&host_token_path);
 
     // 1. 호스트에서 갱신된 토큰이 있으면 같은 이메일을 가진 프로필 슬롯에 먼저 보존한다.
-    if let Some(host_raw) = current_host
-        && let Some(host_id) = identity_from_credentials(ProviderKind::Antigravity, host_raw)
-    {
+    if current_file.is_some() || current_keychain.is_some() {
         for acc in accounts {
             if ProviderKind::parse(&acc.provider) != Some(ProviderKind::Antigravity)
                 || acc.profile_dir.is_empty()
@@ -265,18 +303,58 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
                 continue;
             }
             let prof_token_path = prof_dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
-            let prof_raw = read_token_file(&prof_token_path);
-            let prof_email = prof_raw
-                .as_deref()
-                .and_then(|r| identity_from_credentials(ProviderKind::Antigravity, r))
+            let Some(prof_raw) = read_token_file(&prof_token_path) else {
+                continue;
+            };
+            let host_from_file = current_file.is_some();
+            let Some(host_raw) = current_file.as_ref().or(current_keychain.as_ref()) else {
+                break;
+            };
+            let Some(host_id) = identity_from_credentials(ProviderKind::Antigravity, host_raw)
+            else {
+                break;
+            };
+            let prof_email = identity_from_credentials(ProviderKind::Antigravity, &prof_raw)
                 .map(|i| i.email)
                 .or_else(|| acc.email.clone());
-            if prof_email
+            let same_identity = prof_email
                 .as_deref()
-                .is_some_and(|e| e.eq_ignore_ascii_case(&host_id.email))
-                && prof_raw.as_ref() != Some(host_raw)
-            {
+                .is_some_and(|e| e.eq_ignore_ascii_case(&host_id.email));
+            if !same_identity || &prof_raw == host_raw {
+                continue;
+            }
+            let is_target = target_dir == Some(prof_dir);
+            let host_path_opt = host_from_file.then_some(host_token_path.as_path());
+            if token_is_newer(
+                ProviderKind::Antigravity,
+                host_raw,
+                host_path_opt,
+                &prof_raw,
+                Some(&prof_token_path),
+                is_target,
+            ) {
                 write_atomic_0600(&prof_token_path, host_raw).ok();
+                crate::usage::direct::evict_profile(home, ProviderKind::Antigravity, prof_dir);
+                super::login::evict_profile(ProviderKind::Antigravity, prof_dir);
+            } else if (target_dir.is_none() || is_target)
+                && token_is_newer(
+                    ProviderKind::Antigravity,
+                    &prof_raw,
+                    Some(&prof_token_path),
+                    host_raw,
+                    host_path_opt,
+                    false,
+                )
+            {
+                write_atomic_0600(&host_token_path, &prof_raw).ok();
+                if real_keychain {
+                    write_keychain(&prof_raw);
+                    current_keychain = Some(prof_raw.clone());
+                }
+                current_file = Some(prof_raw);
+                let host_dir = super::host_default_dir(home, ProviderKind::Antigravity);
+                crate::usage::direct::evict_profile(home, ProviderKind::Antigravity, &host_dir);
+                super::login::evict_profile(ProviderKind::Antigravity, &host_dir);
             }
         }
     }
@@ -305,25 +383,28 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
     }
 }
 
+fn is_real_home(home: &Path) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if std::env::var_os("KRILL_TEST_OFFLINE").is_some_and(|v| !v.is_empty() && v != "0") {
+        return false;
+    }
+    let Some(real_home) = krill_proto::os::home_dir() else {
+        return false;
+    };
+    home == real_home
+        || home
+            .canonicalize()
+            .ok()
+            .zip(real_home.canonicalize().ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
 fn use_real_keychain(home: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
-        if cfg!(test) {
-            return false;
-        }
-        if std::env::var_os("KRILL_TEST_OFFLINE").is_some_and(|v| !v.is_empty() && v != "0") {
-            return false;
-        }
-        let Some(real_home) = krill_proto::os::home_dir() else {
-            return false;
-        };
-        let same_home = home == real_home
-            || home
-                .canonicalize()
-                .ok()
-                .zip(real_home.canonicalize().ok())
-                .is_some_and(|(a, b)| a == b);
-        same_home
+        is_real_home(home)
             && !home
                 .join(".gemini/antigravity-cli/cache/antigravity-keyring-unavailable")
                 .exists()
@@ -332,6 +413,139 @@ fn use_real_keychain(home: &Path) -> bool {
     {
         let _ = home;
         false
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TokenStamp {
+    issued_ns: i128,
+    expiry_ns: i128,
+}
+
+fn now_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i128::try_from(d.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+fn rfc3339_ns(s: &str) -> Option<i128> {
+    let secs = i128::from(krill_proto::time::parse_rfc3339_epoch(s)?);
+    let (_, rest) = s.split_once(['T', 't', ' '])?;
+    let clock = rest
+        .strip_suffix(['Z', 'z'])
+        .or_else(|| rest.rsplit_once(['+', '-']).map(|(clock, _)| clock))?;
+    let nanos = match clock.split_once(['.', ',']) {
+        None => 0_i128,
+        Some((_, frac)) => {
+            let mut acc = 0_i128;
+            let mut scale = 100_000_000_i128;
+            for b in frac.bytes().take(9) {
+                if !b.is_ascii_digit() {
+                    return None;
+                }
+                acc += i128::from(b - b'0') * scale;
+                scale /= 10;
+            }
+            acc
+        }
+    };
+    secs.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+fn jwt_times_ns(jwt: &str) -> (Option<i128>, Option<i128>) {
+    let Some(claims) = krill_proto::account_login::jwt_claims(jwt) else {
+        return (None, None);
+    };
+    let ts = |key: &str| {
+        claims
+            .get(key)
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|v| i128::from(v).checked_mul(1_000_000_000))
+    };
+    (ts("iat"), ts("exp"))
+}
+
+fn codex_token_stamp(raw: &[u8]) -> Option<TokenStamp> {
+    let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let last_refresh = v
+        .get("last_refresh")
+        .and_then(serde_json::Value::as_str)
+        .and_then(rfc3339_ns);
+    let (acc_iat, acc_exp) = v
+        .pointer("/tokens/access_token")
+        .and_then(serde_json::Value::as_str)
+        .map_or((None, None), jwt_times_ns);
+    let (id_iat, id_exp) = v
+        .pointer("/tokens/id_token")
+        .or_else(|| v.pointer("/tokens/idToken"))
+        .and_then(serde_json::Value::as_str)
+        .map_or((None, None), jwt_times_ns);
+    let issued = [last_refresh, acc_iat, id_iat].into_iter().flatten().max();
+    let expiry = [acc_exp, id_exp].into_iter().flatten().max();
+    if issued.is_none() && expiry.is_none() {
+        return None;
+    }
+    Some(TokenStamp {
+        issued_ns: issued.unwrap_or(i128::MIN),
+        expiry_ns: expiry.unwrap_or(i128::MIN),
+    })
+}
+
+fn agy_token_stamp(raw: &[u8]) -> Option<TokenStamp> {
+    let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let expiry_rfc = v
+        .pointer("/token/expiry")
+        .or_else(|| v.get("expiry"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(rfc3339_ns);
+    let (id_iat, id_exp) = v
+        .pointer("/token/id_token")
+        .or_else(|| v.get("id_token"))
+        .and_then(serde_json::Value::as_str)
+        .map_or((None, None), jwt_times_ns);
+    let issued = id_iat;
+    let expiry = [expiry_rfc, id_exp].into_iter().flatten().max();
+    if issued.is_none() && expiry.is_none() {
+        return None;
+    }
+    Some(TokenStamp {
+        issued_ns: issued.unwrap_or(i128::MIN),
+        expiry_ns: expiry.unwrap_or(i128::MIN),
+    })
+}
+
+fn token_is_newer(
+    provider: ProviderKind,
+    cand_raw: &[u8],
+    cand_path: Option<&Path>,
+    curr_raw: &[u8],
+    curr_path: Option<&Path>,
+    strict_mtime: bool,
+) -> bool {
+    let stamp = match provider {
+        ProviderKind::Codex => codex_token_stamp,
+        ProviderKind::Antigravity => agy_token_stamp,
+        _ => return false,
+    };
+    match (stamp(cand_raw), stamp(curr_raw)) {
+        (Some(cs), Some(us)) => cs > us,
+        (Some(cs), None) => cs.expiry_ns == i128::MIN || cs.expiry_ns > now_ns(),
+        (None, Some(us)) => us.expiry_ns != i128::MIN && us.expiry_ns <= now_ns(),
+        (None, None) => {
+            let mtime = |p: Option<&Path>| std::fs::metadata(p?).ok()?.modified().ok();
+            match (mtime(cand_path), mtime(curr_path)) {
+                (Some(cm), Some(um)) => {
+                    if strict_mtime {
+                        cm > um
+                    } else {
+                        cm >= um
+                    }
+                }
+                _ => !strict_mtime,
+            }
+        }
     }
 }
 
@@ -671,12 +885,12 @@ mod tests {
             while count >= 6 {
                 count -= 6;
                 let idx = usize::try_from((bits >> count) & 63).unwrap();
-                out.push(char::from(TABLE[idx]));
+                out.push(char::from(*TABLE.get(idx).unwrap()));
             }
         }
         if count > 0 {
             let idx = usize::try_from((bits << (6 - count)) & 63).unwrap();
-            out.push(char::from(TABLE[idx]));
+            out.push(char::from(*TABLE.get(idx).unwrap()));
         }
         out
     }

@@ -4321,7 +4321,7 @@ impl SettingsView {
             .accounts
             .iter()
             .filter(|a| {
-                a.provider == ProviderKind::Claude
+                matches!(a.provider, ProviderKind::Claude | ProviderKind::Codex)
                     && !crate::accounts::orca_managed(a)
                     && !self.identities.1.contains(&a.id)
             })
@@ -4339,16 +4339,29 @@ impl SettingsView {
                     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
                     let path = crate::onboarding::login_path(&shell)
                         .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
-                    let Some(exe) = krill_proto::agent::which("claude", &path) else {
-                        return (Vec::new(), None);
-                    };
+                    let claude_exe = krill_proto::agent::which("claude", &path);
                     let paths = krill_proto::daemon::Paths::dev().ok();
                     let mut found = Vec::new();
                     let mut snapshot = None;
                     for acc in todo {
-                        let dir = (!acc.host_default).then(|| PathBuf::from(&acc.profile_dir));
-                        let Some(identity) = crate::accounts::claude_identity(&exe, dir.as_deref())
-                        else {
+                        let identity = match acc.provider {
+                            ProviderKind::Claude => {
+                                let dir =
+                                    (!acc.host_default).then(|| PathBuf::from(&acc.profile_dir));
+                                claude_exe.as_deref().and_then(|exe| {
+                                    crate::accounts::claude_identity(exe, dir.as_deref())
+                                })
+                            }
+                            ProviderKind::Codex => (!acc.profile_dir.is_empty())
+                                .then(|| {
+                                    krill_proto::account_login::codex_identity_from_dir(
+                                        std::path::Path::new(&acc.profile_dir),
+                                    )
+                                })
+                                .flatten(),
+                            _ => None,
+                        };
+                        let Some(identity) = identity else {
                             continue;
                         };
                         if !acc.host_default && acc.email.as_deref().is_none_or(str::is_empty) {
@@ -4668,10 +4681,39 @@ impl SettingsView {
             }
             Some(outcome) => {
                 self.login_pending = None;
+                if outcome == crate::accounts::LoginOutcome::Succeeded {
+                    for id in [
+                        account_id.as_str(),
+                        "codex-host",
+                        "claude-host",
+                        "agy-host",
+                        "opencode-host",
+                    ] {
+                        self.identities.0.remove(id);
+                        self.identities.1.remove(id);
+                    }
+                }
                 self.refresh_accounts_async(cx);
                 match outcome {
-                    crate::accounts::LoginOutcome::Succeeded
-                    | crate::accounts::LoginOutcome::Cancelled => {}
+                    crate::accounts::LoginOutcome::Succeeded => {
+                        if self.account_host.is_remote()
+                            || is_daemon_state_dir(state_dir(cx).as_deref())
+                        {
+                            cx.spawn(async move |this, cx| {
+                                for delay_ms in [700_u64, 1_500] {
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(delay_ms))
+                                        .await;
+                                    this.update(cx, |this, cx| {
+                                        this.refresh_accounts_async(cx);
+                                    })
+                                    .ok();
+                                }
+                            })
+                            .detach();
+                        }
+                    }
+                    crate::accounts::LoginOutcome::Cancelled => {}
                     crate::accounts::LoginOutcome::Failed(reason) => {
                         let msg = match reason {
                             crate::accounts::LoginFailReason::TimedOut => {

@@ -60,6 +60,10 @@ pub fn clear_rate_limited(provider: ProviderKind, account_id: &str) -> bool {
         .is_some()
 }
 
+pub(super) fn evict_login_profile(provider: ProviderKind, dir: &Path) {
+    login::evict_profile(provider, dir);
+}
+
 fn rate_limited_at(
     limited: &BTreeMap<(String, String), u64>,
     provider: ProviderKind,
@@ -1467,11 +1471,15 @@ fn refresh_accounts_authenticated(
     let statuses = all
         .iter()
         .map(|a| {
+            let profile_path = PathBuf::from(&a.profile_dir);
+            let codex_auth_rejected = a.provider == ProviderKind::Codex
+                && super::direct::has_auth_failure(home, a.provider, &profile_path);
             let (mut error, mut detail, updated_at) = meta.remove(&a.id).unwrap_or_default();
             // 새 로그인 성공은 오래된 사용량 캐시의 인증 오류보다 우선한다.
-            if auth
-                .get(&(a.provider, PathBuf::from(&a.profile_dir)))
-                .is_some_and(|s| s.logged_in)
+            if !codex_auth_rejected
+                && auth
+                    .get(&(a.provider, profile_path.clone()))
+                    .is_some_and(|s| s.logged_in)
                 && error
                     .as_deref()
                     .is_some_and(|e| classify_error(e) == AccountStatus::NeedsLogin)
@@ -1481,8 +1489,9 @@ fn refresh_accounts_authenticated(
             }
             let detected = rate_limited_at(&limited, a.provider, &a.id);
             let (status, detected_at) = if auth
-                .get(&(a.provider, PathBuf::from(&a.profile_dir)))
+                .get(&(a.provider, profile_path))
                 .is_some_and(|status| !status.logged_in)
+                || (codex_auth_rejected && detected.is_none())
             {
                 (AccountStatus::NeedsLogin, None)
             } else {
@@ -1507,9 +1516,19 @@ fn refresh_accounts_authenticated(
         direct_usage: true, // 구버전 클라이언트용 필드. 사용량은 항상 자동 수집한다.
         accounts: all
             .iter()
-            .map(|a| krill_proto::usage::AccountConnection {
-                account_id: a.id.clone(),
-                status: login::connection(a.provider, Path::new(&a.profile_dir)),
+            .map(|a| {
+                let path = Path::new(&a.profile_dir);
+                let status = if a.provider == ProviderKind::Codex
+                    && super::direct::has_auth_failure(home, a.provider, path)
+                {
+                    krill_proto::usage::ConnectionStatus::NeedsLogin
+                } else {
+                    login::connection(a.provider, path)
+                };
+                krill_proto::usage::AccountConnection {
+                    account_id: a.id.clone(),
+                    status,
+                }
             })
             .collect(),
     };
