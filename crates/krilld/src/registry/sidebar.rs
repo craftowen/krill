@@ -21,6 +21,9 @@ pub(super) struct Cache {
     /// 조회가 시한을 넘길 때 돌려줄 cwd별 마지막 결과.
     last: BTreeMap<PathBuf, Option<RepositoryTrees>>,
     revision: u64,
+    /// 세션별 마지막으로 확인한 (cwd, 저장소). 세션이 살아 있는 동안 워크트리가 지워지면
+    /// 같은 cwd를 그 저장소 아래에 남겨 별도 폴더 프로젝트로 떨어지지 않게 한다.
+    homes: BTreeMap<SessionId, (PathBuf, Vec<u8>)>,
 }
 
 impl Cache {
@@ -108,6 +111,7 @@ fn collect_repositories(
     let mut sessions = Vec::new();
     let mut repositories: BTreeMap<Vec<u8>, RepositoryTrees> = BTreeMap::new();
     let mut bytes = 0usize;
+    let mut orphans: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for (session, observed) in entries {
         let path = {
             let mut cache = lock(cache);
@@ -122,27 +126,56 @@ fn collect_repositories(
                 .as_ref()
                 .map_or_else(Vec::new, |p| p.as_os_str().as_bytes().to_vec()),
         });
-        if let Some(path) = path
-            && let Some(trees) = lookup(cache, &path, deadline)
+        let Some(path) = path else { continue };
+        let Some(trees) = lookup(cache, &path, deadline) else {
+            let home = lock(cache).homes.get(session).cloned();
+            if let Some((cwd, repo)) = home
+                && cwd == path
+            {
+                orphans.push((repo, cwd.as_os_str().as_bytes().to_vec()));
+            }
+            continue;
+        };
+        lock(cache)
+            .homes
+            .insert(*session, (path.clone(), trees.repo.clone()));
+        if let Some(previous) = repositories.get(&trees.repo) {
+            if previous.worktrees.len() > trees.worktrees.len() {
+                continue;
+            }
+            bytes -= previous.repo.len() + previous.worktrees.iter().map(Vec::len).sum::<usize>();
+        }
+        bytes += trees.repo.len() + trees.worktrees.iter().map(Vec::len).sum::<usize>();
+        if bytes > 512 * 1024 {
+            return Err(Failure::BadRequest);
+        }
+        repositories.insert(trees.repo.clone(), trees);
+    }
+    for (repo, cwd) in orphans {
+        if !repositories.contains_key(&repo) {
+            let root = PathBuf::from(std::ffi::OsString::from_vec(repo.clone()));
+            let Some(trees) = lookup(cache, &root, deadline).filter(|t| t.repo == repo) else {
+                continue;
+            };
+            repositories.insert(repo.clone(), trees);
+        }
+        if let Some(trees) = repositories.get_mut(&repo)
+            && !trees.worktrees.contains(&cwd)
+            && trees.worktrees.len() < 512
         {
-            if let Some(previous) = repositories.get(&trees.repo) {
-                if previous.worktrees.len() > trees.worktrees.len() {
-                    continue;
-                }
-                bytes -=
-                    previous.repo.len() + previous.worktrees.iter().map(Vec::len).sum::<usize>();
-            }
-            bytes += trees.repo.len() + trees.worktrees.iter().map(Vec::len).sum::<usize>();
-            if bytes > 512 * 1024 {
-                return Err(Failure::BadRequest);
-            }
-            repositories.insert(trees.repo.clone(), trees);
+            trees.worktrees.push(cwd);
         }
     }
     let mut cache = lock(cache);
     if cache.directories.len() > krill_proto::holder::MAX_SESSIONS {
         cache
             .directories
+            .retain(|id, _| entries.iter().any(|(s, _)| s == id));
+    }
+    // 범위 제한 요청(빈 `entries`)이 다른 세션의 기억을 지우지 않게 상한을 넘을 때만 정리한다.
+    if cache.homes.len() > krill_proto::holder::MAX_SESSIONS {
+        cache
+            .homes
             .retain(|id, _| entries.iter().any(|(s, _)| s == id));
     }
     cache
@@ -511,6 +544,65 @@ mod tests {
         assert_eq!(data.repositories[0].worktrees.len(), 2);
         let reversed = snapshot(&cache, &[(SessionId(2), None), (SessionId(1), None)]).unwrap();
         assert_eq!(reversed.repositories[0].worktrees.len(), 2);
+    }
+
+    #[test]
+    fn removed_worktree_stays_under_its_repository() {
+        let base = std::env::temp_dir().join(format!("krilld-sidebar-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        // Windows에서 git이 받는 경로가 되도록 `\\?\` 접두사 없는 형태로 맞춘다(parse와 같은 함수).
+        let base = krill_proto::os::canonicalize(&base).unwrap();
+        let repo = base.join("repo");
+        let wt = base.join("wt");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let (r, w) = (repo.to_str().unwrap(), wt.to_str().unwrap());
+        git(&["init", "-q", r]);
+        git(&["-C", r, "commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["-C", r, "worktree", "add", "-q", "-b", "gone", w]);
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let entries = [
+            (SessionId(1), Some(wt.clone())),
+            (SessionId(2), Some(wt.clone())),
+        ];
+        let before = snapshot(&cache, &entries).unwrap();
+        assert!(
+            before.repositories[0]
+                .worktrees
+                .contains(&w.as_bytes().to_vec())
+        );
+
+        // 범위 제한 연결은 세션 없이 요청한다. 이 요청이 기억을 지우면 안 된다.
+        snapshot(&cache, &[]).unwrap();
+        git(&["-C", r, "worktree", "remove", "--force", w]);
+        lock(&cache).invalidate();
+        // 세션 2는 지워진 폴더가 아닌 다른 곳으로 옮겼다. 기억한 cwd와 달라 저장소에 붙지 않는다.
+        let moved = base.join("elsewhere");
+        let after = snapshot(
+            &cache,
+            &[(SessionId(1), None), (SessionId(2), Some(moved.clone()))],
+        );
+        std::fs::remove_dir_all(&base).ok();
+        let after = after.unwrap();
+        assert_eq!(after.repositories.len(), 1);
+        assert_eq!(after.repositories[0].repo, r.as_bytes());
+        assert!(
+            after.repositories[0]
+                .worktrees
+                .contains(&w.as_bytes().to_vec())
+        );
+        assert!(
+            !after.repositories[0]
+                .worktrees
+                .contains(&moved.as_os_str().as_bytes().to_vec())
+        );
     }
 
     #[test]
