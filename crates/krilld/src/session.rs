@@ -730,7 +730,7 @@ impl Tap {
     /// 핫 스크롤백을 비우고 콜드 세그먼트의 스크롤백 기준선(`seq`)을 기록한다(OWE-873b).
     /// 보이는 화면·세션·PTY는 건드리지 않는다.
     pub fn clear_scrollback(&self) -> u64 {
-        self.clear_scrollback_with(Engine::clear_history)
+        self.clear_scrollback_with(Engine::release_history)
     }
 
     fn clear_scrollback_with(&self, clear: impl FnOnce(&mut Engine)) -> u64 {
