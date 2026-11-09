@@ -405,3 +405,197 @@ fn closing_chat_pane_drops_its_chat_state(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[test]
+fn work_run_pairs_by_tool_id_falls_back_fifo_and_isolates_orphan_results() {
+    let single = work_run::RawSpan::single(5);
+    assert_eq!(single.start(), 5);
+    assert_eq!(single.end(), 6);
+    assert_eq!(single.range(), 5..6);
+
+    let items: Vec<Arc<ChatItem>> = vec![
+        ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_id: "call-read".into(),
+            tool_name: "Read".into(),
+            file_path: "crates/krill-app/src/lib.rs".into(),
+            text: "crates/krill-app/src/lib.rs".into(),
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_id: "call-bash".into(),
+            tool_name: "Bash".into(),
+            title: "Run check".into(),
+            text: "cargo check --locked".into(),
+            is_error: true,
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_name: "Grep".into(),
+            title: "Search symbols".into(),
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolResult,
+            text: "3 matches".into(),
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolResult,
+            tool_id: "call-bash".into(),
+            text: "exit code 1".into(),
+            is_error: true,
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolResult,
+            tool_id: "call-read".into(),
+            text: "pub mod ui;\n".into(),
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolResult,
+            tool_id: "unmatched-id".into(),
+            file_path: "crates/krill-app/src/orphan.rs".into(),
+            text: "orphan payload".into(),
+            ..ChatItem::default()
+        },
+    ]
+    .into_iter()
+    .map(Arc::new)
+    .collect();
+
+    let feed = work_run::DisplayFeed::project(100, &items);
+    assert_eq!(feed.len(), 1);
+    assert_eq!(feed.rows()[0].span().range(), 100..107);
+    let Some(work_run::DisplayRow::WorkRun(run)) = feed.get(0) else {
+        panic!("expected a single WorkRun row");
+    };
+    assert_eq!(run.counts.tool_calls, 3);
+    assert_eq!(run.counts.read, 1);
+    assert_eq!(run.counts.command, 1);
+    assert_eq!(run.counts.search, 1);
+    assert_eq!(run.counts.errors, 1);
+    assert_eq!(run.latest_detail, "crates/krill-app/src/orphan.rs");
+    assert_eq!(run.steps.len(), 4);
+
+    assert_eq!(run.steps[0].primary_abs_idx(), 100);
+    assert_eq!(run.steps[0].file_path(), "crates/krill-app/src/lib.rs");
+    assert_eq!(
+        run.steps[0].badge(),
+        (ui::BadgeTone::Neutral, ctext::STEP_READ.get())
+    );
+    let read_sections = run.steps[0].body_sections();
+    assert_eq!(read_sections.len(), 1);
+    assert_eq!(read_sections[0].abs_idx, 105);
+    assert_eq!(read_sections[0].label, Some(ctext::STEP_OUTPUT.get()));
+    assert_eq!(read_sections[0].text, "pub mod ui;\n");
+
+    assert_eq!(run.steps[1].primary_abs_idx(), 101);
+    assert!(run.steps[1].is_error());
+    assert_eq!(
+        run.steps[1].badge(),
+        (ui::BadgeTone::Destructive, ctext::TOOL_ERROR.get())
+    );
+    let bash_sections = run.steps[1].body_sections();
+    assert_eq!(bash_sections.len(), 2);
+    assert_eq!(bash_sections[0].label, Some(ctext::STEP_INPUT.get()));
+    assert_eq!(bash_sections[1].label, Some(ctext::TOOL_ERROR.get()));
+
+    assert_eq!(run.steps[2].primary_abs_idx(), 102);
+    assert_eq!(run.steps[2].headline(), "Search symbols");
+    assert_eq!(run.steps[2].copy_text(), "3 matches");
+
+    assert_eq!(run.steps[3].primary_abs_idx(), 106);
+    assert!(matches!(
+        run.steps[3],
+        work_run::WorkStep::Tool(work_run::ToolPair::OrphanResult {
+            result_abs_idx: 106,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn display_feed_keeps_solo_reasoning_groups_multi_reasoning_and_invalidates_cache() {
+    let mut log = SessionChatLog {
+        base_index: 50,
+        ..SessionChatLog::default()
+    };
+    log.append_and_trim(
+        vec![
+            ChatItem {
+                kind: ChatItemKind::User,
+                text: "question".into(),
+                ..ChatItem::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "single thought\ndetail".into(),
+                ..ChatItem::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "answer".into(),
+                ..ChatItem::default()
+            },
+        ],
+        MAX_CHAT_KEPT,
+    );
+    let first = log.display_feed();
+    let second = log.display_feed();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.len(), 3);
+    assert!(matches!(
+        first.get(1),
+        Some(work_run::DisplayRow::Item { abs_idx: 51, .. })
+    ));
+
+    log.append_and_trim(
+        vec![
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "first step\nmore".into(),
+                ..ChatItem::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "second step".into(),
+                ..ChatItem::default()
+            },
+        ],
+        MAX_CHAT_KEPT,
+    );
+    let updated = log.display_feed();
+    assert!(!Arc::ptr_eq(&first, &updated));
+    assert_eq!(updated.len(), 4);
+    let Some(work_run::DisplayRow::WorkRun(run)) = updated.get(3) else {
+        panic!("two consecutive reasoning items must collapse into a WorkRun");
+    };
+    assert_eq!(run.span.range(), 53..55);
+    assert_eq!(
+        run.summary_label(),
+        ctext::RUN_REASONING.format(&[("n", "2")])
+    );
+    assert_eq!(run.latest_detail, "second step");
+
+    log.prepend_earlier(
+        vec![ChatItem {
+            kind: ChatItemKind::User,
+            text: "older".into(),
+            ..ChatItem::default()
+        }],
+        None,
+    );
+    let after_prepend = log.display_feed();
+    assert!(!Arc::ptr_eq(&updated, &after_prepend));
+    assert_eq!(
+        after_prepend.rows()[0].span(),
+        work_run::RawSpan::single(49)
+    );
+
+    log.reset_transcript();
+    assert!(log.display_feed().is_empty());
+}

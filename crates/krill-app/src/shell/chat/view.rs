@@ -3,80 +3,490 @@
 // NativeChatMessageRow.tsx, NativeChatReasoningRow.tsx, NativeChatComposerField.tsx,
 // native-chat-autoscroll.ts; rendered with Krill design tokens and GPUI.
 
+use super::work_run;
 use super::*;
 use gpui::StatefulInteractiveElement as _;
 use gpui::prelude::FluentBuilder as _;
 use gpui_component::IconName;
 use std::hash::{Hash as _, Hasher as _};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolStepKind {
-    Read,
-    Edit,
-    Search,
-    Command,
-    Other,
+struct SegmentStyle<'a> {
+    pane: super::super::PaneId,
+    abs_idx: usize,
+    markdown: bool,
+    text_size: gpui::Rems,
+    text_color: gpui::Hsla,
+    epoch: u64,
+    palette: &'a ui::Palette,
 }
 
-impl ToolStepKind {
-    pub(crate) fn from_name_and_title(name: &str, title: &str) -> Self {
-        let n = name.to_ascii_lowercase();
-        let t = title.to_ascii_lowercase();
-        if n.contains("read")
-            || n.contains("view")
-            || n == "cat"
-            || t.contains("read")
-            || t.contains("view")
-        {
-            Self::Read
-        } else if n.contains("edit")
-            || n.contains("write")
-            || n.contains("patch")
-            || t.contains("edit")
-            || t.contains("write")
-        {
-            Self::Edit
-        } else if n.contains("grep")
-            || n.contains("glob")
-            || n.contains("search")
-            || n.contains("find")
-            || n == "ls"
-            || t.contains("search")
-            || t.contains("grep")
-        {
-            Self::Search
-        } else if n.contains("bash")
-            || n.contains("shell")
-            || n.contains("exec")
-            || n.contains("command")
-            || t.contains("run")
-            || t.contains("command")
-        {
-            Self::Command
-        } else {
-            Self::Other
-        }
+fn append_chat_segments<T: gpui::ParentElement>(
+    mut container: T,
+    text: &str,
+    style: &SegmentStyle<'_>,
+) -> T {
+    let pane = style.pane;
+    let abs_idx = style.abs_idx;
+    let epoch = style.epoch;
+    let border = style.palette.border;
+    let fg = style.palette.foreground;
+    let muted_fg = style.palette.muted_foreground;
+    for (code_idx, segment) in parse_chat_segments(text).into_iter().enumerate() {
+        container = match segment {
+            ChatBodySegment::Text(text) => container.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .text_size(style.text_size)
+                    .text_color(style.text_color)
+                    .child(if style.markdown {
+                        gpui_component::text::TextView::markdown(
+                            {
+                                let mut hash = std::hash::DefaultHasher::new();
+                                text.hash(&mut hash);
+                                SharedString::from(format!(
+                                    "chat-markdown-{}-{epoch}-{abs_idx}-{code_idx}-{:x}",
+                                    pane.get(),
+                                    hash.finish()
+                                ))
+                            },
+                            text,
+                        )
+                        .scrollable(false)
+                        .into_any_element()
+                    } else {
+                        div().child(text).into_any_element()
+                    }),
+            ),
+            ChatBodySegment::Code { lang, code } => {
+                let code_for_copy = code.clone();
+                container.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .rounded(ui::RADIUS_SM)
+                        .border_1()
+                        .border_color(border)
+                        .bg(style.palette.muted)
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(muted_fg)
+                                        .child(if lang.is_empty() {
+                                            ctext::CODE.get().to_owned()
+                                        } else {
+                                            lang
+                                        }),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "chat-copy-code-{}-{abs_idx}-{code_idx}",
+                                        pane.get()
+                                    )))
+                                    .debug_selector(|| "chat-copy-code".into())
+                                    .label(ctext::COPY_CODE.get())
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                code_for_copy.clone(),
+                                            ));
+                                        },
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "chat-code-{}-{abs_idx}-{code_idx}",
+                                    pane.get()
+                                )))
+                                .debug_selector(|| "chat-code-content".into())
+                                .w_full()
+                                .min_w_0()
+                                .overflow_x_scroll()
+                                .p_2()
+                                .font_family(ui::FONT_MONO)
+                                .text_size(ui::TEXT_SM)
+                                .whitespace_nowrap()
+                                .text_color(fg)
+                                .child(code),
+                        ),
+                )
+            }
+        };
     }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Read => ctext::STEP_READ.get(),
-            Self::Edit => ctext::STEP_EDIT.get(),
-            Self::Search => ctext::STEP_SEARCH.get(),
-            Self::Command => ctext::STEP_COMMAND.get(),
-            Self::Other => ctext::STEP_OTHER.get(),
-        }
-    }
-
-    pub(crate) fn tone(self) -> ui::BadgeTone {
-        match self {
-            Self::Edit => ui::BadgeTone::Warning,
-            Self::Read | Self::Search | Self::Command | Self::Other => ui::BadgeTone::Neutral,
-        }
-    }
+    container
 }
 
 impl Shell {
+    fn render_display_row(
+        &mut self,
+        pane: super::super::PaneId,
+        session: SessionId,
+        row: &work_run::DisplayRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match row {
+            work_run::DisplayRow::Item { abs_idx, item } => {
+                self.render_chat_item(pane, session, *abs_idx, item, cx)
+            }
+            work_run::DisplayRow::WorkRun(run) => self.render_work_run(pane, session, run, cx),
+        }
+    }
+
+    fn render_work_run(
+        &mut self,
+        pane: super::super::PaneId,
+        session: SessionId,
+        run: &work_run::WorkRun,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = (self.layout.host(pane).clone(), session);
+        let palette = ui::palette(cx);
+        let fg = palette.foreground;
+        let muted_fg = palette.muted_foreground;
+        let run_span = run.span;
+        let run_expanded = self
+            .chat
+            .logs
+            .get(&key)
+            .is_some_and(|log| log.is_run_expanded(run_span));
+        let summary = run.summary_label();
+        let header_text = if run.latest_detail.is_empty() {
+            summary
+        } else {
+            format!("{summary} · {}", run.latest_detail)
+        };
+        let item_selector = format!("chat-item-{}-{}", pane.get(), run_span.start());
+        let debug_selector = item_selector.clone();
+        let mut container = div()
+            .id(SharedString::from(item_selector))
+            .debug_selector(move || debug_selector.clone())
+            .rounded(ui::RADIUS_MD)
+            .border_1()
+            .border_color(palette.border)
+            .bg(palette.card)
+            .overflow_hidden()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-work-run-{}-{}",
+                        pane.get(),
+                        run_span.start()
+                    )))
+                    .debug_selector(|| "chat-work-run-toggle".into())
+                    .role(gpui::Role::Button)
+                    .aria_label(if run_expanded {
+                        ctext::RUN_HIDE.get()
+                    } else {
+                        ctext::RUN_SHOW.get()
+                    })
+                    .aria_expanded(run_expanded)
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(palette.accent))
+                    .focus_visible(|s| s.bg(palette.accent))
+                    .w_full()
+                    .min_w_0()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(log) = this
+                            .chat
+                            .logs
+                            .get_mut(&(this.layout.host(pane).clone(), session))
+                        {
+                            log.toggle_run(run_span);
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div().flex_none().flex().items_center().child(
+                            gpui_component::Icon::new(if run_expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .with_size(ui::ICON_XS)
+                            .text_color(muted_fg),
+                        ),
+                    )
+                    .children((run.counts.errors > 0).then(|| {
+                        ui::badge(palette, ui::BadgeTone::Destructive, ctext::RUN_ERROR.get())
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(fg)
+                            .child(header_text),
+                    ),
+            );
+        if run_expanded {
+            for step in &run.steps {
+                container = container
+                    .child(div().h_px().w_full().bg(palette.border))
+                    .child(self.render_work_step(pane, session, step, cx));
+            }
+        }
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb_4()
+                    .flex()
+                    .child(container),
+            )
+            .into_any_element()
+    }
+
+    fn render_work_step(
+        &mut self,
+        pane: super::super::PaneId,
+        session: SessionId,
+        step: &work_run::WorkStep,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = (self.layout.host(pane).clone(), session);
+        let palette = ui::palette(cx);
+        let fg = palette.foreground;
+        let muted_fg = palette.muted_foreground;
+        let step_abs_idx = step.primary_abs_idx();
+        let step_expanded = self
+            .chat
+            .logs
+            .get(&key)
+            .is_some_and(|log| log.is_step_expanded(step_abs_idx));
+        let epoch = self.chat.logs.get(&key).map_or(0, |log| log.epoch);
+        let is_copied = self
+            .chat
+            .copied_item
+            .as_ref()
+            .is_some_and(|(copied_key, idx, at)| {
+                *copied_key == key && *idx == step_abs_idx && at.elapsed() < Duration::from_secs(2)
+            });
+        let (badge_tone, badge_text) = step.badge();
+        let headline = step.headline();
+        let file_path = step.file_path();
+        let copy_text = step.copy_text();
+        let sections = step.body_sections();
+
+        let toggle = div()
+            .id(SharedString::from(format!(
+                "chat-disclosure-{}-{step_abs_idx}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-disclosure".into())
+            .role(gpui::Role::Button)
+            .aria_label(if step_expanded {
+                ctext::HIDE_DETAILS.get()
+            } else {
+                ctext::SHOW_DETAILS.get()
+            })
+            .aria_expanded(step_expanded)
+            .tab_index(0)
+            .cursor_pointer()
+            .hover(|s| s.bg(palette.accent))
+            .focus_visible(|s| s.bg(palette.accent))
+            .flex_1()
+            .min_w_0()
+            .rounded(ui::RADIUS_XS)
+            .px_1()
+            .py_0p5()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(log) = this
+                    .chat
+                    .logs
+                    .get_mut(&(this.layout.host(pane).clone(), session))
+                {
+                    log.toggle_step(step_abs_idx);
+                }
+                cx.notify();
+            }))
+            .child(
+                div().flex_none().flex().items_center().child(
+                    gpui_component::Icon::new(if step_expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .with_size(ui::ICON_XS)
+                    .text_color(muted_fg),
+                ),
+            )
+            .child(ui::badge(palette, badge_tone, badge_text))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(fg)
+                    .child(headline),
+            );
+
+        let header = div()
+            .w_full()
+            .min_w_0()
+            .px_3()
+            .py_1p5()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(toggle)
+            .children((!file_path.is_empty()).then(|| {
+                let file_path_owned = file_path.to_owned();
+                let raw_path = std::path::PathBuf::from(&file_path_owned);
+                let path = if raw_path.is_relative() {
+                    self.pane_cwd(pane, cx)
+                        .map_or_else(|| raw_path.clone(), |cwd| cwd.join(&raw_path))
+                } else {
+                    raw_path
+                };
+                let file_label = std::path::Path::new(&file_path_owned)
+                    .file_name()
+                    .map_or_else(
+                        || file_path_owned.clone(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                div()
+                    .flex_none()
+                    .max_w(gpui::rems(5.5))
+                    .overflow_hidden()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "chat-open-file-{}-{step_abs_idx}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-open-file".into())
+                        .label(file_label)
+                        .max_w_full()
+                        .overflow_hidden()
+                        .tooltip(file_path_owned.clone())
+                        .accessibility_label(file_path_owned)
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_file_at(path.clone(), 1, 1, cx);
+                        })),
+                    )
+            }))
+            .children((!copy_text.is_empty()).then(|| {
+                let copy_key = key.clone();
+                div().flex_none().child(
+                    Button::new(SharedString::from(format!(
+                        "chat-copy-{}-{step_abs_idx}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-copy-item".into())
+                    .icon(if is_copied {
+                        IconName::Check
+                    } else {
+                        IconName::Copy
+                    })
+                    .tooltip(if is_copied {
+                        ctext::COPIED.get()
+                    } else {
+                        ctext::COPY.get()
+                    })
+                    .accessibility_label(if is_copied {
+                        ctext::COPIED.get()
+                    } else {
+                        ctext::COPY.get()
+                    })
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+                        this.chat.copied_item =
+                            Some((copy_key.clone(), step_abs_idx, std::time::Instant::now()));
+                        cx.notify();
+                    })),
+                )
+            }));
+
+        let mut step_el = div().w_full().min_w_0().flex().flex_col().child(header);
+        if step_expanded && !sections.is_empty() {
+            let mut body = div()
+                .id(SharedString::from(format!(
+                    "chat-body-{}-{step_abs_idx}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-message-body".into())
+                .w_full()
+                .min_w_0()
+                .px_3()
+                .pb_2()
+                .pt_1()
+                .flex()
+                .flex_col()
+                .gap_2();
+            for section in sections {
+                let mut section_el = div().w_full().min_w_0().flex().flex_col().gap_1();
+                if let Some(label) = section.label {
+                    section_el = section_el.child(
+                        div()
+                            .text_size(ui::TEXT_2XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(muted_fg)
+                            .child(label),
+                    );
+                }
+                section_el = append_chat_segments(
+                    section_el,
+                    section.text,
+                    &SegmentStyle {
+                        pane,
+                        abs_idx: section.abs_idx,
+                        markdown: false,
+                        text_size: ui::TEXT_SM,
+                        text_color: muted_fg,
+                        epoch,
+                        palette,
+                    },
+                );
+                body = body.child(section_el);
+            }
+            step_el = step_el.child(body);
+        }
+        step_el.into_any_element()
+    }
     fn render_chat_item(
         &mut self,
         pane: super::super::PaneId,
@@ -92,12 +502,8 @@ impl Shell {
         let muted_fg = palette.muted_foreground;
         let is_user = item.kind == ChatItemKind::User;
         let is_assistant = item.kind == ChatItemKind::Assistant;
-        let is_tool = matches!(item.kind, ChatItemKind::ToolCall | ChatItemKind::ToolResult);
         let is_request = matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission);
-        let disclosure = matches!(
-            item.kind,
-            ChatItemKind::Reasoning | ChatItemKind::ToolCall | ChatItemKind::ToolResult
-        );
+        let disclosure = item.kind == ChatItemKind::Reasoning;
         let log_agent = self
             .chat
             .logs
@@ -108,7 +514,7 @@ impl Shell {
             .chat
             .logs
             .get(&key)
-            .is_some_and(|log| log.expanded.contains(&abs_idx));
+            .is_some_and(|log| log.is_step_expanded(abs_idx));
         let role_label: String = match item.kind {
             ChatItemKind::User => ctext::YOU.get().to_owned(),
             ChatItemKind::Assistant => {
@@ -123,17 +529,6 @@ impl Shell {
             ChatItemKind::ToolResult => ctext::TOOL_RESULT.get().to_owned(),
             ChatItemKind::Question => ctext::QUESTION.get().to_owned(),
             ChatItemKind::Permission => ctext::PERMISSION.get().to_owned(),
-        };
-        let step_badge = if is_tool {
-            let (tone, text) = if item.is_error {
-                (ui::BadgeTone::Destructive, ctext::TOOL_ERROR.get())
-            } else {
-                let kind = ToolStepKind::from_name_and_title(&item.tool_name, &item.title);
-                (kind.tone(), kind.label())
-            };
-            Some(ui::badge(palette, tone, text))
-        } else {
-            None
         };
         let is_copied = self
             .chat
@@ -191,7 +586,6 @@ impl Shell {
                                 };
                                 ui::icons::agent_brand_icon(icon_agent, ui::ICON_XS, fg)
                             }))
-                            .children(step_badge)
                             .child(
                                 div()
                                     .flex_1()
@@ -219,6 +613,7 @@ impl Shell {
                             "chat-open-file-{}-{abs_idx}",
                             pane.get()
                         )))
+                        .debug_selector(|| "chat-open-file".into())
                         .label(
                             std::path::Path::new(&item.file_path)
                                 .file_name()
@@ -307,10 +702,7 @@ impl Shell {
                                 .logs
                                 .get_mut(&(this.layout.host(pane).clone(), session))
                             {
-                                if !log.expanded.remove(&abs_idx) {
-                                    log.expanded.insert(abs_idx);
-                                }
-                                log.revision = log.revision.wrapping_add(1);
+                                log.toggle_step(abs_idx);
                             }
                             cx.notify();
                         })),
@@ -327,117 +719,30 @@ impl Shell {
             );
         }
         if !disclosure || expanded {
-            let mut body = div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .id(SharedString::from(format!(
-                    "chat-body-{}-{abs_idx}",
-                    pane.get()
-                )))
-                .debug_selector(|| "chat-message-body".into());
-            for (code_idx, segment) in parse_chat_segments(&item.text).into_iter().enumerate() {
-                body = match segment {
-                    ChatBodySegment::Text(text) => body.child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .text_size(ui::TEXT_MD)
-                            .text_color(if disclosure { muted_fg } else { fg })
-                            .child(if item.kind == ChatItemKind::Assistant {
-                                gpui_component::text::TextView::markdown(
-                                    {
-                                        let mut hash = std::hash::DefaultHasher::new();
-                                        text.hash(&mut hash);
-                                        SharedString::from(format!(
-                                            "chat-markdown-{}-{}-{abs_idx}-{code_idx}-{:x}",
-                                            pane.get(),
-                                            self.chat.logs.get(&key).map_or(0, |log| log.epoch),
-                                            hash.finish()
-                                        ))
-                                    },
-                                    text,
-                                )
-                                .scrollable(false)
-                                .into_any_element()
-                            } else {
-                                div().child(text).into_any_element()
-                            }),
-                    ),
-                    ChatBodySegment::Code { lang, code } => {
-                        let code_for_copy = code.clone();
-                        body.child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .rounded(ui::RADIUS_SM)
-                                .border_1()
-                                .border_color(border)
-                                .bg(palette.muted)
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_2()
-                                        .px_2()
-                                        .py_1()
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(ui::TEXT_XS)
-                                                .text_color(muted_fg)
-                                                .child(if lang.is_empty() {
-                                                    ctext::CODE.get().to_owned()
-                                                } else {
-                                                    lang
-                                                }),
-                                        )
-                                        .child(
-                                            Button::new(SharedString::from(format!(
-                                                "chat-copy-code-{}-{abs_idx}-{code_idx}",
-                                                pane.get()
-                                            )))
-                                            .debug_selector(|| "chat-copy-code".into())
-                                            .label(ctext::COPY_CODE.get())
-                                            .ghost()
-                                            .xsmall()
-                                            .on_click(move |_, _, cx| {
-                                                cx.write_to_clipboard(
-                                                    gpui::ClipboardItem::new_string(
-                                                        code_for_copy.clone(),
-                                                    ),
-                                                );
-                                            }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "chat-code-{}-{abs_idx}-{code_idx}",
-                                            pane.get()
-                                        )))
-                                        .debug_selector(|| "chat-code-content".into())
-                                        .w_full()
-                                        .min_w_0()
-                                        .overflow_x_scroll()
-                                        .p_2()
-                                        .font_family(ui::FONT_MONO)
-                                        .text_size(ui::TEXT_SM)
-                                        .whitespace_nowrap()
-                                        .text_color(fg)
-                                        .child(code),
-                                ),
-                        )
-                    }
-                };
-            }
+            let epoch = self.chat.logs.get(&key).map_or(0, |log| log.epoch);
+            let body = append_chat_segments(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .id(SharedString::from(format!(
+                        "chat-body-{}-{abs_idx}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-message-body".into()),
+                &item.text,
+                &SegmentStyle {
+                    pane,
+                    abs_idx,
+                    markdown: item.kind == ChatItemKind::Assistant,
+                    text_size: ui::TEXT_MD,
+                    text_color: if disclosure { muted_fg } else { fg },
+                    epoch,
+                    palette,
+                },
+            );
             card = card.child(body);
         }
 
@@ -704,16 +1009,27 @@ impl Shell {
         let border = palette.border;
         let muted_fg = palette.muted_foreground;
 
-        let log = self.chat.logs.get(&key);
-        let agent_label = log
-            .and_then(|l| (!l.agent.is_empty()).then_some(l.agent.as_str()))
-            .unwrap_or("agent")
-            .to_owned();
-        let bound = log.is_some_and(|l| l.bound);
-        let base_index = log.map_or(0, |l| l.base_index);
-        let revision = log.map_or(0, |l| l.revision);
-        let epoch = log.map_or(0, |l| l.epoch);
-        let items = log.map_or_else(Vec::new, |l| l.items.clone());
+        let (agent_label, bound, revision, epoch, display_feed) = match self.chat.logs.get_mut(&key)
+        {
+            Some(log) => (
+                if log.agent.is_empty() {
+                    "agent".to_owned()
+                } else {
+                    log.agent.clone()
+                },
+                log.bound,
+                log.revision,
+                log.epoch,
+                log.display_feed(),
+            ),
+            None => (
+                "agent".to_owned(),
+                false,
+                0,
+                0,
+                work_run::DisplayFeed::empty(),
+            ),
+        };
 
         let mut feed = div()
             .id(SharedString::from(format!(
@@ -732,7 +1048,7 @@ impl Shell {
             .flex_col()
             .gap_2();
 
-        if items.is_empty() {
+        if display_feed.is_empty() {
             feed = feed.child(
                 div()
                     .id("chat-empty")
@@ -770,39 +1086,24 @@ impl Shell {
                     ),
             );
         } else {
-            let count = items.len();
             let host = self.layout.host(pane).clone();
             let owner = cx.weak_entity();
             let list = self
                 .chat
                 .lists
                 .entry((pane, session))
-                .or_insert_with(|| ChatList {
-                    host,
-                    base_index,
-                    count,
-                    revision,
-                    epoch,
-                    state: {
-                        let state =
-                            gpui::ListState::new(count, gpui::ListAlignment::Bottom, ui::SPACE_4);
-                        state.set_follow_mode(gpui::FollowMode::Tail);
-                        state.set_scroll_handler(move |_, _, cx| {
-                            owner.update(cx, |_, cx| cx.notify()).ok();
-                        });
-                        state
-                    },
-                });
-            let list_state = list.sync(base_index, count, revision, epoch);
+                .or_insert_with(|| ChatList::new(host, &display_feed, revision, epoch, owner));
+            let list_state = list.sync(&display_feed, revision, epoch);
             let owner = cx.weak_entity();
+            let rows = Arc::clone(&display_feed);
             feed = feed.child(
-                gpui::list(list_state.clone(), move |index, _, cx| {
-                    let Some(item) = items.get(index) else {
+                gpui::list(list_state.clone(), move |row_ix, _, cx| {
+                    let Some(row) = rows.get(row_ix) else {
                         return div().into_any_element();
                     };
                     owner
                         .update(cx, |this, cx| {
-                            this.render_chat_item(pane, session, base_index + index, item, cx)
+                            this.render_display_row(pane, session, row, cx)
                         })
                         .unwrap_or_else(|_| div().into_any_element())
                 })
