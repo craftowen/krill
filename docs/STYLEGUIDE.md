@@ -4,7 +4,7 @@
 
 근거 및 출처: Orca 레포지토리(`.ref/orca/docs/STYLEGUIDE.md`, `.ref/orca/src/renderer/src/assets/main.css`, `.ref/orca/src/renderer/src/components/ui/*`, `.ref/orca/src/shared/terminal-themes/defaults.ts`, Copyright (c) 2026 Lovecast Inc., MIT License)의 검증된 디자인 토큰·컴포넌트 문법·UX 원칙을 순수 Rust(`gpui` + `gpui-component`) 체계로 이식했다.
 
-**Orca 패리티의 범위**: 레이아웃·치수·단축키·컴포넌트 문법은 Orca와 맞추는 것이 의도된 정책이다(Orca에서 넘어오는 사용자에게 익숙함이 곧 기능이다, `orca_parity_tokens` 테스트가 치수를 고정한다). **색·브랜드·카피 톤은 Krill 고유다** — 무채색 크롬의 심해 틴트, `preserve` 토큰, 코랄 브랜드 마크, 3분절 스피너, 떼 미터는 Orca에 없다.
+**Orca 패리티의 범위**: 레이아웃·치수·단축키·컴포넌트 문법은 Orca와 맞추는 것이 의도된 정책이다(Orca에서 넘어오는 사용자에게 익숙함이 곧 기능이다, `orca_parity_tokens` 테스트가 치수를 고정한다). **색·브랜드·카피 톤은 Krill 고유다** — 무채색 크롬의 심해 틴트, `preserve` 토큰, 코랄 브랜드 마크, 3분절 스피너는 Orca에 없다.
 
 ---
 
@@ -120,7 +120,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 ### 3.5 앱 테마 (`DarkUiTheme` / `LightUiTheme`)
 
 - 앱 색 조합은 다크·라이트 모드마다 하나씩 고른다(설정 > 일반 > 모양 · 인터페이스의 `다크 테마`·`라이트 테마`, 설정 키 `ui_theme_dark`·`ui_theme_light`). 모드 선택(다크·라이트·시스템)은 그대로 `theme`이 맡는다.
-- 다크 기본은 **야광**(`TOKYO_NIGHT`), 라이트 기본은 **종이**(`PAPER`)다. 다크 목록: 야광(`TOKYO_NIGHT`) · 모카(`MOCHA`) · 들장미(`ROSE_PINE`) · 해구(`TRENCH`) · 흑연(`GRAPHITE`) · 해송(`PINE`) · 자수정(`AMETHYST`) · 이탄(`PEAT`) · 황혼(`DUSK`) · 심해(`DARK`, 기존 색 유지) · 심연(`ABYSS`) · 조수(`TIDEPOOL`) · 발광(`GLOW`). 라이트 목록: 종이(`PAPER`) · 기본(`LIGHT`, 기존 색 유지) · 월광 · 석회 · 청자 · 빙하.
+- 다크 기본은 **흑연**(`GRAPHITE`), 라이트 기본은 **종이**(`PAPER`)다. 설정 파일에 `ui_theme_dark`가 이미 저장된 사용자는 저장된 값을 그대로 쓴다. 다크 목록: 야광(`TOKYO_NIGHT`) · 모카(`MOCHA`) · 들장미(`ROSE_PINE`) · 해구(`TRENCH`) · 흑연(`GRAPHITE`) · 해송(`PINE`) · 자수정(`AMETHYST`) · 이탄(`PEAT`) · 황혼(`DUSK`) · 심해(`DARK`, 기존 색 유지) · 심연(`ABYSS`) · 조수(`TIDEPOOL`) · 발광(`GLOW`). 라이트 목록: 종이(`PAPER`) · 기본(`LIGHT`, 기존 색 유지) · 월광 · 석회 · 청자 · 빙하.
 - 선택지가 4개를 넘는 테마 목록은 `DropdownMenu` / `PopupMenuItem`으로 표시하며 현재 항목에 체크하고 트리거에는 드롭다운 화살표를 둔다. 모드(다크·라이트·시스템)는 기존 세그먼트 컨트롤을 유지한다.
 - 새 팔레트는 [`ui/app_themes.rs`](../crates/krill-app/src/ui/app_themes.rs)에 둔다. 공통 `Palette`의 의미·치수는 그대로다.
 
@@ -129,7 +129,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 | 야광 | `TOKYO_NIGHT` | `#1a1b26` | `#16161e` | `Tokyo Night` |
 | 모카 | `MOCHA` | `#1e1e2e` | `#181825` | `Catppuccin Mocha` |
 | 들장미 | `ROSE_PINE` | `#191724` | `#14121d` | `Rose Pine` |
-| 흑연 | `GRAPHITE` | `#1b1b1c` | `#222224` | `Krill Graphite` |
+| 흑연 | `GRAPHITE` | `#131518` | `#101114` | `Krill Graphite` |
 | 해구 | `TRENCH` | `#071923` | `#0c2230` | `Krill Trench` |
 | 해송 | `PINE` | `#111d18` | `#172820` | `Krill Pine` |
 | 자수정 | `AMETHYST` | `#201828` | `#291f33` | `Krill Amethyst` |
@@ -193,6 +193,8 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
   - **워크스페이스 카드 무대와 포커스 링**: 메인 창에 열린 탭이 있을 때 중앙 `"terminal-surface"`는 `ui::workspace_surface_alpha(p, opacity_pct)`(`p.sidebar` 기반)를 깔고 사방에 `PANE_GAP = 6px` 바깥 여백을 둔다. 보이는 각 세션·파일 칸은 `RADIUS_SM`(`6px`) 모서리와 1px 테두리를 가진 카드로 감싸며, 현재 활성 창에서 방해 오버레이 없이 실제 키보드 입력을 받는 칸만 `p.ring` 1px 테두리를 그리고 나머지 칸(크롬/모달/비활성 창에 의해 보류된 선택 칸 및 비선택 분할 형제 칸)은 `p.border` 1px 테두리를 그린다. 카드 안쪽 모서리에 닿는 불투명 자식 표면은 `PANE_CARD_INNER_RADIUS = 5px`로 맞춘다. 탭이 없는 빈 작업 공간과 `FLOATING_SIZE` 팝아웃 창은 여백과 카드 테두리 없이 꽉 채워 그린다.
   - **분할 칸 사이 리사이즈 거터**: 분할된 카드 사이 간격은 `PANE_GAP = 6px`이며 평소에는 투명하게 비워 무대 배경이 그대로 드러나게 한다. 마우스를 올리면 중앙에 `SPLIT_GUTTER_PILL_THICKNESS = 2px` x `SPLIT_GUTTER_PILL_LENGTH = 24px` 둥근 알약 핸들(`p.split_divider`)을 보이고, 드래그 중에는 `p.split_divider_strong`으로 강조하며, 더블클릭하면 분할 비율을 `0.5`로 되돌린다.
   - 하단 바 버튼은 `STATUS_BAR_BUTTON_HEIGHT = 18px`로 맞춰 터미널 영역을 넓힌다.
+  - 상태바 오른쪽 카운터는 0이 아니거나 이상할 때만 보인다: 확인 필요 종·포트·SSH는 1 이상, 데몬 점은 연결 정상(`Link::Up`)이 아닐 때만, 오케스트레이션은 실행·작업이 없으면 숫자 없이 아이콘만 둔다. 세션 수는 늘 보인다.
+  - 타이틀바 오른쪽에는 새 탭(`+`·에이전트 선택 ⌄)·오른쪽 분할·검색·더보기(⋯, `titlebar-more`)만 둔다. 채팅 보기 전환·상하 분할·오른쪽 패널·저장 명령·맥락 복사는 더보기 메뉴 항목이다.
   - 상태바 계정 팝오버는 본문만 스크롤하며 `STATUS_PROVIDER_BODY_MAX_HEIGHT = 320px`로 상한을 둔다. 짧은 내용은 자연 높이를 쓰고, 탭 사이에는 상한을 적용한 높이를 예약한다. 로컬 계정 목록과 상세는 각각 스크롤하며 선택이 바뀌면 상세를 맨 위부터 보여 준다. 작은 창에서는 상태바·여백과 헤더/하단 메뉴 예산 `STATUS_PROVIDER_CHROME_RESERVE = 16rem`(UI 줌 반영)을 먼저 빼 본문을 줄인다.
   - 상태바 사용량은 `STATUS_USAGE_CONTROLS_WIDTH = 480px`를 컨트롤에 예약하고, 프로바이더당 `STATUS_USAGE_PROVIDER_WIDTH = 280px` 여유가 있으면 두 사용량 창을 `0% 1h 31m · 92% 1d 19h`처럼 표시한다. 상태바의 창 이름·리셋 안내 문장 없이 `%`와 남은 시간(`m`·`h`·`d`)만 쓰며 앱 언어와 무관하다. UI 줌도 반영하며, 좁으면 최대 사용률 창의 `% + 남은 시간`으로 축약한다. 만료된 창은 이전 사용률을 재사용하지 않고 `— now`, 시각을 모르면 퍼센트만 표시한다.
   - 사이드바 상단(헤더 바로 아래)에 검색·아티팩트·에이전트 대시보드(작업 중·완료 개수)·Krill 모바일 진입 행을 라벨이 있는 전체 폭 행으로 둔다. 그 아래가 프로젝트 목록이다.
@@ -274,8 +276,8 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
   - 모든 작업 중(`Working`) 스피너는 `Animation::repeat_synced()`(1초 12스텝)를 공유해 탭과 사이드바 전체에서 같은 위상으로 회전한다.
   - 작업 중 스피너 모양은 Orca 3/4 링 대신 **120° 간격 3분절 아크**(크릴 등갑 모티프, `RING_SVG`)다.
   - **접근성 감속(`cx.reduce_motion()`)**: 움직임 감속이 켜져 있으면 멈춘 분절 아크가 고장처럼 보이지 않도록 닫힌 정적 링(`RING_FULL_SVG`)으로 대체한다.
-- **워크트리 상태 요약 (`ui::status::summary_element`)**: 주의를 요하는 순서(`Waiting` → `Blocked` → `Working` → `Done` → `Exited` → `Unknown`)로 최대 3개 그룹(`MAX_GROUPS`), 그룹당 최대 3개 에이전트 아이콘(`MAX_GROUP_ICONS`)을 간격을 두고 나란히 그리고 나머지는 `+N`으로 축약한다. 세션 목록을 펼치면 요약 바는 세션 개수와 접기 화살표로 바뀌고, 요약 바·목록의 별도 배경과 테두리는 없앤다. 행 호버·선택과 활성 워크트리 표면은 유지한다.
-- **떼(swarm) 미터 (`ui::status::swarm_meter(states, max, cx)`)**: 세션마다 3px 상태색 점(`agent_state_color`, 유휴는 50% 투명)을 요약과 같은 우선순위로 최대 `SWARM_MAX`(12)개 그리고, 넘치면 `+N`(`TEXT_XS`, `muted_foreground`)을 붙인다. 점 `max`개 칸과 `+N` 칸을 늘 예약해 세션 수가 바뀌어도 폭이 흔들리지 않는다(§7.3). 순서·넘침 계산은 `ui::status::swarm_dots`.
+- **워크트리 상태 요약 (`ui::status::summary_element`)**: 주의를 요하는 순서(`Waiting` → `Blocked` → `Working` → `Done` → `Exited` → `Unknown`)로 최대 3개 그룹(`MAX_GROUPS`), 그룹당 최대 3개 에이전트 아이콘(`MAX_GROUP_ICONS`)을 간격을 두고 나란히 그리고 나머지는 `+N`으로 축약한다. 세션 목록을 펼치면 요약 바는 세션 개수와 접기 화살표로 바뀐다. 접힘·펼침 모두 요약 바와 그룹에 별도 배경·테두리를 두지 않는다(알약 없음). 행 호버·선택과 활성 워크트리 표면(`worktree_sidebar` 배경 + `worktree_sidebar_border` 1px)은 유지한다.
+- **사이드바 카드 배지**: `기본` 표시와 배지 줄(체크포인트·호스트·이슈·포트·PR)은 배경·테두리 없는 `TEXT_XS` `muted_foreground` 글자다(포트만 `success`). 세션 행은 상태 글리프·에이전트 아이콘·제목·경과 시간만 상시 보이고, 계정 라벨이 없는 계정 전환 버튼은 행 호버 때만 보인다.
 
 ### 6.5 프로바이더 아이콘 (Provider & Agent Icons — OWE-875)
 

@@ -584,6 +584,7 @@ catalog! {
         VIEW_TERM => ("터미널", "Term"),
         VIEW_CHAT => ("채팅", "Chat"),
         JUMP_TOOLTIP => (platform_text!("세션으로 이동 (⌘J)", "세션으로 이동 (Ctrl+Shift+J)"), platform_text!("Jump to session (⌘J)", "Jump to session (Ctrl+Shift+J)")),
+        MORE_ACTIONS => ("더보기", "More actions"),
         OPEN_FOLDER => ("폴더 열기…", "Open folder…"),
         CONNECTING => ("세션에 연결하는 중…", "Connecting to session…"),
         AGENTS => ("에이전트 새 세션", "New agent session"),
@@ -2097,7 +2098,7 @@ catalog! {
         EDIT => ("편집…", "Edit…"),
         COPY => ("맥락 복사", "Copy context"),
         COPY_HINT => ("최근 출력 {n}줄 복사", "Copy last {n} output lines"),
-        QUICK_HINT => ("명령·프롬프트 붙여넣기 (Enter는 직접 입력)", "Paste command or prompt (press Enter manually)"),
+        SEARCH => ("저장 명령 검색…", "Search quick commands…"),
         FAILED => ("맥락 복사 실패", "Failed to copy context"),
     }
     diff_edit {
