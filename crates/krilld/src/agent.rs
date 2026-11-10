@@ -1883,12 +1883,6 @@ fn apply_account_env(
                 );
             } else if is(profile, "claude") {
                 sync_claude_profile_hooks_in(&host_home, Path::new(&account.dir)).ok();
-                crate::usage::accounts::agy_native::sync_provider_account_dir(
-                    &host_home,
-                    state,
-                    ProviderKind::Claude,
-                    Path::new(&account.dir),
-                );
             } else if is(profile, "codex") {
                 crate::usage::accounts::agy_native::sync_provider_account_dir(
                     &host_home,

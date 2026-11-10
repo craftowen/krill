@@ -5,8 +5,8 @@
 //!   원자적으로 반영한다. 교체 전 호스트에서 갱신된 토큰은 동일 이메일의 프로필 슬롯에 먼저 되돌려 저장한다.
 //! - Codex(`codex`): 선택된 프로필의 `auth.json`을 호스트 `~/.codex/auth.json`에도 동기화하고, 호스트에서 갱신된
 //!   `auth.json`은 동일 신원의 프로필 슬롯으로 되돌린다.
-//! - Claude(`claude`): 선택된 프로필의 키체인 자격증명(`Claude Code-credentials-<hash>`) 및 `.credentials.json`을
-//!   호스트 기본 자격증명(`Claude Code-credentials`, `~/.claude/.credentials.json`)에도 동기화한다.
+//! - Claude(`claude`): 호스트 기본 로그인을 건드리지 않는다. 실행은 `CLAUDE_CONFIG_DIR`로 계정 폴더를 고른다
+//!   (Orca `ClaudeProfileRouter`와 같다). 덮어쓰면 기본 로그인 토큰이 사라지고 기본 카드가 활성 계정 값을 보인다.
 //! - `OpenCode`(`opencode`): 선택된 프로필의 `data/opencode/auth.json`을 `~/.local/share/opencode/auth.json`에 동기화한다.
 
 #[cfg(target_os = "macos")]
@@ -18,11 +18,7 @@ use std::process::{Command, Stdio};
 use krill_proto::usage::ProviderKind;
 use zeroize::Zeroizing;
 
-#[cfg(target_os = "macos")]
-use super::profile_name::Vault as _;
 use super::{AccountsFile, StoredAccount, identity_from_credentials, write_atomic_0600};
-#[cfg(target_os = "macos")]
-use crate::usage::direct::claude_service;
 
 const MAX_TOKEN_BYTES: u64 = 64 * 1024;
 
@@ -52,11 +48,6 @@ pub(crate) fn sync_active(home: &Path, file: &AccountsFile) {
             &file.accounts,
             active_dir_for(file, ProviderKind::Codex),
         );
-        sync_claude_account(
-            home,
-            active_dir_for(file, ProviderKind::Claude),
-            use_real_keychain(home),
-        );
         sync_opencode_account(home, active_dir_for(file, ProviderKind::OpenCode));
     }
 }
@@ -85,13 +76,10 @@ pub(crate) fn sync_provider_account_dir(
             let file = super::load_file(home, state_dir);
             sync_codex_account(home, &file.accounts, Some(dir));
         }
-        ProviderKind::Claude => {
-            sync_claude_account(home, Some(dir), use_real_keychain(home));
-        }
         ProviderKind::OpenCode => {
             sync_opencode_account(home, Some(dir));
         }
-        ProviderKind::Gemini => {}
+        ProviderKind::Claude | ProviderKind::Gemini => {}
     }
 }
 
@@ -211,45 +199,6 @@ pub(crate) fn sync_codex_account(
         let host_dir = super::host_default_dir(home, ProviderKind::Codex);
         crate::usage::direct::evict_profile(home, ProviderKind::Codex, &host_dir);
         super::login::evict_profile(ProviderKind::Codex, &host_dir);
-    }
-}
-
-pub(crate) fn sync_claude_account(home: &Path, target_dir: Option<&Path>, allow_keychain: bool) {
-    if home.as_os_str().is_empty() {
-        return;
-    }
-    let Some(target) = target_dir.filter(|d| !d.as_os_str().is_empty()) else {
-        return;
-    };
-    let host_claude = home.join(".claude");
-    if target == host_claude {
-        return;
-    }
-    let target_creds = target.join(".credentials.json");
-    let host_creds = host_claude.join(".credentials.json");
-    let mut host_changed = false;
-    if target_creds != host_creds
-        && let Some(raw) = read_token_file(&target_creds)
-        && read_token_file(&host_creds).as_ref() != Some(&raw)
-    {
-        write_atomic_0600(&host_creds, &raw).ok();
-        host_changed = true;
-    }
-    #[cfg(target_os = "macos")]
-    if allow_keychain
-        && let (Some(src_service), Some(dst_service)) =
-            (claude_service(Some(target)), claude_service(None))
-        && src_service != dst_service
-        && super::Keychain.copy(&src_service, &dst_service).is_ok()
-    {
-        host_changed = true;
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = allow_keychain;
-    if host_changed {
-        let host_dir = super::host_default_dir(home, ProviderKind::Claude);
-        crate::usage::direct::evict_profile(home, ProviderKind::Claude, &host_dir);
-        super::login::evict_profile(ProviderKind::Claude, &host_dir);
     }
 }
 
@@ -804,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_codex_claude_and_opencode_accounts_syncs_host_credentials() {
+    fn switching_codex_and_opencode_accounts_syncs_host_credentials_but_keeps_claude_login() {
         let root =
             std::env::temp_dir().join(format!("krill-all-native-swap-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
@@ -855,12 +804,17 @@ mod tests {
         assert_eq!(std::fs::read(codex1.join("auth.json")).unwrap(), cx1_new);
         assert_eq!(std::fs::read(home.join(".codex/auth.json")).unwrap(), cx2);
 
-        let cl_creds = br#"{"claudeAiOauth":{"accessToken":"cl-1"}}"#;
-        std::fs::write(claude1.join(".credentials.json"), cl_creds).unwrap();
-        sync_claude_account(&home, Some(&claude1), false);
+        let host_creds = br#"{"claudeAiOauth":{"accessToken":"host"}}"#;
+        std::fs::write(home.join(".claude/.credentials.json"), host_creds).unwrap();
+        std::fs::write(
+            claude1.join(".credentials.json"),
+            br#"{"claudeAiOauth":{"accessToken":"cl-1"}}"#,
+        )
+        .unwrap();
+        sync_provider_account_dir(&home, None, ProviderKind::Claude, &claude1);
         assert_eq!(
             std::fs::read(home.join(".claude/.credentials.json")).unwrap(),
-            cl_creds
+            host_creds
         );
 
         let oc_creds = br#"{"anthropic":{"type":"oauth","access":"oc-1"}}"#;
