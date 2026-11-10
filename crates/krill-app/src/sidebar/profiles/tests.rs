@@ -184,6 +184,13 @@ fn pending_switch_keeps_sidebar_row_until_replacement_receipt(cx: &mut TestAppCo
             s.apply(Ok((gap.clone(), Meta::new())), BTreeMap::new(), cx);
             assert_eq!(row_sessions(s, &HostId::Local), before);
         }
+        // The list poll can reveal the replacement before the account snapshot names it.
+        let mut revealed = gap.clone();
+        let mut replacement = snapshot().sessions[1].clone();
+        replacement.id = SessionId(90);
+        revealed.sessions.push(replacement);
+        s.apply(Ok((revealed, Meta::new())), BTreeMap::new(), cx);
+        assert_eq!(row_sessions(s, &HostId::Local), before);
         snap.details.handoffs[0].to = Some(SessionId(90));
         s.sync_session_accounts(&HostId::Local, snap.into(), cx);
         assert_eq!(

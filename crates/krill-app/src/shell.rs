@@ -3841,6 +3841,7 @@ impl Shell {
             krill_app::alert::sync_account_switches(&snap.advanced, cx);
         }
         let mut input_notices = Vec::new();
+        let mut failed_detached = Vec::new();
         for (pane, live) in &mut self.live {
             if self.layout.host(*pane) != &host || !snap.details.supported {
                 continue;
@@ -3852,8 +3853,22 @@ impl Shell {
             match handoff {
                 Some(h) if h.to.is_none() && h.error.is_none() => {} // sync_queued_account_input
                 Some(h) if h.to.is_some() => {} // moved below, retaining unsent input
-                Some(_) => input_notices.extend(live.pane.resume_account_input(true, Now::get())),
+                Some(_) => {
+                    // A pane that kept its picture for the replacement learns the original's fate again.
+                    if live.pane.awaiting_account_replacement() && !live.pane.is_linked() {
+                        failed_detached.push(*pane);
+                    }
+                    input_notices.extend(live.pane.resume_account_input(true, Now::get()));
+                }
                 None => {} // Observations cannot authorize delivery to the original account.
+            }
+        }
+        for pane in failed_detached {
+            if let Some(target) = self.target_for_pane(pane) {
+                let task = Self::spawn_pane(pane, target, None, cx);
+                if let Some(live) = self.live.get_mut(&pane) {
+                    live.task = task;
+                }
             }
         }
         let mut rebound = false;
@@ -4929,11 +4944,16 @@ impl Shell {
                     .detach();
                 }
                 let old = self.layout.session(pane);
-                // 계정 전환이 붙든 입력은 콜드 화면이 지운다. 이어받기가 끝나면 재바인딩이 칸을 다시 붙인다.
-                let held = self
+                // 계정 전환 중이면 옛 세션의 끝은 예정된 일이다. 화면·입력을 그대로 두면 재바인딩이 칸을 다시 붙인다.
+                let awaiting = self
                     .live
                     .get(&pane)
-                    .is_some_and(|l| l.pane.holds_account_input());
+                    .is_some_and(|l| l.pane.awaiting_account_replacement());
+                let held = awaiting
+                    || self
+                        .live
+                        .get(&pane)
+                        .is_some_and(|l| l.pane.holds_account_input());
                 // 데몬이 끝났다고 확정한 세션의 칸은 오류 문구로 남기지 않고 reconcile이 거둔다.
                 if pane::is_session_gone(&e)
                     && !held
@@ -4975,7 +4995,9 @@ impl Shell {
                                 )
                                 .ok();
                         }
-                        l.error = Some(start_error_text(&e));
+                        if !awaiting {
+                            l.error = Some(start_error_text(&e));
+                        }
                         cx.notify();
                         // 생성 요청이 닿았는지 모르면 다시 보내지 않는다. 연결·조회 실패는 계속 다시 붙는다.
                         if pane::is_unknown_outcome(&e) {
@@ -5005,7 +5027,7 @@ impl Shell {
         if self
             .live
             .get(&pane)
-            .is_some_and(|l| l.pane.holds_account_input())
+            .is_some_and(|l| l.pane.awaiting_account_replacement() || l.pane.holds_account_input())
         {
             cx.notify();
             return Next::Gone;
