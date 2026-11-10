@@ -1960,11 +1960,14 @@ impl Registry {
     }
 
     fn list(&self, peer: &Peer) -> Reply {
+        // An unconfirmed account replacement is published as its original's successor, never as a
+        // separate session; account snapshots reveal it at the same moment.
+        let replacements = lock(&self.account_replacements).clone();
         let st = lock(&self.state);
         Reply::Sessions(
             st.sessions
                 .iter()
-                .filter(|_| peer.scope.full())
+                .filter(|(session, _)| peer.scope.full() && !replacements.contains(session))
                 .map(|(&session, e)| Info {
                     session,
                     pid: e.pid,

@@ -1299,6 +1299,11 @@ impl<W: Write> Pane<W> {
         self.journal.pause();
     }
 
+    /// A replacement session is being prepared: the original's end is expected, not a failure.
+    pub fn awaiting_account_replacement(&self) -> bool {
+        self.account_input == AccountInput::Switching
+    }
+
     pub fn account_switching(&self) -> bool {
         matches!(
             self.account_input,
@@ -1360,12 +1365,14 @@ impl<W: Write> Pane<W> {
         notices
     }
 
-    /// An explicit account handoff keeps only unsent input. In-flight bytes remain uncertain
-    /// and are never replayed to another PTY.
+    /// An explicit account handoff keeps only unsent input and the last picture, which the
+    /// replacement's first frame replaces. In-flight bytes remain uncertain and are never
+    /// replayed to another PTY.
     pub fn handoff_account(&mut self, session: SessionId) -> Option<Notice> {
         let notice = self.unlink();
         let journal = std::mem::take(&mut self.journal);
         let grid = self.grid;
+        let shown = Rc::clone(&self.shown);
         let account_input = if journal.has_pending_input() {
             AccountInput::Delivering
         } else {
@@ -1375,6 +1382,7 @@ impl<W: Write> Pane<W> {
             session: Some(session),
             journal,
             grid,
+            shown,
             account_input,
             ..Self::default()
         };
