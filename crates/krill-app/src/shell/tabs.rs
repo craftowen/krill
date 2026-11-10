@@ -522,6 +522,10 @@ impl Shell {
                 TabBar::new("tabs")
                     .flex_1()
                     .min_w_0()
+                    // TabBar는 자기 밑줄을 따로 긋는다. 제목줄 테두리 위에 겹쳐 놓아 한 줄로 보이게
+                    // 한다(gpui는 부모 테두리를 자식 위에 그린다).
+                    .self_end()
+                    .mb(px(-1.))
                     .max_width(ui::TAB_MAX_WIDTH)
                     .menu(true)
                     .reveal_selected(true)
