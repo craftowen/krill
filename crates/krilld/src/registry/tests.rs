@@ -3881,3 +3881,42 @@ fn agent_exit_hides_its_prompts_from_the_next_agent() {
     assert_eq!(state, control::AgentState::Exited);
     assert!(!histories.contains_key(&id), "{histories:?}");
 }
+
+#[test]
+fn session_list_hides_an_unconfirmed_account_replacement() {
+    let reg = Registry::new(None, None);
+    let mut writers = Vec::new();
+    for id in [SessionId(51), SessionId(52)] {
+        let (master, writer) = UnixStream::pair().unwrap();
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )
+        .unwrap();
+        lock(&reg.state).sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: 0,
+                cwd: PathBuf::new(),
+                wrapped: false,
+            },
+        );
+        writers.push(writer);
+    }
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Session(SessionId(51)),
+    };
+    let listed = |reg: &Registry| match reg.list(&peer) {
+        Reply::Sessions(list) => list.into_iter().map(|i| i.session).collect::<Vec<_>>(),
+        _ => panic!("expected session list"),
+    };
+    lock(&reg.account_replacements).insert(SessionId(52));
+    assert_eq!(listed(&reg), [SessionId(51)]);
+    lock(&reg.account_replacements).remove(&SessionId(52));
+    assert_eq!(listed(&reg), [SessionId(51), SessionId(52)]);
+}

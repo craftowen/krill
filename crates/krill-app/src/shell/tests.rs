@@ -3446,6 +3446,74 @@ fn closed_replacement_is_removed_but_a_late_refusal_keeps_the_rebound_pane(
     });
 }
 
+/// A provider account switch must look like the same pane changing profile: the original's end
+/// shows no cold screen or error, and the replacement binds into the same focused pane with the
+/// last picture still on screen until its first frame.
+#[gpui::test]
+fn account_switch_keeps_the_same_pane_and_picture(cx: &mut TestAppContext) {
+    use krill_proto::SessionId;
+    use krill_proto::usage::{AccountsSnapshot, SessionHandoff};
+    let (view, cx) = open(cx, state_path("account-switch-in-place"));
+    cx.simulate_keystrokes("cmd-t");
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let (original, replacement) = (SessionId(806), SessionId(807));
+    let gone = || pane::failure_to_io_error(krill_proto::control::Failure::NoSession);
+    let snapshot = |to| {
+        let mut snapshot = AccountsSnapshot::default();
+        snapshot.details.supported = true;
+        snapshot.details.handoffs.push(SessionHandoff {
+            from: original,
+            to,
+            account_id: "next".into(),
+            error: None,
+        });
+        snapshot
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let fixture = state_path("account-switch-in-place-target");
+            s.paths = Some(Paths {
+                socket: fixture.join("run/krilld.sock"),
+                holder: fixture.join("holder"),
+                krilld: fixture.join("daemon"),
+            });
+            s.link = Link::Up;
+            s.layout.set_session(pane, original);
+            s.live.insert(pane, Live::new(Task::ready(())));
+            let picture = s.live[&pane].pane.shown();
+            s.apply_accounts_snapshot(snapshot(None), cx);
+            assert!(matches!(
+                s.settled_attempt(pane, Some(original), Err(gone()), cx),
+                Next::Gone
+            ));
+            let cold = krill_proto::control::Cold {
+                screen: Vec::new(),
+                history: Vec::new(),
+            };
+            assert!(matches!(
+                s.settled(pane, Ok(Got::Cold(original, cold)), cx),
+                Next::Gone
+            ));
+            assert_eq!(s.layout.focused(), Some(pane), "the pane stays focused");
+            assert!(s.gone_sessions.is_empty(), "the original is not reaped");
+            assert!(s.live[&pane].error.is_none(), "no error while switching");
+            assert!(
+                !s.live[&pane].pane.is_cold(),
+                "no cold screen while switching"
+            );
+            assert!(std::rc::Rc::ptr_eq(&picture, &s.live[&pane].pane.shown()));
+
+            s.apply_accounts_snapshot(snapshot(Some(replacement)), cx);
+            assert_eq!(s.layout.session(pane), Some(replacement));
+            assert_eq!(s.layout.focused(), Some(pane));
+            assert!(
+                std::rc::Rc::ptr_eq(&picture, &s.live[&pane].pane.shown()),
+                "the last picture stays until the replacement paints"
+            );
+        });
+    });
+}
+
 /// OWE-615 원인 1: 연속 음절 입력에서 `insertText` 직후 프레임이 와도 이전 확정 글자가 사라지지 않고
 /// 새 preedit가 그 다음 칸에 그려진다. 에코(커서 전진)가 오면 낙관적 글자가 지워진다.
 #[gpui::test]
