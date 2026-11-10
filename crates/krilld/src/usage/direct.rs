@@ -159,7 +159,7 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
     if cfg!(test) || (cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some()) {
         return;
     } // 실제 자격증명·네트워크는 단위 테스트에서 금지.
-    accounts::agy_native::reconcile_codex_host(home, &file.accounts);
+    accounts::agy_native::migrate_codex_host_once(home, state, &file.accounts);
     agy::refresh(home, state, &file, interval);
     let profiles = [
         ProviderKind::Claude,

@@ -1,13 +1,13 @@
-//! 프로바이더별 호스트 기본 경로 자격증명 동기화 및 Antigravity(`agy`) 단일 `~/.gemini` 네이티브 자격증명 교체.
+//! Antigravity(`agy`) 단일 `~/.gemini` 네이티브 자격증명 교체. 다른 프로바이더는 기본 로그인을 건드리지 않는다.
 //!
 //! - Antigravity(`agy`): `--gemini_dir`로 `.gemini` 루트를 분리하지 않고 호스트 기본 `~/.gemini`를 그대로 쓰면서,
 //!   계정 전환·실행 시 선택된 계정의 `antigravity-oauth-token`을 호스트 파일과 macOS 키체인(`gemini`/`antigravity`)에
 //!   원자적으로 반영한다. 교체 전 호스트에서 갱신된 토큰은 동일 이메일의 프로필 슬롯에 먼저 되돌려 저장한다.
-//! - Codex(`codex`): 선택된 프로필의 `auth.json`을 호스트 `~/.codex/auth.json`에도 동기화하고, 호스트에서 갱신된
-//!   `auth.json`은 동일 신원의 프로필 슬롯으로 되돌린다.
-//! - Claude(`claude`): 선택된 프로필의 키체인 자격증명(`Claude Code-credentials-<hash>`) 및 `.credentials.json`을
-//!   호스트 기본 자격증명(`Claude Code-credentials`, `~/.claude/.credentials.json`)에도 동기화한다.
-//! - `OpenCode`(`opencode`): 선택된 프로필의 `data/opencode/auth.json`을 `~/.local/share/opencode/auth.json`에 동기화한다.
+//! - Claude·Codex·`OpenCode`: 실행은 계정 폴더 env(`CLAUDE_CONFIG_DIR`·`CODEX_HOME`·`XDG_DATA_HOME`)로 고르고
+//!   기본 로그인은 쓰지 않는다(Orca `ClaudeProfileRouter`·Codex 계정별 홈·`OpenCode` 데이터 계정과 같다).
+//!   덮어쓰면 기본 로그인 토큰이 사라지고 기본 카드가 활성 계정 값을 보인다.
+//! - 예전 Krill은 활성 Codex 토큰을 `~/.codex/auth.json`에 복사했다. 그때 기본 경로에서 갱신된 토큰은
+//!   같은 신원의 프로필로 한 번만 옮긴다(Orca `legacy-shared-auth-migration`).
 
 #[cfg(target_os = "macos")]
 use std::io::Write as _;
@@ -18,11 +18,7 @@ use std::process::{Command, Stdio};
 use krill_proto::usage::ProviderKind;
 use zeroize::Zeroizing;
 
-#[cfg(target_os = "macos")]
-use super::profile_name::Vault as _;
 use super::{AccountsFile, StoredAccount, identity_from_credentials, write_atomic_0600};
-#[cfg(target_os = "macos")]
-use crate::usage::direct::claude_service;
 
 const MAX_TOKEN_BYTES: u64 = 64 * 1024;
 
@@ -39,26 +35,13 @@ fn active_dir_for(file: &AccountsFile, provider: ProviderKind) -> Option<&Path> 
         .map(|a| Path::new(&a.profile_dir))
 }
 
-/// `accounts.toml` 저장 시 활성 계정의 자격증명을 호스트 기본 경로와 동기화한다.
+/// `accounts.toml` 저장 시 활성 agy 계정의 자격증명을 호스트 기본 경로에 반영한다.
 pub(crate) fn sync_active(home: &Path, file: &AccountsFile) {
     sync_account(
         home,
         &file.accounts,
         active_dir_for(file, ProviderKind::Antigravity),
     );
-    if is_real_home(home) {
-        sync_codex_account(
-            home,
-            &file.accounts,
-            active_dir_for(file, ProviderKind::Codex),
-        );
-        sync_claude_account(
-            home,
-            active_dir_for(file, ProviderKind::Claude),
-            use_real_keychain(home),
-        );
-        sync_opencode_account(home, active_dir_for(file, ProviderKind::OpenCode));
-    }
 }
 
 /// 명시된 Antigravity 계정 프로필 폴더(`dir`)의 자격증명을 호스트 `~/.gemini`로 활성화한다.
@@ -81,30 +64,36 @@ pub(crate) fn sync_provider_account_dir(
             let file = super::load_file(home, state_dir);
             sync_account(home, &file.accounts, Some(dir));
         }
-        ProviderKind::Codex => {
-            let file = super::load_file(home, state_dir);
-            sync_codex_account(home, &file.accounts, Some(dir));
-        }
-        ProviderKind::Claude => {
-            sync_claude_account(home, Some(dir), use_real_keychain(home));
-        }
-        ProviderKind::OpenCode => {
-            sync_opencode_account(home, Some(dir));
-        }
-        ProviderKind::Gemini => {}
+        ProviderKind::Claude
+        | ProviderKind::Codex
+        | ProviderKind::OpenCode
+        | ProviderKind::Gemini => {}
     }
 }
 
-/// 호스트 기본 경로(및 macOS 키체인)에서 갱신된 토큰을 동일 신원의 프로필 슬롯으로 되돌린다.
+/// 호스트 기본 경로(및 macOS 키체인)에서 갱신된 agy 토큰을 동일 신원의 프로필 슬롯으로 되돌린다.
 pub(crate) fn reconcile_host_to_profiles(home: &Path, accounts: &[StoredAccount]) {
     sync_account(home, accounts, None);
-    reconcile_codex_host(home, accounts);
 }
 
-pub(crate) fn reconcile_codex_host(home: &Path, accounts: &[StoredAccount]) {
-    if is_real_home(home) {
-        sync_codex_account(home, accounts, None);
+const CODEX_MIGRATION_MARKER: &str = "codex-host-auth-migrated-v1";
+
+/// 예전 Krill이 `~/.codex/auth.json`에 복사한 활성 토큰이 거기서 갱신됐으면 같은 신원의 프로필로 한 번 옮긴다.
+/// 계속 옮기면 같은 계정의 별도 로그인 둘이 한 refresh 토큰을 나눠 써서 한쪽이 로그아웃된다.
+pub(crate) fn migrate_codex_host_once(
+    home: &Path,
+    state_dir: Option<&Path>,
+    accounts: &[StoredAccount],
+) {
+    if !is_real_home(home) {
+        return;
     }
+    let marker = super::config_path(home, state_dir).with_file_name(CODEX_MIGRATION_MARKER);
+    if marker.exists() {
+        return;
+    }
+    preserve_codex_host(home, accounts);
+    std::fs::write(&marker, b"").ok();
 }
 
 fn codex_account_id(raw: &[u8]) -> Option<String> {
@@ -116,162 +105,52 @@ fn codex_account_id(raw: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub(crate) fn sync_codex_account(
-    home: &Path,
-    accounts: &[StoredAccount],
-    target_dir: Option<&Path>,
-) {
-    if home.as_os_str().is_empty() {
-        return;
-    }
+fn preserve_codex_host(home: &Path, accounts: &[StoredAccount]) {
     let host_auth_path = home.join(".codex/auth.json");
-    if target_dir
-        .is_some_and(|dir| dir == home.join(".codex") || dir.join("auth.json") == host_auth_path)
-    {
+    let Some(host_raw) = read_token_file(&host_auth_path) else {
+        return;
+    };
+    let host_email = identity_from_credentials(ProviderKind::Codex, &host_raw).map(|i| i.email);
+    let host_acc_id = codex_account_id(&host_raw);
+    if host_email.is_none() && host_acc_id.is_none() {
         return;
     }
-    let mut current_host = read_token_file(&host_auth_path);
-
-    // 1. 호스트 `~/.codex/auth.json`에서 갱신된 토큰이 있으면 동일 신원의 프로필 슬롯에 보존한다.
-    if current_host.is_some() {
-        for acc in accounts {
-            if ProviderKind::parse(&acc.provider) != Some(ProviderKind::Codex)
-                || acc.profile_dir.is_empty()
-            {
-                continue;
-            }
-            let prof_dir = Path::new(&acc.profile_dir);
-            if !prof_dir.is_dir() {
-                continue;
-            }
-            let prof_auth_path = prof_dir.join("auth.json");
-            let Some(prof_raw) = read_token_file(&prof_auth_path) else {
-                continue;
-            };
-            let Some(host_raw) = current_host.as_ref() else {
-                break;
-            };
-            let host_email =
-                identity_from_credentials(ProviderKind::Codex, host_raw).map(|i| i.email);
-            let host_acc_id = codex_account_id(host_raw);
-            if host_email.is_none() && host_acc_id.is_none() {
-                break;
-            }
-            let prof_email = identity_from_credentials(ProviderKind::Codex, &prof_raw)
-                .map(|i| i.email)
-                .or_else(|| acc.email.clone());
-            let prof_acc_id = codex_account_id(&prof_raw);
-            let same_identity = match (&host_email, &prof_email) {
-                (Some(he), Some(pe)) => he.eq_ignore_ascii_case(pe),
-                _ => host_acc_id.is_some() && host_acc_id == prof_acc_id,
-            };
-            if !same_identity || &prof_raw == host_raw {
-                continue;
-            }
-            let is_target = target_dir == Some(prof_dir);
-            if token_is_newer(
+    for acc in accounts {
+        if ProviderKind::parse(&acc.provider) != Some(ProviderKind::Codex)
+            || acc.profile_dir.is_empty()
+        {
+            continue;
+        }
+        let prof_dir = Path::new(&acc.profile_dir);
+        let prof_auth_path = prof_dir.join("auth.json");
+        if prof_auth_path == host_auth_path {
+            continue;
+        }
+        let Some(prof_raw) = read_token_file(&prof_auth_path) else {
+            continue;
+        };
+        let prof_email = identity_from_credentials(ProviderKind::Codex, &prof_raw)
+            .map(|i| i.email)
+            .or_else(|| acc.email.clone());
+        let same_identity = match (&host_email, &prof_email) {
+            (Some(he), Some(pe)) => he.eq_ignore_ascii_case(pe),
+            _ => host_acc_id.is_some() && host_acc_id == codex_account_id(&prof_raw),
+        };
+        if same_identity
+            && prof_raw != host_raw
+            && token_is_newer(
                 ProviderKind::Codex,
-                host_raw,
+                &host_raw,
                 Some(&host_auth_path),
                 &prof_raw,
                 Some(&prof_auth_path),
-                is_target,
-            ) {
-                write_atomic_0600(&prof_auth_path, host_raw).ok();
-                crate::usage::direct::evict_profile(home, ProviderKind::Codex, prof_dir);
-                super::login::evict_profile(ProviderKind::Codex, prof_dir);
-            } else if (target_dir.is_none() || is_target)
-                && token_is_newer(
-                    ProviderKind::Codex,
-                    &prof_raw,
-                    Some(&prof_auth_path),
-                    host_raw,
-                    Some(&host_auth_path),
-                    false,
-                )
-            {
-                write_atomic_0600(&host_auth_path, &prof_raw).ok();
-                current_host = Some(prof_raw);
-                let host_dir = super::host_default_dir(home, ProviderKind::Codex);
-                crate::usage::direct::evict_profile(home, ProviderKind::Codex, &host_dir);
-                super::login::evict_profile(ProviderKind::Codex, &host_dir);
-            }
+                true,
+            )
+        {
+            write_atomic_0600(&prof_auth_path, &host_raw).ok();
+            crate::usage::direct::evict_profile(home, ProviderKind::Codex, prof_dir);
+            super::login::evict_profile(ProviderKind::Codex, prof_dir);
         }
-    }
-
-    // 2. 선택된 프로필의 `auth.json`을 호스트 `~/.codex/auth.json`에 반영한다.
-    let Some(target) = target_dir.filter(|d| !d.as_os_str().is_empty()) else {
-        return;
-    };
-    let Some(target_raw) = read_token_file(&target.join("auth.json")) else {
-        return;
-    };
-    if current_host.as_ref() != Some(&target_raw) {
-        write_atomic_0600(&host_auth_path, &target_raw).ok();
-        let host_dir = super::host_default_dir(home, ProviderKind::Codex);
-        crate::usage::direct::evict_profile(home, ProviderKind::Codex, &host_dir);
-        super::login::evict_profile(ProviderKind::Codex, &host_dir);
-    }
-}
-
-pub(crate) fn sync_claude_account(home: &Path, target_dir: Option<&Path>, allow_keychain: bool) {
-    if home.as_os_str().is_empty() {
-        return;
-    }
-    let Some(target) = target_dir.filter(|d| !d.as_os_str().is_empty()) else {
-        return;
-    };
-    let host_claude = home.join(".claude");
-    if target == host_claude {
-        return;
-    }
-    let target_creds = target.join(".credentials.json");
-    let host_creds = host_claude.join(".credentials.json");
-    let mut host_changed = false;
-    if target_creds != host_creds
-        && let Some(raw) = read_token_file(&target_creds)
-        && read_token_file(&host_creds).as_ref() != Some(&raw)
-    {
-        write_atomic_0600(&host_creds, &raw).ok();
-        host_changed = true;
-    }
-    #[cfg(target_os = "macos")]
-    if allow_keychain
-        && let (Some(src_service), Some(dst_service)) =
-            (claude_service(Some(target)), claude_service(None))
-        && src_service != dst_service
-        && super::Keychain.copy(&src_service, &dst_service).is_ok()
-    {
-        host_changed = true;
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = allow_keychain;
-    if host_changed {
-        let host_dir = super::host_default_dir(home, ProviderKind::Claude);
-        crate::usage::direct::evict_profile(home, ProviderKind::Claude, &host_dir);
-        super::login::evict_profile(ProviderKind::Claude, &host_dir);
-    }
-}
-
-pub(crate) fn sync_opencode_account(home: &Path, target_dir: Option<&Path>) {
-    if home.as_os_str().is_empty() {
-        return;
-    }
-    let Some(target) = target_dir.filter(|d| !d.as_os_str().is_empty()) else {
-        return;
-    };
-    let target_auth = target.join("data/opencode/auth.json");
-    let host_auth = home.join(".local/share/opencode/auth.json");
-    if target_auth == host_auth {
-        return;
-    }
-    if let Some(raw) = read_token_file(&target_auth)
-        && read_token_file(&host_auth).as_ref() != Some(&raw)
-    {
-        write_atomic_0600(&host_auth, &raw).ok();
-        let host_dir = super::host_default_dir(home, ProviderKind::OpenCode);
-        crate::usage::direct::evict_profile(home, ProviderKind::OpenCode, &host_dir);
-        super::login::evict_profile(ProviderKind::OpenCode, &host_dir);
     }
 }
 
@@ -804,73 +683,52 @@ mod tests {
     }
 
     #[test]
-    fn switching_codex_claude_and_opencode_accounts_syncs_host_credentials() {
+    fn switching_claude_codex_and_opencode_accounts_keeps_the_default_login() {
         let root =
-            std::env::temp_dir().join(format!("krill-all-native-swap-{}", std::process::id()));
+            std::env::temp_dir().join(format!("krill-default-login-kept-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let home = root.join("home");
-        let codex1 = root.join("codex1");
-        let codex2 = root.join("codex2");
-        let claude1 = root.join("claude1");
-        let opencode1 = root.join("opencode1");
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
-        std::fs::create_dir_all(&codex1).unwrap();
-        std::fs::create_dir_all(&codex2).unwrap();
-        std::fs::create_dir_all(&claude1).unwrap();
-        std::fs::create_dir_all(opencode1.join("data/opencode")).unwrap();
-
-        let cx1_old = br#"{"tokens":{"access_token":"cx1-old","account_id":"acc-1"}}"#;
-        let cx1_new = br#"{"tokens":{"access_token":"cx1-new","account_id":"acc-1"}}"#;
-        let cx2 = br#"{"tokens":{"access_token":"cx2","account_id":"acc-2"}}"#;
-        std::fs::write(codex1.join("auth.json"), cx1_old).unwrap();
-        std::fs::write(codex2.join("auth.json"), cx2).unwrap();
-
-        let accounts = vec![
-            StoredAccount {
-                id: "cx-1".into(),
-                provider: "codex".into(),
-                label: "CX1".into(),
-                email: Some("cx1@example.test".into()),
-                profile_dir: codex1.display().to_string(),
-            },
-            StoredAccount {
-                id: "cx-2".into(),
-                provider: "codex".into(),
-                label: "CX2".into(),
-                email: Some("cx2@example.test".into()),
-                profile_dir: codex2.display().to_string(),
-            },
-        ];
-
-        sync_codex_account(&home, &accounts, Some(&codex1));
-        assert_eq!(
-            std::fs::read(home.join(".codex/auth.json")).unwrap(),
-            cx1_old
-        );
-
-        std::fs::write(home.join(".codex/auth.json"), cx1_new).unwrap();
-        sync_codex_account(&home, &accounts, Some(&codex2));
-        assert_eq!(std::fs::read(codex1.join("auth.json")).unwrap(), cx1_new);
-        assert_eq!(std::fs::read(home.join(".codex/auth.json")).unwrap(), cx2);
-
-        let cl_creds = br#"{"claudeAiOauth":{"accessToken":"cl-1"}}"#;
-        std::fs::write(claude1.join(".credentials.json"), cl_creds).unwrap();
-        sync_claude_account(&home, Some(&claude1), false);
-        assert_eq!(
-            std::fs::read(home.join(".claude/.credentials.json")).unwrap(),
-            cl_creds
-        );
-
-        let oc_creds = br#"{"anthropic":{"type":"oauth","access":"oc-1"}}"#;
-        std::fs::write(opencode1.join("data/opencode/auth.json"), oc_creds).unwrap();
-        sync_opencode_account(&home, Some(&opencode1));
-        assert_eq!(
-            std::fs::read(home.join(".local/share/opencode/auth.json")).unwrap(),
-            oc_creds
-        );
-
+        let mut cases = Vec::new();
+        for (provider, host, profile) in [
+            (
+                ProviderKind::Claude,
+                ".claude/.credentials.json",
+                ".credentials.json",
+            ),
+            (ProviderKind::Codex, ".codex/auth.json", "auth.json"),
+            (
+                ProviderKind::OpenCode,
+                ".local/share/opencode/auth.json",
+                "data/opencode/auth.json",
+            ),
+        ] {
+            let dir = root.join(provider.as_str());
+            let (host, profile) = (home.join(host), dir.join(profile));
+            for path in [&host, &profile] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            }
+            std::fs::write(&host, br#"{"default":"login"}"#).unwrap();
+            std::fs::write(&profile, br#"{"profile":"login"}"#).unwrap();
+            cases.push((provider, dir, host));
+        }
+        let mut file = AccountsFile::default();
+        for (provider, dir, host) in &cases {
+            sync_provider_account_dir(&home, None, *provider, dir);
+            file.accounts.push(StoredAccount {
+                id: provider.as_str().into(),
+                provider: provider.as_str().into(),
+                label: provider.as_str().into(),
+                email: None,
+                profile_dir: dir.display().to_string(),
+            });
+            file.active
+                .insert(provider.as_str().into(), provider.as_str().into());
+            assert_eq!(std::fs::read(host).unwrap(), br#"{"default":"login"}"#);
+        }
+        sync_active(&home, &file);
+        for (_, _, host) in &cases {
+            assert_eq!(std::fs::read(host).unwrap(), br#"{"default":"login"}"#);
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -926,36 +784,28 @@ mod tests {
     }
 
     #[test]
-    fn codex_relogin_on_profile_is_not_clobbered_by_stale_host_token_and_updates_host() {
-        let root = std::env::temp_dir().join(format!(
-            "krill-codex-relogin-clobber-{}",
-            std::process::id()
-        ));
+    fn codex_migration_moves_only_a_newer_same_identity_default_token_and_never_writes_default() {
+        let root =
+            std::env::temp_dir().join(format!("krill-codex-host-migration-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let home = root.join("home");
         let prof = root.join("prof");
         std::fs::create_dir_all(home.join(".codex")).unwrap();
         std::fs::create_dir_all(&prof).unwrap();
-
-        let stale_host = codex_auth_payload(
+        let older = codex_auth_payload(
             "2026-10-28T11:02:37Z",
             1_793_185_356,
             1_794_049_356,
             1_793_185_356,
             1_793_188_956,
         );
-        let fresh_relogin = codex_auth_payload(
+        let newer = codex_auth_payload(
             "2026-11-08T14:24:24Z",
             1_794_147_864,
             1_795_011_864,
             1_794_147_864,
             1_794_151_464,
         );
-
-        std::fs::write(prof.join("auth.json"), &fresh_relogin).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(home.join(".codex/auth.json"), &stale_host).unwrap();
-
         let accounts = vec![StoredAccount {
             id: "codex-alpha".into(),
             provider: "codex".into(),
@@ -963,24 +813,20 @@ mod tests {
             email: Some("alpha@example.test".into()),
             profile_dir: prof.display().to_string(),
         }];
+        let read = |path: &Path| std::fs::read(path).unwrap();
 
-        sync_codex_account(&home, &accounts, None);
-        sync_codex_account(&home, &accounts, Some(&prof));
+        // A profile relogin newer than the default copy stays, and the default is never written.
+        std::fs::write(prof.join("auth.json"), &newer).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), &older).unwrap();
+        preserve_codex_host(&home, &accounts);
+        assert_eq!(read(&prof.join("auth.json")), newer.as_bytes());
+        assert_eq!(read(&home.join(".codex/auth.json")), older.as_bytes());
 
-        let prof_after = std::fs::read(prof.join("auth.json")).unwrap();
-        assert_eq!(
-            prof_after,
-            fresh_relogin.as_bytes(),
-            "{}",
-            String::from_utf8_lossy(&prof_after)
-        );
-        let host_after = std::fs::read(home.join(".codex/auth.json")).unwrap();
-        assert_eq!(
-            host_after,
-            fresh_relogin.as_bytes(),
-            "{}",
-            String::from_utf8_lossy(&host_after)
-        );
+        // A default copy refreshed after the old swap moves back to its profile.
+        std::fs::write(prof.join("auth.json"), &older).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), &newer).unwrap();
+        preserve_codex_host(&home, &accounts);
+        assert_eq!(read(&prof.join("auth.json")), newer.as_bytes());
 
         std::fs::remove_dir_all(&root).ok();
     }
