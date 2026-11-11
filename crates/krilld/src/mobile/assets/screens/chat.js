@@ -562,6 +562,8 @@
       return true;
     }
     // Snapshot identity changes clear private paint immediately; transient read failures do not.
+    let pollQueued = false,
+      appliedTimer = null;
     function syncReadScope() {
       const sess = state.sessions.get(sessionId),
         key = JSON.stringify([
@@ -624,6 +626,7 @@
         entry.model = null;
         entry.composerStatus = null;
         entry.composerStatusAt = 0;
+        entry.composerProbes = 0;
         statusFlight = null;
         discovery.clear();
         discovering.clear();
@@ -947,53 +950,104 @@
       closeSuggestions();
       if (!capability("composer_models")) return;
       const context = scope(),
-        version = suggestVersion;
+        version = suggestVersion,
+        warm =
+          entry.modelChoices?.scope === context ? entry.modelChoices.items : [];
       entry.model = null;
       syncAgent();
       picker = { kind: "models", scope: context };
-      paintChoices(entry.modelChoices?.scope === context ? entry.modelChoices.items : []);
+      paintChoices(warm, warm.length ? undefined : t("Loading…"));
       try {
-        await refreshStatus(true);
-        const data = await discover("composer_models");
+        const [, data] = await Promise.all([
+          refreshStatus(true).catch(() => {}),
+          discover("composer_models"),
+        ]);
         if (!active() || version !== suggestVersion || scope() !== context)
           return;
+        if (
+          data?.supported &&
+          capability("chat_composer") &&
+          !entry.composerStatus?.effort_supported &&
+          !entry.composerStatus?.models?.length
+        ) {
+          await refreshStatus(true).catch(() => {});
+          if (!active() || version !== suggestVersion || scope() !== context)
+            return;
+        }
         const models = data?.supported
           ? (data.items || data.models || []).filter(
               (item) => typeof item.id === "string" && item.id,
             )
           : [];
-        const current = models.find((item) => item.id === data.current);
+        const status = entry.composerStatus,
+          agent = chatAgent(),
+          current = models.find((item) => item.id === data.current);
         entry.model = current
           ? {
-              agent: chatAgent(),
+              agent,
               scope: context,
               id: current.id,
               label: current.label || current.name || current.id,
-              statusBefore: entry.composerStatus?.model,
+              effort: status?.effort || null,
+              statusBefore: status?.model,
+              statusEffortBefore: status?.effort,
             }
           : null;
         syncAgent();
-        const status = entry.composerStatus,
-          agent = chatAgent();
+        const effortSupported = Boolean(
+            status?.effort_supported ||
+              (data?.supported &&
+                models.some(
+                  (m) => Array.isArray(m.efforts) && m.efforts.length,
+                )),
+          ),
+          activeModelId = data?.current || status?.model;
         const items = models.map((item) => {
-          const current = item.id === data.current || matchesModel(agent, item.id, status?.model),
+          const isCurrent =
+              item.id === data.current ||
+              matchesModel(agent, item.id, status?.model),
             label = t(item.label || item.name || item.id);
           return {
             id: item.id,
             group: "models",
-            current,
-            label: current && agent === "claude" && status?.model ? fullModel(status.model) : label,
-            efforts: status?.effort_supported ? status.models?.find(model => model.id === item.id)?.efforts || [] : [],
+            current: isCurrent,
+            label:
+              isCurrent && agent === "claude" && status?.model
+                ? fullModel(status.model)
+                : label,
+            efforts: effortSupported
+              ? (Array.isArray(item.efforts)
+                  ? item.efforts
+                  : status?.models?.find((model) => model.id === item.id)
+                      ?.efforts) || []
+              : [],
           };
         });
-        const efforts = status?.models?.find(model => model.id === status.model)?.efforts || status?.efforts || [];
-        if (status?.effort_supported && efforts.length > 1)
+        const efforts =
+          models.find((model) => model.id === activeModelId)?.efforts ||
+          status?.models?.find((model) => model.id === activeModelId)
+            ?.efforts ||
+          status?.efforts ||
+          [];
+        if (effortSupported && efforts.length > 1)
           for (const effort of efforts)
-            items.push({id:effort, group:"efforts", current:effort === status.effort, label:t(EFFORT_LABELS.get(effort) || effort)});
-        entry.modelChoices = {scope:context, items};
+            items.push({
+              id: effort,
+              group: "efforts",
+              current: effort === status?.effort,
+              label: t(EFFORT_LABELS.get(effort) || effort),
+            });
+        entry.modelChoices = { scope: context, items };
         paintChoices(
           items,
-          models.length ? undefined : t(data?.reason || "Model selection is unavailable for this session."),
+          models.length
+            ? data?.note
+              ? t(data.note)
+              : undefined
+            : t(
+                data?.reason ||
+                  "Model selection is unavailable for this session.",
+              ),
         );
       } catch (error) {
         if (active() && version === suggestVersion && scope() === context)
@@ -1015,6 +1069,20 @@
         version = suggestVersion,
         operation = { scope: context };
       entry.modelPending = operation;
+      if (picker?.kind === "models" && !suggestions.hidden) {
+        suggestions.dataset.pending = "true";
+        const chosen =
+          choice ||
+          choices.find((item) => item.group === "efforts" && item.id === effort);
+        if (chosen?.node) chosen.node.dataset.pending = "true";
+        for (const item of choices) if (item.node) item.node.disabled = true;
+        for (const child of Array.from(suggestions.children || []))
+          if (child.tagName === "P" || child.tag === "p") child.remove();
+        suggestions.insertBefore(
+          el("p", t("Applying…"), "muted chat-picker-status"),
+          choiceList,
+        );
+      }
       updateComposer();
       try {
         const result = await ctx.rpc({
@@ -1032,16 +1100,34 @@
         discovery.clear();
         if (result?.applied === true) {
           const id =
-            typeof result.model === "string" ? result.model : choice?.id;
-          if (id) entry.model = {
-            agent: chatAgent(),
-            scope: context,
-            id,
-            label: result.label || (id === choice?.id ? choice.label : id),
-            statusBefore: entry.composerStatus?.model,
-          };
+              typeof result.model === "string" ? result.model : choice?.id,
+            nextEffort =
+              result.effort ||
+              effort ||
+              entry.model?.effort ||
+              entry.composerStatus?.effort ||
+              null;
+          if (id)
+            entry.model = {
+              agent: chatAgent(),
+              scope: context,
+              id,
+              label: result.label || (id === choice?.id ? choice.label : id),
+              effort: nextEffort,
+              statusBefore: entry.composerStatus?.model,
+              statusEffortBefore: entry.composerStatus?.effort,
+            };
+          else if (result.effort && entry.model?.scope === context)
+            entry.model.effort = result.effort;
           entry.composerStatusAt = 0;
-          if (result.effort && entry.composerStatus) entry.composerStatus.effort = result.effort;
+          entry.composerProbes = 0;
+          if (result.effort && entry.composerStatus)
+            entry.composerStatus.effort = result.effort;
+          clearTimeout(appliedTimer);
+          modelBtn.dataset.applied = "true";
+          appliedTimer = setTimeout(() => {
+            delete modelBtn.dataset.applied;
+          }, 1500);
           if (active() && version === suggestVersion) closeSuggestions();
         } else if (active() && version === suggestVersion)
           paintChoices(
@@ -1057,6 +1143,7 @@
         )
           paintChoices([], t("Model change was not confirmed."));
       } finally {
+        delete suggestions.dataset.pending;
         if (entry.modelPending === operation) {
           entry.modelPending = null;
           if (ownsEntry()) entry.notifyComposer?.();
@@ -1068,7 +1155,9 @@
       if (!active() || !capability("chat_composer") || state.cached || state.connection?.phase !== "ready") return;
       const binding = scope(), generation = entry.generation, owner = ctx.transport, linkEpoch = state.connection?.generation;
       if (statusFlight?.binding === binding) return statusFlight.promise;
-      if (!force && (!isVisible() || Date.now() - (entry.composerStatusAt || 0) < 15000)) return;
+      const hasLiveMeta = Boolean(entry.composerStatus?.model || entry.composerStatus?.supported),
+        ttl = hasLiveMeta || (entry.composerProbes || 0) >= 10 ? 15000 : 1500;
+      if (!force && (!isVisible() || Date.now() - (entry.composerStatusAt || 0) < ttl)) return;
       const flight = {binding};
       const current = () => statusFlight === flight && active() && scope() === binding && entry.generation === generation && owner === ctx.transport && linkEpoch === state.connection?.generation;
       flight.promise = Promise.resolve().then(async () => {
@@ -1076,6 +1165,8 @@
           const data = await ctx.rpc({action:"chat_composer", session:sessionId});
           if (!current() || data?.agent !== chatAgent() || data.generation && data.generation !== generation) return;
           if (entry.model && data.model && data.model !== entry.model.statusBefore && !matchesModel(chatAgent(), entry.model.id, data.model)) entry.model = null;
+          else if (entry.model && data.effort && data.effort !== entry.model.statusEffortBefore) entry.model.effort = data.effort;
+          entry.composerProbes = data?.model || data?.supported ? 0 : (entry.composerProbes || 0) + 1;
           entry.composerStatus = data; entry.composerStatusAt = Date.now(); syncAgent();
         } catch (error) {
           if (current()) {entry.composerStatus = null; entry.composerStatusAt = Date.now(); syncAgent(); if (force) throw error;}
@@ -1090,12 +1181,14 @@
       const context = scope(),
         agent = chatAgent(),
         status = entry.composerStatus?.agent === agent ? entry.composerStatus : null,
-        currentModel = entry.model?.agent === agent && entry.model.scope === context ? entry.model.label : null,
+        currentEntryModel = entry.model?.agent === agent && entry.model.scope === context ? entry.model : null,
+        currentModel = currentEntryModel?.label || null,
         observedModel = currentModel || status?.model_label || status?.model,
+        observedEffort = currentEntryModel?.effort || status?.effort,
         hasStatus = capability("chat_composer"),
         modelText = observedModel || t(hasStatus ? "Model unknown" : "Model"),
-        label = hasStatus ? `${modelText} · ${status?.effort || t("Effort unknown")}` : modelText,
-        filledBars = EFFORT_BARS.get(status?.effort);
+        label = hasStatus ? `${modelText} · ${observedEffort || t("Effort unknown")}` : modelText,
+        filledBars = EFFORT_BARS.get(observedEffort);
       shell.dataset.composerStatus = String(hasStatus);
       if ((modelBtn.getAttribute ? modelBtn.getAttribute("aria-label") : modelBtn.attrs?.["aria-label"]) !== label) modelBtn.setAttribute("aria-label", label);
       modelName.textContent = observedModel ? shortModel(observedModel) : modelText;
@@ -1111,7 +1204,8 @@
         contextMeter.style.background = `conic-gradient(var(--foreground) ${usage}%, var(--border) 0)`;
         contextMeter.title = description; contextMeter.setAttribute("aria-label",description);
       }
-      modelBtn.hidden = !agent || !capability("composer_models") || (!!status && !status.supported && !status.model && !status.model_label && !currentModel);
+      const controllable = ["claude", "codex", "agy"].includes(agent);
+      modelBtn.hidden = !agent || !capability("composer_models") || (!controllable && !!status && !status.supported && !status.model && !status.model_label && !currentModel);
       modelBtn.disabled =
         !!entry.modelPending ||
         entry.sending ||
@@ -1228,7 +1322,11 @@
       syncOptimistic();
       if (cleared) pinLatestSoon();
       input.disabled = !!liveQuestion;
-      modelBtn.disabled = !!liveQuestion;
+      modelBtn.disabled =
+        !!liveQuestion ||
+        !!entry.modelPending ||
+        entry.sending ||
+        state.connection?.phase !== "ready";
       sendBtn.disabled =
         !!entry.modelPending ||
         !!liveQuestion ||
@@ -2372,7 +2470,7 @@
     }
     function clearTranscript() {
       prefetchedEarlier = null; fillPages = 0;
-      entry.composerStatus = null; entry.composerStatusAt = 0; statusFlight = null;
+      entry.composerStatus = null; entry.composerStatusAt = 0; entry.composerProbes = 0; statusFlight = null;
       entry.items = [];
       entry.retainedBytes = 0;
       entry.disclosures?.clear();
@@ -2656,6 +2754,9 @@
         if (retryWithoutTail) {
           retryWithoutTail = false;
           pollNow(initial);
+        } else if (pollQueued) {
+          pollQueued = false;
+          if (canReadEarlier() && !entry.loaded) pollNow();
         }
       }
     }
@@ -2877,6 +2978,9 @@
         if (!canReadEarlier()) {
           earlierEpoch++;
           earlierQueued = false;
+          pollQueued = false;
+        } else if (inFlight && !entry.loaded && !entry.live) {
+          pollQueued = true;
         }
         if (picker && picker.scope !== scope()) closeSuggestions();
         updateStatus();
@@ -2888,6 +2992,7 @@
         syncDraft();
         earlierEpoch++;
         earlierQueued = false;
+        pollQueued = false;
         closeSuggestions();
         discovery.clear();
         discovering.clear();
@@ -2902,6 +3007,7 @@
         resize?.disconnect();
         pruneCache(state);
         clearTimeout(pollTimer);
+        clearTimeout(appliedTimer);
         pollTimer = null;
         if (entry.notifyComposer === updateComposer)
           entry.notifyComposer = null;

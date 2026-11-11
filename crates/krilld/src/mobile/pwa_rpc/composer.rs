@@ -180,6 +180,14 @@ impl Backend {
         }
     }
 
+    pub(super) fn prewarm_composer(&self, session: u64) {
+        if let Ok(context) = self.composer_context(session)
+            && context.agent == "agy"
+        {
+            agy::prewarm(&context);
+        }
+    }
+
     pub(super) fn composer_context(&self, session: u64) -> io::Result<Context> {
         // Resolve a live session before touching any account/project metadata. Client paths are never accepted.
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
