@@ -43,6 +43,22 @@ const key=(root,id)=>find(root,'keybar').children.find(el=>el.dataset.keyId===id
 const flush=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
 async function advance(ms){const end=clock+ms;for(;;){const next=[...timers].filter(([,t])=>t.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];if(!next)break;clock=next[1].at;timers.delete(next[0]);next[1].fn();await flush();}clock=end;await flush();}
 const inputs=socket=>Array.from(socket.sent).filter(a=>a instanceof Uint8Array&&a[4]===0x13).map(a=>{const r=T.reader(a.slice(5));r.n();return r.text();});
+async function testFrozenRoleReply(){
+ // iOS freezes a hidden home-screen app: the hide-time role request must not time out on the frozen clock,
+ // yet a terminal socket that really died in the background is still found one role window after returning.
+ const doc=context.document,hide=async()=>{doc.hidden=true;doc.visibilityState='hidden';doc.dispatchEvent(new Event('visibilitychange'));await flush();},show=async()=>{doc.hidden=false;doc.visibilityState='visible';doc.dispatchEvent(new Event('visibilitychange'));await flush();};
+ let {root,handle,socket}=await mount(2101,{preferences:{fitToPhone:false}});
+ const roles=()=>socket.sent.filter(a=>a[4]===0x17).length,before=roles();
+ await hide();assert.equal(roles(),before+1,'hiding releases the terminal size');
+ await advance(30000);assert.equal(socket.readyState,1,'time frozen in the background is not a terminal timeout');
+ await show();assert.equal(roles(),before+2,'returning asks the daemon once more');
+ socket.frame(0x2c,T.v(0));socket.frame(0x2c,T.v(0));await flush();await advance(6000);
+ assert.equal(socket.readyState,1);assert.notEqual(root.dataset.phase,'disconnected');handle.unmount();
+ ({root,handle,socket}=await mount(2102,{preferences:{fitToPhone:false}}));
+ await hide();await advance(30000);await show();await advance(4900);assert.equal(socket.readyState,1);
+ await advance(200);assert.notEqual(socket.readyState,1,'a dead socket is found within one role window');assert.equal(root.dataset.phase,'disconnected');handle.unmount();
+ delete doc.hidden;
+}
 async function mount(id=7,extra={}){const root=new Element('div'),handle=context.mountFixture(root,id,extra);await flush();const socket=context.sockets.at(-1);socket.handshake();socket.screen();await flush();return {root,handle,socket};}
 async function testHiddenPaint(){
  const hidden=await mount(1901,{visible:false,preferences:{fitToPhone:false}});
@@ -299,6 +315,7 @@ async function main(){
  // 스크롤 관성·휠 경로는 가상 시계를 performance.now에도 물려 결정적으로 검사한다.
  context.performance={now:()=>clock};try{await testTuiScrollRouting();await testShortCanvasScroll();await testScrollPhysics();await testHistoryRefreshMerge();await testInitialAndQueuedHistoryScroll();}finally{delete context.performance;}
  await testKeyboardKeepsLiveView();
+ await testFrozenRoleReply();
  console.log('All terminal adapter regression checks passed.');
 }
 async function testKeyboardKeepsLiveView(){
