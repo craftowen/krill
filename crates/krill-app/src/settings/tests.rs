@@ -5100,6 +5100,31 @@ fn updates_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppCont
     fs::remove_dir_all(d).ok();
 }
 
+/// 설정 사이드바 맨 아래 피드백 행은 GitHub 이슈 양식 선택 화면을 연다(메뉴 막대 없는 Windows용 창구).
+#[gpui::test]
+fn sidebar_feedback_row_opens_the_issue_chooser(cx: &mut TestAppContext) {
+    let d = dir("sidebar-feedback");
+    init(cx, &d);
+    let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(900.)));
+    vcx.run_until_parked();
+    let sidebar = vcx
+        .debug_bounds("admin-sidebar")
+        .expect("missing admin-sidebar");
+    let feedback = vcx
+        .debug_bounds("admin-feedback")
+        .expect("missing admin-feedback");
+    assert!(feedback.bottom() <= sidebar.bottom());
+    assert!(
+        feedback.bottom() > sidebar.bottom() - px(80.),
+        "feedback row sits at the sidebar bottom"
+    );
+    vcx.simulate_click(feedback.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(cx.opened_url().as_deref(), Some(super::FEEDBACK_URL));
+    fs::remove_dir_all(d).ok();
+}
+
 /// 업데이트 탭은 캐시한 릴리스별 변경 사항을 보여 주고, 시스템 탭에는 업데이트 행이 없다.
 #[gpui::test]
 fn updates_tab_lists_changes_per_release(cx: &mut TestAppContext) {

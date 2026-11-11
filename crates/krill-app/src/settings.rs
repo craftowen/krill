@@ -2019,6 +2019,9 @@ pub fn open_project_settings(repo: &Path, cx: &mut App) {
     open_window_at_tab(AdminTab::Project, cx);
 }
 
+/// 피드백 창구: GitHub 이슈 양식(버그·기능 요청) 선택 화면. 설정 사이드바와 Help 메뉴가 같이 쓴다.
+pub const FEEDBACK_URL: &str = "https://github.com/craftowen/krill/issues/new/choose";
+
 pub fn open_window_at_tab(tab: AdminTab, cx: &mut App) {
     if let Some(handle) = cx
         .windows()
@@ -11618,6 +11621,7 @@ impl SettingsView {
     }
 
     /// 왼쪽 탭 기둥. 탭 자리는 검색해도 움직이지 않고, 맞은 개수가 붙거나 흐려진다.
+    /// 맨 아래 피드백 행은 메뉴 막대가 없는 Windows에서도 피드백 창구를 찾게 한다.
     fn render_settings_nav(
         &self,
         search_field: gpui::Stateful<gpui::Div>,
@@ -11713,6 +11717,35 @@ impl SettingsView {
             )
             .child(search_field)
             .child(tabs)
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("admin-feedback")
+                    .debug_selector(|| "admin-feedback".into())
+                    .min_h(px(30.))
+                    .flex_none()
+                    .py_1()
+                    .px_2()
+                    .rounded(crate::ui::RADIUS_SM)
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(crate::ui::TEXT_SM)
+                    .text_color(p.muted_foreground)
+                    .hover(|d| d.bg(p.sidebar_accent).text_color(p.foreground))
+                    .active(|d| d.bg(p.accent).text_color(p.foreground))
+                    .on_click(|_, _, cx| cx.open_url(FEEDBACK_URL))
+                    .child(
+                        gpui_component::Icon::new(gpui_component::IconName::ExternalLink).small(),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(crate::i18n::catalog::general::SEND_FEEDBACK.get()),
+                    ),
+            )
     }
 
     /// 작은 창에서 왼쪽 탭 기둥 대신 쓰는 탭 메뉴와 검색 칸.
@@ -11759,7 +11792,10 @@ impl SettingsView {
                                     }),
                             );
                         }
-                        menu
+                        menu.separator().item(
+                            PopupMenuItem::new(crate::i18n::catalog::general::SEND_FEEDBACK.get())
+                                .on_click(|_, _, cx| cx.open_url(FEEDBACK_URL)),
+                        )
                     }),
             )
             .child(search_field)
