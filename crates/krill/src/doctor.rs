@@ -114,9 +114,25 @@ fn render_head(collected: &Collected) {
         println!("krilld     unknown ({error})");
     }
     #[cfg(unix)]
-    println!("launch     dev build (posix_spawn + setsid; TCC attribution follows the launcher)");
+    if daemon::is_autostart_registered() {
+        println!(
+            "launch     launchd LaunchAgent ({}; RunAtLoad)",
+            daemon::HOLDER_LABEL
+        );
+    } else {
+        println!(
+            "launch     dev build (posix_spawn + setsid; TCC attribution follows the launcher)"
+        );
+    }
     #[cfg(windows)]
-    println!("launch     detached holder (Windows bootstrap + Job breakaway)");
+    if daemon::is_autostart_registered() {
+        println!(
+            "launch     Windows Run autostart ({}; bootstrap + Job breakaway)",
+            daemon::HOLDER_LABEL
+        );
+    } else {
+        println!("launch     detached holder (Windows bootstrap + Job breakaway)");
+    }
 }
 
 /// 현행 줄 형식을 그대로 그리는 항목(helpers·state·crash·record·telemetry·git·daemon·history).

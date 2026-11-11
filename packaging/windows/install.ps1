@@ -361,3 +361,20 @@ if ($krillUi) {
 if ($alreadyInstalled) { "already installed: $Dest (files preserved; use the app to check for updates)" }
 else { "installed: $Dest" }
 if ($download -and -not $NoOpen) { Start-Process -FilePath (Join-Path $Dest 'krill-app.exe') }
+elseif ($Dest -eq (Join-Path $env:LOCALAPPDATA 'Programs\Krill')) {
+    $cliExe = Join-Path $Dest 'krill.exe'
+    if (Test-Path -LiteralPath $cliExe -PathType Leaf) {
+        try {
+            $stream = [IO.File]::OpenRead($cliExe)
+            try {
+                $b0 = $stream.ReadByte()
+                $b1 = $stream.ReadByte()
+            } finally {
+                $stream.Dispose()
+            }
+            if ($b0 -eq 0x4D -and $b1 -eq 0x5A) {
+                & $cliExe ls *> $null
+            }
+        } catch {}
+    }
+}

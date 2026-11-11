@@ -444,6 +444,9 @@ for root, dirs, files in os.walk(dst, topdown=False):
     VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "${APP_DST}/Contents/Info.plist" 2>/dev/null || echo "latest")"
 
     OPEN_STATUS="$(msg "앱 열기 생략(--no-open)" "skipped opening the app (--no-open)")"
+    if [[ "${PREFIX}" == "${HOME}/.local" && ( "${APP_DIR}" == "/Applications" || "${APP_DIR}" == "${HOME}/Applications" ) ]]; then
+        "${BIN}/krill" ls >/dev/null 2>&1 || true
+    fi
     if [[ "${NO_OPEN}" -eq 0 ]]; then
         if open "${APP_DST}"; then
             OPEN_STATUS="$(msg "앱 열기 요청 전달" "asked the app to open")"
@@ -584,6 +587,9 @@ then
     exit 1
 fi
 ui_step_done "04" "04" "$(msg "완료" "Done")" "$(msg "CLI · krill-holder · krilld 설치 완료" "CLI, krill-holder and krilld installed")"
+if [[ "${PREFIX}" == "${HOME}/.local" ]]; then
+    "${BIN}/krill" ls >/dev/null 2>&1 || true
+fi
 
 if [[ "${UI}" -eq 1 ]]; then
     TOTAL_ELAPSED="$(fmt_elapsed_cs "$(now_cs)" "${INSTALL_START_CS}")"
