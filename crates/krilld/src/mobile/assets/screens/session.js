@@ -814,8 +814,17 @@
     summary.append(liveDot, summaryText);
     header.querySelector("h1").parentElement.append(summary);
 
+    const pendingMode = sessionView(
+      state.preferences,
+      "new",
+      Boolean(M.chat?.mount),
+    );
     for (const node of [
-      button(t("Chat"), () => {}, "ghost small mode-toggle"),
+      button(
+        t(pendingMode === "chat" ? "Term" : "Chat"),
+        () => {},
+        "ghost small mode-toggle",
+      ),
       button(t("Terminal actions"), () => {}, "icon-button", "more"),
     ]) {
       node.disabled = true;
@@ -877,15 +886,34 @@
       () => {},
     );
     scroll.append(fresh);
-    const frame = el("div", undefined, "terminal-frame"),
-      dock = el("footer", undefined, "command-dock"),
-      accessory = el("div", undefined, "accessory-row pending-accessory");
-    dock.setAttribute("aria-hidden", "true");
-    dock.append(accessory);
-    if (state.preferences?.inputMode === "buffered")
-      dock.append(el("div", undefined, "input-row pending-buffered"));
-    mount.append(frame, dock);
-    pane.append(mount);
+    if (pendingMode === "chat") {
+      const chatView = el("div", undefined, "chat-view pending-chat"),
+        feed = el("div", undefined, "chat-feed"),
+        composer = el("footer", undefined, "chat-composer"),
+        box = el("div", undefined, "chat-composer-box"),
+        input = el("textarea", undefined, "chat-input"),
+        statusRow = el("div", undefined, "chat-status-row");
+      input.disabled = true;
+      input.rows = 1;
+      input.placeholder = job.agent
+        ? t("Message {0}", agentName(job.agent)).replace("{0}", agentName(job.agent))
+        : t("Connecting…");
+      composer.setAttribute("aria-hidden", "true");
+      box.append(input);
+      composer.append(box, statusRow);
+      chatView.append(feed, composer);
+      pane.append(chatView);
+    } else {
+      const frame = el("div", undefined, "terminal-frame"),
+        dock = el("footer", undefined, "command-dock"),
+        accessory = el("div", undefined, "accessory-row pending-accessory");
+      dock.setAttribute("aria-hidden", "true");
+      dock.append(accessory);
+      if (state.preferences?.inputMode === "buffered")
+        dock.append(el("div", undefined, "input-row pending-buffered"));
+      mount.append(frame, dock);
+      pane.append(mount);
+    }
     panels.append(pane);
     screen.append(header, tabs, panels);
     root.append(screen);

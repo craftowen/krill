@@ -275,6 +275,42 @@ fn only_the_latest_native_line_confirms() {
         (3, 2),
     );
     assert!(!confirmed(&stale, label));
+    let callout_and_wrap = screen(
+        &[
+            "> /model",
+            "  ⎿  Model set to Gemini 4 Carbon",
+            "     (Medium)",
+            " ┃ Introducing Gemini 4 Carbon",
+            " ┃ Our most advanced model yet!",
+            " ┃ esc to dismiss",
+            RULE,
+            ">",
+            RULE,
+            "Gemini 4 Carbon (Medium) (1.0M) │ 0/1.0M",
+        ],
+        (7, 2),
+    );
+    assert!(
+        confirmed(&callout_and_wrap, "Gemini 4 Carbon (Medium)"),
+        "narrow wrapped acknowledgment above sticky callout banner confirms"
+    );
+    assert!(!confirmed(&callout_and_wrap, "Gemini 4 Carbon (High)"));
+    let stale_behind_callout = screen(
+        &[
+            "  ⎿  Model set to Gemini 4 Carbon (Medium)",
+            "> /help",
+            " ┃ Introducing Gemini 4 Carbon",
+            " ┃ esc to dismiss",
+            RULE,
+            ">",
+            RULE,
+        ],
+        (5, 2),
+    );
+    assert!(!confirmed(
+        &stale_behind_callout,
+        "Gemini 4 Carbon (Medium)"
+    ));
 }
 
 #[test]

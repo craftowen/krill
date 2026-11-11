@@ -2746,8 +2746,38 @@ async function testInstantCreate() {
   view.update();
   assert.equal(f.routes.at(-1), "/g/g/");
   view.cleanup();
+  const chatPendingRoot = new Element("main");
+  f.state.preferences = { defaultSessionView: "chat" };
+  f.sandbox.KrillMobile.chat = { mount: () => ({ update() {}, unmount() {} }) };
+  current = job;
+  const chatPendingView = f.sandbox.KrillMobile.screens.session(
+    chatPendingRoot,
+    f.ctx,
+  );
+  assert(
+    chatPendingRoot
+      .descendants()
+      .some((n) => n.className === "chat-view pending-chat"),
+    "pending session in chat preference renders pending-chat shell instead of terminal",
+  );
+  assert(
+    !chatPendingRoot.descendants().some((n) => n.className === "terminal-mount"),
+  );
+  assert.equal(
+    chatPendingRoot
+      .descendants()
+      .find((n) => n.className?.includes("mode-toggle"))?.textContent,
+    "Term",
+  );
+  assert.equal(
+    chatPendingRoot
+      .descendants()
+      .find((n) => n.className === "chat-composer")?.attrs["aria-hidden"],
+    "true",
+  );
+  chatPendingView.cleanup();
   console.log(
-    "PASS pending session screen: selected new tab and blank terminal surface at once, wording only after 1s",
+    "PASS pending session screen: selected new tab and blank terminal/chat surface at once, wording only after 1s",
   );
 }
 async function testPromptDraftAndInactiveMenu() {
