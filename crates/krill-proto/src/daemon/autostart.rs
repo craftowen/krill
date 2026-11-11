@@ -393,6 +393,7 @@ fn sync_windows_run_in(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn stable_install_path_accepts_installed_locations_and_rejects_ephemeral_builds() {
         let temp = Path::new("/tmp/custom-temp");
@@ -586,15 +587,32 @@ mod tests {
 
         assert!(sync_windows_run_in(&key, HOLDER_LABEL, &receipt, &expected).unwrap());
         assert!(!sync_windows_run_in(&key, HOLDER_LABEL, &receipt, &expected).unwrap());
-        let queried = crate::os::background_command(reg_exe())
-            .args(["query", &key, "/v", HOLDER_LABEL])
-            .output()
+        // `reg.exe query`는 영문 Windows 러너(CP437/CP1252) 파이프에서 한글을 `?`로 바꾸므로,
+        // 항상 UTF-16LE BOM으로 내보내는 `reg.exe export`로 실제 저장된 유니코드를 검증한다.
+        let exported = root.join("exported.reg");
+        let export_status = crate::os::background_command(reg_exe())
+            .args(["export", &key, exported.to_str().unwrap(), "/y"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
             .unwrap();
-        assert!(queried.status.success());
-        let text = String::from_utf8_lossy(&queried.stdout);
+        assert!(export_status.success());
+        let bytes = fs::read(&exported).unwrap();
+        let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(&bytes);
+        let units: Vec<u16> = body
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(u16::from_le_bytes)
+            .collect();
+        let reg_text = String::from_utf16(&units).unwrap();
+        let escaped = expected.replace('\\', r"\\").replace('"', r#"\""#);
+        let needle = format!("\"{HOLDER_LABEL}\"=\"{escaped}\"");
         assert!(
-            text.contains(&expected),
-            "unexpected reg query output: {text}"
+            reg_text.contains(&needle),
+            "unexpected reg export output: {reg_text}"
         );
         fs::remove_dir_all(&root).ok();
     }
