@@ -166,5 +166,5 @@
  if(endpoint.pairingError)error(Error(endpoint.pairingError));
  applyPreferences();
  if(pairing)startPairing();
- let hiddenAt=0;receiveEntry();const resume=e=>{if(document.hidden){hiddenAt=Date.now();return;}const stale=e?.type==='online'||!updates.held&&!productPending&&hiddenAt>0&&Date.now()-hiddenAt>10000;pool.resume(stale);if(credentials&&!pairing&&!pool.owns(transport))transport.resume(stale);hiddenAt=0;receiveEntry();};document.addEventListener('visibilitychange',resume);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);render();if(!pairing&&credentials&&!pool.owns(transport))transport.connect();
+ let hiddenAt=0,networkChanged=false;receiveEntry();const resume=e=>{if(document.hidden){hiddenAt||=Date.now();networkChanged||=e?.type==='online';return;}const stale=e?.type==='online'||networkChanged?'network':!updates.held&&!productPending&&hiddenAt>0&&Date.now()-hiddenAt>10000;pool.resume(stale);if(credentials&&!pairing&&!pool.owns(transport))transport.resume(stale);hiddenAt=0;networkChanged=false;receiveEntry();};document.addEventListener('visibilitychange',resume);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);render();if(!pairing&&credentials&&!pool.owns(transport))transport.connect();
 })();

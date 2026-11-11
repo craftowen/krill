@@ -19,7 +19,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 미인증 연결 상한. 인증된 연결은 기기당 WS 2개(메인+터미널)라 별도 상한을 둔다.
-pub(super) const MAX_PENDING: usize = 4;
+/// 재연결 한 번에 경로 경쟁·예비 터미널·열린 터미널이 함께 인증하므로 `AUTH_TIMEOUT` 동안 이만큼 받는다.
+pub(super) const MAX_PENDING: usize = 8;
 pub(super) const MAX_CONNECTIONS: usize = 12;
 const STACK: usize = 128 * 1024;
 /// 스냅샷·계정 RPC를 수행하는 워커 스택. 수십 KB JSON을 중첩 빌더·직렬화로 조립하는데
@@ -27,6 +28,10 @@ const STACK: usize = 128 * 1024;
 /// 연결당 2개(`mobile-ipc` + `mobile-rpc`)에만 적용한다(수락·WS 루프·전달 스레드는 128KiB 유지).
 pub(super) const RPC_STACK: usize = 512 * 1024;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
+/// 수락부터 인증 응답까지의 전체 예산(직접·릴레이 공통). 휴대폰은 앱 복귀 직후 셀룰러가 깨어나는 동안
+/// 소켓 열기에만 4.6초가 걸린 적이 있어(실측 진단 이벤트) 5초로는 챌린지에 답할 시간이 남지 않았다.
+/// 시간 초과는 실패 예산을 쓰지 않으며, PWA의 연결 단계 마감(20초)보다 짧다.
+pub(super) const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 /// 수락 스레드가 일이 없어도 깨어 reconcile(릴레이·Tailscale 감시)하는 최대 간격.
 const RECONCILE: Duration = Duration::from_secs(1);
 const NETWORK_RECHECK: Duration = Duration::from_secs(10);
@@ -1115,7 +1120,7 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
             if connection.device.is_some() {
                 continue;
             }
-            let due = connection.accepted + TIMEOUT;
+            let due = connection.accepted + AUTH_TIMEOUT;
             if now >= due {
                 connection.socket.shutdown();
             } else {
@@ -1261,7 +1266,8 @@ fn serve(
 ) -> io::Result<()> {
     // macOS에서 nonblocking listener의 accept 결과도 nonblocking이므로 명시적으로 되돌린다.
     socket.set_nonblocking(false)?;
-    socket.set_read_timeout(Some(TIMEOUT))?;
+    // 읽기 하나가 인증 예산 전체를 기다려도 수락 루프가 `accepted + AUTH_TIMEOUT`에 끊는다.
+    socket.set_read_timeout(Some(AUTH_TIMEOUT))?;
     socket.set_write_timeout(Some(TIMEOUT))?;
     socket.set_nodelay(true)?;
     let origin = {
@@ -1316,7 +1322,7 @@ pub(super) fn auth_close_code(error: &io::Error) -> Option<u16> {
 }
 
 fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Result<Channel> {
-    // 실패 예산은 주소가 아니라 주장한 인증 주체별이다(`Devices::attempt`). 미인증 연결은 최대 4개·5초로 제한한다.
+    // 실패 예산은 주소가 아니라 주장한 인증 주체별이다(`Devices::attempt`). 미인증 연결은 최대 `MAX_PENDING`개·`AUTH_TIMEOUT`으로 제한한다.
     let mut principal = None;
     let result = (|| {
         let challenge = random()?;
@@ -1366,7 +1372,13 @@ fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Re
             serde_json::from_slice(&channel.open(&body)?).map_err(|_| invalid())?;
         let authenticated = {
             let mut s = lock(&shared.state);
-            if s.stopped || !s.connections.contains_key(&id) {
+            // 수락 루프가 예산 만료로 소켓을 닫았을 수 있다. 그 뒤에 페어링 티켓을 쓰면 폰은 자격을 받지 못하고
+            // 새 QR이 필요해지므로, 예산이 끝났으면 티켓을 쓰기 전에 멈춘다(`relay::serve_mux_client`와 같다).
+            if s.stopped
+                || s.connections
+                    .get(&id)
+                    .is_none_or(|c| c.accepted.elapsed() >= AUTH_TIMEOUT)
+            {
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }
             let (device_id, credential) = if let Some(token) = token {

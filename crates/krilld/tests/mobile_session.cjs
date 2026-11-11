@@ -3322,15 +3322,14 @@ async function testTransportAuthRetries() {
     JSON.stringify({ version: 2, challenge: "bb".repeat(32) }),
   );
   await flush();
+  // An interrupted handshake is a transport failure: the daemon spends its failure budget only on bad
+  // proofs and answers repeats with 1013, so the phone retries on its normal backoff, never 65s.
   sockets[0].close(1006);
   await flush();
   assert.equal(timers.size, 1);
-  t.resume();
-  await flush();
-  assert.equal(sockets.length, 1);
-  await advance(64999);
-  assert.equal(sockets.length, 1);
-  await advance(1);
+  assert.equal(t.blocked, false);
+  assert.ok(t.state.retryAt - now <= 1000);
+  await advance(1000);
   assert.equal(sockets.length, 2);
   sockets[1].message(
     JSON.stringify({ version: 2, challenge: "bb".repeat(32) }),
@@ -3339,23 +3338,19 @@ async function testTransportAuthRetries() {
   sockets[1].close(1006);
   await flush();
   assert.equal(timers.size, 1);
-  await advance(129999);
-  assert.equal(sockets.length, 2);
-  await advance(1);
-  assert.equal(sockets.length, 3);
+  assert.equal(t.blocked, false);
+  assert.ok(t.state.retryAt - now <= 2000);
+  t.resume();
+  await flush();
+  assert.equal(sockets.length, 3, "a foreground resume retries at once");
   sockets[2].message(
     JSON.stringify({ version: 2, challenge: "bb".repeat(32) }),
   );
   await flush();
   sockets[2].close(1006);
   await flush();
-  assert.equal(timers.size, 0);
-  t.resume();
-  await flush();
-  assert.equal(sockets.length, 3);
-  t.reconnect();
-  await flush();
-  assert.equal(sockets.length, 3);
+  assert.equal(timers.size, 1);
+  assert.equal(t.blocked, false, "repeated interruptions never block");
   await advance(t.state.retryAt - now);
   assert.equal(sockets.length, 4);
   sockets[3].message(
@@ -3582,6 +3577,7 @@ async function testPipelinedHandshakeAndPolling() {
   assert.equal(socket.sent.length, 7);
   const rpcDeadline = [...timers.values()].find((tm) => tm.at === now + 15000);
   assert(rpcDeadline);
+  now = rpcDeadline.at;
   rpcDeadline.fn();
   await flush();
   assert.equal(socket.closed, true);

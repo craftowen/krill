@@ -42,6 +42,7 @@ function harness(
   saved = null,
   href = "https://phone.test/m/0123456789abcdef/",
   useEndpoint = false,
+  document = undefined,
 ) {
   let now = 100000,
     nextTimer = 0;
@@ -106,6 +107,7 @@ function harness(
     URL,
     URLSearchParams,
     AbortController,
+    document,
     MkCrypto: C,
     WebSocket: Socket,
     Date: class extends Date {
@@ -1915,13 +1917,15 @@ async function feeding(h) {
   await flush();
   return socket;
 }
-test("a silent change feed is probed and its dead socket replaced within 10s of silence", async () => {
+test("a silent change feed is probed and its dead socket replaced within 13s of silence", async () => {
   const h = harness(),
     socket = await feeding(h),
     sent = socket.sent.length;
-  for (let silent = 0; silent < 10000; silent += 2500) await h.tick(2500);
+  for (let silent = 0; silent < 12500; silent += 2500) await h.tick(2500);
+  assert.equal(h.transport.ready, true, "a probe outlasts one cellular stall");
+  await h.tick(500);
   assert.equal(socket.sent.length, sent + 1, "one liveness probe");
-  assert.equal(h.transport.ready, false, "dead socket found within 10s");
+  assert.equal(h.transport.ready, false, "dead socket found within 13s");
   assert.equal(socket.closed, true);
   assert(
     !h.events.some((e) => /timed out|not resent/.test(e.message)),
@@ -1957,7 +1961,9 @@ test("a network change probes the live socket at once", async () => {
   h.context.navigator.connection.dispatchEvent(new Event("change"));
   await flush();
   assert.equal(socket.sent.length, sent + 1, "probe sent without waiting");
-  await h.tick(5000);
+  await h.tick(7999);
+  assert.equal(h.transport.ready, true);
+  await h.tick(1);
   assert.equal(h.transport.ready, false, "unanswered probe drops the socket");
   h.transport.close();
 });
@@ -2206,5 +2212,335 @@ test("fast pre-challenge error on primary promotes backup immediately without lo
     h.endpoint.socketUrl(),
     "wss://desktop.tail123.ts.net:18449/ws",
   );
+  h.transport.close();
+});
+
+// iOS freezes a hidden home-screen app, so a deadline that "expires" while hidden measured the freeze.
+function page() {
+  const doc = new EventTarget();
+  doc.hidden = false;
+  doc.hide = () => {
+    doc.hidden = true;
+    doc.dispatchEvent(new Event("visibilitychange"));
+  };
+  doc.show = () => {
+    doc.hidden = false;
+    doc.dispatchEvent(new Event("visibilitychange"));
+  };
+  return doc;
+}
+test("hiding the app does not let the feed-pause request drop a healthy connection", async () => {
+  const doc = page(),
+    h = harness(null, undefined, false, doc),
+    socket = await feeding(h),
+    sent = socket.sent.length;
+  doc.hide();
+  await flush();
+  assert.equal(socket.sent.length, sent + 1, "the hidden page pauses the feed");
+  await h.tick(30000);
+  doc.show();
+  await h.tick(0);
+  assert.equal(h.transport.ready, true, "time frozen in the background is not a timeout");
+  assert.equal(socket.closed, undefined);
+  h.response(socket, { unchanged: true, etag: "e1", feed: 0 });
+  await flush();
+  assert.equal(h.transport.ready, true);
+  assert.equal(socket.closed, undefined, "no reconnect");
+  h.transport.close();
+});
+test("a request left unanswered across a background still drops a dead socket after returning", async () => {
+  const doc = page(),
+    h = harness(null, undefined, false, doc),
+    socket = await feeding(h);
+  doc.hide();
+  await flush();
+  await h.tick(30000);
+  doc.show();
+  await h.tick(0);
+  assert.equal(h.transport.ready, true);
+  await h.tick(8000);
+  assert.equal(h.transport.ready, false, "the deadline restarts once visible");
+  assert.equal(socket.closed, true);
+  h.transport.close();
+});
+test("returning after a long background verifies the open socket instead of reconnecting", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(4);
+  h.response(socket, { sessions: [] });
+  await pending;
+  h.transport.setActive(false);
+  const sent = socket.sent.length,
+    opened = h.sockets.length;
+  h.transport.resume(true);
+  await flush();
+  assert.equal(h.sockets.length, opened, "no new socket for a stale resume");
+  assert.equal(socket.sent.length, sent + 1, "one verifying snapshot");
+  await h.tick(2000);
+  h.response(socket, { sessions: [] });
+  await flush();
+  assert.equal(h.transport.ready, true);
+  assert.equal(socket.closed, undefined);
+  h.transport.close();
+});
+test("a stale resume on a dead socket reconnects within the probe deadline", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(4);
+  h.response(socket, { sessions: [] });
+  await pending;
+  h.transport.setActive(false);
+  h.transport.resume(true);
+  await flush();
+  await h.tick(8000);
+  assert.equal(h.transport.ready, false);
+  assert.equal(socket.closed, true);
+  await h.tick(0);
+  assert.notEqual(h.sockets.at(-1), socket, "reconnecting");
+  h.transport.close();
+});
+test("a network change on resume still replaces the socket at once", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(4);
+  h.response(socket, { sessions: [] });
+  await pending;
+  h.transport.resume("network");
+  await flush();
+  assert.equal(socket.closed, true);
+  assert.notEqual(h.sockets.at(-1), socket);
+  h.transport.close();
+});
+test("a queued read gets its full deadline from when it is sent", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(4);
+  h.transport.setActive(false);
+  h.response(socket, { sessions: [] });
+  await pending;
+  const first = h.transport.rpc({ action: "git" });
+  await h.tick(1000);
+  const second = h.transport.rpc({ action: "accounts" });
+  await h.tick(11000);
+  h.response(socket, { first: true });
+  assert.equal((await first).first, true);
+  await h.tick(4500);
+  assert.equal(h.transport.ready, true, "time spent queued is not the second read's timeout");
+  h.response(socket, { second: true });
+  assert.equal((await second).second, true);
+  assert.equal(socket.closed, undefined);
+  h.transport.close();
+});
+for (const code of [1006, 1011, 1012])
+  test(`a ${code} close while authenticating retries with normal backoff instead of a 65s lockout`, async () => {
+    const h = harness();
+    await h.start(2);
+    for (let i = 0; i < 3; i++) {
+      h.sockets.at(-1).emit("close", { code });
+      await flush();
+      assert.equal(h.transport.blocked, false, `attempt ${i + 1} is not blocked`);
+      assert(
+        h.transport.state.retryAt < h.context.Date.now() + 16000,
+        `attempt ${i + 1} waits only the normal backoff`,
+      );
+      const opened = h.sockets.length;
+      await h.tick(16000);
+      assert.equal(h.sockets.length, opened + 1, "it retries");
+      await h.advance(h.sockets.at(-1), 2);
+    }
+    const last = h.sockets.at(-1);
+    last.emit("message", { data: enc.encode("{}") });
+    await flush();
+    last.emit("message", { data: Uint8Array.from([0, 0, 0, 0, 1]) });
+    await flush();
+    h.response(last, { sessions: [] });
+    await flush();
+    assert.equal(h.transport.ready, true);
+    h.transport.close();
+  });
+test("a deadline that fires late after a freeze, before visibilitychange, keeps the connection", async () => {
+  const doc = page(),
+    h = harness(null, undefined, false, doc),
+    socket = await feeding(h);
+  doc.hide();
+  await flush();
+  // Frozen: no timer runs while hidden. On return the overdue timer runs before the page event.
+  doc.hidden = false;
+  await h.tick(30000);
+  assert.equal(h.transport.ready, true, "a late timer measured the freeze");
+  doc.show();
+  h.response(socket, { unchanged: true, etag: "e1", feed: 2500 });
+  await flush();
+  assert.equal(h.transport.ready, true);
+  assert.equal(socket.closed, undefined);
+  h.transport.close();
+});
+test("a route interrupted while authenticating is tried again after the other route, not dropped", async () => {
+  const rid = "a".repeat(32),
+    saved = {
+      device_id: "phone",
+      credential: "11".repeat(32),
+      rid,
+      hash: "0123456789abcdef",
+      routes: {
+        relay: { origin: "https://phone.test", rid },
+        tailscale: { origin: "https://desktop.tail123.ts.net:18449" },
+      },
+    },
+    h = harness(saved, undefined, true),
+    relay = (s) => s.url.includes("/r/");
+  h.context.fetch = async () => ({ ok: true, json: async () => ({ hash: saved.hash, url: "" }) });
+  h.transport.setActive(false);
+  h.transport.connect();
+  await flush();
+  const first = h.sockets.find(relay);
+  assert(first, "the relay leg starts");
+  await h.advance(first, 2);
+  first.emit("close", { code: 1011 });
+  await flush();
+  await h.tick(0);
+  const retry = h.sockets.length;
+  assert(!relay(h.sockets.at(-1)), "the other route goes first");
+  await h.tick(2000);
+  assert(
+    h.sockets.slice(retry).some(relay),
+    "the interrupted relay is raced again after a 2s head start for the other route",
+  );
+  const back = h.sockets.slice(retry).find(relay);
+  await h.advance(back, 4);
+  h.response(back, { sessions: [] });
+  await flush();
+  assert.equal(h.transport.ready, true, "the Tailscale route never opened, yet the phone reconnects");
+  h.transport.close();
+});
+test("a stale resume abandons an attempt frozen in the background instead of waiting out its deadline", async () => {
+  const h = harness();
+  h.transport.connect();
+  await flush();
+  const frozen = h.sockets.at(-1);
+  await h.tick(12000);
+  h.transport.resume(true);
+  await flush();
+  assert(frozen.closed, "the frozen attempt is dropped");
+  assert.notEqual(h.sockets.at(-1), frozen, "a fresh attempt starts at once");
+  h.transport.close();
+});
+test("a short trip away does not double a request's deadline", async () => {
+  const doc = page(),
+    h = harness(null, undefined, false, doc),
+    { pending, socket } = await h.start(4);
+  h.transport.setActive(false);
+  h.response(socket, { sessions: [] });
+  await pending;
+  const read = h.transport.rpc({ action: "git" });
+  read.catch(() => {});
+  await flush();
+  await h.tick(1000);
+  doc.hide();
+  await h.tick(2000);
+  doc.show();
+  await h.tick(12000);
+  await h.tick(2999);
+  assert.equal(h.transport.ready, true, "15 s of visible time from the return");
+  await h.tick(1);
+  assert.equal(h.transport.ready, false, "not another full window on top");
+  h.transport.close();
+});
+test("timers that keep firing late earn only one extra window", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(4);
+  h.transport.setActive(false);
+  h.response(socket, { sessions: [] });
+  await pending;
+  const read = h.transport.rpc({ action: "git" });
+  read.catch(() => {});
+  await flush();
+  await h.tick(16100);
+  assert.equal(h.transport.ready, true, "one late fire is treated as a freeze");
+  await h.tick(16100);
+  assert.equal(h.transport.ready, false, "a second late fire expires");
+  h.transport.close();
+});
+test("a stale resume finds a dead socket within the probe deadline even behind a queued request", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(4);
+  h.transport.setActive(false);
+  h.response(socket, { sessions: [] });
+  await pending;
+  const read = h.transport.rpc({ action: "git" });
+  read.catch(() => {});
+  await flush();
+  h.transport.resume(true);
+  await flush();
+  await h.tick(7999);
+  assert.equal(h.transport.ready, true);
+  await h.tick(1);
+  assert.equal(h.transport.ready, false, "no frame within the probe deadline");
+  h.transport.close();
+});
+test("a stale resume keeps a socket that answers an earlier request", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(4);
+  h.transport.setActive(false);
+  h.response(socket, { sessions: [] });
+  await pending;
+  const read = h.transport.rpc({ action: "git" });
+  await flush();
+  h.transport.resume(true);
+  await flush();
+  await h.tick(3000);
+  h.response(socket, { git: true });
+  assert.equal((await read).git, true);
+  await h.tick(6000);
+  assert.equal(h.transport.ready, true, "any inbound frame proves the socket");
+  h.transport.close();
+});
+test("a stale resume replaces the idle spare terminal socket", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(4);
+  h.response(socket, { sessions: [] });
+  await pending;
+  await flush();
+  const spare = h.sockets.at(-1);
+  assert.notEqual(spare, socket, "a spare terminal socket is warm");
+  h.transport.resume(true);
+  await flush();
+  assert(spare.closed, "the spare that idled through the background is dropped");
+  assert.notEqual(h.sockets.at(-1), spare, "a fresh spare is warmed");
+  assert.equal(socket.closed, undefined, "the control socket is kept");
+  h.transport.close();
+});
+test("success clears only the winning route, so a route that failed mid-handshake stays last", async () => {
+  const rid = "a".repeat(32),
+    saved = {
+      device_id: "phone",
+      credential: "11".repeat(32),
+      rid,
+      hash: "0123456789abcdef",
+      routes: {
+        relay: { origin: "https://phone.test", rid },
+        tailscale: { origin: "https://desktop.tail123.ts.net:18449" },
+      },
+    },
+    h = harness(saved, undefined, true),
+    relay = (s) => s.url.includes("/r/");
+  h.context.fetch = async () => ({ ok: true, json: async () => ({ hash: saved.hash, url: "" }) });
+  h.transport.setActive(false);
+  h.transport.connect();
+  await flush();
+  const first = h.sockets.find(relay);
+  await h.advance(first, 2);
+  first.emit("close", { code: 1011 });
+  await flush();
+  await h.tick(0);
+  const ts = h.sockets.at(-1);
+  assert(!relay(ts));
+  await h.advance(ts, 4);
+  h.response(ts, { sessions: [] });
+  await flush();
+  assert.equal(h.transport.ready, true, "Tailscale authenticated");
+  const before = h.sockets.length;
+  h.transport.reconnect();
+  await flush();
+  const next = h.sockets.slice(before);
+  assert(next.length >= 1 && !relay(next[0]), "the interrupted relay is still raced last");
+  await h.tick(250);
+  assert(!h.sockets.slice(before).some(relay), "and with the 2 s head start");
   h.transport.close();
 });
