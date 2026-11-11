@@ -8,3 +8,4 @@ krill::worktree cli_new_worktree_starts_session_in_the_created_path  # (3)
 krilld registry::orchestration_delivery_tests::deliver_input_to_tap_paces_unbracketed_and_delayed_echo_submit  # (2)
 krilld::mobile_pwa non_secure_pwa_crypto_and_workflows  # (2)
 krilld agent_history::opencode_sqlite::tests::independent_2307_rows_order_history_reset_wal_rollback_and_rebind  # (1)
+krilld mobile::gateway::tests::legitimate_reconnects_and_pre_auth_eof_do_not_consume_failure_budget  # (1) 2026-11-11 nightly. 끊긴 연결 정리가 5초를 넘김, 로컬 부하 300회 재현 안 됨. 실패 줄은 until()이 호출 위치로 남긴다

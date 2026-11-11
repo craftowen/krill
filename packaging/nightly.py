@@ -41,6 +41,8 @@ KOREAN_NOTES = Path("docs/releases/ko.json")
 HIDDEN_KINDS = ("build", "chore", "ci", "docs", "refactor", "style", "test")
 # launchd PATH에는 ~/.local/bin이 없다.
 TRANSLATOR = Path.home() / ".local/bin/claude"
+# 결과를 사람에게 알리는 명령(stdin 본문). 없는 머신에서는 알리지 않는다.
+NOTIFIER = Path.home() / ".local/bin/discord-notify"
 KOREAN_PROMPT = """다음은 Krill(AI 코딩 에이전트 세션 관리 앱) 새 버전에 들어간 커밋 제목이다.
 사용자에게 보이는 변화만 골라 한국어 항목 최대 10개로 요약하라. 비슷한 것은 하나로 묶는다.
 각 항목은 '~합니다' 또는 '~했습니다'로 끝나는 한 문장이다. 내부 테스트, CI, 빌드 변경은 뺀다.
@@ -524,6 +526,27 @@ class Release:
                     finished_at=datetime.now().astimezone().isoformat())
 
 
+def notify(text):
+    """결과를 알린다. 알림이 실패해도 배포 결과와 종료 코드는 바꾸지 않는다."""
+    if not NOTIFIER.exists():
+        return
+    try:
+        sent = subprocess.run([str(NOTIFIER), "알림-크론"], input=text, text=True, capture_output=True, timeout=60)
+        if sent.returncode:
+            print(f"notify failed: {sent.stderr.strip()}", flush=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"notify failed: {error}", flush=True)
+
+
+def outcome(state):
+    status = state.get("status")
+    if status == "published":
+        return f"Krill nightly 배포 완료: {state.get('tag')}"
+    if status == "skipped":
+        return f"Krill nightly 건너뜀: {state.get('reason')}"
+    return f"Krill nightly 실패: {state.get('error') or status}\n로그: {state.get('log')}"
+
+
 def run_release(config, state_dir):
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "run.lock").open("w") as lock:
@@ -543,6 +566,8 @@ def run_release(config, state_dir):
                 release.update(status="failed", error=str(error), finished_at=datetime.now().astimezone().isoformat())
                 print(f"Nightly stopped: {error}", flush=True)
                 raise
+            finally:
+                notify(outcome(release.state))
 
 
 def dispatch(config, config_path, preflight_only=False):
@@ -646,7 +671,11 @@ def main():
         if args.action == "preflight":
             preflight(config)
         elif args.action == "dispatch":
-            dispatch(config, args.config, args.preflight_only)
+            try:
+                dispatch(config, args.config, args.preflight_only)
+            except BaseException as error:
+                notify(f"Krill nightly 시작 실패: {error}")
+                raise
         else:
             # BSD lockf와 같은 flock 잠금을 실행기 자신이 보유한다. 취소 시 자식 정리 뒤 해제한다.
             with PUBLISH_LOCK.open("a") as lock:

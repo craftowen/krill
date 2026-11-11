@@ -216,10 +216,16 @@ impl Drop for Client {
         self.socket.shutdown(Shutdown::Both).ok();
     }
 }
+/// 실패 위치는 호출한 줄로 보고한다(어느 단계에서 기한을 넘겼는지 남긴다).
+#[track_caller]
 fn until(mut f: impl FnMut() -> bool) {
-    let end = std::time::Instant::now() + Duration::from_secs(5);
+    let start = std::time::Instant::now();
     while !f() {
-        assert!(std::time::Instant::now() < end);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "condition still false after {:?}",
+            start.elapsed()
+        );
         thread::sleep(Duration::from_millis(5));
     }
 }
