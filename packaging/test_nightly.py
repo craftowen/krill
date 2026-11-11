@@ -22,6 +22,9 @@ os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 import nightly
 from nightly_assets import download_artifact, import_assets
 
+# 테스트가 실제 디스코드로 알리지 않게 한다. 알림을 확인하는 테스트만 가짜 명령으로 바꾼다.
+nightly.NOTIFIER = Path("/nonexistent/discord-notify")
+
 SHA = "a" * 40
 BASE = "b" * 40
 PUB = "c" * 64
@@ -705,6 +708,42 @@ class RecoveryTests(unittest.TestCase):
             finally:
                 signal.signal(signal.SIGTERM, previous_handler)
                 timer.join()
+
+
+class NotifyTests(unittest.TestCase):
+    def test_failed_and_skipped_runs_are_reported_and_a_broken_notifier_keeps_the_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sent = root / "sent.txt"
+            notifier = root / "notify"
+            notifier.write_text(f"#!/bin/sh\n[ \"$1\" = 알림-크론 ] || exit 3\ncat >> {sent}\necho >> {sent}\n")
+            notifier.chmod(0o755)
+
+            class Failing:
+                def __init__(self, _config, _state_dir):
+                    self.state = {"status": "running"}
+                def update(self, **values):
+                    self.state.update(values)
+                def publish(self):
+                    raise nightly.NightlyError("run 1: failure")
+
+            class Skipping(Failing):
+                def publish(self):
+                    self.update(status="skipped", reason="no committed changes since the last published release")
+
+            with patch.object(nightly, "NOTIFIER", notifier), patch.object(nightly, "LOGS", root / "logs"):
+                with patch.object(nightly, "Release", Failing), self.assertRaises(nightly.NightlyError):
+                    nightly.run_release({}, root / "state")
+                with patch.object(nightly, "Release", Skipping):
+                    nightly.run_release({}, root / "state")
+                notifier.write_text("#!/bin/sh\nexit 1\n")
+                with patch.object(nightly, "Release", Skipping):
+                    nightly.run_release({}, root / "state")
+            text = sent.read_text()
+            self.assertIn("Krill nightly 실패: run 1: failure", text)
+            self.assertIn("로그: " + str(root / "logs"), text)
+            self.assertIn("Krill nightly 건너뜀: no committed changes", text)
+            self.assertEqual(text.count("Krill nightly"), 2)
 
 
 if __name__ == "__main__":
