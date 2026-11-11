@@ -649,6 +649,7 @@ fn metadata_dirs(repo: &Path) -> Result<Vec<PathBuf>, String> {
 fn path_from_line(bytes: &[u8]) -> &Path {
     use krill_proto::os::ffi::OsStrExt as _;
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     Path::new(std::ffi::OsStr::from_bytes(bytes))
 }
 
@@ -693,3 +694,36 @@ fn relevant(path: &Path, repo: &Path, metadata: &[PathBuf]) -> bool {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod crlf_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_dirs_resolves_crlf_dot_git_and_commondir() {
+        let root =
+            std::env::temp_dir().join(format!("krill-git-watch-crlf-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let common = root.join("main-git");
+        let wt_git = common.join("worktrees").join("feature");
+        let wt_repo = root.join("feature-wt");
+        fs::create_dir_all(&wt_git).unwrap();
+        fs::create_dir_all(&wt_repo).unwrap();
+        fs::write(
+            wt_repo.join(".git"),
+            format!("gitdir: {}\r\n", wt_git.display()),
+        )
+        .unwrap();
+        fs::write(wt_git.join("commondir"), "../..\r\n").unwrap();
+
+        let resolved = metadata_dirs(&wt_repo).unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                fs::canonicalize(&wt_git).unwrap(),
+                fs::canonicalize(&common).unwrap(),
+            ]
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+}

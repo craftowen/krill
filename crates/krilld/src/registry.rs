@@ -1883,7 +1883,7 @@ impl Registry {
             reply,
             (FromHolder::Failed { errno, .. }, _)
                 if missing_path_errno(errno)
-        ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &env)
+        ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &mut env)
         {
             initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
             reply = holder
@@ -1924,6 +1924,7 @@ impl Registry {
             }
             (FromHolder::Failed { errno, .. }, _) => {
                 // spawn 실패: 세션이 없으니 주입 settings만 지우고 만들다 만 계보 기록도 걷는다.
+                tracing::warn!(id = id.0, errno, wrapped, "holder session spawn failed");
                 lock(&self.state).roots.remove(id);
                 self.discard_settings(id);
                 self.agents.forget(id);
@@ -4257,17 +4258,20 @@ fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
 /// `ERROR_DIRECTORY`(267), 중간 폴더까지 없으면 `ERROR_PATH_NOT_FOUND`(3), 파일은 `ERROR_FILE_NOT_FOUND`(2=ENOENT).
 fn missing_path_errno(errno: i32) -> bool {
     Failure::from_holder_errno(errno) == Failure::Os(libc::ENOENT)
-        || cfg!(windows) && matches!(errno, 3 | 267)
+        || cfg!(windows) && matches!(errno, 3 | 15 | 21 | 53 | 67 | 123 | 206 | 267)
 }
 
+#[cfg_attr(
+    unix,
+    expect(
+        clippy::ptr_arg,
+        reason = "Windows fallback replaces argv and pushes to env"
+    )
+)]
 fn fallback_spawn_on_enoent(
-    #[cfg_attr(
-        not(unix),
-        expect(unused_variables, reason = "로그인 셸(-l) 경로 폴백은 Unix 전용")
-    )]
-    argv: &mut [Vec<u8>],
+    argv: &mut Vec<Vec<u8>>,
     cwd: &mut Vec<u8>,
-    env: &[(Vec<u8>, Vec<u8>)],
+    env: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) -> bool {
     use krill_proto::os::ffi::OsStrExt as _;
     let mut changed = false;
@@ -4281,8 +4285,15 @@ fn fallback_spawn_on_enoent(
                 .map(|a| a.as_os_str().as_bytes().to_vec())
                 .or_else(|| {
                     env.iter()
-                        .find(|(k, _)| k.as_slice() == b"HOME")
+                        .find(|(k, _)| {
+                            k.as_slice() == b"HOME" || k.eq_ignore_ascii_case(b"USERPROFILE")
+                        })
                         .map(|(_, v)| Path::new(std::ffi::OsStr::from_bytes(v)))
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.as_os_str().as_bytes().to_vec())
+                })
+                .or_else(|| {
+                    krill_proto::os::home_dir()
                         .filter(|p| p.is_dir())
                         .map(|p| p.as_os_str().as_bytes().to_vec())
                 })
@@ -4306,6 +4317,26 @@ fn fallback_spawn_on_enoent(
                     break;
                 }
             }
+        }
+    }
+    #[cfg(windows)]
+    if !is_wrapper_argv(argv)
+        && argv.first().is_some_and(|prog| {
+            env.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case(b"SHELL") && v == prog)
+                && !Path::new(std::ffi::OsStr::from_bytes(prog)).is_file()
+        })
+    {
+        let fallback = Shell::Login.launch();
+        if fallback.argv != *argv {
+            *argv = fallback.argv;
+            for (k, v) in fallback.env {
+                if k.eq_ignore_ascii_case(b"PROMPT") || k.eq_ignore_ascii_case(b"SHELL") {
+                    env.push((k, v));
+                }
+            }
+            crate::shell::dedupe_env(env);
+            changed = true;
         }
     }
     changed
@@ -5028,6 +5059,32 @@ mod orchestration_delivery_tests {
         drop(reg);
         drop(terminal);
         std::fs::remove_dir_all(dir)
+    }
+}
+
+#[cfg(test)]
+mod spawn_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_spawn_on_enoent_uses_userprofile_and_recovers_missing_shell() {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let home = std::env::temp_dir().join(format!("krilld-userprofile-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).unwrap();
+        let mut argv = vec![b"/nonexistent/custom-shell".to_vec(), b"-l".to_vec()];
+        let mut cwd = b"nonexistent-relative-root/deleted-child".to_vec();
+        let mut env = vec![
+            (
+                b"UserProfile".to_vec(),
+                home.as_os_str().as_bytes().to_vec(),
+            ),
+            (b"SHELL".to_vec(), b"/nonexistent/custom-shell".to_vec()),
+        ];
+        assert!(fallback_spawn_on_enoent(&mut argv, &mut cwd, &mut env));
+        assert_eq!(cwd, home.as_os_str().as_bytes());
+        assert_ne!(argv[0], b"/nonexistent/custom-shell");
+        std::fs::remove_dir_all(home).ok();
     }
 }
 

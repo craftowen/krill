@@ -113,7 +113,29 @@ fn read_prepared(path: &Path) -> std::io::Result<Option<Prepared>> {
 /// Handoffs and replacement journals describe this registry's own sessions, so they live only in
 /// its own state folder; a registry without a folder keeps no records.
 pub(super) fn load(dir: Option<&Path>) -> ledger::HandoffLedger {
+    if let Some(d) = dir {
+        sweep_stale_handoff_temps(d);
+    }
     ledger::HandoffLedger::load(dir)
+}
+
+fn sweep_stale_handoff_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".{FILE}.tmp.");
+    let current_pid_prefix = format!("{}.", std::process::id());
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        if let Some(rest) = text.strip_prefix(&prefix)
+            && !rest.starts_with(&current_pid_prefix)
+        {
+            std::fs::remove_file(entry.path()).ok();
+        }
+    }
 }
 
 fn foreground_vault_agent(
@@ -570,30 +592,33 @@ impl Registry {
                 }
                 continue;
             }
-            if stored.session_id.is_some() || stored.transcript_path.is_some() {
+            let opted_out = lock(&self.account_switch_opt_out).contains(&from);
+            let has_bound_conversation =
+                if provider == ProviderKind::Claude && (opted_out || automatic) {
+                    transcript::has_claude_transcript(home, current.as_ref(), &stored)
+                } else {
+                    stored.session_id.is_some() || stored.transcript_path.is_some()
+                };
+            if has_bound_conversation {
                 lock(&self.account_switch_opt_out).remove(&from);
-            } else {
-                let opted_out = lock(&self.account_switch_opt_out).contains(&from);
-                if opted_out || automatic {
-                    let has_live_identity = self
-                        .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
-                        .ok()
-                        .flatten()
-                        .is_some();
-                    if has_live_identity {
-                        lock(&self.account_switch_opt_out).remove(&from);
-                    } else if opted_out {
+            } else if opted_out || automatic {
+                let has_live_identity = self
+                    .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if has_live_identity {
+                    lock(&self.account_switch_opt_out).remove(&from);
+                } else if opted_out {
+                    continue;
+                } else {
+                    let recently_launched = self.agents.launched_at(from).is_some_and(|launched| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .is_ok_and(|d| d.as_secs().saturating_sub(launched) < 5)
+                    });
+                    if !recently_launched {
                         continue;
-                    } else {
-                        let recently_launched =
-                            self.agents.launched_at(from).is_some_and(|launched| {
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .is_ok_and(|d| d.as_secs().saturating_sub(launched) < 5)
-                            });
-                        if !recently_launched {
-                            continue;
-                        }
                     }
                 }
             }
@@ -1953,7 +1978,19 @@ fn resume_identity(
 // Validation errors constructed without an OS errno must retain their meaning on the wire.
 fn prepare_failure(original: SessionId, stage: &'static str, error: &std::io::Error) -> Failure {
     use std::io::ErrorKind;
-    tracing::warn!(original = original.0, stage, kind = ?error.kind(), errno = error.raw_os_error(), "account handoff preparation failed");
+    if stage == "transcript_preparation"
+        && matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::NotFound)
+    {
+        tracing::debug!(
+            original = original.0,
+            stage,
+            kind = ?error.kind(),
+            errno = error.raw_os_error(),
+            "account handoff preparation deferred until transcript is available"
+        );
+    } else {
+        tracing::warn!(original = original.0, stage, kind = ?error.kind(), errno = error.raw_os_error(), "account handoff preparation failed");
+    }
     Failure::Os(error.raw_os_error().unwrap_or_else(|| match error.kind() {
         ErrorKind::TimedOut => libc::ETIMEDOUT,
         ErrorKind::NotFound => libc::ENOENT,

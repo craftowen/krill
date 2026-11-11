@@ -40,6 +40,20 @@ pub struct Devices {
 }
 impl Devices {
     pub fn open(dir: Option<&Path>) -> io::Result<Self> {
+        if let Some(d) = dir
+            && let Ok(entries) = fs::read_dir(d)
+        {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str()
+                    && name.starts_with(".mobile-")
+                    && std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+                {
+                    fs::remove_file(entry.path()).ok();
+                }
+            }
+        }
         let path = dir.map(|d| d.join("mobile-devices.json"));
         let devices = match path.as_deref().map(read_private).transpose()?.flatten() {
             Some(bytes) => {
@@ -333,3 +347,24 @@ pub fn decode_hex<const N: usize>(value: &str) -> io::Result<[u8; N]> {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+#[cfg(unix)]
+mod orphan_tmp_tests {
+    use super::*;
+
+    #[test]
+    fn open_sweeps_stale_mobile_tmp_files() {
+        let random_bytes = random().unwrap_or([0; 32]);
+        let dir = std::env::temp_dir().join(format!("mk-mobile-tmp-{}", hex(&random_bytes)));
+        assert!(fs::create_dir_all(&dir).is_ok());
+        let stale = dir.join(".mobile-0123456789abcdef.tmp");
+        let keep = dir.join("other.tmp");
+        assert!(fs::write(&stale, b"partial").is_ok());
+        assert!(fs::write(&keep, b"keep").is_ok());
+        assert!(Devices::open(Some(&dir)).is_ok());
+        assert!(!stale.exists());
+        assert!(keep.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+}

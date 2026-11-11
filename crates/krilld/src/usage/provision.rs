@@ -204,6 +204,12 @@ fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
     };
     match result {
         Ok(report) => report_conflicts(profile_dir, report.conflicts),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            tracing::debug!(
+                provider = provider.as_str(),
+                "profile provisioning skipped while another worker holds the history lock"
+            );
+        }
         Err(error)
             if provider == ProviderKind::Antigravity
                 && error.kind() == io::ErrorKind::Unsupported =>

@@ -48,6 +48,38 @@ pub(super) fn session_id(provider: ProviderKind, stored: &StoredLaunch) -> io::R
     ))
 }
 
+/// Claude fires `SessionStart` with a planned `session_id` and `transcript_path` before the first
+/// prompt creates the `.jsonl` file on disk. Auto-switches and opted-out panes check whether a
+/// non-empty transcript file actually exists before queueing a handoff.
+pub(super) fn has_claude_transcript(
+    home: &Path,
+    source: Option<&LaunchAccount>,
+    stored: &StoredLaunch,
+) -> bool {
+    if stored
+        .transcript_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path).is_file())
+    {
+        return true;
+    }
+    let Some(id) = stored
+        .session_id
+        .as_deref()
+        .filter(|id| valid_session_id(id))
+    else {
+        return false;
+    };
+    let from = match source.filter(|s| !s.dir.is_empty()) {
+        Some(account) => PathBuf::from(&account.dir),
+        None => accounts::host_default_dir(home, ProviderKind::Claude),
+    };
+    find_transcript(&from.join("projects"), ProviderKind::Claude, id)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 /// The conversation as the selected profile will see it, re-checked before the original retires.
 pub(super) struct PreparedTranscript {
     path: Option<PathBuf>,
@@ -958,6 +990,52 @@ mod bound_path_tests {
                 "{body}"
             );
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_transcript_check_and_stale_handoff_temp_sweep_work() {
+        let root =
+            std::env::temp_dir().join(format!("kas-claude-has-transcript-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let profile = root.join("claude-profile");
+        let projects = profile.join("projects/work");
+        fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("11111111-2222-4333-8444-555555555555.jsonl");
+        let source = LaunchAccount {
+            id: "claude-a".into(),
+            env_key: "CLAUDE_CONFIG_DIR".into(),
+            dir: profile.to_string_lossy().into_owned(),
+        };
+        let mut stored = StoredLaunch {
+            profile: "claude".into(),
+            permission: krill_proto::agent::Permission::Yolo,
+            session_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+            cwd: Vec::new(),
+            account: Some(source.clone()),
+            hibernation_blocked: false,
+        };
+        assert!(!has_claude_transcript(&root, Some(&source), &stored));
+        fs::write(
+            &transcript,
+            r#"{"sessionId":"11111111-2222-4333-8444-555555555555"}"#,
+        )
+        .unwrap();
+        assert!(has_claude_transcript(&root, Some(&source), &stored));
+        stored.transcript_path = None;
+        assert!(has_claude_transcript(&root, Some(&source), &stored));
+
+        let stale_tmp = root.join(".account-handoffs.json.tmp.999999.0");
+        let live_tmp = root.join(format!(
+            ".account-handoffs.json.tmp.{}.0",
+            std::process::id()
+        ));
+        fs::write(&stale_tmp, b"{}").unwrap();
+        fs::write(&live_tmp, b"{}").unwrap();
+        assert_eq!(super::super::load(Some(&root)).len(), 0);
+        assert!(!stale_tmp.exists());
+        assert!(live_tmp.exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -234,7 +234,7 @@ pub(super) fn migration_lock(host: &Path) -> io::Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(host.join(".krill-history-migration.lock"))?;
-    lock.try_lock().map_err(io::Error::other)?;
+    lock.try_lock().map_err(io::Error::from)?;
     Ok(lock)
 }
 

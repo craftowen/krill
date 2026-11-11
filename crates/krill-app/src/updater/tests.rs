@@ -3074,3 +3074,52 @@ fn stage_publish_tmp_and_non_ascii_bundle_temp_cleanup() {
         "failed write_stage_marker must remove staging.incoming"
     );
 }
+
+#[test]
+fn fetch_bytes_falls_back_to_gh_on_curl_timeout_and_suppresses_timeout_telemetry() {
+    let gh_url = "https://github.com/acme/krill/releases/latest/download/latest.json";
+    let bytes = fetch_bytes_with(
+        gh_url,
+        1024,
+        |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "command timed out; result may be unknown",
+            ))
+        },
+        |repo, tag, asset, max_bytes| {
+            assert_eq!(repo, "acme/krill");
+            assert_eq!(tag, None);
+            assert_eq!(asset, "latest.json");
+            assert_eq!(max_bytes, 1024);
+            Ok(b"{\"version\":\"0.4.0\"}".to_vec())
+        },
+    )
+    .unwrap();
+    assert_eq!(bytes, b"{\"version\":\"0.4.0\"}");
+
+    let err = fetch_bytes_with(
+        gh_url,
+        1024,
+        |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "command timed out; result may be unknown",
+            ))
+        },
+        |_, _, _, _| Err(Error::Http("gh CLI not found".to_owned())),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::Http(_)),
+        "expected Error::Http, got {err:?}"
+    );
+    assert!(!should_report_update_failure(&err));
+
+    let download_timeout = Error::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "download command timed out",
+    ));
+    assert!(!should_report_update_failure(&download_timeout));
+    assert!(should_report_update_failure(&Error::BadSignature));
+}

@@ -444,7 +444,7 @@ fn ensure_session_inner(
     let started = std::time::Instant::now();
     let result = ensure_session_attempt(target, want, create, allow_cold);
     match &result {
-        Err(error) => tracing::warn!(
+        Err(error) if !(want.is_some() && is_session_gone(error)) => tracing::warn!(
             kind = ?error.kind(),
             failure = diagnostics::failure_code(error),
             agent = matches!(create.program, Program::Agent { .. }),
@@ -457,7 +457,7 @@ fn ensure_session_inner(
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "session create slow"
         ),
-        Ok(_) => {}
+        Err(_) | Ok(_) => {}
     }
     result
 }
@@ -1511,10 +1511,12 @@ impl<W: Write> Pane<W> {
             }
         } else {
             let req = self.history.req;
+            let prior = std::mem::take(&mut self.history.prior);
             let mut window = rows.rows.clone();
             window.resize(usize::from(self.view.screen.lines), Vec::new());
             self.history = History::fixed(window);
             self.history.req = req;
+            self.history.prior = prior;
             self.history.offset = self.history.rows.len();
             self.search.scrolled = true;
         }
@@ -1920,7 +1922,11 @@ impl<W: Write> Pane<W> {
             .saturating_add(1);
         let lines = usize::from(self.view.screen.lines.max(1));
         let offset = rows.rows.len().min(depth.saturating_add(lines / 2));
+        let req = self.history.req;
+        let prior = std::mem::take(&mut self.history.prior);
         self.history = History::fixed(rows.rows.clone());
+        self.history.req = req;
+        self.history.prior = prior;
         self.history.offset = offset;
         self.search.scrolled = true;
         if depth >= 1 && depth <= offset {
@@ -1940,8 +1946,10 @@ impl<W: Write> Pane<W> {
         }
         self.search.scrolled = false;
         let req = self.history.req;
+        let prior = std::mem::take(&mut self.history.prior);
         self.history = History::default();
         self.history.req = req;
+        self.history.prior = prior;
         true
     }
 
@@ -2420,3 +2428,64 @@ mod tests;
 
 #[cfg(test)]
 mod upgrade_gate_tests;
+
+#[cfg(test)]
+mod search_history_tests {
+    use super::*;
+
+    #[test]
+    fn search_and_top_fixed_views_preserve_history_req_and_prior_rows() {
+        let mut pane = Pane::<Vec<u8>>::default();
+        pane.view.screen.lines = 4;
+        let prior_row = vec![Cell {
+            ch: 'p',
+            ..Cell::default()
+        }];
+        pane.history.prior = vec![prior_row.clone()];
+        pane.history.req = 42;
+        pane.search.hist_req = Some(42);
+        pane.search.hist_target = Some(SearchTarget {
+            row: 0,
+            column: 0,
+            cols: 1,
+        });
+
+        let hit_row = vec![Cell {
+            ch: 'h',
+            ..Cell::default()
+        }];
+        assert!(pane.search_hist_rows(&HistoryRows {
+            req: 42,
+            total: 1,
+            skip: 0,
+            rows: vec![hit_row.clone()],
+            pages: 0,
+        }));
+        assert_eq!(pane.history.req, 42);
+        assert_eq!(pane.history.prior, vec![prior_row.clone()]);
+
+        assert!(pane.forget_search_view());
+        assert_eq!(pane.history.req, 42);
+        assert_eq!(pane.history.prior, vec![prior_row.clone()]);
+
+        pane.search.top_request = Some(TopRequest {
+            req: 43,
+            source: Source::Hot,
+            total: Some(1),
+        });
+        pane.history.req = 43;
+        assert!(pane.top_rows(&HistoryRows {
+            req: 43,
+            total: 1,
+            skip: 0,
+            rows: vec![hit_row],
+            pages: 0,
+        }));
+        assert_eq!(pane.history.req, 43);
+        assert_eq!(pane.history.prior, vec![prior_row.clone()]);
+
+        assert!(pane.forget_search_view());
+        assert_eq!(pane.history.req, 43);
+        assert_eq!(pane.history.prior, vec![prior_row]);
+    }
+}

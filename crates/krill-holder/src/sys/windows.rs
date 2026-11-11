@@ -539,7 +539,11 @@ pub fn spawn(
     inherit: &[BorrowedHandle<'_>],
     job: Option<&Job>,
 ) -> io::Result<Process> {
-    let app = wide(path)?;
+    let has_sep = path
+        .as_encoded_bytes()
+        .iter()
+        .any(|&b| b == b'\\' || b == b'/' || b == b':');
+    let app = has_sep.then(|| wide(path)).transpose()?;
     let mut cmd = quote(path);
     for arg in args {
         cmd.push(32);
@@ -623,7 +627,7 @@ pub fn spawn(
     // SAFETY: all buffers and attribute storage remain live, inheritance is limited by HANDLE_LIST.
     cvt(unsafe {
         CreateProcessW(
-            app.as_ptr(),
+            app.as_ref().map_or(null(), Vec::as_ptr),
             cmd.as_mut_ptr(),
             null(),
             null(),
