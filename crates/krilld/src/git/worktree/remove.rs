@@ -282,6 +282,7 @@ fn verify_git_link(q: &GitQueue, repo: &Path, path: &Path) -> Result<(), String>
     match fs::read(gitdir.join("gitdir")) {
         Ok(backlink) => {
             let backlink = backlink.strip_suffix(b"\n").unwrap_or(&backlink);
+            let backlink = backlink.strip_suffix(b"\r").unwrap_or(backlink);
             if fs::canonicalize(Path::new(OsStr::from_bytes(backlink))).map_err(|_| invalid())?
                 != link
             {
@@ -1047,6 +1048,21 @@ exec git "$@"
         assert!(wt.exists());
         assert!(!marker.exists());
         assert!(f.git(&["branch", "--list", "child"]).contains("child"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_git_link_accepts_crlf_dot_git_and_gitdir_backlink() {
+        let (f, wt, _req) = fixture_worktree("crlf-backlink");
+        let metadata = orphan_metadata(&wt);
+        let dot_git = wt.join(".git");
+        fs::write(&dot_git, format!("gitdir: {}\r\n", metadata.display())).unwrap();
+        fs::write(
+            metadata.join("gitdir"),
+            format!("{}\r\n", dot_git.display()),
+        )
+        .unwrap();
+        assert_eq!(verify_git_link(&f.queue, &f.repo, &wt), Ok(()));
     }
 
     proptest! {

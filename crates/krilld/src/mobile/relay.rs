@@ -773,6 +773,7 @@ fn handle_mux_frame(
                 && s.tx
                     .send(0, (ws::TEXT, payload.to_vec()), payload.len())
                     .is_err()
+                && let Some(s) = sessions.remove(&conn_id)
             {
                 s.tx.close();
                 s.stream.shutdown(Shutdown::Both).ok();
@@ -784,6 +785,7 @@ fn handle_mux_frame(
                 && s.tx
                     .send(0, (ws::BINARY, payload.to_vec()), payload.len())
                     .is_err()
+                && let Some(s) = sessions.remove(&conn_id)
             {
                 s.tx.close();
                 s.stream.shutdown(Shutdown::Both).ok();

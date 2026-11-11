@@ -623,6 +623,49 @@ mod tests {
         assert_eq!(project_lucide("Rocket"), gpui_kit_assets::IconName::Rocket);
         assert_eq!(project_lucide("Unknown"), gpui_kit_assets::IconName::Folder);
     }
+
+    #[test]
+    fn all_project_and_app_icons_load_from_assets() {
+        use gpui::AssetSource as _;
+        use gpui_kit_assets::IconName;
+
+        for name in [
+            "Code2",
+            "SquareTerminal",
+            "Bot",
+            "Package",
+            "Database",
+            "Globe",
+            "Server",
+            "Cpu",
+            "Layers",
+            "Braces",
+            "Rocket",
+            "Wrench",
+            "Briefcase",
+            "Building2",
+            "Palette",
+            "Gauge",
+            "Sparkles",
+            "Shapes",
+            "Box",
+            "Folder",
+        ] {
+            let icon = project_lucide(name);
+            let path = icon.path();
+            assert!(
+                AppAssets.load(&path).unwrap().is_some(),
+                "missing project icon asset for {name} ({path})"
+            );
+        }
+        for icon in [IconName::Clock, IconName::Lock, IconName::Package] {
+            let path = icon.path();
+            assert!(
+                AppAssets.load(&path).unwrap().is_some(),
+                "missing app icon asset ({path})"
+            );
+        }
+    }
 }
 
 // GPUI Kit's default bundle contains component icons only; application icons are explicit.
@@ -631,6 +674,9 @@ gpui_kit_assets::icon_assets!(
     [
         Bell,
         Bot,
+        Box,
+        Braces,
+        Briefcase,
         Check,
         ChevronDown,
         ChevronLeft,
@@ -639,25 +685,32 @@ gpui_kit_assets::icon_assets!(
         CircleAlert,
         CircleCheck,
         CircleX,
+        Clock,
         Close,
+        CodeXml,
         Copy,
         Cpu,
+        Database,
         Ellipsis,
         ExternalLink,
         File,
         FileText,
         Folder,
         FolderOpen,
+        Gauge,
         Globe,
         Info,
         Keyboard,
+        Layers,
         Link,
         Loader,
         LoaderCircle,
+        Lock,
         MessageCircleQuestionMark,
         Minus,
         Monitor,
         Moon,
+        Package,
         PanelBottom,
         PanelLeft,
         PanelRight,
@@ -669,12 +722,15 @@ gpui_kit_assets::icon_assets!(
         Search,
         Server,
         Settings,
+        Shapes,
         Smartphone,
+        Sparkles,
         SquareTerminal,
         Star,
         StarFill,
         TriangleAlert,
-        User
+        User,
+        Wrench
     ]
 );
 

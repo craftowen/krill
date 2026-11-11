@@ -4603,9 +4603,7 @@ impl Shell {
                             && !allow_cold_resume
                             && let Some(session) = want
                         {
-                            match pane::attach(&p, session, known)
-                                .inspect_err(|e| report("attach", e))
-                            {
+                            match pane::attach(&p, session, known) {
                                 Ok(linked) => {
                                     return Ok(Got::Live {
                                         session,
@@ -4614,6 +4612,7 @@ impl Shell {
                                     });
                                 }
                                 Err(error) if !is_permanent_error(&error) => {
+                                    report("attach", &error);
                                     return Ok(Got::Live {
                                         session,
                                         linked: Err(error),

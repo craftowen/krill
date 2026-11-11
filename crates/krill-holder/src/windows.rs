@@ -347,30 +347,20 @@ impl Holder {
     fn request(&mut self, packet: Packet, handoff_allowed: bool) -> bool {
         let req = request_id(&packet.body).unwrap_or(0);
         let decoded = ToHolder::decode(packet.frame());
-        if let Ok(ToHolder::UpgradeHolder { req, ref path }) = decoded {
-            // Extracted packets are no longer visible to Link::has_pending(). A successful
-            // handoff here would discard them, so let the caller retry after they are served.
-            let result = if handoff_allowed {
-                text(path.clone()).and_then(|path| self.upgrade(&path, req))
-            } else {
-                Err(io::Error::from_raw_os_error(16))
-            };
-            match result {
-                Ok(()) => return true,
-                Err(e) => {
-                    self.send(
-                        &FromHolder::Failed {
-                            req,
-                            errno: e.raw_os_error().unwrap_or(5),
-                        },
-                        None,
-                    )
-                    .ok();
-                    return false;
+        let result = match decoded {
+            Ok(ToHolder::UpgradeHolder { req, path }) => {
+                // Extracted packets are no longer visible to Link::has_pending(). A successful
+                // handoff here would discard them, so let the caller retry after they are served.
+                let result = if handoff_allowed {
+                    text(path).and_then(|path| self.upgrade(&path, req))
+                } else {
+                    Err(io::Error::from_raw_os_error(16))
+                };
+                match result {
+                    Ok(()) => return true,
+                    Err(e) => Err(e),
                 }
             }
-        }
-        let result = match decoded {
             Ok(m) => self.handle(m, packet.fds),
             Err(_) => Err(io::Error::from_raw_os_error(38)),
         };
@@ -468,7 +458,12 @@ impl Holder {
                 };
                 // 전송 실패해도 세션은 holder에 남고 다음 krilld가 받는다.
                 self.sessions.push(session);
-                self.send(&message, self.sessions.last())?;
+                if self.send(&message, self.sessions.last()).is_err()
+                    && let Some(d) = &mut self.daemon
+                {
+                    sys::terminate(&d.process).ok();
+                    d.link = None;
+                }
                 return Ok(None);
             }
             ToHolder::Resize { id, size, .. } => {

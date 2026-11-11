@@ -156,8 +156,14 @@ impl RunGuard {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
-        if !fs::symlink_metadata(&runs)?.file_type().is_dir() || at_capacity(&runs) {
+        if !fs::symlink_metadata(&runs)?.file_type().is_dir() {
             return Ok(None);
+        }
+        if at_capacity(&runs) {
+            drop(Stale::scan(state, consent));
+            if at_capacity(&runs) {
+                return Ok(None);
+            }
         }
         let build = Event::new(process, Code::UncleanExit, None)?;
         let record = Record {

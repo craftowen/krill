@@ -438,7 +438,7 @@
               diagnosticsTrace: trace,
             } = {}) {
               const host = current(), peerRid = host?.routes?.relay?.rid || host?.rid;
-              if ((!peerFixed && !host?.routes?.relay) || !validRid(peerRid)) return !1;
+              if ((!peerFixed && !host?.routes?.relay) || !validRid(peerRid) || !isCurrent() || signal?.aborted) return !1;
               trace?.mark("discovery", { route: "relay" });
               let timedOut = false;
               const controller = new AbortController(),
@@ -981,7 +981,6 @@
           diagnosticsTrace: trace,
         } = {}) {
           if ((pairingPending && pairingDirect) || !destinationFixed || !validRid(rid)) return !1;
-          trace?.mark("discovery", { route: "relay" });
           let timedOut = false;
           const requestRid = rid,
             controller = new AbortController(),
@@ -992,6 +991,7 @@
               isCurrent() &&
               rid === requestRid;
           if (!current()) return !1;
+          trace?.mark("discovery", { route: "relay" });
           signal?.addEventListener("abort", abort, { once: !0 });
           const timeout = setTimeout(() => {
             timedOut = true;
@@ -1199,9 +1199,18 @@
         denied = -1;
       const latestReads = new Map(),
         isRead = (request) =>
-          ["snapshot", "chat_poll", "git", "accounts", "drop_list", "drop_get"].includes(
-            request?.action,
-          );
+          [
+            "snapshot",
+            "chat_poll",
+            "git",
+            "accounts",
+            "drop_list",
+            "drop_get",
+            "orchestration",
+            "command_catalog",
+            "mention_files",
+            "composer_models",
+          ].includes(request?.action);
       let credentials = options.credentials,
         pair = options.pair,
         socket,
@@ -1473,11 +1482,11 @@
       }
       function rpc(request, latest, probe = !1, retried = !1) {
         const current = generation,
-          rpcStarted = Date.now(),
-          silent = probe === "silent",
+          silent = !!probe,
           mutation = !isRead(request);
+        let rpcStarted = Date.now(),
+          submitted = !1;
         pendingRpc++;
-        let submitted = !1;
         const surface = (error, report) => {
           report &&
             submitted &&
@@ -1497,23 +1506,22 @@
           mutation && submitted && !error.definitive && (uncertainMutation = !0);
           return error;
         };
-        const operation = deadline(
-          serial.then(() => {
-            if (!connected || current !== generation)
-              throw transportClosed("Disconnected. The action was not resent.");
-            return (
-              latest && ((latest.submitted = !0), (request = latest.request)),
-              ask(request),
-              (submitted = !0),
-              answer(current)
-            );
-          }),
-          probe ? 5e3 : 15e3,
-          mutation
-            ? "Desktop response timed out. The result may be unknown; pending actions were not resent."
-            : "Disconnected. Reconnecting\u2026",
-          current,
-        );
+        const operation = serial.then(() => {
+          if (!connected || current !== generation)
+            throw transportClosed("Disconnected. The action was not resent.");
+          rpcStarted = Date.now();
+          latest && ((latest.submitted = !0), (request = latest.request));
+          ask(request);
+          submitted = !0;
+          return deadline(
+            answer(current),
+            probe ? 5e3 : 15e3,
+            mutation
+              ? "Desktop response timed out. The result may be unknown; pending actions were not resent."
+              : "Disconnected. Reconnecting\u2026",
+            current,
+          );
+        });
         return (
           (serial = operation.catch(() => {})),
           operation
@@ -1529,7 +1537,7 @@
                 return reconnected().then(
                   () => rpc(request, latest, !1, !0),
                   () => {
-                    throw surface(error, !stopped);
+                    throw surface(error, !1);
                   },
                 );
               throw surface(error, current === generation);
@@ -1774,39 +1782,50 @@
                   const w = waiters.shift();
                   if (w) w.resolve(data);
                   else queue.push(data);
-                },
-                end = (e) => {
-                  if (current !== generation) return;
+                };
+              let reportedError = false;
+              const end = (e) => {
                   const diagnosticReason =
-                    e?.code === 1008 || e?.code === 4009
-                      ? "auth_rejected"
-                      : e?.code
-                        ? "websocket_closed"
-                        : "websocket_error";
+                      e?.code === 1008 || e?.code === 4009
+                        ? "auth_rejected"
+                        : e?.code
+                          ? "websocket_closed"
+                          : "websocket_error",
+                    reportEnd = () =>
+                      trace?.report(
+                        diagnosticReason === "auth_rejected"
+                          ? "mobile_auth_failed"
+                          : "mobile_connect_failed",
+                        {
+                          reason: diagnosticReason,
+                          ws_code: e?.code,
+                          route: timing.route,
+                          phase: !established
+                            ? [
+                                "socket_open",
+                                "challenge",
+                                "authentication",
+                                "ipc",
+                                "snapshot",
+                              ][stage]
+                            : "ipc",
+                        },
+                      );
+                  if (current !== generation) {
+                    if (!stopped && reportedError && e?.code && e.code !== 1000) {
+                      reportedError = false;
+                      reportEnd();
+                    }
+                    return;
+                  }
                   if (
                     !failed ||
                     (e?.code && failed.diagnosticReported) ||
                     diagnosticReason === "auth_rejected"
-                  )
-                    trace?.report(
-                      diagnosticReason === "auth_rejected"
-                        ? "mobile_auth_failed"
-                        : "mobile_connect_failed",
-                      {
-                        reason: diagnosticReason,
-                        ws_code: e?.code,
-                        route: timing.route,
-                        phase: !established
-                          ? [
-                              "socket_open",
-                              "challenge",
-                              "authentication",
-                              "ipc",
-                              "snapshot",
-                            ][stage]
-                          : "ipc",
-                      },
-                    );
+                  ) {
+                    reportedError = !e?.code;
+                    reportEnd();
+                  }
                   const capacity = e?.code === 4009,
                     cooldown = e?.code === 1013,
                     denied = e?.code === 1008 || capacity;
@@ -2201,6 +2220,7 @@
               mark("helloMs");
               connected = true;
               warmTerminal();
+              stage = 4;
               trace?.mark("snapshot");
               const first = serial.then(() =>
                 answer(current).catch((e) =>
@@ -2247,7 +2267,11 @@
                 ? "network_offline"
                 : "protocol_error"),
             transientConnect =
-              reason === "timeout" || reason === "network_offline";
+              reason === "timeout" ||
+              reason === "network_offline" ||
+              (timing.route === "relay" &&
+                (reason === "websocket_closed" ||
+                  reason === "websocket_error"));
           if (!e.diagnosticReported && !failed?.diagnosticReported)
             trace?.report(
               !transientConnect && (stage === 2 || authBlocked)

@@ -1492,3 +1492,195 @@ test("decorative icon and manifest load failures file nothing while the styleshe
     ["mobile_asset_failed"],
   );
 });
+
+test("mid-snapshot close reports snapshot phase and active retry reaching snapshot defers episode release until ok", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 4);
+  socket.emit("close", { code: 1006 });
+  await pending;
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].diagnostics.phase, "snapshot");
+  assert.equal(h.events()[0].diagnostics.ws_code, 1006);
+  t.close();
+
+  const h2 = harness();
+  h2.diagnostics.setEnabled(true);
+  const t2 = h2.transport(),
+    first = await h2.start(t2, 4);
+  await h2.tick(20000);
+  await first.pending;
+  await h2.tick(1000);
+  const retrySocket = h2.sockets.at(-1);
+  for (const data of [
+    undefined,
+    JSON.stringify({ version: 2, challenge: "challenge-secret" }),
+    enc.encode("{}"),
+    Uint8Array.from([0, 0, 0, 0, 1]),
+  ]) {
+    retrySocket.emit(data === undefined ? "open" : "message", { data });
+    await flush();
+  }
+  await h2.tick(15000);
+  assert.equal(h2.events().length, 0);
+  h2.response(retrySocket, { sessions: [] });
+  await flush();
+  await settle(h2);
+  assert.equal(h2.events().length, 0);
+  t2.close();
+});
+
+test("post-ok drop upgrades late close across generation bump, updates held report on retry and allows higher-weight auth report after flush", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 4);
+  h.response(socket, { sessions: [] });
+  await pending;
+  socket.emit("error");
+  await flush();
+  await h.tick(0);
+  socket.emit("close", { code: 1006 });
+  await flush();
+  await h.tick(50);
+  await fail(h);
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].diagnostics.ws_code, 1006);
+  assert.equal(h.events()[0].diagnostics.phase, "socket_open");
+  assert.equal(h.events()[0].diagnostics.elapsed_ms, 50);
+
+  const retrySocket = h.sockets.at(-1);
+  retrySocket.emit("open");
+  await flush();
+  retrySocket.emit("message", {
+    data: JSON.stringify({ version: 2, challenge: "challenge-secret" }),
+  });
+  await flush();
+  retrySocket.emit("close", { code: 1008 });
+  await flush();
+  await settle(h);
+  assert.equal(h.events().length, 2);
+  assert.equal(h.events()[1].error_code, "mobile_auth_failed");
+  assert.equal(h.events()[1].diagnostics.ws_code, 1008);
+  t.close();
+});
+
+test("background sleep rebases attempt elapsed_ms instead of clamping wake breadcrumbs to 300000ms", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const trace = h.diagnostics.attempt();
+  trace.mark("socket_open", { route: "relay" });
+  h.context.document.visibilityState = "hidden";
+  await h.tick(300000);
+  h.context.document.visibilityState = "visible";
+  trace.report("mobile_connect_failed", {
+    reason: "websocket_closed",
+    ws_code: 1006,
+    route: "relay",
+  });
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert(h.events()[0].diagnostics.elapsed_ms < 1000);
+});
+
+test("expanded read RPC actions retry across disconnects, serial queue starts deadline on send and keepalive or reconnected timeout files no duplicate rpc error", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 4);
+  h.response(socket, {
+    sessions: [],
+    etag: "e1",
+    capabilities: { change_feed: true },
+  });
+  await pending;
+
+  for (const action of [
+    "orchestration",
+    "command_catalog",
+    "mention_files",
+    "composer_models",
+  ]) {
+    const p1 = t.rpcLatest(action, { action }),
+      p2 = t.rpcLatest(action, { action });
+    assert.equal(p1, p2);
+    await flush();
+    const active = h.sockets.at(-1);
+    active.emit("close", { code: 1006 });
+    await flush();
+    await h.tick(0);
+    await establish(h, h.sockets.at(-1));
+    h.response(h.sockets.at(-1), { ok_action: action });
+    assert.equal((await p1).ok_action, action);
+    assert.equal(t.updateBusy, false);
+  }
+
+  const slow = t.rpc({ action: "git" }),
+    behind = t.rpc({ action: "accounts" });
+  await flush();
+  await h.tick(12000);
+  h.response(h.sockets.at(-1), { slow: true });
+  assert.equal((await slow).slow, true);
+  await flush();
+  await h.tick(5000);
+  h.response(h.sockets.at(-1), { behind: true });
+  assert.equal((await behind).behind, true);
+
+  const stalledRead = t.rpc({ action: "orchestration" });
+  stalledRead.catch(() => {});
+  await flush();
+  h.sockets.at(-1).emit("close", { code: 1006 });
+  await flush();
+  await h.tick(20000);
+  await assert.rejects(stalledRead);
+  await settle(h);
+  assert.equal(
+    h.events().filter((e) => e.error_code === "mobile_rpc_failed").length,
+    0,
+  );
+  t.close();
+});
+
+test("relay stage-2 transport closes do not trigger auth lockout and aborted locate records no discovery breadcrumb", async () => {
+  const h = harness();
+  relayHost(h);
+  h.diagnostics.setEnabled(true);
+  const endpoint = h.context.KrillMobile.transport.bootstrap(),
+    t = h.transport({ endpoint });
+  for (let i = 0; i < 3; i++) {
+    const { pending, socket } = await h.start(t, 2);
+    socket.emit("close", { code: 1011 });
+    await pending;
+    assert.equal(t.blocked, false);
+    assert(t.state.retryAt < h.context.Date.now() + 20000);
+    await h.tick(15000);
+  }
+  t.close();
+
+  const trace = h.diagnostics.attempt(),
+    controller = new AbortController();
+  controller.abort();
+  await endpoint.locate({ diagnosticsTrace: trace, signal: controller.signal });
+  assert.equal(trace.episode.crumbs.length, 0);
+});
+
+test("document URL runtime errors map source_file to index.html", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const base = "https://krill-mobile.pages.dev/m/0123456789abcdef/";
+  h.emit("error", {
+    filename: base,
+    lineno: 76,
+    colno: 5094,
+    error: new TypeError("inline failure"),
+  });
+  await h.tick();
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].error_code, "mobile_runtime_error");
+  assert.equal(h.events()[0].diagnostics.source_file, "index.html");
+  assert.equal(h.events()[0].diagnostics.line, 76);
+  assert.equal(h.events()[0].diagnostics.column, 5094);
+});

@@ -27,7 +27,18 @@ impl Repeats {
     /// `Some(n)`이면 기록한다(n = 직전 창에서 숨긴 수). `None`이면 이 사건은 버린다.
     fn admit(&mut self, key: u64, now: u128) -> Option<u32> {
         if self.seen.len() >= MAX_KEYS && !self.seen.contains_key(&key) {
-            self.seen.clear();
+            self.seen.retain(|_, &mut (start, count)| {
+                now.saturating_sub(start) < WINDOW_MS || count > REPEATS_PER_WINDOW
+            });
+            if self.seen.len() >= MAX_KEYS
+                && let Some(&oldest_key) = self
+                    .seen
+                    .iter()
+                    .min_by_key(|(_, (start, _))| *start)
+                    .map(|(k, _)| k)
+            {
+                self.seen.remove(&oldest_key);
+            }
         }
         let entry = self.seen.entry(key).or_insert((now, 0));
         let mut hidden = 0;
@@ -111,14 +122,26 @@ impl Subscriber for Logger {
             },
             Err(_) => 0,
         };
-        if hidden > 0 {
-            write!(line, " suppressed_repeats={hidden}").ok();
-        }
+        line.append_suppressed(hidden);
         self.writer.append(&line.0).ok();
     }
 }
 
 struct Line(String);
+
+impl Line {
+    fn append_suppressed(&mut self, hidden: u32) {
+        if hidden == 0 {
+            return;
+        }
+        let suffix = format!(" suppressed_repeats={hidden}");
+        let max_body = (RECORD_BYTES - 1).saturating_sub(suffix.len());
+        if self.0.len() > max_body {
+            self.0.truncate(self.0.floor_char_boundary(max_body));
+        }
+        self.0.push_str(&suffix);
+    }
+}
 
 impl Write for Line {
     fn write_str(&mut self, value: &str) -> fmt::Result {
@@ -164,5 +187,47 @@ mod tests {
             .filter(|n| repeats.admit(7, n * ten_hours_ms / 25_433).is_some())
             .count();
         assert!(kept <= 3 * 601, "kept {kept} of 25433");
+    }
+
+    #[test]
+    fn max_keys_evicts_expired_or_oldest_without_clearing_active_windows() {
+        let mut repeats = Repeats::default();
+        for _ in 0..10 {
+            repeats.admit(999, 100);
+        }
+        for k in 1..(MAX_KEYS as u64) {
+            assert_eq!(repeats.admit(k, 50), Some(0));
+        }
+        assert_eq!(repeats.seen.len(), MAX_KEYS);
+
+        // Inserting a new key after the non-suppressed keys expired reaps them without losing key 999.
+        assert_eq!(repeats.admit(1_000, 100 + WINDOW_MS), Some(0));
+        assert_eq!(
+            repeats.admit(999, 100 + WINDOW_MS),
+            Some(10 - REPEATS_PER_WINDOW)
+        );
+
+        // When all MAX_KEYS entries are still active, only the single oldest entry is evicted.
+        let mut full = Repeats::default();
+        for i in 0..(MAX_KEYS as u64) {
+            assert_eq!(full.admit(i, u128::from(i)), Some(0));
+        }
+        for _ in 0..5 {
+            full.admit(10, 10);
+        }
+        assert_eq!(full.admit(5_000, 500), Some(0));
+        assert_eq!(full.seen.len(), MAX_KEYS);
+        assert!(!full.seen.contains_key(&0));
+        assert_eq!(full.admit(10, 10), None);
+    }
+
+    #[test]
+    fn near_capacity_line_preserves_suppressed_repeats_suffix() {
+        let mut line = Line(String::with_capacity(RECORD_BYTES));
+        write!(line, "{}", "a".repeat(RECORD_BYTES + 32)).ok();
+        assert_eq!(line.0.len(), RECORD_BYTES - 1);
+        line.append_suppressed(338);
+        assert!(line.0.len() < RECORD_BYTES);
+        assert!(line.0.ends_with(" suppressed_repeats=338"));
     }
 }

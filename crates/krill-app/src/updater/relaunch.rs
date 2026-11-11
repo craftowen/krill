@@ -354,13 +354,23 @@ pub fn recover_journal(state_dir: &Path) -> Result<Option<Journal>, Error> {
 }
 
 pub(super) fn recover_with(mode: Mode, state_dir: &Path) -> Result<Option<Journal>, Error> {
-    let Some(mut journal) = Journal::load(state_dir)? else {
+    let Some(journal) = Journal::load(state_dir)? else {
         return Ok(None);
     };
     if matches!(
         journal.stage,
         Stage::MovingToPrev | Stage::MovingStagingToTarget
     ) {
+        let _lock = staging_lock(&journal.bundle)?;
+        let Some(mut journal) = Journal::load(state_dir)? else {
+            return Ok(None);
+        };
+        if !matches!(
+            journal.stage,
+            Stage::MovingToPrev | Stage::MovingStagingToTarget
+        ) {
+            return Ok(Some(journal));
+        }
         let staging = staging_path(&journal.bundle);
         let prev = prev_path(&journal.bundle);
         if mode == Mode::Rename {
@@ -457,6 +467,7 @@ pub(super) fn rollback_with(
     state_dir: &Path,
     reason: &str,
 ) -> Result<(), Error> {
+    let _lock = staging_lock(app_bundle)?;
     // `.prev`가 완결된 백업이라는 증거는 저널 단계뿐이다(`MovingStagingToTarget` 이후 단계는 백업이 끝난
     // 뒤에만 저장된다). 저널이 없거나 읽을 수 없으면 백업 상태를 추정하지 않고 번들·`.prev`를 건드리지
     // 않는다. 없음을 완결로 보면 중단된 백업의 불완전한 `.prev`가 아직 복사되지 않은 원본을 지운다(APP-F02).
@@ -1162,6 +1173,59 @@ mod backup_cleanup_tests {
         assert!(!verified_marker(&bundle).exists());
         assert!(!staged_entries_path(&bundle).exists());
         assert!(bundle.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recover_waits_for_staging_lock_and_reloads_journal_after_concurrent_swap() {
+        let root = std::env::temp_dir().join(format!("krill-recover-lock-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let bundle = root.join("Krill.app");
+        let state = root.join("state");
+        let prev = prev_path(&bundle);
+        fs::create_dir_all(&bundle).unwrap();
+        fs::create_dir_all(&prev).unwrap();
+        fs::write(bundle.join("version"), b"0.2.0").unwrap();
+        fs::write(prev.join("version"), b"0.1.0").unwrap();
+        Journal {
+            bundle: bundle.clone(),
+            from_version: "0.1.0".to_owned(),
+            to_version: "0.2.0".to_owned(),
+            health_timeout_ms: 5_000,
+            stage: Stage::MovingToPrev,
+        }
+        .save(&state)
+        .unwrap();
+
+        let lock = staging_lock(&bundle).unwrap();
+        let state_bg = state.clone();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            recover_with(MODE, &state_bg)
+        });
+        ready.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+
+        // Simulate the in-flight swap completing while holding `staging_lock`.
+        Journal {
+            bundle: bundle.clone(),
+            from_version: "0.1.0".to_owned(),
+            to_version: "0.2.0".to_owned(),
+            health_timeout_ms: 5_000,
+            stage: Stage::VerifyingLaunch,
+        }
+        .save(&state)
+        .unwrap();
+        drop(lock);
+
+        let recovered = waiter.join().unwrap().unwrap().unwrap();
+        assert_eq!(recovered.stage, Stage::VerifyingLaunch);
+        assert!(
+            prev.join("version").exists(),
+            ".prev backup must remain intact"
+        );
+        assert_eq!(fs::read(bundle.join("version")).unwrap(), b"0.2.0");
         fs::remove_dir_all(root).unwrap();
     }
 }
