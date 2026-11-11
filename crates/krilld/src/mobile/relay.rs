@@ -4,8 +4,8 @@
 use super::devices::{decode_hex, hex};
 use super::e2ee::{Channel, Endpoint, MAX_PLAINTEXT, invalid, random};
 use super::gateway::{
-    AuthHello, AuthProof, Connection, MAX_CONNECTIONS, MAX_PENDING, RPC_STACK, Shared,
-    ShutdownHandle, TIMEOUT, authenticated_reply, now_ms,
+    AUTH_TIMEOUT, AuthHello, AuthProof, Connection, MAX_CONNECTIONS, MAX_PENDING, RPC_STACK,
+    Shared, ShutdownHandle, TIMEOUT, authenticated_reply, now_ms,
 };
 use super::ws;
 use crate::registry::Registry;
@@ -413,7 +413,13 @@ fn supervise_loop(
         if stop.cancelled() {
             return;
         }
-        tracing::debug!(?res, "mobile DO relay disconnected; backing off");
+        // 호스트 소켓이 끊기면 DO가 붙어 있던 휴대폰을 모두 1012로 닫으므로, 빈도를 볼 수 있게 남긴다.
+        tracing::info!(
+            ?res,
+            was_connected,
+            ?delay,
+            "mobile DO relay disconnected; backing off"
+        );
         if stop.wait(delay) {
             return;
         }
@@ -748,10 +754,20 @@ fn handle_mux_frame(
                 .spawn(move || {
                     let _close = rx.close_guard();
                     crate::alloc::mobile_thread().ok();
+                    let opened = Instant::now();
                     let code = match serve_mux_client(
                         conn_id, challenge, &rx, &close_tx, local, server, &out, &sh, id, &reg, &h,
                     ) {
-                        Err(err) => super::gateway::auth_close_code(&err).unwrap_or(1011),
+                        Err(err) => {
+                            // 폰이 인증 중 1011을 받은 원인(예산 만료인지)을 가릴 수 있게 남긴다. 비밀값은 없다.
+                            if err.kind() == io::ErrorKind::TimedOut {
+                                tracing::info!(
+                                    elapsed_ms = opened.elapsed().as_millis(),
+                                    "mobile relay connection timed out (1011)"
+                                );
+                            }
+                            super::gateway::auth_close_code(&err).unwrap_or(1011)
+                        }
                         _ => 1000,
                     };
                     out.send_close(conn_id, code);
@@ -802,8 +818,7 @@ fn handle_mux_frame(
     }
 }
 
-fn recv_client_frame(rx: &Mailbox<(u8, Vec<u8>)>, timeout: Duration) -> io::Result<(u8, Vec<u8>)> {
-    let deadline = Instant::now() + timeout;
+fn recv_client_frame(rx: &Mailbox<(u8, Vec<u8>)>, deadline: Instant) -> io::Result<(u8, Vec<u8>)> {
     loop {
         let remain = deadline.saturating_duration_since(Instant::now());
         if remain.is_zero() {
@@ -848,10 +863,12 @@ fn serve_mux_client(
     hello: &ServerHello,
 ) -> io::Result<()> {
     let mut principal = None;
+    // 두 프레임이 예산 하나를 나눠 쓴다(프레임마다 새로 주지 않는다). 수락 루프도 같은 예산으로 정리한다.
+    let deadline = Instant::now() + AUTH_TIMEOUT;
     let result = (|| {
         let greeting = serde_json::json!({"version": 2, "challenge": hex(&challenge)});
         outbox.send_mux(MUX_TEXT, conn_id, greeting.to_string().as_bytes())?;
-        let (opcode, body) = recv_client_frame(rx, TIMEOUT)?;
+        let (opcode, body) = recv_client_frame(rx, deadline)?;
         if opcode == 8 {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
@@ -879,7 +896,7 @@ fn serve_mux_client(
             *a = b;
         }
         let mut channel = Channel::new(&secret, &salt, Endpoint::Daemon)?;
-        let (opcode, body) = recv_client_frame(rx, TIMEOUT)?;
+        let (opcode, body) = recv_client_frame(rx, deadline)?;
         if opcode == 8 {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
@@ -890,7 +907,13 @@ fn serve_mux_client(
             serde_json::from_slice(&channel.open(&body)?).map_err(|_| invalid())?;
         let authenticated = {
             let mut s = lock(&shared.state);
-            if s.stopped || !s.connections.contains_key(&id) {
+            // 수락 루프는 `accepted + AUTH_TIMEOUT`에 미인증 연결을 닫는다. 그 뒤에 인증 응답을 보내면 폰은
+            // 성공을 받고 IPC 단계에서 1011로 끊기므로, 예산이 끝났으면 응답 전에 멈춘다(페어링 티켓은 아직 그대로).
+            if s.stopped
+                || s.connections
+                    .get(&id)
+                    .is_none_or(|c| c.accepted.elapsed() >= AUTH_TIMEOUT)
+            {
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }
             let (device_id, credential) = if let Some(token) = token {

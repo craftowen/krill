@@ -99,8 +99,8 @@ async function fixedOriginTests(){
  const server=new C.Channel(new Uint8Array(32),C.concat(C.unhex('bc'.repeat(32)),new Uint8Array(32).fill(1)),false);
  socket.emit('message',server.seal(new TextEncoder().encode(JSON.stringify({device_id:'new-device',credential:'cd'.repeat(32)}))));socket.emit('message',server.seal(frame(1,Buffer.concat([v(1),v(1),v(0)]))));await flush();
  socket.emit('message',server.seal(frame(0x65,Buffer.concat([v(6),string(JSON.stringify({ok:true,data:{sessions:[]}}))]))));await flush();assert(t.ready);assert.equal(authenticated.rid,rid);assert.equal(authenticated.hash,hash);assert.equal(f.stored().credential,'cd'.repeat(32));const terminal=t.terminalConnect();assert.equal(terminal.socket.url,socket.url);assert.equal(terminal.credentials.rid,rid);
- // Back from a long background (or a new network): resume(stale) reconnects at once instead of probing a likely dead socket.
- {const n=f.sockets.length;t.resume(true);await flush();assert.equal(f.sockets.length,n+1);assert.equal(f.sockets.at(-1).url,socket.url);assert(socket.closed);}t.close();
+ // Back from a long background the open socket is asked once (probe deadline) instead of dropped; a new network reconnects at once.
+ {t.resume(true);await flush();assert(!socket.closed,'the open control socket is kept');const n=f.sockets.length;t.resume('network');await flush();assert(f.sockets.length>n);assert.equal(f.sockets.at(-1).url,socket.url);assert(socket.closed);}t.close();
  // A hung connection handshake gives up after 20 s, so locate/fallback and retry run instead of waiting out the TCP timeout.
  f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();{const guard=[...f.timers.values()].find(x=>x.ms===20000);assert(guard);guard.fn();await flush();assert(f.sockets[0].closed);assert.equal(f.requests.length,1);assert([...f.timers.values()].some(x=>x.ms===1000));}t.close();
  // In-app QR scan (endpoint.adopt): r pairs in place; a Named Tunnel origin, another app version or LAN origin opens the link; a LAN code in the fixed app says what to do.

@@ -3972,6 +3972,220 @@ async function main() {
   console.log(
     "PASS scrolled-up submit jumps to bottom with optimistic user bubble, reconciles without duplicate, and protects dictation input",
   );
+  await agyStartupAndModelApplyUx();
+}
+
+async function agyStartupAndModelApplyUx() {
+  let clock = 100000;
+  const Clock = class extends Date {
+    static now() {
+      return clock;
+    }
+  };
+  const poll1 = deferred(),
+    modelsDeferred = deferred(),
+    setModelDeferred = deferred();
+  let pollCount = 0,
+    composerProbes = 0,
+    settled = false;
+  const f = fixture({
+    Date: Clock,
+    capabilities: {
+      chat_composer: true,
+      composer_models: true,
+      set_model: true,
+      set_effort: true,
+    },
+    handler: async (req) => {
+      if (req.action === "chat_poll") {
+        pollCount++;
+        if (pollCount === 1) return poll1.promise;
+        return {
+          generation: "g-agy",
+          agent: "agy",
+          bound: true,
+          items: [],
+          next_offset: 0,
+        };
+      }
+      if (req.action === "chat_composer") {
+        composerProbes++;
+        return settled
+          ? {
+              agent: "agy",
+              supported: true,
+              effort_supported: true,
+              model: "gemini-4-carbon",
+              model_label: "Gemini 4 Carbon",
+              effort: "high",
+              models: [
+                {
+                  id: "gemini-4-carbon",
+                  label: "Gemini 4 Carbon",
+                  efforts: ["low", "medium", "high"],
+                },
+                {
+                  id: "gemini-4-argon",
+                  label: "Gemini 4 Argon",
+                  efforts: ["low", "medium", "high"],
+                },
+              ],
+            }
+          : {
+              agent: "agy",
+              supported: false,
+              effort_supported: false,
+              model: null,
+              model_label: "Gemini 4 Carbon",
+              effort: "high",
+              models: [],
+            };
+      }
+      if (req.action === "composer_models") return modelsDeferred.promise;
+      if (req.action === "set_model") return setModelDeferred.promise;
+      return {};
+    },
+  });
+  const sess = f.state.sessions.get(7);
+  sess.agent = "agy";
+  f.update();
+  await flush();
+  // Snapshot upgrades synthetic expected session identity while poll1 is still in flight.
+  sess.profile_id = "agy";
+  sess.command_context = "ctx-agy";
+  f.update();
+  poll1.resolve({
+    generation: "g-old",
+    agent: "agy",
+    bound: false,
+    items: [],
+    next_offset: 0,
+  });
+  await flush();
+  assert.equal(
+    pollCount,
+    2,
+    "scope upgrade during in-flight initial poll reloads immediately without waiting 1.5s",
+  );
+  assert.equal(
+    f.find("chat-empty")?.children[0]?.textContent,
+    "Enter a new message",
+    "empty state renders as soon as post-upgrade poll finishes",
+  );
+  const pill = f.find("composer-pill"),
+    modelName = f.find("composer-model-name"),
+    effortBars = f.find("composer-model-effort");
+  assert.equal(
+    pill.hidden,
+    false,
+    "controllable provider keeps model pill visible while cold catalog settles",
+  );
+  assert.equal(modelName.textContent, "gemini 4 carbon");
+  assert.equal(effortBars.hidden, false);
+  assert.equal(
+    effortBars.children.filter((b) => b.dataset.on === "true").length,
+    3,
+  );
+  const probesBefore = composerProbes;
+  clock += 1600;
+  f.update();
+  await flush();
+  assert(
+    composerProbes > probesBefore,
+    "startup status probes retry after 1.5s instead of locking out for 15s",
+  );
+  // Cold picker open shows Loading…, settles catalog, and renders model + effort groups + note.
+  pill.click();
+  const suggestions = f.find("chat-composer-suggestions");
+  assert.equal(suggestions.hidden, false);
+  assert(
+    suggestions.descendants().some((n) => n.textContent === "Loading…"),
+    "cold model picker displays Loading… immediately",
+  );
+  settled = true;
+  modelsDeferred.resolve({
+    agent: "agy",
+    supported: true,
+    current: "gemini-4-carbon",
+    note: "Antigravity also saves this as the default for new sessions.",
+    items: [
+      {
+        id: "gemini-4-carbon",
+        label: "Gemini 4 Carbon",
+        efforts: ["low", "medium", "high"],
+      },
+      {
+        id: "gemini-4-argon",
+        label: "Gemini 4 Argon",
+        efforts: ["low", "medium", "high"],
+      },
+    ],
+  });
+  await flush();
+  assert(
+    suggestions
+      .descendants()
+      .some(
+        (n) =>
+          n.textContent ===
+          "Antigravity also saves this as the default for new sessions.",
+      ),
+    "provider note is surfaced in picker header",
+  );
+  const options = suggestions
+    .descendants()
+    .filter((n) => n.attrs?.role === "option");
+  const argonOption = options.find((n) =>
+    n.descendants().some((c) => c.textContent === "Gemini 4 Argon"),
+  );
+  const highOption = options.find((n) =>
+    n.descendants().some((c) => c.textContent === "High"),
+  );
+  assert(argonOption, "Gemini 4 Argon chip rendered");
+  assert(highOption, "High effort chip rendered");
+  assert.equal(highOption.attrs["aria-current"], "true");
+  argonOption.click();
+  await flush();
+  assert.equal(pill.disabled, true);
+  f.update();
+  assert.equal(
+    pill.disabled,
+    true,
+    "background update does not re-enable model pill while set_model is in flight",
+  );
+  assert.equal(
+    modelName.textContent,
+    "gemini 4 carbon",
+    "unconfirmed target model is never optimistically shown on composer pill",
+  );
+  assert(
+    suggestions.descendants().some((n) => n.textContent === "Applying…"),
+    "in-flight model change shows Applying… feedback",
+  );
+  setModelDeferred.resolve({
+    applied: true,
+    supported: true,
+    model: "gemini-4-argon",
+    label: "Gemini 4 Argon",
+    effort: "high",
+  });
+  await flush();
+  assert.equal(suggestions.hidden, true);
+  assert.equal(modelName.textContent, "gemini 4 argon");
+  assert.equal(
+    effortBars.hidden,
+    false,
+    "confirmed effort bars remain visible after model switch",
+  );
+  assert.equal(
+    effortBars.children.filter((b) => b.dataset.on === "true").length,
+    3,
+  );
+  assert.equal(pill.dataset.applied, "true");
+  f.dispose();
+  console.log(
+    "PASS agy startup reload, 1.5s boot probe, cold picker Loading…/note, Applying… lock, and confirmed effort retention",
+  );
 }
 main().catch((error) => {
   console.error(error);

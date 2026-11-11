@@ -1196,6 +1196,8 @@
         armed = 0,
         rev = 0,
         heard = 0,
+        received = 0,
+        visibleAt = 0,
         denied = -1;
       const latestReads = new Map(),
         isRead = (request) =>
@@ -1226,6 +1228,7 @@
         refreshing,
         timer,
         retryTimer,
+        resumeTimer,
         connectController,
         warm = null,
         terminalSockets = new Set(),
@@ -1233,7 +1236,6 @@
         timing = null,
         retryDelay = 1e3,
         last = null,
-        authFailures = 0,
         retryNotBefore = 0,
         authBlocked = !1,
         retryCount = 0,
@@ -1276,18 +1278,35 @@
           transport: !0,
           diagnosticReason: "websocket_closed",
         });
+      // iOS freezes a hidden home-screen app, so time spent hidden measured the freeze, not the desktop:
+      // the request gets `ms` of visible time, counted from its start or from the page's last return.
+      // A frozen page also fires timers late, possibly before visibilitychange runs; that earns one fresh window.
       function deadline(operation, ms, message, current = generation) {
         let timeout;
         return Promise.race([
           operation,
           new Promise((_, reject) => {
-            timeout = setTimeout(() => {
+            const started = Date.now();
+            let late = false;
+            const arm = (wait) => {
+              const due = Date.now() + wait;
+              timeout = setTimeout(() => {
+                const now = Date.now();
+                if (globalThis.document?.hidden) return arm(ms);
+                if (now - due > 1000 && !late) return ((late = true), arm(ms));
+                const left = Math.max(started, visibleAt) + ms - now;
+                if (left > 0) return arm(left);
+                expire();
+              }, wait);
+            };
+            const expire = () => {
               const error = Error(message);
               error.diagnosticReason = "timeout";
               ((error.transport = !0),
                 reject(error),
                 current === generation && disconnect(error));
-            }, ms);
+            };
+            arm(ms);
           }),
         ]).finally(() => clearTimeout(timeout));
       }
@@ -1506,6 +1525,8 @@
           mutation && submitted && !error.definitive && (uncertainMutation = !0);
           return error;
         };
+        // The deadline starts when the request is sent: time queued behind earlier requests is
+        // bounded by their own deadlines, which drop a dead socket and reject this one.
         const operation = serial.then(() => {
           if (!connected || current !== generation)
             throw transportClosed("Disconnected. The action was not resent.");
@@ -1515,7 +1536,7 @@
           submitted = !0;
           return deadline(
             answer(current),
-            probe ? 5e3 : 15e3,
+            probe ? PROBE_DEADLINE : 15e3,
             mutation
               ? "Desktop response timed out. The result may be unknown; pending actions were not resent."
               : "Disconnected. Reconnecting\u2026",
@@ -1563,7 +1584,9 @@
       // 폴링은 직전 etag를 보내고, 바뀐 게 없으면 데몬이 본문을 생략한다(unchanged). 화면도 다시 그리지 않는다.
       // 변경 피드: 새 데몬은 capabilities.change_feed를 알리고, 그걸 본 클라이언트만 snapshot에 feed 간격(ms)을 싣는다.
       // 데몬은 같은 간격으로 같은 스냅샷을 계산해 바뀐 것만 같은 채널로 푸시한다. rev는 늦게 온 옛 스냅샷을 거른다.
+      // A liveness probe waits longer than one cellular stall before it gives up on the socket.
       const FEED_FALLBACK = 5000,
+        PROBE_DEADLINE = 8000,
         wanted = () =>
           globalThis.document?.hidden ? 0 : M.activeTerminal ? 10000 : 2500;
       const query = () => ({
@@ -1645,6 +1668,7 @@
       }
       // 숨기면 피드를 멈춘다(feed:0). 진행 중인 갱신이 옛 간격을 실었을 수 있어 그 뒤에 맞춘다.
       function visibility() {
+        if (!globalThis.document?.hidden) visibleAt = Date.now();
         const current = generation;
         if (connected && armed > 0 && globalThis.document?.hidden)
           Promise.resolve(refreshing)
@@ -1765,6 +1789,7 @@
               const onMessage = (e) => {
                   if (current !== generation) return;
                   heard = Date.now();
+                  received++;
                   let data = e.data;
                   if (channel && typeof data !== "string") {
                     try {
@@ -1866,12 +1891,12 @@
                   pair || !credentials || rawUrls.length < 2
                     ? [rawUrls[0]]
                     : (() => {
-                        const filtered = rawUrls.filter(
-                          (u) =>
-                            !rejectedRoutes.has(u) &&
-                            !authInterruptedRoutes.has(u),
-                        );
-                        return filtered.length ? filtered : rawUrls;
+                        // Only a 1008 rejection removes a route. One interrupted while authenticating
+                        // goes last instead, so a dead other route cannot strand the phone until reload.
+                        const usable = rawUrls.filter((u) => !rejectedRoutes.has(u)),
+                          list = usable.length ? usable : rawUrls,
+                          late = (u) => authInterruptedRoutes.has(u);
+                        return [...list.filter((u) => !late(u)), ...list.filter(late)];
                       })();
               let active, challenge;
               if (urls.length === 1) {
@@ -2068,10 +2093,17 @@
                     }
                     if (nextIndex < urls.length) {
                       clearTimeout(staggerTimer);
-                      staggerTimer = setTimeout(() => {
-                        staggerTimer = null;
-                        startLeg(nextIndex);
-                      }, 250);
+                      // An interrupted route answers its challenge fast and would win again at 250ms.
+                      staggerTimer = setTimeout(
+                        () => {
+                          staggerTimer = null;
+                          startLeg(nextIndex);
+                        },
+                        authInterruptedRoutes.has(urls[nextIndex]) &&
+                          !authInterruptedRoutes.has(url)
+                          ? 2000
+                          : 250,
+                      );
                     }
                     let ws;
                     try {
@@ -2241,9 +2273,10 @@
               ensureCurrent();
               if (!resumed) mark("readyMs");
               retryDelay = 1000;
-              authFailures = 0;
               rejectedRoutes.clear();
-              authInterruptedRoutes.clear();
+              // Only the route that just authenticated is cleared: another that failed mid-handshake stays
+              // last, so it cannot win the next race on a fast challenge and fail again.
+              authInterruptedRoutes.delete(attempted);
               retryCount = 0;
               trace?.ok();
               nextRetryAt = 0;
@@ -2267,11 +2300,7 @@
                 ? "network_offline"
                 : "protocol_error"),
             transientConnect =
-              reason === "timeout" ||
-              reason === "network_offline" ||
-              (timing.route === "relay" &&
-                (reason === "websocket_closed" ||
-                  reason === "websocket_error"));
+              reason === "timeout" || reason === "network_offline";
           if (!e.diagnosticReported && !failed?.diagnosticReported)
             trace?.report(
               !transientConnect && (stage === 2 || authBlocked)
@@ -2319,14 +2348,14 @@
               quick = true;
             }
           }
+          // A transport close while authenticating is not a rejection: the daemon signals those with
+          // 1008/4009, and its own failure budget answers repeated bad proofs with 1013 (65s above).
+          // Timeouts and interruptions do not consume that budget, so normal backoff is safe here.
           (!transientConnect &&
             stage === 2 &&
             !routeAlternative &&
-            ((e?.transport || failed?.transport) && !authBlocked
-              ? (authFailures++,
-                (retryNotBefore = Date.now() + 65e3 * authFailures),
-                authFailures > 2 && (authBlocked = !0))
-              : (authBlocked = !0)),
+            !(e?.transport || failed?.transport) &&
+            (authBlocked = !0),
             options.onError?.(e),
             disconnect(e),
             status("disconnected", failed?.message || e.message));
@@ -2348,7 +2377,6 @@
           (connecting = !1),
           (refreshing = null),
           (authBlocked = !1),
-          (authFailures = 0),
           (retryDelay = 1e3),
           connect());
       }
@@ -2401,20 +2429,46 @@
         },
         resume(stale) {
           if (!connected) {
+            // An attempt started before the background may be stuck on a dead path; the 1013 wait still holds.
+            if (stale && connecting && !authBlocked) {
+              reconnect(!1);
+              return;
+            }
             ((retryDelay = 1e3), connect());
             return;
           }
-          if (stale) {
+          // A changed network leaves the socket on the old path, so it is replaced at once. After a long
+          // background an open socket is asked once with the probe deadline instead of being dropped.
+          if (stale === "network" || !socket || socket.readyState > 1) {
             reconnect(!1);
             return;
           }
-          (!warm ||
+          // The idle spare socket is the first to lose its NAT mapping, so a long background replaces it.
+          (stale ||
+            !warm ||
             warm.socket.readyState === 2 ||
             warm.socket.readyState === 3 ||
             warm.socket.closed) &&
             (clearWarm(!0), warmTerminal());
           const current = generation;
-          refresh().catch((e) => {
+          if (stale) {
+            // The probe may queue behind an earlier request, so liveness is judged by any inbound frame.
+            const since = received;
+            clearTimeout(resumeTimer);
+            resumeTimer = setTimeout(() => {
+              if (
+                connected &&
+                current === generation &&
+                received === since &&
+                !globalThis.document?.hidden
+              ) {
+                const error = transportClosed("Disconnected. Reconnecting\u2026");
+                error.diagnosticReason = "timeout";
+                disconnect(error);
+              }
+            }, PROBE_DEADLINE);
+          }
+          refresh(!!stale).catch((e) => {
             connected && current === generation && options.onError?.(e);
           });
         },
@@ -2460,6 +2514,7 @@
           connectController?.abort();
           clearTimeout(timer);
           clearTimeout(retryTimer);
+          clearTimeout(resumeTimer);
           clearWarm(true);
           disconnect(transportClosed("Disconnected"));
           generation++;

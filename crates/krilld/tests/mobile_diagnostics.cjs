@@ -1299,12 +1299,15 @@ test("unsent RPC and hidden visibilitychange feed disarm file zero mobile_rpc_fa
   h.context.document.visibilityState = "hidden";
   h.emitDoc("visibilitychange");
   await flush();
+  const opened = h.sockets.length;
   await h.tick(5000);
   await h.tick(0);
-  await establish(h, h.sockets.at(-1));
+  assert.equal(h.sockets.length, opened, "the background does not expire the feed disarm");
+  assert.equal(t1.ready, true);
   h.context.document.hidden = false;
   h.context.document.visibilityState = "visible";
   h.emitDoc("visibilitychange");
+  h.response(s1.socket, { unchanged: true, etag: "e1", feed: 0 });
   await settle(h);
   assert.equal(
     h.events().filter((e) => e.error_code === "mobile_rpc_failed").length,

@@ -424,7 +424,10 @@ impl Backend {
                     rows: 24,
                     account: None,
                 }))? {
-                    Reply::Created { session, .. } => Ok(json!({"session":session.0})),
+                    Reply::Created { session, .. } => {
+                        self.prewarm_composer(session.0);
+                        Ok(json!({"session":session.0}))
+                    }
                     Reply::Failed(error) => Err(io::Error::other(error.to_string())),
                     _ => Err(invalid()),
                 }
@@ -509,6 +512,7 @@ impl Backend {
                                     krill_proto::git::record_session_auto_title(dir, session, name)
                                         .ok();
                                 }
+                                self.prewarm_composer(session.0);
                                 Some(session.0)
                             }
                             other => {
