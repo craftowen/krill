@@ -37,7 +37,7 @@ toml = { version = "1.1.8", default-features = false, features = ["parse", "disp
 # AS-12: 설정 원문의 미지 키·주석을 보존하는 편집기(기존 잠금 버전).
 toml_edit = { version = "=0.25.17", default-features = false, features = ["parse", "display"] }
 # krill-holder: PTY·fd 전달·kqueue. rustix-openpty는 MK-004 결정 2.
-rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "net", "process", "pty", "stdio", "termios", "time"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "event", "fs", "net", "process", "pty", "stdio", "termios", "time"] }
 rustix-openpty = "0.2.0"
 libc = "0.2.190"
 # krilld 세션 Term(ARCHITECTURE §4 버전 핀). serde 기본 기능은 키프레임(MK-023)이 자체 포맷이라 끈다.
