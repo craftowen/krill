@@ -4303,7 +4303,7 @@ fn fallback_spawn_on_enoent(
         }
     }
     #[cfg(unix)]
-    if (argv.len() == 1 || argv.get(1).is_some_and(|a| a.as_slice() == b"-l"))
+    if argv.get(1).is_some_and(|a| a.as_slice() == b"-l")
         && let Some(prog) = argv.first_mut()
     {
         let prog_path = Path::new(std::ffi::OsStr::from_bytes(prog));
@@ -4321,9 +4321,11 @@ fn fallback_spawn_on_enoent(
     }
     #[cfg(windows)]
     if !is_wrapper_argv(argv)
-        && argv
-            .first()
-            .is_some_and(|prog| !Path::new(std::ffi::OsStr::from_bytes(prog)).is_file())
+        && argv.first().is_some_and(|prog| {
+            env.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case(b"SHELL") && v == prog)
+                && !Path::new(std::ffi::OsStr::from_bytes(prog)).is_file()
+        })
     {
         let fallback = Shell::Login.launch();
         if fallback.argv != *argv {
@@ -5070,12 +5072,15 @@ mod spawn_fallback_tests {
         let home = std::env::temp_dir().join(format!("krilld-userprofile-{}", std::process::id()));
         std::fs::remove_dir_all(&home).ok();
         std::fs::create_dir_all(&home).unwrap();
-        let mut argv = vec![b"/nonexistent/custom-shell".to_vec()];
+        let mut argv = vec![b"/nonexistent/custom-shell".to_vec(), b"-l".to_vec()];
         let mut cwd = b"nonexistent-relative-root/deleted-child".to_vec();
-        let mut env = vec![(
-            b"UserProfile".to_vec(),
-            home.as_os_str().as_bytes().to_vec(),
-        )];
+        let mut env = vec![
+            (
+                b"UserProfile".to_vec(),
+                home.as_os_str().as_bytes().to_vec(),
+            ),
+            (b"SHELL".to_vec(), b"/nonexistent/custom-shell".to_vec()),
+        ];
         assert!(fallback_spawn_on_enoent(&mut argv, &mut cwd, &mut env));
         assert_eq!(cwd, home.as_os_str().as_bytes());
         assert_ne!(argv[0], b"/nonexistent/custom-shell");
