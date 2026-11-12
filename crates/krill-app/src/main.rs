@@ -477,7 +477,7 @@ fn init(cx: &mut App) {
         krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Shortcuts, cx);
     });
     cx.on_action(|_: &SendFeedback, cx| {
-        cx.open_url(krill_app::settings::FEEDBACK_URL);
+        krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Feedback, cx);
     });
     cx.on_action(|_: &CloseWindow, cx| {
         if let Some(window) = cx
