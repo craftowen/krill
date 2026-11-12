@@ -172,7 +172,19 @@ impl Dialog {
         });
     }
 
-    fn on_key(&mut self, e: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.prompt.update(cx, |input, cx| {
+            input.focus_handle(cx).is_focused(window)
+                && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+        })
+    }
+
+    fn on_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if (e.keystroke.key == "escape" && window.default_prevented())
+            || self.input_is_composing(window, cx)
+        {
+            return;
+        }
         match e.keystroke.key.as_str() {
             "escape" => {
                 cx.stop_propagation();
@@ -334,6 +346,13 @@ impl Render for Dialog {
             .flex()
             .flex_col()
             .gap_4()
+            .capture_action(
+                cx.listener(|d, _: &gpui_component::input::Escape, window, cx| {
+                    if d.input_is_composing(window, cx) {
+                        window.prevent_default();
+                    }
+                }),
+            )
             .capture_key_down(
                 cx.listener(|d, e: &KeyDownEvent, window, cx| d.on_key(e, window, cx)),
             )

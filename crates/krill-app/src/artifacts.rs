@@ -235,6 +235,12 @@ fn delete_command(command: &mut Command, state: Option<&Path>, slug: &str) -> Re
 #[derive(Debug)]
 pub struct Close;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArmedDelete {
+    Row(String),
+    Detail(String),
+}
+
 /// Always available, including before the first artifact is published.
 #[expect(clippy::struct_excessive_bools, reason = "UI view state flags")]
 pub struct View {
@@ -247,6 +253,7 @@ pub struct View {
     items: Vec<Item>,
     next: Option<String>,
     selected_slug: Option<String>,
+    armed_delete: Option<ArmedDelete>,
     /// Drawer source preview for one slug, read off the UI thread when it is selected.
     local_source: Option<(String, Option<LocalSource>)>,
     local_source_task: Option<Task<()>>,
@@ -320,6 +327,7 @@ impl View {
             items: Vec::new(),
             next: None,
             selected_slug: None,
+            armed_delete: None,
             local_source: None,
             local_source_task: None,
             copied_slug: None,
@@ -349,6 +357,7 @@ impl View {
     }
 
     pub fn select_slug(&mut self, slug: Option<String>, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         if let (Some(slug), Some(dir)) = (slug.clone(), self.state_dir.clone()) {
             self.local_source_task = Some(cx.spawn(async move |this, cx| {
                 let read = slug.clone();
@@ -368,6 +377,7 @@ impl View {
     }
 
     pub fn clear_search(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         self.query.clear();
         if let Some(input) = &self.input
             && let Some(window) = window
@@ -380,6 +390,10 @@ impl View {
     }
 
     pub fn handle_escape(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.armed_delete.take().is_some() {
+            cx.notify();
+            return;
+        }
         if !self.query.is_empty() {
             self.clear_search(window, cx);
             return;
@@ -393,6 +407,7 @@ impl View {
     }
 
     pub fn toggle_sharing(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         let Some(dir) = self.state_dir.clone() else {
             self.sharing_enabled = enabled;
             cx.notify();
@@ -415,7 +430,28 @@ impl View {
         cx.notify();
     }
 
+    fn activate_row_delete(&mut self, slug: String, cx: &mut Context<Self>) {
+        if self.armed_delete.as_ref() == Some(&ArmedDelete::Row(slug.clone())) {
+            self.armed_delete = None;
+            self.delete_artifact(slug, cx);
+        } else {
+            self.armed_delete = Some(ArmedDelete::Row(slug));
+            cx.notify();
+        }
+    }
+
+    fn activate_detail_delete(&mut self, slug: String, cx: &mut Context<Self>) {
+        if self.armed_delete.as_ref() == Some(&ArmedDelete::Detail(slug.clone())) {
+            self.armed_delete = None;
+            self.delete_artifact(slug, cx);
+        } else {
+            self.armed_delete = Some(ArmedDelete::Detail(slug));
+            cx.notify();
+        }
+    }
+
     pub fn delete_artifact(&mut self, slug: String, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         if self.deleting_slug.is_some() || self.retention_slug.is_some() {
             return;
         }
@@ -449,6 +485,7 @@ impl View {
     }
 
     fn load(&mut self, more: bool, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         if self.loading || self.retention_slug.is_some() || (more && self.next.is_none()) {
             return;
         }
@@ -849,15 +886,20 @@ impl View {
                                             .child(meta_line),
                                     ),
                             )
-                            .child(
-                                ui::ghost("artifact-detail-close", "")
+                            .child(ui::button_with_tooltip(
+                                Button::new("artifact-detail-close")
+                                    .small()
+                                    .ghost()
                                     .debug_selector(|| "artifact-detail-close".into())
                                     .icon(IconName::Close)
                                     .on_click(cx.listener(|this, _, _, cx| {
+                                        this.armed_delete = None;
                                         this.selected_slug = None;
                                         cx.notify();
                                     })),
-                            ),
+                                "artifact-detail-close",
+                                text::CLOSE.get(),
+                            )),
                     )
                     .child(
                         div()
@@ -866,18 +908,19 @@ impl View {
                             .items_center()
                             .gap_1p5()
                             .child(
-                                ui::primary(
+                                ui::button_with_reserved_label(
                                     "artifact-detail-copy",
-                                    if is_copied {
-                                        crate::i18n::link_ui::COPIED_LINK.get()
-                                    } else {
-                                        text::COPY_LINK.get()
-                                    },
+                                    text::COPY_LINK.get(),
+                                    crate::i18n::link_ui::COPIED_LINK.get(),
+                                    is_copied,
                                 )
+                                .small()
+                                .primary()
                                 .debug_selector(|| "artifact-detail-copy".into())
                                 .disabled(!is_openable)
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
+                                        this.armed_delete = None;
                                         cx.write_to_clipboard(ClipboardItem::new_string(
                                             share_url.clone(),
                                         ));
@@ -892,17 +935,34 @@ impl View {
                                     .disabled(!is_openable)
                                     .on_click(move |_, _, cx| cx.open_url(&share_url_open)),
                             )
-                            .child(
-                                Button::new("artifact-detail-delete")
-                                    .small()
-                                    .danger()
-                                    .label(text::DELETE.get())
-                                    .debug_selector(|| "artifact-detail-delete".into())
-                                    .disabled(is_deleting || self.retention_slug.is_some())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.delete_artifact(slug_for_delete.clone(), cx);
-                                    })),
-                            ),
+                            .child({
+                                let detail_delete_armed = self.armed_delete.as_ref()
+                                    == Some(&ArmedDelete::Detail(slug_for_delete.clone()));
+                                let out_slug = slug_for_delete.clone();
+                                ui::danger_confirm(
+                                    "artifact-detail-delete",
+                                    text::DELETE.get(),
+                                    crate::i18n::catalog::settings::CONFIRM_AGAIN.get(),
+                                    detail_delete_armed,
+                                )
+                                .debug_selector(|| "artifact-detail-delete".into())
+                                .disabled(is_deleting || self.retention_slug.is_some())
+                                .when(detail_delete_armed, |btn| {
+                                    btn.on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                                        if this.armed_delete.as_ref()
+                                            == Some(&ArmedDelete::Detail(out_slug.clone()))
+                                        {
+                                            this.armed_delete = None;
+                                            cx.notify();
+                                        }
+                                    }))
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.activate_detail_delete(slug_for_delete.clone(), cx);
+                                    },
+                                ))
+                            }),
                     ),
             )
             .child(self.render_retention_control(Some(item), p, cx))
@@ -1089,10 +1149,15 @@ impl Render for View {
         let p = ui::palette(cx);
         if self.input.is_none() && cx.has_global::<gpui_component::Theme>() {
             let input = cx.new(|cx| InputState::new(window, cx).placeholder(text::SEARCH.get()));
-            self.input_sub = Some(cx.observe(&input, |this, input, cx| {
-                this.query = input.read(cx).value().to_lowercase();
-                cx.notify();
-            }));
+            self.input_sub = Some(cx.subscribe(
+                &input,
+                |this, input, event: &gpui_component::input::InputEvent, cx| {
+                    if matches!(event, gpui_component::input::InputEvent::Change) {
+                        this.query = input.read(cx).value().to_lowercase();
+                        cx.notify();
+                    }
+                },
+            ));
             self.input = Some(input);
         }
         let language_changed = self.language != crate::i18n::language();
@@ -1144,14 +1209,18 @@ impl Render for View {
                             .gap_1()
                             .child(div().flex_1().min_w_0().child(Input::new(input).small()))
                             .when(!self.query.is_empty(), |d| {
-                                d.child(
-                                    ui::ghost("artifacts-search-clear", "")
+                                d.child(ui::button_with_tooltip(
+                                    Button::new("artifacts-search-clear")
+                                        .small()
+                                        .ghost()
                                         .debug_selector(|| "artifacts-search-clear".into())
                                         .icon(IconName::Close)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.clear_search(Some(window), cx);
                                         })),
-                                )
+                                    "artifacts-search-clear",
+                                    crate::i18n::catalog::settings::SEARCH_CLEAR.get(),
+                                ))
                             })
                     }))
                     .child(
@@ -1164,14 +1233,14 @@ impl Render for View {
             .when(self.state_dir.is_some(), |d| {
                 let enabled = self.sharing_enabled;
                 d.child(
-                    ui::ghost(
+                    ui::button_with_reserved_label(
                         "artifacts-sharing-toggle",
-                        if enabled {
-                            text::SHARING_ON.get()
-                        } else {
-                            text::SHARING_OFF.get()
-                        },
+                        text::SHARING_ON.get(),
+                        text::SHARING_OFF.get(),
+                        !enabled,
                     )
+                    .small()
+                    .ghost()
                     .debug_selector(|| "artifacts-sharing-toggle".into())
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_sharing(!enabled, cx))),
                 )
@@ -1326,6 +1395,7 @@ impl Render for View {
                                         .disabled(!item.openable())
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
+                                            this.armed_delete = None;
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 copy.clone(),
                                             ));
@@ -1347,16 +1417,46 @@ impl Render for View {
                                         },
                                     ),
                                 )
-                                .child(
-                                    ui::ghost(format!("artifact-delete-{index}"), "")
+                                .child({
+                                    let row_delete_armed = self.armed_delete.as_ref()
+                                        == Some(&ArmedDelete::Row(slug_delete.clone()));
+                                    let out_slug = slug_delete.clone();
+                                    ui::button_with_tooltip(
+                                        (if row_delete_armed {
+                                            Button::new(format!("artifact-delete-{index}")).danger()
+                                        } else {
+                                            Button::new(format!("artifact-delete-{index}")).ghost()
+                                        })
+                                        .small()
                                         .debug_selector(move || format!("artifact-delete-{index}"))
                                         .icon(IconName::Delete)
                                         .disabled(is_deleting)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.delete_artifact(slug_delete.clone(), cx);
-                                        })),
-                                ),
+                                        .when(row_delete_armed, |btn| {
+                                            btn.on_mouse_down_out(cx.listener(
+                                                move |this, _, _, cx| {
+                                                    if this.armed_delete.as_ref()
+                                                        == Some(&ArmedDelete::Row(out_slug.clone()))
+                                                    {
+                                                        this.armed_delete = None;
+                                                        cx.notify();
+                                                    }
+                                                },
+                                            ))
+                                        })
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.activate_row_delete(slug_delete.clone(), cx);
+                                            }),
+                                        ),
+                                        format!("artifact-delete-{index}"),
+                                        if row_delete_armed {
+                                            crate::i18n::catalog::settings::CONFIRM_AGAIN.get()
+                                        } else {
+                                            text::DELETE.get()
+                                        },
+                                    )
+                                }),
                         ),
                 );
             }

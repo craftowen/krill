@@ -1166,3 +1166,35 @@ fn non_git_folder_shows_notice_instead_of_base_refs(cx: &mut TestAppContext) {
     assert_eq!(req.base, None);
     std::fs::remove_dir_all(temp).ok();
 }
+
+#[gpui::test]
+fn preparation_status_reserves_width_so_cancel_button_never_shifts(cx: &mut TestAppContext) {
+    let fake = Arc::new(Fake::default());
+    fake.prep_supported.store(true, Ordering::Release);
+    cx.update(gpui_component::init);
+    let (dialog, vcx) =
+        cx.add_window_view(|window, cx| Dialog::new("/repo".into(), fake.clone(), window, cx));
+    vcx.simulate_resize(gpui::size(px(640.), px(640.)));
+    vcx.executor().advance_clock(Duration::from_millis(300));
+    vcx.run_until_parked();
+
+    dialog.update(vcx, |d, cx| {
+        assert!(d.preparation.is_some());
+        d.advanced_open = true;
+        d.preparation_ready = false;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let preparing_bounds = vcx.debug_bounds("cancel-preparation").unwrap();
+
+    dialog.update(vcx, |d, cx| {
+        d.preparation_ready = true;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let prepared_bounds = vcx.debug_bounds("cancel-preparation").unwrap();
+    assert_eq!(
+        prepared_bounds, preparing_bounds,
+        "cancel-preparation button must not jump when preparation finishes"
+    );
+}

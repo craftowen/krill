@@ -218,6 +218,7 @@ impl Render for Dialog {
                         )
                     })
                     .when(self.preparation.is_some(), |body| {
+                        let ready = self.preparation_ready;
                         body.child(
                             div()
                                 .flex()
@@ -225,13 +226,32 @@ impl Render for Dialog {
                                 .gap_2()
                                 .text_size(crate::ui::TEXT_2XS)
                                 .text_color(muted)
-                                .child(if self.preparation_ready {
-                                    text::PREPARED.get()
-                                } else {
-                                    text::PREPARING.get()
-                                })
+                                .child(
+                                    div()
+                                        .grid()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .row_start(1)
+                                                .col_start(1)
+                                                .min_w_0()
+                                                .truncate()
+                                                .when(ready, gpui::Styled::invisible)
+                                                .child(text::PREPARING.get()),
+                                        )
+                                        .child(
+                                            div()
+                                                .row_start(1)
+                                                .col_start(1)
+                                                .min_w_0()
+                                                .truncate()
+                                                .when(!ready, gpui::Styled::invisible)
+                                                .child(text::PREPARED.get()),
+                                        ),
+                                )
                                 .child(
                                     Button::new("cancel-preparation")
+                                        .debug_selector(|| "cancel-preparation".into())
                                         .ghost()
                                         .xsmall()
                                         .label(text::CANCEL_PREPARATION.get())

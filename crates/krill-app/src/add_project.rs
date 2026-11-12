@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, KeyDownEvent, SharedString, Subscription, Window,
-    div, prelude::*,
+    Context, Entity, EventEmitter, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
+    Subscription, Window, div, prelude::*,
 };
 use gpui_component::Icon;
 use gpui_component::Sizable as _;
@@ -289,7 +289,23 @@ impl Dialog {
         }
     }
 
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        [&self.url, &self.dest, &self.remote_path]
+            .into_iter()
+            .any(|input| {
+                input.update(cx, |input, cx| {
+                    input.focus_handle(cx).is_focused(window)
+                        && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+                })
+            })
+    }
+
     fn on_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if (e.keystroke.key == "escape" && window.default_prevented())
+            || self.input_is_composing(window, cx)
+        {
+            return;
+        }
         match e.keystroke.key.as_str() {
             "escape" => {
                 cx.stop_propagation();
@@ -611,6 +627,13 @@ impl Render for Dialog {
             .flex()
             .flex_col()
             .gap_4()
+            .capture_action(
+                cx.listener(|d, _: &gpui_component::input::Escape, window, cx| {
+                    if d.input_is_composing(window, cx) {
+                        window.prevent_default();
+                    }
+                }),
+            )
             .capture_key_down(cx.listener(|d, e: &KeyDownEvent, window, cx| {
                 d.on_key(e, window, cx);
             }))

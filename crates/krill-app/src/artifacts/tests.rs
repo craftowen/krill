@@ -377,3 +377,163 @@ fn detail_drawer_reads_local_source_once_per_selection(cx: &mut TestAppContext) 
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[gpui::test]
+fn artifact_delete_requires_second_click_and_keeps_neighbor_bounds(cx: &mut TestAppContext) {
+    let deleted = Arc::new(Mutex::new(Vec::new()));
+    let deleted_seen = Arc::clone(&deleted);
+    let call: Call = Arc::new(|_| {
+        Ok(serde_json::from_value(serde_json::json!({
+            "artifacts": [
+                {
+                    "artifact": {"slug": "one", "originalFileName": "one.html"},
+                    "shareUrl": "https://share.krill.page/a/one"
+                },
+                {
+                    "artifact": {"slug": "two", "originalFileName": "two.html"},
+                    "shareUrl": "https://share.krill.page/a/two"
+                }
+            ],
+            "nextCursor": null
+        }))
+        .unwrap())
+    });
+    let delete_call: DeleteCall = Arc::new(move |slug| {
+        deleted_seen.lock().unwrap().push(slug);
+        Ok(())
+    });
+    let closed = Arc::new(Mutex::new(0usize));
+    let closed_seen = Arc::clone(&closed);
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let v = View::with_calls(call, delete_call, None, cx);
+        cx.subscribe(&cx.entity(), move |_, _, _: &Close, _| {
+            *closed_seen.lock().unwrap() += 1;
+        })
+        .detach();
+        v
+    });
+    vcx.simulate_resize(gpui::size(px(960.), px(640.)));
+    vcx.run_until_parked();
+
+    let open_before = vcx.debug_bounds("artifact-open-0").unwrap();
+    let del_before = vcx.debug_bounds("artifact-delete-0").unwrap();
+
+    vcx.simulate_click(del_before.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(deleted.lock().unwrap().is_empty());
+    assert_eq!(vcx.debug_bounds("artifact-open-0"), Some(open_before));
+    assert_eq!(vcx.debug_bounds("artifact-delete-0"), Some(del_before));
+
+    // Escape disarms without emitting Close.
+    view.update(vcx, |v, cx| v.handle_escape(None, cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| assert!(v.armed_delete.is_none()));
+    assert_eq!(*closed.lock().unwrap(), 0);
+
+    // Two clicks on row delete confirm deletion.
+    let del_btn = vcx.debug_bounds("artifact-delete-0").unwrap();
+    vcx.simulate_click(del_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let del_btn = vcx.debug_bounds("artifact-delete-0").unwrap();
+    vcx.simulate_click(del_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(deleted.lock().unwrap().as_slice(), &["one"]);
+
+    // Detail drawer delete also requires two clicks and keeps sibling bounds even while row is mounted.
+    view.update(vcx, |v, cx| v.select_slug(Some("two".into()), cx));
+    vcx.run_until_parked();
+    let detail_open_before = vcx.debug_bounds("artifact-detail-open").unwrap();
+    let detail_del_before = vcx.debug_bounds("artifact-detail-delete").unwrap();
+
+    vcx.simulate_click(detail_del_before.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(deleted.lock().unwrap().as_slice(), &["one"]);
+    assert_eq!(
+        vcx.debug_bounds("artifact-detail-open"),
+        Some(detail_open_before)
+    );
+    assert_eq!(
+        vcx.debug_bounds("artifact-detail-delete"),
+        Some(detail_del_before)
+    );
+
+    let detail_del = vcx.debug_bounds("artifact-detail-delete").unwrap();
+    vcx.simulate_click(detail_del.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(deleted.lock().unwrap().as_slice(), &["one", "two"]);
+    view.read_with(vcx, |v, _| {
+        assert!(v.items.is_empty());
+        assert_eq!(v.selected_slug(), None);
+    });
+}
+
+#[gpui::test]
+fn artifacts_dynamic_labels_reserve_width_and_icon_buttons_expose_tooltips(
+    cx: &mut TestAppContext,
+) {
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir().join(format!(
+        "krill-artifact-reserved-tooltips-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    krill_proto::artifacts::enable_sharing(&dir).unwrap();
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        View::with_calls(
+            Arc::new(|_| Ok(page("one", None))),
+            Arc::new(|_| Ok(())),
+            Some(dir.clone()),
+            cx,
+        )
+    });
+    vcx.simulate_resize(gpui::size(px(960.), px(640.)));
+    vcx.run_until_parked();
+
+    let sharing_on_bounds = vcx.debug_bounds("artifacts-sharing-toggle").unwrap();
+    view.update(vcx, |v, cx| v.toggle_sharing(false, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("artifacts-sharing-toggle"),
+        Some(sharing_on_bounds)
+    );
+
+    view.update(vcx, |v, cx| {
+        v.query = "계획".into();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let clear_btn = vcx.debug_bounds("artifacts-search-clear").unwrap();
+    vcx.simulate_mouse_move(clear_btn.center(), None, gpui::Modifiers::default());
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tooltip:artifacts-search-clear").is_some());
+
+    view.update(vcx, |v, cx| v.clear_search(None, cx));
+    vcx.run_until_parked();
+
+    let row_del = vcx.debug_bounds("artifact-delete-0").unwrap();
+    vcx.simulate_mouse_move(row_del.center(), None, gpui::Modifiers::default());
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tooltip:artifact-delete-0").is_some());
+
+    view.update(vcx, |v, cx| v.select_slug(Some("one".into()), cx));
+    vcx.run_until_parked();
+    let copy_before = vcx.debug_bounds("artifact-detail-copy").unwrap();
+    vcx.simulate_click(copy_before.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(vcx.debug_bounds("artifact-detail-copy"), Some(copy_before));
+
+    let close_btn = vcx.debug_bounds("artifact-detail-close").unwrap();
+    vcx.simulate_mouse_move(close_btn.center(), None, gpui::Modifiers::default());
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tooltip:artifact-detail-close").is_some());
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
