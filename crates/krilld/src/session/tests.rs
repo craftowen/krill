@@ -1143,20 +1143,22 @@ fn clear_viewport_invalidates_capture_cache_and_recovers_poison_and_unwind() {
     assert!(lock(&tap.0.capture).is_none());
     assert!(tap.pulse().revision > rev_before_panic);
 
+    // Stop the PTY reader first so its startup/poll loop cannot race ahead and recover the
+    // poisoned live mutex before `clear_viewport` runs.
+    drop(pty.user);
+    session.wait().unwrap();
+
     // Poisoned live mutex is recovered by clear_viewport without panicking.
-    let shared = Arc::clone(&tap.0);
-    thread::spawn(move || {
-        let _guard = shared.live.lock().unwrap();
-        panic!("poison live");
-    })
-    .join()
-    .ok();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tap.0.live.lock().unwrap();
+            panic!("poison live");
+        }))
+        .is_err()
+    );
     assert!(tap.0.live.is_poisoned());
     let rev_before_poison_clear = tap.pulse().revision;
     assert!(tap.clear_viewport());
     assert!(!tap.0.live.is_poisoned());
     assert!(tap.pulse().revision > rev_before_poison_clear);
-
-    drop(pty.user);
-    session.wait().unwrap();
 }
