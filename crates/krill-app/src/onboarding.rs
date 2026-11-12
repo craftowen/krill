@@ -1166,6 +1166,13 @@ pub(crate) fn stage_binaries(krill: &Path, home: &Path) -> Result<PathBuf, Strin
                     .map_err(|e| format!("{helper}: {e}"))?;
                 }
             }
+            for payload in ["conpty.dll", "x64/OpenConsole.exe", "arm64/OpenConsole.exe"] {
+                let src = src_dir.join(payload);
+                if src.is_file() {
+                    stage_executable(&src, &dst_dir.join(payload))
+                        .map_err(|e| format!("{payload}: {e}"))?;
+                }
+            }
         }
     }
     krill_proto::orchestration::stage_agent_desktop(Some(krill), home).ok();
@@ -1242,8 +1249,71 @@ fn stage_executable(src: &Path, dst: &Path) -> io::Result<()> {
     let tmp = dst.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::copy(src, &tmp)?;
     #[cfg(unix)]
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&tmp, dst)
+    if let Err(err) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(err);
+    }
+    match std::fs::rename(&tmp, dst) {
+        Ok(()) => {
+            #[cfg(windows)]
+            sweep_stale_old_siblings(dst);
+            Ok(())
+        }
+        #[cfg(windows)]
+        Err(_) if dst.exists() => replace_locked_executable(&tmp, dst),
+        Err(err) => {
+            std::fs::remove_file(&tmp).ok();
+            Err(err)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sweep_stale_old_siblings(dst: &Path) {
+    let Some(parent) = dst.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|ext| ext.starts_with("old-"))
+        {
+            std::fs::remove_file(path).ok();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_locked_executable(tmp: &Path, dst: &Path) -> io::Result<()> {
+    sweep_stale_old_siblings(dst);
+    let pid = std::process::id();
+    let mut aside = dst.with_extension(format!("old-{pid}"));
+    if aside.exists() {
+        for seq in 1..=64_u32 {
+            let candidate = dst.with_extension(format!("old-{pid}-{seq}"));
+            if !candidate.exists() {
+                aside = candidate;
+                break;
+            }
+        }
+    }
+    if let Err(err) = std::fs::rename(dst, &aside) {
+        std::fs::remove_file(tmp).ok();
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(tmp, dst) {
+        std::fs::rename(&aside, dst).ok();
+        std::fs::remove_file(tmp).ok();
+        return Err(err);
+    }
+    std::fs::remove_file(&aside).ok();
+    sweep_stale_old_siblings(dst);
+    Ok(())
 }
 
 /// `rustix::fs::access` 대역(비Unix). 실행·쓰기 비트가 없으니 경로가 있는지만 본다.
@@ -1435,6 +1505,34 @@ mod path_tests {
             !bin.join("krill").exists(),
             "hooks need the .exe destination"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stage_binaries_copies_conpty_payload_when_present() {
+        let root = std::env::temp_dir().join(format!("krill-conpty-stage-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let source = root.join("source");
+        let home = root.join("home");
+        std::fs::create_dir_all(source.join("x64")).unwrap();
+        std::fs::create_dir_all(source.join("arm64")).unwrap();
+        let suffix = std::env::consts::EXE_SUFFIX;
+        for name in ["krill", "krill-holder", "krilld"] {
+            std::fs::write(source.join(format!("{name}{suffix}")), name.as_bytes()).unwrap();
+        }
+        for payload in ["conpty.dll", "x64/OpenConsole.exe", "arm64/OpenConsole.exe"] {
+            std::fs::write(source.join(payload), payload.as_bytes()).unwrap();
+        }
+        let staged = stage_binaries(&source.join(format!("krill{suffix}")), &home).unwrap();
+        let bin = krill_proto::user_dirs::share_dir(&home).join("bin");
+        assert_eq!(staged, bin.join(format!("krill{suffix}")));
+        for payload in ["conpty.dll", "x64/OpenConsole.exe", "arm64/OpenConsole.exe"] {
+            assert_eq!(
+                std::fs::read(bin.join(payload)).unwrap(),
+                payload.as_bytes(),
+                "{payload}"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

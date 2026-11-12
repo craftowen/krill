@@ -182,7 +182,7 @@ fn resolve_existing_file(raw: &[u8], cwd: Option<&Path>, home: &Path) -> Option<
     }
     let candidate = if raw == b"~" {
         clean_path(home)
-    } else if let Some(rest) = raw.strip_prefix(b"~/") {
+    } else if let Some(rest) = raw.strip_prefix(b"~/").or_else(|| raw.strip_prefix(b"~\\")) {
         clean_path(&home.join(OsStr::from_bytes(rest)))
     } else {
         let p = Path::new(OsStr::from_bytes(raw));
@@ -413,12 +413,40 @@ fn sort_wire_entries(entries: &mut [WireDirEntry]) {
     });
 }
 
+fn is_forbidden_git_or_win32_segment(part: &OsStr) -> bool {
+    let lossy = part.to_string_lossy();
+    let trimmed = lossy.trim_end_matches(['.', ' ']);
+    trimmed.eq_ignore_ascii_case(".git")
+        || (cfg!(windows) && (lossy.contains(':') || lossy.ends_with(['.', ' '])))
+}
+
 fn read_raw_dir_entries(repo: &Path, dir: &Path) -> io::Result<Vec<WireDirEntry>> {
-    if !dir.starts_with(repo) {
-        return Err(io::Error::new(
+    let denied = || {
+        io::Error::new(
             io::ErrorKind::PermissionDenied,
             "directory is outside repository",
-        ));
+        )
+    };
+    if !dir.starts_with(repo)
+        || dir
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(denied());
+    }
+    let dir_rel = dir.strip_prefix(repo).map_err(|_| denied())?;
+    for comp in dir_rel.components() {
+        let Component::Normal(part) = comp else {
+            return Err(denied());
+        };
+        if is_forbidden_git_or_win32_segment(part) {
+            return Err(denied());
+        }
+    }
+    let canon_repo = fs::canonicalize(repo)?;
+    let canon_dir = fs::canonicalize(dir)?;
+    if !canon_dir.starts_with(&canon_repo) {
+        return Err(denied());
     }
     let rd = fs::read_dir(dir)?;
     let mut out = Vec::new();
@@ -429,7 +457,7 @@ fn read_raw_dir_entries(repo: &Path, dir: &Path) -> io::Result<Vec<WireDirEntry>
         }
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy().into_owned();
-        if name == ".git" || name.len() > MAX_REMOTE_TEXT {
+        if is_forbidden_git_or_win32_segment(&file_name) || name.len() > MAX_REMOTE_TEXT {
             continue;
         }
         let path = entry.path();
@@ -439,7 +467,11 @@ fn read_raw_dir_entries(repo: &Path, dir: &Path) -> io::Result<Vec<WireDirEntry>
         }
         let (is_dir, is_symlink) = entry.file_type().map_or((false, false), |ft| {
             let is_symlink = ft.is_symlink();
-            (ft.is_dir() || (is_symlink && path.is_dir()), is_symlink)
+            let is_dir = ft.is_dir()
+                || (is_symlink
+                    && fs::canonicalize(&path)
+                        .is_ok_and(|t| t.starts_with(&canon_repo) && t.is_dir()));
+            (is_dir, is_symlink)
         });
         let relative_path = path
             .strip_prefix(repo)
@@ -628,7 +660,7 @@ fn validate_relative_input(raw: &str) -> io::Result<PathBuf> {
     let mut clean = PathBuf::new();
     for comp in path.components() {
         match comp {
-            Component::Normal(part) if part != OsStr::new(".git") => clean.push(part),
+            Component::Normal(part) if !is_forbidden_git_or_win32_segment(part) => clean.push(part),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -672,7 +704,7 @@ fn ensure_worktree_create_path(
         let Component::Normal(part) = comp else {
             return Err(denied());
         };
-        if part == OsStr::new(".git") {
+        if is_forbidden_git_or_win32_segment(part) {
             return Err(denied());
         }
         cur.push(part);
@@ -764,6 +796,9 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                 || target
                     .components()
                     .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+                || target
+                    .file_name()
+                    .is_some_and(is_forbidden_git_or_win32_segment)
             {
                 return Err(denied());
             }
@@ -771,9 +806,9 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
             if clean.is_empty()
                 || clean == "."
                 || clean == ".."
-                || clean == ".git"
                 || clean.contains('/')
                 || clean.contains('\\')
+                || is_forbidden_git_or_win32_segment(OsStr::new(clean))
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -790,7 +825,7 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                 let Component::Normal(part) = comp else {
                     return Err(denied());
                 };
-                if part == OsStr::new(".git") {
+                if is_forbidden_git_or_win32_segment(part) {
                     return Err(denied());
                 }
                 cur.push(part);
@@ -819,11 +854,41 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
         }
         WireExplorerOp::Delete { path } => {
             let target = PathBuf::from(OsStr::from_bytes(&path));
-            if !target.starts_with(repo) || target == repo {
-                return Err(io::Error::new(
+            let denied = || {
+                io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "cannot delete worktree root or outside path",
-                ));
+                    "cannot delete worktree root, .git, or outside path",
+                )
+            };
+            if !target.starts_with(repo)
+                || target == repo
+                || target
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+            {
+                return Err(denied());
+            }
+            let rel = target.strip_prefix(repo).map_err(|_| denied())?;
+            let canon_repo = repo.canonicalize().map_err(|_| denied())?;
+            let mut cur = repo.to_path_buf();
+            let mut comps = rel.components().peekable();
+            if comps.peek().is_none() {
+                return Err(denied());
+            }
+            while let Some(comp) = comps.next() {
+                let Component::Normal(part) = comp else {
+                    return Err(denied());
+                };
+                if is_forbidden_git_or_win32_segment(part) {
+                    return Err(denied());
+                }
+                cur.push(part);
+                if comps.peek().is_some() {
+                    let canon_cur = cur.canonicalize().map_err(|_| denied())?;
+                    if !canon_cur.starts_with(&canon_repo) {
+                        return Err(denied());
+                    }
+                }
             }
             let home = crate::usage::accounts::default_home();
             krill_proto::usage::profiles::move_path_to_trash(&home, repo, &target)
@@ -1154,5 +1219,80 @@ mod tests {
             WireWriteOutcome::Failed(_)
         ));
         assert_eq!(fs::read(stage).unwrap(), b"existing transfer");
+    }
+
+    #[test]
+    fn read_dir_and_explorer_ops_reject_traversal_escape_and_git_aliases() {
+        let outer = TestDir::new("escape");
+        let repo = outer.path().join("repo");
+        let outside = outer.path().join("outside");
+        fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        fs::write(repo.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(repo.join("ok.txt"), b"ok\n").unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"secret\n").unwrap();
+
+        let repo = repo.canonicalize().unwrap();
+        let outside = outside.canonicalize().unwrap();
+        let repo_wire = repo.as_os_str().as_bytes().to_vec();
+
+        let traversal = repo.join("sub").join("..").join("..");
+        assert!(read_dir_listing(&repo, &traversal).is_err());
+        assert!(read_dir_listing(&repo, &outside).is_err());
+        assert!(read_dir_listing(&repo, &repo.join(".git")).is_err());
+
+        #[cfg(unix)]
+        {
+            let link = repo.join("out-link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(read_dir_listing(&repo, &link).is_err());
+            let listing = read_dir_listing(&repo, &repo).unwrap();
+            let entry = listing
+                .entries
+                .iter()
+                .find(|e| e.name == "out-link")
+                .unwrap();
+            assert!(entry.is_symlink);
+            assert!(!entry.is_dir);
+        }
+
+        for bad in [".git", ".GIT", ".git.", ".GIT. "] {
+            assert!(validate_relative_input(bad).is_err(), "{bad:?}");
+            let create_res = execute_explorer_op(
+                &repo,
+                WireExplorerOp::CreateFolder {
+                    parent: repo_wire.clone(),
+                    name: bad.to_owned(),
+                },
+            );
+            assert!(create_res.is_err(), "CreateFolder {bad:?}");
+            let rename_res = execute_explorer_op(
+                &repo,
+                WireExplorerOp::Rename {
+                    path: repo.join("ok.txt").as_os_str().as_bytes().to_vec(),
+                    new_name: bad.to_owned(),
+                },
+            );
+            assert!(rename_res.is_err(), "Rename {bad:?}");
+        }
+
+        for protected in [repo.join(".git"), repo.join(".git/HEAD"), repo.join(".GIT")] {
+            let del = execute_explorer_op(
+                &repo,
+                WireExplorerOp::Delete {
+                    path: protected.as_os_str().as_bytes().to_vec(),
+                },
+            );
+            assert!(del.is_err(), "Delete {protected:?}");
+        }
+        assert!(repo.join(".git/HEAD").is_file());
+
+        let home_dir = TestDir::new("tilde-home");
+        let home_note = home_dir.path().join("note.txt");
+        fs::write(&home_note, b"hi").unwrap();
+        assert_eq!(
+            resolve_existing_file(b"~\\note.txt", None, home_dir.path()),
+            Some(home_note.as_os_str().as_bytes().to_vec())
+        );
     }
 }

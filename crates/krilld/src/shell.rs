@@ -19,6 +19,7 @@
 //! - 사용자 지정 프로그램은 `PATH`에서 `.exe`·`.cmd` 등을 붙여 절대 경로로 고정한다(`claude` → `claude.cmd`).
 //!   `CreateProcess`는 확장자 없는 이름으로 `.cmd`를 찾지 못한다(실측).
 
+#[cfg(any(unix, test))]
 use std::process::Stdio;
 
 use krill_proto::os::ffi::{OsStrExt as _, OsStringExt};
@@ -109,6 +110,7 @@ const FALLBACK_LANG: &[u8] = b"en_US.UTF-8";
 #[cfg(target_os = "linux")]
 const FALLBACK_LANG: &[u8] = b"C.UTF-8";
 /// 시스템 로케일 조회의 하드 상한. `defaults read` 실측 4~8ms라 여유를 둔다.
+#[cfg(target_os = "macos")]
 const LOCALE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 /// `defaults read` 출력(`ko_KR`·`ko_KR@...` 등)에서 LANG에 쓸 앞부분만 남길 때의 상한.
 const LOCALE_MAX: usize = 32;
@@ -334,9 +336,9 @@ impl Shell {
 
         let mut env = base;
         env.extend(inherited.iter().filter(|(k, _)| keep(k)).cloned());
-        let has_locale = env
-            .iter()
-            .any(|(k, _)| matches!(k.as_slice(), b"LANG" | b"LC_ALL" | b"LC_CTYPE"));
+        let has_locale = env.iter().any(|(k, _)| {
+            same_key(k, b"LANG") || same_key(k, b"LC_ALL") || same_key(k, b"LC_CTYPE")
+        });
         if !has_locale {
             let lang = system_lang.unwrap_or_else(|| FALLBACK_LANG.to_vec());
             env.push((b"LANG".to_vec(), lang));
@@ -485,7 +487,8 @@ fn keep(key: &[u8]) -> bool {
 
 #[cfg(windows)]
 fn keep(key: &[u8]) -> bool {
-    KEEP.iter().chain(KEEP_WINDOWS).any(|k| same_key(k, key)) || key.starts_with(b"LC_")
+    KEEP.iter().chain(KEEP_WINDOWS).any(|k| same_key(k, key))
+        || key.get(..3).is_some_and(|p| p.eq_ignore_ascii_case(b"LC_"))
 }
 
 #[cfg(unix)]
@@ -565,6 +568,7 @@ fn lang_from_locale(locale: &[u8]) -> Option<Vec<u8>> {
 
 /// `AppleLocale`을 본다. krilld 같은 자식은 launchd GUI 환경을 물려받아 이미 갖고 있다.
 /// 부모에 없을 때만 사용자 기본 설정에서 defaults read로 읽는다(200ms 상한, 실패는 None).
+#[cfg(target_os = "macos")]
 fn system_locale() -> Option<Vec<u8>> {
     if let Some(v) = std::env::var_os("AppleLocale") {
         let v = v.into_vec();
@@ -575,8 +579,14 @@ fn system_locale() -> Option<Vec<u8>> {
     defaults_locale()
 }
 
+#[cfg(not(target_os = "macos"))]
+fn system_locale() -> Option<Vec<u8>> {
+    None
+}
+
 /// defaults read -g AppleLocale(출력이 없으면 NSGlobalDomain)을 짧게 돌린다.
 /// plist 직접 읽기와 `CFPreferences`는 의존성·파서가 필요해 쓰지 않는다(ponytail: std+설치된 도구).
+#[cfg(target_os = "macos")]
 fn defaults_locale() -> Option<Vec<u8>> {
     for domain in ["-g", "NSGlobalDomain"] {
         if let Some(v) = defaults_read(domain) {
@@ -586,6 +596,7 @@ fn defaults_locale() -> Option<Vec<u8>> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn defaults_read(domain: &str) -> Option<Vec<u8>> {
     let mut child = std::process::Command::new("/usr/bin/defaults")
         .args(["read", domain, "AppleLocale"])
@@ -613,10 +624,12 @@ fn defaults_read(domain: &str) -> Option<Vec<u8>> {
 
 /// wait에 200ms 상한을 두기 위한 최소 구현. 자식은 출력이 한 줄이라 파이프가 막히지 않는다.
 /// 출력이 크면 상한까지만 기다리고 `None`이다(호출자는 [`FALLBACK_LANG`]을 쓴다).
+#[cfg(target_os = "macos")]
 trait WaitTimeout {
     fn wait_timeout(&mut self, timeout: std::time::Duration) -> Option<std::process::ExitStatus>;
 }
 
+#[cfg(target_os = "macos")]
 impl WaitTimeout for std::process::Child {
     fn wait_timeout(&mut self, timeout: std::time::Duration) -> Option<std::process::ExitStatus> {
         let start = std::time::Instant::now();
@@ -634,6 +647,7 @@ impl WaitTimeout for std::process::Child {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn trim_ascii(out: &[u8]) -> Vec<u8> {
     let is_space = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r');
     let bytes: Vec<u8> = out.to_vec();
@@ -1002,5 +1016,32 @@ mod socket_environment_tests {
         assert!(!launch.env.iter().any(|(key, _)| key == b"UNRELATED_SECRET"));
         #[cfg(windows)]
         assert!(keep(b"krill_socket_dir"));
+    }
+
+    #[test]
+    fn has_locale_respects_same_key_and_non_macos_skips_defaults() {
+        let base = vec![(b"LC_ALL".to_vec(), b"ja_JP.UTF-8".to_vec())];
+        let launch = Shell::Login.launch_from(None, base, Vec::new(), None);
+        assert!(
+            !launch.env.iter().any(|(k, _)| same_key(k, b"LANG")),
+            "LC_ALL in base must suppress fallback LANG"
+        );
+        #[cfg(windows)]
+        {
+            let win_base = vec![(b"lang".to_vec(), b"ko_KR.UTF-8".to_vec())];
+            let win_launch = Shell::Login.launch_from(None, win_base, Vec::new(), None);
+            let langs: Vec<_> = win_launch
+                .env
+                .iter()
+                .filter(|(k, _)| same_key(k, b"LANG"))
+                .collect();
+            assert_eq!(langs.len(), 1);
+            assert_eq!(
+                langs.first().map(|(_, v)| v.as_slice()),
+                Some(&b"ko_KR.UTF-8"[..])
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(system_locale(), None);
     }
 }

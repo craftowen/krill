@@ -76,8 +76,10 @@ fn hard_join(screen: &Screen, line: usize) -> bool {
     let cols = usize::from(screen.cols);
     let near_right_edge = end + 3 >= cols;
     let path_wrapped = end + (b_tok_end - bi) + 3 >= cols
-        && (b.get(bi).is_some_and(|c| c.ch == '/')
-            || a[a_tok_start..end].iter().any(|c| c.ch == '/'));
+        && (b.get(bi).is_some_and(|c| matches!(c.ch, '/' | '\\'))
+            || a[a_tok_start..end]
+                .iter()
+                .any(|c| matches!(c.ch, '/' | '\\')));
     if !near_right_edge && !path_wrapped {
         return false;
     }
@@ -504,3 +506,30 @@ impl Input {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod windows_wrap_tests {
+    use super::*;
+
+    fn cells(text: &str) -> Vec<Cell> {
+        text.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hard_join_connects_wrapped_windows_backslash_paths() {
+        let mut s = Screen::blank(40, 2);
+        s.rows[0] = cells(r"  see C:\Users\actorjin\repo\src");
+        s.rows[1] = cells(r"  \main.rs:10");
+        assert!(hard_join(&s, 0));
+
+        let mut s2 = Screen::blank(40, 2);
+        s2.rows[0] = cells(r"  see C:\Users\actorjin\repo\src\");
+        s2.rows[1] = cells("  main.rs:10");
+        assert!(hard_join(&s2, 0));
+    }
+}

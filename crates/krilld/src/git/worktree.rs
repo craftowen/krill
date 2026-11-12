@@ -117,7 +117,7 @@ pub fn serve(
     let trust = krill_proto::daemon::state_dir().map(|d| d.join(TRUST_FILE));
     let outcome = match (queue(), root(), trust) {
         (Ok(q), Ok(root), Some(trust)) => {
-            create_with_pool(q, req, &root, &trust, prepare::existing())
+            create_with_pool(q, req, &root, &trust, prepare::existing().as_deref())
         }
         (Err(e), _, _) | (_, Err(e), _) => Err(e),
         (_, _, None) => Err("HOME is not set".to_owned()),
@@ -230,7 +230,7 @@ pub fn create_isolated(repo: &Path, name: &str, state_dir: &Path) -> Result<Path
         base: None,
         setup: Setup::Skip,
     };
-    match create_with_pool(q, &req, &root, &trust, prepare::existing())? {
+    match create_with_pool(q, &req, &root, &trust, prepare::existing().as_deref())? {
         Outcome::Created { worktree, .. } => Ok(PathBuf::from(OsString::from_vec(worktree.path))),
         Outcome::Untrusted { .. } => Err("worktree setup untrusted".to_owned()),
     }
@@ -366,7 +366,8 @@ fn create_folder_workspace(
     if let Some(b) = req.base.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return Err(format!("base ref {b:?} requires a git repository"));
     }
-    let top = fs::canonicalize(given).map_err(|e| format!("{}: {e}", given.display()))?;
+    let top =
+        krill_proto::os::canonicalize(given).map_err(|e| format!("{}: {e}", given.display()))?;
     let config = compat::read_config_with_state(&top, trust.parent())?;
 
     if let (Some(archive), Setup::Approve(h)) = (config.worktree.archive.as_deref(), &req.setup)
@@ -1080,6 +1081,35 @@ mod trust_tests {
         remember(&file, &second).unwrap();
         assert!(trusted(&file, &first).unwrap());
         assert!(trusted(&file, &second).unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn folder_workspace_canonicalizes_without_verbatim_prefix() {
+        let dir = std::env::temp_dir().join(format!("krill-folder-ws-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let workspace = dir.join("plain-folder");
+        fs::create_dir_all(&workspace).unwrap();
+        let trust = dir.join(TRUST_FILE);
+        let req = NewWorktree {
+            repo: workspace.as_os_str().as_bytes().to_vec(),
+            name: "session-1".to_owned(),
+            base: None,
+            setup: Setup::Skip,
+        };
+
+        let out = create_folder_workspace(&workspace, &req, &trust).unwrap();
+        let Outcome::Created { worktree, setup } = out else {
+            panic!("expected Created, got {out:?}");
+        };
+        assert!(setup.is_none());
+        let expected = krill_proto::os::canonicalize(&workspace).unwrap();
+        let got = PathBuf::from(OsString::from_vec(worktree.path));
+        assert_eq!(got, expected);
+        assert!(
+            !got.to_string_lossy().starts_with(r"\\?\"),
+            "unexpected verbatim prefix in {got:?}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
