@@ -119,13 +119,34 @@ fn is_stale_build(running: &str) -> bool {
     running.is_empty() || krill_proto::control::is_newer(krill_proto::BUILD, running) == Some(true)
 }
 
+fn stop_if_stale_running(
+    running: Option<&str>,
+    unload_agent: impl FnOnce() -> Result<(), Error>,
+    shutdown_server: impl FnOnce() -> Result<(), Error>,
+) -> Result<bool, Error> {
+    if !running.is_some_and(is_stale_build) {
+        return Ok(false);
+    }
+    unload_agent()?;
+    shutdown_server()?;
+    Ok(true)
+}
+
 fn start(executable: &Path, state_dir: &Path) -> Result<(), Error> {
     if is_serve_running(state_dir) {
         let running = block_on(crate::serve::serve_build_command(state_dir))?;
-        if !running.as_deref().is_some_and(is_stale_build) {
+        let replaced = stop_if_stale_running(
+            running.as_deref(),
+            || {
+                #[cfg(target_os = "macos")]
+                crate::disable_launch_agent(state_dir)?;
+                Ok(())
+            },
+            || block_on(crate::serve::shutdown_server_command(state_dir))?,
+        )?;
+        if !replaced {
             return Ok(());
         }
-        block_on(crate::serve::shutdown_server_command(state_dir))??;
     }
     #[cfg(target_os = "macos")]
     {
@@ -210,5 +231,57 @@ mod tests {
         assert!(is_stale_build("0.0.1"));
         assert!(!is_stale_build(krill_proto::BUILD));
         assert!(!is_stale_build("999.0.0"));
+    }
+
+    #[test]
+    fn stale_running_server_unloads_launch_agent_before_shutdown_command() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        assert!(
+            !stop_if_stale_running(
+                Some(krill_proto::BUILD),
+                || {
+                    steps.borrow_mut().push("unload");
+                    Ok(())
+                },
+                || {
+                    steps.borrow_mut().push("shutdown");
+                    Ok(())
+                },
+            )
+            .unwrap()
+        );
+        assert!(steps.borrow().is_empty());
+
+        assert!(
+            !stop_if_stale_running(
+                None,
+                || {
+                    steps.borrow_mut().push("unload");
+                    Ok(())
+                },
+                || {
+                    steps.borrow_mut().push("shutdown");
+                    Ok(())
+                },
+            )
+            .unwrap()
+        );
+        assert!(steps.borrow().is_empty());
+
+        assert!(
+            stop_if_stale_running(
+                Some("0.0.1"),
+                || {
+                    steps.borrow_mut().push("unload");
+                    Ok(())
+                },
+                || {
+                    steps.borrow_mut().push("shutdown");
+                    Ok(())
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(*steps.borrow(), vec!["unload", "shutdown"]);
     }
 }

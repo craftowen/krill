@@ -412,6 +412,35 @@ fn sweep_removes_only_dead_forward_sockets() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(unix)]
+#[test]
+fn sweep_removes_dead_control_master_sockets_and_keeps_live_or_self_ones() {
+    let dir = std::env::temp_dir().join(format!("krill-sweep-ctrl-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let dead_ctrl = dir.join("c-999999-0");
+    let dead_ctrl_tmp = dir.join("c-999999-0.AbCdEf12");
+    let live_ctrl = dir.join("c-888888-0");
+    let self_ctrl = dir.join(format!("c-{}-999", std::process::id()));
+    drop(UnixListener::bind(&dead_ctrl).unwrap());
+    drop(UnixListener::bind(&dead_ctrl_tmp).unwrap());
+    let _live = UnixListener::bind(&live_ctrl).unwrap();
+    drop(UnixListener::bind(&self_ctrl).unwrap());
+
+    sweep_stale_forwards(&dir, Duration::from_secs(3600));
+    assert!(dead_ctrl.exists(), "fresh control sockets are left alone");
+
+    sweep_stale_forwards(&dir, Duration::ZERO);
+    assert!(!dead_ctrl.exists(), "refused control socket is removed");
+    assert!(
+        !dead_ctrl_tmp.exists(),
+        "refused temporary control bind socket is removed"
+    );
+    assert!(live_ctrl.exists(), "listening control socket stays");
+    assert!(self_ctrl.exists(), "current-PID control socket stays");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn machine_key_reuses_recent_result_without_running_ssh() {
     let dest = "cache-probe.invalid";

@@ -7,6 +7,8 @@
 //! launchd가 띄운 `serve`가 실제 상태 디렉터리(`link-ctl.sock`)에 붙지 않는다(OWE-669).
 
 use krill_proto::os::ffi::OsStrExt as _;
+#[cfg(any(target_os = "macos", test))]
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 #[cfg(target_os = "macos")]
 use std::fs;
@@ -14,6 +16,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(any(target_os = "macos", test))]
+use std::time::Duration;
 
 use krill_proto::daemon::BUNDLE_ID;
 
@@ -165,6 +169,43 @@ pub(crate) fn launchctl_allowed() -> bool {
     !cfg!(test) && std::env::var_os("KRILL_LINK_SKIP_LAUNCHCTL").is_none()
 }
 
+#[cfg(any(target_os = "macos", test))]
+const BOOTSTRAP_ATTEMPTS: usize = 5;
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_millis(75);
+
+#[cfg(any(target_os = "macos", test))]
+fn bootout_and_bootstrap(
+    domain: &str,
+    label: &str,
+    plist_path: &Path,
+    retry_delay: Duration,
+    mut run_launchctl: impl FnMut(&[&OsStr]) -> io::Result<(bool, String)>,
+) -> Result<(), Error> {
+    let target = format!("{domain}/{label}");
+    // 이미 등록돼 있으면 먼저 bootout 후 다시 bootstrap한다.
+    run_launchctl(&[OsStr::new("bootout"), OsStr::new(&target)]).ok();
+    let mut last_failure = String::new();
+    for attempt in 0..BOOTSTRAP_ATTEMPTS {
+        if attempt > 0 && !retry_delay.is_zero() {
+            std::thread::sleep(retry_delay);
+        }
+        let (ok, detail) = run_launchctl(&[
+            OsStr::new("bootstrap"),
+            OsStr::new(domain),
+            plist_path.as_os_str(),
+        ])
+        .map_err(Error::Io)?;
+        if ok {
+            return Ok(());
+        }
+        last_failure = detail;
+    }
+    Err(Error::Launchd(format!(
+        "launchctl bootstrap {domain} failed {last_failure}"
+    )))
+}
+
 /// `state_dir`용 `LaunchAgent` plist를 설치하고 `launchctl bootstrap gui/<uid>`로 활성화한다.
 #[cfg(target_os = "macos")]
 pub fn enable_launch_agent(krill_link_exe: &Path, state_dir: &Path) -> Result<PathBuf, Error> {
@@ -197,24 +238,17 @@ pub fn enable_launch_agent(krill_link_exe: &Path, state_dir: &Path) -> Result<Pa
     if launchctl_allowed() {
         let uid = rustix::process::getuid().as_raw();
         let domain = format!("gui/{uid}");
-        let target = format!("{domain}/{label}");
-        // 이미 등록돼 있으면 먼저 bootout 후 다시 bootstrap한다.
-        Command::new("/bin/launchctl")
-            .args(["bootout", &target])
-            .output()
-            .ok();
-        let out = Command::new("/bin/launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&plist_path)
-            .output()
-            .map_err(Error::Io)?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-            return Err(Error::Launchd(format!(
-                "launchctl bootstrap {domain} failed ({}): {stderr}",
-                out.status
-            )));
-        }
+        bootout_and_bootstrap(
+            &domain,
+            &label,
+            &plist_path,
+            BOOTSTRAP_RETRY_DELAY,
+            |args| {
+                let out = Command::new("/bin/launchctl").args(args).output()?;
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                Ok((out.status.success(), format!("({}): {stderr}", out.status)))
+            },
+        )?;
     }
     Ok(plist_path)
 }
@@ -333,6 +367,56 @@ mod tests {
     #[test]
     fn link_label_follows_bundle_id() {
         assert_eq!(LINK_LABEL, format!("{BUNDLE_ID}.link"));
+    }
+
+    #[test]
+    fn bootout_and_bootstrap_retries_transient_bootstrap_failure_after_bootout() {
+        let plist = Path::new("/tmp/dev.krill.app.link.plist");
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut bootstrap_calls = 0usize;
+        bootout_and_bootstrap("gui/501", LINK_LABEL, plist, Duration::ZERO, |args| {
+            calls.push(
+                args.iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect(),
+            );
+            if args.first() == Some(&OsStr::new("bootout")) {
+                return Ok((false, "(exit status: 3): No such process".to_owned()));
+            }
+            bootstrap_calls += 1;
+            if bootstrap_calls == 1 {
+                Ok((
+                    false,
+                    "(exit status: 5): Bootstrap failed: 5: Input/output error".to_owned(),
+                ))
+            } else {
+                Ok((true, String::new()))
+            }
+        })
+        .unwrap();
+        assert_eq!(bootstrap_calls, 2);
+        assert_eq!(
+            calls,
+            vec![
+                vec!["bootout", "gui/501/dev.krill.app.link"],
+                vec!["bootstrap", "gui/501", "/tmp/dev.krill.app.link.plist"],
+                vec!["bootstrap", "gui/501", "/tmp/dev.krill.app.link.plist"],
+            ]
+        );
+
+        let mut fail_count = 0usize;
+        let err = bootout_and_bootstrap("gui/501", LINK_LABEL, plist, Duration::ZERO, |args| {
+            if args.first() == Some(&OsStr::new("bootstrap")) {
+                fail_count += 1;
+            }
+            Ok((false, "(exit status: 5): Input/output error".to_owned()))
+        })
+        .unwrap_err();
+        assert_eq!(fail_count, BOOTSTRAP_ATTEMPTS);
+        assert!(
+            matches!(err, Error::Launchd(ref msg) if msg.contains("Input/output error")),
+            "{err:?}"
+        );
     }
 
     #[cfg(target_os = "macos")]
