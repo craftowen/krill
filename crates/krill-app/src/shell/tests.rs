@@ -12870,3 +12870,35 @@ fn pane_card_stage_geometry_split_reset_and_flush_guards(cx: &mut TestAppContext
     assert!(cx.debug_bounds("pane-card-stage").is_none());
     assert!(card_bounds(cx, fp, "active").is_none());
 }
+
+#[gpui::test]
+fn new_single_pane_tab_inherits_measured_full_tab_grid_without_affecting_splits(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let view = cx.new(|cx| Shell::new(None, cx));
+    view.update(cx, |s, cx| {
+        let pane0 = s.layout.active_tab().focused;
+        assert_eq!(s.initial_pane_grid(pane0), None);
+        s.live.insert(pane0, Live::new(Task::ready(())));
+        s.schedule_fit(pane0, (132, 43), cx);
+        assert_eq!(s.initial_pane_grid(pane0), Some((132, 43)));
+
+        // Switching to a newly opened tab drops the previous tab's `live` entry before `spawn_pane` runs.
+        s.layout.new_tab();
+        s.live.clear();
+        let pane1 = s.layout.active_tab().focused;
+        assert_eq!(s.initial_pane_grid(pane1), Some((132, 43)));
+
+        // Split panes do not occupy the full tab and must not inherit or overwrite `full_tab_grid`.
+        s.layout.split(Axis::Horizontal);
+        let split_pane = s.layout.active_tab().focused;
+        assert_eq!(s.initial_pane_grid(pane1), None);
+        assert_eq!(s.initial_pane_grid(split_pane), None);
+        s.schedule_fit(split_pane, (65, 43), cx);
+
+        s.layout.new_tab();
+        let pane2 = s.layout.active_tab().focused;
+        assert_eq!(s.initial_pane_grid(pane2), Some((132, 43)));
+    });
+}

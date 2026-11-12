@@ -288,7 +288,21 @@ pub fn ensure_session_in(
     want: Option<SessionId>,
     create: &Create,
 ) -> io::Result<Found> {
-    ensure_session_inner(&target.into(), want, create, true)
+    ensure_session_inner(&target.into(), want, create, true, false).map(|(found, _)| found)
+}
+
+/// 이미 열린 제어 소켓에서 미리 확인한 [`AgentLaunch`] 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreloadedLaunch(pub Option<AgentLaunch>);
+
+/// [`ensure_session_in`]과 같되 이미 열린 제어 소켓에서 [`AgentLaunch`]까지 함께 확인해,
+/// 직후 [`attach_with_launch`]가 별도 제어 소켓을 다시 열지 않게 한다.
+pub fn ensure_session_with_launch(
+    target: impl Into<HostTarget>,
+    want: Option<SessionId>,
+    create: &Create,
+) -> io::Result<(Found, Option<PreloadedLaunch>)> {
+    ensure_session_inner(&target.into(), want, create, true, true)
 }
 
 /// 이미 아는 세션만 찾는다: 라이브면 [`Found::Live`], 디스크 기록만 있으면 [`Found::Cold`], 없으면 `None`.
@@ -427,9 +441,27 @@ pub fn ensure_live_session_in(
     want: Option<SessionId>,
     create: &Create,
 ) -> io::Result<(SessionId, bool)> {
-    match ensure_session_inner(&target.into(), want, create, false)? {
+    match ensure_session_inner(&target.into(), want, create, false, false)?.0 {
         Found::Live(id, created) => Ok((id, created)),
         Found::Cold(id, _) => Ok((id, false)),
+    }
+}
+
+fn preload_agent_launch(
+    s: &mut UnixStream,
+    features: u64,
+    session: SessionId,
+    fresh_non_agent: bool,
+) -> Option<PreloadedLaunch> {
+    if fresh_non_agent {
+        return Some(PreloadedLaunch(None));
+    }
+    if features & (FEAT_CONTROL | FEAT_AGENTS) != FEAT_CONTROL | FEAT_AGENTS {
+        return None;
+    }
+    match call(s, &Request::AgentLaunch { session }).ok()? {
+        Reply::AgentLaunch(launch) => Some(PreloadedLaunch(launch)),
+        _ => None,
     }
 }
 
@@ -440,9 +472,10 @@ fn ensure_session_inner(
     want: Option<SessionId>,
     create: &Create,
     allow_cold: bool,
-) -> io::Result<Found> {
+    preload_launch: bool,
+) -> io::Result<(Found, Option<PreloadedLaunch>)> {
     let started = std::time::Instant::now();
-    let result = ensure_session_attempt(target, want, create, allow_cold);
+    let result = ensure_session_attempt(target, want, create, allow_cold, preload_launch);
     match &result {
         Err(error) if !(want.is_some() && is_session_gone(error)) => tracing::warn!(
             kind = ?error.kind(),
@@ -467,7 +500,8 @@ fn ensure_session_attempt(
     want: Option<SessionId>,
     create: &Create,
     allow_cold: bool,
-) -> io::Result<Found> {
+    preload_launch: bool,
+) -> io::Result<(Found, Option<PreloadedLaunch>)> {
     prepare_status_hook(target, &create.program);
     let _upgrade = creating();
     let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
@@ -477,12 +511,21 @@ fn ensure_session_attempt(
         if let Some(session) =
             hibernation::wake(&mut |req| call(&mut s, req), features, id, create)?
         {
-            return Ok(Found::Live(session, true));
+            let launch = preload_launch
+                .then(|| preload_agent_launch(&mut s, features, session, false))
+                .flatten();
+            return Ok((Found::Live(session, true), launch));
         }
         let (found, effective_id) =
             known_session(target, &mut s, features, id, allow_cold, Some(create))?;
         if let Some(found) = found {
-            return Ok(found);
+            let launch = match (&found, preload_launch) {
+                (Found::Live(session, _), true) => {
+                    preload_agent_launch(&mut s, features, *session, false)
+                }
+                _ => None,
+            };
+            return Ok((found, launch));
         }
         effective_want = Some(effective_id);
     }
@@ -501,16 +544,21 @@ fn ensure_session_attempt(
         ));
     }
     // 디스크 출력이 없거나 기록을 껐어도 옛 에이전트 ID는 Resume으로 이어야 한다.
-    let create = match effective_want.filter(|_| features & FEAT_RESUME != 0) {
+    let req = match effective_want.filter(|_| features & FEAT_RESUME != 0) {
         Some(session) => Request::Resume {
             session,
             create: create.clone(),
         },
         None => Request::Create(create.clone()),
     };
-    match call(&mut s, &create)? {
+    let fresh_non_agent = matches!(&req, Request::Create(_))
+        && matches!(create.program, Program::Login | Program::Custom { .. });
+    match call(&mut s, &req)? {
         Reply::Created { session, .. } | Reply::Resumed { session, .. } => {
-            Ok(Found::Live(session, true))
+            let launch = preload_launch
+                .then(|| preload_agent_launch(&mut s, features, session, fresh_non_agent))
+                .flatten();
+            Ok((Found::Live(session, true), launch))
         }
         Reply::Failed(f) => Err(failure_to_io_error(f)),
         _ => Err(unexpected_reply()),
@@ -606,10 +654,27 @@ pub fn resume_session_in(
     session: Option<SessionId>,
     create: &Create,
 ) -> io::Result<SessionId> {
-    let target = target.into();
-    prepare_status_hook(&target, &create.program);
+    resume_session_inner(&target.into(), session, create, false).map(|(id, _)| id)
+}
+
+/// [`resume_session_in`]과 같되 열린 제어 소켓에서 [`AgentLaunch`]도 함께 읽는다.
+pub fn resume_session_with_launch(
+    target: impl Into<HostTarget>,
+    session: Option<SessionId>,
+    create: &Create,
+) -> io::Result<(SessionId, Option<PreloadedLaunch>)> {
+    resume_session_inner(&target.into(), session, create, true)
+}
+
+fn resume_session_inner(
+    target: &HostTarget,
+    session: Option<SessionId>,
+    create: &Create,
+    preload_launch: bool,
+) -> io::Result<(SessionId, Option<PreloadedLaunch>)> {
+    prepare_status_hook(target, &create.program);
     let _upgrade = creating();
-    let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
+    let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {
         return Err(io::Error::new(
@@ -624,8 +689,15 @@ pub fn resume_session_in(
         },
         None => Request::Create(create.clone()),
     };
+    let fresh_non_agent = matches!(&req, Request::Create(_))
+        && matches!(create.program, Program::Login | Program::Custom { .. });
     match call(&mut s, &req)? {
-        Reply::Created { session, .. } | Reply::Resumed { session, .. } => Ok(session),
+        Reply::Created { session, .. } | Reply::Resumed { session, .. } => {
+            let launch = preload_launch
+                .then(|| preload_agent_launch(&mut s, features, session, fresh_non_agent))
+                .flatten();
+            Ok((session, launch))
+        }
         Reply::Failed(f) => Err(failure_to_io_error(f)),
         _ => Err(unexpected_reply()),
     }
@@ -823,11 +895,24 @@ pub fn attach(
     session: SessionId,
     known: Option<Known>,
 ) -> io::Result<Linked> {
+    attach_with_launch(target, session, known, None)
+}
+
+/// [`attach`]와 같되 이미 확인한 [`AgentLaunch`]가 있으면 추가 제어 소켓 연결을 생략한다.
+pub fn attach_with_launch(
+    target: impl Into<HostTarget>,
+    session: SessionId,
+    known: Option<Known>,
+    preloaded_launch: Option<PreloadedLaunch>,
+) -> io::Result<Linked> {
     let target = target.into();
-    let launch = match agent_call(&target, &Request::AgentLaunch { session })? {
-        Some(Reply::AgentLaunch(launch)) => launch,
-        None => None,
-        _ => return Err(io::ErrorKind::InvalidData.into()),
+    let launch = match preloaded_launch {
+        Some(PreloadedLaunch(launch)) => launch,
+        None => match agent_call(&target, &Request::AgentLaunch { session })? {
+            Some(Reply::AgentLaunch(launch)) => launch,
+            None => None,
+            _ => return Err(io::ErrorKind::InvalidData.into()),
+        },
     };
     let c = target.connect(&hello()).map_err(connect_error)?;
     if c.negotiated.features & FEAT_SCREEN == 0 {

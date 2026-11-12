@@ -284,13 +284,35 @@ pub fn stage_agent_desktop(
     let Some(asset) = current_agent_desktop_asset() else {
         return Ok(None);
     };
+    let bin_override = std::env::var_os(ENV_BIN_OVERRIDE);
+    let archive_override = std::env::var_os(ENV_ARCHIVE_OVERRIDE);
+    let sha256_override = std::env::var(ENV_SHA256_OVERRIDE).ok();
+    let has_override = bin_override.as_ref().is_some_and(|v| !v.is_empty())
+        || archive_override.as_ref().is_some_and(|v| !v.is_empty());
+    let bin_dir = crate::user_dirs::share_dir(home).join("bin");
+    if !has_override && is_staged_version(&bin_dir, asset) {
+        super::skills::ensure_directory_safe(&bin_dir)?;
+        let lock_path = bin_dir.join(LOCK_FILE);
+        if !super::skills::regular_or_missing(&lock_path)? {
+            return Err(invalid("agent-desktop lock must not be a symlink"));
+        }
+        let staged_main = bin_dir.join(asset.main_binary);
+        let staged_helper = asset.colocated_helper.map(|h| bin_dir.join(h));
+        let link = ensure_agent_desktop_cli_link(home, &staged_main, None)?;
+        return Ok(Some(AgentDesktopReport {
+            executable: staged_main,
+            helper: staged_helper,
+            source: AgentDesktopSource::AlreadyStaged,
+            link,
+        }));
+    }
     let colocated = find_colocated_dir(krill_exe, asset);
     let source = resolve_provision_source(
         Some(asset),
         colocated,
-        std::env::var_os(ENV_BIN_OVERRIDE).as_deref(),
-        std::env::var_os(ENV_ARCHIVE_OVERRIDE).as_deref(),
-        std::env::var(ENV_SHA256_OVERRIDE).ok().as_deref(),
+        bin_override.as_deref(),
+        archive_override.as_deref(),
+        sha256_override.as_deref(),
         true,
     )?;
     match source {
@@ -811,10 +833,11 @@ pub fn ensure_agent_desktop_cli_link(
 
     #[cfg(not(unix))]
     {
-        if link_path.exists() {
-            let existing_matches = fs::read(&link_path)
+        if let Ok(link_meta) = fs::metadata(&link_path) {
+            let existing_matches = fs::metadata(staged_main)
                 .ok()
-                .zip(fs::read(staged_main).ok())
+                .filter(|staged_meta| staged_meta.len() == link_meta.len())
+                .and_then(|_| fs::read(&link_path).ok().zip(fs::read(staged_main).ok()))
                 .is_some_and(|(a, b)| a == b);
             if !existing_matches {
                 return Ok(AgentDesktopLinkStatus::ForeignPreserved(link_path));
@@ -830,7 +853,6 @@ pub fn ensure_agent_desktop_cli_link(
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     fn temp_home(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("krill-ad-test-{tag}-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
@@ -1051,6 +1073,52 @@ mod tests {
             AgentDesktopLinkStatus::ForeignPreserved(foreign_bin)
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stage_agent_desktop_skips_recopy_when_colocated_version_is_already_staged() {
+        let root = temp_home("colocated-idempotent");
+        let home = root.join("home");
+        let bundle = root.join("bundle");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&bundle).unwrap();
+
+        let Some(asset) = current_agent_desktop_asset() else {
+            fs::remove_dir_all(root).ok();
+            return;
+        };
+        let fake_krill = bundle.join(if cfg!(windows) {
+            "krilld.exe"
+        } else {
+            "krilld"
+        });
+        fs::write(&fake_krill, b"krilld").unwrap();
+        for name in std::iter::once(asset.main_binary).chain(asset.colocated_helper) {
+            let path = bundle.join(name);
+            fs::write(&path, b"colocated-binary-payload").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        let first = stage_agent_desktop(Some(&fake_krill), &home)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.source, AgentDesktopSource::ColocatedBundle);
+
+        let seq_before = TEMP_SEQ.load(Ordering::Relaxed);
+        let second = stage_agent_desktop(Some(&fake_krill), &home)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.source, AgentDesktopSource::AlreadyStaged);
+        assert_eq!(
+            TEMP_SEQ.load(Ordering::Relaxed),
+            seq_before,
+            "already-staged binary must not be copied or rewritten again"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -4551,7 +4551,8 @@ impl Shell {
                             && l.pane.session().is_none()
                     });
                     let mut launch = t.launch_for(pane);
-                    if let Some((cols, rows)) = l.pane.grid() {
+                    if let Some((cols, rows)) = l.pane.grid().or_else(|| t.initial_pane_grid(pane))
+                    {
                         (launch.cols, launch.rows) = (cols, rows); // 새 세션도 칸 크기로(OWE-534)
                     }
                     // OWE-842: 죽은 세션 자리 재스폰은 셸 내부 `cd` 포함 최신 cwd로.
@@ -4622,14 +4623,16 @@ impl Shell {
                                 Err(_) => {}
                             }
                         }
-                        let (session, prior_cold) = match old {
+                        let (session, prior_cold, preloaded_launch) = match old {
                             // 앞서 보낸 생성 요청의 결과를 모른다: 아는 세션만 찾고 만들지 않는다.
                             _ if uncertain => match want {
                                 Some(want) => {
                                     match pane::find_session_in(&p, want).inspect_err(|e| {
                                         report("find_session", e);
                                     })? {
-                                        Some(pane::Found::Live(session, _)) => (session, None),
+                                        Some(pane::Found::Live(session, _)) => {
+                                            (session, None, None)
+                                        }
                                         Some(pane::Found::Cold(session, cold)) => {
                                             return Ok(Got::Cold(session, cold));
                                         }
@@ -4638,34 +4641,45 @@ impl Shell {
                                 }
                                 None => return Ok(Got::Stopped),
                             },
-                            Some(old) => match pane::resume_session_in(&p, Some(old), &launch)
-                                .inspect_err(|e| report("resume", e))
-                            {
-                                Ok(session) => {
-                                    (session, pane::load_cold(&p, old).map(|c| (old, c)))
+                            Some(old) => {
+                                match pane::resume_session_with_launch(&p, Some(old), &launch)
+                                    .inspect_err(|e| report("resume", e))
+                                {
+                                    Ok((session, preloaded)) => (
+                                        session,
+                                        pane::load_cold(&p, old).map(|c| (old, c)),
+                                        preloaded,
+                                    ),
+                                    // 사용자가 직접 누른 "다시 시작"인데 옛 세션이 이미 닫혔다: 새 세션으로 잇는다.
+                                    Err(e) if pane::is_session_gone(&e) => {
+                                        let (session, preloaded) =
+                                            pane::resume_session_with_launch(&p, None, &launch)
+                                                .inspect_err(|e| report("create", e))?;
+                                        (session, None, preloaded)
+                                    }
+                                    Err(e) => return Err(e),
                                 }
-                                // 사용자가 직접 누른 "다시 시작"인데 옛 세션이 이미 닫혔다: 새 세션으로 잇는다.
-                                Err(e) if pane::is_session_gone(&e) => (
-                                    pane::resume_session_in(&p, None, &launch)
-                                        .inspect_err(|e| report("create", e))?,
-                                    None,
-                                ),
-                                Err(e) => return Err(e),
-                            },
+                            }
                             None => {
-                                let resolved = if !allow_cold_resume && let Some(want_id) = want {
-                                    pane::resolve_observed_session_in(&p, want_id, &launch)
-                                        .inspect_err(|e| report("restore", e))?
+                                let (resolved, preloaded) = if !allow_cold_resume
+                                    && let Some(want_id) = want
+                                {
+                                    (
+                                        pane::resolve_observed_session_in(&p, want_id, &launch)
+                                            .inspect_err(|e| report("restore", e))?,
+                                        None,
+                                    )
                                 } else {
-                                    pane::ensure_session_in(&p, want, &launch).inspect_err(|e| {
-                                        report(
-                                            if want.is_some() { "restore" } else { "create" },
-                                            e,
-                                        );
-                                    })?
+                                    pane::ensure_session_with_launch(&p, want, &launch)
+                                        .inspect_err(|e| {
+                                            report(
+                                                if want.is_some() { "restore" } else { "create" },
+                                                e,
+                                            );
+                                        })?
                                 };
                                 match resolved {
-                                    pane::Found::Live(session, _) => (session, None),
+                                    pane::Found::Live(session, _) => (session, None, preloaded),
                                     // OWE-842(시나리오 B): 재부팅 등으로 이전 세션이 콜드가 되었으면
                                     // 같은 cwd·셸 설정으로 새 세션을 즉시 자동 재스폰하고,
                                     // 이전 세션의 콜드 화면·스크롤백을 새 세션 위쪽 히스토리로 보존한다.
@@ -4674,7 +4688,7 @@ impl Shell {
                                         if !allow_cold_resume {
                                             return Ok(Got::Cold(cold_session, cold));
                                         }
-                                        match pane::resume_session_in(
+                                        match pane::resume_session_with_launch(
                                             &p,
                                             Some(cold_session),
                                             &launch,
@@ -4682,8 +4696,8 @@ impl Shell {
                                         .inspect_err(|e| {
                                             report("resume_cold", e);
                                         }) {
-                                            Ok(new_session) => {
-                                                (new_session, Some((cold_session, cold)))
+                                            Ok((new_session, preloaded)) => {
+                                                (new_session, Some((cold_session, cold)), preloaded)
                                             }
                                             Err(e) if pane::is_unknown_outcome(&e) => {
                                                 return Ok(Got::ColdUnknown(cold_session, cold, e));
@@ -4702,7 +4716,8 @@ impl Shell {
                             return Err(std::io::ErrorKind::Interrupted.into());
                         }
                         let known = known.filter(|_| want == Some(session));
-                        match pane::attach(&p, session, known).inspect_err(|e| report("attach", e))
+                        match pane::attach_with_launch(&p, session, known, preloaded_launch)
+                            .inspect_err(|e| report("attach", e))
                         {
                             Ok(linked) => Ok(Got::Live {
                                 session,

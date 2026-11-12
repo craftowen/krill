@@ -2371,3 +2371,183 @@ fn reattach_refreshes_agent_launch_after_shell_hook_and_rebind() {
     server.join().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn fresh_create_and_attach_with_launch_reuse_control_socket_without_extra_roundtrips() {
+    use krill_proto::os::net::UnixListener;
+    use krill_proto::screen::Attached;
+
+    let dir = std::env::temp_dir().join(format!("mk-fast-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("s.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let expected_agent = AgentLaunch {
+        profile: "codex".into(),
+        permission: Permission::Manual,
+    };
+    let server_agent = expected_agent.clone();
+    let (release, keep_open) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let handshake = || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(
+                    &ipc::ServerHello {
+                        proto_min: ipc::PROTO_MIN,
+                        proto_max: ipc::PROTO_MAX,
+                        features: FEAT_SCREEN | FEAT_CONTROL | FEAT_AGENTS,
+                        build: "test".into(),
+                        instance_id: 11,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            let (kind, body) = read(&mut stream).unwrap();
+            ipc::ClientHello::decode(kind, &body).unwrap();
+            stream
+        };
+
+        // 1) Login shell: Create on socket #1 (zero AgentLaunch frames), Attach on socket #2.
+        let mut control = handshake();
+        let (kind, body) = read(&mut control).unwrap();
+        assert!(matches!(
+            Request::decode(kind, &body).unwrap(),
+            Request::Create(Create {
+                program: Program::Login,
+                cols: 132,
+                rows: 43,
+                ..
+            })
+        ));
+        control
+            .write_all(
+                &Reply::Created {
+                    session: SessionId(77),
+                    pid: 1001,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        drop(control);
+
+        let mut screen = handshake();
+        let (kind, body) = read(&mut screen).unwrap();
+        assert_eq!(
+            Attach::decode(kind, &body).unwrap(),
+            Attach {
+                session: SessionId(77),
+                stream: Stream::Screen { known: None }
+            }
+        );
+        screen
+            .write_all(
+                &Attached {
+                    seq: Seq(0),
+                    revision: Revision(0),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        keep_open.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(screen);
+
+        // 2) Agent session: Create + AgentLaunch share socket #3, Attach uses socket #4.
+        let mut control = handshake();
+        let (kind, body) = read(&mut control).unwrap();
+        assert!(matches!(
+            Request::decode(kind, &body).unwrap(),
+            Request::Create(Create {
+                program: Program::Agent { .. },
+                cols: 132,
+                rows: 43,
+                ..
+            })
+        ));
+        control
+            .write_all(
+                &Reply::Created {
+                    session: SessionId(78),
+                    pid: 1002,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        let (kind, body) = read(&mut control).unwrap();
+        assert_eq!(
+            Request::decode(kind, &body).unwrap(),
+            Request::AgentLaunch {
+                session: SessionId(78)
+            }
+        );
+        control
+            .write_all(&Reply::AgentLaunch(Some(server_agent)).encode().unwrap())
+            .unwrap();
+        drop(control);
+
+        let mut screen = handshake();
+        let (kind, body) = read(&mut screen).unwrap();
+        assert_eq!(
+            Attach::decode(kind, &body).unwrap(),
+            Attach {
+                session: SessionId(78),
+                stream: Stream::Screen { known: None }
+            }
+        );
+        screen
+            .write_all(
+                &Attached {
+                    seq: Seq(0),
+                    revision: Revision(0),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        keep_open.recv_timeout(Duration::from_secs(2)).unwrap();
+    });
+
+    let target = HostTarget::remote("fixture", socket);
+    let login_create = Create {
+        cwd: Vec::new(),
+        cols: 132,
+        rows: 43,
+        program: Program::Login,
+        account: None,
+    };
+    let (found, preloaded) = ensure_session_with_launch(&target, None, &login_create).unwrap();
+    assert!(matches!(found, Found::Live(SessionId(77), true)));
+    assert_eq!(preloaded, Some(PreloadedLaunch(None)));
+    let linked = attach_with_launch(&target, SessionId(77), None, preloaded).unwrap();
+    assert_eq!(linked.launch, None);
+    drop(linked);
+    release.send(()).unwrap();
+
+    let agent_create = Create {
+        cwd: Vec::new(),
+        cols: 132,
+        rows: 43,
+        program: Program::Agent { id: "codex".into() },
+        account: None,
+    };
+    let (found, preloaded) = ensure_session_with_launch(&target, None, &agent_create).unwrap();
+    assert!(matches!(found, Found::Live(SessionId(78), true)));
+    assert_eq!(
+        preloaded,
+        Some(PreloadedLaunch(Some(expected_agent.clone())))
+    );
+    let linked = attach_with_launch(&target, SessionId(78), None, preloaded).unwrap();
+    assert_eq!(linked.launch, Some(expected_agent));
+    drop(linked);
+    release.send(()).unwrap();
+
+    server.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

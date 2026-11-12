@@ -2202,8 +2202,7 @@ pub fn active_account_info(
 ) -> Option<(ProviderKind, AccountInfo)> {
     let name = Path::new(program).file_name()?.to_str()?;
     let provider = ProviderKind::parse(name)?;
-    let path = config_path(home, state_dir);
-    if !path.exists() {
+    if !has_configured_accounts(home, state_dir) {
         return None;
     }
     let snap = refresh_accounts(home, state_dir);
@@ -2212,6 +2211,24 @@ pub fn active_account_info(
         .into_iter()
         .find(|a| a.provider == provider && a.active && !a.host_default && runnable(a))?;
     Some((provider, active))
+}
+
+/// 로그인 셸 시작(`krilld::agent::login_in`) 시 모든 프로바이더의 비-기본 활성 계정을 한 번의 스냅샷으로 조회한다.
+pub fn active_accounts(home: &Path, state_dir: Option<&Path>) -> Vec<(ProviderKind, AccountInfo)> {
+    if !has_configured_accounts(home, state_dir) {
+        return Vec::new();
+    }
+    refresh_accounts(home, state_dir)
+        .accounts
+        .into_iter()
+        .filter(|a| a.active && !a.host_default && runnable(a))
+        .map(|a| (a.provider, a))
+        .collect()
+}
+
+fn has_configured_accounts(home: &Path, state_dir: Option<&Path>) -> bool {
+    config_path(home, state_dir).exists()
+        && load_file_result(home, state_dir).is_ok_and(|file| !file.accounts.is_empty())
 }
 
 #[cfg(test)]
@@ -2588,5 +2605,65 @@ mod orca_identity_regressions {
         assert!(!orca_row_is_hidden(&file.hidden_accounts, 0, &refreshed[0]));
         assert!(orca_uuid_from_profile_dir("/custom/claude-profiles/not-a-uuid/home").is_none());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn active_accounts_fast_paths_empty_config_and_returns_configured_active_profiles() {
+        let root = std::env::temp_dir().join(format!("mk-active-accounts-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        assert!(!has_configured_accounts(&home, Some(&state)));
+        assert!(active_accounts(&home, Some(&state)).is_empty());
+
+        std::fs::write(state.join("accounts.toml"), "accounts = []\n").unwrap();
+        assert!(!has_configured_accounts(&home, Some(&state)));
+        assert!(active_accounts(&home, Some(&state)).is_empty());
+
+        let claude_dir = root.join("claude-work");
+        let codex_dir = root.join("codex-work");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let file = AccountsFile {
+            active: BTreeMap::from([
+                ("claude".to_owned(), "claude-work".to_owned()),
+                ("codex".to_owned(), "codex-work".to_owned()),
+            ]),
+            accounts: vec![
+                StoredAccount {
+                    id: "claude-work".into(),
+                    provider: "claude".into(),
+                    label: "Work".into(),
+                    email: None,
+                    profile_dir: claude_dir.display().to_string(),
+                },
+                StoredAccount {
+                    id: "codex-work".into(),
+                    provider: "codex".into(),
+                    label: "Work".into(),
+                    email: None,
+                    profile_dir: codex_dir.display().to_string(),
+                },
+            ],
+            ..AccountsFile::default()
+        };
+        save_inner(&home, Some(&state), &file).unwrap();
+        assert!(has_configured_accounts(&home, Some(&state)));
+        let found = active_accounts(&home, Some(&state));
+        assert_eq!(found.len(), 2);
+        assert!(
+            found
+                .iter()
+                .any(|(p, a)| *p == ProviderKind::Claude && a.id == "claude-work")
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(p, a)| *p == ProviderKind::Codex && a.id == "codex-work")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

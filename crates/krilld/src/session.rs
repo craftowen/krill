@@ -710,7 +710,9 @@ impl Tap {
         #[cfg(unix)]
         pty::resize(&self.0.master, size)?;
         #[cfg(windows)]
-        windows::resize(&self.0, size)?;
+        if live.size != size {
+            windows::resize(&self.0, size)?;
+        }
         // OS가 바뀐 뒤에는 panic 복구도 같은 크기와 기록 이벤트를 사용해야 한다.
         live.size = size;
         live.resized = Some(size);

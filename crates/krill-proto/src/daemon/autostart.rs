@@ -32,12 +32,34 @@ const WINDOWS_RECEIPT_REL: &str = "run/autostart.cmd";
 /// 조건을 만족하는 정식 설치 경로일 때만 로그인 자동 시작 구성을 최신 상태로 맞춘다.
 /// 실패해도 데몬 연결 자체는 막지 않는다.
 pub fn ensure_autostart(paths: &Paths) {
+    #[cfg(not(test))]
+    {
+        static VERIFIED: std::sync::Mutex<Option<Paths>> = std::sync::Mutex::new(None);
+        if VERIFIED
+            .lock()
+            .is_ok_and(|cached| cached.as_ref() == Some(paths))
+        {
+            return;
+        }
+        if sync_autostart(paths)
+            && let Ok(mut cached) = VERIFIED.lock()
+        {
+            *cached = Some(paths.clone());
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = sync_autostart(paths);
+    }
+}
+
+fn sync_autostart(paths: &Paths) -> bool {
     if !allowed(paths) {
-        return;
+        return true;
     }
     #[cfg(target_os = "macos")]
     if let (Some(plist_path), Some(expected)) = (macos_plist_path(), render_macos_plist(paths)) {
-        sync_plist_file(&plist_path, &expected).ok();
+        return sync_plist_file(&plist_path, &expected).is_ok();
     }
     #[cfg(windows)]
     if let (Some(state), Some(expected)) = (
@@ -45,8 +67,9 @@ pub fn ensure_autostart(paths: &Paths) {
         windows_run_command(&paths.holder, &paths.krilld, &paths.socket),
     ) {
         let receipt = state.join(WINDOWS_RECEIPT_REL);
-        sync_windows_run_in(WINDOWS_RUN_KEY, HOLDER_LABEL, &receipt, &expected).ok();
+        return sync_windows_run_in(WINDOWS_RUN_KEY, HOLDER_LABEL, &receipt, &expected).is_ok();
     }
+    true
 }
 
 /// `krill doctor` 등에서 현재 자동 시작 구성이 등록돼 있는지 확인한다.
