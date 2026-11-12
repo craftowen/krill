@@ -389,13 +389,21 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshHost> {
                  identity: &Option<String>,
                  out: &mut Vec<SshHost>| {
         for alias in aliases {
-            if alias.contains('*') || alias.contains('?') || alias.is_empty() {
+            if alias.contains('*')
+                || alias.contains('?')
+                || alias.starts_with('!')
+                || alias.is_empty()
+            {
                 continue;
             }
-            let target_host = hostname.as_deref().unwrap_or(alias.as_str());
-            let destination = match user.as_deref() {
-                Some(u) if !u.is_empty() => format!("{u}@{target_host}"),
-                _ => alias.clone(),
+            let destination = if valid_host(alias) {
+                alias.clone()
+            } else {
+                let target_host = hostname.as_deref().unwrap_or(alias.as_str());
+                match user.as_deref() {
+                    Some(u) if !u.is_empty() => format!("{u}@{target_host}"),
+                    _ => target_host.to_owned(),
+                }
             };
             if !valid_host(&destination) {
                 continue;
@@ -437,6 +445,21 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshHost> {
                     &mut out,
                 );
                 current_aliases = rest.into_iter().map(str::to_owned).collect();
+                hostname = None;
+                user = None;
+                port = None;
+                identity = None;
+            }
+            "match" => {
+                flush(
+                    &current_aliases,
+                    &hostname,
+                    &user,
+                    port,
+                    &identity,
+                    &mut out,
+                );
+                current_aliases.clear();
                 hostname = None;
                 user = None;
                 port = None;
@@ -738,7 +761,7 @@ pub fn build_copy_id_command(host: &SshHost, default_key: Option<&Path>) -> Stri
         .or_else(|| default_key.map(|p| p.display().to_string()));
     if let Some(k) = key {
         parts.push("-i".to_owned());
-        parts.push(shell_quote(&k));
+        parts.push(shell_quote_path(&k));
     }
     parts.push(shell_quote(&host.destination));
     format!("{}\n", parts.join(" "))
@@ -793,11 +816,21 @@ pub fn build_connect_command(host: &SshHost) -> String {
         && !id_file.trim().is_empty()
     {
         parts.push("-i".to_owned());
-        parts.push(shell_quote(id_file.trim()));
+        parts.push(shell_quote_path(id_file.trim()));
     }
     parts.push("--".to_owned());
     parts.push(shell_quote(&host.destination));
     format!("{}\n", parts.join(" "))
+}
+
+fn shell_quote_path(s: &str) -> String {
+    if s == "~" {
+        "~".to_owned()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        format!("~/{}", shell_quote(rest))
+    } else {
+        shell_quote(s)
+    }
 }
 
 fn shell_quote(s: &str) -> String {
@@ -951,11 +984,32 @@ Host dev-box
         let hosts = parse_ssh_config(cfg);
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0].label, "mac-studio");
-        assert_eq!(hosts[0].destination, "owen@192.168.1.50");
+        assert_eq!(hosts[0].destination, "mac-studio");
         assert_eq!(hosts[0].port, Some(2222));
         assert_eq!(hosts[0].identity_file.as_deref(), Some("~/.ssh/id_ed25519"));
         assert_eq!(hosts[1].label, "dev-box");
         assert_eq!(hosts[1].destination, "dev-box");
+    }
+
+    #[test]
+    fn parse_ssh_config_preserves_alias_for_proxyjump_skips_negation_and_isolates_match() {
+        let cfg = r"
+Host prod-box !bastion.dev *.corp
+    HostName 10.0.1.25
+    User ubuntu
+    ProxyJump bastion.example.com
+
+Match host *.corp
+    User corp-override
+    Port 2999
+    IdentityFile ~/.ssh/corp_override
+";
+        let hosts = parse_ssh_config(cfg);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].label, "prod-box");
+        assert_eq!(hosts[0].destination, "prod-box");
+        assert_eq!(hosts[0].port, None);
+        assert_eq!(hosts[0].identity_file, None);
     }
 
     #[test]
@@ -976,13 +1030,26 @@ Host dev-box
         let cmd = build_connect_command(&list[0]);
         assert_eq!(
             cmd,
-            "ssh -t -p 2200 -i '~/.ssh/office_key' -- owen@10.0.0.8\n"
+            "ssh -t -p 2200 -i ~/.ssh/office_key -- owen@10.0.0.8\n"
         );
 
         let copy_cmd = build_connect_command(&list[0].clone().with_copy_id());
         assert_eq!(
             copy_cmd,
-            "ssh-copy-id -p 2200 -i '~/.ssh/office_key' owen@10.0.0.8\n"
+            "ssh-copy-id -p 2200 -i ~/.ssh/office_key owen@10.0.0.8\n"
+        );
+
+        let spaced = SshHost {
+            identity_file: Some("~/.ssh/my key".into()),
+            ..list[0].clone()
+        };
+        assert_eq!(
+            build_connect_command(&spaced),
+            "ssh -t -p 2200 -i ~/'.ssh/my key' -- owen@10.0.0.8\n"
+        );
+        assert_eq!(
+            build_copy_id_command(&spaced, None),
+            "ssh-copy-id -p 2200 -i ~/'.ssh/my key' owen@10.0.0.8\n"
         );
 
         let after = remove_host(Some(&dir), &list[0].id).unwrap();

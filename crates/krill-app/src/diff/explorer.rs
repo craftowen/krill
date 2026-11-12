@@ -845,7 +845,7 @@ impl Explorer {
         let tokens: Vec<String> = self
             .filter_query
             .split_whitespace()
-            .map(str::to_ascii_lowercase)
+            .map(crate::jump::normalize_search_str)
             .collect();
         if tokens.is_empty() {
             let root = self.repo.clone();
@@ -858,7 +858,7 @@ impl Explorer {
         if self.filter_normalized.len() != all_entries.len() {
             self.filter_normalized = all_entries
                 .iter()
-                .map(|e| e.relative_path.to_ascii_lowercase())
+                .map(|e| crate::jump::normalize_search_str(&e.relative_path))
                 .collect();
         }
         let mut matched_dirs = BTreeSet::new();
@@ -2695,6 +2695,35 @@ mod performance_tests {
         explorer.rebuild_rows();
         assert_eq!(explorer.rows.len(), 2);
         assert_eq!(explorer.rows[1].relative_path, "src/MATCH-0010");
+    }
+
+    #[test]
+    fn filter_matches_nfd_korean_and_non_ascii_unicode_case_insensitively() {
+        let root = PathBuf::from("/repo");
+        let entry = |relative: &str, is_dir| DirEntry {
+            name: relative.rsplit('/').next().unwrap().to_owned(),
+            path: root.join(relative),
+            relative_path: relative.to_owned(),
+            is_dir,
+            is_symlink: false,
+        };
+        let nfd_korean = "docs/\u{1109}\u{1165}\u{11AF}\u{1100}\u{1168}\u{1109}\u{1165}.md";
+        let mut explorer = Explorer::new(root.clone());
+        explorer.filter_files_cache = Some(vec![
+            entry("docs", true),
+            entry(nfd_korean, false),
+            entry("docs/Résumé.md", false),
+        ]);
+
+        explorer.filter_query = "설계".into();
+        explorer.rebuild_rows();
+        assert_eq!(explorer.rows.len(), 2);
+        assert_eq!(explorer.rows[1].relative_path, nfd_korean);
+
+        explorer.filter_query = "résumé".into();
+        explorer.rebuild_rows();
+        assert_eq!(explorer.rows.len(), 2);
+        assert_eq!(explorer.rows[1].relative_path, "docs/Résumé.md");
     }
 }
 

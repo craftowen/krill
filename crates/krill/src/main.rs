@@ -60,6 +60,10 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
     if matches!(
         raw.as_slice(),
         [flag] if matches!(flag.to_str(), Some("-h" | "--help" | "help"))
+    ) || matches!(
+        raw.as_slice(),
+        [host, _, flag]
+            if host == "--host" && matches!(flag.to_str(), Some("-h" | "--help" | "help"))
     ) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
@@ -344,6 +348,15 @@ mod tests {
     fn top_level_help_exits_zero_and_empty_args_exits_two() {
         for flag in ["-h", "--help", "help"] {
             assert_eq!(run(vec![OsString::from(flag)]), ExitCode::SUCCESS, "{flag}");
+            assert_eq!(
+                run(vec![
+                    OsString::from("--host"),
+                    OsString::from("prod"),
+                    OsString::from(flag),
+                ]),
+                ExitCode::SUCCESS,
+                "--host prod {flag}"
+            );
         }
         assert_eq!(run(Vec::new()), ExitCode::from(2));
         for flag in ["-V", "--version", "version"] {

@@ -103,6 +103,13 @@ impl Options {
             }
             args = rest;
         }
+        if !for_seen {
+            if pattern.is_some() && quiet.is_none() {
+                condition = Condition::Pattern;
+            } else if quiet.is_some() && pattern.is_none() {
+                condition = Condition::Quiet;
+            }
+        }
         if matches!(condition, Condition::Pattern) != pattern.is_some()
             || (quiet.is_some() && !matches!(condition, Condition::Quiet | Condition::Idle))
         {
@@ -433,5 +440,22 @@ mod tests {
             .unwrap()
         );
         assert_eq!(seen, Some(stamp));
+    }
+
+    #[test]
+    fn parse_infers_pattern_and_quiet_when_for_is_omitted() {
+        let os = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+
+        let pat = Options::parse(&os(&["--pattern", "READY", "--timeout", "2s"])).unwrap();
+        assert!(matches!(pat.condition, Condition::Pattern));
+        assert_eq!(pat.pattern.as_ref().map(Regex::as_str), Some("READY"));
+        assert_eq!(pat.timeout, Some(Duration::from_secs(2)));
+
+        let quiet = Options::parse(&os(&["--quiet-ms", "500"])).unwrap();
+        assert!(matches!(quiet.condition, Condition::Quiet));
+        assert_eq!(quiet.quiet, Duration::from_millis(500));
+
+        assert!(Options::parse(&os(&["--pattern", "READY", "--quiet-ms", "500"])).is_err());
+        assert!(Options::parse(&os(&["--for", "done", "--pattern", "READY"])).is_err());
     }
 }

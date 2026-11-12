@@ -88,28 +88,104 @@ fn is_help_flag(s: &OsString) -> bool {
     matches!(s.to_str(), Some("-h" | "--help" | "help"))
 }
 
-/// 도움말 판정: 서브커맨드 자리(`ls --help`, `--help`)와 `--` 앞의 전역 플래그만 본다.
-/// 세션 ID·전송 텍스트(`send 1 help`, `send 1 --text --help`)·`--` 뒤 리터럴은 도움말이 아니다.
+fn option_takes_value(cmd: &str, flag: &str) -> bool {
+    match cmd {
+        "ls" => matches!(flag, "--worktree" | "--cwd"),
+        "new" => matches!(
+            flag,
+            "--worktree"
+                | "--cwd"
+                | "--cols"
+                | "--rows"
+                | "--account"
+                | "--prompt"
+                | "--model"
+                | "--effort"
+                | "--agent"
+        ),
+        "fork" => matches!(flag, "--from" | "--cwd" | "--cols" | "--rows" | "--prompt"),
+        "read" => flag == "--lines",
+        "wait" => matches!(
+            flag,
+            "--for" | "--pattern" | "--quiet-ms" | "--idle-ms" | "--timeout"
+        ),
+        _ => false,
+    }
+}
+
+/// 도움말 판정: 서브커맨드·옵션 위치의 `-h`/`--help`와 베어 `help`만 보고, 옵션 값·`send` 본문·`--` 뒤 리터럴은 제외한다.
 fn has_help_before_literal(args: &[OsString]) -> bool {
-    let mut it = args.iter();
     // `--host`는 extract_host가 이미 걷어냈으나, 직접 호출(run_with_target) 경로를 위해 여기서도 건너뛴다.
-    let first = if args.first().is_some_and(|a| a == "--host") {
-        it.next();
-        it.next();
-        it.next()
-    } else {
-        it.next()
+    let rest = match args {
+        [first, _, tail @ ..] if first == "--host" => tail,
+        _ => args,
     };
-    let Some(cmd) = first else {
+    let Some((cmd, tail)) = rest.split_first() else {
         return false;
     };
     // 베어 `--help` (서브커맨드 없음)
     if is_help_flag(cmd) {
         return true;
     }
-    // 서브커맨드 직후 플래그만 본다. 그 뒤는 각 명령의 인자(ID·텍스트·쿼리)다.
-    matches!(it.next().and_then(|s| s.to_str()), Some("-h" | "--help"))
-        || matches!(cmd.to_str(), Some("-h" | "--help" | "help"))
+    if tail
+        .first()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| matches!(s, "-h" | "--help"))
+    {
+        return true;
+    }
+    let Some(cmd_name) = cmd.to_str() else {
+        return false;
+    };
+    if cmd_name == "send" {
+        let mut seen_id = false;
+        let mut it = tail.iter();
+        while let Some(arg) = it.next() {
+            let s = arg.to_str();
+            if s == Some("--") {
+                return false;
+            }
+            if !seen_id {
+                if matches!(s, Some("-h" | "--help")) {
+                    return true;
+                }
+                seen_id = true;
+                continue;
+            }
+            match s {
+                Some("--text") => {
+                    it.next();
+                }
+                Some("--enter" | "--wait-submit" | "--stdin") => {}
+                Some("--help") => return true,
+                Some(flag) if flag.starts_with("--") => {}
+                _ => return false,
+            }
+        }
+        return false;
+    }
+    if !matches!(
+        cmd_name,
+        "ls" | "new" | "fork" | "read" | "wait" | "attach" | "kill" | "close"
+    ) {
+        return false;
+    }
+    let mut it = tail.iter();
+    while let Some(arg) = it.next() {
+        let Some(s) = arg.to_str() else {
+            continue;
+        };
+        if s == "--" {
+            return false;
+        }
+        if matches!(s, "-h" | "--help") {
+            return true;
+        }
+        if option_takes_value(cmd_name, s) {
+            it.next();
+        }
+    }
+    false
 }
 
 pub(crate) fn run_with_target(target: &Target, rest: &[OsString]) -> ExitCode {
@@ -1705,16 +1781,27 @@ mod tests {
         assert!(is_help_flag(&OsString::from("help")));
         assert!(!is_help_flag(&OsString::from("--hel")));
         assert!(help(&["send", "--help"]));
+        assert!(help(&["send", "1", "--enter", "--help"]));
         assert!(help(&["ls", "--help"]));
+        assert!(help(&["ls", "--json", "-h"]));
+        assert!(help(&["new", "--cwd", "/tmp", "--help"]));
+        assert!(help(&["wait", "1", "--help"]));
+        assert!(help(&["wait", "1", "--pattern", "READY", "-h"]));
+        assert!(help(&["read", "1", "--help"]));
+        assert!(help(&["kill", "1", "--help"]));
         assert!(help(&["--help"]));
         assert!(!help(&["send", "--", "--help"]));
         assert!(!help(&["send", "1", "--", "--help"]));
-        // 세션 ID·전송 텍스트 자리의 `help`는 도움말이 아니다.
+        assert!(!help(&["new", "--", "cmd", "--help"]));
+        // 세션 ID·전송 텍스트 자리의 `help`·`-h`·옵션 값은 도움말이 아니다.
         assert!(!help(&["send", "1", "help"]));
+        assert!(!help(&["send", "1", "-h"]));
+        assert!(!help(&["send", "1", "echo", "--help"]));
         assert!(!help(&["send", "1", "--text", "--help"]));
+        assert!(!help(&["wait", "1", "--pattern", "--help"]));
         // 없는 서브커맨드 뒤 `--help`도 usage를 보여준다(오타 탐색 친화적).
         assert!(help(&["search-is-not-a-session-cmd", "--help"]));
-        // `read 1 --lines --help`에서 --help는 --lines 값 자리가 아니라 오인 방지를 위해 도움말이 아니다.
+        // `read 1 --lines --help`에서 --help는 --lines 값 자리이므로 도움말이 아니다.
         assert!(!help(&["read", "1", "--lines", "--help"]));
     }
 
