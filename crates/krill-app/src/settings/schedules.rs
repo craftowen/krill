@@ -895,7 +895,7 @@ impl SettingsView {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .child(layout::label(
+                    .child(self.search_focus.label(
                         p,
                         text::SCHEDULES_TITLE.get(),
                         Some(text::SCHEDULES_DESC.get()),
@@ -1071,7 +1071,7 @@ impl SettingsView {
                                     .debug_selector(move || toggle_id.clone()),
                                 )
                                 .child(
-                                    layout::primary(
+                                    layout::secondary(
                                         gpui::ElementId::Name(run_now_id.clone().into()),
                                         text::SCHEDULE_RUN_NOW.get(),
                                     )
@@ -1098,18 +1098,12 @@ impl SettingsView {
                                         },
                                     )),
                                 )
-                                .child(
-                                    layout::ghost(
-                                        gpui::ElementId::Name(rm_id.clone().into()),
-                                        text::SCHEDULE_REMOVE.get(),
-                                    )
-                                    .debug_selector(move || rm_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.remove_schedule(&id_for_rm, cx);
-                                        },
-                                    )),
-                                )
+                                .child(self.confirm_button(
+                                    rm_id,
+                                    text::SCHEDULE_REMOVE.get(),
+                                    cx,
+                                    move |this, cx| this.remove_schedule(&id_for_rm, cx),
+                                ))
                         }),
                 );
             }

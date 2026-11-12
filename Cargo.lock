@@ -3784,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "krill"
-version = "0.3.0"
+version = "0.3.7"
 dependencies = [
  "embed-resource",
  "krill-hosts",
@@ -3808,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "krill-app"
-version = "0.3.0"
+version = "0.3.7"
 dependencies = [
  "block2 0.6.2",
  "chrono",
@@ -3845,7 +3845,7 @@ dependencies = [
 
 [[package]]
 name = "krill-holder"
-version = "0.3.0"
+version = "0.3.7"
 dependencies = [
  "embed-resource",
  "krill-log",
@@ -3859,7 +3859,7 @@ dependencies = [
 
 [[package]]
 name = "krill-hosts"
-version = "0.3.0"
+version = "0.3.7"
 dependencies = [
  "krill-proto",
  "postcard",
@@ -3870,7 +3870,7 @@ dependencies = [
 
 [[package]]
 name = "krill-link"
-version = "0.3.0"
+version = "0.3.7"
 dependencies = [
  "embed-resource",
  "iroh",
@@ -3891,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "krill-log"
-version = "0.3.0"
+version = "0.3.7"
 dependencies = [
  "log",
  "rustix",
@@ -3900,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "krill-proto"
-version = "0.3.0"
+version = "0.3.7"
 dependencies = [
  "base64 0.22.1",
  "postcard",
@@ -3919,7 +3919,7 @@ dependencies = [
 
 [[package]]
 name = "krill-term"
-version = "0.3.0"
+version = "0.3.7"
 dependencies = [
  "krill-proto",
  "unicode-width",
@@ -3927,7 +3927,7 @@ dependencies = [
 
 [[package]]
 name = "krilld"
-version = "0.3.0"
+version = "0.3.7"
 dependencies = [
  "aes",
  "alacritty_terminal",
@@ -6635,9 +6635,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",

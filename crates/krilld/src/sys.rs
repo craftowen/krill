@@ -232,6 +232,28 @@ pub(crate) fn tcgetpgrp(fd: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
 #[cfg(unix)]
 static STOP_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+#[cfg(unix)]
+fn stop_signal_pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let (reader, writer) = std::io::pipe()?;
+    let flags = fcntl_getfl(&writer)?;
+    fcntl_setfl(&writer, flags | OFlags::NONBLOCK)?;
+    Ok((reader, writer))
+}
+
+#[cfg(unix)]
+fn wait_for_stop_byte(mut reader: impl std::io::Read) -> bool {
+    let mut buf = [0u8; 1];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(_) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 /// SIGTERM·SIGINT를 받으면 `done` 채널을 깨워 main이 `RunGuard`를 정상 정리하고 종료하게 한다.
 #[cfg(unix)]
 pub fn notify_on_stop_signal(done: std::sync::mpsc::Sender<()>) {
@@ -247,7 +269,7 @@ pub fn notify_on_stop_signal(done: std::sync::mpsc::Sender<()>) {
             }
         }
     }
-    let Ok((reader, writer)) = rustix::pipe::pipe() else {
+    let Ok((reader, writer)) = stop_signal_pipe() else {
         return;
     };
     let raw_writer = writer.into_raw_fd();
@@ -271,9 +293,9 @@ pub fn notify_on_stop_signal(done: std::sync::mpsc::Sender<()>) {
         .name("sig-stop".to_owned())
         .stack_size(64 * 1024)
         .spawn(move || {
-            let mut buf = [0u8; 1];
-            rustix::io::read(&reader, &mut buf).ok();
-            done.send(()).ok();
+            if wait_for_stop_byte(reader) {
+                done.send(()).ok();
+            }
         })
         .ok();
 }
@@ -290,5 +312,50 @@ mod tests {
         child.kill().ok();
         child.wait().ok();
         assert_eq!(args.unwrap(), ["sleep", "30"]);
+    }
+
+    #[test]
+    fn stop_signal_pipe_sets_cloexec_and_nonblocking_writer() {
+        use rustix::fs::{OFlags, fcntl_getfl};
+        use rustix::io::{FdFlags, fcntl_getfd};
+        let (reader, writer) = super::stop_signal_pipe().unwrap();
+        assert!(fcntl_getfd(&reader).unwrap().contains(FdFlags::CLOEXEC));
+        assert!(fcntl_getfd(&writer).unwrap().contains(FdFlags::CLOEXEC));
+        assert!(fcntl_getfl(&writer).unwrap().contains(OFlags::NONBLOCK));
+    }
+
+    #[test]
+    fn wait_for_stop_byte_retries_interrupted_and_ignores_eof() {
+        struct ScriptedRead<'a>(&'a [std::io::Result<u8>]);
+        impl std::io::Read for ScriptedRead<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let Some((first, rest)) = self.0.split_first() else {
+                    return Ok(0);
+                };
+                self.0 = rest;
+                match first {
+                    Ok(byte) => {
+                        if let Some(slot) = buf.first_mut() {
+                            *slot = *byte;
+                        }
+                        Ok(1)
+                    }
+                    Err(e) => Err(std::io::Error::from(e.kind())),
+                }
+            }
+        }
+
+        let interrupted_then_byte = [
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            Ok(1),
+        ];
+        assert!(super::wait_for_stop_byte(ScriptedRead(
+            &interrupted_then_byte
+        )));
+
+        let interrupted_then_eof = [Err(std::io::Error::from(std::io::ErrorKind::Interrupted))];
+        assert!(!super::wait_for_stop_byte(ScriptedRead(
+            &interrupted_then_eof
+        )));
     }
 }

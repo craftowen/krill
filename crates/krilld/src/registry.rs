@@ -120,7 +120,7 @@ struct Entry {
 }
 
 /// argv가 에이전트 셸 복귀 래퍼(`<shell> -l -i -c PREFLIGHT mk-agent ...`)인가.
-fn is_wrapper_argv<S: AsRef<[u8]>>(argv: &[S]) -> bool {
+pub(crate) fn is_wrapper_argv<S: AsRef<[u8]>>(argv: &[S]) -> bool {
     #[cfg(unix)]
     return argv
         .get(5)
@@ -157,6 +157,19 @@ enum MailEpochState {
     Delivered(u64),
 }
 
+#[derive(Debug)]
+pub(crate) struct MobileSessionRow {
+    pub info: Info,
+    pub cwd: Vec<u8>,
+    pub status: control::AgentStatus,
+}
+
+#[derive(Debug)]
+pub(crate) struct MobileDashboardInputs {
+    pub sessions: Vec<MobileSessionRow>,
+    pub repositories: Vec<control::RepositoryTrees>,
+}
+
 /// krilld 전체에 하나.
 pub struct Registry {
     holder: Option<Arc<Holder>>,
@@ -183,7 +196,7 @@ pub struct Registry {
     /// 진행 중인 `Resume`의 `old` id. 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다(K-25).
     resuming: Mutex<HashSet<SessionId>>,
     account_work: Arc<crate::usage::accounts::switch_work::SwitchWork>,
-    account_handoffs: Mutex<BTreeMap<SessionId, krill_proto::usage::SessionHandoff>>,
+    account_handoffs: Mutex<account_switch::ledger::HandoffLedger>,
     account_recovered: std::sync::atomic::AtomicBool,
     account_processing: std::sync::atomic::AtomicBool,
     account_replacements: Mutex<std::collections::BTreeSet<SessionId>>,
@@ -457,6 +470,15 @@ impl Registry {
     }
 
     /// 감시 스냅샷 뒤 세션이 지워졌으면 그 상태를 다시 만들지 않는다.
+    /// 셸이 남은 세션에서 에이전트만 끝났다. 그때까지의 프롬프트를 다음 에이전트에 보여 주지 않는다.
+    pub(crate) fn agent_exited(&self, id: SessionId) {
+        if self.with_status(id, |s| s.exited(id)).is_some()
+            && let Some(dir) = self.state_dir()
+        {
+            krill_proto::git::forget_session_prompts(&dir, id, status::now_ns()).ok();
+        }
+    }
+
     pub(crate) fn with_status<T>(
         &self,
         id: SessionId,
@@ -744,6 +766,9 @@ impl Registry {
         if k == screen::kind::ATTACH && n.features & FEAT_SCREEN != 0 {
             let a = Attach::decode(k, &body)?;
             let tap = self.tap(&peer, a.session);
+            if tap.is_some() && role != Role::Observer {
+                self.acknowledge_retained_handoff(a.session);
+            }
             let frame_min = if mobile {
                 attach::MOBILE_FRAME_MIN
             } else {
@@ -1858,7 +1883,7 @@ impl Registry {
             reply,
             (FromHolder::Failed { errno, .. }, _)
                 if missing_path_errno(errno)
-        ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &env)
+        ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &mut env)
         {
             initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
             reply = holder
@@ -1899,6 +1924,7 @@ impl Registry {
             }
             (FromHolder::Failed { errno, .. }, _) => {
                 // spawn 실패: 세션이 없으니 주입 settings만 지우고 만들다 만 계보 기록도 걷는다.
+                tracing::warn!(id = id.0, errno, wrapped, "holder session spawn failed");
                 lock(&self.state).roots.remove(id);
                 self.discard_settings(id);
                 self.agents.forget(id);
@@ -2033,120 +2059,131 @@ impl Registry {
                     // Reader completion also occurs during daemon handoff. Only the
                     // published EOF flag (or holder exit) proves the terminal ended.
                     let exited = st.exited.contains_key(&session) || tap.pulse().closed;
-                    (session, e.pid, exited, tap)
+                    (session, e.pid, exited, tap, e.wrapped)
                 })
                 .collect()
         };
         Reply::States(
             sessions
                 .into_iter()
-                .map(|(session, root, exited, tap)| {
-                    let mut status = self.status.get(session);
-                    // EOF/holder 종료는 저장된 hook보다 우선한다. 종료 콜백이 늦거나
-                    // 더 최신 시각의 hook이 도착해도 끝난 세션을 Done으로 되살리지 않는다.
-                    if exited {
-                        status.state = control::AgentState::Exited;
-                        status.source = Some(control::Source::Process);
-                        status.confidence = control::Confidence::High;
-                        status.subagents.clear();
-                    }
-                    // Pi has no hook identity. Its executable may be reported as `node`,
-                    // and its terminal title can be renamed. Keep the explicit launch identity.
-                    if status.agent.is_empty()
-                        && let Ok(Some(launch)) = self.agents.launch(session)
-                        && launch.profile == "pi"
-                    {
-                        status.agent = launch.profile;
-                    }
-                    status.foreground = status::session_foreground(root, tap.foreground(), exited);
-                    status.title = tap.title();
-                    status.root_shell = (!exited)
-                        .then(|| crate::sys::process_name(root).ok())
-                        .flatten()
-                        .and_then(|program| {
-                            krill_proto::control::RootShell::new(
-                                if cfg!(windows) {
-                                    krill_proto::control::ShellOs::Windows
-                                } else {
-                                    krill_proto::control::ShellOs::Unix
-                                },
-                                program,
-                            )
-                        })
-                        .map(Box::new);
-                    let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
-                        || status.agent.eq_ignore_ascii_case("antigravity")
-                        || status.foreground.as_deref().is_some_and(|fg| {
-                            fg.eq_ignore_ascii_case("agy") || fg.eq_ignore_ascii_case("antigravity")
-                        });
-                    let stored = if is_agy_fg || status.agent.is_empty() {
-                        self.agents.stored(session).ok().flatten()
-                    } else {
-                        None
-                    };
-                    // Hook 실행 전(기동 직후·계정 전환·재개·Pi 등)에도 저장된 런치 프로필이 있으면 에이전트 정체성을 유지한다.
-                    if status.agent.is_empty()
-                        && let Some(s) = &stored
-                        && !s.profile.is_empty()
-                    {
-                        krill_proto::agent::canonical_id(&s.profile).clone_into(&mut status.agent);
-                    }
-                    let is_agy_stored = stored.as_ref().is_some_and(|s| {
-                        s.profile.eq_ignore_ascii_case("agy")
-                            || s.profile.eq_ignore_ascii_case("antigravity")
-                    });
-                    if is_agy_fg || is_agy_stored {
-                        if status.agent.is_empty() {
-                            "agy".clone_into(&mut status.agent);
-                        }
-                        let (title, discovered) =
-                            crate::agent_history::vault::resolve_live_agy_title(
-                                session,
-                                root,
-                                tap.foreground(),
-                                exited,
-                                stored.as_ref(),
-                            );
-                        if let Some((ref conv_id, ref tp)) = discovered {
-                            if tp.is_some() {
-                                self.agents.bind_discovered_session(
-                                    session,
-                                    conv_id,
-                                    tp.as_deref(),
-                                );
-                            } else if let Ok(Some(found)) = account_switch::identity::discover(
-                                krill_proto::usage::ProviderKind::Antigravity,
-                                root,
-                                tap.foreground(),
-                            ) {
-                                self.agents.bind_discovered_session(
-                                    session,
-                                    &found.id,
-                                    Some(&found.path),
-                                );
-                            } else {
-                                self.agents.bind_discovered_session(session, conv_id, None);
-                            }
-                        }
-                        if !exited
-                            && status.state == control::AgentState::Unknown
-                            && (title.is_some()
-                                || discovered.is_some()
-                                || stored.as_ref().is_some_and(|s| s.session_id.is_some()))
-                        {
-                            status.state = control::AgentState::Done;
-                        }
-                        let title = title
-                            .as_deref()
-                            .and_then(krill_proto::control::display_title);
-                        if title.is_some() || status.title.is_none() {
-                            status.title = title;
-                        }
-                    }
-                    SessionStatus { session, status }
+                .map(|(session, root, exited, tap, wrapped)| SessionStatus {
+                    session,
+                    status: self.resolve_session_status(session, root, exited, &tap, wrapped),
                 })
                 .collect(),
         )
+    }
+
+    fn resolve_session_status(
+        &self,
+        session: SessionId,
+        root: u32,
+        exited: bool,
+        tap: &crate::session::Tap,
+        wrapped: bool,
+    ) -> control::AgentStatus {
+        let mut status = self.status.get(session);
+        // EOF/holder 종료는 저장된 hook보다 우선한다. 종료 콜백이 늦거나
+        // 더 최신 시각의 hook이 도착해도 끝난 세션을 Done으로 되살리지 않는다.
+        if exited {
+            status.state = control::AgentState::Exited;
+            status.source = Some(control::Source::Process);
+            status.confidence = control::Confidence::High;
+            status.subagents.clear();
+        }
+        // Pi has no hook identity. Its executable may be reported as `node`,
+        // and its terminal title can be renamed. Keep the explicit launch identity.
+        if status.agent.is_empty()
+            && let Ok(Some(launch)) = self.agents.launch(session)
+            && launch.profile == "pi"
+        {
+            status.agent = launch.profile;
+        }
+        status.foreground = status::session_foreground(root, tap.foreground(), exited);
+        status.title = tap.title();
+        // Only a launch with no agent evidence yet can still be in shell startup.
+        status.startup_stall = (wrapped
+            && !exited
+            && status.state == control::AgentState::Unknown
+            && status.source.is_none())
+        .then(|| status::startup::startup_stall(root))
+        .flatten();
+        status.root_shell = (!exited)
+            .then(|| crate::sys::process_name(root).ok())
+            .flatten()
+            .and_then(|program| {
+                krill_proto::control::RootShell::new(
+                    if cfg!(windows) {
+                        krill_proto::control::ShellOs::Windows
+                    } else {
+                        krill_proto::control::ShellOs::Unix
+                    },
+                    program,
+                )
+            })
+            .map(Box::new);
+        let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
+            || status.agent.eq_ignore_ascii_case("antigravity")
+            || status.foreground.as_deref().is_some_and(|fg| {
+                fg.eq_ignore_ascii_case("agy") || fg.eq_ignore_ascii_case("antigravity")
+            });
+        let stored = if is_agy_fg || status.agent.is_empty() {
+            self.agents.stored(session).ok().flatten()
+        } else {
+            None
+        };
+        // Hook 실행 전(기동 직후·계정 전환·재개·Pi 등)에도 저장된 런치 프로필이 있으면 에이전트 정체성을 유지한다.
+        if status.agent.is_empty()
+            && let Some(s) = &stored
+            && !s.profile.is_empty()
+        {
+            krill_proto::agent::canonical_id(&s.profile).clone_into(&mut status.agent);
+        }
+        let is_agy_stored = stored.as_ref().is_some_and(|s| {
+            s.profile.eq_ignore_ascii_case("agy") || s.profile.eq_ignore_ascii_case("antigravity")
+        });
+        if is_agy_fg || is_agy_stored {
+            if status.agent.is_empty() {
+                "agy".clone_into(&mut status.agent);
+            }
+            let (title, discovered) = crate::agent_history::vault::resolve_live_agy_title(
+                session,
+                root,
+                tap.foreground(),
+                exited,
+                stored.as_ref(),
+            );
+            if let Some((ref conv_id, ref tp)) = discovered {
+                if tp.is_some() {
+                    self.agents
+                        .bind_discovered_session(session, conv_id, tp.as_deref());
+                } else if let Ok(Some(found)) = account_switch::identity::discover(
+                    krill_proto::usage::ProviderKind::Antigravity,
+                    root,
+                    tap.foreground(),
+                ) {
+                    self.agents
+                        .bind_discovered_session(session, &found.id, Some(&found.path));
+                } else {
+                    self.agents.bind_discovered_session(session, conv_id, None);
+                }
+            }
+            if !exited
+                && status.state == control::AgentState::Unknown
+                && (title.is_some()
+                    || discovered.is_some()
+                    || stored.as_ref().is_some_and(|s| s.session_id.is_some()))
+            {
+                status.state = control::AgentState::Done;
+            }
+            let title = title
+                .as_deref()
+                .and_then(krill_proto::control::display_title);
+            if title.is_some() || status.title.is_none() {
+                status.title = title;
+            }
+        }
+        status
     }
 
     /// 소켓으로 온 hook 이벤트. 세션 후손이 보냈으면 그 세션만, 외부에서 왔으면 `ppid` 계보의 세션.
@@ -2250,6 +2287,17 @@ impl Registry {
                 cwd_hint,
             ),
         };
+        if !is_subagent_or_foreign
+            && let Ok(Some(stored)) = self.agents.stored(id)
+            && stored.permission == krill_proto::agent::Permission::Manual
+            && self.live_agent_has_yolo_args(id, &stored.profile)
+        {
+            let yolo = crate::agent::control::StoredLaunch {
+                permission: krill_proto::agent::Permission::Yolo,
+                ..stored
+            };
+            self.agents.bind_switch_identity(id, &yolo).ok();
+        }
         if !is_subagent_or_foreign
             && let Ok(Some(stored)) = self.agents.stored(id)
             && (stored.session_id.is_none() || stored.transcript_path.is_none())
@@ -2369,6 +2417,7 @@ impl Registry {
                 // 끝나면 on_exited가 지운다. 잠금 안에서 표시해 그사이 온 Exited를 놓치지 않는다.
                 let first = st.closing.insert(id);
                 drop(st);
+                self.cancel_queued_account_switch(id);
                 let end = |req| {
                     if holder.version() >= TERMINATE_SINCE {
                         ToHolder::Terminate { req, id }
@@ -2534,7 +2583,7 @@ impl Registry {
         self.status.remove(id);
         lock(&self.orch_mail_notified_done).retain(|(sid, _, _), _| *sid != id.0);
         self.clear_sleeping(id);
-        self.forget_failed_account_handoff(id);
+        self.forget_failed_account_handoff(id, ids_durable);
     }
 
     #[cfg(all(test, unix))]
@@ -2824,6 +2873,87 @@ impl Registry {
     /// 활성 세션 터미널이 현재 Bracketed Paste 모드(`?2004h`)를 켰는지 확인한다(OWE-944 / MK-241).
     pub(crate) fn session_bracketed_paste(&self, id: SessionId) -> bool {
         self.session_screen_and_bracketed_paste(id).1
+    }
+
+    pub(crate) fn agent_control(&self) -> &crate::agent::control::Control {
+        &self.agents
+    }
+
+    pub(crate) fn mobile_repositories(&self) -> io::Result<Vec<control::RepositoryTrees>> {
+        let ids: Vec<_> = lock(&self.state).sessions.keys().copied().collect();
+        let entries: Vec<_> = ids
+            .into_iter()
+            .map(|id| (id, self.session_cwd(id)))
+            .collect();
+        sidebar::mobile_repositories(&self.sidebar, &entries, self.state_dir().as_deref())
+            .map(|(_, repos)| repos)
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    pub(crate) fn mobile_dashboard_inputs(&self) -> io::Result<MobileDashboardInputs> {
+        let raw: Vec<_> = {
+            let st = lock(&self.state);
+            st.sessions
+                .iter()
+                .map(|(&session, e)| {
+                    (
+                        session,
+                        e.pid,
+                        st.exited.get(&session).copied(),
+                        e.session.tap(),
+                        e.wrapped,
+                    )
+                })
+                .collect()
+        };
+        let entries: Vec<_> = raw
+            .iter()
+            .map(|(id, ..)| (*id, self.session_cwd(*id)))
+            .collect();
+        let (dirs, repositories) =
+            sidebar::mobile_repositories(&self.sidebar, &entries, self.state_dir().as_deref())
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut sessions = Vec::with_capacity(raw.len());
+        for ((session, root, exit_code, tap, wrapped), dir) in raw.into_iter().zip(dirs) {
+            let exited = exit_code.is_some() || tap.pulse().closed;
+            let status = self.resolve_session_status(session, root, exited, &tap, wrapped);
+            sessions.push(MobileSessionRow {
+                info: Info {
+                    session,
+                    pid: root,
+                    status: exit_code,
+                },
+                cwd: dir.cwd,
+                status,
+            });
+        }
+        Ok(MobileDashboardInputs {
+            sessions,
+            repositories,
+        })
+    }
+
+    pub(crate) fn mobile_session_cwd(&self, id: SessionId) -> io::Result<PathBuf> {
+        if !lock(&self.state).sessions.contains_key(&id) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Session not found"));
+        }
+        let path = self
+            .session_cwd(id)
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| io::Error::other("session working directory unavailable"))?;
+        lock(&self.sidebar).record_directory(id, path.clone());
+        Ok(path)
+    }
+
+    pub(crate) fn mobile_session_status(&self, id: SessionId) -> Option<control::AgentStatus> {
+        let (tap, exited, root, wrapped) = {
+            let st = lock(&self.state);
+            let e = st.sessions.get(&id)?;
+            let tap = e.session.tap();
+            let exited = st.exited.contains_key(&id) || tap.pulse().closed;
+            (tap, exited, e.pid, e.wrapped)
+        };
+        Some(self.resolve_session_status(id, root, exited, &tap, wrapped))
     }
 
     /// An existing live tap only; mobile model control must never spawn/resume a replacement.
@@ -3186,10 +3316,13 @@ impl Registry {
             }
         }
         let before_end = tap.pulse().end;
-        let was_working = self.status.get(session).state == control::AgentState::Working;
+        let status = self.status.get(session);
+        let was_working = status.state == control::AgentState::Working;
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
+        self.acknowledge_retained_handoff(session);
         if submit
-            && !self.status.get(session).agent.is_empty()
+            && !status.agent.is_empty()
+            && status.state != control::AgentState::Exited
             && let Ok(text) = std::str::from_utf8(bytes)
             && let Some(dir) = self.state_dir()
         {
@@ -3309,7 +3442,7 @@ impl Registry {
                 bytes.hash(&mut revision);
             }
         }
-        revision.finish()
+        revision.finish() ^ sidebar::revision(&self.sidebar).wrapping_mul(0xBF58_476D_1CE4_E5B9)
     }
 
     fn notify_orch(&self) {
@@ -4125,17 +4258,20 @@ fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
 /// `ERROR_DIRECTORY`(267), 중간 폴더까지 없으면 `ERROR_PATH_NOT_FOUND`(3), 파일은 `ERROR_FILE_NOT_FOUND`(2=ENOENT).
 fn missing_path_errno(errno: i32) -> bool {
     Failure::from_holder_errno(errno) == Failure::Os(libc::ENOENT)
-        || cfg!(windows) && matches!(errno, 3 | 267)
+        || cfg!(windows) && matches!(errno, 3 | 15 | 21 | 53 | 67 | 123 | 206 | 267)
 }
 
+#[cfg_attr(
+    unix,
+    expect(
+        clippy::ptr_arg,
+        reason = "Windows fallback replaces argv and pushes to env"
+    )
+)]
 fn fallback_spawn_on_enoent(
-    #[cfg_attr(
-        not(unix),
-        expect(unused_variables, reason = "로그인 셸(-l) 경로 폴백은 Unix 전용")
-    )]
-    argv: &mut [Vec<u8>],
+    argv: &mut Vec<Vec<u8>>,
     cwd: &mut Vec<u8>,
-    env: &[(Vec<u8>, Vec<u8>)],
+    env: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) -> bool {
     use krill_proto::os::ffi::OsStrExt as _;
     let mut changed = false;
@@ -4149,8 +4285,15 @@ fn fallback_spawn_on_enoent(
                 .map(|a| a.as_os_str().as_bytes().to_vec())
                 .or_else(|| {
                     env.iter()
-                        .find(|(k, _)| k.as_slice() == b"HOME")
+                        .find(|(k, _)| {
+                            k.as_slice() == b"HOME" || k.eq_ignore_ascii_case(b"USERPROFILE")
+                        })
                         .map(|(_, v)| Path::new(std::ffi::OsStr::from_bytes(v)))
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.as_os_str().as_bytes().to_vec())
+                })
+                .or_else(|| {
+                    krill_proto::os::home_dir()
                         .filter(|p| p.is_dir())
                         .map(|p| p.as_os_str().as_bytes().to_vec())
                 })
@@ -4174,6 +4317,26 @@ fn fallback_spawn_on_enoent(
                     break;
                 }
             }
+        }
+    }
+    #[cfg(windows)]
+    if !is_wrapper_argv(argv)
+        && argv.first().is_some_and(|prog| {
+            env.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case(b"SHELL") && v == prog)
+                && !Path::new(std::ffi::OsStr::from_bytes(prog)).is_file()
+        })
+    {
+        let fallback = Shell::Login.launch();
+        if fallback.argv != *argv {
+            *argv = fallback.argv;
+            for (k, v) in fallback.env {
+                if k.eq_ignore_ascii_case(b"PROMPT") || k.eq_ignore_ascii_case(b"SHELL") {
+                    env.push((k, v));
+                }
+            }
+            crate::shell::dedupe_env(env);
+            changed = true;
         }
     }
     changed
@@ -4896,6 +5059,32 @@ mod orchestration_delivery_tests {
         drop(reg);
         drop(terminal);
         std::fs::remove_dir_all(dir)
+    }
+}
+
+#[cfg(test)]
+mod spawn_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_spawn_on_enoent_uses_userprofile_and_recovers_missing_shell() {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let home = std::env::temp_dir().join(format!("krilld-userprofile-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).unwrap();
+        let mut argv = vec![b"/nonexistent/custom-shell".to_vec(), b"-l".to_vec()];
+        let mut cwd = b"nonexistent-relative-root/deleted-child".to_vec();
+        let mut env = vec![
+            (
+                b"UserProfile".to_vec(),
+                home.as_os_str().as_bytes().to_vec(),
+            ),
+            (b"SHELL".to_vec(), b"/nonexistent/custom-shell".to_vec()),
+        ];
+        assert!(fallback_spawn_on_enoent(&mut argv, &mut cwd, &mut env));
+        assert_eq!(cwd, home.as_os_str().as_bytes());
+        assert_ne!(argv[0], b"/nonexistent/custom-shell");
+        std::fs::remove_dir_all(home).ok();
     }
 }
 

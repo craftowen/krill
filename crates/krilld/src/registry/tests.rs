@@ -3396,9 +3396,10 @@ fn kept_session_restart_hidden_tab_preserves_size_without_overprint_or_clipped_r
     holder_link
         .send(&FromHolder::Ready.encode().unwrap(), &[])
         .unwrap();
-    drop(master);
 
     let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    // Only after receipt: macOS can disconnect a socket whose last reference is in flight.
+    drop(master);
     let reg = Registry::new(Some((holder, kept)), Some(&dir));
     let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
 
@@ -3537,9 +3538,10 @@ fn kept_session_restart_active_tab_does_not_reflow_into_two_columns() {
     holder_link
         .send(&FromHolder::Ready.encode().unwrap(), &[])
         .unwrap();
-    drop(master);
 
     let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    // Only after receipt: macOS can disconnect a socket whose last reference is in flight.
+    drop(master);
     let reg = Registry::new(Some((holder, kept)), Some(&dir));
     let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
 
@@ -3642,9 +3644,10 @@ fn kept_quiet_session_wire_size_prevents_two_column_reflow() {
     holder_link
         .send(&FromHolder::Ready.encode().unwrap(), &[])
         .unwrap();
-    drop(master);
 
     let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    // Only after receipt: macOS can disconnect a socket whose last reference is in flight.
+    drop(master);
     let reg = Registry::new(Some((holder, kept)), Some(&dir));
     let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
 
@@ -3775,6 +3778,108 @@ fn kept_session_without_shell_reports_keeps_launch_cwd_after_daemon_restart() {
     assert_eq!(reg.session_cwd(id), Some(work));
     drop(reg);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn input_sent_after_the_agent_exits_is_not_a_prompt_turn() {
+    let dir = std::env::temp_dir().join(format!("krill-ended-turn-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(78);
+    let (master, _terminal) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    lock(&reg.state).sessions.insert(
+        id,
+        Entry {
+            session,
+            pid: 0,
+            cwd: dir.clone(),
+            wrapped: false,
+        },
+    );
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Session(id),
+    };
+    let send = |text: &str| {
+        let request = Request::SendInput {
+            session: id,
+            bytes: text.as_bytes().to_vec(),
+            submit: true,
+            wait_submit: false,
+        };
+        reg.handle(&peer, request, &mut HashMap::new());
+    };
+    let started = HookEvent {
+        id: hook::EventId {
+            pid: 1,
+            unix_ns: status::now_ns(),
+        },
+        agent: "claude".into(),
+        ppid: 1,
+        input: hook::Input::Complete,
+        payload: br#"{"hook_event_name":"SessionStart","source":"startup"}"#.to_vec(),
+    };
+    reg.with_status(id, |s| s.hook(&[(id, &started)]))
+        .unwrap()
+        .unwrap();
+
+    send("fix the bug");
+    reg.with_status(id, |s| s.exited(id));
+    send("codex");
+
+    let history = krill_proto::git::load_session_prompt_histories(&dir)
+        .remove(&id)
+        .expect("the running agent's prompt is recorded");
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+    assert_eq!(history.total_turns, 1);
+    assert_eq!(history.turns[0].text, "fix the bug");
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_exit_hides_its_prompts_from_the_next_agent() {
+    let dir = std::env::temp_dir().join(format!("krill-agent-exit-prompts-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(79);
+    let (master, _terminal) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    lock(&reg.state).sessions.insert(
+        id,
+        Entry {
+            session,
+            pid: 0,
+            cwd: dir.clone(),
+            wrapped: false,
+        },
+    );
+    krill_proto::git::record_session_prompt(&dir, id, "fix the bug", status::now_ns()).unwrap();
+
+    reg.agent_exited(id);
+
+    let histories = krill_proto::git::load_session_prompt_histories(&dir);
+    let state = reg.status.get(id).state;
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+    assert_eq!(state, control::AgentState::Exited);
+    assert!(!histories.contains_key(&id), "{histories:?}");
 }
 
 #[test]

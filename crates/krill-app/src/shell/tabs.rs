@@ -480,6 +480,7 @@ impl Shell {
         let launch_host = self.launch_host.clone();
         let weak = cx.weak_entity();
         let disabled = self.agents_busy || self.agents.is_none() || self.link != Link::Up;
+        let toolbar_menu = self.toolbar_menu(cx);
         div()
             .id("titlebar")
             .debug_selector(|| "titlebar".into())
@@ -521,6 +522,10 @@ impl Shell {
                 TabBar::new("tabs")
                     .flex_1()
                     .min_w_0()
+                    // TabBar는 자기 밑줄을 따로 긋는다. 제목줄 테두리 위에 겹쳐 놓아 한 줄로 보이게
+                    // 한다(gpui는 부모 테두리를 자식 위에 그린다).
+                    .self_end()
+                    .mb(px(-1.))
                     .max_width(ui::TAB_MAX_WIDTH)
                     .menu(true)
                     .reveal_selected(true)
@@ -554,9 +559,9 @@ impl Shell {
                     .items_center()
                     .gap_0p5()
                     .pr_2()
-                    .child(self.render_commands(cx))
                     .child(ui::button_with_tooltip(
                         Button::new("new-tab")
+                            .debug_selector(|| "new-tab".into())
                             .icon(IconName::Plus)
                             .ghost()
                             .xsmall()
@@ -623,17 +628,6 @@ impl Shell {
                         text::SPLIT_RIGHT.get(),
                     ))
                     .child(ui::button_with_tooltip(
-                        Button::new("split-down")
-                            .icon(IconName::PanelBottom)
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.split_active(Axis::Vertical, cx);
-                            })),
-                        "split-down",
-                        text::SPLIT_DOWN.get(),
-                    ))
-                    .child(ui::button_with_tooltip(
                         Button::new("titlebar-jump")
                             .icon(IconName::Search)
                             .ghost()
@@ -644,34 +638,18 @@ impl Shell {
                         "titlebar-jump",
                         text::JUMP_TOOLTIP.get(),
                     ))
-                    .child(ui::button_with_tooltip(
-                        Button::new("toggle-chat-view")
-                            .label(if self.is_active_chat_view_in(cx) {
-                                text::VIEW_TERM.get()
-                            } else {
-                                text::VIEW_CHAT.get()
-                            })
-                            .ghost()
-                            .xsmall()
-                            .toggled(self.is_active_chat_view_in(cx))
-                            .debug_selector(|| "toggle-chat-view".into())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_chat_view_with_focus(window, cx);
-                            })),
-                        "toggle-chat-view",
-                        text::TOGGLE_CHAT_VIEW.get(),
-                    ))
-                    .child(ui::button_with_tooltip(
-                        Button::new("toggle-panel")
-                            .icon(IconName::PanelRight)
-                            .ghost()
-                            .xsmall()
-                            .toggled(!self.panel_collapsed)
-                            .debug_selector(|| "toggle-panel".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(cx))),
-                        "toggle-panel",
-                        text::TOGGLE_PANEL.get(),
-                    )),
+                    .child(
+                        ui::button_with_tooltip(
+                            Button::new("titlebar-more")
+                                .debug_selector(|| "titlebar-more".into())
+                                .icon(IconName::Ellipsis)
+                                .ghost()
+                                .xsmall(),
+                            "titlebar-more",
+                            text::MORE_ACTIONS.get(),
+                        )
+                        .dropdown_menu(toolbar_menu),
+                    ),
             )
     }
 

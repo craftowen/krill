@@ -73,6 +73,13 @@ struct Slot {
 }
 
 static CACHE: Mutex<BTreeMap<Option<PathBuf>, Slot>> = Mutex::new(BTreeMap::new());
+type ExeStamp = (PathBuf, Option<std::time::SystemTime>, u64, bool);
+static VERIFIED_EXE: Mutex<BTreeMap<ExeStamp, Result<(), &'static str>>> =
+    Mutex::new(BTreeMap::new());
+
+pub(super) fn prewarm(context: &Context) {
+    let _ = cached(context);
+}
 
 /// Returns what is known now and refreshes on its own thread, so a poll never waits on `agy`.
 fn cached(context: &Context) -> (Option<Families>, Option<&'static str>) {
@@ -112,6 +119,42 @@ fn refresh(config: Option<PathBuf>, home: &Path) {
     }
 }
 
+fn verify_exe(exe: &Path, ssh: bool) -> Result<(), &'static str> {
+    let stamp = std::fs::metadata(exe)
+        .ok()
+        .map(|m| (exe.to_path_buf(), m.modified().ok(), m.len(), ssh));
+    if let Some(ref key) = stamp
+        && let Some(&cached) = lock(&VERIFIED_EXE).get(key)
+    {
+        return cached;
+    }
+    let version = direct::agy::run_agy(
+        exe,
+        &["--version".to_owned()],
+        ssh,
+        VERSION_TIMEOUT,
+        MAX_BYTES,
+    )
+    .ok_or(LIST_FAILED)?;
+    let result = if String::from_utf8_lossy(&version)
+        .split_whitespace()
+        .find(|word| word.contains('.'))
+        .is_some_and(|word| native::at_least(word, FLOOR))
+    {
+        Ok(())
+    } else {
+        Err(UNVERIFIED)
+    };
+    if let Some(key) = stamp {
+        let mut verified = lock(&VERIFIED_EXE);
+        if verified.len() >= 16 && !verified.contains_key(&key) {
+            verified.pop_first();
+        }
+        verified.insert(key, result);
+    }
+    result
+}
+
 fn fetch(config: Option<&Path>, home: &Path) -> Result<Vec<Family>, &'static str> {
     let exe = direct::agy_exe()
         .or_else(|| krill_proto::agent::which("agy", home.join(".local/bin").as_os_str()))
@@ -120,21 +163,7 @@ fn fetch(config: Option<&Path>, home: &Path) -> Result<Vec<Family>, &'static str
         .join("antigravity-oauth-token")
         .is_file();
     let ssh = config.is_some() || file_token;
-    let version = direct::agy::run_agy(
-        &exe,
-        &["--version".to_owned()],
-        ssh,
-        VERSION_TIMEOUT,
-        MAX_BYTES,
-    )
-    .ok_or(LIST_FAILED)?;
-    if !String::from_utf8_lossy(&version)
-        .split_whitespace()
-        .find(|word| word.contains('.'))
-        .is_some_and(|word| native::at_least(word, FLOOR))
-    {
-        return Err(UNVERIFIED);
-    }
+    verify_exe(&exe, ssh)?;
     let mut args = Vec::new();
     if let Some(dir) = config {
         let gemini = dir.join(".gemini");
@@ -256,16 +285,34 @@ fn footer(screen: &Screen) -> Option<(String, String)> {
     (plain_label(label) && valid_effort(&effort)).then(|| (label.to_owned(), effort))
 }
 
+/// Reads from the newest `⎿` down, ignoring blank rows and sticky `┃` callout banners pinned
+/// above the composer border, and joining wrapped continuation lines on narrow mobile screens.
 fn confirmed(screen: &Screen, label: &str) -> bool {
-    (0..usize::from(screen.cursor.line).saturating_sub(1))
-        .rev()
+    let mut rows: Vec<_> = (0..usize::from(screen.cursor.line).saturating_sub(1))
         .map(|y| native::row(screen, y))
-        .find(|row| !row.trim().is_empty())
-        .is_some_and(|row| {
-            let row = row.split_whitespace().collect::<Vec<_>>().join(" ");
-            row == format!("⎿ Model set to {label}")
-                || row == format!("⎿ Model already set to {label}")
-        })
+        .collect();
+    while rows
+        .last()
+        .is_some_and(|row| row.trim().is_empty() || row.trim_start().starts_with('┃'))
+    {
+        rows.pop();
+    }
+    let Some(newest) = rows
+        .iter()
+        .rposition(|row| row.trim_start().starts_with('⎿'))
+    else {
+        return false;
+    };
+    if rows
+        .get(newest.saturating_add(1)..)
+        .unwrap_or_default()
+        .iter()
+        .any(|row| row.trim().is_empty() || !row.starts_with("  "))
+    {
+        return false;
+    }
+    let text = native::words(rows.get(newest..).unwrap_or_default());
+    text == format!("⎿ Model set to {label}") || text == format!("⎿ Model already set to {label}")
 }
 
 pub(super) struct Agy;

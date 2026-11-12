@@ -493,7 +493,7 @@ fn fallback_shell(_path: Option<&[u8]>) -> Vec<u8> {
     FALLBACK_SHELL.to_vec()
 }
 
-/// `path`(물려받은 PATH)에서 [`SHELL_CANDIDATES`]를 찾는다. 없으면 `%COMSPEC%`, 그것도 없으면 `cmd.exe`.
+/// `path`(물려받은 PATH)에서 [`SHELL_CANDIDATES`]를 찾는다. 없으면 `%COMSPEC%`, `%SystemRoot%\System32\cmd.exe`, 그것도 없으면 `cmd.exe`.
 #[cfg(windows)]
 fn fallback_shell(path: Option<&[u8]>) -> Vec<u8> {
     use krill_proto::os::ffi::OsStrExt as _;
@@ -502,7 +502,16 @@ fn fallback_shell(path: Option<&[u8]>) -> Vec<u8> {
         .iter()
         .find_map(|c| krill_proto::agent::which(c, path))
         .map(std::path::PathBuf::into_os_string)
-        .or_else(|| std::env::var_os("COMSPEC"))
+        .or_else(|| std::env::var_os("COMSPEC").filter(|p| std::path::Path::new(p).is_file()))
+        .or_else(|| {
+            std::env::var_os("SystemRoot")
+                .map(|root| {
+                    std::path::PathBuf::from(root)
+                        .join(r"System32\cmd.exe")
+                        .into_os_string()
+                })
+                .filter(|p| std::path::Path::new(p).is_file())
+        })
         .map_or_else(|| b"cmd.exe".to_vec(), OsStringExt::into_vec)
 }
 

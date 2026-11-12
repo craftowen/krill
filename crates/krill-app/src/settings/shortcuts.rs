@@ -10,7 +10,7 @@ use std::path::Path;
 
 use gpui::{
     App, Context, FontWeight, KeyBinding, KeyDownEvent, Keystroke, SharedString, Window, div,
-    prelude::*,
+    prelude::*, px,
 };
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 
@@ -170,10 +170,16 @@ pub(super) fn action_category(action: &str) -> Category {
         | "shell::ClosePane"
         | "shell::FocusNextPane"
         | "shell::FocusPrevPane"
+        | "shell::FocusPaneLeft"
+        | "shell::FocusPaneRight"
+        | "shell::FocusPaneUp"
+        | "shell::FocusPaneDown"
         | "shell::ToggleZoomPane"
         | "shell::ClearPane"
         | "shell::SelectAll"
         | "shell::Find"
+        | "shell::FindNext"
+        | "shell::FindPrev"
         | "shell::Copy"
         | "shell::CopyClean"
         | "shell::Paste"
@@ -183,6 +189,7 @@ pub(super) fn action_category(action: &str) -> Category {
         "shell::ToggleSidebar"
         | "shell::FocusSidebar"
         | "shell::TogglePanel"
+        | "shell::ToggleChanges"
         | "shell::ToggleExplorer"
         | "shell::ToggleSearch"
         | "popout::DashboardPopout" => Category::Panels,
@@ -203,7 +210,11 @@ pub(super) struct Recorder {
     pub(super) target: Option<Target>,
     /// 충돌 확인 대기: 대상, 새 키, 그 키를 이미 쓰는 액션들.
     conflict: Option<(Target, String, Vec<&'static str>)>,
+    /// 펼친 행의 액션. 고른 행만 동작 버튼을 만든다.
+    selected: Option<&'static str>,
     pub(super) error: Option<SharedString>,
+    /// 오류가 난 행의 액션. `None`이면 특정 행의 일이 아니라 목록 위에 보인다.
+    error_action: Option<&'static str>,
     intercept: Option<gpui::Subscription>,
     return_focus: Option<gpui::FocusHandle>,
     pub(super) filter: ShortcutFilter,
@@ -589,9 +600,14 @@ impl SettingsView {
             view.update(cx, |this, cx| this.on_recorded(&keystroke, cx))
                 .ok();
         });
+        // 펼친 행이 있거나 키 추가면 이 행을 펼쳐 ×와 초기화까지 바로 닿게 한다.
+        if self.shortcuts.selected.is_some() || old.is_none() {
+            self.shortcuts.selected = Some(action);
+        }
         self.shortcuts.target = Some(Target { action, old });
         self.shortcuts.conflict = None;
         self.shortcuts.error = None;
+        self.shortcuts.error_action = None;
         self.shortcuts.intercept = Some(intercept);
         cx.notify();
     }
@@ -624,6 +640,7 @@ impl SettingsView {
         // 바인딩하지 않고 오류로 알린다. 지우기는 키 옆 ×, 끄기는 사용 안 함 버튼으로 한다.
         if needs_modifier(keystroke) {
             self.shortcuts.error = Some(text::SC_NEEDS_MODIFIER.get().into());
+            self.shortcuts.error_action = Some(target.action);
             cx.notify();
             return;
         }
@@ -639,13 +656,14 @@ impl SettingsView {
     fn save_key(&mut self, target: &Target, key: &str, cx: &mut Context<Self>) {
         let target = target.clone();
         let key = key.to_owned();
-        self.write_keys(cx, move |t, defaults| {
+        self.write_keys(Some(target.action), cx, move |t, defaults| {
             set_key(t, defaults, target.action, target.old.as_deref(), &key);
         });
     }
 
     fn write_keys(
         &mut self,
+        action: Option<&'static str>,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Keys, &[Pair]) + Send + 'static,
     ) {
@@ -659,14 +677,16 @@ impl SettingsView {
         self.file_job(
             "keys-edit",
             move || edit_keys(&dir, |keys| f(keys, &defaults)),
-            |this, result, cx| match result {
+            move |this, result, cx| match result {
                 Ok(()) => {
                     this.shortcuts.error = None;
+                    this.shortcuts.error_action = None;
                     super::reload(cx);
                 }
                 Err(error) => {
                     this.shortcuts.error =
                         Some(text::SC_WRITE_FAILED.format(&[("error", &error)]).into());
+                    this.shortcuts.error_action = action;
                 }
             },
             cx,
@@ -681,12 +701,14 @@ impl SettingsView {
 
     pub(super) fn reset_shortcut(&mut self, action: &'static str, cx: &mut Context<Self>) {
         self.shortcuts.conflict = None;
-        self.write_keys(cx, move |t, defaults| reset_action(t, defaults, action));
+        self.write_keys(Some(action), cx, move |t, defaults| {
+            reset_action(t, defaults, action);
+        });
     }
 
     pub(super) fn reset_all_shortcuts(&mut self, cx: &mut Context<Self>) {
         self.shortcuts.conflict = None;
-        self.write_keys(cx, |t, _| {
+        self.write_keys(None, cx, |t, _| {
             t.bindings.clear();
             t.disabled.clear();
         });
@@ -696,7 +718,9 @@ impl SettingsView {
     pub(super) fn delete_key(&mut self, action: &'static str, key: &str, cx: &mut Context<Self>) {
         self.shortcuts.conflict = None;
         let key = key.to_owned();
-        self.write_keys(cx, move |t, defaults| remove_key(t, defaults, action, &key));
+        self.write_keys(Some(action), cx, move |t, defaults| {
+            remove_key(t, defaults, action, &key);
+        });
     }
 
     /// 액션의 현재 키를 모두 꺼 단축키를 비활성화한다(OWE-863). 초기화로 되돌릴 수 있다.
@@ -708,7 +732,7 @@ impl SettingsView {
     ) {
         self.shortcuts.conflict = None;
         let current = current.to_vec();
-        self.write_keys(cx, move |t, defaults| {
+        self.write_keys(Some(action), cx, move |t, defaults| {
             disable_action(t, defaults, action, &current);
         });
     }
@@ -751,14 +775,115 @@ impl SettingsView {
             .tab_index(0)
             .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
                 if e.keystroke.key == "enter" {
+                    cx.stop_propagation();
                     this.start_recording(action, old_for_key.clone(), window, cx);
                 }
             }))
             .cursor_pointer()
             .child(cap)
             .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
                 this.start_recording(action, old.clone(), window, cx);
             }))
+    }
+
+    fn toggle_shortcut_row(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        self.shortcuts.selected = (self.shortcuts.selected != Some(action)).then_some(action);
+        cx.notify();
+    }
+
+    /// 고른 행 아래의 동작 칸: 키별 ×, 키 추가, 사용 안 함, 초기화와 기본 키 안내.
+    fn render_shortcut_tray(
+        &self,
+        action: &'static str,
+        current: &[String],
+        default: &[String],
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let p = crate::ui::palette(cx);
+        let mut caps = layout::controls().flex_shrink_1().min_w_0();
+        for key in current {
+            let del_id = format!("sc-del-{action}-{key}");
+            let del_selector = del_id.clone();
+            let key_owned = key.clone();
+            caps = caps.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(self.key_button(action, Some(key.clone()), cx))
+                    .child(
+                        layout::ghost(SharedString::from(del_id), "×")
+                            .debug_selector(move || del_selector.clone())
+                            .accessibility_label(text::SC_DELETE_KEY.get())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.delete_key(action, &key_owned, cx);
+                            })),
+                    ),
+            );
+        }
+        caps = caps.child(self.key_button(action, None, cx));
+        if !current.is_empty() {
+            let id = format!("sc-disable-{action}");
+            let selector = id.clone();
+            caps = caps.child(
+                layout::ghost(SharedString::from(id), text::SC_DISABLE.get())
+                    .debug_selector(move || selector.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let live = live_pairs(cx);
+                        let current = keys_of(&live, action);
+                        this.disable_shortcut(action, &current, cx);
+                    })),
+            );
+        }
+        if is_modified(current, default) {
+            let id = format!("sc-reset-{action}");
+            let selector = id.clone();
+            caps = caps.child(
+                layout::secondary(SharedString::from(id), text::SC_RESET.get())
+                    .debug_selector(move || selector.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.reset_shortcut(action, cx);
+                    })),
+            );
+        }
+        // OWE-863: 키를 모두 끈 행은 되돌리는 법을, 키가 남은 행은 기본 키를 알려 준다.
+        let hint = if current.is_empty() {
+            text::SC_DISABLED_HINT.get().to_owned()
+        } else {
+            let keys = default
+                .iter()
+                .map(|key| keycap_text(key))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let keys = if keys.is_empty() {
+                text::SC_DEFAULT_KEYS_NONE.get().to_owned()
+            } else {
+                keys
+            };
+            text::SC_DEFAULT_KEYS.format(&[("keys", &keys)])
+        };
+        let tray_id = format!("sc-tray-{action}");
+        div()
+            .debug_selector(move || tray_id)
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .px_1p5()
+            .pt_1p5()
+            .pb_2p5()
+            .bg(p.accent.opacity(0.45))
+            .border_b_1()
+            .border_color(p.border)
+            .child(caps)
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(hint),
+            )
     }
 
     pub(super) fn render_shortcuts_tab(
@@ -804,7 +929,64 @@ impl SettingsView {
             }
         }
 
-        let mut list = div().flex().flex_col().gap_4();
+        // 안내는 그 행 안에 넣는다. 행이 검색이나 필터로 숨었으면 아래에서 목록 위에 보인다.
+        let mut conflict = self
+            .shortcuts
+            .conflict
+            .as_ref()
+            .map(|(target, key, others)| {
+                let names = others
+                    .iter()
+                    .map(|a| action_label(a))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let msg =
+                    text::SC_CONFLICT.format(&[("key", &keycap_text(key)), ("actions", &names)]);
+                let note = div()
+                    .debug_selector(|| "sc-conflict".into())
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded(crate::ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(p.warning.opacity(0.3))
+                    .bg(p.warning.opacity(0.1))
+                    .child(layout::label(p, msg, None))
+                    .child(
+                        layout::controls()
+                            .child(
+                                layout::primary("sc-conflict-save", text::SC_CONFLICT_SAVE.get())
+                                    .debug_selector(|| "sc-conflict-save".into())
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.confirm_conflict(cx)),
+                                    ),
+                            )
+                            .child(
+                                layout::ghost("sc-conflict-cancel", text::SC_CANCEL.get())
+                                    .debug_selector(|| "sc-conflict-cancel".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.shortcuts.conflict = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+                (target.action, note)
+            });
+        let mut error = self.shortcuts.error.clone().map(|e| {
+            (
+                self.shortcuts.error_action,
+                crate::ui::error_banner(p, e)
+                    .debug_selector(|| "sc-error".into())
+                    .w_full(),
+            )
+        });
+
+        let mut list = div().flex().flex_col().gap_3();
         for &cat in Category::ALL {
             let mut group_rows = Vec::new();
             for &(action, _) in ACTIONS {
@@ -825,72 +1007,37 @@ impl SettingsView {
                 }
                 visible_count += 1;
 
-                let mut caps = layout::controls().flex_wrap().flex_shrink_1().min_w_0();
+                let open = self.shortcuts.selected == Some(action);
+                let mut caps = div()
+                    .flex_none()
+                    .max_w(gpui::relative(0.6))
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .items_center()
+                    .gap_1();
                 for key in &current {
-                    let del_id = format!("sc-del-{action}-{key}");
-                    let del_selector = del_id.clone();
-                    let key_owned = key.clone();
+                    caps = caps.child(self.key_button(action, Some(key.clone()), cx));
+                }
+                if current.is_empty() {
                     caps = caps.child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(self.key_button(action, Some(key.clone()), cx))
-                            .child(
-                                layout::ghost(SharedString::from(del_id), "×")
-                                    .debug_selector(move || del_selector.clone())
-                                    .accessibility_label(text::SC_DELETE_KEY.get())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.delete_key(action, &key_owned, cx);
-                                    })),
-                            ),
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::SC_OFF.get()),
                     );
-                }
-                caps = caps.child(self.key_button(action, None, cx));
-                // OWE-863: 키를 모두 끈 행은 사용 안 함 힌트를, 키가 남은 행은 끄기 버튼을 보인다.
-                if current.is_empty() {
-                    if !default.is_empty() {
-                        caps = caps.child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(text::SC_DISABLED_HINT.get()),
-                        );
+                    if !open {
+                        caps = caps.child(self.key_button(action, None, cx));
                     }
-                } else {
-                    let id = format!("sc-disable-{action}");
-                    let selector = id.clone();
-                    caps = caps.child(
-                        layout::ghost(SharedString::from(id), text::SC_DISABLE.get())
-                            .debug_selector(move || selector.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let live = live_pairs(cx);
-                                let current = keys_of(&live, action);
-                                this.disable_shortcut(action, &current, cx);
-                            })),
-                    );
-                }
-                let (mut a, mut b) = (current, default);
-                a.sort();
-                b.sort();
-                if a != b {
-                    let id = format!("sc-reset-{action}");
-                    let selector = id.clone();
-                    caps = caps.child(
-                        layout::secondary(SharedString::from(id), text::SC_RESET.get())
-                            .debug_selector(move || selector.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.reset_shortcut(action, cx);
-                            })),
-                    );
                 }
 
-                let mut left = div()
+                let mut name = div()
                     .flex_1()
                     .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .gap_2()
+                    .gap_1p5()
                     .child(
                         div()
                             .min_w_0()
@@ -900,7 +1047,7 @@ impl SettingsView {
                     );
                 if modified {
                     let mod_id = format!("sc-modified-{action}");
-                    left = left.child(
+                    name = name.child(
                         div()
                             .id(SharedString::from(mod_id.clone()))
                             .debug_selector(move || mod_id.clone())
@@ -912,18 +1059,64 @@ impl SettingsView {
                     );
                 }
 
+                let conflict_note = conflict.take_if(|(a, _)| *a == action).map(|(_, n)| n);
+                let error_note = error.take_if(|(a, _)| *a == Some(action)).map(|(_, n)| n);
+                let tray = open.then(|| self.render_shortcut_tray(action, &current, &default, cx));
                 let row_id = format!("sc-row-{action}");
+                let line_id = format!("sc-line-{action}");
+                let line_selector = line_id.clone();
                 group_rows.push(
-                    layout::card(p)
+                    div()
                         .id(SharedString::from(row_id.clone()))
                         .debug_selector(move || row_id.clone())
+                        .w_full()
+                        .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap_3()
-                        .items_start()
-                        .py_2()
-                        .child(left)
-                        .child(caps),
+                        .child(
+                            div()
+                                .id(SharedString::from(line_id))
+                                .debug_selector(move || line_selector.clone())
+                                .role(gpui::Role::Button)
+                                .aria_label(action_label(action))
+                                .aria_expanded(open)
+                                .tab_index(0)
+                                .w_full()
+                                .min_w_0()
+                                .min_h(px(30.))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_1p5()
+                                .py(px(3.))
+                                .cursor_pointer()
+                                .when(open, |d| d.bg(p.accent))
+                                .when(!open, |d| d.border_b_1().border_color(p.border))
+                                .hover(|d| d.bg(p.accent))
+                                .on_key_down(cx.listener(move |this, e: &KeyDownEvent, _, cx| {
+                                    if matches!(e.keystroke.key.as_str(), "enter" | "space") {
+                                        cx.stop_propagation();
+                                        this.toggle_shortcut_row(action, cx);
+                                    }
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_shortcut_row(action, cx);
+                                }))
+                                .child(name)
+                                .child(caps)
+                                .child(
+                                    Icon::new(if open {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .xsmall()
+                                    .text_color(p.muted_foreground),
+                                ),
+                        )
+                        .children(tray)
+                        .children(conflict_note.map(|note| div().py_1p5().child(note)))
+                        .children(error_note.map(|note| div().py_1p5().child(note))),
                 );
             }
 
@@ -943,7 +1136,6 @@ impl SettingsView {
                         .debug_selector(move || sel.into())
                         .flex()
                         .flex_col()
-                        .gap_1p5()
                         .child(layout::section_title(p, header_id, cat.label()))
                         .children(group_rows),
                 );
@@ -973,145 +1165,104 @@ impl SettingsView {
                 }))
         });
 
-        let filter_bar = layout::row(p)
+        // 머리 띠에 동작 칸이 없어 전체 초기화와 파일 열기도 이 줄에 둔다. 좁으면 줄을 바꾼다.
+        let filter_bar = div()
             .id("sc-filter-bar")
             .debug_selector(|| "sc-filter-bar".into())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .py_2()
             .child(
                 div()
+                    .id("sc-search")
+                    .debug_selector(|| "sc-search".into())
                     .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
+                    .min_w(px(140.))
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_component::input::Escape, window, cx| {
+                            cx.stop_propagation();
+                            if !this.shortcuts.search_query(cx).is_empty() {
+                                this.shortcuts.clear_search(window, cx);
+                            } else if this.shortcuts.target.is_none() {
+                                close_settings_page_for(Some(cx.entity_id()), window, cx);
+                            }
+                        },
+                    ))
                     .child(
-                        div()
-                            .id("sc-search")
-                            .debug_selector(|| "sc-search".into())
-                            .flex_1()
-                            .min_w_0()
-                            .capture_action(cx.listener(
-                                |this, _: &gpui_component::input::Escape, window, cx| {
-                                    cx.stop_propagation();
-                                    if !this.shortcuts.search_query(cx).is_empty() {
-                                        this.shortcuts.clear_search(window, cx);
-                                    } else if this.shortcuts.target.is_none() {
-                                        close_settings_page_for(Some(cx.entity_id()), window, cx);
-                                    }
-                                },
-                            ))
-                            .child(
-                                gpui_component::input::Input::new(&search_input)
-                                    .small()
-                                    .prefix(Icon::new(IconName::Search).xsmall()),
-                            ),
-                    )
-                    .children(clear_btn),
+                        gpui_component::input::Input::new(&search_input)
+                            .small()
+                            .prefix(Icon::new(IconName::Search).xsmall()),
+                    ),
             )
+            .children(clear_btn)
+            .child(
+                div()
+                    .id("sc-count")
+                    .debug_selector(|| "sc-count".into())
+                    .flex_none()
+                    .font_family(crate::ui::FONT_MONO)
+                    .text_size(crate::ui::TEXT_2XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::SC_COUNT_SUMMARY.format(&[
+                        ("visible", &visible_count.to_string()),
+                        ("total", &total_count.to_string()),
+                    ])),
+            )
+            .child(layout::segmented_control(
+                p,
+                [
+                    layout::segment(
+                        p,
+                        "sc-filter-all",
+                        text::SC_FILTER_ALL.get(),
+                        active_filter == ShortcutFilter::All,
+                    )
+                    .debug_selector(|| "sc-filter-all".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_shortcut_filter(ShortcutFilter::All, cx);
+                    })),
+                    layout::segment(
+                        p,
+                        "sc-filter-modified",
+                        text::SC_FILTER_MODIFIED.get(),
+                        active_filter == ShortcutFilter::Modified,
+                    )
+                    .debug_selector(|| "sc-filter-modified".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_shortcut_filter(ShortcutFilter::Modified, cx);
+                    })),
+                ],
+            ))
             .child(
                 layout::controls()
                     .child(
-                        div()
-                            .id("sc-count")
-                            .debug_selector(|| "sc-count".into())
-                            .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
-                            .text_color(p.muted_foreground)
-                            .child(text::SC_COUNT_SUMMARY.format(&[
-                                ("visible", &visible_count.to_string()),
-                                ("total", &total_count.to_string()),
-                            ])),
+                        layout::secondary("shortcuts-reset-all", text::SC_RESET_ALL.get())
+                            .disabled(modified_count == 0)
+                            .debug_selector(|| "shortcuts-reset-all".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.reset_all_shortcuts(cx);
+                            })),
                     )
-                    .child(layout::segmented_control(
-                        p,
-                        [
-                            layout::segment(
-                                p,
-                                "sc-filter-all",
-                                text::SC_FILTER_ALL.get(),
-                                active_filter == ShortcutFilter::All,
-                            )
-                            .debug_selector(|| "sc-filter-all".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_shortcut_filter(ShortcutFilter::All, cx);
-                            })),
-                            layout::segment(
-                                p,
-                                "sc-filter-modified",
-                                text::SC_FILTER_MODIFIED.get(),
-                                active_filter == ShortcutFilter::Modified,
-                            )
-                            .debug_selector(|| "sc-filter-modified".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_shortcut_filter(ShortcutFilter::Modified, cx);
-                            })),
-                        ],
-                    )),
+                    .child(
+                        layout::secondary("shortcuts-open-keys", text::SC_OPEN_KEYS.get())
+                            .debug_selector(|| "shortcuts-open-keys".into())
+                            .on_click(|_, _, cx| {
+                                open_file(KEYS_FILE, text::KEYS_TEMPLATE.get(), cx);
+                            }),
+                    ),
             );
-
-        let conflict = self.shortcuts.conflict.as_ref().map(|(_, key, others)| {
-            let names = others
-                .iter()
-                .map(|a| action_label(a))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let msg = text::SC_CONFLICT.format(&[("key", &keycap_text(key)), ("actions", &names)]);
-            layout::row(p)
-                .debug_selector(|| "sc-conflict".into())
-                .border_color(p.warning.opacity(0.3))
-                .bg(p.warning.opacity(0.1))
-                .child(layout::label(p, msg, None))
-                .child(
-                    layout::controls()
-                        .child(
-                            layout::primary("sc-conflict-save", text::SC_CONFLICT_SAVE.get())
-                                .debug_selector(|| "sc-conflict-save".into())
-                                .on_click(cx.listener(|this, _, _, cx| this.confirm_conflict(cx))),
-                        )
-                        .child(
-                            layout::ghost("sc-conflict-cancel", text::SC_CANCEL.get())
-                                .debug_selector(|| "sc-conflict-cancel".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.shortcuts.conflict = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-        });
-        let error = self
-            .shortcuts
-            .error
-            .clone()
-            .map(|e| crate::ui::error_banner(p, e));
 
         div()
             .flex()
             .flex_col()
-            .gap_3()
-            .child(
-                layout::row(p)
-                    .child(layout::label(p, text::SHORTCUTS_TITLE.get(), None))
-                    .child(
-                        layout::controls()
-                            .child(
-                                layout::secondary("shortcuts-reset-all", text::SC_RESET_ALL.get())
-                                    .disabled(modified_count == 0)
-                                    .debug_selector(|| "shortcuts-reset-all".into())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.reset_all_shortcuts(cx);
-                                    })),
-                            )
-                            .child(
-                                layout::secondary("shortcuts-open-keys", text::OPEN_KEYS.get())
-                                    .debug_selector(|| "shortcuts-open-keys".into())
-                                    .on_click(|_, _, cx| {
-                                        open_file(KEYS_FILE, text::KEYS_TEMPLATE.get(), cx);
-                                    }),
-                            ),
-                    ),
-            )
+            .gap_2()
             .child(filter_bar)
-            .children(conflict)
-            .children(error)
+            .children(conflict.map(|(_, note)| note))
+            .children(error.map(|(_, note)| note))
             .child(list)
     }
 }

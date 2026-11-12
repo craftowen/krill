@@ -617,6 +617,23 @@ fn start_refuses_when_the_marker_directory_is_full() {
 }
 
 #[test]
+fn start_reclaims_clean_markers_when_directory_reaches_capacity() {
+    let (scratch, consent) = consented("full-clean");
+    for _ in 0..MAX_MARKERS {
+        let guard = RunGuard::start_with(&scratch.0, Process::App, &consent)
+            .unwrap()
+            .unwrap();
+        drop(guard);
+    }
+    assert_eq!(markers(&scratch.0).len(), MAX_MARKERS);
+    let guard = RunGuard::start_with(&scratch.0, Process::Daemon, &consent)
+        .unwrap()
+        .expect("clean markers must be pruned so new runs can still be tracked");
+    assert_eq!(markers(&scratch.0).len(), 1);
+    drop(guard);
+}
+
+#[test]
 fn start_across_a_consent_change_leaves_only_a_clean_marker() {
     let (scratch, consent) = consented("recheck");
     let old = Consent {

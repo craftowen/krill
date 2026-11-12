@@ -170,8 +170,36 @@
             ? "Ran {0} command(s)"
             : "Did {0} other step(s)";
   }
+  function firstNonEmptyLine(text) {
+    return (
+      String(text || "")
+        .split("\n")
+        .map((line) => line.trim())
+        .find(Boolean) || ""
+    );
+  }
   function toolDetail(item) {
-    return String(item.title || item.file_path || item.text || "").trim().split("\n", 1)[0];
+    return (
+      firstNonEmptyLine(item.title) ||
+      firstNonEmptyLine(item.file_path) ||
+      firstNonEmptyLine(item.text)
+    );
+  }
+  function isWorkItemKind(kind) {
+    return (
+      kind === "tool_call" || kind === "tool_result" || kind === "reasoning"
+    );
+  }
+  function workRunEnd(items, start) {
+    let tools = 0,
+      thoughts = 0,
+      idx = start;
+    while (idx < items.length && isWorkItemKind(items[idx]?.kind)) {
+      if (items[idx].kind === "reasoning") thoughts++;
+      else tools++;
+      idx++;
+    }
+    return tools >= 1 || thoughts >= 2 ? idx : 0;
   }
   const cacheLimit = 8,
     cacheByteLimit = 8 * 1024 * 1024,
@@ -506,7 +534,9 @@
     box.append(suggestions, input, sendBtn);
     statusRow.append(attachBtn, modelBtn, contextMeter, statusLine);
     composer.append(attachment, box, statusRow, photoPicker);
-    globalThis.MkKeyboard?.keepFocus(composer, ctx.signal);
+    // Like Orca, the send tap takes focus so the IME commits the last syllable first.
+    for (const row of [attachment, statusRow])
+      globalThis.MkKeyboard?.keepFocus(row, ctx.signal);
     // Read-only discovery is scoped to this mount, host cache and current provider/workspace.
     function chatAgent() {
       return (
@@ -532,6 +562,8 @@
       return true;
     }
     // Snapshot identity changes clear private paint immediately; transient read failures do not.
+    let pollQueued = false,
+      appliedTimer = null;
     function syncReadScope() {
       const sess = state.sessions.get(sessionId),
         key = JSON.stringify([
@@ -594,6 +626,7 @@
         entry.model = null;
         entry.composerStatus = null;
         entry.composerStatusAt = 0;
+        entry.composerProbes = 0;
         statusFlight = null;
         discovery.clear();
         discovering.clear();
@@ -917,53 +950,104 @@
       closeSuggestions();
       if (!capability("composer_models")) return;
       const context = scope(),
-        version = suggestVersion;
+        version = suggestVersion,
+        warm =
+          entry.modelChoices?.scope === context ? entry.modelChoices.items : [];
       entry.model = null;
       syncAgent();
       picker = { kind: "models", scope: context };
-      paintChoices(entry.modelChoices?.scope === context ? entry.modelChoices.items : []);
+      paintChoices(warm, warm.length ? undefined : t("Loading…"));
       try {
-        await refreshStatus(true);
-        const data = await discover("composer_models");
+        const [, data] = await Promise.all([
+          refreshStatus(true).catch(() => {}),
+          discover("composer_models"),
+        ]);
         if (!active() || version !== suggestVersion || scope() !== context)
           return;
+        if (
+          data?.supported &&
+          capability("chat_composer") &&
+          !entry.composerStatus?.effort_supported &&
+          !entry.composerStatus?.models?.length
+        ) {
+          await refreshStatus(true).catch(() => {});
+          if (!active() || version !== suggestVersion || scope() !== context)
+            return;
+        }
         const models = data?.supported
           ? (data.items || data.models || []).filter(
               (item) => typeof item.id === "string" && item.id,
             )
           : [];
-        const current = models.find((item) => item.id === data.current);
+        const status = entry.composerStatus,
+          agent = chatAgent(),
+          current = models.find((item) => item.id === data.current);
         entry.model = current
           ? {
-              agent: chatAgent(),
+              agent,
               scope: context,
               id: current.id,
               label: current.label || current.name || current.id,
-              statusBefore: entry.composerStatus?.model,
+              effort: status?.effort || null,
+              statusBefore: status?.model,
+              statusEffortBefore: status?.effort,
             }
           : null;
         syncAgent();
-        const status = entry.composerStatus,
-          agent = chatAgent();
+        const effortSupported = Boolean(
+            status?.effort_supported ||
+              (data?.supported &&
+                models.some(
+                  (m) => Array.isArray(m.efforts) && m.efforts.length,
+                )),
+          ),
+          activeModelId = data?.current || status?.model;
         const items = models.map((item) => {
-          const current = item.id === data.current || matchesModel(agent, item.id, status?.model),
+          const isCurrent =
+              item.id === data.current ||
+              matchesModel(agent, item.id, status?.model),
             label = t(item.label || item.name || item.id);
           return {
             id: item.id,
             group: "models",
-            current,
-            label: current && agent === "claude" && status?.model ? fullModel(status.model) : label,
-            efforts: status?.effort_supported ? status.models?.find(model => model.id === item.id)?.efforts || [] : [],
+            current: isCurrent,
+            label:
+              isCurrent && agent === "claude" && status?.model
+                ? fullModel(status.model)
+                : label,
+            efforts: effortSupported
+              ? (Array.isArray(item.efforts)
+                  ? item.efforts
+                  : status?.models?.find((model) => model.id === item.id)
+                      ?.efforts) || []
+              : [],
           };
         });
-        const efforts = status?.models?.find(model => model.id === status.model)?.efforts || status?.efforts || [];
-        if (status?.effort_supported && efforts.length > 1)
+        const efforts =
+          models.find((model) => model.id === activeModelId)?.efforts ||
+          status?.models?.find((model) => model.id === activeModelId)
+            ?.efforts ||
+          status?.efforts ||
+          [];
+        if (effortSupported && efforts.length > 1)
           for (const effort of efforts)
-            items.push({id:effort, group:"efforts", current:effort === status.effort, label:t(EFFORT_LABELS.get(effort) || effort)});
-        entry.modelChoices = {scope:context, items};
+            items.push({
+              id: effort,
+              group: "efforts",
+              current: effort === status?.effort,
+              label: t(EFFORT_LABELS.get(effort) || effort),
+            });
+        entry.modelChoices = { scope: context, items };
         paintChoices(
           items,
-          models.length ? undefined : t(data?.reason || "Model selection is unavailable for this session."),
+          models.length
+            ? data?.note
+              ? t(data.note)
+              : undefined
+            : t(
+                data?.reason ||
+                  "Model selection is unavailable for this session.",
+              ),
         );
       } catch (error) {
         if (active() && version === suggestVersion && scope() === context)
@@ -985,6 +1069,20 @@
         version = suggestVersion,
         operation = { scope: context };
       entry.modelPending = operation;
+      if (picker?.kind === "models" && !suggestions.hidden) {
+        suggestions.dataset.pending = "true";
+        const chosen =
+          choice ||
+          choices.find((item) => item.group === "efforts" && item.id === effort);
+        if (chosen?.node) chosen.node.dataset.pending = "true";
+        for (const item of choices) if (item.node) item.node.disabled = true;
+        for (const child of Array.from(suggestions.children || []))
+          if (child.tagName === "P" || child.tag === "p") child.remove();
+        suggestions.insertBefore(
+          el("p", t("Applying…"), "muted chat-picker-status"),
+          choiceList,
+        );
+      }
       updateComposer();
       try {
         const result = await ctx.rpc({
@@ -1002,16 +1100,34 @@
         discovery.clear();
         if (result?.applied === true) {
           const id =
-            typeof result.model === "string" ? result.model : choice?.id;
-          if (id) entry.model = {
-            agent: chatAgent(),
-            scope: context,
-            id,
-            label: result.label || (id === choice?.id ? choice.label : id),
-            statusBefore: entry.composerStatus?.model,
-          };
+              typeof result.model === "string" ? result.model : choice?.id,
+            nextEffort =
+              result.effort ||
+              effort ||
+              entry.model?.effort ||
+              entry.composerStatus?.effort ||
+              null;
+          if (id)
+            entry.model = {
+              agent: chatAgent(),
+              scope: context,
+              id,
+              label: result.label || (id === choice?.id ? choice.label : id),
+              effort: nextEffort,
+              statusBefore: entry.composerStatus?.model,
+              statusEffortBefore: entry.composerStatus?.effort,
+            };
+          else if (result.effort && entry.model?.scope === context)
+            entry.model.effort = result.effort;
           entry.composerStatusAt = 0;
-          if (result.effort && entry.composerStatus) entry.composerStatus.effort = result.effort;
+          entry.composerProbes = 0;
+          if (result.effort && entry.composerStatus)
+            entry.composerStatus.effort = result.effort;
+          clearTimeout(appliedTimer);
+          modelBtn.dataset.applied = "true";
+          appliedTimer = setTimeout(() => {
+            delete modelBtn.dataset.applied;
+          }, 1500);
           if (active() && version === suggestVersion) closeSuggestions();
         } else if (active() && version === suggestVersion)
           paintChoices(
@@ -1027,6 +1143,7 @@
         )
           paintChoices([], t("Model change was not confirmed."));
       } finally {
+        delete suggestions.dataset.pending;
         if (entry.modelPending === operation) {
           entry.modelPending = null;
           if (ownsEntry()) entry.notifyComposer?.();
@@ -1038,7 +1155,9 @@
       if (!active() || !capability("chat_composer") || state.cached || state.connection?.phase !== "ready") return;
       const binding = scope(), generation = entry.generation, owner = ctx.transport, linkEpoch = state.connection?.generation;
       if (statusFlight?.binding === binding) return statusFlight.promise;
-      if (!force && (!isVisible() || Date.now() - (entry.composerStatusAt || 0) < 15000)) return;
+      const hasLiveMeta = Boolean(entry.composerStatus?.model || entry.composerStatus?.supported),
+        ttl = hasLiveMeta || (entry.composerProbes || 0) >= 10 ? 15000 : 1500;
+      if (!force && (!isVisible() || Date.now() - (entry.composerStatusAt || 0) < ttl)) return;
       const flight = {binding};
       const current = () => statusFlight === flight && active() && scope() === binding && entry.generation === generation && owner === ctx.transport && linkEpoch === state.connection?.generation;
       flight.promise = Promise.resolve().then(async () => {
@@ -1046,6 +1165,8 @@
           const data = await ctx.rpc({action:"chat_composer", session:sessionId});
           if (!current() || data?.agent !== chatAgent() || data.generation && data.generation !== generation) return;
           if (entry.model && data.model && data.model !== entry.model.statusBefore && !matchesModel(chatAgent(), entry.model.id, data.model)) entry.model = null;
+          else if (entry.model && data.effort && data.effort !== entry.model.statusEffortBefore) entry.model.effort = data.effort;
+          entry.composerProbes = data?.model || data?.supported ? 0 : (entry.composerProbes || 0) + 1;
           entry.composerStatus = data; entry.composerStatusAt = Date.now(); syncAgent();
         } catch (error) {
           if (current()) {entry.composerStatus = null; entry.composerStatusAt = Date.now(); syncAgent(); if (force) throw error;}
@@ -1060,12 +1181,14 @@
       const context = scope(),
         agent = chatAgent(),
         status = entry.composerStatus?.agent === agent ? entry.composerStatus : null,
-        currentModel = entry.model?.agent === agent && entry.model.scope === context ? entry.model.label : null,
+        currentEntryModel = entry.model?.agent === agent && entry.model.scope === context ? entry.model : null,
+        currentModel = currentEntryModel?.label || null,
         observedModel = currentModel || status?.model_label || status?.model,
+        observedEffort = currentEntryModel?.effort || status?.effort,
         hasStatus = capability("chat_composer"),
         modelText = observedModel || t(hasStatus ? "Model unknown" : "Model"),
-        label = hasStatus ? `${modelText} · ${status?.effort || t("Effort unknown")}` : modelText,
-        filledBars = EFFORT_BARS.get(status?.effort);
+        label = hasStatus ? `${modelText} · ${observedEffort || t("Effort unknown")}` : modelText,
+        filledBars = EFFORT_BARS.get(observedEffort);
       shell.dataset.composerStatus = String(hasStatus);
       if ((modelBtn.getAttribute ? modelBtn.getAttribute("aria-label") : modelBtn.attrs?.["aria-label"]) !== label) modelBtn.setAttribute("aria-label", label);
       modelName.textContent = observedModel ? shortModel(observedModel) : modelText;
@@ -1081,7 +1204,8 @@
         contextMeter.style.background = `conic-gradient(var(--foreground) ${usage}%, var(--border) 0)`;
         contextMeter.title = description; contextMeter.setAttribute("aria-label",description);
       }
-      modelBtn.hidden = !agent || !capability("composer_models") || (!!status && !status.supported && !status.model && !status.model_label && !currentModel);
+      const controllable = ["claude", "codex", "agy"].includes(agent);
+      modelBtn.hidden = !agent || !capability("composer_models") || (!controllable && !!status && !status.supported && !status.model && !status.model_label && !currentModel);
       modelBtn.disabled =
         !!entry.modelPending ||
         entry.sending ||
@@ -1198,7 +1322,11 @@
       syncOptimistic();
       if (cleared) pinLatestSoon();
       input.disabled = !!liveQuestion;
-      modelBtn.disabled = !!liveQuestion;
+      modelBtn.disabled =
+        !!liveQuestion ||
+        !!entry.modelPending ||
+        entry.sending ||
+        state.connection?.phase !== "ready";
       sendBtn.disabled =
         !!entry.modelPending ||
         !!liveQuestion ||
@@ -1281,9 +1409,7 @@
       e.preventDefault();
       if (
         !active() ||
-        e.isComposing ||
         liveQuestion ||
-        composing ||
         entry.modelPending ||
         !suggestions.hidden ||
         entry.sending ||
@@ -1728,14 +1854,19 @@
     }
     function renderItems(appendFrom) {
       const anchor = readerAnchor();
+      const prevWasSoloThought =
+        !tailRun && entry.items[appendFrom - 1]?.kind === "reasoning";
+      const nextStartsWork = isWorkItemKind(entry.items[appendFrom]?.kind);
       const incremental =
         appendFrom > 0 &&
         renderedItems === entry.items &&
-        renderedCount === appendFrom;
+        renderedCount === appendFrom &&
+        !(prevWasSoloThought && nextStartsWork);
       const wanted = new Set(),
         wantedRuns = new Set(),
         nodes = [];
-      let run = incremental ? tailRun : null;
+      let run = incremental ? tailRun : null,
+        runEnd = 0;
       // Retain the actual question/details nodes so selection, write-in, focus and expansion survive deltas.
       for (
         let idx = incremental ? appendFrom : 0;
@@ -1755,68 +1886,134 @@
           card.replaceChildren(...Array.from(next.children));
         }
         card._item = item;
-        if (item.kind === "tool_call" || item.kind === "tool_result") {
+        if (!run && idx >= runEnd) runEnd = workRunEnd(entry.items, idx);
+        if (run ? isWorkItemKind(item.kind) : idx < runEnd) {
           if (!run) {
             let group = toolRuns.get(key);
+            if (!group && !incremental) {
+              for (let m = idx; m < runEnd && !group; m++) {
+                const memberKey = itemKey(entry.items[m], m);
+                for (const [oldKey, oldGroup] of toolRuns) {
+                  if (
+                    !wantedRuns.has(oldKey) &&
+                    oldGroup.memberKeys?.has(memberKey)
+                  ) {
+                    const discloseKey = "run:" + key;
+                    toolRuns.delete(oldKey);
+                    toolRuns.set(key, oldGroup);
+                    if (
+                      oldGroup.discloseKey &&
+                      oldGroup.discloseKey !== discloseKey &&
+                      entry.disclosures?.has(oldGroup.discloseKey)
+                    ) {
+                      entry.disclosures.set(
+                        discloseKey,
+                        entry.disclosures.get(oldGroup.discloseKey),
+                      );
+                      entry.disclosures.delete(oldGroup.discloseKey);
+                    }
+                    oldGroup.discloseKey = discloseKey;
+                    group = oldGroup;
+                    break;
+                  }
+                }
+              }
+            }
             if (!group) {
               const details = el("details", undefined, "chat-tool-run"),
                 summary = el("summary", undefined, "chat-tool-summary"),
                 body = el("div", undefined, "chat-tool-items");
-              rememberDetails(details, "run:" + key);
+              group = {
+                details,
+                summary,
+                body,
+                pairs: new Map(),
+                memberKeys: new Set(),
+                discloseKey: "run:" + key,
+              };
+              rememberDetails(details, () => group.discloseKey);
               details.append(summary, body);
-              group = { details, summary, body, pairs: new Map() };
               toolRuns.set(key, group);
+            } else {
+              group.memberKeys.clear();
             }
+            const nodeSet = new Set(),
+              activePairs = new Set();
+            group.activeNodes = nodeSet;
+            group.activePairs = activePairs;
             run = {
               ...group,
               key,
               nodes: [],
-              nodeSet: new Set(),
+              nodeSet,
+              activePairs,
               steps: new Map(),
               calls: new Map(),
               pending: [],
               pairs: group.pairs,
+              memberKeys: group.memberKeys,
               count: 0,
+              tools: 0,
+              thoughts: 0,
               errors: 0,
+              detail: "",
+              thoughtDetail: "",
             };
             wantedRuns.add(key);
             nodes.push(run.details);
           }
-          // Pair results by the wire tool ID, with ordered fallback for older transcripts.
-          const callId = item.call_id || item.tool_use_id || item.tool_id;
-          let pair;
-          if (item.kind === "tool_call") {
-            pair = run.pairs.get(key) || {
-              node: el("div", undefined, "chat-tool-pair"),
-              call: item,
-            };
-            run.pairs.set(key, pair);
-            run.pending.push(pair);
-            if (callId) run.calls.set(String(callId), pair);
-            run.count++;
-            run.detail = toolDetail(item) || run.detail;
-            const step = toolStep(item.tool_name);
-            run.steps.set(step, (run.steps.get(step) || 0) + 1);
+          run.memberKeys.add(key);
+          let node = card;
+          if (item.kind === "reasoning") {
+            run.thoughts++;
+            if (!run.count)
+              run.thoughtDetail =
+                firstNonEmptyLine(item.text) || run.thoughtDetail;
           } else {
-            pair = callId ? run.calls.get(String(callId)) : run.pending[0];
-            if (pair) {
-              const index = run.pending.indexOf(pair);
-              if (index >= 0) run.pending.splice(index, 1);
-              const summary = card.children?.[0]?.children?.[0];
-              if (summary)
-                summary.textContent = [
-                  t(item.is_error ? "Tool error" : "Tool output"),
-                  pair.call.tool_name,
-                  pair.call.title || pair.call.file_path,
-                ]
-                  .filter(Boolean)
-                  .join(" · ");
+            run.tools++;
+            // Pair results by the wire tool ID, with ordered fallback for older transcripts.
+            const callId = item.call_id || item.tool_use_id || item.tool_id;
+            let pair;
+            if (item.kind === "tool_call") {
+              pair = run.pairs.get(key) || {
+                node: el("div", undefined, "chat-tool-pair"),
+                call: item,
+              };
+              pair.call = item;
+              run.pairs.set(key, pair);
+              run.activePairs.add(key);
+              run.pending.push(pair);
+              if (callId) run.calls.set(String(callId), pair);
+              run.count++;
+              run.detail = toolDetail(item) || run.detail;
+              const step = toolStep(item.tool_name);
+              run.steps.set(step, (run.steps.get(step) || 0) + 1);
+            } else {
+              pair = callId ? run.calls.get(String(callId)) : run.pending[0];
+              if (pair) {
+                const index = run.pending.indexOf(pair);
+                if (index >= 0) run.pending.splice(index, 1);
+                const summary = card.children?.[0]?.children?.[0];
+                if (summary)
+                  summary.textContent = [
+                    t(item.is_error ? "Tool error" : "Tool output"),
+                    pair.call.tool_name,
+                    pair.call.title || pair.call.file_path,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ");
+              } else {
+                run.detail =
+                  toolDetail(item) || firstNonEmptyLine(item.text) || run.detail;
+              }
             }
-          }
-          const node = pair?.node || card;
-          if (pair) {
-            const at = pair.node.children?.[item.kind === "tool_call" ? 0 : 1];
-            if (at !== card) pair.node.insertBefore(card, at || null);
+            node = pair?.node || card;
+            if (pair) {
+              const at =
+                pair.node.children?.[item.kind === "tool_call" ? 0 : 1];
+              if (at !== card) pair.node.insertBefore(card, at || null);
+            }
+            if (item.is_error) run.errors++;
           }
           if (!run.nodeSet.has(node)) {
             run.nodeSet.add(node);
@@ -1824,18 +2021,23 @@
             const at = run.body.children?.[run.nodes.length - 1];
             if (at !== node) run.body.insertBefore(node, at || null);
           }
-          if (item.is_error) run.errors++;
           run.summary.textContent = [
-            run.errors || !run.count
-              ? t(run.errors ? "Tool error" : "Tool activity")
-              : "",
+            run.errors
+              ? t("Tool error")
+              : !run.count && run.tools
+                ? t("Tool activity")
+                : "",
             ...[...run.steps].map(([step, n]) => t(step, n)),
-            run.detail,
+            !run.tools && run.thoughts
+              ? t("Thought {0} time(s)", run.thoughts)
+              : "",
+            run.count ? run.detail : run.detail || run.thoughtDetail,
           ]
             .filter(Boolean)
             .join(" · ");
         } else {
           run = null;
+          runEnd = 0;
           nodes.push(card);
         }
       }
@@ -1856,12 +2058,15 @@
             group.details.remove();
             resize?.unobserve(group.details);
             toolRuns.delete(key);
-          } else
+          } else {
             for (const [callKey, pair] of group.pairs)
-              if (!wanted.has(callKey)) {
+              if (!group.activePairs?.has(callKey)) {
                 pair.node.remove();
                 group.pairs.delete(callKey);
               }
+            for (const child of Array.from(group.body.children || []))
+              if (!group.activeNodes?.has(child)) child.remove();
+          }
         }
       for (const [key, card] of cards)
         if (!incremental && !wanted.has(key)) {
@@ -1902,11 +2107,13 @@
       restoreReader(anchor);
     }
     function rememberDetails(node, key) {
-      node.open = entry.disclosures?.get(key) || false;
+      const resolve = () => (typeof key === "function" ? key() : key);
+      node.open = entry.disclosures?.get(resolve()) || false;
       node.addEventListener("toggle", () => {
+        const current = resolve();
         entry.disclosures ||= new Map();
-        if (node.open) entry.disclosures.set(key, true);
-        else entry.disclosures.delete(key);
+        if (node.open) entry.disclosures.set(current, true);
+        else entry.disclosures.delete(current);
       });
     }
     function lazyDetails(details, build) {
@@ -2263,7 +2470,7 @@
     }
     function clearTranscript() {
       prefetchedEarlier = null; fillPages = 0;
-      entry.composerStatus = null; entry.composerStatusAt = 0; statusFlight = null;
+      entry.composerStatus = null; entry.composerStatusAt = 0; entry.composerProbes = 0; statusFlight = null;
       entry.items = [];
       entry.retainedBytes = 0;
       entry.disclosures?.clear();
@@ -2547,6 +2754,9 @@
         if (retryWithoutTail) {
           retryWithoutTail = false;
           pollNow(initial);
+        } else if (pollQueued) {
+          pollQueued = false;
+          if (canReadEarlier() && !entry.loaded) pollNow();
         }
       }
     }
@@ -2668,15 +2878,20 @@
           ...previous,
         ];
         trimItems(filling);
-        const anchorKey =
-          anchor?.node.dataset.chatId ||
-          [...toolRuns].find(
-            ([, group]) => group.details === anchor?.node,
-          )?.[0];
+        const anchorGroup = [...toolRuns.values()].find(
+            (group) => group.details === anchor?.node,
+          ),
+          anchorKey = anchor?.node.dataset.chatId;
         // If the reader moved past the retained window, defer the prepend rather than evict their card.
         if (
-          anchorKey &&
-          !entry.items.some((item, index) => itemKey(item, index) === anchorKey)
+          anchorKey
+            ? !entry.items.some(
+                (item, index) => itemKey(item, index) === anchorKey,
+              )
+            : anchorGroup &&
+              !entry.items.some((item, index) =>
+                anchorGroup.memberKeys?.has(itemKey(item, index)),
+              )
         ) {
           entry.items = previous;
           entry.live = live;
@@ -2763,6 +2978,9 @@
         if (!canReadEarlier()) {
           earlierEpoch++;
           earlierQueued = false;
+          pollQueued = false;
+        } else if (inFlight && !entry.loaded && !entry.live) {
+          pollQueued = true;
         }
         if (picker && picker.scope !== scope()) closeSuggestions();
         updateStatus();
@@ -2774,6 +2992,7 @@
         syncDraft();
         earlierEpoch++;
         earlierQueued = false;
+        pollQueued = false;
         closeSuggestions();
         discovery.clear();
         discovering.clear();
@@ -2788,6 +3007,7 @@
         resize?.disconnect();
         pruneCache(state);
         clearTimeout(pollTimer);
+        clearTimeout(appliedTimer);
         pollTimer = null;
         if (entry.notifyComposer === updateComposer)
           entry.notifyComposer = null;

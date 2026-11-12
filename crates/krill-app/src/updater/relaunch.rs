@@ -50,8 +50,26 @@ pub fn localize_reason(reason: &str) -> String {
         let ms = ms.strip_suffix("ms").unwrap_or(ms);
         return text::REASON_NO_READY_SIGNAL.format(&[("ms", ms)]);
     }
-    if reason == "old app did not exit; replacement aborted" {
+    let io_detail = reason.strip_prefix("updater I/O error: ");
+    if reason == "old app did not exit; replacement aborted"
+        || io_detail == Some("old app did not exit; replacement aborted")
+    {
         return text::REASON_OLD_APP_LINGERING.get().to_owned();
+    }
+    if let Some(detail) = io_detail {
+        return text::UPDATE_ERR_IO.format(&[("detail", detail)]);
+    }
+    if let Some(detail) = reason.strip_prefix("updater config error: ") {
+        return text::UPDATE_ERR_CONFIG.format(&[("detail", detail)]);
+    }
+    if let Some(detail) = reason.strip_prefix("codesign verification failed: ") {
+        return text::UPDATE_ERR_CODESIGN.format(&[("detail", detail)]);
+    }
+    if let Some(detail) = reason.strip_prefix("invalid app bundle structure: ") {
+        return text::UPDATE_ERR_BUNDLE.format(&[("detail", detail)]);
+    }
+    if reason == "ed25519 signature verification failed" {
+        return text::UPDATE_ERR_SIGNATURE.get().to_owned();
     }
     reason.to_owned()
 }
@@ -164,15 +182,20 @@ pub(super) fn swap_with(
     }
     verifier.verify(&staging)?;
 
-    match mode {
-        Mode::InPlace if prev.exists() => fs::remove_dir_all(&prev)?,
-        Mode::InPlace => {}
+    let staged_entries = match mode {
+        Mode::InPlace => {
+            if prev.exists() {
+                fs::remove_dir_all(&prev)?;
+            }
+            Vec::new()
+        }
         Mode::Rename => {
-            rename::check_install_entries(app_bundle, &staging)?;
+            let entries = rename::list_staged_entries(&staging)?;
             rename::purge(&trash);
             rename::clear(&prev, &trash)?;
+            entries
         }
-    }
+    };
     let timeout_ms = u64::try_from(health_timeout.as_millis()).unwrap_or(u64::MAX);
     let mut journal = Journal {
         bundle: app_bundle.to_path_buf(),
@@ -192,7 +215,10 @@ pub(super) fn swap_with(
         }
         match mode {
             Mode::InPlace => sync_bundle_in_place(app_bundle, &prev)?,
-            Mode::Rename => rename::move_tree(app_bundle, &prev, &trash)?,
+            Mode::Rename => {
+                rename::save_staged_entries(&staged_entries_path(app_bundle), &staged_entries)?;
+                rename::move_managed(app_bundle, &staged_entries, &prev, &trash)?;
+            }
         }
         journal.stage = Stage::MovingStagingToTarget;
         journal.save(state_dir)?;
@@ -227,6 +253,9 @@ pub(super) fn swap_with(
             }
         } else if backup == Backup::Complete {
             return Err(error);
+        }
+        if backup == Backup::Partial {
+            fs::remove_file(staged_entries_path(app_bundle)).ok();
         }
         journal.stage = Stage::RolledBack {
             reason: error.to_string(),
@@ -325,13 +354,23 @@ pub fn recover_journal(state_dir: &Path) -> Result<Option<Journal>, Error> {
 }
 
 pub(super) fn recover_with(mode: Mode, state_dir: &Path) -> Result<Option<Journal>, Error> {
-    let Some(mut journal) = Journal::load(state_dir)? else {
+    let Some(journal) = Journal::load(state_dir)? else {
         return Ok(None);
     };
     if matches!(
         journal.stage,
         Stage::MovingToPrev | Stage::MovingStagingToTarget
     ) {
+        let _lock = staging_lock(&journal.bundle)?;
+        let Some(mut journal) = Journal::load(state_dir)? else {
+            return Ok(None);
+        };
+        if !matches!(
+            journal.stage,
+            Stage::MovingToPrev | Stage::MovingStagingToTarget
+        ) {
+            return Ok(Some(journal));
+        }
         let staging = staging_path(&journal.bundle);
         let prev = prev_path(&journal.bundle);
         if mode == Mode::Rename {
@@ -339,7 +378,9 @@ pub(super) fn recover_with(mode: Mode, state_dir: &Path) -> Result<Option<Journa
             if journal.stage == Stage::MovingToPrev {
                 if prev.exists() {
                     rename::move_tree(&prev, &journal.bundle, &trash)?;
+                    fs::remove_dir_all(&prev).ok();
                 }
+                fs::remove_file(staged_entries_path(&journal.bundle)).ok();
                 fs::remove_file(journal_path(state_dir)).ok();
                 return Ok(None);
             }
@@ -426,6 +467,7 @@ pub(super) fn rollback_with(
     state_dir: &Path,
     reason: &str,
 ) -> Result<(), Error> {
+    let _lock = staging_lock(app_bundle)?;
     // `.prev`가 완결된 백업이라는 증거는 저널 단계뿐이다(`MovingStagingToTarget` 이후 단계는 백업이 끝난
     // 뒤에만 저장된다). 저널이 없거나 읽을 수 없으면 백업 상태를 추정하지 않고 번들·`.prev`를 건드리지
     // 않는다. 없음을 완결로 보면 중단된 백업의 불완전한 `.prev`가 아직 복사되지 않은 원본을 지운다(APP-F02).
@@ -453,13 +495,15 @@ fn rollback_from(
     let partial = backup == Backup::Partial;
     if mode == Mode::Rename {
         // 설치 폴더에 남은 것은 아직 안 옮긴 구 파일이라 지우지 않는다.
-        // 그 뒤 단계면 설치 폴더의 파일은 새 버전이므로 치우고 구 파일을 되돌린다.
+        // 그 뒤 단계면 설치 폴더의 Krill 관리 파일만 치우고(사용자·백업 파일은 보존) 구 파일을 되돌린다.
         let trash = trash_path(app_bundle);
+        let staged_entries = staged_entries_path(app_bundle);
         if !partial {
-            rename::clear(app_bundle, &trash)?;
+            rename::clear_managed(app_bundle, &prev, &staged_entries, &trash)?;
         }
         rename::move_tree(&prev, app_bundle, &trash)?;
         fs::remove_dir_all(&prev).ok();
+        fs::remove_file(staged_entries).ok();
     } else if partial && app_bundle.exists() {
         // 불완전한 `.prev`를 번들에 동기화하면 아직 백업되지 않은 원본 파일이 prune으로 지워진다.
         // 번들은 그대로 두고 백업만 버린다.
@@ -699,6 +743,8 @@ pub fn maybe_run_relauncher_cli() -> Option<ExitCode> {
     if args.next().is_none_or(|a| a != RELAUNCH_ARG) {
         return None;
     }
+    // The old app has already quit, so this log is the only place a failure reason can surface.
+    krill_log::init(krill_log::Component::App).ok();
     let code = match run_relauncher_args(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -738,19 +784,52 @@ pub(super) fn run_relauncher_args(
         .and_then(|s| s.into_string().ok())
         .and_then(|s| s.parse().ok());
 
-    let cfg = Config::load_for_bundle(&state_dir, Some(&bundle))?;
-    let _ = cfg.public_key_bytes()?;
-    let verifier = CodesignVerifier::from_config(&cfg);
-    let _outcome = relaunch_and_verify(
-        &bundle,
-        &state_dir,
-        &from,
-        &to,
-        wait_pid,
-        Duration::from_millis(timeout_ms),
-        &verifier,
-    )?;
-    Ok(())
+    let before = Journal::load(&state_dir).ok().flatten();
+    let result = Config::load_for_bundle(&state_dir, Some(&bundle)).and_then(|cfg| {
+        cfg.public_key_bytes()?;
+        relaunch_and_verify(
+            &bundle,
+            &state_dir,
+            &from,
+            &to,
+            wait_pid,
+            Duration::from_millis(timeout_ms),
+            &CodesignVerifier::from_config(&cfg),
+        )
+    });
+    if let Err(error) = &result {
+        let failed = Journal {
+            bundle: bundle.clone(),
+            from_version: from,
+            to_version: to,
+            health_timeout_ms: timeout_ms,
+            stage: Stage::RolledBack {
+                reason: error.to_string(),
+            },
+        };
+        recover_failed_relaunch(&state_dir, &failed, before.as_ref(), wait_pid);
+    }
+    result.map(|_| ())
+}
+
+/// The update button quits the app before this helper runs, so a failure here
+/// must never leave the user with no app and no explanation. When the swap never
+/// started, the bundle is untouched: record the failure as a rollback so the next
+/// launch explains it and stops re-offering this version, then reopen the old app
+/// unless it is still alive.
+fn recover_failed_relaunch(
+    state_dir: &Path,
+    failed: &Journal,
+    before: Option<&Journal>,
+    old_pid: Option<u32>,
+) {
+    if Journal::load(state_dir).ok().flatten().as_ref() == before {
+        failed.save(state_dir).ok();
+    }
+    let old_app_alive = old_pid.is_some_and(|pid| wait_process_exit(pid, Duration::ZERO).is_err());
+    if !old_app_alive && let Err(error) = spawn_bundle_app(&failed.bundle, state_dir, None) {
+        tracing::error!(%error, "could not reopen the app after a failed update");
+    }
 }
 
 /// 앱이 창과 데몬 연결을 준비한 직후 호출해 relauncher에 정상 기동 신호(`ready`)를 보낸다.
@@ -790,15 +869,20 @@ fn verified_marker(app_bundle: &Path) -> PathBuf {
     append_ext(app_bundle, "staging.verified")
 }
 
+fn staged_entries_path(app_bundle: &Path) -> PathBuf {
+    append_ext(app_bundle, "prev.entries")
+}
+
 /// 앞선 실행에서 확정(Healthy)된 업데이트의 `.prev` 백업과 소비된 스테이징의 검증 표식을 치운다.
 /// Healthy 뒤로 `.prev`는 롤백 원천이 아니다. 확정한 그 실행에서는 구 krilld·krill-link가 `.prev`의 이미지로
 /// 아직 돌 수 있어 다음 실행까지 둔다. 못 지운 것(Windows 실행 중 파일)은 `.trash`로 옮기거나 다음 실행에 다시 본다.
 pub(super) fn discard_confirmed_backup(mode: Mode, state_dir: &Path, confirmed: &Journal) {
     let bundle = &confirmed.bundle;
     let prev = prev_path(bundle);
+    let prev_entries = staged_entries_path(bundle);
     let marker = verified_marker(bundle);
     let staging = staging_path(bundle);
-    if !prev.exists() && (staging.exists() || !marker.exists()) {
+    if !prev.exists() && !prev_entries.exists() && (staging.exists() || !marker.exists()) {
         return;
     }
     let Ok(_lock) = staging_lock(bundle) else {
@@ -811,6 +895,7 @@ pub(super) fn discard_confirmed_backup(mode: Mode, state_dir: &Path, confirmed: 
     if !staging.exists() {
         fs::remove_file(&marker).ok();
     }
+    fs::remove_file(&prev_entries).ok();
     let result = match mode {
         Mode::InPlace => fs::remove_dir_all(&prev),
         Mode::Rename => {
@@ -1048,6 +1133,7 @@ mod backup_cleanup_tests {
         fs::write(prev.join("sub").join("krilld.exe"), b"old").unwrap();
         fs::write(prev.join("krill-link.exe"), b"old").unwrap();
         fs::write(verified_marker(&bundle), b"[]").unwrap();
+        fs::write(staged_entries_path(&bundle), b"[\"krill-app.exe\"]").unwrap();
         Journal {
             bundle: bundle.clone(),
             from_version: "0.1.0".to_owned(),
@@ -1085,7 +1171,61 @@ mod backup_cleanup_tests {
         mark_ready(&state, "0.2.0");
         assert!(!prev.exists());
         assert!(!verified_marker(&bundle).exists());
+        assert!(!staged_entries_path(&bundle).exists());
         assert!(bundle.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recover_waits_for_staging_lock_and_reloads_journal_after_concurrent_swap() {
+        let root = std::env::temp_dir().join(format!("krill-recover-lock-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let bundle = root.join("Krill.app");
+        let state = root.join("state");
+        let prev = prev_path(&bundle);
+        fs::create_dir_all(&bundle).unwrap();
+        fs::create_dir_all(&prev).unwrap();
+        fs::write(bundle.join("version"), b"0.2.0").unwrap();
+        fs::write(prev.join("version"), b"0.1.0").unwrap();
+        Journal {
+            bundle: bundle.clone(),
+            from_version: "0.1.0".to_owned(),
+            to_version: "0.2.0".to_owned(),
+            health_timeout_ms: 5_000,
+            stage: Stage::MovingToPrev,
+        }
+        .save(&state)
+        .unwrap();
+
+        let lock = staging_lock(&bundle).unwrap();
+        let state_bg = state.clone();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            recover_with(MODE, &state_bg)
+        });
+        ready.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+
+        // Simulate the in-flight swap completing while holding `staging_lock`.
+        Journal {
+            bundle: bundle.clone(),
+            from_version: "0.1.0".to_owned(),
+            to_version: "0.2.0".to_owned(),
+            health_timeout_ms: 5_000,
+            stage: Stage::VerifyingLaunch,
+        }
+        .save(&state)
+        .unwrap();
+        drop(lock);
+
+        let recovered = waiter.join().unwrap().unwrap().unwrap();
+        assert_eq!(recovered.stage, Stage::VerifyingLaunch);
+        assert!(
+            prev.join("version").exists(),
+            ".prev backup must remain intact"
+        );
+        assert_eq!(fs::read(bundle.join("version")).unwrap(), b"0.2.0");
         fs::remove_dir_all(root).unwrap();
     }
 }

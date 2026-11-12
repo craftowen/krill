@@ -2037,6 +2037,69 @@ fn info_plist_zero_config_stages_and_loads_without_updater_toml() {
     server.join().ok();
 }
 
+/// The update button quits the app before the relauncher swaps anything. A failure
+/// before the swap must reopen the untouched app and leave a rollback the next launch
+/// explains, instead of silently leaving the user with no app.
+#[test]
+fn relauncher_failure_before_swap_reopens_the_app_and_records_why() {
+    let root = temp_dir("relaunch-strand");
+    let _guard = TempGuard(root.clone());
+    let app = root.join("Krill.app");
+    let state = root.join("state");
+    let reopened = root.join("reopened");
+    build_test_app_bundle(
+        &app,
+        "0.1.0",
+        &format!("touch '{}'", reopened.display()),
+        false,
+    );
+    fs::create_dir_all(&state).unwrap();
+    let (_kp, pk) = fresh_key();
+    fs::write(
+        state.join(CONFIG_FILE),
+        format!("public_key = \"{}\"\n", encode_hex(&pk)),
+    )
+    .unwrap();
+    // A previous update was confirmed; this attempt's payload is gone before the swap.
+    let healthy = Journal {
+        bundle: app.clone(),
+        from_version: "0.0.9".into(),
+        to_version: "0.1.0".into(),
+        health_timeout_ms: 1000,
+        stage: Stage::Healthy,
+    };
+    healthy.save(&state).unwrap();
+
+    let result = relaunch::run_relauncher_args(
+        [
+            app.to_string_lossy().as_ref(),
+            state.to_string_lossy().as_ref(),
+            "0.1.0",
+            "0.2.0",
+            "1000",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from),
+    );
+
+    assert!(result.is_err(), "{result:?}");
+    let journal = Journal::load(&state).unwrap().expect("journal");
+    assert_eq!(
+        (journal.from_version.as_str(), journal.to_version.as_str()),
+        ("0.1.0", "0.2.0")
+    );
+    assert!(
+        matches!(journal.stage, Stage::RolledBack { .. }),
+        "{journal:?}"
+    );
+    assert_eq!(bundle_short_version(&app).as_deref(), Some("0.1.0"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !reopened.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(reopened.exists(), "the old app must be reopened");
+}
+
 #[test]
 fn github_release_asset_url_parsing_and_gh_fallback() {
     assert_eq!(
@@ -2206,6 +2269,27 @@ fn owe883_localize_reason_maps_known_english_reasons() {
         relaunch::localize_reason("old app did not exit; replacement aborted"),
         "이전 앱이 종료되지 않아 교체 중단됨"
     );
+    assert_eq!(
+        relaunch::localize_reason("updater I/O error: old app did not exit; replacement aborted"),
+        "이전 앱이 종료되지 않아 교체 중단됨"
+    );
+    let io_err = relaunch::localize_reason("updater I/O error: access is denied");
+    assert!(io_err.contains("access is denied"), "{io_err}");
+    assert!(!io_err.contains("updater I/O error"), "{io_err}");
+    let cfg_err = relaunch::localize_reason("updater config error: bad key");
+    assert!(cfg_err.contains("bad key"), "{cfg_err}");
+    assert!(!cfg_err.contains("updater config error"), "{cfg_err}");
+    let cs_err = relaunch::localize_reason("codesign verification failed: unsigned");
+    assert!(cs_err.contains("unsigned"), "{cs_err}");
+    assert!(!cs_err.contains("codesign verification failed"), "{cs_err}");
+    let bundle_err = relaunch::localize_reason("invalid app bundle structure: missing krill.exe");
+    assert!(bundle_err.contains("missing krill.exe"), "{bundle_err}");
+    assert!(
+        !bundle_err.contains("invalid app bundle structure"),
+        "{bundle_err}"
+    );
+    let sig_err = relaunch::localize_reason("ed25519 signature verification failed");
+    assert!(!sig_err.contains("ed25519"), "{sig_err}");
     let exited = relaunch::localize_reason("new app exited before ready (exit status: 1)");
     assert!(exited.contains("exit status: 1"), "{exited}");
     assert!(!exited.contains("new app exited before ready"), "{exited}");
@@ -2326,18 +2410,107 @@ mod rename_mode {
     }
 
     #[test]
-    fn updater_rename_refuses_unknown_files_in_install_dir() {
-        let d = TempGuard(temp_dir("rename-unknown"));
+    fn updater_rename_preserves_unmanaged_and_backup_files() {
+        let d = TempGuard(temp_dir("rename-unmanaged"));
         let state = d.0.join("state");
         let (install, staging) = layout(&d.0);
+        write(&install, "krill.exe.bak", "manual backup");
         write(&install, "notes.txt", "user data");
+        write(&install, "custom-dir/keep.txt", "keep");
+        write(&install, "THIRD_PARTY_NOTICES.TXT", "old-notice");
+        write(&staging, "future-helper.exe", "new-helper");
 
-        let err = swap(&install, &state).unwrap_err();
-        assert!(err.to_string().contains("notes.txt"), "{err}");
+        let journal = swap(&install, &state).unwrap();
+        assert_eq!(journal.stage, Stage::VerifyingLaunch);
+        assert!(!staging.exists());
+        assert_eq!(
+            read(&install, "krill.exe.bak").as_deref(),
+            Some("manual backup")
+        );
         assert_eq!(read(&install, "notes.txt").as_deref(), Some("user data"));
+        assert_eq!(
+            read(&install, "custom-dir/keep.txt").as_deref(),
+            Some("keep")
+        );
+        assert_eq!(
+            read(&install, "future-helper.exe").as_deref(),
+            Some("new-helper")
+        );
+        assert_eq!(read(&install, "krill-app.exe").as_deref(), Some("new"));
+        assert!(
+            !install.read_dir().unwrap().flatten().any(|e| e
+                .file_name()
+                .eq_ignore_ascii_case("THIRD_PARTY_NOTICES.txt")),
+            "known entry removed from new release must move to .prev even with uppercase name"
+        );
+        assert_eq!(read(&prev_path(&install), "krill.exe.bak"), None);
+        assert_eq!(read(&prev_path(&install), "notes.txt"), None);
+        assert!(!prev_path(&install).join("custom-dir").exists());
+
+        // 롤백 시에도 백업·사용자 파일은 그대로 남고, KNOWN_ENTRIES 밖 신규 스테이징 파일은 지워진다.
+        rollback_with(Mode::Rename, &install, &state, "health").unwrap();
+        assert_eq!(
+            read(&install, "krill.exe.bak").as_deref(),
+            Some("manual backup")
+        );
+        assert_eq!(read(&install, "notes.txt").as_deref(), Some("user data"));
+        assert_eq!(
+            read(&install, "custom-dir/keep.txt").as_deref(),
+            Some("keep")
+        );
+        assert_eq!(
+            read(&install, "future-helper.exe"),
+            None,
+            "staged file outside KNOWN_ENTRIES must be removed on rollback"
+        );
         assert_eq!(read(&install, "krill-app.exe").as_deref(), Some("old"));
-        assert!(staging.exists());
-        assert!(Journal::load(&state).unwrap().is_none());
+        assert_eq!(
+            read(&install, "THIRD_PARTY_NOTICES.TXT").as_deref(),
+            Some("old-notice")
+        );
+        assert!(!prev_path(&install).exists());
+        assert!(!append_ext(&install, "prev.entries").exists());
+
+        // 다시 업데이트해 Healthy 확정 후 백업 정리가 돌아도 백업·사용자 파일은 보존된다.
+        let (_, staging2) = layout(&d.0.join("restage"));
+        rename::move_tree(&staging2, &staging, &trash_path(&install)).unwrap();
+        let mut confirmed = swap(&install, &state).unwrap();
+        confirmed.stage = Stage::Healthy;
+        confirmed.save(&state).unwrap();
+        relaunch::discard_confirmed_backup(Mode::Rename, &state, &confirmed);
+        assert!(!prev_path(&install).exists());
+        assert!(!append_ext(&install, "prev.entries").exists());
+        assert_eq!(
+            read(&install, "krill.exe.bak").as_deref(),
+            Some("manual backup")
+        );
+        assert_eq!(read(&install, "notes.txt").as_deref(), Some("user data"));
+        assert_eq!(
+            read(&install, "custom-dir/keep.txt").as_deref(),
+            Some("keep")
+        );
+        assert_eq!(read(&install, "krill-app.exe").as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn updater_rename_known_entries_cover_windows_bundle_layout() {
+        for expected in [
+            "Krill.json",
+            "krill-app.exe",
+            "krill.exe",
+            "krilld.exe",
+            "krill-holder.exe",
+            "krill-link.exe",
+            "conpty.dll",
+            "x64",
+            "arm64",
+            "THIRD_PARTY_NOTICES.txt",
+        ] {
+            assert!(
+                rename::KNOWN_ENTRIES.contains(&expected),
+                "missing {expected} in KNOWN_ENTRIES"
+            );
+        }
     }
 
     #[test]
@@ -2900,4 +3073,53 @@ fn stage_publish_tmp_and_non_ascii_bundle_temp_cleanup() {
         !append_ext(&blocked_bundle, "staging.incoming").exists(),
         "failed write_stage_marker must remove staging.incoming"
     );
+}
+
+#[test]
+fn fetch_bytes_falls_back_to_gh_on_curl_timeout_and_suppresses_timeout_telemetry() {
+    let gh_url = "https://github.com/acme/krill/releases/latest/download/latest.json";
+    let bytes = fetch_bytes_with(
+        gh_url,
+        1024,
+        |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "command timed out; result may be unknown",
+            ))
+        },
+        |repo, tag, asset, max_bytes| {
+            assert_eq!(repo, "acme/krill");
+            assert_eq!(tag, None);
+            assert_eq!(asset, "latest.json");
+            assert_eq!(max_bytes, 1024);
+            Ok(b"{\"version\":\"0.4.0\"}".to_vec())
+        },
+    )
+    .unwrap();
+    assert_eq!(bytes, b"{\"version\":\"0.4.0\"}");
+
+    let err = fetch_bytes_with(
+        gh_url,
+        1024,
+        |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "command timed out; result may be unknown",
+            ))
+        },
+        |_, _, _, _| Err(Error::Http("gh CLI not found".to_owned())),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::Http(_)),
+        "expected Error::Http, got {err:?}"
+    );
+    assert!(!should_report_update_failure(&err));
+
+    let download_timeout = Error::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "download command timed out",
+    ));
+    assert!(!should_report_update_failure(&download_timeout));
+    assert!(should_report_update_failure(&Error::BadSignature));
 }

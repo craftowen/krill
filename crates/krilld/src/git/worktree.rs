@@ -578,12 +578,32 @@ pub(crate) fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
     if let Some(d) = file.parent() {
         fs::create_dir_all(d)?;
     }
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(file)?
-        .write_all(format!("{}\n", hex(hash)).as_bytes())
+    let mut content = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&hex(hash));
+    content.push('\n');
+    let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
+    let write_result = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        drop(f);
+        fs::rename(&tmp, file)
+    })();
+    if write_result.is_err() {
+        fs::remove_file(&tmp).ok();
+    }
+    write_result
 }
 
 /// `state_dir/setup-trust`에 `(top, script)` SHA-256 해시가 승인돼 있거나
@@ -1041,4 +1061,25 @@ fn worktree_root_uses_the_profile_when_home_is_unset() {
         root_in(profile),
         Ok(PathBuf::from(r"C:\Users\u").join("Krill/worktrees"))
     );
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn remember_separates_entries_when_existing_trust_file_lacks_trailing_newline() {
+        let dir = std::env::temp_dir().join(format!("krill-setup-trust-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(TRUST_FILE);
+        let first = digest(Path::new("/tmp/repo-a"), "echo a");
+        let second = digest(Path::new("/tmp/repo-b"), "echo b");
+        fs::write(&file, hex(&first)).unwrap();
+
+        remember(&file, &second).unwrap();
+        assert!(trusted(&file, &first).unwrap());
+        assert!(trusted(&file, &second).unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
 }

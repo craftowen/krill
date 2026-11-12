@@ -52,10 +52,16 @@ impl State {
 
     fn finish(&mut self, tap: &Tap) -> io::Result<()> {
         // 이미 쓴 종료 표지의 접두사는 반복하지 않는다.
-        if self.paste {
-            write_all(tap, END.get(self.matched..).unwrap_or(END), None, self)?;
-        }
-        Ok(())
+        let result = if self.paste {
+            write_all(tap, END.get(self.matched..).unwrap_or(END), None, self)
+        } else {
+            Ok(())
+        };
+        self.paste = false;
+        self.matched = 0;
+        self.owner = None;
+        self.peer = None;
+        result
     }
 }
 
@@ -173,7 +179,12 @@ fn write_all(
 
 #[cfg(unix)]
 fn write_once(tap: &Tap, bytes: &[u8]) -> io::Result<usize> {
-    write(&tap.0.master, bytes).map_err(io::Error::from)
+    loop {
+        match write(&tap.0.master, bytes) {
+            Err(Errno::INTR) => {}
+            other => return other.map_err(io::Error::from),
+        }
+    }
 }
 
 /// A short local CLI command, serialized with every other writer. The caller must recognize
@@ -245,7 +256,14 @@ fn write_command(
     };
     // The screen authority and the first write share the live lock; a resize/output cannot
     // invalidate the inspected empty composer before these bytes enter the PTY.
-    let written = write_once(tap, &bytes)?;
+    let written = match write_once(tap, &bytes) {
+        Ok(written) => written,
+        Err(err) => {
+            state.matched = 0;
+            state.owner = None;
+            return Err(err);
+        }
+    };
     state.record(bytes.get(..written).unwrap_or_default());
     state.owner = Some(thread::current().id());
     live.input_since_done = true;
@@ -258,6 +276,7 @@ fn write_command(
             "Command delivery was partial; no Enter was sent",
         ));
     }
+    state.owner = None;
     // Codex coalesces fast text+Enter as paste. Wait for its actual echo, without allowing
     // another user's input to be interleaved between text and submission.
     let started = std::time::Instant::now();
@@ -354,3 +373,86 @@ pub(super) fn finish_input(tap: &Tap) {
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod prefix_recovery_tests {
+    use super::*;
+    use crate::appearance::Appearance;
+    use crate::session::{Session, lock};
+    use krill_proto::{SessionId, holder::WinSize};
+    use std::io::{Read as _, Write as _};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[test]
+    fn partial_paste_prefix_finish_resets_matched_and_unblocks_write_command() {
+        let pty = rustix_openpty::openpty(None, None).unwrap();
+        let mut termios = rustix::termios::tcgetattr(&pty.user).unwrap();
+        termios.make_raw();
+        rustix::termios::tcsetattr(&pty.user, rustix::termios::OptionalActions::Now, &termios)
+            .unwrap();
+        rustix::fs::fcntl_setfl(
+            &pty.user,
+            rustix::fs::fcntl_getfl(&pty.user).unwrap() | rustix::fs::OFlags::NONBLOCK,
+        )
+        .unwrap();
+        let session = Session::start(
+            SessionId(92),
+            pty.controller,
+            WinSize { cols: 80, rows: 24 },
+            Arc::new(Appearance::load(PathBuf::new())),
+            None,
+        )
+        .unwrap();
+        let mut user = std::fs::File::from(pty.user);
+        user.write_all(b"EMPTY").unwrap();
+        let started = Instant::now();
+        while !session.screen_text().contains("EMPTY") {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let tap = session.tap();
+        {
+            let mut state = lock(&tap.0.input);
+            state.record(b"\x1b[20");
+            assert!(!state.paste);
+            assert_eq!(state.matched, 4);
+            state.owner = Some(thread::current().id());
+            state.finish(&tap).unwrap();
+            assert!(!state.paste);
+            assert_eq!(state.matched, 0);
+            assert!(state.owner.is_none());
+        }
+
+        let writer = tap.clone();
+        let command = b"/model actual";
+        let worker = thread::spawn(move || {
+            streaming_command(&writer, command, |s, pasted| {
+                let text: String = s.rows.iter().flatten().map(|c| c.ch).collect();
+                text.contains(if pasted { "/model actual" } else { "EMPTY" })
+            })
+        });
+        let mut received = Vec::new();
+        let read_started = Instant::now();
+        while received.len() < command.len() {
+            let mut chunk = [0u8; 64];
+            match user.read(&mut chunk) {
+                Ok(n) => received.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                other => {
+                    assert!(matches!(other, Ok(0)), "unexpected PTY read: {other:?}");
+                }
+            }
+            assert!(read_started.elapsed() < Duration::from_secs(3));
+        }
+        assert_eq!(received, command);
+        user.write_all(b"\x1b[2J\x1b[H/model actual").unwrap();
+        worker.join().unwrap().unwrap();
+        drop(user);
+        session.wait().unwrap();
+    }
+}

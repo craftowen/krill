@@ -365,7 +365,8 @@ impl Schedules {
                     attempts = attempts.saturating_add(1);
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                Err(e) => return Err(io::Error::other(e)),
+                Err(fs::TryLockError::WouldBlock) => return Err(io::ErrorKind::WouldBlock.into()),
+                Err(fs::TryLockError::Error(e)) => return Err(e),
             }
         }
     }

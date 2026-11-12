@@ -102,6 +102,20 @@ class HookTests(unittest.TestCase):
                         "--format=%(refname)").stdout.splitlines()
         self.assertEqual(refs, ["refs/tags/v0.1.0"])
 
+    def test_commits_on_main_are_refused_but_other_branches_commit(self):
+        shutil.copy2(ROOT / "scripts/hooks/pre-commit", self.work / "scripts/hooks/pre-commit")
+        (self.work / "change").write_text("work\n")
+        self.git(self.work, "add", "change")
+        blocked = subprocess.run(["git", "commit", "-qm", "on main"], cwd=self.work,
+                                 env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("main 브랜치에는 커밋하지 않는다", blocked.stderr)
+        self.git(self.work, "checkout", "-q", "-b", "feature")
+        self.git(self.work, "commit", "-qm", "on a work branch")
+        self.git(self.work, "checkout", "-q", "--detach")
+        (self.work / "change").write_text("detached\n")
+        self.git(self.work, "commit", "-qam", "detached release candidate")
+
     def test_feature_branch_needs_no_protected_ref_reason(self):
         result = self.push("refs/heads/feature")
         self.assertEqual(result.returncode, 0, result.stderr)

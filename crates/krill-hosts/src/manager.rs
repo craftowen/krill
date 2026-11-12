@@ -522,10 +522,6 @@ impl HostManager {
             s.tunnel = None;
         }
 
-        if let Some(t) = &s.tunnel {
-            return Ok(t.socket().to_path_buf());
-        }
-
         if let Some(until) = s.next_retry_at {
             if Instant::now() < until {
                 return Err(io::Error::new(
@@ -537,6 +533,10 @@ impl HostManager {
             }
             s.next_retry_at = None;
             s.status = HostStatus::Connecting;
+        }
+
+        if let Some(t) = &s.tunnel {
+            return Ok(t.socket().to_path_buf());
         }
 
         let key = self.offline_key(&s.spec);
@@ -658,7 +658,8 @@ impl HostManager {
         {
             s.tunnel = None;
         }
-        // 터널은 살았는데 원격 krilld에 닿지 못했다(원격 소켓 없음·데몬 죽음 → ssh가 채널을 닫음). 터널을 내려야
+        s.failures = s.failures.saturating_add(1);
+        // 터널은 살았는데 원격 krilld에 닿지 못했다(원격 소켓 없음·데몬 죽음·채널 시간 초과). 터널을 내려야
         // 다음 시도에서 원격 경로를 다시 찾고 데몬을 깨운다. 그대로 두면 앱을 재시작할 때까지 계속 실패했다.
         if err.is_some_and(|e| {
             matches!(
@@ -666,15 +667,14 @@ impl HostManager {
                 io::ErrorKind::UnexpectedEof
                     | io::ErrorKind::ConnectionReset
                     | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::TimedOut
             )
-        }) {
+        }) || s.failures >= OFFLINE_AFTER_FAILURES
+        {
             s.tunnel = None;
         }
-        s.failures = s.failures.saturating_add(1);
-        if s.tunnel.is_none() {
-            let delay = Self::backoff_delay(s.failures);
-            s.next_retry_at = Some(Instant::now() + delay);
-        }
+        let delay = Self::backoff_delay(s.failures);
+        s.next_retry_at = Some(Instant::now() + delay);
         if let Some(e) = err {
             s.last_error = Some(e.to_string());
         }
@@ -684,3 +684,55 @@ impl HostManager {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod timeout_backoff_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn timed_out_ipc_drops_live_tunnel_and_schedules_backoff() {
+        let dir = std::env::temp_dir().join(format!("m131-timeout-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ssh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $ARGV[0], Listen => 5) or exit 3; sleep 60' "${fwd%%:*}"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+        manager.sync_specs(&[RemoteHostSpec {
+            id: "studio".into(),
+            label: "Studio".into(),
+            address: "owen@studio.local".into(),
+            port: Some(2222),
+            identity_file: None,
+            remote_socket: Some("/tmp/remote.sock".into()),
+        }]);
+        manager.ensure_tunnel_socket("studio").unwrap();
+        assert!(manager.tunnel_pid("studio").is_some());
+
+        let timeout = io::Error::new(io::ErrorKind::TimedOut, "ServerHello timed out");
+        manager.record_ipc_outcome("studio", false, Some(&timeout));
+        assert_eq!(
+            manager.tunnel_pid("studio"),
+            None,
+            "TimedOut must drop the wedged tunnel"
+        );
+        assert_eq!(manager.status("studio"), HostStatus::Disconnected);
+        let retry_err = manager.ensure_tunnel_socket("studio").unwrap_err();
+        assert_eq!(retry_err.kind(), io::ErrorKind::WouldBlock);
+        drop(manager);
+        fs::remove_dir_all(&dir).ok();
+    }
+}

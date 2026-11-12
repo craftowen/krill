@@ -625,7 +625,7 @@ fn recovery_keeps_only_remaining_unconfirmed_replacement_without_publishing_comp
                 registry: &reg,
                 original: SessionId(7),
                 session: SessionId(8),
-                committed: false,
+                disposition: ReplacementDisposition::Unresolved,
             };
         }
         assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
@@ -661,8 +661,13 @@ fn explicit_cancel_accepts_pending_or_failed_live_original_and_preserves_untrack
     reg.cancel_failed_account_switch(session).unwrap();
     assert!(lock(&reg.account_work.pending).is_empty());
     assert!(lock(&reg.account_handoffs).is_empty());
-    lock(&reg.account_handoffs).insert(session, handoff);
-    lock(&reg.account_handoffs).get_mut(&session).unwrap().error = Some("fixture failed".into());
+    lock(&reg.account_handoffs).insert(
+        session,
+        SessionHandoff {
+            error: Some("fixture failed".into()),
+            ..handoff
+        },
+    );
     let peer = Peer {
         pid: None,
         scope: Scope::Full,
@@ -1293,6 +1298,175 @@ fn unconfirmed_replacement_retires_original_immediately_without_input() {
     reader_worker.join().unwrap();
     drop(reg);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn closing_a_session_cancels_its_queued_switch_and_stops_an_unconfirmed_replacement() {
+    for in_flight in [true, false] {
+        let root = Path::new("/tmp").join(format!(
+            "kas-close-queued-{}-{in_flight}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let home = root.join("home");
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(from.join("sessions/2026/10/28")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(to.join("auth.json"), "fixture credentials").unwrap();
+        let target = accounts::add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            "Selected",
+            None,
+            to.to_str().unwrap(),
+        )
+        .unwrap()
+        .accounts
+        .into_iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id;
+        let sid = "cccccccc-dddd-eeee-ffff-000000000001";
+        fs::write(
+            from.join(format!("sessions/2026/10/28/rollout-date-{sid}.jsonl")),
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
+        )
+        .unwrap();
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (master, _old_process) = UnixStream::pair().unwrap();
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let old = SessionId(31);
+        let reg = Arc::new(Registry::new(
+            Some((
+                holder,
+                vec![Kept {
+                    id: old,
+                    pid: 731,
+                    status: None,
+                    size: None,
+                    master: OwnedFd::from(master),
+                }],
+            )),
+            Some(&state),
+        ));
+        reg.agents
+            .remember_session(
+                old,
+                &AgentLaunch {
+                    profile: "codex".into(),
+                    permission: Permission::Yolo,
+                },
+                Some(sid.into()),
+                root.as_os_str().as_encoded_bytes().to_vec(),
+                Some(LaunchAccount {
+                    id: "codex-old".into(),
+                    env_key: "CODEX_HOME".into(),
+                    dir: from.display().to_string(),
+                }),
+            )
+            .unwrap();
+        reg.agents.mark_rate_limited(old);
+        let reader = Arc::clone(&reg);
+        let reader_worker =
+            std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let close_old = {
+            let reg = Arc::clone(&reg);
+            move || reg.close(&peer, old).unwrap()
+        };
+        let next_terminate = |link: &mut Link| loop {
+            let packet = link.recv().unwrap().unwrap();
+            match ToHolder::decode(packet.frame()).unwrap() {
+                ToHolder::Release { .. } => {}
+                ToHolder::Terminate { req, id } => {
+                    link.send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                        .unwrap();
+                    return id;
+                }
+                other => panic!("unexpected holder request: {other:?}"),
+            }
+        };
+
+        reg.queue_account_switch(ProviderKind::Codex, &target);
+        let mock = if in_flight {
+            let mock_reg = Arc::clone(&reg);
+            std::thread::spawn(move || {
+                let packet = holder_link.recv().unwrap().unwrap();
+                let ToHolder::Spawn { req, id: new, .. } =
+                    ToHolder::decode(packet.frame()).unwrap()
+                else {
+                    panic!("expected replacement spawn");
+                };
+                let (master, mut process) = UnixStream::pair().unwrap();
+                holder_link
+                    .send(
+                        &FromHolder::Spawned {
+                            req,
+                            id: new,
+                            pid: 831,
+                        }
+                        .encode()
+                        .unwrap(),
+                        &[master.as_fd()],
+                    )
+                    .unwrap();
+                let closer = std::thread::spawn(close_old);
+                // Cancelling lets the attempt stop its replacement before the close reaches the holder.
+                let first = next_terminate(&mut holder_link);
+                mock_reg.on_exited(first, 0);
+                process.write_all(b"Resuming session").ok();
+                let second = next_terminate(&mut holder_link);
+                mock_reg.on_exited(second, 0);
+                closer.join().unwrap();
+                let mut ended = [first, second];
+                ended.sort();
+                assert_eq!(ended, [old, new]);
+            })
+        } else {
+            let closer = std::thread::spawn(close_old);
+            assert_eq!(next_terminate(&mut holder_link), old);
+            closer.join().unwrap();
+            std::thread::spawn(move || drop(holder_link))
+        };
+
+        reg.process_account_work_in(&home);
+
+        let saved = load(Some(&state));
+        assert!(
+            !saved.contains_key(&old),
+            "in_flight={in_flight}: closed session keeps a switch record: {:?}",
+            saved.get(&old)
+        );
+        assert!(lock(&reg.account_work.pending).is_empty());
+        assert!(lock(&reg.account_replacements).is_empty());
+        mock.join().unwrap();
+        assert!(
+            !fs::read_dir(state.join("account-replacements"))
+                .is_ok_and(|mut journals| journals.next().is_some()),
+            "in_flight={in_flight}: replacement journal survived"
+        );
+        reader_worker.join().unwrap();
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 // Codex 0.166 shares `thread-writer-locks` across profiles. A resumed TUI that finds the
@@ -2388,7 +2562,7 @@ fn replacement_journals_are_independent_and_legacy_record_is_preserved() {
         registry: &reg,
         original: SessionId(7),
         session: SessionId(8),
-        committed: true,
+        disposition: ReplacementDisposition::Committed,
     });
     assert!(!replacement_journal(&root, SessionId(8)).exists());
     assert!(replacement_journal(&root, SessionId(9)).exists());
@@ -2626,7 +2800,7 @@ fn unreadable_replacement_evidence_is_preserved_and_blocks_new_spawns() {
         registry: &reg,
         original: SessionId(7),
         session: SessionId(8),
-        committed: false,
+        disposition: ReplacementDisposition::Unresolved,
     });
     assert!(path.exists());
     fs::remove_file(&path).unwrap();
@@ -2825,4 +2999,310 @@ fn stateless_registry_leaves_the_default_folder_account_records_alone() {
         "the default folder's handoff records were overwritten"
     );
     assert!(status.success());
+}
+
+#[test]
+fn dead_retained_replacement_handoff_is_hidden_and_pruned_preserving_session_id_floor() {
+    let root = std::env::temp_dir().join(format!("kas-retained-dead-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let retained = SessionHandoff {
+        from: SessionId(40_351),
+        to: None,
+        account_id: "codex-alpha".into(),
+        error: Some(
+            "Original session ended; unconfirmed replacement 40373 was retained. Select it explicitly to continue; held input was not sent"
+                .into(),
+        ),
+    };
+    accounts::write_atomic_0600(&root.join(FILE), &serde_json::to_vec(&[retained]).unwrap())
+        .unwrap();
+    assert!(!root.join("session-id-sequence.json").exists());
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (holder, _reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Registry::new(Some((holder, Vec::new())), Some(&root));
+
+    let mut snapshot = AccountsSnapshot::default();
+    reg.account_switch_snapshot(&mut snapshot);
+    assert!(
+        snapshot.details.handoffs.is_empty(),
+        "dead retained replacement handoff must be hidden: {:?}",
+        snapshot.details.handoffs
+    );
+
+    reg.recover_account_work(&home);
+    assert!(
+        load(Some(&root)).is_empty(),
+        "recover_account_work must prune dead retained handoff from account-handoffs.json"
+    );
+
+    let next = reg.reserve_session_id(None).unwrap();
+    assert!(
+        next >= SessionId(40_374),
+        "expected session ID >= 40374 after reserving retained 40373, got {next:?}"
+    );
+
+    drop(reg);
+    drop(holder_link);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_retained_replacement_clears_on_interactive_selection_replacement_close_or_manual_cancel() {
+    use krill_proto::control::Reply;
+    use krill_proto::ipc::{self, ClientRole, ServerHello};
+    use krill_proto::roles::{self, Role};
+    use krill_proto::screen::{Attach, Msg as _, Stream, kind as screen_kind};
+    use krill_proto::usage::{UsageReply, UsageRequest};
+
+    let attach_screen = |reg: &Arc<Registry>, role: Role, session: SessionId| {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let serving_reg = Arc::clone(reg);
+        let serving = std::thread::spawn(move || {
+            serving_reg.serve(
+                server,
+                &ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features: ipc::FEATURES,
+                    build: "test".into(),
+                    instance_id: 1,
+                },
+            )
+        });
+        ipc::read_frame(&mut client).unwrap().unwrap();
+        let hello = krill_proto::daemon::client_hello(ClientRole::App, "test");
+        client.write_all(&hello.encode().unwrap()).unwrap();
+        client
+            .write_all(&roles::Request::Set(role).encode().unwrap())
+            .unwrap();
+        let (ack_kind, ack_body) = ipc::read_frame(&mut client).unwrap().unwrap();
+        assert_eq!(
+            roles::Ack::decode(ack_kind, &ack_body).unwrap(),
+            roles::Ack::Applied
+        );
+        client
+            .write_all(
+                &Attach {
+                    session,
+                    stream: Stream::Screen { known: None },
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            ipc::read_frame(&mut client).unwrap().unwrap().0,
+            screen_kind::ATTACHED
+        );
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+    };
+
+    for mode in ["interactive_attach", "close_replacement", "manual_cancel"] {
+        let root =
+            std::env::temp_dir().join(format!("kas-retained-live-{}-{mode}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let retained = SessionHandoff {
+            from: SessionId(7),
+            to: None,
+            account_id: "codex-alpha".into(),
+            error: Some(
+                "Original session ended; unconfirmed replacement 8 was retained. Select it explicitly to continue; held input was not sent"
+                    .into(),
+            ),
+        };
+        accounts::write_atomic_0600(&root.join(FILE), &serde_json::to_vec(&[retained]).unwrap())
+            .unwrap();
+
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let pty = rustix_openpty::openpty(None, None).unwrap();
+        let _replacement_process = pty.user;
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let reg = Arc::new(Registry::new(
+            Some((
+                holder,
+                vec![Kept {
+                    id: SessionId(8),
+                    pid: 800,
+                    status: None,
+                    size: None,
+                    master: pty.controller,
+                }],
+            )),
+            Some(&root),
+        ));
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&reg);
+        let reader_worker = std::thread::spawn(move || {
+            reader.holder.as_ref().unwrap().run(link, |id, status| {
+                reader.on_exited(id, status);
+                exited_tx.send(id).ok();
+            });
+        });
+
+        let mut initial = AccountsSnapshot::default();
+        reg.account_switch_snapshot(&mut initial);
+        assert_eq!(initial.details.handoffs.len(), 1, "{mode}");
+        let handoff = initial.details.handoffs.first().unwrap();
+        assert_eq!(handoff.from, SessionId(7), "{mode}");
+        assert_eq!(handoff.to, None, "{mode}");
+        assert!(
+            handoff
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("retained")),
+            "{mode}"
+        );
+
+        attach_screen(&reg, Role::Observer, SessionId(8));
+        let mut after_observer = AccountsSnapshot::default();
+        reg.account_switch_snapshot(&mut after_observer);
+        assert_eq!(
+            after_observer.details.handoffs.len(),
+            1,
+            "observer attach must not clear retained handoff: {mode}"
+        );
+
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        match mode {
+            "interactive_attach" => {
+                attach_screen(&reg, Role::Interactive, SessionId(8));
+            }
+            "close_replacement" => {
+                let mock = std::thread::spawn(move || {
+                    let packet = holder_link.recv().unwrap().unwrap();
+                    let ToHolder::Terminate { req, id } = ToHolder::decode(packet.frame()).unwrap()
+                    else {
+                        panic!("expected Terminate for replacement 8");
+                    };
+                    assert_eq!(id, SessionId(8));
+                    holder_link
+                        .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                        .unwrap();
+                    holder_link
+                        .send(
+                            &FromHolder::Exited {
+                                id: SessionId(8),
+                                status: 0,
+                            }
+                            .encode()
+                            .unwrap(),
+                            &[],
+                        )
+                        .unwrap();
+                    let packet = holder_link.recv().unwrap().unwrap();
+                    let ToHolder::Release { id, .. } = ToHolder::decode(packet.frame()).unwrap()
+                    else {
+                        panic!("expected Release for replacement 8");
+                    };
+                    assert_eq!(id, SessionId(8));
+                    holder_link
+                });
+                assert_eq!(reg.close(&peer, SessionId(8)), Ok(Reply::Closed));
+                holder_link = mock.join().unwrap();
+                assert_eq!(
+                    exited_rx.recv_timeout(Duration::from_secs(3)),
+                    Ok(SessionId(8))
+                );
+            }
+            "manual_cancel" => {
+                let reply = reg.on_usage(
+                    &peer,
+                    Role::Interactive,
+                    UsageRequest::CancelAccountSwitch {
+                        session: SessionId(7),
+                    },
+                );
+                assert!(
+                    matches!(reply, UsageReply::Accounts(_)),
+                    "expected UsageReply::Accounts, got {reply:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        let mut cleared = AccountsSnapshot::default();
+        reg.account_switch_snapshot(&mut cleared);
+        assert!(
+            cleared.details.handoffs.is_empty(),
+            "expected cleared handoffs in snapshot for {mode}, got {:?}",
+            cleared.details.handoffs
+        );
+        assert!(
+            load(Some(&root)).is_empty(),
+            "expected cleared account-handoffs.json for {mode}"
+        );
+
+        drop(holder_link);
+        reader_worker.join().unwrap();
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn retained_replacement_disposition_unlinks_journal_only_when_persisted_without_stopping_session() {
+    let root = std::env::temp_dir().join(format!("kas-retained-disp-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let (reg, _process) = kept_fixture(&root, SessionId(8));
+    let journal = replacement_journal(&root, SessionId(8));
+    accounts::write_atomic_0600(&journal, b"fixture").unwrap();
+
+    lock(&reg.account_replacements).insert(SessionId(8));
+    drop(Replacement {
+        registry: &reg,
+        original: SessionId(7),
+        session: SessionId(8),
+        disposition: ReplacementDisposition::Retained { persisted: false },
+    });
+    assert!(journal.exists());
+    assert!(lock(&reg.state).sessions.contains_key(&SessionId(8)));
+    assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
+
+    lock(&reg.account_replacements).insert(SessionId(8));
+    drop(Replacement {
+        registry: &reg,
+        original: SessionId(7),
+        session: SessionId(8),
+        disposition: ReplacementDisposition::Retained { persisted: true },
+    });
+    assert!(!journal.exists());
+    assert!(lock(&reg.state).sessions.contains_key(&SessionId(8)));
+    assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
+
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
 }

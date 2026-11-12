@@ -3,9 +3,10 @@
 
 use krill_proto::os::net::UnixListener;
 use std::fs;
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use krill_proto::ipc::{self, ClientHello, ServerHello};
@@ -36,14 +37,16 @@ fn cli(root: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// The returned sender tells the server that the CLI has exited.
 fn fake(
     root: &Path,
     features: u64,
     expected: Option<UsageRequest>,
     reply: UsageReply,
-) -> std::thread::JoinHandle<()> {
+) -> (std::thread::JoinHandle<()>, mpsc::Sender<()>) {
     let listener = UnixListener::bind(root.join("run/krilld.sock")).unwrap();
-    std::thread::spawn(move || {
+    let (exited_tx, exited) = mpsc::channel();
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -63,15 +66,27 @@ fn fake(
             .unwrap();
         let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
         ClientHello::decode(kind, &body).unwrap();
-        let frame = ipc::read_frame(&mut stream).unwrap();
         if let Some(expected) = expected {
-            let (kind, body) = frame.unwrap();
+            let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
             assert_eq!(UsageRequest::decode(kind, &body).unwrap(), expected);
             stream.write_all(&reply.encode().unwrap()).unwrap();
         } else {
-            assert!(frame.is_none(), "미지원 피어에 요청을 보내면 안 된다");
+            // Windows can deliver the exited CLI's EOF late. Anything it sent is already queued,
+            // so the read timeout set above also means nothing was sent.
+            exited.recv().unwrap();
+            let frame = ipc::read_frame(&mut stream);
+            let silent = match &frame {
+                Ok(None) => true,
+                Err(e) => matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ),
+                Ok(Some(_)) => false,
+            };
+            assert!(silent, "미지원 피어에 요청을 보내면 안 된다: {frame:?}");
         }
-    })
+    });
+    (server, exited_tx)
 }
 
 #[test]
@@ -110,7 +125,7 @@ fn provisioning_on_off_status_and_json_use_daemon() {
         ),
     ] {
         let root = root(tag);
-        let server = fake(
+        let (server, _) = fake(
             &root,
             FEAT_USAGE | FEAT_USAGE_MANAGE,
             Some(request),
@@ -142,8 +157,9 @@ fn provisioning_on_off_status_and_json_use_daemon() {
 fn provisioning_refuses_old_peer_without_sending_request() {
     for action in ["on", "off", "status"] {
         let root = root(&format!("legacy-{action}"));
-        let server = fake(&root, FEAT_USAGE, None, UsageReply::Provisioning(false));
+        let (server, exited) = fake(&root, FEAT_USAGE, None, UsageReply::Provisioning(false));
         let output = cli(&root, &[action, "--json"]);
+        exited.send(()).unwrap();
         server.join().unwrap();
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("does not support"));
@@ -173,7 +189,7 @@ fn provisioning_without_daemon_errors_and_never_changes_local_file() {
 #[test]
 fn provisioning_reports_daemon_failure_and_rejects_bad_arguments() {
     let root = root("failure");
-    let server = fake(
+    let (server, _) = fake(
         &root,
         FEAT_USAGE | FEAT_USAGE_MANAGE,
         Some(UsageRequest::SetProvisioning(true)),

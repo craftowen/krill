@@ -1,9 +1,9 @@
 #![deny(clippy::indexing_slicing, clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 #[cfg(unix)]
 use std::fs::File;
-use std::io;
-use std::process::ExitCode;
+use std::{io, process::ExitCode};
 
 use krill_proto::daemon::DETACH_ARG;
 
@@ -37,7 +37,7 @@ fn detach() -> io::Result<()> {
     Ok(())
 }
 
-/// Windows: 콘솔 분리는 띄운 쪽의 `DETACHED_PROCESS` 생성 플래그가 맡는다(OWE-829).
+/// Windows: 콘솔 분리는 릴리스 `windows_subsystem`과 띄운 쪽의 `DETACHED_PROCESS` 플래그가 맡는다(OWE-829).
 #[cfg(windows)]
 fn detach() -> io::Result<()> {
     krill_holder::close_inherited()

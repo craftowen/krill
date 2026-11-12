@@ -48,8 +48,8 @@ fn port_cache_tracks_replaced_screens_and_removes_stale_urls() {
     assert!(cache.detect(42, &cleared).is_empty());
 }
 
-#[gpui::test]
-fn status_indicators_expose_status_role_and_label(cx: &mut TestAppContext) {
+#[test]
+fn status_indicators_expose_status_role_and_label() {
     let p = &krill_app::ui::DARK;
     let el = daemon_status_dot("daemon up".to_owned(), p.success);
     let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
@@ -57,8 +57,7 @@ fn status_indicators_expose_status_role_and_label(cx: &mut TestAppContext) {
     assert_eq!(gpui::Element::a11y_role(&el), Some(gpui::Role::Status));
     assert_eq!(node.label(), Some("daemon up"));
 
-    // 떼 미터를 붙여도 세션 수·알림 수 라벨은 그대로다.
-    let el = cx.update(|cx| usage_status(p, &[AgentState::Working; 3], 1, cx));
+    let el = usage_status(p, 3, 1);
     let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
     gpui::Element::write_a11y_info(&el, &mut node);
     assert_eq!(gpui::Element::a11y_role(&el), Some(gpui::Role::Status));
@@ -1492,6 +1491,7 @@ fn status_bar_right_items_render_compact_icons_and_show_hover_tooltips(cx: &mut 
         s.orch_snapshot = Arc::default();
         s.recording = krill_app::recording::Status::Unavailable;
         s.link = Link::Up;
+        s.ssh_hosts.clear();
         if let Some(pane) = s.layout.focused() {
             s.layout.set_session(pane, SessionId(1));
         }
@@ -1502,6 +1502,26 @@ fn status_bar_right_items_render_compact_icons_and_show_hover_tooltips(cx: &mut 
     let vcx = &mut VisualTestContext::from_window(handle, cx);
 
     // 아이콘 전용·점 전용 항목은 텍스트 라벨 없이 좁은 폭(≤ 32px)으로 축약되어야 한다.
+    // 0이거나 정상인 카운터는 그리지 않는다.
+    for hidden in [
+        "status-daemon",
+        "status-needs-you",
+        "status-ports-menu",
+        "status-ssh-switcher",
+    ] {
+        assert!(
+            vcx.debug_bounds(hidden).is_none(),
+            "{hidden} must hide at zero"
+        );
+    }
+    vcx.update(|_, cx| {
+        shell.update(cx, |s, cx| {
+            s.link = Link::Connecting;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+
     for icon_only_id in [
         "status-recording-warning",
         "status-daemon",
@@ -1520,12 +1540,8 @@ fn status_bar_right_items_render_compact_icons_and_show_hover_tooltips(cx: &mut 
         );
     }
     assert!(vcx.debug_bounds("status-sessions").is_some());
-    assert!(vcx.debug_bounds("status-needs-you").is_some());
 
-    let ssh_count = vcx.read(|cx| shell.read(cx).ssh_hosts.len().to_string());
-    let ssh_full = text::SSH_MENU_BTN.format(&[("count", &ssh_count)]);
     let orch_full = text::ORCH_MENU_BTN.format(&[("runs", "0"), ("tasks", "0")]);
-    let ports_full = text::PORTS_MENU_BTN.format(&[("count", "0")]);
     let checks_warn = krill_app::i18n::catalog::onboarding::STATUS_CHECKS_WARN.get();
     let update_badge = krill_app::i18n::catalog::updater_relaunch::STATUS_READY_BADGE
         .format(&[("version", "0.2.0")]);
@@ -1542,19 +1558,11 @@ fn status_bar_right_items_render_compact_icons_and_show_hover_tooltips(cx: &mut 
             format!("{checks_warn}: user.name 미설정"),
         ),
         ("status-update-ready", update_badge),
-        ("status-daemon", text::DAEMON_UP.get().to_owned()),
+        ("status-daemon", text::DAEMON_CONNECTING.get().to_owned()),
         ("status-usage", counts(0, 0)),
         (
             "status-orchestration-menu",
             format!("{} — {orch_full}", text::ORCH_MENU_TITLE.get()),
-        ),
-        (
-            "status-ports-menu",
-            format!("{} — {ports_full}", text::PORTS_MENU_TITLE.get()),
-        ),
-        (
-            "status-ssh-switcher",
-            format!("{} — {ssh_full}", text::SSH_MENU_TITLE.get()),
         ),
         (
             "float-terminal",
@@ -1624,10 +1632,10 @@ fn status_menu_open_hides_sibling_tooltips(cx: &mut TestAppContext) {
     let (shell, handle) = open(cx);
     cx.run_until_parked();
     let vcx = &mut VisualTestContext::from_window(handle, cx);
-    let ssh = vcx
-        .debug_bounds("status-ssh-switcher")
-        .expect("ssh menu button");
-    vcx.simulate_click(ssh.center(), gpui::Modifiers::default());
+    let orch = vcx
+        .debug_bounds("status-orchestration-menu")
+        .expect("orchestration menu button");
+    vcx.simulate_click(orch.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     assert_eq!(vcx.read(|cx| shell.read(cx).status_menus_open), 1);
     let refresh = vcx

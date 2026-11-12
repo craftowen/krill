@@ -532,7 +532,9 @@ fn mentions_disk_full(text: &str) -> bool {
 }
 
 fn should_report_update_failure(error: &Error) -> bool {
-    !matches!(error, Error::Http(_)) && !error.is_disk_full()
+    !matches!(error, Error::Http(_))
+        && !matches!(error, Error::Io(io_err) if io_err.kind() == io::ErrorKind::TimedOut)
+        && !error.is_disk_full()
 }
 
 impl fmt::Display for Error {
@@ -923,39 +925,56 @@ fn run_codesign(args: &[&str], target: &Path) -> Result<(), Error> {
 /// URL에서 바이트를 내려받는다(`https://` 또는 로컬 루프백 `http://`만 허용).
 /// 1차 `/usr/bin/curl`이 실패하고 URL이 GitHub Releases 자산 형식이면 로컬 `gh release download`로 폴백한다(MK-155).
 pub fn fetch_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, Error> {
-    validate_url(url)?;
-    let max_str = max_bytes.to_string();
-    let out = crate::settings::child::output(
-        crate::platform::background_command(system_tool("curl")).args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time",
-            "30",
-            "--max-filesize",
-            &max_str,
-            "--proto",
-            "=https,http",
-            "--proto-redir",
-            "=https",
-            url,
-        ]),
-        Duration::from_secs(40),
-        u64::try_from(max_bytes).unwrap_or(u64::MAX),
-    )?;
-    if out.status.success() {
-        if out.stdout.len() > max_bytes {
-            return Err(Error::Http(format!(
-                "response exceeded max size ({max_bytes} bytes)"
-            )));
-        }
-        return Ok(out.stdout);
-    }
+    fetch_bytes_with(
+        url,
+        max_bytes,
+        |url, max_bytes| {
+            let max_str = max_bytes.to_string();
+            crate::settings::child::output(
+                crate::platform::background_command(system_tool("curl")).args([
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--max-time",
+                    "30",
+                    "--max-filesize",
+                    &max_str,
+                    "--proto",
+                    "=https,http",
+                    "--proto-redir",
+                    "=https",
+                    url,
+                ]),
+                Duration::from_secs(40),
+                u64::try_from(max_bytes).unwrap_or(u64::MAX),
+            )
+        },
+        fetch_github_release_asset,
+    )
+}
 
-    let curl_err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+fn fetch_bytes_with(
+    url: &str,
+    max_bytes: usize,
+    run_curl: impl FnOnce(&str, usize) -> io::Result<std::process::Output>,
+    run_gh: impl FnOnce(&str, Option<&str>, &str, usize) -> Result<Vec<u8>, Error>,
+) -> Result<Vec<u8>, Error> {
+    validate_url(url)?;
+    let curl_err = match run_curl(url, max_bytes) {
+        Ok(out) if out.status.success() => {
+            if out.stdout.len() > max_bytes {
+                return Err(Error::Http(format!(
+                    "response exceeded max size ({max_bytes} bytes)"
+                )));
+            }
+            return Ok(out.stdout);
+        }
+        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        Err(error) => error.to_string(),
+    };
     if let Some((repo, tag, asset)) = parse_github_release_asset(url)
-        && let Ok(bytes) = fetch_github_release_asset(&repo, tag.as_deref(), &asset, max_bytes)
+        && let Ok(bytes) = run_gh(&repo, tag.as_deref(), &asset, max_bytes)
     {
         return Ok(bytes);
     }
@@ -1465,7 +1484,7 @@ pub fn on_startup(state_dir: PathBuf, window: &mut gpui::Window, cx: &mut gpui::
 /// Stream stdout to a private file. A descendant holding a pipe cannot extend the total deadline.
 fn stream_download(cmd: &mut std::process::Command, path: &Path) -> Result<(), Error> {
     use std::process::Stdio;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(210);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1587,8 +1606,10 @@ fn fetch_archive_with_probe(
         "--silent",
         "--show-error",
         "--location",
+        "--connect-timeout",
+        "15",
         "--max-time",
-        "30",
+        "180",
         "--max-filesize",
         &MAX_ARCHIVE_BYTES.to_string(),
         "--proto",

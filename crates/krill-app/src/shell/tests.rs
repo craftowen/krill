@@ -167,6 +167,15 @@ fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
     cx.run_until_parked();
 }
 
+/// 탭 넘침 메뉴(⌄)를 열고 키보드로 항목을 고른다. 위쪽 항목 순서: 채팅 보기, 상하 분할, 오른쪽 패널, 저장 명령, 맥락 복사.
+pub(super) fn pick_overflow(cx: &mut VisualTestContext, keys: &str) {
+    let menu = cx.debug_bounds("titlebar-more").unwrap();
+    cx.simulate_click(menu.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes(keys);
+    cx.run_until_parked();
+}
+
 pub(super) fn layout_of(view: &Entity<Shell>, cx: &mut VisualTestContext) -> Layout {
     cx.run_until_parked();
     cx.update(|_, cx| {
@@ -213,7 +222,7 @@ fn keys_drag_and_restart_restore(cx: &mut TestAppContext) {
     assert!((ratio - 100. / center).abs() < 0.01, "ratio {ratio}");
 
     // 최소 50px: 왼쪽 끝까지 끌어도 첫 칸은 50px.
-    let line = left + ratio * center + 2.;
+    let line = f32::from(cx.debug_bounds("split-[]").unwrap().center().x);
     drag(cx, point(px(line), px(y)), point(px(0.), px(y)));
     let l = layout_of(&view, cx);
     let PaneTree::Split { ratio, .. } = l.active_tab().root else {
@@ -579,6 +588,58 @@ fn ended_agent_keeps_its_pane_as_a_plain_terminal(cx: &mut TestAppContext) {
     assert_eq!(launch.program, Program::Login);
     assert_eq!(launch.account, None);
     assert_eq!(launch.cwd, b"/tmp/repo");
+}
+
+#[gpui::test]
+fn ended_agent_hides_the_sticky_prompt_bar(cx: &mut TestAppContext) {
+    use krill_proto::control::{AgentState, AgentStatus, Source as StatusSource};
+    use std::sync::Arc;
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let (view, cx) = open(cx, state_path("ended-agent-hides-prompt-bar"));
+    let pane = layout_of(&view, cx).focused().expect("focused pane");
+    let sid = SessionId(42);
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![sidebar::Session {
+            id: sid,
+            status: AgentStatus {
+                state: AgentState::Unknown,
+                source: Some(StatusSource::Process),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: None,
+        }],
+        trees: std::collections::BTreeMap::default(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.layout.set_session(pane, sid);
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.sidebar
+                .update(cx, |b, cx| b.record_local_prompt(sid, "fix the bug", cx));
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bar: &'static str = Box::leak(format!("sticky-prompt-bar-{}", pane.get()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(bar).is_none(),
+        "a pane back at its shell must not show the agent's last prompt"
+    );
 }
 
 /// D-01: 닫기 확인창이 떠 있는 사이 앞쪽 탭이 정리돼 번호가 당겨져도 확인은 원래 고른 탭만 닫는다.
@@ -1991,10 +2052,7 @@ fn titlebar_collapse_toggles_and_status_bar(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.debug_bounds("sidebar-column").is_some());
 
-    let panel_btn = cx.debug_bounds("toggle-panel").unwrap();
-    cx.simulate_mouse_down(panel_btn.center(), MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_up(panel_btn.center(), MouseButton::Left, Modifiers::default());
-    cx.run_until_parked();
+    pick_overflow(cx, "down down down enter");
     assert!(cx.debug_bounds("panel-column").is_none());
     assert!(!cx.update(|_, cx| view.read(cx).diff.read(cx).is_visible()));
 
@@ -2408,7 +2466,7 @@ fn active_tab_stays_visible_after_keyboard_switch(cx: &mut TestAppContext) {
         let tab = cx
             .debug_bounds(Box::leak(format!("session-tab-{active}").into_boxed_str()))
             .unwrap();
-        let limit = cx.debug_bounds("quick-commands").unwrap();
+        let limit = cx.debug_bounds("new-tab").unwrap();
         (
             active,
             tab.right() <= limit.left() && tab.left() >= gpui::px(0.),
@@ -2443,7 +2501,7 @@ fn new_last_tab_is_revealed_with_motion_in_narrow_window(cx: &mut TestAppContext
         let tab = cx
             .debug_bounds(Box::leak(format!("session-tab-{active}").into_boxed_str()))
             .unwrap();
-        let limit = cx.debug_bounds("quick-commands").unwrap();
+        let limit = cx.debug_bounds("new-tab").unwrap();
         let all: Vec<_> = (0..=active)
             .map(|i| {
                 cx.debug_bounds(Box::leak(format!("session-tab-{i}").into_boxed_str()))
@@ -2576,7 +2634,7 @@ fn tabs_have_padding_min_width_and_separators(cx: &mut TestAppContext) {
     assert!(next.left() >= tab.right(), "tabs must not overlap");
     // 타이틀바 오른쪽 명령 버튼은 탭 줄과 겹치지 않는다.
     let tabs_right = active_tab.right();
-    let commands = cx.debug_bounds("quick-commands").expect("quick-commands");
+    let commands = cx.debug_bounds("new-tab").expect("new-tab");
     let titlebar = cx.debug_bounds("titlebar").expect("titlebar");
     assert!(tabs_right <= commands.left() && commands.right() <= titlebar.right());
 }
@@ -2603,7 +2661,7 @@ fn terminal_palette_push_tracks_theme_and_reconnect(cx: &mut TestAppContext) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
         path.with_file_name("settings.toml"),
-        "theme = \"dark\"\nterminal_use_separate_light_theme = true\n",
+        "theme = \"dark\"\nui_theme_dark = \"tokyo_night\"\nterminal_use_separate_light_theme = true\n",
     )
     .unwrap();
     let (view, cx) = open(cx, path.clone());
@@ -4637,7 +4695,17 @@ fn status_bar_keeps_provider_controls_left_and_session_tools_right(cx: &mut Test
         "float-terminal",
         "dashboard-popout",
     ] {
-        let bounds = cx.debug_bounds(selector).unwrap();
+        // 데몬 점·포트·SSH는 비정상이거나 1 이상일 때만 그린다.
+        let Some(bounds) = cx.debug_bounds(selector) else {
+            assert!(
+                matches!(
+                    selector,
+                    "status-daemon" | "status-ports-menu" | "status-ssh-switcher"
+                ),
+                "{selector} must render"
+            );
+            continue;
+        };
         assert!(providers.right() <= bounds.left(), "{selector}: {bounds:?}");
         assert!(
             bounds.left() >= right.left() && bounds.right() <= right.right(),
@@ -5418,7 +5486,7 @@ fn single_pane_hides_header_and_commands_live_in_titlebar(cx: &mut TestAppContex
         "single pane shows no header row"
     );
     let bar = cx.debug_bounds("titlebar").expect("titlebar");
-    for id in ["quick-commands", "copy-context"] {
+    for id in ["titlebar-more", "new-tab"] {
         let b = cx.debug_bounds(id).expect("command button stays reachable");
         assert!(
             bar.contains(&b.center()),
@@ -6235,7 +6303,7 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1);
     assert!(cx.debug_bounds("admin-center").is_some());
-    assert!(cx.debug_bounds("admin-accounts-refresh").is_some());
+    assert!(cx.debug_bounds("admin-auto-switch-strip").is_some());
 
     let back = cx
         .debug_bounds("admin-modal-close")
@@ -6494,7 +6562,7 @@ fn status_provider_usage_menu_renders_comparison_columns_and_opens_in_app_accoun
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1);
     assert!(cx.debug_bounds("admin-center").is_some());
-    assert!(cx.debug_bounds("admin-accounts-refresh").is_some());
+    assert!(cx.debug_bounds("admin-auto-switch-strip").is_some());
 }
 
 /// 상태바 Codex 팝업의 "사용량 초기화" 2단계 확인(무장 → 실행/취소).
@@ -6641,7 +6709,7 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
         cx.debug_bounds("status-provider-reset-usage-confirm")
             .is_none()
     );
-    // 미터가 아직 없더라도(초기 로드/로컬 파일 폴백) 실시간 프로브·차감을 위해 초기화 행이 활성화된다.
+    // 미터가 아직 없으면(초기 로드/로컬 파일 폴백) 가능 여부를 모르므로 누를 수 없다.
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     cx.update(|_, cx| {
@@ -6654,16 +6722,14 @@ fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppCon
     });
     cx.run_until_parked();
     open_menu(cx);
-    let arm_unprobed = cx
+    let unprobed = cx
         .debug_bounds("status-provider-reset-usage")
-        .expect("reset row must remain available before meters are fetched");
-    cx.simulate_click(arm_unprobed.center(), Modifiers::default());
+        .expect("unprobed account shows a disabled reset row");
+    cx.simulate_click(unprobed.center(), Modifiers::default());
     cx.run_until_parked();
-    open_menu(cx);
     assert!(
-        cx.debug_bounds("status-provider-reset-usage-confirm")
-            .is_some(),
-        "clicking unprobed reset row must arm confirmation"
+        cx.update(|_, cx| view.read(cx).reset_armed.is_none()),
+        "clicking the unprobed reset row must not arm confirmation"
     );
 }
 
@@ -9076,7 +9142,7 @@ fn pairing_opens_machines_invite_page(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("admin-center").is_some());
     assert!(cx.debug_bounds("link-pairing-modal").is_none());
     assert!(cx.debug_bounds("link-client-input-link").is_some());
-    assert!(cx.debug_bounds("link-server-panel").is_none());
+    assert!(cx.debug_bounds("link-server-panel").is_some());
     cx.update(|_, cx| {
         let settings = view.read(cx).settings().unwrap();
         assert_eq!(
@@ -9158,6 +9224,80 @@ fn owe903_first_run_offer_inside_shell_update_does_not_panic(cx: &mut TestAppCon
         cx.debug_bounds("onboarding-wizard").is_none(),
         "no first-run modal"
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+fn first_run_env(name: &str) -> (std::path::PathBuf, krill_app::onboarding::Env) {
+    let root = std::env::temp_dir().join(format!("mk-{name}-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let env = krill_app::onboarding::Env {
+        shell: "/bin/sh".into(),
+        krill: root.join("krill"),
+        state: root.join("state"),
+        default_state: Some(krill_proto::daemon::state_dir_in(&root.join("home"))),
+        home: root.clone(),
+        state_overridden: true,
+    };
+    (root, env)
+}
+
+/// 첫 실행 빈 화면에는 환영 패널이 보이고, 닫으면 한 줄 문구로 돌아간다.
+#[gpui::test]
+fn first_run_empty_workspace_shows_welcome_panel_until_dismissed(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("welcome-dismiss"));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert!(cx.debug_bounds("empty-welcome").is_none());
+
+    let (root, env) = first_run_env("welcome-dismiss");
+    cx.update(|_, cx| krill_app::onboarding::offer(env, cx));
+    cx.run_until_parked();
+    let panel = cx.debug_bounds("empty-welcome").expect("welcome panel");
+    assert!(cx.debug_bounds("empty-tagline").is_none());
+    for row in [
+        "empty-welcome-alive",
+        "empty-welcome-jump-open",
+        "empty-welcome-remote-open",
+        "empty-welcome-mobile-open",
+        "empty-welcome-cli",
+    ] {
+        assert!(cx.debug_bounds(row).is_some(), "{row}");
+    }
+    let shortcuts = cx.debug_bounds("empty-new-terminal").expect("shortcut row");
+    assert!(panel.bottom() <= shortcuts.top());
+
+    let dismiss = cx.debug_bounds("empty-welcome-dismiss").unwrap();
+    cx.simulate_click(dismiss.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("empty-welcome").is_none());
+    assert!(cx.debug_bounds("empty-tagline").is_some());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 첫 탭을 열면 환영 패널은 끝난 것으로 기록되어, 탭을 다 닫아도 다시 나오지 않는다.
+#[gpui::test]
+fn first_tab_retires_welcome_panel(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("welcome-first-tab"));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    let (root, env) = first_run_env("welcome-first-tab");
+    cx.update(|_, cx| krill_app::onboarding::offer(env, cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("empty-welcome").is_some());
+
+    let new_terminal = cx.debug_bounds("empty-new-terminal").unwrap();
+    cx.simulate_click(new_terminal.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!layout_of(&view, cx).tabs().is_empty());
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert!(cx.debug_bounds("empty-welcome").is_none());
+    assert!(cx.debug_bounds("empty-tagline").is_some());
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -12496,4 +12636,237 @@ fn narrow_mobile_modal_keeps_qr_inside_without_losing_sidebar_preferences(cx: &m
             assert_eq!(shell.layout.sidebar_width.to_bits(), 260_f32.to_bits());
         });
     }
+}
+
+fn card_bounds(cx: &mut VisualTestContext, id: PaneId, state: &str) -> Option<Bounds<Pixels>> {
+    let sel: &'static str = Box::leak(format!("pane-card-{}-{state}", id.get()).into_boxed_str());
+    cx.debug_bounds(sel)
+}
+
+#[gpui::test]
+fn pane_card_focus_ring_tracks_terminal_file_and_chat_panes(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-pane-focus-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let rs_file = dir.join("sample.rs");
+    std::fs::write(&rs_file, "fn main() {}\n").unwrap();
+
+    let (view, cx) = open(cx, dir.join("layout.bin"));
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    let p0 = layout_of(&view, cx).active_tab().focused;
+    let p0_header: &'static str = Box::leak(format!("pane-header-{}", p0.get()).into_boxed_str());
+    assert!(card_bounds(cx, p0, "active").is_some());
+    assert!(cx.debug_bounds(p0_header).is_none());
+
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let p1 = layout_of(&view, cx).active_tab().focused;
+    assert_ne!(p0, p1);
+    assert!(card_bounds(cx, p1, "active").is_some());
+    assert!(card_bounds(cx, p0, "inactive").is_some());
+
+    let c0 = card_bounds(cx, p0, "inactive").unwrap().center();
+    cx.simulate_click(c0, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).focused(), Some(p0));
+    assert!(card_bounds(cx, p0, "active").is_some());
+    assert!(card_bounds(cx, p1, "inactive").is_some());
+
+    let rs_path = rs_file.clone();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.open_file(rs_path, cx));
+    });
+    cx.run_until_parked();
+    let file_pane = layout_of(&view, cx).active_tab().focused;
+    assert!(cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)));
+    assert!(card_bounds(cx, file_pane, "active").is_some());
+
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let term_pane = layout_of(&view, cx).active_tab().focused;
+    assert_ne!(file_pane, term_pane);
+    assert!(!cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)));
+    assert!(card_bounds(cx, term_pane, "active").is_some());
+    assert!(card_bounds(cx, file_pane, "inactive").is_some());
+
+    let cf = card_bounds(cx, file_pane, "inactive").unwrap().center();
+    cx.simulate_click(cf, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).focused(), Some(file_pane));
+    assert!(cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)));
+    assert!(card_bounds(cx, file_pane, "active").is_some());
+    assert!(card_bounds(cx, term_pane, "inactive").is_some());
+
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(term_pane, SessionId(77), ours, cx);
+            s.layout.set_session(term_pane, SessionId(77));
+            s.layout.set_chat_view(term_pane, true);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, term_pane, "inactive").is_some());
+
+    let chat_center = cx.debug_bounds("desktop-chat-overlay").unwrap().center();
+    cx.simulate_click(chat_center, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).focused(), Some(term_pane));
+    assert!(cx.update(|window, cx| view.read(cx).chat_pane_has_focus(term_pane, window, cx)));
+    assert!(card_bounds(cx, term_pane, "active").is_some());
+    assert!(card_bounds(cx, file_pane, "inactive").is_some());
+
+    cx.update(|_, cx| {
+        view.update(cx, Shell::toggle_chat_view);
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, term_pane, "active").is_some());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+fn pane_card_focus_ring_demotes_to_retained_under_overlays_search_and_inactive_window(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("pane-focus-retained"));
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    let p0 = layout_of(&view, cx).active_tab().focused;
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(p0, SessionId(88), ours, cx);
+            s.layout.set_session(p0, SessionId(88));
+        });
+    });
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let p1 = layout_of(&view, cx).active_tab().focused;
+    let c0 = card_bounds(cx, p0, "inactive").unwrap().center();
+    cx.simulate_click(c0, Modifiers::default());
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+    assert!(card_bounds(cx, p1, "inactive").is_some());
+
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+    assert!(card_bounds(cx, p1, "inactive").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+
+    cx.simulate_keystrokes("cmd-p");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(FocusSidebar), cx);
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+    let c0 = card_bounds(cx, p0, "retained").unwrap().center();
+    cx.simulate_click(c0, Modifiers::default());
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.on_window_active_changed(false, cx));
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "retained").is_some());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.on_window_active_changed(true, cx));
+    });
+    cx.run_until_parked();
+    assert!(card_bounds(cx, p0, "active").is_some());
+}
+
+#[gpui::test]
+fn pane_card_stage_geometry_split_reset_and_flush_guards(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("pane-card-geometry"));
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    let p0 = layout_of(&view, cx).active_tab().focused;
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let p1 = layout_of(&view, cx).active_tab().focused;
+
+    let surface = cx.debug_bounds("terminal-surface").unwrap();
+    let stage = cx.debug_bounds("pane-card-stage").unwrap();
+    let card0 = card_bounds(cx, p0, "inactive").unwrap();
+    let card1 = card_bounds(cx, p1, "active").unwrap();
+    let gutter = cx.debug_bounds("split-[]").unwrap();
+    let gap = f32::from(krill_app::ui::PANE_GAP);
+
+    assert_eq!(stage, surface);
+    assert!((f32::from(card0.left() - surface.left()) - gap).abs() < 0.01);
+    assert!((f32::from(surface.right() - card1.right()) - gap).abs() < 0.01);
+    assert!((f32::from(card0.top() - surface.top()) - gap).abs() < 0.01);
+    assert!((f32::from(surface.bottom() - card0.bottom()) - gap).abs() < 0.01);
+    assert!((f32::from(card1.left() - card0.right()) - gap).abs() < 0.01);
+    assert!((f32::from(gutter.size.width) - gap).abs() < 0.01);
+    assert!((f32::from(card0.size.width - card1.size.width)).abs() < 0.5);
+
+    let target_x = surface.left() + px(180.);
+    drag(cx, gutter.center(), point(target_x, gutter.center().y));
+    let moved = cx.debug_bounds("split-[]").unwrap();
+    assert!((f32::from(moved.center().x - target_x)).abs() < 1.0);
+
+    let center = moved.center();
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: center,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        position: center,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+    });
+    cx.run_until_parked();
+    let PaneTree::Split { ratio, .. } = layout_of(&view, cx).active_tab().root else {
+        panic!("expected split root");
+    };
+    assert!((ratio - 0.5).abs() < 0.001, "ratio {ratio}");
+
+    cx.simulate_keystrokes("cmd-shift-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert!(cx.debug_bounds("pane-card-stage").is_none());
+    let surface = cx.debug_bounds("terminal-surface").unwrap();
+    let empty = cx.debug_bounds("empty-workspace").unwrap();
+    assert_eq!(empty, surface);
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.role = WindowRole::Floating;
+            s.layout.new_tab();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let fp = layout_of(&view, cx).active_tab().focused;
+    assert!(cx.debug_bounds("pane-card-stage").is_none());
+    assert!(card_bounds(cx, fp, "active").is_none());
 }

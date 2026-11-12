@@ -635,6 +635,23 @@ globalThis.MkTerminalCodec = (() => {
       key: JSON.stringify([context, choices, active]),
     };
   }
+  // iOS freezes a hidden home-screen app, so a reply timer that ran while hidden measured the freeze,
+  // not the desktop. A frozen page also fires timers late, possibly before visibilitychange on return:
+  // that earns one fresh window. The callback runs only after a full window of visible, on-time waiting.
+  const patient = (fn, ms) => {
+    const handle = { id: 0, clear: () => clearTimeout(handle.id) };
+    let late = false;
+    const arm = (wait) => {
+      const due = Date.now() + wait;
+      handle.id = setTimeout(() => {
+        if (globalThis.document?.hidden) return arm(ms);
+        if (Date.now() - due > 1000 && !late) return ((late = true), arm(ms));
+        fn();
+      }, wait);
+    };
+    arm(ms);
+    return handle;
+  };
   class Terminal {
     constructor(root, options) {
       if (
@@ -2782,8 +2799,11 @@ globalThis.MkTerminalCodec = (() => {
         await this.role(Uint8Array.from([0, 2, 0]));
         return;
       }
+      // Every branch asks the daemon something with a reply deadline, so a socket that died while the app
+      // was in the background is found within one role window after returning.
       if (this.autoFit && !this.fit) await this.fitToPhone(true, false);
       else if (this.fit) await this.resize(true);
+      else this.guard(() => this.role(Uint8Array.from([0, 2, 0])));
       this.maybeLoadInitialHistory();
     }
     queueFit() {
@@ -2993,7 +3013,7 @@ globalThis.MkTerminalCodec = (() => {
                 pending = this.pendingInputs.get(id);
               if (!pending) break;
               this.pendingInputs.delete(id);
-              clearTimeout(pending.timer);
+              pending.timer.clear();
               clearTimeout(pending.slowTimer);
               if (result) {
                 this.inputWaiting = false;
@@ -3031,7 +3051,7 @@ globalThis.MkTerminalCodec = (() => {
               const result = r.n(3),
                 pending = this.pendingRoles.shift();
               if (pending) {
-                clearTimeout(pending.timer);
+                pending.timer.clear();
                 if (result) pending.reject(Error("Terminal resize rejected"));
                 else pending.resolve();
               } else if (result) throw Error("Terminal role rejected");
@@ -3131,7 +3151,7 @@ globalThis.MkTerminalCodec = (() => {
               this.status("ready", "Waiting for input confirmation…");
             }
           }, 1000),
-          timer: setTimeout(() => {
+          timer: patient(() => {
             if (this.pendingInputs.has(id))
               this.disconnect("disconnected", "Input confirmation timed out");
           }, 10000),
@@ -3143,7 +3163,7 @@ globalThis.MkTerminalCodec = (() => {
           this.send(0x13, C.concat(T.v(id), T.v(bytes.length), bytes));
         } catch (e) {
           this.pendingInputs.delete(id);
-          clearTimeout(pending.timer);
+          pending.timer.clear();
           clearTimeout(pending.slowTimer);
           this.contextBlocked = true;
           this.invalidateInput();
@@ -3157,7 +3177,7 @@ globalThis.MkTerminalCodec = (() => {
         const pending = {
           resolve,
           reject,
-          timer: setTimeout(() => {
+          timer: patient(() => {
             this.socket?.close();
             this.disconnect("disconnected", "Terminal resize timed out");
           }, 5000),
@@ -3167,7 +3187,7 @@ globalThis.MkTerminalCodec = (() => {
           this.send(0x17, body);
         } catch (e) {
           this.pendingRoles.pop();
-          clearTimeout(pending.timer);
+          pending.timer.clear();
           reject(e);
         }
       });
@@ -3942,13 +3962,13 @@ globalThis.MkTerminalCodec = (() => {
         this.contextBlocked = true;
       }
       for (const pending of this.pendingInputs.values()) {
-        clearTimeout(pending.timer);
+        pending.timer.clear();
         clearTimeout(pending.slowTimer);
         pending.reject(error);
       }
       this.pendingInputs.clear();
       for (const pending of this.pendingRoles.splice(0)) {
-        clearTimeout(pending.timer);
+        pending.timer.clear();
         pending.reject(Error("Terminal disconnected"));
       }
       this.channel = null;

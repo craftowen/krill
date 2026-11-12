@@ -99,8 +99,8 @@ async function fixedOriginTests(){
  const server=new C.Channel(new Uint8Array(32),C.concat(C.unhex('bc'.repeat(32)),new Uint8Array(32).fill(1)),false);
  socket.emit('message',server.seal(new TextEncoder().encode(JSON.stringify({device_id:'new-device',credential:'cd'.repeat(32)}))));socket.emit('message',server.seal(frame(1,Buffer.concat([v(1),v(1),v(0)]))));await flush();
  socket.emit('message',server.seal(frame(0x65,Buffer.concat([v(6),string(JSON.stringify({ok:true,data:{sessions:[]}}))]))));await flush();assert(t.ready);assert.equal(authenticated.rid,rid);assert.equal(authenticated.hash,hash);assert.equal(f.stored().credential,'cd'.repeat(32));const terminal=t.terminalConnect();assert.equal(terminal.socket.url,socket.url);assert.equal(terminal.credentials.rid,rid);
- // Back from a long background (or a new network): resume(stale) reconnects at once instead of probing a likely dead socket.
- {const n=f.sockets.length;t.resume(true);await flush();assert.equal(f.sockets.length,n+1);assert.equal(f.sockets.at(-1).url,socket.url);assert(socket.closed);}t.close();
+ // Back from a long background the open socket is asked once (probe deadline) instead of dropped; a new network reconnects at once.
+ {t.resume(true);await flush();assert(!socket.closed,'the open control socket is kept');const n=f.sockets.length;t.resume('network');await flush();assert(f.sockets.length>n);assert.equal(f.sockets.at(-1).url,socket.url);assert(socket.closed);}t.close();
  // A hung connection handshake gives up after 20 s, so locate/fallback and retry run instead of waiting out the TCP timeout.
  f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();{const guard=[...f.timers.values()].find(x=>x.ms===20000);assert(guard);guard.fn();await flush();assert(f.sockets[0].closed);assert.equal(f.requests.length,1);assert([...f.timers.values()].some(x=>x.ms===1000));}t.close();
  // In-app QR scan (endpoint.adopt): r pairs in place; a Named Tunnel origin, another app version or LAN origin opens the link; a LAN code in the fixed app says what to do.
@@ -275,10 +275,20 @@ async function connect(url,credential){
   const history=JSON.parse(fs.readFileSync(path.join(dir,'orchestration.json')));assert(!history.messages.find(m=>m.id===internalQuestion.id).acked);assert(!history.messages.find(m=>m.id===staleQuestion.id).acked);assert.equal(history.gates.find(g=>g.id===staleGate.id).status,'pending');
   const diff=await phone.rpc({action:'git',session,path:'example.txt'});assert(diff.patch.includes('+after'));const outside=await phone.rpc({action:'git',session,path:'../../secrets'});assert.equal(outside.diff_status,'outside_scope');assert.equal(outside.patch,'');
   const handoff=await phone.rpc({action:'handoff',session,agent:'codex'});assert(handoff.to_session);await until(()=>cli(['read',String(handoff.to_session)]).includes('KRILL HANDOFF'));
+  const DROP_CHUNK=384*1024,dropFile=crypto.randomBytes(DROP_CHUNK*2+12345),upload=crypto.randomBytes(16).toString('hex'),dropPut=(client,offset)=>client.rpc({action:'drop_put',upload,name:'../phone photo.bin',size:dropFile.length,offset,data:dropFile.subarray(offset,offset+DROP_CHUNK).toString('base64')});
+  assert.equal(data.capabilities.drop,true);assert.deepEqual(await dropPut(phone,0),{received:DROP_CHUNK});
   const saved={device_id:phone.authenticated.device_id,credential:phone.authenticated.credential};phone.socket.close();await new Promise(r=>setTimeout(r,80));
   const rejectedCode=await new Promise((resolve,reject)=>{const u=new URL(url),ws=new WebSocket(`ws://${u.host}/ws`);ws.binaryType='arraybuffer';ws.addEventListener('error',reject,{once:true});ws.addEventListener('message',e=>{const ch=JSON.parse(e.data),nonce=crypto.randomBytes(32),chan=new C.Channel(new Uint8Array(32),C.concat(C.unhex(ch.challenge),nonce));ws.send(JSON.stringify({token:null,device_id:saved.device_id,client_nonce:nonce.toString('hex')}));ws.send(chan.seal(new TextEncoder().encode('{"label":"Bad credential"}')));},{once:true});ws.addEventListener('close',e=>resolve(e.code),{once:true});});
   assert.equal(rejectedCode,1008);
   other=await connect(url,saved);const resumed=await other.rpc({action:'snapshot'});assert(resumed.sessions.some(s=>s.id===session));
+  assert.deepEqual(await dropPut(other,0),{received:DROP_CHUNK},'a resent chunk after reconnect only reports what the PC holds');
+  let dropReply={received:DROP_CHUNK};while(!dropReply.saved)dropReply=await dropPut(other,dropReply.received);
+  const inboxFile=path.join(home,'Downloads','Krill Drop','phone photo.bin');assert.equal(dropReply.saved,inboxFile);assert.deepEqual(fs.readFileSync(inboxFile),dropFile);
+  const outBytes=crypto.randomBytes(DROP_CHUNK+777),outFile=path.join(dir,'agent report.md');fs.writeFileSync(outFile,outBytes);const queued=jsonCli(['drop',outFile]).items[0];
+  const dropList=await other.rpc({action:'drop_list'});assert.equal(dropList.inbox,path.dirname(inboxFile));assert.deepEqual(dropList.items.map(i=>[i.id,i.name,i.size]),[[queued.id,'agent report.md',outBytes.length]]);
+  const parts=[];for(let at=0;;){const r=await other.rpc({action:'drop_get',id:queued.id,offset:at});parts.push(Buffer.from(r.data,'base64'));at+=parts.at(-1).length;if(r.eof)break;}assert.deepEqual(Buffer.concat(parts),outBytes);
+  assert.deepEqual(await other.rpc({action:'drop_remove',id:queued.id}),{removed:true});assert.deepEqual((await other.rpc({action:'drop_list'})).items,[]);
+  console.log('PASS Krill Drop: chunked phone upload resumed after reconnect lands byte-identical in Downloads/Krill Drop; a krill drop item lists, downloads byte-identical and is removed');
   const {fragment}=await other.rpc({action:'install_handoff'});assert.match(fragment,/^pair=[0-9a-f]{64}&key=[\w-]{43}$/);await require('./mobile_install.cjs').main({base,fragment});
   console.log('PWA E2E passed: non-secure pure JS E2EE, gzip assets, approval, IME text, photo 0600, account switch, gate reply, diff, mock handoff and credential reconnect');
  } finally {cleanup();}

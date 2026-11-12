@@ -814,8 +814,17 @@
     summary.append(liveDot, summaryText);
     header.querySelector("h1").parentElement.append(summary);
 
+    const pendingMode = sessionView(
+      state.preferences,
+      "new",
+      Boolean(M.chat?.mount),
+    );
     for (const node of [
-      button(t("Chat"), () => {}, "ghost small mode-toggle"),
+      button(
+        t(pendingMode === "chat" ? "Term" : "Chat"),
+        () => {},
+        "ghost small mode-toggle",
+      ),
       button(t("Terminal actions"), () => {}, "icon-button", "more"),
     ]) {
       node.disabled = true;
@@ -877,15 +886,34 @@
       () => {},
     );
     scroll.append(fresh);
-    const frame = el("div", undefined, "terminal-frame"),
-      dock = el("footer", undefined, "command-dock"),
-      accessory = el("div", undefined, "accessory-row pending-accessory");
-    dock.setAttribute("aria-hidden", "true");
-    dock.append(accessory);
-    if (state.preferences?.inputMode === "buffered")
-      dock.append(el("div", undefined, "input-row pending-buffered"));
-    mount.append(frame, dock);
-    pane.append(mount);
+    if (pendingMode === "chat") {
+      const chatView = el("div", undefined, "chat-view pending-chat"),
+        feed = el("div", undefined, "chat-feed"),
+        composer = el("footer", undefined, "chat-composer"),
+        box = el("div", undefined, "chat-composer-box"),
+        input = el("textarea", undefined, "chat-input"),
+        statusRow = el("div", undefined, "chat-status-row");
+      input.disabled = true;
+      input.rows = 1;
+      input.placeholder = job.agent
+        ? t("Message {0}", agentName(job.agent)).replace("{0}", agentName(job.agent))
+        : t("Connecting…");
+      composer.setAttribute("aria-hidden", "true");
+      box.append(input);
+      composer.append(box, statusRow);
+      chatView.append(feed, composer);
+      pane.append(chatView);
+    } else {
+      const frame = el("div", undefined, "terminal-frame"),
+        dock = el("footer", undefined, "command-dock"),
+        accessory = el("div", undefined, "accessory-row pending-accessory");
+      dock.setAttribute("aria-hidden", "true");
+      dock.append(accessory);
+      if (state.preferences?.inputMode === "buffered")
+        dock.append(el("div", undefined, "input-row pending-buffered"));
+      mount.append(frame, dock);
+      pane.append(mount);
+    }
     panels.append(pane);
     screen.append(header, tabs, panels);
     root.append(screen);
@@ -1248,6 +1276,8 @@
     }
 
     function newSession() {
+      // 고르는 동안 터미널 소켓 핸드셰이크를 끝내 둔다. 안 쓰면 다음 터미널이 가져간다.
+      ctx.transport?.prewarmTerminal?.();
       const agents =
         state.snapshot?.agents ||
         ["claude", "codex"].map((id) => ({ id, name: agentName(id) }));
@@ -1306,8 +1336,7 @@
         input.placeholder = t("Write a prompt…");
         input.setAttribute("aria-label", t("Prompt"));
         input.value = state.drafts.get(target.id) || "";
-        let composing = false,
-          pending = false,
+        let pending = false,
           version = 0;
         const versions = promptDraftVersions.get(state.drafts) || new Map();
         promptDraftVersions.set(state.drafts, versions);
@@ -1319,23 +1348,13 @@
             : state.drafts.delete(target.id);
         };
         input.addEventListener("input", edit);
-        input.addEventListener("compositionstart", () => (composing = true));
-        input.addEventListener("compositionend", () => (composing = false));
         const send = el("button", t("Send prompt"), "primary");
         send.type = "submit";
         form.id = "composer";
         form.append(input, send);
-        globalThis.MkKeyboard?.keepFocus(form, ctx.signal);
         form.addEventListener("submit", (e) => {
           e.preventDefault();
-          if (
-            composing ||
-            e.isComposing ||
-            pending ||
-            disposed ||
-            ctx.signal.aborted
-          )
-            return;
+          if (pending || disposed || ctx.signal.aborted) return;
           const text = input.value,
             sentVersion = version,
             draftVersion = versions.get(target.id);
@@ -1668,6 +1687,19 @@
     );
     primaryPane.insertBefore(primaryHeader, mount);
     primaryPane.dataset.session = selectedId;
+    // The daemon reports a launch whose login shell is stuck before the agent started.
+    const startupStall = el("div", undefined, "connection-banner startup-stall");
+    startupStall.hidden = true;
+    startupStall.setAttribute("role", "status");
+    screen.insertBefore(startupStall, panels);
+    function drawStartupStall() {
+      const command = session?.startup_stall;
+      startupStall.hidden = !command;
+      const text = command
+        ? t("The agent has not started. A shell startup file is stuck at {0}.", command)
+        : "";
+      if (startupStall.textContent !== text) startupStall.textContent = text;
+    }
     function activeSession() {
       return activePane === 1 && splitSession
         ? state.sessions.get(splitSession.id) || session
@@ -1966,6 +1998,7 @@
     function draw() {
       quickHandle?.update?.();
       session = state.sessions.get(selectedId);
+      drawStartupStall();
       group =
         state.groups.get(group.key) ||
         (session && state.groups.get(session.groupKey));

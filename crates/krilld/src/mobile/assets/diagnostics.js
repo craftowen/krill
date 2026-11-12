@@ -428,27 +428,47 @@
         : 0;
   function attempt(retry = 0, previous) {
     let started = Date.now(),
+      lastAt = started,
       attemptId = id(),
       established = false,
       state = { phase: "socket_open", route: "unknown" };
     const episode = previous?.episode.open
       ? previous.episode
-      : { open: false, held: null, timer: null, away: false, crumbs: [] };
+      : {
+          open: false,
+          held: null,
+          timer: null,
+          away: false,
+          inFlight: false,
+          flushedWeight: -1,
+          crumbs: [],
+        };
+    episode.inFlight = false;
     const resetPostOk = () => {
       if (established && !episode.open) {
         started = Date.now();
+        lastAt = started;
         attemptId = id();
         retry = 0;
         established = false;
       }
     };
-    const metadata = (extra) => ({
-      ...state,
-      attempt_id: attemptId,
-      elapsed_ms: Math.min(300000, Math.max(0, Date.now() - started)),
-      retry_count: Math.min(10000, Math.max(0, retry)),
-      ...extra,
-    });
+    const metadata = (extra) => {
+      const now = Date.now();
+      if (now - lastAt >= 60000) {
+        started += now - lastAt;
+        if (episode.away || document.visibilityState === "hidden")
+          episode.crumbs = [];
+      }
+      lastAt = now;
+      return {
+        ...state,
+        attempt_id: attemptId,
+        elapsed_ms: Math.min(300000, Math.max(0, now - started)),
+        retry_count: Math.min(10000, Math.max(0, retry)),
+        ...extra,
+      };
+    };
     const remember = (input) => {
       episode.away ||= document.visibilityState === "hidden";
       episode.crumbs.push(crumb(input));
@@ -457,15 +477,21 @@
     const release = () => {
       clearTimeout(episode.timer);
       const hidden = document.visibilityState === "hidden";
-      if (hidden || episode.away) {
+      if (hidden || episode.away || episode.inFlight) {
         episode.away = hidden;
+        episode.inFlight = false;
         episode.timer = setTimeout(release, 10000);
         return;
       }
       const held = episode.held;
       episode.held = null;
-      if (held)
+      if (held) {
+        episode.flushedWeight = Math.max(
+          episode.flushedWeight ?? -1,
+          weight(held.code, held.input),
+        );
         report(held.code, { ...held.input, breadcrumbs: episode.crumbs });
+      }
     };
     return {
       episode,
@@ -477,24 +503,54 @@
           route: clean.route || state.route,
         };
         remember(metadata(clean));
+        if (
+          episode.open &&
+          ["challenge", "authentication", "ipc", "snapshot"].includes(
+            clean.phase,
+          )
+        ) {
+          episode.inFlight = true;
+          if (episode.held) {
+            clearTimeout(episode.timer);
+            episode.timer = setTimeout(release, 10000);
+          }
+        }
       },
       report(code, extra = {}) {
         resetPostOk();
+        episode.inFlight = false;
         const input = metadata(extra);
         remember(input);
         if (episode.open) {
-          if (
-            episode.held &&
-            (weight(code, input) > weight(episode.held.code, episode.held.input) ||
+          const w = weight(code, input);
+          if (episode.held) {
+            const heldWeight = weight(episode.held.code, episode.held.input);
+            if (
+              w > heldWeight ||
+              (w === heldWeight &&
+                code !== "mobile_discovery_failed" &&
+                input.attempt_id !== episode.held.input.attempt_id) ||
               (code === "mobile_rpc_failed" &&
-                episode.held.code !== "mobile_auth_failed"))
+                episode.held.code !== "mobile_auth_failed")
+            ) {
+              episode.held = { code, input };
+              if (code === "mobile_rpc_failed") release();
+            }
+          } else if (
+            w > (episode.flushedWeight ?? -1) ||
+            (code === "mobile_rpc_failed" && (episode.flushedWeight ?? -1) < 2)
           ) {
             episode.held = { code, input };
             if (code === "mobile_rpc_failed") release();
+            else {
+              clearTimeout(episode.timer);
+              episode.timer = setTimeout(release, 10000);
+            }
           }
           return;
         }
         episode.open = true;
+        episode.flushedWeight = -1;
         episode.held = { code, input };
         if (code === "mobile_rpc_failed") release();
         else episode.timer = setTimeout(release, 10000);
@@ -503,10 +559,13 @@
         clearTimeout(episode.timer);
         established = true;
         started = Date.now();
+        lastAt = started;
         Object.assign(episode, {
           open: false,
           held: null,
           away: false,
+          inFlight: false,
+          flushedWeight: -1,
           crumbs: [],
         });
       },
@@ -524,6 +583,15 @@
   function source(value) {
     const file = assetFile(value);
     if (files.has(file)) return file;
+    if (typeof value !== "string" || !value.trim()) return;
+    try {
+      const u = new URL(value, location.href);
+      if (
+        u.origin === location.origin &&
+        (/^\/m\/[0-9a-f]{16}\/?$/.test(u.pathname) || u.pathname === "/")
+      )
+        return "index.html";
+    } catch {}
   }
   const exception = (error) => {
     const out = { error_name: names.has(error?.name) ? error.name : "Unknown" },

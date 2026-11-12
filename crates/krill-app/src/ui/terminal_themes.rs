@@ -931,7 +931,7 @@ pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
     builtin(
         KRILL_GRAPHITE,
         true,
-        0x0017_1719,
+        0x0017_191d,
         0x00de_dee3,
         0x00ee_eeef,
         [

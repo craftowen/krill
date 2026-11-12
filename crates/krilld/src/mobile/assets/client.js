@@ -281,6 +281,12 @@
         } catch {}
         return !0;
       };
+    const validRid = (value) =>
+        typeof value == "string" && /^[0-9a-f]{32}$/.test(value),
+      prefersRelay = (host, id = host?.rid) =>
+        host?.preferred_route === "tailscale" && host?.routes?.tailscale
+          ? !1
+          : validRid(id);
     if (
       (globalThis.addEventListener?.("storage", (event) => {
         if (pairingPending || (event.key !== null && event.key !== HOSTS))
@@ -304,7 +310,7 @@
           (rid = active?.rid),
           (directOrigin = active?.origin || location.origin),
           (destinationFixed = active?.fixed ?? fixed),
-          (useRelay = validRid(rid)));
+          (useRelay = prefersRelay(active, rid)));
         for (const fn of hostListeners) fn();
       }),
       saved && !active)
@@ -326,10 +332,8 @@
       (destinationFixed = active.fixed ?? fixed)),
       pair && ((directOrigin = location.origin), (destinationFixed = fixed)));
     let rid = pair ? fragment.get("r") : credentials?.rid;
-    const validRid = (value) =>
-        typeof value == "string" && /^[0-9a-f]{32}$/.test(value);
     let pairingDirect = pair ? secureDirect(fragment.get("d")) : null;
-    let useRelay = validRid(rid);
+    let useRelay = pair ? validRid(rid) : prefersRelay(saved, rid);
     const relayUrl = () =>
       `${new URL(credentials?.routes?.relay?.origin || credentials?.relay_origin || location.origin).origin.replace(/^http/, "ws")}/r/${rid}?v=${hash}`;
     return (
@@ -394,6 +398,11 @@
               selectedRoute = selected.url;
               return selectedRoute;
             },
+            socketUrls() {
+              const primary = this.socketUrl(),
+                choices = routeUrls(current() || source, hash).map((r) => r.url);
+              return [primary, ...choices.filter((u) => u !== primary)];
+            },
             selectRoute(url) {
               const host = current();
               if (!host || !routeUrls(host, hash).some((route) => route.url === url))
@@ -429,7 +438,7 @@
               diagnosticsTrace: trace,
             } = {}) {
               const host = current(), peerRid = host?.routes?.relay?.rid || host?.rid;
-              if ((!peerFixed && !host?.routes?.relay) || !validRid(peerRid)) return !1;
+              if ((!peerFixed && !host?.routes?.relay) || !validRid(peerRid) || !isCurrent() || signal?.aborted) return !1;
               trace?.mark("discovery", { route: "relay" });
               let timedOut = false;
               const controller = new AbortController(),
@@ -513,7 +522,7 @@
             (rid = next?.rid),
             (directOrigin = next?.origin || location.origin),
             (destinationFixed = next?.fixed ?? fixed),
-            (useRelay = validRid(rid)),
+            (useRelay = prefersRelay(next, rid)),
             (updatePending = !1),
             !0
           );
@@ -544,7 +553,7 @@
             (rid = host.rid),
             (directOrigin = host.origin || location.origin),
             (destinationFixed = host.fixed ?? fixed),
-            (useRelay = validRid(rid)),
+            (useRelay = prefersRelay(host, rid)),
             persist());
           try {
             localStorage.setItem(STORE, JSON.stringify(host));
@@ -611,7 +620,7 @@
               (rid = next?.rid),
               (directOrigin = next?.origin || location.origin),
               (destinationFixed = next?.fixed ?? fixed),
-              (useRelay = validRid(rid))),
+              (useRelay = prefersRelay(next, rid))),
             next?.id || null
           );
         },
@@ -637,7 +646,7 @@
             (directOrigin = active?.origin || location.origin),
             (destinationFixed = active?.fixed ?? fixed),
             (rid = saved?.rid),
-            (useRelay = validRid(rid)),
+            (useRelay = prefersRelay(saved, rid)),
             fixed &&
               /^[0-9a-f]{16}$/.test(saved?.hash || "") &&
               saved.hash !== hash &&
@@ -658,6 +667,29 @@
           if (useRelay && validRid(rid)) return relayUrl();
           if (validRid(rid)) return relayUrl();
           throw Error("Scan a fresh QR code from desktop Settings → Mobile.");
+        },
+        socketUrls() {
+          const primary = this.socketUrl();
+          if (!pairingPending && credentials?.routes) {
+            const choices = routeUrls(credentials, hash).map((r) => r.url);
+            return [primary, ...choices.filter((u) => u !== primary)];
+          }
+          return [primary];
+        },
+        selectRoute(url) {
+          if (pairingPending || !credentials?.routes) return false;
+          const chosen = routeUrls(credentials, hash).find((r) => r.url === url);
+          if (!chosen) return false;
+          useRelay = chosen.kind === "relay";
+          if (active && stillSaved(active)) {
+            active.preferred_route = chosen.kind;
+            saved = credentials = active;
+            try {
+              persist();
+              localStorage.setItem(STORE, JSON.stringify(credentials));
+            } catch {}
+          }
+          return true;
         },
         adopt(href) {
           const NOT =
@@ -768,7 +800,11 @@
                 ...credentials,
                 rid,
                 hash,
-                preferred_route: useRelay ? "relay" : null,
+                preferred_route: useRelay
+                  ? "relay"
+                  : credentials?.routes?.tailscale
+                    ? "tailscale"
+                    : null,
               }),
             !credentials)
           )
@@ -803,7 +839,10 @@
             removed(active))
           )
             throw Error("Desktop is no longer saved.");
-          ((saved = credentials = active), (rid = active.rid), persist());
+          ((saved = credentials = active),
+            (rid = active.rid),
+            (useRelay = prefersRelay(active, rid)),
+            persist());
           try {
             localStorage.setItem(STORE, JSON.stringify(credentials));
           } catch {
@@ -919,7 +958,7 @@
             return (
               hosts.splice(0, hosts.length, ...nextHosts),
               (active = saved = credentials = next),
-              (useRelay = validRid(rid)),
+              (useRelay = prefersRelay(next, rid)),
               (storageFailed = !1),
               !0
             );
@@ -942,7 +981,6 @@
           diagnosticsTrace: trace,
         } = {}) {
           if ((pairingPending && pairingDirect) || !destinationFixed || !validRid(rid)) return !1;
-          trace?.mark("discovery", { route: "relay" });
           let timedOut = false;
           const requestRid = rid,
             controller = new AbortController(),
@@ -953,6 +991,7 @@
               isCurrent() &&
               rid === requestRid;
           if (!current()) return !1;
+          trace?.mark("discovery", { route: "relay" });
           signal?.addEventListener("abort", abort, { once: !0 });
           const timeout = setTimeout(() => {
             timedOut = true;
@@ -1157,12 +1196,23 @@
         armed = 0,
         rev = 0,
         heard = 0,
+        received = 0,
+        visibleAt = 0,
         denied = -1;
       const latestReads = new Map(),
         isRead = (request) =>
-          ["snapshot", "chat_poll", "git", "accounts"].includes(
-            request?.action,
-          );
+          [
+            "snapshot",
+            "chat_poll",
+            "git",
+            "accounts",
+            "drop_list",
+            "drop_get",
+            "orchestration",
+            "command_catalog",
+            "mention_files",
+            "composer_models",
+          ].includes(request?.action);
       let credentials = options.credentials,
         pair = options.pair,
         socket,
@@ -1178,6 +1228,7 @@
         refreshing,
         timer,
         retryTimer,
+        resumeTimer,
         connectController,
         warm = null,
         terminalSockets = new Set(),
@@ -1185,7 +1236,6 @@
         timing = null,
         retryDelay = 1e3,
         last = null,
-        authFailures = 0,
         retryNotBefore = 0,
         authBlocked = !1,
         retryCount = 0,
@@ -1228,18 +1278,35 @@
           transport: !0,
           diagnosticReason: "websocket_closed",
         });
+      // iOS freezes a hidden home-screen app, so time spent hidden measured the freeze, not the desktop:
+      // the request gets `ms` of visible time, counted from its start or from the page's last return.
+      // A frozen page also fires timers late, possibly before visibilitychange runs; that earns one fresh window.
       function deadline(operation, ms, message, current = generation) {
         let timeout;
         return Promise.race([
           operation,
           new Promise((_, reject) => {
-            timeout = setTimeout(() => {
+            const started = Date.now();
+            let late = false;
+            const arm = (wait) => {
+              const due = Date.now() + wait;
+              timeout = setTimeout(() => {
+                const now = Date.now();
+                if (globalThis.document?.hidden) return arm(ms);
+                if (now - due > 1000 && !late) return ((late = true), arm(ms));
+                const left = Math.max(started, visibleAt) + ms - now;
+                if (left > 0) return arm(left);
+                expire();
+              }, wait);
+            };
+            const expire = () => {
               const error = Error(message);
               error.diagnosticReason = "timeout";
               ((error.transport = !0),
                 reject(error),
                 current === generation && disconnect(error));
-            }, ms);
+            };
+            arm(ms);
           }),
         ]).finally(() => clearTimeout(timeout));
       }
@@ -1434,11 +1501,11 @@
       }
       function rpc(request, latest, probe = !1, retried = !1) {
         const current = generation,
-          rpcStarted = Date.now(),
-          silent = probe === "silent",
+          silent = !!probe,
           mutation = !isRead(request);
+        let rpcStarted = Date.now(),
+          submitted = !1;
         pendingRpc++;
-        let submitted = !1;
         const surface = (error, report) => {
           report &&
             submitted &&
@@ -1458,23 +1525,24 @@
           mutation && submitted && !error.definitive && (uncertainMutation = !0);
           return error;
         };
-        const operation = deadline(
-          serial.then(() => {
-            if (!connected || current !== generation)
-              throw transportClosed("Disconnected. The action was not resent.");
-            return (
-              latest && ((latest.submitted = !0), (request = latest.request)),
-              ask(request),
-              (submitted = !0),
-              answer(current)
-            );
-          }),
-          probe ? 5e3 : 15e3,
-          mutation
-            ? "Desktop response timed out. The result may be unknown; pending actions were not resent."
-            : "Disconnected. Reconnecting\u2026",
-          current,
-        );
+        // The deadline starts when the request is sent: time queued behind earlier requests is
+        // bounded by their own deadlines, which drop a dead socket and reject this one.
+        const operation = serial.then(() => {
+          if (!connected || current !== generation)
+            throw transportClosed("Disconnected. The action was not resent.");
+          rpcStarted = Date.now();
+          latest && ((latest.submitted = !0), (request = latest.request));
+          ask(request);
+          submitted = !0;
+          return deadline(
+            answer(current),
+            probe ? PROBE_DEADLINE : 15e3,
+            mutation
+              ? "Desktop response timed out. The result may be unknown; pending actions were not resent."
+              : "Disconnected. Reconnecting\u2026",
+            current,
+          );
+        });
         return (
           (serial = operation.catch(() => {})),
           operation
@@ -1490,7 +1558,7 @@
                 return reconnected().then(
                   () => rpc(request, latest, !1, !0),
                   () => {
-                    throw surface(error, !stopped);
+                    throw surface(error, !1);
                   },
                 );
               throw surface(error, current === generation);
@@ -1516,7 +1584,9 @@
       // 폴링은 직전 etag를 보내고, 바뀐 게 없으면 데몬이 본문을 생략한다(unchanged). 화면도 다시 그리지 않는다.
       // 변경 피드: 새 데몬은 capabilities.change_feed를 알리고, 그걸 본 클라이언트만 snapshot에 feed 간격(ms)을 싣는다.
       // 데몬은 같은 간격으로 같은 스냅샷을 계산해 바뀐 것만 같은 채널로 푸시한다. rev는 늦게 온 옛 스냅샷을 거른다.
+      // A liveness probe waits longer than one cellular stall before it gives up on the socket.
       const FEED_FALLBACK = 5000,
+        PROBE_DEADLINE = 8000,
         wanted = () =>
           globalThis.document?.hidden ? 0 : M.activeTerminal ? 10000 : 2500;
       const query = () => ({
@@ -1598,6 +1668,7 @@
       }
       // 숨기면 피드를 멈춘다(feed:0). 진행 중인 갱신이 옛 간격을 실었을 수 있어 그 뒤에 맞춘다.
       function visibility() {
+        if (!globalThis.document?.hidden) visibleAt = Date.now();
         const current = generation;
         if (connected && armed > 0 && globalThis.document?.hidden)
           Promise.resolve(refreshing)
@@ -1681,152 +1752,446 @@
         let stage = 0,
           established = false,
           attempted,
-          quick = !1;
+          quick = !1,
+          cleanupRace = null,
+          allRoutesTried = !1;
         try {
           if (!pair && !credentials)
             throw Error(
               "Scan a fresh QR code from desktop Settings \u2192 Mobile.",
             );
           const ensureCurrent = () => {
-            if (stopped || current !== generation || failed)
-              throw (
-                failed ||
-                transportClosed("Disconnected. Pending actions were not resent.")
-              );
-          };
-          await connectDeadline(current, async (advanceStage) => {
-              attempted = socketUrl();
-              const target = new URL(attempted);
-              timing.route = target.pathname.startsWith("/r/") ? "relay" : "direct";
-              const octets = target.hostname.split(".").map(Number);
-              if ((octets.length === 4 && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) || target.hostname.endsWith(".ts.net")) timing.route = "tailscale";
-              trace?.mark("socket_open", {route: timing.route});
-              const active = (socket = new WebSocket(attempted));
-              active.binaryType = "arraybuffer";
-              // Bound stalled opening handshakes so discovery/fallback can run.
-              // Deadline includes authentication and the first snapshot.
+              if (stopped || current !== generation || failed)
+                throw (
+                  failed ||
+                  transportClosed(
+                    "Disconnected. Pending actions were not resent.",
+                  )
+                );
+            },
+            noop = () => {},
+            classifyRoute = (url) => {
+              const target = new URL(url),
+                octets = target.hostname.split(".").map(Number);
+              return target.pathname.startsWith("/r/")
+                ? "relay"
+                : (octets.length === 4 &&
+                      octets[0] === 100 &&
+                      octets[1] >= 64 &&
+                      octets[1] <= 127) ||
+                    target.hostname.endsWith(".ts.net")
+                  ? "tailscale"
+                  : "direct";
+            };
+          try {
+            await connectDeadline(current, async (advanceStage) => {
               // 인증 뒤 프레임은 도착 순서대로 바로 연다. 피드 푸시는 응답 대기열을 거치지 않는다.
-              active.addEventListener("message", (e) => {
-                if (current !== generation) return;
-                heard = Date.now();
-                let data = e.data;
-                if (channel && typeof data !== "string") {
-                  try {
-                    data = channel.open(data);
-                  } catch (error) {
-                    disconnect(error);
-                    return;
+              const onMessage = (e) => {
+                  if (current !== generation) return;
+                  heard = Date.now();
+                  received++;
+                  let data = e.data;
+                  if (channel && typeof data !== "string") {
+                    try {
+                      data = channel.open(data);
+                    } catch (error) {
+                      disconnect(error);
+                      return;
+                    }
+                    const p = pushed(data);
+                    if (p) {
+                      feedPush(current, p);
+                      return;
+                    }
                   }
-                  const p = pushed(data);
-                  if (p) {
-                    feedPush(current, p);
-                    return;
-                  }
-                }
-                const w = waiters.shift();
-                if (w) w.resolve(data);
-                else queue.push(data);
-              });
+                  const w = waiters.shift();
+                  if (w) w.resolve(data);
+                  else queue.push(data);
+                };
+              let reportedError = false;
               const end = (e) => {
-                if (current !== generation) return;
                   const diagnosticReason =
-                    e?.code === 1008 || e?.code === 4009
-                      ? "auth_rejected"
-                      : e?.code
-                        ? "websocket_closed"
-                        : "websocket_error";
+                      e?.code === 1008 || e?.code === 4009
+                        ? "auth_rejected"
+                        : e?.code
+                          ? "websocket_closed"
+                          : "websocket_error",
+                    reportEnd = () =>
+                      trace?.report(
+                        diagnosticReason === "auth_rejected"
+                          ? "mobile_auth_failed"
+                          : "mobile_connect_failed",
+                        {
+                          reason: diagnosticReason,
+                          ws_code: e?.code,
+                          route: timing.route,
+                          phase: !established
+                            ? [
+                                "socket_open",
+                                "challenge",
+                                "authentication",
+                                "ipc",
+                                "snapshot",
+                              ][stage]
+                            : "ipc",
+                        },
+                      );
+                  if (current !== generation) {
+                    if (!stopped && reportedError && e?.code && e.code !== 1000) {
+                      reportedError = false;
+                      reportEnd();
+                    }
+                    return;
+                  }
                   if (
                     !failed ||
                     (e?.code && failed.diagnosticReported) ||
                     diagnosticReason === "auth_rejected"
-                  )
-                    trace?.report(
-                      diagnosticReason === "auth_rejected"
-                        ? "mobile_auth_failed"
-                        : "mobile_connect_failed",
-                      {
-                        reason: diagnosticReason,
-                        ws_code: e?.code,
-                        route: timing.route,
-                        phase: !established
-                          ? [
-                              "socket_open",
-                              "challenge",
-                              "authentication",
-                              "ipc",
-                              "snapshot",
-                            ][stage]
-                          : "ipc",
-                      },
+                  ) {
+                    reportedError = !e?.code;
+                    reportEnd();
+                  }
+                  const capacity = e?.code === 4009,
+                    cooldown = e?.code === 1013,
+                    denied = e?.code === 1008 || capacity;
+                  if (denied && !pair && !capacity) {
+                    rejectedRoutes.add(attempted);
+                    routeAlternative =
+                      !!options.endpoint?.fallback?.(attempted) &&
+                      !rejectedRoutes.has(socketUrl());
+                  }
+                  if (denied && !routeAlternative) {
+                    authBlocked = true;
+                    clearTimeout(retryTimer);
+                  }
+                  if (cooldown) retryNotBefore = Date.now() + 65000;
+                  const error = Error(
+                    capacity
+                      ? "Desktop device limit reached. Revoke an unused device in desktop Settings → Mobile, then scan a new QR code."
+                      : cooldown
+                        ? "Connection temporarily limited. Wait before reconnecting."
+                        : denied
+                          ? pair
+                            ? "This QR code expired or was already used. Tap New QR code on desktop and scan again."
+                            : "Desktop rejected authentication. Access may have been revoked; scan a fresh QR code."
+                          : "Disconnected. Pending actions were not resent. If desktop access was revoked, scan a fresh QR code.",
+                  );
+                  error.diagnosticReason = diagnosticReason;
+                  error.diagnosticReported = true;
+                  error.transport = !denied;
+                  if (denied && failed) {
+                    failed = error;
+                    status("disconnected", error.message);
+                    return;
+                  }
+                  disconnect(error);
+                },
+                rawUrls = options.endpoint?.socketUrls?.() || [socketUrl()],
+                urls =
+                  pair || !credentials || rawUrls.length < 2
+                    ? [rawUrls[0]]
+                    : (() => {
+                        // Only a 1008 rejection removes a route. One interrupted while authenticating
+                        // goes last instead, so a dead other route cannot strand the phone until reload.
+                        const usable = rawUrls.filter((u) => !rejectedRoutes.has(u)),
+                          list = usable.length ? usable : rawUrls,
+                          late = (u) => authInterruptedRoutes.has(u);
+                        return [...list.filter((u) => !late(u)), ...list.filter(late)];
+                      })();
+              let active, challenge;
+              if (urls.length === 1) {
+                attempted = urls[0];
+                timing.route = classifyRoute(attempted);
+                trace?.mark("socket_open", { route: timing.route });
+                active = socket = new WebSocket(attempted);
+                active.binaryType = "arraybuffer";
+                active.addEventListener("message", onMessage);
+                active.addEventListener("close", end);
+                active.addEventListener("error", end);
+                await new Promise((resolve, reject) => {
+                  active.addEventListener(
+                    "open",
+                    () => {
+                      stage = 1;
+                      resolve();
+                    },
+                    { once: true },
+                  );
+                  active.addEventListener(
+                    "error",
+                    () => reject(Error("Could not connect to desktop")),
+                    { once: true },
+                  );
+                  active.addEventListener(
+                    "close",
+                    () => reject(failed || Error("Disconnected")),
+                    { once: true },
+                  );
+                });
+                ensureCurrent();
+                advanceStage();
+                mark("socketOpenMs");
+                trace?.mark("challenge");
+                const challengeBytes = await next();
+                ensureCurrent();
+                challenge = JSON.parse(challengeBytes);
+                stage = 2;
+                advanceStage();
+                mark("challengeMs");
+                if (challenge.version !== 2)
+                  throw Error("Unsupported desktop protocol");
+              } else {
+                challenge = await new Promise((resolve, reject) => {
+                  const legs = [];
+                  let nextIndex = 0,
+                    staggerTimer = null,
+                    settled = false;
+                  const detachAll = (except = null) => {
+                    clearTimeout(staggerTimer);
+                    staggerTimer = null;
+                    controller.signal.removeEventListener("abort", onAbort);
+                    for (const leg of legs) {
+                      leg.detach();
+                      if (leg !== except && leg.socket && !leg.failed) {
+                        leg.socket.addEventListener("error", noop);
+                        try {
+                          leg.socket.close();
+                        } catch {}
+                      }
+                    }
+                  };
+                  cleanupRace = () => {
+                    if (settled) return;
+                    settled = true;
+                    cleanupRace = null;
+                    allRoutesTried = legs.length === urls.length;
+                    detachAll();
+                  };
+                  function onAbort() {
+                    if (settled) return;
+                    cleanupRace?.();
+                    reject(
+                      failed ||
+                        transportClosed(
+                          "Disconnected. Pending actions were not resent.",
+                        ),
                     );
-                const capacity = e?.code === 4009,
-                  cooldown = e?.code === 1013,
-                  denied = e?.code === 1008 || capacity;
-                if (denied && !pair && !capacity) {
-                  rejectedRoutes.add(attempted);
-                  routeAlternative = !!options.endpoint?.fallback?.(attempted) && !rejectedRoutes.has(socketUrl());
-                }
-                if (denied && !routeAlternative) {
-                  authBlocked = true;
-                  clearTimeout(retryTimer);
-                }
-                if (cooldown) retryNotBefore = Date.now() + 65000;
-                const error = Error(
-                  capacity
-                    ? "Desktop device limit reached. Revoke an unused device in desktop Settings → Mobile, then scan a new QR code."
-                    : cooldown
-                      ? "Connection temporarily limited. Wait before reconnecting."
-                      : denied
-                        ? pair
-                          ? "This QR code expired or was already used. Tap New QR code on desktop and scan again."
-                          : "Desktop rejected authentication. Access may have been revoked; scan a fresh QR code."
-                        : "Disconnected. Pending actions were not resent. If desktop access was revoked, scan a fresh QR code.",
-                );
-                error.diagnosticReason = diagnosticReason;
-                error.diagnosticReported = true;
-                error.transport = !denied;
-                if (denied && failed) {
-                  failed = error;
-                  status("disconnected", error.message);
-                  return;
-                }
-                disconnect(error);
-              };
-              active.addEventListener("close", end);
-              active.addEventListener("error", end);
-              await new Promise((resolve, reject) => {
-                active.addEventListener(
-                  "open",
-                  () => {
-                    stage = 1;
-                    resolve();
-                  },
-                  { once: true },
-                );
-                active.addEventListener(
-                  "error",
-                  () => reject(Error("Could not connect to desktop")),
-                  { once: true },
-                );
-                active.addEventListener(
-                  "close",
-                  () => reject(failed || Error("Disconnected")),
-                  { once: true },
-                );
-              });
-              ensureCurrent();
-              advanceStage();
-              mark("socketOpenMs");
-              trace?.mark("challenge");
-              const challengeBytes = await next();
-              ensureCurrent();
-              const challenge = JSON.parse(challengeBytes),
-                nonce = crypto.getRandomValues(new Uint8Array(32));
-              stage = 2;
-              advanceStage();
-              mark("challengeMs");
-              if (challenge.version !== 2)
-                throw Error("Unsupported desktop protocol");
+                  }
+                  if (controller.signal.aborted) {
+                    onAbort();
+                    return;
+                  }
+                  controller.signal.addEventListener("abort", onAbort, {
+                    once: true,
+                  });
+                  const priority = (leg) => {
+                      const code = leg.closeEvent?.code;
+                      return code === 4009
+                        ? 5
+                        : code === 1013
+                          ? 4
+                          : code === 1008
+                            ? 3
+                            : code
+                              ? 2
+                              : leg.protocolError
+                                ? 0
+                                : 1;
+                    },
+                    finishAllFailed = () => {
+                      if (settled) return;
+                      settled = true;
+                      cleanupRace = null;
+                      allRoutesTried = legs.length === urls.length;
+                      detachAll();
+                      let chosen = legs[0];
+                      for (const leg of legs)
+                        if (priority(leg) > priority(chosen)) chosen = leg;
+                      attempted = chosen.url;
+                      timing.route = chosen.route;
+                      socket = chosen.socket;
+                      if (chosen.protocolError && priority(chosen) === 0) {
+                        reject(chosen.protocolError);
+                        return;
+                      }
+                      if (!chosen.closeEvent && chosen.socket)
+                        chosen.socket.addEventListener(
+                          "close",
+                          (e) => {
+                            attempted = chosen.url;
+                            timing.route = chosen.route;
+                            end(e);
+                          },
+                          { once: true },
+                        );
+                      end(chosen.closeEvent || {});
+                      reject(
+                        failed ||
+                          chosen.error ||
+                          Error("Could not connect to desktop"),
+                      );
+                    },
+                    failLeg = (leg, event, isClose, err) => {
+                      if (settled) return;
+                      if (isClose && event?.code) {
+                        leg.closeEvent = event;
+                        if (event.code === 1008 && !pair)
+                          rejectedRoutes.add(leg.url);
+                      }
+                      if (leg.failed) {
+                        if (
+                          nextIndex >= urls.length &&
+                          legs.length === urls.length &&
+                          legs.every((l) => l.failed)
+                        )
+                          finishAllFailed();
+                        return;
+                      }
+                      leg.failed = true;
+                      leg.error =
+                        err ||
+                        (isClose
+                          ? Error("Disconnected")
+                          : Error("Could not connect to desktop"));
+                      if (nextIndex < urls.length) {
+                        clearTimeout(staggerTimer);
+                        staggerTimer = null;
+                        startLeg(nextIndex);
+                        return;
+                      }
+                      if (
+                        legs.length === urls.length &&
+                        legs.every((l) => l.failed)
+                      )
+                        finishAllFailed();
+                    };
+                  function startLeg(index) {
+                    if (settled || index < nextIndex || index >= urls.length)
+                      return;
+                    nextIndex = index + 1;
+                    const url = urls[index],
+                      route = classifyRoute(url),
+                      leg = {
+                        url,
+                        route,
+                        socket: null,
+                        socketOpenMs: undefined,
+                        failed: false,
+                        closeEvent: null,
+                        protocolError: null,
+                        error: null,
+                        detach: noop,
+                      };
+                    legs.push(leg);
+                    if (
+                      index === 0 ||
+                      legs.slice(0, index).every((l) => l.failed)
+                    ) {
+                      attempted = url;
+                      timing.route = route;
+                      if (stage < 1) trace?.mark("socket_open", { route });
+                    }
+                    if (nextIndex < urls.length) {
+                      clearTimeout(staggerTimer);
+                      // An interrupted route answers its challenge fast and would win again at 250ms.
+                      staggerTimer = setTimeout(
+                        () => {
+                          staggerTimer = null;
+                          startLeg(nextIndex);
+                        },
+                        authInterruptedRoutes.has(urls[nextIndex]) &&
+                          !authInterruptedRoutes.has(url)
+                          ? 2000
+                          : 250,
+                      );
+                    }
+                    let ws;
+                    try {
+                      ws = new WebSocket(url);
+                    } catch (err) {
+                      failLeg(leg, null, false, err);
+                      return;
+                    }
+                    ws.binaryType = "arraybuffer";
+                    leg.socket = ws;
+                    if (
+                      index === 0 ||
+                      legs.slice(0, index).every((l) => l.failed)
+                    )
+                      socket = ws;
+                    const onOpen = () => {
+                        if (settled || leg.failed) return;
+                        leg.socketOpenMs = Math.max(
+                          0,
+                          clock() - timing.started,
+                        );
+                        if (stage < 1) {
+                          stage = 1;
+                          advanceStage();
+                          timing.socketOpenMs = leg.socketOpenMs;
+                          trace?.mark("challenge");
+                        }
+                      },
+                      onLegMessage = (e) => {
+                        if (settled || leg.failed) return;
+                        let parsed;
+                        try {
+                          const raw =
+                            typeof e.data === "string"
+                              ? e.data
+                              : decode.decode(e.data);
+                          parsed = JSON.parse(raw);
+                          if (parsed?.version !== 2)
+                            throw Error("Unsupported desktop protocol");
+                        } catch (err) {
+                          leg.protocolError = err;
+                          leg.detach();
+                          ws.addEventListener("error", noop);
+                          try {
+                            ws.close();
+                          } catch {}
+                          failLeg(leg, null, false, err);
+                          return;
+                        }
+                        settled = true;
+                        cleanupRace = null;
+                        leg.detach();
+                        options.endpoint?.selectRoute?.(leg.url);
+                        attempted = leg.url;
+                        active = socket = ws;
+                        timing.route = leg.route;
+                        timing.socketOpenMs =
+                          leg.socketOpenMs ??
+                          Math.max(0, clock() - timing.started);
+                        heard = Date.now();
+                        stage = 2;
+                        ws.addEventListener("message", onMessage);
+                        ws.addEventListener("close", end);
+                        ws.addEventListener("error", end);
+                        detachAll(leg);
+                        advanceStage();
+                        mark("challengeMs");
+                        resolve(parsed);
+                      },
+                      onLegError = (e) => failLeg(leg, e, false),
+                      onLegClose = (e) => failLeg(leg, e, true);
+                    leg.detach = () => {
+                      ws.removeEventListener?.("open", onOpen);
+                      ws.removeEventListener?.("message", onLegMessage);
+                      ws.removeEventListener?.("error", onLegError);
+                      ws.removeEventListener?.("close", onLegClose);
+                      leg.detach = noop;
+                    };
+                    ws.addEventListener("open", onOpen);
+                    ws.addEventListener("message", onLegMessage);
+                    ws.addEventListener("error", onLegError);
+                    ws.addEventListener("close", onLegClose);
+                  }
+                  startLeg(0);
+                });
+                ensureCurrent();
+              }
+              const nonce = crypto.getRandomValues(new Uint8Array(32));
               trace?.mark("authentication");
               const pairing = !!pair,
                 secret = pairing
@@ -1887,6 +2252,7 @@
               mark("helloMs");
               connected = true;
               warmTerminal();
+              stage = 4;
               trace?.mark("snapshot");
               const first = serial.then(() =>
                 answer(current).catch((e) =>
@@ -1907,9 +2273,10 @@
               ensureCurrent();
               if (!resumed) mark("readyMs");
               retryDelay = 1000;
-              authFailures = 0;
               rejectedRoutes.clear();
-              authInterruptedRoutes.clear();
+              // Only the route that just authenticated is cleared: another that failed mid-handshake stays
+              // last, so it cannot win the next race on a fast challenge and fail again.
+              authInterruptedRoutes.delete(attempted);
               retryCount = 0;
               trace?.ok();
               nextRetryAt = 0;
@@ -1919,7 +2286,10 @@
               established = true;
               for (const fn of routeListeners) fn();
               poll();
-          });
+            });
+          } finally {
+            cleanupRace?.();
+          }
           if (!isCurrent()) return;
         } catch (e) {
           if (!isCurrent()) return;
@@ -1953,7 +2323,10 @@
               try {
                 (socketUrl() === attempted &&
                   options.endpoint?.fallback?.(attempted),
-                  (quick = retryDelay <= 1e3 && socketUrl() !== attempted));
+                  (quick =
+                    !allRoutesTried &&
+                    retryDelay <= 1e3 &&
+                    socketUrl() !== attempted));
               } catch {}
           } else if (transientConnect && stage === 2 && !authBlocked) {
             try {
@@ -1975,14 +2348,14 @@
               quick = true;
             }
           }
+          // A transport close while authenticating is not a rejection: the daemon signals those with
+          // 1008/4009, and its own failure budget answers repeated bad proofs with 1013 (65s above).
+          // Timeouts and interruptions do not consume that budget, so normal backoff is safe here.
           (!transientConnect &&
             stage === 2 &&
             !routeAlternative &&
-            ((e?.transport || failed?.transport) && !authBlocked
-              ? (authFailures++,
-                (retryNotBefore = Date.now() + 65e3 * authFailures),
-                authFailures > 2 && (authBlocked = !0))
-              : (authBlocked = !0)),
+            !(e?.transport || failed?.transport) &&
+            (authBlocked = !0),
             options.onError?.(e),
             disconnect(e),
             status("disconnected", failed?.message || e.message));
@@ -2004,7 +2377,6 @@
           (connecting = !1),
           (refreshing = null),
           (authBlocked = !1),
-          (authFailures = 0),
           (retryDelay = 1e3),
           connect());
       }
@@ -2057,20 +2429,46 @@
         },
         resume(stale) {
           if (!connected) {
+            // An attempt started before the background may be stuck on a dead path; the 1013 wait still holds.
+            if (stale && connecting && !authBlocked) {
+              reconnect(!1);
+              return;
+            }
             ((retryDelay = 1e3), connect());
             return;
           }
-          if (stale) {
+          // A changed network leaves the socket on the old path, so it is replaced at once. After a long
+          // background an open socket is asked once with the probe deadline instead of being dropped.
+          if (stale === "network" || !socket || socket.readyState > 1) {
             reconnect(!1);
             return;
           }
-          (!warm ||
+          // The idle spare socket is the first to lose its NAT mapping, so a long background replaces it.
+          (stale ||
+            !warm ||
             warm.socket.readyState === 2 ||
             warm.socket.readyState === 3 ||
             warm.socket.closed) &&
             (clearWarm(!0), warmTerminal());
           const current = generation;
-          refresh().catch((e) => {
+          if (stale) {
+            // The probe may queue behind an earlier request, so liveness is judged by any inbound frame.
+            const since = received;
+            clearTimeout(resumeTimer);
+            resumeTimer = setTimeout(() => {
+              if (
+                connected &&
+                current === generation &&
+                received === since &&
+                !globalThis.document?.hidden
+              ) {
+                const error = transportClosed("Disconnected. Reconnecting\u2026");
+                error.diagnosticReason = "timeout";
+                disconnect(error);
+              }
+            }, PROBE_DEADLINE);
+          }
+          refresh(!!stale).catch((e) => {
             connected && current === generation && options.onError?.(e);
           });
         },
@@ -2116,6 +2514,7 @@
           connectController?.abort();
           clearTimeout(timer);
           clearTimeout(retryTimer);
+          clearTimeout(resumeTimer);
           clearWarm(true);
           disconnect(transportClosed("Disconnected"));
           generation++;

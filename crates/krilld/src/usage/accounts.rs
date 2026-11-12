@@ -33,6 +33,8 @@ use crate::session::lock;
 
 const ACCOUNTS_FILE: &str = "accounts.toml";
 const ACTIVE_ENV_FILE: &str = "active-accounts.env";
+/// 실행 중인 Orca가 갱신하는 캐시 행의 이메일을 현재 로그인으로 믿는 최대 나이(초).
+const ORCA_EMAIL_MAX_AGE: u64 = 3600;
 /// 상태 꼬리 재료: (Orca `error` 원문, `detail` 원문, 갱신 시각 epoch 초).
 type StatusMeta = (Option<String>, Option<String>, Option<u64>);
 /// `StopFailure` `rate_limit` 감지 계정 기록(OWE-703 2단계 지시·OWE-710).
@@ -56,6 +58,10 @@ pub fn clear_rate_limited(provider: ProviderKind, account_id: &str) -> bool {
     lock(&RATE_LIMITED)
         .remove(&(provider.as_str().to_owned(), account_id.to_owned()))
         .is_some()
+}
+
+pub(super) fn evict_login_profile(provider: ProviderKind, dir: &Path) {
+    login::evict_profile(provider, dir);
 }
 
 fn rate_limited_at(
@@ -414,17 +420,20 @@ fn runnable(a: &AccountInfo) -> bool {
     a.host_default || Path::new(&a.profile_dir).is_dir()
 }
 
-/// Claude 프로필의 statusline 캐시 파일 값. 수정 시각이 `updated_at`이다.
-pub(crate) fn claude_statusline_usage(profile_dir: &Path) -> Option<ProfileUsage> {
-    [CLAUDE_CACHE, "usage_cache.json"].iter().find_map(|name| {
-        let path = profile_dir.join(name);
-        let usage = parse_claude(&std::fs::read_to_string(&path).ok()?);
-        (!usage.is_empty()).then(|| ProfileUsage {
-            usage,
-            updated_at: mtime_secs(&path),
-            ..ProfileUsage::default()
-        })
+/// Claude 사용량 파일 값. 수정 시각이 `updated_at`이다.
+fn claude_usage_file(profile_dir: &Path, name: &str) -> Option<ProfileUsage> {
+    let path = profile_dir.join(name);
+    let usage = parse_claude(&std::fs::read_to_string(&path).ok()?);
+    (!usage.is_empty()).then(|| ProfileUsage {
+        usage,
+        updated_at: mtime_secs(&path),
+        ..ProfileUsage::default()
     })
+}
+
+/// `krill statusline`이 세션의 `CLAUDE_CONFIG_DIR`에 기록한 값. 폴더가 곧 계정이다.
+pub(crate) fn claude_recorded_usage(profile_dir: &Path) -> Option<ProfileUsage> {
+    claude_usage_file(profile_dir, krill_proto::statusline::CACHE_FILE)
 }
 
 /// 프로필 디렉터리에서 해당 프로바이더 계정의 5h/7d 사용량·상태 근거를 읽는다.
@@ -439,15 +448,27 @@ pub fn read_profile_usage(
     host_default: bool,
 ) -> ProfileUsage {
     let direct = super::direct::cached(home, provider, profile_dir);
-    // Orca 패리티: 실행 중인 세션의 statusline 값이 직접 조회 값보다 새롭거나 조회가 실패했으면 그것을 쓴다.
-    let live = (provider == ProviderKind::Claude)
-        .then(|| claude_statusline_usage(profile_dir))
+    // 실행 중인 세션이 이 프로필에 기록한 값이 직접 조회보다 새롭거나 조회가 실패했으면 그것을 쓴다.
+    let recorded = (provider == ProviderKind::Claude)
+        .then(|| claude_recorded_usage(profile_dir))
         .flatten();
-    match (direct, live) {
+    // `statusline_cache.json`은 외부 스크립트가 계정과 무관한 경로에 쓸 수 있어(cc-alchemy는
+    // 항상 `~/.claude`) 다른 값이 전혀 없을 때만 쓴다.
+    let legacy = || {
+        (provider == ProviderKind::Claude)
+            .then(|| claude_usage_file(profile_dir, CLAUDE_CACHE))
+            .flatten()
+    };
+    match (direct, recorded) {
         (Some(d), Some(l)) if l.updated_at > d.updated_at || d.usage.is_empty() => return l,
+        (Some(d), None) if d.usage.is_empty() => return legacy().unwrap_or(d),
         (Some(d), _) => return d,
         (None, Some(l)) => return l,
-        (None, None) => {}
+        (None, None) => {
+            if let Some(l) = legacy() {
+                return l;
+            }
+        }
     }
     match provider {
         ProviderKind::Gemini => ProfileUsage::default(),
@@ -1003,7 +1024,11 @@ fn refresh_accounts_authenticated(
                     .iter_mut()
                     .find(|a| a.provider == ProviderKind::Claude && a.host_default)
                 {
-                    if let Some(email) = row_email {
+                    // Orca가 멈춘 뒤의 오래된 행은 지금 로그인을 말해 주지 못한다(이후 프로브가 채운다).
+                    let now = u64::try_from(now_epoch()).unwrap_or_default();
+                    if orca_stamp.is_some_and(|at| now.saturating_sub(at) < ORCA_EMAIL_MAX_AGE)
+                        && let Some(email) = row_email
+                    {
                         host_acc.email = Some(email);
                     }
                     if host_acc.usage.is_empty() && !row.usage.is_empty() {
@@ -1446,11 +1471,15 @@ fn refresh_accounts_authenticated(
     let statuses = all
         .iter()
         .map(|a| {
+            let profile_path = PathBuf::from(&a.profile_dir);
+            let codex_auth_rejected = a.provider == ProviderKind::Codex
+                && super::direct::has_auth_failure(home, a.provider, &profile_path);
             let (mut error, mut detail, updated_at) = meta.remove(&a.id).unwrap_or_default();
             // 새 로그인 성공은 오래된 사용량 캐시의 인증 오류보다 우선한다.
-            if auth
-                .get(&(a.provider, PathBuf::from(&a.profile_dir)))
-                .is_some_and(|s| s.logged_in)
+            if !codex_auth_rejected
+                && auth
+                    .get(&(a.provider, profile_path.clone()))
+                    .is_some_and(|s| s.logged_in)
                 && error
                     .as_deref()
                     .is_some_and(|e| classify_error(e) == AccountStatus::NeedsLogin)
@@ -1460,8 +1489,9 @@ fn refresh_accounts_authenticated(
             }
             let detected = rate_limited_at(&limited, a.provider, &a.id);
             let (status, detected_at) = if auth
-                .get(&(a.provider, PathBuf::from(&a.profile_dir)))
+                .get(&(a.provider, profile_path))
                 .is_some_and(|status| !status.logged_in)
+                || (codex_auth_rejected && detected.is_none())
             {
                 (AccountStatus::NeedsLogin, None)
             } else {
@@ -1486,9 +1516,19 @@ fn refresh_accounts_authenticated(
         direct_usage: true, // 구버전 클라이언트용 필드. 사용량은 항상 자동 수집한다.
         accounts: all
             .iter()
-            .map(|a| krill_proto::usage::AccountConnection {
-                account_id: a.id.clone(),
-                status: login::connection(a.provider, Path::new(&a.profile_dir)),
+            .map(|a| {
+                let path = Path::new(&a.profile_dir);
+                let status = if a.provider == ProviderKind::Codex
+                    && super::direct::has_auth_failure(home, a.provider, path)
+                {
+                    krill_proto::usage::ConnectionStatus::NeedsLogin
+                } else {
+                    login::connection(a.provider, path)
+                };
+                krill_proto::usage::AccountConnection {
+                    account_id: a.id.clone(),
+                    status,
+                }
             })
             .collect(),
     };
@@ -1609,6 +1649,85 @@ mod login_regression_tests {
             AccountStatus::NeedsLogin
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_http_401_marks_needs_login_and_clears_immediately_when_auth_json_changes() {
+        let root =
+            std::env::temp_dir().join(format!("krill-codex-401-relogin-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        let added = add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            "Codex Profile #1",
+            None,
+            "",
+        )
+        .unwrap();
+        let account = added
+            .accounts
+            .iter()
+            .find(|a| a.id == "codex-codex-profile-1")
+            .unwrap();
+        let dir = PathBuf::from(&account.profile_dir);
+
+        std::fs::write(
+            dir.join("auth.json"),
+            br#"{"tokens":{"access_token":"expired-token","account_id":"acc-401"}}"#,
+        )
+        .unwrap();
+        crate::usage::direct::fail_for_tests(&home, ProviderKind::Codex, &dir);
+
+        let auth = BTreeMap::from([(
+            (ProviderKind::Codex, dir.clone()),
+            krill_proto::account_login::AuthStatus {
+                logged_in: true,
+                identity: None,
+            },
+        )]);
+
+        let snap =
+            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let first = snap.status_for("codex-codex-profile-1").unwrap();
+        assert_eq!(first.status, AccountStatus::NeedsLogin, "{first:?}");
+        assert!(
+            first
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("HTTP 401")),
+            "{first:?}"
+        );
+        assert_eq!(
+            snap.connection_for("codex-codex-profile-1"),
+            krill_proto::usage::ConnectionStatus::NeedsLogin
+        );
+
+        std::fs::write(
+            dir.join("auth.json"),
+            br#"{"tokens":{"access_token":"fresh-token","account_id":"acc-401"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(".krill-login-completed"), b"").unwrap();
+
+        let snap2 =
+            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let second = snap2.status_for("codex-codex-profile-1").unwrap();
+        assert_ne!(second.status, AccountStatus::NeedsLogin, "{second:?}");
+        assert!(second.detail.is_none(), "{second:?}");
+        assert_ne!(
+            snap2.connection_for("codex-codex-profile-1"),
+            krill_proto::usage::ConnectionStatus::NeedsLogin
+        );
+
+        crate::usage::direct::evict_profile(&home, ProviderKind::Codex, &dir);
+        std::fs::remove_dir_all(&root).ok();
     }
 }
 

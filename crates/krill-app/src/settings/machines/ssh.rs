@@ -14,7 +14,7 @@ impl SettingsView {
         let p = crate::ui::palette(cx);
         let mut root = div().flex().flex_col().gap_3().child(
             layout::row(p)
-                .child(layout::label(
+                .child(self.search_focus.label(
                     p,
                     text::SSH_TITLE.get(),
                     Some(text::SSH_DESC.get()),
@@ -363,12 +363,13 @@ impl SettingsView {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .p_2p5()
-                .rounded(crate::ui::RADIUS_SM)
-                .bg(p.card)
-                .border_1()
-                .border_color(p.border)
-                .child(div().text_size(crate::ui::TEXT_XS).child(status.clone()));
+                .px_2()
+                .child(
+                    div()
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(status.clone()),
+                );
             if let Some(failed_host) = &self.ssh_auth_failed_host {
                 let host_for_reg = failed_host.clone();
                 status_box = status_box.child(
@@ -440,13 +441,16 @@ impl SettingsView {
         root
     }
 
+    /// 펼친 머신 행의 SSH 경로: 상태, 원격 정보, 일반 동작. 지우기는 [`Self::render_ssh_remove`]가 맡는다.
+    /// `with_connect`는 행 머리의 연결 버튼이 맡지 않은 경로에만 켠다.
     #[expect(
         clippy::too_many_lines,
-        reason = "SSH route card retains connection, test, install and edit controls"
+        reason = "SSH route keeps connection, test, probe, install and edit controls"
     )]
-    pub(super) fn render_ssh_host_card(
+    pub(super) fn render_ssh_route(
         &mut self,
         host: &crate::ssh_hosts::SshHost,
+        with_connect: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
@@ -473,14 +477,12 @@ impl SettingsView {
         let probe_id = format!("admin-ssh-probe-{}", host.id);
         let install_id = format!("admin-ssh-install-{}", host.id);
         let edit_id = format!("admin-ssh-edit-{}", host.id);
-        let rm_id = format!("admin-ssh-remove-{}", host.id);
         let host_conn = host.clone();
         let host_disc = host.clone();
         let host_cl = host.clone();
         let host_probe = host.clone();
         let host_install = host.clone();
         let host_edit = host.clone();
-        let rm_host_id = host.id.clone();
         let card_state = self.ssh_remote_infos.get(&host.id);
         let (remote_text, remote_is_error) = remote_line_text(card_state);
         // OWE-897: 설치·업데이트 버튼은 프로브 완료 + 지원 플랫폼 + 구버전/미설치일 때만.
@@ -515,27 +517,29 @@ impl SettingsView {
             _ => text::SSH_REMOTE_PROBE.get(),
         };
 
-        let connect_or_disconnect_btn = if status == SshHostCardStatus::Connected {
-            layout::secondary(
-                gpui::ElementId::Name(disc_id.clone().into()),
-                text::SSH_DISCONNECT.get(),
-            )
-            .small()
-            .debug_selector(move || disc_id.clone())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.disconnect_ssh_host(&host_disc, cx);
-            }))
-        } else {
-            layout::secondary(
-                gpui::ElementId::Name(conn_id.clone().into()),
-                text::SSH_CONNECT.get(),
-            )
-            .small()
-            .debug_selector(move || conn_id.clone())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.connect_ssh_host(host_conn.clone(), cx);
-            }))
-        };
+        let connect_or_disconnect_btn = with_connect.then(|| {
+            if status == SshHostCardStatus::Connected {
+                layout::secondary(
+                    gpui::ElementId::Name(disc_id.clone().into()),
+                    text::SSH_DISCONNECT.get(),
+                )
+                .small()
+                .debug_selector(move || disc_id.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.disconnect_ssh_host(&host_disc, cx);
+                }))
+            } else {
+                layout::secondary(
+                    gpui::ElementId::Name(conn_id.clone().into()),
+                    text::SSH_CONNECT.get(),
+                )
+                .small()
+                .debug_selector(move || conn_id.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.connect_ssh_host(host_conn.clone(), cx);
+                }))
+            }
+        });
 
         let probe_btn = if probe_loading {
             layout::ghost(
@@ -557,7 +561,7 @@ impl SettingsView {
             .w_full()
             .flex_wrap()
             .flex_shrink_1()
-            .child(connect_or_disconnect_btn)
+            .children(connect_or_disconnect_btn)
             .child({
                 let testing = self.is_ssh_test_pending(&host.id);
                 crate::ui::button_with_reserved_label(
@@ -596,122 +600,101 @@ impl SettingsView {
                     })),
             );
         }
-        controls = controls
-            .child(
-                layout::ghost(
-                    gpui::ElementId::Name(edit_id.clone().into()),
-                    text::SSH_EDIT.get(),
-                )
-                .small()
-                .debug_selector(move || edit_id.clone())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.start_edit_ssh_host(&host_edit, window, cx);
-                })),
+        controls = controls.child(
+            layout::ghost(
+                gpui::ElementId::Name(edit_id.clone().into()),
+                text::SSH_EDIT.get(),
             )
-            // OWE-897: 삭제는 두 번 눌러 확인(파괴적 동작 규칙).
-            .child(
-                self.confirm_button(
-                    rm_id.clone(),
-                    text::SSH_REMOVE.get(),
-                    cx,
-                    move |this, cx| {
-                        this.remove_ssh_host(&rm_host_id, cx);
-                    },
-                )
-                .small(),
-            );
+            .small()
+            .debug_selector(move || edit_id.clone())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                // 입력 칸은 하나라 추가 패널과 함께 쓰지 않는다.
+                if this.machine_add == Some(crate::machines::AddMethod::Ssh) {
+                    this.machine_add = None;
+                }
+                this.start_edit_ssh_host(&host_edit, window, cx);
+            })),
+        );
 
-        layout::card(p)
+        div()
             .id(gpui::ElementId::Name(card_id.clone().into()))
             .debug_selector(move || card_id.clone())
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_1p5()
             .items_start()
             .child(
                 div()
-                    .w_full()
-                    .flex_1()
-                    .min_w_0()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .child(crate::ui::icons::svg_box(
-                        crate::ui::icons::SERVER_SVG,
-                        crate::ui::ICON_MD,
-                        p.muted_foreground,
-                    ))
+                    .gap_1()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(crate::ui::TEXT_SM)
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .child(host.label.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .id(gpui::ElementId::Name(
-                                                        dot_id.clone().into(),
-                                                    ))
-                                                    .debug_selector(move || dot_id.clone())
-                                                    .size(crate::ui::STATE_DOT)
-                                                    .rounded_full()
-                                                    .bg(dot_color),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(crate::ui::TEXT_XS)
-                                                    .text_color(status_text_color)
-                                                    .child(status_label),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .text_color(p.muted_foreground)
-                                    .child(host.format_summary()),
-                            )
-                            .child(
-                                div()
-                                    .id(gpui::ElementId::Name(remote_id.clone().into()))
-                                    .debug_selector(move || remote_id.clone())
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_SM)
-                                    .text_color(if remote_is_error {
-                                        p.destructive
-                                    } else {
-                                        p.muted_foreground
-                                    })
-                                    .child(remote_text),
-                            ),
+                            .id(gpui::ElementId::Name(dot_id.clone().into()))
+                            .debug_selector(move || dot_id.clone())
+                            .size(crate::ui::STATE_DOT)
+                            .rounded_full()
+                            .bg(dot_color),
+                    )
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(status_text_color)
+                            .child(status_label),
                     ),
             )
+            .child(
+                div()
+                    .id(gpui::ElementId::Name(remote_id.clone().into()))
+                    .debug_selector(move || remote_id.clone())
+                    .min_w_0()
+                    .font_family(crate::ui::FONT_MONO)
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(if remote_is_error {
+                        p.destructive
+                    } else {
+                        p.muted_foreground
+                    })
+                    .child(remote_text),
+            )
             .child(controls)
+    }
+
+    /// SSH 제거 위험 행. 결과 문구는 누르기 전부터 보인다.
+    pub(super) fn render_ssh_remove(
+        &mut self,
+        host: &crate::ssh_hosts::SshHost,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let p = crate::ui::palette(cx);
+        let rm_host_id = host.id.clone();
+        // OWE-897: 삭제는 두 번 눌러 확인(파괴적 동작 규칙).
+        let remove = self.confirm_button(
+            format!("admin-ssh-remove-{}", host.id),
+            text::SSH_REMOVE.get(),
+            cx,
+            move |this, cx| {
+                this.remove_ssh_host(&rm_host_id, cx);
+            },
+        );
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(170.))
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::SSH_REMOVE_DETAIL.get()),
+            )
+            .child(layout::controls().child(remove))
     }
 }

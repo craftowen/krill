@@ -476,9 +476,8 @@ fn init(cx: &mut App) {
     cx.on_action(|_: &ShowShortcuts, cx| {
         krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Shortcuts, cx);
     });
-    // 피드백 창구: 기존 GitHub 이슈 양식(버그·기능 요청) 선택 화면을 연다.
     cx.on_action(|_: &SendFeedback, cx| {
-        cx.open_url("https://github.com/craftowen/krill/issues/new/choose");
+        cx.open_url(krill_app::settings::FEEDBACK_URL);
     });
     cx.on_action(|_: &CloseWindow, cx| {
         if let Some(window) = cx

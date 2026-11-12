@@ -216,10 +216,16 @@ impl Drop for Client {
         self.socket.shutdown(Shutdown::Both).ok();
     }
 }
+/// 실패 위치는 호출한 줄로 보고한다(어느 단계에서 기한을 넘겼는지 남긴다).
+#[track_caller]
 fn until(mut f: impl FnMut() -> bool) {
-    let end = std::time::Instant::now() + Duration::from_secs(5);
+    let start = std::time::Instant::now();
     while !f() {
-        assert!(std::time::Instant::now() < end);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "condition still false after {:?}",
+            start.elapsed()
+        );
         thread::sleep(Duration::from_millis(5));
     }
 }
@@ -2436,4 +2442,65 @@ fn relay_capacity_close_is_not_the_auth_cooldown_code() {
         !matches!(code, 1008 | 1013 | 4009),
         "a full relay must close with a retryable code, got {code}"
     );
+}
+
+#[test]
+fn relay_handshake_answered_after_five_seconds_still_authenticates() {
+    use super::super::relay::{MUX_BINARY, MUX_OPEN, MUX_TEXT, decode_mux, encode_mux};
+    fn reply(host: &mut TcpStream, cid: u32) -> (u8, Vec<u8>) {
+        loop {
+            let (_, body) = ws::read(host).unwrap();
+            let (kind, from, payload) = decode_mux(&body).unwrap();
+            if from == cid {
+                return (kind, payload.to_vec());
+            }
+        }
+    }
+    let (_registry, g, host_ws) = relay_with_upgrade_status("101");
+    let mut host = host_ws.unwrap();
+    host.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let MobileReply::PairingOffer { .. } = g.request(MobileRequest::MintPairingTicket {
+        mode: ConnectMode::Tunnel,
+        custom_address: None,
+        rotate: true,
+    }) else {
+        panic!("expected relay offer");
+    };
+    let ticket = lock(&g.shared.state)
+        .devices
+        .ticket(now_ms())
+        .unwrap()
+        .clone();
+    ws::write(&mut host, ws::BINARY, &encode_mux(MUX_OPEN, 7, &[])).unwrap();
+    let (kind, greeting) = reply(&mut host, 7);
+    assert_eq!(kind, MUX_TEXT);
+    let greeting: serde_json::Value = serde_json::from_slice(&greeting).unwrap();
+    let challenge = decode_hex::<32>(greeting["challenge"].as_str().unwrap()).unwrap();
+    // A phone waking its cellular radio took 4.6s just to open the socket; the old 5s budget closed it with 1011.
+    thread::sleep(Duration::from_secs(6));
+    let nonce = [0x44_u8; 32];
+    let mut salt = [0_u8; 64];
+    salt[..32].copy_from_slice(&challenge);
+    salt[32..].copy_from_slice(&nonce);
+    let mut channel = Channel::new(&ticket.secret, &salt, Endpoint::Client).unwrap();
+    let auth = serde_json::to_vec(&AuthHello {
+        token: Some(hex(&ticket.token)),
+        device_id: None,
+        client_nonce: hex(&nonce),
+    })
+    .unwrap();
+    ws::write(&mut host, ws::BINARY, &encode_mux(MUX_TEXT, 7, &auth)).unwrap();
+    let proof = channel
+        .seal(
+            &serde_json::to_vec(&AuthProof {
+                label: "slow phone".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    ws::write(&mut host, ws::BINARY, &encode_mux(MUX_BINARY, 7, &proof)).unwrap();
+    let (kind, sealed) = reply(&mut host, 7);
+    assert_eq!(kind, MUX_BINARY, "authenticated instead of closed");
+    let _: Authenticated = serde_json::from_slice(&channel.open(&sealed).unwrap()).unwrap();
 }

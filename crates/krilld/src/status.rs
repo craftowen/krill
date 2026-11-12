@@ -35,6 +35,7 @@ pub mod detect;
 mod monitor;
 #[cfg(any(windows, test))]
 pub(crate) mod process_tree;
+pub(crate) mod startup;
 mod subagents;
 pub(crate) use monitor::monitor;
 

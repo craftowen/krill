@@ -119,6 +119,12 @@ pub const PANEL_ROW_HEIGHT: Pixels = px(26.);
 pub const PANEL_TAB_HEIGHT: Pixels = px(24.);
 /// 분할 창 헤더 높이(26px).
 pub const PANE_HEADER_HEIGHT: Pixels = px(26.);
+pub const PANE_GAP: Pixels = px(6.);
+/// Matches `RADIUS_SM - 1px` because gpui's `overflow_hidden` clips only to an axis-aligned box,
+/// so opaque edge-touching children round their own corners to stay inside the 1px card border.
+pub const PANE_CARD_INNER_RADIUS: Pixels = px(5.);
+pub const SPLIT_GUTTER_PILL_THICKNESS: Pixels = px(2.);
+pub const SPLIT_GUTTER_PILL_LENGTH: Pixels = px(24.);
 /// 워크트리 상태 요약 에이전트 아이콘 타일 크기(15px, `ui::status::summary_element` 전용).
 pub const STATUS_GROUP_ICON: Pixels = px(15.);
 /// 상태 요약 에이전트 아이콘 사이 간격(2px).
@@ -129,6 +135,12 @@ pub const DIALOG_WIDTH: Pixels = px(512.);
 pub const SETTINGS_MODAL_WIDTH: Pixels = px(640.);
 /// 설정 화면 왼쪽 탭 탐색 열 고정 너비(248px).
 pub const SETTINGS_NAV_WIDTH: Pixels = px(248.);
+/// 모달이 좁을 때의 설정 왼쪽 탐색 열 너비(줌 100%에서 168px). UI 줌을 따라 탭 이름이 덜 잘린다.
+pub const SETTINGS_NAV_WIDTH_NARROW: Rems = rems(10.5);
+/// 설정 본문 위 머리 띠 높이(44px).
+pub const SETTINGS_BAND_HEIGHT: Pixels = px(44.);
+/// 모달이 좁을 때의 설정 머리 띠 높이(40px).
+pub const SETTINGS_BAND_HEIGHT_NARROW: Pixels = px(40.);
 /// 설정 화면 오른쪽 본문 열 최대 너비(1120px, 창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지, OWE-793).
 pub const SETTINGS_CONTENT_MAX_WIDTH: Pixels = px(1120.);
 
@@ -289,7 +301,7 @@ pub const LIGHT: Palette = Palette {
     destructive_foreground: hex(0x00fc_f3f3),
     border: hex(0x00e4_e7ec),
     input: hex(0x00e4_e7ec),
-    ring: hex(0x009a_a3b5),
+    ring: hex(0x006b_7487),
     // Krill 심해 틴트(Orca 값에서 변경): sidebar·worktree_sidebar 계열.
     sidebar: hex(0x00f6_f7f9),
     sidebar_foreground: hex(0x000a_0a0a),
@@ -298,7 +310,7 @@ pub const LIGHT: Palette = Palette {
     sidebar_accent: hex(0x00e9_ecf1),
     sidebar_accent_foreground: hex(0x0017_1717),
     sidebar_border: hex(0x00e4_e7ec),
-    sidebar_ring: hex(0x009a_a3b5),
+    sidebar_ring: hex(0x006b_7487),
     worktree_sidebar: hex(0x00f1_f3f6),
     worktree_sidebar_foreground: hex(0x000a_0a0a),
     worktree_sidebar_accent: hex(0x00e6_e9ef),
@@ -335,7 +347,7 @@ pub const DARK: Palette = Palette {
     destructive_foreground: hex(0x00fa_fafa),
     border: hexa(0x00ff_ffff, 0.08),
     input: hexa(0x00ff_ffff, 0.15),
-    ring: hex(0x005b_6478),
+    ring: hex(0x007c_869c),
     // Krill 심해 틴트(Orca 값에서 변경): sidebar·worktree_sidebar 계열.
     sidebar: hex(0x0012_151d),
     sidebar_foreground: hex(0x00fa_fafa),
@@ -344,7 +356,7 @@ pub const DARK: Palette = Palette {
     sidebar_accent: hex(0x0022_2836),
     sidebar_accent_foreground: hex(0x00fa_fafa),
     sidebar_border: hexa(0x00ff_ffff, 0.07),
-    sidebar_ring: hex(0x004b_5366),
+    sidebar_ring: hex(0x007c_869c),
     worktree_sidebar: hex(0x0023_2836),
     worktree_sidebar_foreground: hex(0x00fa_fafa),
     worktree_sidebar_accent: hex(0x002e_3445),
@@ -380,7 +392,7 @@ pub const ABYSS: Palette = Palette {
     destructive_foreground: hex(0x00fa_fafa),
     border: hexa(0x00ff_ffff, 0.09),
     input: hexa(0x00ff_ffff, 0.15),
-    ring: hex(0x0052_5252),
+    ring: hex(0x007a_7a7a),
     sidebar: hex(0x0000_0000),
     sidebar_foreground: hex(0x00ed_eded),
     sidebar_primary: hex(0x0040_4040),
@@ -388,7 +400,7 @@ pub const ABYSS: Palette = Palette {
     sidebar_accent: hex(0x001a_1a1a),
     sidebar_accent_foreground: hex(0x00ed_eded),
     sidebar_border: hexa(0x00ff_ffff, 0.08),
-    sidebar_ring: hex(0x0040_4040),
+    sidebar_ring: hex(0x007a_7a7a),
     worktree_sidebar: hex(0x000f_0f0f),
     worktree_sidebar_foreground: hex(0x00ed_eded),
     worktree_sidebar_accent: hex(0x001c_1c1c),
@@ -509,7 +521,7 @@ pub const PAPER: Palette = Palette {
     destructive_foreground: hex(0x00fd_f3f2),
     border: hex(0x00e2_dccf),
     input: hex(0x00dd_d6c7),
-    ring: hex(0x00a3_9d8f),
+    ring: hex(0x0075_6f63),
     sidebar: hex(0x00ef_ebe3),
     sidebar_foreground: hex(0x001f_1d1a),
     sidebar_primary: hex(0x001f_1d1a),
@@ -517,7 +529,7 @@ pub const PAPER: Palette = Palette {
     sidebar_accent: hex(0x00e3_dccd),
     sidebar_accent_foreground: hex(0x001f_1d1a),
     sidebar_border: hex(0x00e2_dccf),
-    sidebar_ring: hex(0x00a3_9d8f),
+    sidebar_ring: hex(0x0075_6f63),
     worktree_sidebar: hex(0x00ea_e5da),
     worktree_sidebar_foreground: hex(0x001f_1d1a),
     worktree_sidebar_accent: hex(0x00e0_d9ca),
@@ -535,11 +547,11 @@ pub const PAPER: Palette = Palette {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DarkUiTheme {
-    #[default]
     TokyoNight,
     Mocha,
     RosePine,
     Trench,
+    #[default]
     Graphite,
     Pine,
     Amethyst,
@@ -799,6 +811,13 @@ pub fn terminal_surface_alpha(theme: TerminalTheme, opacity_pct: u8) -> Hsla {
     terminal_surface(theme).opacity(f32::from(opacity_pct.clamp(50, 100)) / 100.)
 }
 
+#[must_use]
+pub fn workspace_surface_alpha(palette: &Palette, opacity_pct: u8) -> Hsla {
+    palette
+        .sidebar
+        .opacity(f32::from(opacity_pct.clamp(50, 100)) / 100.)
+}
+
 /// 주어진 [`ThemeMode`]와 설정에 따라 적용할 터미널 테마를 계산한다(OWE-956).
 /// 라이트 모드에서도 `terminal_use_separate_light_theme`가 `false`면 다크 터미널 테마를 그대로 쓴다.
 /// 선택값을 해석하지 못하면 모드별 기본 테마로 돌아간다.
@@ -820,11 +839,11 @@ pub fn terminal_theme(cx: &App) -> TerminalTheme {
     terminal_theme_for_mode(mode, &crate::settings::current(cx))
 }
 
-/// 주어진 [`ThemeMode`]의 기본 팔레트(야광·[`PAPER`]). 설정 테마는 [`palette`]가 반영한다.
+/// 주어진 [`ThemeMode`]의 기본 팔레트(흑연·[`PAPER`]). 설정 테마는 [`palette`]가 반영한다.
 #[inline]
 pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
     if matches!(mode, ThemeMode::Dark) {
-        &TOKYO_NIGHT
+        &GRAPHITE
     } else {
         &PAPER
     }
@@ -832,7 +851,7 @@ pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
 
 /// [`apply`]가 설정 테마(`ui_theme_dark`·`ui_theme_light`)로 고른 [`Palette`]를 돌려준다. [`apply`] 전에는 활성
 /// [`ThemeMode`]의 기본 팔레트다.
-/// `gpui_component::init`를 부르지 않은 단위 테스트에서도 패닉 없이 야광 팔레트로 동작한다.
+/// `gpui_component::init`를 부르지 않은 단위 테스트에서도 패닉 없이 흑연 팔레트로 동작한다.
 #[inline]
 pub fn palette(cx: &App) -> &'static Palette {
     if let Some(active) = cx.try_global::<ActivePalette>() {
@@ -840,7 +859,7 @@ pub fn palette(cx: &App) -> &'static Palette {
     } else if cx.has_global::<Theme>() {
         palette_for(cx.theme().mode)
     } else {
-        &TOKYO_NIGHT
+        &GRAPHITE
     }
 }
 
@@ -1081,7 +1100,7 @@ mod tests {
         assert!(light.foreground.l < 0.15);
         assert!(dark.foreground.l > 0.90);
         assert_eq!(light, &PAPER);
-        assert_eq!(dark, &TOKYO_NIGHT);
+        assert_eq!(dark, &GRAPHITE);
     }
 
     #[gpui::test]
@@ -1090,8 +1109,8 @@ mod tests {
             gpui_component::init(cx);
             apply(ThemeMode::Dark, cx);
             assert_eq!(cx.theme().mode, ThemeMode::Dark);
-            assert_eq!(cx.theme().background, TOKYO_NIGHT.background);
-            assert_eq!(cx.theme().sidebar, TOKYO_NIGHT.sidebar);
+            assert_eq!(cx.theme().background, GRAPHITE.background);
+            assert_eq!(cx.theme().sidebar, GRAPHITE.sidebar);
             assert_eq!(cx.theme().radius, RADIUS_SM);
             assert_ne!(cx.theme().button, cx.theme().button_hover);
             assert_ne!(cx.theme().button_hover, cx.theme().button_active);
@@ -1168,6 +1187,59 @@ mod tests {
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
     }
 
+    fn blend_over(fg: Hsla, bg: Hsla) -> Hsla {
+        let fg = fg.to_rgb();
+        let bg = bg.to_rgb();
+        let a = fg.a.clamp(0.0, 1.0);
+        Hsla::from(gpui::Rgba {
+            r: fg.r * a + bg.r * (1.0 - a),
+            g: fg.g * a + bg.g * (1.0 - a),
+            b: fg.b * a + bg.b * (1.0 - a),
+            a: 1.0,
+        })
+    }
+
+    #[test]
+    fn focus_ring_meets_non_text_contrast_on_workspace_surfaces() {
+        let themes: Vec<(&'static str, &'static Palette, &'static str)> = DarkUiTheme::ALL
+            .into_iter()
+            .map(|t| (t.label(), t.palette(), t.terminal_theme_name()))
+            .chain(
+                LightUiTheme::ALL
+                    .into_iter()
+                    .map(|t| (t.label(), t.palette(), t.terminal_theme_name())),
+            )
+            .collect();
+        assert_eq!(themes.len(), 19);
+        for (name, p, term_name) in themes {
+            let paired = super::super::builtin_terminal_theme(term_name)
+                .unwrap_or_else(|| panic!("{name} paired terminal theme `{term_name}` missing"));
+            let term_bg = terminal_surface(paired.theme);
+            let surfaces = [
+                ("background", p.background),
+                ("sidebar", p.sidebar),
+                ("editor_surface", p.editor_surface),
+                ("card", p.card),
+                ("terminal_background", term_bg),
+            ];
+            for (surface_name, surface) in surfaces {
+                let ring_on_surface = blend_over(p.ring, surface);
+                let ratio = contrast(ring_on_surface, surface);
+                assert!(
+                    ratio >= 3.0,
+                    "{name}: ring on {surface_name} = {ratio:.2}:1 < 3.0:1"
+                );
+            }
+            let ring_on_sidebar = blend_over(p.ring, p.sidebar);
+            let border_on_sidebar = blend_over(p.border, p.sidebar);
+            let ring_vs_border = contrast(ring_on_sidebar, border_on_sidebar);
+            assert!(
+                ring_vs_border >= 2.25,
+                "{name}: ring vs border on sidebar = {ring_vs_border:.2}:1 < 2.25:1"
+            );
+        }
+    }
+
     /// 심해 틴트·앱 테마 대비 회귀: 본문·보조 글자가 모든 크롬 표면 위에서 WCAG AA(4.5:1) 이상, `preserve`도 바탕 위 AA.
     #[test]
     fn text_tokens_meet_wcag_aa_on_every_surface() {
@@ -1213,7 +1285,7 @@ mod tests {
     /// 앱 테마마다 자기 팔레트를 쓰고, 짝 터미널 테마는 같은 밝기(다크·라이트)의 내장 테마다.
     #[test]
     fn ui_themes_map_to_palettes_and_paired_terminal_themes() {
-        assert_eq!(DarkUiTheme::default().palette(), &TOKYO_NIGHT);
+        assert_eq!(DarkUiTheme::default().palette(), &GRAPHITE);
         assert_eq!(LightUiTheme::default().palette(), &PAPER);
         for theme in DarkUiTheme::ALL {
             let p = theme.palette();
@@ -1264,6 +1336,15 @@ mod tests {
         assert_eq!(terminal_surface_alpha(TERMINAL_DARK, 0), half);
         assert_eq!(terminal_surface_alpha(TERMINAL_DARK, 200), opaque);
         assert!((terminal_surface_alpha(TERMINAL_DARK, 75).a - opaque.a * 0.75).abs() < 1e-6);
+
+        let stage_opaque = workspace_surface_alpha(&TOKYO_NIGHT, 100);
+        assert!((stage_opaque.a - 1.).abs() < 1e-6);
+        assert_eq!(stage_opaque, TOKYO_NIGHT.sidebar);
+        let stage_half = workspace_surface_alpha(&TOKYO_NIGHT, 50);
+        assert!((stage_half.a - 0.5).abs() < 1e-6);
+        assert!((stage_half.h - stage_opaque.h).abs() < 1e-6);
+        assert_eq!(workspace_surface_alpha(&TOKYO_NIGHT, 0), stage_half);
+        assert_eq!(workspace_surface_alpha(&TOKYO_NIGHT, 200), stage_opaque);
     }
 
     fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -1644,6 +1725,9 @@ mod tests {
             "DIALOG_WIDTH",
             "SETTINGS_MODAL_WIDTH",
             "SETTINGS_NAV_WIDTH",
+            "SETTINGS_NAV_WIDTH_NARROW",
+            "SETTINGS_BAND_HEIGHT",
+            "SETTINGS_BAND_HEIGHT_NARROW",
             "SETTINGS_CONTENT_MAX_WIDTH",
             "CHAT_CONTENT_MAX_WIDTH",
             "SWITCH_WIDTH",
@@ -1658,10 +1742,17 @@ mod tests {
             "PANEL_ROW_HEIGHT",
             "PANEL_TAB_HEIGHT",
             "PANE_HEADER_HEIGHT",
+            "PANE_GAP",
+            "PANE_CARD_INNER_RADIUS",
+            "SPLIT_GUTTER_PILL_THICKNESS",
+            "SPLIT_GUTTER_PILL_LENGTH",
+            "workspace_surface_alpha",
             "STATUS_GROUP_ICON",
             "STATUS_GROUP_GAP",
             "ui::card",
             "ui::row",
+            "ui::group",
+            "ui::group_row",
             "ui::label",
             "ui::controls",
             "ui::primary",

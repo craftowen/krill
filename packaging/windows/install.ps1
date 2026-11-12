@@ -23,10 +23,16 @@ param(
     [switch]$NoOpen
 )
 $ErrorActionPreference = 'Stop'
-if ($env:OS -ne 'Windows_NT') { throw 'This installer requires Windows x64.' }
+if ($env:OS -ne 'Windows_NT') { throw 'This installer requires Windows x64 or Windows 11 on ARM64.' }
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }
-if ($arch -ne 'AMD64') { throw 'Windows release packages require an x64 PC.' }
+# ARM64 PCs run the x64 package through Windows 11's built-in x64 emulation (build 22000+).
+# Windows 10 on ARM only emulates 32-bit x86, so the x64 binaries cannot start there.
+if ($arch -eq 'ARM64') {
+    if ([Environment]::OSVersion.Version.Build -lt 22000) { throw 'Krill on ARM64 PCs requires Windows 11 (x64 emulation). Windows 10 on ARM is not supported.' }
+} elseif ($arch -ne 'AMD64') {
+    throw 'Windows release packages require an x64 PC or Windows 11 on ARM64.'
+}
 $required = @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64\OpenConsole.exe')
 $alreadyInstalled = Test-Path -LiteralPath $Dest
 if ($alreadyInstalled) {
@@ -205,7 +211,8 @@ function Fail-KrillStep([string]$Reason) {
 
 $download = -not $Zip
 if ($download -and -not $PSBoundParameters.ContainsKey('AddToPath')) { $AddToPath = $true }
-$modeText = if ($download) { "Windows $gDot x64 $gDot release: $Release" } else { "Windows $gDot x64 $gDot local package" }
+$archText = if ($arch -eq 'ARM64') { 'ARM64 (x64 emulation)' } else { 'x64' }
+$modeText = if ($download) { "Windows $gDot $archText $gDot release: $Release" } else { "Windows $gDot $archText $gDot local package" }
 Show-KrillIntro $modeText
 
 if (-not $alreadyInstalled) {
@@ -284,6 +291,11 @@ if (-not $alreadyInstalled) {
                 throw "Not a Krill package (missing $file)."
             }
         }
+        # conpty.dll starts <dll folder>\<native OS architecture>\OpenConsole.exe, so an ARM64 PC needs
+        # arm64\OpenConsole.exe even though Krill itself runs as x64; without it sessions fail.
+        if ($arch -eq 'ARM64' -and -not (Test-Path -LiteralPath (Join-Path $unpacked 'Krill\arm64\OpenConsole.exe') -PathType Leaf)) {
+            throw 'This Krill release has no ARM64 console host (arm64\OpenConsole.exe); ARM64 PCs need a newer release.'
+        }
         Complete-KrillStep '04' (Convert-KrillUnicode '\uAC80\uC99D') (Convert-KrillUnicode '\uBC88\uB4E4 \uD574\uC81C \u00B7 \uD544\uC218 \uAD6C\uC131 \uD30C\uC77C 5\uC885 \uD655\uC778')
 
 
@@ -349,3 +361,20 @@ if ($krillUi) {
 if ($alreadyInstalled) { "already installed: $Dest (files preserved; use the app to check for updates)" }
 else { "installed: $Dest" }
 if ($download -and -not $NoOpen) { Start-Process -FilePath (Join-Path $Dest 'krill-app.exe') }
+elseif ($Dest -eq (Join-Path $env:LOCALAPPDATA 'Programs\Krill')) {
+    $cliExe = Join-Path $Dest 'krill.exe'
+    if (Test-Path -LiteralPath $cliExe -PathType Leaf) {
+        try {
+            $stream = [IO.File]::OpenRead($cliExe)
+            try {
+                $b0 = $stream.ReadByte()
+                $b1 = $stream.ReadByte()
+            } finally {
+                $stream.Dispose()
+            }
+            if ($b0 -eq 0x4D -and $b1 -eq 0x5A) {
+                & $cliExe ls *> $null
+            }
+        } catch {}
+    }
+}

@@ -5,6 +5,7 @@
 
 pub(super) mod identity;
 mod input_recovery;
+pub(crate) mod ledger;
 #[cfg(all(test, unix))]
 mod tests;
 mod transcript;
@@ -16,7 +17,10 @@ use std::time::{Duration, Instant};
 use krill_proto::SessionId;
 use krill_proto::control::{AgentLaunch, Failure};
 use krill_proto::os::ffi::OsStrExt as _;
-use krill_proto::usage::{AccountsSnapshot, ConnectionStatus, ProviderKind, SessionHandoff};
+use krill_proto::usage::{
+    AccountsSnapshot, ConnectionStatus, HandoffOutcome, ProviderKind, RetainedReason,
+    SessionHandoff,
+};
 
 use super::{Peer, Registry, Scope, lock};
 use crate::usage::accounts;
@@ -108,21 +112,30 @@ fn read_prepared(path: &Path) -> std::io::Result<Option<Prepared>> {
 
 /// Handoffs and replacement journals describe this registry's own sessions, so they live only in
 /// its own state folder; a registry without a folder keeps no records.
-pub(super) fn load(dir: Option<&Path>) -> BTreeMap<SessionId, SessionHandoff> {
-    dir.and_then(|d| std::fs::read(d.join(FILE)).ok())
-        .and_then(|raw| serde_json::from_slice::<Vec<SessionHandoff>>(&raw).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|h| (h.from, h))
-        .collect()
+pub(super) fn load(dir: Option<&Path>) -> ledger::HandoffLedger {
+    if let Some(d) = dir {
+        sweep_stale_handoff_temps(d);
+    }
+    ledger::HandoffLedger::load(dir)
 }
 
-fn is_prunable_failed_handoff(handoff: &SessionHandoff) -> bool {
-    handoff.to.is_none()
-        && handoff
-            .error
-            .as_deref()
-            .is_some_and(|e| !e.contains("retained"))
+fn sweep_stale_handoff_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".{FILE}.tmp.");
+    let current_pid_prefix = format!("{}.", std::process::id());
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        if let Some(rest) = text.strip_prefix(&prefix)
+            && !rest.starts_with(&current_pid_prefix)
+        {
+            std::fs::remove_file(entry.path()).ok();
+        }
+    }
 }
 
 fn foreground_vault_agent(
@@ -298,14 +311,18 @@ impl Registry {
         account_id: &str,
         snapshot: &AccountsSnapshot,
     ) -> Result<(), Failure> {
-        let mut pending = lock(&self.account_work.pending);
-        self.queue_session_account_switch_locked(
-            session,
-            provider,
-            account_id,
-            snapshot,
-            &mut pending,
-        )
+        {
+            let mut pending = lock(&self.account_work.pending);
+            self.queue_session_account_switch_locked(
+                session,
+                provider,
+                account_id,
+                snapshot,
+                &mut pending,
+            )?;
+        }
+        self.acknowledge_retained_handoff(session);
+        Ok(())
     }
 
     fn provider_for_profile(&self, profile_id: &str) -> Option<ProviderKind> {
@@ -353,7 +370,7 @@ impl Registry {
 
     /// 셸에서 직접 띄운 에이전트는 Krill이 권한을 모르므로 Manual로 기록된다.
     /// 살아 있는 프로세스 argv에 프로필의 `yolo_args`가 모두 있으면 YOLO로 본다.
-    fn live_agent_has_yolo_args(&self, session: SessionId, profile_id: &str) -> bool {
+    pub(super) fn live_agent_has_yolo_args(&self, session: SessionId, profile_id: &str) -> bool {
         let Some(yolo) = self
             .agents
             .agents()
@@ -575,30 +592,33 @@ impl Registry {
                 }
                 continue;
             }
-            if stored.session_id.is_some() || stored.transcript_path.is_some() {
+            let opted_out = lock(&self.account_switch_opt_out).contains(&from);
+            let has_bound_conversation =
+                if provider == ProviderKind::Claude && (opted_out || automatic) {
+                    transcript::has_claude_transcript(home, current.as_ref(), &stored)
+                } else {
+                    stored.session_id.is_some() || stored.transcript_path.is_some()
+                };
+            if has_bound_conversation {
                 lock(&self.account_switch_opt_out).remove(&from);
-            } else {
-                let opted_out = lock(&self.account_switch_opt_out).contains(&from);
-                if opted_out || automatic {
-                    let has_live_identity = self
-                        .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
-                        .ok()
-                        .flatten()
-                        .is_some();
-                    if has_live_identity {
-                        lock(&self.account_switch_opt_out).remove(&from);
-                    } else if opted_out {
+            } else if opted_out || automatic {
+                let has_live_identity = self
+                    .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if has_live_identity {
+                    lock(&self.account_switch_opt_out).remove(&from);
+                } else if opted_out {
+                    continue;
+                } else {
+                    let recently_launched = self.agents.launched_at(from).is_some_and(|launched| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .is_ok_and(|d| d.as_secs().saturating_sub(launched) < 5)
+                    });
+                    if !recently_launched {
                         continue;
-                    } else {
-                        let recently_launched =
-                            self.agents.launched_at(from).is_some_and(|launched| {
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .is_ok_and(|d| d.as_secs().saturating_sub(launched) < 5)
-                            });
-                        if !recently_launched {
-                            continue;
-                        }
                     }
                 }
             }
@@ -618,20 +638,77 @@ impl Registry {
         }
     }
 
-    pub(super) fn forget_failed_account_handoff(&self, session: SessionId) {
-        lock(&self.account_switch_opt_out).remove(&session);
-        let removed = {
-            let mut handoffs = lock(&self.account_handoffs);
-            if handoffs
-                .get(&session)
-                .is_some_and(is_prunable_failed_handoff)
-            {
-                handoffs.remove(&session);
-                true
-            } else {
-                false
-            }
+    pub(super) fn acknowledge_retained_handoff(&self, session: SessionId) {
+        if !lock(&self.account_handoffs).has_retained_replacement(session) {
+            return;
+        }
+        if lock(&self.account_replacements).contains(&session) || !lock(&self.ids).ensure_ready() {
+            return;
+        }
+        let Some(from) = lock(&self.account_handoffs).retained_from(session) else {
+            return;
         };
+        if !self.account_original_ended(from)
+            || self.ensure_no_unresolved_account_replacement(from).is_err()
+            || self
+                .ensure_no_unresolved_account_replacement(session)
+                .is_err()
+        {
+            return;
+        }
+        let mut handoffs = lock(&self.account_handoffs);
+        let Some((removed_from, previous)) =
+            handoffs.acknowledge_replacement(session, |id| id == from)
+        else {
+            return;
+        };
+        if self.write_account_handoffs(&handoffs).is_err() {
+            handoffs.insert(removed_from, previous);
+        }
+    }
+
+    pub(super) fn forget_failed_account_handoff(&self, session: SessionId, ids_durable: bool) {
+        lock(&self.account_switch_opt_out).remove(&session);
+        if !ids_durable {
+            return;
+        }
+        let inspect = {
+            let handoffs = lock(&self.account_handoffs);
+            let mut ids = std::collections::BTreeSet::new();
+            if let Some(handoff) = handoffs.get(&session) {
+                match handoff.outcome() {
+                    HandoffOutcome::RetryableFailure { .. } => {
+                        ids.insert((session, false));
+                    }
+                    HandoffOutcome::RetainedReplacement {
+                        replacement: Some(rep),
+                        ..
+                    } => {
+                        ids.insert((session, false));
+                        ids.insert((rep, true));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(from) = handoffs.retained_from(session) {
+                ids.insert((from, false));
+                ids.insert((session, true));
+            }
+            ids
+        };
+        if inspect.is_empty() {
+            return;
+        }
+        let mut ended = std::collections::BTreeSet::new();
+        for (id, check_replacement_guard) in inspect {
+            let guard_busy =
+                check_replacement_guard && lock(&self.account_replacements).contains(&id);
+            if !guard_busy && self.account_original_ended(id) {
+                ended.insert(id);
+            }
+        }
+        let removed =
+            lock(&self.account_handoffs).on_session_removed(session, |id| ended.contains(&id));
         if removed {
             self.save_account_handoffs().ok();
         }
@@ -641,19 +718,34 @@ impl Registry {
         self.cancel_account_switch(session, None)
     }
 
+    /// The user is ending this conversation's session, so nothing may resume it on their behalf.
+    /// An attempt already in flight sees its selection disappear and stops its replacement.
+    pub(super) fn cancel_queued_account_switch(&self, session: SessionId) {
+        let mut pending = lock(&self.account_work.pending);
+        let mut handoffs = lock(&self.account_handoffs);
+        if handoffs
+            .get(&session)
+            .is_some_and(|h| h.to.is_none() && h.error.is_none())
+        {
+            handoffs.remove(&session);
+            self.write_account_handoffs(&handoffs).ok();
+            pending
+                .retain(|scope, _| !matches!(scope, SwitchScope::Session(id, _) if *id == session));
+        }
+    }
+
     pub(super) fn account_switch_snapshot(&self, snapshot: &mut AccountsSnapshot) {
         let handoffs = lock(&self.account_handoffs);
         let replacements = lock(&self.account_replacements);
         let state = lock(&self.state);
         let has_holder = self.holder.is_some();
+        let is_ended = |id: SessionId| {
+            state.exited.contains_key(&id)
+                || (!state.sessions.contains_key(&id) && !state.unregistered_kept.contains(&id))
+        };
         snapshot.details.handoffs = handoffs
             .values()
-            .filter(|handoff| {
-                !has_holder
-                    || !is_prunable_failed_handoff(handoff)
-                    || (state.sessions.contains_key(&handoff.from)
-                        && !state.exited.contains_key(&handoff.from))
-            })
+            .filter(|handoff| !has_holder || !ledger::is_prunable_when_ended(handoff, is_ended))
             .cloned()
             .map(|mut handoff| {
                 // The durable recovery alias precedes retirement. Keep clients on the original
@@ -674,10 +766,7 @@ impl Registry {
         self.write_account_handoffs(&lock(&self.account_handoffs))
     }
 
-    fn write_account_handoffs(
-        &self,
-        handoffs: &BTreeMap<SessionId, SessionHandoff>,
-    ) -> std::io::Result<()> {
+    fn write_account_handoffs(&self, handoffs: &ledger::HandoffLedger) -> std::io::Result<()> {
         let Some(dir) = self.dir.as_deref() else {
             return Ok(());
         };
@@ -695,7 +784,7 @@ impl Registry {
     fn commit_account_handoff(
         &self,
         handoff: SessionHandoff,
-        persist: impl FnOnce(&BTreeMap<SessionId, SessionHandoff>) -> std::io::Result<()>,
+        persist: impl FnOnce(&ledger::HandoffLedger) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         let mut handoffs = lock(&self.account_handoffs);
         let from = handoff.from;
@@ -852,21 +941,38 @@ impl Registry {
             .or_else(|| selection.get(&SwitchScope::Provider(provider)))
             .is_some_and(|target| target.account_id == account_id);
         let mut handoffs = lock(&self.account_handoffs);
-        if let Some(handoff) = handoffs.get_mut(&old).filter(|h| {
+        if let Some(mut handoff) = handoffs.get(&old).cloned().filter(|h| {
             h.account_id == account_id && h.to.is_none() && !(result.is_err() && retry_queued)
         }) {
             match result {
                 Ok(new) => handoff.to = Some(new),
                 Err(error) => {
                     let reason = match error {
-                                Failure::Denied => "selected account login or credential scope could not be verified".into(),
-                                Failure::Os(libc::EAGAIN) => "conversation identity is not bound; wait for the original agent's session-start hook before retrying".into(),
-                                Failure::Os(libc::ENOENT) => "conversation transcript is missing; original conversation was not replaced".into(),
-                                Failure::Os(libc::EILSEQ) => "conversation transcript identity is mismatched or ambiguous".into(),
-                                Failure::Os(libc::EEXIST) => "selected profile contains a separate or conflicting conversation copy; reconcile its history before retrying".into(),
-                                Failure::Os(libc::ETIMEDOUT) => "conversation preparation or resume confirmation timed out; check that provider hooks are enabled before retrying".into(),
-                                _ => error.to_string(),
-                            };
+                        Failure::Denied => {
+                            "selected account login or credential scope could not be verified"
+                                .into()
+                        }
+                        Failure::Os(libc::EAGAIN) => {
+                            "conversation identity is not bound; wait for the original agent's session-start hook before retrying"
+                                .into()
+                        }
+                        Failure::Os(libc::ENOENT) => {
+                            "conversation transcript is missing; original conversation was not replaced"
+                                .into()
+                        }
+                        Failure::Os(libc::EILSEQ) => {
+                            "conversation transcript identity is mismatched or ambiguous".into()
+                        }
+                        Failure::Os(libc::EEXIST) => {
+                            "selected profile contains a separate or conflicting conversation copy; reconcile its history before retrying"
+                                .into()
+                        }
+                        Failure::Os(libc::ETIMEDOUT) => {
+                            "conversation preparation or resume confirmation timed out; check that provider hooks are enabled before retrying"
+                                .into()
+                        }
+                        _ => error.to_string(),
+                    };
                     if handoff.error.is_none() {
                         handoff.error = Some(format!(
                             "Session {}: could not resume with selected account ({reason}); original session preserved",
@@ -875,12 +981,11 @@ impl Registry {
                     }
                 }
             }
+            handoffs.insert(old, handoff);
         }
         if let Ok(new) = result {
             // Keep durable aliases short across repeated A -> B -> C switches.
-            for alias in handoffs.values_mut().filter(|h| h.to == Some(old)) {
-                alias.to = Some(new);
-            }
+            handoffs.retarget_completed_aliases(old, new);
         }
         drop(handoffs);
         self.save_account_handoffs().ok();
@@ -917,6 +1022,28 @@ impl Registry {
         if saved.is_empty() {
             return;
         }
+        let ids_durable = lock(&self.ids).ensure_ready();
+        if self.holder.is_some() && ids_durable {
+            let mut candidates = std::collections::BTreeSet::new();
+            for handoff in &saved {
+                candidates.insert((handoff.from, false));
+                if let HandoffOutcome::RetainedReplacement {
+                    replacement: Some(rep),
+                    ..
+                } = handoff.outcome()
+                {
+                    candidates.insert((rep, true));
+                }
+            }
+            let mut ended = std::collections::BTreeSet::new();
+            for (id, is_rep) in candidates {
+                let busy = is_rep && lock(&self.account_replacements).contains(&id);
+                if !busy && self.account_original_ended(id) {
+                    ended.insert(id);
+                }
+            }
+            lock(&self.account_handoffs).prune_dead(|id| ended.contains(&id));
+        }
         let state_dir = self.state_dir();
         let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);
         let peer = Peer {
@@ -924,6 +1051,9 @@ impl Registry {
             scope: Scope::Full,
         };
         for mut handoff in saved {
+            if !lock(&self.account_handoffs).contains_key(&handoff.from) {
+                continue;
+            }
             let (old_live, new_live) = {
                 let state = lock(&self.state);
                 let live = |id: &SessionId| {
@@ -934,7 +1064,9 @@ impl Registry {
                 (live(&handoff.from), handoff.to.is_some_and(|id| live(&id)))
             };
             if !old_live {
-                if is_prunable_failed_handoff(&handoff) {
+                if matches!(handoff.outcome(), HandoffOutcome::RetryableFailure { .. })
+                    && ids_durable
+                {
                     lock(&self.account_handoffs).remove(&handoff.from);
                 } else if handoff.to.is_none() && handoff.error.is_none() {
                     handoff.error =
@@ -944,7 +1076,8 @@ impl Registry {
                 continue;
             }
             if handoff.error.is_some() {
-                if is_prunable_failed_handoff(&handoff)
+                if matches!(handoff.outcome(), HandoffOutcome::RetryableFailure { .. })
+                    && ids_durable
                     && self.live_agent_for_switch_in(handoff.from, home).is_none()
                 {
                     lock(&self.account_handoffs).remove(&handoff.from);
@@ -1073,10 +1206,15 @@ impl Registry {
         }
         if self.account_original_ended(prepared.from) {
             // Retain the only remaining PTY. Persist the decision before removing evidence.
-            lock(&self.account_handoffs).insert(prepared.from, SessionHandoff {
-                from: prepared.from, to: None, account_id: prepared.account_id.clone(),
-                error: Some(format!("Original session ended during recovery; unconfirmed replacement {} was retained. Select it explicitly to continue; held input was not sent", prepared.to.0)),
-            });
+            lock(&self.account_handoffs).insert(
+                prepared.from,
+                SessionHandoff::retained(
+                    prepared.from,
+                    prepared.to,
+                    prepared.account_id.clone(),
+                    RetainedReason::OriginalEndedDuringRecovery,
+                ),
+            );
             return self.save_account_handoffs().is_ok() && std::fs::remove_file(path).is_ok();
         }
         if lock(&self.state).closing.contains(&prepared.from) {
@@ -1400,7 +1538,7 @@ impl Registry {
             registry: self,
             original: old,
             session: new,
-            committed: false,
+            disposition: ReplacementDisposition::Unresolved,
         };
         self.agents.watch_account_resume(new);
         #[cfg(windows)]
@@ -1631,16 +1769,22 @@ impl Registry {
         while !self.account_original_ended(old) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        replacement.committed = true;
         if !self.account_original_ended(old) {
-            lock(&self.account_handoffs).insert(old, SessionHandoff {
-                from: old, to: None, account_id: account_id.into(),
-                error: Some(format!("Original process termination could not be confirmed; replacement {} was retained for explicit selection. Held input was not sent", new.0)),
-            });
-            self.save_account_handoffs().ok();
+            lock(&self.account_handoffs).insert(
+                old,
+                SessionHandoff::retained(
+                    old,
+                    new,
+                    account_id,
+                    RetainedReason::OriginalExitUnconfirmed,
+                ),
+            );
+            let persisted = self.save_account_handoffs().is_ok();
+            replacement.mark_retained(persisted);
             self.agents.finish_account_resume(new);
             return Err(Failure::Os(libc::ETIMEDOUT));
         }
+        replacement.mark_committed();
         if provider == ProviderKind::Codex {
             // Codex prints before it tries the writer lock, so this prompt can follow retirement
             // and no pre-retirement check can see it. Held input stays withheld until the guard
@@ -1736,45 +1880,76 @@ fn run_bounded<T: Sync>(jobs: &[T], work: impl Fn(&T) + Sync) {
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacementDisposition {
+    Unresolved,
+    Retained { persisted: bool },
+    Committed,
+}
+
 struct Replacement<'a> {
     registry: &'a Registry,
     original: SessionId,
     session: SessionId,
-    committed: bool,
+    disposition: ReplacementDisposition,
+}
+
+impl Replacement<'_> {
+    fn mark_retained(&mut self, persisted: bool) {
+        self.disposition = ReplacementDisposition::Retained { persisted };
+    }
+
+    fn mark_committed(&mut self) {
+        self.disposition = ReplacementDisposition::Committed;
+    }
 }
 
 impl Drop for Replacement<'_> {
     fn drop(&mut self) {
         // A committed replacement keeps its resume watch for the continuation gate.
-        if !self.committed {
+        if self.disposition != ReplacementDisposition::Committed {
             self.registry.agents.finish_account_resume(self.session);
         }
         lock(&self.registry.account_replacements).remove(&self.session);
-        let only_remaining = !self.committed
-            && self.registry.account_original_ended(self.original)
-            && !self.registry.account_original_ended(self.session);
-        let resolved = if only_remaining {
-            let retained = if let Some(handoff) =
-                lock(&self.registry.account_handoffs).get_mut(&self.original)
-            {
-                handoff.to = None;
-                handoff.error = Some(format!(
-                    "Original session ended; unconfirmed replacement {} was retained. Select it explicitly to continue; held input was not sent",
-                    self.session.0
-                ));
-                true
-            } else {
-                false
-            };
-            retained && self.registry.save_account_handoffs().is_ok()
-        } else if self.committed {
-            self.registry.account_original_ended(self.original)
-        } else {
-            // An unregistered target may be an unknown Spawn outcome. Leave its journal.
-            let registered = lock(&self.registry.state)
-                .sessions
-                .contains_key(&self.session);
-            registered && self.registry.stop_account_replacement(self.session)
+        let resolved = match self.disposition {
+            ReplacementDisposition::Retained { persisted } => persisted,
+            ReplacementDisposition::Committed => {
+                self.registry.account_original_ended(self.original)
+            }
+            ReplacementDisposition::Unresolved => {
+                // Without a handoff record the switch was cancelled, so the replacement has no claim to stay.
+                let only_remaining = self.registry.account_original_ended(self.original)
+                    && !self.registry.account_original_ended(self.session)
+                    && lock(&self.registry.account_handoffs).contains_key(&self.original);
+                if only_remaining {
+                    let retained = {
+                        let mut handoffs = lock(&self.registry.account_handoffs);
+                        if let Some(account_id) =
+                            handoffs.get(&self.original).map(|h| h.account_id.clone())
+                        {
+                            handoffs.insert(
+                                self.original,
+                                SessionHandoff::retained(
+                                    self.original,
+                                    self.session,
+                                    account_id,
+                                    RetainedReason::OriginalEnded,
+                                ),
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    retained && self.registry.save_account_handoffs().is_ok()
+                } else {
+                    // An unregistered target may be an unknown Spawn outcome. Leave its journal.
+                    let registered = lock(&self.registry.state)
+                        .sessions
+                        .contains_key(&self.session);
+                    registered && self.registry.stop_account_replacement(self.session)
+                }
+            }
         };
         if resolved && let Some(dir) = self.registry.dir.as_deref() {
             std::fs::remove_file(replacement_journal(dir, self.session)).ok();
@@ -1803,7 +1978,19 @@ fn resume_identity(
 // Validation errors constructed without an OS errno must retain their meaning on the wire.
 fn prepare_failure(original: SessionId, stage: &'static str, error: &std::io::Error) -> Failure {
     use std::io::ErrorKind;
-    tracing::warn!(original = original.0, stage, kind = ?error.kind(), errno = error.raw_os_error(), "account handoff preparation failed");
+    if stage == "transcript_preparation"
+        && matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::NotFound)
+    {
+        tracing::debug!(
+            original = original.0,
+            stage,
+            kind = ?error.kind(),
+            errno = error.raw_os_error(),
+            "account handoff preparation deferred until transcript is available"
+        );
+    } else {
+        tracing::warn!(original = original.0, stage, kind = ?error.kind(), errno = error.raw_os_error(), "account handoff preparation failed");
+    }
     Failure::Os(error.raw_os_error().unwrap_or_else(|| match error.kind() {
         ErrorKind::TimedOut => libc::ETIMEDOUT,
         ErrorKind::NotFound => libc::ENOENT,

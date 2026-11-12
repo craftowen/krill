@@ -444,7 +444,7 @@ fn ensure_session_inner(
     let started = std::time::Instant::now();
     let result = ensure_session_attempt(target, want, create, allow_cold);
     match &result {
-        Err(error) => tracing::warn!(
+        Err(error) if !(want.is_some() && is_session_gone(error)) => tracing::warn!(
             kind = ?error.kind(),
             failure = diagnostics::failure_code(error),
             agent = matches!(create.program, Program::Agent { .. }),
@@ -457,7 +457,7 @@ fn ensure_session_inner(
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "session create slow"
         ),
-        Ok(_) => {}
+        Err(_) | Ok(_) => {}
     }
     result
 }
@@ -1055,6 +1055,8 @@ pub struct Pane<W> {
     grid: Option<(u16, u16)>,
     /// 이 연결로 보낸 크기.
     sent: Option<(u16, u16)>,
+    /// 칸이 방금 보이게 됐다. 그사이 다른 클라이언트가 바꾼 크기를 한 번만 되찾는다([`Pane::show`]).
+    reclaim: bool,
     /// 이 연결이 `FEAT_ROLES`를 협상했다.
     roles: bool,
     account_input: AccountInput,
@@ -1078,6 +1080,7 @@ impl<W> Default for Pane<W> {
             shown: Rc::default(),
             grid: None,
             sent: None,
+            reclaim: false,
             roles: false,
             account_input: AccountInput::Normal,
         }
@@ -1161,21 +1164,38 @@ impl<W: Write> Pane<W> {
         self.grid
     }
 
+    /// 칸이 방금 보이게 됐다(탭 전환, 덮던 화면이 닫힘). 그사이 다른 클라이언트가 세션 크기를 바꿨으면 다음
+    /// [`Pane::fit`]이 한 번 되찾는다. 계속 보이는 칸은 되찾지 않는다. 두 기기가 서로 다른 크기로 보면 다시 그릴
+    /// 때마다 뺏고 뺏겨 PTY 크기가 번갈아 바뀐다.
+    pub fn show(&mut self) {
+        self.reclaim = true;
+    }
+
+    /// 보이게 된 뒤 세션 크기가 칸과 달라 되찾아야 한다. 이미 같으면 되찾을 일을 끝낸다.
+    pub fn reclaims(&mut self, want: (u16, u16)) -> bool {
+        let s = &self.view.screen;
+        if s.cols == 0 || s.lines == 0 {
+            return false;
+        }
+        if (s.cols, s.lines) == want {
+            self.reclaim = false;
+        }
+        self.reclaim
+    }
+
     /// 칸 크기가 (열, 행)이다. 붙어 있고 보낸 크기와 다르면 `Resize`·`Focus`로 PTY를 맞춘다(MK-050: 이 연결이 크기
     /// 주인이 된다). 끊겨 있으면 다음 [`Pane::link`]에서 보낸다. 쓰기가 실패하면 연결을 끊고 그 알림.
     pub fn fit(&mut self, cols: u16, rows: u16) -> Option<Notice> {
         let want = (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_LINES));
         self.grid = Some(want);
-        let screen_diverged = self.view.screen.cols > 0
-            && self.view.screen.lines > 0
-            && (self.view.screen.cols, self.view.screen.lines) != want;
-        if self.sent == Some(want) && !screen_diverged {
+        if self.sent == Some(want) && !self.reclaims(want) {
             return None;
         }
         if !self.roles || self.out.is_none() {
             return None;
         }
         self.sent = Some(want);
+        self.reclaim = false;
         let failed = self
             .send(&roles::Request::Resize {
                 cols: want.0,
@@ -1336,7 +1356,8 @@ impl<W: Write> Pane<W> {
         self.journal.delivery(receipt)
     }
 
-    /// Only an acknowledged cancellation may deliver held input to the original account.
+    /// Held input reaches the original account only after an acknowledged cancellation or when
+    /// the switch is still queued behind a busy agent.
     /// Failed switches keep their journal paused for an explicit recovery decision.
     pub fn resume_account_input(&mut self, failed: bool, now: Now) -> Vec<Notice> {
         if failed {
@@ -1490,10 +1511,12 @@ impl<W: Write> Pane<W> {
             }
         } else {
             let req = self.history.req;
+            let prior = std::mem::take(&mut self.history.prior);
             let mut window = rows.rows.clone();
             window.resize(usize::from(self.view.screen.lines), Vec::new());
             self.history = History::fixed(window);
             self.history.req = req;
+            self.history.prior = prior;
             self.history.offset = self.history.rows.len();
             self.search.scrolled = true;
         }
@@ -1899,7 +1922,11 @@ impl<W: Write> Pane<W> {
             .saturating_add(1);
         let lines = usize::from(self.view.screen.lines.max(1));
         let offset = rows.rows.len().min(depth.saturating_add(lines / 2));
+        let req = self.history.req;
+        let prior = std::mem::take(&mut self.history.prior);
         self.history = History::fixed(rows.rows.clone());
+        self.history.req = req;
+        self.history.prior = prior;
         self.history.offset = offset;
         self.search.scrolled = true;
         if depth >= 1 && depth <= offset {
@@ -1919,8 +1946,10 @@ impl<W: Write> Pane<W> {
         }
         self.search.scrolled = false;
         let req = self.history.req;
+        let prior = std::mem::take(&mut self.history.prior);
         self.history = History::default();
         self.history.req = req;
+        self.history.prior = prior;
         true
     }
 
@@ -2399,3 +2428,64 @@ mod tests;
 
 #[cfg(test)]
 mod upgrade_gate_tests;
+
+#[cfg(test)]
+mod search_history_tests {
+    use super::*;
+
+    #[test]
+    fn search_and_top_fixed_views_preserve_history_req_and_prior_rows() {
+        let mut pane = Pane::<Vec<u8>>::default();
+        pane.view.screen.lines = 4;
+        let prior_row = vec![Cell {
+            ch: 'p',
+            ..Cell::default()
+        }];
+        pane.history.prior = vec![prior_row.clone()];
+        pane.history.req = 42;
+        pane.search.hist_req = Some(42);
+        pane.search.hist_target = Some(SearchTarget {
+            row: 0,
+            column: 0,
+            cols: 1,
+        });
+
+        let hit_row = vec![Cell {
+            ch: 'h',
+            ..Cell::default()
+        }];
+        assert!(pane.search_hist_rows(&HistoryRows {
+            req: 42,
+            total: 1,
+            skip: 0,
+            rows: vec![hit_row.clone()],
+            pages: 0,
+        }));
+        assert_eq!(pane.history.req, 42);
+        assert_eq!(pane.history.prior, vec![prior_row.clone()]);
+
+        assert!(pane.forget_search_view());
+        assert_eq!(pane.history.req, 42);
+        assert_eq!(pane.history.prior, vec![prior_row.clone()]);
+
+        pane.search.top_request = Some(TopRequest {
+            req: 43,
+            source: Source::Hot,
+            total: Some(1),
+        });
+        pane.history.req = 43;
+        assert!(pane.top_rows(&HistoryRows {
+            req: 43,
+            total: 1,
+            skip: 0,
+            rows: vec![hit_row],
+            pages: 0,
+        }));
+        assert_eq!(pane.history.req, 43);
+        assert_eq!(pane.history.prior, vec![prior_row.clone()]);
+
+        assert!(pane.forget_search_view());
+        assert_eq!(pane.history.req, 43);
+        assert_eq!(pane.history.prior, vec![prior_row]);
+    }
+}

@@ -46,6 +46,7 @@ mod tests;
 #[cfg(test)]
 mod ui_tests;
 mod view;
+mod work_run;
 use actions::{RequestIdentity, Submission};
 #[cfg(test)]
 mod action_tests;
@@ -84,7 +85,9 @@ pub(crate) struct SessionChatLog {
     pub items: Vec<Arc<ChatItem>>,
     pub revision: u64,
     pub meta: ComposerMeta,
-    expanded: BTreeSet<usize>,
+    expanded_runs: BTreeSet<usize>,
+    expanded_steps: BTreeSet<usize>,
+    cached_feed: Option<Arc<work_run::DisplayFeed>>,
     pub answered: BTreeSet<String>,
     binding: (String, String),
     host: Option<krill_app::hosts::HostId>,
@@ -97,47 +100,210 @@ pub(crate) struct SessionChatLog {
     pub multi_selected: BTreeMap<String, BTreeSet<usize>>,
 }
 
+impl SessionChatLog {
+    fn display_feed(&mut self) -> Arc<work_run::DisplayFeed> {
+        Arc::clone(self.cached_feed.get_or_insert_with(|| {
+            if self.items.is_empty() {
+                work_run::DisplayFeed::empty()
+            } else {
+                Arc::new(work_run::DisplayFeed::project(self.base_index, &self.items))
+            }
+        }))
+    }
+
+    fn is_run_expanded(&self, span: work_run::RawSpan) -> bool {
+        self.expanded_runs.range(span.range()).next().is_some()
+    }
+
+    fn toggle_run(&mut self, span: work_run::RawSpan) {
+        let range = span.range();
+        let before = self.expanded_runs.len();
+        self.expanded_runs.retain(|idx| !range.contains(idx));
+        if self.expanded_runs.len() == before {
+            self.expanded_runs.insert(span.start());
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn is_step_expanded(&self, abs_idx: usize) -> bool {
+        self.expanded_steps.contains(&abs_idx)
+    }
+
+    fn toggle_step(&mut self, abs_idx: usize) {
+        if !self.expanded_steps.remove(&abs_idx) {
+            self.expanded_steps.insert(abs_idx);
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub(super) fn reset_transcript(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.items.clear();
+        self.base_index = 0;
+        self.seeded = false;
+        self.earlier = None;
+        self.meta = ComposerMeta::default();
+        self.answered.clear();
+        self.expanded_runs.clear();
+        self.expanded_steps.clear();
+        self.cached_feed = None;
+        self.multi_selected.clear();
+        self.submissions.clear();
+    }
+
+    pub(super) fn prepend_earlier(&mut self, older: Vec<ChatItem>, next_earlier: Option<u64>) {
+        let count = older.len();
+        self.items.splice(0..0, older.into_iter().map(Arc::new));
+        self.base_index = self.base_index.saturating_sub(count);
+        self.earlier = next_earlier;
+        self.cached_feed = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub(super) fn append_and_trim(&mut self, incoming: Vec<ChatItem>, max_kept: usize) {
+        if incoming.is_empty() {
+            return;
+        }
+        self.items.extend(incoming.into_iter().map(Arc::new));
+        self.cached_feed = None;
+        if self.items.len() > max_kept {
+            let excess = self.items.len() - max_kept;
+            let old_base = self.base_index;
+            let base = old_base.saturating_add(excess);
+            if self
+                .items
+                .get(excess - 1)
+                .is_some_and(|item| work_run::is_work_kind(item.kind))
+                && self
+                    .items
+                    .get(excess)
+                    .is_some_and(|item| work_run::is_work_kind(item.kind))
+            {
+                let run_start = (0..excess)
+                    .rev()
+                    .take_while(|&idx| work_run::is_work_kind(self.items[idx].kind))
+                    .last()
+                    .unwrap_or(excess);
+                if self
+                    .expanded_runs
+                    .range((old_base + run_start)..base)
+                    .next()
+                    .is_some()
+                {
+                    self.expanded_runs.insert(base);
+                }
+            }
+            self.items.drain(0..excess);
+            self.base_index = base;
+            self.earlier = None;
+            let retained: BTreeSet<_> = self
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| format!("{}:{}", item.tool_id, base + index))
+                .collect();
+            self.expanded_runs.retain(|index| *index >= base);
+            self.expanded_steps.retain(|index| *index >= base);
+            self.answered.retain(|key| retained.contains(key));
+            self.multi_selected.retain(|key, _| retained.contains(key));
+            self.submissions.retain(|key, _| retained.contains(key));
+        }
+    }
+}
+
 struct ChatList {
     host: krill_app::hosts::HostId,
-    base_index: usize,
-    count: usize,
+    feed: Arc<work_run::DisplayFeed>,
     revision: u64,
     epoch: u64,
     state: gpui::ListState,
 }
 
 impl ChatList {
+    fn new(
+        host: krill_app::hosts::HostId,
+        feed: &Arc<work_run::DisplayFeed>,
+        revision: u64,
+        epoch: u64,
+        owner: gpui::WeakEntity<Shell>,
+    ) -> Self {
+        let state = gpui::ListState::new(feed.len(), gpui::ListAlignment::Bottom, ui::SPACE_4);
+        state.set_follow_mode(gpui::FollowMode::Tail);
+        state.set_scroll_handler(move |_, _, cx| {
+            owner.update(cx, |_, cx| cx.notify()).ok();
+        });
+        Self {
+            host,
+            feed: Arc::clone(feed),
+            revision,
+            epoch,
+            state,
+        }
+    }
+
+    fn near_top(&self, base_index: usize, raw_threshold: usize) -> bool {
+        let top_row = self.state.logical_scroll_top().item_ix;
+        self.feed
+            .get(top_row)
+            .is_none_or(|row| row.span().start().saturating_sub(base_index) < raw_threshold)
+    }
+
+    // Straddling runs have end > cutoff, so partition_point leaves them in place to remeasure.
     fn sync(
         &mut self,
-        base_index: usize,
-        count: usize,
+        feed: &Arc<work_run::DisplayFeed>,
         revision: u64,
         epoch: u64,
     ) -> gpui::ListState {
-        let removed = base_index.saturating_sub(self.base_index);
-        let added = self.base_index.saturating_sub(base_index);
-        if epoch != self.epoch || removed > self.count {
-            self.state.reset(count);
-            self.state.set_follow_mode(gpui::FollowMode::Tail);
-        } else {
-            if removed != 0 {
-                self.state.splice(0..removed, 0);
-            }
-            if added != 0 {
-                self.state.splice(0..0, added);
-            }
-            let kept = self.count - removed + added;
-            if count >= kept {
-                self.state.splice(kept..kept, count - kept);
-            } else {
-                self.state.splice(count..kept, 0);
-            }
+        if epoch == self.epoch && Arc::ptr_eq(&self.feed, feed) {
             if revision != self.revision {
                 self.state.remeasure();
+                self.revision = revision;
+            }
+            return self.state.clone();
+        }
+        let prev = self.feed.rows();
+        let next = feed.rows();
+        match (prev.first().zip(prev.last()), next.first().zip(next.last())) {
+            (Some((prev_first, prev_last)), Some((next_first, next_last)))
+                if epoch == self.epoch
+                    && next_first.span().start() < prev_last.span().end()
+                    && prev_first.span().start() < next_last.span().end() =>
+            {
+                let old_base = prev_first.span().start();
+                let new_base = next_first.span().start();
+                let removed = if new_base > old_base {
+                    prev.partition_point(|r| r.span().end() <= new_base)
+                } else {
+                    0
+                };
+                let added = if new_base < old_base {
+                    next.partition_point(|r| r.span().end() <= old_base)
+                } else {
+                    0
+                };
+                if removed != 0 {
+                    self.state.splice(0..removed, 0);
+                }
+                if added != 0 {
+                    self.state.splice(0..0, added);
+                }
+                let kept = prev.len() - removed + added;
+                if next.len() > kept {
+                    self.state.splice(kept..kept, next.len() - kept);
+                } else if next.len() < kept {
+                    self.state.splice(next.len()..kept, 0);
+                }
+                if revision != self.revision {
+                    self.state.remeasure();
+                }
+            }
+            _ => {
+                self.state.reset(next.len());
+                self.state.set_follow_mode(gpui::FollowMode::Tail);
             }
         }
-        self.base_index = base_index;
-        self.count = count;
+        self.feed = Arc::clone(feed);
         self.revision = revision;
         self.epoch = epoch;
         self.state.clone()
@@ -706,7 +872,7 @@ impl Shell {
         pane.is_some_and(|pane| self.is_pane_chat_view(pane, cx))
     }
 
-    fn is_pane_chat_view(&self, pane: PaneId, cx: &gpui::App) -> bool {
+    pub(super) fn is_pane_chat_view(&self, pane: PaneId, cx: &gpui::App) -> bool {
         if self.layout.session(pane).is_none() {
             return false;
         }
@@ -1040,6 +1206,7 @@ impl Shell {
         log.base_index = CHAT_BASE_ORIGIN;
         log.seeded = true;
         log.earlier = page.has_earlier.then_some(page.start);
+        log.cached_feed = None;
     }
 
     fn load_earlier_chat(&mut self, pane: super::PaneId, key: &ChatKey, cx: &mut Context<Self>) {
@@ -1050,9 +1217,11 @@ impl Shell {
             return;
         };
         let near_top = log.items.len() < CHAT_PRELOAD_ITEMS
-            || self.chat.lists.get(&(pane, key.1)).is_some_and(|list| {
-                list.state.logical_scroll_top().item_ix < CHAT_PRELOAD_ITEMS / 2
-            });
+            || self
+                .chat
+                .lists
+                .get(&(pane, key.1))
+                .is_some_and(|list| list.near_top(log.base_index, CHAT_PRELOAD_ITEMS / 2));
         if !near_top
             || log.items.len() >= MAX_CHAT_KEPT
             || self.chat.earlier_tasks.contains_key(key)
@@ -1087,12 +1256,10 @@ impl Shell {
                 if log.binding != (snapshot.session_id, snapshot.transcript_path) {
                     return;
                 }
-                let count = snapshot.items.len();
-                log.items
-                    .splice(0..0, snapshot.items.into_iter().map(Arc::new));
-                log.base_index = log.base_index.saturating_sub(count);
-                log.earlier = (page.has_earlier && page.start < before).then_some(page.start);
-                log.revision = log.revision.wrapping_add(1);
+                log.prepend_earlier(
+                    snapshot.items,
+                    (page.has_earlier && page.start < before).then_some(page.start),
+                );
                 cx.notify();
             })
             .ok();
@@ -1139,16 +1306,7 @@ impl Shell {
             log.revision = log.revision.wrapping_add(1);
         }
         if reset {
-            log.epoch = log.epoch.wrapping_add(1);
-            log.items.clear();
-            log.base_index = 0;
-            log.seeded = false;
-            log.earlier = None;
-            log.meta = ComposerMeta::default();
-            log.answered.clear();
-            log.expanded.clear();
-            log.multi_selected.clear();
-            log.submissions.clear();
+            log.reset_transcript();
             self.chat.request_tasks.remove(&key);
         }
         log.binding = binding;
@@ -1172,23 +1330,7 @@ impl Shell {
             }
         }
         if !snap.items.is_empty() {
-            log.items.extend(snap.items.into_iter().map(Arc::new));
-            if log.items.len() > MAX_CHAT_KEPT {
-                let excess = log.items.len() - MAX_CHAT_KEPT;
-                log.items.drain(0..excess);
-                log.base_index = log.base_index.saturating_add(excess);
-                log.earlier = None;
-                let retained: BTreeSet<_> = log
-                    .items
-                    .iter()
-                    .enumerate()
-                    .map(|(index, item)| format!("{}:{}", item.tool_id, log.base_index + index))
-                    .collect();
-                log.expanded.retain(|index| *index >= log.base_index);
-                log.answered.retain(|key| retained.contains(key));
-                log.multi_selected.retain(|key, _| retained.contains(key));
-                log.submissions.retain(|key, _| retained.contains(key));
-            }
+            log.append_and_trim(snap.items, MAX_CHAT_KEPT);
         }
         log.offset = snap.next_offset;
         // A matching transcript result is evidence of a response; queue delivery is not.
@@ -1477,7 +1619,7 @@ impl Shell {
         notice.is_none()
     }
 
-    fn ensure_chat_input(
+    pub(super) fn ensure_chat_input(
         &mut self,
         key: ChatKey,
         window: &mut Window,
@@ -1499,13 +1641,25 @@ impl Shell {
                 .submit_on_enter(true)
                 .placeholder(ctext::PROMPT_PLACEHOLDER.get())
         });
+        let focus_key = key.clone();
         let sub = cx.subscribe_in(
             &input,
             window,
-            move |_this, _state, ev: &InputEvent, _window, cx| {
-                if matches!(ev, InputEvent::Change) {
+            move |this, _state, ev: &InputEvent, _window, cx| match ev {
+                InputEvent::Focus => {
+                    if let Some(pane) = this.chat_pane(&focus_key)
+                        && this.layout.focused() != Some(pane)
+                    {
+                        this.change(false, cx, |l| l.focus(pane));
+                        this.files.refocus = false;
+                    } else {
+                        cx.notify();
+                    }
+                }
+                InputEvent::Change | InputEvent::Blur => {
                     cx.notify();
                 }
+                InputEvent::PressEnter { .. } => {}
             },
         );
         let active =
@@ -1515,6 +1669,46 @@ impl Shell {
             input.update(cx, |state, cx| state.focus(window, cx));
         }
         input
+    }
+
+    pub(super) fn chat_pane_has_focus(
+        &self,
+        pane: PaneId,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> bool {
+        use gpui::Focusable as _;
+        let Some(key) = self.chat_key(pane) else {
+            return false;
+        };
+        self.chat
+            .inputs
+            .get(&key)
+            .is_some_and(|(input, _)| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    pub(super) fn flush_chat_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(focused) = self.layout.focused() else {
+            return;
+        };
+        let Some(pane_key) = self.chat_key(focused) else {
+            return;
+        };
+        match &self.chat.focus_pending {
+            Some(ChatFocus::Terminal(id)) if *id == pane_key => {
+                self.chat.focus_pending = None;
+                window.focus(&self.focus, cx);
+            }
+            Some(ChatFocus::Composer(id))
+                if *id == pane_key && self.is_pane_chat_view(focused, cx) =>
+            {
+                let key = id.clone();
+                self.chat.focus_pending = None;
+                let input = self.ensure_chat_input(key, window, cx);
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn submit_chat_prompt(

@@ -35,6 +35,53 @@ class NightlyError(RuntimeError):
     pass
 
 
+# 앱 설정 > 업데이트는 main의 이 파일에서 버전별 한국어 항목을 읽고, 없으면 영어 커밋 제목을 보여 준다.
+KOREAN_NOTES = Path("docs/releases/ko.json")
+# 앱 release_notes.rs의 HIDDEN_KINDS와 같다: 사용자에게 보이는 동작을 바꾸지 않는 커밋 종류.
+HIDDEN_KINDS = ("build", "chore", "ci", "docs", "refactor", "style", "test")
+# launchd PATH에는 ~/.local/bin이 없다.
+TRANSLATOR = Path.home() / ".local/bin/claude"
+# 결과를 사람에게 알리는 명령(stdin 본문). 없는 머신에서는 알리지 않는다.
+NOTIFIER = Path.home() / ".local/bin/discord-notify"
+KOREAN_PROMPT = """다음은 Krill(AI 코딩 에이전트 세션 관리 앱) 새 버전에 들어간 커밋 제목이다.
+사용자에게 보이는 변화만 골라 한국어 항목 최대 10개로 요약하라. 비슷한 것은 하나로 묶는다.
+각 항목은 '~합니다' 또는 '~했습니다'로 끝나는 한 문장이다. 내부 테스트, CI, 빌드 변경은 뺀다.
+가운뎃점, 대시, 이모지를 쓰지 않는다. 출력은 JSON 문자열 배열 하나뿐이다.
+
+"""
+
+
+def release_titles(log):
+    """`git log --format=%s` 출력에서 사용자에게 보일 커밋 제목만 순서대로 고른다."""
+    titles = []
+    for line in log.splitlines():
+        title = re.sub(r" \(#\d+\)$", "", line.strip())
+        if not title or title.startswith(("Merge ", "Release v", "Revert ")):
+            continue
+        conventional = re.match(r"^(\w+)(\([^)]*\))?!?: (.+)$", title)
+        if conventional:
+            if conventional[1] in HIDDEN_KINDS:
+                continue
+            title = conventional[3]
+        title = title[:1].upper() + title[1:]
+        if title not in titles:
+            titles.append(title)
+    return titles
+
+
+def korean_items(output):
+    """번역기 출력에서 한국어 항목 배열을 꺼낸다. 형식이 어긋나면 ValueError."""
+    start, end = output.find("["), output.rfind("]")
+    if start < 0 or end < start:
+        raise ValueError("translator returned no JSON array")
+    items = json.loads(output[start:end + 1])
+    if (not isinstance(items, list) or not 1 <= len(items) <= 12
+            or not all(isinstance(item, str) and 0 < len(item.strip()) <= 300
+                       and re.search(r"[가-힣]", item) for item in items)):
+        raise ValueError("translator output is not 1-12 Korean sentences")
+    return [item.strip() for item in items]
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
@@ -223,6 +270,33 @@ class Release:
             return results
         raise NightlyError(f"CI timed out at {sha} ({branch})")
 
+    def write_korean_notes(self, version, published):
+        """Release 커밋에 이 버전의 한국어 변경 사항을 넣는다. 번역 실패는 게시를 막지 않는다(앱은 영어로 대신한다)."""
+        path = self.work / KOREAN_NOTES
+        if not path.is_file():
+            return
+        notes = json.loads(path.read_text(encoding="utf-8"))
+        if version in notes:
+            return
+        titles = release_titles(self.git("log", "--no-merges", "--format=%s", f"{published}..HEAD"))[:60]
+        if not titles:
+            return
+        translator = Path(self.config.get("translator", TRANSLATOR))
+        try:
+            with tempfile.TemporaryDirectory() as neutral:
+                # 저장소 밖에서 실행해 저장소 지침·훅을 읽히지 않는다.
+                output = command([translator, "-p", "--model", "haiku",
+                                  KOREAN_PROMPT + "\n".join(f"- {title}" for title in titles)],
+                                 cwd=neutral, env=self.env, timeout=300)
+            items = korean_items(output)
+        except (NightlyError, ValueError, OSError, subprocess.TimeoutExpired) as error:
+            self.update(korean_notes=f"skipped: {error}")
+            print(f"Korean release notes skipped: {error}", flush=True)
+            return
+        path.write_text(json.dumps({version: items, **notes}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.git("add", str(KOREAN_NOTES))
+        self.update(korean_notes=f"added {len(items)} items")
+
     def prepare(self):
         self.root.mkdir(parents=True, exist_ok=True)
         if not self.work.exists():
@@ -280,23 +354,28 @@ class Release:
         if all(self.ancestor(sha, published) for sha in (remote, main)):
             skip_unchanged()
             return None
+        # 출고 재료는 dev 하나다. main은 출고된 커밋만 fast-forward로 따라가므로 dev에 없는 main 커밋은 없어야 한다.
+        if not self.ancestor(main, remote):
+            raise NightlyError(f"origin/main has commits missing from origin/{self.config['branch']}; "
+                               "merge main into it first (releases are cut from that branch only)")
         branch = CANDIDATE_BRANCH
         created = datetime.fromisoformat(pending["created_at"]) if pending.get("created_at") else None
         age = (datetime.now().astimezone() - created).total_seconds() if created else float("inf")
+        # main까지 올라갔는데 main CI 등으로 게시 전에 멈췄으면 sync_dev가 dev도 이미 옮겼다. 그 커밋을 끝까지 게시한다.
+        promoted = main == pending.get("candidate_head")
         if (0 <= age < 23 * 3600 and pending.get("validation_context") == self.state.get("validation_context")
-                and pending.get("source_head") == remote and pending.get("previous_release") == latest
-                and main in (pending.get("base_main"), pending.get("candidate_head"))):
+                and pending.get("previous_release") == latest
+                and (promoted or (pending.get("source_head") == remote and main == pending.get("base_main")))):
             candidate = pending["candidate_head"]
-            if self.ancestor(remote, candidate) and self.ancestor(main, candidate):
+            if promoted or (self.ancestor(remote, candidate) and self.ancestor(main, candidate)):
                 self.git("checkout", "-B", branch, candidate)
                 self.update(**pending, resumed=True)
                 return candidate, branch, pending["version"], pending["base_main"]
-        self.git("checkout", "-B", branch, main)
+        self.git("checkout", "-B", branch, remote)
         for field in ("user.name", "user.email"):
             self.git("config", field, self.config[field])
         self.git("config", "core.hooksPath", "scripts/hooks")
-        self.git("merge", "--no-edit", remote)
-        # Squash-merged dev commits never become ancestors of the release, so compare content.
+        # dev가 출고 커밋을 병합 커밋으로 받았으면 조상은 아니어도 내용은 같을 수 있다.
         if self.git("rev-parse", "HEAD^{tree}") == self.git("rev-parse", f"{published}^{{tree}}"):
             skip_unchanged()
             return None
@@ -310,6 +389,7 @@ class Release:
         manifest.write_text(re.sub(pattern, lambda item: item[1] + version + item[3], text, count=1))
         self.run("cargo", "update", "--workspace", "--offline")
         self.run("python3", "docs/licensing/generate_notices.py", timeout=900)
+        self.write_korean_notes(version, published)
         self.git("add", "Cargo.toml", "Cargo.lock", "THIRD_PARTY_NOTICES.md")
         self.git("commit", "-m", f"Release v{version}\n\nNightly-Source: {remote}\nNightly-Main: {main}\nNightly-Candidate: {datetime.now().astimezone().isoformat()}")
         sha = self.git("rev-parse", "HEAD")
@@ -318,6 +398,35 @@ class Release:
         write_json(self.state_dir / "pending.json", {key: self.state.get(key) for key in (
             "source_head", "base_main", "previous_release", "candidate_head", "candidate_branch", "version", "created_at", "validation_context")})
         return sha, branch, version, main
+
+    def sync_dev(self, sha):
+        """main에 올린 출고 커밋을 dev에도 넣어 다음 후보가 dev에서 바로 나오게 한다.
+
+        출고는 이미 main에 올라갔으므로 실패해도 게시를 막지 않고 기록만 남긴다. 다음 실행의 prepare가
+        main이 dev에 없다며 멈추므로 놓치지 않는다.
+        """
+        branch = self.config["branch"]
+        try:
+            self.git("fetch", "origin", branch)
+            dev = self.git("rev-parse", f"origin/{branch}")
+            if self.ancestor(sha, dev):
+                result = "already contained"
+            elif self.ancestor(dev, sha):
+                self.git("push", "origin", f"{sha}:refs/heads/{branch}")
+                result = "fast-forwarded"
+            else:
+                # 검사하는 동안 dev가 움직였다. 출고 커밋은 버전 파일만 바꾸므로 병합 커밋으로 넣는다.
+                self.git("checkout", "-B", "nightly-dev-sync", dev)
+                try:
+                    self.git("merge", "--no-edit", sha)
+                    self.git("push", "origin", f"HEAD:refs/heads/{branch}")
+                finally:
+                    subprocess.run(["git", "merge", "--abort"], cwd=self.work, env=self.env, capture_output=True)
+                    self.git("checkout", "-f", CANDIDATE_BRANCH)
+                result = "merged"
+        except NightlyError as error:
+            result = f"failed: {error}"
+        self.update(dev_sync=result)
 
     def publish(self):
         public_key = preflight(self.config)
@@ -400,6 +509,7 @@ class Release:
             raise NightlyError("candidate changed after validation")
         if current_main != sha:
             self.git("push", "origin", "HEAD:refs/heads/main")
+        self.sync_dev(sha)
         self.wait_ci(sha, "main", {"ci.yml", "ci-macos.yml", "ci-windows.yml"})
         self.update(step="publish")
         self.env["KRILL_RELEASE_ASSET_DIR"] = str(verified)
@@ -414,6 +524,27 @@ class Release:
         (self.state_dir / "pending.json").unlink(missing_ok=True)
         self.update(status="published", step="done", tag=f"v{version}",
                     finished_at=datetime.now().astimezone().isoformat())
+
+
+def notify(text):
+    """결과를 알린다. 알림이 실패해도 배포 결과와 종료 코드는 바꾸지 않는다."""
+    if not NOTIFIER.exists():
+        return
+    try:
+        sent = subprocess.run([str(NOTIFIER), "알림-크론"], input=text, text=True, capture_output=True, timeout=60)
+        if sent.returncode:
+            print(f"notify failed: {sent.stderr.strip()}", flush=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"notify failed: {error}", flush=True)
+
+
+def outcome(state):
+    status = state.get("status")
+    if status == "published":
+        return f"Krill nightly 배포 완료: {state.get('tag')}"
+    if status == "skipped":
+        return f"Krill nightly 건너뜀: {state.get('reason')}"
+    return f"Krill nightly 실패: {state.get('error') or status}\n로그: {state.get('log')}"
 
 
 def run_release(config, state_dir):
@@ -435,6 +566,8 @@ def run_release(config, state_dir):
                 release.update(status="failed", error=str(error), finished_at=datetime.now().astimezone().isoformat())
                 print(f"Nightly stopped: {error}", flush=True)
                 raise
+            finally:
+                notify(outcome(release.state))
 
 
 def dispatch(config, config_path, preflight_only=False):
@@ -538,7 +671,11 @@ def main():
         if args.action == "preflight":
             preflight(config)
         elif args.action == "dispatch":
-            dispatch(config, args.config, args.preflight_only)
+            try:
+                dispatch(config, args.config, args.preflight_only)
+            except BaseException as error:
+                notify(f"Krill nightly 시작 실패: {error}")
+                raise
         else:
             # BSD lockf와 같은 flock 잠금을 실행기 자신이 보유한다. 취소 시 자식 정리 뒤 해제한다.
             with PUBLISH_LOCK.open("a") as lock:

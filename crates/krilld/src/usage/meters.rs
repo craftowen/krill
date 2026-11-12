@@ -79,8 +79,8 @@ pub(super) fn read(home: &Path, account: &AccountInfo) -> AccountMeters {
 fn read_local(home: &Path, account: &AccountInfo) -> AccountMeters {
     let dir = Path::new(&account.profile_dir);
     for name in [
+        krill_proto::statusline::CACHE_FILE,
         "statusline_cache.json",
-        "usage_cache.json",
         "usage.json",
         "quota.json",
         "rate_limits.json",
@@ -247,6 +247,7 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("Models");
+                let start = out.meters.len();
                 for raw in group
                     .get("buckets")
                     .and_then(Value::as_array)
@@ -276,6 +277,19 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                         value: None,
                     });
                 }
+                // agy lists the weekly bucket first; show the short window first like every other provider.
+                let group_meters = out.meters.get_mut(start..).unwrap_or_default();
+                group_meters.sort_by_key(|m| {
+                    let window = m.label.rsplit(" · ").next().unwrap_or("");
+                    let hours = |unit: char, mul: u64| {
+                        window
+                            .strip_suffix(unit)?
+                            .parse::<u64>()
+                            .ok()
+                            .map(|n| n * mul)
+                    };
+                    hours('h', 1).or_else(|| hours('d', 24)).unwrap_or(u64::MAX)
+                });
             }
         }
         ProviderKind::OpenCode => {
@@ -387,6 +401,36 @@ fn value_meter(out: &mut AccountMeters, key: &str, label: &str, value: String) {
 mod tests {
     use super::*;
     #[test]
+    fn profile_recorded_usage_beats_unattributed_statusline_file() {
+        let dir = std::env::temp_dir().join(format!("krill-meters-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("statusline_cache.json"),
+            r#"{"seven_day":{"utilization":97}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(krill_proto::statusline::CACHE_FILE),
+            r#"{"rate_limits":{"seven_day":{"used_percentage":66}}}"#,
+        )
+        .unwrap();
+        let account = AccountInfo {
+            id: "a".into(),
+            provider: ProviderKind::Claude,
+            label: "A".into(),
+            email: None,
+            profile_dir: dir.display().to_string(),
+            active: false,
+            host_default: false,
+            stale: false,
+            usage: krill_proto::usage::Snapshot::default(),
+        };
+        let reading = read(&dir, &account);
+        assert_eq!(reading.meters[0].window.as_ref().unwrap().percent, 66);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn codex_reset_credit_expiry_is_metadata_not_a_usage_pool() {
         for (raw, expected) in [
             (r#","expires_at":"2099-01-01T00:00:00Z""#, "4070908800"),
@@ -407,6 +451,12 @@ mod tests {
             r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini","buckets":[{"id":"g","window":"weekly","remaining_fraction":0.2},{"id":"disabled","window":"5h","disabled":true,"remaining_fraction":0}]},{"name":"Claude and GPT","buckets":[{"id":"c","window":"weekly","remaining_fraction":0.8}]}]}}}"#,
         );
         assert_eq!(agy.meters.len(), 2);
+        let both = parse(
+            ProviderKind::Antigravity,
+            r#"{"groups":[{"name":"Gemini Models","buckets":[{"id":"w","window":"weekly","remaining_fraction":0.9},{"id":"f","window":"5h","remaining_fraction":0.5}]}]}"#,
+        );
+        let labels: Vec<_> = both.meters.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["Gemini Models · 5h", "Gemini Models · 7d"]);
         assert_eq!(agy.meters[0].window.as_ref().unwrap().percent, 80);
         assert_eq!(agy.meters[1].label, "Claude and GPT · 7d");
         let go = parse(

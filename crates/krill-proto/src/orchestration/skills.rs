@@ -26,7 +26,7 @@ pub const BUILTIN_SKILLS: &[SkillEntry] = &[
     SkillEntry {
         name: "krill",
         description: "Operate Krill sessions, worktrees, checkpoints, references, handoffs, and ports via the `krill` CLI.",
-        content: "---\nname: krill\ndescription: Operate Krill sessions, worktrees, checkpoints, references, handoffs, and ports via the krill CLI.\n---\n\n# Krill (`krill`) CLI Skill\n\n- List/manage sessions: `krill ls --json`, `krill new --cwd <dir> --agent <profile>` (or `krill new --cwd <dir> -- <program> <args>...`), `krill send <session_id> --text \"<text>\" --enter`, `krill read <session_id> --lines 80`, `krill wait <session_id> --for idle --timeout 30`, `krill kill <session_id>`\n- Worktree checkpoints: `krill set --comment \"...\" --workspace-status in-progress --pr 42 --issue OWE-100 --reference https://...`\n- References: `krill reference list`, `krill reference add <url>`, `krill reference find <query>`\n- Handoff context to another agent: `krill handoff --from <id> --to-agent codex --prompt \"Continue verification\"`\n- Detect listening ports: `krill ports --json`\n",
+        content: "---\nname: krill\ndescription: Operate Krill sessions, worktrees, checkpoints, references, handoffs, and ports via the krill CLI.\n---\n\n# Krill (`krill`) CLI Skill\n\n- List/manage sessions: `krill ls --json`, `krill new --cwd <dir> --agent <profile>` (or `krill new --cwd <dir> -- <program> <args>...`), `krill send <session_id> --text \"<text>\" --enter`, `krill read <session_id> --lines 80`, `krill wait <session_id> --for idle --timeout 30`, `krill kill <session_id>`\n- Worktree checkpoints: `krill set --comment \"...\" --workspace-status in-progress --pr 42 --issue OWE-100 --reference https://...`\n- References: `krill reference list`, `krill reference add <url>`, `krill reference find <query>`\n- Handoff context to another agent: `krill handoff --from <id> --to-agent codex --prompt \"Continue verification\"`\n- Detect listening ports: `krill ports --json`\n- Send a file to the user's phone (Krill Drop; the phone fetches it when it next connects, kept 7 days): `krill drop <file>`\n",
     },
     SkillEntry {
         name: "orchestration",
@@ -163,6 +163,14 @@ pub fn sync_builtin_skills(directories: &[PathBuf]) -> SkillSyncReport {
                     report.busy.push(dir.clone());
                     break;
                 }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                    ) || (cfg!(unix) && error.raw_os_error() == Some(1)) =>
+                {
+                    break;
+                }
                 Err(error) => {
                     report
                         .failures
@@ -226,13 +234,75 @@ fn candidate_writable(dir: &Path, skill: &SkillEntry) -> io::Result<bool> {
     }
 }
 
+fn already_current(skill: &SkillEntry, base_dir: &Path) -> io::Result<Option<PathBuf>> {
+    let orca_owned = ORCA_SKILL_NAMES.contains(&skill.name);
+    let candidates = [skill.name.to_owned(), format!("krill-{}", skill.name)];
+    let mut selected = None;
+    for (index, name) in candidates.iter().enumerate().skip(usize::from(orca_owned)) {
+        let dir = base_dir.join(name);
+        if candidate_writable(&dir, skill)? {
+            selected = Some((dir, index != 0));
+            break;
+        }
+    }
+    let Some((dir, prefixed)) = selected else {
+        return Ok(None);
+    };
+    let mut stale = vec![base_dir.join(format!("mk-{}", skill.name))];
+    if orca_owned {
+        stale.push(base_dir.join(skill.name));
+    }
+    if stale
+        .into_iter()
+        .any(|old| old != dir && old.join("SKILL.md").is_file())
+    {
+        return Ok(None);
+    }
+    let body = if prefixed {
+        prefixed_content(skill, "krill-")
+    } else {
+        skill.content.to_owned()
+    };
+    let entry = dir.join("SKILL.md");
+    let expected_entry = format!("{}\n{MARKER}\n", body.trim_end());
+    if !regular_or_missing(&entry)?
+        || fs::read(&entry).ok().as_deref() != Some(expected_entry.as_bytes())
+    {
+        return Ok(None);
+    }
+    let references = skill_references(skill.name);
+    if references.is_empty() {
+        if dir.join("references").exists() {
+            return Ok(None);
+        }
+        return Ok(Some(entry));
+    }
+    for (relative, content) in references {
+        let path = dir.join(relative);
+        let Some(parent) = path.parent() else {
+            return Ok(None);
+        };
+        if ensure_directory_safe(parent).is_err() || !regular_or_missing(&path)? {
+            return Ok(None);
+        }
+        let expected = format!("{}\n{MARKER}\n", content.trim_end());
+        if fs::read(&path).ok().as_deref() != Some(expected.as_bytes()) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(entry))
+}
+
 fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
     ensure_directory_safe(base_dir)?;
-    fs::create_dir_all(base_dir)?;
     let lock = base_dir.join(".krill-skills.lock");
     if !regular_or_missing(&lock)? {
         return Err(invalid("skill lock must not be a symlink"));
     }
+    if let Some(entry) = already_current(skill, base_dir)? {
+        return Ok((entry, false));
+    }
+    fs::create_dir_all(base_dir)?;
     let _lock = skill_lock(&lock)?;
     let orca_owned = ORCA_SKILL_NAMES.contains(&skill.name);
     let candidates = [skill.name.to_owned(), format!("krill-{}", skill.name)];
@@ -405,3 +475,36 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod sandbox_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn up_to_date_readonly_roots_succeed_and_unwritable_missing_roots_skip_quietly() {
+        let home = std::env::temp_dir().join(format!("krill-skill-ro-{}", std::process::id()));
+        fs::remove_dir_all(&home).ok();
+        let populated = home.join("populated");
+        let missing_parent = home.join("readonly-parent");
+        fs::create_dir_all(&populated).unwrap();
+        fs::create_dir_all(&missing_parent).unwrap();
+        let initial = sync_builtin_skills(std::slice::from_ref(&populated));
+        assert!(initial.failures.is_empty());
+        assert_eq!(initial.updated, builtin_skills().len());
+
+        // Remove `.krill-skills.lock` and make both directories read-only (0500) to simulate
+        // a sandboxed subshell where `create_dir_all` / lock creation fails with EACCES/EPERM.
+        fs::remove_file(populated.join(".krill-skills.lock")).ok();
+        fs::set_permissions(&populated, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&missing_parent, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let report = sync_builtin_skills(&[populated.clone(), missing_parent.join("skills")]);
+        fs::set_permissions(&populated, fs::Permissions::from_mode(0o700)).ok();
+        fs::set_permissions(&missing_parent, fs::Permissions::from_mode(0o700)).ok();
+        fs::remove_dir_all(&home).ok();
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.unchanged, builtin_skills().len());
+    }
+}

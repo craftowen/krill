@@ -5,21 +5,11 @@ use krill_proto::usage::ProviderKind;
 use serde_json::Value;
 
 pub(crate) fn from_credentials(provider: ProviderKind, raw: &[u8]) -> Option<Identity> {
+    if provider == ProviderKind::Codex {
+        return krill_proto::account_login::codex_identity_from_credentials(raw);
+    }
     let data: Value = serde_json::from_slice(raw).ok()?;
     let token = match provider {
-        ProviderKind::Codex => {
-            // API 키 로그인에 남은 OAuth 토큰을 현재 계정으로 표시하지 않는다.
-            if data.get("auth_mode").and_then(Value::as_str) == Some("apikey")
-                || data
-                    .get("OPENAI_API_KEY")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.trim().is_empty())
-            {
-                return None;
-            }
-            data.pointer("/tokens/id_token")
-                .or_else(|| data.pointer("/tokens/idToken"))?
-        }
         ProviderKind::Antigravity => {
             match data
                 .get("id_token")
@@ -32,24 +22,19 @@ pub(crate) fn from_credentials(provider: ProviderKind, raw: &[u8]) -> Option<Ide
         _ => return None,
     }
     .as_str()?;
-    let claims = claims(token)?;
-    if provider == ProviderKind::Antigravity
-        && (!matches!(
-            claims.get("iss").and_then(Value::as_str),
-            Some("accounts.google.com" | "https://accounts.google.com")
-        ) || claims
-            .get("sub")
-            .and_then(Value::as_str)
-            .is_none_or(|s| s.trim().is_empty())
-            || claims.get("email_verified").and_then(Value::as_bool) != Some(true))
+    let claims = krill_proto::account_login::jwt_claims(token)?;
+    if !matches!(
+        claims.get("iss").and_then(Value::as_str),
+        Some("accounts.google.com" | "https://accounts.google.com")
+    ) || claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s.trim().is_empty())
+        || claims.get("email_verified").and_then(Value::as_bool) != Some(true)
     {
         return None;
     }
-    let email = claims
-        .get("email")
-        .or_else(|| claims.pointer("/https:~1~1api.openai.com~1profile/email"))?
-        .as_str()?
-        .trim();
+    let email = claims.get("email")?.as_str()?.trim();
     if email.is_empty() || email.len() > 320 || email.chars().any(char::is_control) {
         return None;
     }
@@ -132,41 +117,10 @@ fn agy_email(value: &Value) -> Option<Identity> {
     })
 }
 
-fn claims(token: &str) -> Option<Value> {
-    let mut parts = token.split('.');
-    parts.next()?;
-    let payload = parts.next()?;
-    parts.next()?;
-    if parts.next().is_some() || payload.is_empty() || payload.len() > 16 * 1024 {
-        return None;
-    }
-    let (mut bits, mut count) = (0_u32, 0_u32);
-    let mut decoded = Vec::new();
-    for byte in payload.bytes() {
-        let n = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        };
-        bits = (bits << 6) | u32::from(n);
-        count += 6;
-        if count >= 8 {
-            count -= 8;
-            decoded.push(u8::try_from((bits >> count) & 255).ok()?);
-        }
-    }
-    if count >= 6 || bits & ((1 << count) - 1) != 0 {
-        return None;
-    }
-    serde_json::from_slice(&decoded).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use krill_proto::account_login::jwt_claims as claims;
     fn encode(bytes: &[u8]) -> String {
         let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let (mut bits, mut count) = (0_u32, 0_u32);
@@ -419,7 +373,7 @@ mod tests {
         fn malformed_credentials_never_panic(raw in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
             let _ = from_credentials(ProviderKind::Codex, &raw);
             let _ = from_credentials(ProviderKind::Antigravity, &raw);
-            let _ = claims(&String::from_utf8_lossy(&raw));
+            drop(claims(&String::from_utf8_lossy(&raw)));
         }
     }
 }

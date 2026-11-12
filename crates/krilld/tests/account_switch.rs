@@ -365,7 +365,8 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
         Reply::Closed
     );
     drop(daemon);
-    fs::remove_dir_all(root).unwrap();
+    // Processes killed just above can still be writing here; a leftover in /tmp is not a failure.
+    fs::remove_dir_all(root).ok();
 }
 
 // Account migration belongs to the daemon that owns a state folder. A registry without one (a

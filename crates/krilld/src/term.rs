@@ -946,6 +946,8 @@ impl Engine {
     }
 
     /// 핫 스크롤백을 비운다. 보이는 화면·커서·모드는 그대로 둔다(OWE-873b).
+    /// 할당한 행은 alacritty 캐시(최대 1,000행)로 남는다. 콜드 재생은 256바이트마다 이걸 불러서,
+    /// 캐시까지 버리면 매번 1,000행을 다시 할당해 페이지 하나에 10초가 걸렸다.
     pub(crate) fn clear_history(&mut self) {
         self.parked_hot.clear();
         self.parked_hot.shrink_to_fit();
@@ -953,6 +955,11 @@ impl Engine {
         self.scheme.clear = ClearTrack::None;
         self.scheme.stop = StopReason::None;
         self.term.grid_mut().clear_history();
+    }
+
+    /// [`Self::clear_history`]에 더해 캐시 행 메모리도 돌려준다. 사용자가 라이브 세션을 지울 때 쓴다.
+    pub(crate) fn release_history(&mut self) {
+        self.clear_history();
         self.term.grid_mut().truncate();
     }
 
@@ -962,7 +969,7 @@ impl Engine {
         ansi::Handler::clear_screen(&mut self.term, ansi::ClearMode::All);
         self.term.grid_mut()[Line(0)] = row;
         self.term.grid_mut().cursor.point.line = Line(0);
-        self.clear_history();
+        self.release_history();
     }
 
     /// 스크롤백을 오래된 행부터 꺼내고 비운다. 콜드 페이지 재생이 메모리를 일정하게 두려고 쓴다.

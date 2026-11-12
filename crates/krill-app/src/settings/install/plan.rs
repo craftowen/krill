@@ -74,12 +74,9 @@ fn brew_update(binary: &Path) -> Option<String> {
     None
 }
 
-pub(super) fn prerequisite(spec: &ToolSpec, path: &OsStr) -> Option<String> {
-    let cmd = command(spec, path);
-    let required = if cfg!(windows) {
-        if spec.id == "pkgmgr" {
-            return Some(text::INSTALL_WINGET_MANUAL.get().to_owned());
-        }
+/// 설치 명령을 돌리기 전에 PATH에 있어야 하는 실행 파일.
+pub(super) fn required_bin(cmd: &str) -> Option<&'static str> {
+    if cfg!(windows) {
         if cmd.starts_with("winget ") {
             Some("winget")
         } else if cmd.starts_with("npm.cmd ") {
@@ -87,16 +84,24 @@ pub(super) fn prerequisite(spec: &ToolSpec, path: &OsStr) -> Option<String> {
         } else {
             None
         }
-    } else if spec.id == "pkgmgr" && krill_proto::agent::which("brew", path).is_none() {
-        return Some(text::INSTALL_BREW_TERMINAL.get().to_owned());
     } else if cmd.starts_with("brew ") {
         Some("brew")
     } else if cmd.starts_with("npm ") {
         Some("npm")
     } else {
         None
-    };
-    required
+    }
+}
+
+pub(super) fn prerequisite(spec: &ToolSpec, path: &OsStr) -> Option<String> {
+    let cmd = command(spec, path);
+    if cfg!(windows) && spec.id == "pkgmgr" {
+        return Some(text::INSTALL_WINGET_MANUAL.get().to_owned());
+    }
+    if !cfg!(windows) && spec.id == "pkgmgr" && krill_proto::agent::which("brew", path).is_none() {
+        return Some(text::INSTALL_BREW_TERMINAL.get().to_owned());
+    }
+    required_bin(&cmd)
         .filter(|bin| krill_proto::agent::which(bin, path).is_none())
         .map(|bin| {
             text::INSTALL_MISSING_PREREQUISITE

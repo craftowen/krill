@@ -1,5 +1,5 @@
 use super::{Call, Panel, SettingsView, layout, text};
-use gpui::{Context, div, prelude::*, px};
+use gpui::{Context, div, prelude::*};
 use gpui_component::Disableable as _;
 use krill_proto::mobile::{ConnectMode, MobileReply, MobileRequest};
 use std::{sync::Arc, time::Duration};
@@ -22,6 +22,14 @@ fn account_call(call: &Call, action: &str) -> Result<serde_json::Value, String> 
     Ok(value.get("data").cloned().unwrap_or_default())
 }
 impl Panel {
+    fn account_shown_values(&self) -> (bool, Option<String>, bool, Option<String>) {
+        (
+            self.account.required,
+            self.account.email.clone(),
+            self.account.pending,
+            self.error.clone(),
+        )
+    }
     fn accept_account(&mut self, data: &serde_json::Value) {
         if let Some(required) = data
             .get("requires_sign_in")
@@ -92,6 +100,7 @@ impl SettingsView {
                             {
                                 return;
                             }
+                            let shown = this.mobile.account_shown_values();
                             match result {
                                 Ok(data) => this.mobile.accept_account(&data),
                                 Err(_) if pending => {
@@ -102,7 +111,10 @@ impl SettingsView {
                                 Err(_) => {}
                             }
                             this.mobile_resume_after_login(cx);
-                            cx.notify();
+                            // 탭에 있는 동안 5초마다 묻는다. 값이 같으면 다시 그리지 않는다.
+                            if this.mobile.account_shown_values() != shown {
+                                cx.notify();
+                            }
                         })
                         .is_err()
                     {
@@ -176,69 +188,58 @@ impl SettingsView {
         .detach();
         cx.notify();
     }
-    pub(super) fn mobile_account_card(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    /// 계정 한 줄. 로그인이 필요 없는 경로에서는 안내만, 릴레이에서는 상태와 그때 쓸 버튼만 보인다.
+    pub(super) fn mobile_account_line(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
-        let signed_in = self.mobile.account.email.is_some();
-        let label = if !self.mobile.account.required {
-            text::ACCOUNT_OPTIONAL.get().to_owned()
-        } else if self.mobile.account.pending {
-            text::ACCOUNT_WAITING.get().to_owned()
-        } else {
-            self.mobile
-                .account
-                .email
-                .clone()
-                .unwrap_or_else(|| text::ACCOUNT_REQUIRED.get().to_owned())
-        };
-        layout::card(p)
+        let account = &self.mobile.account;
+        let row = div()
             .id("mobile-relay-account")
-            .debug_selector(|| "mobile-relay-account".into())
-            .p_3()
+            .debug_selector(|| "mobile-relay-account".into());
+        if self.mobile.mode != ConnectMode::Tunnel && !account.pending {
+            return row
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(p.muted_foreground)
+                .child(text::ACCOUNT_LOCAL.get());
+        }
+        let logout = || {
+            layout::ghost("mobile-relay-logout", text::ACCOUNT_LOGOUT.get())
+                .disabled(account.busy)
+                .debug_selector(|| "mobile-relay-logout".into())
+                .on_click(cx.listener(|this, _, _, cx| this.mobile_account_action(true, cx)))
+        };
+        let (label, action) = if let Some(email) = &account.email {
+            (email.clone(), Some(logout()))
+        } else if account.pending {
+            (text::ACCOUNT_WAITING.get().to_owned(), Some(logout()))
+        } else if !account.required {
+            (text::ACCOUNT_OPTIONAL.get().to_owned(), None)
+        } else {
+            (
+                text::ACCOUNT_REQUIRED.get().to_owned(),
+                Some(
+                    layout::primary("mobile-relay-login", text::ACCOUNT_LOGIN.get())
+                        .disabled(account.busy)
+                        .debug_selector(|| "mobile-relay-login".into())
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.mobile_account_action(false, cx)),
+                        ),
+                ),
+            )
+        };
+        row.w_full()
+            .min_w_0()
             .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .min_h(px(40.))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(div().text_size(crate::ui::TEXT_SM).truncate().child(label))
-                    .child(
-                        div()
-                            .text_size(crate::ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(text::ACCOUNT_LOCAL.get()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        layout::primary("mobile-relay-login", text::ACCOUNT_LOGIN.get())
-                            .disabled(
-                                self.mobile.account.busy
-                                    || signed_in
-                                    || self.mobile.account.pending,
-                            )
-                            .debug_selector(|| "mobile-relay-login".into())
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.mobile_account_action(false, cx)),
-                            ),
-                    )
-                    .child(
-                        layout::ghost("mobile-relay-logout", text::ACCOUNT_LOGOUT.get())
-                            .disabled(
-                                self.mobile.account.busy
-                                    || !signed_in && !self.mobile.account.pending,
-                            )
-                            .debug_selector(|| "mobile-relay-logout".into())
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.mobile_account_action(true, cx)),
-                            ),
-                    ),
-            )
+            .flex_wrap()
+            .items_center()
+            .gap_1p5()
+            .px_2()
+            .py_1p5()
+            .rounded(crate::ui::RADIUS_SM)
+            .bg(p.background)
+            .border_1()
+            .border_color(p.border)
+            .text_size(crate::ui::TEXT_XS)
+            .child(div().flex_1().min_w_0().child(label))
+            .children(action)
     }
 }

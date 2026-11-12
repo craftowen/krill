@@ -30,6 +30,7 @@ mod liveness;
 mod new_session;
 mod notifications;
 mod overlays;
+mod pane_frame;
 mod persist;
 pub(crate) mod popout;
 mod release;
@@ -629,6 +630,10 @@ pub struct Shell {
     orch_poll: Option<Task<()>>,
     fits: fit::Pending,
     focus: FocusHandle,
+    focus_observed_window: Option<AnyWindowHandle>,
+    focus_subscriptions: Vec<Subscription>,
+    terminal_focus_owned: bool,
+    pub(super) active_split_drag: Option<Vec<Branch>>,
     /// 세션 데몬 감시 연결 상태(MK-025·MK-026). 재연결 상태는 우하단 알림으로 보인다.
     link: Link,
     daemon_task: Option<Task<()>>,
@@ -1261,6 +1266,10 @@ impl Shell {
             orch_poll: None,
             fits: fit::Pending::default(),
             focus: cx.focus_handle(),
+            focus_observed_window: None,
+            focus_subscriptions: Vec::new(),
+            terminal_focus_owned: true,
+            active_split_drag: None,
             link: Link::Connecting,
             daemon_task: None,
             paths: None,
@@ -3842,7 +3851,7 @@ impl Shell {
                 .session(*pane)
                 .and_then(|session| snap.details.handoffs.iter().find(|h| h.from == session));
             match handoff {
-                Some(h) if h.to.is_none() && h.error.is_none() => live.pane.pause_account_input(),
+                Some(h) if h.to.is_none() && h.error.is_none() => {} // sync_queued_account_input
                 Some(h) if h.to.is_some() => {} // moved below, retaining unsent input
                 Some(_) => {
                     // A pane that kept its picture for the replacement learns the original's fate again.
@@ -4368,7 +4377,7 @@ impl Shell {
                         || live.pane.session().is_none()
                         || paste_queue.has_pending_for(*p))
         });
-        self.fits.0.retain(|p, _| self.live.contains_key(p));
+        self.fits.tasks.retain(|p, _| self.live.contains_key(p));
         let mut notices = Vec::new();
         for (id, live) in &mut self.live {
             if live.target.as_ref().is_some_and(|target| {
@@ -4594,9 +4603,7 @@ impl Shell {
                             && !allow_cold_resume
                             && let Some(session) = want
                         {
-                            match pane::attach(&p, session, known)
-                                .inspect_err(|e| report("attach", e))
-                            {
+                            match pane::attach(&p, session, known) {
                                 Ok(linked) => {
                                     return Ok(Got::Live {
                                         session,
@@ -4605,6 +4612,7 @@ impl Shell {
                                     });
                                 }
                                 Err(error) if !is_permanent_error(&error) => {
+                                    report("attach", &error);
                                     return Ok(Got::Live {
                                         session,
                                         linked: Err(error),
@@ -5824,11 +5832,11 @@ impl Shell {
 
     /// 포커스 칸 커서가 깜박여야 하면(프로그램 지정 또는 설정 기본값, OWE-658) 타이머로 숨김을 뒤집는다.
     /// 깜박일 커서가 없으면 타이머를 버린다.
-    fn sync_cursor_blink(&mut self, active: bool, cx: &mut Context<Self>) {
+    fn sync_cursor_blink(&mut self, terminal_focused: bool, cx: &mut Context<Self>) {
         let default = krill_app::settings::terminal_cursor(cx);
-        let blink = active
-            && !self.page_open()
-            && self.dashboard.is_none()
+        let blink = terminal_focused
+            && self.security.is_window_active()
+            && !self.has_workspace_focus_blocker(cx)
             && !self.is_active_chat_view_in(cx)
             && self
                 .layout
@@ -5962,6 +5970,9 @@ impl Shell {
         let focused = self.layout.focused();
         let before = self.layout.clone();
         f(&mut self.layout);
+        if !self.layout.tabs().is_empty() {
+            krill_app::onboarding::dismiss_welcome(cx);
+        }
         self.forget_closed_file_tabs();
         self.cancel_closed_pastes(cx);
         if policy == close::Policy::Terminate {
@@ -6573,8 +6584,8 @@ impl Shell {
         let second = self.render_tree(second, path, window, cx);
         path.pop();
 
-        let divider_id = ElementId::Name(format!("split-{mine:?}").into());
-        let drag = Drag::Split(mine.clone());
+        let dragging = self.active_split_drag.as_ref() == Some(&mine);
+        let gutter = pane_frame::split_gutter(mine.clone(), axis, dragging, cx);
         let horizontal = axis == Axis::Horizontal;
         div()
             .flex()
@@ -6584,28 +6595,30 @@ impl Shell {
                 if *e.drag(cx) != Drag::Split(mine.clone()) {
                     return;
                 }
+                this.active_split_drag = Some(mine.clone());
                 let (pos, start, len) = if horizontal {
                     (e.event.position.x, e.bounds.left(), e.bounds.size.width)
                 } else {
                     (e.event.position.y, e.bounds.top(), e.bounds.size.height)
                 };
-                let r = layout::drag_ratio(f32::from(pos), f32::from(start), f32::from(len));
+                let r = pane_frame::split_drag_ratio(pos, start, len);
                 let mine = mine.clone();
                 this.change(false, cx, move |l| l.set_ratio(&mine, r));
             }))
             .child(
                 div()
-                    .flex_basis(relative(ratio))
-                    .flex_shrink_0()
+                    .flex_basis(px(0.))
+                    .flex_grow(ratio)
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
                     .child(first),
             )
-            .child(divider(divider_id, drag, axis, cx))
+            .child(gutter)
             .child(
                 div()
-                    .flex_1()
+                    .flex_basis(px(0.))
+                    .flex_grow(1. - ratio)
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
@@ -6755,6 +6768,9 @@ impl Shell {
             return self.render_file_pane(id, window, cx);
         }
         let focused = self.layout.focused() == Some(id);
+        let in_card = self.workspace_stage() == pane_frame::WorkspaceStage::CardStage;
+        let focus_state = self.pane_focus_state(id, window, cx);
+        let solid_cursor = focus_state.shows_solid_terminal_cursor();
         let is_split = self.layout.visible().len() > 1;
         let show_header = is_split || self.layout.host(id).is_remote();
         let ended = self.live.get(&id).is_some_and(|live| {
@@ -6897,9 +6913,8 @@ impl Shell {
                     el.screen.cursor_explicit,
                     krill_app::settings::terminal_cursor(cx),
                 );
-                el.cursor_hidden = focused && self.cursor_blink.as_ref().is_some_and(|b| b.1);
-                // OWE-871: 비포커스 칸의 블록 커서는 빈 테두리로 그려 포커스 칸과 구별한다.
-                el.cursor_hollow = !focused;
+                el.cursor_hidden = solid_cursor && self.cursor_blink.as_ref().is_some_and(|b| b.1);
+                el.cursor_hollow = !solid_cursor;
                 el.painted = Some(Rc::clone(&l.painted));
                 el.selection = l.shown_selection();
                 el.highlight = l.pane.highlight();
@@ -7034,16 +7049,17 @@ impl Shell {
             self.terminal_theme,
             krill_app::settings::terminal_opacity_pct(cx),
         );
-        let (sticky_bar, sticky_popover) = match self.render_sticky_prompt_bar(id, cx) {
+        let (sticky_bar, sticky_popover) = match self.render_sticky_prompt_bar(id, in_card, cx) {
             Some((bar, pop)) => (Some(bar), pop),
             None => (None, None),
         };
+        let has_sticky_bar = sticky_bar.is_some();
         let pane = div()
             .id(ElementId::Name(format!("pane-{}", id.get()).into()))
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(term_bg)
+            .when(!in_card, |d| d.bg(term_bg))
             .text_color(p.muted_foreground)
             .flex()
             .flex_col()
@@ -7065,7 +7081,7 @@ impl Shell {
                             // 종료·콜드 패인의 헤더는 body가 이미 가져갔다.
                             .children(pane_header.filter(|_| show_header)),
                     )
-                    .children(self.render_pane_chat_overlay(id, window, cx))
+                    .children(self.render_pane_chat_overlay(id, has_sticky_bar, window, cx))
                     .children(sticky_popover),
             )
             .when(self.files.hover.as_ref().is_some_and(|h| h.0 == id), |d| {
@@ -7297,11 +7313,16 @@ impl Shell {
             .get(&id)
             .filter(|_| self.selects(id, window.modifiers()))
             .map(|_| cx.weak_entity());
-        match menu {
+        let pane_el = match menu {
             Some(weak) => pane
                 .context_menu(move |m, window, cx| terminal_menu::build(m, &weak, id, window, cx))
                 .into_any_element(),
             None => pane.into_any_element(),
+        };
+        if in_card {
+            pane_frame::render_pane_card(id, focus_state, p, term_bg, pane_el)
+        } else {
+            pane_el
         }
     }
 
@@ -7310,6 +7331,7 @@ impl Shell {
     fn render_sticky_prompt_bar(
         &self,
         id: PaneId,
+        in_card: bool,
         cx: &mut Context<Self>,
     ) -> Option<(AnyElement, Option<AnyElement>)> {
         let host = self.layout.host(id);
@@ -7318,6 +7340,12 @@ impl Shell {
             .session(id)
             .or_else(|| self.live.get(&id).and_then(|l| l.pane.session()))?;
         let sidebar_ref = self.sidebar.read(cx);
+        if sidebar_ref
+            .session_on(host, session_id)
+            .is_some_and(sidebar::Session::agent_ended)
+        {
+            return None;
+        }
         let history = sidebar_ref
             .session_prompt_history_on(host, session_id)?
             .clone();
@@ -7350,6 +7378,9 @@ impl Shell {
             .min_w_0()
             .px_2p5()
             .py_1()
+            .when(in_card, |d| {
+                d.rounded_t(krill_app::ui::PANE_CARD_INNER_RADIUS)
+            })
             .bg(p.sidebar)
             .border_b_1()
             .border_color(p.border)
@@ -7688,6 +7719,7 @@ fn session_shown(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.fits.next_frame();
         #[cfg(windows)]
         krill_app::platform::sync_window(
             window,
@@ -7742,6 +7774,16 @@ impl Render for Shell {
                 krill_app::settings::system_appearance_changed(window.appearance(), cx);
             }));
         }
+        if self.focus_observed_window != Some(window.window_handle()) {
+            self.focus_observed_window = Some(window.window_handle());
+            self.focus_subscriptions = vec![
+                cx.on_focus(&self.focus, window, |_, _, cx| cx.notify()),
+                cx.on_blur(&self.focus, window, |_, _, cx| cx.notify()),
+            ];
+        }
+        if !cx.has_active_drag() {
+            self.active_split_drag = None;
+        }
         match std::mem::replace(&mut self.pending_focus, PendingFocus::None) {
             PendingFocus::None => {}
             PendingFocus::Workspace => window.focus(&self.focus, cx),
@@ -7751,11 +7793,12 @@ impl Render for Shell {
                 }
             }
         }
-        // 첫 렌더도 실제 창의 활성 상태로 커서 타이머를 결정한다.
-        self.sync_cursor_blink(window.is_window_active(), cx);
         if !self.page_open() {
             self.sync_files(window, cx);
         }
+        self.flush_pending_pane_focus(window, cx);
+        self.terminal_focus_owned = self.focus.is_focused(window);
+        self.sync_cursor_blink(window.is_window_active() && self.terminal_focus_owned, cx);
         let cell = cell_size(window, cx);
         let pixel = |p: Pixels| -> u16 {
             // 글꼴 측정값은 유한한 양수이며 u16 범위로 제한한다.
@@ -7835,9 +7878,23 @@ impl Render for Shell {
                 .get(self.layout.active())
                 .map(|t| t.root.clone())
         };
-        let tree = match root {
-            Some(r) => self.render_tree(&r, &mut Vec::new(), window, cx),
-            None => self.render_empty_workspace(cx),
+        let stage = self.workspace_stage();
+        let opacity_pct = krill_app::settings::terminal_opacity_pct(cx);
+        let (surface_bg, tree) = match (stage, root) {
+            (pane_frame::WorkspaceStage::CardStage, Some(r)) => {
+                let stage_bg =
+                    krill_app::ui::workspace_surface_alpha(krill_app::ui::palette(cx), opacity_pct);
+                let rendered = self.render_tree(&r, &mut Vec::new(), window, cx);
+                (stage_bg, pane_frame::render_card_stage(rendered))
+            }
+            (_, Some(r)) => (
+                krill_app::ui::terminal_surface_alpha(self.terminal_theme, opacity_pct),
+                self.render_tree(&r, &mut Vec::new(), window, cx),
+            ),
+            (_, None) => (
+                krill_app::ui::terminal_surface_alpha(self.terminal_theme, opacity_pct),
+                self.render_empty_workspace(window, cx),
+            ),
         };
         let center_diff = self.render_center_diff(window, cx);
         let show_panel = !self.panel_collapsed;
@@ -8306,8 +8363,12 @@ impl Render for Shell {
             .on_drag_move(
                 cx.listener(|this, e: &DragMoveEvent<Drag>, _, cx| this.on_column_drag(e, cx)),
             )
-            // 드래그는 놓을 때 한 번 저장한다(창 전체가 드롭 대상).
-            .on_drop(cx.listener(|this, _: &Drag, _, _| this.save()))
+            .on_drop(cx.listener(|this, _: &Drag, _, cx| {
+                if this.active_split_drag.take().is_some() {
+                    cx.notify();
+                }
+                this.save();
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -8368,10 +8429,7 @@ impl Render for Shell {
                                     .min_h_0()
                                     .relative()
                                     .debug_selector(|| "terminal-surface".into())
-                                    .bg(krill_app::ui::terminal_surface_alpha(
-                                        self.terminal_theme,
-                                        krill_app::settings::terminal_opacity_pct(cx),
-                                    ))
+                                    .bg(surface_bg)
                                     .child(tree)
                                     .children(center_diff)
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
@@ -8431,12 +8489,7 @@ impl Render for Shell {
                     ),
                 };
                 let viewport = window.viewport_size();
-                let modal_w = (viewport.width - krill_app::ui::SPACE_4 * 4.)
-                    .clamp(px(680.), px(1080.))
-                    .min(viewport.width - krill_app::ui::SPACE_2 * 2.);
-                let modal_h = (viewport.height - krill_app::ui::SPACE_4 * 4.)
-                    .clamp(px(480.), px(760.))
-                    .min(viewport.height - krill_app::ui::SPACE_2 * 2.);
+                let modal = krill_app::ui::page_modal_size(viewport);
                 krill_app::ui::modal_backdrop(
                     viewport,
                     div()
@@ -8462,8 +8515,8 @@ impl Render for Shell {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
-                                .w(modal_w)
-                                .h(modal_h)
+                                .w(modal.width)
+                                .h(modal.height)
                                 .rounded(krill_app::ui::RADIUS_XL)
                                 .bg(p.background)
                                 .border_1()
@@ -8521,9 +8574,182 @@ impl Shell {
         }
     }
 
-    fn render_empty_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// 첫 실행 빈 화면의 환영 패널. 닫거나 첫 탭을 열면 다시 나오지 않는다(OWE-904: 모달 없음).
+    fn render_welcome_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.role != WindowRole::Main || !krill_app::onboarding::welcome_pending(cx) {
+            return None;
+        }
+        let p = krill_app::ui::palette(cx);
+        let row = |id: &'static str,
+                   icon: AnyElement,
+                   title: &'static str,
+                   body: &'static str,
+                   controls: Option<gpui::Div>| {
+            div()
+                .debug_selector(move || id.into())
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_3()
+                .py_3()
+                .border_t_1()
+                .border_color(p.border)
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(28.))
+                        .rounded(krill_app::ui::RADIUS_SM)
+                        .bg(p.muted)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_size(krill_app::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(p.foreground)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(krill_app::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(body),
+                        ),
+                )
+                .children(controls)
+        };
+        let svg = |bytes: &'static [u8]| {
+            krill_app::ui::icons::svg_box(bytes, krill_app::ui::ICON_MD, p.muted_foreground)
+                .into_any_element()
+        };
+        let jump_label = krill_app::keys::shortcut_label(window, &Jump);
+        Some(
+            div()
+                .id("empty-welcome")
+                .debug_selector(|| "empty-welcome".into())
+                .w(px(520.))
+                .max_w_full()
+                .px_4()
+                .pt_3()
+                .pb_1()
+                .rounded(krill_app::ui::RADIUS_MD)
+                .bg(p.card)
+                .border_1()
+                .border_color(p.border)
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .pb_2()
+                        .child(
+                            div()
+                                .text_size(krill_app::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.foreground)
+                                .child(text::WELCOME_TITLE.get()),
+                        )
+                        .child(
+                            krill_app::ui::ghost(
+                                "empty-welcome-dismiss",
+                                text::WELCOME_DISMISS.get(),
+                            )
+                            .debug_selector(|| "empty-welcome-dismiss".into())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                krill_app::onboarding::dismiss_welcome(cx);
+                                cx.notify();
+                            })),
+                        ),
+                )
+                .child(row(
+                    "empty-welcome-alive",
+                    svg(krill_app::ui::icons::HISTORY_SVG),
+                    text::WELCOME_ALIVE_TITLE.get(),
+                    text::WELCOME_ALIVE_BODY.get(),
+                    None,
+                ))
+                .child(row(
+                    "empty-welcome-jump",
+                    gpui_component::Icon::new(IconName::Search)
+                        .with_size(krill_app::ui::ICON_MD)
+                        .text_color(p.muted_foreground)
+                        .into_any_element(),
+                    text::WELCOME_JUMP_TITLE.get(),
+                    text::WELCOME_JUMP_BODY.get(),
+                    jump_label.map(|label| {
+                        krill_app::ui::controls().child(
+                            krill_app::ui::secondary("empty-welcome-jump-open", label)
+                                .debug_selector(|| "empty-welcome-jump-open".into())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_jump(window, cx);
+                                })),
+                        )
+                    }),
+                ))
+                .child(row(
+                    "empty-welcome-remote",
+                    svg(krill_app::ui::icons::SERVER_SVG),
+                    text::WELCOME_REMOTE_TITLE.get(),
+                    text::WELCOME_REMOTE_BODY.get(),
+                    Some(
+                        krill_app::ui::controls()
+                            .child(
+                                krill_app::ui::secondary(
+                                    "empty-welcome-remote-open",
+                                    text::WELCOME_REMOTE_BUTTON.get(),
+                                )
+                                .debug_selector(|| "empty-welcome-remote-open".into())
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.open_settings(
+                                            krill_app::settings::AdminTab::Machines,
+                                            Some(window),
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                krill_app::ui::secondary(
+                                    "empty-welcome-mobile-open",
+                                    text::WELCOME_MOBILE_BUTTON.get(),
+                                )
+                                .debug_selector(|| "empty-welcome-mobile-open".into())
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.open_mobile_page(Some(window), cx);
+                                    },
+                                )),
+                            ),
+                    ),
+                ))
+                .child(row(
+                    "empty-welcome-cli",
+                    svg(krill_app::ui::icons::SQUARE_TERMINAL_SVG),
+                    text::WELCOME_CLI_TITLE.get(),
+                    text::WELCOME_CLI_BODY.get(),
+                    None,
+                ))
+                .into_any_element(),
+        )
+    }
+
+    fn render_empty_workspace(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         krill_app::star_nag::ensure_checked(cx);
         let has_projects = self.sidebar.read(cx).has_projects();
+        let welcome = self.render_welcome_panel(window, cx);
         let p = krill_app::ui::palette(cx);
         let action_row = |id: &'static str, label: &'static str, shortcut: &'static str| {
             div()
@@ -8570,14 +8796,18 @@ impl Shell {
                             .text_color(p.foreground)
                             .child(text::APP_TITLE.get()),
                     )
-                    .child(
-                        div()
-                            .debug_selector(|| "empty-tagline".into())
-                            .text_size(krill_app::ui::TEXT_SM)
-                            .text_color(p.muted_foreground)
-                            .child(text::EMPTY_TAGLINE.get()),
-                    ),
+                    // 환영 패널의 첫 항목이 같은 내용이라 그동안은 한 줄 문구를 숨긴다.
+                    .when(welcome.is_none(), |d| {
+                        d.child(
+                            div()
+                                .debug_selector(|| "empty-tagline".into())
+                                .text_size(krill_app::ui::TEXT_SM)
+                                .text_color(p.muted_foreground)
+                                .child(text::EMPTY_TAGLINE.get()),
+                        )
+                    }),
             )
+            .children(welcome)
             .child(
                 div()
                     .w(px(240.))

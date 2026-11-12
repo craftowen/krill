@@ -1,210 +1,16 @@
 //! MK-092 셸 연결. 잠정 결정 의존: MK-030 gpui 셸·포커스 칸. 거부 시 이 파일과 shell.rs의 연결만 되돌린다.
 
-use gpui::{ClipboardItem, Context, Entity, Subscription, WeakEntity, Window, div, prelude::*};
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::PopupMenu;
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_component::{Disableable as _, IconName, Sizable as _};
+use gpui::{ClipboardItem, Context, Window};
+use gpui_component::IconName;
+use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use krill_app::commands::{QuickCommand, text};
-use std::ops::Range;
+use krill_app::layout::Axis;
 use std::sync::Arc;
 
 use super::Shell;
 
+/// 이보다 많은 저장 명령은 메뉴에 다 펼치지 않고 검색되는 명령 팔레트로 보낸다.
 const QUICK_MENU_THRESHOLD: usize = 32;
-const QUICK_VISIBLE_ROWS: usize = 8;
-
-/// Keep source indices so filtering never changes which command is injected.
-fn filtered_commands(commands: &[QuickCommand], query: &str) -> Vec<usize> {
-    let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
-    commands
-        .iter()
-        .enumerate()
-        .filter_map(|(index, command)| {
-            let haystack = format!("{}\n{}", command.name, command.text).to_lowercase();
-            terms
-                .iter()
-                .all(|term| haystack.contains(term))
-                .then_some(index)
-        })
-        .collect()
-}
-
-fn command_window(indices: &[usize], range: Range<usize>) -> &[usize] {
-    let start = range.start.min(indices.len());
-    let end = range.end.min(indices.len()).max(start);
-    indices.get(start..end).unwrap_or_default()
-}
-
-/// Created when a large menu opens; only visible rows become GPUI elements.
-struct CommandList {
-    commands: Arc<Vec<QuickCommand>>,
-    filtered: Vec<usize>,
-    input: Entity<InputState>,
-    shell: WeakEntity<Shell>,
-    menu: WeakEntity<PopupMenu>,
-    can_inject: bool,
-    selected: Option<usize>,
-    scroll: gpui::UniformListScrollHandle,
-    _input: Subscription,
-}
-
-impl CommandList {
-    fn new(
-        commands: Arc<Vec<QuickCommand>>,
-        shell: WeakEntity<Shell>,
-        menu: WeakEntity<PopupMenu>,
-        can_inject: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder(text::QUICK.get()));
-        let subscription =
-            cx.subscribe_in(
-                &input,
-                window,
-                |this, input, event, window, cx| match event {
-                    InputEvent::Change => {
-                        this.filtered = filtered_commands(&this.commands, &input.read(cx).value());
-                        this.selected = None;
-                        this.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
-                        cx.notify();
-                    }
-                    InputEvent::PressEnter { .. } => {
-                        let composing = input.update(cx, |input, cx| {
-                            gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
-                        });
-                        if !composing {
-                            this.inject(this.selected.unwrap_or(0), window, cx);
-                        }
-                    }
-                    _ => {}
-                },
-            );
-        // DropdownMenu focuses its menu after building; defer search focus until then.
-        cx.defer_in(window, |this, window, cx| {
-            this.input.update(cx, |input, cx| input.focus(window, cx));
-        });
-        Self {
-            filtered: filtered_commands(&commands, ""),
-            commands,
-            input,
-            shell,
-            menu,
-            can_inject,
-            selected: None,
-            scroll: gpui::UniformListScrollHandle::new(),
-            _input: subscription,
-        }
-    }
-
-    fn inject(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(command) = self.filtered.get(row).and_then(|&i| self.commands.get(i)) else {
-            return;
-        };
-        if !self.can_inject || command.text.is_empty() {
-            return;
-        }
-        self.shell
-            .update(cx, |shell, cx| shell.inject_command(command, window, cx))
-            .ok();
-        self.menu
-            .update(cx, |_, cx| cx.emit(gpui::DismissEvent))
-            .ok();
-    }
-}
-
-impl Render for CommandList {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = krill_app::ui::palette(cx);
-        let rows = self.filtered.len().clamp(1, QUICK_VISIBLE_ROWS);
-        let height = gpui::px(32. * f32::from(u16::try_from(rows).unwrap_or(8)));
-        div()
-            .id("quick-command-search-list")
-            .debug_selector(|| "quick-command-search-list".into())
-            .w(krill_app::ui::DIALOG_WIDTH)
-            .max_w((window.viewport_size().width - krill_app::ui::SPACE_4 * 2.).max(gpui::px(0.)))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                let next = match event.keystroke.key.as_str() {
-                    "down" => Some(this.selected.map_or(0, |row| {
-                        (row + 1).min(this.filtered.len().saturating_sub(1))
-                    })),
-                    "up" => Some(this.selected.unwrap_or(0).saturating_sub(1)),
-                    _ => None,
-                };
-                if let Some(next) = next {
-                    this.selected = Some(next);
-                    this.scroll
-                        .scroll_to_item(next, gpui::ScrollStrategy::Nearest);
-                    cx.stop_propagation();
-                    cx.notify();
-                }
-            }))
-            .child(Input::new(&self.input).small())
-            .when(self.filtered.is_empty(), |d| {
-                d.child(
-                    div()
-                        .p_2()
-                        .text_size(krill_app::ui::TEXT_SM)
-                        .text_color(p.muted_foreground)
-                        .child(text::EMPTY.get()),
-                )
-            })
-            .child(
-                gpui::uniform_list(
-                    "quick-command-rows",
-                    self.filtered.len(),
-                    cx.processor(|this, range: Range<usize>, _, cx| {
-                        let p = krill_app::ui::palette(cx);
-                        let start = range.start;
-                        command_window(&this.filtered, range)
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(offset, &index)| {
-                                let command = this.commands.get(index)?;
-                                let row = start + offset;
-                                let enabled = this.can_inject && !command.text.is_empty();
-                                Some(
-                                    div()
-                                        .id(("quick-command", index))
-                                        .debug_selector(move || format!("quick-command-{index}"))
-                                        .role(gpui::Role::ListBoxOption)
-                                        .aria_selected(this.selected == Some(row))
-                                        .h(gpui::px(32.))
-                                        .px_2()
-                                        .flex()
-                                        .items_center()
-                                        .text_size(krill_app::ui::TEXT_SM)
-                                        .text_color(p.popover_foreground)
-                                        .when(this.selected == Some(row), |d| d.bg(p.accent))
-                                        .when(!enabled, |d| d.opacity(0.5))
-                                        .when(enabled, |d| {
-                                            d.cursor_pointer().hover(|d| d.bg(p.accent))
-                                        })
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .child(command.name.clone()),
-                                        )
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.inject(row, window, cx);
-                                        })),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .track_scroll(&self.scroll)
-                .h(height),
-            )
-    }
-}
 
 impl Shell {
     pub(super) fn inject_command(
@@ -237,8 +43,12 @@ impl Shell {
         }
     }
 
-    /// 탭 바 오른쪽 아이콘 두 개(OWE-653: 따로 차지하던 툴바 줄을 없앴다).
-    pub(super) fn render_commands(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 탭 넘침 메뉴(⌄) 위쪽 항목: 채팅 보기·상하 분할·오른쪽 패널·저장 명령·맥락 복사.
+    pub(super) fn toolbar_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        use krill_app::i18n::catalog::shell as shell_text;
         let settings = krill_app::settings::current(cx);
         let lines = settings
             .copy_context_lines
@@ -247,132 +57,109 @@ impl Shell {
         let live = self.layout.focused().and_then(|p| self.live.get(&p));
         let can_inject = live.is_some_and(|l| l.pane.is_linked() && !l.pane.is_closed());
         let can_copy = live.is_some_and(|l| !l.pane.screen().rows.is_empty());
+        let chat_view = self.is_active_chat_view_in(cx);
+        let panel_open = !self.panel_collapsed;
         let this = cx.weak_entity();
-        let quick_tooltip = format!("{} · {}", text::QUICK.get(), text::QUICK_HINT.get());
-        let quick = krill_app::ui::button_with_tooltip(
-            Button::new("quick-commands")
-                .icon(IconName::Play)
-                .ghost()
-                .xsmall()
-                .debug_selector(|| "quick-commands".into()),
-            "quick-commands",
-            quick_tooltip,
-        )
-        .dropdown_menu(move |mut menu, window, cx| {
-            let edit = {
-                let this = this.clone();
-                PopupMenuItem::new(text::EDIT.get()).on_click(move |_, window, cx| {
-                    this.update(cx, |s, cx| {
-                        s.open_settings(
-                            krill_app::settings::AdminTab::QuickCommands,
-                            Some(window),
-                            cx,
-                        );
-                    })
-                    .ok();
-                })
-            };
-            if commands.is_empty() {
-                return menu.label(text::EMPTY.get()).separator().item(edit);
-            }
-            if commands.len() > QUICK_MENU_THRESHOLD {
-                let parent = cx.weak_entity();
-                let list = cx.new(|cx| {
-                    CommandList::new(
-                        Arc::clone(&commands),
-                        this.clone(),
-                        parent,
-                        can_inject,
-                        window,
-                        cx,
-                    )
-                });
-                return menu
-                    .item(PopupMenuItem::element(move |_, _| list.clone()))
-                    .separator()
-                    .item(edit);
-            }
-            menu = menu.scrollable(true).max_h(krill_app::ui::DIALOG_WIDTH);
-            for command in commands.iter() {
-                let this = this.clone();
-                let command = command.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(command.name.clone())
-                        .disabled(!can_inject || command.text.is_empty())
-                        .on_click(move |_, window, cx| {
-                            this.update(cx, |s, cx| s.inject_command(&command, window, cx))
-                                .ok();
-                        }),
-                );
-            }
-            menu.separator().item(edit)
-        });
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_0p5()
-            .child(quick)
-            .child(krill_app::ui::button_with_tooltip(
-                Button::new("copy-context")
+        move |menu, window, cx| {
+            let commands = Arc::clone(&commands);
+            let quick_this = this.clone();
+            menu.item(
+                PopupMenuItem::new(shell_text::TOGGLE_CHAT_VIEW.get())
+                    .checked(chat_view)
+                    .on_click(on_shell(this.clone(), |s, window, cx| {
+                        s.toggle_chat_view_with_focus(window, cx);
+                    })),
+            )
+            .item(
+                PopupMenuItem::new(shell_text::SPLIT_DOWN.get())
+                    .icon(IconName::PanelBottom)
+                    .on_click(on_shell(this.clone(), |s, _, cx| {
+                        s.split_active(Axis::Vertical, cx);
+                    })),
+            )
+            .item(
+                PopupMenuItem::new(shell_text::TOGGLE_PANEL.get())
+                    .checked(panel_open)
+                    .on_click(on_shell(this.clone(), |s, _, cx| s.toggle_panel(cx))),
+            )
+            .separator()
+            .submenu_with_icon(
+                Some(IconName::Play.into()),
+                text::QUICK.get(),
+                window,
+                cx,
+                move |menu, _, _| quick_menu(menu, &commands, can_inject, &quick_this),
+            )
+            .item(
+                PopupMenuItem::new(text::COPY_HINT.format(&[("n", &lines.to_string())]))
                     .icon(IconName::Copy)
-                    .ghost()
-                    .xsmall()
                     .disabled(!can_copy)
-                    .debug_selector(|| "copy-context".into())
-                    .on_click(cx.listener(move |s, _, _, cx| s.copy_context(lines, cx))),
-                "copy-context",
-                format!(
-                    "{} · {}",
-                    text::COPY.get(),
-                    text::COPY_HINT.format(&[("n", &lines.to_string())])
-                ),
-            ))
+                    .on_click(on_shell(this.clone(), move |s, _, cx| {
+                        s.copy_context(lines, cx);
+                    })),
+            )
+        }
     }
+}
+
+fn on_shell(
+    this: gpui::WeakEntity<Shell>,
+    f: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
+) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static {
+    move |_, window, cx| {
+        this.update(cx, |s, cx| f(s, window, cx)).ok();
+    }
+}
+
+/// 저장 명령 하위 메뉴. 목록이 길면 검색되는 명령 팔레트를 연다(팔레트도 저장 명령을 실행한다).
+fn quick_menu(
+    mut menu: PopupMenu,
+    commands: &[QuickCommand],
+    can_inject: bool,
+    this: &gpui::WeakEntity<Shell>,
+) -> PopupMenu {
+    let edit = {
+        let this = this.clone();
+        PopupMenuItem::new(text::EDIT.get()).on_click(move |_, window, cx| {
+            this.update(cx, |s, cx| {
+                s.open_settings(
+                    krill_app::settings::AdminTab::QuickCommands,
+                    Some(window),
+                    cx,
+                );
+            })
+            .ok();
+        })
+    };
+    if commands.is_empty() {
+        return menu.label(text::EMPTY.get()).separator().item(edit);
+    }
+    if commands.len() > QUICK_MENU_THRESHOLD {
+        let this = this.clone();
+        return menu
+            .item(
+                PopupMenuItem::new(text::SEARCH.get()).on_click(move |_, window, cx| {
+                    this.update(cx, |s, cx| s.toggle_jump(window, cx)).ok();
+                }),
+            )
+            .separator()
+            .item(edit);
+    }
+    for command in commands {
+        let this = this.clone();
+        let command = command.clone();
+        menu = menu.item(
+            PopupMenuItem::new(command.name.clone())
+                .disabled(!can_inject || command.text.is_empty())
+                .on_click(move |_, window, cx| {
+                    this.update(cx, |s, cx| s.inject_command(&command, window, cx))
+                        .ok();
+                }),
+        );
+    }
+    menu.separator().item(edit)
 }
 
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
-
-#[cfg(test)]
-mod window_tests {
-    use super::*;
-
-    #[test]
-    fn commands_filter_matches_name_body_case_and_multiple_terms() {
-        let commands = vec![
-            QuickCommand {
-                name: "상태 Git".into(),
-                text: "git STATUS".into(),
-            },
-            QuickCommand {
-                name: "배포".into(),
-                text: "cargo run".into(),
-            },
-        ];
-        assert_eq!(filtered_commands(&commands, " 상태 status "), vec![0]);
-        assert_eq!(filtered_commands(&commands, "RUN"), vec![1]);
-        assert_eq!(filtered_commands(&commands, "  "), vec![0, 1]);
-        assert!(filtered_commands(&commands, "missing").is_empty());
-    }
-
-    #[test]
-    fn commands_large_windows_keep_source_identity_and_boundaries() {
-        let commands: Vec<_> = (0..10_000)
-            .map(|i| QuickCommand {
-                name: format!("command {i}"),
-                text: format!("echo {i}"),
-            })
-            .collect();
-        let indices = filtered_commands(&commands, "command");
-        assert_eq!(
-            command_window(&indices, 500..508),
-            &[500, 501, 502, 503, 504, 505, 506, 507]
-        );
-        assert_eq!(command_window(&indices, 9999..usize::MAX), &[9999]);
-        assert!(command_window(&indices, 20_000..usize::MAX).is_empty());
-        assert!(command_window(&[], 0..8).is_empty());
-        assert_eq!(filtered_commands(&commands, "9999"), vec![9999]);
-    }
-}

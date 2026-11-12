@@ -305,8 +305,7 @@ impl Shell {
         self.resources
             .update(cx, |view, cx| view.set_visible(resources_visible, cx));
         self.security.set_window_active(active);
-        // 비활성화 뒤 다음 렌더를 기다리지 않고 커서 타이머를 끊는다.
-        self.sync_cursor_blink(active, cx);
+        self.sync_cursor_blink(active && self.terminal_focus_owned, cx);
         krill_app::alert::set_active(active, cx);
         self.sidebar.update(cx, |s, cx| s.set_active(active, cx));
         self.diff.update(cx, |d, cx| d.set_active(active, cx));

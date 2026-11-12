@@ -1,7 +1,7 @@
 use super::*;
 
 impl SettingsView {
-    fn save_worktree_location(&mut self, raw: String, cx: &mut Context<Self>) {
+    pub(super) fn save_worktree_location(&mut self, raw: String, cx: &mut Context<Self>) {
         let Some(dir) = state_dir(cx) else { return };
         if !self.workflow_hooks_ready(cx) {
             return;
@@ -11,6 +11,7 @@ impl SettingsView {
         };
         let repo = form.repo_path.read(cx).value().trim().to_owned();
         let saving_repo = repo.clone();
+        let saved = raw.trim().to_owned();
         self.file_job(
             "worktree-location-edit",
             move || {
@@ -21,10 +22,16 @@ impl SettingsView {
                 if let Some(form) = &mut this.workflow_form
                     && form.repo_path.read(cx).value().trim() == saving_repo
                 {
-                    form.location_status = Some(match result {
-                        Ok(()) => (text::HOOKS_SAVED.get().into(), false),
-                        Err(error) => (error.into(), true),
-                    });
+                    match result {
+                        // 저장한 값이 새 기준이다. 결과 문구는 저장 버튼 옆에 나오되 훅 실패를 덮지 않는다.
+                        Ok(()) => {
+                            form.loaded_location = saved;
+                            if !form.status.as_ref().is_some_and(|(_, error)| *error) {
+                                form.status = Some((text::HOOKS_SAVED.get().into(), false));
+                            }
+                        }
+                        Err(error) => form.location_status = Some((error.into(), true)),
+                    }
                 }
                 this.refresh_service_cache(cx);
                 cx.defer(notify_external_change);
@@ -46,65 +53,43 @@ impl SettingsView {
             .debug_selector(|| "admin-worktree-location".into())
             .flex()
             .flex_col()
-            .gap_2()
-            .child(crate::ui::field_label(
-                text::WORKTREE_LOCATION_TITLE.get(),
-                None,
-                p,
-            ))
+            .gap_1()
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
+                    .justify_between()
                     .gap_2()
+                    .child(crate::ui::field_label(
+                        text::WORKTREE_LOCATION_TITLE.get(),
+                        None,
+                        p,
+                    ))
                     .child(
-                        div()
-                            .id("admin-worktree-location-input")
-                            .debug_selector(|| "admin-worktree-location-input".into())
-                            .flex_1()
-                            .min_w_0()
-                            .flex_basis(gpui::relative(0.5))
-                            .child(gpui_component::input::Input::new(&input).small()),
-                    )
-                    .child(
-                        layout::controls()
-                            .child(
-                                layout::ghost(
-                                    "admin-worktree-location-default",
-                                    text::WORKTREE_LOCATION_DEFAULT.get(),
-                                )
-                                .debug_selector(|| "admin-worktree-location-default".into())
-                                .disabled(!ready)
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        if let Some(form) = &this.workflow_form {
-                                            form.worktree_location.update(cx, |input, cx| {
-                                                input.set_value("", window, cx);
-                                            });
-                                        }
-                                        this.save_worktree_location(String::new(), cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                layout::primary(
-                                    "admin-worktree-location-save",
-                                    text::QC_SAVE.get(),
-                                )
-                                .debug_selector(|| "admin-worktree-location-save".into())
-                                .disabled(!ready)
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        if let Some(form) = &this.workflow_form {
-                                            let value =
-                                                form.worktree_location.read(cx).value().to_string();
-                                            this.save_worktree_location(value, cx);
-                                        }
-                                    },
-                                )),
-                            ),
+                        layout::ghost(
+                            "admin-worktree-location-default",
+                            text::WORKTREE_LOCATION_DEFAULT.get(),
+                        )
+                        .debug_selector(|| "admin-worktree-location-default".into())
+                        .disabled(!ready)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(form) = &this.workflow_form {
+                                form.worktree_location.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                            }
+                            this.save_worktree_location(String::new(), cx);
+                        })),
                     ),
+            )
+            .child(
+                div()
+                    .id("admin-worktree-location-input")
+                    .debug_selector(|| "admin-worktree-location-input".into())
+                    .w_full()
+                    .min_w_0()
+                    .child(gpui_component::input::Input::new(&input).small()),
             )
             .child(
                 div()

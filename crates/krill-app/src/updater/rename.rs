@@ -6,14 +6,17 @@
 //! 이유는 그 폴더가 실행 중 프로세스의 작업 디렉터리면 폴더 이름 바꾸기가 실패하기 때문이다(실측).
 //! 지울 수 없는 파일(아직 도는 구 holder·krilld·OpenConsole 이미지)은 `<설치>.trash`로 옮겨 두고 다음 업데이트 때 다시 지운다.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::Path;
 
-/// 업데이트가 설치 폴더 최상위에서 옮겨도 되는 이름. 패키지에서 빠진 파일도 지우지 말고 남겨 둔다.
-/// 이 목록에도 새 패키지에도 없는 항목이 있으면 사용자 파일일 수 있어 교체를 거부한다([`check_install_entries`]).
-const KNOWN_ENTRIES: [&str; 9] = [
+use super::{append_ext, write_private_file};
+
+/// 업데이트가 설치 폴더 최상위에서 관리하는 Krill 배포 항목(`packaging/windows/bundle.ps1`).
+/// 패키지에서 빠진 구 파일도 `.prev`로 치우고, 이 목록에도 새 패키지에도 없는 항목(예: `krill.exe.bak`,
+/// 사용자 메모·덤프 파일)은 건드리지 않고 제자리에 남긴다.
+pub(super) const KNOWN_ENTRIES: [&str; 10] = [
     "Krill.json",
     "krill-app.exe",
     "krill.exe",
@@ -22,24 +25,67 @@ const KNOWN_ENTRIES: [&str; 9] = [
     "krill-link.exe",
     "conpty.dll",
     "x64",
+    "arm64",
     "THIRD_PARTY_NOTICES.txt",
 ];
 
-/// 설치 폴더 최상위 항목이 모두 Krill 파일(알려진 이름이거나 새 패키지에 있는 이름)인지 확인한다.
-/// 사용자가 exe를 다른 파일과 같은 폴더(예: 바탕 화면)에 두었을 때 그 파일들을 `.prev`로 옮기지 않기 위함이다.
-pub fn check_install_entries(install: &Path, staging: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(install)? {
-        let name = entry?.file_name();
-        let known = KNOWN_ENTRIES.iter().any(|k| OsStr::new(k) == name);
-        if !known && !staging.join(&name).exists() {
-            return Err(io::Error::new(
+/// 스테이징 폴더의 최상위 항목 이름을 읽어 온다.
+pub fn list_staged_entries(staging: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(staging)? {
+        let name = entry?.file_name().into_string().map_err(|_| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "unexpected entry in install dir: {}",
-                    Path::new(&name).display()
-                ),
-            ));
+                "staged entry name is not valid UTF-8",
+            )
+        })?;
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// 이번 교체가 스테이징에서 들여온 최상위 항목 목록을 기록한다.
+/// 롤백 시 `KNOWN_ENTRIES`에 아직 없는 미래 버전의 신규 파일까지 지우되 사용자 파일은 남기기 위함이다.
+pub fn save_staged_entries(path: &Path, entries: &[String]) -> io::Result<()> {
+    let bytes = serde_json::to_vec(entries).map_err(io::Error::other)?;
+    let tmp = append_ext(path, "tmp");
+    write_private_file(&tmp, &bytes)?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        fs::remove_file(&tmp).ok();
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn load_staged_entries(path: &Path) -> Vec<String> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn is_managed_name(name: &OsStr, staged: &[String], extra: &[OsString]) -> bool {
+    KNOWN_ENTRIES.iter().any(|k| name.eq_ignore_ascii_case(k))
+        || staged.iter().any(|s| name.eq_ignore_ascii_case(s))
+        || extra.iter().any(|e| name.eq_ignore_ascii_case(e))
+}
+
+/// 설치 폴더 최상위에서 Krill 관리 대상(`KNOWN_ENTRIES` ∪ `staged`)만 `prev`로 옮긴다.
+/// 백업본(`krill.exe.bak`)이나 사용자 파일은 건드리지 않고 설치 폴더에 그대로 둔다.
+pub fn move_managed(
+    install: &Path,
+    staged: &[String],
+    prev: &Path,
+    trash: &Path,
+) -> io::Result<()> {
+    fs::create_dir_all(prev)?;
+    for entry in fs::read_dir(install)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !is_managed_name(&name, staged, &[]) {
+            continue;
         }
+        move_entry(&entry, &prev.join(&name), trash)?;
     }
     Ok(())
 }
@@ -50,16 +96,58 @@ pub fn move_tree(src: &Path, dst: &Path, trash: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        let from = entry.path();
         let to = dst.join(entry.file_name());
+        move_entry(&entry, &to, trash)?;
+    }
+    Ok(())
+}
+
+fn move_entry(entry: &fs::DirEntry, to: &Path, trash: &Path) -> io::Result<()> {
+    let from = entry.path();
+    if entry.file_type()?.is_dir() {
+        move_tree(&from, to, trash)?;
+        fs::remove_dir(&from).ok();
+    } else {
+        if to.symlink_metadata().is_ok() {
+            discard(to, trash)?;
+        }
+        fs::rename(&from, to)?;
+    }
+    Ok(())
+}
+
+/// 롤백 시 설치 폴더 최상위에서 Krill 관리 대상(`KNOWN_ENTRIES` ∪ `prev` ∪ `staged_entries_file`)만 치운다.
+/// 관리 대상 밖의 사용자·백업 파일은 그대로 남긴다.
+pub fn clear_managed(
+    install: &Path,
+    prev: &Path,
+    staged_entries_file: &Path,
+    trash: &Path,
+) -> io::Result<()> {
+    let entries = match fs::read_dir(install) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let staged = load_staged_entries(staged_entries_file);
+    let prev_names: Vec<OsString> = fs::read_dir(prev)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !is_managed_name(&name, &staged, &prev_names) {
+            continue;
+        }
+        let path = entry.path();
         if entry.file_type()?.is_dir() {
-            move_tree(&from, &to, trash)?;
-            fs::remove_dir(&from).ok();
+            clear(&path, trash)?;
+            fs::remove_dir(&path).ok();
         } else {
-            if to.symlink_metadata().is_ok() {
-                discard(&to, trash)?;
-            }
-            fs::rename(&from, &to)?;
+            discard(&path, trash)?;
         }
     }
     Ok(())

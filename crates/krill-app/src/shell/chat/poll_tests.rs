@@ -86,9 +86,7 @@ fn chat_switch_moves_focus_and_feed_click_keeps_input_out_of_terminal(
         cx.notify();
     });
     cx.run_until_parked();
-    let toggle = cx.debug_bounds("toggle-chat-view").unwrap().center();
-    cx.simulate_click(toggle, gpui::Modifiers::default());
-    cx.run_until_parked();
+    crate::shell::tests::pick_overflow(cx, "down enter");
     cx.update(|window, cx| {
         view.read_with(cx, |shell, cx| {
             assert!(shell.is_active_chat_view());
@@ -125,8 +123,7 @@ fn chat_switch_moves_focus_and_feed_click_keeps_input_out_of_terminal(
             assert!(shell.focus.is_focused(window));
         });
     });
-    cx.simulate_click(toggle, gpui::Modifiers::default());
-    cx.run_until_parked();
+    crate::shell::tests::pick_overflow(cx, "down enter");
     cx.simulate_keystrokes("space a g a i n");
     view.read_with(cx, |shell, cx| {
         assert_eq!(
@@ -231,21 +228,33 @@ fn chat_opens_on_the_newest_rows_and_adds_older_ones_above(cx: &mut gpui::TestAp
 
 #[gpui::test]
 fn prepended_rows_keep_the_rows_on_screen_in_place(cx: &mut gpui::TestAppContext) {
-    let state = gpui::ListState::new(100, gpui::ListAlignment::Bottom, gpui::px(0.));
+    let make_items = |n: usize| -> Vec<Arc<ChatItem>> {
+        (0..n)
+            .map(|i| {
+                Arc::new(ChatItem {
+                    kind: ChatItemKind::Assistant,
+                    text: format!("msg {i}"),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    };
+    let initial = Arc::new(work_run::DisplayFeed::project(1_000, &make_items(100)));
+    let state = gpui::ListState::new(initial.len(), gpui::ListAlignment::Bottom, gpui::px(0.));
     state.scroll_to(gpui::ListOffset {
         item_ix: 40,
         offset_in_item: gpui::px(0.),
     });
     let mut list = ChatList {
         host: local_key(SessionId(1)).0,
-        base_index: 1_000,
-        count: 100,
+        feed: initial,
         revision: 0,
         epoch: 1,
         state: state.clone(),
     };
+    let prepended = Arc::new(work_run::DisplayFeed::project(990, &make_items(110)));
     cx.update(|_| {
-        list.sync(990, 110, 1, 1);
+        list.sync(&prepended, 1, 1);
     });
     assert_eq!(state.logical_scroll_top().item_ix, 50);
     assert_eq!(state.item_count(), 110);
@@ -296,4 +305,115 @@ fn chat_poll_reads_composer_meta_from_the_transcript(cx: &mut gpui::TestAppConte
         assert_eq!(log.meta.model.as_deref(), Some("claude-meta-test"));
     });
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+fn work_run_list_sync_preserves_anchor_across_boundary_prepend_head_drain_and_tail_growth(
+    cx: &mut gpui::TestAppContext,
+) {
+    let item = |kind: ChatItemKind, text: &str| ChatItem {
+        kind,
+        text: text.to_owned(),
+        ..Default::default()
+    };
+    let mut log = SessionChatLog {
+        base_index: 1_000,
+        epoch: 1,
+        items: vec![
+            Arc::new(item(ChatItemKind::ToolCall, "read a.rs")),
+            Arc::new(item(ChatItemKind::ToolResult, "contents a")),
+            Arc::new(item(ChatItemKind::Assistant, "answer 1")),
+            Arc::new(item(ChatItemKind::User, "anchor user message")),
+            Arc::new(item(ChatItemKind::Assistant, "answer 2")),
+            Arc::new(item(ChatItemKind::ToolCall, "read b.rs")),
+        ],
+        ..Default::default()
+    };
+    let feed = log.display_feed();
+    assert_eq!(feed.len(), 5);
+    log.toggle_run(feed.rows()[0].span());
+    assert!(log.is_run_expanded(feed.rows()[0].span()));
+    log.toggle_run(feed.rows()[4].span());
+    assert!(log.is_run_expanded(feed.rows()[4].span()));
+
+    let state = gpui::ListState::new(feed.len(), gpui::ListAlignment::Bottom, gpui::px(0.));
+    state.scroll_to(gpui::ListOffset {
+        item_ix: 2,
+        offset_in_item: gpui::px(0.),
+    });
+    let mut list = ChatList {
+        host: local_key(SessionId(1)).0,
+        feed,
+        revision: log.revision,
+        epoch: log.epoch,
+        state: state.clone(),
+    };
+    assert!(list.near_top(log.base_index, 4));
+    assert!(!list.near_top(log.base_index, 3));
+
+    log.append_and_trim(
+        vec![
+            item(ChatItemKind::ToolResult, "contents b"),
+            item(ChatItemKind::Reasoning, "checking"),
+            item(ChatItemKind::ToolCall, "read c.rs"),
+        ],
+        1_000,
+    );
+    log.revision = log.revision.wrapping_add(1);
+    let tail_grown = log.display_feed();
+    assert_eq!(tail_grown.len(), 5);
+    cx.update(|_| {
+        list.sync(&tail_grown, log.revision, log.epoch);
+    });
+    assert_eq!(state.item_count(), 5);
+    assert_eq!(state.logical_scroll_top().item_ix, 2);
+
+    log.prepend_earlier(
+        vec![
+            item(ChatItemKind::User, "older question"),
+            item(ChatItemKind::ToolCall, "earlier tool merged into front run"),
+        ],
+        None,
+    );
+    let merged = log.display_feed();
+    assert_eq!(merged.len(), 6);
+    assert_eq!(merged.rows()[1].span().range(), 999..1_002);
+    assert!(log.is_run_expanded(merged.rows()[1].span()));
+    cx.update(|_| {
+        list.sync(&merged, log.revision, log.epoch);
+    });
+    assert_eq!(state.item_count(), 6);
+    assert_eq!(state.logical_scroll_top().item_ix, 3);
+
+    log.append_and_trim(vec![item(ChatItemKind::Assistant, "final answer")], 9);
+    log.revision = log.revision.wrapping_add(1);
+    let drained = log.display_feed();
+    assert_eq!(log.base_index, 1_001);
+    assert_eq!(drained.rows()[0].span().range(), 1_001..1_002);
+    assert!(
+        log.is_run_expanded(drained.rows()[0].span()),
+        "partially drained front WorkRun must keep its expanded state"
+    );
+    cx.update(|_| {
+        list.sync(&drained, log.revision, log.epoch);
+    });
+    assert_eq!(state.logical_scroll_top().item_ix, 2);
+    let Some(work_run::DisplayRow::Item {
+        abs_idx,
+        item: row_item,
+    }) = drained.get(state.logical_scroll_top().item_ix)
+    else {
+        panic!("expected anchor row to remain DisplayRow::Item");
+    };
+    assert_eq!(*abs_idx, 1_003);
+    assert_eq!(row_item.text, "anchor user message");
+
+    log.append_and_trim(vec![item(ChatItemKind::Assistant, "later answer")], 4);
+    let tail_drained = log.display_feed();
+    assert_eq!(log.base_index, 1_007);
+    assert_eq!(tail_drained.rows()[0].span().range(), 1_007..1_009);
+    assert!(
+        log.is_run_expanded(tail_drained.rows()[0].span()),
+        "run expanded before tail growth keeps its open state after draining past its initial span"
+    );
 }
