@@ -80,6 +80,10 @@ Only `/v1/mobile-events` supports CORS. Allowed origins are the exact `https://k
 
 `OPTIONS` preflight allows `POST` with `Content-Type` only and a 600-second preflight lifetime. All responses on the mobile path, including validation, method, size, content-type, admission and internal failures, carry `Vary: Origin`; allowed origins also receive `Access-Control-Allow-Origin` and expose `Retry-After`. Untrusted origins receive 403 without reflection. Native ingestion, health and administrator APIs receive no CORS headers. The PWA host and desktop-hosted `/m/*` pages must permit `https://errors.krill.page` in their `connect-src` Content Security Policy before browser reports can reach the receiver.
 
+## In-app feedback
+
+`POST /v1/feedback` receives the text a user writes in the desktop Settings → Send feedback page. The body is exactly `{"message","release","os","arch"}`: message 1–4,000 characters after trimming, `release` in the native version format, `os` `macos|windows|linux`, `arch` `aarch64|x86_64`. Unknown fields are rejected. The receiver stores a random ID, receipt time and those four fields in the `feedback` table (migration `0002_feedback.sql`); no account, device, IP or header is stored. Success returns `{"ok":true}`. The shared edge limiter uses key `v1/feedback`; a trigger caps storage at 300 messages per UTC day and 50,000 rows (429 when full). There is no CORS and no automatic deletion. Read with `wrangler d1 execute krill-errors --remote --command "SELECT received_at, message, release, os FROM feedback ORDER BY received_at DESC LIMIT 50"`.
+
 ## Admission and retention
 
 The migration installs these policies in the singleton `limits` row:

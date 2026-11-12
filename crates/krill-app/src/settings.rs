@@ -2019,9 +2019,6 @@ pub fn open_project_settings(repo: &Path, cx: &mut App) {
     open_window_at_tab(AdminTab::Project, cx);
 }
 
-/// 피드백 창구: GitHub 이슈 양식(버그·기능 요청) 선택 화면. 설정 사이드바와 Help 메뉴가 같이 쓴다.
-pub const FEEDBACK_URL: &str = "https://github.com/craftowen/krill/issues/new/choose";
-
 pub fn open_window_at_tab(tab: AdminTab, cx: &mut App) {
     if let Some(handle) = cx
         .windows()
@@ -2100,6 +2097,8 @@ pub enum AdminTab {
     Install,
     /// 내비에 없는 하위 페이지. 시스템 탭·명령 팔레트에서 연다.
     Disk,
+    /// 내비 아래 '피드백 보내기' 행과 Help 메뉴에서 여는 단독 페이지.
+    Feedback,
 }
 
 // 기본 번들 밖 탭 아이콘. 지정한 SVG만 바이너리에 싣는다.
@@ -2164,6 +2163,7 @@ impl AdminTab {
             Self::System => "admin-tab-system",
             Self::Updates => "admin-tab-updates",
             Self::Disk => "admin-tab-disk",
+            Self::Feedback => "admin-tab-feedback",
             Self::Mobile => "admin-tab-mobile",
         }
     }
@@ -2185,6 +2185,7 @@ impl AdminTab {
             Self::System => text::TAB_SYSTEM,
             Self::Updates => text::TAB_UPDATES,
             Self::Disk => text::TAB_DISK,
+            Self::Feedback => text::TAB_FEEDBACK,
             Self::Mobile => crate::i18n::catalog::mobile::TAB,
         }
     }
@@ -2202,6 +2203,7 @@ impl AdminTab {
             Self::System => text::TAB_SYSTEM_DESC,
             Self::Updates => text::TAB_UPDATES_DESC,
             Self::Disk => text::TAB_DISK_DESC,
+            Self::Feedback => text::TAB_FEEDBACK_DESC,
             Self::Mobile => text::TAB_MOBILE_DESC,
         }
     }
@@ -2224,6 +2226,7 @@ impl AdminTab {
             Self::System => IconName::Settings,
             Self::Updates => IconName::RefreshCw,
             Self::Disk => IconName::CircleCheck,
+            Self::Feedback => IconName::MessageSquare,
             Self::Mobile => IconName::Smartphone,
         }
     }
@@ -2843,6 +2846,9 @@ pub struct SettingsView {
     ),
     /// 에이전트 카드의 추가 인자·환경변수 편집(OWE-657). 에이전트 탭을 처음 그릴 때 만든다.
     agent_edits: std::collections::BTreeMap<&'static str, AgentEdit>,
+    /// 피드백 입력. 창이 필요해 처음 그릴 때 만들고, 보내고 나면 비운다.
+    feedback_input: Option<gpui::Entity<gpui_component::input::TextareaState>>,
+    feedback_status: Option<feedback::Status>,
     /// 에이전트 탭에서 인자·환경변수 편집기를 펼친 에이전트 id 집합(OWE-796). 기본 접힘.
     agent_expanded: std::collections::BTreeSet<&'static str>,
     /// 사이드바 설정 검색 입력(OWE-656). 창이 필요해 처음 그릴 때 만든다.
@@ -3308,6 +3314,8 @@ impl SettingsView {
             workspace_trust_confirm_pending: false,
             identities: Default::default(),
             agent_edits: std::collections::BTreeMap::new(),
+            feedback_input: None,
+            feedback_status: None,
             agent_expanded: std::collections::BTreeSet::new(),
             search_focus: search::SearchFocus::new(cx),
             search_pending: false,
@@ -11735,16 +11743,12 @@ impl SettingsView {
                     .text_color(p.muted_foreground)
                     .hover(|d| d.bg(p.sidebar_accent).text_color(p.foreground))
                     .active(|d| d.bg(p.accent).text_color(p.foreground))
-                    .on_click(|_, _, cx| cx.open_url(FEEDBACK_URL))
-                    .child(
-                        gpui_component::Icon::new(gpui_component::IconName::ExternalLink).small(),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(crate::i18n::catalog::general::SEND_FEEDBACK.get()),
-                    ),
+                    .when(self.tab == AdminTab::Feedback, |d| {
+                        d.bg(p.sidebar_accent).text_color(p.foreground)
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tab(AdminTab::Feedback, cx)))
+                    .child(AdminTab::Feedback.icon_element().small())
+                    .child(div().flex_1().min_w_0().child(AdminTab::Feedback.label())),
             )
     }
 
@@ -11792,9 +11796,15 @@ impl SettingsView {
                                     }),
                             );
                         }
+                        let view = view.clone();
                         menu.separator().item(
-                            PopupMenuItem::new(crate::i18n::catalog::general::SEND_FEEDBACK.get())
-                                .on_click(|_, _, cx| cx.open_url(FEEDBACK_URL)),
+                            PopupMenuItem::new(AdminTab::Feedback.label())
+                                .checked(page == AdminTab::Feedback)
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.set_tab(AdminTab::Feedback, cx);
+                                    });
+                                }),
                         )
                     }),
             )
@@ -12020,6 +12030,7 @@ impl Render for SettingsView {
                         .child(self.render_resources_tab(&s, cx))
                 }
                 AdminTab::Disk => div().child(self.render_space_section(window, cx)),
+                AdminTab::Feedback => self.render_feedback_page(window, cx),
                 AdminTab::Updates => self.render_updates_tab(&settings(cx), cx),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
             };
@@ -12289,6 +12300,7 @@ impl Render for SettingsView {
 }
 
 pub(crate) mod child;
+mod feedback;
 pub mod install;
 pub(crate) mod layout;
 mod mobile;

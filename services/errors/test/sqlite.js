@@ -8,7 +8,8 @@ export class SQLiteD1 {
     if (this.sqlite.prepare('PRAGMA user_version').get().user_version === 0) {
       this.sqlite.exec('BEGIN');
       try {
-        this.sqlite.exec(readFileSync(new URL('../migrations/0001_errors.sql', import.meta.url), 'utf8'));
+        for (const name of ['0001_errors.sql', '0002_feedback.sql'])
+          this.sqlite.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
         this.sqlite.exec('PRAGMA user_version=1; COMMIT');
       } catch (error) { this.sqlite.exec('ROLLBACK'); throw error; }
     }

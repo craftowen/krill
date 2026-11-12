@@ -5100,12 +5100,13 @@ fn updates_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppCont
     fs::remove_dir_all(d).ok();
 }
 
-/// 설정 사이드바 맨 아래 피드백 행은 GitHub 이슈 양식 선택 화면을 연다(메뉴 막대 없는 Windows용 창구).
+/// 설정 사이드바 맨 아래 피드백 행은 앱 안 피드백 페이지를 연다(브라우저로 나가지 않는다).
+/// 보내기에 실패하면 쓴 글을 지우지 않고 실패를 알린다(테스트 프로세스는 운영 수신기로 보내지 않는다).
 #[gpui::test]
-fn sidebar_feedback_row_opens_the_issue_chooser(cx: &mut TestAppContext) {
+fn sidebar_feedback_row_opens_in_app_feedback_page(cx: &mut TestAppContext) {
     let d = dir("sidebar-feedback");
     init(cx, &d);
-    let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(900.)));
     vcx.run_until_parked();
     let sidebar = vcx
@@ -5121,7 +5122,35 @@ fn sidebar_feedback_row_opens_the_issue_chooser(cx: &mut TestAppContext) {
     );
     vcx.simulate_click(feedback.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    assert_eq!(cx.opened_url().as_deref(), Some(super::FEEDBACK_URL));
+    assert_eq!(view.read_with(vcx, |v, _| v.tab), AdminTab::Feedback);
+    let send = vcx
+        .debug_bounds("admin-feedback-send")
+        .expect("missing admin-feedback-send");
+    vcx.update(|window, cx| {
+        let input = view
+            .read(cx)
+            .feedback_input
+            .clone()
+            .expect("feedback input");
+        input.update(cx, |s, cx| {
+            s.set_value("  창을 나누면 커서가 사라져요  ", window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.simulate_click(send.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(v.feedback_status, Some(super::feedback::Status::Failed));
+        let input = v
+            .feedback_input
+            .as_ref()
+            .expect("failed send keeps the input");
+        assert_eq!(
+            input.read(cx).value().as_ref(),
+            "  창을 나누면 커서가 사라져요  "
+        );
+    });
+    assert_eq!(cx.opened_url(), None, "feedback must not leave the app");
     fs::remove_dir_all(d).ok();
 }
 
