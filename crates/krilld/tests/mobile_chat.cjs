@@ -2760,8 +2760,91 @@ async function liveQuestionSheet() {
     "completed questions release drafts/cache/update pins",
   );
   multi.dispose();
+  // Inline transcript question card matching liveQuestion: opens automatically and 1-tap option immediately proceeds.
+  const inlineReplies = [];
+  let inlineLive = {
+    identity: "capture-q",
+    token: "cap-1",
+    title: "지금 찍을까요?",
+    enabled: true,
+    multiple: false,
+    choices: [
+      {
+        label:
+          "지금 찍어 (Recommended) 10초쯤 기다려 주시면 설정 열기, 시스템 순서로 찍어 둡니다",
+        checked: null,
+      },
+      {
+        label: "찍지 마 글 초안만 쓰고 캡처는 하지 않습니다",
+        checked: null,
+      },
+      { label: "Type something.", checked: null },
+      { label: "Chat about this", checked: null },
+    ],
+  };
+  const inline = fixture({
+    getQuestion: () => inlineLive,
+    onAnswerQuestion: async (token, selected) => {
+      inlineReplies.push({ token, selected: Array.from(selected) });
+    },
+  });
+  await flush();
+  await inline.poll({
+    generation: "g-inline",
+    items: [
+      {
+        id: "q-old",
+        kind: "question",
+        title: "이전",
+        text: "Old question",
+        multi_select: false,
+        options: [{ label: "Run" }, { label: "Skip" }],
+      },
+      { id: "a-mid", kind: "assistant", text: "계속합니다." },
+      {
+        id: "q-cap",
+        kind: "question",
+        title: "캡처",
+        text: "지금 찍을까요?",
+        multi_select: false,
+        options: [
+          {
+            label: "지금 찍어 (Recommended)",
+            description: "10초쯤 기다려 주시면 설정 열기, 시스템 순서로 찍어 둡니다",
+          },
+          {
+            label: "찍지 마",
+            description: "글 초안만 쓰고 캡처는 하지 않습니다",
+          },
+        ],
+      },
+    ],
+    next_offset: 10,
+    bound: true,
+  });
+  inline.setQuestion(inlineLive);
+  const qCards = inline.root
+    .descendants()
+    .filter((n) => n.className === "chat-card chat-question");
+  assert.equal(qCards[0].dataset.liveQuestion, "false");
+  assert.equal(qCards[1].dataset.liveQuestion, "true");
+  assert.equal(qCards[1].children[0].open, true);
+  assert.equal(
+    inline.find("chat-live-question").hidden,
+    true,
+    "matched inline question card suppresses duplicate bottom banner while following",
+  );
+  inline.button("찍지 마 — 글 초안만 쓰고 캡처는 하지 않습니다").action();
+  await flush();
+  assert.deepEqual(inlineReplies, [{ token: "cap-1", selected: [1] }]);
+  inlineLive = null;
+  inline.setQuestion(null, { settled: true });
+  await flush();
+  assert.equal(qCards[1].dataset.liveQuestion, "false");
+  assert.equal(qCards[1].children[0].open, false);
+  inline.dispose();
   console.log(
-    "PASS A+B current-question card/sheet: local selection, disabled composer preserves its draft, duplicate send, failed-send retention, fresh retry token, multi-select/reopen, changed-question gate",
+    "PASS A+B current-question card/sheet: local selection, inline 1-tap proceed, disabled composer preserves its draft, duplicate send, failed-send retention, fresh retry token, multi-select/reopen, changed-question gate",
   );
 }
 

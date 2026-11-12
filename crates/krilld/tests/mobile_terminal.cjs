@@ -157,6 +157,34 @@ async function testChatQuestionReplies(){
  socket.screen('Working');socket.question(menu(false,false));const timeout=handle.replyQuestion(handle.getQuestion().token,[1]);const expired=assert.rejects(timeout,/Could not confirm/);await flush();await advance(3000);await expired;assert.equal(inputs(socket).at(-1),'\x1b[B ','unconfirmed checkbox state never submits');
  socket.screen('Working');socket.question(menu(false,false));const lost=handle.replyQuestion(handle.getQuestion().token,[0]);const disconnected=assert.rejects(lost,/question changed|uncertain/i);await flush();socket.close();await disconnected;assert.equal(handle.getQuestion(),null);handle.unmount();
  assert(snapshots.some(q=>q?.multiple)&&snapshots.at(-1)===null);
+ // Real Claude Code AskUserQuestion layout: top rule, ☐ header chip, divider before Chat about this, wrapped footer and non-alt TERM_MODES update.
+ const c2=await mount(1972,{visible:false,questionActive:true,preferences:{fitToPhone:false}});c2.socket.autoAck=true;
+ c2.socket.question([
+  '────────────────────────────────────────────────────────',
+  ' ☐ 캡처',
+  '',
+  '│ 캡처는 이 맥에서 찍을 수 있습니다.',
+  '│ 지금 찍을까요?',
+  '',
+  '❯ 1. 지금 찍어 (Recommended)',
+  '     10초쯤 기다려 주시면 찍어 둡니다',
+  '  2. 찍지 마',
+  '     글 초안만 쓰고 캡처는 하지 않습니다',
+  '  3. Type something.',
+  '────────────────────────────────────────────────────────',
+  '  4. Chat about this',
+  '',
+  'Enter to select · ↑/↓ to navigate · Esc to',
+  'cancel',
+ ]);
+ let cq=c2.handle.getQuestion();assert(cq?.enabled,'divider before Chat about this and wrapped footer still recognize live question');
+ assert.equal(cq.choices.length,4);assert.equal(cq.title,'캡처는 이 맥에서 찍을 수 있습니다.\n지금 찍을까요?');
+ c2.socket.frame(0x2b,Uint8Array.of(0),T.v(32));cq=c2.handle.getQuestion();assert(cq?.enabled,'non-alt TERM_MODES frame without new grid diff keeps screenComplete live');
+ await c2.handle.replyQuestion(cq.token,[1]);assert.deepEqual(inputs(c2.socket),['\x1b[B\r']);
+ c2.socket.screen('Working');
+ c2.socket.question(['Pick checks', '❯ 1. [ ] Lint', '  2. [✔] Tests', '  3. [ ] Type something', '────────────────────', '  4. Chat about this', 'Enter to select · ↑/↓ to navigate · Esc to cancel']);
+ cq=c2.handle.getQuestion();assert(cq?.enabled&&cq.multiple);assert.equal(cq.choices.length,3);assert.equal(cq.choices[1].checked,true);
+ c2.handle.unmount();
  console.log('PASS Chat live replies: hidden single submit, native-key guard, stale/generation/background/partial/duplicate validation, authoritative multi-select pacing, timeout and disconnect never submit');
 }
 
