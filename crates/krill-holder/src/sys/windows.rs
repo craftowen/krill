@@ -237,9 +237,15 @@ impl Api {
         })
     }
     fn bundle() -> io::Result<Self> {
+        type RawProc = unsafe extern "system" fn() -> isize;
         let exe = std::env::current_exe()?;
         let dir = exe.parent().ok_or(io::ErrorKind::NotFound)?;
-        if !dir.join("x64/OpenConsole.exe").is_file() {
+        let var = std::env::var_os;
+        let console = bundled_console_rel(
+            var("PROCESSOR_ARCHITEW6432").as_deref(),
+            var("PROCESSOR_ARCHITECTURE").as_deref(),
+        );
+        if !dir.join(console).is_file() {
             return Err(io::ErrorKind::NotFound.into());
         }
         let path = wide(dir.join("conpty.dll").as_os_str())?;
@@ -252,57 +258,51 @@ impl Api {
             // SAFETY: static NUL-terminated ASCII export name and a loaded module.
             unsafe { GetProcAddress(module, name.as_ptr()) }.ok_or(io::ErrorKind::NotFound)
         };
-        // SAFETY: export signatures match conpty.h. LoadLibrary reference stays live.
-        let create = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, Create>(get(
-                b"ConptyCreatePseudoConsole\0",
-            )?)
-        };
-        // SAFETY: export signature matches conpty.h.
-        let resize = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, Resize>(get(
-                b"ConptyResizePseudoConsole\0",
-            )?)
-        };
-        // SAFETY: export signature matches conpty.h.
-        let close = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, Close>(get(
-                b"ConptyClosePseudoConsole\0",
-            )?)
-        };
-        // SAFETY: export signature matches conpty.h.
-        let pack = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, Pack>(get(
-                b"ConptyPackPseudoConsole\0",
-            )?)
-        };
+        let create = get(b"ConptyCreatePseudoConsole\0")?;
+        let resize = get(b"ConptyResizePseudoConsole\0")?;
+        let close = get(b"ConptyClosePseudoConsole\0")?;
+        let pack = get(b"ConptyPackPseudoConsole\0")?;
         Ok(Self {
-            create,
-            resize,
-            close,
-            pack: Some(pack),
+            // SAFETY: export signatures match conpty.h; LoadLibrary reference stays live.
+            create: unsafe { std::mem::transmute::<RawProc, Create>(create) },
+            // SAFETY: export signature matches conpty.h.
+            resize: unsafe { std::mem::transmute::<RawProc, Resize>(resize) },
+            // SAFETY: export signature matches conpty.h.
+            close: unsafe { std::mem::transmute::<RawProc, Close>(close) },
+            // SAFETY: export signature matches conpty.h.
+            pack: Some(unsafe { std::mem::transmute::<RawProc, Pack>(pack) }),
         })
     }
     pub fn inbox(self) -> bool {
         self.pack.is_none()
     }
 }
-fn hr(code: i32) -> io::Result<()> {
-    if code < 0 {
-        Err(io::Error::other(format!("ConPTY HRESULT {code:#x}")))
-    } else {
-        Ok(())
+fn bundled_console_rel(wow: Option<&OsStr>, arch: Option<&OsStr>) -> &'static str {
+    if [wow, arch]
+        .into_iter()
+        .flatten()
+        .any(|v| v.eq_ignore_ascii_case("ARM64"))
+    {
+        return "arm64/OpenConsole.exe";
     }
+    "x64/OpenConsole.exe"
+}
+fn hr(code: i32) -> io::Result<()> {
+    if code >= 0 {
+        return Ok(());
+    }
+    if (code.cast_unsigned() & 0xffff_0000) == 0x8007_0000 && (code & 0xffff) != 0 {
+        return Err(io::Error::from_raw_os_error(code & 0xffff));
+    }
+    Err(io::Error::other(format!("ConPTY HRESULT {code:#x}")))
 }
 fn coord(size: WinSize) -> io::Result<COORD> {
-    let c = COORD {
-        X: i16::try_from(size.cols).map_err(|_| io::ErrorKind::InvalidInput)?,
-        Y: i16::try_from(size.rows).map_err(|_| io::ErrorKind::InvalidInput)?,
-    };
-    if c.X <= 0 || c.Y <= 0 {
+    let (Ok(x), Ok(y)) = (i16::try_from(size.cols), i16::try_from(size.rows)) else {
         return Err(io::ErrorKind::InvalidInput.into());
-    }
-    Ok(c)
+    };
+    (x > 0 && y > 0)
+        .then_some(COORD { X: x, Y: y })
+        .ok_or_else(|| io::ErrorKind::InvalidInput.into())
 }
 #[derive(Debug)]
 pub struct Console {
@@ -315,7 +315,7 @@ impl Console {
         // Preserve adoption of existing inbox sessions, but never dereference a new
         // opaque OS HPCON. Only the packaging-pinned bundled ABI is supported here.
         if api.inbox() {
-            tracing::error!("new sessions require bundled conpty.dll and x64/OpenConsole.exe");
+            tracing::error!("new sessions require bundled conpty.dll and OpenConsole.exe");
             // Preserve a meaningful Windows error across the existing errno-only
             // SpawnFailed contract; a synthetic ErrorKind would become access denied.
             return Err(io::Error::from_raw_os_error(126)); // ERROR_MOD_NOT_FOUND
@@ -1208,5 +1208,27 @@ mod tests {
         job.terminate()?;
         assert!(job.empty()?);
         Ok(())
+    }
+    #[test]
+    fn hr_preserves_win32_facility_raw_os_error() {
+        assert!(hr(0).is_ok());
+        let not_found = hr(0x8007_0002_u32.cast_signed()).unwrap_err();
+        assert_eq!(not_found.raw_os_error(), Some(2));
+        let access_denied = hr(0x8007_0005_u32.cast_signed()).unwrap_err();
+        assert_eq!(access_denied.raw_os_error(), Some(5));
+        let generic = hr(0x8000_4005_u32.cast_signed()).unwrap_err();
+        assert_eq!(generic.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            bundled_console_rel(Some(OsStr::new("arm64")), Some(OsStr::new("AMD64"))),
+            "arm64/OpenConsole.exe"
+        );
+        assert_eq!(
+            bundled_console_rel(None, Some(OsStr::new("ARM64"))),
+            "arm64/OpenConsole.exe"
+        );
+        assert_eq!(
+            bundled_console_rel(None, Some(OsStr::new("AMD64"))),
+            "x64/OpenConsole.exe"
+        );
     }
 }

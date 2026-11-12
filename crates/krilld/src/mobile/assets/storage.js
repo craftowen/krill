@@ -2,12 +2,17 @@
 (()=>{
  const M=globalThis.KrillMobile||={},DB='krill-mobile-metadata',VERSION=1,STORE='snapshots',LEGACY='krill-mobile-snapshot-v1',TTL=86400000,LIMIT=32;
  const SEED_PREFIX='krill-mobile-seed-v1:';
+ const VISIBILITY=['asleep','default_branch','automation','external','external_shown'];
  const pick=(value,keys)=>Object.fromEntries(keys.filter(k=>['string','number','boolean'].includes(typeof value?.[k])||value?.[k]===null).map(k=>[k,value[k]]));
- const rows=(values,keys)=>Array.isArray(values)?values.slice(0,256).map(v=>pick(v,keys)):[];
+ const cleanIcon=v=>v?.kind==='emoji'&&typeof v.value==='string'&&v.value.trim().length>0&&v.value.length<=16?{kind:'emoji',value:v.value}:undefined;
+ const cleanVisibility=v=>{if(!v||typeof v!=='object'||Array.isArray(v))return undefined;const out={};let any=false;for(const k of VISIBILITY)if(typeof v[k]==='boolean'){out[k]=v[k];any=true;}return any?out:undefined;};
+ const cleanOrders=v=>Array.isArray(v)&&v.length>0&&v.length<=4&&v.every(n=>typeof n==='number'&&Number.isFinite(n)&&n>=0)?v.slice():undefined;
+ const rows=(values,keys,extra)=>Array.isArray(values)?values.slice(0,256).map(v=>{const out=pick(v,keys);extra?.(v,out);return out;}):[];
  // Explicit allowlists keep transcripts, questions, approvals, credentials and future payloads out.
  function metadata(data){return {etag:null,host:pick(data?.host,['display_name','platform']),truncated:!!data?.truncated||['sessions','repositories','workspaces'].some(key=>Array.isArray(data?.[key])&&data[key].length>256),capabilities:{},
   sessions:rows(data?.sessions,['id','state','agent','title','foreground','cwd','exited','branch','added','deleted','repo_key','worktree_key','group_label','group_path','state_source','state_confidence','state_since_unix_ns']),
-  repositories:rows(data?.repositories,['key','label','path']),workspaces:rows(data?.workspaces,['key','label','path','repo_key','pinned','branch','depth','primary'])};}
+  repositories:rows(data?.repositories,['key','label','path','removed','remote','badge_color'],(v,out)=>{const icon=cleanIcon(v?.icon);if(icon)out.icon=icon;}),
+  workspaces:rows(data?.workspaces,['key','label','path','repo_key','pinned','branch','depth','primary','parent','status','badge_color'],(v,out)=>{const icon=cleanIcon(v?.icon),visibility=cleanVisibility(v?.visibility),orders=cleanOrders(v?.orders);if(icon)out.icon=icon;if(visibility)out.visibility=visibility;if(orders)out.orders=orders;})};}
  const identity=(host,auth)=>auth?.device_id&&auth?.credential?{host,device:auth.device_id,scope:JSON.stringify([host,auth.device_id,MkCrypto.hex(MkCrypto.sha256(MkCrypto.enc.encode(auth.credential)))])}:null;
  function create({indexedDB,storage,timeout=1500,now=()=>Date.now(),broadcast=true}={}){
   try{indexedDB??=globalThis.indexedDB;}catch{}try{storage??=globalThis.localStorage;}catch{}

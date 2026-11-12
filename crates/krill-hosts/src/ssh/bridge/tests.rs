@@ -171,3 +171,65 @@ fn bridge_normal_remote_eof_delivers_complete_payload() {
     drop(tunnel);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[cfg(unix)]
+#[test]
+fn bridge_unlinks_control_path_on_drop_and_startup_failure_or_timeout() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = PathBuf::from(format!("/tmp/mk-br-ctrl-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("fake-ctrl-ssh");
+    let write_mode = |probe_body: &str| {
+        let contents = format!(
+            "#!/bin/sh\nctrl=\"\"\nfor a in \"$@\"; do\n  case \"$a\" in\n    ControlPath=*) ctrl=$(printf '%s' \"${{a#ControlPath=}}\" | tr -d '\"') ;;\n  esac\ndone\nif [ -n \"$ctrl\" ]; then\n  : > \"$ctrl\"\n  : > \"$ctrl.tmpbind\"\nfi\n{probe_body}\n"
+        );
+        std::fs::write(&script, contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let count_ctrl = || {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("c-"))
+            .count()
+    };
+
+    // 1. Normal start + Tunnel::drop removes both fwd.sock and ControlPath artifacts.
+    write_mode("printf 'krill-os=windows\\nkrill-bridge=ok\\n'\nexec cat >/dev/null");
+    let opts = SshOptions::new("user@win-pc");
+    let sock = dir.join("fwd.sock");
+    let tunnel =
+        crate::ssh::Tunnel::start_bridge_with_program(&opts, sock.clone(), script.as_os_str())
+            .unwrap();
+    assert!(count_ctrl() >= 2, "ControlPath artifacts should exist");
+    drop(tunnel);
+    assert!(!sock.exists());
+    assert_eq!(count_ctrl(), 0, "Tunnel::drop must unlink ControlPath");
+
+    // 2. Relay::start immediate probe failure unlinks ControlPath artifacts.
+    write_mode("printf 'krill-bridge-error=stopped\\n'\nexit 1");
+    let err =
+        crate::ssh::Tunnel::start_bridge_with_program(&opts, sock.clone(), script.as_os_str())
+            .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    assert!(!sock.exists());
+    assert_eq!(count_ctrl(), 0, "probe failure must unlink ControlPath");
+
+    // 3. Relay::start timeout unlinks ControlPath artifacts.
+    write_mode("sleep 5");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let ctrl = control_path(&sock).unwrap();
+    let err = Relay::start_with_timeout(
+        &opts,
+        listener,
+        Some(ctrl.as_path()),
+        script.as_os_str(),
+        Duration::from_millis(60),
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert!(!ctrl.exists());
+    assert_eq!(count_ctrl(), 0, "timeout must unlink ControlPath");
+    std::fs::remove_dir_all(&dir).ok();
+}

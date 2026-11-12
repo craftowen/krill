@@ -154,6 +154,53 @@ fn persist_status(status_path: &Path, status: &HostTunnelStatus) -> bool {
         .is_ok_and(|bytes| write_status_0600(status_path, &bytes).is_ok())
 }
 
+#[cfg(unix)]
+fn is_pid_dead_after_host_lock(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return true;
+    };
+    let Some(p) = rustix::process::Pid::from_raw(raw) else {
+        return true;
+    };
+    matches!(
+        rustix::process::test_kill_process(p),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
+#[cfg(windows)]
+fn is_pid_dead_after_host_lock(_pid: u32) -> bool {
+    // Caller holds the exclusive `<host_id>.lock`; no other tunnel for `host_id` can be alive.
+    true
+}
+
+fn sweep_stale_status_tmps(hosts_dir: &Path, host_id: &str) {
+    let Ok(entries) = fs::read_dir(hosts_dir) else {
+        return;
+    };
+    let prefix = format!("{host_id}.status.json.tmp.");
+    let dot_prefix = format!(".{prefix}");
+    let self_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(rest) = name
+            .strip_prefix(&prefix)
+            .or_else(|| name.strip_prefix(&dot_prefix))
+        else {
+            continue;
+        };
+        let Some(pid) = rest.split('.').next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid != self_pid && is_pid_dead_after_host_lock(pid) {
+            fs::remove_file(entry.path()).ok();
+        }
+    }
+}
+
 /// 실행 중인 `krill-link connect` 터널 인스턴스 핸들.
 #[derive(Debug)]
 pub struct TunnelHandle {
@@ -212,6 +259,9 @@ pub async fn start_tunnel(opts: ConnectOptions) -> Result<TunnelHandle, Error> {
     let status_path = host_status_path(&state_dir, &host.id)?;
     let instance_lock =
         acquire_instance_lock(&socket_path.with_extension("lock")).map_err(Error::Io)?;
+    if let Some(dir) = status_path.parent() {
+        sweep_stale_status_tmps(dir, &host.id);
+    }
     let mut cfg = LinkConfig::load(&state_dir)?;
     cfg.validate()?;
     let remote_addr = host.to_endpoint_addr(cfg.relay != RelaySetting::Off)?;
@@ -719,5 +769,35 @@ mod tests {
             host_socket_path(&long_base, "home-mac"),
             Err(Error::PathTooLong(_))
         ));
+    }
+
+    #[test]
+    fn sweep_stale_status_tmps_removes_dead_pid_temps_only() {
+        let dir = std::env::temp_dir().join(format!("kl-status-sweep-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let dead_plain = dir.join("home-mac.status.json.tmp.999999999.42");
+        let dead_dot = dir.join(".home-mac.status.json.tmp.999999999.7");
+        let self_tmp = dir.join(format!("home-mac.status.json.tmp.{}.1", std::process::id()));
+        let other_host_tmp = dir.join("other-mac.status.json.tmp.999999999.1");
+        let live_status = dir.join("home-mac.status.json");
+        for path in [
+            &dead_plain,
+            &dead_dot,
+            &self_tmp,
+            &other_host_tmp,
+            &live_status,
+        ] {
+            fs::write(path, b"{}").unwrap();
+        }
+
+        sweep_stale_status_tmps(&dir, "home-mac");
+
+        assert!(!dead_plain.exists());
+        assert!(!dead_dot.exists());
+        assert!(self_tmp.exists());
+        assert!(other_host_tmp.exists());
+        assert!(live_status.exists());
+        fs::remove_dir_all(&dir).ok();
     }
 }

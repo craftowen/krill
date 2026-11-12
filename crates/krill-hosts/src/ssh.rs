@@ -698,6 +698,7 @@ pub fn extract_host(args: &[OsString]) -> Result<(Option<String>, Vec<OsString>)
 pub struct Tunnel {
     child: Child,
     socket: PathBuf,
+    control: Option<PathBuf>,
     /// Windows 원격 중계([`RemoteEndpoint::Bridge`])일 때만 있다.
     relay: Option<bridge::Relay>,
 }
@@ -771,6 +772,7 @@ impl Tunnel {
                 return Ok(Self {
                     child,
                     socket: local,
+                    control: None,
                     relay: None,
                 });
             }
@@ -803,13 +805,17 @@ impl Tunnel {
         prepare_local(&local)?;
         let listener = UnixListener::bind(&local)?;
         let control = bridge::control_path(&local);
-        match bridge::Relay::start(opts, listener, control, ssh_bin) {
+        match bridge::Relay::start(opts, listener, control.as_deref(), ssh_bin) {
             Ok((child, relay)) => Ok(Self {
                 child,
                 socket: local,
+                control,
                 relay: Some(relay),
             }),
             Err(e) => {
+                if let Some(control) = &control {
+                    remove_control_socket(control);
+                }
                 std::fs::remove_file(&local).ok();
                 Err(e)
             }
@@ -856,34 +862,86 @@ impl Drop for Tunnel {
     fn drop(&mut self) {
         // 연결별 중계 ssh를 먼저 끝내고 ControlMaster(keepalive)를 끝낸다.
         self.relay.take();
+        drop(self.child.stdin.take());
         self.child.kill().ok();
         self.child.wait().ok();
         std::fs::remove_file(&self.socket).ok();
+        if let Some(control) = &self.control {
+            remove_control_socket(control);
+        }
     }
 }
 
-/// 소유 프로세스가 SIGKILL로 죽어 `Drop`이 못 지운 포워딩 소켓(`fwd-*`·`f-*`)을 지운다.
-/// 듣는 쪽이 없어 연결이 거부되는 것만 지우므로 살아 있는 다른 터널은 남는다.
+#[cfg(unix)]
+pub(crate) fn remove_control_socket(control: &Path) {
+    std::fs::remove_file(control).ok();
+    let (Some(dir), Some(stem)) = (
+        control.parent(),
+        control.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return;
+    };
+    let prefix = format!("{stem}.");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+            {
+                std::fs::remove_file(entry.path()).ok();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_control_socket_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("c-")?;
+    let (pid, tail) = rest.split_once('-')?;
+    let seq = tail.split('.').next().unwrap_or_default();
+    if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<u32>().ok().filter(|&p| p > 0)
+}
+
+/// 소유 프로세스가 SIGKILL로 죽어 `Drop`이 못 지운 포워딩 소켓(`fwd-*`·`f-*`)과
+/// `ControlMaster` 소켓(`c-<pid>-*`)을 지운다. 듣는 쪽이 없어 연결이 거부되는 것만 지우므로 살아 있는 다른 터널은 남는다.
 #[cfg(unix)]
 fn sweep_stale_forwards(dir: &Path, min_age: Duration) {
+    use std::os::unix::fs::FileTypeExt as _;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let self_pid = std::process::id();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !(name.starts_with("fwd-") || name.starts_with("f-")) || !name.ends_with(".sock") {
+        let is_forward =
+            (name.starts_with("fwd-") || name.starts_with("f-")) && name.ends_with(".sock");
+        let control_pid = is_control_socket_name(&name);
+        if !is_forward && control_pid.is_none() {
+            continue;
+        }
+        if control_pid == Some(self_pid) {
             continue;
         }
         let old = entry
             .metadata()
             .and_then(|m| m.modified())
             .is_ok_and(|t| t.elapsed().is_ok_and(|age| age >= min_age));
+        if !old {
+            continue;
+        }
         let path = entry.path();
-        if old
-            && UnixStream::connect(&path)
-                .is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused)
-        {
+        let is_dead = match entry.file_type() {
+            Ok(ft) if ft.is_socket() => UnixStream::connect(&path)
+                .is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused),
+            Ok(ft) if control_pid.is_some() && ft.is_file() => true,
+            _ => false,
+        };
+        if is_dead {
             std::fs::remove_file(&path).ok();
         }
     }

@@ -1170,3 +1170,105 @@ fn chat_narrow_320px_work_run_stays_inside_pane_collapsed_and_expanded(cx: &mut 
         );
     }
 }
+
+#[gpui::test]
+fn chat_composer_popovers_close_on_second_trigger_click_and_escape_and_expose_plus_a11y(
+    cx: &mut TestAppContext,
+) {
+    use gpui::EntityInputHandler as _;
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-composer-popover-toggle",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Ready.".into(),
+            ..Default::default()
+        }],
+    );
+    cx.simulate_resize(size(px(640.), px(680.)));
+    cx.run_until_parked();
+
+    let plus = cx.debug_bounds("chat-composer-plus").unwrap();
+    cx.simulate_mouse_move(plus.center(), None, gpui::Modifiers::default());
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tooltip:chat-composer-plus").is_some(),
+        "closed quick-commands button must show hover tooltip"
+    );
+
+    // Open quick menu via +, confirm tooltip hides while open, and confirm 2nd click closes it.
+    cx.simulate_click(plus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-quick-model").is_some());
+    cx.simulate_mouse_move(plus.center(), None, gpui::Modifiers::default());
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tooltip:chat-composer-plus").is_none(),
+        "open quick menu must suppress trigger tooltip"
+    );
+
+    let plus = cx.debug_bounds("chat-composer-plus").unwrap();
+    cx.simulate_click(plus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-quick-model").is_none(),
+        "clicking + while quick menu is open must close it without reopening"
+    );
+
+    // Reopen quick menu: IME Escape keeps it open, unmarked Escape closes it.
+    let plus = cx.debug_bounds("chat-composer-plus").unwrap();
+    cx.simulate_click(plus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-quick-model").is_some());
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let (input, _) = &shell.chat.inputs[&local_key(SESSION)];
+            input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-quick-model").is_some(),
+        "IME Escape cancellation must not dismiss quick menu"
+    );
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let (input, _) = &shell.chat.inputs[&local_key(SESSION)];
+            input.update(cx, |state, cx| state.unmark_text(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-quick-model").is_none());
+
+    // Model picker: 1st click opens, 2nd click on trigger closes, Escape closes.
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_some());
+
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-model-picker").is_none(),
+        "clicking model button while picker is open must close it without reopening"
+    );
+
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_none());
+}

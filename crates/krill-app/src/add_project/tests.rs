@@ -194,3 +194,86 @@ fn add_project_clone_actions_stay_inside_small_viewport_at_large_zoom(cx: &mut T
         "{submit:?} outside {card:?}"
     );
 }
+
+#[gpui::test]
+fn add_project_ignores_escape_during_ime_preedit(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+
+    cx.update(gpui_component::init);
+    let remote = HostId::Remote("mini".to_owned());
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new_with_hosts(
+            window,
+            cx,
+            vec![
+                (HostId::Local, "local".to_owned()),
+                (remote.clone(), "mini".to_owned()),
+            ],
+            remote,
+        )
+    });
+    cx.run_until_parked();
+
+    // Clone step: url & dest IME preedit must not return to Step::Start on Escape.
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.show_clone(window, cx);
+            d.url.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(dialog.read(cx).step, Step::Clone));
+
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.url.update(cx, |input, cx| input.unmark_text(window, cx));
+            d.dest.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "한", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(dialog.read(cx).step, Step::Clone));
+
+    // RemotePath step: remote_path IME preedit must not return to Step::Start on Escape.
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.dest.update(cx, |input, cx| input.unmark_text(window, cx));
+            d.show_start(window, cx);
+            d.browse_activated(window, cx);
+            d.remote_path.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "경", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(dialog.read(cx).step, Step::RemotePath(RemoteMode::Browse));
+    });
+
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.remote_path
+                .update(cx, |input, cx| input.unmark_text(window, cx));
+            assert!(!d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(dialog.read(cx).step, Step::Start));
+}

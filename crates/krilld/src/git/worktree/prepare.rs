@@ -6,7 +6,7 @@ use crate::git::worktree::compat::read_config;
 use krill_proto::os::fs::DirBuilderExt as _;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ pub const DISK_LIMIT: u64 = 512 * 1024 * 1024;
 const DIRECTORY: &str = ".krill-preparing";
 const MARKER: &str = "owner.json";
 const RECENT: usize = 128;
-static POOL: OnceLock<Result<Arc<Pool>, String>> = OnceLock::new();
+static POOL: Mutex<Option<Arc<Pool>>> = Mutex::new(None);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Owner {
@@ -98,13 +98,7 @@ impl Pool {
         });
         // A previous daemon may have died between marker creation and worktree add/move.
         if pool.dir.join(MARKER).exists() {
-            let owner: Owner = serde_json::from_slice(
-                &fs::read(pool.dir.join(MARKER)).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            let repo = PathBuf::from(OsString::from_vec(owner.repo));
-            let _transaction = transaction(&pool.q, &repo)?;
-            pool.cleanup(&repo)?;
+            pool.cleanup_marker()?;
         } else if pool.tree().exists() {
             return Err("unowned preparation directory; refusing cleanup".to_owned());
         }
@@ -182,9 +176,11 @@ impl Pool {
         let result = self.prepare(req, cancel);
         if let Ok(Some((repo, commit))) = &result {
             let mut state = lock(&self.state);
-            if let Some(slot) = state.slot.as_mut().filter(|s| s.token == req.token) {
-                slot.ready
-                    .get_or_insert_with(|| (repo.clone(), commit.clone()));
+            if let Some(slot) = state.slot.as_mut().filter(|s| s.token == req.token)
+                && slot.ready.is_none()
+            {
+                slot.ready = Some((repo.clone(), commit.clone()));
+                slot.deadline = Instant::now() + self.ttl;
             }
             self.changed.notify_all();
             loop {
@@ -203,18 +199,7 @@ impl Pool {
             }
         }
         // The marker is the sole authority for cleanup, including failed/partial checkouts.
-        let cleanup = (|| {
-            if self.dir.join(MARKER).exists() {
-                let owner: Owner = serde_json::from_slice(
-                    &fs::read(self.dir.join(MARKER)).map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
-                let repo = PathBuf::from(OsString::from_vec(owner.repo));
-                let _transaction = transaction(&self.q, &repo)?;
-                self.cleanup(&repo)?;
-            }
-            Ok::<_, String>(())
-        })();
+        let cleanup = self.cleanup_marker();
         let mut state = lock(&self.state);
         // Failed cleanup occupies the only slot: never accumulate abandoned disk usage.
         if cleanup.is_ok() {
@@ -285,13 +270,11 @@ impl Pool {
             repo: repo.as_os_str().as_bytes().to_vec(),
         };
         let bytes = serde_json::to_vec(&owner).map_err(|e| e.to_string())?;
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(self.dir.join(MARKER))
-            .and_then(|mut f| f.write_all(&bytes))
-            .map_err(|e| e.to_string())?;
+        let marker = self.dir.join(MARKER);
+        if marker.exists() {
+            return Err("preparation marker already exists".to_owned());
+        }
+        krill_proto::os::write_atomic_0600(&marker, &bytes).map_err(|e| e.to_string())?;
         let path = self.tree();
         let add = [
             OsString::from("-c"),
@@ -332,6 +315,7 @@ impl Pool {
                 && let Some(slot) = state.slot.as_mut().filter(|s| s.token == req.token)
             {
                 slot.ready = Some((repo.clone(), commit.clone()));
+                slot.deadline = Instant::now() + self.ttl;
                 self.changed.notify_all();
             }
         }
@@ -357,6 +341,38 @@ impl Pool {
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
         text(out, "speculative checkout failed").map(|_| ())
+    }
+
+    fn cleanup_marker(&self) -> Result<(), String> {
+        let marker = self.dir.join(MARKER);
+        if !marker.exists() {
+            return Ok(());
+        }
+        let repo = fs::read(&marker)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Owner>(&bytes).ok())
+            .filter(|owner| !owner.repo.is_empty())
+            .map(|owner| PathBuf::from(OsString::from_vec(owner.repo)));
+        match repo {
+            Some(repo) if repo.exists() && repo.join(".git").exists() => {
+                let _transaction = transaction(&self.q, &repo)?;
+                self.cleanup(&repo)
+            }
+            _ => self.remove_tree_and_marker(),
+        }
+    }
+
+    fn remove_tree_and_marker(&self) -> Result<(), String> {
+        match fs::remove_dir_all(self.tree()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        match fs::remove_file(self.dir.join(MARKER)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     fn cleanup(&self, repo: &Path) -> Result<(), String> {
@@ -607,16 +623,25 @@ pub(crate) fn disk_usage(path: &Path, limit: u64) -> io::Result<u64> {
     Ok(used)
 }
 
-pub(super) fn global() -> Result<&'static Arc<Pool>, String> {
-    POOL.get_or_init(|| Pool::new(Arc::clone(queue()?), &root()?))
-        .as_ref()
-        .map_err(Clone::clone)
+fn get_or_try_init_pool(
+    slot: &Mutex<Option<Arc<Pool>>>,
+    init: impl FnOnce() -> Result<Arc<Pool>, String>,
+) -> Result<Arc<Pool>, String> {
+    let mut guard = lock(slot);
+    if let Some(pool) = guard.as_ref() {
+        return Ok(Arc::clone(pool));
+    }
+    let pool = init()?;
+    *guard = Some(Arc::clone(&pool));
+    Ok(pool)
 }
 
-pub(super) fn existing() -> Option<&'static Pool> {
-    POOL.get()
-        .and_then(|pool| pool.as_ref().ok())
-        .map(AsRef::as_ref)
+pub(super) fn global() -> Result<Arc<Pool>, String> {
+    get_or_try_init_pool(&POOL, || Pool::new(Arc::clone(queue()?), &root()?))
+}
+
+pub(super) fn existing() -> Option<Arc<Pool>> {
+    lock(&POOL).clone()
 }
 
 pub(super) fn recover() -> Result<(), String> {

@@ -555,6 +555,94 @@ fn parse_hunk_header_starts(header_line: &str) -> Option<(usize, usize, String)>
     Some((old_start, new_start, suffix.to_owned()))
 }
 
+fn rewrite_partial_file_mode_header(
+    header: &str,
+    has_old_lines: bool,
+    has_new_lines: bool,
+) -> String {
+    let convert_new_file = has_old_lines
+        && header.lines().any(|l| {
+            l.starts_with("new file mode ") || l.trim_end_matches('\r') == "--- /dev/null"
+        });
+    let convert_deleted_file = has_new_lines
+        && header.lines().any(|l| {
+            l.starts_with("deleted file mode ") || l.trim_end_matches('\r') == "+++ /dev/null"
+        });
+    if !convert_new_file && !convert_deleted_file {
+        return header.to_owned();
+    }
+    let old_marker = convert_new_file.then(|| {
+        counterpart_marker(header, "+++ ", 'b', "--- ", 'a')
+            .unwrap_or_else(|| "--- /dev/null".to_owned())
+    });
+    let new_marker = convert_deleted_file.then(|| {
+        counterpart_marker(header, "--- ", 'a', "+++ ", 'b')
+            .unwrap_or_else(|| "+++ /dev/null".to_owned())
+    });
+    let mut out = String::with_capacity(header.len());
+    for raw_line in header.split_inclusive('\n') {
+        let trimmed = raw_line.trim_end_matches(['\r', '\n']);
+        if convert_new_file && trimmed.starts_with("new file mode ") {
+            continue;
+        }
+        if convert_deleted_file && trimmed.starts_with("deleted file mode ") {
+            continue;
+        }
+        if trimmed == "--- /dev/null"
+            && let Some(ref repl) = old_marker
+        {
+            push_patch_line(&mut out, repl);
+            continue;
+        }
+        if trimmed == "+++ /dev/null"
+            && let Some(ref repl) = new_marker
+        {
+            push_patch_line(&mut out, repl);
+            continue;
+        }
+        push_patch_line(&mut out, raw_line);
+    }
+    out
+}
+
+fn counterpart_marker(
+    header: &str,
+    from_prefix: &str,
+    from_side: char,
+    to_prefix: &str,
+    to_side: char,
+) -> Option<String> {
+    for raw_line in header.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        let Some(rest) = line.strip_prefix(from_prefix) else {
+            continue;
+        };
+        if let Some(rel) = rest
+            .strip_prefix(from_side)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            return Some(format!("{to_prefix}{to_side}/{rel}"));
+        }
+        if let Some(rel) = rest
+            .strip_prefix('"')
+            .and_then(|s| s.strip_prefix(from_side))
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            return Some(format!("{to_prefix}\"{to_side}/{rel}"));
+        }
+    }
+    for raw_line in header.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("diff --git a/")
+            && let Some((a_path, b_path)) = rest.split_once(" b/")
+            && a_path == b_path
+        {
+            return Some(format!("{to_prefix}{to_side}/{a_path}"));
+        }
+    }
+    None
+}
+
 #[must_use]
 pub fn build_line_patch(
     raw_patch: &str,
@@ -573,6 +661,8 @@ pub fn build_line_patch(
         return None;
     }
     let mut out_hunks = Vec::new();
+    let mut has_old_lines = false;
+    let mut has_new_lines = false;
     for hunk in &hunks {
         // `\n`만 떼고 `\r`은 본문의 일부로 남긴다(CRLF 보존).
         let mut lines = hunk
@@ -708,8 +798,20 @@ pub fn build_line_patch(
             .iter()
             .filter(|l| l.starts_with(' ') || l.starts_with('+'))
             .count();
+        has_old_lines |= old_count > 0;
+        has_new_lines |= new_count > 0;
+        let hunk_old_start = if old_start == 0 && old_count > 0 {
+            1
+        } else {
+            old_start
+        };
+        let hunk_new_start = if new_start == 0 && new_count > 0 {
+            1
+        } else {
+            new_start
+        };
         let mut hunk_out =
-            format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}\n");
+            format!("@@ -{hunk_old_start},{old_count} +{hunk_new_start},{new_count} @@{suffix}\n");
         for bl in body_lines {
             hunk_out.push_str(&bl);
             hunk_out.push('\n');
@@ -719,7 +821,7 @@ pub fn build_line_patch(
     if out_hunks.is_empty() {
         return None;
     }
-    let mut out = header;
+    let mut out = rewrite_partial_file_mode_header(&header, has_old_lines, has_new_lines);
     for h in out_hunks {
         out.push_str(&h);
     }

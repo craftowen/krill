@@ -385,6 +385,7 @@
       if (gap <= 1) following = true;
       else if (upward) following = false;
       else if (gap < 60) following = true;
+      syncLiveCardVisibility();
       const threshold = historyThreshold();
       if (top > threshold) {
         autoBlocked = null;
@@ -397,7 +398,7 @@
     let touchStartY = null, touchHistory = false, wheelAt = -Infinity;
     function earlierGesture() {
       if (!capability("chat_tail") || !canReadEarlier() || feed.scrollHeight > feed.clientHeight + 1) return;
-      following = false; fillPages = 0; autoBlocked = null; earlierQueued = true; drainEarlier();
+      following = false; syncLiveCardVisibility(); fillPages = 0; autoBlocked = null; earlierQueued = true; drainEarlier();
     }
     feed.addEventListener("touchstart", e => {touchStartY = e.touches?.[0]?.clientY ?? null; touchHistory = false;}, {passive:true});
     feed.addEventListener("touchmove", e => {if (touchStartY !== null && !touchHistory && (e.touches?.[0]?.clientY ?? touchStartY) - touchStartY > 12) {touchHistory = true; earlierGesture();}}, {passive:true});
@@ -419,6 +420,7 @@
         entry.live = null;
       }
       following = true;
+      syncLiveCardVisibility();
     }
     function pinLatest() {
       if (visible && following && !entry.live)
@@ -650,6 +652,7 @@
       suggestTimer = null;
       picker = null;
       choices = [];
+      delete suggestions.dataset.pending;
       suggestions.hidden = true;
       input.setAttribute("aria-expanded", "false");
       input.setAttribute("aria-activedescendant", "");
@@ -1496,9 +1499,60 @@
     liveCard.append(liveCopy, liveOpen);
     shell.append(history, pollStatus, feed, liveCard, composer);
     root.replaceChildren(shell);
-    // Only a complete live terminal screen supplies an answer target. Transcript cards stay historical.
+    // Only a complete live terminal screen supplies an answer target. Historical cards stay inert.
     let liveQuestion = null,
+      activeQuestionKey = null,
       replyPanel = null;
+    const isWriteInLabel = (label) =>
+      /^(?:other(?:\b|[ (])|type something|write[- ]?in|직접 입력|기타)/i.test(
+        label || "",
+      );
+    const compactQuestionText = (value) =>
+      String(value || "").replace(/[\s`]+/g, "");
+    function matchesLiveQuestion(item, question) {
+      if (
+        !item ||
+        item.kind !== "question" ||
+        !question ||
+        Boolean(item.multi_select) !== Boolean(question.multiple) ||
+        !Array.isArray(item.options) ||
+        item.options.length < 2 ||
+        !Array.isArray(question.choices) ||
+        question.choices.length < item.options.length
+      )
+        return false;
+      return item.options.every((opt, index) => {
+        const choice = compactQuestionText(question.choices[index]?.label),
+          label = compactQuestionText(opt?.label),
+          withDesc = opt?.description
+            ? compactQuestionText(`${opt.label} ${opt.description}`)
+            : label;
+        return Boolean(label) && (choice === label || choice === withDesc);
+      });
+    }
+    function computeActiveQuestionKey() {
+      if (!liveQuestion || !entry.items.length) return null;
+      for (let idx = entry.items.length - 1; idx >= 0; idx--) {
+        const item = entry.items[idx];
+        if (item.kind === "question") {
+          if (matchesLiveQuestion(item, liveQuestion))
+            return itemKey(item, idx);
+          continue;
+        }
+        if (item.kind === "reasoning") continue;
+        break;
+      }
+      return null;
+    }
+    function syncLiveCardVisibility() {
+      if (!liveCard) return;
+      liveCard.hidden =
+        !liveQuestion || Boolean(activeQuestionKey && following && !entry.live);
+    }
+    function syncQuestionCards() {
+      activeQuestionKey = computeActiveQuestionKey();
+      for (const card of cards.values()) card._syncQuestion?.();
+    }
     const draftFor = (question) => {
       if (entry.questionDraft?.identity !== question.identity)
         entry.questionDraft = {
@@ -1519,11 +1573,15 @@
       if (disposed) return;
       if (!question && status.settled) entry.questionDraft = null;
       liveQuestion = question;
+      const prevActive = activeQuestionKey;
+      syncQuestionCards();
       renderLiveQuestion();
+      if (activeQuestionKey && activeQuestionKey !== prevActive)
+        pinLatestSoon();
       if (panelOpen(replyPanel)) renderReplyPanel(replyPanel);
     }
     function renderLiveQuestion() {
-      liveCard.hidden = !liveQuestion;
+      syncLiveCardVisibility();
       updateComposer();
       syncAgent();
       if (!liveQuestion) {
@@ -1884,6 +1942,7 @@
         } else if (!sameItem(card._item, item)) {
           const next = renderCard(item, key);
           card.replaceChildren(...Array.from(next.children));
+          card._syncQuestion = next._syncQuestion;
         }
         card._item = item;
         if (!run && idx >= runEnd) runEnd = workRunEnd(entry.items, idx);
@@ -2102,6 +2161,8 @@
         !failedEarlier &&
         !entry.latestRecovery;
       history.hidden = earlierBtn.hidden && latestBtn.hidden;
+      syncQuestionCards();
+      syncLiveCardVisibility();
       syncOptimistic();
       pinLatest();
       restoreReader(anchor);
@@ -2215,20 +2276,22 @@
     }
     function renderQuestionCard(card, item, key) {
       const history = el("details", undefined, "chat-past-question"),
+        summary = el("summary"),
         body = el("div", undefined, "chat-past-question-body");
-      rememberDetails(history, "past:" + key);
-      history.append(
-        el(
-          "summary",
-          item.title
-            ? `${t("Past question")} • ${item.title}`
-            : t("Past question"),
-        ),
-        body,
-      );
+      let wasLive = false,
+        ignoreToggle = false,
+        cardError = "",
+        sendingIndex = -1;
+      history.open = entry.disclosures?.get("past:" + key) || false;
+      history.addEventListener("toggle", () => {
+        if (ignoreToggle || activeQuestionKey === key) return;
+        entry.disclosures ||= new Map();
+        if (history.open) entry.disclosures.set("past:" + key, true);
+        else entry.disclosures.delete("past:" + key);
+      });
+      history.append(summary, body);
       card.append(history);
-      card = body;
-      card.append(el("p", item.text, "chat-p"));
+      body.append(el("p", item.text, "chat-p"));
       const list = el("div", undefined, "chat-question-options"),
         selected = new Set(),
         buttons = [];
@@ -2237,6 +2300,18 @@
       custom.value = "";
       custom.placeholder = t("Other (write-in)…");
       custom.setAttribute("aria-label", t("Other answer notes"));
+      const statusNote = el(
+        "p",
+        t(
+          "These are answer notes only. Confirm the current question and enter your answer in Term.",
+        ),
+        "muted",
+      );
+      const currentLive = () => {
+        if (activeQuestionKey !== key) return null;
+        const q = opts.getQuestion?.() || liveQuestion;
+        return matchesLiveQuestion(item, q) ? q : null;
+      };
       const draftAnswer = () =>
         [
           ...[...selected].map((i) => item.options?.[i]?.label).filter(Boolean),
@@ -2252,49 +2327,188 @@
         },
         "secondary small",
       );
-      const syncAnswer = () => {
-        const has = Boolean(draftAnswer());
-        copyBtn.hidden = !has;
-        copyBtn.disabled = !has;
-      };
+      const sendAnswerBtn = button(
+        t("Send answer"),
+        () => {
+          const question = currentLive();
+          if (question)
+            sendFromCard(question, draftFor(question).selected.slice());
+        },
+        "primary small",
+      );
+      const termBtn = button(
+        t("Confirm in Term"),
+        () => onSwitchTerm?.(),
+        "ghost small",
+      );
+      async function sendFromCard(question, picks) {
+        if (
+          !question?.enabled ||
+          entry.questionSending ||
+          disposed ||
+          (!picks.length && !question.multiple)
+        )
+          return;
+        const draft = entry.questionDraft;
+        entry.questionSending = true;
+        sendingIndex = !question.multiple && picks.length === 1 ? picks[0] : -1;
+        cardError = "";
+        syncQuestionCards();
+        renderLiveQuestion();
+        if (panelOpen(replyPanel)) renderReplyPanel(replyPanel);
+        try {
+          await opts.onAnswerQuestion(question.token, picks);
+          if (disposed || ctx.signal?.aborted) return;
+          if (draft && entry.questionDraft === draft) entry.questionDraft = null;
+          if (panelOpen(replyPanel)) ctx.closeSheet?.();
+          ctx.toast?.(t("Answer sent"));
+          if (picks.some((i) => isWriteInLabel(question.choices[i]?.label)))
+            onSwitchTerm?.();
+        } catch (error) {
+          if (!disposed) cardError = String(error?.message || error);
+        } finally {
+          entry.questionSending = false;
+          sendingIndex = -1;
+          if (!disposed) {
+            syncQuestionCards();
+            renderLiveQuestion();
+            if (panelOpen(replyPanel)) renderReplyPanel(replyPanel);
+          }
+        }
+      }
+      function syncCard() {
+        const question = activeQuestionKey === key ? liveQuestion : null,
+          isLive = Boolean(question);
+        card.dataset.liveQuestion = String(isLive);
+        const prefix = t(isLive ? "Current question" : "Past question");
+        summary.textContent = item.title ? `${prefix} • ${item.title}` : prefix;
+        if (isLive && !history.open) {
+          ignoreToggle = true;
+          history.open = true;
+          Promise.resolve().then(() => {
+            ignoreToggle = false;
+          });
+        } else if (!isLive && wasLive) {
+          const saved = entry.disclosures?.get("past:" + key) || false;
+          if (history.open !== saved) {
+            ignoreToggle = true;
+            history.open = saved;
+            Promise.resolve().then(() => {
+              ignoreToggle = false;
+            });
+          }
+        }
+        wasLive = isLive;
+        if (isLive) {
+          const draft = draftFor(question),
+            picks = question.multiple
+              ? draft.selected
+              : sendingIndex >= 0
+                ? [sendingIndex]
+                : [],
+            enabled = question.enabled && !entry.questionSending && !disposed;
+          buttons.forEach(({ button: b, baseLabel }, i) => {
+            const active = picks.includes(i);
+            b.textContent = question.multiple
+              ? `${active ? "☑ " : "☐ "}${baseLabel}`
+              : baseLabel;
+            b.className = `${active ? "primary" : "ghost"} small chat-opt`;
+            b.setAttribute("aria-pressed", String(active));
+            b.disabled = !enabled;
+          });
+          custom.hidden = true;
+          copyBtn.hidden = true;
+          copyBtn.disabled = true;
+          sendAnswerBtn.hidden = !question.multiple;
+          sendAnswerBtn.disabled = !enabled;
+          sendAnswerBtn.textContent = t(
+            entry.questionSending ? "Sending answer…" : "Send answer",
+          );
+          sendAnswerBtn.setAttribute("aria-label", sendAnswerBtn.textContent);
+          termBtn.textContent = t("Write an answer in Term");
+          termBtn.setAttribute("aria-label", termBtn.textContent);
+          const note =
+            cardError ||
+            (entry.questionSending
+              ? t("Sending answer…")
+              : !question.enabled
+                ? t(
+                    "Waiting for the current question. Check Term if this continues.",
+                  )
+                : question.multiple
+                  ? t("Select answers, then submit")
+                  : "");
+          statusNote.textContent = note;
+          statusNote.hidden = !note;
+          statusNote.dataset.error = String(Boolean(cardError));
+        } else {
+          cardError = "";
+          buttons.forEach(({ button: b, baseLabel }, i) => {
+            const active = selected.has(i);
+            b.textContent = baseLabel;
+            b.className = `${active ? "primary" : "ghost"} small chat-opt`;
+            b.setAttribute("aria-pressed", String(active));
+            b.disabled = false;
+          });
+          custom.hidden = false;
+          const has = Boolean(draftAnswer());
+          copyBtn.hidden = !has;
+          copyBtn.disabled = !has;
+          sendAnswerBtn.hidden = true;
+          sendAnswerBtn.disabled = true;
+          termBtn.textContent = t("Confirm in Term");
+          termBtn.setAttribute("aria-label", termBtn.textContent);
+          statusNote.textContent = t(
+            "These are answer notes only. Confirm the current question and enter your answer in Term.",
+          );
+          statusNote.hidden = false;
+          statusNote.dataset.error = "false";
+        }
+      }
       for (const [index, opt] of (item.options || []).entries()) {
+        const baseLabel = opt.description
+          ? `${opt.label} — ${opt.description}`
+          : opt.label;
         const b = button(
-          opt.description ? `${opt.label} — ${opt.description}` : opt.label,
+          baseLabel,
           () => {
+            const question = currentLive();
+            if (question) {
+              if (!question.enabled || entry.questionSending || disposed)
+                return;
+              cardError = "";
+              if (question.multiple) {
+                const draft = draftFor(question),
+                  cur = draft.selected;
+                draft.changed = true;
+                draft.selected = cur.includes(index)
+                  ? cur.filter((i) => i !== index)
+                  : [...cur, index];
+                syncCard();
+                renderLiveQuestion();
+                if (panelOpen(replyPanel)) renderReplyPanel(replyPanel);
+              } else {
+                sendFromCard(question, [index]);
+              }
+              return;
+            }
             if (!item.multi_select) selected.clear();
             if (selected.has(index)) selected.delete(index);
             else selected.add(index);
-            buttons.forEach((b, i) => {
-              b.className = `${selected.has(i) ? "primary" : "ghost"} small chat-opt`;
-              b.setAttribute("aria-pressed", String(selected.has(i)));
-            });
-            syncAnswer();
+            syncCard();
           },
           "ghost small chat-opt",
         );
         b.setAttribute("aria-pressed", "false");
-        buttons.push(b);
+        buttons.push({ button: b, baseLabel });
         list.append(b);
       }
-      custom.addEventListener("input", syncAnswer);
-      syncAnswer();
+      custom.addEventListener("input", syncCard);
       const actions = el("div", undefined, "chat-actions");
-      actions.append(
-        button(t("Confirm in Term"), () => onSwitchTerm?.(), "ghost small"),
-        copyBtn,
-      );
-      card.append(
-        list,
-        custom,
-        el(
-          "p",
-          t(
-            "These are answer notes only. Confirm the current question and enter your answer in Term.",
-          ),
-          "muted",
-        ),
-        actions,
-      );
+      actions.append(sendAnswerBtn, termBtn, copyBtn);
+      body.append(list, custom, statusNote, actions);
+      card._syncQuestion = syncCard;
+      syncCard();
     }
     function openDiff(filePath) {
       run(async () => {

@@ -850,3 +850,140 @@ fn thousand_remote_items_search_under_50_ms() {
         assert!(took < Duration::from_millis(50), "{query}: {took:?}");
     }
 }
+
+#[test]
+fn nfd_korean_filenames_match_nfc_syllables_and_choseong_in_jump_and_worktrees() {
+    let nfd_doc = "docs/\u{1109}\u{1165}\u{11AF}\u{1100}\u{1168}\u{1109}\u{1165}.md";
+    let mut file_item = item(1, nfd_doc, false);
+    file_item.is_file = true;
+    let mut other_item = item(2, "docs/readme.md", false);
+    other_item.is_file = true;
+    let items = vec![other_item, file_item];
+
+    assert_eq!(search(&items, "설계"), vec![1]);
+    assert_eq!(search(&items, "ㅅㄱㅅ"), vec![1]);
+    assert_eq!(
+        search(&items, "\u{1109}\u{1165}\u{11AF}\u{1100}\u{1168}"),
+        vec![1]
+    );
+
+    let mut rebuilt = item(3, "session", false);
+    rebuilt.cwd = format!("/repo/{nfd_doc}");
+    rebuilt.rebuild_search_chars();
+    assert_eq!(search(&[rebuilt], "설계서"), vec![0]);
+
+    let entries = vec![
+        WorktreeEntry::new("/repo/main".into(), "main".into(), None, None),
+        WorktreeEntry::new(
+            PathBuf::from(format!("/repo/{nfd_doc}")),
+            nfd_doc.into(),
+            None,
+            None,
+        ),
+    ];
+    assert_eq!(worktree_search(&entries, "설계"), vec![1]);
+    assert_eq!(worktree_search(&entries, "ㅅㄱㅅ"), vec![1]);
+}
+
+#[gpui::test]
+fn jump_palette_traps_shift_tab_occludes_backdrop_and_labels_dialog(cx: &mut TestAppContext) {
+    struct Host {
+        outside: gpui::FocusHandle,
+        bg_clicks: Rc<RefCell<usize>>,
+        palette: Entity<Palette>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let clicks = self.bg_clicks.clone();
+            div()
+                .size_full()
+                .tab_group()
+                .child(
+                    div()
+                        .id("bg-surface")
+                        .size_full()
+                        .track_focus(&self.outside)
+                        .tab_index(0)
+                        .on_mouse_down(gpui::MouseButton::Left, move |_, _, _| {
+                            *clicks.borrow_mut() += 1;
+                        }),
+                )
+                .child(self.palette.clone())
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let bg_clicks = Rc::new(RefCell::new(0usize));
+    let bg_clicks_view = bg_clicks.clone();
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let palette = cx.new(|cx| Palette::new(vec![item(1, "s1", false)], window, cx));
+        Host {
+            outside: cx.focus_handle().tab_stop(true),
+            bg_clicks: bg_clicks_view,
+            palette,
+        }
+    });
+    let palette = cx.update(|_, cx| host.read(cx).palette.clone());
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let got = events.clone();
+    cx.update(|window, cx| {
+        cx.subscribe(&palette, move |_, e: &Event, _| {
+            got.borrow_mut().push(e.clone());
+        })
+        .detach();
+        palette.update(cx, |p, cx| p.focus(window, cx));
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("jump-backdrop").is_some());
+    assert!(cx.debug_bounds("jump-palette").is_some());
+
+    // Shift+Tab must remain trapped inside jump-palette rather than escaping to `outside`.
+    cx.simulate_keystrokes("shift-tab");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(!host.read(cx).outside.is_focused(window));
+        assert!(
+            palette
+                .read(cx)
+                .input()
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        );
+        assert!(!palette.read(cx).filter_open);
+    });
+
+    // Unmodified Tab toggles the filter bar while keeping focus inside jump-palette.
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(!host.read(cx).outside.is_focused(window));
+        assert!(palette.read(cx).filter_open);
+    });
+
+    // Clicking the backdrop outside jump-palette must be occluded from `bg-surface` while dismissing.
+    cx.simulate_click(gpui::point(px(4.), px(4.)), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        *bg_clicks.borrow(),
+        0,
+        "backdrop must occlude background clicks"
+    );
+    assert_eq!(events.borrow().as_slice(), &[Event::Dismiss]);
+
+    // Verify Dialog role + localized aria_label contract on jump-palette.
+    cx.update(|_, cx| {
+        use gpui::Element as _;
+        let label = palette.read(cx).mode().placeholder();
+        let probe = div()
+            .id("jump-palette")
+            .role(gpui::Role::Dialog)
+            .aria_label(label);
+        let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+        probe.write_a11y_info(&mut node);
+        assert_eq!(probe.a11y_role(), Some(gpui::Role::Dialog));
+        assert_eq!(node.label(), Some(label));
+    });
+}

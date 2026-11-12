@@ -756,22 +756,29 @@ impl Tap {
 
     /// 입력은 보내지 않고 화면만 지운 뒤 구독자에게 새 revision을 알린다.
     pub fn clear_viewport(&self) -> bool {
+        self.clear_viewport_with(Engine::clear_viewport)
+    }
+
+    fn clear_viewport_with(&self, clear: impl FnOnce(&mut Engine)) -> bool {
         let _history = lock(&self.0.history_access);
-        let (seq, revision) = {
-            let mut live = lock(&self.0.live);
-            if panic::catch_unwind(AssertUnwindSafe(|| live.engine.clear_viewport())).is_err() {
-                return false;
-            }
-            live.revision = live.revision.wrapping_add(1);
+        let (seq, revision, cleared) = {
+            let mut live = self.0.live();
             live.history_epoch = live.history_epoch.wrapping_add(1);
-            (live.seq, live.revision)
+            let cleared = live.update_engine(clear).is_some();
+            if cleared {
+                live.revision = live.revision.wrapping_add(1);
+            }
+            *lock(&self.0.capture) = None;
+            (live.seq, live.revision, cleared)
         };
-        self.wait(|p| p.end >= seq || p.closed);
-        if let Some(store) = &self.0.store {
-            store.clear_scrollback(self.0.id, seq);
+        if cleared {
+            self.wait(|p| p.end >= seq || p.closed);
+            if let Some(store) = &self.0.store {
+                store.clear_scrollback(self.0.id, seq);
+            }
         }
         self.0.publish(&[], revision, false);
-        true
+        cleared
     }
 
     /// 디스크 저장소(콜드 페이지·링 밖 원본). 기록하지 않는 세션이면 `None`.

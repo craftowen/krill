@@ -805,9 +805,23 @@ pub fn validate_bundle_layout(app_bundle: &Path) -> Result<Vec<PathBuf>, Error> 
     Ok(binaries)
 }
 
-/// Windows 설치 폴더의 필수 구조(`Krill.json`, 실행 파일 4개, 번들 ConPTY)를 확인하고 실행 파일 목록을 돌려준다.
-/// `krill-link.exe`는 선택이다. 새 세션은 고정된 번들 `ConPTY` ABI를 요구한다.
-pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+fn is_windows_arm64_arch(wow64_arch: Option<&str>, native_arch: Option<&str>) -> bool {
+    wow64_arch
+        .map(str::trim)
+        .filter(|arch| !arch.is_empty())
+        .or_else(|| native_arch.map(str::trim))
+        .is_some_and(|arch| arch.eq_ignore_ascii_case("ARM64"))
+}
+
+fn is_windows_arm64_host() -> bool {
+    cfg!(all(windows, target_arch = "aarch64"))
+        || is_windows_arm64_arch(
+            std::env::var("PROCESSOR_ARCHITEW6432").ok().as_deref(),
+            std::env::var("PROCESSOR_ARCHITECTURE").ok().as_deref(),
+        )
+}
+
+fn validate_install_layout_for_arch(dir: &Path, arm64_host: bool) -> Result<Vec<PathBuf>, Error> {
     let mut binaries = Vec::new();
     for name in [
         "krill-holder.exe",
@@ -830,7 +844,12 @@ pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
             dir.display()
         )));
     }
-    for name in ["conpty.dll", "x64/OpenConsole.exe"] {
+    let required_conpty: &[&str] = if arm64_host {
+        &["conpty.dll", "x64/OpenConsole.exe", "arm64/OpenConsole.exe"]
+    } else {
+        &["conpty.dll", "x64/OpenConsole.exe"]
+    };
+    for name in required_conpty {
         if !dir.join(name).is_file() {
             return Err(Error::BundleStructure(format!(
                 "missing {name} in {}",
@@ -841,11 +860,18 @@ pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(binaries)
 }
 
+/// Windows 설치 폴더의 필수 구조(`Krill.json`, 실행 파일 4개, 번들 ConPTY)를 확인하고 실행 파일 목록을 돌려준다.
+/// `krill-link.exe`는 선택이다. 새 세션은 고정된 번들 `ConPTY` ABI를 요구한다.
+pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    validate_install_layout_for_arch(dir, is_windows_arm64_host())
+}
+
 #[cfg(test)]
 #[test]
 fn windows_install_layout_requires_both_conpty_components() {
     let dir = std::env::temp_dir().join(format!("krill-conpty-layout-{}", std::process::id()));
     fs::create_dir_all(dir.join("x64")).unwrap();
+    fs::create_dir_all(dir.join("arm64")).unwrap();
     for name in [
         "Krill.json",
         "krill-holder.exe",
@@ -854,6 +880,7 @@ fn windows_install_layout_requires_both_conpty_components() {
         "krill-app.exe",
         "conpty.dll",
         "x64/OpenConsole.exe",
+        "arm64/OpenConsole.exe",
     ] {
         fs::write(dir.join(name), b"fixture").unwrap();
     }
@@ -866,6 +893,47 @@ fn windows_install_layout_requires_both_conpty_components() {
         ));
         fs::write(dir.join(name), b"fixture").unwrap();
     }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn windows_install_layout_requires_arm64_openconsole_on_arm64_host() {
+    assert!(is_windows_arm64_arch(Some("ARM64"), Some("AMD64")));
+    assert!(is_windows_arm64_arch(Some(""), Some("arm64")));
+    assert!(is_windows_arm64_arch(None, Some("Arm64")));
+    assert!(!is_windows_arm64_arch(None, Some("AMD64")));
+    assert!(!is_windows_arm64_arch(None, None));
+
+    let dir =
+        std::env::temp_dir().join(format!("krill-conpty-arm64-layout-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(dir.join("x64")).unwrap();
+    fs::create_dir_all(dir.join("arm64")).unwrap();
+    for name in [
+        "Krill.json",
+        "krill-holder.exe",
+        "krilld.exe",
+        "krill.exe",
+        "krill-app.exe",
+        "conpty.dll",
+        "x64/OpenConsole.exe",
+    ] {
+        fs::write(dir.join(name), b"fixture").unwrap();
+    }
+    assert_eq!(
+        validate_install_layout_for_arch(&dir, false).unwrap().len(),
+        4
+    );
+    assert!(matches!(
+        validate_install_layout_for_arch(&dir, true),
+        Err(Error::BundleStructure(msg)) if msg.contains("arm64/OpenConsole.exe")
+    ));
+    fs::write(dir.join("arm64/OpenConsole.exe"), b"fixture").unwrap();
+    assert_eq!(
+        validate_install_layout_for_arch(&dir, true).unwrap().len(),
+        4
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 

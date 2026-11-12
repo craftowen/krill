@@ -148,7 +148,7 @@ fn ttl_and_cancel_cleanup_registered_locked_worktrees() {
             if cancel {
                 TTL
             } else {
-                Duration::from_millis(800)
+                Duration::from_millis(1200)
             },
             DISK_LIMIT,
         )
@@ -363,4 +363,45 @@ fn in_flight_preparation_promotes_matching_base_and_cancels_mismatched_base() {
     pool.cancel_mismatched_in_flight(f.repo.as_os_str().as_bytes(), Some("dev"));
     assert!(cancel_flag.load(Ordering::Acquire));
     assert_eq!(pool.request(&request(&f, 42)), Status::Cancelled);
+}
+
+#[test]
+fn deleted_owner_repo_and_corrupt_marker_recover_and_do_not_brick_pool() {
+    let f_a = Fixture::new("prep-deleted-a", "");
+    let f_b = Fixture::new("prep-deleted-b", "");
+    let pool_live = Pool::new(Arc::new(GitQueue::new().unwrap()), &f_a.root).unwrap();
+    let req_a = request(&f_a, 50);
+    ready(&pool_live, &req_a);
+
+    // Delete owner repository while preparation is Ready, then cancel: slot must unwind cleanly.
+    fs::remove_dir_all(&f_a.repo).unwrap();
+    assert_eq!(
+        pool_live.request(&PrepareWorktree {
+            cancel: true,
+            ..req_a
+        }),
+        Status::Cancelled
+    );
+    cleaned(&pool_live);
+
+    // Another repository can immediately prepare in the same pool.
+    let req_b = request(&f_b, 51);
+    ready(&pool_live, &req_b);
+    pool_live.request(&PrepareWorktree {
+        cancel: true,
+        ..req_b
+    });
+    cleaned(&pool_live);
+
+    // Corrupt / 0-byte marker + leftover tree on restart recovers instead of failing Pool::new.
+    fs::create_dir_all(pool_live.tree()).unwrap();
+    fs::write(pool_live.dir.join(MARKER), b"").unwrap();
+    let recovered = Pool::new(Arc::new(GitQueue::new().unwrap()), &f_a.root).unwrap();
+    cleaned(&recovered);
+
+    // Transient init error is not permanently cached by get_or_try_init_pool.
+    let slot = Mutex::new(None);
+    assert!(get_or_try_init_pool(&slot, || Err("transient".to_owned())).is_err());
+    let initialized = get_or_try_init_pool(&slot, || Ok(Arc::clone(&recovered))).unwrap();
+    assert!(Arc::ptr_eq(&initialized, &recovered));
 }

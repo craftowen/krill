@@ -2,8 +2,16 @@
 // Copyright (c) 2026 Lovecast Inc.
 use super::*;
 use gpui::prelude::FluentBuilder as _;
-use gpui::{StatefulInteractiveElement as _, px};
+use gpui::{Focusable as _, StatefulInteractiveElement as _, px};
 use gpui_component::{Icon, IconName, Selectable as _, progress::ProgressCircle, tooltip::Tooltip};
+
+#[derive(Default)]
+struct DismissedComposerPopovers {
+    quick_menu: Option<ChatKey>,
+    model_picker: Option<ChatKey>,
+}
+
+impl gpui::Global for DismissedComposerPopovers {}
 
 pub(super) fn agent_display_name(agent: &str) -> String {
     match agent.to_ascii_lowercase().as_str() {
@@ -381,7 +389,10 @@ impl Shell {
                 )
         });
 
-        let quick_menu = self.chat.quick_menu.contains(&key).then(|| {
+        let quick_menu_open = self.chat.quick_menu.contains(&key);
+        let model_picker_open = self.chat.model_picker.contains(&key);
+
+        let quick_menu = quick_menu_open.then(|| {
             let close_key = key.clone();
             composer_popup(palette)
                 .id(SharedString::from(format!(
@@ -412,6 +423,15 @@ impl Shell {
                                     this.chat.quick_menu.remove(&key);
                                     if cmd_str == "/model" {
                                         this.toggle_chat_model_picker(&key, cx);
+                                        if this.chat.model_picker.contains(&key)
+                                            && !input_state
+                                                .read(cx)
+                                                .focus_handle(cx)
+                                                .is_focused(window)
+                                        {
+                                            input_state
+                                                .update(cx, |state, cx| state.focus(window, cx));
+                                        }
                                         return;
                                     }
                                     input_state.update(cx, |state, cx| {
@@ -432,7 +452,7 @@ impl Shell {
         });
 
         let model_picker =
-            self.chat.model_picker.contains(&key).then(|| {
+            model_picker_open.then(|| {
                 let active_model = current_model.map(str::to_owned);
                 let active_effort = current_effort.map(str::to_owned);
                 let reason = meta.and_then(|m| m.reason.as_deref());
@@ -520,127 +540,231 @@ impl Shell {
             && !self.chat.prompt_tasks.contains_key(&key)
             && !self.chat.prompt_review.contains(&key);
 
-        let inner_card =
-            div()
-                .id("desktop-chat-composer")
-                .debug_selector(|| "desktop-chat-composer".into())
-                .on_action(cx.listener(
-                    move |this, action: &gpui_component::input::Enter, window, cx| {
-                        if action.secondary || action.shift {
-                            cx.propagate();
-                        } else {
-                            this.submit_chat_prompt(&submit_key, window, cx);
-                        }
-                    },
-                ))
-                .relative()
-                .w_full()
-                .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
-                .min_w_0()
-                .rounded(ui::RADIUS_LG)
-                .border_1()
-                .border_color(border)
-                .bg(palette.card)
-                .px_2()
-                .pt_1p5()
-                .pb_1p5()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .children(quick_menu)
-                .children(model_picker)
-                .child(
-                    Textarea::new(input_state)
-                        .small()
-                        .appearance(false)
-                        .w_full()
-                        .min_w_0()
-                        .accessibility_id("chat-composer-input")
-                        .aria_label(ctext::PROMPT_PLACEHOLDER.get()),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "chat-composer-plus-{}",
-                                        pane.get()
-                                    )))
-                                    .debug_selector(|| "chat-composer-plus".into())
-                                    .icon(IconName::Plus)
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener({
-                                        let key = key.clone();
-                                        move |this, _, _, cx| {
-                                            this.chat.model_picker.remove(&key);
-                                            if this.chat.quick_menu.contains(&key) {
-                                                this.chat.quick_menu.remove(&key);
-                                            } else {
-                                                this.chat.quick_menu.insert(key.clone());
+        let inner_card = div()
+            .id("desktop-chat-composer")
+            .debug_selector(|| "desktop-chat-composer".into())
+            .capture_action(cx.listener({
+                let escape_input = input_state.clone();
+                move |_, _: &gpui_component::input::Escape, window, cx| {
+                    let composing = escape_input.update(cx, |state, cx| {
+                        state.focus_handle(cx).is_focused(window)
+                            && gpui::EntityInputHandler::marked_text_range(state, window, cx)
+                                .is_some()
+                    });
+                    if composing {
+                        window.prevent_default();
+                    }
+                }
+            }))
+            .capture_key_down(cx.listener({
+                let escape_key = key.clone();
+                let escape_input = input_state.clone();
+                move |this, e: &gpui::KeyDownEvent, window, cx| {
+                    if e.keystroke.key != "escape"
+                        || e.keystroke.modifiers.modified()
+                        || window.default_prevented()
+                    {
+                        return;
+                    }
+                    if !this.chat.quick_menu.contains(&escape_key)
+                        && !this.chat.model_picker.contains(&escape_key)
+                    {
+                        return;
+                    }
+                    let composing = escape_input.update(cx, |state, cx| {
+                        state.focus_handle(cx).is_focused(window)
+                            && gpui::EntityInputHandler::marked_text_range(state, window, cx)
+                                .is_some()
+                    });
+                    if composing {
+                        return;
+                    }
+                    this.chat.quick_menu.remove(&escape_key);
+                    this.chat.model_picker.remove(&escape_key);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(
+                move |this, action: &gpui_component::input::Enter, window, cx| {
+                    if action.secondary || action.shift {
+                        cx.propagate();
+                    } else {
+                        this.submit_chat_prompt(&submit_key, window, cx);
+                    }
+                },
+            ))
+            .relative()
+            .w_full()
+            .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+            .min_w_0()
+            .rounded(ui::RADIUS_LG)
+            .border_1()
+            .border_color(border)
+            .bg(palette.card)
+            .px_2()
+            .pt_1p5()
+            .pb_1p5()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(quick_menu)
+            .children(model_picker)
+            .child(
+                Textarea::new(input_state)
+                    .small()
+                    .appearance(false)
+                    .w_full()
+                    .min_w_0()
+                    .accessibility_id("chat-composer-input")
+                    .aria_label(ctext::PROMPT_PLACEHOLDER.get()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(ui::button_with_tooltip_when(
+                                !quick_menu_open,
+                                Button::new(SharedString::from(format!(
+                                    "chat-composer-plus-{}",
+                                    pane.get()
+                                )))
+                                .debug_selector(|| "chat-composer-plus".into())
+                                .icon(IconName::Plus)
+                                .ghost()
+                                .xsmall()
+                                .on_mouse_down(gpui::MouseButton::Left, {
+                                    let down_key = key.clone();
+                                    move |_, _, cx| {
+                                        cx.default_global::<DismissedComposerPopovers>()
+                                            .quick_menu = quick_menu_open.then(|| down_key.clone());
+                                    }
+                                })
+                                .on_click(cx.listener({
+                                    let key = key.clone();
+                                    let input_state = input_state.clone();
+                                    move |this, event, window, cx| {
+                                        let dismissed = matches!(event, gpui::ClickEvent::Mouse(_))
+                                            && cx
+                                                .default_global::<DismissedComposerPopovers>()
+                                                .quick_menu
+                                                .take()
+                                                .as_ref()
+                                                == Some(&key);
+                                        if dismissed {
+                                            return;
+                                        }
+                                        this.chat.model_picker.remove(&key);
+                                        if this.chat.quick_menu.contains(&key) {
+                                            this.chat.quick_menu.remove(&key);
+                                        } else {
+                                            this.chat.quick_menu.insert(key.clone());
+                                            if matches!(event, gpui::ClickEvent::Mouse(_))
+                                                && !input_state
+                                                    .read(cx)
+                                                    .focus_handle(cx)
+                                                    .is_focused(window)
+                                            {
+                                                input_state.update(cx, |state, cx| {
+                                                    state.focus(window, cx);
+                                                });
                                             }
-                                            cx.notify();
                                         }
-                                    })),
+                                        cx.notify();
+                                    }
+                                })),
+                                "chat-composer-plus",
+                                krill_app::i18n::catalog::settings::TAB_QUICK_COMMANDS.get(),
+                            ))
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "chat-composer-model-{}",
+                                    pane.get()
+                                )))
+                                .debug_selector(|| "chat-composer-model".into())
+                                .label(model_label)
+                                .children(
+                                    filled_bars.map(|filled| effort_bars_icon(palette, filled)),
                                 )
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "chat-composer-model-{}",
-                                        pane.get()
-                                    )))
-                                    .debug_selector(|| "chat-composer-model".into())
-                                    .label(model_label)
-                                    .children(
-                                        filled_bars.map(|filled| effort_bars_icon(palette, filled)),
-                                    )
-                                    .dropdown_caret(true)
-                                    .disabled(is_pending)
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener({
-                                        let key = key.clone();
-                                        move |this, _, _, cx| {
-                                            this.toggle_chat_model_picker(&key, cx);
+                                .dropdown_caret(true)
+                                .disabled(is_pending)
+                                .ghost()
+                                .xsmall()
+                                .on_mouse_down(gpui::MouseButton::Left, {
+                                    let down_key = key.clone();
+                                    move |_, _, cx| {
+                                        cx.default_global::<DismissedComposerPopovers>()
+                                            .model_picker =
+                                            model_picker_open.then(|| down_key.clone());
+                                    }
+                                })
+                                .on_click(cx.listener({
+                                    let key = key.clone();
+                                    let input_state = input_state.clone();
+                                    move |this, event, window, cx| {
+                                        let dismissed = matches!(event, gpui::ClickEvent::Mouse(_))
+                                            && cx
+                                                .default_global::<DismissedComposerPopovers>()
+                                                .model_picker
+                                                .take()
+                                                .as_ref()
+                                                == Some(&key);
+                                        if dismissed {
+                                            return;
                                         }
-                                    })),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .children(context_ring)
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "desktop-chat-send-{}",
-                                        pane.get()
-                                    )))
-                                    .debug_selector(|| "desktop-chat-send".into())
-                                    .icon(IconName::ArrowUp)
-                                    .tooltip(ctext::SEND.get())
-                                    .small()
-                                    .primary()
-                                    .rounded(px(999.))
-                                    .disabled(!can_send)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.toggle_chat_model_picker(&key, cx);
+                                        if this.chat.model_picker.contains(&key)
+                                            && matches!(event, gpui::ClickEvent::Mouse(_))
+                                            && !input_state
+                                                .read(cx)
+                                                .focus_handle(cx)
+                                                .is_focused(window)
+                                        {
+                                            input_state.update(cx, |state, cx| {
+                                                state.focus(window, cx);
+                                            });
+                                        }
+                                    }
+                                })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .children(context_ring)
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "desktop-chat-send-{}",
+                                    pane.get()
+                                )))
+                                .debug_selector(|| "desktop-chat-send".into())
+                                .icon(IconName::ArrowUp)
+                                .tooltip(ctext::SEND.get())
+                                .small()
+                                .primary()
+                                .rounded(px(999.))
+                                .disabled(!can_send)
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
                                         this.submit_chat_prompt(&key, window, cx);
-                                    })),
-                                ),
-                        ),
-                );
+                                    },
+                                )),
+                            ),
+                    ),
+            );
 
         div()
             .w_full()

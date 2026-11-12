@@ -121,6 +121,45 @@ async function desktopVisibility(){
  // 다시 열어도 이 폰에 저장한 옵션이 남고, 저장한 적 없는 폰은 데스크톱 기본값(모두 보임·프로젝트별·최근순)으로 시작한다.
  const kept=fixture('workspaces',{state:{preferences:{workspaceTree:{},workspaceViews:JSON.parse(JSON.stringify(f.state.preferences.workspaceViews))}}}),keptBox={state:kept.state,M:{}};vm.createContext(keptBox);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',keptBox);keptBox.groupSnapshot(data);kept.view.update();assert.equal(kept.byText('Name').getAttribute('aria-pressed'),'true');assert.equal(kept.byText('Project').getAttribute('aria-pressed'),'true');kept.abort.abort();
  const fresh=fixture('workspaces'),freshBox={state:fresh.state,M:{}};vm.createContext(freshBox);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',freshBox);freshBox.groupSnapshot(data);fresh.view.update();assert.deepEqual(fresh.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),['a-main','a-idle','a-busy','b-main']);assert.equal(fresh.find('.chip-badge').hidden,true);assert.equal(fresh.byText('Recent').getAttribute('aria-pressed'),'true');fresh.abort.abort();
+ // Warm-cache snapshot sanitizer parity across Home and Workspaces + NaN-free rank comparator.
+ const storageCtx=vm.createContext({TextEncoder,TextDecoder,Uint8Array,DataView,URL,URLSearchParams,AbortController,MkCrypto:{enc:new TextEncoder(),hex:()=>'00',sha256:()=>new Uint8Array(32)}});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/storage.js'),'utf8'),storageCtx);
+ const warmInput={
+  host:{display_name:'Studio',platform:'macos'},
+  repositories:[{key:'a',label:'Shown',path:'/a',remote:'craftowen/krill',badge_color:'#3b82f6',icon:{kind:'emoji',value:'🚀'}},{key:'b',label:'Other',path:'/b'},{key:'c',label:'Removed',path:'/c',removed:true}],
+  workspaces:[
+   ...data.workspaces,
+   {key:'a-ext-hidden',repo_key:'a',label:'.claude/wt',status:'in-review',orders:[5,5,5,5],visibility:facts({asleep:false,external:true,external_shown:false})}
+  ],
+  sessions:[]
+ };
+ const cachedData=storageCtx.KrillMobile.storage.metadata(warmInput);
+ for(const groupBy of [0,1,3]){
+  const renderPair=snap=>{const w=fixture('workspaces',{state:{cached:snap===cachedData,preferences:{workspaceTree:{},workspaceViews:{'workspace-view':{group_by:groupBy,hide_sleeping:true}}}}}),box={state:w.state,M:{}};vm.createContext(box);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',box);box.groupSnapshot(snap);w.view.update();const out={sections:w.all().filter(n=>n.classList.contains('repo-toggle')&&!n.parentElement.hidden).map(n=>n.querySelector('.repo-label').textContent),groups:w.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),depths:w.all().filter(n=>n.classList.contains('tree-node')).map(n=>n.dataset.depth)};w.abort.abort();return out;};
+  const liveOut=renderPair(warmInput),warmOut=renderPair(cachedData);
+  assert.deepEqual(warmOut,liveOut,`warm-cache Workspaces parity for group_by=${groupBy}`);
+  assert(!warmOut.groups.includes('a-ext-hidden'));assert(!warmOut.groups.includes('c-main'));
+ }
+ const homeLive=fixture('home'),homeWarm=fixture('home');
+ homeLive.ctx.connections=[{id:'pc',name:'Studio',connection:{phase:'ready'},snapshot:warmInput,workspaceView:{hide_sleeping:true}}];
+ homeWarm.ctx.connections=[{id:'pc',name:'Studio',connection:{phase:'connecting'},cached:true,snapshot:cachedData,workspaceView:{hide_sleeping:true}}];
+ homeLive.view.update();homeWarm.view.update();
+ assert.equal(homeWarm.find('.session-summary').textContent,homeLive.find('.session-summary').textContent,'Home workspace count matches warm-cached snapshot');
+ homeLive.abort.abort();homeWarm.abort.abort();
+ // Missing/mixed orders never yield NaN in Array.prototype.sort across Project, Status, and None modes.
+ const origSort=Array.prototype.sort;let sawNaN=false;
+ Array.prototype.sort=function(cmp){return origSort.call(this,cmp?(a,b)=>{const r=cmp(a,b);if(Number.isNaN(r))sawNaN=true;return r;}:undefined);};
+ try{
+  for(const groupBy of [0,1,3]){
+   const m=fixture('workspaces',{state:{preferences:{workspaceTree:{},workspaceViews:{'workspace-view':{group_by:groupBy}}}}}),mBox={state:m.state,M:{}};
+   vm.createContext(mBox);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',mBox);
+   mBox.groupSnapshot({repositories:[{key:'a',label:'Repo'}],workspaces:[{key:'w-z',repo_key:'a',label:'Zeta',status:'todo'},{key:'w-a',repo_key:'a',label:'Alpha',status:'todo'},{key:'w-ranked',repo_key:'a',label:'Ranked',status:'todo',orders:[0,0,0,0]}],sessions:[]});
+   m.view.update();
+   assert.deepEqual(m.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),['w-ranked','w-a','w-z'],`deterministic order for group_by=${groupBy}`);
+   m.abort.abort();
+  }
+ }finally{Array.prototype.sort=origSort;}
+ assert.equal(sawNaN,false,'rank comparator never returns NaN');
  console.log('PASS Orca workspace options: per-device project picker, group by none/status/project, sort, sleeping/automation/CLI filters redraw at once and save on this phone only');
 }
 async function desktopWorkspaceOrder(){
@@ -183,6 +222,104 @@ async function createWorktreeSheet(){
  await f.sheets.at(-1)[1][0].action();await f.flush();
  assert.deepEqual(JSON.parse(JSON.stringify(f.calls.at(-1))),{action:'create_workspace',repository:'krill',name:'custom-wt',base:'feat/mobile-ui',agent:'codex',setup_hash:'a'.repeat(64)});
  f.abort.abort();
+ // Multi-desktop "Run on" omits offline/cached/unsupported desktops and guards mid-open disconnect; app.js newWorkspace & pendingHostAction lifecycle.
+ const md=fixture('workspaces');
+ md.state.snapshot.capabilities={worktree_create:true};
+ md.state.snapshot.repositories=[{key:'krill',label:'krill',path:'/krill'}];
+ const connA={id:'a',name:'Studio Mac',active:true,endpoint:'Relay · aaaa',connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'krill',label:'krill',path:'/krill'}]}},
+  connB={id:'b',name:'Linux Box',active:false,endpoint:'Relay · bbbb',connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'krill',label:'krill',path:'/krill'}]}},
+  connOff={id:'off',name:'Sleeping MacBook',active:false,endpoint:'Relay · cccc',connection:{phase:'disconnected'},snapshot:{capabilities:{worktree_create:true}}},
+  connCached={id:'cached',name:'Cached Mac',active:false,endpoint:'Relay · dddd',cached:true,connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:true}}},
+  connOld={id:'old',name:'Legacy Mac',active:false,endpoint:'Relay · eeee',connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:false},repositories:[{key:'krill'}]}};
+ md.ctx.connections=[connA,connB,connOff,connCached,connOld];
+ md.ctx.hosts=[connA,connB,connOff,connCached,connOld];
+ md.view.update();
+ await md.byText('New workspace').action();
+ const mdBody=md.ctx.el('div');md.sheets.at(-1)[3](mdBody);const mdForm=mdBody.querySelector('.worktree-composer'),mdTargetBtn=mdForm.querySelector('.worktree-target-button'),mdTargetList=mdForm.querySelector('.target-picker-list');
+ await mdTargetBtn.action();
+ assert.deepEqual(mdTargetList.children.map(n=>n.querySelector('.worktree-field-title').textContent),['Studio Mac','Linux Box'],'Run on lists only ready non-cached desktops supporting worktree_create');
+ connB.connection.phase='disconnected';
+ await mdTargetList.children[1].action();
+ assert.equal(md.ctx.selected,undefined,'disconnecting while Run on is open prevents host switch');
+ connB.connection.phase='ready';
+ await mdTargetBtn.action();
+ let reopenedRepo=null;md.ctx.newWorkspace=repoKey=>{reopenedRepo=repoKey;};
+ await mdTargetList.children[1].action();
+ assert.equal(md.ctx.selected,'b');assert.equal(reopenedRepo,'krill');
+ md.abort.abort();
+ // Exercise real app.js newWorkspace(), selectHost(id, after), go() and hashchange cancellation.
+ {
+  const appSource=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8'),lines=appSource.split('\n'),pick=m=>lines.find(l=>l.trim().startsWith(m));
+  const selectIdx=lines.findIndex(l=>l.trim().startsWith('function selectHost(')),hashLine=lines.find(l=>l.includes("globalThis.addEventListener('hashchange'")),hashHandler=hashLine.slice(hashLine.indexOf("globalThis.addEventListener('hashchange'"));
+  let activeId='off',composers=[],sheetsOpen=[],renders=0,reloads=0;
+  const profiles=[{id:'off',name:'Sleeping MacBook',endpoint:'Relay · off',get active(){return activeId==='off';}},{id:'studio',name:'Studio Mac',endpoint:'Relay · studio',get active(){return activeId==='studio';}},{id:'linux',name:'Linux Box',endpoint:'Relay · linux',get active(){return activeId==='linux';}}];
+  const entries=new Map([
+   ['off',{id:'off',transport:{ready:false,setActive(){}},connection:{phase:'disconnected',message:'Not connected'},snapshot:{capabilities:{worktree_create:true}},cached:false,endpoint:{credentials:{device_id:'d1'}} }],
+   ['studio',{id:'studio',transport:{ready:true,setActive(){}},connection:{phase:'ready',message:'Connected'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'r1'}]},cached:false,endpoint:{credentials:{device_id:'d2'}} }],
+   ['linux',{id:'linux',transport:{ready:false,setActive(){}},connection:{phase:'connecting',message:'Connecting…'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'r1'}]},cached:false,endpoint:{credentials:{device_id:'d3'}} }]
+  ]);
+  const win=new EventTarget(),historyEntries=['#/'];let histIdx=0;
+  const loc={pathname:'/',search:'',reload(){reloads++;}};
+  Object.defineProperty(loc,'hash',{get:()=>historyEntries[histIdx],set:v=>{if(v===historyEntries[histIdx])return;historyEntries.splice(histIdx+1,Infinity,v);histIdx++;queueMicrotask(()=>win.dispatchEvent(new Event('hashchange')));}});
+  const box={
+   location:loc,history:{replaceState:(_a,_b,url)=>{historyEntries[histIdx]=url.slice(url.indexOf('#'));},back:()=>{histIdx--;queueMicrotask(()=>win.dispatchEvent(new Event('hashchange')));}},
+   addEventListener:win.addEventListener.bind(win),URLSearchParams,
+   endpoint:{profiles:()=>profiles,selectHost:id=>{activeId=id;return {device_id:'d-'+id};}},
+   pool:{sync(){},get:id=>entries.get(id),owns:()=>true},
+   state:{connection:entries.get('off').connection,cached:false,logs:[],preferences:{},groups:new Map(),sessions:new Map()},
+   transport:entries.get('off').transport,landing:false,activeRouteScreen:'home',
+   banner:{replaceChildren(){},append(){},hidden:true,className:''},notice:{hidden:true,textContent:''},dialog:{open:false,close(){this.open=false;}},
+   hideNotice(){},update(){},render(){renders++;box.activeRouteScreen=box.parseRoute().screen;},clearHost(){},
+   activateEntry:entry=>{activeId=entry.id;box.transport=entry.transport;box.state.connection=entry.connection;box.state.cached=entry.cached;box.state.snapshot=entry.snapshot;},
+   workspaceComposer:repo=>composers.push([activeId,repo]),
+   sheet:(title,items)=>sheetsOpen.push({title,items}),closeSheet(){box.dialog.open=false;},scanner:null,
+   el:()=>({append(){}}),button:()=>({}),t:s=>s,M:{recentSession:{list:()=>[]}}
+  };
+  box.globalThis=box;
+  vm.createContext(box);
+  vm.runInContext([
+   pick('let routeStack='),pick('const hostRoute='),pick('const sessionPath='),pick('const go='),pick('function back('),pick('const pairingLink='),
+   pick('function parseRoute('),pick('function showConnection('),lines[selectIdx],lines[selectIdx+1],pick('function getConnections('),
+   pick('const canCreateWorkspace='),pick('function newWorkspace('),hashHandler
+  ].join('\n')+'\nglobalThis.parseRoute=parseRoute;globalThis.newWorkspace=newWorkspace;globalThis.selectHost=selectHost;globalThis.go=go;globalThis.back=back;globalThis.showConnection=showConnection;',box);
+  // 1) Home with 1 offline active desktop + 1 online ready desktop -> skips "Choose desktop" and selects Studio Mac directly!
+  box.newWorkspace('r1');
+  assert.equal(sheetsOpen.length,0,'single ready desktop skips offline desktop chooser');
+  assert.equal(activeId,'studio');
+  assert.deepEqual(composers,[['studio','r1']]);
+  // 2) Home with 2 ready desktops + 1 offline -> "Choose desktop" lists only the 2 ready desktops.
+  entries.get('linux').transport.ready=true;entries.get('linux').connection={phase:'ready',message:'Connected'};
+  box.go('/',true);box.newWorkspace('r1');
+  assert.equal(sheetsOpen.length,1);
+  assert.deepEqual(sheetsOpen[0].items.map(i=>i.label),['Studio Mac · Relay · studio','Linux Box · Relay · linux']);
+  // 3) pendingHostAction runs when staying on target host, but cancels on go() or Back (hashchange).
+  entries.get('linux').transport.ready=false;entries.get('linux').connection={phase:'connecting',message:'Connecting…'};
+  let fired=0;
+  box.go('/',true);box.selectHost('linux',()=>{fired++;});
+  entries.get('linux').transport.ready=true;entries.get('linux').connection={phase:'ready',message:'Connected'};
+  box.showConnection(entries.get('linux').connection);
+  assert.equal(fired,1,'valid selectHost callback runs once target becomes ready');
+  // Arm on connecting active host from Home, let initial #/host/linux hashchange settle, then navigate away via go('/settings').
+  entries.get('linux').transport.ready=false;entries.get('linux').connection={phase:'connecting',message:'Connecting…'};
+  box.go('/',true);box.selectHost('linux',()=>{fired++;});
+  await Promise.resolve();await Promise.resolve();
+  box.go('/settings');
+  await Promise.resolve();await Promise.resolve();
+  entries.get('linux').transport.ready=true;entries.get('linux').connection={phase:'ready',message:'Connected'};
+  box.showConnection(entries.get('linux').connection);
+  assert.equal(fired,1,'go() cancels stale pendingHostAction before delayed ready');
+  // Arm again from Home, let initial #/host/linux hashchange settle, then press Back to Home (#/).
+  entries.get('linux').transport.ready=false;entries.get('linux').connection={phase:'connecting',message:'Connecting…'};
+  box.go('/',true);box.selectHost('linux',()=>{fired++;});
+  await Promise.resolve();await Promise.resolve();
+  box.back();
+  await Promise.resolve();await Promise.resolve();
+  assert.equal(loc.hash,'#/');
+  entries.get('linux').transport.ready=true;entries.get('linux').connection={phase:'ready',message:'Connected'};
+  box.showConnection(entries.get('linux').connection);
+  assert.equal(fired,1,'Back hashchange cancels stale pendingHostAction');
+  assert.equal(reloads,0);
+ }
  console.log('PASS Orca Create worktree sheet: FAB, project/remote picker, Run on target, branch source suggestions, agent picker, auto-name and setup review');
 }
 async function home(){const f=fixture('home');assert.equal(f.find('.krill-logo').src,'icon.svg');assert(!f.root.textContent.includes('Welcome back'));assert(f.root.textContent.includes('Connect your desktop'));
@@ -271,7 +408,20 @@ async function settings(){const f=fixture('settings'),link=label=>f.all().find(n
  const a=fixture('settings',{route:{subpage:'appearance'}});assert.deepEqual(a.all().find(n=>n.getAttribute('role')==='group'&&n.getAttribute('aria-label')==='Theme').children.map(n=>n.getAttribute('aria-pressed')),['false','false','true'],'Dark is the default theme');for(const v of [['Language','한국어','language','ko'],['Theme','Light','appearance','light'],['UI text size','150%','uiTextScale',1.5]])await choose(a,...v);assert(!a.all().some(n=>n.getAttribute('aria-label')==='Default session view'));a.headers[0].onBack();assert.equal(a.routes.at(-1),'/settings');a.abort.abort();
  const c=fixture('settings',{route:{subpage:'chat'}});await choose(c,'Default session view','Chat','defaultSessionView','chat');c.abort.abort();
  const invalid=fixture('settings',{route:{subpage:'chat'},state:{preferences:{defaultSessionView:'invalid'}}});assert.deepEqual(invalid.all().find(n=>n.getAttribute('aria-label')==='Default session view').children.map(n=>n.getAttribute('aria-pressed')),['false','true']);invalid.abort.abort();
- const g=fixture('settings',{route:{subpage:'terminal'}});g.headers[0].onBack();assert.equal(g.routes.at(-1),'/settings');for(const check of g.all().filter(n=>n.tagName==='INPUT'&&n.type==='checkbox')){const label=g.all().find(n=>n.tagName==='LABEL'&&n.htmlFor===check.id);assert(label);assert(label.textContent.length);assert(!label.querySelector('button'));check.checked=false;emit(check,'change');assert(!g.state.preferences.visibleKeyIds.includes(check.id.replace('accessory-key-','')));}await g.all().find(n=>n.getAttribute('aria-label')==='Buffered input').action();assert.equal(g.state.preferences.inputMode,'buffered');g.abort.abort();console.log('PASS SC-A11, CO-A14 and SC-Q01/Q02 support: checkbox label association excludes move buttons, installation reentry, persisted language/theme/UI scale and input mode segmented choices, settings page bar');}
+ const g=fixture('settings',{route:{subpage:'terminal'}});g.headers[0].onBack();assert.equal(g.routes.at(-1),'/settings');for(const check of g.all().filter(n=>n.tagName==='INPUT'&&n.type==='checkbox')){const label=g.all().find(n=>n.tagName==='LABEL'&&n.htmlFor===check.id);assert(label);assert(label.textContent.length);assert(!label.querySelector('button'));check.checked=false;emit(check,'change');assert(!g.state.preferences.visibleKeyIds.includes(check.id.replace('accessory-key-','')));}await g.all().find(n=>n.getAttribute('aria-label')==='Buffered input').action();assert.equal(g.state.preferences.inputMode,'buffered');g.abort.abort();
+ // Verify theme-color meta + manifest.json #0b0d13/#ffffff parity and system prefers-color-scheme change listener.
+ const manifest=JSON.parse(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/manifest.json'),'utf8'));
+ assert.equal(manifest.theme_color,'#0b0d13');assert.equal(manifest.background_color,'#0b0d13');
+ const appLines=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n'),media=Object.assign(new EventTarget(),{matches:false}),meta={content:'',setAttribute(_k,v){this.content=v;}},themeBox={state:{preferences:{}},M:{i18n:{configure(){}}},document:{documentElement:{dataset:{},style:{setProperty(){}}},querySelector:s=>s==='meta[name="theme-color"]'?meta:null},matchMedia:q=>q==='(prefers-color-scheme: light)'?media:null};
+ themeBox.globalThis=themeBox;vm.createContext(themeBox);
+ vm.runInContext([appLines.find(l=>l.trim().startsWith('function applyPreferences(')),appLines.find(l=>l.trim().startsWith('const colorSchemeMedia='))].join('\n')+'\nglobalThis.apply=applyPreferences;',themeBox);
+ themeBox.apply();assert.equal(meta.content,'#0b0d13','dark theme uses --surface-base #0b0d13');
+ themeBox.state.preferences.appearance='light';themeBox.apply();assert.equal(meta.content,'#ffffff','light theme uses --surface-base #ffffff');
+ themeBox.state.preferences.appearance='system';media.matches=false;themeBox.apply();assert.equal(meta.content,'#0b0d13');
+ media.matches=true;media.dispatchEvent(new Event('change'));assert.equal(meta.content,'#ffffff','OS switch to light updates theme-color in system mode');
+ media.matches=false;media.dispatchEvent(new Event('change'));assert.equal(meta.content,'#0b0d13','OS switch to dark updates theme-color in system mode');
+ themeBox.state.preferences.appearance='dark';media.matches=true;media.dispatchEvent(new Event('change'));assert.equal(meta.content,'#0b0d13','explicit dark ignores OS light change');
+ console.log('PASS SC-A11, CO-A14 and SC-Q01/Q02 support: checkbox label association excludes move buttons, installation reentry, persisted language/theme/UI scale and input mode segmented choices, settings page bar');}
 async function renderPerformance(){
  const f=fixture('workspaces');f.state.snapshot.repositories=[{key:'repo',label:'Large project'}];f.state.snapshot.workspaces=[];f.state.preferences.workspaceTree={'repo:repo':true};for(let i=0;i<1000;i++){const g={key:'g'+i,label:'Same',repoKey:'repo',path:'/repo/'+i+'/same',sessions:[]};f.state.groups.set(g.key,g);}f.view.update();assert.equal(f.all().filter(n=>n.dataset.group).length,1000);assert(f.find('.workspace-list').classList.contains('large-workspace-list'));assert(f.all().find(n=>n.dataset.group==='g500').textContent.includes('500/same'),'indexed suffix remains unambiguous');const focused=f.all().find(n=>n.dataset.group==='g500');let attributeWrites=0;const setAttribute=focused.setAttribute.bind(focused);focused.setAttribute=(...args)=>{attributeWrites++;setAttribute(...args);};f.view.update();assert.equal(attributeWrites,0,'unchanged row signature skips DOM attributes');focused.focus();const first=f.state.groups.get('g0');f.state.groups.delete(first.key);f.state.groups.set(first.key,first);f.view.update();assert.equal(f.doc.activeElement,focused);assert.equal(f.all().filter(n=>n.dataset.group).at(-1).dataset.group,'g0');const composing=f.find('input');composing.value='Same';composing.selectionStart=1;composing.selectionEnd=3;composing.focus();emit(composing,'compositionstart');emit(composing,'input');f.view.update();assert.equal(f.doc.activeElement,composing);assert.equal(composing.value,'Same');assert.equal(composing.selectionStart,1);assert.equal(composing.selectionEnd,3);emit(composing,'compositionend');f.abort.abort();
  const fields=fixture('workspaces'),{a,ga}=groups(fields);fields.state.preferences.workspaceTree['w:g-a']=true;fields.view.update();const stable=fields.all().find(n=>n.dataset.group==='g-a'),terminal=fields.all().find(n=>n.dataset.session==='1');terminal.focus();a.title='New terminal';a.agent='claude';a.lines=['new last line'];a.state='Blocked';a.branch='feature';ga.label='Renamed';ga.depth=2;ga.primary=true;fields.view.update();assert.equal(fields.all().find(n=>n.dataset.group==='g-a'),stable);assert.equal(fields.all().find(n=>n.dataset.session==='1'),terminal);assert.equal(fields.doc.activeElement,terminal);assert.equal(stable.parentElement.parentElement.dataset.depth,'2');assert(stable.textContent.includes('Renamed'));assert(stable.textContent.includes('feature'));assert(terminal.textContent.includes('New terminal'));assert(terminal.textContent.includes('new last line'));assert(terminal.getAttribute('aria-label').includes('Blocked'));assert(terminal.descendants().some(n=>n.getAttribute('class')==='agent-icon claude'));a.exited=true;fields.view.update();assert(!fields.all().some(n=>n.dataset.session==='1'),'exited session removal invalidates signature');fields.abort.abort();
@@ -329,6 +479,82 @@ async function installHandoffFragments(){
   for(const invalid of [null,123,'',`${direct}&t=krill.example.com&r=${r}`,`pair=${'A'.repeat(64)}&key=${key}`,`pair=${'a'.repeat(63)}&key=${key}`,`pair=${pair}&key=${key.slice(1)}`,`${direct}&r=`,`${direct}&r=${'C'.repeat(32)}`,`${direct}&r=${'c'.repeat(31)}`,`${direct}&r=${'c'.repeat(33)}`,`${direct}&t=https://krill.example.com&r=${r}`,`${direct}&t=krill.example.com/path&r=${r}`,`${direct}&t=localhost&r=${r}`,`${direct}&t=-bad.example.com&r=${r}`,`${direct}&t=bad-.example.com&r=${r}`,`${direct}&t=a..b.com&r=${r}`,`${direct}&t=${'a'.repeat(64)}.example.com&r=${r}`,`${direct}&t=user@krill.example.com&r=${r}`,`${direct}&r=${r}&t=krill.example.com`,`${direct}&r=${r}&r=${r}`,`${direct}&install=1`,`${direct}&extra=1`]){
    await assert.rejects(()=>run(code,invalid),/Could not prepare the Home Screen app/,`${platform} must reject ${invalid}`);
   }
+ }
+ // End-to-end install handoff lifecycle: live snapshot() updates continue while open and after close, hash restores to #/host/local, and forward + back() never calls location.reload().
+ {
+  const f=fixture('workspaces'),E=f.root.constructor,lines=source.split('\n'),pick=m=>lines.find(l=>l.trim().startsWith(m));
+  const dialog=new E('dialog'),sheetBody=new E('div'),rootNode=new E('main'),bannerNode=new E('div');
+  dialog.open=false;dialog.showModal=()=>{dialog.open=true;};dialog.close=()=>{dialog.open=false;dialog.dispatchEvent(new Event('close'));};dialog.removeAttribute=k=>{delete dialog.attrs[k];};
+  sheetBody.querySelector=()=>null;f.doc.body.classList.remove=v=>{f.doc.body.classList.toggle(v,false);};
+  dialog.append(sheetBody);f.doc.body.append(rootNode,dialog);
+  const win=new EventTarget(),entries=['#/host/local'];let idx=0,reloads=0,screenUpdates=0,renderedRoutes=[];
+  const loc={pathname:'/m/0123456789abcdef/',search:'',reload(){reloads++;}};
+  Object.defineProperty(loc,'hash',{get:()=>entries[idx],set:v=>{if(v===entries[idx])return;entries.splice(idx+1,Infinity,v);idx++;win.dispatchEvent(new Event('hashchange'));}});
+  const snapIdx=lines.findIndex(l=>l.trim().startsWith('function snapshot(')),hashLine=lines.find(l=>l.includes("globalThis.addEventListener('hashchange'")),hashHandler=hashLine.slice(hashLine.indexOf("globalThis.addEventListener('hashchange'"));
+  f.doc.addEventListener=()=>{};
+  const box={
+   document:f.doc,location:loc,history:{replaceState:(_a,_b,url)=>{entries[idx]=url.slice(url.indexOf('#'));},back:()=>{idx--;win.dispatchEvent(new Event('hashchange'));}},
+   addEventListener:win.addEventListener.bind(win),URLSearchParams,AbortController,Date,
+   credentials:{device_id:'dev'},endpoint:{profiles:()=>[{id:'local',active:true}],describeHost(){}},
+   transport:{ready:true,rpc:async req=>{assert.equal(req.action,'install_handoff');return {fragment:direct};}},
+   state:{snapshot:{workspaces:[{key:'w1',label:'Initial'}],sessions:[]},connection:{phase:'ready',message:'Connected'},groups:new Map(),sessions:new Map(),expected:new Map(),preferences:{}},
+   root:rootNode,banner:bannerNode,dialog,sheetBody,lastFocus:null,lastTrigger:null,routeKey:'#/host/local',activeRouteScreen:'workspaces',
+   screen:null,abort:null,hostGeneration:1,deepLink:null,parameters:new URLSearchParams(),
+   ios:true,android:false,installed:()=>false,landing:false,scanner:null,tabletMedia:null,tabletList:null,
+   el:(...v)=>new E(...v),icon:()=>new E('svg'),t:s=>s,error:e=>{throw e;},savePreferences(){},
+   button:(label,action,cls='')=>{const b=new E('button',label,cls);b.setAttribute('aria-label',label);b.action=()=>Promise.resolve().then(action);return b;},
+   sessionScope:()=>'scope',offerInstall:()=>false,M:{screens:{},recentSession:{resolve:()=>null}}
+  };
+  box.globalThis=box;
+  box.render=()=>{const r=box.parseRoute();const currentHash=typeof box.getInstallRestore()==='string'&&loc.hash.includes('&install=1')?box.getInstallRestore():loc.hash;box.routeKey=currentHash;box.activeRouteScreen=r.screen;renderedRoutes.push(r.screen);rootNode.replaceChildren(new E('section','','workspaces screen'));box.screen={update(){screenUpdates++;}};};
+  vm.createContext(box);
+  vm.runInContext([
+   pick('let routeStack='),pick('const hostRoute='),pick('const sessionPath='),pick('const go='),pick('function back('),
+   pick('function restoreFocus()'),pick('function closeSheet()'),pick("dialog.addEventListener('close'"),pick('function sheet('),
+   pick('const pairingLink='),iosFn,androidFn,pick('const install=M.install='),pick('function parseRoute('),
+   pick('let imeComposing='),pick('function update(){'),pick('function group(data)'),
+   'let pendingRecent=null;',lines[snapIdx],lines[snapIdx+1],lines[snapIdx+2],lines[snapIdx+3],hashHandler
+  ].join('\n')+'\nglobalThis.parseRoute=parseRoute;globalThis.getInstallRestore=()=>installRestoreHash;globalThis.runIos=installIos;globalThis.runAndroid=installAndroid;globalThis.closeSheet=closeSheet;globalThis.snapshot=snapshot;globalThis.go=go;globalThis.back=back;globalThis.install=install;',box);
+  box.render();
+  // 1) iOS install sheet open -> live snapshot() still updates -> closeSheet restores #/host/local -> forward + back() does not reload.
+  await box.runIos();
+  assert.equal(dialog.open,true);
+  assert.equal(loc.hash,`#${direct}&install=1`);
+  const beforeOpenUpdate=screenUpdates;
+  box.snapshot({workspaces:[{key:'w1',label:'Updated while sheet open'}],sessions:[{id:1,worktree_key:'w1',state:'Working'}]});
+  assert.equal(screenUpdates,beforeOpenUpdate+1,'live snapshot updates continue while iOS install sheet is open');
+  assert.equal(box.state.groups.get('w1').label,'Updated while sheet open');
+  box.closeSheet();
+  assert.equal(dialog.open,false);
+  assert.equal(loc.hash,'#/host/local','closing install sheet restores #/host/local');
+  box.snapshot({workspaces:[{key:'w1',label:'Updated after close'}],sessions:[{id:1,worktree_key:'w1',state:'Waiting'}]});
+  assert.equal(screenUpdates,beforeOpenUpdate+2,'live snapshot updates continue after closing install sheet');
+  assert.equal(box.state.groups.get('w1').label,'Updated after close');
+  box.go('/settings');
+  assert.equal(loc.hash,'#/settings');
+  box.back();
+  assert.equal(loc.hash,'#/host/local','Back returns to #/host/local');
+  assert.equal(reloads,0,'Back never triggers location.reload()');
+  // 2) Android install sheet with deferred beforeinstallprompt -> keeps &install=1 until install.show() settles, then restores #/host/local.
+  const choice=deferred();let prompted=0;
+  box.install.prompt={prompt:async()=>{prompted++;},userChoice:choice.promise};
+  await box.runAndroid();
+  assert.equal(dialog.open,true);
+  assert.equal(loc.hash,`#${direct}&install=1`);
+  const installBtn=sheetBody.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Install');
+  const pendingInstall=installBtn.action();
+  await f.flush();
+  assert.equal(dialog.open,false);
+  assert.equal(prompted,1);
+  assert.equal(loc.hash,`#${direct}&install=1`,'Android Install button keeps handoff hash while native prompt is open');
+  box.snapshot({workspaces:[{key:'w1',label:'Updated during Android prompt'}],sessions:[{id:1,worktree_key:'w1',state:'Done'}]});
+  assert.equal(screenUpdates,beforeOpenUpdate+3,'live snapshot updates continue while Android native prompt awaits userChoice');
+  choice.resolve({outcome:'dismissed'});
+  await pendingInstall;
+  assert.equal(loc.hash,'#/host/local','settling install.show() restores #/host/local');
+  box.go('/settings');box.back();
+  assert.equal(loc.hash,'#/host/local');assert.equal(reloads,0);
+  f.abort.abort();
  }
  console.log('PASS REMOTE-001: iOS/Android install_handoff accepts direct, relay and fixed/named tunnel fragments and rejects malformed fragments');
 }

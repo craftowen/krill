@@ -44,6 +44,65 @@ for(const name of ['screens/details.js','screens/home.js','screens/settings.js']
 console.log('PASS mobile screens: account usage/reset/status, Needs You, connection log, toast auto-hide and same-tab pairing link detection');
 for(const name of ['index.html','app.js','app.css','i18n.js','manifest.json','icon.svg','icon-192.png','icon-512.png','icon-maskable-512.png','apple-touch-icon.png','crypto.js','storage.js','client.js','terminal.js','qr.js','sw.js','screens/chat.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
 const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','i18n.js','storage.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','app.js']){const at=html.indexOf('src="'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
+// Direct-origin offline shell service worker: v6 icon inventory, 5xx fallback and fetch timeout.
+async function serviceWorkerTests(){
+ const swSource=fs.readFileSync(path.join(assets,'sw.js'),'utf8');
+ function swFixture(){
+  const listeners=new Map(),stores=new Map(),signals=[];let skipped=0,claimed=0;
+  const openStore=name=>{let map=stores.get(name);if(!map){map=new Map();stores.set(name,map);}return {async addAll(urls){for(const u of urls)map.set('https://desktop.tail123.ts.net:18449'+u,{status:200,ok:true,body:'precached:'+u,clone(){return {...this};}});},async match(key){return map.get(key)||undefined;},async put(key,res){map.set(key,res);}};};
+  let responder=async url=>({status:200,ok:true,redirected:false,body:'live:'+url,clone(){return {...this};}});
+  const context=vm.createContext({
+   URL,
+   location:new URL('https://desktop.tail123.ts.net:18449/'),
+   AbortSignal:{timeout(ms){const s={timeoutMs:ms};signals.push(s);return s;}},
+   caches:{async open(name){return openStore(name);},async keys(){return [...stores.keys()];},async delete(name){return stores.delete(name);}},
+   fetch:(req,init)=>{signals.push({url:req.url,init});return responder(req.url,init);},
+   self:{addEventListener:(type,fn)=>listeners.set(type,fn),skipWaiting:async()=>{skipped++;},clients:{claim:async()=>{claimed++;}}}
+  });
+  context.globalThis=context;
+  vm.runInContext(swSource,context);
+  return {stores,signals,get skipped(){return skipped;},get claimed(){return claimed;},setResponder(fn){responder=fn;},
+   async install(){let p;listeners.get('install')({waitUntil:v=>{p=v;}});await p;},
+   async activate(){let p;listeners.get('activate')({waitUntil:v=>{p=v;}});await p;},
+   async get(pathname,method='GET',origin='https://desktop.tail123.ts.net:18449'){let p;listeners.get('fetch')({request:{url:origin+pathname,method},respondWith:v=>{p=v;}});return p?await p:null;}
+  };
+ }
+ const sw=swFixture();
+ sw.stores.set('krill-direct-shell-v5',new Map([['https://desktop.tail123.ts.net:18449/',{status:200,body:'old'}]]));
+ sw.stores.set('unrelated-cache',new Map([['k','v']]));
+ await sw.install();
+ assert(sw.stores.has('krill-direct-shell-v6'));
+ assert.equal(sw.skipped,1);
+ const cachedKeys=[...sw.stores.get('krill-direct-shell-v6').keys()];
+ for(const icon of ['/icon.svg','/apple-touch-icon.png','/icon-192.png','/icon-512.png','/icon-maskable-512.png','/manifest.json','/'])assert(cachedKeys.includes('https://desktop.tail123.ts.net:18449'+icon),icon);
+ await sw.activate();
+ assert(!sw.stores.has('krill-direct-shell-v5'),'activate deletes prior shell cache');
+ assert(sw.stores.has('krill-direct-shell-v6'));
+ assert(sw.stores.has('unrelated-cache'));
+ assert.equal(sw.claimed,1);
+ const liveShell=await sw.get('/');
+ assert.equal(liveShell.body,'live:https://desktop.tail123.ts.net:18449/');
+ const fetchCall=sw.signals.find(x=>x.url==='https://desktop.tail123.ts.net:18449/');
+ assert.equal(fetchCall.init.cache,'no-store');
+ assert.equal(fetchCall.init.signal.timeoutMs,3500);
+ // Upstream 502/503 during daemon restart falls back to cached shell/icons without overwriting cache.
+ for(const status of [502,503]){
+  sw.setResponder(async()=>({status,ok:false,redirected:false,body:'proxy-error-'+status,clone(){return {...this};}}));
+  assert.equal((await sw.get('/')).body,'live:https://desktop.tail123.ts.net:18449/');
+  assert.equal((await sw.get('/apple-touch-icon.png')).body,'precached:/apple-touch-icon.png');
+ }
+ // If a shell entry is not yet cached, a 502 still returns the upstream response cleanly.
+ sw.stores.get('krill-direct-shell-v6').delete('https://desktop.tail123.ts.net:18449/qr.js');
+ assert.equal((await sw.get('/qr.js')).status,503);
+ // Stalled fetch aborting via AbortSignal.timeout(3500) serves cached /app.js.
+ sw.setResponder(async(_url,init)=>{assert.equal(init.signal.timeoutMs,3500);const err=new Error('The operation was aborted due to timeout');err.name='TimeoutError';throw err;});
+ assert.equal((await sw.get('/app.js')).body,'precached:/app.js');
+ // Auth URLs remain network-only on 200/502 and never overwrite SHELL cache.
+ sw.setResponder(async()=>({status:200,ok:true,redirected:false,body:'auth-page'}));
+ assert.equal((await sw.get('/?pair=abc&key=def')).body,'auth-page');
+ assert.equal(sw.stores.get('krill-direct-shell-v6').get('https://desktop.tail123.ts.net:18449/').body,'live:https://desktop.tail123.ts.net:18449/');
+ console.log('PASS service worker v6: raster icons precached, 3500ms fetch timeout, 5xx and timeout fallback to cache, auth bypass');
+}
 // Fixed-origin bootstrap and transport, with real crypto and deterministic sockets.
 async function fixedOriginTests(){
  const hash='0123456789abcdef',rid='a'.repeat(32),saved={device_id:'saved',credential:'ab'.repeat(32),rid,hash};
@@ -123,6 +182,7 @@ const historyFixture=T.history(Buffer.from('100000002609e807030a0201017800000000
 const before=model.rows[3];T.update(Buffer.concat([v(301),v(70000),v(1),v(1),v(1),v(2)]),model);assert.equal(model.rows[2],before);
 for(let n=0;n<128;n++){const bytes=crypto.randomBytes(n);try{T.update(bytes,{cols:80,lines:24,rows:Array.from({length:24},()=>[])});}catch{}try{T.history(bytes);}catch{}}
 assert.equal(sandbox.KrillMobile.terminal.keys.length,24);
+if(process.argv.includes('--unit-only')){(async()=>{await serviceWorkerTests();await fixedOriginTests();console.log('PASS mobile_pwa unit-only suite');})().catch(error=>{console.error(error.stack);process.exitCode=1;});return;}
 const dir=fs.mkdtempSync('/tmp/m9pwa-'),repo=path.join(dir,'repo'),home=path.join(dir,'home'),profile=path.join(dir,'account');
 fs.mkdirSync(repo);fs.mkdirSync(home);fs.mkdirSync(profile);fs.mkdirSync(path.join(dir,'paste'),{mode:0o700});
 const env={...process.env,KRILL_TEST_OFFLINE:'1',KRILL_TELEMETRY_DISABLED:'1',KRILL_ERROR_REPORTING_DISABLED:'1',KRILL_STATE_DIR:dir,HOME:home,CLAUDE_CONFIG_DIR:path.join(home,'.claude'),CODEX_HOME:path.join(home,'.codex'),TMPDIR:path.join(dir,'paste')};
@@ -154,6 +214,7 @@ async function connect(url,credential){
 }
 (async()=>{
  try {
+  await serviceWorkerTests();
   await fixedOriginTests();
   await require('./mobile_session.cjs').main();
   git(['init','-b','mobile-test']);git(['config','user.email','test@example.invalid']);git(['config','user.name','M9 test']);fs.writeFileSync(path.join(repo,'example.txt'),'before\n');git(['add','.']);git(['commit','-m','fixture']);fs.appendFileSync(path.join(repo,'example.txt'),'after\n');

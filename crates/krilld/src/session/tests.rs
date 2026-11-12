@@ -1100,3 +1100,65 @@ fn frozen_snapshot_waits_for_publication_but_cancels_without_holding_pty_live_lo
     drop(pty.user);
     session.wait().unwrap();
 }
+
+#[test]
+fn clear_viewport_invalidates_capture_cache_and_recovers_poison_and_unwind() {
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let session = Session::start(
+        SessionId(995),
+        pty.controller,
+        WinSize { cols: 80, rows: 24 },
+        Arc::new(Appearance::load(PathBuf::new())),
+        None,
+    )
+    .unwrap();
+    let tap = session.tap();
+    let (_, rev1, _) = guarded(&tap.0, 12, |engine| {
+        engine.feed(b"before\r\nkeep", Feed::Live, &tap.0.look)
+    });
+    tap.0.publish(b"before\r\nkeep", rev1, false);
+    let cached_before = tap.capture_shared_with_modes();
+    assert!(cached_before.0.rows.first().is_some_and(|r| {
+        r.iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .contains("before")
+    }));
+
+    assert!(tap.clear_viewport());
+    let cached_after = tap.capture_shared_with_modes();
+    assert!(!Arc::ptr_eq(&cached_before.0, &cached_after.0));
+    assert_eq!(tap.pulse().revision, cached_after.1.0);
+    let first_row: String = cached_after
+        .0
+        .rows
+        .first()
+        .map(|r| r.iter().map(|c| c.ch).collect())
+        .unwrap_or_default();
+    assert!(first_row.contains("keep"), "{first_row:?}");
+
+    // Unwind inside clear_viewport_with replaces engine, invalidates capture cache, and publishes bumped revision.
+    let rev_before_panic = tap.pulse().revision;
+    assert!(!tap.clear_viewport_with(|_| panic!("boom")));
+    assert!(lock(&tap.0.capture).is_none());
+    assert!(tap.pulse().revision > rev_before_panic);
+
+    // Stop the PTY reader first so its startup/poll loop cannot race ahead and recover the
+    // poisoned live mutex before `clear_viewport` runs.
+    drop(pty.user);
+    session.wait().unwrap();
+
+    // Poisoned live mutex is recovered by clear_viewport without panicking.
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tap.0.live.lock().unwrap();
+            panic!("poison live");
+        }))
+        .is_err()
+    );
+    assert!(tap.0.live.is_poisoned());
+    let rev_before_poison_clear = tap.pulse().revision;
+    assert!(tap.clear_viewport());
+    assert!(!tap.0.live.is_poisoned());
+    assert!(tap.pulse().revision > rev_before_poison_clear);
+}

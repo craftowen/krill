@@ -5,6 +5,7 @@
 //! UI/design adapted from Orca (src/renderer/src/components/automations/AutomationsPage.tsx).
 //! Copyright (c) 2026 Lovecast Inc., MIT License; implemented here in Rust.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
-use gpui_component::{IconName, Sizable as _};
+use gpui_component::{Disableable as _, IconName, Sizable as _};
 use krill_proto::schedule::{
     Cron, Schedule, ScheduleRun, Schedules, WorkspaceMode, load_coalesced_runs, request_run_now,
 };
@@ -409,6 +410,12 @@ pub fn project_label(cwd: &str) -> String {
         .to_owned()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArmedDelete {
+    Row(String),
+    Detail(String),
+}
+
 #[derive(Debug)]
 pub struct EditorModal {
     pub editing_id: Option<String>,
@@ -422,6 +429,7 @@ pub struct EditorModal {
     pub agent: AgentFilter,
     pub workspace_mode: WorkspaceMode,
     pub enabled: bool,
+    pub submitting: bool,
     pub error: Option<SharedString>,
 }
 
@@ -449,11 +457,14 @@ pub struct View {
     filter_menu_open: bool,
     template_menu_open: bool,
     modal: Option<EditorModal>,
+    armed_delete: Option<ArmedDelete>,
     run_log_output: String,
     run_log_generation: u64,
     form_generation: u64,
     error: Option<SharedString>,
-    task: Option<Task<()>>,
+    save_task: Option<Task<()>>,
+    action_tasks: BTreeMap<u64, Task<()>>,
+    next_action_task_id: u64,
     language: crate::i18n::Language,
 }
 
@@ -502,11 +513,14 @@ impl View {
             filter_menu_open: false,
             template_menu_open: false,
             modal: None,
+            armed_delete: None,
             run_log_output: String::new(),
             run_log_generation: 0,
             form_generation: 0,
             error: None,
-            task: None,
+            save_task: None,
+            action_tasks: BTreeMap::new(),
+            next_action_task_id: 0,
             language: crate::i18n::language(),
         };
         view.reload(cx);
@@ -546,6 +560,7 @@ impl View {
     }
 
     pub fn open_detail(&mut self, id: String, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         self.prompt_expanded = false;
         self.screen = PageView::Detail {
             id,
@@ -555,6 +570,7 @@ impl View {
     }
 
     pub fn set_detail_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         if let PageView::Detail {
             tab: current_tab, ..
         } = &mut self.screen
@@ -565,6 +581,7 @@ impl View {
     }
 
     pub fn open_runs_dashboard(&mut self, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         self.screen = PageView::RunsDashboard;
         cx.notify();
     }
@@ -575,6 +592,7 @@ impl View {
         return_to_detail: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.armed_delete = None;
         self.run_log_generation = self.run_log_generation.wrapping_add(1);
         let generation = self.run_log_generation;
         let dir = self.state_dir.clone();
@@ -638,6 +656,10 @@ impl View {
             self.close_modal(cx);
             return;
         }
+        if self.armed_delete.take().is_some() {
+            cx.notify();
+            return;
+        }
         match &self.screen {
             PageView::RunDetails {
                 return_to_detail, ..
@@ -668,6 +690,7 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.armed_delete = None;
         self.form_generation = self.form_generation.wrapping_add(1);
         self.template_menu_open = false;
         let editing_id = existing.map(|s| s.id.clone());
@@ -742,6 +765,7 @@ impl View {
             agent,
             workspace_mode,
             enabled,
+            submitting: false,
             error: None,
         });
         cx.notify();
@@ -782,6 +806,9 @@ impl View {
     }
 
     pub fn close_modal(&mut self, cx: &mut Context<Self>) {
+        if self.modal.as_ref().is_some_and(|m| m.submitting) {
+            return;
+        }
         self.form_generation = self.form_generation.wrapping_add(1);
         self.modal = None;
         self.template_menu_open = false;
@@ -792,6 +819,9 @@ impl View {
         let Some(modal) = &mut self.modal else {
             return;
         };
+        if modal.submitting {
+            return;
+        }
         let id = modal.id.read(cx).value().trim().to_owned();
         let cron = modal.cron.read(cx).value().trim().to_owned();
         let cwd = modal.cwd.read(cx).value().trim().to_owned();
@@ -859,8 +889,12 @@ impl View {
             fail(modal, stext::NO_STATE_DIR.get().to_owned(), cx);
             return;
         };
+        modal.submitting = true;
+        modal.error = None;
+        self.error = None;
+        cx.notify();
         let generation = self.form_generation;
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.save_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
@@ -871,6 +905,7 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.save_task = None;
                 if this.form_generation != generation {
                     this.reload(cx);
                     return;
@@ -889,6 +924,7 @@ impl View {
                         let msg: SharedString = err.to_string().into();
                         this.error = Some(msg.clone());
                         if let Some(m) = &mut this.modal {
+                            m.submitting = false;
                             m.error = Some(msg);
                         }
                     }
@@ -899,12 +935,36 @@ impl View {
         }));
     }
 
+    fn activate_row_delete(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.armed_delete.as_ref() == Some(&ArmedDelete::Row(id.to_owned())) {
+            self.armed_delete = None;
+            self.delete_schedule(id, cx);
+        } else {
+            self.armed_delete = Some(ArmedDelete::Row(id.to_owned()));
+            cx.notify();
+        }
+    }
+
+    fn activate_detail_delete(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.armed_delete.as_ref() == Some(&ArmedDelete::Detail(id.to_owned())) {
+            self.armed_delete = None;
+            self.delete_schedule(id, cx);
+        } else {
+            self.armed_delete = Some(ArmedDelete::Detail(id.to_owned()));
+            cx.notify();
+        }
+    }
+
     pub fn toggle_enabled(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         let Some(dir) = self.state_dir.clone() else {
             return;
         };
+        self.error = None;
         let id = id.to_owned();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        let task_id = self.next_action_task_id;
+        self.next_action_task_id = self.next_action_task_id.wrapping_add(1);
+        let task = cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -918,20 +978,28 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.error = res.err().map(|e| e.to_string().into());
+                this.action_tasks.remove(&task_id);
+                if let Err(e) = res {
+                    this.error = Some(e.to_string().into());
+                }
                 this.reload(cx);
             })
             .ok();
-        }));
+        });
+        self.action_tasks.insert(task_id, task);
     }
 
     pub fn delete_schedule(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         let Some(dir) = self.state_dir.clone() else {
             return;
         };
+        self.error = None;
         let id = id.to_owned();
         let id_check = id.clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        let task_id = self.next_action_task_id;
+        self.next_action_task_id = self.next_action_task_id.wrapping_add(1);
+        let task = cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -942,6 +1010,7 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.action_tasks.remove(&task_id);
                 match res {
                     Ok(()) => {
                         if let PageView::Detail { id: cur, .. } = &this.screen
@@ -949,7 +1018,6 @@ impl View {
                         {
                             this.screen = PageView::List;
                         }
-                        this.error = None;
                     }
                     Err(e) => {
                         this.error = Some(e.to_string().into());
@@ -958,15 +1026,20 @@ impl View {
                 this.reload(cx);
             })
             .ok();
-        }));
+        });
+        self.action_tasks.insert(task_id, task);
     }
 
     pub fn run_now(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         let Some(dir) = self.state_dir.clone() else {
             return;
         };
+        self.error = None;
         let id = id.to_owned();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        let task_id = self.next_action_task_id;
+        self.next_action_task_id = self.next_action_task_id.wrapping_add(1);
+        let task = cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -980,11 +1053,15 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.error = res.err().map(|e| e.to_string().into());
+                this.action_tasks.remove(&task_id);
+                if let Err(e) = res {
+                    this.error = Some(e.to_string().into());
+                }
                 this.reload(cx);
             })
             .ok();
-        }));
+        });
+        self.action_tasks.insert(task_id, task);
     }
 
     fn latest_run_for(&self, id: &str) -> Option<&ScheduleRun> {
@@ -998,6 +1075,7 @@ impl View {
     }
 
     pub fn clear_filters(&mut self, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         self.status_filter = StatusFilter::All;
         self.last_run_filter = LastRunFilter::All;
         self.agent_filter = AgentFilter::All;
@@ -1898,8 +1976,10 @@ impl View {
                                         },
                                     )),
                                 )
-                                .child(
-                                    ui::ghost(format!("automation-edit-{id}"), "")
+                                .child(ui::button_with_tooltip(
+                                    Button::new(format!("automation-edit-{id}"))
+                                        .small()
+                                        .ghost()
                                         .debug_selector({
                                             let id = id.clone();
                                             move || format!("automation-edit-{id}")
@@ -1913,16 +1993,18 @@ impl View {
                                                 cx,
                                             );
                                         })),
-                                )
+                                    format!("automation-edit-{id}"),
+                                    text::ACT_EDIT.get(),
+                                ))
                                 .child(
-                                    ui::ghost(
+                                    ui::button_with_reserved_label(
                                         format!("automation-toggle-{id}"),
-                                        if sched.enabled {
-                                            text::ACT_PAUSE.get()
-                                        } else {
-                                            text::ACT_RESUME.get()
-                                        },
+                                        text::ACT_PAUSE.get(),
+                                        text::ACT_RESUME.get(),
+                                        !sched.enabled,
                                     )
+                                    .small()
+                                    .ghost()
                                     .debug_selector({
                                         let id = id.clone();
                                         move || format!("automation-toggle-{id}")
@@ -1934,18 +2016,48 @@ impl View {
                                         },
                                     )),
                                 )
-                                .child(
-                                    ui::ghost(format!("automation-delete-{id}"), "")
+                                .child({
+                                    let row_delete_armed = self.armed_delete.as_ref()
+                                        == Some(&ArmedDelete::Row(id.clone()));
+                                    ui::button_with_tooltip(
+                                        (if row_delete_armed {
+                                            Button::new(format!("automation-delete-{id}")).danger()
+                                        } else {
+                                            Button::new(format!("automation-delete-{id}")).ghost()
+                                        })
+                                        .small()
                                         .debug_selector({
                                             let id = id.clone();
                                             move || format!("automation-delete-{id}")
                                         })
                                         .icon(IconName::Delete)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.delete_schedule(&id_delete, cx);
-                                        })),
-                                ),
+                                        .when(row_delete_armed, |btn| {
+                                            let out_id = id.clone();
+                                            btn.on_mouse_down_out(cx.listener(
+                                                move |this, _, _, cx| {
+                                                    if this.armed_delete.as_ref()
+                                                        == Some(&ArmedDelete::Row(out_id.clone()))
+                                                    {
+                                                        this.armed_delete = None;
+                                                        cx.notify();
+                                                    }
+                                                },
+                                            ))
+                                        })
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.activate_row_delete(&id_delete, cx);
+                                            }),
+                                        ),
+                                        format!("automation-delete-{id}"),
+                                        if row_delete_armed {
+                                            stext::CONFIRM_AGAIN.get()
+                                        } else {
+                                            text::ACT_DELETE.get()
+                                        },
+                                    )
+                                }),
                         ),
                 );
             }
@@ -2249,14 +2361,14 @@ impl View {
                                         ),
                                     )
                                     .child(
-                                        ui::secondary(
+                                        ui::button_with_reserved_label(
                                             "automations-detail-toggle",
-                                            if sched.enabled {
-                                                text::ACT_PAUSE.get()
-                                            } else {
-                                                text::ACT_RESUME.get()
-                                            },
+                                            text::ACT_PAUSE.get(),
+                                            text::ACT_RESUME.get(),
+                                            !sched.enabled,
                                         )
+                                        .small()
+                                        .outline()
                                         .debug_selector(|| "automations-detail-toggle".into())
                                         .on_click(
                                             cx.listener(move |this, _, _, cx| {
@@ -2264,16 +2376,37 @@ impl View {
                                             }),
                                         ),
                                     )
-                                    .child(
-                                        Button::new("automations-detail-delete")
-                                            .small()
-                                            .danger()
-                                            .label(text::ACT_DELETE.get())
-                                            .debug_selector(|| "automations-detail-delete".into())
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.delete_schedule(&id_delete, cx);
-                                            })),
-                                    ),
+                                    .child({
+                                        let detail_delete_armed = self.armed_delete.as_ref()
+                                            == Some(&ArmedDelete::Detail(id.to_owned()));
+                                        ui::danger_confirm(
+                                            "automations-detail-delete",
+                                            text::ACT_DELETE.get(),
+                                            stext::CONFIRM_AGAIN.get(),
+                                            detail_delete_armed,
+                                        )
+                                        .debug_selector(|| "automations-detail-delete".into())
+                                        .when(detail_delete_armed, |btn| {
+                                            let out_id = id.to_owned();
+                                            btn.on_mouse_down_out(cx.listener(
+                                                move |this, _, _, cx| {
+                                                    if this.armed_delete.as_ref()
+                                                        == Some(&ArmedDelete::Detail(
+                                                            out_id.clone(),
+                                                        ))
+                                                    {
+                                                        this.armed_delete = None;
+                                                        cx.notify();
+                                                    }
+                                                },
+                                            ))
+                                        })
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.activate_detail_delete(&id_delete, cx);
+                                            }),
+                                        )
+                                    }),
                             ),
                     )
                     .child(
@@ -3030,6 +3163,7 @@ impl View {
         };
 
         let reuse_active = modal.workspace_mode == WorkspaceMode::Reuse;
+        let submitting = modal.submitting;
         // Keep both form sections usable when the modal cannot fit two columns.
         let stacked = window.viewport_size().width < px(960.) + ui::SPACE_4 * 2.;
 
@@ -3082,6 +3216,7 @@ impl View {
                                         text::USE_TEMPLATE.get(),
                                     )
                                     .debug_selector(|| "automations-modal-template-btn".into())
+                                    .disabled(submitting)
                                     .on_click(cx.listener(
                                         |this, _, _, cx| {
                                             this.template_menu_open = !this.template_menu_open;
@@ -3090,11 +3225,17 @@ impl View {
                                     )),
                                 )
                             })
-                            .child(
-                                ui::ghost("automations-modal-close", "")
+                            .child(ui::button_with_tooltip(
+                                Button::new("automations-modal-close")
+                                    .small()
+                                    .ghost()
+                                    .debug_selector(|| "automations-modal-close".into())
                                     .icon(IconName::Close)
+                                    .disabled(submitting)
                                     .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
-                            ),
+                                "automations-modal-close",
+                                text::CLOSE.get(),
+                            )),
                     ),
             )
             .when(self.template_menu_open, |d| {
@@ -3423,6 +3564,7 @@ impl View {
                             .child(
                                 ui::ghost("automations-modal-cancel", stext::SCHEDULE_CANCEL.get())
                                     .debug_selector(|| "automations-modal-cancel".into())
+                                    .disabled(submitting)
                                     .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
                             )
                             .child(
@@ -3435,6 +3577,7 @@ impl View {
                                     },
                                 )
                                 .debug_selector(|| "automations-modal-save".into())
+                                .disabled(submitting)
                                 .on_click(cx.listener(
                                     |this, _, window, cx| {
                                         this.submit_modal(window, cx);
@@ -3456,19 +3599,29 @@ impl Render for View {
         let p = ui::palette(cx);
         if self.search_input.is_none() && cx.has_global::<gpui_component::Theme>() {
             let input = cx.new(|cx| InputState::new(window, cx).placeholder(text::SEARCH.get()));
-            self.search_sub = Some(cx.observe(&input, |this, input, cx| {
-                this.query = input.read(cx).value().to_lowercase();
-                cx.notify();
-            }));
+            self.search_sub = Some(cx.subscribe(
+                &input,
+                |this, input, event: &gpui_component::input::InputEvent, cx| {
+                    if matches!(event, gpui_component::input::InputEvent::Change) {
+                        this.query = input.read(cx).value().to_lowercase();
+                        cx.notify();
+                    }
+                },
+            ));
             self.search_input = Some(input);
         }
         if self.runs_search_input.is_none() && cx.has_global::<gpui_component::Theme>() {
             let input =
                 cx.new(|cx| InputState::new(window, cx).placeholder(text::SEARCH_RUNS.get()));
-            self.runs_search_sub = Some(cx.observe(&input, |this, input, cx| {
-                this.runs_query = input.read(cx).value().to_lowercase();
-                cx.notify();
-            }));
+            self.runs_search_sub = Some(cx.subscribe(
+                &input,
+                |this, input, event: &gpui_component::input::InputEvent, cx| {
+                    if matches!(event, gpui_component::input::InputEvent::Change) {
+                        this.runs_query = input.read(cx).value().to_lowercase();
+                        cx.notify();
+                    }
+                },
+            ));
             self.runs_search_input = Some(input);
         }
 
@@ -3762,5 +3915,249 @@ mod tests {
         });
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[gpui::test]
+    fn automation_delete_requires_second_click_and_keeps_neighbor_bounds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-automations-delete-confirm-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |id: &str| Schedule {
+            id: id.into(),
+            cron: "0 9 * * *".into(),
+            cwd: dir.to_string_lossy().into_owned(),
+            command: vec!["claude".into(), "-p".into()],
+            prompt: "Check repo".into(),
+            workspace_mode: WorkspaceMode::Isolate,
+            enabled: true,
+            ..Schedule::default()
+        };
+        Schedules {
+            schedule: vec![make("daily"), make("weekly")],
+        }
+        .save(&dir)
+        .unwrap();
+
+        cx.update(gpui_component::init);
+        let dir_clone = dir.clone();
+        let (view, visual) =
+            cx.add_window_view(|_, cx| View::new(Some(dir_clone), Some(PathBuf::from("/tmp")), cx));
+        visual.simulate_resize(gpui::size(px(1200.), px(640.)));
+        visual.run_until_parked();
+
+        let toggle_before = visual.debug_bounds("automation-toggle-daily").unwrap();
+        let edit_before = visual.debug_bounds("automation-edit-daily").unwrap();
+        let del_before = visual.debug_bounds("automation-delete-daily").unwrap();
+
+        visual.simulate_click(del_before.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        view.read_with(visual, |v, _| assert_eq!(v.schedules().len(), 2));
+        assert_eq!(
+            visual.debug_bounds("automation-toggle-daily"),
+            Some(toggle_before)
+        );
+        assert_eq!(
+            visual.debug_bounds("automation-edit-daily"),
+            Some(edit_before)
+        );
+        assert_eq!(
+            visual.debug_bounds("automation-delete-daily"),
+            Some(del_before)
+        );
+
+        // Escape disarms without emitting Close.
+        view.update(visual, View::handle_escape);
+        visual.run_until_parked();
+        view.read_with(visual, |v, _| {
+            assert!(v.armed_delete.is_none());
+            assert_eq!(v.page_view(), &PageView::List);
+        });
+
+        // Two clicks on row delete confirm deletion.
+        let del_btn = visual.debug_bounds("automation-delete-daily").unwrap();
+        visual.simulate_click(del_btn.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        let del_btn = visual.debug_bounds("automation-delete-daily").unwrap();
+        visual.simulate_click(del_btn.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        view.read_with(visual, |v, _| {
+            assert_eq!(v.schedules().len(), 1);
+            assert_eq!(v.schedules()[0].id, "weekly");
+        });
+
+        // Detail page delete also requires two clicks and reserves width.
+        view.update(visual, |v, cx| v.open_detail("weekly".into(), cx));
+        visual.run_until_parked();
+        let detail_toggle_before = visual.debug_bounds("automations-detail-toggle").unwrap();
+        let detail_del_before = visual.debug_bounds("automations-detail-delete").unwrap();
+
+        visual.simulate_click(detail_del_before.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        view.read_with(visual, |v, _| assert_eq!(v.schedules().len(), 1));
+        assert_eq!(
+            visual.debug_bounds("automations-detail-toggle"),
+            Some(detail_toggle_before)
+        );
+        assert_eq!(
+            visual.debug_bounds("automations-detail-delete"),
+            Some(detail_del_before)
+        );
+
+        let detail_del = visual.debug_bounds("automations-detail-delete").unwrap();
+        visual.simulate_click(detail_del.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        view.read_with(visual, |v, _| {
+            assert!(v.schedules().is_empty());
+            assert_eq!(v.page_view(), &PageView::List);
+        });
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[gpui::test]
+    fn submit_modal_ignores_reentrant_click_and_concurrent_toggle_preserves_run_now_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-automations-concurrency-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        cx.update(gpui_component::init);
+        let dir_clone = dir.clone();
+        let cwd_str = dir.to_string_lossy().into_owned();
+        let (view, visual) = cx
+            .add_window_view(|_, cx| View::new(Some(dir_clone), Some(PathBuf::from(&cwd_str)), cx));
+        visual.simulate_resize(gpui::size(px(960.), px(640.)));
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.open_editor_modal(None, window, cx);
+                let modal = v.modal.as_ref().unwrap();
+                modal
+                    .id
+                    .update(cx, |s, cx| s.set_value("created-once", window, cx));
+                modal
+                    .prompt
+                    .update(cx, |s, cx| s.set_value("Run audit", window, cx));
+                v.submit_modal(window, cx);
+                assert!(v.modal.as_ref().unwrap().submitting);
+                // Re-entrant second submit and close attempts while submitting must be ignored.
+                v.submit_modal(window, cx);
+                v.close_modal(cx);
+                assert!(v.modal.is_some());
+            });
+        });
+        visual.run_until_parked();
+        view.read_with(visual, |v, _| {
+            assert!(v.modal.is_none());
+            assert!(v.error.is_none(), "unexpected error: {:?}", v.error);
+            assert_eq!(v.schedules().len(), 1);
+            assert!(v.schedules()[0].enabled);
+        });
+
+        // Concurrent run_now (daemon missing -> error) + toggle_enabled must complete both
+        // without cancelling run_now's error banner.
+        view.update(visual, |v, cx| {
+            v.run_now("created-once", cx);
+            v.toggle_enabled("created-once", cx);
+        });
+        visual.run_until_parked();
+        view.read_with(visual, |v, _| {
+            assert!(!v.schedules()[0].enabled);
+            assert_eq!(
+                v.error.as_deref(),
+                Some(stext::ACCOUNTS_DAEMON_REQUIRED.get())
+            );
+        });
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[gpui::test]
+    fn automations_toggle_reserves_width_and_icon_buttons_expose_tooltips(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::time::Duration;
+
+        cx.update(gpui_component::init);
+        let (view, visual) = cx.add_window_view(|_, cx| View::new(None, None, cx));
+        view.update(visual, |v, cx| {
+            v.schedules.push(Schedule {
+                id: "daily".into(),
+                cron: "0 9 * * *".into(),
+                cwd: "/tmp".into(),
+                command: vec!["claude".into(), "-p".into()],
+                enabled: true,
+                ..Schedule::default()
+            });
+            cx.notify();
+        });
+        visual.simulate_resize(gpui::size(px(1200.), px(640.)));
+        visual.run_until_parked();
+
+        let row_toggle_enabled = visual.debug_bounds("automation-toggle-daily").unwrap();
+        view.update(visual, |v, cx| {
+            v.schedules[0].enabled = false;
+            cx.notify();
+        });
+        visual.run_until_parked();
+        assert_eq!(
+            visual.debug_bounds("automation-toggle-daily"),
+            Some(row_toggle_enabled)
+        );
+
+        for (selector, tip) in [
+            ("automation-edit-daily", "tooltip:automation-edit-daily"),
+            ("automation-delete-daily", "tooltip:automation-delete-daily"),
+        ] {
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+            visual.executor().advance_clock(Duration::from_millis(600));
+            visual.run_until_parked();
+            assert!(
+                visual.debug_bounds(tip).is_some(),
+                "missing tooltip for {selector}"
+            );
+        }
+
+        view.update(visual, |v, cx| v.open_detail("daily".into(), cx));
+        visual.run_until_parked();
+        let detail_toggle_paused = visual.debug_bounds("automations-detail-toggle").unwrap();
+        view.update(visual, |v, cx| {
+            v.schedules[0].enabled = true;
+            cx.notify();
+        });
+        visual.run_until_parked();
+        assert_eq!(
+            visual.debug_bounds("automations-detail-toggle"),
+            Some(detail_toggle_paused)
+        );
+
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| v.open_editor_modal(None, window, cx));
+        });
+        visual.run_until_parked();
+        let modal_close = visual.debug_bounds("automations-modal-close").unwrap();
+        visual.simulate_mouse_move(modal_close.center(), None, gpui::Modifiers::default());
+        visual.executor().advance_clock(Duration::from_millis(600));
+        visual.run_until_parked();
+        assert!(
+            visual
+                .debug_bounds("tooltip:automations-modal-close")
+                .is_some()
+        );
     }
 }
