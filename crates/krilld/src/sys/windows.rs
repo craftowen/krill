@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use windows_sys::Win32::Foundation::{
-    ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
-    LocalFree, WAIT_OBJECT_0,
+    ERROR_BUFFER_OVERFLOW, ERROR_INVALID_PARAMETER, ERROR_NO_DATA, ERROR_SUCCESS, FILETIME, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
@@ -51,7 +51,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use zeroize::Zeroizing;
 
-use super::{AUDIT_TOKEN_LEN, CodeSign, User};
+use super::{AUDIT_TOKEN_LEN, CodeSign, ProcessCache, ProcessEntry as Process, User};
 
 mod child;
 mod file_users;
@@ -190,13 +190,23 @@ pub(crate) fn footprint(pid: u32) -> io::Result<u64> {
     private_bytes(process.as_raw_handle())
 }
 
-/// Toolhelp 스냅숏의 한 항목.
-#[derive(Debug, Clone)]
-struct Process {
-    pid: u32,
-    parent: u32,
-    /// 실행 파일 이름(경로 없이, 예: `node.exe`).
-    exe: String,
+/// 디렉터리·파일이 놓인 볼륨 일련번호(`dwVolumeSerialNumber`). 마운트 지점 경계 판정용.
+pub(crate) fn volume_id(path: &Path) -> Option<u64> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: file은 방금 연 유효한 핸들이고 info는 쓰기 가능한 구조체다.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
+        return None;
+    }
+    Some(u64::from(info.dwVolumeSerialNumber))
 }
 
 /// 지금 있는 모든 프로세스.
@@ -226,26 +236,30 @@ fn snapshot() -> io::Result<Vec<Process>> {
     Ok(out)
 }
 
-/// `pid` 항목. 캐시가 [`SNAPSHOT_TTL`]보다 오래됐거나 `pid`가 없으면 새로 찍는다. `pid`가 `None`이면 전체.
+fn pid_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    match open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(_) => true,
+        Err(e) => e.raw_os_error() != i32::try_from(ERROR_INVALID_PARAMETER).ok(),
+    }
+}
+
+/// `pid` 항목. 캐시가 [`SNAPSHOT_TTL`]보다 오래됐거나 살아 있는 새 `pid`가 없으면 새로 찍는다. `pid`가 `None`이면 전체.
 fn processes(pid: Option<u32>) -> io::Result<Vec<Process>> {
-    static CACHE: Mutex<Option<(Instant, Vec<Process>)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<ProcessCache>> = Mutex::new(None);
     let mut cache = CACHE
         .lock()
         .map_err(|_| io::Error::other("process cache poisoned"))?;
-    let fresh = cache.as_ref().is_some_and(|(at, list)| {
-        at.elapsed() < SNAPSHOT_TTL && pid.is_none_or(|p| list.iter().any(|e| e.pid == p))
-    });
-    if !fresh {
-        *cache = Some((Instant::now(), snapshot()?));
-    }
-    let list = cache
-        .as_ref()
-        .map(|(_, list)| list.as_slice())
-        .unwrap_or_default();
-    Ok(match pid {
-        Some(p) => list.iter().filter(|e| e.pid == p).cloned().collect(),
-        None => list.to_vec(),
-    })
+    ProcessCache::query(
+        &mut cache,
+        pid,
+        SNAPSHOT_TTL,
+        Instant::now(),
+        pid_exists,
+        snapshot,
+    )
 }
 
 fn process(pid: u32) -> io::Result<Process> {

@@ -12,6 +12,9 @@ use super::Shell;
 #[derive(Default)]
 pub(super) struct Pending {
     pub(super) tasks: HashMap<PaneId, ((u16, u16), Task<()>)>,
+    /// 단일 칸 탭의 최근 측정 `(열, 행)`. 새 탭이 첫 페인트 전에 `80×24`로 생성되어 75ms 뒤 다시 리사이즈되는
+    /// 이중 리플로우를 피한다.
+    pub(super) full_tab_grid: Option<(u16, u16)>,
     /// 직전 렌더와 이번 렌더에 그린 칸. 직전에 없던 칸이 새로 보인 칸이다([`Pane::show`](krill_app::pane::Pane::show)).
     drawn: HashSet<PaneId>,
     drawing: HashSet<PaneId>,
@@ -24,7 +27,25 @@ impl Pending {
 }
 
 impl Shell {
+    pub(super) fn is_full_tab_pane(&self, pane: PaneId) -> bool {
+        self.layout
+            .tab_of_pane(pane)
+            .is_some_and(|tab| self.layout.tab_panes(tab) == [pane])
+    }
+
+    pub(super) fn initial_pane_grid(&self, pane: PaneId) -> Option<(u16, u16)> {
+        self.is_full_tab_pane(pane)
+            .then_some(self.fits.full_tab_grid)
+            .flatten()
+    }
+
     pub(super) fn schedule_fit(&mut self, pane: PaneId, want: (u16, u16), cx: &mut Context<Self>) {
+        if self.is_full_tab_pane(pane) && !cx.has_active_drag() {
+            self.fits.full_tab_grid = Some((
+                want.0.clamp(1, krill_proto::screen::MAX_COLS),
+                want.1.clamp(1, krill_proto::screen::MAX_LINES),
+            ));
+        }
         let Some(live) = self.live.get_mut(&pane) else {
             return;
         };

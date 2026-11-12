@@ -22,7 +22,8 @@ type Environment = Vec<(Vec<u8>, Vec<u8>)>;
 pub fn environment(cwd: &Path) -> Environment {
     match discover(cwd) {
         Some(Discovered::Repo { root, worktree }) => {
-            return variables(root.as_os_str().as_bytes(), &worktree);
+            let root = git_path_bytes(&root);
+            return variables(&root, &worktree);
         }
         Some(Discovered::NotRepo) => return Vec::new(),
         None => {}
@@ -56,7 +57,7 @@ pub(super) fn discover(cwd: &Path) -> Option<Discovered> {
     if GIT_ENV.iter().any(|k| std::env::var_os(k).is_some()) {
         return None;
     }
-    let start = std::fs::canonicalize(cwd).ok()?;
+    let start = krill_proto::os::canonicalize(cwd).ok()?;
     let start_device = device(&start)?;
     for dir in start.ancestors() {
         if device(dir)? != start_device {
@@ -89,7 +90,8 @@ pub(super) fn discover(cwd: &Path) -> Option<Discovered> {
         let gitdir = dir.join(OsStr::from_bytes(gitdir));
         let common = std::fs::read(gitdir.join("commondir")).ok()?; // 없으면 서브모듈
         let common =
-            std::fs::canonicalize(gitdir.join(OsStr::from_bytes(common.trim_ascii_end()))).ok()?;
+            krill_proto::os::canonicalize(&gitdir.join(OsStr::from_bytes(common.trim_ascii_end())))
+                .ok()?;
         if common.file_name() != Some(OsStr::new(".git")) {
             return None;
         }
@@ -111,14 +113,19 @@ fn unusual_config(line: &[u8]) -> bool {
     key == b"bare=true" || key.starts_with(b"worktree=") || key.starts_with(b"worktreeconfig=")
 }
 
-/// 파일시스템 번호. Windows는 경로 규칙(`\\?\` 접두사 등)이 달라 빠른 경로를 쓰지 않는다(`None` → git).
+/// 파일시스템·볼륨 번호. 마운트 지점 경계를 넘으면 `discover`를 멈추고 git에 맡긴다.
 #[cfg(unix)]
 fn device(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::metadata(path).ok().map(|m| m.dev())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn device(path: &Path) -> Option<u64> {
+    crate::sys::volume_id(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn device(_: &Path) -> Option<u64> {
     None
 }
@@ -140,9 +147,25 @@ pub(super) fn environment_in(q: &super::GitQueue, cwd: &Path) -> Result<Environm
     Ok(variables(root, &worktree))
 }
 
+#[cfg(unix)]
+fn git_path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+/// Git for Windows(`rev-parse --show-toplevel`·`worktree list`)와 같은 슬래시 표기로 맞춘다.
+#[cfg(not(unix))]
+fn git_path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|&b| if b == b'\\' { b'/' } else { b })
+        .collect()
+}
+
 fn variables(root: &[u8], worktree: &Path) -> Environment {
     let name = worktree.file_name().unwrap_or(OsStr::new("")).as_bytes();
-    let path = worktree.as_os_str().as_bytes();
+    let path = git_path_bytes(worktree);
+    let path = path.as_slice();
     [
         ("KRILL_ROOT_PATH", root),
         ("KRILL_WORKTREE_PATH", path),
@@ -355,7 +378,7 @@ fn read(path: &Path) -> Result<Option<String>, String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 fn include_entries(s: &str) -> Result<Vec<String>, String> {
     let mut entries = Vec::new();
     for (index, line) in s
@@ -422,5 +445,4 @@ fn copy_with(
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 mod tests;

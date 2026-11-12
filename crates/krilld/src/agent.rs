@@ -290,14 +290,15 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
         return login;
     }
     let home = accounts::default_home();
-    for (prog, provider) in [
-        ("claude", ProviderKind::Claude),
-        ("codex", ProviderKind::Codex),
-        ("opencode", ProviderKind::OpenCode),
-        ("agy", ProviderKind::Antigravity),
-        ("gemini", ProviderKind::Gemini),
+    let active_accounts = accounts::active_accounts(&home, Some(state));
+    for provider in [
+        ProviderKind::Claude,
+        ProviderKind::Codex,
+        ProviderKind::OpenCode,
+        ProviderKind::Antigravity,
+        ProviderKind::Gemini,
     ] {
-        let Some((_, active)) = accounts::active_account_info(&home, Some(state), prog) else {
+        let Some((_, active)) = active_accounts.iter().find(|(p, _)| *p == provider) else {
             continue;
         };
         let dir = &active.profile_dir;
