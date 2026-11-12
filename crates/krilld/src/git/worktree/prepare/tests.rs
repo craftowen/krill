@@ -148,7 +148,7 @@ fn ttl_and_cancel_cleanup_registered_locked_worktrees() {
             if cancel {
                 TTL
             } else {
-                Duration::from_millis(800)
+                Duration::from_millis(1200)
             },
             DISK_LIMIT,
         )

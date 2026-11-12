@@ -176,9 +176,11 @@ impl Pool {
         let result = self.prepare(req, cancel);
         if let Ok(Some((repo, commit))) = &result {
             let mut state = lock(&self.state);
-            if let Some(slot) = state.slot.as_mut().filter(|s| s.token == req.token) {
-                slot.ready
-                    .get_or_insert_with(|| (repo.clone(), commit.clone()));
+            if let Some(slot) = state.slot.as_mut().filter(|s| s.token == req.token)
+                && slot.ready.is_none()
+            {
+                slot.ready = Some((repo.clone(), commit.clone()));
+                slot.deadline = Instant::now() + self.ttl;
             }
             self.changed.notify_all();
             loop {
@@ -313,6 +315,7 @@ impl Pool {
                 && let Some(slot) = state.slot.as_mut().filter(|s| s.token == req.token)
             {
                 slot.ready = Some((repo.clone(), commit.clone()));
+                slot.deadline = Instant::now() + self.ttl;
                 self.changed.notify_all();
             }
         }

@@ -3112,8 +3112,11 @@ fn live_retained_replacement_clears_on_interactive_selection_replacement_close_o
             ipc::read_frame(&mut client).unwrap().unwrap().0,
             screen_kind::ATTACHED
         );
-        client.shutdown(std::net::Shutdown::Write).unwrap();
-        serving.join().unwrap().unwrap();
+        // OWE-530: macOS는 shutdown만으로는 상대의 막힌 read를 드물게 깨우지 못하므로
+        // join 전에 소켓을 먼저 닫는다. 초기 keyframe 기록 중 닫히면 BrokenPipe가 날 수 있다.
+        client.shutdown(std::net::Shutdown::Both).ok();
+        drop(client);
+        serving.join().unwrap().ok();
     };
 
     for mode in ["interactive_attach", "close_replacement", "manual_cancel"] {
@@ -3146,7 +3149,7 @@ fn live_retained_replacement_clears_on_interactive_selection_replacement_close_o
             holder_link.send(&message.encode().unwrap(), &[]).unwrap();
         }
         let pty = rustix_openpty::openpty(None, None).unwrap();
-        let _replacement_process = pty.user;
+        let replacement_process = pty.user;
         let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
         let reg = Arc::new(Registry::new(
             Some((
@@ -3266,6 +3269,7 @@ fn live_retained_replacement_clears_on_interactive_selection_replacement_close_o
             "expected cleared account-handoffs.json for {mode}"
         );
 
+        drop(replacement_process);
         drop(holder_link);
         reader_worker.join().unwrap();
         drop(reg);
