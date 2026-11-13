@@ -102,7 +102,7 @@ pub(super) struct CodexResume {
 #[cfg(windows)]
 impl CodexResume {
     pub(super) fn new(file: &Path) -> io::Result<Self> {
-        let found = from_paths(ProviderKind::Codex, [file.to_path_buf()])?
+        let found = from_paths_with(ProviderKind::Codex, [file.to_path_buf()], None)?
             .ok_or(io::ErrorKind::InvalidData)?;
         let lock = found
             .home
@@ -149,7 +149,7 @@ impl CodexResume {
         if crate::sys::start_us(root).ok() != Some(start) {
             return Ok(None);
         }
-        from_paths(ProviderKind::Codex, [self.file.clone()])
+        from_paths_with(ProviderKind::Codex, [self.file.clone()], None)
     }
 }
 
@@ -159,6 +159,27 @@ pub(in crate::registry) fn discover(
     provider: ProviderKind,
     root: u32,
     foreground: Option<u32>,
+) -> io::Result<Option<Identity>> {
+    discover_with(provider, root, foreground, None)
+}
+
+/// Inspect foreground ancestry of a resumed process looking for `expected_id`.
+/// Unlike `discover`, unrelated conversations open in the process (such as `agy`
+/// holding multiple `conversations/*.db*` handles during startup) are ignored.
+pub(in crate::registry) fn discover_resumed(
+    provider: ProviderKind,
+    root: u32,
+    foreground: Option<u32>,
+    expected_id: &str,
+) -> io::Result<Option<Identity>> {
+    discover_with(provider, root, foreground, Some(expected_id))
+}
+
+fn discover_with(
+    provider: ProviderKind,
+    root: u32,
+    foreground: Option<u32>,
+    expected_id: Option<&str>,
 ) -> io::Result<Option<Identity>> {
     if !matches!(
         provider,
@@ -183,7 +204,7 @@ pub(in crate::registry) fn discover(
     if crate::sys::start_us(root).ok() != Some(root_start) {
         return Ok(None);
     }
-    let found = from_paths(provider, paths)?;
+    let found = from_paths_with(provider, paths, expected_id)?;
     if found.is_some() {
         return Ok(found);
     }
@@ -202,15 +223,24 @@ pub(in crate::registry) fn discover(
     if crate::sys::start_us(root).ok() != Some(root_start) {
         return Ok(None);
     }
-    from_paths(provider, paths)
+    from_paths_with(provider, paths, expected_id)
 }
 
+#[cfg(test)]
 fn from_paths(
     provider: ProviderKind,
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> io::Result<Option<Identity>> {
+    from_paths_with(provider, paths, None)
+}
+
+fn from_paths_with(
+    provider: ProviderKind,
+    paths: impl IntoIterator<Item = PathBuf>,
+    expected_id: Option<&str>,
+) -> io::Result<Option<Identity>> {
     if provider == ProviderKind::Antigravity {
-        return agy_from_paths(paths);
+        return agy_from_paths(paths, expected_id);
     }
     let mut found: Option<Identity> = None;
     for path in paths {
@@ -225,6 +255,11 @@ fn from_paths(
             Err(error) if error.kind() == io::ErrorKind::Unsupported => continue,
             Err(error) => return Err(error),
         };
+        if let Some(expected) = expected_id
+            && id != expected
+        {
+            continue;
+        }
         if let Some(previous) = &found {
             if previous.id != id || !same_file::is_same_file(&previous.path, &path)? {
                 return Err(io::Error::new(
@@ -239,28 +274,87 @@ fn from_paths(
     Ok(found)
 }
 
-fn agy_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> io::Result<Option<Identity>> {
+fn is_agy_presence_lock(path: &Path) -> bool {
+    path.parent().is_some_and(|d| d.ends_with("presence"))
+        && path.extension().is_some_and(|e| e == "lock")
+}
+
+fn is_agy_conversation_db(path: &Path) -> bool {
+    path.parent().is_some_and(|d| d.ends_with("conversations"))
+        && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("db")
+                        || ext.eq_ignore_ascii_case("db-wal")
+                        || ext.eq_ignore_ascii_case("db-shm")
+                })
+                && !n.is_empty()
+        })
+}
+
+fn agy_identity(home: PathBuf, id: String) -> Identity {
+    let conv_dir = home.join("brain").join(&id);
+    let logs = conv_dir.join(".system_generated/logs");
+    let transcript = [
+        logs.join("transcript_full.jsonl"),
+        logs.join("transcript.jsonl"),
+        conv_dir.join("transcript.jsonl"),
+        home.join("sessions").join(format!("{id}.jsonl")),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+    Identity {
+        path: transcript.unwrap_or_else(|| home.join("conversations").join(format!("{id}.db"))),
+        home,
+        id,
+    }
+}
+
+fn agy_from_paths(
+    paths: impl IntoIterator<Item = PathBuf>,
+    expected_id: Option<&str>,
+) -> io::Result<Option<Identity>> {
     let paths: Vec<_> = paths.into_iter().collect();
+    if let Some(expected) = expected_id {
+        let mut presence_match: Option<Identity> = None;
+        let mut db_match: Option<Identity> = None;
+        for path in &paths {
+            let is_presence = is_agy_presence_lock(path);
+            if !is_presence && !is_agy_conversation_db(path) {
+                continue;
+            }
+            let Some((home, id)) = crate::agent_history::vault::agy_root_and_id_from_path(path)
+            else {
+                continue;
+            };
+            if id != expected {
+                continue;
+            }
+            let slot = if is_presence {
+                &mut presence_match
+            } else {
+                &mut db_match
+            };
+            if let Some(previous) = slot {
+                if previous.home != home {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+            } else {
+                *slot = Some(agy_identity(home, id));
+            }
+        }
+        return Ok(presence_match.or(db_match));
+    }
     // agy also opens old brain directories. Its held presence lock identifies the live
     // conversation; otherwise require one unambiguous open conversation database.
-    let presence = paths.iter().any(|p| {
-        p.parent().is_some_and(|d| d.ends_with("presence"))
-            && p.extension().is_some_and(|e| e == "lock")
-    });
+    let presence = paths.iter().any(|p| is_agy_presence_lock(p));
     let mut found: Option<Identity> = None;
     for path in paths.iter().filter(|p| {
         if presence {
-            p.parent().is_some_and(|d| d.ends_with("presence"))
-                && p.extension().is_some_and(|e| e == "lock")
+            is_agy_presence_lock(p)
         } else {
-            p.parent().is_some_and(|d| d.ends_with("conversations"))
-                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    p.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
-                        ext.eq_ignore_ascii_case("db")
-                            || ext.eq_ignore_ascii_case("db-wal")
-                            || ext.eq_ignore_ascii_case("db-shm")
-                    }) && !n.is_empty()
-                })
+            is_agy_conversation_db(p)
         }
     }) {
         let Some((home, id)) = crate::agent_history::vault::agy_root_and_id_from_path(path) else {
@@ -271,22 +365,7 @@ fn agy_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> io::Result<Option
                 return Err(io::ErrorKind::InvalidData.into());
             }
         } else {
-            let conv_dir = home.join("brain").join(&id);
-            let logs = conv_dir.join(".system_generated/logs");
-            let transcript = [
-                logs.join("transcript_full.jsonl"),
-                logs.join("transcript.jsonl"),
-                conv_dir.join("transcript.jsonl"),
-                home.join("sessions").join(format!("{id}.jsonl")),
-            ]
-            .into_iter()
-            .find(|p| p.is_file());
-            found = Some(Identity {
-                path: transcript
-                    .unwrap_or_else(|| home.join("conversations").join(format!("{id}.db"))),
-                home,
-                id,
-            });
+            found = Some(agy_identity(home, id));
         }
     }
     Ok(found)

@@ -213,3 +213,54 @@ fn resume_retries_only_pending_metadata_and_disappearing_files() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn resumed_agy_ignores_unrelated_open_conversation_dbs() {
+    let root = PathBuf::from("/tmp/krill-agy-resumed-identity/.gemini/antigravity-cli");
+    let multi_db_paths = [
+        root.join("conversations/other-a.db"),
+        root.join("conversations/other-b.db-wal"),
+        root.join("conversations/expected.db"),
+    ];
+    // Blind discovery must still reject ambiguous open conversations.
+    assert_eq!(
+        from_paths(ProviderKind::Antigravity, multi_db_paths.clone())
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    // Resumed discovery knows the target conversation ID and picks it out cleanly.
+    let found = from_paths_with(
+        ProviderKind::Antigravity,
+        multi_db_paths.clone(),
+        Some("expected"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.id, "expected");
+    assert_eq!(found.home, root);
+    assert_eq!(found.path, root.join("conversations/expected.db"));
+    // Even if another conversation holds a presence lock, resumed discovery matches expected.
+    let with_other_lock = multi_db_paths
+        .into_iter()
+        .chain([root.join("presence/unrelated.lock")]);
+    let found = from_paths_with(ProviderKind::Antigravity, with_other_lock, Some("expected"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, "expected");
+    // If the expected conversation is not open yet, resumed discovery stays pending (None)
+    // instead of aborting the handoff with InvalidData.
+    assert!(
+        from_paths_with(
+            ProviderKind::Antigravity,
+            [
+                root.join("conversations/other-a.db"),
+                root.join("conversations/other-b.db"),
+            ],
+            Some("expected"),
+        )
+        .unwrap()
+        .is_none()
+    );
+}

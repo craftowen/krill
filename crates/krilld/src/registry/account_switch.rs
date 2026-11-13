@@ -1621,7 +1621,12 @@ impl Registry {
             {
                 next_identity_probe = Instant::now() + Duration::from_millis(200);
                 let observed = resume_identity(|| {
-                    let observed = identity::discover(provider, new_pid, tap.foreground())?;
+                    let observed = identity::discover_resumed(
+                        provider,
+                        new_pid,
+                        tap.foreground(),
+                        &session_id,
+                    )?;
                     #[cfg(windows)]
                     let observed = if observed.is_none() {
                         match &codex_resume {
@@ -1792,8 +1797,9 @@ impl Registry {
             let mut retried = false;
             let mut deadline = Instant::now() + CODEX_LOCK_PROMPT_SETTLE;
             let took_over = loop {
-                let observed =
-                    resume_identity(|| identity::discover(provider, new_pid, tap.foreground()));
+                let observed = resume_identity(|| {
+                    identity::discover_resumed(provider, new_pid, tap.foreground(), &session_id)
+                });
                 #[cfg(windows)]
                 let observed = match (observed, &codex_resume) {
                     (Ok(None), Some(watch)) => watch.observe(new_pid, tap.foreground()),
