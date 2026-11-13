@@ -230,8 +230,7 @@ fn save_bound_serve_port(state_dir: &Path, addr: &EndpointAddr) {
 
 /// 실행 중인 `krill-link serve`의 현재 `EndpointAddr`를 읽는다(없거나 프로세스가 죽었으면 `None`).
 pub fn read_live_server_addr(state_dir: &Path) -> Option<EndpointAddr> {
-    let ctl = state_dir.join(SERVE_CTL_SOCK_REL_PATH);
-    if !ctl.exists() {
+    if !is_serve_running(state_dir) {
         return None;
     }
     let ticket = fs::read_to_string(state_dir.join(SERVE_TICKET_REL_PATH)).ok()?;
@@ -935,4 +934,34 @@ pub async fn shutdown_server_command(state_dir: &Path) -> Result<(), Error> {
     })
     .await
     .map_err(|_| Error::Timeout("incoming server shutdown"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    #[test]
+    fn read_live_server_addr_ignores_stale_ctl_socket_and_reads_live_listener() {
+        let dir = std::env::temp_dir().join(format!("mklink-live-addr-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::create_dir_all(dir.join("link")).unwrap();
+
+        let sk = SecretKey::generate();
+        let addr = EndpointAddr::new(sk.public()).with_ip_addr("127.0.0.1:41235".parse().unwrap());
+        let ticket = crate::pair::encode_addr_ticket(&addr).unwrap();
+        std::fs::write(dir.join(SERVE_TICKET_REL_PATH), ticket).unwrap();
+
+        // Stale non-listening ctl socket path left behind after an unclean exit must not look live.
+        let ctl = dir.join(SERVE_CTL_SOCK_REL_PATH);
+        std::fs::write(&ctl, b"stale").unwrap();
+        assert_eq!(read_live_server_addr(&dir), None);
+        std::fs::remove_file(&ctl).ok();
+
+        let _listener = krill_proto::os::net::UnixListener::bind(&ctl).unwrap();
+        assert_eq!(read_live_server_addr(&dir), Some(addr));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
