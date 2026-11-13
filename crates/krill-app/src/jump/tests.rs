@@ -987,3 +987,62 @@ fn jump_palette_traps_shift_tab_occludes_backdrop_and_labels_dialog(cx: &mut Tes
         assert_eq!(node.label(), Some(label));
     });
 }
+
+#[gpui::test]
+fn ime_preedit_blocks_palette_navigation_confirm_and_dismiss(cx: &mut TestAppContext) {
+    let items = vec![
+        item(1, "claude 1 · 하늘", false),
+        item(2, "codex 2 · 한강", false),
+    ];
+    let (view, events, cx) = open(cx, items);
+    let input = cx.update(|_, cx| view.read(cx).input().clone());
+
+    cx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            s.replace_and_mark_text_in_range(None, "하", None, window, cx);
+        });
+        assert!(view.update(cx, |p, cx| p.input_is_composing(window, cx)));
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("down up");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 0);
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        events.borrow().is_empty(),
+        "IME preedit Enter must not confirm selection: {:?}",
+        *events.borrow()
+    );
+
+    cx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            s.replace_and_mark_text_in_range(None, "하", None, window, cx);
+        });
+        assert!(view.update(cx, |p, cx| p.input_is_composing(window, cx)));
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        events.borrow().is_empty(),
+        "IME preedit Escape must not dismiss palette: {:?}",
+        *events.borrow()
+    );
+
+    cx.update(|window, cx| {
+        input.update(cx, |s, cx| s.unmark_text(window, cx));
+        assert!(!view.update(cx, |p, cx| p.input_is_composing(window, cx)));
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("down enter escape");
+    cx.run_until_parked();
+    assert_eq!(
+        events.borrow().as_slice(),
+        &[Event::Confirm(SessionId(2)), Event::Dismiss]
+    );
+}

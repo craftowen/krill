@@ -935,6 +935,13 @@ impl Palette {
         self.input.update(cx, |input, cx| input.focus(window, cx));
     }
 
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.input.update(cx, |input, cx| {
+            input.focus_handle(cx).is_focused(window)
+                && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+        })
+    }
+
     /// 지금 보이는 순서의 일치 항목.
     pub fn matches(&self) -> impl Iterator<Item = &Item> {
         self.matches.iter().filter_map(|&i| self.items.get(i))
@@ -2787,19 +2794,31 @@ impl Render for Palette {
             .border_color(border)
             .rounded(crate::ui::RADIUS_XL)
             .shadow_lg()
-            .capture_action(cx.listener(|p, _: &MoveUp, _, cx| {
+            .capture_action(cx.listener(|p, _: &MoveUp, window, cx| {
+                if p.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 p.step(-1, cx);
             }))
-            .capture_action(cx.listener(|p, _: &MoveDown, _, cx| {
+            .capture_action(cx.listener(|p, _: &MoveDown, window, cx| {
+                if p.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 p.step(1, cx);
             }))
-            .capture_action(cx.listener(|p, _: &Enter, _, cx| {
+            .capture_action(cx.listener(|p, _: &Enter, window, cx| {
+                if p.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 p.confirm(cx);
             }))
-            .capture_action(cx.listener(|_, _: &Escape, _, cx| {
+            .capture_action(cx.listener(|p, _: &Escape, window, cx| {
+                if p.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 cx.emit(Event::Dismiss);
             }))
