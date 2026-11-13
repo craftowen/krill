@@ -117,9 +117,7 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
             && let Some(home) = krill_proto::os::home_dir()
         {
             let report = krill_proto::orchestration::sync_builtin_skills_at(&home);
-            for error in report.failures {
-                tracing::warn!(%error, "built-in skill synchronization skipped a target");
-            }
+            log_skill_sync_failures(&report.failures);
         }
     }
     if raw.first().is_some_and(|s| s == "__forward") {
@@ -337,12 +335,99 @@ fn agent_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Emit at most one privacy-safe summary warning when built-in skill sync skips targets.
+/// `krill-log` forbids filesystem paths and error `Display` strings at `tracing` call sites.
+fn log_skill_sync_failures(failures: &[String]) {
+    let skipped_count = failures.len();
+    if skipped_count > 0 {
+        tracing::warn!(
+            skipped_count,
+            "built-in skill synchronization skipped target(s)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::fmt;
     use std::process::ExitCode;
+    use std::sync::{Arc, Mutex};
 
-    use super::{USAGE, run};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    use super::{USAGE, log_skill_sync_failures, run};
+
+    #[derive(Default)]
+    struct RecordedEvents {
+        lines: Vec<String>,
+    }
+
+    struct CaptureVisitor<'a> {
+        out: &'a mut String,
+    }
+
+    impl Visit for CaptureVisitor<'_> {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            fmt::Write::write_fmt(self.out, format_args!("{}={value} ", field.name())).ok();
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            fmt::Write::write_fmt(self.out, format_args!("{}={value:?} ", field.name())).ok();
+        }
+    }
+
+    struct CaptureSubscriber(Arc<Mutex<RecordedEvents>>);
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut line = String::new();
+            let mut visitor = CaptureVisitor { out: &mut line };
+            event.record(&mut visitor);
+            if let Ok(mut guard) = self.0.lock() {
+                guard.lines.push(line);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[test]
+    fn skill_sync_warning_logs_count_without_paths_or_error_display() {
+        let recorded = Arc::new(Mutex::new(RecordedEvents::default()));
+        let subscriber = CaptureSubscriber(Arc::clone(&recorded));
+        let failures = vec![
+            "artifacts (/Users/alice/.claude/skills): Operation not permitted (os error 1)"
+                .to_owned(),
+            "krill (/Users/alice/.codex/skills): Permission denied (os error 13)".to_owned(),
+        ];
+        tracing::subscriber::with_default(subscriber, || {
+            log_skill_sync_failures(&[]);
+            log_skill_sync_failures(&failures);
+        });
+        let lines = recorded.lock().unwrap().lines.clone();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("skipped_count=2"));
+        assert!(!lines[0].contains("/Users/alice"));
+        assert!(!lines[0].contains("Operation not permitted"));
+        assert!(!lines[0].contains("Permission denied"));
+    }
 
     #[test]
     fn top_level_help_exits_zero_and_empty_args_exits_two() {
