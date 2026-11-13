@@ -56,12 +56,16 @@ pub(super) fn has_claude_transcript(
     source: Option<&LaunchAccount>,
     stored: &StoredLaunch,
 ) -> bool {
-    if stored
-        .transcript_path
-        .as_deref()
-        .is_some_and(|path| Path::new(path).is_file())
-    {
-        return true;
+    if let Some(path) = stored.transcript_path.as_deref().map(Path::new) {
+        if let Ok(found_id) = file_session_id(path, ProviderKind::Claude) {
+            return stored
+                .session_id
+                .as_deref()
+                .is_none_or(|expected| expected == found_id);
+        }
+        if path.exists() {
+            return false;
+        }
     }
     let Some(id) = stored
         .session_id
@@ -1016,6 +1020,14 @@ mod bound_path_tests {
             account: Some(source.clone()),
             hibernation_blocked: false,
         };
+        assert!(!has_claude_transcript(&root, Some(&source), &stored));
+        fs::write(&transcript, b"").unwrap();
+        assert!(!has_claude_transcript(&root, Some(&source), &stored));
+        fs::write(
+            &transcript,
+            r#"{"sessionId":"99999999-2222-4333-8444-555555555555"}"#,
+        )
+        .unwrap();
         assert!(!has_claude_transcript(&root, Some(&source), &stored));
         fs::write(
             &transcript,
