@@ -24,8 +24,11 @@ use super::{SettingsView, edit, layout, queue_terminal_command, state_dir};
 use crate::i18n::catalog::settings as text;
 use crate::ui::BadgeTone;
 
+mod latest;
 mod plan;
 mod runner;
+
+pub use latest::{UpdateAvailability, extract_semver};
 
 /// 설치 탭 카테고리.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +228,8 @@ pub struct ToolStatus {
     pub version: Option<String>,
     /// 백그라운드에서 감지한 기존 설치 출처에 맞는 명령.
     pub command: Option<String>,
+    /// 업스트림에서 확인한 최신 semver(조회 실패·미지원 시 `None`).
+    pub latest_version: Option<String>,
 }
 
 /// 인라인 설치 실행 결과.
@@ -341,16 +346,27 @@ impl std::fmt::Debug for Panel {
 /// 로그인 셸 + 자주 쓰는 사용자 바이너리 경로(`~/.local/bin`, `~/.bun/bin`, `~/.cargo/bin`, Homebrew 등)를 합친 탐색 PATH.
 #[must_use]
 pub fn effective_search_path(home: &Path) -> std::ffi::OsString {
-    let base = crate::onboarding::Env::current()
+    let env = if cfg!(test) {
+        crate::onboarding::Env::current()
+    } else {
+        crate::onboarding::Env::discover_current()
+    };
+    let base = env
+        .filter(|env| env.home == home)
         .and_then(|env| crate::onboarding::login_path(&env.shell))
         .or_else(|| std::env::var_os("PATH"))
         .unwrap_or_default();
     let mut paths: Vec<PathBuf> = std::env::split_paths(&base).collect();
-    let extra = [
+    let mut extra = vec![
         home.join(".local/bin"),
         home.join(".bun/bin"),
         home.join(".cargo/bin"),
         home.join(".npm-global/bin"),
+        home.join(".volta/bin"),
+        home.join(".asdf/shims"),
+        home.join(".local/share/mise/shims"),
+        home.join(".fnm/current/bin"),
+        home.join(".nvm/current/bin"),
         home.join("Library/pnpm"),
         home.join(".local/share/pnpm"),
         home.join("AppData/Roaming/npm"),
@@ -361,6 +377,11 @@ pub fn effective_search_path(home: &Path) -> std::ffi::OsString {
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
     ];
+    if let Ok(npmrc) = std::fs::read_to_string(home.join(".npmrc"))
+        && let Some(npm_bin) = npmrc_prefix_bin(home, &npmrc)
+    {
+        extra.push(npm_bin);
+    }
     for p in extra {
         if !paths.contains(&p) {
             paths.push(p);
@@ -371,30 +392,92 @@ pub fn effective_search_path(home: &Path) -> std::ffi::OsString {
     std::env::join_paths(paths).unwrap_or(base)
 }
 
+fn npmrc_prefix_bin(home: &Path, content: &str) -> Option<PathBuf> {
+    let raw = content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            return None;
+        }
+        let (key, val) = trimmed.split_once('=')?;
+        (key.trim() == "prefix").then_some(val.trim().trim_matches(|c| matches!(c, '\u{27}' | '"')))
+    })?;
+    if raw.is_empty() {
+        return None;
+    }
+    let prefix = if raw == "~" || raw == "$HOME" || raw == "${HOME}" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw
+        .strip_prefix("~/")
+        .or_else(|| raw.strip_prefix("$HOME/"))
+        .or_else(|| raw.strip_prefix("${HOME}/"))
+    {
+        home.join(rest)
+    } else {
+        PathBuf::from(raw)
+    };
+    Some(if cfg!(windows) {
+        prefix
+    } else {
+        prefix.join("bin")
+    })
+}
+
 /// 단일 도구의 설치 상태 및 버전을 확인한다(백그라운드 실행기용).
 #[must_use]
 pub fn probe_tool(spec: &ToolSpec, search_path: &OsStr) -> ToolStatus {
+    probe_tool_in(spec, search_path, None)
+}
+
+/// 지정된 `PATH`·`HOME` 문맥에서 단일 도구의 모든 실행 후보를 검사해 설치 상태 및 버전을 확인한다.
+#[must_use]
+pub fn probe_tool_in(spec: &ToolSpec, search_path: &OsStr, home: Option<&Path>) -> ToolStatus {
+    let mut candidates = Vec::new();
     for &bin in spec.probe_bins() {
-        if let Some(exe) = krill_proto::agent::which(bin, search_path) {
-            let version = probe_version(&exe, spec.version_args);
+        for exe in krill_proto::agent::which_all(bin, search_path) {
+            if let Some(version) = probe_version(&exe, spec.version_args, search_path, home) {
+                return ToolStatus {
+                    installed: true,
+                    binary_path: Some(exe),
+                    version: Some(version),
+                    command: Some(plan::command(spec, search_path)),
+                    latest_version: None,
+                };
+            }
+            candidates.push(exe);
+        }
+    }
+    for exe in &candidates {
+        if let Some(version) = krill_proto::agent::package_version(exe) {
             return ToolStatus {
                 installed: true,
-                binary_path: Some(exe),
-                version,
+                binary_path: Some(exe.clone()),
+                version: Some(version),
                 command: Some(plan::command(spec, search_path)),
+                latest_version: None,
             };
         }
     }
+    let first_exe = candidates.into_iter().next();
     ToolStatus {
-        installed: false,
-        binary_path: None,
+        installed: first_exe.is_some(),
+        binary_path: first_exe,
         version: None,
         command: Some(plan::command(spec, search_path)),
+        latest_version: None,
     }
 }
 
-fn probe_version(exe: &Path, args: &[&str]) -> Option<String> {
+fn probe_version(
+    exe: &Path,
+    args: &[&str],
+    search_path: &OsStr,
+    home: Option<&Path>,
+) -> Option<String> {
     let mut cmd = runner::version_command(exe, args);
+    cmd.env("PATH", search_path);
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+    }
     let out = super::child::output(&mut cmd, Duration::from_secs(4), 4096).ok()?;
     if !out.status.success() {
         return None;
@@ -424,7 +507,7 @@ pub fn probe_all_tools(home: &Path) -> BTreeMap<&'static str, ToolStatus> {
     let path = effective_search_path(home);
     CATALOG
         .iter()
-        .map(|spec| (spec.id, probe_tool(spec, &path)))
+        .map(|spec| (spec.id, probe_tool_in(spec, &path, Some(home))))
         .collect()
 }
 
@@ -636,11 +719,15 @@ impl SettingsView {
         if self.install.scanned || self.install.scanning {
             return;
         }
-        self.rescan_install_tools(cx);
+        self.scan_install_tools(false, cx);
     }
 
     /// 도구 설치 상태를 백그라운드에서 다시 스캔한다.
     pub fn rescan_install_tools(&mut self, cx: &mut Context<Self>) {
+        self.scan_install_tools(true, cx);
+    }
+
+    fn scan_install_tools(&mut self, force_refresh: bool, cx: &mut Context<Self>) {
         if self.install.scanning || !self.install.installing.is_empty() {
             return;
         }
@@ -670,7 +757,11 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             let statuses = cx
                 .background_executor()
-                .spawn(async move { probe_all_tools(&home) })
+                .spawn(async move {
+                    let mut statuses = probe_all_tools(&home);
+                    latest::populate_latest_versions(&mut statuses, force_refresh);
+                    statuses
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.install.scanning = false;
@@ -689,6 +780,14 @@ impl SettingsView {
     /// 단일 도구를 백그라운드에서 인라인 설치하고 완료 후 상태를 갱신한다.
     pub fn run_inline_install(&mut self, tool_id: &'static str, cx: &mut Context<Self>) {
         if self.install.installing.contains(tool_id) {
+            return;
+        }
+        if self
+            .install
+            .statuses
+            .get(tool_id)
+            .is_some_and(|s| s.update_availability() == UpdateAvailability::UpToDate)
+        {
             return;
         }
         let Some(spec) = CATALOG.iter().find(|s| s.id == tool_id) else {
@@ -735,6 +834,7 @@ impl SettingsView {
                     )),
                     version: Some("1.0.0-test".to_owned()),
                     command: Some(spec.install_command().to_owned()),
+                    latest_version: None,
                 },
             );
             self.install.results.insert(
@@ -780,7 +880,8 @@ impl SettingsView {
                     } else {
                         runner::run(&command, &home, &path)
                     };
-                    let statuses = probe_all_tools(&home);
+                    let mut statuses = probe_all_tools(&home);
+                    latest::populate_latest_versions(&mut statuses, true);
                     let mut res = res;
                     if res.success
                         && !statuses
@@ -1220,13 +1321,17 @@ impl SettingsView {
             let version = status
                 .and_then(|s| s.version.as_deref())
                 .filter(|v| !v.is_empty());
-            (
-                p.success,
-                p.muted_foreground,
-                version
+            let availability = status.map(ToolStatus::update_availability);
+            let label = match (version, availability) {
+                (Some(ver), Some(UpdateAvailability::UpdateAvailable { latest })) => {
+                    text::INSTALL_STATUS_UPDATE_AVAILABLE
+                        .format(&[("current", ver), ("latest", &latest)])
+                }
+                _ => version
                     .unwrap_or(text::INSTALL_STATUS_INSTALLED.get())
                     .to_owned(),
-            )
+            };
+            (p.success, p.muted_foreground, label)
         } else if self
             .install
             .results
@@ -1280,7 +1385,13 @@ impl SettingsView {
                 .into_any_element()
         };
 
-        let requires_terminal = tool_id == "pkgmgr" && (cfg!(windows) || !is_installed);
+        let availability = self.install.statuses.get(tool_id).map_or(
+            UpdateAvailability::NotInstalled,
+            ToolStatus::update_availability,
+        );
+        let is_up_to_date = availability == UpdateAvailability::UpToDate;
+        let requires_terminal =
+            tool_id == "pkgmgr" && ((cfg!(windows) && !is_up_to_date) || !is_installed);
         let row_id = format!("admin-install-row-{tool_id}");
         let toggle_id = format!("admin-install-toggle-{tool_id}");
         let name_id = format!("admin-install-name-{tool_id}");
@@ -1292,6 +1403,8 @@ impl SettingsView {
             } else {
                 text::INSTALL_BTN_INSTALLING.get()
             }
+        } else if is_up_to_date {
+            text::INSTALL_BTN_UP_TO_DATE.get()
         } else if requires_terminal {
             text::INSTALL_IN_TERMINAL.get()
         } else if is_installed {
@@ -1314,6 +1427,7 @@ impl SettingsView {
                     .disabled(
                         self.install.scanning
                             || is_installing
+                            || is_up_to_date
                             || (requires_terminal && !self.install.installing.is_empty()),
                     )
                     .debug_selector(move || btn_install_id.clone())
@@ -2030,5 +2144,116 @@ mod tests {
             assert!(!spec.display_name().is_empty());
             assert!(!spec.probe_bins().is_empty());
         }
+    }
+
+    #[test]
+    fn npmrc_prefix_bin_resolves_home_and_ignores_comments() {
+        let home = Path::new("/tmp/krill-home");
+        assert_eq!(
+            npmrc_prefix_bin(home, "# prefix=/ignored\nprefix=\"~/.npm-packages\"\n"),
+            Some(if cfg!(windows) {
+                home.join(".npm-packages")
+            } else {
+                home.join(".npm-packages/bin")
+            })
+        );
+        assert_eq!(
+            npmrc_prefix_bin(home, "; prefix=/ignored\nprefix=${HOME}/npm-global\n"),
+            Some(if cfg!(windows) {
+                home.join("npm-global")
+            } else {
+                home.join("npm-global/bin")
+            })
+        );
+        assert_eq!(
+            npmrc_prefix_bin(home, "# no prefix\nregistry=https://registry.npmjs.org\n"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_tool_in_resolves_env_shebang_interpreter_and_skips_broken_shadow() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!("krill-probe-env-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let broken_dir = home.join("broken");
+        let interp_dir = home.join(".nvm/current/bin");
+        let npm_dir = home.join(".npm-global/bin");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::create_dir_all(&interp_dir).unwrap();
+        std::fs::create_dir_all(&npm_dir).unwrap();
+
+        let broken_codex = broken_dir.join("codex");
+        std::fs::write(&broken_codex, "#!/bin/sh\nexit 127\n").unwrap();
+        std::fs::set_permissions(&broken_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_node_name = format!("krill-fake-node-{}", std::process::id());
+        let fake_node = interp_dir.join(&fake_node_name);
+        std::fs::write(&fake_node, "#!/bin/sh\necho 'codex-cli 0.167.2'\n").unwrap();
+        std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let real_codex = npm_dir.join("codex");
+        std::fs::write(&real_codex, format!("#!/usr/bin/env {fake_node_name}\n")).unwrap();
+        std::fs::set_permissions(&real_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let search_path = std::env::join_paths([
+            broken_dir.as_path(),
+            npm_dir.as_path(),
+            interp_dir.as_path(),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap();
+        let codex_spec = CATALOG.iter().find(|s| s.id == "codex").unwrap();
+        let status = probe_tool_in(codex_spec, &search_path, Some(&home));
+        assert!(status.installed);
+        assert_eq!(status.binary_path.as_deref(), Some(real_codex.as_path()));
+        assert_eq!(status.version.as_deref(), Some("codex-cli 0.167.2"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_tool_in_falls_back_to_caskroom_package_version_when_version_command_fails() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root =
+            std::env::temp_dir().join(format!("krill-probe-cask-ver-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let wrapper_dir = home.join(".local/bin");
+        let brew_bin_dir = root.join("homebrew/bin");
+        let cask_bin = root.join("homebrew/Caskroom/codex/0.167.2/bin/codex");
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::create_dir_all(&brew_bin_dir).unwrap();
+        std::fs::create_dir_all(cask_bin.parent().unwrap()).unwrap();
+
+        let wrapper_codex = wrapper_dir.join("codex");
+        std::fs::write(&wrapper_codex, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&wrapper_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::fs::write(&cask_bin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&cask_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let brew_codex = brew_bin_dir.join("codex");
+        symlink(&cask_bin, &brew_codex).unwrap();
+
+        let search_path = std::env::join_paths([
+            wrapper_dir.as_path(),
+            brew_bin_dir.as_path(),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap();
+        let codex_spec = CATALOG.iter().find(|s| s.id == "codex").unwrap();
+        let status = probe_tool_in(codex_spec, &search_path, Some(&home));
+        assert!(status.installed);
+        assert_eq!(status.binary_path.as_deref(), Some(brew_codex.as_path()));
+        assert_eq!(status.version.as_deref(), Some("0.167.2"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -11016,6 +11016,7 @@ fn install_tab_terminal_and_copy_use_detected_package_manager(cx: &mut TestAppCo
                     binary_path: Some("/opt/homebrew/bin/codex".into()),
                     version: Some("codex-test".into()),
                     command: Some(command.into()),
+                    ..Default::default()
                 },
             );
         });
@@ -11064,6 +11065,63 @@ fn install_tab_package_manager_bootstrap_uses_terminal_without_claiming_success(
         assert_eq!(take_pending_terminal_command(cx).as_deref(), Some(expected));
         assert!(!view.read(cx).install.results.contains_key("pkgmgr"));
         assert!(!view.read(cx).install.statuses["pkgmgr"].installed);
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn install_tab_disables_update_button_when_up_to_date_and_enables_when_outdated(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("install-up-to-date");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(5000.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Install, cx);
+            v.install.statuses.insert(
+                "agy",
+                install::ToolStatus {
+                    installed: true,
+                    binary_path: Some("/usr/local/bin/agy".into()),
+                    version: Some("1.5.8".into()),
+                    latest_version: Some("1.5.8".into()),
+                    ..Default::default()
+                },
+            );
+            v.install.statuses.insert(
+                "codex",
+                install::ToolStatus {
+                    installed: true,
+                    binary_path: Some("/usr/local/bin/codex".into()),
+                    version: Some("codex-cli 0.167.2".into()),
+                    latest_version: Some("0.168.0".into()),
+                    ..Default::default()
+                },
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    assert!(vcx.debug_bounds("admin-install-btn-agy").is_some());
+    click_install_control(vcx, "admin-install-btn-agy");
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(
+            !v.install.results.contains_key("agy"),
+            "clicking disabled up-to-date button must not start install"
+        );
+        assert_eq!(v.install.statuses["agy"].version.as_deref(), Some("1.5.8"));
+    });
+
+    click_install_control(vcx, "admin-install-btn-codex");
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(
+            v.install.results.get("codex").is_some_and(|r| r.success),
+            "outdated tool update button must trigger install"
+        );
     });
     fs::remove_dir_all(d).ok();
 }

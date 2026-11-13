@@ -43,6 +43,11 @@ pub const BUILTIN_SKILLS: &[SkillEntry] = &[
         description: "Operate desktop applications on macOS, Windows, and Linux through native accessibility trees using the bundled agent-desktop CLI.",
         content: include_str!("skills/computer-use/SKILL.md"),
     },
+    SkillEntry {
+        name: "krig",
+        description: "Route tasks across recon, align, design, model, drive, demock, slim, verify, ship, eval, backprop, and resume playbooks with automated verification gates.",
+        content: include_str!("skills/krig/SKILL.md"),
+    },
 ];
 
 pub fn builtin_skills() -> &'static [SkillEntry] {
@@ -80,6 +85,137 @@ pub const ORCHESTRATION_REFERENCES: &[(&str, &str)] = &[
     ),
 ];
 
+pub const KRIG_FILES: &[(&str, &str)] = &[
+    (
+        "agents/openai.yaml",
+        include_str!("skills/krig/agents/openai.yaml"),
+    ),
+    (
+        "playbooks/align.md",
+        include_str!("skills/krig/playbooks/align.md"),
+    ),
+    (
+        "playbooks/backprop.md",
+        include_str!("skills/krig/playbooks/backprop.md"),
+    ),
+    (
+        "playbooks/demock.md",
+        include_str!("skills/krig/playbooks/demock.md"),
+    ),
+    (
+        "playbooks/design.md",
+        include_str!("skills/krig/playbooks/design.md"),
+    ),
+    (
+        "playbooks/drive.md",
+        include_str!("skills/krig/playbooks/drive.md"),
+    ),
+    (
+        "playbooks/eval.md",
+        include_str!("skills/krig/playbooks/eval.md"),
+    ),
+    (
+        "playbooks/model.md",
+        include_str!("skills/krig/playbooks/model.md"),
+    ),
+    (
+        "playbooks/recon.md",
+        include_str!("skills/krig/playbooks/recon.md"),
+    ),
+    (
+        "playbooks/resume.md",
+        include_str!("skills/krig/playbooks/resume.md"),
+    ),
+    (
+        "playbooks/ship.md",
+        include_str!("skills/krig/playbooks/ship.md"),
+    ),
+    (
+        "playbooks/slim.md",
+        include_str!("skills/krig/playbooks/slim.md"),
+    ),
+    (
+        "playbooks/verify.md",
+        include_str!("skills/krig/playbooks/verify.md"),
+    ),
+    (
+        "references/deepening.md",
+        include_str!("skills/krig/references/deepening.md"),
+    ),
+    (
+        "references/leakage-8.md",
+        include_str!("skills/krig/references/leakage-8.md"),
+    ),
+    (
+        "references/standards-baseline.md",
+        include_str!("skills/krig/references/standards-baseline.md"),
+    ),
+    (
+        "scripts/ab-eval.mjs",
+        include_str!("skills/krig/scripts/ab-eval.mjs"),
+    ),
+    (
+        "scripts/checkpoint.mjs",
+        include_str!("skills/krig/scripts/checkpoint.mjs"),
+    ),
+    (
+        "scripts/decision-log.mjs",
+        include_str!("skills/krig/scripts/decision-log.mjs"),
+    ),
+    (
+        "scripts/ledger.mjs",
+        include_str!("skills/krig/scripts/ledger.mjs"),
+    ),
+    (
+        "scripts/lib/cli.mjs",
+        include_str!("skills/krig/scripts/lib/cli.mjs"),
+    ),
+    (
+        "scripts/lib/git-state.mjs",
+        include_str!("skills/krig/scripts/lib/git-state.mjs"),
+    ),
+    (
+        "scripts/lib/markdown.mjs",
+        include_str!("skills/krig/scripts/lib/markdown.mjs"),
+    ),
+    (
+        "scripts/lib/source-lex.mjs",
+        include_str!("skills/krig/scripts/lib/source-lex.mjs"),
+    ),
+    (
+        "scripts/recon.mjs",
+        include_str!("skills/krig/scripts/recon.mjs"),
+    ),
+    (
+        "scripts/route-table.mjs",
+        include_str!("skills/krig/scripts/route-table.mjs"),
+    ),
+    (
+        "scripts/route.mjs",
+        include_str!("skills/krig/scripts/route.mjs"),
+    ),
+    (
+        "scripts/scan.mjs",
+        include_str!("skills/krig/scripts/scan.mjs"),
+    ),
+    (
+        "scripts/ship-check.mjs",
+        include_str!("skills/krig/scripts/ship-check.mjs"),
+    ),
+    (
+        "scripts/slim.mjs",
+        include_str!("skills/krig/scripts/slim.mjs"),
+    ),
+    (
+        "scripts/statecheck.mjs",
+        include_str!("skills/krig/scripts/statecheck.mjs"),
+    ),
+    (
+        "scripts/unwrap.mjs",
+        include_str!("skills/krig/scripts/unwrap.mjs"),
+    ),
+];
+
 #[must_use]
 pub fn canonical_skill_name(raw: &str) -> &str {
     let trimmed = raw.trim();
@@ -96,13 +232,26 @@ pub fn canonical_skill_name(raw: &str) -> &str {
 pub fn skill_references(name: &str) -> &'static [(&'static str, &'static str)] {
     match canonical_skill_name(name) {
         "orchestration" => ORCHESTRATION_REFERENCES,
+        "krig" => KRIG_FILES,
         _ => &[],
     }
 }
 
 // Orca's discovery entries must keep their own names and update ownership.
 pub(super) const ORCA_SKILL_NAMES: &[&str] = &["orchestration", "computer-use"];
+// Explicit slash-invoked skills must not create duplicate `krill-<name>` copies next to developer symlinks.
+const NO_PREFIX_FALLBACK_SKILLS: &[&str] = &["krig"];
 const MARKER: &str = "<!-- krill-managed-skill -->";
+const JS_MARKER: &str = "// krill-managed-skill";
+const YAML_MARKER: &str = "# krill-managed-skill";
+
+fn marker_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("mjs" | "js" | "cjs") => JS_MARKER,
+        Some("yaml" | "yml") => YAML_MARKER,
+        _ => MARKER,
+    }
+}
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Global discovery roots. agy's CLI-specific root and shared App/IDE root are distinct.
@@ -150,6 +299,14 @@ pub fn sync_builtin_skills(directories: &[PathBuf]) -> SkillSyncReport {
     let mut report = SkillSyncReport::default();
     for dir in directories {
         for skill in builtin_skills() {
+            if NO_PREFIX_FALLBACK_SKILLS.contains(&skill.name)
+                && ensure_directory_safe(dir).is_ok()
+                && fs::symlink_metadata(dir.join(skill.name))
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                report.unchanged = report.unchanged.saturating_add(1);
+                continue;
+            }
             match install(skill, dir) {
                 Ok((path, changed)) => {
                     report.installed.push(path);
@@ -234,18 +391,25 @@ fn candidate_writable(dir: &Path, skill: &SkillEntry) -> io::Result<bool> {
     }
 }
 
-fn already_current(skill: &SkillEntry, base_dir: &Path) -> io::Result<Option<PathBuf>> {
+fn select_writable_dir(skill: &SkillEntry, base_dir: &Path) -> io::Result<Option<(PathBuf, bool)>> {
+    if NO_PREFIX_FALLBACK_SKILLS.contains(&skill.name) {
+        let dir = base_dir.join(skill.name);
+        return Ok(candidate_writable(&dir, skill)?.then_some((dir, false)));
+    }
     let orca_owned = ORCA_SKILL_NAMES.contains(&skill.name);
     let candidates = [skill.name.to_owned(), format!("krill-{}", skill.name)];
-    let mut selected = None;
     for (index, name) in candidates.iter().enumerate().skip(usize::from(orca_owned)) {
         let dir = base_dir.join(name);
         if candidate_writable(&dir, skill)? {
-            selected = Some((dir, index != 0));
-            break;
+            return Ok(Some((dir, index != 0)));
         }
     }
-    let Some((dir, prefixed)) = selected else {
+    Ok(None)
+}
+
+fn already_current(skill: &SkillEntry, base_dir: &Path) -> io::Result<Option<PathBuf>> {
+    let orca_owned = ORCA_SKILL_NAMES.contains(&skill.name);
+    let Some((dir, prefixed)) = select_writable_dir(skill, base_dir)? else {
         return Ok(None);
     };
     let mut stale = vec![base_dir.join(format!("mk-{}", skill.name))];
@@ -285,7 +449,8 @@ fn already_current(skill: &SkillEntry, base_dir: &Path) -> io::Result<Option<Pat
         if ensure_directory_safe(parent).is_err() || !regular_or_missing(&path)? {
             return Ok(None);
         }
-        let expected = format!("{}\n{MARKER}\n", content.trim_end());
+        let marker = marker_for_path(&path);
+        let expected = format!("{}\n{marker}\n", content.trim_end());
         if fs::read(&path).ok().as_deref() != Some(expected.as_bytes()) {
             return Ok(None);
         }
@@ -305,16 +470,7 @@ fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
     fs::create_dir_all(base_dir)?;
     let _lock = skill_lock(&lock)?;
     let orca_owned = ORCA_SKILL_NAMES.contains(&skill.name);
-    let candidates = [skill.name.to_owned(), format!("krill-{}", skill.name)];
-    let mut selected = None;
-    for (index, name) in candidates.iter().enumerate().skip(usize::from(orca_owned)) {
-        let dir = base_dir.join(name);
-        if candidate_writable(&dir, skill)? {
-            selected = Some((dir, index != 0));
-            break;
-        }
-    }
-    let (dir, prefixed) = selected.ok_or_else(|| {
+    let (dir, prefixed) = select_writable_dir(skill, base_dir)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::AlreadyExists,
             "skill paths belong to external skills or symlinks",
@@ -337,7 +493,7 @@ fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
             return Err(invalid("skill reference must not be a symlink"));
         }
         match fs::read_to_string(&path) {
-            Ok(existing) if !existing.contains(MARKER) => {
+            Ok(existing) if !existing.contains(marker_for_path(&path)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "skill reference belongs to another owner",
@@ -352,7 +508,8 @@ fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
     // Publish references before the entrypoint, so newly discovered instructions have their files.
     let mut changed = false;
     for (path, body) in files.iter().skip(1).chain(files.first()) {
-        let bytes = format!("{}\n{MARKER}\n", body.trim_end());
+        let marker = marker_for_path(path);
+        let bytes = format!("{}\n{marker}\n", body.trim_end());
         changed |= write_if_changed(path, bytes.as_bytes())?;
     }
     if skill_references(skill.name).is_empty() {
@@ -363,7 +520,7 @@ fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if regular_or_missing(&p).unwrap_or(false)
-                    && fs::read_to_string(&p).is_ok_and(|s| s.contains(MARKER))
+                    && fs::read_to_string(&p).is_ok_and(|s| s.contains(marker_for_path(&p)))
                 {
                     fs::remove_file(&p).ok();
                 }
