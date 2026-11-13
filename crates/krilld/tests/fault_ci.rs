@@ -164,7 +164,8 @@ impl Rig {
         let dir = PathBuf::from(format!("/tmp/mk064-{tag}-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("run/k.sock");
+        // 앱이 KRILL_STATE_DIR에서 찾는 경로와 같아야 GUI가 이 데몬에 붙는다(krill_proto::daemon).
+        let sock = dir.join("run/krilld.sock");
         Self {
             dir,
             sock,
@@ -246,10 +247,11 @@ impl Drop for Rig {
     }
 }
 
-/// 이 소켓 경로를 인자로 가진 holder 프로세스가 0개인지 확인한다.
+/// Rig 디렉터리를 가리키는 holder 프로세스가 0개인지 확인한다. 소켓이 아니라 디렉터리로 찾아야
+/// Rig가 모르는 소켓에 뜬 holder(GUI가 스스로 띄운 것 등)도 잡힌다.
 /// 테스트 본문 끝에서 `Rig`를 명시 drop한 뒤 부른다(Drop 안에서는 단언하지 않는다).
-fn assert_no_holders(sock: &Path) {
-    let left = daemons(sock);
+fn assert_no_holders(dir: &Path) {
+    let left = daemons(dir);
     let holders: Vec<String> = left
         .iter()
         .map(|p| (*p, command_of(*p)))
@@ -258,8 +260,8 @@ fn assert_no_holders(sock: &Path) {
         .collect();
     assert!(
         holders.is_empty(),
-        "residual holder on {}: {holders:?} (all on socket: {left:?})",
-        sock.display()
+        "residual holder under {}: {holders:?} (all under dir: {left:?})",
+        dir.display()
     );
 }
 
@@ -884,9 +886,9 @@ fn survival_e2e_3_krilld_crash_and_total_daemon_crash_recovery() {
     eprintln!(
         "MK-064 e2e-3 crash: detect {detect_ms:.2}ms recover {recover_ms:.2}ms, held=10/10, cold-restore+resume PASS"
     );
-    let sock = rig.sock.clone();
+    let dir = rig.dir.clone();
     drop(rig);
-    assert_no_holders(&sock);
+    assert_no_holders(&dir);
 }
 
 /// 장애 주입: 세션 A 출력 폭주 중 세션 B 키 입력→화면 에코 지연(p99 < 33ms 목표 / 100ms 차단선)과
@@ -1044,9 +1046,9 @@ fn fault_injection_output_flood_isolation_and_disk_cap() {
         p99 < p99_limit,
         "flood isolation echo p99 {p99:.2}ms >= {p99_limit}ms"
     );
-    let sock = rig.sock.clone();
+    let dir = rig.dir.clone();
     drop(rig);
-    assert_no_holders(&sock);
+    assert_no_holders(&dir);
 }
 
 /// 장애 주입: 24시간 메모리 가속 측정(10세션 120×40 × 24에포크 연속 출력·세그먼트 봉인·재접속·히스토리 조회).
@@ -1192,9 +1194,9 @@ fn fault_injection_accelerated_24h_memory_soak() {
         drift_kib <= 20 * 1024,
         "24-epoch memory drift {drift_kib}KiB > 20MiB blocking limit"
     );
-    let sock = rig.sock.clone();
+    let dir = rig.dir.clone();
     drop(rig);
-    assert_no_holders(&sock);
+    assert_no_holders(&dir);
 }
 
 /// GUI 게이트의 앱은 `KRILL_STATE_DIR`의 기본 소켓(`run/krilld.sock`)에 자기 holder를 detach로 띄운다. `Rig`이 자기 소켓
@@ -1400,7 +1402,7 @@ fn gui_survival_round(round: usize, app_bin: &Path) {
         "MK-064 GUI round {round}: app={app_pid} session={session_pid} holder={holder_pid} krilld={v1_krilld}->{v2_krilld}->{v3_krilld} bytes={} sha256={got_hash} PASS",
         full.len()
     );
-    let sock = rig.sock.clone();
+    let dir = rig.dir.clone();
     drop(rig);
-    assert_no_holders(&sock);
+    assert_no_holders(&dir);
 }
