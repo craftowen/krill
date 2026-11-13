@@ -1063,7 +1063,13 @@ impl Layout {
         self.clear_stale_preview();
         self.file_states.retain(|p, _| self.files.contains_key(p));
         self.respawn_cwds.retain(|p, _| live.contains(p));
-        self.zoomed.retain(|p| live.contains(p));
+        self.zoomed.retain(|p| {
+            live.contains(p)
+                && self
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.root.contains(*p) && !matches!(tab.root, PaneTree::Leaf(_)))
+        });
         self.chat_views
             .retain(|p, _| live.contains(p) && !self.files.contains_key(p));
     }
@@ -1663,6 +1669,8 @@ impl Layout {
             if !host.is_local() {
                 self.hosts.insert(new, host);
             }
+            let active = self.active;
+            self.zoomed.retain(|p| !self.tabs[active].root.contains(*p));
             self.record_pane_mru();
         }
     }

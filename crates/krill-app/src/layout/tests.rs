@@ -1291,3 +1291,38 @@ fn startup_edits_are_appended_to_the_restored_layout() {
     assert_eq!(kept.tabs(), saved.tabs());
     assert_eq!(kept.active(), saved.active());
 }
+
+#[test]
+fn zoom_clears_when_sibling_closes_to_single_pane_or_when_splitting() {
+    // 1) Closing the non-zoomed pane leaves one leaf: stale zoom must not survive or hide a future split.
+    let mut l = Layout::default();
+    l.split(Axis::Horizontal); // PaneId(0) | PaneId(1), focused = 1
+    l.focus(PaneId(0));
+    l.set_zoomed_pane(Some(PaneId(0)));
+    assert_eq!(l.zoomed_pane(), Some(PaneId(0)));
+
+    l.focus(PaneId(1));
+    l.close_pane();
+    assert_eq!(l.visible(), vec![PaneId(0)]);
+    assert_eq!(
+        l.zoomed_pane(),
+        None,
+        "single-pane tab must not retain stale zoom"
+    );
+
+    l.split(Axis::Vertical);
+    assert_eq!(l.visible().len(), 2);
+    assert_eq!(l.zoomed_pane(), None);
+
+    // 2) Splitting a zoomed multi-pane tab clears zoom so the newly focused pane is visible.
+    l.set_zoomed_pane(Some(PaneId(0)));
+    assert_eq!(l.zoomed_pane(), Some(PaneId(0)));
+    l.focus(PaneId(0));
+    l.split(Axis::Horizontal);
+    assert_eq!(l.visible().len(), 3);
+    assert_eq!(
+        l.zoomed_pane(),
+        None,
+        "splitting while zoomed must reveal the newly created pane"
+    );
+}
