@@ -1512,6 +1512,9 @@ impl Shell {
                 this.files.sharing.remove(&id);
                 this.notice = Some(match res {
                     Ok(out) => {
+                        if let Some(cached) = this.artifacts_cache.clone() {
+                            cached.update(cx, krill_app::artifacts::View::sync_from_disk_cache);
+                        }
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                             out.share_url.clone(),
                         ));
