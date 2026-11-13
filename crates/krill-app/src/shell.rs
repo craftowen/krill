@@ -2929,8 +2929,10 @@ impl Shell {
                 (host, label, target)
             })
             .collect();
+        let sidebar = self.sidebar.read(cx);
         for (host, target) in &self.host_targets {
-            if !hosts.iter().any(|(h, _, _)| h == host) {
+            if !hosts.iter().any(|(h, _, _)| h == host) && !sidebar.is_suppressed_remote_host(host)
+            {
                 hosts.push((
                     host.clone(),
                     host.remote_id().unwrap_or_else(|| host.as_key()).to_owned(),
@@ -6105,7 +6107,7 @@ impl Shell {
         if let Some(old) = self.layout.focused() {
             self.commit_ime(old, None, cx);
         }
-        let target = self.tab_pane_for_session_on(&host, session);
+        let target = self.tab_pane_for_machine_session(&host, session, cx);
         self.change(true, cx, |l| {
             if let Some((tab, pane)) = target {
                 l.activate(tab);
@@ -6160,6 +6162,29 @@ impl Shell {
         None
     }
 
+    fn tab_pane_for_machine_session(
+        &self,
+        host: &krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &App,
+    ) -> Option<(usize, PaneId)> {
+        if let Some(found) = self.tab_pane_for_session_on(host, session) {
+            return Some(found);
+        }
+        let sidebar = self.sidebar.read(cx);
+        for i in 0..self.layout.tabs().len() {
+            let mut layout = self.layout.clone();
+            layout.activate(i);
+            if let Some(pane) = layout.visible().into_iter().find(|&p| {
+                layout.session(p) == Some(session)
+                    && sidebar.same_machine_host(layout.host(p), host)
+            }) {
+                return Some((i, pane));
+            }
+        }
+        None
+    }
+
     /// OWE-854: 사이드바 세션 행의 '새 세션에 이어하기…'. 칸에 없으면 먼저 붙이고 모달을 연다.
     fn continue_sidebar_session(
         &mut self,
@@ -6167,10 +6192,10 @@ impl Shell {
         session: krill_proto::SessionId,
         cx: &mut Context<Self>,
     ) {
-        let mut target = self.tab_pane_for_session_on(host, session);
+        let mut target = self.tab_pane_for_machine_session(host, session, cx);
         if target.is_none() {
             self.open_session_on(host.clone(), session, cx);
-            target = self.tab_pane_for_session_on(host, session);
+            target = self.tab_pane_for_machine_session(host, session, cx);
         }
         let Some((_, pane)) = target else {
             return;

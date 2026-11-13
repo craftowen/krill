@@ -631,7 +631,10 @@ impl Sidebar {
         }
         for remote in &self.remote_hosts {
             let r_host = crate::hosts::HostId::Remote(remote.id.clone());
-            if remote.status != crate::hosts::HostStatus::Connected && &r_host != initial_host {
+            if &r_host != initial_host
+                && (remote.status != crate::hosts::HostStatus::Connected
+                    || self.is_suppressed_remote_host(&r_host))
+            {
                 continue;
             }
             let Some(r_source) = remote.source.clone() else {
