@@ -784,6 +784,7 @@ pub struct Shell {
     /// 상태바 포트 감지 메모(AS-24): 세션별 마지막 화면 텍스트와 감지 결과.
     /// 렌더마다 모든 칸의 화면 텍스트에 정규식을 돌리지 않고 텍스트가 바뀔 때만 다시 감지한다.
     ports_cache: std::cell::RefCell<HashMap<(krill_app::hosts::HostId, u64), popout::PortCache>>,
+    artifacts_cache: Option<gpui::Entity<krill_app::artifacts::View>>,
     modal: Option<Modal>,
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
     pub(super) role: WindowRole,
@@ -1368,6 +1369,7 @@ impl Shell {
             last_synced_selection: None,
             workspace_closing: std::collections::HashSet::new(),
             ports_cache: std::cell::RefCell::default(),
+            artifacts_cache: None,
             modal: None,
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,

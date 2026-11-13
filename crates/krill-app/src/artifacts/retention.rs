@@ -104,6 +104,7 @@ impl View {
                             .find(|item| item.artifact.slug == slug)
                         {
                             *current = item;
+                            this.rebuild_rows();
                         }
                     }
                     Err(error) => this.error = Some(error),
@@ -115,7 +116,7 @@ impl View {
         cx.notify();
     }
 
-    pub(super) fn render_retention_control(
+    pub(super) fn render_inline_retention_control(
         &self,
         item: Option<&Item>,
         p: &ui::Palette,
@@ -180,29 +181,21 @@ impl View {
             });
         div()
             .flex()
-            .flex_col()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
             .min_w_0()
-            .gap_1()
-            .p_3()
-            .child(ui::field_label(
-                if item.is_some() {
-                    text::RETENTION_TITLE.get()
-                } else {
-                    text::RETENTION_DEFAULT.get()
-                },
-                None,
-                p,
-            ))
-            .child(dropdown)
             .child(
                 div()
+                    .flex_none()
                     .text_size(ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(if item.is_some() {
-                        text::RETENTION_HINT.get()
+                        text::RETENTION_TITLE.get()
                     } else {
-                        text::RETENTION_DEFAULT_HINT.get()
+                        text::RETENTION_DEFAULT.get()
                     }),
             )
+            .child(dropdown)
     }
 }

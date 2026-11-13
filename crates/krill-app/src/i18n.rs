@@ -193,6 +193,12 @@ catalog! {
         RETENTION_365 => ("1년", "1yr"),
         RETENTION_DAYS => ("{days}일", "{days} days"),
         RETENTION_NEVER => ("무기한", "Never"),
+        PUBLIC_SHARING => ("공개 공유", "Public sharing"),
+        BACK_TO_LIST => ("목록으로", "Back to list"),
+        OPEN_LOCAL => ("로컬 파일 열기", "Open local file"),
+        PREVIEW_RENDERED => ("미리보기", "Preview"),
+        PREVIEW_SOURCE => ("원본", "Source"),
+        PREVIEW_LOADING => ("내용을 불러오는 중…", "Loading content…"),
     }
     automations {
         TITLE => ("자동화", "Automations"),
