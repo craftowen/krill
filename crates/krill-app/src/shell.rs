@@ -1552,7 +1552,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok((dir, screens, mut previous, old_ports)) = this.read_with(cx, |this, cx| {
-                    let mut cache = this.ports_cache.borrow_mut();
+                    let cache = this.ports_cache.borrow();
                     let mut previous = HashMap::new();
                     let screens = this
                         .live
@@ -1560,11 +1560,12 @@ impl Shell {
                         .filter_map(|(pane, live)| {
                             let id = (this.layout.host(*pane).clone(), live.pane.session()?.0);
                             let screen = live.pane.shown();
-                            if cache.get(&id).is_some_and(|entry| entry.matches(&screen)) {
-                                return None;
-                            }
-                            if let Some(old) = cache.remove(&id) {
-                                previous.insert(id.clone(), old.into_data());
+                            // 직전 결과는 새 결과가 올 때까지 캐시에 남겨 계속 표시한다.
+                            if let Some(old) = cache.get(&id) {
+                                if old.matches(&screen) {
+                                    return None;
+                                }
+                                previous.insert(id.clone(), old.data());
                             }
                             Some((id, screen))
                         })
@@ -1633,7 +1634,6 @@ impl Shell {
                                 .any(|(pane, live)| {
                                     this.layout.host(*pane) == &id.0
                                         && live.pane.session().is_some_and(|sid| sid.0 == id.1)
-                                        && Rc::ptr_eq(screen, &live.pane.shown())
                                 })
                                 .then(|| {
                                     changed |=
