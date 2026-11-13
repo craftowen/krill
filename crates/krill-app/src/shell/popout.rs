@@ -1337,8 +1337,11 @@ impl Shell {
                     (h, label, s)
                 })
                 .collect();
+            let sidebar = self.sidebar.read(cx);
             for (h, s) in &self.remote_accounts {
-                if !list.iter().any(|(existing, _, _)| existing == h) {
+                if !list.iter().any(|(existing, _, _)| existing == h)
+                    && !sidebar.is_suppressed_remote_host(h)
+                {
                     let label = h.remote_id().unwrap_or_else(|| h.as_key()).to_owned();
                     list.push((h.clone(), label, s.clone()));
                 }

@@ -602,7 +602,8 @@ impl Sidebar {
             .focused
             .and_then(|id| self.folder_on(&self.focused_host, id))
         {
-            return self.row_host(index) == &self.focused_host && focused == path;
+            return self.same_machine_host(self.row_host(index), &self.focused_host)
+                && focused == path;
         }
         self.selected_workspace()
             .is_some_and(|(host, folder)| self.row_host(index) == &host && folder == path)
@@ -3316,8 +3317,8 @@ impl Render for Sidebar {
             .filter(|repo| !self.removed_projects.contains(*repo))
             .map(|repo| (HostId::Local, repo.clone(), self.project_header_name(repo)))
             .collect();
-        for remote in &self.remote_hosts {
-            if remote.status == HostStatus::Connected && remote.source.is_some() {
+        for remote in self.connected_remote_hosts() {
+            if remote.source.is_some() {
                 let r_host = HostId::Remote(remote.id.clone());
                 for repo in remote.snapshot.trees.keys() {
                     projects.push((

@@ -1661,16 +1661,13 @@ impl Sidebar {
     pub fn has_projects(&self) -> bool {
         !self.snapshot.trees.is_empty()
             || !self.snapshot.sessions.is_empty()
-            || self.remote_hosts.iter().any(|r| {
-                r.status == HostStatus::Connected
-                    && (!r.snapshot.trees.is_empty() || !r.snapshot.sessions.is_empty())
-            })
+            || self
+                .connected_remote_hosts()
+                .any(|r| !r.snapshot.trees.is_empty() || !r.snapshot.sessions.is_empty())
     }
 
     pub(super) fn has_connected_remote_hosts(&self) -> bool {
-        self.remote_hosts
-            .iter()
-            .any(|r| r.status == HostStatus::Connected)
+        self.connected_remote_hosts().next().is_some()
     }
 
     /// 마지막으로 선택·활성화된 워크트리/폴더 경로.
@@ -1703,10 +1700,8 @@ impl Sidebar {
         // 커서 밖 선택(복원된 상태 등)은 스냅샷에서 소유 호스트를 찾는다.
         // 여러 호스트에 동명 경로가 있으면 판단을 미루고 None(실행 위치 메뉴 폴백).
         let mut found: Option<HostId> = None;
-        for remote in &self.remote_hosts {
-            if remote.status == HostStatus::Connected
-                && Self::snapshot_contains(&remote.snapshot, &path)
-            {
+        for remote in self.connected_remote_hosts() {
+            if Self::snapshot_contains(&remote.snapshot, &path) {
                 if found.is_some() {
                     return None;
                 }
@@ -2021,6 +2016,77 @@ impl Sidebar {
     #[must_use]
     pub fn machine_identities(&self) -> BTreeMap<HostId, krill_proto::ipc::MachineIdentity> {
         self.machine_identities.clone()
+    }
+
+    /// 두 호스트 식별자가 같은 경로이거나 검증된 [`MachineIdentity`]가 같으면 같은 머신으로 본다.
+    #[must_use]
+    pub fn same_machine_host(&self, a: &HostId, b: &HostId) -> bool {
+        a == b
+            || self
+                .machine_identities
+                .get(a)
+                .is_some_and(|id| self.machine_identities.get(b) == Some(id))
+    }
+
+    /// 검증된 [`MachineIdentity`] 기준으로 로컬이나 앞선 연결 경로가 이미 대표하고 있어
+    /// 표시 목록에서 숨겨야 하는 중복 원격 경로인지 돌려준다. 신원 미확인(`None`) 경로는 유지한다.
+    #[must_use]
+    pub fn is_suppressed_remote_host(&self, host: &HostId) -> bool {
+        let HostId::Remote(id) = host else {
+            return false;
+        };
+        let Some(&identity) = self.machine_identities.get(host) else {
+            return false;
+        };
+        if self.local_status == HostStatus::Connected
+            && self.machine_identities.get(&HostId::Local) == Some(&identity)
+        {
+            return true;
+        }
+        for r in &self.remote_hosts {
+            if r.id == *id {
+                if r.status == HostStatus::Connected {
+                    return false;
+                }
+                continue;
+            }
+            if r.status == HostStatus::Connected
+                && self.machine_identities.get(&HostId::Remote(r.id.clone())) == Some(&identity)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 연결된 원격 호스트 중 검증된 [`MachineIdentity`]가 겹치는 중복 경로(로컬 루프백, 같은 원격 PC의 SSH+초대)를
+    /// 제외한 대표 경로만 순서대로 돌려준다. 신원 미확인(`None`) 경로는 합치지 않는다.
+    pub fn connected_remote_hosts(&self) -> impl Iterator<Item = &RemoteHost> {
+        let mut seen = BTreeSet::new();
+        if self.local_status == HostStatus::Connected
+            && let Some(&local_id) = self.machine_identities.get(&HostId::Local)
+        {
+            seen.insert(local_id);
+        }
+        self.remote_hosts.iter().filter(move |r| {
+            r.status == HostStatus::Connected
+                && self
+                    .machine_identities
+                    .get(&HostId::Remote(r.id.clone()))
+                    .is_none_or(|&id| seen.insert(id))
+        })
+    }
+
+    pub(super) fn host_filter_matches(&self, host: &HostId) -> bool {
+        if self.options.filters.contains_host(host) {
+            return true;
+        }
+        let Some(identity) = self.machine_identities.get(host) else {
+            return false;
+        };
+        self.machine_identities.iter().any(|(other, other_id)| {
+            other_id == identity && self.options.filters.hosts.contains(other.as_key())
+        })
     }
 
     fn observe_machine(
@@ -2743,18 +2809,19 @@ impl Sidebar {
             .iter()
             .enumerate()
             .position(|(i, r)| {
-                self.row_host(i) == host && matches!(r, Row::Session(s, true) if s.id == focused_id)
+                self.same_machine_host(self.row_host(i), host)
+                    && matches!(r, Row::Session(s, true) if s.id == focused_id)
             })
             .or_else(|| {
                 self.rows.iter().enumerate().position(|(i, r)| {
-                    self.row_host(i) == host
+                    self.same_machine_host(self.row_host(i), host)
                         && matches!(r, Row::Session(s, _) if s.id == focused_id)
                 })
             })
             .or_else(|| {
                 let wt = target_wt?;
                 self.rows.iter().enumerate().position(|(i, r)| {
-                    self.row_host(i) == host
+                    self.same_machine_host(self.row_host(i), host)
                         && matches!(r, Row::Worktree(p) | Row::Folder(p) if p == wt)
                 })
             })
@@ -3167,20 +3234,15 @@ impl Sidebar {
 
     /// 연결된 원격 호스트만 목록에 띄운다(연결 안 된 호스트와 그 프로젝트는 숨기고, 호스트 관리는 설정에서 한다).
     fn live_remote_hosts(&self) -> impl Iterator<Item = &RemoteHost> {
-        self.remote_hosts.iter().filter(|r| {
-            r.status == HostStatus::Connected
-                && self
-                    .options
-                    .filters
-                    .contains_host(&HostId::Remote(r.id.clone()))
-        })
+        self.connected_remote_hosts()
+            .filter(|r| self.host_filter_matches(&HostId::Remote(r.id.clone())))
     }
 
     /// Orca처럼 프로젝트가 맨 위 단계다. 여러 PC에 같은 프로젝트가 있으면 한 머리줄 아래로 합치고
     /// 원격 PC의 워크트리·세션은 호스트 배지로 구분한다. 작업 폴더를 모르는 세션은 끝에 한 묶음으로 둔다.
     fn rebuild_by_project(&mut self) {
         let mut merge = ProjectMerge::default();
-        if self.options.filters.contains_host(&HostId::Local) {
+        if self.host_filter_matches(&HostId::Local) {
             merge.absorb(&HostId::Local, self.local_rows());
         }
         for remote in self.live_remote_hosts() {
@@ -3222,7 +3284,7 @@ impl Sidebar {
         self.ensure_external_polling(cx);
         self.merged_projects.clear();
         if !self.has_connected_remote_hosts() {
-            self.rows = if self.options.filters.contains_host(&HostId::Local) {
+            self.rows = if self.host_filter_matches(&HostId::Local) {
                 self.local_rows()
             } else {
                 Vec::new()
@@ -3233,7 +3295,7 @@ impl Sidebar {
         } else {
             let mut rows = Vec::new();
             let mut row_hosts = Vec::new();
-            if self.options.filters.contains_host(&HostId::Local) {
+            if self.host_filter_matches(&HostId::Local) {
                 rows.push(Row::HostHeader {
                     host: HostId::Local,
                     label: text::HOST_LOCAL
@@ -3280,14 +3342,18 @@ impl Sidebar {
         }
         if let Some((host, row)) = &cursor_item {
             self.cursor = self.rows.iter().enumerate().find_map(|(i, new_row)| {
-                (self.row_host(i) == host && viewport::same_item(row, new_row)).then_some(i)
+                (self.same_machine_host(self.row_host(i), host)
+                    && viewport::same_item(row, new_row))
+                .then_some(i)
             });
         }
         if self.cursor.is_none()
             && let Some(sel) = &self.selected_worktree
         {
             self.cursor = self.rows.iter().enumerate().find_map(|(i, r)| {
-                (cursor_item.as_ref().is_none_or(|(host, _)| self.row_host(i) == host)
+                (cursor_item
+                    .as_ref()
+                    .is_none_or(|(host, _)| self.same_machine_host(self.row_host(i), host))
                     && matches!(r, Row::Worktree(p) | Row::Folder(p) | Row::Repository(p) if p == sel))
                 .then_some(i)
             });
@@ -3622,10 +3688,9 @@ impl Sidebar {
                         s.meta.extend(meta);
                         s.rebuild(cx);
                     }
+                    let mut identity_changed = false;
                     let result = result.map(|(snapshot, meta, identity)| {
-                        if s.observe_machine(HostId::Local, identity) {
-                            cx.notify();
-                        }
+                        identity_changed = s.observe_machine(HostId::Local, identity);
                         (snapshot, meta)
                     });
                     s.apply_with_auto_titles(
@@ -3636,6 +3701,13 @@ impl Sidebar {
                         closed_sessions,
                         cx,
                     );
+                    if identity_changed {
+                        if s.remote_hosts.is_empty() {
+                            cx.notify();
+                        } else {
+                            s.rebuild(cx);
+                        }
+                    }
                     s.is_visible().then(|| s.poll_interval())
                 });
                 forced = false;
@@ -4191,9 +4263,7 @@ impl Sidebar {
             &self.snapshot,
         ))
         .chain(
-            self.remote_hosts
-                .iter()
-                .filter(|r| r.status == HostStatus::Connected)
+            self.connected_remote_hosts()
                 .map(|r| (HostId::Remote(r.id.clone()), r.label.as_str(), &r.snapshot)),
         )
     }
@@ -4751,7 +4821,7 @@ impl Sidebar {
     #[must_use]
     pub fn dashboard_sessions(&self) -> Vec<(HostId, Session)> {
         let mut out = Vec::new();
-        if self.options.filters.contains_host(&HostId::Local) {
+        if self.host_filter_matches(&HostId::Local) {
             out.extend(
                 self.snapshot
                     .sessions
@@ -4761,11 +4831,8 @@ impl Sidebar {
                     .map(|s| (HostId::Local, s)),
             );
         }
-        for remote in &self.remote_hosts {
+        for remote in self.live_remote_hosts() {
             let host = HostId::Remote(remote.id.clone());
-            if !self.options.filters.contains_host(&host) {
-                continue;
-            }
             out.extend(
                 remote
                     .snapshot
