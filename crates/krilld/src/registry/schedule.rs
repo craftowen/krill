@@ -715,7 +715,9 @@ impl<'a> Journal<'a> {
                     Err(error) => {
                         tracing::warn!(
                             file = name,
-                            ?error,
+                            classify = ?error.classify(),
+                            line = error.line(),
+                            column = error.column(),
                             "skipping corrupted schedule journal line"
                         );
                         continue;

@@ -267,7 +267,7 @@ impl Registry {
                 Some(store)
             }
             Err(e) => {
-                tracing::warn!("segment store unavailable in {}: {e}", d.display());
+                tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "segment store unavailable");
                 note_record_warning(d, &format!("store open failed: {e}"));
                 None
             }
@@ -414,7 +414,7 @@ impl Registry {
         if ids_ready && let Some(store) = &self.store {
             let live: Vec<_> = lock(&self.state).sessions.keys().copied().collect();
             if let Err(e) = store.gc(&live, wall) {
-                tracing::warn!(error = %e, "history gc failed");
+                tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "history gc failed");
             }
         }
     }
@@ -1476,7 +1476,12 @@ impl Registry {
             .and_then(|s| match s.recorder(id, size) {
                 Ok(rec) => Some(rec),
                 Err(e) => {
-                    tracing::warn!("session {} recorder unavailable: {e}", id.0);
+                    tracing::warn!(
+                        session = id.0,
+                        kind = ?e.kind(),
+                        errno = e.raw_os_error(),
+                        "session recorder unavailable"
+                    );
                     if let Some(dir) = self.dir.as_deref() {
                         note_record_warning(dir, &format!("session {} recorder failed: {e}", id.0));
                     }

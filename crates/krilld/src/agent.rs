@@ -1033,7 +1033,7 @@ static TRUST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 fn read_trust_file_snapshot(target: &Path) -> io::Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(target) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            tracing::warn!(path = %target.display(), "refusing to read symlink trust config");
+            tracing::warn!("refusing to read symlink trust config");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "symlink trust config refused",
@@ -1067,7 +1067,7 @@ pub(crate) fn write_trust_file_cas(
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
     if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
-        tracing::warn!(path = %target.display(), "refusing to write symlink trust config");
+        tracing::warn!("refusing to write symlink trust config");
         return Ok(false);
     }
     #[cfg(unix)]
@@ -1098,7 +1098,7 @@ pub(crate) fn write_trust_file_cas(
     }
     if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
         std::fs::remove_file(&tmp).ok();
-        tracing::warn!(path = %target.display(), "trust config became symlink before rename; skipping");
+        tracing::warn!("trust config became symlink before rename; skipping");
         return Ok(false);
     }
     let unchanged = match (expected_original, std::fs::read(target)) {
@@ -1108,10 +1108,7 @@ pub(crate) fn write_trust_file_cas(
     };
     if !unchanged {
         std::fs::remove_file(&tmp).ok();
-        tracing::warn!(
-            path = %target.display(),
-            "trust config modified concurrently by another process; skipping write"
-        );
+        tracing::warn!("trust config modified concurrently by another process; skipping write");
         return Ok(false);
     }
     if let Err(e) = std::fs::rename(&tmp, target) {
@@ -1484,14 +1481,14 @@ pub(crate) fn pre_trust_claude_in_with_hook(
             if let Ok(s) = std::str::from_utf8(b) {
                 Some(s)
             } else {
-                tracing::warn!(path = %config_path.display(), "claude config is not valid UTF-8; skipping");
+                tracing::warn!("claude config is not valid UTF-8; skipping");
                 return Ok(false);
             }
         }
         None => None,
     };
     let Some((next, changed)) = patch_claude_trust_json(existing_str, &candidates) else {
-        tracing::warn!(path = %config_path.display(), "skipping claude trust preset due to malformed JSON or unexpected schema");
+        tracing::warn!("skipping claude trust preset due to malformed JSON or unexpected schema");
         return Ok(false);
     };
     if !changed {
@@ -1543,14 +1540,14 @@ pub(crate) fn pre_trust_codex_in_with_hook(
             if let Ok(s) = std::str::from_utf8(b) {
                 s
             } else {
-                tracing::warn!(path = %config_path.display(), "codex config.toml is not valid UTF-8; skipping");
+                tracing::warn!("codex config.toml is not valid UTF-8; skipping");
                 return Ok(false);
             }
         }
         None => "",
     };
     let Some((next, changed)) = upsert_codex_project_trust_checked(existing, project_path) else {
-        tracing::warn!(path = %config_path.display(), "skipping codex trust preset due to malformed TOML or unexpected schema");
+        tracing::warn!("skipping codex trust preset due to malformed TOML or unexpected schema");
         return Ok(false);
     };
     if !changed {
@@ -1716,14 +1713,16 @@ pub(crate) fn pre_trust_workspace_in(home: &Path, cwd: &Path) -> io::Result<()> 
             if let Ok(s) = std::str::from_utf8(b) {
                 Some(s)
             } else {
-                tracing::warn!(path = %settings_path.display(), "antigravity settings.json is not valid UTF-8; skipping");
+                tracing::warn!("antigravity settings.json is not valid UTF-8; skipping");
                 return Ok(());
             }
         }
         None => None,
     };
     let Some((next, changed)) = patch_antigravity_settings_json(existing_str, &candidates) else {
-        tracing::warn!(path = %settings_path.display(), "skipping antigravity trust preset due to malformed JSON or unexpected schema");
+        tracing::warn!(
+            "skipping antigravity trust preset due to malformed JSON or unexpected schema"
+        );
         return Ok(());
     };
     if !changed {

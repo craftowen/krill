@@ -290,7 +290,7 @@ impl Holder {
                     return true;
                 }
                 Err(e) => {
-                    tracing::warn!(kind = ?e.kind(), error = %e, "holder link receive failed");
+                    tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "holder link receive failed");
                     return false;
                 }
             };
@@ -298,7 +298,7 @@ impl Holder {
             let m = match decode(p) {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!(kind = ?e.kind(), error = %e, "holder link frame undecodable");
+                    tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "holder link frame undecodable");
                     return false;
                 }
             };

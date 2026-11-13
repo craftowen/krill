@@ -127,7 +127,17 @@ fn main() -> ExitCode {
             }
         }
         Err(error) => {
-            tracing::error!(kind = ?error.kind(), error = %error, "listener failed");
+            let reason = (error.kind() == io::ErrorKind::PermissionDenied
+                && error
+                    .to_string()
+                    .contains("socket directory must be a 0700 directory"))
+            .then_some("socket directory must be a 0700 directory");
+            tracing::error!(
+                kind = ?error.kind(),
+                errno = error.raw_os_error(),
+                reason,
+                "listener failed"
+            );
             krill_proto::error_reporting::capture(
                 krill_proto::error_reporting::Process::Daemon,
                 krill_proto::error_reporting::Code::DaemonListenerFailed,

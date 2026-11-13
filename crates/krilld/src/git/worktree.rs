@@ -1048,8 +1048,8 @@ mod tests;
 
 /// Best-effort startup cleanup; preparation failures never prevent session recovery.
 pub fn recover_preparation() {
-    if let Err(error) = prepare::recover() {
-        tracing::warn!(%error, "cannot recover speculative worktree");
+    if prepare::recover().is_err() {
+        tracing::warn!("cannot recover speculative worktree");
     }
 }
 
