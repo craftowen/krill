@@ -1296,16 +1296,34 @@ impl Shell {
                         .into_any_element(),
                 );
             }
+            let is_remote_file = self.layout.host(pane).is_remote();
             file_items.push(
                 menu_item(
                     "tab-menu-reveal-finder",
-                    krill_app::i18n::catalog::diff::EXPLORER_REVEAL_FINDER.get(),
+                    krill_app::file_format::view::reveal_action_label(is_remote_file),
                     true,
                     None,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.tab_context_menu = None;
-                    cx.reveal_path(&path);
+                    match this.file_host_for_pane(pane) {
+                        super::files::FileHost::Local => {
+                            #[cfg(not(test))]
+                            cx.reveal_path(&path);
+                            #[cfg(test)]
+                            let _ = &path;
+                        }
+                        super::files::FileHost::Remote(..) => {
+                            this.start_file_pane_open(pane, true, cx);
+                        }
+                        super::files::FileHost::Unavailable(_) => {
+                            this.notice = Some(
+                                krill_app::i18n::catalog::editor::REMOTE_DISCONNECTED
+                                    .get()
+                                    .to_owned(),
+                            );
+                        }
+                    }
                     cx.notify();
                 }))
                 .into_any_element(),

@@ -296,6 +296,8 @@ catalog! {
     }
     other_os {
         REVEAL => ("파일 탐색기에서 보기", "Show in File Explorer"),
+        OPEN_ON_THIS_PC => ("이 PC에서 열기", "Open on This PC"),
+        DOWNLOAD_AND_REVEAL => ("내려받아 파일 탐색기에서 보기", "Download and Show in File Explorer"),
         HOST_LOCAL => ("내 컴퓨터", "My computer"),
         THEME_DESC => ("시스템은 OS 설정을 따릅니다.", "System follows the OS setting."),
         NOTIFICATIONS_DESC => ("에이전트 입력 대기·완료 알림을 보냅니다.", "Notify when an agent waits for input or finishes."),
@@ -2211,7 +2213,14 @@ catalog! {
         NO_PREVIEW => ("앱 안에서 미리볼 수 없습니다", "This file can't be previewed in the app"),
         HTML_PREVIEW_DESC => ("브라우저에서 렌더링된 화면을 확인하거나 코드 편집기로 소스를 수정할 수 있습니다.", "Open in your browser to view the rendered page, or switch to the code editor to edit the source."),
         OPEN_DEFAULT => ("기본 앱으로 열기", "Open with Default App"),
+        OPEN_ON_THIS_PC => ("이 PC에서 열기", "Open on This Mac"),
         REVEAL => ("Finder에서 보기", "Reveal in Finder"),
+        DOWNLOAD_AND_REVEAL => ("내려받아 Finder에서 보기", "Download and Reveal in Finder"),
+        DOWNLOADING_PERCENT => ("내려받는 중 {percent}%", "Downloading {percent}%"),
+        CANCEL_DOWNLOAD => ("취소", "Cancel"),
+        STAGE_FAILED => ("원격 파일을 내려받지 못했습니다: {error}", "Couldn't download the remote file: {error}"),
+        STAGE_NO_SPACE => ("디스크 여유 공간이 부족해 원격 파일을 내려받을 수 없습니다", "Not enough disk space to download the remote file"),
+        STAGE_TOO_LARGE => ("파일이 너무 커서 내려받을 수 없습니다(최대 {limit})", "File is too large to download (limit {limit})"),
         FIT => ("맞춤", "Fit"),
         ACTUAL_SIZE => ("100%", "100%"),
         ZOOM_IN => ("확대", "Zoom In"),

@@ -1706,7 +1706,7 @@ fn host_status_label(status: HostStatus) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 pub(super) fn host_visibility_summary(
     filters: &WorkspaceFilters,
