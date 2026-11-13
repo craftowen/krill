@@ -82,7 +82,7 @@ Only `/v1/mobile-events` supports CORS. Allowed origins are the exact `https://k
 
 ## In-app feedback
 
-`POST /v1/feedback` receives the text a user writes in the desktop Settings → Send feedback page. The body is exactly `{"message","release","os","arch"}`: message 1–4,000 characters after trimming, `release` in the native version format, `os` `macos|windows|linux`, `arch` `aarch64|x86_64`. Unknown fields are rejected. The receiver stores a random ID, receipt time and those four fields in the `feedback` table (migration `0002_feedback.sql`); no account, device, IP or header is stored. Success returns `{"ok":true}`. The shared edge limiter uses key `v1/feedback`; a trigger caps storage at 300 messages per UTC day and 50,000 rows (429 when full). There is no CORS and no automatic deletion. Read with `wrangler d1 execute krill-errors --remote --command "SELECT received_at, message, release, os FROM feedback ORDER BY received_at DESC LIMIT 50"`.
+`POST /v1/feedback` receives the text a user writes in the desktop Settings → Send feedback page. The body is exactly `{"message","release","os","arch"}`: message 1–4,000 characters after trimming, `release` in the native version format, `os` `macos|windows|linux`, `arch` `aarch64|x86_64`. Unknown fields are rejected. The receiver stores a random ID, receipt time and those four fields in the `feedback` table (migration `0002_feedback.sql`); no account, device, IP or header is stored. Success returns `{"ok":true}`. When the optional `FEEDBACK_WEBHOOK_URL` secret is configured, the Worker forwards the stored ID, receipt timestamp and those four fields as a Discord embed (`allowed_mentions` disabled) via `ctx.waitUntil`; webhook delivery failures do not affect the `200` ingestion response. The shared edge limiter uses key `v1/feedback`; a trigger caps storage at 300 messages per UTC day and 50,000 rows (429 when full). There is no CORS and no automatic deletion. Read with `wrangler d1 execute krill-errors --remote --command "SELECT received_at, message, release, os FROM feedback ORDER BY received_at DESC LIMIT 50"`.
 
 ## Admission and retention
 
@@ -122,6 +122,7 @@ From this directory, use the installed Wrangler CLI:
 ```sh
 wrangler d1 migrations apply krill-errors --remote
 wrangler secret put ADMIN_TOKEN
+wrangler secret put FEEDBACK_WEBHOOK_URL # optional Discord webhook for /v1/feedback
 wrangler deploy --dry-run
 wrangler deploy
 ```

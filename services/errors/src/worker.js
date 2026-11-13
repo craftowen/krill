@@ -2,7 +2,7 @@ import {timingSafeEqual} from 'node:crypto';
 import {CODES, HEX32, HttpError, KINDS, PROCESSES, readBody, validate, validRelease} from './validation.js';
 import {cleanup, eventDetail, health, ingest, listEvents, stats} from './storage.js';
 import {MOBILE_CODES, mobileAdmission, mobileCors, validateMobile} from './mobile.js';
-import {storeFeedback, validateFeedback} from './feedback.js';
+import {notifyFeedback, storeFeedback, validateFeedback} from './feedback.js';
 const SECURITY = {
   'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
   'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
@@ -52,7 +52,7 @@ function eventOptions(url) {
   }
   return options;
 }
-export async function handle(request, env, now = Math.floor(Date.now() / 1000)) {
+export async function handle(request, env, now = Math.floor(Date.now() / 1000), ctx = null) {
   const url = new URL(request.url);
   const mobile = url.pathname === '/v1/mobile-events';
   if (url.pathname === '/v1/events' || mobile) {
@@ -83,7 +83,10 @@ export async function handle(request, env, now = Math.floor(Date.now() / 1000)) 
     const rate = await env.INGEST_RATE_LIMITER.limit({key: 'v1/feedback'});
     if (rate?.success === false) return json({error: 'rate limited'}, 429, {'retry-after': '60'});
     if (rate?.success !== true) throw new HttpError(503, 'rate limiter unavailable');
-    await storeFeedback(env.DB, validateFeedback(await readBody(request)), now);
+    const feedback = validateFeedback(await readBody(request));
+    const id = await storeFeedback(env.DB, feedback, now);
+    const notify = notifyFeedback(env.FEEDBACK_WEBHOOK_URL, id, feedback, now, env.FEEDBACK_FETCH);
+    if (ctx?.waitUntil) ctx.waitUntil(notify); else await notify;
     return json({ok: true});
   }
   if (url.pathname === '/health') {
@@ -108,9 +111,9 @@ export async function handle(request, env, now = Math.floor(Date.now() / 1000)) 
   return json({error: 'not found'}, 404);
 }
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     let response;
-    try { response = await handle(request, env); }
+    try { response = await handle(request, env, undefined, ctx); }
     catch (error) {
       // Never log/reflect SQL, credentials, request headers, report bodies or paths.
       response = json({error: error instanceof HttpError ? error.message : 'service unavailable'},
