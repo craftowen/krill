@@ -232,6 +232,8 @@ impl ServerPanel {
                         .update(cx, |panel, cx| {
                             if !panel.busy && panel.generation == generation {
                                 let mut changed = false;
+                                let all_ok =
+                                    snapshot.0.is_ok() && snapshot.1.is_ok() && snapshot.2.is_ok();
                                 if let Ok(status) = snapshot.0 {
                                     changed |= panel.status != status;
                                     panel.status = status;
@@ -243,6 +245,9 @@ impl ServerPanel {
                                 if let Ok(hosts) = snapshot.2 {
                                     changed |= panel.remote_hosts != hosts;
                                     panel.remote_hosts = hosts;
+                                }
+                                if all_ok {
+                                    changed |= panel.error.take().is_some();
                                 }
                                 if changed {
                                     cx.notify();
@@ -317,6 +322,7 @@ impl ServerPanel {
         self.busy = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
+        self.error = None;
         cx.notify();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let (status_res, devices_res, hosts_res) = cx
@@ -464,6 +470,7 @@ impl ServerPanel {
     /// "연결 끊기(회수)" 버튼 무장을 푼다.
     pub fn cancel_revoke(&mut self, cx: &mut Context<Self>) {
         self.confirm_revoke = None;
+        self.confirmation_deadline = None;
         cx.notify();
     }
 
@@ -482,6 +489,7 @@ impl ServerPanel {
         let Some(target) = self.confirm_revoke.take() else {
             return;
         };
+        self.confirmation_deadline = None;
         let backend = self.backend.clone();
         let target_id = target.id.clone();
         self.busy = true;
@@ -646,6 +654,7 @@ impl ServerPanel {
 
     fn cancel_disconnect(&mut self, cx: &mut Context<Self>) {
         self.confirm_disconnect = None;
+        self.confirmation_deadline = None;
         cx.notify();
     }
 
@@ -663,6 +672,7 @@ impl ServerPanel {
         let Some(host) = self.confirm_disconnect.take() else {
             return;
         };
+        self.confirmation_deadline = None;
         self.busy = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
