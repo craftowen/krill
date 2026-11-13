@@ -122,6 +122,7 @@ pub(super) struct Files {
     close_guard: bool,
     closing: bool,
     next_request: u64,
+    next_stage_id: u64,
     loading: HashMap<PaneId, (u64, PathBuf)>,
     cache_clock: u64,
     cache_visible: Vec<PaneId>,
@@ -135,6 +136,8 @@ pub(super) struct Files {
     next_io: Option<tokio::sync::oneshot::Receiver<()>>,
     #[cfg(test)]
     link_next_io: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    opened_external: Vec<(PathBuf, bool)>,
     /// 다음 그리기 전에 디코드 캐시를 버릴 이미지 경로(재로드·탭 닫힘). 놓으려면 창이 있어야 해서 모아 둔다.
     released: Vec<PathBuf>,
     /// 터미널 링크(OWE-663 4번, OWE-867): 디스크 확인 캐시, ⌘ 아래 링크(칸, 밑줄 범위), 열고 나서 옮길 (파일, 줄, 열).
@@ -200,6 +203,7 @@ impl Default for Files {
             close_guard: false,
             closing: false,
             next_request: 0,
+            next_stage_id: 0,
             loading: HashMap::new(),
             cache_clock: 0,
             cache_visible: Vec::new(),
@@ -213,6 +217,8 @@ impl Default for Files {
             next_io: None,
             #[cfg(test)]
             link_next_io: None,
+            #[cfg(test)]
+            opened_external: Vec::new(),
             released: Vec::new(),
             link_lookup: None,
             link_busy: false,
@@ -261,11 +267,25 @@ impl Files {
     }
 }
 
+struct ActiveStage {
+    id: u64,
+    percent: u8,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ActiveStage {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 struct FileTab {
     path: PathBuf,
     /// 본문을 읽어 온 호스트. 칸의 호스트가 달라지면 본문을 재사용하지 않는다(APP-F01 후속).
     host: krill_app::hosts::HostId,
     staged_image: Option<PathBuf>,
+    staging: Option<ActiveStage>,
     revision: u64,
     preview_generation: u64,
     selection_pin: bool,
@@ -404,6 +424,7 @@ impl FileTab {
             path,
             host,
             staged_image: None,
+            staging: None,
             revision: 0,
             preview_generation: 0,
             selection_pin: false,
@@ -1227,7 +1248,7 @@ impl Shell {
                     .child(self.diff.read(cx).display_path(&path)),
             )
             .children(self.preview_toggle(id, cx))
-            .children(Self::open_browser_button(id, &path, &file_host))
+            .children(self.open_browser_button(id, &path, &file_host, cx))
             .children(self.share_button(id, &path, &file_host, cx))
             .when(is_split, |d| {
                 d.child(
@@ -1275,6 +1296,20 @@ impl Shell {
                 .child(krill_app::ui::error_banner(p, e))
                 .debug_selector(|| "file-error".into())
         });
+        let inline_stage_in_body = matches!(
+            tab.map(|t| &t.body),
+            Some(
+                Body::Placeholder(..)
+                    | Body::Text {
+                        shown: Some(Shown::Html { .. }),
+                        ..
+                    }
+            )
+        );
+        let stage_bar = (!inline_stage_in_body)
+            .then(|| self.pane_stage_view(id, cx))
+            .flatten()
+            .map(|stage| fview::stage_status_bar(stage, p));
         let notice = |msg: String| {
             div()
                 .size_full()
@@ -1309,17 +1344,35 @@ impl Shell {
                     // 브라우저 열기·Finder 보기가 같은 경로의 로컬 파일로 가므로 띄우지 않는다.
                     Err(_) => offline(),
                     Ok(remote) => {
-                        let weak = cx.weak_entity();
-                        fview::html_preview_on(
+                        let open_weak = cx.weak_entity();
+                        let source_weak = cx.weak_entity();
+                        let reveal_weak = cx.weak_entity();
+                        fview::html_preview_interactive(
                             &path,
-                            remote,
+                            remote.is_some(),
                             title.as_deref(),
                             *len,
+                            self.pane_stage_view(id, cx),
+                            move |_, cx| {
+                                open_weak
+                                    .update(cx, |this, cx| {
+                                        this.start_file_pane_open(id, false, cx);
+                                    })
+                                    .ok();
+                            },
                             move |window, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.set_preview(id, false, window, cx);
-                                })
-                                .ok();
+                                source_weak
+                                    .update(cx, |this, cx| {
+                                        this.set_preview(id, false, window, cx);
+                                    })
+                                    .ok();
+                            },
+                            move |_, cx| {
+                                reveal_weak
+                                    .update(cx, |this, cx| {
+                                        this.start_file_pane_open(id, true, cx);
+                                    })
+                                    .ok();
                             },
                             cx,
                         )
@@ -1343,7 +1396,32 @@ impl Shell {
             Some(Body::Table(view)) => view.clone().into_any_element(),
             Some(Body::Placeholder(kind, len)) => match file_host.transport() {
                 Err(_) => offline(),
-                Ok(remote) => fview::placeholder_on(&path, remote, *kind, *len, cx),
+                Ok(remote) => {
+                    let open_weak = cx.weak_entity();
+                    let reveal_weak = cx.weak_entity();
+                    fview::placeholder_interactive(
+                        &path,
+                        remote.is_some(),
+                        *kind,
+                        *len,
+                        self.pane_stage_view(id, cx),
+                        move |_, cx| {
+                            open_weak
+                                .update(cx, |this, cx| {
+                                    this.start_file_pane_open(id, false, cx);
+                                })
+                                .ok();
+                        },
+                        move |_, cx| {
+                            reveal_weak
+                                .update(cx, |this, cx| {
+                                    this.start_file_pane_open(id, true, cx);
+                                })
+                                .ok();
+                        },
+                        cx,
+                    )
+                }
             },
             Some(Body::Offline) => offline(),
             Some(Body::Unopenable(reason)) => notice(unopenable_text(*reason)),
@@ -1360,6 +1438,7 @@ impl Shell {
             .when(!in_card, |d| d.bg(p.background))
             .text_color(p.foreground)
             .child(header)
+            .children(stage_bar)
             .children(disk_banner)
             .children(error)
             .child(div().flex_1().min_h_0().child(body))
@@ -1401,14 +1480,249 @@ impl Shell {
         Some(preview.is_some() && shown.is_some())
     }
 
+    fn pane_stage_view(&self, id: PaneId, cx: &Context<Self>) -> Option<fview::PlaceholderStage> {
+        let stage = self.files.tabs.get(&id)?.staging.as_ref()?;
+        let weak = cx.weak_entity();
+        Some(fview::PlaceholderStage {
+            percent: stage.percent,
+            on_cancel: Box::new(move |_, cx| {
+                weak.update(cx, |this, cx| {
+                    this.cancel_file_pane_open(id, cx);
+                })
+                .ok();
+            }),
+        })
+    }
+
+    pub(super) fn cancel_file_pane_open(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if let Some(tab) = self.files.tabs.get_mut(&pane)
+            && let Some(stage) = tab.staging.take()
+        {
+            stage
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.files.cache_count = usize::MAX;
+            cx.notify();
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "test build records opened external paths on self.files"
+        )
+    )]
+    fn finish_external_open_for_pane(
+        &mut self,
+        target_path: PathBuf,
+        reveal: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let command = if reveal {
+            krill_app::file_format::reveal_command
+        } else {
+            krill_app::file_format::open_default_command
+        };
+        #[cfg(test)]
+        {
+            let _ = command(&target_path);
+            self.files.opened_external.push((target_path, reveal));
+            cx.notify();
+        }
+        #[cfg(not(test))]
+        {
+            cx.background_executor()
+                .spawn(async move {
+                    fview::run_open_command(&target_path, command);
+                })
+                .detach();
+        }
+    }
+
+    /// 파일 칸에서 외부 열기(`이 PC에서 열기`·`브라우저에서 열기`) 또는 파일 관리자 표시를 시작한다.
+    pub(super) fn start_file_pane_open(
+        &mut self,
+        pane: PaneId,
+        reveal: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.layout.file(pane).map(Path::to_owned) else {
+            return;
+        };
+        if self
+            .files
+            .tabs
+            .get(&pane)
+            .is_some_and(|t| t.staging.is_some())
+        {
+            return;
+        }
+        match self.file_host_for_pane(pane) {
+            FileHost::Unavailable(_) => {
+                self.mark_remote_unavailable(pane, cx);
+            }
+            FileHost::Local => {
+                if let Some(tab) = self.files.tabs.get_mut(&pane) {
+                    tab.error = None;
+                }
+                self.finish_external_open_for_pane(path, reveal, cx);
+            }
+            FileHost::Remote(host, target) => {
+                let target = *target;
+                if !self.files.tabs.contains_key(&pane) {
+                    let command = if reveal {
+                        krill_app::file_format::reveal_command
+                    } else {
+                        krill_app::file_format::open_default_command
+                    };
+                    let weak = cx.weak_entity();
+                    fview::spawn_open_on_reported(
+                        path,
+                        Some((host, target)),
+                        command,
+                        move |msg, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.notice = Some(msg);
+                                cx.notify();
+                            })
+                            .ok();
+                        },
+                        cx,
+                    );
+                    return;
+                }
+                self.files.next_stage_id = self.files.next_stage_id.wrapping_add(1);
+                let stage_id = self.files.next_stage_id;
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if let Some(tab) = self.files.tabs.get_mut(&pane) {
+                    tab.error = None;
+                    tab.staging = Some(ActiveStage {
+                        id: stage_id,
+                        percent: 0,
+                        cancel: cancel.clone(),
+                    });
+                    self.files.cache_count = usize::MAX;
+                }
+                cx.notify();
+
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+                let cancel_bg = cancel;
+                let host_bg = host.clone();
+                let path_bg = path.clone();
+                #[cfg(test)]
+                let gate = self.files.next_io.take();
+                let work = cx.background_executor().spawn(async move {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    let mut last_pct: Option<u8> = None;
+                    krill_app::remote_fs::stage_to_local_cache_with_progress(
+                        &target,
+                        &host_bg,
+                        &path_bg,
+                        krill_app::remote_fs::MAX_STAGE_BYTES,
+                        Some(&cancel_bg),
+                        |done, total| {
+                            let pct = done
+                                .saturating_mul(100)
+                                .checked_div(total)
+                                .map_or(100, |v| u8::try_from(v).unwrap_or(100).min(100));
+                            if last_pct != Some(pct) {
+                                last_pct = Some(pct);
+                                progress_tx.send(pct).ok();
+                            }
+                        },
+                    )
+                });
+
+                let progress_weak = cx.weak_entity();
+                cx.spawn(async move |_, cx| {
+                    while let Some(pct) = progress_rx.recv().await {
+                        let alive = progress_weak
+                            .update(cx, |this, cx| {
+                                if let Some(tab) = this.files.tabs.get_mut(&pane)
+                                    && let Some(stage) = tab.staging.as_mut()
+                                    && stage.id == stage_id
+                                    && stage.percent != pct
+                                {
+                                    stage.percent = pct;
+                                    cx.notify();
+                                }
+                            })
+                            .is_ok();
+                        if !alive {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+
+                cx.spawn(async move |this, cx| {
+                    let outcome = work.await;
+                    this.update(cx, |this, cx| {
+                        let still_current = this
+                            .files
+                            .tabs
+                            .get(&pane)
+                            .and_then(|t| t.staging.as_ref())
+                            .is_some_and(|s| s.id == stage_id);
+                        if !still_current {
+                            return;
+                        }
+                        if let Some(tab) = this.files.tabs.get_mut(&pane) {
+                            tab.staging = None;
+                            this.files.cache_count = usize::MAX;
+                        }
+                        if this.layout.file(pane) != Some(path.as_path())
+                            || *this.layout.host(pane) != host
+                        {
+                            cx.notify();
+                            return;
+                        }
+                        match outcome {
+                            Ok((local, _)) => {
+                                this.finish_external_open_for_pane(local, reveal, cx);
+                            }
+                            Err(err) => {
+                                if let Some(msg) = krill_app::remote_fs::stage_error_message(&err) {
+                                    if !this.layout.visible().contains(&pane) {
+                                        this.notice = Some(msg.clone());
+                                    }
+                                    if let Some(tab) = this.files.tabs.get_mut(&pane) {
+                                        tab.error = Some(msg);
+                                    }
+                                }
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
     /// 열린 HTML 파일을 기본 웹 브라우저에서 여는 머리 버튼.
-    fn open_browser_button(id: PaneId, path: &Path, host: &FileHost) -> Option<Button> {
+    fn open_browser_button(
+        &self,
+        id: PaneId,
+        path: &Path,
+        host: &FileHost,
+        cx: &mut Context<Self>,
+    ) -> Option<Button> {
         if !krill_app::file_format::is_html_path(path) {
             return None;
         }
         // 전송이 없는 원격 파일은 같은 경로의 로컬 파일을 열게 되므로 버튼을 두지 않는다.
-        let remote = host.transport().ok()?;
-        let path = path.to_path_buf();
+        host.transport().ok()?;
+        let busy = self
+            .files
+            .tabs
+            .get(&id)
+            .is_some_and(|t| t.staging.is_some());
         Some(
             Button::new(("file-open-browser", id.get()))
                 .debug_selector(|| "file-open-browser".into())
@@ -1416,19 +1730,15 @@ impl Shell {
                 .label(etext::OPEN_BROWSER.get())
                 .ghost()
                 .xsmall()
+                .disabled(busy)
                 .max_w(gpui::relative(1.))
                 .overflow_hidden()
                 .accessibility_label(etext::OPEN_BROWSER_TOOLTIP.get())
                 .tooltip(etext::OPEN_BROWSER_TOOLTIP.get())
-                .on_click(move |_, _, cx| {
+                .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    fview::spawn_open_on(
-                        path.clone(),
-                        remote.clone(),
-                        krill_app::file_format::open_default_command,
-                        cx,
-                    );
-                }),
+                    this.start_file_pane_open(id, false, cx);
+                })),
         )
     }
 
@@ -1935,6 +2245,7 @@ impl Shell {
                 || self.layout.focused() == Some(pane)
                 || selected
                 || tab.error.is_some()
+                || tab.staging.is_some()
                 || self.files.loading.contains_key(&pane)
                 || tab.doc.as_ref().is_some_and(|doc| doc.disk() != Disk::Same)
             {
@@ -2176,6 +2487,7 @@ impl Shell {
                     path: path.clone(),
                     host,
                     staged_image: None,
+                    staging: None,
                     revision: 0,
                     preview_generation: 0,
                     selection_pin: false,
@@ -2212,6 +2524,7 @@ impl Shell {
                     path: path.clone(),
                     host,
                     staged_image: None,
+                    staging: None,
                     revision: 0,
                     preview_generation: 0,
                     selection_pin: false,
@@ -2226,6 +2539,7 @@ impl Shell {
             path: path.clone(),
             host,
             staged_image,
+            staging: None,
             revision: 0,
             preview_generation: 0,
             selection_pin: false,

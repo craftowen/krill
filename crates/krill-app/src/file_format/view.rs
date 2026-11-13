@@ -633,52 +633,158 @@ pub fn notebook(
         .into_any_element()
 }
 
-/// HTML metadata preview with host-scoped external actions.
-pub fn html_preview_on(
+/// 자리표시자·미리보기의 UI 버튼 콜백 타입.
+pub type StageCallback = Box<dyn Fn(&mut Window, &mut App) + 'static>;
+
+/// 원격 파일을 이 기기로 내려받는 중일 때 자리표시자·미리보기에 그릴 진행률과 취소 동작.
+pub struct PlaceholderStage {
+    pub percent: u8,
+    pub on_cancel: StageCallback,
+}
+
+impl std::fmt::Debug for PlaceholderStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaceholderStage")
+            .field("percent", &self.percent)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 호스트 위치(로컬 vs 원격)에 맞는 기본 앱 열기 버튼 라벨.
+#[must_use]
+pub fn open_action_label(is_remote: bool) -> &'static str {
+    if is_remote {
+        text::OPEN_ON_THIS_PC
+            .mac_or(crate::i18n::catalog::other_os::OPEN_ON_THIS_PC)
+            .get()
+    } else {
+        text::OPEN_DEFAULT.get()
+    }
+}
+
+/// 호스트 위치(로컬 vs 원격)에 맞는 파일 관리자 표시 버튼·메뉴 라벨.
+#[must_use]
+pub fn reveal_action_label(is_remote: bool) -> &'static str {
+    if is_remote {
+        text::DOWNLOAD_AND_REVEAL
+            .mac_or(crate::i18n::catalog::other_os::DOWNLOAD_AND_REVEAL)
+            .get()
+    } else {
+        text::REVEAL
+            .mac_or(crate::i18n::catalog::other_os::REVEAL)
+            .get()
+    }
+}
+
+/// 원격 파일 스테이징 진행률·취소 컨텐츠. `100%` 폭을 미리 예약해 자릿수가 바뀌어도 취소 버튼이 밀리지 않는다.
+fn stage_status_controls(stage: PlaceholderStage, pal: &crate::ui::Palette) -> gpui::Div {
+    let on_cancel = stage.on_cancel;
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .grid()
+                .font_family(crate::ui::FONT_MONO)
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(pal.muted_foreground)
+                .child(
+                    div()
+                        .row_start(1)
+                        .col_start(1)
+                        .invisible()
+                        .child(text::DOWNLOADING_PERCENT.format(&[("percent", "100")])),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "file-stage-progress".into())
+                        .row_start(1)
+                        .col_start(1)
+                        .child(
+                            text::DOWNLOADING_PERCENT
+                                .format(&[("percent", &stage.percent.to_string())]),
+                        ),
+                ),
+        )
+        .child(
+            Button::new("file-stage-cancel")
+                .debug_selector(|| "file-stage-cancel".into())
+                .ghost()
+                .xsmall()
+                .label(text::CANCEL_DOWNLOAD.get())
+                .on_click(move |_, window, cx| on_cancel(window, cx)),
+        )
+}
+
+/// 자리표시자·HTML 미리보기 밖(원본 보기·일반 파일 탭 우클릭 등)에서 스테이징 중일 때 띄우는 상단 진행 줄.
+pub fn stage_status_bar(stage: PlaceholderStage, pal: &crate::ui::Palette) -> AnyElement {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_end()
+        .px_2()
+        .py_1()
+        .border_b_1()
+        .border_color(pal.border)
+        .bg(pal.editor_surface)
+        .child(stage_status_controls(stage, pal))
+        .into_any_element()
+}
+
+/// 원격 파일 스테이징 진행률·취소 줄. 원격 칸에서는 대기 중에도 같은 높이(`h_6`)를 예약해 레이아웃 흔들림을 막는다.
+fn stage_status_row(
+    is_remote: bool,
+    stage: Option<PlaceholderStage>,
+    pal: &crate::ui::Palette,
+) -> Option<AnyElement> {
+    if !is_remote {
+        return None;
+    }
+    let mut row = div().h_6().flex().items_center().justify_center();
+    if let Some(stage) = stage {
+        row = row.child(stage_status_controls(stage, pal));
+    }
+    Some(row.into_any_element())
+}
+
+/// 진행률·취소·호출자 콜백을 연결한 HTML 메타데이터 미리보기.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "HTML preview wires path, remote state, metadata, stage progress, and three action callbacks"
+)]
+pub fn html_preview_interactive(
     path: &Path,
-    remote: Option<(krill_hosts::HostId, crate::hosts::HostTarget)>,
+    is_remote: bool,
     title: Option<&str>,
     len: u64,
+    stage: Option<PlaceholderStage>,
+    on_open_browser: impl Fn(&mut Window, &mut App) + 'static,
     on_source: impl Fn(&mut Window, &mut App) + 'static,
+    on_reveal: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
     let pal = crate::ui::palette(cx);
+    let busy = stage.is_some();
     let open_label = crate::i18n::catalog::editor::OPEN_BROWSER.get();
     let source_label = crate::i18n::catalog::editor::SOURCE.get();
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let open_browser = {
-        let path = path.to_path_buf();
-        let remote = remote.clone();
-        crate::ui::primary("file-html-open-browser", open_label)
-            .debug_selector(|| "file-html-open-browser".into())
-            .on_click(move |_, _, cx| {
-                spawn_open_on(
-                    path.clone(),
-                    remote.clone(),
-                    super::open_default_command,
-                    cx,
-                );
-            })
-    };
+    let open_browser = crate::ui::primary("file-html-open-browser", open_label)
+        .debug_selector(|| "file-html-open-browser".into())
+        .disabled(busy)
+        .on_click(move |_, window, cx| on_open_browser(window, cx));
     let show_source = crate::ui::secondary("file-html-edit", source_label)
         .debug_selector(|| "file-html-edit".into())
+        .disabled(busy)
         .on_click(move |_, window, cx| on_source(window, cx));
-    let reveal_action = {
-        let path = path.to_path_buf();
-        crate::ui::secondary(
-            "file-reveal",
-            text::REVEAL
-                .mac_or(crate::i18n::catalog::other_os::REVEAL)
-                .get(),
-        )
+    let reveal_action = crate::ui::secondary("file-reveal", reveal_action_label(is_remote))
         .debug_selector(|| "file-reveal".into())
-        .on_click(move |_, _, cx| {
-            spawn_open_on(path.clone(), remote.clone(), super::reveal_command, cx);
-        })
-    };
+        .disabled(busy)
+        .on_click(move |_, window, cx| on_reveal(window, cx));
     div()
         .debug_selector(|| "file-html-preview".into())
         .size_full()
@@ -728,23 +834,59 @@ pub fn html_preview_on(
                 .child(show_source)
                 .child(reveal_action),
         )
+        .children(stage_status_row(is_remote, stage, pal))
         .into_any_element()
 }
 
-/// 미리보기할 수 없는 파일: 종류·크기와 "기본 앱으로 열기"·"Finder에서 보기".
+/// 미리보기할 수 없는 로컬 파일: 종류·크기와 "기본 앱으로 열기"·"Finder에서 보기".
 pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
-    placeholder_on(path, None, kind, len, cx)
+    let open_path = path.to_path_buf();
+    let reveal_path = path.to_path_buf();
+    placeholder_interactive(
+        path,
+        false,
+        kind,
+        len,
+        None,
+        move |_, cx| {
+            spawn_open_on_reported(
+                open_path.clone(),
+                None,
+                super::open_default_command,
+                |_, _| {},
+                cx,
+            );
+        },
+        move |_, cx| {
+            spawn_open_on_reported(
+                reveal_path.clone(),
+                None,
+                super::reveal_command,
+                |_, _| {},
+                cx,
+            );
+        },
+        cx,
+    )
 }
 
-/// 원격 호스트 파일을 포함한 미리보기 불가 자리표시자.
-pub fn placeholder_on(
+/// 진행률·취소·호출자 콜백을 연결한 미리보기 불가 자리표시자.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "placeholder wires path, remote state, kind, size, stage progress, and two action callbacks"
+)]
+pub fn placeholder_interactive(
     path: &Path,
-    remote: Option<(krill_hosts::HostId, crate::hosts::HostTarget)>,
+    is_remote: bool,
     kind: Kind,
     len: u64,
+    stage: Option<PlaceholderStage>,
+    on_open: impl Fn(&mut Window, &mut App) + 'static,
+    on_reveal: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
     let pal = crate::ui::palette(cx);
+    let busy = stage.is_some();
     let label = match kind {
         Kind::Media => text::KIND_MEDIA.get(),
         Kind::Font => text::KIND_FONT.get(),
@@ -756,33 +898,14 @@ pub fn placeholder_on(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let open_action = {
-        let path = path.to_path_buf();
-        let remote = remote.clone();
-        crate::ui::primary("file-open-default", text::OPEN_DEFAULT.get())
-            .debug_selector(|| "file-open-default".into())
-            .on_click(move |_, _, cx| {
-                spawn_open_on(
-                    path.clone(),
-                    remote.clone(),
-                    super::open_default_command,
-                    cx,
-                );
-            })
-    };
-    let reveal_action = {
-        let path = path.to_path_buf();
-        crate::ui::secondary(
-            "file-reveal",
-            text::REVEAL
-                .mac_or(crate::i18n::catalog::other_os::REVEAL)
-                .get(),
-        )
+    let open_action = crate::ui::primary("file-open-default", open_action_label(is_remote))
+        .debug_selector(|| "file-open-default".into())
+        .disabled(busy)
+        .on_click(move |_, window, cx| on_open(window, cx));
+    let reveal_action = crate::ui::secondary("file-reveal", reveal_action_label(is_remote))
         .debug_selector(|| "file-reveal".into())
-        .on_click(move |_, _, cx| {
-            spawn_open_on(path.clone(), remote.clone(), super::reveal_command, cx);
-        })
-    };
+        .disabled(busy)
+        .on_click(move |_, window, cx| on_reveal(window, cx));
     div()
         .size_full()
         .flex()
@@ -824,6 +947,7 @@ pub fn placeholder_on(
                 .child(open_action)
                 .child(reveal_action),
         )
+        .children(stage_status_row(is_remote, stage, pal))
         .into_any_element()
 }
 
@@ -837,14 +961,26 @@ pub(crate) fn size_label(len: u64) -> String {
     }
 }
 
-/// 원격 파일이면 로컬 캐시로 먼저 내려받은 뒤 `command`를 실행한다.
-pub fn spawn_open_on(
+/// 로컬 경로에 대해 외부 앱·파일 관리자 실행 명령을 만들고 실행한다(실행 파일 방지 `stat` 포함).
+pub fn run_open_command(target_path: &Path, command: fn(&Path) -> Command) {
+    // Building an Open command can stat the target to avoid executing binaries.
+    match command(target_path).status() {
+        // explorer.exe는 열기에 성공해도 1로 끝난다.
+        Ok(status) if status.success() || cfg!(windows) => {}
+        Ok(status) => tracing::warn!(?status, "open failed"),
+        Err(error) => tracing::warn!(kind = ?error.kind(), "open failed to start"),
+    }
+}
+
+/// 원격 파일이면 로컬 캐시로 내려받은 뒤 `command`를 실행하고, 스테이징 실패 시 UI 스레드에서 `on_error`를 호출한다.
+pub fn spawn_open_on_reported(
     path: PathBuf,
     remote: Option<(krill_hosts::HostId, crate::hosts::HostTarget)>,
     command: fn(&Path) -> Command,
+    on_error: impl FnOnce(String, &mut App) + 'static,
     cx: &App,
 ) {
-    cx.background_spawn(async move {
+    let work = cx.background_executor().spawn(async move {
         let target_path = match remote {
             Some((host, target)) => match crate::remote_fs::stage_to_local_cache(
                 &target,
@@ -853,19 +989,18 @@ pub fn spawn_open_on(
                 crate::remote_fs::MAX_STAGE_BYTES,
             ) {
                 Ok((local, _)) => local,
-                Err(error) => {
-                    tracing::warn!(kind = ?error.kind(), "remote stage for open failed");
-                    return;
-                }
+                Err(error) => return Err(error),
             },
             None => path,
         };
-        // Building an Open command can stat the target to avoid executing binaries.
-        match command(&target_path).status() {
-            // explorer.exe는 열기에 성공해도 1로 끝난다.
-            Ok(status) if status.success() || cfg!(windows) => {}
-            Ok(status) => tracing::warn!(?status, "open failed"),
-            Err(error) => tracing::warn!(kind = ?error.kind(), "open failed to start"),
+        run_open_command(&target_path, command);
+        Ok(())
+    });
+    cx.spawn(async move |cx| {
+        if let Err(error) = work.await
+            && let Some(msg) = crate::remote_fs::stage_error_message(&error)
+        {
+            cx.update(|cx| on_error(msg, cx));
         }
     })
     .detach();

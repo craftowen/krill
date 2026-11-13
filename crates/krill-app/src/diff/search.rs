@@ -2162,8 +2162,8 @@ impl Panel {
                                         this.toggle_search_file_collapse(&rel_for_click, cx);
                                     }),
                                 )
-                                .context_menu(move |menu, _, _| {
-                                    file_header_context_menu(menu, &weak, &menu_path, &menu_rel)
+                                .context_menu(move |menu, _, cx| {
+                                    file_header_context_menu(menu, &weak, &menu_path, &menu_rel, cx)
                                 })
                                 .into_any_element(),
                         )
@@ -2301,11 +2301,16 @@ fn file_header_context_menu(
     weak: &gpui::WeakEntity<Panel>,
     path: &Path,
     relative_path: &str,
+    cx: &gpui::App,
 ) -> PopupMenu {
     let (w_open, open_path) = (weak.clone(), path.to_path_buf());
     let abs_str = path.to_string_lossy().into_owned();
     let rel_str = relative_path.to_owned();
     let reveal_path = path.to_path_buf();
+    let is_remote = weak
+        .read_with(cx, |panel, _| panel.remote_host())
+        .unwrap_or(false);
+    let w_reveal = weak.clone();
 
     menu.item(
         PopupMenuItem::new(text::OPEN_IN_EDITOR.get())
@@ -2333,15 +2338,16 @@ fn file_header_context_menu(
     )
     .separator()
     .item(
-        PopupMenuItem::new(
-            text::EXPLORER_REVEAL_FINDER
-                .mac_or(crate::i18n::catalog::other_os::REVEAL)
-                .get(),
-        )
-        .icon(IconName::FolderOpen)
-        .on_click(move |_, _, cx| {
-            cx.reveal_path(&reveal_path);
-        }),
+        PopupMenuItem::new(crate::file_format::view::reveal_action_label(is_remote))
+            .icon(IconName::FolderOpen)
+            .on_click(move |_, _, cx| {
+                super::explorer::reveal_panel_path(
+                    &w_reveal,
+                    reveal_path.clone(),
+                    |panel, msg| panel.search.error = Some(msg),
+                    cx,
+                );
+            }),
     )
 }
 

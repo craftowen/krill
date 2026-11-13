@@ -2480,6 +2480,73 @@ fn background_context_menu(
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PanelRevealHost {
+    Local,
+    RemoteConnected(Box<crate::hosts::HostTarget>),
+    RemoteDisconnected,
+}
+
+pub(super) fn panel_reveal_host(panel: &Panel) -> PanelRevealHost {
+    if let Some(target) = panel.explorer.remote_target() {
+        if panel.source.is_none() || target.socket().as_os_str().is_empty() {
+            PanelRevealHost::RemoteDisconnected
+        } else {
+            PanelRevealHost::RemoteConnected(Box::new(target.clone()))
+        }
+    } else if panel.remote_host() {
+        PanelRevealHost::RemoteDisconnected
+    } else {
+        PanelRevealHost::Local
+    }
+}
+
+pub(super) fn reveal_panel_path(
+    weak: &gpui::WeakEntity<Panel>,
+    reveal_path: PathBuf,
+    set_error: fn(&mut Panel, String),
+    cx: &mut gpui::App,
+) {
+    let Some(host_state) = weak.read_with(cx, |panel, _| panel_reveal_host(panel)).ok() else {
+        return;
+    };
+    match host_state {
+        PanelRevealHost::RemoteDisconnected => {
+            weak.update(cx, |panel, cx| {
+                set_error(
+                    panel,
+                    crate::i18n::catalog::editor::REMOTE_DISCONNECTED
+                        .get()
+                        .to_owned(),
+                );
+                cx.notify();
+            })
+            .ok();
+        }
+        PanelRevealHost::RemoteConnected(target) => {
+            let target = *target;
+            let w_err = weak.clone();
+            crate::file_format::view::spawn_open_on_reported(
+                reveal_path,
+                Some((target.host().clone(), target)),
+                crate::file_format::reveal_command,
+                move |msg, cx| {
+                    w_err
+                        .update(cx, |panel, cx| {
+                            set_error(panel, msg);
+                            cx.notify();
+                        })
+                        .ok();
+                },
+                cx,
+            );
+        }
+        PanelRevealHost::Local => {
+            cx.reveal_path(&reveal_path);
+        }
+    }
+}
+
 fn row_context_menu(
     mut menu: PopupMenu,
     weak: &gpui::WeakEntity<Panel>,
@@ -2569,41 +2636,29 @@ fn row_context_menu(
         )
         .separator();
 
-    let reveal_path = row.path.clone();
-    let reveal_is_dir = row.is_dir;
-    let w_reveal = weak.clone();
-    menu = menu.item(
-        PopupMenuItem::new(
-            text::EXPLORER_REVEAL_FINDER
-                .mac_or(crate::i18n::catalog::other_os::REVEAL)
-                .get(),
-        )
-        .icon(IconName::FolderOpen)
-        .on_click(move |_, _, cx| {
-            let remote = w_reveal
-                .read_with(cx, |panel, _| panel.explorer.remote_target().cloned())
-                .ok()
-                .flatten();
-            if let Some(target) = remote {
-                if !reveal_is_dir {
-                    crate::file_format::view::spawn_open_on(
-                        reveal_path.clone(),
-                        Some((target.host().clone(), target)),
-                        crate::file_format::reveal_command,
-                        cx,
-                    );
-                }
-            } else {
-                cx.reveal_path(&reveal_path);
-            }
-        }),
-    );
-
     // 모든 전송 방식에 외부 에디터 주소가 있는 것은 아니다.
     // 원격 경로를 로컬에서 해석하지 않도록 미지원 항목은 숨긴다.
-    let local_editors = weak
-        .read_with(cx, |panel, _| panel.explorer.remote_target().is_none())
+    let is_remote = weak
+        .read_with(cx, |panel, _| panel.remote_host())
         .unwrap_or(false);
+    let local_editors = !is_remote;
+    if local_editors || !row.is_dir {
+        let reveal_path = row.path.clone();
+        let w_reveal = weak.clone();
+        menu = menu.item(
+            PopupMenuItem::new(crate::file_format::view::reveal_action_label(is_remote))
+                .icon(IconName::FolderOpen)
+                .on_click(move |_, _, cx| {
+                    reveal_panel_path(
+                        &w_reveal,
+                        reveal_path.clone(),
+                        |panel, msg| panel.explorer.error = Some(msg),
+                        cx,
+                    );
+                }),
+        );
+    }
+
     for target in [Target::VsCode, Target::Cursor, Target::Zed]
         .into_iter()
         .filter(|_| local_editors)
@@ -2805,6 +2860,70 @@ mod external_open_tests {
             assert!(
                 panel.explorer.error.is_none(),
                 "remote path must never enter the local opener"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn panel_reveal_guards_disconnected_remote_and_reports_stage_errors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let panel = cx.new(|cx| Panel::unconnected(PathBuf::from("/repo"), cx));
+        let weak = panel.downgrade();
+        let expected_disconnected = crate::i18n::catalog::editor::REMOTE_DISCONNECTED.get();
+
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel_reveal_host(panel), PanelRevealHost::Local);
+            panel.disconnect_remote(&krill_hosts::HostId::Remote("macmini".into()), cx);
+            assert_eq!(
+                panel_reveal_host(panel),
+                PanelRevealHost::RemoteDisconnected
+            );
+        });
+
+        cx.update(|cx| {
+            reveal_panel_path(
+                &weak,
+                PathBuf::from("/repo/clip.mp4"),
+                |p, msg| p.explorer.error = Some(msg),
+                cx,
+            );
+            reveal_panel_path(
+                &weak,
+                PathBuf::from("/repo/clip.mp4"),
+                |p, msg| p.search.error = Some(msg),
+                cx,
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.explorer.error.as_deref(), Some(expected_disconnected));
+            assert_eq!(panel.search.error.as_deref(), Some(expected_disconnected));
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.explorer.error = None;
+            panel.connect(
+                crate::hosts::HostTarget::remote("macmini", "/krill-missing-rfs.sock".into()),
+                cx,
+            );
+            assert!(matches!(
+                panel_reveal_host(panel),
+                PanelRevealHost::RemoteConnected(_)
+            ));
+        });
+        cx.update(|cx| {
+            reveal_panel_path(
+                &weak,
+                PathBuf::from("/repo/clip.mp4"),
+                |p, msg| p.explorer.error = Some(msg),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.explorer.error.is_some(),
+                "failed remote reveal must surface an error on the panel"
             );
         });
     }

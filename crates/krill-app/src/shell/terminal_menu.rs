@@ -2,7 +2,7 @@
 
 use gpui::WeakEntity;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use krill_app::i18n::catalog::{diff as dtext, file_format as ftext, security as stext};
+use krill_app::i18n::catalog::{diff as dtext, security as stext};
 use krill_app::terminal::path_link::{Cache, PathLink};
 
 use super::*;
@@ -44,35 +44,30 @@ impl Shell {
         };
         match action {
             FileAction::Open => self.open_path_link(link, cx),
-            FileAction::OpenDefault => krill_app::file_format::view::spawn_open_on(
-                link.path,
-                remote,
-                krill_app::file_format::open_default_command,
-                cx,
-            ),
-            FileAction::Reveal => {
-                if let Some((host, target)) = remote {
-                    let path = link.path;
-                    cx.spawn(async move |_, cx| {
-                        let staged = cx
-                            .background_executor()
-                            .spawn(async move {
-                                krill_app::remote_fs::stage_to_local_cache(
-                                    &target,
-                                    &host,
-                                    &path,
-                                    krill_app::remote_fs::MAX_STAGE_BYTES,
-                                )
-                            })
-                            .await;
-                        if let Ok((local, _)) = staged {
-                            cx.update(|cx| cx.reveal_path(&local));
-                        }
-                    })
-                    .detach();
-                } else {
+            FileAction::OpenDefault | FileAction::Reveal => {
+                if matches!(action, FileAction::Reveal) && remote.is_none() {
                     cx.reveal_path(&link.path);
+                    return;
                 }
+                let command = if matches!(action, FileAction::Reveal) {
+                    krill_app::file_format::reveal_command
+                } else {
+                    krill_app::file_format::open_default_command
+                };
+                let weak = cx.weak_entity();
+                krill_app::file_format::view::spawn_open_on_reported(
+                    link.path,
+                    remote,
+                    command,
+                    move |msg, cx| {
+                        weak.update(cx, |s, cx| {
+                            s.notice = Some(msg);
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                    cx,
+                );
             }
             FileAction::CopyPath => {
                 cx.write_to_clipboard(ClipboardItem::new_string(link.path.display().to_string()));
@@ -83,6 +78,7 @@ impl Shell {
 
 struct MenuState {
     pane: PaneId,
+    is_remote: bool,
     focus: FocusHandle,
     has_selection: bool,
     fork_enabled: Option<bool>,
@@ -135,14 +131,12 @@ impl MenuState {
                 ),
                 (
                     "terminal-file-open-default",
-                    ftext::OPEN_DEFAULT.get(),
+                    krill_app::file_format::view::open_action_label(self.is_remote),
                     FileAction::OpenDefault,
                 ),
                 (
                     "terminal-file-reveal",
-                    ftext::REVEAL
-                        .mac_or(krill_app::i18n::catalog::other_os::REVEAL)
-                        .get(),
+                    krill_app::file_format::view::reveal_action_label(self.is_remote),
                     FileAction::Reveal,
                 ),
                 (
@@ -254,6 +248,7 @@ pub(super) fn build(
     let s = entity.read(cx);
     let state = MenuState {
         pane,
+        is_remote: s.layout.host(pane).is_remote(),
         focus: s.focus.clone(),
         has_selection: s.live.get(&pane).is_some_and(|l| l.selection.is_some()),
         fork_enabled: s

@@ -33,8 +33,34 @@ use crate::file_format::{self, ImageFormat, Kind, csv, raster};
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REMOTE_CHUNK_U32: u32 = 512 * 1024;
 
-/// 기본 앱으로 열기·Finder에서 보기 시 로컬 캐시로 내려받는 최대 크기(64 MiB).
-pub const MAX_STAGE_BYTES: u64 = 64 * 1024 * 1024;
+/// 이 PC에서 열기·내려받아 Finder에서 보기 시 단일 파일 스트리밍 최대 크기(4 GiB).
+pub const MAX_STAGE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_CACHE_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MIN_FREE_DISK_BYTES: u64 = 256 * 1024 * 1024;
+const STALE_STAGE_MAX_AGE: Duration = Duration::from_hours(1);
+const HOST_SLUG_MAX: usize = 24;
+const FILE_NAME_MAX_BYTES: usize = 120;
+
+#[derive(Debug)]
+struct StageSizeLimitError(u64);
+
+impl std::fmt::Display for StageSizeLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "remote file exceeds staging size limit ({} B)", self.0)
+    }
+}
+
+impl std::error::Error for StageSizeLimitError {}
+
+const fn is_retryable_stream_close(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
 
 /// 원격 로컬호스트 URL 클릭으로 연 로컬 포트포워딩 리스너의 유휴 자동 해제 시간(10분).
 const IDLE_FORWARD_TIMEOUT: Duration = Duration::from_mins(10);
@@ -54,46 +80,98 @@ fn stamp_from_opt_wire(w: Option<WireStamp>) -> Stamp {
     }))
 }
 
+struct RemoteSession {
+    stream: Option<krill_proto::os::net::UnixStream>,
+}
+
+impl RemoteSession {
+    const fn new() -> Self {
+        Self { stream: None }
+    }
+
+    fn connect_fresh(target: &HostTarget) -> io::Result<krill_proto::os::net::UnixStream> {
+        let hello = daemon::client_hello(ClientRole::App, "krill-app-remote-fs");
+        let conn = target.connect(&hello).map_err(io::Error::other)?;
+        let need = FEAT_CONTROL | FEAT_REMOTE_FS;
+        if conn.negotiated.features & need != need {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote filesystem RPC unavailable (update remote krilld)",
+            ));
+        }
+        conn.stream.set_read_timeout(Some(RPC_TIMEOUT))?;
+        conn.stream.set_write_timeout(Some(RPC_TIMEOUT))?;
+        Ok(conn.stream)
+    }
+
+    /// 단일 제어 스트림 위에서 `RemoteFsRequest`를 연속 호출한다.
+    /// 읽기 전용 요청에서 이전 응답 직후 피어가 유휴 스트림을 닫았으면 1회 새 연결로 이어간다.
+    fn request(&mut self, target: &HostTarget, req: RemoteFsRequest) -> io::Result<RemoteFsReply> {
+        let can_retry = req.is_read_only() && self.stream.is_some();
+        let encoded = Request::RemoteFs(req).encode()?;
+        match self.send_encoded(target, &encoded, can_retry) {
+            Ok(reply) => Ok(reply),
+            Err(err) if can_retry && is_retryable_stream_close(err.kind()) => {
+                self.stream = None;
+                self.send_encoded(target, &encoded, false)
+            }
+            Err(err) => {
+                self.stream = None;
+                Err(err)
+            }
+        }
+    }
+
+    fn send_encoded(
+        &mut self,
+        target: &HostTarget,
+        encoded: &[u8],
+        allow_retry: bool,
+    ) -> io::Result<RemoteFsReply> {
+        if self.stream.is_none() {
+            self.stream = Some(Self::connect_fresh(target)?);
+        }
+        let Some(sock) = self.stream.as_mut() else {
+            return Err(io::Error::other("missing remote_fs stream"));
+        };
+        let record_err = |e: &io::Error| {
+            if !(allow_retry && is_retryable_stream_close(e.kind())) {
+                target.record_outcome(false, Some(e));
+            }
+        };
+        if let Err(e) = sock.write_all(encoded) {
+            record_err(&e);
+            return Err(e);
+        }
+        let frame = match ipc::read_frame(sock) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                let e = io::Error::from(io::ErrorKind::UnexpectedEof);
+                record_err(&e);
+                return Err(e);
+            }
+            Err(e) => {
+                record_err(&e);
+                return Err(e);
+            }
+        };
+        target.record_outcome(true, None);
+        let (kind, bytes) = frame;
+        match Reply::decode(kind, &bytes)? {
+            Reply::RemoteFs(reply) => Ok(reply),
+            Reply::Failed(f) => Err(io::Error::other(f.to_string())),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected remote_fs reply",
+            )),
+        }
+    }
+}
+
 /// 원격 호스트 데몬에 `RemoteFsRequest` 1회를 보내고 응답을 받는다.
 pub fn request(target: &HostTarget, req: RemoteFsRequest) -> io::Result<RemoteFsReply> {
-    let hello = daemon::client_hello(ClientRole::App, "krill-app-remote-fs");
-    let conn = target.connect(&hello).map_err(io::Error::other)?;
-    let need = FEAT_CONTROL | FEAT_REMOTE_FS;
-    if conn.negotiated.features & need != need {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "remote filesystem RPC unavailable (update remote krilld)",
-        ));
-    }
-    let mut sock = conn.stream;
-    sock.set_read_timeout(Some(RPC_TIMEOUT))?;
-    sock.set_write_timeout(Some(RPC_TIMEOUT))?;
-    if let Err(e) = sock.write_all(&Request::RemoteFs(req).encode()?) {
-        target.record_outcome(false, Some(&e));
-        return Err(e);
-    }
-    let frame = match ipc::read_frame(&mut sock) {
-        Ok(Some(frame)) => frame,
-        Ok(None) => {
-            let e = io::Error::from(io::ErrorKind::UnexpectedEof);
-            target.record_outcome(false, Some(&e));
-            return Err(e);
-        }
-        Err(e) => {
-            target.record_outcome(false, Some(&e));
-            return Err(e);
-        }
-    };
-    target.record_outcome(true, None);
-    let (kind, bytes) = frame;
-    match Reply::decode(kind, &bytes)? {
-        Reply::RemoteFs(reply) => Ok(reply),
-        Reply::Failed(f) => Err(io::Error::other(f.to_string())),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unexpected remote_fs reply",
-        )),
-    }
+    let mut session = RemoteSession::new();
+    session.request(target, req)
 }
 
 /// 후보 경로들을 원격 호스트에서 한 번에 검사해 존재하는 파일 경로만 돌려준다.
@@ -196,7 +274,142 @@ fn read_rest_bounded(
     Ok(bytes)
 }
 
-fn cache_file_path(host: &HostId, remote_path: &Path) -> io::Result<PathBuf> {
+fn truncate_utf8_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or("")
+}
+
+fn is_dos_reserved(stem: &str) -> bool {
+    let prefix = stem.split('.').next().unwrap_or(stem).trim_end_matches(' ');
+    matches!(
+        prefix.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn sanitize_stem(stem: &str, max_bytes: usize, fallback: &str) -> String {
+    let trimmed = stem.trim_end_matches([' ', '.']);
+    if trimmed.is_empty() {
+        return fallback.to_owned();
+    }
+    let prefixed = if is_dos_reserved(trimmed) {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_owned()
+    };
+    let clipped = truncate_utf8_boundary(&prefixed, max_bytes).trim_end_matches([' ', '.']);
+    if clipped.is_empty() {
+        fallback.to_owned()
+    } else if is_dos_reserved(clipped) {
+        let escaped = format!("_{clipped}");
+        let reclipped = truncate_utf8_boundary(&escaped, max_bytes).trim_end_matches([' ', '.']);
+        if reclipped.is_empty() || is_dos_reserved(reclipped) {
+            fallback.to_owned()
+        } else {
+            reclipped.to_owned()
+        }
+    } else {
+        clipped.to_owned()
+    }
+}
+
+/// 원격 경로(POSIX `/`·Windows `\`)에서 마지막 파일명을 꺼내고, 로컬 OS 파일시스템 금지 문자와
+/// 길이 한도를 정리하되 확장자는 보존한다(`open_default_command`의 실행 파일 판정 유지).
+fn sanitize_cache_file_name(remote_path: &Path) -> String {
+    let raw = remote_path.to_string_lossy();
+    let base = raw
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or("remote-file");
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if let Some((raw_stem, raw_ext)) = cleaned.rsplit_once('.') {
+        let ext = raw_ext.trim_end_matches([' ', '.']);
+        if !ext.is_empty() && ext.len() < FILE_NAME_MAX_BYTES.saturating_sub(2) {
+            let max_stem = FILE_NAME_MAX_BYTES.saturating_sub(ext.len() + 1);
+            let fallback = if max_stem >= "remote-file".len()
+                && raw_stem.trim_end_matches([' ', '.']).is_empty()
+            {
+                "remote-file"
+            } else {
+                "f"
+            };
+            let safe_stem = sanitize_stem(raw_stem, max_stem, fallback);
+            return format!("{safe_stem}.{ext}");
+        }
+    }
+    sanitize_stem(&cleaned, FILE_NAME_MAX_BYTES, "remote-file")
+}
+
+fn default_cache_root() -> PathBuf {
+    if daemon::state_dir_isolated()
+        && let Some(state) = daemon::state_dir()
+    {
+        return state.join("remote-files");
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for var in ["HOME", "LOCALAPPDATA", "USER", "USERNAME"] {
+        if let Some(val) = std::env::var_os(var) {
+            val.hash(&mut hasher);
+        }
+    }
+    std::env::temp_dir().join(format!("krill-remote-files-{:016x}", hasher.finish()))
+}
+
+fn ensure_private_real_dir(dir: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache directory must not be a symlink",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if meta.mode() & 0o077 != 0 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+fn cache_file_path_in(cache_root: &Path, host: &HostId, remote_path: &Path) -> io::Result<PathBuf> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     host.as_key().hash(&mut hasher);
     remote_path.hash(&mut hasher);
@@ -205,6 +418,7 @@ fn cache_file_path(host: &HostId, remote_path: &Path) -> io::Result<PathBuf> {
     let host_slug: String = host
         .as_key()
         .chars()
+        .take(HOST_SLUG_MAX)
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
@@ -213,36 +427,159 @@ fn cache_file_path(host: &HostId, remote_path: &Path) -> io::Result<PathBuf> {
             }
         })
         .collect();
-    let file_name = remote_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|s| !s.is_empty() && !s.contains('/') && !s.contains('\\'))
-        .unwrap_or("remote-file");
-    let dir = std::env::temp_dir()
-        .join("krill-remote-files")
-        .join(if host_slug.is_empty() {
-            "remote"
-        } else {
-            &host_slug
-        })
-        .join(hash);
+    let file_name = sanitize_cache_file_name(remote_path);
+    let host_dir = cache_root.join(if host_slug.is_empty() {
+        "remote"
+    } else {
+        &host_slug
+    });
+    let dir = host_dir.join(hash);
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&dir)?;
+    ensure_private_real_dir(cache_root)?;
+    ensure_private_real_dir(&host_dir)?;
+    ensure_private_real_dir(&dir)?;
     Ok(dir.join(file_name))
 }
 
-fn write_cache_bytes(local_path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn cache_file_path(host: &HostId, remote_path: &Path) -> io::Result<PathBuf> {
+    cache_file_path_in(&default_cache_root(), host, remote_path)
+}
+
+fn stamp_sidecar_path(local_path: &Path) -> Option<PathBuf> {
+    local_path.parent().map(|p| p.join(".stamp"))
+}
+
+fn read_cached_stamp(local_path: &Path) -> Option<WireStamp> {
+    let sidecar = stamp_sidecar_path(local_path)?;
+    let text = fs::read_to_string(sidecar).ok()?;
+    let mut lines = text.lines();
+    let len = lines.next()?.parse::<u64>().ok()?;
+    let mtime_raw = lines.next()?;
+    let modified_unix_ns = if mtime_raw == "none" {
+        None
+    } else {
+        Some(mtime_raw.parse::<u64>().ok()?)
+    };
+    Some(WireStamp {
+        modified_unix_ns,
+        len,
+    })
+}
+
+fn write_cached_stamp(local_path: &Path, stamp: WireStamp) {
+    let Some(sidecar) = stamp_sidecar_path(local_path) else {
+        return;
+    };
+    let mtime = stamp
+        .modified_unix_ns
+        .map_or_else(|| "none".to_owned(), |ns| ns.to_string());
+    let body = format!("{}\n{mtime}\n", stamp.len);
+    write_cache_bytes(&sidecar, body.as_bytes()).ok();
+}
+
+/// 캐시 루트 아래의 오래된 `.stage-*` 임시 파일을 청소하고, 총량이 `max_total_bytes`를 넘으면
+/// 오래된 해시 디렉터리부터 비운다(`keep_dir`와 진행 중인 `.stage-*`가 있는 디렉터리는 제외).
+fn evict_remote_cache_if_needed(
+    cache_root: &Path,
+    keep_dir: &Path,
+    incoming_bytes: u64,
+    max_total_bytes: u64,
+) {
+    let Ok(host_dirs) = fs::read_dir(cache_root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let mut candidates: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total_bytes: u64 = 0;
+
+    for host_entry in host_dirs.flatten() {
+        if !host_entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let host_path = host_entry.path();
+        let Ok(hash_dirs) = fs::read_dir(&host_path) else {
+            continue;
+        };
+        for hash_entry in hash_dirs.flatten() {
+            if !hash_entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let dir_path = hash_entry.path();
+            let Ok(files) = fs::read_dir(&dir_path) else {
+                continue;
+            };
+            let mut dir_bytes: u64 = 0;
+            let mut has_active_stage = false;
+            let mut newest_mtime = std::time::UNIX_EPOCH;
+            for file_entry in files.flatten() {
+                if !file_entry.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                let fp = file_entry.path();
+                let Ok(meta) = file_entry.metadata() else {
+                    continue;
+                };
+                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                let is_stage = fp
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".stage-"));
+                if is_stage {
+                    let stale =
+                        now.duration_since(mtime).unwrap_or(Duration::ZERO) >= STALE_STAGE_MAX_AGE;
+                    if stale {
+                        fs::remove_file(&fp).ok();
+                    } else {
+                        has_active_stage = true;
+                    }
+                    continue;
+                }
+                if mtime > newest_mtime {
+                    newest_mtime = mtime;
+                }
+                dir_bytes = dir_bytes.saturating_add(meta.len());
+            }
+            total_bytes = total_bytes.saturating_add(dir_bytes);
+            if dir_path == keep_dir {
+                continue;
+            }
+            if !has_active_stage {
+                candidates.push((newest_mtime, dir_bytes, dir_path));
+            }
+        }
+    }
+
+    if total_bytes.saturating_add(incoming_bytes) <= max_total_bytes {
+        return;
+    }
+    candidates.sort_by_key(|(mtime, _, _)| *mtime);
+    for (_, dir_bytes, dir_path) in candidates {
+        if total_bytes.saturating_add(incoming_bytes) <= max_total_bytes {
+            break;
+        }
+        if fs::remove_dir_all(&dir_path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(dir_bytes);
+        }
+    }
+}
+
+fn next_stage_temp_path(parent: &Path) -> PathBuf {
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let parent = local_path
-        .parent()
-        .ok_or_else(|| io::Error::other("missing cache parent dir"))?;
-    let tmp = parent.join(format!(
+    parent.join(format!(
         ".stage-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    ))
+}
+
+fn write_cache_bytes(local_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = local_path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing cache parent dir"))?;
+    let tmp = next_stage_temp_path(parent);
     let written = (|| -> io::Result<()> {
         let mut f = OpenOptions::new()
             .write(true)
@@ -264,27 +601,228 @@ fn write_cache_bytes(local_path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// 원격 파일을 로컬 캐시 경로로 내려받아 저장한다(이미지 뷰어·기본 앱으로 열기·Finder에서 보기용).
+/// 스테이징 실패를 사용자 안내 문구로 바꾼다. 사용자가 취소(`Interrupted`)했으면 `None`을 돌려준다.
+#[must_use]
+pub fn stage_error_message(error: &io::Error) -> Option<String> {
+    use crate::i18n::catalog::file_format as ftext;
+    if let Some(limit) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<StageSizeLimitError>())
+    {
+        return Some(ftext::STAGE_TOO_LARGE.format(&[("limit", &crate::resources::mb(limit.0))]));
+    }
+    match error.kind() {
+        io::ErrorKind::Interrupted => None,
+        io::ErrorKind::StorageFull => Some(ftext::STAGE_NO_SPACE.get().to_owned()),
+        _ => Some(ftext::STAGE_FAILED.format(&[("error", &error.to_string())])),
+    }
+}
+
+/// 원격 파일을 로컬 캐시 경로로 내려받아 저장한다(이 PC에서 열기·Finder에서 보기용).
 pub fn stage_to_local_cache(
     target: &HostTarget,
     host: &HostId,
     remote_path: &Path,
     max_bytes: u64,
 ) -> io::Result<(PathBuf, Stamp)> {
-    let chunk_cap = u32::try_from(MAX_REMOTE_CHUNK).unwrap_or(MAX_REMOTE_CHUNK_U32);
-    let first = read_chunk(target, remote_path, 0, chunk_cap)?;
-    let stamp = stamp_from_opt_wire(first.stat.stamp);
-    if first.stat.is_dir || !first.stat.is_file {
+    stage_to_local_cache_with_progress(target, host, remote_path, max_bytes, None, |_, _| {})
+}
+
+/// 단일 제어 연결 위에서 원격 파일을 디스크에 바로 스트리밍하고 진행률과 취소를 처리한다.
+pub fn stage_to_local_cache_with_progress(
+    target: &HostTarget,
+    host: &HostId,
+    remote_path: &Path,
+    max_bytes: u64,
+    cancel: Option<&AtomicBool>,
+    on_progress: impl FnMut(u64, u64),
+) -> io::Result<(PathBuf, Stamp)> {
+    stage_to_local_cache_in(
+        &default_cache_root(),
+        MAX_CACHE_TOTAL_BYTES,
+        target,
+        host,
+        remote_path,
+        max_bytes,
+        cancel,
+        on_progress,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper injects cache_root and budget for isolated unit tests"
+)]
+fn stage_to_local_cache_in(
+    cache_root: &Path,
+    max_cache_total_bytes: u64,
+    target: &HostTarget,
+    host: &HostId,
+    remote_path: &Path,
+    max_bytes: u64,
+    cancel: Option<&AtomicBool>,
+    mut on_progress: impl FnMut(u64, u64),
+) -> io::Result<(PathBuf, Stamp)> {
+    let check_cancel = || -> io::Result<()> {
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "remote file download cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancel()?;
+
+    let mut session = RemoteSession::new();
+    let wire_path = path_to_wire(remote_path);
+    let initial_stat = match session.request(
+        target,
+        RemoteFsRequest::Stat {
+            path: wire_path.clone(),
+        },
+    )? {
+        RemoteFsReply::Stat(Ok(s)) => s,
+        RemoteFsReply::Stat(Err(e)) => return Err(io::Error::other(e)),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected stat reply",
+            ));
+        }
+    };
+    if !initial_stat.exists || initial_stat.is_dir || !initial_stat.is_file {
         return Err(io::Error::other("remote path is not a regular file"));
     }
-    let file_len = first.stat.stamp.map_or(0, |s| s.len);
+    let expected_stamp = initial_stat.stamp;
+    let file_len = expected_stamp.map_or(0, |s| s.len);
     if file_len > max_bytes {
-        return Err(io::Error::other("remote file exceeds staging size limit"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            StageSizeLimitError(max_bytes),
+        ));
     }
-    let bytes = read_rest_bounded(target, remote_path, first.bytes, first.eof, max_bytes)?;
-    let local_path = cache_file_path(host, remote_path)?;
-    write_cache_bytes(&local_path, &bytes)?;
-    Ok((local_path, stamp))
+
+    let local_path = cache_file_path_in(cache_root, host, remote_path)?;
+    let parent = local_path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing cache parent dir"))?;
+
+    if let Some(ws) = expected_stamp
+        && ws.modified_unix_ns.is_some()
+        && read_cached_stamp(&local_path) == Some(ws)
+        && fs::symlink_metadata(&local_path)
+            .is_ok_and(|m| m.file_type().is_file() && m.len() == ws.len)
+    {
+        write_cached_stamp(&local_path, ws);
+        on_progress(ws.len, ws.len);
+        return Ok((local_path, Stamp::from_wire(ws)));
+    }
+
+    evict_remote_cache_if_needed(cache_root, parent, file_len, max_cache_total_bytes);
+    if file_len > 0
+        && let Ok(avail) = crate::platform::available_disk_bytes(parent)
+        && avail < file_len.saturating_add(MIN_FREE_DISK_BYTES)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "insufficient local disk space",
+        ));
+    }
+
+    let chunk_cap = u32::try_from(MAX_REMOTE_CHUNK).unwrap_or(MAX_REMOTE_CHUNK_U32);
+    let tmp = next_stage_temp_path(parent);
+    let mut latest_stamp = expected_stamp;
+
+    let streamed = (|| -> io::Result<()> {
+        let f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        let mut writer = io::BufWriter::with_capacity(MAX_REMOTE_CHUNK, f);
+        let mut offset: u64 = 0;
+        on_progress(0, file_len);
+
+        if file_len == 0 {
+            writer.flush()?;
+            return Ok(());
+        }
+
+        loop {
+            check_cancel()?;
+            let reply = session.request(
+                target,
+                RemoteFsRequest::ReadFile {
+                    path: wire_path.clone(),
+                    offset,
+                    max_bytes: chunk_cap,
+                },
+            )?;
+            let chunk = match reply {
+                RemoteFsReply::FileChunk(Ok(c)) => c,
+                RemoteFsReply::FileChunk(Err(e)) => return Err(io::Error::other(e)),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected read chunk reply",
+                    ));
+                }
+            };
+            if !chunk.stat.exists || chunk.stat.is_dir || !chunk.stat.is_file {
+                return Err(io::Error::other("remote path is no longer a regular file"));
+            }
+            if expected_stamp.is_some() && chunk.stat.stamp != expected_stamp {
+                return Err(io::Error::other("remote file changed while downloading"));
+            }
+            latest_stamp = chunk.stat.stamp.or(latest_stamp);
+            if chunk.bytes.is_empty() {
+                if chunk.eof && offset >= file_len {
+                    break;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "remote file ended before its reported end",
+                ));
+            }
+            let next_offset = offset.saturating_add(byte_len(&chunk.bytes));
+            if next_offset > max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    StageSizeLimitError(max_bytes),
+                ));
+            }
+            writer.write_all(&chunk.bytes)?;
+            offset = next_offset;
+            let total = latest_stamp.map_or(file_len, |s| s.len).max(offset);
+            on_progress(offset, total);
+            if chunk.eof {
+                if offset < file_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "remote file ended before its reported end",
+                    ));
+                }
+                break;
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    })();
+
+    if let Err(e) = streamed {
+        fs::remove_file(&tmp).ok();
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, &local_path) {
+        fs::remove_file(&tmp).ok();
+        return Err(e);
+    }
+    if let Some(ws) = latest_stamp {
+        write_cached_stamp(&local_path, ws);
+    }
+    Ok((local_path, stamp_from_opt_wire(latest_stamp)))
 }
 
 /// 원격 파일을 읽어 에디터/뷰어 [`Opened`]와 [`Stamp`], 그리고 래스터 이미지인 경우 로컬 캐시 경로를 돌려준다.
@@ -324,7 +862,18 @@ pub fn open(
                 file_format::MAX_IMAGE_BYTES,
             )?;
             let local_path = cache_file_path(host, path)?;
+            if let Some(parent) = local_path.parent() {
+                evict_remote_cache_if_needed(
+                    &default_cache_root(),
+                    parent,
+                    byte_len(&bytes),
+                    MAX_CACHE_TOTAL_BYTES,
+                );
+            }
             write_cache_bytes(&local_path, &bytes)?;
+            if let Some(ws) = wire_stamp {
+                write_cached_stamp(&local_path, ws);
+            }
             Ok((Opened::Image(dims), stamp, Some(local_path)))
         }
         kind if kind.is_text_editable() => {
@@ -1003,5 +1552,260 @@ mod tests {
 
         daemon_thread.join().unwrap();
         fs::remove_dir_all(&sock_dir).ok();
+    }
+
+    #[test]
+    fn sanitize_cache_file_name_preserves_extensions_and_strips_forbidden_chars() {
+        assert_eq!(
+            sanitize_cache_file_name(Path::new(r"C:\Users\macmini\output\demo.mp4")),
+            "demo.mp4"
+        );
+        assert_eq!(
+            sanitize_cache_file_name(Path::new("/tmp/recording_12:30:00\"a?.mp4")),
+            "recording_12_30_00_a_.mp4"
+        );
+        assert_eq!(
+            sanitize_cache_file_name(Path::new("/tmp/CON.mp4")),
+            "_CON.mp4"
+        );
+        assert_eq!(
+            sanitize_cache_file_name(Path::new("/tmp/CON.tar.gz")),
+            "_CON.tar.gz"
+        );
+        let clipped_dos = format!("/tmp/CON{}.mp4", " ".repeat(FILE_NAME_MAX_BYTES));
+        assert_eq!(
+            sanitize_cache_file_name(Path::new(&clipped_dos)),
+            "_CON.mp4"
+        );
+        assert_eq!(
+            sanitize_cache_file_name(Path::new(r"C:\repo\installer.pkg")),
+            "installer.pkg"
+        );
+        assert_eq!(
+            sanitize_cache_file_name(Path::new("/tmp/.mp4")),
+            "remote-file.mp4"
+        );
+        let long = format!("/tmp/{}.mp4", "가".repeat(80));
+        let sanitized = sanitize_cache_file_name(Path::new(&long));
+        assert!(sanitized.len() <= FILE_NAME_MAX_BYTES);
+        assert!(
+            Path::new(&sanitized)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
+        );
+    }
+
+    #[test]
+    fn stage_streams_over_single_connection_reuses_stamp_cache_and_cancels_cleanly() {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let base_dir = std::env::temp_dir().join(format!(
+            "krill-rfs-stage-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cache_root = base_dir.join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        let sock_path = base_dir.join("d.sock");
+        let ipc_listener = UnixListener::bind(&sock_path).unwrap();
+
+        let payload_len = MAX_REMOTE_CHUNK * 2 + 12345;
+        let payload: Vec<u8> = (0..payload_len)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let expected_payload = payload.clone();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let generation = Arc::new(AtomicU64::new(10));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let accepts_bg = accepts.clone();
+        let reads_bg = reads.clone();
+        let gen_bg = generation.clone();
+        let stop_bg = stop.clone();
+        let daemon_thread = thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                let Ok((mut stream, _)) = ipc_listener.accept() else {
+                    break;
+                };
+                if stop_bg.load(Ordering::Acquire) {
+                    break;
+                }
+                accepts_bg.fetch_add(1, Ordering::AcqRel);
+                let mut writer = stream.try_clone().unwrap();
+                accept_test_handshake(&mut stream, &mut writer);
+                while let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) {
+                    let req = Request::decode(kind, &body).unwrap();
+                    let cur_gen = gen_bg.load(Ordering::Acquire);
+                    let wire_stat = WireStat {
+                        exists: true,
+                        is_file: true,
+                        is_dir: false,
+                        is_symlink: false,
+                        stamp: Some(WireStamp {
+                            modified_unix_ns: Some(cur_gen),
+                            len: u64::try_from(payload.len()).unwrap(),
+                        }),
+                    };
+                    let reply = match req {
+                        Request::RemoteFs(RemoteFsRequest::Stat { .. }) => {
+                            Reply::RemoteFs(RemoteFsReply::Stat(Ok(wire_stat)))
+                        }
+                        Request::RemoteFs(RemoteFsRequest::ReadFile {
+                            offset, max_bytes, ..
+                        }) => {
+                            reads_bg.fetch_add(1, Ordering::AcqRel);
+                            let start = usize::try_from(offset).unwrap().min(payload.len());
+                            let cap = usize::try_from(max_bytes).unwrap().min(MAX_REMOTE_CHUNK);
+                            let end = (start + cap).min(payload.len());
+                            let eof = end >= payload.len();
+                            Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
+                                stat: wire_stat,
+                                bytes: payload[start..end].to_vec(),
+                                eof,
+                            })))
+                        }
+                        _ => panic!("unexpected request"),
+                    };
+                    if writer.write_all(&reply.encode().unwrap()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let host = HostId::Remote("macmini".into());
+        let target = HostTarget::remote("macmini", sock_path.clone());
+        let remote_path = Path::new("/Users/macmini/video-test/output/clip.mp4");
+
+        // 1. 첫 다운로드: 단일 연결 1회로 Stat + 3개 청크를 모두 스트리밍한다.
+        let mut progress_steps = Vec::new();
+        let (local, stamp) = stage_to_local_cache_in(
+            &cache_root,
+            MAX_CACHE_TOTAL_BYTES,
+            &target,
+            &host,
+            remote_path,
+            MAX_STAGE_BYTES,
+            None,
+            |done, total| progress_steps.push((done, total)),
+        )
+        .unwrap();
+        assert_eq!(accepts.load(Ordering::Acquire), 1);
+        assert_eq!(reads.load(Ordering::Acquire), 3);
+        assert_eq!(fs::read(&local).unwrap(), expected_payload);
+        assert_eq!(
+            stamp,
+            Stamp::from_wire(WireStamp {
+                modified_unix_ns: Some(10),
+                len: u64::try_from(payload_len).unwrap(),
+            })
+        );
+        assert_eq!(progress_steps.first().copied().map(|p| p.0), Some(0));
+        assert_eq!(
+            progress_steps.last().copied(),
+            Some((
+                u64::try_from(payload_len).unwrap(),
+                u64::try_from(payload_len).unwrap()
+            ))
+        );
+
+        // 2. 같은 Stamp 재요청: ReadFile을 한 번도 호출하지 않고 즉시 캐시를 돌려준다.
+        let (cached_path, _) = stage_to_local_cache_in(
+            &cache_root,
+            MAX_CACHE_TOTAL_BYTES,
+            &target,
+            &host,
+            remote_path,
+            MAX_STAGE_BYTES,
+            None,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(cached_path, local);
+        assert_eq!(reads.load(Ordering::Acquire), 3);
+
+        // 3. 원격 Stamp가 바뀌고 진행 중 취소하면 Interrupted를 반환하며 .stage-* 임시 파일을 남기지 않는다.
+        generation.store(20, Ordering::Release);
+        let cancel = AtomicBool::new(false);
+        let err = stage_to_local_cache_in(
+            &cache_root,
+            MAX_CACHE_TOTAL_BYTES,
+            &target,
+            &host,
+            remote_path,
+            MAX_STAGE_BYTES,
+            Some(&cancel),
+            |done, _| {
+                if done > 0 {
+                    cancel.store(true, Ordering::Release);
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(stage_error_message(&err).is_none());
+        let leftovers: Vec<_> = fs::read_dir(local.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".stage-"))
+            .collect();
+        assert!(leftovers.is_empty());
+
+        stop.store(true, Ordering::Release);
+        krill_proto::os::net::UnixStream::connect(&sock_path).ok();
+        daemon_thread.join().unwrap();
+        fs::remove_dir_all(&base_dir).ok();
+    }
+
+    #[test]
+    fn cache_eviction_error_mapping_and_symlink_guards_behave_honestly() {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let base_dir = std::env::temp_dir().join(format!(
+            "krill-rfs-evict-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cache_root = base_dir.join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        let host = HostId::Remote("macmini".into());
+        let old_file = cache_file_path_in(&cache_root, &host, Path::new("/repo/old.mp4")).unwrap();
+        let old_dir = old_file.parent().unwrap().to_path_buf();
+        fs::write(&old_file, vec![b'a'; 600]).unwrap();
+        thread::sleep(Duration::from_millis(15));
+
+        let active_file =
+            cache_file_path_in(&cache_root, &host, Path::new("/repo/active.mp4")).unwrap();
+        let active_dir = active_file.parent().unwrap().to_path_buf();
+        fs::write(active_dir.join(".stage-999-0"), vec![b's'; 200]).unwrap();
+
+        let keep_file =
+            cache_file_path_in(&cache_root, &host, Path::new("/repo/keep.mp4")).unwrap();
+        let keep_dir = keep_file.parent().unwrap().to_path_buf();
+        fs::write(&keep_file, vec![b'k'; 400]).unwrap();
+
+        // keep_dir(400 B) + old_dir(600 B) + incoming(500 B) > 1200 B -> old_dir만 제거되고 active_dir/keep_dir은 유지된다.
+        evict_remote_cache_if_needed(&cache_root, &keep_dir, 500, 1200);
+        assert!(!old_dir.exists());
+        assert!(active_dir.exists());
+        assert!(keep_dir.exists());
+
+        // 크기 한도·디스크 부족 에러 문구가 정확히 매핑된다.
+        let too_large = io::Error::new(io::ErrorKind::InvalidInput, StageSizeLimitError(10 << 20));
+        assert!(stage_error_message(&too_large).is_some_and(|m| m.contains("10.0 MB")));
+        let disk_full = io::Error::new(io::ErrorKind::StorageFull, "disk full");
+        assert_eq!(
+            stage_error_message(&disk_full).as_deref(),
+            Some(crate::i18n::catalog::file_format::STAGE_NO_SPACE.get())
+        );
+
+        #[cfg(unix)]
+        {
+            let sym_root = base_dir.join("sym-cache");
+            std::os::unix::fs::symlink(&cache_root, &sym_root).unwrap();
+            assert!(cache_file_path_in(&sym_root, &host, Path::new("/repo/x.mp4")).is_err());
+        }
+
+        fs::remove_dir_all(&base_dir).ok();
     }
 }
