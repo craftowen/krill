@@ -1800,6 +1800,8 @@ catalog! {
         INSTALL_BTN_INSTALL => ("원클릭 설치", "One-click install"),
         INSTALL_BTN_INSTALLING => ("설치 중…", "Installing…"),
         INSTALL_BTN_REINSTALL => ("업데이트", "Update"),
+        INSTALL_BTN_UP_TO_DATE => ("최신 버전", "Up to date"),
+        INSTALL_STATUS_UPDATE_AVAILABLE => ("{current} (최신 {latest})", "{current} ({latest} available)"),
         INSTALL_COPY_CMD => ("설치 명령어 복사", "Copy install command"),
         INSTALL_LOG_DONE => ("출력 로그", "Output log"),
         INSTALL_LOG_FAILED => ("오류 로그 보기", "View error log"),

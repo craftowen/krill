@@ -330,3 +330,83 @@ fn launch_overrides_encode_decode_and_apply_across_providers() {
         .is_err()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn version_in_resolves_env_shebang_interpreter_and_which_all_preserves_order() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::env::temp_dir().join(format!("krill-agent-version-in-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let interp_dir = root.join("interp");
+    let first_dir = root.join("first");
+    let second_dir = root.join("second");
+    std::fs::create_dir_all(&interp_dir).unwrap();
+    std::fs::create_dir_all(&first_dir).unwrap();
+    std::fs::create_dir_all(&second_dir).unwrap();
+
+    let interp_name = format!("krill-test-node-{}", std::process::id());
+    let interp_bin = interp_dir.join(&interp_name);
+    std::fs::write(&interp_bin, "#!/bin/sh\necho 'codex-cli 0.167.2'\n").unwrap();
+    std::fs::set_permissions(&interp_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let first_bin = first_dir.join("codex");
+    std::fs::write(&first_bin, format!("#!/usr/bin/env {interp_name}\n")).unwrap();
+    std::fs::set_permissions(&first_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let second_bin = second_dir.join("codex");
+    std::fs::write(&second_bin, "#!/bin/sh\necho 'codex-cli 0.160.0'\n").unwrap();
+    std::fs::set_permissions(&second_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let search_path = std::env::join_paths([
+        first_dir.as_path(),
+        second_dir.as_path(),
+        first_dir.as_path(),
+        interp_dir.as_path(),
+    ])
+    .unwrap();
+    assert_eq!(
+        which_all("codex", &search_path),
+        vec![first_bin.clone(), second_bin]
+    );
+    assert_eq!(
+        version_in(&first_bin, &search_path).as_deref(),
+        Some("codex-cli 0.167.2")
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn package_version_reads_homebrew_caskroom_and_scoped_npm_metadata() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!("krill-agent-pkg-ver-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+
+    let cask_bin = root.join("brew/Caskroom/codex/0.167.2/bin/codex");
+    let brew_bin_dir = root.join("brew/bin");
+    std::fs::create_dir_all(cask_bin.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&brew_bin_dir).unwrap();
+    std::fs::write(&cask_bin, "#!/bin/sh\nexit 1\n").unwrap();
+    let cask_link = brew_bin_dir.join("codex");
+    symlink(&cask_bin, &cask_link).unwrap();
+    assert_eq!(package_version(&cask_link).as_deref(), Some("0.167.2"));
+
+    let npm_pkg = root.join("npm/lib/node_modules/@openai/codex");
+    let npm_js = npm_pkg.join("bin/codex.js");
+    let npm_bin_dir = root.join("npm/bin");
+    std::fs::create_dir_all(npm_js.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&npm_bin_dir).unwrap();
+    std::fs::write(&npm_js, "#!/usr/bin/env node\n").unwrap();
+    std::fs::write(
+        npm_pkg.join("package.json"),
+        r#"{"name":"@openai/codex","version":"0.168.0"}"#,
+    )
+    .unwrap();
+    let npm_link = npm_bin_dir.join("codex");
+    symlink(&npm_js, &npm_link).unwrap();
+    assert_eq!(package_version(&npm_link).as_deref(), Some("0.168.0"));
+
+    std::fs::remove_dir_all(&root).ok();
+}
