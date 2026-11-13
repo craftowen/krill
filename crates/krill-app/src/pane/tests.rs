@@ -1258,6 +1258,61 @@ fn search_highlights_all_visible_matches() {
             },
         ]
     );
+
+    // Changing query or search options immediately clears stale highlights from the prior query,
+    // even before the next search response arrives or when disconnected.
+    assert!(p.search("other", Direction::Next));
+    assert_eq!(p.highlight(), None);
+    assert!(p.highlights().is_empty());
+    assert!(p.search_result().is_none());
+
+    // Simulate a screen hit for "other", then change query while unlinked.
+    let req2 = {
+        let frames = sent(out(&mut p));
+        SearchRequest::decode(frames[0].0, &frames[0].1).unwrap()
+    };
+    update(
+        &mut p,
+        2,
+        vec![Op::Line {
+            line: 1,
+            cells: row("other"),
+        }],
+    );
+    let res2 = SearchResult {
+        req: req2.req,
+        snapshot: Snapshot {
+            revision: Revision(2),
+            seq: Seq(2),
+            ..Snapshot::default()
+        },
+        total: 1,
+        hit: Some(Hit {
+            index: 0,
+            source: SearchSource::Screen,
+            row: 1,
+            total_rows: 3,
+            column: 0,
+            cols: 5,
+            cells: row("other"),
+        }),
+        wrapped: false,
+        stale: false,
+        incomplete: false,
+        approximate: false,
+    };
+    assert!(feed(&mut p, &res2.encode().unwrap()).redraw);
+    assert!(p.highlight().is_some());
+    assert!(!p.highlights().is_empty());
+
+    p.unlink();
+    assert!(!p.search_with_options(
+        "alpha",
+        Direction::Next,
+        krill_proto::search::Options::default(),
+    ));
+    assert_eq!(p.highlight(), None);
+    assert!(p.highlights().is_empty());
 }
 
 #[test]
