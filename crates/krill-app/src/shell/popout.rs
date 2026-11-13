@@ -77,8 +77,8 @@ impl PortCache {
         &self.entries
     }
 
-    pub(super) fn into_data(self) -> (String, Vec<krill_proto::orchestration::PortEntry>) {
-        (self.text, self.entries)
+    pub(super) fn data(&self) -> (String, Vec<krill_proto::orchestration::PortEntry>) {
+        (self.text.clone(), self.entries.clone())
     }
 
     pub(super) fn from_result(
@@ -1011,6 +1011,7 @@ pub(super) const ACCOUNTS_POLL: std::time::Duration = std::time::Duration::from_
 
 impl Shell {
     /// 현재 실행 중인 호스트·세션에 속하는 캐시 URL만 메뉴에 표시한다.
+    /// 화면이 바뀌어도 다음 감지 결과가 올 때까지 직전 결과를 유지한다(버튼 깜빡임 방지).
     pub(super) fn detected_ports(
         &self,
     ) -> Vec<(
@@ -1023,7 +1024,6 @@ impl Shell {
             let Some((&pane, _)) = self.live.iter().find(|(pane, live)| {
                 self.layout.host(**pane) == host
                     && live.pane.session().is_some_and(|session| session.0 == *sid)
-                    && cache.matches(&live.pane.shown())
             }) else {
                 continue;
             };
