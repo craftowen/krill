@@ -148,3 +148,24 @@ fn wait_for(mut condition: impl FnMut() -> bool) {
         thread::sleep(Duration::from_millis(1));
     }
 }
+
+#[test]
+fn is_connected_observes_peer_hangup_before_reader_drains_eof() {
+    let (daemon, peer) = UnixStream::pair().unwrap();
+    let peer = Link::new(peer.into());
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        peer.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (holder, _reader, _, _) = Holder::connect(daemon.into()).unwrap();
+    assert!(holder.is_connected());
+    drop(peer);
+    // Even without running `Holder::run` to clear `pending`, kernel POLLHUP marks it disconnected.
+    assert!(!holder.is_connected());
+}

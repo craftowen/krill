@@ -114,7 +114,32 @@ impl Holder {
 
     /// An orphan daemon must not claim scheduled work for a disconnected holder.
     pub(crate) fn is_connected(&self) -> bool {
-        lock(&self.pending).is_some()
+        if lock(&self.pending).is_none() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use rustix::event::{PollFd, PollFlags, Timespec, poll};
+            use rustix::io::Errno;
+            use std::os::fd::AsFd as _;
+            let out = lock(&self.out);
+            let mut fds = [PollFd::from_borrowed_fd(out.as_fd(), PollFlags::HUP)];
+            loop {
+                match poll(
+                    &mut fds,
+                    Some(&Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    }),
+                ) {
+                    Ok(_) => return fds.first().is_none_or(|fd| fd.revents().is_empty()),
+                    Err(Errno::INTR) => {}
+                    Err(_) => return false,
+                }
+            }
+        }
+        #[cfg(windows)]
+        true
     }
 
     /// `make(req)`를 보내고 같은 `req`의 답을 기다린다. holder는 요청마다 바로 답한다.
