@@ -945,10 +945,13 @@ fn upgrade_holder_loss_after_done_resumes_readers_and_keeps_output() {
         // 요청마다 `Done`. `UpgradeKrilld`의 `Done` 뒤 링크를 닫는다: 리더 정지 중 holder 상실.
         while let Ok(Some(p)) = link.recv() {
             let m = ToHolder::decode(p.frame()).unwrap();
-            send(&link, &FromHolder::Done { req: m.req() }, &[]);
+            let done = FromHolder::Done { req: m.req() }.encode().unwrap();
             if matches!(m, ToHolder::UpgradeKrilld { .. }) {
-                break;
+                link.send(&done, &[]).unwrap();
+                drop(link);
+                return controller;
             }
+            link.send(&done, &[]).unwrap();
         }
         drop(link);
         controller
