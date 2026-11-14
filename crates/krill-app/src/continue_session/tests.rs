@@ -211,3 +211,44 @@ fn continue_session_ignores_enter_and_escape_during_ime_preedit(cx: &mut TestApp
     cx.run_until_parked();
     assert_eq!(*events.lock().unwrap(), [Event::Close]);
 }
+
+#[gpui::test]
+fn keyboard_space_and_enter_select_agent_chip(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new(
+            SessionId(7),
+            vec![
+                ("claude".to_owned(), "Claude".to_owned()),
+                ("codex".to_owned(), "Codex".to_owned()),
+            ],
+            Some("claude"),
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            assert_eq!(d.selected_agent, "claude");
+            window.focus(&d.agent_focus[1], cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.selected_agent, "codex");
+    });
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            window.focus(&d.agent_focus[0], cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.selected_agent, "claude");
+    });
+}

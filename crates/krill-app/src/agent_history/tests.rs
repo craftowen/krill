@@ -762,3 +762,56 @@ fn panel_hides_claude_mem_observer_sessions_from_scan_and_search(cx: &mut TestAp
         assert_eq!(p.visible_hits()[0].cwd, "/tmp/한글");
     });
 }
+
+#[test]
+fn hangul_nfd_text_matches_nfc_query_and_highlights_complete_syllables() {
+    let nfd_prefix = "/tmp/\u{1112}\u{1161}\u{11AB}\u{1100}\u{1161}\u{11BC}";
+    let spans = highlight_spans(nfd_prefix, "한강");
+    assert_eq!(
+        spans,
+        vec![
+            ("/tmp/".to_owned(), false),
+            (
+                "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1161}\u{11BC}".to_owned(),
+                true
+            ),
+        ]
+    );
+}
+
+#[gpui::test]
+fn ime_preedit_escape_does_not_toggle_history_panel(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    cx.update(gpui_component::init);
+    let toggled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = toggled.clone();
+    let (panel, visual) = cx.add_window_view(|_, _| {
+        let mut p = Panel::new(Arc::new(|_| unreachable!()));
+        p.open = true;
+        p
+    });
+    visual.update(|_, cx| {
+        cx.subscribe(&panel, move |_, _: &Toggle, _| {
+            seen.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .detach();
+    });
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        panel.update(cx, |p, cx| {
+            let input = p.input.as_ref().unwrap().clone();
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+            assert!(p.input_is_composing(window, cx));
+        });
+    });
+    visual.run_until_parked();
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert!(
+        !toggled.load(std::sync::atomic::Ordering::Acquire),
+        "IME preedit Escape must not toggle agent history panel"
+    );
+}

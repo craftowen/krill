@@ -243,6 +243,17 @@ impl Render for Dialog {
                     .on_click(cx.listener(move |d, _, _, cx| {
                         d.select_agent(agent_id.clone(), cx);
                     }))
+                    .on_key_down({
+                        let key_agent_id = id.clone();
+                        cx.listener(move |d, e: &gpui::KeyDownEvent, _, cx| {
+                            if !e.keystroke.modifiers.modified()
+                                && matches!(e.keystroke.key.as_str(), "space" | " " | "enter")
+                            {
+                                cx.stop_propagation();
+                                d.select_agent(key_agent_id.clone(), cx);
+                            }
+                        })
+                    })
             })
             .collect::<Vec<_>>();
 

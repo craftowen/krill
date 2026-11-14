@@ -2488,12 +2488,18 @@ pub fn install_agent_hook_at(
 #[must_use]
 pub fn install_all_skills_at(home: &Path) -> Vec<String> {
     let report = krill_proto::orchestration::sync_builtin_skills_at(home);
-    for error in &report.failures {
-        tracing::warn!(%error, "built-in skill synchronization skipped a target");
+    if !report.failures.is_empty() {
+        tracing::warn!(
+            count = report.failures.len(),
+            "built-in skill synchronization skipped targets"
+        );
     }
-    for dir in &report.busy {
+    if !report.busy.is_empty() {
         // 앱 시작과 krilld 세션 복원이 같은 폴더를 동시에 맞추는 예상된 경합이다. 잠금을 쥔 쪽이 같은 묶음을 쓴다.
-        tracing::debug!(dir = %dir.display(), "built-in skill synchronization deferred to the running installer");
+        tracing::debug!(
+            count = report.busy.len(),
+            "built-in skill synchronization deferred to the running installer"
+        );
     }
     report
         .installed
@@ -2771,6 +2777,7 @@ pub struct SettingsView {
     accounts_offline: bool,
     /// 규칙 변경 응답 전에는 다음 변경을 보내지 않는다.
     account_rule_pending: bool,
+    account_rule_generation: u64,
     /// 브라우저 OAuth 로그인 진행 중(OWE-881). 있으면 해당 계정 행에 진행 표시·[취소].
     login_pending: Option<PendingLogin>,
     /// agy·OpenCode 대화형 로그인 안내를 표시할 제공자. 값이 있으면 안내 카드와
@@ -3263,6 +3270,7 @@ impl SettingsView {
             account_error: None,
             accounts_offline: false,
             account_rule_pending: false,
+            account_rule_generation: 0,
             login_pending: None,
             terminal_login_provider: None,
             terminal_login_account: None,
@@ -3792,6 +3800,72 @@ impl SettingsView {
         self.armed_timer = None;
     }
 
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let app: &mut gpui::App = cx;
+        for input in [
+            self.opencode_api_key_input.as_ref(),
+            self.rename.as_ref().map(|(_, input)| input),
+            self.search.as_ref().map(|(input, _)| input),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if crate::jump::entity_input_is_composing(input, window, app) {
+                return true;
+            }
+        }
+        for edit in self.agent_edits.values() {
+            if crate::jump::entity_input_is_composing(&edit.args, window, app) {
+                return true;
+            }
+        }
+        if let Some(form) = &self.ssh_form {
+            for input in [&form.label, &form.address, &form.port, &form.identity_file] {
+                if crate::jump::entity_input_is_composing(input, window, app) {
+                    return true;
+                }
+            }
+        }
+        if let Some(form) = &self.workflow_form {
+            for input in [
+                &form.repo_path,
+                &form.symlink_path,
+                &form.setup_script,
+                &form.archive_script,
+                &form.worktree_location,
+            ] {
+                if crate::jump::entity_input_is_composing(input, window, app) {
+                    return true;
+                }
+            }
+        }
+        if let Some(form) = &self.quick_form
+            && (crate::jump::entity_input_is_composing(&form.name, window, app)
+                || crate::jump::entity_input_is_composing(&form.command, window, app))
+        {
+            return true;
+        }
+        if let Some(modal) = &self.schedule_modal {
+            for input in [
+                &modal.id,
+                &modal.cron,
+                &modal.cwd,
+                &modal.command,
+                &modal.name,
+                &modal.extra_args,
+                &modal.precheck_timeout,
+                &modal.base_branch,
+                &modal.grace,
+                &modal.precheck,
+            ] {
+                if crate::jump::entity_input_is_composing(input, window, app) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn accounts(&self) -> &krill_proto::usage::AccountsSnapshot {
         &self.accounts_snapshot
     }
@@ -3849,6 +3923,8 @@ impl SettingsView {
     /// `AI 제공자 계정` 탭에서 관리할 대상 호스트를 전환한다.
     pub fn select_account_host(&mut self, host: crate::hosts::HostId, cx: &mut Context<Self>) {
         if self.account_host != host {
+            self.account_rule_generation = self.account_rule_generation.wrapping_add(1);
+            self.account_rule_pending = false;
             if self.account_host.is_local() {
                 self.local_accounts_snapshot = self.accounts_snapshot.clone();
             } else {
@@ -4003,36 +4079,67 @@ impl SettingsView {
         if self.account_rule_pending {
             return;
         }
+        let request_host = self.account_host.clone();
+        let req_gen = self.account_rule_generation.wrapping_add(1);
+        self.account_rule_generation = req_gen;
         self.account_rule_pending = true;
         self.account_error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(request).await;
-            this.update(cx, |this, cx| this.finish_account_rule_request(result, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                this.finish_account_rule_request_for(&request_host, req_gen, result, cx);
+            })
+            .ok();
         })
         .detach();
     }
 
+    #[cfg(all(test, unix))]
     fn finish_account_rule_request(
         &mut self,
         result: Result<krill_proto::usage::AccountsSnapshot, String>,
         cx: &mut Context<Self>,
     ) {
-        self.account_rule_pending = false;
+        let host = self.account_host.clone();
+        self.finish_account_rule_request_for(&host, self.account_rule_generation, result, cx);
+    }
+
+    fn finish_account_rule_request_for(
+        &mut self,
+        request_host: &crate::hosts::HostId,
+        req_gen: u64,
+        result: Result<krill_proto::usage::AccountsSnapshot, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.account_rule_generation == req_gen {
+            self.account_rule_pending = false;
+        }
+        let is_current = accept_account_mutation_reply(
+            &self.account_host,
+            self.account_rule_generation,
+            request_host,
+            req_gen,
+        );
         match result {
             Ok(snap) => {
-                if self.account_host.is_local() {
+                if request_host.is_local() {
                     self.local_accounts_snapshot = snap.clone();
                 } else {
                     self.remote_accounts_snapshots
-                        .insert(self.account_host.clone(), snap.clone());
+                        .insert(request_host.clone(), snap.clone());
                 }
-                self.accounts_snapshot = snap;
-                self.account_error = None;
-                cx.defer(notify_external_change);
+                if is_current {
+                    self.accounts_snapshot = snap;
+                    self.account_error = None;
+                    cx.defer(notify_external_change);
+                }
             }
-            Err(error) => self.account_error = Some(error.into()),
+            Err(error) => {
+                if is_current {
+                    self.account_error = Some(error.into());
+                }
+            }
         }
         cx.notify();
     }
@@ -4423,6 +4530,7 @@ impl SettingsView {
         if self.daemon_required(cx) {
             return;
         }
+        let req_gen = self.account_rule_generation;
         if self.account_host.is_remote() {
             let host = self.account_host.clone();
             let target = self.selected_account_target();
@@ -4438,15 +4546,25 @@ impl SettingsView {
                     })
                     .await;
                 this.update(cx, |this, cx| {
+                    let is_current = accept_account_mutation_reply(
+                        &this.account_host,
+                        this.account_rule_generation,
+                        &host,
+                        req_gen,
+                    );
                     match result {
                         Ok(left) => {
                             this.remote_orphan_profiles
                                 .insert(host.clone(), left.clone());
-                            if this.account_host == host {
+                            if is_current {
                                 this.orphan_profiles = left;
                             }
                         }
-                        Err(e) => this.account_error = Some(e.into()),
+                        Err(e) => {
+                            if is_current {
+                                this.account_error = Some(e.into());
+                            }
+                        }
                     }
                     cx.notify();
                 })
@@ -4456,6 +4574,7 @@ impl SettingsView {
             return;
         }
         let dir = state_dir(cx);
+        let request_host = self.account_host.clone();
         if !is_daemon_state_dir(dir.as_deref()) {
             let home = crate::accounts::default_home();
             self.file_job(
@@ -4469,13 +4588,26 @@ impl SettingsView {
                     let orphans = crate::accounts::orphans_local(&home, dir.as_deref());
                     (result, orphans)
                 },
-                |this, (result, orphans), cx| {
+                move |this, (result, orphans), cx| {
+                    let is_current = accept_account_mutation_reply(
+                        &this.account_host,
+                        this.account_rule_generation,
+                        &request_host,
+                        req_gen,
+                    );
                     match result {
                         Ok(snapshot) => {
-                            this.accounts_snapshot = snapshot;
-                            this.orphan_profiles = orphans;
+                            this.local_accounts_snapshot = snapshot.clone();
+                            if is_current {
+                                this.accounts_snapshot = snapshot;
+                                this.orphan_profiles = orphans;
+                            }
                         }
-                        Err(error) => this.account_error = Some(error.to_string().into()),
+                        Err(error) => {
+                            if is_current {
+                                this.account_error = Some(error.to_string().into());
+                            }
+                        }
                     }
                     cx.notify();
                 },
@@ -4495,9 +4627,17 @@ impl SettingsView {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                match result {
-                    Ok(left) => this.orphan_profiles = left,
-                    Err(e) => this.account_error = Some(e.into()),
+                let is_current = accept_account_mutation_reply(
+                    &this.account_host,
+                    this.account_rule_generation,
+                    &request_host,
+                    req_gen,
+                );
+                if is_current {
+                    match result {
+                        Ok(left) => this.orphan_profiles = left,
+                        Err(e) => this.account_error = Some(e.into()),
+                    }
                 }
                 cx.notify();
             })
@@ -4852,6 +4992,8 @@ impl SettingsView {
             ))
         };
         {
+            let req_gen = self.account_rule_generation.wrapping_add(1);
+            self.account_rule_generation = req_gen;
             self.account_rule_pending = true;
             cx.spawn(async move |this, cx| {
                 let result = cx
@@ -4859,7 +5001,15 @@ impl SettingsView {
                     .spawn(async move { request() })
                     .await;
                 this.update(cx, |this, cx| {
-                    this.account_rule_pending = false;
+                    if this.account_rule_generation == req_gen {
+                        this.account_rule_pending = false;
+                    }
+                    let is_current = accept_account_mutation_reply(
+                        &this.account_host,
+                        this.account_rule_generation,
+                        &host,
+                        req_gen,
+                    );
                     match result {
                         Ok((snap, command)) => {
                             if host.is_local() {
@@ -4868,13 +5018,17 @@ impl SettingsView {
                                 this.remote_accounts_snapshots
                                     .insert(host.clone(), snap.clone());
                             }
-                            if this.account_host == host {
+                            if is_current {
                                 this.accounts_snapshot = snap;
+                                this.account_error = None;
+                                queue_terminal_command_on(host, &command, cx);
                             }
-                            this.account_error = None;
-                            queue_terminal_command_on(host, &command, cx);
                         }
-                        Err(error) => this.account_error = Some(error.into()),
+                        Err(error) => {
+                            if is_current {
+                                this.account_error = Some(error.into());
+                            }
+                        }
                     }
                     cx.notify();
                 })
@@ -5050,18 +5204,35 @@ impl SettingsView {
             }
             let home = crate::accounts::default_home();
             let prev = self.accounts_snapshot.clone();
+            let request_host = self.account_host.clone();
+            let req_gen = self.account_rule_generation;
             self.account_error = None;
             self.file_job(
                 "account-local",
                 move || crate::accounts::request_local(&home, dir.as_deref(), &req),
-                move |this, result, cx| match result {
-                    Ok(mut snap) => {
-                        Self::merge_local_snapshot_tails(&prev, &mut snap);
-                        this.accounts_snapshot = snap;
-                        this.account_error = None;
-                        cx.defer(notify_external_change);
+                move |this, result, cx| {
+                    let is_current = accept_account_mutation_reply(
+                        &this.account_host,
+                        this.account_rule_generation,
+                        &request_host,
+                        req_gen,
+                    );
+                    match result {
+                        Ok(mut snap) => {
+                            Self::merge_local_snapshot_tails(&prev, &mut snap);
+                            this.local_accounts_snapshot = snap.clone();
+                            if is_current {
+                                this.accounts_snapshot = snap;
+                                this.account_error = None;
+                                cx.defer(notify_external_change);
+                            }
+                        }
+                        Err(error) => {
+                            if is_current {
+                                this.account_error = Some(error.to_string().into());
+                            }
+                        }
                     }
-                    Err(error) => this.account_error = Some(error.to_string().into()),
                 },
                 cx,
             );
@@ -5074,26 +5245,13 @@ impl SettingsView {
             self.refresh_accounts_async(cx);
             return;
         }
-        if self.account_rule_pending {
-            return;
-        }
-        self.account_rule_pending = true;
-        self.account_error = None;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let paths = krill_proto::daemon::Paths::dev().ok();
-                    crate::accounts::request(paths.as_ref(), &req)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.finish_account_rule_request(result, cx);
-            })
-            .ok();
-        })
-        .detach();
+        self.spawn_account_rule_request(
+            async move {
+                let paths = krill_proto::daemon::Paths::dev().ok();
+                crate::accounts::request(paths.as_ref(), &req)
+            },
+            cx,
+        );
     }
 
     fn consume_reset_credit(
@@ -5127,6 +5285,8 @@ impl SettingsView {
             provider,
             account_id,
         };
+        let req_gen = self.account_rule_generation.wrapping_add(1);
+        self.account_rule_generation = req_gen;
         self.account_rule_pending = true;
         self.account_error = None;
         cx.notify();
@@ -5143,7 +5303,15 @@ impl SettingsView {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.account_rule_pending = false;
+                if this.account_rule_generation == req_gen {
+                    this.account_rule_pending = false;
+                }
+                let is_current = accept_account_mutation_reply(
+                    &this.account_host,
+                    this.account_rule_generation,
+                    &host,
+                    req_gen,
+                );
                 match result {
                     Ok(consumed) => {
                         if host.is_local() {
@@ -5152,29 +5320,36 @@ impl SettingsView {
                             this.remote_accounts_snapshots
                                 .insert(host.clone(), consumed.snapshot.clone());
                         }
-                        if this.account_host == host {
+                        if is_current {
                             this.accounts_snapshot = consumed.snapshot;
-                        }
-                        match consumed.outcome {
-                            ResetConsumeOutcome::Reset | ResetConsumeOutcome::AlreadyRedeemed => {
-                                this.account_error = None;
-                                cx.defer(notify_external_change);
-                            }
-                            ResetConsumeOutcome::NoCredit => {
-                                this.account_error =
-                                    Some(status_text::PROVIDER_RESET_USAGE_NO_CREDIT.get().into());
-                            }
-                            ResetConsumeOutcome::NothingToReset => {
-                                this.account_error =
-                                    Some(status_text::PROVIDER_RESET_USAGE_NOTHING.get().into());
+                            match consumed.outcome {
+                                ResetConsumeOutcome::Reset
+                                | ResetConsumeOutcome::AlreadyRedeemed => {
+                                    this.account_error = None;
+                                    cx.defer(notify_external_change);
+                                }
+                                ResetConsumeOutcome::NoCredit => {
+                                    this.account_error = Some(
+                                        status_text::PROVIDER_RESET_USAGE_NO_CREDIT.get().into(),
+                                    );
+                                }
+                                ResetConsumeOutcome::NothingToReset => {
+                                    this.account_error = Some(
+                                        status_text::PROVIDER_RESET_USAGE_NOTHING.get().into(),
+                                    );
+                                }
                             }
                         }
                     }
                     Err(err) => {
-                        this.account_error = Some(err.into());
+                        if is_current {
+                            this.account_error = Some(err.into());
+                        }
                     }
                 }
-                this.refresh_accounts_async(cx);
+                if is_current {
+                    this.refresh_accounts_async(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -5204,6 +5379,7 @@ impl SettingsView {
             return;
         }
         let hosts = self.ssh_hosts.clone();
+        let requested_hosts = hosts.clone();
         self.ssh_duplicates_for = Some(hosts.clone());
         cx.spawn(async move |this, cx| {
             let dups = cx
@@ -5211,8 +5387,12 @@ impl SettingsView {
                 .spawn(async move { crate::ssh_hosts::duplicate_hosts(&hosts) })
                 .await;
             this.update(cx, |this, cx| {
-                this.ssh_duplicates = dups;
-                cx.notify();
+                if this.ssh_duplicates_for.as_ref() == Some(&requested_hosts)
+                    && this.ssh_hosts == requested_hosts
+                {
+                    this.ssh_duplicates = dups;
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -7022,6 +7202,9 @@ impl SettingsView {
             .id("admin-account-rename-row")
             .capture_action(cx.listener(
                 move |this, _: &gpui_component::input::Enter, window, cx| {
+                    if this.input_is_composing(window, cx) {
+                        return;
+                    }
                     cx.stop_propagation();
                     let label = enter_state.read(cx).value().trim().to_owned();
                     this.rename = None;
@@ -7044,6 +7227,10 @@ impl SettingsView {
             ))
             .capture_action(
                 cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    if this.input_is_composing(window, cx) {
+                        window.prevent_default();
+                        return;
+                    }
                     cx.stop_propagation();
                     this.rename = None;
                     if let Some(focus) = this.rename_return_focus.take() {
@@ -11580,6 +11767,10 @@ impl SettingsView {
             .debug_selector(|| "admin-search-pill".into())
             // Esc는 검색어를 지우고, 이미 비어 있으면 설정 페이지를 닫는다. ↑↓와 Enter는 결과 목록을 다룬다.
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                if this.input_is_composing(window, cx) {
+                    window.prevent_default();
+                    return;
+                }
                 cx.stop_propagation();
                 if !this.search_query(cx).is_empty() {
                     this.clear_search(window, cx);
@@ -11587,11 +11778,22 @@ impl SettingsView {
                     close_settings_page_for(Some(cx.entity_id()), window, cx);
                 }
             }))
-            .capture_action(cx.listener(|this, _: &Enter, _, cx| this.submit_search(cx)))
-            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+            .capture_action(cx.listener(|this, _: &Enter, window, cx| {
+                if this.input_is_composing(window, cx) {
+                    return;
+                }
+                this.submit_search(cx);
+            }))
+            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                if this.input_is_composing(window, cx) {
+                    return;
+                }
                 this.move_search_selection(false, cx);
             }))
-            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+            .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                if this.input_is_composing(window, cx) {
+                    return;
+                }
                 this.move_search_selection(true, cx);
             }))
             .child(
@@ -12122,6 +12324,10 @@ impl Render for SettingsView {
             .key_context(SEARCH_CONTEXT)
             .capture_action(
                 cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    if this.input_is_composing(window, cx) {
+                        window.prevent_default();
+                        return;
+                    }
                     if this.schedule_modal.is_some() {
                         this.close_schedule_modal(cx);
                         cx.stop_propagation();
@@ -12168,6 +12374,11 @@ impl Render for SettingsView {
                 this.focus_search(window, cx);
             }))
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                if ev.keystroke.key == "escape"
+                    && (window.default_prevented() || this.input_is_composing(window, cx))
+                {
+                    return;
+                }
                 if ev.keystroke.key == "escape" {
                     if this.rename.take().is_some() {
                         if let Some(focus) = this.rename_return_focus.take() {
@@ -12311,6 +12522,111 @@ pub mod space;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+#[cfg(test)]
+mod host_fence_tests {
+    use super::*;
+    use gpui::{EntityInputHandler as _, TestAppContext};
+
+    #[test]
+    fn host_and_generation_fence_rejects_stale_or_wrong_host_replies() {
+        let local = crate::hosts::HostId::Local;
+        let studio = crate::hosts::HostId::Remote("studio".to_owned());
+        assert!(accept_account_mutation_reply(&local, 3, &local, 3));
+        assert!(!accept_account_mutation_reply(&studio, 3, &local, 3));
+        assert!(!accept_account_mutation_reply(&local, 4, &local, 3));
+    }
+
+    #[gpui::test]
+    fn select_account_host_resets_pending_and_fences_stale_rule_completion(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!("krill-settings-fence-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+        let studio = crate::hosts::HostId::Remote("studio".to_owned());
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.account_rule_pending = true;
+                v.account_rule_generation = 7;
+                v.select_account_host(studio.clone(), cx);
+                assert!(!v.account_rule_pending);
+                assert_eq!(v.account_rule_generation, 8);
+
+                // Stale local error from generation 7 must not overwrite active remote host.
+                v.finish_account_rule_request_for(
+                    &crate::hosts::HostId::Local,
+                    7,
+                    Err("stale local failure".to_owned()),
+                    cx,
+                );
+                assert!(v.account_error.is_none());
+
+                // Stale error matching generation 8? No, different host must also be ignored.
+                v.finish_account_rule_request_for(
+                    &crate::hosts::HostId::Local,
+                    8,
+                    Err("wrong host error".to_owned()),
+                    cx,
+                );
+                assert!(v.account_error.is_none());
+
+                // Matching host & generation records the error.
+                v.finish_account_rule_request_for(
+                    &studio,
+                    8,
+                    Err("current host error".to_owned()),
+                    cx,
+                );
+                assert_eq!(v.account_error.as_deref(), Some("current host error"));
+            });
+        });
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[gpui::test]
+    fn settings_ime_preedit_blocks_rename_and_search_actions(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("krill-settings-ime-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let rename_input = cx.new(|cx| gpui_component::input::InputState::new(window, cx));
+                rename_input.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                    input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                v.rename = Some(("acc-1".to_owned(), rename_input));
+                assert!(v.input_is_composing(window, cx));
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        vcx.read_entity(&view, |v, _| {
+            assert!(
+                v.rename.is_some(),
+                "IME preedit Escape must not cancel settings account rename"
+            );
+        });
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
 mod updates;
 
 pub fn usage_color(pct: u8, normal: gpui::Hsla, p: &crate::ui::Palette) -> gpui::Hsla {
@@ -12338,4 +12654,13 @@ pub fn usage_tone(pct: u8) -> UsageTone {
     } else {
         UsageTone::Normal
     }
+}
+
+fn accept_account_mutation_reply(
+    current_host: &crate::hosts::HostId,
+    current_gen: u64,
+    req_host: &crate::hosts::HostId,
+    req_gen: u64,
+) -> bool {
+    current_host == req_host && current_gen == req_gen
 }

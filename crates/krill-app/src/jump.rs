@@ -491,47 +491,65 @@ pub(crate) fn normalize_search_str(text: &str) -> String {
     out
 }
 
+pub(crate) fn normalize_search_chars_with_ranges(
+    text: &str,
+) -> Vec<(char, std::ops::Range<usize>)> {
+    let mut out = Vec::with_capacity(text.len());
+    push_normalized_chars_with_ranges(text, |ch, range| out.push((ch, range)));
+    out
+}
+
 fn push_normalized_chars(text: &str, mut push: impl FnMut(char)) {
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
+    push_normalized_chars_with_ranges(text, |ch, _| push(ch));
+}
+
+fn push_normalized_chars_with_ranges(
+    text: &str,
+    mut push: impl FnMut(char, std::ops::Range<usize>),
+) {
+    let mut chars = text.chars().enumerate().peekable();
+    while let Some((start, ch)) = chars.next() {
+        let mut end = start + 1;
         if ch.is_ascii() {
-            push(ch.to_ascii_lowercase());
+            push(ch.to_ascii_lowercase(), start..end);
             continue;
         }
         let code = u32::from(ch);
         if (0x1100..=0x1112).contains(&code)
-            && let Some(&next_v) = chars.peek()
+            && let Some(&(v_idx, next_v)) = chars.peek()
             && (0x1161..=0x1175).contains(&u32::from(next_v))
         {
             chars.next();
+            end = v_idx + 1;
             let l = code - 0x1100;
             let v = u32::from(next_v) - 0x1161;
             let t = chars
                 .peek()
                 .copied()
-                .map(u32::from)
-                .filter(|t| (0x11A8..=0x11C2).contains(t))
-                .map_or(0, |t| {
+                .filter(|&(_, ch_t)| (0x11A8..=0x11C2).contains(&u32::from(ch_t)))
+                .map_or(0, |(t_idx, ch_t)| {
                     chars.next();
-                    t - 0x11A7
+                    end = t_idx + 1;
+                    u32::from(ch_t) - 0x11A7
                 });
             if let Some(composed) = char::from_u32(0xAC00 + l * 588 + v * 28 + t) {
-                push(composed);
+                push(composed, start..end);
                 continue;
             }
         } else if (0xAC00..0xAC00 + 11_172).contains(&code)
             && (code - 0xAC00) % 28 == 0
-            && let Some(&next_t) = chars.peek()
+            && let Some(&(t_idx, next_t)) = chars.peek()
             && (0x11A8..=0x11C2).contains(&u32::from(next_t))
         {
             chars.next();
+            end = t_idx + 1;
             if let Some(composed) = char::from_u32(code + (u32::from(next_t) - 0x11A7)) {
-                push(composed);
+                push(composed, start..end);
                 continue;
             }
         }
         for lower in ch.to_lowercase() {
-            push(lower);
+            push(lower, start..end);
         }
     }
 }
@@ -936,10 +954,7 @@ impl Palette {
     }
 
     pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.input.update(cx, |input, cx| {
-            input.focus_handle(cx).is_focused(window)
-                && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
-        })
+        entity_input_is_composing(&self.input, window, cx)
     }
 
     /// 지금 보이는 순서의 일치 항목.
@@ -1575,6 +1590,17 @@ impl Palette {
         }
         self.projects = names;
     }
+}
+
+pub(crate) fn entity_input_is_composing(
+    input: &Entity<InputState>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> bool {
+    input.update(cx, |input, cx| {
+        input.focus_handle(cx).is_focused(window)
+            && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+    })
 }
 
 fn render_vault_highlight(text_str: &str, query: &str, p: &crate::ui::Palette) -> gpui::Div {
