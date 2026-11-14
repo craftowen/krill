@@ -100,6 +100,14 @@ impl<'a> OrchCtx<'a> {
         }
     }
 
+    fn resolve_env_depth(&self, krill_depth: Option<&str>, mk_depth: Option<&str>) -> Option<u32> {
+        resolve_env_depth_for(self.is_remote(), krill_depth, mk_depth)
+    }
+
+    fn resolve_caller_pane(&self, mk_pane: Option<&str>) -> Option<u64> {
+        resolve_caller_pane_for(self.is_remote(), mk_pane)
+    }
+
     fn can_query_daemon(&self) -> bool {
         self.is_remote() || daemon::state_dir().as_deref() == Some(self.state_dir)
     }
@@ -459,7 +467,7 @@ fn cmd_run_show_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         }
     }
     let store = ctx.load_store()?;
-    let run_id = store.resolve_run_for_session(given.as_deref(), caller_session_id())?;
+    let run_id = store.resolve_run_for_session(given.as_deref(), ctx.caller_session())?;
     let Some(run) = store.runs.iter().find(|r| r.id == run_id) else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -548,7 +556,7 @@ fn cmd_run_current_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     }
     let store = ctx.load_store()?;
     let current: Option<Run> = store
-        .resolve_run_for_session(None, caller_session_id())
+        .resolve_run_for_session(None, ctx.caller_session())
         .ok()
         .and_then(|id| store.runs.into_iter().find(|r| r.id == id));
     let Some(r) = current else {
@@ -647,7 +655,7 @@ fn cmd_task_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         Some(id) => id,
         None => ctx
             .load_store()?
-            .resolve_run_for_session(None, caller_session_id())?,
+            .resolve_run_for_session(None, ctx.caller_session())?,
     };
     let task = match ctx.try_ipc(
         &OrchAction::CreateTask {
@@ -1120,10 +1128,10 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             spec.effort.as_deref(),
         )?;
     }
-    let env_depth = std::env::var("KRILL_ORCH_DEPTH")
-        .or_else(|_| std::env::var("MK_WORKER_DEPTH"))
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let env_depth = ctx.resolve_env_depth(
+        std::env::var("KRILL_ORCH_DEPTH").ok().as_deref(),
+        std::env::var("MK_WORKER_DEPTH").ok().as_deref(),
+    );
     let max_depth = explicit_max_depth
         .or(spec.max_depth)
         .or_else(|| {
@@ -1152,9 +1160,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         }
         None => return Err(bad_arg("missing --worker")),
     };
-    let current_pane = std::env::var("MK_PANE_ID")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
+    let current_pane = ctx.resolve_caller_pane(std::env::var("MK_PANE_ID").ok().as_deref());
     let depth = explicit_depth
         .or(spec.depth)
         .or(env_depth)
@@ -1163,7 +1169,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let run_id = match spec.run_id {
         Some(id) => id,
         None => store
-            .resolve_run_for_session(None, caller_session_id())
+            .resolve_run_for_session(None, ctx.caller_session())
             .map_err(|_| bad_arg("missing --run"))?,
     };
     store.validate_worker_start_with_depth(
@@ -1564,7 +1570,7 @@ fn cmd_send_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let to = to.unwrap_or_else(|| "coordinator".to_owned());
     let summary = summary.ok_or_else(|| bad_arg("missing --summary"))?;
     if run_id.is_none()
-        && let Some(sid) = caller_session_id()
+        && let Some(sid) = ctx.caller_session()
     {
         run_id = ctx.load_store()?.session_runs.get(&sid).cloned();
     }
@@ -2026,7 +2032,7 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let body = body.ok_or_else(|| bad_arg("missing --body"))?;
     let from = match from {
         Some(explicit) => explicit,
-        None => match caller_session_id() {
+        None => match ctx.caller_session() {
             Some(sid) => inferred_reply_sender(&ctx.load_store()?, u64::from(sid))?,
             None => "coordinator".to_owned(),
         },
@@ -4818,6 +4824,24 @@ mod delivery_and_launch_cli_tests {
     }
 }
 
+fn resolve_env_depth_for(
+    remote: bool,
+    krill_depth: Option<&str>,
+    mk_depth: Option<&str>,
+) -> Option<u32> {
+    if remote {
+        return None;
+    }
+    krill_depth.or(mk_depth).and_then(|v| v.parse().ok())
+}
+
+fn resolve_caller_pane_for(remote: bool, mk_pane: Option<&str>) -> Option<u64> {
+    if remote {
+        return None;
+    }
+    mk_pane.and_then(|v| v.parse::<u64>().ok())
+}
+
 #[cfg(test)]
 mod snapshot_fallback_tests {
     use super::*;
@@ -4843,5 +4867,14 @@ mod snapshot_fallback_tests {
         assert!(!snapshot_unavailable(&io::Error::other(
             "orchestration snapshot kept changing while paging; retry"
         )));
+    }
+
+    #[test]
+    fn remote_orchestration_ignores_local_worker_depth_and_pane_env() {
+        assert_eq!(resolve_env_depth_for(true, Some("2"), Some("1")), None);
+        assert_eq!(resolve_env_depth_for(false, Some("2"), Some("1")), Some(2));
+        assert_eq!(resolve_env_depth_for(false, None, Some("3")), Some(3));
+        assert_eq!(resolve_caller_pane_for(true, Some("42")), None);
+        assert_eq!(resolve_caller_pane_for(false, Some("42")), Some(42));
     }
 }

@@ -509,9 +509,12 @@ fn load_queue(file: &Path) -> io::Result<FileRequestQueue> {
         Err(e) => return Err(e),
     }
     if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_FILE_BYTES) {
-        return Ok(FileRequestQueue::default());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file request queue exceeds size limit",
+        ));
     }
-    Ok(serde_json::from_slice(&bytes).unwrap_or_default())
+    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 fn save_queue(file: &Path, queue: &FileRequestQueue) -> io::Result<()> {
@@ -693,6 +696,31 @@ mod tests {
         assert_eq!(queue.requests.len(), 2);
         assert_eq!(queue.requests[0].id, 1);
         assert_eq!(queue.requests[1].id, 2);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn corrupt_queue_returns_error_and_preserves_existing_file() {
+        let tmp =
+            std::env::temp_dir().join(format!("krill-file-corrupt-test-{}", std::process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let state_dir = tmp.join("state");
+        let repo = tmp.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        let target_file = repo.join("hello.rs");
+        fs::write(&target_file, "fn main() {}\n").unwrap();
+
+        let queue_path = state_dir.join(FILE_REQUESTS_FILE);
+        let original = b"{not valid json";
+        fs::write(&queue_path, original).unwrap();
+
+        let err = load_queue(&queue_path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let open_cmd = parse(&[OsString::from("open"), OsString::from("hello.rs")]).unwrap();
+        assert!(execute(&state_dir, &repo, &open_cmd).is_err());
+        assert_eq!(fs::read(&queue_path).unwrap(), original);
 
         fs::remove_dir_all(&tmp).ok();
     }

@@ -142,6 +142,8 @@ use krill_proto::usage::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
+mod account_sources;
+
 pub const PROJECTS_FILE: &str = "projects.toml";
 const HOSTS_FILE: &str = "hosts.toml";
 const SETTINGS_FILE: &str = "settings.toml";
@@ -1281,6 +1283,8 @@ fn import_accounts_domain_inner(
         });
     }
 
+    planned.extend(account_sources::opencode(opts));
+
     let mut summary = AccountsImportSummary::default();
     // OWE-901: agy 계정은 Orca 암호화 저장소라 이관하지 않는다. 새로 로그인을 안내한다.
     if let Some(note) = detect_agy_import_note(opts, domains) {
@@ -1646,21 +1650,24 @@ fn find_registered_account<'a>(
 }
 
 /// Orca 프로필 경로에서 계정 uuid를 뽑는다.
-/// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`.
+/// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`·`managed-data-accounts/opencode/<uuid>`.
 /// uuid 형태가 아니면 `None`(사용자 임의 경로와 오인 병합 방지).
 fn orca_uuid_from_profile_dir(dir: &str) -> Option<&str> {
     let mut parts = dir.split(['/', '\\']);
-    let leaf = parts.next_back()?;
-    let uuid = parts.next_back()?;
-    let parent = parts.next_back()?;
+    let last = parts.next_back()?;
+    let mid = parts.next_back()?;
+    let root = parts.next_back()?;
+    if root == "managed-data-accounts" && mid == "opencode" {
+        return is_uuid_shape(last).then_some(last);
+    }
     if !matches!(
-        parent,
+        root,
         "claude-profiles" | "claude-accounts" | "codex-accounts"
-    ) || !matches!(leaf, "home" | "auth")
+    ) || !matches!(last, "home" | "auth")
     {
         return None;
     }
-    is_uuid_shape(uuid).then_some(uuid)
+    is_uuid_shape(mid).then_some(mid)
 }
 
 /// uuid v4 텍스트 형태(8-4-4-4-12 hex)만 인정한다.
@@ -4919,6 +4926,12 @@ mod tests {
             ),
             Some("96f8c826-8b89-4470-a327-f4918efb8177")
         );
+        assert_eq!(
+            orca_uuid_from_profile_dir(
+                "/o/managed-data-accounts/opencode/96f8c826-8b89-4470-a327-f4918efb8177"
+            ),
+            Some("96f8c826-8b89-4470-a327-f4918efb8177")
+        );
         assert_eq!(orca_uuid_from_profile_dir("/tmp/other"), None);
         assert_eq!(
             orca_uuid_from_profile_dir("/o/claude-profiles/not-a-uuid/home"),
@@ -4928,6 +4941,38 @@ mod tests {
         assert_eq!(primary_email("표시명"), "표시명");
         assert!(emails_equal("A@EXAMPLE.COM", "a@example.com (Org A)"));
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn import_accounts_domain_includes_opencode_data_accounts_in_dry_run() {
+        let root =
+            std::env::temp_dir().join(format!("owe744-opencode-domain-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let base = root.join("orca/managed-data-accounts/opencode");
+        let id = "96f8c826-8b89-4470-a327-f4918efb8177";
+        fs::create_dir_all(base.join(id).join("data/opencode")).unwrap();
+        fs::write(base.join(id).join("data/opencode/auth.json"), "{}").unwrap();
+        fs::write(
+            base.join("accounts.json"),
+            format!(
+                r#"{{"accounts":[{{"id":"{id}","label":"OpenCode Work"}}],"activeAccountId":"{id}"}}"#
+            ),
+        )
+        .unwrap();
+        let opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: root.join("state"),
+            orca_dir: root.join("orca"),
+            dry_run: true,
+            domains: vec![ImportDomain::Accounts],
+        };
+        let mut warnings = Vec::new();
+        let summary = import_accounts_domain(&opts, &BTreeMap::new(), &mut warnings);
+        assert_eq!(summary.items.len(), 1);
+        assert_eq!(summary.items[0].provider, "opencode");
+        assert_eq!(summary.items[0].label, "OpenCode Work");
+        assert!(summary.items[0].active);
         fs::remove_dir_all(root).ok();
     }
 
