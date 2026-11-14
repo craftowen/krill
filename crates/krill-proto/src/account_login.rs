@@ -240,12 +240,15 @@ pub fn probe_with_environment(
     for mut pipe in pipes {
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let mut text = String::new();
+            let mut buf = Vec::new();
             let result = pipe
                 .by_ref()
                 .take(64 * 1024)
-                .read_to_string(&mut text)
-                .map(|_| text);
+                .read_to_end(&mut buf)
+                .map(|_| {
+                    std::io::copy(&mut pipe, &mut std::io::sink()).ok();
+                    String::from_utf8_lossy(&buf).into_owned()
+                });
             tx.send(result).ok();
         });
     }
@@ -704,6 +707,47 @@ mod tests {
             assert_eq!(codex_identity_from_dir(&linked), None);
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_with_environment_handles_multibyte_boundary_and_large_output() {
+        let dir = std::env::temp_dir().join(format!("krill-probe-boundary-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("claude");
+        let filler = "a".repeat(65_534);
+        let body = format!(
+            "#!/bin/sh\nprintf '%s' '{filler}가'\nprintf '\\377bad\\n' >&2\nprintf '{{\"loggedIn\":true}}'\n"
+        );
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Check a second script where the valid JSON fits before 64KiB and invalid UTF-8 / >64KiB follows.
+        let script2 = dir.join("codex");
+        let tail = "b".repeat(70 * 1024);
+        let body2 = format!(
+            "#!/bin/sh\nprintf 'Logged in\\n%s가{tail}' '{filler}'\nprintf '\\377\\376' >&2\n"
+        );
+        std::fs::write(&script2, body2).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script2, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_env = dir.to_string_lossy().into_owned();
+        let res = probe_with_environment(
+            &script2,
+            ProviderKind::Codex,
+            None,
+            Some(&dir),
+            Some(std::ffi::OsStr::new(&path_env)),
+        );
+        assert_eq!(res.map(|s| s.logged_in), Some(true));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
