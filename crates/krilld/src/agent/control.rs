@@ -163,8 +163,8 @@ impl Control {
         let bytes = fs::read(&rules_path).ok()?;
         let payload = match krill_proto::agent::rules::load_signed(&public, &bytes) {
             Ok(signed) => Some(Arc::new(signed)),
-            Err(e) => {
-                tracing::warn!("signed agent rules rejected, keeping builtin: {e}");
+            Err(reason) => {
+                tracing::warn!(?reason, "signed agent rules rejected, keeping builtin");
                 None
             }
         };

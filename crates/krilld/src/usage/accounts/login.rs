@@ -222,7 +222,7 @@ fn spawn_probe(
         });
     if let Err(error) = spawned {
         lock(&STATES).insert(key.clone(), ConnectionStatus::CheckFailed);
-        tracing::warn!(%error, "account auth probe thread failed to start");
+        tracing::warn!(kind = ?error.kind(), errno = error.raw_os_error(), "account auth probe thread failed to start");
         lock(&PROBING).remove(key);
     }
 }

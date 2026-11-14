@@ -24,6 +24,8 @@ const OFFLINE_AFTER_FAILURES: u32 = 10;
 /// 꺼진 기기 재시도 간격. 사이드바 '다시 연결'([`HostManager::reconnect_now`])은 이 대기를 바로 푼다.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
 
+type AttemptToken = Option<(Arc<()>, u64)>;
+
 /// 같은 접속 대상을 가리키는 관리자끼리 나누는 '꺼진 기기' 판정의 키.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct OfflineKey {
@@ -431,30 +433,45 @@ impl HostManager {
                 };
                 let manager = self.clone();
                 let host_id = id.clone();
-                let connector =
-                    RemoteConnector::new(move || manager.ensure_tunnel_socket(&host_id), {
-                        let manager = self.clone();
-                        let host_id = id.clone();
-                        move |ok, err| manager.record_ipc_outcome(&host_id, ok, err)
-                    })
-                    .with_lifetime(registration.clone(), {
-                        let manager = self.clone();
-                        let host_id = id.clone();
-                        let expected = Arc::downgrade(&slot);
-                        move || {
-                            let (Some(current), Some(expected)) =
-                                (manager.slot(&host_id), expected.upgrade())
-                            else {
-                                return false;
-                            };
-                            if !Arc::ptr_eq(&current, &expected) {
-                                return false;
-                            }
-                            current.lock().is_ok_and(|slot| {
-                                !slot.suspended && Arc::ptr_eq(&slot.registration, &registration)
-                            })
+                let attempt: Arc<Mutex<AttemptToken>> = Arc::new(Mutex::new(None));
+                let ensure_attempt = Arc::clone(&attempt);
+                let outcome_attempt = Arc::clone(&attempt);
+                let connector = RemoteConnector::new(
+                    move || {
+                        let (sock, reg, gen_) =
+                            manager.ensure_tunnel_socket_for_attempt(&host_id)?;
+                        if let Ok(mut guard) = ensure_attempt.lock() {
+                            *guard = Some((reg, gen_));
                         }
-                    });
+                        Ok(sock)
+                    },
+                    {
+                        let manager = self.clone();
+                        let host_id = id.clone();
+                        move |ok, err| {
+                            let token = outcome_attempt.lock().ok().and_then(|mut g| g.take());
+                            manager.record_ipc_outcome_for_attempt(&host_id, token, ok, err);
+                        }
+                    },
+                )
+                .with_lifetime(registration.clone(), {
+                    let manager = self.clone();
+                    let host_id = id.clone();
+                    let expected = Arc::downgrade(&slot);
+                    move || {
+                        let (Some(current), Some(expected)) =
+                            (manager.slot(&host_id), expected.upgrade())
+                        else {
+                            return false;
+                        };
+                        if !Arc::ptr_eq(&current, &expected) {
+                            return false;
+                        }
+                        current.lock().is_ok_and(|slot| {
+                            !slot.suspended && Arc::ptr_eq(&slot.registration, &registration)
+                        })
+                    }
+                });
                 Some(HostTarget::remote_with_connector(
                     id.clone(),
                     initial_socket,
@@ -492,7 +509,13 @@ impl HostManager {
         }
     }
 
+    #[cfg(all(test, unix))]
     fn ensure_tunnel_socket(&self, id: &str) -> io::Result<PathBuf> {
+        self.ensure_tunnel_socket_for_attempt(id)
+            .map(|(sock, _, _)| sock)
+    }
+
+    fn ensure_tunnel_socket_for_attempt(&self, id: &str) -> io::Result<(PathBuf, Arc<()>, u64)> {
         let slot = self.slot(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::ConnectionRefused, "unknown remote host")
         })?;
@@ -536,7 +559,11 @@ impl HostManager {
         }
 
         if let Some(t) = &s.tunnel {
-            return Ok(t.socket().to_path_buf());
+            return Ok((
+                t.socket().to_path_buf(),
+                Arc::clone(&s.registration),
+                s.generation,
+            ));
         }
 
         let key = self.offline_key(&s.spec);
@@ -588,7 +615,7 @@ impl HostManager {
                 s.placeholder_socket.clone_from(&sock);
                 s.tunnel = Some(tunnel);
                 s.tunnel_starts = s.tunnel_starts.saturating_add(1);
-                Ok(sock)
+                Ok((sock, Arc::clone(&s.registration), s.generation))
             }
             Err(err) => {
                 s.failures = s.failures.saturating_add(1);
@@ -630,13 +657,29 @@ impl HostManager {
         s.status = HostStatus::Disconnected;
     }
 
+    #[cfg(all(test, unix))]
     fn record_ipc_outcome(&self, id: &str, ok: bool, err: Option<&io::Error>) {
+        self.record_ipc_outcome_for_attempt(id, None, ok, err);
+    }
+
+    fn record_ipc_outcome_for_attempt(
+        &self,
+        id: &str,
+        attempt: Option<(Arc<()>, u64)>,
+        ok: bool,
+        err: Option<&io::Error>,
+    ) {
         let Some(slot) = self.slot(id) else {
             return;
         };
         let Ok(mut s) = slot.lock() else {
             return;
         };
+        if let Some((expected_reg, expected_gen)) = attempt
+            && (!Arc::ptr_eq(&s.registration, &expected_reg) || s.generation != expected_gen)
+        {
+            return;
+        }
         if s.suspended {
             s.status = HostStatus::Disconnected;
             return;
@@ -732,6 +775,90 @@ exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $A
         assert_eq!(manager.status("studio"), HostStatus::Disconnected);
         let retry_err = manager.ensure_tunnel_socket("studio").unwrap_err();
         assert_eq!(retry_err.kind(), io::ErrorKind::WouldBlock);
+        drop(manager);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_socket_failure_counts_once_and_stale_generation_outcome_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("m131-fence-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let bad_ssh = dir.join("fail-ssh");
+        fs::write(&bad_ssh, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&bad_ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let manager = HostManager::with_ssh_program(dir.clone(), bad_ssh.into_os_string());
+        manager.sync_specs(&[RemoteHostSpec {
+            id: "studio".into(),
+            label: "Studio".into(),
+            address: "owen@studio.local".into(),
+            port: None,
+            identity_file: None,
+            remote_socket: Some("/tmp/remote.sock".into()),
+        }]);
+        let target = manager
+            .target_for(&HostId::Remote("studio".into()), None)
+            .unwrap();
+        let hello = krill_proto::ipc::ClientHello {
+            proto_min: 1,
+            proto_max: 1,
+            features: 0,
+            role: krill_proto::ipc::ClientRole::Cli,
+            name: "test".into(),
+        };
+        assert!(target.connect(&hello).is_err());
+        let failures = manager
+            .slot("studio")
+            .and_then(|slot| slot.lock().ok().map(|s| s.failures));
+        assert_eq!(
+            failures,
+            Some(1),
+            "ensure_socket error must increment failures only once"
+        );
+
+        let good_ssh = dir.join("ok-ssh");
+        fs::write(
+            &good_ssh,
+            r#"#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $ARGV[0], Listen => 5) or exit 3; sleep 60' "${fwd%%:*}"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&good_ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let manager2 = HostManager::with_ssh_program(dir.clone(), good_ssh.into_os_string());
+        manager2.sync_specs(&[RemoteHostSpec {
+            id: "studio".into(),
+            label: "Studio".into(),
+            address: "owen@studio.local".into(),
+            port: None,
+            identity_file: None,
+            remote_socket: Some("/tmp/remote.sock".into()),
+        }]);
+        let (_, reg1, gen1) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
+        manager2.reconnect_now("studio");
+        let (_, reg2, gen2) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
+        manager2.record_ipc_outcome_for_attempt("studio", Some((reg2, gen2)), true, None);
+        let pid2 = manager2.tunnel_pid("studio").unwrap();
+
+        let timeout = io::Error::new(io::ErrorKind::TimedOut, "stale RPC timeout");
+        manager2.record_ipc_outcome_for_attempt(
+            "studio",
+            Some((reg1, gen1)),
+            false,
+            Some(&timeout),
+        );
+        assert_eq!(manager2.status("studio"), HostStatus::Connected);
+        assert_eq!(manager2.tunnel_pid("studio"), Some(pid2));
+
+        drop(manager2);
         drop(manager);
         fs::remove_dir_all(&dir).ok();
     }

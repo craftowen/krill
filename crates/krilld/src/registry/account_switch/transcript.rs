@@ -3,7 +3,7 @@
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -56,12 +56,16 @@ pub(super) fn has_claude_transcript(
     source: Option<&LaunchAccount>,
     stored: &StoredLaunch,
 ) -> bool {
-    if stored
-        .transcript_path
-        .as_deref()
-        .is_some_and(|path| Path::new(path).is_file())
-    {
-        return true;
+    if let Some(path) = stored.transcript_path.as_deref().map(Path::new) {
+        if let Ok(found_id) = file_session_id(path, ProviderKind::Claude) {
+            return stored
+                .session_id
+                .as_deref()
+                .is_none_or(|expected| expected == found_id);
+        }
+        if path.exists() {
+            return false;
+        }
     }
     let Some(id) = stored
         .session_id
@@ -261,31 +265,46 @@ pub(super) fn prepare_bound(
 
 /// Read only provider identity metadata, never infer an ID from an arbitrary rollout filename.
 pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result<String> {
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    let mut head = Vec::new();
     let file = File::open(path)?;
-    let len = file.metadata()?.len();
-    file.take(128 * 1024).read_to_end(&mut head)?;
-    // A newly opened rollout may be visible before its metadata write completes.
-    // Only an empty file or an incomplete last line is retryable; complete invalid
-    // metadata stays fatal. A read cut at the size cap is not a pending write.
-    let last_line = head
-        .rsplit(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    let pending_header = head.is_empty()
-        || (len <= head.len() as u64
-            && !last_line.is_empty()
-            && serde_json::from_slice::<serde_json::Value>(last_line).is_err_and(|e| e.is_eof()));
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut total_read = 0_usize;
+    let mut saw_any_bytes = false;
+    let mut last_incomplete = false;
     let mut identity: Option<String> = None;
     // A forked Codex rollout replays the parent's `session_meta` after its own.
     let mut parent: Option<String> = None;
-    for record in String::from_utf8_lossy(&head)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-    {
+    while total_read < MAX_BYTES {
+        let cap = MAX_BYTES
+            .saturating_sub(total_read)
+            .min(MAX_LINE_BYTES)
+            .saturating_add(1);
+        line.clear();
+        let n = reader
+            .by_ref()
+            .take(u64::try_from(cap).unwrap_or(u64::MAX))
+            .read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        saw_any_bytes = true;
+        total_read = total_read.saturating_add(n);
+        let ended_with_newline = line.last() == Some(&b'\n');
+        let truncated_at_cap = n == cap && !ended_with_newline;
+        last_incomplete = !ended_with_newline
+            && !truncated_at_cap
+            && serde_json::from_slice::<serde_json::Value>(&line).is_err_and(|e| e.is_eof());
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            if truncated_at_cap {
+                break;
+            }
+            continue;
+        };
         let id = match provider {
             ProviderKind::Codex
                 if record.get("type").and_then(serde_json::Value::as_str)
@@ -329,10 +348,13 @@ pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result
             }
             identity = Some(id.to_owned());
         }
+        if truncated_at_cap {
+            break;
+        }
     }
     identity.ok_or_else(|| {
         io::Error::new(
-            if pending_header {
+            if !saw_any_bytes || last_incomplete {
                 io::ErrorKind::WouldBlock
             } else {
                 io::ErrorKind::InvalidData
@@ -1017,6 +1039,14 @@ mod bound_path_tests {
             hibernation_blocked: false,
         };
         assert!(!has_claude_transcript(&root, Some(&source), &stored));
+        fs::write(&transcript, b"").unwrap();
+        assert!(!has_claude_transcript(&root, Some(&source), &stored));
+        fs::write(
+            &transcript,
+            r#"{"sessionId":"99999999-2222-4333-8444-555555555555"}"#,
+        )
+        .unwrap();
+        assert!(!has_claude_transcript(&root, Some(&source), &stored));
         fs::write(
             &transcript,
             r#"{"sessionId":"11111111-2222-4333-8444-555555555555"}"#,
@@ -1036,6 +1066,37 @@ mod bound_path_tests {
         assert_eq!(super::super::load(Some(&root)).len(), 0);
         assert!(!stale_tmp.exists());
         assert!(live_tmp.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_session_id_scans_past_128k_lines_and_preserves_would_block_on_incomplete_line() {
+        let root = std::env::temp_dir().join(format!("kas-file-sid-128k-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let claude_path = root.join("claude.jsonl");
+        let filler = "{\"type\":\"summary\",\"summary\":\"x\"}\n";
+        let repeat_count = (140 * 1024) / filler.len() + 1;
+        let mut content = filler.repeat(repeat_count);
+        content.push_str(r#"{"sessionId":"after-128k"}"#);
+        content.push('\n');
+        fs::write(&claude_path, content).unwrap();
+        assert_eq!(
+            file_session_id(&claude_path, ProviderKind::Claude).unwrap(),
+            "after-128k"
+        );
+
+        let partial = root.join("partial.jsonl");
+        let pad = "{\"type\":\"summary\"}\n".repeat(7_500);
+        assert!(pad.len() > 130 * 1024);
+        fs::write(&partial, format!("{pad}{{\"type\":\"turn_context\"")).unwrap();
+        assert_eq!(
+            file_session_id(&partial, ProviderKind::Claude)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

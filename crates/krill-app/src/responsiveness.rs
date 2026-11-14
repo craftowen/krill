@@ -449,8 +449,9 @@ impl Watch {
             .replace(now)
             .map_or(0, |previous| now.saturating_sub(previous));
         let whole_process = observer_gap_ms >= STALL_MS;
-        // Hidden, covered or on a sleeping display: macOS may throttle us and no one waits on input.
-        let shown = || seen.window_visible && !display_asleep();
+        // Hidden, backgrounded (App Nap drops LatencyActivity), or on a sleeping display:
+        // macOS may throttle this thread and no one is waiting on foreground input.
+        let shown = || seen.is_foreground() && !display_asleep();
         match self.monitor.check(now, last) {
             Some(Event::Stalled(_)) if !shown() => {
                 self.quiet = true;
@@ -642,6 +643,38 @@ mod tests {
             assert_eq!(watch.observe(3_100, 3_050, SHOWN, || false), None);
             assert_eq!(watch.observe(3_200, 3_150, SHOWN, || false), None);
         }
+    }
+
+    #[test]
+    fn backgrounded_app_nap_suppresses_stall_and_observer_late_warnings() {
+        let backgrounded = Seen {
+            app_active: false,
+            window_visible: true,
+        };
+        let mut watch = Watch::default();
+        assert_eq!(watch.observe(100, 100, SHOWN, || false), None);
+        // hold_activity releases LatencyActivity when !app_active; waking >500ms late is App Nap, not a hang.
+        assert_eq!(watch.observe(700, 680, backgrounded, || false), None);
+        assert_eq!(watch.observe(3_200, 680, backgrounded, || false), None);
+        assert_eq!(watch.observe(3_300, 3_250, SHOWN, || false), None);
+    }
+
+    #[test]
+    fn foreground_stall_still_reports_recovery_after_losing_focus() {
+        let backgrounded = Seen {
+            app_active: false,
+            window_visible: true,
+        };
+        let mut watch = Watch::default();
+        assert_eq!(watch.observe(100, 100, SHOWN, || false), None);
+        assert!(matches!(
+            watch.observe(2_900, 100, SHOWN, || false),
+            Some(Report::Stalled { .. })
+        ));
+        assert!(matches!(
+            watch.observe(3_050, 3_000, backgrounded, || false),
+            Some(Report::Recovered { .. })
+        ));
     }
 
     #[test]

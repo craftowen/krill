@@ -82,3 +82,46 @@ fn bundle_failure_shows_error_and_keeps_logs_pending(cx: &mut TestAppContext) {
     assert_eq!(diag::pending(&state).len(), 1);
     fs::remove_dir_all(&state).ok();
 }
+
+#[test]
+fn bundle_failure_logs_error_kind_without_display_paths() {
+    struct Capture(std::sync::Arc<std::sync::Mutex<String>>);
+    struct Line<'a>(&'a mut String);
+    impl tracing::field::Visit for Line<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            write!(self.0, " {}={value:?}", field.name()).ok();
+        }
+    }
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if let Ok(mut buf) = self.0.lock() {
+                event.record(&mut Line(&mut buf));
+                buf.push('\n');
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let error = std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "/Users/alice/secret/diagnostics",
+    );
+    tracing::subscriber::with_default(Capture(logs.clone()), || {
+        warn_bundle_write_failed(&error);
+    });
+    let recorded = logs.lock().unwrap().clone();
+    assert!(recorded.contains("PermissionDenied"), "{recorded}");
+    assert!(!recorded.contains("/Users/alice"), "{recorded}");
+    assert!(!recorded.contains("secret"), "{recorded}");
+}

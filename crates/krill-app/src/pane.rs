@@ -1093,20 +1093,24 @@ fn find_matches_with_pattern(
 }
 
 impl SearchState {
-    fn clear(&mut self) {
-        self.pending = None;
-        self.query.clear();
+    fn clear_matches(&mut self) {
         self.pattern = None;
         self.row_marks.clear();
         self.cursor = None;
         self.result = None;
         self.hist_req = None;
         self.hist_target = None;
-        self.top_request = None;
-        self.scrolled = false;
         self.highlight = None;
         self.track_screen_hit = false;
         self.highlights.clear();
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+        self.query.clear();
+        self.top_request = None;
+        self.scrolled = false;
+        self.clear_matches();
     }
 }
 
@@ -2083,23 +2087,18 @@ impl<W: Write> Pane<W> {
             self.clear_search();
             return false;
         }
+        if self.search.query != query || self.search.options != options {
+            self.search.clear_matches();
+        }
         if !self.search.supported || self.is_cold() || self.out.is_none() {
             return false;
         }
-        let after = if self.search.query == query && self.search.options == options {
-            self.search.cursor
-        } else {
-            self.search.cursor = None;
-            self.search.result = None;
-            None
-        };
+        let after = self.search.cursor;
         self.search.options = options;
         query.clone_into(&mut self.search.query);
         self.search.req = self.search.req.wrapping_add(1);
         let req = self.search.req;
         self.search.pending = Some(req);
-        self.search.hist_req = None;
-        self.search.hist_target = None;
         let msg = krill_proto::search::SearchRequest {
             req,
             query: self.search.query.clone(),

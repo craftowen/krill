@@ -147,8 +147,8 @@ pub struct Store {
     written: AtomicU64,
     /// 일시중지 ACK는 진행 중인 쓰기가 끝난 뒤에만 돌려준다.
     pause: RwLock<Pause>,
-    /// 세션별 스크롤백 지우기 기준선 `(generation, cleared_seq)`(OWE-873b).
-    cleared: Mutex<HashMap<SessionId, (u64, u64)>>,
+    /// 세션별 스크롤백 지우기 기준선 `(generation, cleared_seq, unpersisted)`(OWE-873b).
+    cleared: Mutex<HashMap<SessionId, (u64, u64, bool)>>,
     /// 명시적 `Close`로 닫힌 세션 집합.
     closed: Mutex<HashSet<SessionId>>,
 }
@@ -342,21 +342,21 @@ impl Store {
         let pause = self.record_guard();
         let _gate = lock(&self.gate);
         let generation = self.generation.load(Ordering::Acquire);
+        let dir = self.session_dir(id);
+        let can_persist = self.recording && !pause.paused && dir.is_dir();
         let target = {
             let mut cleared = lock(&self.cleared);
-            let entry = cleared.entry(id).or_insert((generation, 0));
+            let entry = cleared.entry(id).or_insert((generation, 0, false));
             if entry.0 == generation {
                 entry.1 = entry.1.max(seq);
+                entry.2 = !can_persist;
             } else {
-                *entry = (generation, seq);
+                *entry = (generation, seq, !can_persist);
             }
             entry.1
         };
-        if self.recording && !pause.paused {
-            let dir = self.session_dir(id);
-            if dir.is_dir() {
-                write_cleared(&dir, target);
-            }
+        if can_persist {
+            write_cleared(&dir, target);
         }
     }
 
@@ -366,7 +366,8 @@ impl Store {
         if !self.recording {
             return false;
         }
-        let Ok(mut paths) = segments(&self.session_dir(id)) else {
+        let dir = self.session_dir(id);
+        let Ok(mut paths) = segments(&dir) else {
             return false;
         };
         while let Some(path) = paths.pop() {
@@ -377,14 +378,27 @@ impl Store {
                 return true;
             }
         }
+        if dir.join(archive::PRIOR).is_file() {
+            self.clear_scrollback(id, 0);
+            return true;
+        }
         false
+    }
+
+    pub(super) fn is_unpersisted_clear(&self, id: SessionId) -> bool {
+        let generation = self.generation.load(Ordering::Acquire);
+        lock(&self.cleared)
+            .get(&id)
+            .is_some_and(|&(recorded_gen, _, unpersisted)| {
+                recorded_gen == generation && unpersisted
+            })
     }
 
     fn cleared_seq(&self, id: SessionId) -> u64 {
         let generation = self.generation.load(Ordering::Acquire);
         {
             let cleared = lock(&self.cleared);
-            if let Some(&(recorded_gen, seq)) = cleared.get(&id)
+            if let Some(&(recorded_gen, seq, _)) = cleared.get(&id)
                 && recorded_gen == generation
             {
                 return seq;
@@ -396,11 +410,11 @@ impl Store {
         let seq = read_cleared(&self.session_dir(id)).unwrap_or(0);
         if seq > 0 {
             let mut cleared = lock(&self.cleared);
-            let entry = cleared.entry(id).or_insert((generation, 0));
+            let entry = cleared.entry(id).or_insert((generation, 0, false));
             if entry.0 == generation {
                 entry.1 = entry.1.max(seq);
             } else {
-                *entry = (generation, seq);
+                *entry = (generation, seq, false);
             }
             return entry.1;
         }

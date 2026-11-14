@@ -732,3 +732,35 @@ fn install_roundtrip_succeeds_when_remote_home_contains_spaces() {
     let after = query_remote_info_with_program(&opts, &fake.ssh_bin()).unwrap();
     assert_eq!(after.version, RemoteVersion::Known("0.2.9".into()));
 }
+
+#[cfg(unix)]
+#[test]
+fn run_piped_ssh_preserves_stderr_when_remote_exits_before_draining_large_stdin() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!("krill-piped-ssh-stderr-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("fake-ssh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'No space left on device' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let large_stdin = vec![b'x'; 2 * 1024 * 1024];
+    let output = run_piped_ssh_with_timeout(
+        script.as_os_str(),
+        &[],
+        Some(&large_stdin),
+        std::time::Duration::from_secs(10),
+    )
+    .expect("early exit with stderr must return Output, not BrokenPipe");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No space left on device"),
+        "stderr lost: {stderr}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

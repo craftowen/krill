@@ -434,7 +434,7 @@ pub async fn start_tunnel(opts: ConnectOptions) -> Result<TunnelHandle, Error> {
                 accepted=listener.accept()=>{
                     // EMFILE and similar failures drop only that client. The listener stays usable,
                     // and leaving the loop would close every live stream.
-                    let (unix,_)=match accepted { Ok(accepted)=>accepted, Err(error)=>{ tracing::debug!(%error, "local tunnel accept failed"); tokio::time::sleep(Duration::from_millis(50)).await; continue; } };
+                    let (unix,_)=match accepted { Ok(accepted)=>accepted, Err(error)=>{ tracing::debug!(kind = ?error.kind(), os_code = ?error.raw_os_error(), "local tunnel accept failed"); tokio::time::sleep(Duration::from_millis(50)).await; continue; } };
                     if rejected.load(std::sync::atomic::Ordering::Acquire) { continue; }
                     let Ok(id)=crate::resume::StreamId::random() else { continue };
                     let grace=Duration::from_millis(cfg.resume_grace_ms);

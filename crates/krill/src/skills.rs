@@ -374,33 +374,57 @@ fn dispatch_handoff(args: &[String]) -> io::Result<()> {
         crate::session::send_session_line(&target, sid, &packet)
     });
 
-    if json {
-        print_json(&serde_json::json!({
-            "from_session": from_id,
-            "to_agent": to_agent,
-            "to_session": target_session,
-            "worktree": wt_key,
-            "prompt": prompt,
-            "captured_lines": all_lines.len().saturating_sub(start),
-            "packet": packet,
-        }))?;
-    } else {
-        println!(
-            "handoff\tfrom={from_id}\tto_agent={to_agent}\tto_session={}\tlines={}",
-            target_session.map_or_else(|| "-".to_owned(), |n| n.to_string()),
-            all_lines.len().saturating_sub(start)
-        );
-    }
+    finish_handoff_delivery(
+        delivered,
+        newly_spawned,
+        target_session,
+        &to_agent,
+        |sid| crate::session::close_session(sid).is_ok(),
+        || {
+            if json {
+                print_json(&serde_json::json!({
+                    "from_session": from_id,
+                    "to_agent": to_agent,
+                    "to_session": target_session,
+                    "worktree": wt_key,
+                    "prompt": prompt,
+                    "captured_lines": all_lines.len().saturating_sub(start),
+                    "packet": packet,
+                }))
+            } else {
+                println!(
+                    "handoff\tfrom={from_id}\tto_agent={to_agent}\tto_session={}\tlines={}",
+                    target_session.map_or_else(|| "-".to_owned(), |n| n.to_string()),
+                    all_lines.len().saturating_sub(start)
+                );
+                Ok(())
+            }
+        },
+    )
+}
+
+fn finish_handoff_delivery<F, P>(
+    delivered: std::result::Result<(), String>,
+    newly_spawned: bool,
+    target_session: Option<u64>,
+    to_agent: &str,
+    close_session: F,
+    emit_output: P,
+) -> io::Result<()>
+where
+    F: FnOnce(u64) -> bool,
+    P: FnOnce() -> io::Result<()>,
+{
     match delivered {
-        Ok(()) => Ok(()),
+        Ok(()) => emit_output(),
         Err(e) => {
             // 새로 띄운 세션으로 전달이 안 되면 고아 에이전트 세션을 남기지 않는다(C6).
             // 방금 만든 세션이라 정리해도 사용자 작업 손실이 없다. 남의 세션(`--to-session`)은 절대 닫지 않는다.
             if newly_spawned && let Some(sid) = target_session {
-                let closed = crate::session::close_session(sid).is_ok();
-                return Err(handoff_delivery_error(&to_agent, &e, Some((sid, closed))));
+                let closed = close_session(sid);
+                return Err(handoff_delivery_error(to_agent, &e, Some((sid, closed))));
             }
-            Err(handoff_delivery_error(&to_agent, &e, None))
+            Err(handoff_delivery_error(to_agent, &e, None))
         }
     }
 }
@@ -919,5 +943,47 @@ mod tests {
         dispatch_ports(&raw)?;
         assert!(collect_ports(&args(&["--text"])).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn finish_handoff_delivery_does_not_emit_output_when_delivery_fails() {
+        let mut emitted = false;
+        let mut closed_sid = None;
+        let err = finish_handoff_delivery(
+            Err("pane not ready".into()),
+            true,
+            Some(99),
+            "codex",
+            |sid| {
+                closed_sid = Some(sid);
+                true
+            },
+            || {
+                emitted = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            !emitted,
+            "must not print success JSON/TSV when delivery fails"
+        );
+        assert_eq!(closed_sid, Some(99));
+        assert!(err.to_string().contains("closed"), "{err}");
+
+        let mut ok_emitted = false;
+        finish_handoff_delivery(
+            Ok(()),
+            true,
+            Some(99),
+            "codex",
+            |_| panic!("must not close on success"),
+            || {
+                ok_emitted = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(ok_emitted);
     }
 }

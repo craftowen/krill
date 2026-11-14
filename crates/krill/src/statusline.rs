@@ -534,24 +534,32 @@ fn uninstall_with(
         .changes
         .first()
         .ok_or_else(|| io::Error::other("receipt is empty"))?;
-    let current = store::read(&paths.settings)?;
+    let target_settings = &change.path;
+    let current = store::read(target_settings)?;
     let restored = statusline::apply_uninstall(
         current.as_deref(),
         change.before.as_deref(),
         &change.after,
         exe,
     )?;
+    let write_target = match restored.as_deref() {
+        Some(text) => Some(text.to_owned()),
+        None if change.before.is_none() && current.as_deref() == Some(change.after.as_str()) => {
+            None
+        }
+        None => current.clone(),
+    };
     write_diff(
         out,
-        &paths.settings,
+        target_settings,
         current.as_deref(),
-        restored.as_deref(),
+        write_target.as_deref(),
     )?;
     if dry_run {
         writeln!(out, "preview only; no files written").ok();
         return Ok(());
     }
-    if restored.as_deref() != current.as_deref() && !yes && !consent()? {
+    if write_target.as_deref() != current.as_deref() && !yes && !consent()? {
         writeln!(out, "cancelled; no files written").ok();
         return Ok(());
     }
@@ -561,10 +569,12 @@ fn uninstall_with(
             "statusline receipt changed; rerun to review",
         ));
     }
-    if store::read(&paths.settings)? != current {
+    if store::read(target_settings)? != current {
         return Err(io::Error::other("configuration changed; rerun to review"));
     }
-    store::replace(&paths.settings, current.as_deref(), restored.as_deref())?;
+    if write_target != current {
+        store::replace(target_settings, current.as_deref(), write_target.as_deref())?;
+    }
     store::replace(&paths.receipt, previous.as_deref(), None)?;
     writeln!(out, "statusline uninstall complete").ok();
     Ok(())

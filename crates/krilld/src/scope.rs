@@ -204,7 +204,7 @@ impl SigningPolicy {
                 Ok(text) => text,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Self::default(),
                 Err(e) => {
-                    tracing::warn!("peer signing policy unreadable ({}): {e}", path.display());
+                    tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "peer signing policy unreadable");
                     return Self::deny_all();
                 }
             },
@@ -213,7 +213,10 @@ impl SigningPolicy {
         let mut policy: Self = match toml::from_str(&text) {
             Ok(policy) => policy,
             Err(e) => {
-                tracing::warn!("peer signing policy malformed, denying full peers: {e}");
+                tracing::warn!(
+                    span = ?e.span(),
+                    "peer signing policy malformed, denying full peers"
+                );
                 return Self::deny_all();
             }
         };

@@ -129,3 +129,12 @@ fn vs16_single_at_row_end_may_overflow() {
     let heart = || narrow('❤', &['\u{FE0F}']);
     assert_eq!(plan(&[heart()]), [(0, 1, true)]);
 }
+
+#[test]
+fn leading_wide_wrap_spacer_keeps_column_while_trailing_spacer_is_skipped() {
+    let (w0, w1) = wide('한', &[]);
+    let mut leading_spacer = narrow(' ', &[]);
+    leading_spacer.flags = Flags::SPACER;
+    let row = [w0, w1, leading_spacer];
+    assert_eq!(plan(&row), [(0, 2, false), (2, 3, false)]);
+}

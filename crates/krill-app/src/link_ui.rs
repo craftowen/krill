@@ -232,6 +232,8 @@ impl ServerPanel {
                         .update(cx, |panel, cx| {
                             if !panel.busy && panel.generation == generation {
                                 let mut changed = false;
+                                let all_ok =
+                                    snapshot.0.is_ok() && snapshot.1.is_ok() && snapshot.2.is_ok();
                                 if let Ok(status) = snapshot.0 {
                                     changed |= panel.status != status;
                                     panel.status = status;
@@ -243,6 +245,9 @@ impl ServerPanel {
                                 if let Ok(hosts) = snapshot.2 {
                                     changed |= panel.remote_hosts != hosts;
                                     panel.remote_hosts = hosts;
+                                }
+                                if all_ok {
+                                    changed |= panel.error.take().is_some();
                                 }
                                 if changed {
                                     cx.notify();
@@ -317,6 +322,7 @@ impl ServerPanel {
         self.busy = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
+        self.error = None;
         cx.notify();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let (status_res, devices_res, hosts_res) = cx
@@ -464,6 +470,7 @@ impl ServerPanel {
     /// "연결 끊기(회수)" 버튼 무장을 푼다.
     pub fn cancel_revoke(&mut self, cx: &mut Context<Self>) {
         self.confirm_revoke = None;
+        self.confirmation_deadline = None;
         cx.notify();
     }
 
@@ -482,6 +489,7 @@ impl ServerPanel {
         let Some(target) = self.confirm_revoke.take() else {
             return;
         };
+        self.confirmation_deadline = None;
         let backend = self.backend.clone();
         let target_id = target.id.clone();
         self.busy = true;
@@ -518,6 +526,13 @@ impl ServerPanel {
         self.renaming.as_ref().map(|r| r.id.as_str())
     }
 
+    fn rename_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let app: &mut gpui::App = cx;
+        self.renaming.as_ref().is_some_and(|rename| {
+            crate::jump::entity_input_is_composing(&rename.input, window, app)
+        })
+    }
+
     /// 원격 Mac 행을 이름 입력칸으로 바꾼다. Enter는 저장, Escape는 취소.
     pub fn start_rename(&mut self, host: &PairedHost, window: &mut Window, cx: &mut Context<Self>) {
         self.rename_return_focus = window.focused(cx);
@@ -525,7 +540,9 @@ impl ServerPanel {
         input.update(cx, |input, cx| input.focus(window, cx));
         let subscription =
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !this.rename_is_composing(window, cx)
+                {
                     this.save_rename(window, cx);
                 }
             });
@@ -646,6 +663,7 @@ impl ServerPanel {
 
     fn cancel_disconnect(&mut self, cx: &mut Context<Self>) {
         self.confirm_disconnect = None;
+        self.confirmation_deadline = None;
         cx.notify();
     }
 
@@ -663,6 +681,7 @@ impl ServerPanel {
         let Some(host) = self.confirm_disconnect.take() else {
             return;
         };
+        self.confirmation_deadline = None;
         self.busy = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -903,12 +922,19 @@ impl ServerPanel {
                         .min_w(gpui::px(160.))
                         .capture_action(cx.listener(
                             |this, _: &gpui_component::input::Escape, window, cx| {
+                                if this.rename_is_composing(window, cx) {
+                                    window.prevent_default();
+                                    return;
+                                }
                                 cx.stop_propagation();
                                 this.cancel_rename(window, cx);
                             },
                         ))
                         .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                            if event.keystroke.key == "escape" {
+                            if event.keystroke.key == "escape"
+                                && !window.default_prevented()
+                                && !this.rename_is_composing(window, cx)
+                            {
                                 cx.stop_propagation();
                                 this.cancel_rename(window, cx);
                             }
@@ -1209,8 +1235,17 @@ impl ServerPanel {
             .id("link-server-panel")
             .debug_selector(|| "link-server-panel".into())
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    if this.rename_is_composing(window, cx) {
+                        window.prevent_default();
+                    }
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if matches!(event.keystroke.key.as_str(), "tab" | "escape")
+                    && !(event.keystroke.key == "escape"
+                        && (window.default_prevented() || this.rename_is_composing(window, cx)))
                     && (this.confirm_revoke.is_some() || this.confirm_disconnect.is_some())
                 {
                     this.confirm_revoke = None;
@@ -1367,27 +1402,42 @@ impl ClientDialog {
                 .placeholder(text::DEVICE_NAME_PLACEHOLDER.get())
                 .default_value(initial_name)
         });
-        let enter_link = cx.subscribe(&link_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. })
-                && !matches!(this.phase, ClientPhase::Connecting)
-            {
-                this.submit_pair(cx);
-            }
-        });
-        let enter_host_name = cx.subscribe(&host_name_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. })
-                && !matches!(this.phase, ClientPhase::Connecting)
-            {
-                this.submit_pair(cx);
-            }
-        });
-        let enter_name = cx.subscribe(&device_name_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. })
-                && !matches!(this.phase, ClientPhase::Connecting)
-            {
-                this.submit_pair(cx);
-            }
-        });
+        let enter_link = cx.subscribe_in(
+            &link_input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !matches!(this.phase, ClientPhase::Connecting)
+                    && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    this.submit_pair(cx);
+                }
+            },
+        );
+        let enter_host_name = cx.subscribe_in(
+            &host_name_input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !matches!(this.phase, ClientPhase::Connecting)
+                    && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    this.submit_pair(cx);
+                }
+            },
+        );
+        let enter_name = cx.subscribe_in(
+            &device_name_input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !matches!(this.phase, ClientPhase::Connecting)
+                    && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    this.submit_pair(cx);
+                }
+            },
+        );
         let clipboard_suggestion = None;
 
         let mut dialog = Self {

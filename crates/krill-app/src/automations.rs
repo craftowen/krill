@@ -641,6 +641,29 @@ impl View {
         cx.notify();
     }
 
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let app: &mut gpui::App = cx;
+        self.search_input
+            .as_ref()
+            .is_some_and(|input| crate::jump::entity_input_is_composing(input, window, app))
+            || self
+                .runs_search_input
+                .as_ref()
+                .is_some_and(|input| crate::jump::entity_input_is_composing(input, window, app))
+            || self.modal.as_ref().is_some_and(|modal| {
+                [
+                    &modal.id,
+                    &modal.cron,
+                    &modal.cwd,
+                    &modal.command,
+                    &modal.prompt,
+                    &modal.precheck,
+                ]
+                .into_iter()
+                .any(|input| crate::jump::entity_input_is_composing(input, window, app))
+            })
+    }
+
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) {
         if self.template_menu_open {
             self.template_menu_open = false;
@@ -3653,8 +3676,18 @@ impl Render for View {
             .id("automations-page")
             .debug_selector(|| "automations-page".into())
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    if this.input_is_composing(window, cx) {
+                        window.prevent_default();
+                    }
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+                    if window.default_prevented() || this.input_is_composing(window, cx) {
+                        return;
+                    }
                     this.handle_escape(cx);
                     cx.stop_propagation();
                 }
@@ -4159,5 +4192,43 @@ mod tests {
                 .debug_bounds("tooltip:automations-modal-close")
                 .is_some()
         );
+    }
+
+    #[gpui::test]
+    fn ime_preedit_escape_does_not_close_modal_or_navigate_back(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler as _;
+        cx.update(gpui_component::init);
+        let dir = std::env::temp_dir().join(format!(
+            "krill-automations-ime-escape-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (view, visual) = cx.add_window_view(|window, cx| {
+            let mut v = View::new(Some(dir.clone()), Some(PathBuf::from("/tmp")), cx);
+            v.open_editor_modal(None, window, cx);
+            v
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let prompt = v.modal.as_ref().unwrap().prompt.clone();
+                prompt.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                    input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(v.input_is_composing(window, cx));
+            });
+        });
+        visual.run_until_parked();
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        visual.read_entity(&view, |v, _| {
+            assert!(
+                v.modal.is_some(),
+                "IME preedit Escape must not close the automation editor modal"
+            );
+        });
+        std::fs::remove_dir_all(dir).ok();
     }
 }

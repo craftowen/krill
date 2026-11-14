@@ -417,7 +417,7 @@ pub fn load_runs(dir: &Path) -> io::Result<Vec<ScheduleRun>> {
             Err(e) => return Err(e),
         };
         let mut bytes = Vec::new();
-        file.take(MAX_RUNS.saturating_add(4096))
+        file.take(MAX_RUNS.saturating_add(128 * 1024))
             .read_to_end(&mut bytes)?;
         for line in bytes.split_inclusive(|b| *b == b'\n') {
             if line.last() != Some(&b'\n') {
@@ -1075,5 +1075,34 @@ mod indexed_run_tests {
         drop(file);
         assert_eq!(load_coalesced_runs(&dir).unwrap(), expected);
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_runs_reads_lines_past_1mib_plus_4096_boundary() {
+        let dir = std::env::temp_dir().join(format!("krill-load-runs-cap-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let padding = "x".repeat(8 * 1024);
+        let entry = ScheduleRun {
+            id: "big".into(),
+            minute: 1,
+            phase: "finished".into(),
+            status: Some(0),
+            output: Some(padding),
+            ..Default::default()
+        };
+        let line = format!("{}\n", serde_json::to_string(&entry).unwrap());
+        let mut total = 0_u64;
+        let mut file = File::create(dir.join(RUNS)).unwrap();
+        let mut count = 0_usize;
+        while total <= MAX_RUNS.saturating_add(8192) {
+            file.write_all(line.as_bytes()).unwrap();
+            total = total.saturating_add(u64::try_from(line.len()).unwrap());
+            count = count.saturating_add(1);
+        }
+        drop(file);
+        let loaded = load_runs(&dir).unwrap();
+        assert_eq!(loaded.len(), count);
+        fs::remove_dir_all(&dir).ok();
     }
 }

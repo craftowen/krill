@@ -825,3 +825,28 @@ fn isolated_worktree_uses_schedule_base_branch() {
     );
     assert_eq!(fs::read_to_string(repo.join("base.txt")).unwrap(), "main");
 }
+
+#[test]
+fn journal_rotates_before_exceeding_max_runs_and_reopens_cleanly() {
+    let dir = Temp::new("journal-rotate");
+    let mut journal = Journal::open(&dir.0).unwrap();
+    let big_output = "x".repeat(8 * 1024);
+    for i in 0..140_u64 {
+        journal
+            .append(&Run {
+                id: format!("job-{i}"),
+                minute: i + 1,
+                phase: "finished".into(),
+                status: Some(0),
+                output: Some(big_output.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    drop(journal);
+    assert!(dir.0.join(PREVIOUS_RUNS).is_file());
+    assert!(fs::metadata(dir.0.join(RUNS)).unwrap().len() <= MAX_RUNS);
+    assert!(fs::metadata(dir.0.join(PREVIOUS_RUNS)).unwrap().len() <= MAX_RUNS);
+    let reopened = Journal::open(&dir.0).unwrap();
+    assert!(reopened.claimed("job-139", 140));
+}

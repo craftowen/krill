@@ -1238,7 +1238,7 @@ fn remove_update_temp(path: &Path, directory: bool) {
     if let Err(error) = result
         && error.kind() != io::ErrorKind::NotFound
     {
-        tracing::warn!(%error, "updater temporary file cleanup failed");
+        tracing::warn!(kind = ?error.kind(), "updater temporary file cleanup failed");
     }
 }
 
@@ -1496,7 +1496,7 @@ fn cleanup_update_orphans(bundle: &Path) -> io::Result<()> {
         let metadata = match fs::symlink_metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(error) => {
-                tracing::warn!(%error, "updater temporary file metadata failed");
+                tracing::warn!(kind = ?error.kind(), "updater temporary file metadata failed");
                 continue;
             }
         };
@@ -1514,7 +1514,7 @@ fn cleanup_update_orphans(bundle: &Path) -> io::Result<()> {
             fs::remove_file(entry.path())
         };
         if let Err(error) = result {
-            tracing::warn!(%error, "updater temporary file cleanup failed");
+            tracing::warn!(kind = ?error.kind(), "updater temporary file cleanup failed");
         }
     }
     Ok(())
@@ -1528,7 +1528,7 @@ pub fn on_startup(state_dir: PathBuf, window: &mut gpui::Window, cx: &mut gpui::
             let configured = std::env::var("KRILL_UPDATE_BUNDLE_PATH").ok();
             if let Some(bundle) = current_app_bundle_in(configured.as_deref(), &exe) {
                 if let Err(error) = cleanup_update_orphans(&bundle) {
-                    tracing::warn!(%error, "updater temporary file scan failed");
+                    tracing::warn!(kind = ?error.kind(), "updater temporary file scan failed");
                 }
                 if append_ext(&bundle, "stage-publish").exists()
                     && let Ok(_lock) = staging_lock(&bundle)

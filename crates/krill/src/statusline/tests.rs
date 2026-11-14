@@ -351,3 +351,47 @@ fn chain_timeout_also_kills_the_shells_children() {
     std::fs::remove_dir_all(&dir).ok();
     assert!(!alive, "the chain's child outlived the timeout");
 }
+
+#[test]
+fn uninstall_preserves_settings_file_when_user_manually_removed_slot() {
+    let (root, paths) = install_paths("uninstall-manual-remove");
+    let exe = "/test/krill";
+    let probe = || Some("2.1.301".to_owned());
+    let mut out = Vec::new();
+    install_with(&paths, exe, &probe, true, false, &mut out).unwrap();
+    // User manually clears `statusLine` while keeping other keys.
+    std::fs::write(&paths.settings, r#"{"theme": "light"}"#).unwrap();
+    let mut out = Vec::new();
+    uninstall_with(&paths, exe, true, false, &mut out).unwrap();
+    assert!(
+        paths.settings.exists(),
+        "user settings must not be deleted when statusLine was already removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&paths.settings).unwrap(),
+        r#"{"theme": "light"}"#
+    );
+    assert!(!paths.receipt.exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn uninstall_targets_recorded_receipt_change_path() {
+    let (root, mut paths) = install_paths("uninstall-recorded-path");
+    let exe = "/test/krill";
+    let probe = || Some("2.1.301".to_owned());
+    let mut out = Vec::new();
+    install_with(&paths, exe, &probe, true, false, &mut out).unwrap();
+    let installed_settings = paths.settings.clone();
+    assert!(installed_settings.exists());
+    // Point `paths.settings` somewhere else (simulating an env override change after install).
+    paths.settings = root.join("other/settings.json");
+    let mut out = Vec::new();
+    uninstall_with(&paths, exe, true, false, &mut out).unwrap();
+    assert!(
+        !installed_settings.exists(),
+        "uninstall must revert change.path recorded in receipt"
+    );
+    assert!(!paths.receipt.exists());
+    std::fs::remove_dir_all(&root).ok();
+}

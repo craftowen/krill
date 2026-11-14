@@ -229,26 +229,62 @@ fn git_remote_slug(tree: &Path) -> Option<String> {
     cache.insert(config, (modified, slug.clone()));
     slug
 }
+fn parse_remote_section(trimmed: &str) -> Option<&str> {
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let name = inner.strip_prefix("remote")?.trim_start();
+    if name.is_empty() {
+        return None;
+    }
+    Some(
+        name.strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(name),
+    )
+}
+
+fn parse_remote_url(url: &str) -> Option<String> {
+    let url = url.trim_end_matches('/').trim_end_matches(".git");
+    let path = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/').map(|(_, p)| p))
+        .or_else(|| {
+            url.split_once(':')
+                .filter(|(host, _)| !host.contains('/') && !host.contains('\\') && host.len() > 1)
+                .map(|(_, p)| p.trim_start_matches('/'))
+        })?;
+    let mut parts = path.rsplit('/').take(2);
+    let (repo, owner) = (parts.next()?, parts.next()?);
+    (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
+}
+
 fn remote_slug(config: &str) -> Option<String> {
+    let mut current_remote: Option<&str> = None;
+    let mut fallback: Option<String> = None;
     for line in config.lines() {
-        let Some(url) = line.trim().strip_prefix("url") else {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_remote = parse_remote_section(trimmed);
+            continue;
+        }
+        let Some(remote_name) = current_remote else {
+            continue;
+        };
+        let Some(url) = trimmed.strip_prefix("url") else {
             continue;
         };
         let Some(url) = url.trim_start().strip_prefix('=').map(str::trim) else {
             continue;
         };
-        let url = url.trim_end_matches('/').trim_end_matches(".git");
-        let path = url
-            .split_once("://")
-            .and_then(|(_, rest)| rest.split_once('/').map(|(_, p)| p))
-            .or_else(|| url.split_once(':').map(|(_, p)| p.trim_start_matches('/')))?;
-        let mut parts = path.rsplit('/').take(2);
-        let (repo, owner) = (parts.next()?, parts.next()?);
-        if !owner.is_empty() && !repo.is_empty() {
-            return Some(format!("{owner}/{repo}"));
+        if let Some(slug) = parse_remote_url(url) {
+            if remote_name == "origin" {
+                return Some(slug);
+            }
+            if fallback.is_none() {
+                fallback = Some(slug);
+            }
         }
     }
-    None
+    fallback
 }
 fn main_worktree(tree: &Path) -> Option<PathBuf> {
     let dir = git_dir(tree);
@@ -1476,6 +1512,37 @@ value = "🚀"
         let json = catalog.repositories_json();
         assert_eq!(json[0]["remote"], "craftowen/krill");
         assert_eq!(json[1]["remote"], "lovecast/orca");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repository_remote_slug_prefers_origin_over_submodules_and_local_remotes() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-ws-remote-order-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(
+            dir.join(".git/config"),
+            concat!(
+                "[submodule \"vendor\"]\n\turl = https://github.com/other/sub.git\n",
+                "[remote \"local\"]\n\turl = /tmp/bare-repo.git\n",
+                "[remote \"upstream\"]\n\turl = https://github.com/up/stream.git\n",
+                "[remote \"origin\"]\n\turl = https://github.com/owner/main.git\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(git_remote_slug(&dir).as_deref(), Some("owner/main"));
+
+        // Without origin, skips unparseable local remote and uses valid upstream remote.
+        fs::write(
+            dir.join(".git/config"),
+            concat!(
+                "[remote \"local\"]\n\turl = C:\\repos\\local.git\n",
+                "[remote \"upstream\"]\n\turl = git@github.com:up/stream.git\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(git_remote_slug(&dir).as_deref(), Some("up/stream"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -2055,7 +2055,7 @@ pub fn delete_account(
     if krill_proto::usage::profiles::is_managed(home, &dir)
         && let Err(e) = krill_proto::usage::profiles::move_to_trash(home, &dir)
     {
-        tracing::warn!(error = %e, "account profile left as orphan");
+        tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "account profile left as orphan");
     }
     Ok(refresh_accounts(home, state_dir))
 }
@@ -2122,7 +2122,7 @@ pub fn purge_orphan_profiles(
             continue;
         }
         if let Err(e) = krill_proto::usage::profiles::move_to_trash(home, Path::new(&orphan.dir)) {
-            tracing::warn!(error = %e, "orphan profile not moved");
+            tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "orphan profile not moved");
         }
     }
     Ok(krill_proto::usage::profiles::orphans(home, &registered))

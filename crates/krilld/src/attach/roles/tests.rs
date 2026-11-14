@@ -119,3 +119,21 @@ fn failed_mobile_fallback_is_retained_for_the_next_resize_attempt() {
     drop(slave);
     session.wait().unwrap();
 }
+
+#[test]
+fn invalid_mobile_resize_does_not_latch_fallback() {
+    let (slave, session) = fixture();
+    let tap = session.tap();
+    let desktop = Client::new(tap.clone(), Role::Interactive).unwrap();
+    assert_eq!(desktop.request(Request::Focus), Ack::Applied);
+    let mobile = Client::new(tap.clone(), Role::InteractiveWithSize { owns_size: false }).unwrap();
+    assert_eq!(
+        mobile.request(Request::Resize { cols: 0, rows: 24 }),
+        Ack::Invalid
+    );
+    assert_eq!(tap.clients().lock().unwrap().mobile_fallback, None);
+    drop(mobile);
+    drop(desktop);
+    drop(slave);
+    session.wait().unwrap();
+}

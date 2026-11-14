@@ -140,8 +140,9 @@ impl<V: Clone + PartialEq> SearchableListItem for PickItem<V> {
     }
 
     fn matches(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
-        self.title.to_lowercase().contains(&query) || self.detail.to_lowercase().contains(&query)
+        let query = crate::jump::normalize_search_str(query);
+        crate::jump::normalize_search_str(&self.title).contains(&query)
+            || crate::jump::normalize_search_str(&self.detail).contains(&query)
     }
 }
 
@@ -400,6 +401,7 @@ impl Dialog {
         self.host_options = options;
         let host_changed = self.host != host;
         self.host = host;
+        let prev_repo = self.repo.clone();
         if let Some(opt) = self
             .host_options
             .iter()
@@ -413,7 +415,11 @@ impl Dialog {
                 self.repo = first.path.clone();
             }
         }
-        if host_changed {
+        let repo_changed = self.repo != prev_repo;
+        if repo_changed {
+            self.parent = None;
+        }
+        if host_changed || repo_changed {
             self.refresh_repo_hooks(cx);
             self.prepare(cx);
         }
@@ -814,6 +820,9 @@ impl Dialog {
         for agent in &self.selected_agents {
             let mut req = base_req.clone();
             req.name = format!("{}-{agent}", base_req.name);
+            if req.name.len() > 255 {
+                return Err(text::NAME_TOO_LONG.get());
+            }
             out.push((req, Some(agent.clone()), prompt.clone()));
         }
         Ok(out)

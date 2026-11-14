@@ -121,6 +121,16 @@ pub(super) fn provision(
     Ok(report)
 }
 
+fn symlink_points_to(link: &Path, target: &Path) -> io::Result<bool> {
+    if fs::read_link(link)? == target {
+        return Ok(true);
+    }
+    Ok(matches!(
+        (link.canonicalize(), target.canonicalize()),
+        (Ok(a), Ok(b)) if a == b
+    ))
+}
+
 fn share_gemini_extensions(
     home: &Path,
     profile: &Path,
@@ -141,13 +151,13 @@ fn share_gemini_extensions(
         (".gemini/antigravity-cli/mcp_config.json", "mcp_config.json"),
     ] {
         let target = home.join(rel);
-        let Ok(target_meta) = target.symlink_metadata() else {
+        let Ok(target_meta) = fs::metadata(&target) else {
             continue;
         };
         let source = profile.join(rel);
         match source.symlink_metadata() {
             Ok(meta) if meta.file_type().is_symlink() => {
-                if fs::read_link(&source)? != target {
+                if !symlink_points_to(&source, &target)? {
                     report.conflicts.push(label);
                 }
                 continue;
@@ -237,7 +247,7 @@ fn share_summary(host: &Path, local: &Path, report: &mut Report) -> io::Result<(
     let source = local.join(SUMMARY);
     let target = host.join(SUMMARY);
     if source.is_symlink() {
-        if fs::read_link(&source)? != target {
+        if !symlink_points_to(&source, &target)? {
             report.conflicts.push(SUMMARY);
         }
         return Ok(());
@@ -436,5 +446,30 @@ mod unit_tests {
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         drop(held);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn symlinked_host_skills_dir_shares_cleanly_and_is_idempotent() {
+        let root = std::env::temp_dir().join(format!("krill-agy-sym-host-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let host = home.join(".gemini/antigravity-cli");
+        let external = root.join("external-skills");
+        let profile = root.join("profile");
+        let local = profile.join(".gemini/antigravity-cli");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        std::os::unix::fs::symlink(&external, host.join("skills")).unwrap();
+
+        let report = provision(&home, &profile, &|| true).unwrap();
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert!(report.changed.contains(&"antigravity-cli/skills"));
+        assert!(symlink_points_to(&local.join("skills"), &host.join("skills")).unwrap());
+        assert_eq!(
+            provision(&home, &profile, &|| true).unwrap(),
+            Report::default()
+        );
+        fs::remove_dir_all(root).ok();
     }
 }

@@ -292,6 +292,9 @@ impl Ime {
     /// 같은 자리에 이어 붙인다.
     fn push_pending(&mut self, text: &str) {
         let columns: usize = text.chars().map(char_width).sum();
+        if text.is_empty() || columns == 0 {
+            return;
+        }
         if self.pending_text.is_empty() {
             self.pending_origin = self.cursor;
         }
@@ -300,12 +303,13 @@ impl Ime {
         self.pending_at = Some(Instant::now());
     }
 
-    /// 커서가 확정 자리를 지나면 에코가 온 것으로 보고 지운다(표시 여부 무관).
+    /// 커서가 확정 자리를 지나거나 왼쪽으로 후퇴하면 에코가 온 것으로 보고 지운다(표시 여부 무관).
     fn confirm_pending(&mut self, at: CellPoint) {
         if self.pending_text.is_empty() {
             return;
         }
         if at.line != self.pending_origin.line
+            || at.column < self.pending_origin.column
             || at.column >= self.pending_origin.column + self.pending_columns
         {
             self.clear_pending();
@@ -356,5 +360,18 @@ mod edge_tests {
         assert_eq!(ime.candidate_anchor_in_columns(3, 0).column, 0);
         assert_eq!(ime.candidate_anchor_in_columns(3, 0).line, 3);
         assert_eq!(ime.commit().pty, "글😀".as_bytes());
+    }
+
+    #[test]
+    fn leftward_cursor_move_clears_pending_and_zero_width_insert_is_not_queued() {
+        let mut ime = Ime::default();
+        ime.set_cursor(CellPoint { line: 1, column: 5 }, true);
+        drop(ime.insert("한"));
+        assert!(ime.pending().is_some());
+        ime.set_cursor(CellPoint { line: 1, column: 2 }, true);
+        assert!(ime.pending().is_none());
+
+        drop(ime.insert("\u{200B}"));
+        assert!(ime.pending().is_none());
     }
 }

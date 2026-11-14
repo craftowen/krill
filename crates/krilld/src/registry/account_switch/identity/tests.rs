@@ -213,3 +213,133 @@ fn resume_retries_only_pending_metadata_and_disappearing_files() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn resumed_agy_ignores_unrelated_open_conversation_dbs() {
+    let root = PathBuf::from("/tmp/krill-agy-resumed-identity/.gemini/antigravity-cli");
+    let multi_db_paths = [
+        root.join("conversations/other-a.db"),
+        root.join("conversations/other-b.db-wal"),
+        root.join("conversations/expected.db"),
+    ];
+    // Blind discovery must still reject ambiguous open conversations.
+    assert_eq!(
+        from_paths(ProviderKind::Antigravity, multi_db_paths.clone())
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    // Resumed discovery knows the target conversation ID and picks it out cleanly.
+    let found = from_paths_with(
+        ProviderKind::Antigravity,
+        multi_db_paths.clone(),
+        Some("expected"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.id, "expected");
+    assert_eq!(found.home, root);
+    assert_eq!(found.path, root.join("conversations/expected.db"));
+    // Even if another conversation holds a presence lock, resumed discovery matches expected.
+    let with_other_lock = multi_db_paths
+        .into_iter()
+        .chain([root.join("presence/unrelated.lock")]);
+    let found = from_paths_with(ProviderKind::Antigravity, with_other_lock, Some("expected"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, "expected");
+    // If the expected conversation is not open yet, resumed discovery stays pending (None)
+    // instead of aborting the handoff with InvalidData.
+    assert!(
+        from_paths_with(
+            ProviderKind::Antigravity,
+            [
+                root.join("conversations/other-a.db"),
+                root.join("conversations/other-b.db"),
+            ],
+            Some("expected"),
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
+fn resumed_claude_ignores_unrelated_and_corrupt_transcripts() {
+    let root = std::env::temp_dir().join(format!("kas-claude-resumed-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let home = root.join(".claude");
+    let proj = home.join("projects/work");
+    fs::create_dir_all(&proj).unwrap();
+    let other = proj.join("other.jsonl");
+    let corrupt = proj.join("corrupt.jsonl");
+    let expected = proj.join("expected.jsonl");
+    fs::write(&other, r#"{"sessionId":"other"}"#).unwrap();
+    fs::write(&corrupt, "{\"type\":\"summary\"}\n").unwrap();
+    fs::write(&expected, r#"{"sessionId":"expected"}"#).unwrap();
+
+    // Unrelated valid transcripts still make blind discovery fail closed.
+    assert_eq!(
+        from_paths(ProviderKind::Claude, [other.clone(), expected.clone()])
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    // Resumed discovery with expected_id ignores unrelated/corrupt siblings and selects expected.
+    let found = from_paths_with(
+        ProviderKind::Claude,
+        [other.clone(), corrupt.clone(), expected.clone()],
+        Some("expected"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.id, "expected");
+    assert_eq!(found.path, expected);
+    assert_eq!(found.home, home);
+    // Still rejects when expected.jsonl itself is invalid.
+    assert_eq!(
+        from_paths_with(
+            ProviderKind::Claude,
+            [other.clone(), corrupt.clone()],
+            Some("corrupt"),
+        )
+        .err()
+        .unwrap()
+        .kind(),
+        io::ErrorKind::InvalidData
+    );
+    // Prefer picks `expected` when open alongside unrelated siblings, and falls back to an
+    // unambiguous mismatch when `expected` is absent so callers can reject stale IDs.
+    let mismatch = from_paths_mode(
+        ProviderKind::Claude,
+        [other.clone()],
+        ExpectedId::Prefer("missing"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(mismatch.id, "other");
+    let preferred = from_paths_mode(
+        ProviderKind::Claude,
+        [other, corrupt, expected.clone()],
+        ExpectedId::Prefer("expected"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(preferred.id, "expected");
+    assert_eq!(
+        from_paths_mode(
+            ProviderKind::Antigravity,
+            [PathBuf::from(
+                "/tmp/krill-agy-prefer/.gemini/antigravity-cli/conversations/bound.db"
+            )],
+            ExpectedId::Prefer("wrong-conversation"),
+        )
+        .unwrap()
+        .unwrap()
+        .id,
+        "bound"
+    );
+    fs::remove_dir_all(root).unwrap();
+}

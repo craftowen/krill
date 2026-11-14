@@ -1198,3 +1198,55 @@ fn preparation_status_reserves_width_so_cancel_button_never_shifts(cx: &mut Test
         "cancel-preparation button must not jump when preparation finishes"
     );
 }
+
+#[gpui::test]
+fn nfd_hangul_matches_pick_item_branches_and_fanout_rejects_long_names_and_host_repo_change_resets(
+    cx: &mut TestAppContext,
+) {
+    let pick = PickItem {
+        value: "id".to_owned(),
+        title: "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1161}\u{11BC}".into(),
+        detail: "".into(),
+    };
+    assert!(pick.matches("한강"));
+
+    let fake = Arc::new(Fake::default());
+    cx.update(gpui_component::init);
+    let (dialog, vcx) =
+        cx.add_window_view(|window, cx| Dialog::new("/repo-a".into(), fake.clone(), window, cx));
+    vcx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_branch_candidates(
+                vec!["feature/\u{1112}\u{1161}\u{11AB}\u{1100}\u{1161}\u{11BC}".to_owned()],
+                cx,
+            );
+            d.branch_query
+                .update(cx, |input, cx| input.set_value("한강", window, cx));
+            assert_eq!(
+                d.filtered_bases(cx),
+                vec!["feature/\u{1112}\u{1161}\u{11AB}\u{1100}\u{1161}\u{11BC}".to_owned()]
+            );
+
+            d.name
+                .update(cx, |input, cx| input.set_value("a".repeat(253), window, cx));
+            d.selected_agents = vec!["claude".to_owned(), "codex".to_owned()];
+            assert!(d.fan_out_requests(Setup::Ask, cx).is_err());
+
+            d.set_host_options(
+                HostId::Local,
+                vec![WorktreeHostOption {
+                    host: HostId::Local,
+                    label: "local".to_owned(),
+                    source: fake.clone(),
+                    repos: vec![WorktreeRepoOption {
+                        path: "/repo-b".into(),
+                        label: "repo-b".to_owned(),
+                        branch: Some("main".to_owned()),
+                    }],
+                }],
+                cx,
+            );
+            assert_eq!(d.repo(), std::path::Path::new("/repo-b"));
+        });
+    });
+}

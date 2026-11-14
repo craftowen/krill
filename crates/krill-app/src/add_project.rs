@@ -358,7 +358,7 @@ impl Dialog {
                 let key = id.as_key().to_owned();
                 let debug_key = key.clone();
                 let chip_label = label.clone();
-                div()
+                let chip = div()
                     .id(SharedString::from(format!("add-project-host-{key}")))
                     .debug_selector(move || format!("add-project-host-{debug_key}"))
                     .role(gpui::Role::Button)
@@ -379,10 +379,10 @@ impl Dialog {
                             .bg(p.background)
                             .text_color(p.muted_foreground)
                     })
-                    .child(label.clone())
-                    .on_click(cx.listener(move |d, _, window, cx| {
-                        d.set_host(next.clone(), window, cx);
-                    }))
+                    .child(label.clone());
+                on_activate(chip, cx, move |d, window, cx| {
+                    d.set_host(next.clone(), window, cx);
+                })
             })
             .collect::<Vec<_>>();
         Some(
@@ -398,6 +398,30 @@ impl Dialog {
 
 /// 아이콘 + 제목 + 설명 한 줄(Orca `AddRepoPrimaryStartAction`/`AddRepoSecondaryStartAction`).
 /// OWE-852: 스크린 리더가 버튼으로 읽도록 `Role::Button`을 단다.
+fn is_activation_key(e: &KeyDownEvent) -> bool {
+    matches!(e.keystroke.key.as_str(), "enter" | "space" | " ")
+        && !e.keystroke.modifiers.control
+        && !e.keystroke.modifiers.alt
+        && !e.keystroke.modifiers.platform
+        && !e.keystroke.modifiers.function
+}
+
+fn on_activate(
+    el: gpui::Stateful<gpui::Div>,
+    cx: &mut Context<Dialog>,
+    handler: impl Fn(&mut Dialog, &mut Window, &mut Context<Dialog>) + Clone + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let click = handler.clone();
+    el.on_click(cx.listener(move |d, _, window, cx| click(d, window, cx)))
+        .on_key_down(cx.listener(move |d, e: &KeyDownEvent, window, cx| {
+            if is_activation_key(e) {
+                cx.stop_propagation();
+                window.prevent_default();
+                handler(d, window, cx);
+            }
+        }))
+}
+
 fn action(
     p: &ui::Palette,
     id: &'static str,
@@ -474,15 +498,18 @@ impl Render for Dialog {
                 let selected = self.selected;
                 body.children(host_selector)
                     .child(selected_card(
-                        action(
-                            p,
-                            "add-project-browse",
-                            IconName::FolderOpen,
-                            text::BROWSE.get(),
-                            text::BROWSE_DESC.get(),
-                        )
-                        .child(ui::keycap(p, "↵"))
-                        .on_click(cx.listener(|d, _, window, cx| d.browse_activated(window, cx))),
+                        on_activate(
+                            action(
+                                p,
+                                "add-project-browse",
+                                IconName::FolderOpen,
+                                text::BROWSE.get(),
+                                text::BROWSE_DESC.get(),
+                            )
+                            .child(ui::keycap(p, "↵")),
+                            cx,
+                            Dialog::browse_activated,
+                        ),
                         p,
                         selected == 0,
                     ))
@@ -499,30 +526,32 @@ impl Render for Dialog {
                             .flex_col()
                             .gap_2()
                             .child(selected_card(
-                                action(
-                                    p,
-                                    "add-project-clone",
-                                    IconName::Globe,
-                                    text::CLONE.get(),
-                                    text::CLONE_DESC.get(),
-                                )
-                                .on_click(cx.listener(|d, _, window, cx| d.show_clone(window, cx))),
+                                on_activate(
+                                    action(
+                                        p,
+                                        "add-project-clone",
+                                        IconName::Globe,
+                                        text::CLONE.get(),
+                                        text::CLONE_DESC.get(),
+                                    ),
+                                    cx,
+                                    Dialog::show_clone,
+                                ),
                                 p,
                                 selected == 1,
                             ))
                             .child(selected_card(
-                                action(
-                                    p,
-                                    "add-project-create",
-                                    IconName::Plus,
-                                    text::CREATE.get(),
-                                    text::CREATE_DESC.get(),
-                                )
-                                .on_click(cx.listener(
-                                    |d, _, window, cx| {
-                                        d.create_activated(window, cx);
-                                    },
-                                )),
+                                on_activate(
+                                    action(
+                                        p,
+                                        "add-project-create",
+                                        IconName::Plus,
+                                        text::CREATE.get(),
+                                        text::CREATE_DESC.get(),
+                                    ),
+                                    cx,
+                                    Dialog::create_activated,
+                                ),
                                 p,
                                 selected == 2,
                             )),

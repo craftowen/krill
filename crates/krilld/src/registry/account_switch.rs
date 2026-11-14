@@ -343,7 +343,15 @@ impl Registry {
         root_pid: u32,
         fg_pid: Option<u32>,
     ) -> std::io::Result<Option<identity::Identity>> {
-        let mut observed = identity::discover(provider, root_pid, fg_pid)?;
+        let expected = stored
+            .and_then(|s| s.session_id.as_deref())
+            .filter(|id| crate::agent::control::valid_session_id(id));
+        let mut observed = match expected {
+            Some(expected_id) => {
+                identity::discover_preferring(provider, root_pid, fg_pid, expected_id)?
+            }
+            None => identity::discover(provider, root_pid, fg_pid)?,
+        };
         if observed.is_none() && provider == ProviderKind::Claude {
             let state_dir = self.state_dir();
             let file = accounts::load_file(home, state_dir.as_deref());
@@ -363,7 +371,12 @@ impl Registry {
             }
             claude_homes.sort();
             claude_homes.dedup();
-            observed = identity::discover_claude(&claude_homes, root_pid, fg_pid)?;
+            observed = identity::discover_claude_with(
+                &claude_homes,
+                root_pid,
+                fg_pid,
+                expected.map_or(identity::ExpectedId::Any, identity::ExpectedId::Prefer),
+            )?;
         }
         Ok(observed)
     }
@@ -1437,11 +1450,25 @@ impl Registry {
                 .get(&old)
                 .and_then(|e| e.session.tap().foreground())
                 .or(old_fg);
-            let mut observed = identity::discover(provider, old_pid, foreground)
-                .map_err(|e| prepare_failure(old, "process_identity", &e))?;
+            let expected = stored
+                .session_id
+                .as_deref()
+                .filter(|id| crate::agent::control::valid_session_id(id));
+            let mut observed = match expected {
+                Some(expected_id) => {
+                    identity::discover_preferring(provider, old_pid, foreground, expected_id)
+                }
+                None => identity::discover(provider, old_pid, foreground),
+            }
+            .map_err(|e| prepare_failure(old, "process_identity", &e))?;
             if observed.is_none() && provider == ProviderKind::Claude {
-                observed = identity::discover_claude(&claude_homes, old_pid, foreground)
-                    .map_err(|e| prepare_failure(old, "process_identity", &e))?;
+                observed = identity::discover_claude_with(
+                    &claude_homes,
+                    old_pid,
+                    foreground,
+                    expected.map_or(identity::ExpectedId::Any, identity::ExpectedId::Prefer),
+                )
+                .map_err(|e| prepare_failure(old, "process_identity", &e))?;
             }
             if observed.is_none()
                 && provider == ProviderKind::Antigravity
@@ -1621,7 +1648,12 @@ impl Registry {
             {
                 next_identity_probe = Instant::now() + Duration::from_millis(200);
                 let observed = resume_identity(|| {
-                    let observed = identity::discover(provider, new_pid, tap.foreground())?;
+                    let observed = identity::discover_resumed(
+                        provider,
+                        new_pid,
+                        tap.foreground(),
+                        &session_id,
+                    )?;
                     #[cfg(windows)]
                     let observed = if observed.is_none() {
                         match &codex_resume {
@@ -1632,7 +1664,12 @@ impl Registry {
                         observed
                     };
                     if observed.is_none() && provider == ProviderKind::Claude {
-                        identity::discover_claude(&claude_homes, new_pid, tap.foreground())
+                        identity::discover_claude_with(
+                            &claude_homes,
+                            new_pid,
+                            tap.foreground(),
+                            identity::ExpectedId::Exact(&session_id),
+                        )
                     } else {
                         Ok(observed)
                     }
@@ -1792,8 +1829,9 @@ impl Registry {
             let mut retried = false;
             let mut deadline = Instant::now() + CODEX_LOCK_PROMPT_SETTLE;
             let took_over = loop {
-                let observed =
-                    resume_identity(|| identity::discover(provider, new_pid, tap.foreground()));
+                let observed = resume_identity(|| {
+                    identity::discover_resumed(provider, new_pid, tap.foreground(), &session_id)
+                });
                 #[cfg(windows)]
                 let observed = match (observed, &codex_resume) {
                     (Ok(None), Some(watch)) => watch.observe(new_pid, tap.foreground()),

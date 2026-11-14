@@ -82,7 +82,11 @@ pub fn equivalent(path: &Path, other: &Path) -> bool {
 pub fn within(path: &Path, root: &Path) -> bool {
     match (windows_text(path), windows_text(root)) {
         (Some(path), Some(root)) => {
-            if path.split('\\').chain(root.split('\\')).any(|p| p == "..") {
+            if path
+                .split(['\\', '/'])
+                .chain(root.split(['\\', '/']))
+                .any(|p| p == "..")
+            {
                 return false;
             }
             let path = path.to_ascii_lowercase();
@@ -92,7 +96,22 @@ pub fn within(path: &Path, root: &Path) -> bool {
                     .strip_prefix(root.trim_end_matches('\\'))
                     .is_some_and(|rest| rest.starts_with('\\'))
         }
-        (None, None) => path.starts_with(root),
+        (None, None) => {
+            let Some(path_str) = path.to_str() else {
+                return false;
+            };
+            let Some(root_str) = root.to_str() else {
+                return false;
+            };
+            if path_str
+                .split('/')
+                .chain(root_str.split('/'))
+                .any(|p| p == "..")
+            {
+                return false;
+            }
+            path.starts_with(root)
+        }
         _ => false,
     }
 }
@@ -149,5 +168,7 @@ mod tests {
         assert!(within(Path::new("/repo/한글"), Path::new("/repo")));
         assert!(within(Path::new("/repo"), Path::new("/")));
         assert!(!within(Path::new("/repository"), Path::new("/repo")));
+        assert!(!within(Path::new("/repo/../outside"), Path::new("/repo")));
+        assert!(!within(Path::new("/repo/sub"), Path::new("/repo/../repo")));
     }
 }

@@ -255,7 +255,13 @@ impl Intent {
         serde_json::from_slice(&bytes).map(Some).map_err(|error| {
             let backup = path.with_extension(format!("json.corrupt-{}", now_ms()));
             let kept = std::fs::rename(path, &backup).is_ok();
-            tracing::error!(%error, kept, "mobile-gateway.json is unreadable; moved aside");
+            tracing::error!(
+                classify = ?error.classify(),
+                line = error.line(),
+                column = error.column(),
+                kept,
+                "mobile-gateway.json is unreadable; moved aside"
+            );
             io::Error::new(io::ErrorKind::InvalidData, error)
         })
     }

@@ -1788,14 +1788,39 @@ impl OrchestrationStore {
                 && run_id.is_none_or(|rid| m.run_id.as_deref() == Some(rid))
                 && (types.is_empty() || types.contains(&m.msg_type))
         };
-        // Other consumers (reply/answer waits) may have already consumed an entire batch.
+        // Other consumers (reply/answer waits) may have already consumed part or all of a batch.
+        let acked_ids: BTreeSet<String> = self
+            .messages
+            .iter()
+            .filter(|m| m.acked)
+            .map(|m| m.id.clone())
+            .collect();
         for delivery in &mut self.deliveries {
-            if delivery
-                .message_ids
-                .iter()
-                .all(|id| self.messages.iter().any(|m| &m.id == id && m.acked))
-            {
+            if delivery_id.is_none() && !delivery.acked {
+                delivery.message_ids.retain(|id| !acked_ids.contains(id));
+            }
+            if delivery.message_ids.iter().all(|id| acked_ids.contains(id)) {
                 delivery.acked = true;
+            }
+        }
+        if delivery_id.is_none() && !types.is_empty() {
+            for delivery in &mut self.deliveries {
+                if delivery.acked
+                    || recipient.is_some_and(|to| delivery.to != to)
+                    || run_id.is_some_and(|id| delivery.run_id.as_deref() != Some(id))
+                {
+                    continue;
+                }
+                let matches_id = |id: &String| {
+                    self.messages
+                        .iter()
+                        .any(|m| &m.id == id && (!unread_only || !m.acked) && matches(m))
+                };
+                let has_match = delivery.message_ids.iter().any(matches_id);
+                let has_other = delivery.message_ids.iter().any(|id| !matches_id(id));
+                if has_match && has_other {
+                    delivery.message_ids.retain(|id| !matches_id(id));
+                }
             }
         }
         let selected = if let Some(id) = delivery_id {
@@ -3088,7 +3113,8 @@ pub fn validate_symlink_path(raw: &str) -> io::Result<String> {
                 "symlink path must not contain '.' or '..' traversal segments",
             ));
         }
-        if part == ".git" {
+        let trimmed_part = part.trim_end_matches(['.', ' ']);
+        if trimmed_part.eq_ignore_ascii_case(".git") || trimmed_part.eq_ignore_ascii_case("git~1") {
             return Err(invalid("symlink path must not target '.git'"));
         }
         parts.push(part);
@@ -6742,5 +6768,113 @@ mod frame_bound_tests {
                 .is_some_and(|ids| ids.contains(&msg.id)),
             "bound session dispatch message must be pre-marked in idle_mail_notified"
         );
+    }
+
+    #[test]
+    fn typed_check_does_not_starve_after_unfiltered_peek_and_partial_ack_prunes_batch()
+    -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("check-split", None)?;
+        let dispatch = store.start_worker_with_depth(
+            &run.id,
+            None,
+            "worker-1",
+            "claude",
+            Some(77),
+            "/tmp",
+            "inspect",
+            0,
+            DEFAULT_MAX_WORKER_DEPTH,
+        )?;
+        store.send_message(&SendParams {
+            from: "worker-1".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Status,
+            summary: "working".into(),
+            body: String::new(),
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            dispatch_id: Some(dispatch.id.clone()),
+            outcome: None,
+            reply_to: None,
+        })?;
+        store.send_message(&SendParams {
+            from: "worker-1".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "done".into(),
+            body: String::new(),
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            dispatch_id: Some(dispatch.id.clone()),
+            outcome: Some("succeeded".into()),
+            reply_to: None,
+        })?;
+        // Unfiltered peek reserves [Status, WorkerDone] into an unacked delivery.
+        let (_, peeked) =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&run.id), None)?;
+        assert_eq!(peeked.len(), 2);
+
+        // Filtered typed check must split out WorkerDone instead of starving.
+        let (typed_del, typed_msgs) = store.check_delivery(
+            Some("coordinator"),
+            &[MessageType::WorkerDone],
+            true,
+            true,
+            Some(&run.id),
+            None,
+        )?;
+        assert!(typed_del.is_some());
+        assert_eq!(typed_msgs.len(), 1);
+        assert_eq!(typed_msgs[0].msg_type, MessageType::WorkerDone);
+        // The remaining Status stays in its batch and is delivered when polled unfiltered.
+        let (status_del, status_msgs) =
+            store.check_delivery(Some("coordinator"), &[], true, true, Some(&run.id), None)?;
+        assert!(status_del.is_some());
+        assert_eq!(status_msgs.len(), 1);
+        assert_eq!(status_msgs[0].msg_type, MessageType::Status);
+
+        // Partial ack via reply_message must prune the answered question from an unacked batch.
+        let q = store.send_message(&SendParams {
+            from: "worker-2".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Question,
+            summary: "q?".into(),
+            body: String::new(),
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            dispatch_id: None,
+            outcome: None,
+            reply_to: None,
+        })?;
+        store.send_message(&SendParams {
+            from: "worker-2".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Escalation,
+            summary: "blocked".into(),
+            body: String::new(),
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            dispatch_id: None,
+            outcome: None,
+            reply_to: None,
+        })?;
+        let (_, mixed) =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&run.id), None)?;
+        assert_eq!(mixed.len(), 2);
+        let q_id = q[0].id.clone();
+        store.reply_message(&q_id, "coordinator", "yes")?;
+        let (_, remaining) =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&run.id), None)?;
+        assert_eq!(remaining.len(), 1);
+        assert_ne!(remaining[0].id, q_id);
+        Ok(())
+    }
+
+    #[test]
+    fn validate_symlink_path_rejects_case_and_short_name_dot_git() {
+        for bad in [".GIT", ".Git/hooks", ".git.", "GIT~1", "sub/.GIT/config"] {
+            assert!(validate_symlink_path(bad).is_err(), "{bad}");
+        }
     }
 }

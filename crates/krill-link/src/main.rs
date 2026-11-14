@@ -8,9 +8,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use krill_link::{
-    ConnectOptions, Error, LinkConfig, RelaySetting, ServeOptions, create_invite_command,
-    host_status, load_devices, pair_with_server, resolve_state_dir, revoke_device_command,
-    start_server, start_tunnel, status_report,
+    ConnectOptions, DEFAULT_INVITE_TTL, Error, LinkConfig, RelaySetting, ServeOptions,
+    create_invite_command, host_status, load_devices, pair_with_server, resolve_state_dir,
+    revoke_device_command, start_server, start_tunnel, status_report,
 };
 
 #[tokio::main]
@@ -193,7 +193,14 @@ fn cmd_disable(state_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InviteArgs {
+    ttl_secs: Option<u64>,
+    no_qr: bool,
+    json: bool,
+}
+
+fn parse_invite_args(args: &[String]) -> Result<InviteArgs, Error> {
     let mut ttl_secs: Option<u64> = None;
     let mut no_qr = false;
     let mut json = false;
@@ -206,10 +213,15 @@ async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
                 let val = args.get(i).ok_or_else(|| {
                     Error::InvalidConfig("--ttl-secs requires a value".to_owned())
                 })?;
-                ttl_secs =
-                    Some(val.parse().map_err(|e| {
-                        Error::InvalidConfig(format!("invalid --ttl-secs value: {e}"))
-                    })?);
+                let secs: u64 = val
+                    .parse()
+                    .map_err(|e| Error::InvalidConfig(format!("invalid --ttl-secs value: {e}")))?;
+                if secs == 0 {
+                    return Err(Error::InvalidConfig(
+                        "--ttl-secs must be greater than 0".to_owned(),
+                    ));
+                }
+                ttl_secs = Some(secs);
             }
             "--no-qr" => no_qr = true,
             "--json" => json = true,
@@ -222,24 +234,55 @@ async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
         i += 1;
     }
 
-    let out = create_invite_command(state_dir, ttl_secs.map(Duration::from_secs)).await?;
-    if json {
+    Ok(InviteArgs {
+        ttl_secs,
+        no_qr,
+        json,
+    })
+}
+
+fn format_invite_ttl(ttl: Duration) -> String {
+    let secs = ttl.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    match (h, m, s) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, 0) => format!("{m}m"),
+        (0, m, s) => format!("{m}m{s}s"),
+        (h, 0, 0) => format!("{h}h"),
+        (h, m, 0) => format!("{h}h{m}m"),
+        (h, 0, s) => format!("{h}h{s}s"),
+        (h, m, s) => format!("{h}h{m}m{s}s"),
+    }
+}
+
+async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
+    let parsed = parse_invite_args(args)?;
+    let effective_ttl = parsed
+        .ttl_secs
+        .map_or(DEFAULT_INVITE_TTL, Duration::from_secs);
+    let out = create_invite_command(state_dir, parsed.ttl_secs.map(Duration::from_secs)).await?;
+    if parsed.json {
         let mut value =
             serde_json::to_value(&out).map_err(|e| Error::InvalidConfig(e.to_string()))?;
-        if no_qr && let Some(fields) = value.as_object_mut() {
+        if parsed.no_qr
+            && let Some(fields) = value.as_object_mut()
+        {
             fields.remove("qr_unicode");
         }
         let s = serde_json::to_string_pretty(&value)
             .map_err(|e| Error::InvalidConfig(e.to_string()))?;
         writeln!(io::stdout(), "{s}").ok();
     } else {
+        let ttl_label = format_invite_ttl(effective_ttl);
         writeln!(
             io::stdout(),
-            "Invite link, valid once for 10m. Paste it on the other computer:\n{}",
+            "Invite link, valid once for {ttl_label}. Paste it on the other computer:\n{}",
             out.link
         )
         .ok();
-        if !no_qr {
+        if !parsed.no_qr {
             writeln!(io::stdout(), "\n{}", out.qr_unicode).ok();
         }
     }
@@ -546,4 +589,52 @@ fn cmd_config(state_dir: &Path, args: &[String]) -> Result<(), Error> {
         writeln!(io::stdout(), "{}", cfg.to_toml_string()?).ok();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_invite_args_validates_ttl_and_flags() {
+        let defaults = parse_invite_args(&[]).unwrap();
+        assert_eq!(
+            defaults,
+            InviteArgs {
+                ttl_secs: None,
+                no_qr: false,
+                json: false,
+            }
+        );
+
+        let custom = parse_invite_args(&[
+            "--ttl-secs".to_owned(),
+            "90".to_owned(),
+            "--no-qr".to_owned(),
+            "--json".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(
+            custom,
+            InviteArgs {
+                ttl_secs: Some(90),
+                no_qr: true,
+                json: true,
+            }
+        );
+
+        assert!(parse_invite_args(&["--ttl-secs".to_owned(), "0".to_owned()]).is_err());
+        assert!(parse_invite_args(&["--ttl-secs".to_owned()]).is_err());
+        assert!(parse_invite_args(&["--bogus".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn format_invite_ttl_matches_duration_units() {
+        assert_eq!(format_invite_ttl(DEFAULT_INVITE_TTL), "10m");
+        assert_eq!(format_invite_ttl(Duration::from_secs(45)), "45s");
+        assert_eq!(format_invite_ttl(Duration::from_secs(60)), "1m");
+        assert_eq!(format_invite_ttl(Duration::from_secs(90)), "1m30s");
+        assert_eq!(format_invite_ttl(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_invite_ttl(Duration::from_secs(3665)), "1h1m5s");
+    }
 }

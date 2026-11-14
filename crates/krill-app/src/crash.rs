@@ -48,7 +48,7 @@ pub fn offer_report(
                 Ok(path) => cx.update(|cx| on_bundle(&path, cx)),
                 Err(e) => {
                     // 번들을 못 만들면 알리고 확인 처리하지 않는다: 다음 실행에서 다시 물어 로그를 잃지 않는다.
-                    tracing::warn!(%e, "diagnostic bundle write failed");
+                    warn_bundle_write_failed(&e);
                     let detail = text::BUNDLE_FAILED_DETAIL.format(&[("error", &e.to_string())]);
                     handle
                         .update(cx, |_, window, cx| {
@@ -70,6 +70,11 @@ pub fn offer_report(
             .await;
     })
     .detach();
+}
+
+/// 운영 로그 프라이버시 규칙(`krill-log`): 경로가 섞일 수 있는 `io::Error` 원문 대신 `ErrorKind`만 기록한다.
+fn warn_bundle_write_failed(error: &std::io::Error) {
+    tracing::warn!(kind = ?error.kind(), "diagnostic bundle write failed");
 }
 
 #[cfg(test)]

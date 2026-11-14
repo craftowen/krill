@@ -265,10 +265,20 @@ pub fn plan_row(row: &[Cell], theme: &Theme) -> RowPlan {
     for cluster in crate::width::clusters(row) {
         let begin = usize::from(cluster.start);
         let end = usize::from(cluster.end).min(row.len());
-        // 묶음 안의 실제 칸 수(자리 칸 제외). 2칸 글자 하나는 한 칸이다.
+        // 묶음 안의 실제 칸 수(꼬리 WIDE SPACER 제외). 2칸 글자 하나는 한 칸이다.
+        let is_trailing = |offset: usize| {
+            let abs = begin + offset;
+            row.get(abs)
+                .is_some_and(|c| c.flags.contains(Flags::SPACER))
+                && abs > 0
+                && row
+                    .get(abs - 1)
+                    .is_some_and(|prev| prev.flags.contains(Flags::WIDE))
+        };
         let cells = row[begin..end]
             .iter()
-            .filter(|c| !c.flags.contains(Flags::SPACER))
+            .enumerate()
+            .filter(|(offset, _)| !is_trailing(*offset))
             .count();
         // 여러 칸 묶음·넘침 묶음은 혼자 묶는다.
         let standalone = cells > 1 || cluster.overflow;
@@ -283,8 +293,8 @@ pub fn plan_row(row: &[Cell], theme: &Theme) -> RowPlan {
                 colors: Vec::new(),
             });
         }
-        for (column, cell) in (cluster.start..).zip(row[begin..end].iter()) {
-            if cell.flags.contains(Flags::SPACER) {
+        for (offset, (column, cell)) in (cluster.start..).zip(row[begin..end].iter()).enumerate() {
+            if is_trailing(offset) {
                 continue;
             }
             let wide = cell.flags.contains(Flags::WIDE);

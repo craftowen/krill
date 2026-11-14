@@ -280,6 +280,19 @@ fn probe_holder_orphan(target: &Target) -> bool {
         .is_some_and(|s| s == daemon::HolderStatus::Orphan)
 }
 
+fn resolve_list_worktree_filter(remote: bool, raw: &str) -> Result<String> {
+    if remote {
+        if !crate::remote::is_remote_absolute_path(raw.as_bytes()) {
+            return Err(remote_usage(
+                "remote --worktree must be an absolute path on the remote host",
+            ));
+        }
+        Ok(raw.to_owned())
+    } else {
+        Ok(shown_worktree(std::path::Path::new(raw)))
+    }
+}
+
 fn list(target: &Target, args: &[OsString]) -> Result<()> {
     struct EnrichedSession {
         id: u64,
@@ -305,12 +318,7 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
                     .and_then(|s| s.to_str())
                     .filter(|s| !s.is_empty())
                     .ok_or_else(usage)?;
-                let resolved = if target.is_remote() {
-                    raw.to_owned()
-                } else {
-                    shown_worktree(std::path::Path::new(raw))
-                };
-                worktree_filter = Some(resolved);
+                worktree_filter = Some(resolve_list_worktree_filter(target.is_remote(), raw)?);
             }
             _ => return Err(usage()),
         }
@@ -743,6 +751,7 @@ fn parse_fork_args(
     }
     let from = match from {
         Some(sid) => sid,
+        None if remote => return Err(remote_usage("remote session fork requires --from <id>")),
         None => id(&env_pane.ok_or_else(usage)?)?,
     };
     Ok(ForkArgs {
@@ -1821,5 +1830,16 @@ mod tests {
         assert!(err.text.contains("update the daemon"), "{}", err.text);
         drop(client);
         assert!(ipc::read_frame(&mut server).unwrap().is_none());
+    }
+
+    #[test]
+    fn remote_list_and_fork_reject_implicit_local_repo_or_pane_env() {
+        assert!(resolve_list_worktree_filter(true, "relative/repo").is_err());
+        assert_eq!(
+            resolve_list_worktree_filter(true, "/srv/repo").unwrap(),
+            "/srv/repo"
+        );
+        let parsed = parse_fork_args(&[], true, Some(OsString::from("9")), (80, 24));
+        assert!(parsed.is_err());
     }
 }

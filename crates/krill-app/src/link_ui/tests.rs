@@ -943,3 +943,134 @@ fn remote_rename_all_closures_restore_initiating_focus(cx: &mut TestAppContext) 
         vcx.run_until_parked();
     }
 }
+
+#[derive(Debug)]
+struct RecoveringBackend {
+    inner: MockLinkBackend,
+    fail_queries: std::sync::atomic::AtomicBool,
+}
+
+impl RecoveringBackend {
+    fn new(fail_queries: bool) -> Self {
+        Self {
+            inner: MockLinkBackend::new(),
+            fail_queries: std::sync::atomic::AtomicBool::new(fail_queries),
+        }
+    }
+
+    fn set_fail(&self, fail: bool) {
+        self.fail_queries
+            .store(fail, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl LinkBackend for RecoveringBackend {
+    fn enable_server(&self) -> Result<ServerStatus, String> {
+        self.inner.enable_server()
+    }
+    fn disable_server(&self) -> Result<ServerStatus, String> {
+        self.inner.disable_server()
+    }
+    fn server_status(&self) -> Result<ServerStatus, String> {
+        if self.fail_queries.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("transient daemon error".to_owned());
+        }
+        self.inner.server_status()
+    }
+    fn create_invite(&self) -> Result<Invite, String> {
+        self.inner.create_invite()
+    }
+    fn pair(&self, link: &str, device_name: &str, host_name: &str) -> PairOutcome {
+        self.inner.pair(link, device_name, host_name)
+    }
+    fn devices(&self) -> Result<Vec<PairedDevice>, String> {
+        if self.fail_queries.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("transient daemon error".to_owned());
+        }
+        self.inner.devices()
+    }
+    fn remote_hosts(&self) -> Result<Vec<PairedHost>, String> {
+        if self.fail_queries.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("transient daemon error".to_owned());
+        }
+        self.inner.remote_hosts()
+    }
+    fn revoke(&self, id: &str) -> Result<Vec<PairedDevice>, String> {
+        self.inner.revoke(id)
+    }
+    fn nearby(&self) -> Result<Vec<NearbyMac>, String> {
+        self.inner.nearby()
+    }
+}
+
+#[gpui::test]
+fn server_panel_clears_stale_error_on_refresh_and_cancel_clears_deadline(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let backend = Arc::new(RecoveringBackend::new(true));
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend.clone(), cx));
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.debug_bounds("link-server-error").is_some(),
+        "initial query failure should show error banner"
+    );
+
+    // Recover backend and refresh: stale error must disappear.
+    backend.set_fail(false);
+    vcx.update(|_, cx| panel.update(cx, ServerPanel::refresh));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("link-server-error").is_none(),
+        "successful refresh must clear stale error banner"
+    );
+
+    // Background poll recovery must also clear a previously surfaced error.
+    vcx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            p.error = Some(SharedString::from("stale poll error"));
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("link-server-error").is_some());
+    for _ in 0..3 {
+        vcx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        vcx.run_until_parked();
+    }
+    assert!(
+        vcx.debug_bounds("link-server-error").is_none(),
+        "healthy background poll must clear stale error banner"
+    );
+
+    // Cancelling revoke/disconnect confirmation must clear confirmation_deadline too.
+    vcx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            p.request_revoke(
+                PairedDevice {
+                    id: "d1".into(),
+                    name: "Mac".into(),
+                    added_at: 1,
+                    last_seen_at: None,
+                },
+                cx,
+            );
+            assert!(p.confirmation_deadline.is_some());
+            p.cancel_revoke(cx);
+            assert!(p.confirmation_deadline.is_none());
+
+            p.request_disconnect(
+                PairedHost {
+                    id: "h1".into(),
+                    name: "Host".into(),
+                    status: krill_hosts::HostStatus::Disconnected,
+                    version: None,
+                },
+                cx,
+            );
+            assert!(p.confirmation_deadline.is_some());
+            p.cancel_disconnect(cx);
+            assert!(p.confirmation_deadline.is_none());
+        });
+    });
+}

@@ -415,7 +415,9 @@ fn supervise_loop(
         }
         // 호스트 소켓이 끊기면 DO가 붙어 있던 휴대폰을 모두 1012로 닫으므로, 빈도를 볼 수 있게 남긴다.
         tracing::info!(
-            ?res,
+            ok = res.is_ok(),
+            kind = ?res.as_ref().err().map(io::Error::kind),
+            errno = res.as_ref().err().and_then(io::Error::raw_os_error),
             was_connected,
             ?delay,
             "mobile DO relay disconnected; backing off"

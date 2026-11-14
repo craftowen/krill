@@ -923,19 +923,30 @@ pub(crate) fn glob_path_matches(pattern: &str, path: &str) -> bool {
 }
 
 fn match_glob_segments(pat: &[&str], segs: &[&str]) -> bool {
-    let Some((&first, rest)) = pat.split_first() else {
-        return segs.is_empty();
-    };
-    if first == "**" {
-        return match_glob_segments(rest, segs)
-            || segs
-                .split_first()
-                .is_some_and(|(_, srest)| match_glob_segments(pat, srest));
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star_pi, mut star_si) = (None, 0usize);
+    while si < segs.len() {
+        if pat.get(pi) == Some(&"**") {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+        } else if let (Some(&p), Some(&s)) = (pat.get(pi), segs.get(si))
+            && match_glob_segment(p, s)
+        {
+            pi += 1;
+            si += 1;
+        } else if let Some(sp) = star_pi {
+            star_si += 1;
+            si = star_si;
+            pi = sp + 1;
+        } else {
+            return false;
+        }
     }
-    let Some((&seg, seg_rest)) = segs.split_first() else {
-        return false;
-    };
-    match_glob_segment(first, seg) && match_glob_segments(rest, seg_rest)
+    while pat.get(pi) == Some(&"**") {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 fn match_glob_segment(pat: &str, text: &str) -> bool {
@@ -944,39 +955,66 @@ fn match_glob_segment(pat: &str, text: &str) -> bool {
     match_glob_chars(&p, &t)
 }
 
+fn find_class_close(prest: &[char]) -> Option<usize> {
+    let mut start = usize::from(matches!(prest.first(), Some('!' | '^')));
+    if prest.get(start) == Some(&']') {
+        start += 1;
+    }
+    prest
+        .get(start..)?
+        .iter()
+        .position(|&c| c == ']')
+        .map(|pos| start + pos)
+}
+
 fn match_glob_chars(pat: &[char], text: &[char]) -> bool {
-    let Some((&pc, prest)) = pat.split_first() else {
-        return text.is_empty();
-    };
-    match pc {
-        '*' => {
-            match_glob_chars(prest, text)
-                || text
-                    .split_first()
-                    .is_some_and(|(_, trest)| match_glob_chars(pat, trest))
-        }
-        '?' => text
-            .split_first()
-            .is_some_and(|(_, trest)| match_glob_chars(prest, trest)),
-        '[' => {
-            let Some((&tc, trest)) = text.split_first() else {
-                return false;
-            };
-            let Some(close) = prest.iter().position(|&c| c == ']') else {
-                return pc == tc && match_glob_chars(prest, trest);
-            };
-            let class = prest.get(..close).unwrap_or_default();
-            let after = prest.get(close + 1..).unwrap_or_default();
-            if match_char_class(class, tc) {
-                match_glob_chars(after, trest)
-            } else {
-                false
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None, 0usize);
+    while ti < text.len() {
+        match (pat.get(pi), text.get(ti)) {
+            (Some('*'), _) => {
+                star_pi = Some(pi);
+                star_ti = ti;
+                pi += 1;
+            }
+            (Some('?'), Some(_)) => {
+                pi += 1;
+                ti += 1;
+            }
+            (Some('['), Some(&tc)) if pat.get(pi + 1..).and_then(find_class_close).is_some() => {
+                let prest = pat.get(pi + 1..).unwrap_or_default();
+                let close = find_class_close(prest).unwrap_or(0);
+                let class = prest.get(..close).unwrap_or_default();
+                if match_char_class(class, tc) {
+                    pi += 1 + close + 1;
+                    ti += 1;
+                } else if let Some(sp) = star_pi {
+                    star_ti += 1;
+                    ti = star_ti;
+                    pi = sp + 1;
+                } else {
+                    return false;
+                }
+            }
+            (Some(&pc), Some(&tc)) if pc == tc => {
+                pi += 1;
+                ti += 1;
+            }
+            _ => {
+                if let Some(sp) = star_pi {
+                    star_ti += 1;
+                    ti = star_ti;
+                    pi = sp + 1;
+                } else {
+                    return false;
+                }
             }
         }
-        c => text
-            .split_first()
-            .is_some_and(|(&tc, trest)| tc == c && match_glob_chars(prest, trest)),
     }
+    while pat.get(pi) == Some(&'*') {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 fn match_char_class(class: &[char], target: char) -> bool {
@@ -1048,8 +1086,8 @@ mod tests;
 
 /// Best-effort startup cleanup; preparation failures never prevent session recovery.
 pub fn recover_preparation() {
-    if let Err(error) = prepare::recover() {
-        tracing::warn!(%error, "cannot recover speculative worktree");
+    if prepare::recover().is_err() {
+        tracing::warn!("cannot recover speculative worktree");
     }
 }
 
