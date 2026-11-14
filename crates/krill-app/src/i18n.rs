@@ -384,7 +384,7 @@ catalog! {
         PROVIDER_RESET_USAGE_NOTHING ["status.provider.reset_usage_nothing"] => ("초기화할 사용량 창이 없습니다", "No usage windows to reset"),
         PROVIDER_RESET_USAGE_NO_CREDIT ["status.provider.reset_usage_no_credit"] => ("사용 가능한 초기화 크레딧이 없습니다", "No reset credits available"),
         PROVIDER_RESET_USAGE_AUTH_REQUIRED => ("계정 인증이 만료되었거나 실패했습니다. 다시 로그인한 뒤 시도하세요.", "Authentication failed or expired. Sign in again and retry."),
-        PROVIDER_RESET_USAGE_RATE_LIMITED => ("사용량 API 요청 제한(HTTP 429)에 걸렸습니다. 잠시 후 다시 시도하세요.", "Usage API rate limited (HTTP 429). Wait a moment and retry."),
+        PROVIDER_RESET_USAGE_RATE_LIMITED => ("사용량 확인 요청이 잠시 제한되었습니다. 잠시 후 다시 시도하세요.", "Usage check is temporarily rate-limited. Wait a moment and try again."),
         PROVIDER_RESET_USAGE_TIMED_OUT => ("사용량 초기화 응답 시간이 초과되었습니다. 크레딧 차감 여부를 사용량 새로고침으로 먼저 확인하세요.", "Usage reset timed out. Refresh usage to check remaining credits before retrying."),
         PROVIDER_RESET_USAGE_NETWORK_FAILED => ("사용량 초기화 서버에 연결하지 못했습니다. 네트워크를 확인한 뒤 다시 시도하세요.", "Could not reach the usage reset server. Check your network and retry."),
         PROVIDER_RESET_USAGE_REJECTED => ("사용량 초기화 요청이 거부되었습니다. 사용량을 새로고침해 크레딧 상태를 확인하세요.", "Usage reset request was rejected. Refresh usage to check your credit status."),
@@ -1294,7 +1294,21 @@ catalog! {
         ORPHANS_PURGE => ("휴지통으로 이동", "Move to Trash"),
         ACCOUNT_REMOVE => ("제거", "Remove"),
         ACCOUNT_ORCA_MANAGED => ("Krill에서 실행 불가(Orca 관리)", "Can't run in Krill (managed by Orca)"),
-        ACCOUNTS_DAEMON_REQUIRED => ("데몬 연결 필요 — krilld가 연결될 때까지 계정 정보는 읽기 전용입니다.", "Daemon connection required — accounts are read-only until krilld is connected."),
+        ACCOUNTS_DAEMON_REQUIRED => ("백그라운드 서비스에 연결될 때까지 계정 정보는 읽기 전용입니다.", "Background service connection required. Accounts are read-only until connected."),
+        ACCOUNTS_DAEMON_RESTART_REQUIRED => ("백그라운드 서비스가 이 계정 기능을 지원하지 않습니다. 데몬을 재시작하세요.", "Background service does not support this account feature. Restart the daemon."),
+        HANDOFF_RETAINED => ("새 계정 대화 준비가 끝나지 않아 기존 대화를 닫은 뒤 새 세션을 남겨 두었습니다. 직접 선택해 이어서 진행하세요.", "Kept the new session for manual selection after the original ended. Held input was not sent."),
+        HANDOFF_PRESERVED => ("실행 중인 일부 대화를 이 계정으로 전환하지 못해 기존 대화를 유지했습니다.", "Couldn't switch a running session to this account. Kept the original session."),
+        HANDOFF_FAILED => ("계정 전환을 마무리하지 못해 기존 대화를 유지했습니다.", "Couldn't finish switching accounts. Kept the original session."),
+        ACCOUNTS_ACTION_FAILED => ("계정 작업을 완료하지 못했습니다. 잠시 후 다시 시도하세요.", "Couldn't complete the account action. Try again later."),
+        ACCOUNTS_PROFILE_MISSING => ("새 계정 프로필을 찾을 수 없습니다. 다시 로그인해 주세요.", "Couldn't find the new account profile. Try signing in again."),
+        REMOTE_HOST_DISCONNECTED => ("원격 호스트 연결이 끊겼습니다.", "Remote host disconnected."),
+        IO_CONNECTION_LOST => ("백그라운드 서비스와의 연결이 끊겼습니다. 잠시 후 다시 시도하세요.", "Lost connection to the background service. Try again in a moment."),
+        IO_CONNECTION_REFUSED => ("백그라운드 서비스에 연결할 수 없습니다. 잠시 후 다시 시도하세요.", "Couldn't connect to the background service. Try again in a moment."),
+        IO_TIMED_OUT => ("응답 시간이 초과되었습니다. 잠시 후 다시 시도하세요.", "The request timed out. Try again in a moment."),
+        IO_PERMISSION_DENIED => ("필요한 파일이나 작업 권한이 없습니다.", "Permission was denied for this action."),
+        IO_NOT_FOUND => ("필요한 파일이나 프로그램을 찾을 수 없습니다.", "Couldn't find the required file or program."),
+        IO_GENERIC => ("작업을 완료하지 못했습니다. 잠시 후 다시 시도하세요.", "Couldn't complete the operation. Try again in a moment."),
+        PROVIDER_CLI_NOT_FOUND => ("이 계정 CLI 실행 파일을 찾을 수 없습니다. 설치 상태를 확인하세요.", "Couldn't find this account's CLI executable. Check that it is installed."),
         ACCOUNT_USAGE_EMPTY => ("5h — · 7d —", "5h — · 7d —"),
         ACCOUNT_USAGE_RESET_SOON => ("곧 리셋", "Resetting soon"),
         ACCOUNT_USAGE_RESET_M => ("{m}분 후 리셋", "{m}m until reset"),
@@ -2277,69 +2291,336 @@ catalog! {
     daemon_notice {
         MOBILE_MODE_CHANGED => ("모바일 연결 모드가 변경되었습니다", "Mobile connection mode changed"),
         PAIRING_CANCELLED => ("페어링 요청이 취소되었거나 만료되었습니다", "The pairing request was cancelled or expired"),
-        TAILSCALE_BACKUP => ("Tailscale 백업 주소를 열 수 없습니다 — Tailscale 연결을 확인하세요", "Can't open the Tailscale backup address. Check your Tailscale connection"),
+        TAILSCALE_BACKUP => ("Tailscale 백업 주소를 열 수 없습니다. Tailscale 연결을 확인하세요", "Can't open the Tailscale backup address. Check your Tailscale connection"),
         MOBILE_WEB_NOT_DEPLOYED => ("이 버전의 모바일 웹앱이 아직 배포되지 않아 새 기기를 연결할 수 없습니다", "This version's mobile web app isn't deployed yet, so new devices can't connect"),
-        RELAY_FAILED => ("모바일 릴레이에 연결하지 못했습니다 — 네트워크 확인 후 다시 시도", "Couldn't connect to the mobile relay. Check your network and try again"),
-        USAGE_CREDENTIALS => ("사용량 자격증명 읽기 실패", "Failed to read usage credentials"),
-        USAGE_EXPIRED => ("사용량 자격증명 만료 — 해당 계정 CLI에서 갱신하거나 다시 로그인하세요", "Usage credentials expired. Refresh them in that account's CLI or sign in again"),
-        USAGE_REQUEST => ("사용량 요청 구성 실패", "Failed to build the usage request"),
-        USAGE_TRANSPORT => ("사용량 API 연결·전송 실패", "Usage API connection failed"),
-        USAGE_HTTP_401 => ("사용량 API 인증 거절(HTTP 401) — 계정 로그인을 확인하세요", "Usage API rejected the sign-in (HTTP 401). Check the account login"),
-        USAGE_HTTP_403 => ("사용량 API 접근 거절(HTTP 403)", "Usage API denied access (HTTP 403)"),
-        USAGE_RESPONSE => ("사용량 API 응답 해석 실패", "Failed to read the usage API response"),
-        USAGE_INTERNAL => ("사용량 조회 작업 실패", "Usage lookup failed"),
-        USAGE_RATE_LIMITED => ("사용량 API 요청 제한(429)", "Usage API rate limited (429)"),
-        USAGE_LAST_VALUE => ("마지막 성공 값", "last successful value"),
+        RELAY_FAILED => ("모바일 릴레이에 연결하지 못했습니다. 네트워크를 확인한 뒤 다시 시도하세요", "Couldn't connect to the mobile relay. Check your network and try again"),
+        USAGE_CREDENTIALS => ("저장된 계정 로그인 정보를 읽지 못했습니다", "Couldn't read saved sign-in credentials for this account"),
+        USAGE_EXPIRED => ("계정 로그인이 만료되었습니다. 해당 CLI에서 갱신하거나 다시 로그인하세요", "Account sign-in expired. Refresh it in that account's CLI or sign in again"),
+        USAGE_REQUEST => ("지금은 사용량을 확인할 수 없습니다", "Couldn't check usage right now"),
+        USAGE_TRANSPORT => ("사용량 서버에 연결하지 못했습니다. 네트워크를 확인하세요", "Couldn't reach the usage service. Check your network"),
+        USAGE_HTTP_401 => ("사용량을 확인하려면 이 계정에 다시 로그인하세요", "Sign in to this account again to check usage"),
+        USAGE_HTTP_403 => ("이 계정의 사용량을 확인할 수 없습니다", "Couldn't check usage for this account"),
+        USAGE_UNSUPPORTED => ("이 계정은 사용량 조회를 지원하지 않습니다", "Usage details aren't available for this account"),
+        USAGE_RESPONSE => ("사용량 응답을 확인하지 못했습니다. 잠시 후 다시 시도하세요", "Couldn't read usage details right now. Try again later"),
+        USAGE_INTERNAL => ("지금은 사용량을 확인할 수 없습니다. 잠시 후 다시 시도하세요", "Couldn't check usage right now. Try again later"),
+        USAGE_RATE_LIMITED => ("사용량 조회 요청이 잠시 제한되었습니다", "Usage check is temporarily rate-limited"),
+        USAGE_LAST_VALUE => ("마지막 확인 값", "last known value"),
     }
 }
 
-fn cached_notice_line(value: &str) -> String {
-    if let Some(key) = ALL.iter().find(|key| key.ko == value || key.en == value) {
-        return key.get().to_owned();
+fn is_last_value_suffix(value: &str) -> bool {
+    let trimmed = value.trim();
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "last successful value" | "last known value"
+    ) || matches!(trimmed, "마지막 성공 값" | "마지막 확인 값")
+}
+
+fn has_internal_diagnostic_marker(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("usage api")
+        || lower.contains("사용량 api")
+        || lower.contains("(os error")
+        || lower.contains("os error ")
+        || lower.contains("feat_")
+        || lower.contains(".sock")
+        || lower.contains("http 4")
+        || lower.contains("http 5")
+        || lower.contains("(http ")
+        || lower.contains("(401)")
+        || lower.contains("(403)")
+        || lower.contains("(429)")
+}
+
+fn translate_daemon_notice_atom(trimmed: &str, lang: Language) -> Option<String> {
+    let lower = trimmed.to_ascii_lowercase();
+    let key = match lower.as_str() {
+        "tailscale 백업 주소를 열 수 없습니다 — tailscale 연결을 확인하세요"
+        | "can't open the tailscale backup address. check your tailscale connection" => {
+            catalog::daemon_notice::TAILSCALE_BACKUP
+        }
+        "모바일 릴레이에 연결하지 못했습니다 — 네트워크 확인 후 다시 시도"
+        | "couldn't connect to the mobile relay. check your network and try again" => {
+            catalog::daemon_notice::RELAY_FAILED
+        }
+        "사용량 자격증명 읽기 실패" | "failed to read usage credentials" => {
+            catalog::daemon_notice::USAGE_CREDENTIALS
+        }
+        "사용량 자격증명 만료 — 해당 계정 cli에서 갱신하거나 다시 로그인하세요"
+        | "usage credentials expired. refresh them in that account's cli or sign in again" => {
+            catalog::daemon_notice::USAGE_EXPIRED
+        }
+        "사용량 요청 구성 실패" | "failed to build the usage request" => {
+            catalog::daemon_notice::USAGE_REQUEST
+        }
+        "사용량 api 연결·전송 실패" | "usage api connection failed" => {
+            catalog::daemon_notice::USAGE_TRANSPORT
+        }
+        "사용량 api 인증 거절(http 401) — 계정 로그인을 확인하세요"
+        | "usage api rejected the sign-in (http 401). check the account login" => {
+            catalog::daemon_notice::USAGE_HTTP_401
+        }
+        "사용량 api 접근 거절(http 403)"
+        | "usage api denied access (http 403)"
+        | "usage api returned http 403" => catalog::daemon_notice::USAGE_HTTP_403,
+        "사용량 api 응답 해석 실패" | "failed to read the usage api response" => {
+            catalog::daemon_notice::USAGE_RESPONSE
+        }
+        "사용량 조회 작업 실패" | "usage lookup failed" => {
+            catalog::daemon_notice::USAGE_INTERNAL
+        }
+        "사용량 api 요청 제한(429)"
+        | "usage api rate limited (429)"
+        | "usage api rate limited (http 429); wait and retry" => {
+            catalog::daemon_notice::USAGE_RATE_LIMITED
+        }
+        "마지막 성공 값" | "last successful value" | "last known value" => {
+            catalog::daemon_notice::USAGE_LAST_VALUE
+        }
+        "remote host disconnected" => catalog::settings::REMOTE_HOST_DISCONNECTED,
+        "feat_usage not negotiated"
+        | "daemon does not support this account extension; restart daemon" => {
+            catalog::settings::ACCOUNTS_DAEMON_RESTART_REQUIRED
+        }
+        "daemon closed usage stream" | "broken pipe" | "not connected" => {
+            catalog::settings::IO_CONNECTION_LOST
+        }
+        "account handoff cancellation requires the daemon"
+        | "session account switching requires the daemon" => {
+            catalog::settings::ACCOUNTS_DAEMON_REQUIRED
+        }
+        "new account missing from daemon reply" | "new account profile missing" => {
+            catalog::settings::ACCOUNTS_PROFILE_MISSING
+        }
+        "unexpected account reply" | "unexpected account input recovery reply" => {
+            catalog::settings::ACCOUNTS_ACTION_FAILED
+        }
+        "provider executable not found" => catalog::settings::PROVIDER_CLI_NOT_FOUND,
+        "timed out" | "operation timed out" => catalog::settings::IO_TIMED_OUT,
+        "connection refused" => catalog::settings::IO_CONNECTION_REFUSED,
+        "permission denied" => catalog::settings::IO_PERMISSION_DENIED,
+        _ => {
+            let is_usage = lower.contains("usage") || trimmed.contains("사용량");
+            if is_usage && (lower.contains("401") || lower.contains("rejected the sign-in")) {
+                catalog::daemon_notice::USAGE_HTTP_401
+            } else if is_usage && (lower.contains("403") || lower.contains("denied access")) {
+                catalog::daemon_notice::USAGE_HTTP_403
+            } else if is_usage && (lower.contains("429") || lower.contains("rate limit")) {
+                catalog::daemon_notice::USAGE_RATE_LIMITED
+            } else if is_usage && lower.contains("credentials expired") {
+                catalog::daemon_notice::USAGE_EXPIRED
+            } else if is_usage && (lower.contains("credential") || trimmed.contains("자격증명"))
+            {
+                catalog::daemon_notice::USAGE_CREDENTIALS
+            } else if is_usage
+                && (lower.contains("connection failed")
+                    || lower.contains("transport")
+                    || trimmed.contains("연결"))
+            {
+                catalog::daemon_notice::USAGE_TRANSPORT
+            } else if is_usage && (lower.contains("response") || trimmed.contains("응답")) {
+                catalog::daemon_notice::USAGE_RESPONSE
+            } else if is_usage
+                && (lower.contains("build the usage request") || trimmed.contains("요청 구성"))
+            {
+                catalog::daemon_notice::USAGE_REQUEST
+            } else if lower.contains("usage api")
+                || lower.contains("사용량 api")
+                || lower.starts_with("usage lookup")
+            {
+                catalog::daemon_notice::USAGE_INTERNAL
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(key.in_language(lang).to_owned())
+}
+
+pub(crate) fn translate_daemon_notice_in(value: &str, lang: Language) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-    if let Some((label, detail)) = value.split_once(": ")
+    if let Some((reason, suffix)) = trimmed.rsplit_once(" — ")
+        && is_last_value_suffix(suffix)
+    {
+        let reason_trimmed = reason.trim();
+        let reason_msg = translate_daemon_notice_atom(reason_trimmed, lang)
+            .or_else(|| {
+                ALL.iter()
+                    .find(|key| key.ko == reason_trimmed || key.en == reason_trimmed)
+                    .map(|k| k.in_language(lang).to_owned())
+            })
+            .unwrap_or_else(|| {
+                if has_internal_diagnostic_marker(reason_trimmed) {
+                    catalog::daemon_notice::USAGE_INTERNAL
+                        .in_language(lang)
+                        .to_owned()
+                } else {
+                    reason_trimmed.to_owned()
+                }
+            });
+        return Some(format!(
+            "{reason_msg} ({})",
+            catalog::daemon_notice::USAGE_LAST_VALUE.in_language(lang),
+        ));
+    }
+    translate_daemon_notice_atom(trimmed, lang)
+}
+
+pub fn translate_daemon_notice(value: &str) -> Option<String> {
+    translate_daemon_notice_in(value, language())
+}
+
+fn is_session_id_prefix(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("Session ")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(id, _)| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn try_sanitize_handoff_error_in(trimmed: &str, lang: Language) -> Option<String> {
+    let lower = trimmed.to_ascii_lowercase();
+    let key = if lower.contains("was retained") {
+        catalog::settings::HANDOFF_RETAINED
+    } else if is_session_id_prefix(trimmed)
+        || lower.contains("could not resume")
+        || lower.contains("could not retire")
+    {
+        catalog::settings::HANDOFF_PRESERVED
+    } else if lower.contains("replacement session is unavailable")
+        || lower.contains("selected account is unavailable")
+        || lower.contains("original session preserved")
+        || lower.contains("automatic resume cancelled")
+        || lower.contains("unconfirmed replacement")
+    {
+        catalog::settings::HANDOFF_FAILED
+    } else {
+        return None;
+    };
+    Some(key.in_language(lang).to_owned())
+}
+
+pub(crate) fn sanitize_handoff_error_in(raw: &str, lang: Language) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(handoff) = try_sanitize_handoff_error_in(trimmed, lang) {
+        return handoff;
+    }
+    if let Some(notice) = translate_daemon_notice_in(trimmed, lang) {
+        return notice;
+    }
+    if let Some(key) = ALL
+        .iter()
+        .find(|key| key.ko == trimmed || key.en == trimmed)
+    {
+        return key.in_language(lang).to_owned();
+    }
+    if has_internal_diagnostic_marker(trimmed) {
+        return catalog::settings::HANDOFF_FAILED
+            .in_language(lang)
+            .to_owned();
+    }
+    trimmed.to_owned()
+}
+
+pub fn sanitize_handoff_error(raw: &str) -> String {
+    sanitize_handoff_error_in(raw, language())
+}
+
+fn cached_notice_line_in(value: &str, lang: Language) -> String {
+    let trimmed = value.trim();
+    if let Some(notice) = translate_daemon_notice_in(trimmed, lang) {
+        return notice;
+    }
+    if let Some(handoff) = try_sanitize_handoff_error_in(trimmed, lang) {
+        return handoff;
+    }
+    if let Some(key) = ALL
+        .iter()
+        .find(|key| key.ko == trimmed || key.en == trimmed)
+    {
+        return key.in_language(lang).to_owned();
+    }
+    if let Some((label, detail)) = trimmed.split_once(": ")
         && let Some(app) = label
             .strip_suffix(" 열기 실패")
             .or_else(|| label.strip_prefix("Failed to open "))
     {
-        return catalog::open_in::FAILED.format(&[("app", app), ("error", detail)]);
+        let clean_detail = translate_daemon_notice_in(detail, lang)
+            .or_else(|| {
+                has_internal_diagnostic_marker(detail)
+                    .then(|| catalog::settings::IO_GENERIC.in_language(lang).to_owned())
+            })
+            .unwrap_or_else(|| detail.to_owned());
+        return catalog::open_in::FAILED
+            .in_language(lang)
+            .replace("{app}", app)
+            .replace("{error}", &clean_detail);
     }
-    let parts = value
+    let parts = trimmed
         .split_once(": ")
         .map(|(label, detail)| (label, detail, ": "))
         .into_iter()
         // 데몬 알림의 "<이유> — <상태>". 이유 안에도 줄표가 있을 수 있어 마지막에서 나눈다.
         .chain(
-            value
+            trimmed
                 .rsplit_once(" — ")
                 .map(|(label, detail)| (label, detail, " — ")),
         );
     for (label, detail, separator) in parts {
-        let label_key = ALL.iter().find(|key| key.ko == label || key.en == label);
-        let detail_key = ALL.iter().find(|key| key.ko == detail || key.en == detail);
-        if label_key.is_some() || detail_key.is_some() {
+        let label_msg = translate_daemon_notice_in(label, lang).or_else(|| {
+            ALL.iter()
+                .find(|key| key.ko == label || key.en == label)
+                .map(|k| k.in_language(lang).to_owned())
+        });
+        let detail_msg = translate_daemon_notice_in(detail, lang).or_else(|| {
+            ALL.iter()
+                .find(|key| key.ko == detail || key.en == detail)
+                .map(|k| k.in_language(lang).to_owned())
+        });
+        if label_msg.is_some() || detail_msg.is_some() {
+            if separator == " — " && is_last_value_suffix(detail) {
+                return format!(
+                    "{} ({})",
+                    label_msg.as_deref().unwrap_or(label),
+                    catalog::daemon_notice::USAGE_LAST_VALUE.in_language(lang),
+                );
+            }
             return format!(
                 "{}{separator}{}",
-                label_key.map_or(label, |k| k.get()),
-                detail_key.map_or(detail, |k| k.get()),
+                label_msg.as_deref().unwrap_or(label),
+                detail_msg.as_deref().unwrap_or(detail),
             );
         }
     }
-    value.to_owned()
+    if has_internal_diagnostic_marker(trimmed) {
+        return catalog::settings::ACCOUNTS_ACTION_FAILED
+            .in_language(lang)
+            .to_owned();
+    }
+    trimmed.to_owned()
+}
+
+pub(crate) fn cached_notice_in(value: &str, lang: Language) -> String {
+    if !value.contains('\n') {
+        return cached_notice_line_in(value, lang);
+    }
+    value
+        .split('\n')
+        .map(|line| cached_notice_line_in(line, lang))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Resolve an app-owned cached notice again after a language change. Only complete
 /// messages or catalog labels/details around `: ` are translated; error details and input
 /// previews are copied verbatim. Do not use this for terminal output or user-authored content.
 pub fn cached_notice(value: &str) -> String {
-    if !value.contains('\n') {
-        return cached_notice_line(value);
-    }
-    value
-        .split('\n')
-        .map(cached_notice_line)
-        .collect::<Vec<_>>()
-        .join("\n")
+    cached_notice_in(value, language())
 }
 
 /// 설정 검색 색인(OWE-656) — 한·영 키워드는 UI 문구라 카탈로그에 둔다. 사용처: `settings/search.rs`.
@@ -2759,6 +3040,115 @@ mod tests {
                 m.in_language(Ko)
             );
         }
+    }
+
+    #[test]
+    fn daemon_notice_and_handoff_sanitization_covers_ko_and_en() {
+        use super::{
+            Language::{En, Ko},
+            cached_notice, cached_notice_in, sanitize_handoff_error, sanitize_handoff_error_in,
+        };
+
+        for lang in [Ko, En] {
+            let msg_401 = cached_notice_in(
+                "Usage API rejected the sign-in (HTTP 401). Check the account login",
+                lang,
+            );
+            assert_eq!(
+                msg_401,
+                catalog::daemon_notice::USAGE_HTTP_401.in_language(lang)
+            );
+            assert!(!msg_401.contains("401") && !msg_401.contains("Usage API"));
+
+            let msg_403 = cached_notice_in("Usage API denied access (HTTP 403)", lang);
+            assert_eq!(
+                msg_403,
+                catalog::daemon_notice::USAGE_HTTP_403.in_language(lang)
+            );
+            assert_eq!(
+                cached_notice_in("  usage API returned HTTP 403  ", lang),
+                catalog::daemon_notice::USAGE_HTTP_403.in_language(lang)
+            );
+
+            let msg_500 = cached_notice_in("Usage API error (HTTP 500)", lang);
+            assert_eq!(
+                msg_500,
+                catalog::daemon_notice::USAGE_INTERNAL.in_language(lang)
+            );
+            assert!(!msg_500.contains("500") && !msg_500.contains("HTTP"));
+
+            let msg_429_last =
+                cached_notice_in("Usage API rate limited (429) — last successful value", lang);
+            assert_eq!(
+                msg_429_last,
+                format!(
+                    "{} ({})",
+                    catalog::daemon_notice::USAGE_RATE_LIMITED.in_language(lang),
+                    catalog::daemon_notice::USAGE_LAST_VALUE.in_language(lang),
+                )
+            );
+            assert!(!msg_429_last.contains('—') && !msg_429_last.contains("429"));
+
+            let resume_err = sanitize_handoff_error_in(
+                "Session 41205: could not resume with selected account (exit 1); original session preserved",
+                lang,
+            );
+            assert_eq!(
+                resume_err,
+                catalog::settings::HANDOFF_PRESERVED.in_language(lang)
+            );
+            assert!(!resume_err.contains("41205"));
+            assert_eq!(
+                cached_notice_in(
+                    "Session 41205: could not resume with selected account",
+                    lang
+                ),
+                catalog::settings::HANDOFF_PRESERVED.in_language(lang)
+            );
+
+            let retained = sanitize_handoff_error_in("replacement 99 was retained", lang);
+            assert_eq!(
+                retained,
+                catalog::settings::HANDOFF_RETAINED.in_language(lang)
+            );
+            assert!(!retained.contains("99"));
+
+            let unavailable = sanitize_handoff_error_in(
+                "Replacement session is unavailable; original session preserved",
+                lang,
+            );
+            assert_eq!(
+                unavailable,
+                catalog::settings::HANDOFF_FAILED.in_language(lang)
+            );
+
+            let selected_unavail = sanitize_handoff_error_in(
+                "Selected account is unavailable; original session preserved",
+                lang,
+            );
+            assert_eq!(
+                selected_unavail,
+                catalog::settings::HANDOFF_FAILED.in_language(lang)
+            );
+
+            let retire = sanitize_handoff_error_in(
+                "Could not retire original session (busy); original session preserved",
+                lang,
+            );
+            assert_eq!(
+                retire,
+                catalog::settings::HANDOFF_PRESERVED.in_language(lang)
+            );
+
+            assert_eq!(
+                cached_notice_in("Custom calm notice", lang),
+                "Custom calm notice"
+            );
+        }
+
+        // Also check active-language entry points do not leak raw diagnostics.
+        assert!(!cached_notice("Usage API error (HTTP 500)").contains("HTTP"));
+        assert!(!sanitize_handoff_error("Session 41205: could not resume").contains("41205"));
     }
 }
 

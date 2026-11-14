@@ -3982,7 +3982,7 @@ impl SettingsView {
 
     fn displayed_account_error(&self) -> Option<SharedString> {
         if let Some(error) = &self.account_error {
-            return Some(error.clone());
+            return Some(SharedString::from(crate::i18n::cached_notice(error)));
         }
         self.accounts_snapshot
             .details
@@ -3990,9 +3990,9 @@ impl SettingsView {
             .iter()
             .find_map(|handoff| match handoff.outcome() {
                 krill_proto::usage::HandoffOutcome::RetryableFailure { message }
-                | krill_proto::usage::HandoffOutcome::RetainedReplacement { message, .. } => {
-                    Some(SharedString::from(message.to_owned()))
-                }
+                | krill_proto::usage::HandoffOutcome::RetainedReplacement { message, .. } => Some(
+                    SharedString::from(crate::i18n::sanitize_handoff_error(message)),
+                ),
                 krill_proto::usage::HandoffOutcome::Pending
                 | krill_proto::usage::HandoffOutcome::Completed { .. } => None,
             })
@@ -4251,7 +4251,8 @@ impl SettingsView {
                 let loaded = cx
                     .background_executor()
                     .spawn(async move {
-                        let target = target.ok_or_else(|| "remote host disconnected".to_owned())?;
+                        let target = target
+                            .ok_or_else(|| text::REMOTE_HOST_DISCONNECTED.get().to_owned())?;
                         let snapshot = crate::accounts::request_target(
                             &target,
                             &krill_proto::usage::UsageRequest::ListAccounts,
@@ -4538,7 +4539,8 @@ impl SettingsView {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let target = target.ok_or_else(|| "remote host disconnected".to_owned())?;
+                        let target = target
+                            .ok_or_else(|| text::REMOTE_HOST_DISCONNECTED.get().to_owned())?;
                         crate::accounts::orphans_target(
                             &target,
                             &krill_proto::usage::UsageRequest::PurgeOrphanProfiles,
@@ -4605,7 +4607,8 @@ impl SettingsView {
                         }
                         Err(error) => {
                             if is_current {
-                                this.account_error = Some(error.to_string().into());
+                                this.account_error =
+                                    Some(crate::errors::user_io_error(&error).into());
                             }
                         }
                     }
@@ -4619,7 +4622,8 @@ impl SettingsView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let paths = krill_proto::daemon::Paths::dev().map_err(|e| e.to_string())?;
+                    let paths = krill_proto::daemon::Paths::dev()
+                        .map_err(|e| crate::errors::user_io_error(&e))?;
                     crate::accounts::orphans_ipc(
                         &paths,
                         &krill_proto::usage::UsageRequest::PurgeOrphanProfiles,
@@ -4695,7 +4699,8 @@ impl SettingsView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let paths = krill_proto::daemon::Paths::dev().map_err(|e| e.to_string())?;
+                    let paths = krill_proto::daemon::Paths::dev()
+                        .map_err(|e| crate::errors::user_io_error(&e))?;
                     let (account, newly_added) = if let Some(account) = account {
                         (account, false)
                     } else {
@@ -4728,7 +4733,7 @@ impl SettingsView {
                             .accounts
                             .into_iter()
                             .find(|a| a.provider == provider && a.label == label)
-                            .ok_or_else(|| "new account missing from daemon reply".to_owned())?;
+                            .ok_or_else(|| text::ACCOUNTS_PROFILE_MISSING.get().to_owned())?;
                         // 그사이 같은 라벨이 생겨 기존 계정이 돌아왔으면, 로그인을 취소해도 정리(삭제)하지 않는다.
                         let newly_added = !existing.iter().any(|a| a.id == added.id);
                         (added, newly_added)
@@ -4946,17 +4951,20 @@ impl SettingsView {
         self.added_counter = n.saturating_add(1);
         let request = move || {
             let paths = if remote_target.is_none() && daemon {
-                Some(krill_proto::daemon::Paths::dev().map_err(|e| e.to_string())?)
+                Some(
+                    krill_proto::daemon::Paths::dev()
+                        .map_err(|e| crate::errors::user_io_error(&e))?,
+                )
             } else {
                 None
             };
             let send = |req: &UsageRequest| match &remote_target {
                 Some(Some(target)) => crate::accounts::request_target(target, req),
-                Some(None) => Err("remote host disconnected".to_owned()),
+                Some(None) => Err(text::REMOTE_HOST_DISCONNECTED.get().to_owned()),
                 None => match &paths {
                     Some(paths) => crate::accounts::request_ipc(paths, req),
                     None => crate::accounts::request_local(&home, dir.as_deref(), req)
-                        .map_err(|e| e.to_string()),
+                        .map_err(|e| crate::errors::user_io_error(&e)),
                 },
             };
             let snap = send(&UsageRequest::ListAccounts)?;
@@ -4984,7 +4992,7 @@ impl SettingsView {
                 .accounts
                 .into_iter()
                 .find(|a| a.provider == provider && a.label == label)
-                .ok_or_else(|| "new account profile missing".to_owned())?
+                .ok_or_else(|| text::ACCOUNTS_PROFILE_MISSING.get().to_owned())?
             };
             Ok::<_, String>((
                 send(&UsageRequest::ListAccounts)?,
@@ -5122,7 +5130,9 @@ impl SettingsView {
                         this.opencode_api_key_error = None;
                         this.opencode_api_key_input = None;
                     }
-                    Err(e) => this.opencode_api_key_error = Some(e.to_string().into()),
+                    Err(e) => {
+                        this.opencode_api_key_error = Some(crate::errors::user_io_error(&e).into());
+                    }
                 }
                 cx.notify();
             })
@@ -5150,7 +5160,9 @@ impl SettingsView {
                         this.opencode_api_key_configured = Some(false);
                         this.opencode_api_key_error = None;
                     }
-                    Err(e) => this.opencode_api_key_error = Some(e.to_string().into()),
+                    Err(e) => {
+                        this.opencode_api_key_error = Some(crate::errors::user_io_error(&e).into());
+                    }
                 }
                 cx.notify();
             })
@@ -5177,7 +5189,7 @@ impl SettingsView {
                 return;
             }
             let Some(target) = self.selected_account_target() else {
-                self.account_error = Some("remote host disconnected".into());
+                self.account_error = Some(text::REMOTE_HOST_DISCONNECTED.get().into());
                 cx.notify();
                 return;
             };
@@ -5229,7 +5241,8 @@ impl SettingsView {
                         }
                         Err(error) => {
                             if is_current {
-                                this.account_error = Some(error.to_string().into());
+                                this.account_error =
+                                    Some(crate::errors::user_io_error(&error).into());
                             }
                         }
                     }
@@ -5268,7 +5281,7 @@ impl SettingsView {
         let host = self.account_host.clone();
         let target = if host.is_remote() {
             let Some(target) = self.selected_account_target() else {
-                self.account_error = Some("remote host disconnected".into());
+                self.account_error = Some(text::REMOTE_HOST_DISCONNECTED.get().into());
                 cx.notify();
                 return;
             };
@@ -7444,7 +7457,7 @@ impl SettingsView {
             );
         if let Some(err) = self.opencode_api_key_error.clone() {
             card = card.child(
-                crate::ui::error_banner(p, err)
+                crate::ui::error_banner(p, crate::i18n::cached_notice(&err))
                     .id("admin-opencode-api-key-error")
                     .debug_selector(|| "admin-opencode-api-key-error".into()),
             );

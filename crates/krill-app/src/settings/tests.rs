@@ -12033,6 +12033,12 @@ fn retained_handoff_banner_clears_when_snapshot_resolves_and_hides_switch_on_act
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-account-row-codex-alpha").is_some());
     assert!(vcx.debug_bounds("admin-account-error").is_some());
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).displayed_account_error().as_deref(),
+            Some(text::HANDOFF_RETAINED.get())
+        );
+    });
     assert!(
         vcx.debug_bounds("admin-switch-account-codex-alpha")
             .is_none()
@@ -12054,6 +12060,12 @@ fn retained_handoff_banner_clears_when_snapshot_resolves_and_hides_switch_on_act
         });
     });
     vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).displayed_account_error().as_deref(),
+            Some(text::HANDOFF_FAILED.get())
+        );
+    });
     assert!(
         vcx.debug_bounds("admin-switch-account-codex-alpha")
             .is_some()

@@ -2994,7 +2994,7 @@ impl Shell {
                 self.notice = Some(format!(
                     "{}: {}",
                     self.layout.host(pane),
-                    std::io::Error::from(std::io::ErrorKind::NotConnected)
+                    krill_app::i18n::catalog::sidebar::HOST_DISCONNECTED.get()
                 ));
                 cx.notify();
                 return;
@@ -3014,7 +3014,7 @@ impl Shell {
                         cx.open_url(&rewritten);
                     }
                     Err(err) => {
-                        this.notice = Some(err.to_string());
+                        this.notice = Some(krill_app::errors::user_io_error(&err));
                         cx.notify();
                     }
                 })
@@ -3914,7 +3914,7 @@ impl Shell {
                     && self.handoff_errors.insert(error.clone())
                 {
                     // Failure preserves held input until an explicit cancellation is acknowledged.
-                    self.notice = Some(error.clone());
+                    self.notice = Some(krill_app::i18n::sanitize_handoff_error(error));
                 }
             }
             rebound |= changed;
@@ -4296,7 +4296,7 @@ impl Shell {
                         this.agents = Some(settings);
                         this.sidebar.update(cx, |s, cx| s.set_agents(profiles, cx));
                     }
-                    Err(e) => this.notice = Some(e.to_string()),
+                    Err(e) => this.notice = Some(krill_app::errors::user_io_error(&e)),
                 }
                 cx.notify();
             })
