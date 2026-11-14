@@ -12051,6 +12051,78 @@ fn ports_keep_same_session_and_url_on_different_hosts(cx: &mut TestAppContext) {
     });
 }
 
+/// 새 프레임이 올 때마다 화면 객체가 바뀐다. 다음 감지 결과가 오기 전에도 직전 URL은 남아야
+/// 상태바 포트 버튼이 몇 초마다 깜빡이지 않는다.
+#[gpui::test]
+fn ports_stay_listed_until_the_next_detection_replaces_them(cx: &mut TestAppContext) {
+    use krill_proto::screen::{Cell, Op, Revision, Seq, encode_update};
+    fn paint(s: &mut Shell, pane: krill_app::layout::PaneId, rev: u64, text: &str) {
+        let cells = text
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Default::default()
+            })
+            .collect();
+        let ops = vec![
+            Op::Reset { cols: 40, lines: 2 },
+            Op::Line { line: 0, cells },
+        ];
+        for frame in encode_update(Revision(rev), Seq(rev), ops).unwrap() {
+            let (kind, body) = krill_proto::ipc::read_frame(&mut &frame[..])
+                .unwrap()
+                .unwrap();
+            let live = s.live.get_mut(&pane).unwrap();
+            live.pane.frame(kind, &body).unwrap();
+        }
+    }
+    let poll = |cx: &mut VisualTestContext| {
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+    };
+    let (view, cx) = open(cx, state_path("ports-stable"));
+    cx.run_until_parked();
+    let pane = view.update(cx, |s, _| {
+        let pane = s.layout.tabs()[0].focused;
+        let (ours, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut live = Live::new(Task::ready(()));
+        live.pane.link(
+            krill_proto::SessionId(42),
+            1,
+            pane::Writer::spawn(ours).unwrap(),
+            krill_proto::input::FEAT_INPUT,
+            Now::get(),
+        );
+        s.live.insert(pane, live);
+        paint(s, pane, 1, "Local: http://localhost:3000");
+        pane
+    });
+    poll(cx);
+    view.update(cx, |s, _| {
+        assert_eq!(s.detected_ports().len(), 1);
+        let before = s.live[&pane].pane.shown();
+        paint(s, pane, 2, "Local: http://localhost:3000 |");
+        assert!(!Rc::ptr_eq(&before, &s.live[&pane].pane.shown()));
+        assert_eq!(
+            s.detected_ports().len(),
+            1,
+            "a new frame must not hide the URL before the next detection"
+        );
+    });
+    poll(cx);
+    view.update(cx, |s, _| {
+        assert_eq!(s.detected_ports().len(), 1);
+        paint(s, pane, 3, "ready");
+    });
+    poll(cx);
+    view.update(cx, |s, _| {
+        assert!(
+            s.detected_ports().is_empty(),
+            "a URL that left the screen is dropped by the next detection"
+        );
+    });
+}
+
 #[gpui::test]
 fn tab_menu_home_end_arrows_space_escape_skip_disabled(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("tab-menu-boundaries"));

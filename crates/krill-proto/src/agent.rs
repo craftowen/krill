@@ -607,15 +607,26 @@ pub fn decode_agent_program_id(encoded: &str) -> Result<(&str, LaunchOverrides),
 /// `program`을 `path`(PATH 형식)에서 찾는다. 경로 구분자(`/`, Windows는 `\`도)가 들어 있으면 그 경로만 본다
 /// (셸 `command -v`와 같은 규칙).
 pub fn which(program: &str, path: &OsStr) -> Option<PathBuf> {
+    which_all(program, path).into_iter().next()
+}
+
+/// `program`과 일치하는 모든 실행 파일 후보를 `path` 순서대로(중복 제외) 찾는다.
+pub fn which_all(program: &str, path: &OsStr) -> Vec<PathBuf> {
     if program.is_empty() {
-        return None;
+        return Vec::new();
     }
     if program.contains(std::path::is_separator) {
-        return executable(PathBuf::from(program));
+        return executable(PathBuf::from(program)).into_iter().collect();
     }
-    std::env::split_paths(path)
-        .filter(|d| !d.as_os_str().is_empty())
-        .find_map(|d| executable(d.join(program)))
+    let mut found = Vec::new();
+    for dir in std::env::split_paths(path).filter(|d| !d.as_os_str().is_empty()) {
+        if let Some(exe) = executable(dir.join(program))
+            && !found.contains(&exe)
+        {
+            found.push(exe);
+        }
+    }
+    found
 }
 
 /// 실행 비트가 있는 일반 파일이면 그 경로.
@@ -647,6 +658,74 @@ fn executable(p: PathBuf) -> Option<PathBuf> {
 pub fn version(exe: &Path) -> Option<String> {
     let mut cmd = crate::os::background_command(exe);
     cmd.arg("--version");
+    run_version(cmd)
+}
+
+/// `PATH=path` 환경에서 `<exe> --version` 출력의 첫 줄을 읽는다.
+/// GUI 앱처럼 최소 PATH로 뜬 프로세스에서도 `#!/usr/bin/env node` 기반 CLI 버전을 확인할 수 있다.
+pub fn version_in(exe: &Path, path: &OsStr) -> Option<String> {
+    let mut cmd = crate::os::background_command(exe);
+    cmd.arg("--version").env("PATH", path);
+    run_version(cmd)
+}
+
+/// 실행 파일(`exe`)이 Homebrew `Cellar`/`Caskroom` 또는 npm `node_modules` 패키지 심볼릭 링크일 때
+/// 바이너리를 실행하지 않고 패키지 메타데이터(폴더명 또는 `package.json`)에서 버전을 읽는다.
+#[must_use]
+pub fn package_version(exe: &Path) -> Option<String> {
+    let canon = exe.canonicalize().ok()?;
+    for dir in canon.ancestors().skip(1) {
+        let Some(ver_name) = dir.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if let Some(pkg_dir) = dir.parent()
+            && pkg_dir
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(OsStr::to_str)
+                .is_some_and(|kind| matches!(kind, "Cellar" | "Caskroom"))
+            && !ver_name.is_empty()
+            && !ver_name.starts_with('.')
+        {
+            return Some(ver_name.to_owned());
+        }
+        let in_node_modules = dir
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(OsStr::to_str)
+            .is_some_and(|parent| {
+                parent == "node_modules"
+                    || (parent.starts_with('@')
+                        && dir
+                            .parent()
+                            .and_then(Path::parent)
+                            .and_then(Path::file_name)
+                            .and_then(OsStr::to_str)
+                            == Some("node_modules"))
+            });
+        if in_node_modules {
+            let pkg_json = dir.join("package.json");
+            let Ok(bytes) = std::fs::read(&pkg_json) else {
+                continue;
+            };
+            if bytes.len() > 65_536 {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && let Some(ver) = json
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+            {
+                return Some(ver.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn run_version(cmd: Command) -> Option<String> {
     capture(cmd, VERSION_TIMEOUT)?
         .lines()
         .map(str::trim)

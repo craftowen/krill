@@ -556,9 +556,17 @@ fn collect_agents(path: &OsString) -> Vec<AgentFact> {
     });
     rows.into_iter()
         .map(|(id, p)| {
-            let exe = p.program().and_then(|prog| agent::which(prog, path));
+            let candidates = p
+                .program()
+                .map(|prog| agent::which_all(prog, path))
+                .unwrap_or_default();
+            let version = candidates
+                .iter()
+                .find_map(|e| agent::version_in(e, path))
+                .or_else(|| candidates.iter().find_map(|e| agent::package_version(e)));
+            let exe = candidates.into_iter().next();
             AgentFact {
-                version: exe.as_deref().and_then(agent::version),
+                version,
                 exe,
                 id,
                 install: p.install_command().to_owned(),

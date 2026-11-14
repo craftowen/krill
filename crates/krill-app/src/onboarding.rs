@@ -222,7 +222,7 @@ pub fn login_path(_shell: &OsStr) -> Option<OsString> {
 pub fn survey(env: &Env) -> Survey {
     let path =
         login_path(&env.shell).unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
-    let git = agent::which("git", &path).and_then(|g| agent::version(&g));
+    let git = agent::which("git", &path).and_then(|g| agent::version_in(&g, &path));
     let user = std::fs::read_to_string(env.state.join(agent::FILE_NAME)).ok();
     let agents = Agents::load(user.as_deref())
         .or_else(|_| Agents::load(None))
@@ -231,9 +231,17 @@ pub fn survey(env: &Env) -> Survey {
         .profiles
         .into_iter()
         .map(|(id, p)| {
-            let exe = p.program().and_then(|prog| agent::which(prog, &path));
+            let candidates = p
+                .program()
+                .map(|prog| agent::which_all(prog, &path))
+                .unwrap_or_default();
+            let version = candidates
+                .iter()
+                .find_map(|e| agent::version_in(e, &path))
+                .or_else(|| candidates.iter().find_map(|e| agent::package_version(e)));
+            let exe = candidates.into_iter().next();
             Found {
-                version: exe.as_deref().and_then(agent::version),
+                version,
                 exe,
                 id,
                 install: p.install_command().to_owned(),

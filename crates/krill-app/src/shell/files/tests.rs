@@ -1626,13 +1626,15 @@ fn early_file_editor_survives_startup_restore(cx: &mut TestAppContext) {
     );
 }
 
-/// APP-F01 후속 회귀용 가짜 원격 파일 데몬: 연결마다 요청 하나를 처리한다(`Stat`·`ReadFile`·`WriteAtomic`).
-/// 읽기 횟수와 써진 바이트를 기록해, 원격 칸이 로컬 디스크 대신 이 데몬만 읽고 아무것도 쓰지 않는지 확인한다.
+/// APP-F01 후속 회귀용 가짜 원격 파일 데몬: 실제 `krilld`처럼 한 제어 연결에서 연속 `Stat`·`ReadFile`·`WriteAtomic`
+/// 요청을 처리하고 `offset`/`max_bytes` 슬라이싱과 연결·읽기 횟수, 오류 주입을 지원한다.
 struct FakeRemoteFs {
     sock_path: PathBuf,
     text: Arc<std::sync::Mutex<Vec<u8>>>,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
     reads: Arc<std::sync::atomic::AtomicUsize>,
     writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    fail_reads: Arc<std::sync::atomic::AtomicBool>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -1660,11 +1662,19 @@ impl FakeRemoteFs {
         let listener = UnixListener::bind(&sock_path).unwrap();
         let text = Arc::new(std::sync::Mutex::new(initial.to_vec()));
         let generation = Arc::new(AtomicUsize::new(1));
+        let connections = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
         let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fail_reads = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let (text_bg, reads_bg, writes_bg, stop_bg) =
-            (text.clone(), reads.clone(), writes.clone(), stop.clone());
+        let (text_bg, conns_bg, reads_bg, writes_bg, fail_bg, stop_bg) = (
+            text.clone(),
+            connections.clone(),
+            reads.clone(),
+            writes.clone(),
+            fail_reads.clone(),
+            stop.clone(),
+        );
         let stat = move |text: &[u8], generation: usize| WireStat {
             exists: true,
             is_file: true,
@@ -1682,6 +1692,7 @@ impl FakeRemoteFs {
                 if stop_bg.load(Ordering::SeqCst) {
                     break;
                 }
+                conns_bg.fetch_add(1, Ordering::SeqCst);
                 let mut writer = stream.try_clone().unwrap();
                 let server = ServerHello {
                     proto_min: ipc::PROTO_MIN,
@@ -1697,48 +1708,66 @@ impl FakeRemoteFs {
                     continue;
                 };
                 let _ = ClientHello::decode(kind, &body).unwrap();
-                let Some((kind, payload)) = ipc::read_frame(&mut stream).ok().flatten() else {
-                    continue;
-                };
-                let Ok(req) = Request::decode(kind, &payload) else {
-                    continue;
-                };
-                let reply = match req {
-                    Request::RemoteFs(RemoteFsRequest::Stat { .. }) => {
-                        let text = text_bg.lock().unwrap();
-                        Reply::RemoteFs(RemoteFsReply::Stat(Ok(stat(
-                            &text,
-                            generation.load(Ordering::SeqCst),
-                        ))))
+                while let Some((kind, payload)) = ipc::read_frame(&mut stream).ok().flatten() {
+                    let Ok(req) = Request::decode(kind, &payload) else {
+                        break;
+                    };
+                    let reply = match req {
+                        Request::RemoteFs(RemoteFsRequest::Stat { .. }) => {
+                            let text = text_bg.lock().unwrap();
+                            Reply::RemoteFs(RemoteFsReply::Stat(Ok(stat(
+                                &text,
+                                generation.load(Ordering::SeqCst),
+                            ))))
+                        }
+                        Request::RemoteFs(RemoteFsRequest::ReadFile {
+                            offset, max_bytes, ..
+                        }) => {
+                            reads_bg.fetch_add(1, Ordering::SeqCst);
+                            if fail_bg.load(Ordering::SeqCst) {
+                                Reply::RemoteFs(RemoteFsReply::FileChunk(Err(
+                                    "simulated remote disk read error".to_owned(),
+                                )))
+                            } else {
+                                let text = text_bg.lock().unwrap();
+                                let start = usize::try_from(offset)
+                                    .unwrap_or(text.len())
+                                    .min(text.len());
+                                let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+                                let end = start.saturating_add(cap).min(text.len());
+                                Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
+                                    stat: stat(&text, generation.load(Ordering::SeqCst)),
+                                    bytes: text[start..end].to_vec(),
+                                    eof: end >= text.len(),
+                                })))
+                            }
+                        }
+                        Request::RemoteFs(RemoteFsRequest::WriteAtomic {
+                            bytes, commit, ..
+                        }) => {
+                            assert!(commit, "test files fit one chunk");
+                            *text_bg.lock().unwrap() = bytes.clone();
+                            let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                            writes_bg.lock().unwrap().push(bytes.clone());
+                            Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(
+                                stat(&bytes, generation).stamp.unwrap(),
+                            )))
+                        }
+                        _ => break,
+                    };
+                    if stream.write_all(&reply.encode().unwrap()).is_err() {
+                        break;
                     }
-                    Request::RemoteFs(RemoteFsRequest::ReadFile { .. }) => {
-                        reads_bg.fetch_add(1, Ordering::SeqCst);
-                        let text = text_bg.lock().unwrap().clone();
-                        Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
-                            stat: stat(&text, generation.load(Ordering::SeqCst)),
-                            bytes: text,
-                            eof: true,
-                        })))
-                    }
-                    Request::RemoteFs(RemoteFsRequest::WriteAtomic { bytes, commit, .. }) => {
-                        assert!(commit, "test files fit one chunk");
-                        *text_bg.lock().unwrap() = bytes.clone();
-                        let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
-                        writes_bg.lock().unwrap().push(bytes.clone());
-                        Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(
-                            stat(&bytes, generation).stamp.unwrap(),
-                        )))
-                    }
-                    _ => continue,
-                };
-                stream.write_all(&reply.encode().unwrap()).ok();
+                }
             }
         });
         Self {
             sock_path,
             text,
+            connections,
             reads,
             writes,
+            fail_reads,
             stop,
             thread: Some(thread),
         }
@@ -1748,12 +1777,21 @@ impl FakeRemoteFs {
         krill_app::hosts::HostTarget::remote("studio", self.sock_path.clone())
     }
 
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn reads(&self) -> usize {
         self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn writes(&self) -> Vec<Vec<u8>> {
         self.writes.lock().unwrap().clone()
+    }
+
+    fn set_fail_reads(&self, fail: bool) {
+        self.fail_reads
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2097,5 +2135,320 @@ fn quick_open_stops_and_reports_remote_failure(cx: &mut TestAppContext) {
             s.notice.as_deref(),
             Some(krill_app::i18n::catalog::editor::QUICK_OPEN_FAILED.get())
         );
+    });
+}
+
+#[gpui::test]
+fn remote_media_placeholder_stages_multi_chunk_file_to_this_pc_and_reuses_stamp_cache(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostId;
+    use krill_proto::remote_fs::MAX_REMOTE_CHUNK;
+
+    let remote_bytes: Vec<u8> = (0..(MAX_REMOTE_CHUNK * 2 + 123_456))
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    let daemon = FakeRemoteFs::serve(&remote_bytes);
+    let host = HostId::Remote(format!("studio-stage-{}", std::process::id()));
+    let remote_path = PathBuf::from(format!(
+        "/remote/output/video-{}/joseon_hangae_deo_v11_clean.mp4",
+        std::process::id()
+    ));
+
+    let (view, cx) = open(cx, state_path("remote-media-stage-open"));
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(host.clone(), daemon.target());
+        s.open_file_on(host.clone(), remote_path.clone(), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+
+    let pane = layout_of(&view, cx).active_tab().focused;
+    view.read_with(cx, |s, _| {
+        assert!(matches!(
+            s.files.tabs.get(&pane).map(|t| &t.body),
+            Some(Body::Placeholder(Kind::Media, len)) if *len == u64::try_from(remote_bytes.len()).unwrap()
+        ));
+    });
+    let reads_after_preview_open = daemon.reads();
+    let conns_after_preview_open = daemon.connections();
+    assert_eq!(reads_after_preview_open, 1);
+
+    let open_btn = cx.debug_bounds("file-open-default").unwrap().center();
+    cx.simulate_click(open_btn, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        let done = view.read_with(cx, |s, _| s.files.opened_external.len() == 1);
+        if done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let staged_path = view.read_with(cx, |s, _| {
+        assert_eq!(s.files.opened_external.len(), 1);
+        let (path, reveal) = &s.files.opened_external[0];
+        assert!(!reveal);
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("joseon_hangae_deo_v11_clean.mp4")
+        );
+        path.clone()
+    });
+    assert_eq!(fs::read(&staged_path).unwrap(), remote_bytes);
+    assert_eq!(
+        daemon.connections() - conns_after_preview_open,
+        1,
+        "Stat + 3 ReadFile chunks must stream over one control connection"
+    );
+    let reads_after_first_stage = daemon.reads();
+    assert_eq!(reads_after_first_stage - reads_after_preview_open, 3);
+
+    // 두 번째 클릭(이 PC에서 열기)과 내려받아 Finder에서 보기는 .stamp 캐시를 재사용해 추가 ReadFile이 없다.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let open_btn = cx.debug_bounds("file-open-default").unwrap().center();
+    cx.simulate_click(open_btn, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.files.opened_external.len() == 2) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(daemon.reads(), reads_after_first_stage);
+
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let reveal_btn = cx.debug_bounds("file-reveal").unwrap().center();
+    cx.simulate_click(reveal_btn, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.files.opened_external.len() == 3) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(daemon.reads(), reads_after_first_stage);
+    view.read_with(cx, |s, _| {
+        assert_eq!(s.files.opened_external[2], (staged_path.clone(), true));
+    });
+    if let Some(parent) = staged_path.parent() {
+        fs::remove_dir_all(parent).ok();
+    }
+}
+
+#[gpui::test]
+fn remote_media_placeholder_cancel_and_error_banner_behave_cleanly(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostId;
+    use krill_proto::remote_fs::MAX_REMOTE_CHUNK;
+
+    let remote_bytes = vec![0x5au8; MAX_REMOTE_CHUNK * 3];
+    let daemon = FakeRemoteFs::serve(&remote_bytes);
+    let host = HostId::Remote(format!("studio-cancel-{}", std::process::id()));
+    let remote_path = PathBuf::from(format!(
+        "/remote/output/cancel-{}/clip.mp4",
+        std::process::id()
+    ));
+
+    let (view, cx) = open(cx, state_path("remote-media-stage-cancel"));
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(host.clone(), daemon.target());
+        s.open_file_on(host.clone(), remote_path.clone(), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+    view.update(cx, |s, _| {
+        s.files.next_io = Some(gate_rx);
+    });
+    let reads_before_cancel = daemon.reads();
+    let open_btn = cx.debug_bounds("file-open-default").unwrap().center();
+    cx.simulate_click(open_btn, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-stage-progress").is_some());
+    let cancel_btn = cx.debug_bounds("file-stage-cancel").unwrap().center();
+    cx.simulate_click(cancel_btn, gpui::Modifiers::default());
+    gate_tx.send(()).ok();
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-stage-cancel").is_none());
+    assert!(
+        cx.debug_bounds("file-error").is_none(),
+        "user cancellation must not raise an error banner"
+    );
+    assert_eq!(daemon.reads(), reads_before_cancel);
+    view.read_with(cx, |s, _| {
+        assert!(s.files.opened_external.is_empty());
+        assert!(s.files.tabs[&pane].error.is_none());
+    });
+
+    // 원격 디스크 읽기 오류가 나면 무음 무시 대신 파일 칸 오류 배너를 띄운다.
+    daemon.set_fail_reads(true);
+    let open_btn = cx.debug_bounds("file-open-default").unwrap().center();
+    cx.simulate_click(open_btn, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.files.tabs[&pane].error.is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-error").is_some());
+    view.read_with(cx, |s, _| {
+        assert!(s.files.opened_external.is_empty());
+    });
+}
+
+#[gpui::test]
+fn remote_tab_context_menu_reveal_guards_disconnected_host_and_stages_connected_host(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostId;
+
+    let dir = TempDir::new("remote-tab-menu-reveal");
+    let colliding_path = dir.0.join("secret.mp4");
+    fs::write(&colliding_path, b"local secret bytes").unwrap();
+
+    let remote_bytes = b"\0\0\0\x18ftypmp42remote video bytes";
+    let daemon = FakeRemoteFs::serve(remote_bytes);
+    let host = HostId::Remote(format!("studio-tabmenu-{}", std::process::id()));
+
+    let (view, cx) = open(cx, state_path("remote-tab-menu-reveal"));
+    view.update(cx, |s, cx| {
+        s.open_file_on(host.clone(), colliding_path.clone(), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // 1. 연결 끊긴 원격 파일 탭 우클릭 -> 내려받아 Finder에서 보기 클릭 시 로컬 파일을 건드리지 않고 안내를 띄운다.
+    let tab = cx.debug_bounds("session-tab-1").unwrap().center();
+    cx.simulate_mouse_down(tab, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let reveal_item = cx.debug_bounds("tab-menu-reveal-finder").unwrap().center();
+    cx.simulate_click(reveal_item, gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert_eq!(s.notice.as_deref(), Some(etext::REMOTE_DISCONNECTED.get()));
+        assert!(s.files.opened_external.is_empty());
+    });
+
+    // 2. 연결이 복구되면 원격 바이트를 스테이징한 로컬 캐시 경로로만 표시한다.
+    view.update(cx, |s, _| {
+        s.notice = None;
+        s.host_targets.insert(host.clone(), daemon.target());
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+
+    let tab = cx.debug_bounds("session-tab-1").unwrap().center();
+    cx.simulate_mouse_down(tab, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let reveal_item = cx.debug_bounds("tab-menu-reveal-finder").unwrap().center();
+    cx.simulate_click(reveal_item, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.files.opened_external.len() == 1) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let staged = view.read_with(cx, |s, _| {
+        let (path, reveal) = &s.files.opened_external[0];
+        assert!(*reveal);
+        assert_ne!(path, &colliding_path);
+        path.clone()
+    });
+    assert_eq!(fs::read(&staged).unwrap(), remote_bytes);
+    if let Some(parent) = staged.parent() {
+        fs::remove_dir_all(parent).ok();
+    }
+}
+
+#[gpui::test]
+fn remote_html_source_bar_and_background_tab_reveal_surface_progress_and_errors(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostId;
+
+    let html_bytes = b"<!doctype html><title>Demo</title><h1>Hello</h1>";
+    let daemon = FakeRemoteFs::serve(html_bytes);
+    let host = HostId::Remote(format!("studio-html-{}", std::process::id()));
+    let remote_path = PathBuf::from("/Users/macmini/site/index.html");
+
+    let (view, cx) = open(cx, state_path("remote-html-stage-bar"));
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(host.clone(), daemon.target());
+        s.open_file_on(host.clone(), remote_path.clone(), cx);
+    });
+    for _ in 0..50 {
+        cx.run_until_parked();
+        let ready = view.read_with(cx, |s, _| {
+            s.layout
+                .focused()
+                .and_then(|p| s.files.tabs.get(&p))
+                .is_some()
+        });
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // 1. HTML 원본 보기(Source)로 전환한 뒤 머리줄 [브라우저에서 열기]를 누르면 상단 진행률·취소 줄이 뜬다.
+    let edit_btn = cx.debug_bounds("file-html-edit").unwrap().center();
+    cx.simulate_click(edit_btn, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+    view.update(cx, |s, _| s.files.next_io = Some(gate_rx));
+    let browser_btn = cx.debug_bounds("file-open-browser").unwrap().center();
+    cx.simulate_click(browser_btn, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-stage-progress").is_some());
+    let cancel_btn = cx.debug_bounds("file-stage-cancel").unwrap().center();
+    cx.simulate_click(cancel_btn, gpui::Modifiers::default());
+    drop(gate_tx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // 2. 같은 원격 호스트에서 다른 탭을 열어 index.html(session-tab-1)을 배경에 둔 채 우클릭 실패 시 s.notice에 노출된다.
+    view.update(cx, |s, cx| {
+        s.open_file_on(
+            host.clone(),
+            PathBuf::from("/Users/macmini/site/second.html"),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    daemon.set_fail_reads(true);
+    let tab1 = cx.debug_bounds("session-tab-1").unwrap().center();
+    cx.simulate_mouse_down(tab1, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let reveal_item = cx.debug_bounds("tab-menu-reveal-finder").unwrap().center();
+    cx.simulate_click(reveal_item, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.notice.is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.notice.is_some(),
+            "background tab reveal failure must surface to Shell.notice"
+        );
+        assert!(s.files.opened_external.is_empty());
     });
 }

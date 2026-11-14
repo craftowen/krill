@@ -266,18 +266,18 @@ impl Shell {
                 .get()
                 .to_owned(),
         )];
-        for host in self.sidebar.read(cx).remote_hosts() {
-            if host.status == krill_app::hosts::HostStatus::Connected {
-                out.push((
-                    krill_app::hosts::HostId::Remote(host.id.clone()),
-                    host.label.clone(),
-                ));
-            }
+        let sidebar = self.sidebar.read(cx);
+        for host in sidebar.connected_remote_hosts() {
+            out.push((
+                krill_app::hosts::HostId::Remote(host.id.clone()),
+                host.label.clone(),
+            ));
         }
         for (spec, status) in &self.host_statuses {
             let id = krill_app::hosts::HostId::Remote(spec.id.clone());
             if *status == krill_app::hosts::HostStatus::Connected
                 && !out.iter().any(|(h, _)| h == &id)
+                && !sidebar.is_suppressed_remote_host(&id)
             {
                 out.push((id, spec.display_name().to_owned()));
             }

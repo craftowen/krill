@@ -62,9 +62,9 @@ krill artifacts rm <slug> [--json]
 
 ### 앱 UI
 
-- **사이드바 진입점**: 메인 창 왼쪽 사이드바의 '에이전트 대시보드' 바로 아래 '아티팩트' 항목을 누르면 아래 페이지가 열린다.
-- **설정 > 아티팩트**(메인 창 안 페이지): 공개 공유 허용 스위치, 사용 방법, 공유한 아티팩트 목록(이름·종류·만료, 링크 복사·브라우저에서 열기·두 번 눌러 삭제, 새로고침·더 보기). 목록·삭제는 `krill artifacts list|delete --json`을 하위 프로세스로 부른다.
-- **파일 머리 공유 버튼**: 열린 `.html`·`.htm`·`.md`·`.markdown` 파일 머리에 있다. 누르면 `krill artifacts share <file> --json`으로 링크를 만들거나 같은 링크의 내용을 갱신하고 링크를 클립보드에 복사한다. 저장 안 된 변경이 있으면 저장하라고 안내하고, 공개 공유가 꺼져 있으면 설정 > 아티팩트를 연다.
+- **사이드바 진입점**: 메인 창 왼쪽 사이드바의 '에이전트 대시보드' 바로 아래 '아티팩트' 항목을 누르면 메인 창 위 모달이 열린다. 모달은 앱 실행 중 캐시되어 재오픈 시 즉시 열리며(`<state_dir>/artifact-list-cache.json` 로컬 캐시로 초기 목록을 먼저 채운 뒤 백그라운드 갱신), 상세 화면과 목록 화면을 같은 폭 안에서 전체 화면 전환(`목록 ↔ 상세`)으로 오간다.
+- **아티팩트 목록·상세 모달**: 공개 공유 허용 스위치(상단 헤더), 새 링크 기본 기한(도구 모음 인라인 선택), 검색·새로고침·더 보기, 행별 링크 복사·브라우저 열기·두 번 눌러 삭제. 상세 화면에서는 뒤로 가기 브레드크럼, Markdown 인앱 렌더링 미리보기/원본 전환, 로컬 원본 경로가 남아 있으면 기본 앱으로 로컬 파일 열기, 개별 링크 기한 변경을 제공한다. 목록·상세 삭제·기한 변경은 `krill artifacts list|delete|retention --json`을 하위 프로세스로 부른다.
+- **파일 머리 공유 버튼**: 열린 `.html`·`.htm`·`.md`·`.markdown` 파일 머리에 있다. 누르면 `krill artifacts share <file> --json`으로 링크를 만들거나 같은 링크의 내용을 갱신하고 링크를 클립보드에 복사하며, 아티팩트 모달 캐시도 함께 동기화한다. 저장 안 된 변경이 있으면 저장하라고 안내하고, 공개 공유가 꺼져 있으면 설정 > 아티팩트를 연다.
 
 - 앱이 부르는 CLI는 `KRILL_STATE_DIR`만 넘기고 `KRILL_ARTIFACTS_AUTH_TOKEN`은 넘기지 않는다. 셸에서 토큰을 재정의했다면 앱 목록과 터미널 목록이 다를 수 있다.
 
@@ -75,9 +75,10 @@ krill artifacts rm <slug> [--json]
 - **자동 만료**: 마지막 발행·갱신 또는 기한 변경부터 **선택한 일수** 뒤 만료한다(기본 30일). 무기한 링크는 자동 만료·정리하지 않으며 명시적으로 삭제할 수 있다. 단순 열람은 기간을 늘리지 않는다. 만료 즉시 목록·뷰어·원문·갱신에서 제외하고, 매시간 정리 작업이 R2 본문과 D1 메타데이터를 함께 삭제한다. 한 실행은 최대 500건을 처리하며 남은 자료는 다음 실행에서 이어서 정리한다. 저장소 삭제 실패 시 메타데이터를 남겨 재시도한다. 로컬 원본 파일은 삭제하지 않는다.
 - **기본 서버 주소**: `https://share.krill.page` (`--api-url <url>` 플래그 또는 `KRILL_ARTIFACTS_API_URL` 환경변수로 재정의 가능; HTTPS origin만, 로컬 개발 시에만 `http://127.0.0.1`·`http://localhost` 허용. 경로·자격증명(`user@`)·쿼리는 거부).
 - **계정 연결**: 설정 > 모바일 또는 `krill mobile login`으로 Google 계정에 로그인하면 krilld가 `<state_dir>/mobile-relay-session.json`에 기기 세션을 저장한다. CLI는 이 세션을 `x-krill-session` 헤더로 공식 서버(`https://share.krill.page`)에만 보낸다(`--api-url`·환경변수로 바꾼 서버에는 보내지 않는다). 서버는 새 아티팩트를 계정에 묶고, 이 기기 토큰을 계정에 연결해 로그인 전 이 기기에서 올린 아티팩트도 같은 계정의 다른 기기 목록에 보여 준다. 아티팩트 행의 소유자는 바꾸지 않으므로 로그인을 모르는 구버전 앱도 자기 기기에서 올린 것을 계속 본다. 로그아웃하면 다시 이 기기 것만 보인다.
-- **로컬 인증 (0600 권한)**:
+- **로컬 인증·캐시 (0600 권한)**:
   - `<state_dir>/artifact-token`: 최초 실행 시 256-bit 무작위 소유자 토큰을 자동 생성해 보관한다(`KRILL_ARTIFACTS_AUTH_TOKEN`으로 재정의 가능).
   - `<state_dir>/artifact-shares.json`: 정규화된 로컬 파일 경로(`canonical_path`) ↔ `{ slug, edit_token, share_url, api_origin, expires_at }` 매핑을 저장한다.
+  - `<state_dir>/artifact-list-cache.json`: 첫 페이지 목록 응답을 캐시해 모달 초기 표시를 가속한다(`list`/`share`/`retention`/`unshare`/`delete` 시 갱신).
   - 외부 프로세스 실행 시 토큰이나 본문이 프로세스 인자(`ps`)에 노출되지 않도록 임시 `0600` 헤더 파일과 `stdin`으로 `curl`을 구동한다.
 
 ---
@@ -151,6 +152,8 @@ Orca 아티팩트 클라이언트 규약과 호환된다.
 (cd cloud/share && npx wrangler d1 execute krill-artifacts --remote --file=migrations/0002_configurable_retention.sql)
 # 계정 연결 표(owner_links). 이미 있으면 아무것도 바꾸지 않는다. krill-rendezvous가 먼저 배포돼 있어야 한다.
 (cd cloud/share && npx wrangler d1 execute krill-artifacts --remote --file=migrations/0003_account_owner_links.sql)
+# 소유자별 생성일 역순 조회 인덱스. 이미 있으면 아무것도 바꾸지 않는다.
+(cd cloud/share && npx wrangler d1 execute krill-artifacts --remote --file=migrations/0004_owner_created_index.sql)
 (cd cloud/share && npx wrangler deploy)
 
 # 3. 아티팩트 서버 라이브 E2E 검증

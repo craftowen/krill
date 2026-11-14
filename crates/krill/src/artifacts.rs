@@ -37,6 +37,8 @@ const MAX_BYTES: u64 = schema::MAX_CONTENT_BYTES;
 const TOKEN_FILE: &str = "artifact-token";
 const SHARES_FILE: &str = "artifact-shares.json";
 const PENDING_FILE: &str = "artifact-pending.json";
+const LIST_CACHE_FILE: &str = "artifact-list-cache.json";
+const LIST_CACHE_LIMIT: usize = 50;
 /// krilld가 Google 로그인 뒤 저장하는 기기 세션(`crates/krilld/src/mobile/relay_auth.rs`).
 const ACCOUNT_SESSION_FILE: &str = "mobile-relay-session.json";
 const ACCOUNT_ORIGIN: &str = "https://krill-mobile.pages.dev";
@@ -54,6 +56,16 @@ struct Record {
 }
 
 type Shares = BTreeMap<String, Record>;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListCache {
+    api_origin: String,
+    #[serde(default)]
+    artifacts: Vec<Value>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
 
 struct Ctx {
     state_dir: PathBuf,
@@ -211,6 +223,9 @@ fn execute(ctx: &Ctx, raw: &[OsString]) -> Result<String, Error> {
             "--expires-in is only valid for share, update, or retention".into(),
         ));
     }
+    if matches!(cmd.as_str(), "list" | "ls") && opts.positional.is_empty() {
+        return list(ctx, &api, &opts);
+    }
     // Hold the lock through the HTTP operation and the following read/modify/write.
     // A per-write lock would still lose another process's newly received edit token.
     let _lock = artifact_lock(&ctx.state_dir, "artifact-shares.lock")?;
@@ -220,7 +235,6 @@ fn execute(ctx: &Ctx, raw: &[OsString]) -> Result<String, Error> {
         "update" => share(ctx, &api, &one("file")?, &opts, true),
         "unshare" => unshare(ctx, &api, &one("file")?, &opts),
         "status" => status(ctx, &api, &one("file")?, &opts),
-        "list" | "ls" if opts.positional.is_empty() => list(ctx, &api, &opts),
         "delete" | "rm" => delete(ctx, &api, &one("slug")?, &opts),
         _ => Err(Error::Usage(USAGE.into())),
     }
@@ -329,6 +343,7 @@ fn share(
             };
             shares.insert(key, rec.clone());
             save_shares(&ctx.state_dir, &shares)?;
+            upsert_list_cache_item(&ctx.state_dir, api, &v);
             returned_retention(&v, requested_retention)?;
             return Ok(share_output(&rec, "updated", opts.json));
         }
@@ -400,6 +415,7 @@ fn share(
             .as_u64()
             .and_then(|days| u16::try_from(days).ok()),
     )?;
+    upsert_list_cache_item(&ctx.state_dir, api, &v);
     Ok(share_output(&rec, "created", opts.json))
 }
 
@@ -421,6 +437,7 @@ fn unshare(ctx: &Ctx, api: &str, file: &str, opts: &Opts) -> Result<String, Erro
     }
     shares.remove(&key);
     save_shares(&ctx.state_dir, &shares)?;
+    remove_list_cache_item(&ctx.state_dir, api, &rec.slug);
     Ok(deleted_output(&rec.slug, opts.json))
 }
 
@@ -469,6 +486,7 @@ fn retention(ctx: &Ctx, api: &str, slug: &str, opts: &Opts) -> Result<String, Er
         rec.retention_days = Some(days);
     }
     save_shares(&ctx.state_dir, &shares)?;
+    upsert_list_cache_item(&ctx.state_dir, api, &result);
     if opts.json {
         Ok(result.to_string())
     } else {
@@ -508,6 +526,9 @@ fn list(ctx: &Ctx, api: &str, opts: &Opts) -> Result<String, Error> {
     }
     let (status, resp) = request(ctx, "GET", &url, &token, None, None)?;
     let v = expect_ok(status, &resp)?;
+    if opts.cursor.is_none() {
+        update_list_cache_on_list(&ctx.state_dir, api, &v);
+    }
     if opts.json {
         return Ok(v.to_string());
     }
@@ -565,6 +586,7 @@ fn delete(ctx: &Ctx, api: &str, slug: &str, opts: &Opts) -> Result<String, Error
     if shares.len() != before {
         save_shares(&ctx.state_dir, &shares)?;
     }
+    remove_list_cache_item(&ctx.state_dir, api, slug);
     Ok(deleted_output(slug, opts.json))
 }
 
@@ -760,6 +782,80 @@ fn artifact_lock(dir: &Path, name: &str) -> io::Result<fs::File> {
 // Caller holds artifact-shares.lock across the entire transaction.
 fn save_shares(dir: &Path, shares: &Shares) -> Result<(), Error> {
     save_json(dir, SHARES_FILE, shares)
+}
+
+fn cache_item_from_response(value: &Value) -> Option<Value> {
+    let artifact = value.get("artifact")?.clone();
+    artifact.get("slug")?.as_str()?;
+    Some(json!({
+        "artifact": artifact,
+        "shareUrl": value.get("shareUrl").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+fn mutate_list_cache(dir: &Path, api: &str, edit: impl FnOnce(&mut ListCache)) {
+    let Ok(_lock) = artifact_lock(dir, "artifact-list-cache.lock") else {
+        return;
+    };
+    let mut cache = match fs::read(dir.join(LIST_CACHE_FILE)) {
+        Ok(bytes) => serde_json::from_slice::<ListCache>(&bytes)
+            .ok()
+            .filter(|existing| existing.api_origin == api)
+            .unwrap_or_else(|| ListCache {
+                api_origin: api.to_owned(),
+                ..ListCache::default()
+            }),
+        Err(_) => ListCache {
+            api_origin: api.to_owned(),
+            ..ListCache::default()
+        },
+    };
+    edit(&mut cache);
+    cache.artifacts.truncate(LIST_CACHE_LIMIT);
+    save_json(dir, LIST_CACHE_FILE, &cache).ok();
+}
+
+fn update_list_cache_on_list(dir: &Path, api: &str, response: &Value) {
+    let items: Vec<Value> = response["artifacts"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(cache_item_from_response).collect())
+        .unwrap_or_default();
+    let next_cursor = response["nextCursor"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    mutate_list_cache(dir, api, |cache| {
+        cache.artifacts = items;
+        cache.next_cursor = next_cursor;
+    });
+}
+
+fn upsert_list_cache_item(dir: &Path, api: &str, response: &Value) {
+    let Some(entry) = cache_item_from_response(response) else {
+        return;
+    };
+    let Some(slug) = entry["artifact"]["slug"].as_str().map(str::to_owned) else {
+        return;
+    };
+    mutate_list_cache(dir, api, |cache| {
+        if let Some(existing) = cache
+            .artifacts
+            .iter_mut()
+            .find(|it| it["artifact"]["slug"].as_str() == Some(slug.as_str()))
+        {
+            *existing = entry;
+        } else {
+            cache.artifacts.insert(0, entry);
+        }
+    });
+}
+
+fn remove_list_cache_item(dir: &Path, api: &str, slug: &str) {
+    mutate_list_cache(dir, api, |cache| {
+        cache
+            .artifacts
+            .retain(|it| it["artifact"]["slug"].as_str() != Some(slug));
+    });
 }
 
 fn save_json(dir: &Path, name: &str, value: &impl Serialize) -> Result<(), Error> {
@@ -1517,6 +1613,37 @@ printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-01"},"shareUrl":"http://lo
         assert_eq!(account_session(dir, official), None);
         write("http://127.0.0.1:9", u64::MAX);
         assert_eq!(account_session(dir, official), None);
+    }
+
+    #[test]
+    fn list_and_mutations_maintain_local_list_cache_with_0600_mode() {
+        let env = Env::new("list-cache");
+        let file = env.file("cached.md", "# cached");
+        env.run(&["share", &file]).unwrap();
+        let cache_path = env.ctx.state_dir.join(LIST_CACHE_FILE);
+        assert_eq!(mode(&cache_path), 0o600);
+        let after_share: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(after_share["apiOrigin"], "http://localhost");
+        assert_eq!(after_share["artifacts"][0]["artifact"]["slug"], "s1");
+        assert!(after_share["artifacts"][0].get("editToken").is_none());
+
+        env.run(&["list", "--json"]).unwrap();
+        let after_list: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(after_list["artifacts"][0]["artifact"]["title"], "T");
+        assert_eq!(after_list["nextCursor"], "c2");
+
+        env.run(&["retention", "s1", "--expires-in", "never"])
+            .unwrap();
+        let after_retention: Value =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(
+            after_retention["artifacts"][0]["artifact"]["retentionDays"],
+            0
+        );
+
+        env.run(&["delete", "s1"]).unwrap();
+        let after_delete: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(after_delete["artifacts"].as_array().unwrap().len(), 0);
     }
 }
 

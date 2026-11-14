@@ -20,6 +20,9 @@ impl Shell {
             // Back/Escape can invoke this host while SettingsView itself is
             // borrowed by its handler; stop hidden polling after that borrow ends.
             cx.defer(move |cx| settings.update(cx, |view, cx| view.set_visible(false, cx)));
+        } else if let Some(Modal::Artifacts(view)) = &previous {
+            let view = view.clone();
+            cx.defer(move |cx| view.update(cx, krill_app::artifacts::View::on_hide));
         }
         previous.is_some()
     }
@@ -63,21 +66,28 @@ impl Shell {
             live.pane.clear_search();
         }
         if !matches!(self.modal, Some(Modal::Artifacts(_))) {
-            #[cfg(not(test))]
-            let state = self.state_dir(cx);
-            #[cfg(not(test))]
-            let view = cx.new(|cx| krill_app::artifacts::View::new(state, cx));
-            #[cfg(test)]
-            let view = cx.new(|cx| {
-                krill_app::artifacts::View::with_call(
-                    Arc::new(|_| Ok(krill_app::artifacts::Page::default())),
-                    cx,
-                )
-            });
-            cx.subscribe(&view, |this, _, _: &krill_app::artifacts::Close, cx| {
-                this.close_settings(None, cx);
-            })
-            .detach();
+            let view = if let Some(cached) = self.artifacts_cache.clone() {
+                cached.update(cx, krill_app::artifacts::View::reopen);
+                cached
+            } else {
+                #[cfg(not(test))]
+                let state = self.state_dir(cx);
+                #[cfg(not(test))]
+                let created = cx.new(|cx| krill_app::artifacts::View::new(state, cx));
+                #[cfg(test)]
+                let created = cx.new(|cx| {
+                    krill_app::artifacts::View::with_call(
+                        Arc::new(|_| Ok(krill_app::artifacts::Page::default())),
+                        cx,
+                    )
+                });
+                cx.subscribe(&created, |this, _, _: &krill_app::artifacts::Close, cx| {
+                    this.close_settings(None, cx);
+                })
+                .detach();
+                self.artifacts_cache = Some(created.clone());
+                created
+            };
             self.replace_modal(Some(Modal::Artifacts(view)), cx);
         }
         self.nav_history.push(NavEntry::Artifacts);

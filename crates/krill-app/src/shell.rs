@@ -784,6 +784,7 @@ pub struct Shell {
     /// 상태바 포트 감지 메모(AS-24): 세션별 마지막 화면 텍스트와 감지 결과.
     /// 렌더마다 모든 칸의 화면 텍스트에 정규식을 돌리지 않고 텍스트가 바뀔 때만 다시 감지한다.
     ports_cache: std::cell::RefCell<HashMap<(krill_app::hosts::HostId, u64), popout::PortCache>>,
+    artifacts_cache: Option<gpui::Entity<krill_app::artifacts::View>>,
     modal: Option<Modal>,
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
     pub(super) role: WindowRole,
@@ -1368,6 +1369,7 @@ impl Shell {
             last_synced_selection: None,
             workspace_closing: std::collections::HashSet::new(),
             ports_cache: std::cell::RefCell::default(),
+            artifacts_cache: None,
             modal: None,
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,
@@ -1552,7 +1554,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok((dir, screens, mut previous, old_ports)) = this.read_with(cx, |this, cx| {
-                    let mut cache = this.ports_cache.borrow_mut();
+                    let cache = this.ports_cache.borrow();
                     let mut previous = HashMap::new();
                     let screens = this
                         .live
@@ -1560,11 +1562,12 @@ impl Shell {
                         .filter_map(|(pane, live)| {
                             let id = (this.layout.host(*pane).clone(), live.pane.session()?.0);
                             let screen = live.pane.shown();
-                            if cache.get(&id).is_some_and(|entry| entry.matches(&screen)) {
-                                return None;
-                            }
-                            if let Some(old) = cache.remove(&id) {
-                                previous.insert(id.clone(), old.into_data());
+                            // 직전 결과는 새 결과가 올 때까지 캐시에 남겨 계속 표시한다.
+                            if let Some(old) = cache.get(&id) {
+                                if old.matches(&screen) {
+                                    return None;
+                                }
+                                previous.insert(id.clone(), old.data());
                             }
                             Some((id, screen))
                         })
@@ -1633,7 +1636,6 @@ impl Shell {
                                 .any(|(pane, live)| {
                                     this.layout.host(*pane) == &id.0
                                         && live.pane.session().is_some_and(|sid| sid.0 == id.1)
-                                        && Rc::ptr_eq(screen, &live.pane.shown())
                                 })
                                 .then(|| {
                                     changed |=
@@ -2929,8 +2931,10 @@ impl Shell {
                 (host, label, target)
             })
             .collect();
+        let sidebar = self.sidebar.read(cx);
         for (host, target) in &self.host_targets {
-            if !hosts.iter().any(|(h, _, _)| h == host) {
+            if !hosts.iter().any(|(h, _, _)| h == host) && !sidebar.is_suppressed_remote_host(host)
+            {
                 hosts.push((
                     host.clone(),
                     host.remote_id().unwrap_or_else(|| host.as_key()).to_owned(),
@@ -6105,7 +6109,7 @@ impl Shell {
         if let Some(old) = self.layout.focused() {
             self.commit_ime(old, None, cx);
         }
-        let target = self.tab_pane_for_session_on(&host, session);
+        let target = self.tab_pane_for_machine_session(&host, session, cx);
         self.change(true, cx, |l| {
             if let Some((tab, pane)) = target {
                 l.activate(tab);
@@ -6160,6 +6164,29 @@ impl Shell {
         None
     }
 
+    fn tab_pane_for_machine_session(
+        &self,
+        host: &krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &App,
+    ) -> Option<(usize, PaneId)> {
+        if let Some(found) = self.tab_pane_for_session_on(host, session) {
+            return Some(found);
+        }
+        let sidebar = self.sidebar.read(cx);
+        for i in 0..self.layout.tabs().len() {
+            let mut layout = self.layout.clone();
+            layout.activate(i);
+            if let Some(pane) = layout.visible().into_iter().find(|&p| {
+                layout.session(p) == Some(session)
+                    && sidebar.same_machine_host(layout.host(p), host)
+            }) {
+                return Some((i, pane));
+            }
+        }
+        None
+    }
+
     /// OWE-854: 사이드바 세션 행의 '새 세션에 이어하기…'. 칸에 없으면 먼저 붙이고 모달을 연다.
     fn continue_sidebar_session(
         &mut self,
@@ -6167,10 +6194,10 @@ impl Shell {
         session: krill_proto::SessionId,
         cx: &mut Context<Self>,
     ) {
-        let mut target = self.tab_pane_for_session_on(host, session);
+        let mut target = self.tab_pane_for_machine_session(host, session, cx);
         if target.is_none() {
             self.open_session_on(host.clone(), session, cx);
-            target = self.tab_pane_for_session_on(host, session);
+            target = self.tab_pane_for_machine_session(host, session, cx);
         }
         let Some((_, pane)) = target else {
             return;

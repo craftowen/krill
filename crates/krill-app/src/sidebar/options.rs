@@ -1440,7 +1440,20 @@ impl Sidebar {
     }
 
     pub fn toggle_host_filter(&mut self, host: &HostId, cx: &mut Context<Self>) {
-        self.options.filters.toggle_host(host);
+        if !self.options.filters.hosts.is_empty() && self.host_filter_matches(host) {
+            let identity = self.machine_identities.get(host).copied();
+            self.options.filters.hosts.retain(|key| {
+                key != host.as_key()
+                    && identity.is_none_or(|target| {
+                        !self
+                            .machine_identities
+                            .iter()
+                            .any(|(other, id)| id == &target && other.as_key() == key)
+                    })
+            });
+        } else {
+            self.options.filters.toggle_host(host);
+        }
         self.persist(cx);
     }
 
@@ -1693,17 +1706,27 @@ fn host_status_label(status: HostStatus) -> &'static str {
     }
 }
 
+#[cfg(all(test, unix))]
 #[must_use]
 pub(super) fn host_visibility_summary(
     filters: &WorkspaceFilters,
     hosts: &[(HostId, String)],
+) -> String {
+    host_visibility_summary_with(filters, hosts, |id| filters.hosts.contains(id.as_key()))
+}
+
+#[must_use]
+fn host_visibility_summary_with(
+    filters: &WorkspaceFilters,
+    hosts: &[(HostId, String)],
+    mut is_selected: impl FnMut(&HostId) -> bool,
 ) -> String {
     if filters.hosts.is_empty() || hosts.is_empty() {
         return text::ALL_HOSTS.get().to_owned();
     }
     let selected: Vec<&str> = hosts
         .iter()
-        .filter(|(id, _)| filters.hosts.contains(id.as_key()))
+        .filter(|(id, _)| is_selected(id))
         .map(|(_, label)| label.as_str())
         .collect();
     if selected.is_empty() || selected.len() == hosts.len() {
@@ -1874,13 +1897,13 @@ fn add_options_submenu(
                         ))
                         .chain(
                             sidebar
-                                .remote_hosts
-                                .iter()
-                                .filter(|h| h.status == HostStatus::Connected)
+                                .connected_remote_hosts()
                                 .map(|h| (HostId::Remote(h.id.clone()), h.label.clone())),
                         )
                         .collect::<Vec<_>>();
-                        host_visibility_summary(&sidebar.options.filters, &hosts)
+                        host_visibility_summary_with(&sidebar.options.filters, &hosts, |id| {
+                            sidebar.host_filter_matches(id)
+                        })
                     }
                     OptionsSubmenu::Projects => project_visibility_summary(
                         &sidebar.options.filters,
@@ -1944,18 +1967,13 @@ fn render_options_submenu(
                     .to_owned(),
                 status_label: host_status_label(s.local_status),
             })
-            .chain(
-                s.remote_hosts
-                    .iter()
-                    .filter(|h| h.status == HostStatus::Connected)
-                    .map(|h| HostMenuEntry {
-                        id: HostId::Remote(h.id.clone()),
-                        label: h.label.clone(),
-                        status_label: host_status_label(h.status),
-                    }),
-            )
+            .chain(s.connected_remote_hosts().map(|h| HostMenuEntry {
+                id: HostId::Remote(h.id.clone()),
+                label: h.label.clone(),
+                status_label: host_status_label(h.status),
+            }))
             .collect::<Vec<_>>();
-            render_hosts_panel(sidebar, menu, &s.options.filters, &hosts, p)
+            render_hosts_panel(sidebar, menu, s, &hosts, p)
         }
         OptionsSubmenu::Projects => {
             let repos = s.filterable_project_repos();
@@ -1974,11 +1992,11 @@ fn render_options_submenu(
 fn render_hosts_panel(
     sidebar_weak: &gpui::WeakEntity<Sidebar>,
     menu_weak: &gpui::WeakEntity<PopupMenu>,
-    filters: &WorkspaceFilters,
+    s: &Sidebar,
     hosts: &[HostMenuEntry],
     p: &'static ui::Palette,
 ) -> gpui::Stateful<gpui::Div> {
-    let all_checked = filters.hosts.is_empty();
+    let all_checked = s.options.filters.hosts.is_empty();
     let clear_sidebar = sidebar_weak.clone();
     let clear_menu = menu_weak.clone();
     let mut panel = submenu_panel_frame("sidebar-hosts-panel", p)
@@ -2022,7 +2040,7 @@ fn render_hosts_panel(
         .child(menu_separator(p));
 
     for host in hosts {
-        let checked = !filters.hosts.is_empty() && filters.hosts.contains(host.id.as_key());
+        let checked = !s.options.filters.hosts.is_empty() && s.host_filter_matches(&host.id);
         let row_id = format!("sidebar-host-item-{}", host.id.as_key());
         let debug_id = row_id.clone();
         let target_host = host.id.clone();

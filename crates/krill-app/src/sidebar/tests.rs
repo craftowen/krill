@@ -7397,3 +7397,158 @@ fn hidden_sidebar_reads_one_snapshot_for_tab_labels(cx: &mut TestAppContext) {
     assert_eq!(source.0.load(Ordering::SeqCst), 1);
     assert!(cx.update(|_, cx| view.read(cx).session(SessionId(1)).is_some()));
 }
+
+/// 같은 머신(`MachineIdentity`)으로 동시에 연결된 SSH + 초대(iroh) 경로와 로컬 루프백 경로는
+/// 사이드바·대시보드·Jump에서 한 번만 표시하고, 주 경로가 끊기면 보조 경로로 즉시 이어받는다.
+#[gpui::test]
+fn duplicate_verified_machine_routes_render_once_and_fail_over(cx: &mut TestAppContext) {
+    struct Identified {
+        identity: Option<krill_proto::ipc::MachineIdentity>,
+        snapshot: Arc<Snapshot>,
+    }
+    impl Source for Identified {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok((*self.snapshot).clone())
+        }
+        fn fetch_identified(&self) -> io::Result<IdentifiedSnapshot> {
+            Ok(IdentifiedSnapshot {
+                snapshot: self.snapshot.clone(),
+                daemon_identity: None,
+                machine_identity: self.identity,
+            })
+        }
+        fn poll_snapshot(&self) -> PollSnapshot {
+            let observed = IdentifiedSnapshot {
+                snapshot: self.snapshot.clone(),
+                daemon_identity: None,
+                machine_identity: self.identity,
+            };
+            Box::pin(async move {
+                Ok(PolledSnapshot {
+                    observed,
+                    meta: Meta::new(),
+                })
+            })
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let local_id = krill_proto::ipc::MachineIdentity([1; 16]);
+    let office_id = krill_proto::ipc::MachineIdentity([7; 16]);
+    let local_snap = Arc::new(Snapshot {
+        sessions: vec![session(
+            1,
+            AgentState::Working,
+            Some("/local/sd-tax-system"),
+        )],
+        trees: BTreeMap::from([(
+            PathBuf::from("/local/sd-tax-system"),
+            vec![PathBuf::from("/local/sd-tax-system")],
+        )]),
+    });
+    let office_snap = Arc::new(Snapshot {
+        sessions: vec![
+            session(10, AgentState::Done, Some("/remote/sd-tax-system")),
+            session(11, AgentState::Done, Some("/remote/sd-tax-system")),
+            session(12, AgentState::Done, Some("/remote/sd-tax-system")),
+        ],
+        trees: BTreeMap::from([(
+            PathBuf::from("/remote/sd-tax-system"),
+            vec![PathBuf::from("/remote/sd-tax-system")],
+        )]),
+    });
+
+    view.update(vcx, |s, cx| {
+        s.connect_source(
+            Arc::new(Identified {
+                identity: Some(local_id),
+                snapshot: local_snap.clone(),
+            }),
+            cx,
+        );
+        s.set_remote_host_source(
+            "ssh-tp-pc",
+            "이상덕세무사사무소",
+            HostStatus::Connected,
+            Arc::new(Identified {
+                identity: Some(office_id),
+                snapshot: office_snap.clone(),
+            }),
+            cx,
+        );
+        s.set_remote_host_source(
+            "iroh:krill-mac",
+            "이상덕세무사사무소",
+            HostStatus::Connected,
+            Arc::new(Identified {
+                identity: Some(office_id),
+                snapshot: office_snap.clone(),
+            }),
+            cx,
+        );
+        s.set_remote_host_source(
+            "ssh-loopback",
+            "내 Mac 루프백",
+            HostStatus::Connected,
+            Arc::new(Identified {
+                identity: Some(local_id),
+                snapshot: local_snap.clone(),
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |s, _| {
+        // 설정 > 머신 페이지용 관측 맵에는 모든 경로가 유지된다.
+        assert_eq!(s.machine_identities().len(), 4);
+        let remote_worktrees: Vec<_> = s
+            .rows
+            .iter()
+            .enumerate()
+            .filter(
+                |(_, r)| matches!(r, Row::Worktree(p) if p == Path::new("/remote/sd-tax-system")),
+            )
+            .map(|(i, _)| s.row_host(i).clone())
+            .collect();
+        assert_eq!(remote_worktrees, vec![HostId::Remote("ssh-tp-pc".into())]);
+        let local_worktrees = s
+            .rows
+            .iter()
+            .filter(|r| matches!(r, Row::Worktree(p) if p == Path::new("/local/sd-tax-system")))
+            .count();
+        assert_eq!(local_worktrees, 1);
+        assert_eq!(s.dashboard_sessions().len(), 4);
+        assert_eq!(s.jump_items().len(), 4);
+    });
+
+    // SSH 경로가 끊기면 같은 머신의 iroh 경로가 즉시 대표 경로가 되고 선택 워크트리도 유지된다.
+    view.update(vcx, |s, cx| {
+        s.select_worktree(Some(PathBuf::from("/remote/sd-tax-system")), cx);
+        s.set_remote_host_status("ssh-tp-pc", HostStatus::Disconnected, cx);
+    });
+    view.read_with(vcx, |s, _| {
+        let remote_worktrees: Vec<_> = s
+            .rows
+            .iter()
+            .enumerate()
+            .filter(
+                |(_, r)| matches!(r, Row::Worktree(p) if p == Path::new("/remote/sd-tax-system")),
+            )
+            .map(|(i, _)| s.row_host(i).clone())
+            .collect();
+        assert_eq!(
+            remote_worktrees,
+            vec![HostId::Remote("iroh:krill-mac".into())]
+        );
+        assert_eq!(
+            s.selected_workspace(),
+            Some((
+                HostId::Remote("iroh:krill-mac".into()),
+                PathBuf::from("/remote/sd-tax-system"),
+            ))
+        );
+        assert_eq!(s.dashboard_sessions().len(), 4);
+    });
+}

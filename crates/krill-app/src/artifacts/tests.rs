@@ -537,3 +537,143 @@ fn artifacts_dynamic_labels_reserve_width_and_icon_buttons_expose_tooltips(
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[gpui::test]
+fn selecting_row_switches_to_full_width_detail_without_side_panel_compression(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (_, vcx) =
+        cx.add_window_view(|_, cx| View::with_call(Arc::new(|_| Ok(page("one", None))), cx));
+    vcx.simulate_resize(gpui::size(px(960.), px(640.)));
+    vcx.run_until_parked();
+
+    let page_bounds = vcx.debug_bounds("artifacts-page").unwrap();
+    let list_bounds = vcx.debug_bounds("artifact-list").unwrap();
+    assert!(vcx.debug_bounds("artifact-detail-drawer").is_none());
+
+    let row = vcx.debug_bounds("artifact-row-0").unwrap();
+    vcx.simulate_click(row.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    let drawer_bounds = vcx.debug_bounds("artifact-detail-drawer").unwrap();
+    assert_eq!(drawer_bounds.size.width, page_bounds.size.width);
+    assert!(vcx.debug_bounds("artifact-list").is_none());
+
+    let back_btn = vcx.debug_bounds("artifact-detail-close").unwrap();
+    vcx.simulate_click(back_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    assert!(vcx.debug_bounds("artifact-detail-drawer").is_none());
+    let restored_list = vcx.debug_bounds("artifact-list").unwrap();
+    assert_eq!(restored_list.size.width, list_bounds.size.width);
+}
+
+#[gpui::test]
+fn flat_cli_shares_file_and_markdown_preview_render_in_modal(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("krill-artifact-flat-md-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    krill_proto::artifacts::enable_sharing(&dir).unwrap();
+    let doc = dir.join("spec.md");
+    std::fs::write(&doc, "# Heading\n\n- bullet item\n").unwrap();
+    std::fs::write(
+        dir.join("artifact-shares.json"),
+        serde_json::json!({
+            doc.to_string_lossy(): {
+                "slug": "spec",
+                "edit_token": "e1",
+                "share_url": "https://share.krill.page/a/spec",
+                "api_origin": "https://share.krill.page"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let call: Call = Arc::new(|_| {
+        Ok(serde_json::from_value(serde_json::json!({
+            "artifacts": [{
+                "artifact": {
+                    "slug": "spec",
+                    "originalFileName": "spec.md",
+                    "sourceContentType": "text/markdown"
+                },
+                "shareUrl": "https://share.krill.page/a/spec"
+            }],
+            "nextCursor": null
+        }))
+        .unwrap())
+    });
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        View::with_calls(call, Arc::new(|_| Ok(())), Some(dir.clone()), cx)
+    });
+    vcx.simulate_resize(gpui::size(px(960.), px(640.)));
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| v.select_slug(Some("spec".into()), cx));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("artifact-local-source").is_some());
+    assert!(vcx.debug_bounds("artifact-detail-open-local").is_some());
+
+    let source_tab = vcx.debug_bounds("artifact-tab-source").unwrap();
+    vcx.simulate_click(source_tab.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.detail.as_ref().map(|d| d.tab),
+            Some(detail::DetailTab::Source)
+        );
+    });
+
+    let preview_tab = vcx.debug_bounds("artifact-tab-preview").unwrap();
+    vcx.simulate_click(preview_tab.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.detail.as_ref().map(|d| d.tab),
+            Some(detail::DetailTab::Preview)
+        );
+    });
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[gpui::test]
+fn disk_list_cache_seeds_items_before_network_completes(cx: &mut TestAppContext) {
+    let dir =
+        std::env::temp_dir().join(format!("krill-artifact-seed-cache-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    krill_proto::artifacts::enable_sharing(&dir).unwrap();
+    std::fs::write(
+        dir.join("artifact-list-cache.json"),
+        serde_json::json!({
+            "apiOrigin": "https://share.krill.page",
+            "artifacts": [{
+                "artifact": { "slug": "cached-1", "title": "Cached Item" },
+                "shareUrl": "https://share.krill.page/a/cached-1"
+            }],
+            "nextCursor": "c2"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let view = cx.new(|cx| {
+        View::with_calls(
+            Arc::new(|_| Err("network pending".into())),
+            Arc::new(|_| Ok(())),
+            Some(dir.clone()),
+            cx,
+        )
+    });
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.items.len(), 1);
+        assert_eq!(v.items[0].artifact.slug, "cached-1");
+        assert_eq!(v.rows[0].title, "Cached Item");
+        assert_eq!(v.next.as_deref(), Some("c2"));
+    });
+
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -225,3 +225,62 @@ fn agent_desktop_alias_installs_computer_use_and_cleans_stale_references() {
     assert!(!stale_refs.exists());
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn krig_bundle_uses_syntax_valid_markers_and_skips_developer_symlinks() {
+    let home = home("krig-bundle");
+    let first = sync_builtin_skills_at(&home);
+    assert!(first.failures.is_empty(), "{:?}", first.failures);
+
+    let krig_dir = home.join(".claude/skills/krig");
+    let skill_md = fs::read_to_string(krig_dir.join("SKILL.md")).unwrap();
+    assert!(skill_md.ends_with(&format!("{MARKER}\n")));
+
+    let openai_yaml = fs::read_to_string(krig_dir.join("agents/openai.yaml")).unwrap();
+    assert!(openai_yaml.ends_with(&format!("{YAML_MARKER}\n")));
+    assert!(!openai_yaml.contains(MARKER));
+
+    let route_mjs = fs::read_to_string(krig_dir.join("scripts/route.mjs")).unwrap();
+    assert!(route_mjs.ends_with(&format!("{JS_MARKER}\n")));
+    assert!(!route_mjs.contains(MARKER));
+    assert!(krig_dir.join("playbooks/drive.md").is_file());
+    assert!(krig_dir.join("references/standards-baseline.md").is_file());
+
+    if let Some(node) = crate::agent::which("node", &std::env::var_os("PATH").unwrap_or_default()) {
+        for script in [
+            "scripts/route.mjs",
+            "scripts/scan.mjs",
+            "scripts/ship-check.mjs",
+        ] {
+            let status = std::process::Command::new(&node)
+                .arg("--check")
+                .arg(krig_dir.join(script))
+                .status()
+                .unwrap();
+            assert!(status.success(), "{script} failed node --check");
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let codex_skills = home.join(".codex/skills");
+        let codex_krig = codex_skills.join("krig");
+        let external = home.join("external-krig");
+        fs::create_dir_all(&external).unwrap();
+        fs::remove_dir_all(&codex_krig).unwrap();
+        std::os::unix::fs::symlink(&external, &codex_krig).unwrap();
+
+        let second = sync_builtin_skills_at(&home);
+        assert!(second.failures.is_empty(), "{:?}", second.failures);
+        assert!(
+            fs::symlink_metadata(&codex_krig)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!codex_skills.join("krill-krig").exists());
+        assert!(install_skill("krig", &codex_skills).is_err());
+    }
+
+    fs::remove_dir_all(home).unwrap();
+}
