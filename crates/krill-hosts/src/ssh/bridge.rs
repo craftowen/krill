@@ -384,7 +384,14 @@ pub(crate) fn control_path(local: &std::path::Path) -> Option<PathBuf> {
     let path = local
         .parent()?
         .join(format!("c-{}-{seq}", std::process::id()));
-    (path.as_os_str().len() + CONTROL_SUFFIX < daemon::SUN_PATH_MAX).then_some(path)
+    let text = path.to_str()?;
+    if text.chars().any(char::is_control)
+        || text.contains(['"', '\'', '$', '\\'])
+        || path.as_os_str().len() + CONTROL_SUFFIX >= daemon::SUN_PATH_MAX
+    {
+        return None;
+    }
+    Some(path)
 }
 
 /// `-o ControlPath=…` 값. 상태 디렉터리 경로의 공백은 따옴표로, ssh 토큰 문자 `%`는 `%%`로 지킨다.

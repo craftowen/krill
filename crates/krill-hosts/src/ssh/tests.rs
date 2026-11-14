@@ -530,3 +530,34 @@ fn bounded_home_and_machine_queries_use_injected_local_program() {
     );
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn valid_local_socket_and_start_at_reject_colon_and_control_chars() {
+    #[cfg(unix)]
+    assert!(!valid_local_socket(Path::new("/tmp/a:b.sock")));
+    assert!(!valid_local_socket(Path::new("")));
+    assert!(!valid_local_socket(Path::new("/tmp/bad\nname.sock")));
+    assert!(valid_local_socket(Path::new("/tmp/good.sock")));
+
+    #[cfg(unix)]
+    {
+        let opts = SshOptions::new("fixture-host");
+        let err = Tunnel::start_at_with_program(
+            &opts,
+            PathBuf::from("/tmp/bad:local.sock"),
+            Path::new("/remote/krilld.sock"),
+            std::ffi::OsStr::new("ssh"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err2 = Tunnel::start_at_with_program(
+            &opts,
+            PathBuf::from("/tmp/good-local.sock"),
+            Path::new("/remote/bad\n.sock"),
+            std::ffi::OsStr::new("ssh"),
+        )
+        .unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidInput);
+    }
+}

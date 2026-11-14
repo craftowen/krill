@@ -620,6 +620,17 @@ pub fn valid_remote_socket(path: &str) -> bool {
     s.starts_with('/') && !s.contains(':') && !s.chars().any(char::is_control)
 }
 
+/// 로컬 포워딩 소켓 경로 검사. Unix `-L` 구분자(`:`)와 제어문자를 거부한다.
+pub fn valid_local_socket(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| {
+        #[cfg(unix)]
+        let no_colon = !s.contains(':');
+        #[cfg(not(unix))]
+        let no_colon = true;
+        !s.is_empty() && no_colon && !s.chars().any(char::is_control)
+    })
+}
+
 /// 파일명에 쓸 호스트 별명. `@`는 살리고 나머지는 영숫자·`.-`_ 로 바꾼다.
 pub fn slug(host: &str) -> String {
     let mut out = String::with_capacity(host.len());
@@ -656,6 +667,12 @@ pub fn local_socket_in(state: &Path, host: &str) -> io::Result<PathBuf> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("forward socket path too long for {}", path.display()),
+        ));
+    }
+    if !valid_local_socket(&path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid local forward socket path",
         ));
     }
     Ok(path)
@@ -751,6 +768,12 @@ impl Tunnel {
         ssh_bin: &std::ffi::OsStr,
     ) -> io::Result<Self> {
         opts.validate()?;
+        if !valid_local_socket(&local) || !remote.to_str().is_some_and(valid_remote_socket) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid forward socket path for ssh -L",
+            ));
+        }
         prepare_local(&local)?;
         let host = &opts.destination;
         // stdin 파이프의 쓰기 쪽은 `child`가 쥔다. 이 프로세스가 죽으면 닫혀 원격 `cat`과 ssh가 끝난다.

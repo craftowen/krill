@@ -233,3 +233,22 @@ fn bridge_unlinks_control_path_on_drop_and_startup_failure_or_timeout() {
     assert_eq!(count_ctrl(), 0, "timeout must unlink ControlPath");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[cfg(unix)]
+#[test]
+fn control_path_rejects_shell_and_control_metacharacters() {
+    for bad in [
+        "/tmp/bad$dir/fwd.sock",
+        "/tmp/bad\"dir/fwd.sock",
+        "/tmp/bad'dir/fwd.sock",
+        "/tmp/bad\\dir/fwd.sock",
+        "/tmp/bad\ndir/fwd.sock",
+    ] {
+        assert_eq!(
+            control_path(std::path::Path::new(bad)),
+            None,
+            "should reject {bad}"
+        );
+    }
+    assert!(control_path(std::path::Path::new("/tmp/safe/fwd.sock")).is_some());
+}

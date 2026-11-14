@@ -32,8 +32,9 @@ impl Forward {
     }
 
     fn admit(&self, second: u64) -> bool {
+        let sec = second & 0xffff_ffff;
         let used = |packed: u64| {
-            if packed >> 32 == second {
+            if packed >> 32 == sec {
                 packed & 0xffff_ffff
             } else {
                 0
@@ -42,23 +43,22 @@ impl Forward {
         let previous = self
             .window
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
-                Some((second << 32) | (used(packed) + 1).min(PER_SECOND))
+                Some((sec << 32) | (used(packed) + 1).min(PER_SECOND))
             })
             .unwrap_or_else(|packed| packed);
         used(previous) < PER_SECOND
     }
 
-    fn coalesce_display_link(&self, message: &str, second: u64) -> Option<u32> {
-        let slot = if message.starts_with("could not create display link, code: ") {
-            &self.display_link_create
+    fn display_link_slot(&self, message: &str) -> Option<&AtomicU64> {
+        if message.starts_with("could not create display link, code: ") {
+            Some(&self.display_link_create)
         } else if message.starts_with("display link stalled ")
             && message.contains("subscribed: false")
         {
-            &self.display_link_stall
+            Some(&self.display_link_stall)
         } else {
-            return Some(0);
-        };
-        admit_cooldown(slot, second, DISPLAY_LINK_COOLDOWN_SECS)
+            None
+        }
     }
 
     fn log_at(&self, record: &log::Record, second: u64) {
@@ -69,12 +69,21 @@ impl Forward {
         if is_expected_font_skip(record.target(), &message) {
             return;
         }
-        let Some(coalesced) = self.coalesce_display_link(&message, second) else {
-            return;
+        let coalesced = if let Some(slot) = self.display_link_slot(&message) {
+            let Some(count) =
+                admit_cooldown_gated(slot, second, DISPLAY_LINK_COOLDOWN_SECS, || {
+                    self.admit(second)
+                })
+            else {
+                return;
+            };
+            count
+        } else {
+            if !self.admit(second) {
+                return;
+            }
+            0
         };
-        if !self.admit(second) {
-            return;
-        }
         let source = resolve_source(record);
         let source = source.as_ref();
         match (record.level() == log::Level::Error, coalesced) {
@@ -86,12 +95,46 @@ impl Forward {
     }
 }
 
-fn admit_cooldown(slot: &AtomicU64, second: u64, cooldown_secs: u64) -> Option<u32> {
+fn bump_suppressed(slot: &AtomicU64, mut cur: u64) {
+    const SUPPRESSED_MASK: u64 = 0x7fff_ffff;
+    loop {
+        if cur == 0 {
+            return;
+        }
+        let next_suppressed = (cur & SUPPRESSED_MASK)
+            .saturating_add(1)
+            .min(SUPPRESSED_MASK);
+        let next = (cur & !SUPPRESSED_MASK) | next_suppressed;
+        match slot.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+fn admit_cooldown_gated(
+    slot: &AtomicU64,
+    second: u64,
+    cooldown_secs: u64,
+    admit_fn: impl FnOnce() -> bool,
+) -> Option<u32> {
     const INIT_BIT: u64 = 1 << 31;
     const SUPPRESSED_MASK: u64 = 0x7fff_ffff;
 
     let sec32 = (second & 0xffff_ffff) as u32;
     let fresh = (u64::from(sec32) << 32) | INIT_BIT;
+    let cur = slot.load(Ordering::Acquire);
+    if cur != 0 {
+        let last_sec = (cur >> 32) as u32;
+        if u64::from(sec32.wrapping_sub(last_sec)) < cooldown_secs {
+            bump_suppressed(slot, cur);
+            return None;
+        }
+    }
+    if !admit_fn() {
+        bump_suppressed(slot, slot.load(Ordering::Acquire));
+        return None;
+    }
     let mut cur = slot.load(Ordering::Acquire);
     loop {
         if cur == 0 {
@@ -105,20 +148,13 @@ fn admit_cooldown(slot: &AtomicU64, second: u64, cooldown_secs: u64) -> Option<u
         }
         let last_sec = (cur >> 32) as u32;
         if u64::from(sec32.wrapping_sub(last_sec)) < cooldown_secs {
-            let next_suppressed = (cur & SUPPRESSED_MASK)
-                .saturating_add(1)
-                .min(SUPPRESSED_MASK);
-            let next = (cur & !SUPPRESSED_MASK) | next_suppressed;
-            match slot.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return None,
-                Err(actual) => cur = actual,
-            }
-        } else {
-            let hidden = (cur & SUPPRESSED_MASK) as u32;
-            match slot.compare_exchange_weak(cur, fresh, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Some(hidden),
-                Err(actual) => cur = actual,
-            }
+            bump_suppressed(slot, cur);
+            return None;
+        }
+        let hidden = (cur & SUPPRESSED_MASK) as u32;
+        match slot.compare_exchange_weak(cur, fresh, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(hidden),
+            Err(actual) => cur = actual,
         }
     }
 }
@@ -138,23 +174,27 @@ fn resolve_source<'a>(record: &'a log::Record<'_>) -> Cow<'a, str> {
     Cow::Borrowed("unknown")
 }
 
-fn module_from_source_path(path: &str) -> Option<String> {
-    let normalized = if path.contains('\\') {
-        Cow::Owned(path.replace('\\', "/"))
-    } else {
-        Cow::Borrowed(path)
+fn is_rust_ident_segment(seg: &str) -> bool {
+    !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn is_home_parent(before_crate: &str) -> bool {
+    let trimmed = before_crate.trim_end_matches('/');
+    let Some(parent) = trimmed.rsplit('/').next() else {
+        return false;
     };
-    let (prefix, rest) = normalized.rsplit_once("/src/")?;
-    let crate_dir = prefix.rsplit('/').next().filter(|seg| !seg.is_empty())?;
+    trimmed.is_empty() || matches!(parent.to_ascii_lowercase().as_str(), "users" | "home")
+}
+
+fn format_module_parts(crate_dir: &str, rel_path: &str) -> Option<String> {
     let crate_name = strip_crate_version(crate_dir).replace('-', "_");
-    if crate_name.is_empty() || matches!(crate_name.as_str(), "." | "..") {
+    if !is_rust_ident_segment(&crate_name) {
         return None;
     }
-
-    let rel = rest.strip_suffix(".rs").unwrap_or(rest);
+    let rel = rel_path.strip_suffix(".rs").unwrap_or(rel_path);
     let mut parts = vec![crate_name];
     for seg in rel.split('/').filter(|seg| !seg.is_empty()) {
-        if matches!(seg, "." | "..") {
+        if !is_rust_ident_segment(seg) {
             return None;
         }
         parts.push(seg.to_owned());
@@ -168,6 +208,26 @@ fn module_from_source_path(path: &str) -> Option<String> {
         parts.pop();
     }
     Some(parts.join("::"))
+}
+
+fn module_from_source_path(path: &str) -> Option<String> {
+    let normalized = if path.contains('\\') {
+        Cow::Owned(path.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(path)
+    };
+    if let Some((_, after_reg)) = normalized.rsplit_once("/.cargo/registry/src/") {
+        let (_, after_index) = after_reg.split_once('/')?;
+        let (crate_dir, rest) = after_index.split_once('/')?;
+        let rel = rest.strip_prefix("src/").unwrap_or(rest);
+        return format_module_parts(crate_dir, rel);
+    }
+    let (prefix, rest) = normalized.rsplit_once("/src/")?;
+    let (before_crate, crate_dir) = prefix.rsplit_once('/').unwrap_or(("", prefix));
+    if crate_dir.is_empty() || crate_dir == "registry" || is_home_parent(before_crate) {
+        return None;
+    }
+    format_module_parts(crate_dir, rest)
 }
 
 fn strip_crate_version(dir: &str) -> &str {
@@ -404,5 +464,78 @@ mod tests {
         assert_eq!(idle_stalls, 1, "{text}");
         assert!(text.contains("subscribed: true"), "{text}");
         assert!(text.contains("unrelated error stays visible"), "{text}");
+    }
+
+    #[test]
+    fn admit_masks_upper_bits_of_second() {
+        let forward = Forward::new();
+        let big_sec = (1_u64 << 33) + 42;
+        assert!((0..PER_SECOND).all(|_| forward.admit(big_sec)));
+        assert!(!forward.admit(big_sec));
+        assert!(forward.admit(big_sec + 1));
+    }
+
+    #[test]
+    fn saturated_second_does_not_drop_display_link_cooldown_window() {
+        let dir = std::env::temp_dir().join(format!("krill-log-dl-rate-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let writer = crate::RollingLog::open(&dir, crate::Component::App).unwrap();
+        let forward = Forward::new();
+
+        tracing::subscriber::with_default(crate::subscriber::Logger::new(writer), || {
+            for _ in 0..PER_SECOND {
+                forward.log_at(
+                    &log::Record::builder()
+                        .level(log::Level::Warn)
+                        .target("gpui::app")
+                        .args(format_args!("noise"))
+                        .build(),
+                    1000,
+                );
+            }
+            forward.log_at(
+                &log::Record::builder()
+                    .level(log::Level::Error)
+                    .target("gpui")
+                    .args(format_args!("could not create display link, code: -6661"))
+                    .build(),
+                1000,
+            );
+            forward.log_at(
+                &log::Record::builder()
+                    .level(log::Level::Error)
+                    .target("gpui")
+                    .args(format_args!("could not create display link, code: -6661"))
+                    .build(),
+                1001,
+            );
+        });
+
+        let text = std::fs::read_to_string(dir.join("krill-app.log")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            text.contains("could not create display link, code: -6661"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn module_from_source_path_blocks_home_dirs_and_parses_registry_paths() {
+        assert_eq!(
+            module_from_source_path("/Users/alice/src/secret-project/helper.rs"),
+            None
+        );
+        assert_eq!(module_from_source_path("/home/alice/src/helper.rs"), None);
+        assert_eq!(
+            module_from_source_path(
+                "/.cargo/registry/src/index.crates.io-123/foo-bar-0.2.1/lib.rs"
+            )
+            .as_deref(),
+            Some("foo_bar")
+        );
+        assert_eq!(
+            module_from_source_path("crates/krill-app/src/terminal.rs").as_deref(),
+            Some("krill_app::terminal")
+        );
     }
 }

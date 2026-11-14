@@ -475,6 +475,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
                     let krilld_conn = Arc::clone(&krilld_arc);
                     let state_conn = state_loop.clone();
                     let rate_conn = Arc::clone(&rate_limiter);
+                    let server_id = endpoint.id();
                     tasks.spawn(async move {
                         let _permit=permit;
                         let Ok(accepting) = incoming.accept() else { return };
@@ -492,6 +493,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
                         } else if alpn == ALPN_PAIR {
                             handle_pair_connection(
                                 conn,
+                                server_id,
                                 state_conn,
                                 allowed_conn,
                                 rate_conn,
@@ -777,6 +779,7 @@ async fn handle_link_connection(
 
 async fn handle_pair_connection(
     conn: Connection,
+    server_id: EndpointId,
     state_dir: PathBuf,
     allowed: Arc<RwLock<BTreeSet<EndpointId>>>,
     rate_limiter: Arc<PairRateLimiter>,
@@ -802,7 +805,7 @@ async fn handle_pair_connection(
 
     let cfg = LinkConfig::load(&state_dir).unwrap_or_default();
     let server_name = cfg.effective_server_name();
-    let host_id = sanitize_id_slug(&server_name, "host", &conn.alpn().len().to_string());
+    let host_id = sanitize_id_slug(&server_name, "host", &server_id.to_string());
 
     let verify_res = verify_and_consume_invite(&state_dir, &req.token, now_unix_ms());
     let resp = match verify_res {
@@ -963,5 +966,16 @@ mod tests {
         assert_eq!(read_live_server_addr(&dir), Some(addr));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_ascii_server_names_with_distinct_endpoint_ids_do_not_collide() {
+        let id_a = SecretKey::generate().public();
+        let id_b = SecretKey::generate().public();
+        let slug_a = sanitize_id_slug("집 맥미니", "host", &id_a.to_string());
+        let slug_b = sanitize_id_slug("회사 맥", "host", &id_b.to_string());
+        assert!(slug_a.starts_with("host-"));
+        assert!(slug_b.starts_with("host-"));
+        assert_ne!(slug_a, slug_b);
     }
 }

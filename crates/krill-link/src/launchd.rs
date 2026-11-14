@@ -32,12 +32,9 @@ use crate::store::write_atomic_0600;
 /// `krill-link` `launchd` `LaunchAgent` 레이블 (CONVENTIONS A3 고유 식별자). 기본 상태 디렉터리 전용.
 pub const LINK_LABEL: &str = "dev.krill.app.link";
 
-/// launchd 항목을 따로 둘 격리 상태 디렉터리. 재정의 없는 기본 상태 디렉터리면 `None`.
+/// launchd 항목을 따로 둘 격리 상태 디렉터리. 기본 상태 디렉터리와 같으면 `None`.
 pub fn isolated_state_dir(state_dir: &Path) -> Option<&Path> {
-    let default = krill_proto::daemon::state_dir_override()
-        .is_none()
-        .then(krill_proto::daemon::state_dir)
-        .flatten();
+    let default = krill_proto::daemon::default_state_dir();
     isolated_in(state_dir, default.as_deref())
 }
 
@@ -361,6 +358,9 @@ mod tests {
         assert_eq!(isolated_in(iso, Some(real)), Some(iso));
         // 재정의가 있으면(기본값 없음) 어떤 상태 디렉터리도 격리로 본다.
         assert_eq!(isolated_in(real, None), Some(real));
+        if let Some(default) = krill_proto::daemon::default_state_dir() {
+            assert_eq!(isolated_state_dir(&default), None);
+        }
     }
 
     /// 이관(MK-170)은 `<번들 id>.link`로 새 라벨을 만든다.
