@@ -1289,10 +1289,11 @@ impl Indexer {
                         .get("content")
                         .or_else(|| v.get("text"))
                         .and_then(Value::as_str)
-                        && !c.trim().is_empty()
-                        && !is_injected_user_context(c)
                     {
-                        messages.push(("user".to_owned(), c.to_owned()));
+                        let cleaned = clean_vault_user_text(c);
+                        if !cleaned.is_empty() {
+                            messages.push(("user".to_owned(), cleaned));
+                        }
                     }
                 }
             }
@@ -1518,15 +1519,21 @@ impl Indexer {
                         .get("message")
                         .or_else(|| payload.get("text"))
                         .and_then(Value::as_str)
-                        && !msg.trim().is_empty()
-                        && (role != "user" || !is_injected_user_context(msg))
                     {
-                        if role == "user" && first_user.is_empty() {
-                            first_user = truncate_chars(&one_line(msg), TITLE_CHARS);
-                        } else if role == "assistant" && first_assistant.is_empty() {
-                            first_assistant = truncate_chars(&one_line(msg), SNIPPET_CHARS);
+                        if role == "user" {
+                            let cleaned = clean_vault_user_text(msg);
+                            if !cleaned.is_empty() {
+                                if first_user.is_empty() {
+                                    first_user = truncate_chars(&one_line(&cleaned), TITLE_CHARS);
+                                }
+                                messages.push(("user".to_owned(), cleaned));
+                            }
+                        } else if !msg.trim().is_empty() {
+                            if first_assistant.is_empty() {
+                                first_assistant = truncate_chars(&one_line(msg), SNIPPET_CHARS);
+                            }
+                            messages.push((role.to_owned(), msg.to_owned()));
                         }
-                        messages.push((role.to_owned(), msg.to_owned()));
                     }
                 } else if p_type == "item_completed"
                     && let Some(item) = payload.get("item")
@@ -1551,13 +1558,14 @@ impl Indexer {
                 .or_else(|| v.get("text"))
                 .or_else(|| v.get("message"))
                 .and_then(Value::as_str)
-                && !msg.trim().is_empty()
             {
                 let role = v.get("role").and_then(Value::as_str).unwrap_or("user");
-                if role != "developer"
-                    && role != "system"
-                    && (role != "user" || !is_injected_user_context(msg))
-                {
+                if role == "user" {
+                    let cleaned = clean_vault_user_text(msg);
+                    if !cleaned.is_empty() {
+                        messages.push(("user".to_owned(), cleaned));
+                    }
+                } else if role != "developer" && role != "system" && !msg.trim().is_empty() {
                     messages.push((role.to_owned(), msg.to_owned()));
                 }
             }
@@ -1725,12 +1733,16 @@ impl Indexer {
                 cwd = extracted_cwd;
             }
 
+            if source.eq_ignore_ascii_case("SYSTEM") && !content.contains("<USER_REQUEST>") {
+                return;
+            }
+
             if matches!(source, "USER_EXPLICIT" | "USER")
                 || matches!(rec_type, "USER_INPUT" | "REQUEST")
                 || role == "user"
             {
                 let req = extract_agy_user_request(content);
-                if !req.is_empty() {
+                if !req.is_empty() && !is_injected_user_context(&req) {
                     if first_user.is_empty() {
                         let cleaned = krill_proto::git::clean_user_prompt(&req);
                         let candidate = if cleaned.is_empty() { &req } else { &cleaned };
@@ -1998,7 +2010,10 @@ impl Indexer {
                 *summary = extract_summary_field(v.get("summary"));
             }
             extract_content_messages(role, &v, messages);
-            if let Some(msg_id) = v.get("id").and_then(Value::as_str) {
+            if role != "developer"
+                && role != "system"
+                && let Some(msg_id) = v.get("id").and_then(Value::as_str)
+            {
                 let part_dir = storage_root.join("part").join(msg_id);
                 if let Ok(parts) = fs::read_dir(part_dir) {
                     for part in parts.take(32).flatten() {
@@ -2008,9 +2023,15 @@ impl Indexer {
                                 .get("text")
                                 .or_else(|| pv.get("content"))
                                 .and_then(Value::as_str)
-                            && !t.trim().is_empty()
                         {
-                            messages.push((role.to_owned(), t.to_owned()));
+                            if role == "user" {
+                                let cleaned = clean_vault_user_text(t);
+                                if !cleaned.is_empty() {
+                                    messages.push(("user".to_owned(), cleaned));
+                                }
+                            } else if !t.trim().is_empty() {
+                                messages.push((role.to_owned(), t.to_owned()));
+                            }
                         }
                     }
                 }
@@ -2152,7 +2173,12 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
         return;
     };
     if let Some(s) = content.as_str() {
-        if !s.trim().is_empty() && (role != "user" || !is_injected_user_context(s)) {
+        if role == "user" {
+            let cleaned = clean_vault_user_text(s);
+            if !cleaned.is_empty() {
+                out.push(("user".to_owned(), cleaned));
+            }
+        } else if !s.trim().is_empty() {
             out.push((role.to_owned(), s.to_owned()));
         }
         return;
@@ -2161,7 +2187,12 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
         let mut text_parts = Vec::new();
         for block in arr {
             if let Some(s) = block.as_str() {
-                if !s.trim().is_empty() && (role != "user" || !is_injected_user_context(s)) {
+                if role == "user" {
+                    let cleaned = clean_vault_user_text(s);
+                    if !cleaned.is_empty() {
+                        text_parts.push(cleaned);
+                    }
+                } else if !s.trim().is_empty() {
                     text_parts.push(s.to_owned());
                 }
                 continue;
@@ -2185,10 +2216,15 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
                 .get("text")
                 .or_else(|| block.get("content"))
                 .and_then(Value::as_str)
-                && !t.trim().is_empty()
-                && (role != "user" || !is_injected_user_context(t))
             {
-                text_parts.push(t.to_owned());
+                if role == "user" {
+                    let cleaned = clean_vault_user_text(t);
+                    if !cleaned.is_empty() {
+                        text_parts.push(cleaned);
+                    }
+                } else if !t.trim().is_empty() {
+                    text_parts.push(t.to_owned());
+                }
             }
         }
         if !text_parts.is_empty() {
@@ -2197,17 +2233,97 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
     }
 }
 
-/// 에이전트 런타임(`codex`·`claude`·`opencode`)이 `role: "user"` 메시지로 주입하는
+const INJECTED_USER_BLOCK_TAGS: &[(&str, &str)] = &[
+    ("<ADDITIONAL_METADATA>", "</ADDITIONAL_METADATA>"),
+    ("<USER_SETTINGS_CHANGE>", "</USER_SETTINGS_CHANGE>"),
+    ("<EPHEMERAL_MESSAGE>", "</EPHEMERAL_MESSAGE>"),
+    ("<system-reminder>", "</system-reminder>"),
+    ("<system_instruction>", "</system_instruction>"),
+    ("<system-instruction>", "</system-instruction>"),
+];
+
+/// 사용자 메시지 안에 섞여 들어온 런타임 메타데이터·알림·지침 XML 블록을 걷어낸다.
+pub(crate) fn strip_injected_user_blocks(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let next = INJECTED_USER_BLOCK_TAGS
+            .iter()
+            .filter_map(|&(opener, closer)| rest.find(opener).map(|idx| (idx, opener, closer)))
+            .min_by_key(|&(idx, _, _)| idx);
+        let Some((open_idx, opener, closer)) = next else {
+            out.push_str(rest);
+            break;
+        };
+        if let Some(before) = rest.get(..open_idx) {
+            out.push_str(before);
+        }
+        let after_open = open_idx.saturating_add(opener.len());
+        let Some(tail) = rest.get(after_open..) else {
+            break;
+        };
+        let Some(close_rel) = tail.find(closer) else {
+            // 닫는 태그 없이 잘린 후행 메타데이터는 여는 태그부터 끝까지 제거한다.
+            break;
+        };
+        let after_close = close_rel.saturating_add(closer.len());
+        let mut next_rest = tail.get(after_close..).unwrap_or("");
+        if out.ends_with('\n') {
+            if let Some(stripped) = next_rest.strip_prefix("\r\n") {
+                next_rest = stripped;
+            } else if let Some(stripped) = next_rest.strip_prefix('\n') {
+                next_rest = stripped;
+            }
+        } else if out.ends_with(' ')
+            && let Some(stripped) = next_rest.strip_prefix(' ')
+        {
+            next_rest = stripped;
+        }
+        rest = next_rest;
+    }
+    let trimmed = out.trim();
+    if !raw.contains("<USER_REQUEST>") && trimmed.starts_with("<CONTEXT_SUMMARY>") {
+        return String::new();
+    }
+    trimmed.to_owned()
+}
+
+pub(super) fn clean_vault_user_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let stripped = strip_injected_user_blocks(trimmed);
+    if is_injected_user_context(&stripped) {
+        String::new()
+    } else {
+        stripped
+    }
+}
+
+/// 에이전트 런타임(`codex`·`claude`·`agy`·`opencode`)이 `role: "user"` 메시지로 주입하는
 /// 시스템 지침·환경 컨텍스트·스킬 본문·이미지 래퍼·알림 블록인지 판별한다.
 pub(crate) fn is_injected_user_context(raw: &str) -> bool {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return true;
     }
+    if trimmed == "[plan review]"
+        || trimmed.starts_with("[plan review]\n")
+        || trimmed.starts_with("[plan review]\r\n")
+        || trimmed.starts_with("[plan review] ")
+    {
+        return true;
+    }
     if trimmed.starts_with("# AGENTS.md instructions for ")
         || (trimmed.starts_with("# ")
             && trimmed.contains("\n<INSTRUCTIONS>")
             && trimmed.ends_with("</INSTRUCTIONS>"))
+    {
+        return true;
+    }
+    if (trimmed.starts_with("<CONTEXT_SUMMARY>") || trimmed.starts_with("<ADDITIONAL_METADATA>"))
+        && !trimmed.contains("<USER_REQUEST>")
     {
         return true;
     }
@@ -2225,9 +2341,16 @@ pub(crate) fn is_injected_user_context(raw: &str) -> bool {
         "<task-notification>",
         "<local-command-caveat>",
         "<local-command-stdout>",
+        "<local-command-stderr>",
         "<command-name>",
         "<command-message>",
         "<system-reminder>",
+        "<USER_SETTINGS_CHANGE>",
+        "<EPHEMERAL_MESSAGE>",
+        "<system_instruction>",
+        "<system-instruction>",
+        "<turn_aborted>",
+        "Caveat: The messages below were generated by the user while running local commands",
     ] {
         if trimmed.starts_with(prefix) {
             return true;
@@ -2235,7 +2358,6 @@ pub(crate) fn is_injected_user_context(raw: &str) -> bool {
     }
     if trimmed.starts_with("<skill>\n")
         || (trimmed.starts_with("<skill>") && trimmed.ends_with("</skill>"))
-        || (trimmed.starts_with("<CONTEXT_SUMMARY>") && trimmed.ends_with("</CONTEXT_SUMMARY>"))
     {
         return true;
     }
@@ -2250,15 +2372,25 @@ pub(super) fn extract_agy_user_request(content: &str) -> String {
     if let Some(start) = content.find(opener) {
         let after = start.saturating_add(opener.len());
         if let Some(tail) = content.get(after..) {
-            if let Some(end) = tail.find(closer)
-                && let Some(inner) = tail.get(..end)
-            {
-                return inner.trim().to_owned();
-            }
-            return tail.trim().to_owned();
+            let inner = if let Some(end) = tail.find(closer) {
+                tail.get(..end).unwrap_or(tail)
+            } else {
+                tail
+            };
+            let cleaned = strip_injected_user_blocks(inner);
+            return if is_injected_user_context(&cleaned) {
+                String::new()
+            } else {
+                cleaned
+            };
         }
     }
-    content.trim().to_owned()
+    let stripped = strip_injected_user_blocks(content);
+    if is_injected_user_context(&stripped) {
+        String::new()
+    } else {
+        stripped
+    }
 }
 
 /// Protobuf text-format 문자열 리터럴(`"..."`)의 C/octal/hex 이스케이프를 UTF-8로 복원한다.
@@ -2587,7 +2719,14 @@ fn read_agy_first_user_prompt(agy_root: &Path, conv_id: &str) -> Option<String> 
                         .or_else(|| v.get("text"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
+                    if source.eq_ignore_ascii_case("SYSTEM") && !content.contains("<USER_REQUEST>")
+                    {
+                        continue;
+                    }
                     let req = extract_agy_user_request(content);
+                    if req.is_empty() || is_injected_user_context(&req) {
+                        continue;
+                    }
                     let cleaned = krill_proto::git::clean_user_prompt(&req);
                     let candidate = if cleaned.is_empty() {
                         req.as_str()
@@ -3270,6 +3409,205 @@ mod cache_budget_tests {
             );
             clear();
         }
+        fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod injected_transcript_filter_tests {
+    use super::*;
+
+    #[test]
+    fn strip_injected_user_blocks_handles_multiple_tags_utf8_and_unclosed_truncation() {
+        let mixed = "한글 첫 문장\n<ADDITIONAL_METADATA>{\"k\":\"값\"}</ADDITIONAL_METADATA>\n<system-reminder>\n내부 지시\n</system-reminder>\n한글 둘째 문장\n<USER_SETTINGS_CHANGE>{\"model\":\"x\"}</USER_SETTINGS_CHANGE>\n<EPHEMERAL_MESSAGE>임시</EPHEMERAL_MESSAGE>\n<system_instruction>지침1</system_instruction>\n<system-instruction>지침2</system-instruction>";
+        assert_eq!(
+            strip_injected_user_blocks(mixed),
+            "한글 첫 문장\n한글 둘째 문장"
+        );
+
+        // Unclosed trailing block with multibyte UTF-8 text before it must not panic or leak.
+        let truncated = "한글 질문 끝\n<ADDITIONAL_METADATA>{\"broken\":\"한글 잘림";
+        assert_eq!(strip_injected_user_blocks(truncated), "한글 질문 끝");
+        assert_eq!(strip_injected_user_blocks("<system-reminder>잘린 블록"), "");
+
+        // <CONTEXT_SUMMARY> without <USER_REQUEST> and only metadata around it -> "".
+        assert_eq!(
+            strip_injected_user_blocks(
+                "<CONTEXT_SUMMARY>이전 대화 요약</CONTEXT_SUMMARY>\n<ADDITIONAL_METADATA>{\"a\":1}</ADDITIONAL_METADATA>"
+            ),
+            ""
+        );
+        assert_eq!(
+            strip_injected_user_blocks(
+                "<ADDITIONAL_METADATA>{\"a\":1}</ADDITIONAL_METADATA>\n<CONTEXT_SUMMARY>이전 대화 요약</CONTEXT_SUMMARY>"
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn is_injected_user_context_and_extract_agy_user_request_cover_all_runtime_tags() {
+        assert!(is_injected_user_context("   \n\t "));
+        assert!(is_injected_user_context("[plan review]"));
+        assert!(is_injected_user_context("[plan review]\nReview steps"));
+        assert!(is_injected_user_context("[plan review] please review"));
+        assert!(!is_injected_user_context("[plan review]s are helpful"));
+
+        assert!(is_injected_user_context(
+            "<CONTEXT_SUMMARY>sum</CONTEXT_SUMMARY>\n<ADDITIONAL_METADATA>meta</ADDITIONAL_METADATA>"
+        ));
+        assert!(!is_injected_user_context(
+            "<CONTEXT_SUMMARY>sum</CONTEXT_SUMMARY>\n<USER_REQUEST>질문</USER_REQUEST>"
+        ));
+        assert!(is_injected_user_context(
+            "<ADDITIONAL_METADATA>meta</ADDITIONAL_METADATA>"
+        ));
+        assert!(!is_injected_user_context(
+            "<ADDITIONAL_METADATA>meta</ADDITIONAL_METADATA>\n<USER_REQUEST>질문</USER_REQUEST>"
+        ));
+
+        for sample in [
+            "<USER_SETTINGS_CHANGE>x</USER_SETTINGS_CHANGE>",
+            "<EPHEMERAL_MESSAGE>x</EPHEMERAL_MESSAGE>",
+            "<local-command-stderr>err</local-command-stderr>",
+            "<system_instruction>x</system_instruction>",
+            "<system-instruction>x</system-instruction>",
+            "<turn_aborted>x</turn_aborted>",
+            "Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages.",
+        ] {
+            assert!(is_injected_user_context(sample), "{sample}");
+        }
+
+        assert_eq!(
+            extract_agy_user_request(
+                "<USER_REQUEST>실제 질문</USER_REQUEST>\n<ADDITIONAL_METADATA>{\"a\":1}</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>{\"b\":2}</USER_SETTINGS_CHANGE>"
+            ),
+            "실제 질문"
+        );
+        assert_eq!(
+            extract_agy_user_request(
+                "<USER_REQUEST>실제 질문\n<system-reminder>숨김</system-reminder></USER_REQUEST>"
+            ),
+            "실제 질문"
+        );
+        assert_eq!(
+            extract_agy_user_request(
+                "<CONTEXT_SUMMARY>요약</CONTEXT_SUMMARY>\n<ADDITIONAL_METADATA>{\"a\":1}</ADDITIONAL_METADATA>"
+            ),
+            ""
+        );
+        assert_eq!(extract_agy_user_request("[plan review]\nPlease check"), "");
+    }
+
+    #[test]
+    fn vault_search_filters_injected_agy_system_compaction_plan_review_and_reminders() {
+        let root =
+            std::env::temp_dir().join(format!("vault-injected-filter-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+
+        let agy_root = root.join("agy");
+        let agy_id = "aaaaaaaa-2222-4333-8444-555555555555";
+        let agy_logs = agy_root
+            .join("brain")
+            .join(agy_id)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&agy_logs).unwrap();
+        fs::write(
+            agy_logs.join("transcript.jsonl"),
+            concat!(
+                "{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"USER_INPUT\",\"cwd\":\"/tmp/vault-filter\",\"content\":\"SystemSecretAlpha <system_instruction>hidden</system_instruction>\"}\n",
+                "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<CONTEXT_SUMMARY>CompactionSecretBeta</CONTEXT_SUMMARY>\\n<ADDITIONAL_METADATA>{\\\"meta\\\":\\\"MetaSecretGamma\\\"}</ADDITIONAL_METADATA>\"}\n",
+                "{\"step_index\":2,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>[plan review]\\nPlanReviewSecretDelta</USER_REQUEST>\"}\n",
+                "{\"step_index\":3,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>실제 질문</USER_REQUEST>\\n<ADDITIONAL_METADATA>{\\\"meta\\\":\\\"MetaSecretEpsilon\\\"}</ADDITIONAL_METADATA>\\n<USER_SETTINGS_CHANGE>{\\\"setting\\\":\\\"SettingsSecretZeta\\\"}</USER_SETTINGS_CHANGE>\"}\n",
+                "{\"step_index\":4,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"정상 답변입니다\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let claude_root = root.join("claude");
+        let claude_proj = claude_root.join("projects/-tmp-vault-filter");
+        fs::create_dir_all(&claude_proj).unwrap();
+        let claude_id = "bbbbbbbb-2222-4333-8444-555555555555";
+        fs::write(
+            claude_proj.join(format!("{claude_id}.jsonl")),
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"bbbbbbbb-2222-4333-8444-555555555555\",\"cwd\":\"/tmp/vault-filter\",\"message\":{\"role\":\"user\",\"content\":\"<system-reminder>StandaloneReminderSecret</system-reminder>\"}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"bbbbbbbb-2222-4333-8444-555555555555\",\"cwd\":\"/tmp/vault-filter\",\"message\":{\"role\":\"user\",\"content\":\"<system-reminder>MixedReminderSecret</system-reminder>\\n클로드 실제 질문\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let roots = VaultRoots {
+            claude: vec![claude_root],
+            agy: vec![agy_root.clone()],
+            ..VaultRoots::default()
+        };
+
+        // Title uses the real user prompt ("실제 질문"), never [plan review], compaction, or SYSTEM.
+        let snap = search_in(
+            &roots,
+            &SearchQuery {
+                query: "실제 질문".into(),
+                ..SearchQuery::default()
+            },
+        );
+        assert_eq!(snap.hits.len(), 2);
+        let agy_hit = snap
+            .hits
+            .iter()
+            .find(|h| h.agent == VaultAgent::Agy)
+            .expect("agy hit");
+        assert_eq!(agy_hit.title, "실제 질문");
+        assert!(!agy_hit.snippet.contains("ADDITIONAL_METADATA"));
+        assert!(!agy_hit.snippet.contains("USER_SETTINGS_CHANGE"));
+
+        let claude_hit = snap
+            .hits
+            .iter()
+            .find(|h| h.agent == VaultAgent::Claude)
+            .expect("claude hit");
+        assert_eq!(claude_hit.title, "클로드 실제 질문");
+
+        // None of the hidden/injected secrets may be indexed in Vault.
+        for leaked in [
+            "SystemSecretAlpha",
+            "CompactionSecretBeta",
+            "MetaSecretGamma",
+            "PlanReviewSecretDelta",
+            "MetaSecretEpsilon",
+            "SettingsSecretZeta",
+            "StandaloneReminderSecret",
+            "MixedReminderSecret",
+        ] {
+            let hidden = search_in(
+                &roots,
+                &SearchQuery {
+                    query: leaked.into(),
+                    ..SearchQuery::default()
+                },
+            );
+            assert!(hidden.hits.is_empty(), "secret leaked into vault: {leaked}");
+        }
+
+        // Live agy title resolution also skips SYSTEM / compaction / [plan review].
+        let stored = crate::agent::control::StoredLaunch {
+            profile: "agy".into(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: Some(agy_id.into()),
+            transcript_path: Some(
+                agy_logs
+                    .join("transcript.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            cwd: Vec::new(),
+            hibernation_blocked: false,
+            account: None,
+        };
+        let (live_title, _) =
+            resolve_live_agy_title(krill_proto::SessionId(9099), 0, None, false, Some(&stored));
+        assert_eq!(live_title.as_deref(), Some("실제 질문"));
+
         fs::remove_dir_all(&root).ok();
     }
 }

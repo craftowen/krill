@@ -27,7 +27,7 @@ use crate::agent::control::StoredLaunch;
 use super::vault::{
     VaultRoots, agy_candidate_dirs, collect_roots, extract_agy_user_request,
     extract_agy_workspace_from_record, is_injected_user_context, normalize_path,
-    opencode_candidate_bases,
+    opencode_candidate_bases, strip_injected_user_blocks,
 };
 
 /// 폴링 1회당 읽는 최대 바이트(512 KiB).
@@ -1914,7 +1914,7 @@ fn parse_codex_line(v: &Value, out: &mut Vec<ChatItem>) {
 }
 
 fn parse_agy_line(v: &Value, out: &mut Vec<ChatItem>) {
-    let source = v.get("source").and_then(Value::as_str).unwrap_or("");
+    let source = v.get("source").and_then(Value::as_str);
     let rec_type = v.get("type").and_then(Value::as_str).unwrap_or("");
     let role = v.get("role").and_then(Value::as_str).unwrap_or("");
     let content = v
@@ -1922,6 +1922,13 @@ fn parse_agy_line(v: &Value, out: &mut Vec<ChatItem>) {
         .or_else(|| v.get("text"))
         .and_then(Value::as_str)
         .unwrap_or("");
+
+    if source.is_some_and(|s| s.eq_ignore_ascii_case("SYSTEM"))
+        && !content.contains("<USER_REQUEST>")
+    {
+        return;
+    }
+    let source = source.unwrap_or("");
 
     if let Some(thinking) = v
         .get("thinking")
@@ -2515,8 +2522,12 @@ fn clean_user_or_assistant_text(kind: ChatItemKind, raw: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    if kind == ChatItemKind::User && is_injected_user_context(trimmed) {
-        return String::new();
+    if kind == ChatItemKind::User {
+        let stripped = strip_injected_user_blocks(trimmed);
+        if is_injected_user_context(&stripped) {
+            return String::new();
+        }
+        return stripped;
     }
     trimmed.to_owned()
 }
@@ -3101,6 +3112,63 @@ mod tests {
             snap_full.transcript_path,
             transcript_full.to_string_lossy().as_ref()
         );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agy_and_runtime_injected_metadata_and_system_steps_are_filtered_from_chat() {
+        let dir = std::env::temp_dir().join(format!("chat-agy-filter-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let agy_path = dir.join("agy-filtered.jsonl");
+        let agy_lines = [
+            // 1. source: "SYSTEM" without <USER_REQUEST> -> completely filtered
+            r#"{"step_index":0,"source":"SYSTEM","type":"USER_INPUT","content":"<system_instruction>Internal runtime rule</system_instruction>"}"#,
+            r#"{"step_index":1,"source":"system","type":"GENERIC","content":"Internal system event"}"#,
+            // 2. <CONTEXT_SUMMARY> + <ADDITIONAL_METADATA> without <USER_REQUEST> -> completely filtered
+            r#"{"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<CONTEXT_SUMMARY>\n이전 대화 압축 요약\n</CONTEXT_SUMMARY>\n<ADDITIONAL_METADATA>\n{\"timestamp\":\"2026-11-14T00:00:00Z\"}\n</ADDITIONAL_METADATA>"}"#,
+            // 3. [plan review] inside <USER_REQUEST> and standalone -> completely filtered
+            r#"{"step_index":3,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>[plan review]\nPlease review the attached plan.</USER_REQUEST>"}"#,
+            r#"{"step_index":4,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"[plan review]"}"#,
+            // 4. <ADDITIONAL_METADATA> / <USER_SETTINGS_CHANGE> / <EPHEMERAL_MESSAGE> standalone -> filtered
+            r#"{"step_index":5,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<ADDITIONAL_METADATA>{\"k\":1}</ADDITIONAL_METADATA>"}"#,
+            r#"{"step_index":6,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_SETTINGS_CHANGE>{\"model\":\"x\"}</USER_SETTINGS_CHANGE>"}"#,
+            r#"{"step_index":7,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<EPHEMERAL_MESSAGE>ephemeral</EPHEMERAL_MESSAGE>"}"#,
+            // 5. Real user request with trailing metadata blocks -> keeps ONLY "실제 질문"
+            r#"{"step_index":8,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>실제 질문</USER_REQUEST>\n<ADDITIONAL_METADATA>{\"cwd\":\"/tmp\"}</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>{\"mode\":\"fast\"}</USER_SETTINGS_CHANGE>"}"#,
+            // 6. Assistant message mentioning XML tags stays intact
+            r#"{"step_index":9,"source":"MODEL","type":"PLANNER_RESPONSE","content":"<system-reminder> 태그는 내부 알림입니다."}"#,
+        ];
+        fs::write(&agy_path, format!("{}\n", agy_lines.join("\n"))).unwrap();
+        let agy_snap = poll_transcript_file(VaultAgent::Agy, "agy-filtered", &agy_path, 0);
+        assert_eq!(agy_snap.items.len(), 2);
+        assert_eq!(agy_snap.items[0].kind, ChatItemKind::User);
+        assert_eq!(agy_snap.items[0].text, "실제 질문");
+        assert_eq!(agy_snap.items[1].kind, ChatItemKind::Assistant);
+        assert_eq!(
+            agy_snap.items[1].text,
+            "<system-reminder> 태그는 내부 알림입니다."
+        );
+
+        // Claude/Codex mixed <system-reminder> and standalone <system-reminder> / <turn_aborted>
+        let claude_path = dir.join("claude-reminders.jsonl");
+        let claude_lines = [
+            r#"{"type":"user","message":{"role":"user","content":"<system-reminder>\nStandalone hook note\n</system-reminder>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<system-reminder>Before hint</system-reminder>\n앞쪽 리마인더 제거 후 질문"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"뒤쪽 리마인더 제거 전 질문\n<system-reminder>After hint</system-reminder>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<turn_aborted>\nInterrupted\n</turn_aborted>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"Caveat: The messages below were generated by the user while running local commands. Do not respond."}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stderr>err</local-command-stderr>"}}"#,
+        ];
+        fs::write(&claude_path, format!("{}\n", claude_lines.join("\n"))).unwrap();
+        let claude_snap = poll_transcript_file(VaultAgent::Claude, "claude-rem", &claude_path, 0);
+        assert_eq!(claude_snap.items.len(), 2);
+        assert_eq!(claude_snap.items[0].kind, ChatItemKind::User);
+        assert_eq!(claude_snap.items[0].text, "앞쪽 리마인더 제거 후 질문");
+        assert_eq!(claude_snap.items[1].kind, ChatItemKind::User);
+        assert_eq!(claude_snap.items[1].text, "뒤쪽 리마인더 제거 전 질문");
 
         fs::remove_dir_all(dir).unwrap();
     }
