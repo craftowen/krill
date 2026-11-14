@@ -213,20 +213,22 @@ fn git_dir(tree: &Path) -> PathBuf {
         .unwrap_or(dot)
 }
 fn git_remote_slug(tree: &Path) -> Option<String> {
-    type RemoteCache = HashMap<PathBuf, (Option<SystemTime>, Option<String>)>;
+    type RemoteCache = HashMap<PathBuf, (Option<(SystemTime, u64)>, Option<String>)>;
     static CACHE: LazyLock<Mutex<RemoteCache>> = LazyLock::new(Mutex::default);
     let config = git_dir(tree).join("config");
-    let modified = fs::metadata(&config).and_then(|m| m.modified()).ok();
+    let current_stamp = fs::metadata(&config)
+        .and_then(|m| m.modified().map(|t| (t, m.len())))
+        .ok();
     let mut cache = crate::session::lock(&CACHE);
     if let Some((stamp, slug)) = cache.get(&config)
-        && *stamp == modified
+        && *stamp == current_stamp
     {
         return slug.clone();
     }
     let slug = read(&config, 16384)
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|text| remote_slug(&text));
-    cache.insert(config, (modified, slug.clone()));
+    cache.insert(config, (current_stamp, slug.clone()));
     slug
 }
 fn parse_remote_section(trimmed: &str) -> Option<&str> {
@@ -1520,9 +1522,10 @@ value = "🚀"
         let dir =
             std::env::temp_dir().join(format!("krill-ws-remote-order-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
-        fs::create_dir_all(dir.join(".git")).unwrap();
+        let with_origin = dir.join("with-origin");
+        fs::create_dir_all(with_origin.join(".git")).unwrap();
         fs::write(
-            dir.join(".git/config"),
+            with_origin.join(".git/config"),
             concat!(
                 "[submodule \"vendor\"]\n\turl = https://github.com/other/sub.git\n",
                 "[remote \"local\"]\n\turl = /tmp/bare-repo.git\n",
@@ -1531,18 +1534,23 @@ value = "🚀"
             ),
         )
         .unwrap();
-        assert_eq!(git_remote_slug(&dir).as_deref(), Some("owner/main"));
+        assert_eq!(git_remote_slug(&with_origin).as_deref(), Some("owner/main"));
 
         // Without origin, skips unparseable local remote and uses valid upstream remote.
+        let without_origin = dir.join("without-origin");
+        fs::create_dir_all(without_origin.join(".git")).unwrap();
         fs::write(
-            dir.join(".git/config"),
+            without_origin.join(".git/config"),
             concat!(
                 "[remote \"local\"]\n\turl = C:\\repos\\local.git\n",
                 "[remote \"upstream\"]\n\turl = git@github.com:up/stream.git\n",
             ),
         )
         .unwrap();
-        assert_eq!(git_remote_slug(&dir).as_deref(), Some("up/stream"));
+        assert_eq!(
+            git_remote_slug(&without_origin).as_deref(),
+            Some("up/stream")
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }
