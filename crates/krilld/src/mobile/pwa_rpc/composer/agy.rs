@@ -334,7 +334,13 @@ impl Adapter for Agy {
         };
         let tap = match live.tap() {
             Ok(tap) => tap,
-            Err(error) => return set(catalog, "reason", error.to_string().into()),
+            Err(error) => {
+                return set(
+                    catalog,
+                    "reason",
+                    super::super::sanitize_tap_reason(&error).into(),
+                );
+            }
         };
         let (screen, _, _) = tap.capture();
         if !verified(&screen) || !composer(&screen, None) {

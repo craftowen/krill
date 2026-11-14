@@ -778,6 +778,57 @@
     "Frame size": "통신 데이터 크기가 올바르지 않습니다",
     "Replay rejected": "중복 수신된 통신 데이터가 거부되었습니다",
     "Authentication failed": "인증에 실패했습니다",
+    "Kept the new session for manual selection after the original ended. Held input was not sent.":
+      "기존 세션이 끝난 뒤 직접 선택할 수 있도록 새 세션을 유지했습니다. 대기 중이던 입력은 보내지 않았습니다.",
+    "Couldn't switch a running session to this account. Kept the original session.":
+      "실행 중인 세션을 이 계정으로 전환하지 못했습니다. 기존 세션을 유지합니다.",
+    "Couldn't finish switching accounts. Kept the original session.":
+      "계정 전환을 완료하지 못했습니다. 기존 세션을 유지합니다.",
+    "Usage details aren't available for this account.":
+      "이 계정은 사용량 정보를 제공하지 않습니다.",
+    "Sign in to this account again to check usage.":
+      "사용량을 확인하려면 이 계정에 다시 로그인하세요.",
+    "Account sign-in expired. Refresh it in that account's CLI or sign in again.":
+      "계정 로그인이 만료되었습니다. 해당 계정 CLI에서 새로 고치거나 다시 로그인하세요.",
+    "Could not check usage for this account.":
+      "이 계정의 사용량을 확인할 수 없습니다.",
+    "Usage check is temporarily rate-limited. Try again shortly.":
+      "사용량 확인 요청이 일시적으로 제한되었습니다. 잠시 후 다시 시도하세요.",
+    "Could not reach the usage service. Check your network and try again.":
+      "사용량 서비스에 연결할 수 없습니다. 네트워크를 확인한 뒤 다시 시도하세요.",
+    "Could not read saved sign-in credentials for this account.":
+      "이 계정에 저장된 로그인 정보를 읽을 수 없습니다.",
+    "Could not check usage right now. Try again later.":
+      "지금은 사용량을 확인할 수 없습니다. 나중에 다시 시도하세요.",
+    "showing last known usage": "마지막으로 확인된 사용량 표시 중",
+    "Request failed. Check the desktop connection and try again.":
+      "요청에 실패했습니다. 데스크톱 연결을 확인한 뒤 다시 시도하세요.",
+    "Request timed out. Try again.":
+      "요청 시간이 초과되었습니다. 다시 시도하세요.",
+    "Permission denied on desktop.":
+      "데스크톱에서 권한이 거부되었습니다.",
+    "Could not connect to the live agent session.":
+      "실행 중인 에이전트 세션에 연결할 수 없습니다.",
+    "Session is no longer active.":
+      "세션이 더 이상 활성 상태가 아닙니다.",
+    "Workspace created; terminal unavailable":
+      "작업 공간을 만들었지만 터미널을 사용할 수 없습니다.",
+    "agent handoff failed; check the desktop agent configuration":
+      "에이전트 전환에 실패했습니다. 데스크톱 에이전트 설정을 확인하세요.",
+    "This historical request cannot be verified against the current question. Confirm in Term.":
+      "이 이전 요청은 현재 질문과 일치하는지 확인할 수 없습니다. 터미널에서 확인하세요.",
+    "File exceeds 128 KiB diff limit":
+      "파일 크기가 128 KiB diff 제한을 초과했습니다",
+    "File is outside the repository":
+      "저장소 바깥에 있는 파일입니다",
+    "mobile command output exceeds limit":
+      "모바일 명령 출력이 허용 범위를 초과했습니다",
+    "mobile command failed":
+      "모바일 명령 실행에 실패했습니다",
+    "session working directory unavailable":
+      "세션 작업 디렉터리를 사용할 수 없습니다",
+    "No active terminal": "활성 터미널이 없습니다",
+    "input rejected": "입력이 거부되었습니다",
   };
   function t(text, ...values) {
     let out = language === "ko" ? ko[text] || text : text;
