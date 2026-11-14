@@ -27,7 +27,7 @@ pub(super) fn quiescent_at(files: &[PathBuf], profile: &Path, env_key: &str) -> 
     };
     if !output.status.success()
         || !output.stderr.is_empty()
-        || !String::from_utf8(output.stdout).is_ok_and(|text| !has_writer(&text, profile, env_key))
+        || has_writer(&String::from_utf8_lossy(&output.stdout), profile, env_key)
     {
         return false;
     }
@@ -90,7 +90,10 @@ pub(super) fn has_writer(text: &str, profile: &Path, env_key: &str) -> bool {
                 || line.contains("/claude/cli.js");
             // macOS는 보호 프로세스의 환경을 경고 없이 생략할 수 있다.
             // Claude 후보의 환경이 보이지 않으면 다른 계정이라고 단정하지 않는다.
-            claude && !line.contains(" HOME=") && !line.contains(" PATH=")
+            env_key == "CLAUDE_CONFIG_DIR"
+                && claude
+                && !line.contains(" HOME=")
+                && !line.contains(" PATH=")
         })
 }
 
@@ -168,5 +171,14 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bare_claude_process_only_blocks_claude_config_dir_probes() {
+        let profile = Path::new("/tmp/krill-profile-test");
+        let ps_table = "/opt/homebrew/bin/claude --resume abc\n";
+        assert!(has_writer(ps_table, profile, "CLAUDE_CONFIG_DIR"));
+        assert!(!has_writer(ps_table, profile, "CODEX_HOME"));
+        assert!(!has_writer(ps_table, profile, "ANTIGRAVITY_CLI_HOME"));
     }
 }

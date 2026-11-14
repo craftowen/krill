@@ -314,9 +314,6 @@ fn write_atomic(
     let stage_path = staging_path(path, stage_id);
     let current = current_stamp(path);
     if expected.is_some() && current != expected {
-        if stage_id != 0 {
-            fs::remove_file(&stage_path).ok();
-        }
         return WireWriteOutcome::Conflict { current };
     }
 
@@ -349,7 +346,7 @@ fn write_atomic(
             }
         }
     } else {
-        let mut owned_stage = offset != 0;
+        let mut owned_stage = false;
         let res = (|| -> io::Result<WireWriteOutcome> {
             let mut file = if offset == 0 {
                 OpenOptions::new()
@@ -1294,5 +1291,43 @@ mod tests {
             resolve_existing_file(b"~\\note.txt", None, home_dir.path()),
             Some(home_note.as_os_str().as_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn offset_conflict_or_mismatch_does_not_unlink_existing_stage_file() {
+        let dir = TestDir::new("stage-preserve");
+        let target = dir.path().join("target.txt");
+        fs::write(&target, b"initial").unwrap();
+        let initial_stamp = current_stamp(&target).unwrap();
+
+        assert_eq!(
+            write_atomic(&target, b"0123456789", None, 42, 0, false),
+            WireWriteOutcome::StageAck
+        );
+        let stage = staging_path(&target, 42);
+        assert_eq!(fs::read(&stage).unwrap(), b"0123456789");
+
+        // Stale expected stamp at offset == 0 must report Conflict without deleting active stage.
+        let stale = WireStamp {
+            modified_unix_ns: Some(
+                initial_stamp
+                    .modified_unix_ns
+                    .unwrap_or(0)
+                    .saturating_add(1),
+            ),
+            len: 0,
+        };
+        assert!(matches!(
+            write_atomic(&target, b"dup", Some(stale), 42, 0, false),
+            WireWriteOutcome::Conflict { .. }
+        ));
+        assert_eq!(fs::read(&stage).unwrap(), b"0123456789");
+
+        // Wrong offset on an existing stage file must fail without deleting it.
+        assert!(matches!(
+            write_atomic(&target, b"bad", None, 42, 999, false),
+            WireWriteOutcome::Failed(_)
+        ));
+        assert_eq!(fs::read(&stage).unwrap(), b"0123456789");
     }
 }

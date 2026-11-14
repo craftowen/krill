@@ -699,9 +699,10 @@ impl<'a> Journal<'a> {
                 Err(e) => return Err(e),
             };
             let mut bytes = Vec::new();
-            file.take(MAX_RUNS.saturating_add(4096))
+            file.take(MAX_RUNS.saturating_add(128 * 1024))
                 .read_to_end(&mut bytes)?;
-            if u64::try_from(bytes.len()).unwrap_or(u64::MAX) >= MAX_RUNS.saturating_add(4096) {
+            if u64::try_from(bytes.len()).unwrap_or(u64::MAX) >= MAX_RUNS.saturating_add(128 * 1024)
+            {
                 return Err(io::Error::other("schedule journal too large"));
             }
             let mut valid = 0_u64;
@@ -760,7 +761,13 @@ impl<'a> Journal<'a> {
 
     fn append(&mut self, run: &Run) -> io::Result<()> {
         track_session_run(&mut self.sessions, run);
-        if self.file.metadata()?.len() >= MAX_RUNS {
+        let mut bytes = serde_json::to_vec(run).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        let current_len = self.file.metadata()?.len();
+        let add_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if current_len >= MAX_RUNS
+            || (current_len > 0 && current_len.saturating_add(add_len) > MAX_RUNS)
+        {
             fs::rename(self.dir.join(RUNS), self.dir.join(PREVIOUS_RUNS))?;
             self.file = Self::writer(self.dir)?;
             for active in self.sessions.values().flatten() {
@@ -776,8 +783,6 @@ impl<'a> Journal<'a> {
                 }
             }
         }
-        let mut bytes = serde_json::to_vec(run).map_err(io::Error::other)?;
-        bytes.push(b'\n');
         self.file.write_all(&bytes)?;
         self.file.sync_data()?;
         self.latest

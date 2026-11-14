@@ -819,7 +819,7 @@ impl Backend {
         socket.set_write_timeout(Some(Duration::from_secs(5)))?;
         let worker = thread::Builder::new()
             .name("mobile-rpc".into())
-            .stack_size(128 * 1024)
+            .stack_size(super::gateway::RPC_STACK)
             .spawn(move || {
                 crate::alloc::mobile_thread().ok();
                 let out = registry.serve_mobile(server, &hello).ok();

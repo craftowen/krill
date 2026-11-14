@@ -10,6 +10,22 @@ use super::transcript;
 #[cfg(unix)]
 mod claude;
 
+#[derive(Clone, Copy)]
+pub(super) enum ExpectedId<'a> {
+    Any,
+    Prefer(&'a str),
+    Exact(&'a str),
+}
+
+impl<'a> ExpectedId<'a> {
+    pub(super) fn expected(self) -> Option<&'a str> {
+        match self {
+            Self::Any => None,
+            Self::Prefer(id) | Self::Exact(id) => Some(id),
+        }
+    }
+}
+
 #[cfg_attr(
     not(unix),
     expect(
@@ -17,18 +33,19 @@ mod claude;
         reason = "Unix process discovery may fail; other platforms keep the same interface"
     )
 )]
-pub(super) fn discover_claude(
+pub(super) fn discover_claude_with(
     homes: &[PathBuf],
     root: u32,
     foreground: Option<u32>,
+    expected_id: ExpectedId<'_>,
 ) -> io::Result<Option<Identity>> {
     #[cfg(unix)]
     {
-        claude::discover(homes, root, foreground)
+        claude::discover(homes, root, foreground, expected_id)
     }
     #[cfg(not(unix))]
     {
-        let _ = (homes, root, foreground);
+        let _ = (homes, root, foreground, expected_id);
         Ok(None)
     }
 }
@@ -102,7 +119,7 @@ pub(super) struct CodexResume {
 #[cfg(windows)]
 impl CodexResume {
     pub(super) fn new(file: &Path) -> io::Result<Self> {
-        let found = from_paths_with(ProviderKind::Codex, [file.to_path_buf()], None)?
+        let found = from_paths_mode(ProviderKind::Codex, [file.to_path_buf()], ExpectedId::Any)?
             .ok_or(io::ErrorKind::InvalidData)?;
         let lock = found
             .home
@@ -149,7 +166,7 @@ impl CodexResume {
         if crate::sys::start_us(root).ok() != Some(start) {
             return Ok(None);
         }
-        from_paths_with(ProviderKind::Codex, [self.file.clone()], None)
+        from_paths_mode(ProviderKind::Codex, [self.file.clone()], ExpectedId::Any)
     }
 }
 
@@ -160,7 +177,7 @@ pub(in crate::registry) fn discover(
     root: u32,
     foreground: Option<u32>,
 ) -> io::Result<Option<Identity>> {
-    discover_with(provider, root, foreground, None)
+    discover_with(provider, root, foreground, ExpectedId::Any)
 }
 
 /// Inspect foreground ancestry of a resumed process looking for `expected_id`.
@@ -172,14 +189,25 @@ pub(in crate::registry) fn discover_resumed(
     foreground: Option<u32>,
     expected_id: &str,
 ) -> io::Result<Option<Identity>> {
-    discover_with(provider, root, foreground, Some(expected_id))
+    discover_with(provider, root, foreground, ExpectedId::Exact(expected_id))
+}
+
+/// Inspect foreground ancestry preferring `expected_id`, falling back to an
+/// unambiguous non-matching conversation so callers can detect stale identity bindings.
+pub(in crate::registry) fn discover_preferring(
+    provider: ProviderKind,
+    root: u32,
+    foreground: Option<u32>,
+    expected_id: &str,
+) -> io::Result<Option<Identity>> {
+    discover_with(provider, root, foreground, ExpectedId::Prefer(expected_id))
 }
 
 fn discover_with(
     provider: ProviderKind,
     root: u32,
     foreground: Option<u32>,
-    expected_id: Option<&str>,
+    expected_id: ExpectedId<'_>,
 ) -> io::Result<Option<Identity>> {
     if !matches!(
         provider,
@@ -204,7 +232,7 @@ fn discover_with(
     if crate::sys::start_us(root).ok() != Some(root_start) {
         return Ok(None);
     }
-    let found = from_paths_with(provider, paths, expected_id)?;
+    let found = from_paths_mode(provider, paths, expected_id)?;
     if found.is_some() {
         return Ok(found);
     }
@@ -223,7 +251,7 @@ fn discover_with(
     if crate::sys::start_us(root).ok() != Some(root_start) {
         return Ok(None);
     }
-    from_paths_with(provider, paths, expected_id)
+    from_paths_mode(provider, paths, expected_id)
 }
 
 #[cfg(test)]
@@ -231,18 +259,33 @@ fn from_paths(
     provider: ProviderKind,
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> io::Result<Option<Identity>> {
-    from_paths_with(provider, paths, None)
+    from_paths_mode(provider, paths, ExpectedId::Any)
 }
 
+#[cfg(test)]
 fn from_paths_with(
     provider: ProviderKind,
     paths: impl IntoIterator<Item = PathBuf>,
     expected_id: Option<&str>,
 ) -> io::Result<Option<Identity>> {
+    from_paths_mode(
+        provider,
+        paths,
+        expected_id.map_or(ExpectedId::Any, ExpectedId::Exact),
+    )
+}
+
+fn from_paths_mode(
+    provider: ProviderKind,
+    paths: impl IntoIterator<Item = PathBuf>,
+    mode: ExpectedId<'_>,
+) -> io::Result<Option<Identity>> {
     if provider == ProviderKind::Antigravity {
-        return agy_from_paths(paths, expected_id);
+        return agy_from_paths(paths, mode);
     }
-    let mut found: Option<Identity> = None;
+    let mut preferred: Option<Identity> = None;
+    let mut fallback: Option<Identity> = None;
+    let mut fallback_ambiguous = false;
     for path in paths {
         if path.extension().is_none_or(|ext| ext != "jsonl") {
             continue;
@@ -253,25 +296,56 @@ fn from_paths_with(
         let id = match transcript::file_session_id(&path, provider) {
             Ok(id) => id,
             Err(error) if error.kind() == io::ErrorKind::Unsupported => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidData
+                    && mode.expected().is_some_and(|expected| {
+                        path.file_stem().and_then(|s| s.to_str()) != Some(expected)
+                    }) =>
+            {
+                continue;
+            }
             Err(error) => return Err(error),
         };
-        if let Some(expected) = expected_id
-            && id != expected
-        {
+        if Some(id.as_str()) == mode.expected() {
+            if let Some(previous) = &preferred {
+                if previous.id != id || !same_file::is_same_file(&previous.path, &path)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "process holds multiple conversation transcripts",
+                    ));
+                }
+            } else {
+                preferred = Some(Identity { id, path, home });
+            }
             continue;
         }
-        if let Some(previous) = &found {
+        if matches!(mode, ExpectedId::Exact(_)) {
+            continue;
+        }
+        if let Some(previous) = &fallback {
             if previous.id != id || !same_file::is_same_file(&previous.path, &path)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "process holds multiple conversation transcripts",
-                ));
+                if matches!(mode, ExpectedId::Any) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "process holds multiple conversation transcripts",
+                    ));
+                }
+                fallback_ambiguous = true;
             }
         } else {
-            found = Some(Identity { id, path, home });
+            fallback = Some(Identity { id, path, home });
         }
     }
-    Ok(found)
+    if preferred.is_some() {
+        return Ok(preferred);
+    }
+    if fallback_ambiguous {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process holds multiple conversation transcripts",
+        ));
+    }
+    Ok(fallback)
 }
 
 fn is_agy_presence_lock(path: &Path) -> bool {
@@ -313,10 +387,10 @@ fn agy_identity(home: PathBuf, id: String) -> Identity {
 
 fn agy_from_paths(
     paths: impl IntoIterator<Item = PathBuf>,
-    expected_id: Option<&str>,
+    mode: ExpectedId<'_>,
 ) -> io::Result<Option<Identity>> {
     let paths: Vec<_> = paths.into_iter().collect();
-    if let Some(expected) = expected_id {
+    if let Some(expected) = mode.expected() {
         let mut presence_match: Option<Identity> = None;
         let mut db_match: Option<Identity> = None;
         for path in &paths {
@@ -344,7 +418,12 @@ fn agy_from_paths(
                 *slot = Some(agy_identity(home, id));
             }
         }
-        return Ok(presence_match.or(db_match));
+        if let Some(matched) = presence_match.or(db_match) {
+            return Ok(Some(matched));
+        }
+        if matches!(mode, ExpectedId::Exact(_)) {
+            return Ok(None);
+        }
     }
     // agy also opens old brain directories. Its held presence lock identifies the live
     // conversation; otherwise require one unambiguous open conversation database.

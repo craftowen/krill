@@ -108,9 +108,6 @@ impl Client {
         let mut e = clients.entries.remove(at);
         let acquire = matches!(request, Request::Resize { .. })
             && matches!(e.role, Role::InteractiveWithSize { owns_size: false });
-        if acquire && clients.mobile_fallback.is_none() {
-            clients.mobile_fallback = self.tap.size().ok();
-        }
         match request {
             Request::Set(role) => {
                 if e.role != role {
@@ -126,6 +123,9 @@ impl Client {
                 if cols == 0 || rows == 0 || cols > MAX_COLS || rows > MAX_LINES {
                     clients.entries.insert(at, e);
                     return Ack::Invalid;
+                }
+                if acquire && clients.mobile_fallback.is_none() {
+                    clients.mobile_fallback = self.tap.size().ok();
                 }
                 e.size = WinSize { cols, rows };
                 if matches!(e.role, Role::InteractiveWithSize { .. }) {

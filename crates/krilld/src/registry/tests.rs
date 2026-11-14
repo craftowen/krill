@@ -3920,3 +3920,113 @@ fn session_list_hides_an_unconfirmed_account_replacement() {
     lock(&reg.account_replacements).remove(&SessionId(52));
     assert_eq!(listed(&reg), [SessionId(51), SessionId(52)]);
 }
+
+#[test]
+fn check_messages_wait_timeout_keeps_legacy_and_unidentified_ack_wire_shape() {
+    use krill_proto::orchestration::{OrchAction, OrchResponse, OrchestrationStore};
+
+    let dir =
+        std::env::temp_dir().join(format!("krill-check-timeout-shape-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    OrchestrationStore::default().save(&dir).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+
+    // Legacy CheckMessages timing out must still reply with Messages(vec![]).
+    let legacy = reg.orchestration(
+        &peer,
+        OrchAction::CheckMessagesLegacy {
+            recipient: Some("nobody".into()),
+            types: vec![],
+            unread_only: true,
+            ack: false,
+            wait_ms: 5,
+        },
+    );
+    assert!(
+        matches!(
+            legacy,
+            Ok(Reply::Orchestration(OrchResponse::Messages(ref m))) if m.is_empty()
+        ),
+        "expected empty Messages for legacy timeout, got {legacy:?}"
+    );
+
+    // CheckMessages with ack=true and delivery_id=None timing out must also reply with Messages(vec![]).
+    let ack_without_id = reg.orchestration(
+        &peer,
+        OrchAction::CheckMessages {
+            recipient: Some("nobody".into()),
+            types: vec![],
+            unread_only: true,
+            ack: true,
+            wait_ms: 5,
+            run_id: None,
+            delivery_id: None,
+        },
+    );
+    assert!(
+        matches!(
+            ack_without_id,
+            Ok(Reply::Orchestration(OrchResponse::Messages(ref m))) if m.is_empty()
+        ),
+        "expected empty Messages for ack without delivery_id timeout, got {ack_without_id:?}"
+    );
+
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_holder_failure_cleans_up_staged_settings_and_launch_record() {
+    let dir = std::env::temp_dir().join(format!("krill-spawn-cleanup-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let (reg, _, guard) = fake_holder_registry(Some(&dir));
+    let sid = SessionId(19);
+    let settings =
+        crate::agent::claude::Settings::create(&dir, Path::new("/usr/bin/true"), sid, None)
+            .unwrap();
+    assert!(settings.path.is_file());
+    reg.agents
+        .remember_session(
+            sid,
+            &control::AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            Some("sid-19".into()),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+    assert!(dir.join("agent-launches/19.json").is_file());
+
+    // Stop the fake holder so spawn_holder fails on closed IPC channel.
+    drop(guard);
+    let holder = reg.holder.as_ref().unwrap();
+    let res = reg.spawn_holder(
+        holder,
+        sid,
+        vec![b"/usr/bin/true".to_vec()],
+        vec![],
+        dir.to_string_lossy().as_bytes().to_vec(),
+        80,
+        24,
+    );
+    assert_eq!(res, Err(Failure::NoHolder));
+    assert!(
+        !settings.path.exists(),
+        "claude-settings should be discarded on spawn_holder failure"
+    );
+    assert!(
+        !dir.join("agent-launches/19.json").exists(),
+        "agent-launches/19.json should be forgotten on spawn_holder failure"
+    );
+
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}

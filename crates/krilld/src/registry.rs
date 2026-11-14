@@ -1800,7 +1800,11 @@ impl Registry {
         };
         if let Some(store) = &self.store {
             // holder Spawn 전에 연결을 남겨 데몬이 응답 전에 죽어도 이력을 잇는다.
-            store.inherit_history(session, old).map_err(|e| os(&e))?;
+            store.inherit_history(session, old).map_err(|e| {
+                self.discard_settings(session);
+                self.agents.forget(session);
+                os(&e)
+            })?;
         }
         let (session, pid) =
             match self.spawn_holder(holder, session, argv, env, c.cwd, c.cols, c.rows) {
@@ -1874,16 +1878,18 @@ impl Registry {
         // socket hook 적용과 spool 소거를 막아 최초 이벤트가 미귀속 상태로 ACK/폐기되지 않게 한다.
         // holder 응답 리더는 on_exited 워커와 분리돼 있어 이 잠금을 기다리지 않는다.
         let commit = lock(&self.hook_commit);
-        let mut reply = holder
-            .request(|req| ToHolder::Spawn {
-                req,
-                id,
-                argv: argv.clone(),
-                env: env.clone(),
-                cwd: cwd.clone(),
-                size,
-            })
-            .map_err(|_| Failure::NoHolder)?;
+        let Ok(mut reply) = holder.request(|req| ToHolder::Spawn {
+            req,
+            id,
+            argv: argv.clone(),
+            env: env.clone(),
+            cwd: cwd.clone(),
+            size,
+        }) else {
+            self.discard_settings(id);
+            self.agents.forget(id);
+            return Err(Failure::NoHolder);
+        };
         if matches!(
             reply,
             (FromHolder::Failed { errno, .. }, _)
@@ -1891,16 +1897,19 @@ impl Registry {
         ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &mut env)
         {
             initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
-            reply = holder
-                .request(|req| ToHolder::Spawn {
-                    req,
-                    id,
-                    argv,
-                    env,
-                    cwd,
-                    size,
-                })
-                .map_err(|_| Failure::NoHolder)?;
+            let Ok(next_reply) = holder.request(|req| ToHolder::Spawn {
+                req,
+                id,
+                argv,
+                env,
+                cwd,
+                size,
+            }) else {
+                self.discard_settings(id);
+                self.agents.forget(id);
+                return Err(Failure::NoHolder);
+            };
+            reply = next_reply;
         }
         match reply {
             (FromHolder::Spawned { pid, .. }, Some(master)) => {
@@ -1947,7 +1956,10 @@ impl Registry {
                 Err(Failure::from_holder_errno(errno))
             }
             _ => {
+                holder.notify(|req| ToHolder::Release { req, id }).ok();
                 lock(&self.state).roots.remove(id);
+                self.discard_settings(id);
+                self.agents.forget(id);
                 Err(Failure::Os(libc::EIO))
             }
         }
@@ -4020,21 +4032,24 @@ impl Registry {
                         }
                     });
                     match checked {
-                        Ok((delivery, messages))
-                            if !messages.is_empty() || Instant::now() >= deadline =>
-                        {
-                            break Ok(if !v2 || (ack && delivery_id.is_none()) {
-                                OrchResponse::Messages(messages)
-                            } else {
-                                OrchResponse::Delivery { delivery, messages }
-                            });
-                        }
-                        Ok(_) => {
-                            let rem = deadline.saturating_duration_since(Instant::now());
+                        Ok((delivery, messages)) => {
+                            let now = Instant::now();
+                            if !messages.is_empty() || now >= deadline {
+                                break Ok(if !v2 || (ack && delivery_id.is_none()) {
+                                    OrchResponse::Messages(messages)
+                                } else {
+                                    OrchResponse::Delivery { delivery, messages }
+                                });
+                            }
+                            let rem = deadline.saturating_duration_since(now);
                             if rem.is_zero() {
-                                break Ok(OrchResponse::Delivery {
-                                    delivery: None,
-                                    messages: Vec::new(),
+                                break Ok(if !v2 || (ack && delivery_id.is_none()) {
+                                    OrchResponse::Messages(Vec::new())
+                                } else {
+                                    OrchResponse::Delivery {
+                                        delivery: None,
+                                        messages: Vec::new(),
+                                    }
                                 });
                             }
                             let (lock_gen, cvar) = &self.orch_signal;
