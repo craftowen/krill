@@ -339,6 +339,105 @@ fn review_in_term() -> io::Error {
     )
 }
 
+const RPC_GENERIC_ERROR: &str = "Request failed. Check the desktop connection and try again.";
+
+fn contains_session_prefix(lower: &str) -> bool {
+    let mut rest = lower;
+    while let Some((_, after)) = rest.split_once("session ") {
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && after.as_bytes().get(digits) == Some(&b':') {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+fn contains_http_status(lower: &str) -> bool {
+    let mut rest = lower;
+    while let Some((_, after)) = rest.split_once("http ") {
+        if let Some(code) = after.as_bytes().get(..3)
+            && code.iter().all(u8::is_ascii_digit)
+        {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+fn sanitize_mobile_rpc_error(err: &io::Error) -> String {
+    let raw = err.to_string();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return RPC_GENERIC_ERROR.to_string();
+    }
+    if trimmed.eq_ignore_ascii_case("invalid mobile authentication or frame")
+        || trimmed.contains("Confirm in Term")
+    {
+        return trimmed.to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if err.kind() == io::ErrorKind::TimedOut {
+        return "Request timed out. Try again.".to_string();
+    }
+    if err.kind() == io::ErrorKind::PermissionDenied
+        && (lower == "permission denied" || lower.contains("os error"))
+    {
+        return "Permission denied on desktop.".to_string();
+    }
+    if matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    ) || lower.contains("os error")
+        || lower.contains("broken pipe")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection aborted")
+        || lower.contains("unexpected control reply")
+        || lower.contains("unexpected daemon reply")
+        || lower.contains("bad request")
+        || lower.contains("entity not found")
+        || lower.contains("no such file or directory")
+        || lower.contains("usage api")
+        || lower.contains("/users/")
+        || lower.contains("/home/")
+        || lower.contains("/var/")
+        || lower.contains("/tmp/")
+        || lower.contains("/volumes/")
+        || lower.contains(".sock")
+        || lower.contains(":\\")
+        || contains_session_prefix(&lower)
+        || contains_http_status(&lower)
+    {
+        return RPC_GENERIC_ERROR.to_string();
+    }
+    trimmed.to_string()
+}
+
+pub(crate) fn sanitize_tap_reason(error: &io::Error) -> &'static str {
+    if error.kind() == io::ErrorKind::NotFound {
+        return "Session is no longer active.";
+    }
+    match error.to_string().trim() {
+        "Wait for the running agent to become idle" => "Wait for the running agent to become idle",
+        "Wait for an idle Claude Code 2.1.311 or later chat with an empty native composer" => {
+            "Wait for an idle Claude Code 2.1.311 or later chat with an empty native composer"
+        }
+        "Wait for an idle Claude Code chat with an empty native composer" => {
+            "Wait for an idle Claude Code chat with an empty native composer"
+        }
+        "Wait for an idle Codex 0.164.0 or later chat with an empty native composer" => {
+            "Wait for an idle Codex 0.164.0 or later chat with an empty native composer"
+        }
+        _ => "Could not connect to the live agent session.",
+    }
+}
+
 impl Backend {
     pub(super) fn new(registry: Weak<Registry>, dir: Option<&Path>, hello: ServerHello) -> Self {
         Self {
@@ -367,7 +466,7 @@ impl Backend {
         })();
         let value = match result {
             Ok(data) => json!({"ok":true,"data":data}),
-            Err(e) => json!({"ok":false,"error":e.to_string()}),
+            Err(e) => json!({"ok":false,"error":sanitize_mobile_rpc_error(&e)}),
         };
         let out = serde_json::to_string(&value)
             .ok()
@@ -498,29 +597,26 @@ impl Backend {
                         Ok(json!({"needs_setup":true,"script":script,"hash":hex(&hash)}))
                     }
                     Reply::WorktreeCreated(mut tree) => {
-                        let session = match self.control(&Request::Create(Create {
-                            program,
-                            cwd: tree.path.clone(),
-                            cols: 80,
-                            rows: 24,
-                            account: None,
-                        })) {
-                            Ok(Reply::Created { session, .. }) => {
-                                if let Some(dir) = self.dir.as_deref()
-                                    && !krill_proto::git::is_default_branch_or_worktree_name(name)
-                                {
-                                    krill_proto::git::record_session_auto_title(dir, session, name)
-                                        .ok();
-                                }
-                                self.prewarm_composer(session.0);
-                                Some(session.0)
+                        let session = if let Ok(Reply::Created { session, .. }) =
+                            self.control(&Request::Create(Create {
+                                program,
+                                cwd: tree.path.clone(),
+                                cols: 80,
+                                rows: 24,
+                                account: None,
+                            })) {
+                            if let Some(dir) = self.dir.as_deref()
+                                && !krill_proto::git::is_default_branch_or_worktree_name(name)
+                            {
+                                krill_proto::git::record_session_auto_title(dir, session, name)
+                                    .ok();
                             }
-                            other => {
-                                tree.warnings.push(format!(
-                                    "Workspace created; terminal unavailable: {other:?}"
-                                ));
-                                None
-                            }
+                            self.prewarm_composer(session.0);
+                            Some(session.0)
+                        } else {
+                            tree.warnings
+                                .push("Workspace created; terminal unavailable".to_string());
+                            None
                         };
                         let path = PathBuf::from(std::ffi::OsStr::from_bytes(&tree.path));
                         let path = fs::canonicalize(&path).unwrap_or(path);
@@ -3391,5 +3487,59 @@ mod revision_tests {
                 .is_none()
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sanitize_mobile_rpc_error_preserves_safe_messages_and_hides_internals() {
+        for safe in [
+            "This historical request cannot be verified against the current question. Confirm in Term.",
+            "invalid mobile authentication or frame",
+            "Not a Git repository",
+            "File exceeds 128 KiB diff limit",
+            "This file is no longer on the PC",
+            "Session not found",
+            "File is larger than 2 GiB",
+            "Invalid file name",
+            "This request is no longer pending.",
+        ] {
+            assert_eq!(sanitize_mobile_rpc_error(&io::Error::other(safe)), safe);
+        }
+
+        for leaked in [
+            io::Error::new(io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)"),
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "Connection refused (os error 61)",
+            ),
+            io::Error::other("unexpected control reply: Denied"),
+            io::Error::other("unexpected daemon reply"),
+            io::Error::other("bad request"),
+            io::Error::other("failed connecting /Users/owen/.krill/daemon.sock"),
+            io::Error::other("Session 41205: could not resume with selected account"),
+            io::Error::other("Usage API rejected the sign-in (HTTP 401)"),
+        ] {
+            assert_eq!(sanitize_mobile_rpc_error(&leaked), RPC_GENERIC_ERROR);
+        }
+    }
+
+    #[test]
+    fn sanitize_tap_reason_hides_raw_io_and_preserves_wait_guidance() {
+        assert_eq!(
+            sanitize_tap_reason(&io::Error::new(io::ErrorKind::NotFound, "no /Users/foo")),
+            "Session is no longer active."
+        );
+        assert_eq!(
+            sanitize_tap_reason(&io::Error::other(
+                "Wait for the running agent to become idle"
+            )),
+            "Wait for the running agent to become idle"
+        );
+        assert_eq!(
+            sanitize_tap_reason(&io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Broken pipe (os error 32)"
+            )),
+            "Could not connect to the live agent session."
+        );
     }
 }

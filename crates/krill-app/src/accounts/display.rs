@@ -1,9 +1,9 @@
 //! 계정 카드와 상태바가 함께 쓰는 사용량·상태 표시(OWE-703).
 
-use crate::i18n::catalog::settings as text;
+use crate::i18n::catalog::{daemon_notice, settings as text};
 use krill_proto::usage::{
-    AccountInfo, AccountStatus, AccountStatusInfo, AccountsSnapshot, ConnectionStatus, Snapshot,
-    Window,
+    AccountInfo, AccountStatus, AccountStatusInfo, AccountsSnapshot, ConnectionStatus,
+    ProviderKind, Snapshot, Window,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,18 +155,31 @@ pub struct AccountDisplay {
 
 pub fn account(info: &AccountInfo, status: Option<&AccountStatusInfo>, now: u64) -> AccountDisplay {
     // N-1 데몬은 꼬리가 없으므로 기존 stale·사용량에서 보수적으로 표시한다.
-    let kind = status.map_or_else(
-        || {
-            if info.stale {
-                AccountStatus::Stale
-            } else if info.usage.is_empty() {
-                AccountStatus::Unknown
-            } else {
-                AccountStatus::Ok
-            }
-        },
-        |s| s.status,
-    );
+    let opencode_host_default_403 = info.provider == ProviderKind::OpenCode
+        && info.host_default
+        && status.is_some_and(|s| {
+            s.status == AccountStatus::Error
+                && s.detail.as_deref().is_some_and(|raw| {
+                    let lower = raw.to_ascii_lowercase();
+                    lower.contains("denied access") || lower.contains("403")
+                })
+        });
+    let kind = if opencode_host_default_403 {
+        AccountStatus::Unknown
+    } else {
+        status.map_or_else(
+            || {
+                if info.stale {
+                    AccountStatus::Stale
+                } else if info.usage.is_empty() {
+                    AccountStatus::Unknown
+                } else {
+                    AccountStatus::Ok
+                }
+            },
+            |s| s.status,
+        )
+    };
     let label = match kind {
         AccountStatus::Unknown => text::ACCOUNT_STATUS_UNKNOWN,
         AccountStatus::Stale => text::ACCOUNT_STATUS_STALE,
@@ -184,11 +197,15 @@ pub fn account(info: &AccountInfo, status: Option<&AccountStatusInfo>, now: u64)
         faded: info.stale
             || kind == AccountStatus::Stale
             || krill_proto::usage::is_updated_stale(updated, now),
-        detail: status
-            .and_then(|s| s.detail.as_deref())
-            .map(str::trim)
-            .filter(|detail| !detail.is_empty())
-            .map(crate::i18n::cached_notice),
+        detail: if opencode_host_default_403 {
+            Some(daemon_notice::USAGE_UNSUPPORTED.get().to_owned())
+        } else {
+            status
+                .and_then(|s| s.detail.as_deref())
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty())
+                .map(crate::i18n::cached_notice)
+        },
     }
 }
 
@@ -543,11 +560,26 @@ mod tests {
         status.detail = Some("  usage API returned HTTP 403  ".into());
         assert_eq!(
             account(&info, Some(&status), 5000).detail.as_deref(),
-            Some("usage API returned HTTP 403")
+            Some(daemon_notice::USAGE_HTTP_403.get())
+        );
+        status.detail = Some("  Custom notice  ".into());
+        assert_eq!(
+            account(&info, Some(&status), 5000).detail.as_deref(),
+            Some("Custom notice")
         );
         status.detail = Some(" \n ".into());
         assert!(account(&info, Some(&status), 5000).detail.is_none());
         assert!(account(&info, None, 5000).detail.is_none());
+        info.provider = ProviderKind::OpenCode;
+        info.host_default = true;
+        status.status = AccountStatus::Error;
+        status.detail = Some("Usage API denied access (HTTP 403)".into());
+        let opencode_display = account(&info, Some(&status), 5000);
+        assert_eq!(opencode_display.status, AccountStatus::Unknown);
+        assert_eq!(
+            opencode_display.detail.as_deref(),
+            Some(daemon_notice::USAGE_UNSUPPORTED.get())
+        );
         assert_eq!(
             updated_text(None, 5000),
             text::ACCOUNT_UPDATED_UNKNOWN.get()

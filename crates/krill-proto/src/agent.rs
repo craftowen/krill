@@ -59,9 +59,60 @@ install = 'if command -v agy >/dev/null 2>&1; then agy update; elif [ -x "$HOME/
 install_windows = 'if (Get-Command agy -ErrorAction SilentlyContinue) { agy update } elseif (Test-Path "$env:LOCALAPPDATA/agy/bin/agy.exe") { & "$env:LOCALAPPDATA/agy/bin/agy.exe" update } else { irm https://antigravity.google/cli/install.ps1 | iex }'
 "#;
 
-/// 추가 에이전트 생태계 프리셋(MK-229). `Agents::load(None)`의 기본 5종([`BUILTIN`])은 그대로 두고,
-/// `Agents::resolve(id)` 및 `krill agent list`에서 별도 설정 없이 바로 해석·실행할 수 있게 한다.
+/// 추가 에이전트 생태계 프리셋(MK-229, Orca 카탈로그 기반). `Agents::load(None)`의 기본 5종([`BUILTIN`])은
+/// 그대로 두고, UI 카탈로그 추가·`Agents::resolve(id)`·`krill agent list`에서 해석·실행할 수 있게 한다.
 pub const PRESETS: &str = r#"
+[agent.grok]
+name = "Grok"
+launch = ["grok"]
+yolo_args = ["--permission-mode", "bypassPermissions"]
+
+[agent.muse]
+name = "Muse"
+launch = ["muse"]
+yolo_args = ["--yolo"]
+
+[agent.copilot]
+name = "GitHub Copilot"
+launch = ["copilot"]
+yolo_args = ["--yolo"]
+
+[agent.pi]
+name = "Pi"
+launch = ["pi"]
+install = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+
+[agent.omp]
+name = "OMP"
+launch = ["omp"]
+
+[agent.hermes]
+name = "Hermes"
+launch = ["hermes", "--tui"]
+yolo_args = ["--yolo"]
+
+[agent.kimi]
+name = "Kimi"
+launch = ["kimi"]
+yolo_args = ["--yolo"]
+install = "uv tool install kimi-cli"
+
+[agent.qwen]
+name = "Qwen Code"
+launch = ["qwen"]
+yolo_args = ["--yolo"]
+install = "npm install -g @qwen-code/qwen-code"
+
+[agent.droid]
+name = "Droid"
+launch = ["droid"]
+yolo_args = ["--auto", "high"]
+
+[agent.kiro]
+name = "Kiro"
+launch = ["kiro-cli", "chat", "--tui"]
+yolo_args = ["--trust-all-tools"]
+
 [agent.aider]
 name = "Aider"
 launch = ["aider"]
@@ -74,33 +125,160 @@ launch = ["goose"]
 install = "curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash"
 install_windows = "irm https://raw.githubusercontent.com/block/goose/main/download_cli.ps1 | iex"
 
-[agent.copilot]
-name = "GitHub Copilot CLI"
-launch = ["github-copilot-cli"]
-install = "npm install -g @githubnext/github-copilot-cli"
-
 [agent.amp]
 name = "Amp"
 launch = ["amp"]
+yolo_args = ["--dangerously-allow-all"]
 install = "npm install -g @sourcegraph/amp"
 
-[agent.pi]
-name = "Pi"
-launch = ["pi"]
-install = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+[agent.mistral-vibe]
+name = "Mistral Vibe"
+launch = ["vibe"]
+yolo_args = ["--agent", "auto-approve"]
+install = "uv tool install mistral-vibe"
 
-[agent.qwen]
-name = "Qwen Code"
-launch = ["qwen"]
+[agent.crush]
+name = "Charm"
+launch = ["crush"]
 yolo_args = ["--yolo"]
-install = "npm install -g @qwen-code/qwen-code"
 
-[agent.kimi]
-name = "Kimi CLI"
-launch = ["kimi"]
+[agent.cline]
+name = "Cline"
+launch = ["cline"]
+yolo_args = ["--auto-approve", "true"]
+
+[agent.kilo]
+name = "Kilocode"
+launch = ["kilo"]
+
+[agent.continue]
+name = "Continue"
+launch = ["cn"]
+yolo_args = ["--allow", "*"]
+
+[agent.devin]
+name = "Devin"
+launch = ["devin"]
+yolo_args = ["--permission-mode", "bypass", "--respect-workspace-trust", "false"]
+
+[agent.trae]
+name = "Trae"
+launch = ["traecli"]
 yolo_args = ["--yolo"]
-install = "uv tool install kimi-cli"
+
+[agent.zcode]
+name = "ZCode"
+launch = ["zcode"]
+yolo_args = ["--mode", "yolo"]
+
+[agent.dsh]
+name = "DeepSeek Harness"
+launch = ["dsh-tui", "."]
+
+[agent.openclaude]
+name = "OpenClaude"
+launch = ["openclaude"]
+yolo_args = ["--dangerously-skip-permissions"]
+
+[agent.opencode2]
+name = "OpenCode 2"
+launch = ["opencode2", "--standalone"]
 "#;
+
+/// UI 카탈로그·정렬에서 프리셋 프로바이더를 노출하는 기본 순서.
+pub const PRESET_ORDER: &[&str] = &[
+    "grok",
+    "muse",
+    "copilot",
+    "pi",
+    "omp",
+    "hermes",
+    "kimi",
+    "qwen",
+    "droid",
+    "kiro",
+    "aider",
+    "goose",
+    "amp",
+    "mistral-vibe",
+    "crush",
+    "cline",
+    "kilo",
+    "continue",
+    "devin",
+    "trae",
+    "zcode",
+    "dsh",
+    "openclaude",
+    "opencode2",
+];
+
+/// 내장·프리셋 에이전트의 공식 문서/설치 안내 URL.
+#[must_use]
+pub fn agent_homepage(id: &str) -> Option<&'static str> {
+    let canon = canonical_id(id);
+    if canon.eq_ignore_ascii_case("claude") {
+        Some("https://code.claude.com/docs")
+    } else if canon.eq_ignore_ascii_case("codex") {
+        Some("https://github.com/openai/codex")
+    } else if canon.eq_ignore_ascii_case("agy") {
+        Some("https://antigravity.google/docs/cli-overview")
+    } else if canon.eq_ignore_ascii_case("cursor") {
+        Some("https://cursor.com/cli")
+    } else if canon.eq_ignore_ascii_case("opencode") {
+        Some("https://opencode.ai/docs/cli/")
+    } else if canon.eq_ignore_ascii_case("grok") {
+        Some("https://x.ai/cli")
+    } else if canon.eq_ignore_ascii_case("muse") {
+        Some("https://dev.meta.ai/docs/muse-code")
+    } else if canon.eq_ignore_ascii_case("copilot") {
+        Some("https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli")
+    } else if canon.eq_ignore_ascii_case("pi") {
+        Some("https://pi.dev")
+    } else if canon.eq_ignore_ascii_case("omp") {
+        Some("https://omp.sh")
+    } else if canon.eq_ignore_ascii_case("hermes") {
+        Some("https://hermes-agent.nousresearch.com/docs/")
+    } else if canon.eq_ignore_ascii_case("kimi") {
+        Some("https://www.kimi.com/code/docs/en/kimi-code-cli/getting-started.html")
+    } else if canon.eq_ignore_ascii_case("qwen") {
+        Some("https://github.com/QwenLM/qwen-code")
+    } else if canon.eq_ignore_ascii_case("droid") {
+        Some("https://docs.factory.ai/cli/getting-started/quickstart")
+    } else if canon.eq_ignore_ascii_case("kiro") {
+        Some("https://kiro.dev/docs/cli/")
+    } else if canon.eq_ignore_ascii_case("aider") {
+        Some("https://aider.chat/docs/")
+    } else if canon.eq_ignore_ascii_case("goose") {
+        Some("https://block.github.io/goose/docs/quickstart/")
+    } else if canon.eq_ignore_ascii_case("amp") {
+        Some("https://ampcode.com/manual#install")
+    } else if canon.eq_ignore_ascii_case("mistral-vibe") {
+        Some("https://github.com/mistralai/mistral-vibe")
+    } else if canon.eq_ignore_ascii_case("crush") {
+        Some("https://github.com/charmbracelet/crush")
+    } else if canon.eq_ignore_ascii_case("cline") {
+        Some("https://docs.cline.bot/cline-cli/overview")
+    } else if canon.eq_ignore_ascii_case("kilo") {
+        Some("https://kilo.ai/docs/cli")
+    } else if canon.eq_ignore_ascii_case("continue") {
+        Some("https://docs.continue.dev/guides/cli")
+    } else if canon.eq_ignore_ascii_case("devin") {
+        Some("https://devin.ai/cli")
+    } else if canon.eq_ignore_ascii_case("trae") {
+        Some("https://docs.trae.cn/cli_get-started-with-trae-cli")
+    } else if canon.eq_ignore_ascii_case("zcode") {
+        Some("https://zcode.z.ai/en/docs")
+    } else if canon.eq_ignore_ascii_case("dsh") {
+        Some("https://deepseek-harness.github.io/deepseek-harness/")
+    } else if canon.eq_ignore_ascii_case("openclaude") {
+        Some("https://openclaude.gitlawb.com/")
+    } else if canon.eq_ignore_ascii_case("opencode2") {
+        Some("https://opencode.ai/v2/docs/")
+    } else {
+        None
+    }
+}
 
 /// 내장 외 확장 프리셋 프로필 목록.
 #[must_use]
@@ -130,8 +308,27 @@ pub fn canonical_id(id: &str) -> &str {
         "aider"
     } else if trimmed.eq_ignore_ascii_case("qwen-code") {
         "qwen"
-    } else if trimmed.eq_ignore_ascii_case("kimi-cli") {
+    } else if trimmed.eq_ignore_ascii_case("kimi-cli") || trimmed.eq_ignore_ascii_case("kimi-code")
+    {
         "kimi"
+    } else if trimmed.eq_ignore_ascii_case("kiro-cli") {
+        "kiro"
+    } else if trimmed.eq_ignore_ascii_case("vibe") {
+        "mistral-vibe"
+    } else if trimmed.eq_ignore_ascii_case("cn") {
+        "continue"
+    } else if trimmed.eq_ignore_ascii_case("traecli") {
+        "trae"
+    } else if trimmed.eq_ignore_ascii_case("dsh-tui") || trimmed.eq_ignore_ascii_case("dst") {
+        "dsh"
+    } else if trimmed.eq_ignore_ascii_case("zcode-cli") {
+        "zcode"
+    } else if trimmed.eq_ignore_ascii_case("open-code") {
+        "opencode"
+    } else if trimmed.eq_ignore_ascii_case("claude-code")
+        || trimmed.eq_ignore_ascii_case("claudecode")
+    {
+        "claude"
     } else {
         trimmed
     }
@@ -151,7 +348,15 @@ pub fn executable_id(program: &str) -> &str {
             name.get(..split)
         })
         .unwrap_or(name);
-    for id in ["claude", "codex", "agy", "opencode"] {
+    for id in [
+        "claude",
+        "codex",
+        "agy",
+        "opencode",
+        "opencode2",
+        "grok",
+        "muse",
+    ] {
         if name.eq_ignore_ascii_case(id) {
             return id;
         }
@@ -159,16 +364,22 @@ pub fn executable_id(program: &str) -> &str {
     if name.eq_ignore_ascii_case("antigravity-cli") {
         return "agy";
     }
-    if name.eq_ignore_ascii_case("open-code") {
-        return "opencode";
+    if name
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("grok-"))
+    {
+        return "grok";
     }
-    if name.eq_ignore_ascii_case("claude-code") || name.eq_ignore_ascii_case("claudecode") {
-        return "claude";
+    if name
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("muse-bin-"))
+    {
+        return "muse";
     }
     canonical_id(name)
 }
 
-/// UI·단축키(`⌥⌘1~4`) 및 설정 목록에서 내장 에이전트의 표준 표시 순서.
+/// UI·단축키(`⌥⌘1~4`) 및 설정 목록에서 내장·프리셋 에이전트의 표준 표시 순서.
 #[must_use]
 pub fn profile_rank(id: &str) -> u8 {
     match id {
@@ -177,8 +388,25 @@ pub fn profile_rank(id: &str) -> u8 {
         "agy" => 2,
         "cursor" => 3,
         "opencode" => 4,
-        _ => 5,
+        _ => PRESET_ORDER
+            .iter()
+            .position(|&preset| preset == id)
+            .and_then(|idx| idx.checked_add(5))
+            .and_then(|rank| u8::try_from(rank).ok())
+            .unwrap_or(u8::MAX),
     }
+}
+
+/// 데몬 프로세스 모니터에서 알려진 AI 에이전트 전경 프로세스인지 판정한다.
+#[must_use]
+pub fn is_known_agent_process(name: &str) -> bool {
+    let exe = executable_id(name);
+    let lower = exe.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "claude" | "codex" | "agy" | "cursor" | "opencode"
+    ) || lower.starts_with("codex-")
+        || preset_profiles().contains_key(lower.as_str())
 }
 
 /// 사용자 프로필 파일 이름. 상태 디렉터리([`crate::daemon::state_dir`]) 아래에 둔다.
@@ -286,6 +514,42 @@ pub fn set_user_profile(user: Option<&str>, id: &str, profile: &Profile) -> Resu
     let mut agents: Agents = toml::from_str(original).map_err(|e| e.to_string())?;
     agents.profiles.insert(id.to_owned(), profile.clone());
     crate::config_document::edit_toml(original, &agents).map_err(|e| e.to_string())
+}
+
+/// 사용자 `agents.toml` 텍스트에서 `[agent.<id>]`를 제거한 새 텍스트. 다른 프로필·전역 키·원문 주석을 보존한다.
+///
+/// # Errors
+/// 기존 텍스트가 TOML이 아니거나 `agent` 테이블이 올바르지 않으면 실패한다.
+pub fn remove_user_profile(user: Option<&str>, id: &str) -> Result<String, String> {
+    let original = user.unwrap_or_default();
+    let mut agents: Agents = toml::from_str(original).map_err(|e| e.to_string())?;
+    agents.profiles.remove(id);
+    crate::config_document::edit_toml(original, &agents).map_err(|e| e.to_string())
+}
+
+/// 사용자 정의 에이전트 ID를 정규화하고 TOML·UI 식별자 규칙을 검증한다.
+///
+/// # Errors
+/// 비어 있거나, 48자를 넘거나, 소문자 영숫자/`-`/`_` 규칙에 어긋나거나 예약된 ID이면 오류 문자열을 돌려준다.
+pub fn validate_custom_agent_id(raw: &str) -> Result<String, &'static str> {
+    let id = raw.trim().to_ascii_lowercase();
+    if id.is_empty() {
+        return Err("empty agent id");
+    }
+    if id.len() > 48 {
+        return Err("agent id too long");
+    }
+    if !id.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'))
+    {
+        return Err("invalid agent id characters");
+    }
+    if id == "gemini" {
+        return Err("reserved agent id");
+    }
+    Ok(id)
 }
 
 /// 전역 권한과 프로필 전부(id 순).
@@ -406,6 +670,8 @@ fn has_effort_flag_in_args(args: &[String]) -> bool {
     while let Some(arg) = iter.next() {
         if arg == "--effort"
             || arg.starts_with("--effort=")
+            || arg == "--reasoning-effort"
+            || arg.starts_with("--reasoning-effort=")
             || arg == "--thinking"
             || arg.starts_with("--thinking=")
             || arg.contains("model_reasoning_effort")
@@ -436,7 +702,19 @@ pub fn validate_launch_overrides(
             let valid = validate_model_syntax(raw)?;
             if !matches!(
                 canon,
-                "claude" | "codex" | "agy" | "opencode" | "cursor" | "pi" | "kimi"
+                "claude"
+                    | "codex"
+                    | "agy"
+                    | "opencode"
+                    | "opencode2"
+                    | "openclaude"
+                    | "cursor"
+                    | "pi"
+                    | "omp"
+                    | "kimi"
+                    | "grok"
+                    | "aider"
+                    | "qwen"
             ) {
                 return Err(format!(
                     "--model override is not supported for agent '{agent_id}'"
@@ -467,14 +745,14 @@ pub fn validate_launch_overrides(
                         ));
                     }
                 }
-                "claude" => {
+                "claude" | "openclaude" => {
                     if !matches!(valid.as_str(), "low" | "medium" | "high" | "max") {
                         return Err(format!(
                             "agent '{agent_id}' supports effort: low, medium, high, max (got '{valid}')"
                         ));
                     }
                 }
-                "pi" => {
+                "pi" | "omp" => {
                     if !matches!(
                         valid.as_str(),
                         "minimal" | "low" | "medium" | "high" | "xhigh"
@@ -484,9 +762,16 @@ pub fn validate_launch_overrides(
                         ));
                     }
                 }
+                "grok" => {
+                    if !matches!(valid.as_str(), "low" | "medium" | "high" | "xhigh") {
+                        return Err(format!(
+                            "agent '{agent_id}' supports effort: low, medium, high, xhigh (got '{valid}')"
+                        ));
+                    }
+                }
                 _ => {
                     return Err(format!(
-                        "--effort override is not supported for agent '{agent_id}' (supported: claude, codex, pi)"
+                        "--effort override is not supported for agent '{agent_id}' (supported: claude, codex, grok, pi, omp)"
                     ));
                 }
             }
@@ -514,7 +799,9 @@ pub fn apply_launch_overrides(
     let normalized = validate_launch_overrides(agent_id, profile, overrides)?;
     let canon = canonical_id(agent_id);
     if let Some(model) = normalized.model {
-        profile.launch.push("--model".to_owned());
+        profile
+            .launch
+            .push(if canon == "grok" { "-m" } else { "--model" }.to_owned());
         profile.launch.push(model);
     }
     if let Some(effort) = normalized.effort {
@@ -525,11 +812,15 @@ pub fn apply_launch_overrides(
                     .launch
                     .push(format!("model_reasoning_effort=\"{effort}\""));
             }
-            "claude" => {
+            "claude" | "openclaude" => {
                 profile.launch.push("--effort".to_owned());
                 profile.launch.push(effort);
             }
-            "pi" => {
+            "grok" => {
+                profile.launch.push("--reasoning-effort".to_owned());
+                profile.launch.push(effort);
+            }
+            "pi" | "omp" => {
                 profile.launch.push("--thinking".to_owned());
                 profile.launch.push(effort);
             }

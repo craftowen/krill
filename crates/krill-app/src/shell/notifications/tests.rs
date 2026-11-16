@@ -295,7 +295,9 @@ fn notices_overlay_top_right_without_resize_focus_or_duplicates(cx: &mut TestApp
     assert_eq!(cx.debug_bounds("terminal-surface").unwrap(), before);
     // One-shot notices close themselves on the stack's timer.
     view.update(cx, |s, cx| {
-        s.notice = Some("Session 7: could not resume with selected account".into());
+        s.notice = Some(krill_app::i18n::sanitize_handoff_error(
+            "Session 7: could not resume with selected account",
+        ));
         cx.notify();
     });
     cx.run_until_parked();

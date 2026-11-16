@@ -396,7 +396,7 @@ impl Sidebar {
         if !self.session_account_pending(host, session)
             && let Some(error) = self.session_account_error(host, session)
         {
-            format!("{account} · {error}")
+            format!("{account} · {}", crate::i18n::sanitize_handoff_error(error))
         } else {
             account
         }

@@ -318,10 +318,157 @@ fn send_pending(state: &Path) -> io::Result<()> {
     }
 }
 
+pub(crate) fn user_io_error_in(err: &io::Error, lang: crate::i18n::Language) -> String {
+    let raw = err.to_string();
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.contains("remote host disconnected") {
+        return text::REMOTE_HOST_DISCONNECTED.in_language(lang).to_owned();
+    }
+    if lower.contains("provider executable not found") {
+        return text::PROVIDER_CLI_NOT_FOUND.in_language(lang).to_owned();
+    }
+    if lower.contains("requires the daemon")
+        || lower.contains("requires daemon")
+        || lower.contains("require daemon")
+        || trimmed == text::ACCOUNTS_DAEMON_REQUIRED.in_language(crate::i18n::Language::Ko)
+        || trimmed == text::ACCOUNTS_DAEMON_REQUIRED.in_language(crate::i18n::Language::En)
+    {
+        return text::ACCOUNTS_DAEMON_REQUIRED.in_language(lang).to_owned();
+    }
+    if lower.contains("feat_")
+        || lower.contains("not negotiated")
+        || lower.contains("does not support")
+    {
+        return text::ACCOUNTS_DAEMON_RESTART_REQUIRED
+            .in_language(lang)
+            .to_owned();
+    }
+    if lower.contains("closed usage stream")
+        || lower.contains("broken pipe")
+        || lower.contains("not connected")
+    {
+        return text::IO_CONNECTION_LOST.in_language(lang).to_owned();
+    }
+    if lower.contains("connection refused") || err.kind() == io::ErrorKind::ConnectionRefused {
+        return text::IO_CONNECTION_REFUSED.in_language(lang).to_owned();
+    }
+    if matches!(
+        err.kind(),
+        io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    ) {
+        return text::IO_CONNECTION_LOST.in_language(lang).to_owned();
+    }
+    if matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) || lower.contains("timed out")
+    {
+        return text::IO_TIMED_OUT.in_language(lang).to_owned();
+    }
+    if err.kind() == io::ErrorKind::PermissionDenied || lower.contains("permission denied") {
+        return text::IO_PERMISSION_DENIED.in_language(lang).to_owned();
+    }
+    if err.kind() == io::ErrorKind::NotFound || lower.contains("no such file") {
+        return text::IO_NOT_FOUND.in_language(lang).to_owned();
+    }
+    if let Some(msg) = crate::i18n::translate_daemon_notice_in(trimmed, lang) {
+        return msg;
+    }
+    text::IO_GENERIC.in_language(lang).to_owned()
+}
+
+/// Format an `io::Error` into calm, localized copy suitable for user-facing UI surfaces.
+pub fn user_io_error(err: &io::Error) -> String {
+    user_io_error_in(err, crate::i18n::language())
+}
+
+pub(crate) fn user_daemon_error_in(
+    err: &krill_proto::daemon::Error,
+    lang: crate::i18n::Language,
+) -> String {
+    use krill_proto::daemon::Error;
+    match err {
+        Error::Spawn(io_err) | Error::Io(io_err) => user_io_error_in(io_err, lang),
+        Error::Missing(_) => text::IO_NOT_FOUND.in_language(lang).to_owned(),
+        Error::Timeout | Error::LockTimeout => text::IO_TIMED_OUT.in_language(lang).to_owned(),
+        Error::PathTooLong(_) | Error::HolderExited(_) | Error::Backoff { .. } => {
+            text::IO_CONNECTION_REFUSED.in_language(lang).to_owned()
+        }
+    }
+}
+
+/// Format a daemon connection error into calm, localized copy suitable for user-facing UI surfaces.
+pub fn user_daemon_error(err: &krill_proto::daemon::Error) -> String {
+    user_daemon_error_in(err, crate::i18n::language())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Language::{En, Ko};
     use std::sync::mpsc;
+
+    #[test]
+    fn user_io_error_sanitizes_kinds_sockets_and_features() {
+        for lang in [Ko, En] {
+            let not_connected = io::Error::from(io::ErrorKind::NotConnected);
+            assert_eq!(
+                user_io_error_in(&not_connected, lang),
+                text::IO_CONNECTION_LOST.in_language(lang)
+            );
+
+            let broken_pipe = io::Error::from(io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                user_io_error_in(&broken_pipe, lang),
+                text::IO_CONNECTION_LOST.in_language(lang)
+            );
+
+            let refused = io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "/Users/alice/.krill/krilld.sock: connection refused (os error 61)",
+            );
+            let refused_msg = user_io_error_in(&refused, lang);
+            assert_eq!(refused_msg, text::IO_CONNECTION_REFUSED.in_language(lang));
+            assert!(!refused_msg.contains("krilld.sock") && !refused_msg.contains("os error"));
+
+            let timed_out = io::Error::from(io::ErrorKind::TimedOut);
+            assert_eq!(
+                user_io_error_in(&timed_out, lang),
+                text::IO_TIMED_OUT.in_language(lang)
+            );
+
+            let perm = io::Error::from(io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                user_io_error_in(&perm, lang),
+                text::IO_PERMISSION_DENIED.in_language(lang)
+            );
+
+            let not_found = io::Error::from(io::ErrorKind::NotFound);
+            assert_eq!(
+                user_io_error_in(&not_found, lang),
+                text::IO_NOT_FOUND.in_language(lang)
+            );
+
+            let feat = io::Error::other("FEAT_USAGE not negotiated");
+            let feat_msg = user_io_error_in(&feat, lang);
+            assert_eq!(
+                feat_msg,
+                text::ACCOUNTS_DAEMON_RESTART_REQUIRED.in_language(lang)
+            );
+            assert!(!feat_msg.contains("FEAT_"));
+
+            let raw_sock = io::Error::other("/tmp/krill-999.sock: broken (os error 54)");
+            let sock_msg = user_io_error_in(&raw_sock, lang);
+            assert_eq!(sock_msg, text::IO_GENERIC.in_language(lang));
+            assert!(!sock_msg.contains(".sock") && !sock_msg.contains("os error"));
+        }
+    }
 
     #[test]
     fn error_reporting_quit_waits_for_refresh_and_fences_late_refresh() {
