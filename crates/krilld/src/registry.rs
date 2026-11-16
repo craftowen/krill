@@ -3081,8 +3081,17 @@ impl Registry {
                 .as_ref()
                 .is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none())
         {
-            if let Ok(Some(found)) = account_switch::identity::discover(provider, root_pid, fg_pid)
-            {
+            let expected_id = stored
+                .as_ref()
+                .and_then(|s| s.session_id.as_deref())
+                .filter(|sid| crate::agent::control::valid_session_id(sid));
+            let discovered = match expected_id {
+                Some(sid) => {
+                    account_switch::identity::discover_resumed(provider, root_pid, fg_pid, sid)
+                }
+                None => account_switch::identity::discover(provider, root_pid, fg_pid),
+            };
+            if let Ok(Some(found)) = discovered {
                 // A process-owned file also covers external account homes that are
                 // absent from the daemon's configured transcript search roots.
                 // Never replace a launch/hook-bound conversation with another ID.
@@ -5078,6 +5087,180 @@ mod orchestration_delivery_tests {
 
         drop(reg);
         drop(terminal);
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn unbound_agy_ignores_startup_conversation_files_until_presence_lock() -> io::Result<()> {
+        use std::fmt::Write as _;
+        use std::io::Read as _;
+        use std::process::{Child, Command, Stdio};
+
+        struct ChildGuard(Option<Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    child.kill().ok();
+                    child.wait().ok();
+                }
+            }
+        }
+
+        fn spawn_holding(paths: &[&Path]) -> io::Result<ChildGuard> {
+            let mut script = String::from("exec");
+            for (idx, _) in paths.iter().enumerate() {
+                let _ = write!(script, " {}<\"${}\"", idx + 3, idx + 1);
+            }
+            script.push_str("; printf ready; exec sleep 30");
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg(script).arg("krill-test-holder");
+            for path in paths {
+                cmd.arg(path);
+            }
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let mut child = cmd.spawn()?;
+            let mut ready = [0_u8; 5];
+            if let Some(mut stdout) = child.stdout.take() {
+                stdout.read_exact(&mut ready)?;
+            }
+            assert_eq!(&ready, b"ready");
+            Ok(ChildGuard(Some(child)))
+        }
+
+        let dir = std::env::temp_dir().join(format!("krill-agy-unbound-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let agy_home = dir.join(".gemini/antigravity-cli");
+        let old_conv = "0373fc46-0d68-498c-9c95-c8dd17bd4352";
+        let new_conv = "1f11082a-215d-4b11-941a-28f6acdc1b75";
+
+        let old_db = agy_home
+            .join("conversations")
+            .join(format!("{old_conv}.db"));
+        let old_pbtxt = agy_home
+            .join("annotations")
+            .join(format!("{old_conv}.pbtxt"));
+        let old_log = agy_home
+            .join("brain")
+            .join(old_conv)
+            .join(".system_generated/logs/transcript.jsonl");
+        std::fs::create_dir_all(old_db.parent().unwrap())?;
+        std::fs::create_dir_all(old_pbtxt.parent().unwrap())?;
+        std::fs::create_dir_all(old_log.parent().unwrap())?;
+        std::fs::write(&old_db, b"sqlite")?;
+        std::fs::write(&old_pbtxt, b"title: \"Old Session Title\"\n")?;
+        std::fs::write(
+            &old_log,
+            "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nOld session prompt\\n</USER_REQUEST>\"}\n",
+        )?;
+
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let id = SessionId(416);
+        let (master, _terminal) = UnixStream::pair()?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )?;
+        let child1 = spawn_holding(&[&old_db, &old_pbtxt, &old_log])?;
+        let pid1 = child1.0.as_ref().unwrap().id();
+        {
+            let mut st = lock(&reg.state);
+            st.roots.insert(id, pid1).unwrap();
+            st.sessions.insert(
+                id,
+                Entry {
+                    session,
+                    pid: pid1,
+                    cwd: dir.clone(),
+                    wrapped: false,
+                },
+            );
+        }
+        reg.agents.remember_session(
+            id,
+            &control::AgentLaunch {
+                profile: "agy".into(),
+                permission: krill_proto::agent::Permission::Yolo,
+            },
+            None,
+            dir.as_os_str().as_encoded_bytes().to_vec(),
+            Some(crate::agent::control::LaunchAccount {
+                id: String::new(),
+                env_key: "ANTIGRAVITY_CLI_HOME".into(),
+                dir: agy_home.display().to_string(),
+            }),
+        )?;
+
+        // Phase 1: startup reconciliation opens old conversation files without a presence lock.
+        // Neither status polling nor chat polling may bind this new session to `old_conv`.
+        let status = reg.mobile_session_status(id).expect("session status");
+        let checked_at = Instant::now();
+        assert_eq!(status.state, control::AgentState::Unknown);
+        assert_eq!(status.title, None);
+
+        let poll = reg.chat_poll(id, 0);
+        assert!(!poll.bound);
+        assert!(poll.session_id.is_empty());
+        assert!(poll.items.is_empty());
+
+        let stored = reg.agents.stored(id)?.expect("stored launch");
+        assert_eq!(stored.session_id, None);
+        assert_eq!(stored.transcript_path, None);
+
+        // Phase 2: once the process holds `presence/<new_conv>.lock`, both status and chat bind it.
+        let new_lock = agy_home.join("presence").join(format!("{new_conv}.lock"));
+        let new_pbtxt = agy_home
+            .join("annotations")
+            .join(format!("{new_conv}.pbtxt"));
+        let new_log = agy_home
+            .join("brain")
+            .join(new_conv)
+            .join(".system_generated/logs/transcript.jsonl");
+        std::fs::create_dir_all(new_lock.parent().unwrap())?;
+        std::fs::create_dir_all(new_log.parent().unwrap())?;
+        std::fs::write(&new_lock, b"")?;
+        std::fs::write(&new_pbtxt, b"title: \"New Session Title\"\n")?;
+        std::fs::write(
+            &new_log,
+            "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nNew user prompt\\n</USER_REQUEST>\"}\n",
+        )?;
+
+        drop(child1);
+        let child2 = spawn_holding(&[&new_lock, &old_db, &old_pbtxt])?;
+        let pid2 = child2.0.as_ref().unwrap().id();
+        {
+            let mut st = lock(&reg.state);
+            st.roots.insert(id, pid2).unwrap();
+            st.sessions.get_mut(&id).unwrap().pid = pid2;
+        }
+
+        // Wait past resolve_live_agy_title's 1s negative cooldown from Phase 1.
+        if let Some(remaining) = Duration::from_millis(1100).checked_sub(checked_at.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+
+        let bound_poll = reg.chat_poll(id, 0);
+        assert!(bound_poll.bound);
+        assert_eq!(bound_poll.session_id, new_conv);
+        assert!(!bound_poll.items.is_empty());
+
+        let bound_status = reg.mobile_session_status(id).expect("bound status");
+        assert_eq!(bound_status.state, control::AgentState::Done);
+        assert_eq!(bound_status.title.as_deref(), Some("New user prompt"));
+
+        let stored = reg.agents.stored(id)?.expect("stored launch");
+        assert_eq!(stored.session_id.as_deref(), Some(new_conv));
+        let expected_log = std::fs::canonicalize(&new_log)?;
+        let stored_log =
+            std::fs::canonicalize(stored.transcript_path.as_deref().expect("transcript path"))?;
+        assert_eq!(stored_log, expected_log);
+
+        drop(child2);
+        drop(reg);
         std::fs::remove_dir_all(dir)
     }
 }

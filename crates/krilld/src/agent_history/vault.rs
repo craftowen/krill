@@ -2563,34 +2563,41 @@ pub(crate) fn agy_root_and_id_from_path(path: &Path) -> Option<(PathBuf, String)
     None
 }
 
+pub(crate) fn is_agy_presence_lock(path: &Path) -> bool {
+    path.parent().is_some_and(|d| d.ends_with("presence"))
+        && path.extension().is_some_and(|e| e == "lock")
+}
+
 fn agy_root_and_id_from_vnodes(paths: &[PathBuf]) -> Option<(PathBuf, String)> {
+    let mut found: Option<(PathBuf, String)> = None;
     for p in paths {
-        if p.extension().and_then(|e| e.to_str()) == Some("lock")
-            && let Some(found) = agy_root_and_id_from_path(p)
-        {
-            return Some(found);
+        if !is_agy_presence_lock(p) {
+            continue;
+        }
+        let Some(candidate) = agy_root_and_id_from_path(p) else {
+            continue;
+        };
+        if let Some(previous) = &found {
+            if previous != &candidate {
+                return None;
+            }
+        } else {
+            found = Some(candidate);
         }
     }
-    for p in paths {
-        if let Some(found) = agy_root_and_id_from_path(p) {
-            return Some(found);
-        }
-    }
-    None
+    found
 }
 
 fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf, String)> {
     let mut seeds = Vec::new();
+    let mut seed_paths = Vec::new();
     let mut cur = fg_pid.unwrap_or(root_pid);
     for _ in 0..16 {
         if cur <= 1 || seeds.contains(&cur) {
             break;
         }
         seeds.push(cur);
-        let paths = crate::sys::open_vnode_paths(cur);
-        if let Some(found) = agy_root_and_id_from_vnodes(&paths) {
-            return Some(found);
-        }
+        seed_paths.extend(crate::sys::open_vnode_paths(cur));
         if cur == root_pid {
             break;
         }
@@ -2604,16 +2611,17 @@ fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf
     }
     if root_pid > 1 && !seeds.contains(&root_pid) {
         seeds.push(root_pid);
-        let paths = crate::sys::open_vnode_paths(root_pid);
-        if let Some(found) = agy_root_and_id_from_vnodes(&paths) {
-            return Some(found);
-        }
+        seed_paths.extend(crate::sys::open_vnode_paths(root_pid));
+    }
+    if let Some(found) = agy_root_and_id_from_vnodes(&seed_paths) {
+        return Some(found);
     }
     if !seeds.is_empty()
         && let Ok(pids) = crate::sys::all_pids()
     {
         let mut seen = seeds;
         let mut frontier = seen.clone();
+        let mut desc_paths = Vec::new();
         for _ in 0..3 {
             let mut next = Vec::new();
             for &pid in &pids {
@@ -2623,16 +2631,16 @@ fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf
                 if crate::sys::parent_pid(pid).is_ok_and(|ppid| frontier.contains(&ppid)) {
                     seen.push(pid);
                     next.push(pid);
-                    let paths = crate::sys::open_vnode_paths(pid);
-                    if let Some(found) = agy_root_and_id_from_vnodes(&paths) {
-                        return Some(found);
-                    }
+                    desc_paths.extend(crate::sys::open_vnode_paths(pid));
                 }
             }
             if next.is_empty() {
                 break;
             }
             frontier = next;
+        }
+        if let Some(found) = agy_root_and_id_from_vnodes(&desc_paths) {
+            return Some(found);
         }
     }
     None
@@ -3220,6 +3228,45 @@ mod agy_title_tests {
 
         lock(cache_mutex).remove(&session.0);
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn agy_root_and_id_from_vnodes_requires_unambiguous_presence_lock() {
+        let root = PathBuf::from("/tmp/krill-agy-vnodes/.gemini/antigravity-cli");
+        let conv_id = "0373fc46-0d68-498c-9c95-c8dd17bd4352";
+        let other_id = "1f11082a-215d-4b11-941a-28f6acdc1b75";
+
+        assert!(
+            agy_root_and_id_from_vnodes(&[
+                root.join("conversations").join(format!("{conv_id}.db")),
+                root.join("conversations").join(format!("{conv_id}.db-wal")),
+                root.join("conversations").join(format!("{conv_id}.db-shm")),
+                root.join("annotations").join(format!("{conv_id}.pbtxt")),
+                root.join("sessions").join(format!("{conv_id}.jsonl")),
+                root.join("brain")
+                    .join(conv_id)
+                    .join(".system_generated/logs/transcript.jsonl"),
+                root.join("brain").join(conv_id).join("scratch.lock"),
+            ])
+            .is_none()
+        );
+
+        let found = agy_root_and_id_from_vnodes(&[
+            root.join("conversations").join(format!("{other_id}.db")),
+            root.join("annotations").join(format!("{other_id}.pbtxt")),
+            root.join("brain").join(other_id).join("scratch.lock"),
+            root.join("presence").join(format!("{conv_id}.lock")),
+        ])
+        .expect("presence lock identifies active conversation");
+        assert_eq!(found, (root.clone(), conv_id.to_owned()));
+
+        assert!(
+            agy_root_and_id_from_vnodes(&[
+                root.join("presence").join(format!("{conv_id}.lock")),
+                root.join("presence").join(format!("{other_id}.lock")),
+            ])
+            .is_none()
+        );
     }
 }
 
