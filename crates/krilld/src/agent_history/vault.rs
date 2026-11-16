@@ -3552,6 +3552,9 @@ mod injected_transcript_filter_tests {
             std::env::temp_dir().join(format!("vault-injected-filter-{}", std::process::id()));
         fs::remove_dir_all(&root).ok();
 
+        let cwd_json =
+            serde_json::to_string(&root.join("workspace").to_string_lossy().into_owned()).unwrap();
+
         let agy_root = root.join("agy");
         let agy_id = "aaaaaaaa-2222-4333-8444-555555555555";
         let agy_logs = agy_root
@@ -3561,12 +3564,15 @@ mod injected_transcript_filter_tests {
         fs::create_dir_all(&agy_logs).unwrap();
         fs::write(
             agy_logs.join("transcript.jsonl"),
-            concat!(
-                "{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"USER_INPUT\",\"cwd\":\"/tmp/vault-filter\",\"content\":\"SystemSecretAlpha <system_instruction>hidden</system_instruction>\"}\n",
-                "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<CONTEXT_SUMMARY>CompactionSecretBeta</CONTEXT_SUMMARY>\\n<ADDITIONAL_METADATA>{\\\"meta\\\":\\\"MetaSecretGamma\\\"}</ADDITIONAL_METADATA>\"}\n",
-                "{\"step_index\":2,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>[plan review]\\nPlanReviewSecretDelta</USER_REQUEST>\"}\n",
-                "{\"step_index\":3,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>실제 질문</USER_REQUEST>\\n<ADDITIONAL_METADATA>{\\\"meta\\\":\\\"MetaSecretEpsilon\\\"}</ADDITIONAL_METADATA>\\n<USER_SETTINGS_CHANGE>{\\\"setting\\\":\\\"SettingsSecretZeta\\\"}</USER_SETTINGS_CHANGE>\"}\n",
-                "{\"step_index\":4,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"정상 답변입니다\"}\n"
+            format!(
+                concat!(
+                    "{{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"USER_INPUT\",\"cwd\":{cwd},\"content\":\"SystemSecretAlpha <system_instruction>hidden</system_instruction>\"}}\n",
+                    "{{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<CONTEXT_SUMMARY>CompactionSecretBeta</CONTEXT_SUMMARY>\\n<ADDITIONAL_METADATA>{{\\\"meta\\\":\\\"MetaSecretGamma\\\"}}</ADDITIONAL_METADATA>\"}}\n",
+                    "{{\"step_index\":2,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>[plan review]\\nPlanReviewSecretDelta</USER_REQUEST>\"}}\n",
+                    "{{\"step_index\":3,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>실제 질문</USER_REQUEST>\\n<ADDITIONAL_METADATA>{{\\\"meta\\\":\\\"MetaSecretEpsilon\\\"}}</ADDITIONAL_METADATA>\\n<USER_SETTINGS_CHANGE>{{\\\"setting\\\":\\\"SettingsSecretZeta\\\"}}</USER_SETTINGS_CHANGE>\"}}\n",
+                    "{{\"step_index\":4,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"정상 답변입니다\"}}\n"
+                ),
+                cwd = cwd_json,
             ),
         )
         .unwrap();
@@ -3577,9 +3583,12 @@ mod injected_transcript_filter_tests {
         let claude_id = "bbbbbbbb-2222-4333-8444-555555555555";
         fs::write(
             claude_proj.join(format!("{claude_id}.jsonl")),
-            concat!(
-                "{\"type\":\"user\",\"sessionId\":\"bbbbbbbb-2222-4333-8444-555555555555\",\"cwd\":\"/tmp/vault-filter\",\"message\":{\"role\":\"user\",\"content\":\"<system-reminder>StandaloneReminderSecret</system-reminder>\"}}\n",
-                "{\"type\":\"user\",\"sessionId\":\"bbbbbbbb-2222-4333-8444-555555555555\",\"cwd\":\"/tmp/vault-filter\",\"message\":{\"role\":\"user\",\"content\":\"<system-reminder>MixedReminderSecret</system-reminder>\\n클로드 실제 질문\"}}\n"
+            format!(
+                concat!(
+                    "{{\"type\":\"user\",\"sessionId\":\"bbbbbbbb-2222-4333-8444-555555555555\",\"cwd\":{cwd},\"message\":{{\"role\":\"user\",\"content\":\"<system-reminder>StandaloneReminderSecret</system-reminder>\"}}}}\n",
+                    "{{\"type\":\"user\",\"sessionId\":\"bbbbbbbb-2222-4333-8444-555555555555\",\"cwd\":{cwd},\"message\":{{\"role\":\"user\",\"content\":\"<system-reminder>MixedReminderSecret</system-reminder>\\n클로드 실제 질문\"}}}}\n"
+                ),
+                cwd = cwd_json,
             ),
         )
         .unwrap();

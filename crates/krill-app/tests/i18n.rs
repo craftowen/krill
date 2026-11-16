@@ -160,23 +160,20 @@ fn ko_en_ko_switch_refreshes_existing_inputs_results_and_saved_settings(cx: &mut
             assert_eq!(i18n::cached_notice("사용량 API 연결·전송 실패"), transport);
             assert_eq!(
                 i18n::cached_notice("Usage API connection failed — last successful value"),
-                format!("{transport} — {last_value}")
+                format!("{transport} ({last_value})")
             );
             assert_eq!(
                 i18n::cached_notice(
                     "사용량 자격증명 만료 — 해당 계정 CLI에서 갱신하거나 다시 로그인하세요 — 마지막 성공 값"
                 ),
                 format!(
-                    "{} — {last_value}",
+                    "{} ({last_value})",
                     catalog::daemon_notice::USAGE_EXPIRED.get()
                 )
             );
             assert_eq!(
                 i18n::cached_notice("Failed to read usage credentials: timeout"),
-                format!(
-                    "{}: timeout",
-                    catalog::daemon_notice::USAGE_CREDENTIALS.get()
-                )
+                catalog::daemon_notice::USAGE_CREDENTIALS.get()
             );
             assert_eq!(
                 i18n::cached_notice("VS Code 열기 실패: broken"),
