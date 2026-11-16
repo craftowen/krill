@@ -1969,7 +1969,7 @@ fn save_agent_profile_with_command(
 
 /// 에이전트 카드의 추가 인자·환경변수를 `agents.toml`의 `[agent.<id>]`에 쓴다(OWE-657). 인자는 공백으로
 /// 나누고 실행 프로그램(`launch[0]`)은 유지한다. 환경변수에 잘못된 줄이 있으면 쓰지 않는다.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn save_agent_profile(dir: &Path, id: &str, args: &str, env: &str) -> Result<(), String> {
     save_agent_profile_with_command(dir, id, None, args, env)
 }

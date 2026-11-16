@@ -101,7 +101,7 @@ pub fn spawn_detect(shell: OsString, cx: &mut App) {
 }
 
 /// 로그인 셸 PATH가 있을 때만 감지한다. 없으면 `None`(모름 = 전부 설치로 본다).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn detect_login(login: Option<OsString>) -> Option<Vec<ProviderKind>> {
     login.map(|path| detect(&path))
 }
