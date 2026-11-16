@@ -3955,10 +3955,33 @@ fn map_orca_agent_id(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "claude" => Some("claude"),
         "codex" => Some("codex"),
-        "gemini" => Some("gemini"),
         "opencode" => Some("opencode"),
         "cursor" | "cursor-agent" => Some("cursor"),
         "agy" | "antigravity" => Some("agy"),
+        "grok" | "grok-cli" => Some("grok"),
+        "muse" | "muse-cli" => Some("muse"),
+        "copilot" | "github-copilot" => Some("copilot"),
+        "pi" => Some("pi"),
+        "omp" | "oh-my-pi" => Some("omp"),
+        "hermes" => Some("hermes"),
+        "kimi" | "kimi-cli" => Some("kimi"),
+        "qwen" | "qwen-code" => Some("qwen"),
+        "droid" => Some("droid"),
+        "kiro" | "kiro-cli" => Some("kiro"),
+        "aider" => Some("aider"),
+        "goose" => Some("goose"),
+        "amp" => Some("amp"),
+        "mistral-vibe" | "vibe" => Some("mistral-vibe"),
+        "crush" => Some("crush"),
+        "cline" => Some("cline"),
+        "kilo" | "kilocode" => Some("kilo"),
+        "continue" | "cn" => Some("continue"),
+        "devin" => Some("devin"),
+        "trae" | "trae-cli" => Some("trae"),
+        "zcode" => Some("zcode"),
+        "dsh" | "deepagents" => Some("dsh"),
+        "openclaude" | "open-claude" => Some("openclaude"),
+        "opencode2" | "open-code-2" => Some("opencode2"),
         _ => None,
     }
 }
@@ -3978,7 +4001,22 @@ fn import_agent_profiles(
         .unwrap_or_default();
     let default_args: BTreeMap<String, Vec<String>> = settings
         .get("agentDefaultArgs")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .and_then(|v| serde_json::from_value::<BTreeMap<String, Json>>(v.clone()).ok())
+        .map(|map| {
+            map.into_iter()
+                .filter_map(|(k, val)| {
+                    let parsed = match val {
+                        Json::Array(arr) => arr
+                            .into_iter()
+                            .filter_map(|item| item.as_str().map(str::to_owned))
+                            .collect(),
+                        Json::String(s) => s.split_whitespace().map(str::to_owned).collect(),
+                        _ => return None,
+                    };
+                    Some((k, parsed))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let default_env: BTreeMap<String, BTreeMap<String, String>> = settings
         .get("agentDefaultEnv")
@@ -3995,12 +4033,19 @@ fn import_agent_profiles(
             touched_ids.insert((k.clone(), canon));
         }
     }
+    if let Some(raw_agent) = settings.get("defaultTuiAgent").and_then(Json::as_str)
+        && let Some(canon) = map_orca_agent_id(raw_agent)
+        && !loaded.profiles.contains_key(canon)
+    {
+        touched_ids.insert((raw_agent.to_owned(), canon));
+    }
 
     let mut current_doc = existing_raw.clone();
     let mut updated_count = 0usize;
 
     for (orca_key, canon_id) in touched_ids {
-        let Some(base_profile) = loaded.profiles.get(canon_id).cloned() else {
+        let missing_in_user = !loaded.profiles.contains_key(canon_id);
+        let Some(base_profile) = loaded.resolve(canon_id).map(|(_, p)| p.clone()) else {
             continue;
         };
         let mut next: AgentProfile = base_profile.clone();
@@ -4040,7 +4085,7 @@ fn import_agent_profiles(
             }
         }
 
-        if next != base_profile {
+        if next != base_profile || missing_in_user {
             match agent::set_user_profile(current_doc.as_deref(), canon_id, &next) {
                 Ok(rendered) => {
                     current_doc = Some(rendered);
@@ -6136,5 +6181,66 @@ mod source_discovery_tests {
         assert!(discovered.join("orca-profile-index.json").is_file());
         // from_env preserves explicit --orca-dir and KRILL_ORCA_DIR before discovery.
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod multi_provider_tests {
+    use super::*;
+
+    #[test]
+    fn orca_import_preserves_grok_and_muse_presets() {
+        let root =
+            std::env::temp_dir().join(format!("krill-orca-multi-provider-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let orca_dir = root.join("orca");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&orca_dir).unwrap();
+        fs::create_dir_all(root.join("home")).unwrap();
+        let payload = serde_json::json!({
+            "settings": {
+                "defaultTuiAgent": "grok",
+                "agentCmdOverrides": {"muse": "/custom/muse"},
+                "agentDefaultArgs": {
+                    "grok": "-m grok-4",
+                    "muse": ["--fast"]
+                },
+                "agentDefaultEnv": {
+                    "grok": {"XAI_API_KEY": "secret"}
+                }
+            }
+        });
+        fs::write(orca_dir.join("orca-data.json"), payload.to_string()).unwrap();
+
+        let opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: state_dir.clone(),
+            orca_dir,
+            domains: vec![ImportDomain::Settings],
+            dry_run: false,
+        };
+        let report = run_import(&opts).unwrap();
+        assert_eq!(report.settings.default_agent.as_deref(), Some("grok"));
+        assert!(report.settings.agents_updated >= 2);
+
+        let settings_toml = fs::read_to_string(state_dir.join(SETTINGS_FILE)).unwrap();
+        assert!(
+            settings_toml.contains("default_agent = \"grok\""),
+            "{settings_toml}"
+        );
+
+        let agents_toml = fs::read_to_string(state_dir.join(agent::FILE_NAME)).unwrap();
+        let loaded = Agents::load(Some(&agents_toml)).unwrap();
+        assert_eq!(loaded.profiles["grok"].launch, ["grok", "-m", "grok-4"]);
+        assert_eq!(
+            loaded.profiles["grok"]
+                .env
+                .get("XAI_API_KEY")
+                .map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(loaded.profiles["muse"].launch, ["/custom/muse", "--fast"]);
+
+        fs::remove_dir_all(&root).ok();
     }
 }

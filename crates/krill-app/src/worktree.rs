@@ -196,6 +196,43 @@ pub struct Dialog {
     hooks_task: Option<Task<()>>,
     /// git이 아닌 폴더인지(레포 경로별 캐시). 폴더면 기준 ref 대신 안내를 보인다.
     folder: Option<(PathBuf, bool)>,
+    /// Fan-Out 칩에 노출할 에이전트 `(id, label)` 목록.
+    fan_out_agents: Vec<(String, String)>,
+}
+
+fn fan_out_label(id: &str, profile: &krill_proto::agent::Profile) -> String {
+    match id {
+        "claude" => "Claude".to_owned(),
+        "codex" => "Codex".to_owned(),
+        "agy" => "Antigravity".to_owned(),
+        "opencode" => "OpenCode".to_owned(),
+        "cursor" => "Cursor".to_owned(),
+        _ => profile.name.clone(),
+    }
+}
+
+fn build_fan_out_agents(agents: &krill_proto::agent::Agents) -> Vec<(String, String)> {
+    let mut keys: Vec<String> = agents.profiles.keys().cloned().collect();
+    keys.sort_by(|a, b| {
+        krill_proto::agent::profile_rank(a)
+            .cmp(&krill_proto::agent::profile_rank(b))
+            .then_with(|| a.cmp(b))
+    });
+    let mut list: Vec<(String, String)> = keys
+        .into_iter()
+        .filter_map(|id| {
+            agents
+                .profiles
+                .get(&id)
+                .map(|prof| (id.clone(), fan_out_label(&id, prof)))
+        })
+        .collect();
+    for &(extra_id, extra_label) in &[("pi", "Pi"), ("aider", "Aider")] {
+        if !list.iter().any(|(id, _)| id == extra_id) {
+            list.push((extra_id.to_owned(), extra_label.to_owned()));
+        }
+    }
+    list
 }
 
 struct Preparation {
@@ -373,7 +410,31 @@ impl Dialog {
             hooks: krill_proto::orchestration::RepoHookSummary::default(),
             hooks_task: None,
             folder: None,
+            fan_out_agents: FAN_OUT_AGENTS
+                .iter()
+                .map(|&(id, label)| (id.to_owned(), label.to_owned()))
+                .collect(),
         };
+        if let Some(dir) = crate::settings::state_dir(cx) {
+            cx.spawn(async move |this, cx| {
+                let list = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let path = dir.join(krill_proto::agent::FILE_NAME);
+                        let user = std::fs::read_to_string(path).ok();
+                        let agents =
+                            krill_proto::agent::Agents::load(user.as_deref()).unwrap_or_default();
+                        build_fan_out_agents(&agents)
+                    })
+                    .await;
+                this.update(cx, |d, cx| {
+                    d.fan_out_agents = list;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         if !candidates.is_empty() {
             dialog.set_branch_candidates(candidates, cx);
         }

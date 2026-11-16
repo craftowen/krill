@@ -664,6 +664,8 @@ pub struct Shell {
     titles: HashMap<PaneId, String>,
     agents: Option<AgentSettings>,
     agents_busy: bool,
+    agents_reload_queued: bool,
+    agents_pending_permission: Option<Permission>,
     agent_task: Option<Task<()>>,
     agent_client: Arc<dyn pane::AgentClient>,
     /// 마지막 입력 알림(누르면 닫힘).
@@ -1291,6 +1293,8 @@ impl Shell {
             titles: HashMap::new(),
             agents: None,
             agents_busy: false,
+            agents_reload_queued: false,
+            agents_pending_permission: None,
             agent_task: None,
             agent_client: Arc::new(pane::DaemonAgents),
             notice,
@@ -3192,8 +3196,10 @@ impl Shell {
                 .ok();
             });
         }
-        if let Some(permission) = krill_app::settings::take_pending_permission(cx) {
-            self.load_agents(Some(permission), cx);
+        let permission = krill_app::settings::take_pending_permission(cx);
+        let agents_changed = krill_app::settings::take_pending_agents_reload(cx);
+        if permission.is_some() || agents_changed {
+            self.load_agents(permission, cx);
         }
         // 설정 창이 닫힌 뒤에도 보여야 할 안내(예: ssh-copy-id 비밀번호 입력)를 메인 창 배너로 잇는다(OWE-884).
         if let Some(msg) = krill_app::settings::take_pending_notice(cx) {
@@ -4276,6 +4282,10 @@ impl Shell {
     /// 전역 설정은 데몬 응답을 받은 뒤 반영한다. 실패하면 현재 값을 유지하고 이유를 보인다.
     fn load_agents(&mut self, permission: Option<Permission>, cx: &mut Context<Self>) {
         if self.agents_busy {
+            self.agents_reload_queued = true;
+            if permission.is_some() {
+                self.agents_pending_permission = permission;
+            }
             return;
         }
         let Some(target) = self.local_target() else {
@@ -4297,6 +4307,11 @@ impl Shell {
                         this.sidebar.update(cx, |s, cx| s.set_agents(profiles, cx));
                     }
                     Err(e) => this.notice = Some(krill_app::errors::user_io_error(&e)),
+                }
+                if this.agents_reload_queued || this.agents_pending_permission.is_some() {
+                    this.agents_reload_queued = false;
+                    let queued_permission = this.agents_pending_permission.take();
+                    this.load_agents(queued_permission, cx);
                 }
                 cx.notify();
             })

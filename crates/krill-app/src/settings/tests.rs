@@ -4248,7 +4248,7 @@ fn agents_render_defers_file_io(cx: &mut TestAppContext) {
             // 펼치기 전에는 입력 상태를 만들지 않는다.
             let _ = v.render_agents_tab(&Settings::default(), window, cx);
             assert!(v.agent_edits.is_empty());
-            v.agent_expanded.insert("claude");
+            v.agent_expanded.insert("claude".into());
             let _ = v.render_agents_tab(&Settings::default(), window, cx);
             assert_eq!(
                 v.agent_edits["claude"].args.read(cx).value().as_ref(),
@@ -7117,7 +7117,7 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.agent_expanded
-                .extend(["claude", "codex", "agy", "cursor", "opencode"]);
+                .extend(["claude", "codex", "agy", "cursor", "opencode"].map(str::to_owned));
             cx.notify();
         });
         window.draw(cx).clear(cx);
@@ -7887,7 +7887,7 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.agent_expanded
-                .extend(["claude", "codex", "agy", "cursor", "opencode"]);
+                .extend(["claude", "codex", "agy", "cursor", "opencode"].map(str::to_owned));
             cx.notify();
         });
         window.draw(cx).clear(cx);
@@ -9944,7 +9944,7 @@ fn agents_list_locks_expansion_until_profiles_load(cx: &mut TestAppContext) {
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.set_tab(AdminTab::Agents, cx);
-            v.agent_expanded.insert("codex");
+            v.agent_expanded.insert("codex".into());
         });
         window.draw(cx).clear(cx);
     });
@@ -12092,6 +12092,150 @@ fn retained_handoff_banner_clears_when_snapshot_resolves_and_hides_switch_on_act
     });
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-account-error").is_some());
+
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn multi_provider_add_search_edit_remove_and_custom_agent(cx: &mut TestAppContext) {
+    let d = dir("multi-provider-ui");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(4000.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // 프리셋 목록에서 grok, muse 추가
+    let add_grok = vcx.debug_bounds("admin-preset-add-grok").unwrap().center();
+    vcx.simulate_click(add_grok, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-agent-card-grok").is_some());
+    assert!(vcx.debug_bounds("admin-preset-row-grok").is_none());
+    assert!(vcx.debug_bounds("admin-agent-hook-grok").is_none());
+
+    let add_muse = vcx.debug_bounds("admin-preset-add-muse").unwrap().center();
+    vcx.simulate_click(add_muse, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-agent-card-muse").is_some());
+
+    let toml_after_add = fs::read_to_string(d.join(krill_proto::agent::FILE_NAME)).unwrap();
+    let loaded = krill_proto::agent::Agents::load(Some(&toml_after_add)).unwrap();
+    assert!(loaded.profiles.contains_key("grok"));
+    assert!(loaded.profiles.contains_key("muse"));
+
+    // 검색으로 aider 필터링
+    vcx.update(|window, cx| {
+        let search = view
+            .read(cx)
+            .agent_preset_search
+            .as_ref()
+            .unwrap()
+            .0
+            .clone();
+        search.update(cx, |s, cx| s.set_value("aider", window, cx));
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("admin-preset-row-aider").is_some());
+    assert!(vcx.debug_bounds("admin-preset-row-copilot").is_none());
+    vcx.update(|window, cx| {
+        let search = view
+            .read(cx)
+            .agent_preset_search
+            .as_ref()
+            .unwrap()
+            .0
+            .clone();
+        search.update(cx, |s, cx| s.set_value("", window, cx));
+        window.draw(cx).clear(cx);
+    });
+
+    // muse 펼쳐서 실행 명령어 편집 후 저장
+    let toggle_muse = vcx
+        .debug_bounds("admin-agent-toggle-muse")
+        .unwrap()
+        .center();
+    vcx.simulate_click(toggle_muse, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-agent-editor-muse").is_some());
+    assert!(vcx.debug_bounds("admin-agent-hook-muse").is_none());
+    vcx.update(|window, cx| {
+        let cmd = view.read(cx).agent_edits["muse"].cmd.clone();
+        cmd.update(cx, |s, cx| s.set_value("/opt/bin/muse", window, cx));
+        window.draw(cx).clear(cx);
+    });
+    let save_muse = vcx.debug_bounds("admin-agent-save-muse").unwrap().center();
+    vcx.simulate_click(save_muse, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let toml_after_save = fs::read_to_string(d.join(krill_proto::agent::FILE_NAME)).unwrap();
+    let loaded = krill_proto::agent::Agents::load(Some(&toml_after_save)).unwrap();
+    assert_eq!(loaded.profiles["muse"].launch[0], "/opt/bin/muse");
+
+    // 기본 에이전트로 고른 뒤 제거하면 claude로 복귀한다.
+    let default_muse = vcx
+        .debug_bounds("admin-default-agent-muse")
+        .unwrap()
+        .center();
+    vcx.simulate_click(default_muse, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(current(cx).default_agent, "muse"));
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    let remove_muse = vcx
+        .debug_bounds("admin-agent-remove-muse")
+        .unwrap()
+        .center();
+    vcx.simulate_click(remove_muse, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    let toml_after_remove = fs::read_to_string(d.join(krill_proto::agent::FILE_NAME)).unwrap();
+    let loaded = krill_proto::agent::Agents::load(Some(&toml_after_remove)).unwrap();
+    assert!(!loaded.profiles.contains_key("muse"));
+    vcx.update(|_, cx| assert_eq!(current(cx).default_agent, "claude"));
+
+    // 커스텀 프로바이더 추가
+    let toggle_custom = vcx
+        .debug_bounds("admin-agents-custom-toggle")
+        .unwrap()
+        .center();
+    vcx.simulate_click(toggle_custom, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let form = view.read(cx).custom_agent_form.as_ref().unwrap();
+        let id = form.id.clone();
+        let name = form.name.clone();
+        let cmd = form.command.clone();
+        let env = form.env.clone();
+        id.update(cx, |s, cx| s.set_value("my-bot", window, cx));
+        name.update(cx, |s, cx| s.set_value("My Bot", window, cx));
+        cmd.update(cx, |s, cx| s.set_value("my-bot --chat", window, cx));
+        env.update(cx, |s, cx| s.set_value("API_KEY=1", window, cx));
+        window.draw(cx).clear(cx);
+    });
+    let submit_custom = vcx
+        .debug_bounds("admin-custom-agent-submit")
+        .unwrap()
+        .center();
+    vcx.simulate_click(submit_custom, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-agent-card-my-bot").is_some());
+    let toml_after_custom = fs::read_to_string(d.join(krill_proto::agent::FILE_NAME)).unwrap();
+    let loaded = krill_proto::agent::Agents::load(Some(&toml_after_custom)).unwrap();
+    assert_eq!(loaded.profiles["my-bot"].name, "My Bot");
+    assert_eq!(loaded.profiles["my-bot"].launch, ["my-bot", "--chat"]);
+    assert_eq!(
+        loaded.profiles["my-bot"]
+            .env
+            .get("API_KEY")
+            .map(String::as_str),
+        Some("1")
+    );
 
     fs::remove_dir_all(d).ok();
 }
