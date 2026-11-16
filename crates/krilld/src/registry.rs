@@ -5109,7 +5109,7 @@ mod orchestration_delivery_tests {
         fn spawn_holding(paths: &[&Path]) -> io::Result<ChildGuard> {
             let mut script = String::from("exec");
             for (idx, _) in paths.iter().enumerate() {
-                let _ = write!(script, " {}<\"${}\"", idx + 3, idx + 1);
+                write!(script, " {}<\"${}\"", idx + 3, idx + 1).map_err(io::Error::other)?;
             }
             script.push_str("; printf ready; exec sleep 30");
             let mut cmd = Command::new("/bin/sh");
