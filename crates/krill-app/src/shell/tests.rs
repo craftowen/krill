@@ -1286,7 +1286,10 @@ fn agent_permission_changes_only_after_successful_reply(cx: &mut TestAppContext)
     cx.update(|_, cx| {
         let s = view.read(cx);
         assert_eq!(s.agents.as_ref().unwrap().permission, Permission::Yolo);
-        assert_eq!(s.notice.as_deref(), Some("fixture save failed"));
+        assert_eq!(
+            s.notice.as_deref(),
+            Some(krill_app::i18n::catalog::settings::IO_GENERIC.get())
+        );
         assert!(!s.agents_busy);
     });
 }

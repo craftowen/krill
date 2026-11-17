@@ -661,8 +661,8 @@ pub struct Config {
     dir: Option<PathBuf>,
     /// 재정의 전 기본 키맵: 초기화 시점에 묶여 있던 모든 바인딩(셸·gpui-component) + 설정 액션.
     defaults: Vec<KeyBinding>,
-    /// 설정·키맵·계정·호스트 네 파일의 마지막 수정 시각(바뀌었는지 보는 용도).
-    stamp: [Option<SystemTime>; 7],
+    /// 설정·키맵·계정·호스트·에이전트 파일들의 마지막 수정 시각(바뀌었는지 보는 용도).
+    stamp: [Option<SystemTime>; 8],
     /// 관리자 창에서 요청한 원격 터미널 열기 호스트(메인 셸 창이 꺼내 실행).
     pending_ssh_connect: Option<crate::ssh_hosts::SshHost>,
     /// 설정·점검 창에서 요청한 터미널 명령 자동 입력 큐(메인 셸 창이 순서대로 꺼내 실행).
@@ -671,6 +671,8 @@ pub struct Config {
     pending_terminal_host: Option<crate::hosts::HostId>,
     /// 관리자 YOLO 토글이 요청한 새 세션 권한(메인 셸 창이 꺼내 데몬에 적용).
     pending_permission: Option<krill_proto::agent::Permission>,
+    /// `agents.toml`이 바뀌어 메인 셸이 데몬에서 에이전트 프로필을 다시 불러와야 함을 알린다.
+    pending_agents_reload: bool,
     /// `ssh-copy-id` 실행 안내처럼 설정 창이 닫힌 뒤에도 보여야 할 문구(메인 셸 창이 꺼내 배너로 표시).
     pending_notice: Option<String>,
 }
@@ -702,7 +704,7 @@ fn modified(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-fn file_stamps(dir: &Path) -> [Option<SystemTime>; 7] {
+fn file_stamps(dir: &Path) -> [Option<SystemTime>; 8] {
     [
         modified(&dir.join(SETTINGS_FILE)),
         modified(&dir.join(KEYS_FILE)),
@@ -712,6 +714,7 @@ fn file_stamps(dir: &Path) -> [Option<SystemTime>; 7] {
         modified(&dir.join("link/devices.toml")),
         // 터미널의 `krill import orca`가 쓴 projects.toml도 `on_config_changed` → 사이드바 재로드로 잇는다(OWE-744).
         modified(&dir.join("projects.toml")),
+        modified(&dir.join(krill_proto::agent::FILE_NAME)),
     ]
 }
 
@@ -748,7 +751,18 @@ pub fn notify_external_change(cx: &mut App) {
         return;
     }
     // Notify observers using memory only; even metadata may block on a remote volume.
-    cx.global_mut::<Config>().stamp = [None; 7];
+    cx.global_mut::<Config>().stamp = [None; 8];
+    reload(cx);
+}
+
+/// `agents.toml`이 바뀌었음을 메인 셸과 설정 창에 알린다.
+pub fn notify_agents_changed(cx: &mut App) {
+    if !cx.has_global::<Config>() {
+        return;
+    }
+    let config = cx.global_mut::<Config>();
+    config.pending_agents_reload = true;
+    config.stamp = [None; 8];
     reload(cx);
 }
 
@@ -1011,6 +1025,19 @@ pub fn take_pending_permission(cx: &mut App) -> Option<krill_proto::agent::Permi
     cx.global_mut::<Config>().pending_permission.take()
 }
 
+/// `agents.toml` 변경으로 데몬 에이전트 목록을 다시 읽어야 하는지 확인하고 플래그를 비운다.
+pub fn take_pending_agents_reload(cx: &mut App) -> bool {
+    if cx
+        .try_global::<Config>()
+        .is_none_or(|c| !c.pending_agents_reload)
+    {
+        return false;
+    }
+    let reload_needed = cx.global::<Config>().pending_agents_reload;
+    cx.global_mut::<Config>().pending_agents_reload = false;
+    reload_needed
+}
+
 /// 설정 창이 닫힌 뒤 메인 셸 배너로 보여줄 문구를 예약한다.
 pub fn queue_notice(msg: impl Into<String>, cx: &mut App) {
     let msg = msg.into();
@@ -1094,11 +1121,12 @@ fn init_at_with_language(dir: Option<PathBuf>, language: Language, cx: &mut App)
         error: None,
         dir,
         defaults,
-        stamp: [None; 7],
+        stamp: [None; 8],
         pending_ssh_connect: None,
         pending_terminal_commands: std::collections::VecDeque::new(),
         pending_terminal_host: None,
         pending_permission: None,
+        pending_agents_reload: false,
         pending_notice: None,
     });
     reload(cx);
@@ -1170,7 +1198,7 @@ fn start_reload(force: bool, cx: &mut App) {
     pending.pending_epoch = Some(epoch);
     pending.again = false;
     let work = background_file_io(cx, move || {
-        if !force && dir.as_deref().map_or([None; 7], file_stamps) == previous {
+        if !force && dir.as_deref().map_or([None; 8], file_stamps) == previous {
             return None;
         }
         Some(read_config(dir.as_deref(), settings))
@@ -1199,10 +1227,12 @@ fn start_reload(force: bool, cx: &mut App) {
                     None => {}
                 }
                 let c = cx.global_mut::<Config>();
+                let agents_changed = c.stamp[7] != stamp[7];
                 c.initial_loaded = true;
                 c.durable = settings.clone();
                 c.settings = settings.into();
                 c.stamp = stamp;
+                c.pending_agents_reload |= agents_changed;
                 c.error = (!errors.is_empty()).then(|| errors.join("\n").into());
                 crate::alert::sync_settings(cx);
                 cx.defer(apply);
@@ -1215,13 +1245,13 @@ fn start_reload(force: bool, cx: &mut App) {
     .detach();
 }
 
-type LoadedConfig = (Settings, Option<Keys>, [Option<SystemTime>; 7], Vec<String>);
+type LoadedConfig = (Settings, Option<Keys>, [Option<SystemTime>; 8], Vec<String>);
 
 fn read_config(dir: Option<&Path>, mut settings: Settings) -> LoadedConfig {
     let mut errors = Vec::new();
     // 틀린 keys.toml이면 `None`: 키맵을 건드리지 않는다(직전 재정의 유지).
     let mut keys = Some(Keys::default());
-    let mut stamp = [None; 7];
+    let mut stamp = [None; 8];
     let mut settings_read_failed = false;
     if let Some(dir) = &dir {
         stamp = file_stamps(dir);
@@ -1856,33 +1886,159 @@ fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::i
     krill_proto::os::write_atomic_0600(path, body.as_bytes())
 }
 
-/// 에이전트 카드의 추가 인자·환경변수를 `agents.toml`의 `[agent.<id>]`에 쓴다(OWE-657). 인자는 공백으로
-/// 나누고 실행 프로그램(`launch[0]`)은 유지한다. 환경변수에 잘못된 줄이 있으면 쓰지 않는다.
-// ponytail: 인자 따옴표·이스케이프 미지원(공백 분리). 공백 든 인자가 필요하면 agents.toml을 직접 고친다.
-fn save_agent_profile(dir: &Path, id: &str, args: &str, env: &str) -> Result<(), String> {
-    let env = krill_proto::agent::parse_env_lines(env)
-        .map_err(|line| text::AGENT_ENV_BAD_LINE.format(&[("line", &line.to_string())]))?;
-    let path = dir.join(krill_proto::agent::FILE_NAME);
-    let user = match std::fs::read_to_string(&path) {
+fn read_agents_file(path: &Path) -> Result<(Option<String>, krill_proto::agent::Agents), String> {
+    let user = match std::fs::read_to_string(path) {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.to_string()),
     };
     let agents = krill_proto::agent::Agents::load(user.as_deref()).map_err(|e| e.to_string())?;
-    let mut profile = agents
-        .profiles
+    Ok((user, agents))
+}
+
+fn mutate_agents_toml<R>(
+    dir: &Path,
+    f: impl FnOnce(Option<&str>, &krill_proto::agent::Agents) -> Result<(Option<String>, R), String>,
+) -> Result<R, String> {
+    let path = dir.join(krill_proto::agent::FILE_NAME);
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let _lock = krill_proto::config_document::lock_toml(&path).map_err(|e| e.to_string())?;
+    let (user, agents) = read_agents_file(&path)?;
+    let (body, out) = f(user.as_deref(), &agents)?;
+    if let Some(body) = body {
+        // krilld가 읽는 도중 반쯤 쓴 파일을 보지 않게 원자 교체한다(AS-08).
+        krill_proto::os::write_atomic_0600(&path, body.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+fn read_agents_cache(
+    dir: &Path,
+) -> (
+    (Option<SystemTime>, Option<String>),
+    std::sync::Arc<krill_proto::agent::Agents>,
+) {
+    let path = dir.join(krill_proto::agent::FILE_NAME);
+    let body = std::fs::read_to_string(&path).ok();
+    let parsed =
+        std::sync::Arc::new(krill_proto::agent::Agents::load(body.as_deref()).unwrap_or_default());
+    ((modified(&path), body), parsed)
+}
+
+/// 에이전트 카드의 실행 명령어·추가 인자·환경변수를 `agents.toml`의 `[agent.<id>]`에 쓴다.
+// ponytail: 인자 따옴표·이스케이프 미지원(공백 분리). 공백 든 인자가 필요하면 agents.toml을 직접 고친다.
+fn save_agent_profile_with_command(
+    dir: &Path,
+    id: &str,
+    command: Option<&str>,
+    args: &str,
+    env: &str,
+) -> Result<(), String> {
+    let env = krill_proto::agent::parse_env_lines(env)
+        .map_err(|line| text::AGENT_ENV_BAD_LINE.format(&[("line", &line.to_string())]))?;
+    let next_cmd = match command {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(text::AGENT_CMD_EMPTY.get().to_owned());
+            }
+            Some(trimmed.to_owned())
+        }
+        None => None,
+    };
+    mutate_agents_toml(dir, |user, agents| {
+        let mut profile = agents
+            .resolve(id)
+            .map(|(_, p)| p.clone())
+            .ok_or_else(|| format!("{id}: unknown agent"))?;
+        if let Some(cmd) = next_cmd {
+            profile.launch = std::iter::once(cmd)
+                .chain(args.split_whitespace().map(str::to_owned))
+                .collect();
+        } else {
+            profile.launch.truncate(1);
+            profile
+                .launch
+                .extend(args.split_whitespace().map(str::to_owned));
+        }
+        profile.env = env;
+        let body = krill_proto::agent::set_user_profile(user, id, &profile)?;
+        Ok((Some(body), ()))
+    })
+}
+
+/// 에이전트 카드의 추가 인자·환경변수를 `agents.toml`의 `[agent.<id>]`에 쓴다(OWE-657). 인자는 공백으로
+/// 나누고 실행 프로그램(`launch[0]`)은 유지한다. 환경변수에 잘못된 줄이 있으면 쓰지 않는다.
+#[cfg(all(test, unix))]
+fn save_agent_profile(dir: &Path, id: &str, args: &str, env: &str) -> Result<(), String> {
+    save_agent_profile_with_command(dir, id, None, args, env)
+}
+
+/// 큐레이션 프리셋 에이전트를 `agents.toml`에 추가한다. 이미 설정되어 있으면 그대로 둔다.
+fn add_preset_agent_profile(dir: &Path, id: &str) -> Result<(), String> {
+    let preset = krill_proto::agent::preset_profiles()
         .get(id)
         .cloned()
-        .ok_or_else(|| format!("{id}: unknown agent"))?;
-    profile.launch.truncate(1);
-    profile
-        .launch
-        .extend(args.split_whitespace().map(str::to_owned));
-    profile.env = env;
-    let body = krill_proto::agent::set_user_profile(user.as_deref(), id, &profile)?;
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    // krilld가 읽는 도중 반쯤 쓴 파일을 보지 않게 원자 교체한다(AS-08).
-    krill_proto::os::write_atomic_0600(&path, body.as_bytes()).map_err(|e| e.to_string())
+        .ok_or_else(|| format!("{id}: unknown preset agent"))?;
+    mutate_agents_toml(dir, |user, agents| {
+        if agents.profiles.contains_key(id) {
+            return Ok((None, ()));
+        }
+        let body = krill_proto::agent::set_user_profile(user, id, &preset)?;
+        Ok((Some(body), ()))
+    })
+}
+
+/// 사용자 정의 에이전트를 `agents.toml`의 `[agent.<id>]`에 등록한다.
+fn add_custom_agent_profile(
+    dir: &Path,
+    raw_id: &str,
+    name: &str,
+    command: &str,
+    env: &str,
+) -> Result<(String, String), String> {
+    let id = krill_proto::agent::validate_custom_agent_id(raw_id)
+        .map_err(|_| text::AGENTS_CUSTOM_BAD_ID.get().to_owned())?;
+    let launch: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+    if launch.is_empty() {
+        return Err(text::AGENT_CMD_EMPTY.get().to_owned());
+    }
+    let env = krill_proto::agent::parse_env_lines(env)
+        .map_err(|line| text::AGENT_ENV_BAD_LINE.format(&[("line", &line.to_string())]))?;
+    let display_name = {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            id.clone()
+        } else {
+            trimmed.to_owned()
+        }
+    };
+    mutate_agents_toml(dir, |user, agents| {
+        if agents.profiles.contains_key(&id) {
+            return Err(text::AGENTS_CUSTOM_EXISTS.format(&[("id", &id)]));
+        }
+        let profile = krill_proto::agent::Profile {
+            name: display_name.clone(),
+            launch,
+            yolo_args: Vec::new(),
+            install: String::new(),
+            install_windows: String::new(),
+            env,
+        };
+        let body = krill_proto::agent::set_user_profile(user, &id, &profile)?;
+        Ok((Some(body), (id, display_name)))
+    })
+}
+
+/// 내장 에이전트를 제외한 사용자·프리셋 프로필을 `agents.toml`에서 제거한다.
+fn remove_agent_profile_from_disk(dir: &Path, id: &str) -> Result<(), String> {
+    if builtin_agents().profiles.contains_key(id) {
+        return Err(format!("{id}: built-in agent cannot be removed"));
+    }
+    mutate_agents_toml(dir, |user, _| {
+        let body = krill_proto::agent::remove_user_profile(user, id)?;
+        Ok((Some(body), ()))
+    })
 }
 
 /// 파일을 시스템 편집기로 연다. 없으면 `template`로 만든다.
@@ -2573,6 +2729,7 @@ pub fn agent_install_command(agent_id: &str) -> Option<String> {
     builtin_agents()
         .profiles
         .get(id)
+        .or_else(|| krill_proto::agent::preset_profiles().get(id))
         .map(|p| p.install_command().to_owned())
         .filter(|s| !s.trim().is_empty())
 }
@@ -2851,13 +3008,20 @@ pub struct SettingsView {
         std::collections::BTreeMap<String, crate::accounts::Identity>,
         std::collections::BTreeSet<String>,
     ),
-    /// 에이전트 카드의 추가 인자·환경변수 편집(OWE-657). 에이전트 탭을 처음 그릴 때 만든다.
-    agent_edits: std::collections::BTreeMap<&'static str, AgentEdit>,
+    /// 에이전트 카드의 명령어·추가 인자·환경변수 편집(OWE-657). 에이전트 탭을 처음 그릴 때 만든다.
+    agent_edits: std::collections::BTreeMap<String, AgentEdit>,
     /// 피드백 입력. 창이 필요해 처음 그릴 때 만들고, 보내고 나면 비운다.
     feedback_input: Option<gpui::Entity<gpui_component::input::TextareaState>>,
     feedback_status: Option<feedback::Status>,
-    /// 에이전트 탭에서 인자·환경변수 편집기를 펼친 에이전트 id 집합(OWE-796). 기본 접힘.
-    agent_expanded: std::collections::BTreeSet<&'static str>,
+    /// 에이전트 탭에서 명령어·인자·환경변수 편집기를 펼친 에이전트 id 집합(OWE-796). 기본 접힘.
+    agent_expanded: std::collections::BTreeSet<String>,
+    /// 추가 프로바이더 섹션 검색 입력과 전체 프리셋 펼침 상태·커스텀 프로바이더 폼.
+    agent_preset_search: Option<(
+        gpui::Entity<gpui_component::input::InputState>,
+        Subscription,
+    )>,
+    agent_presets_show_all: bool,
+    custom_agent_form: Option<CustomAgentForm>,
     /// 사이드바 설정 검색 입력(OWE-656). 창이 필요해 처음 그릴 때 만든다.
     search_focus: search::SearchFocus,
     search_pending: bool,
@@ -3037,9 +3201,19 @@ const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// 에이전트 카드 하나의 편집 입력과 저장 결과(오류면 `true`).
 struct AgentEdit {
+    cmd: gpui::Entity<gpui_component::input::InputState>,
     args: gpui::Entity<gpui_component::input::InputState>,
     env: gpui::Entity<gpui_component::input::TextareaState>,
     status: Option<(SharedString, bool)>,
+}
+
+/// 커스텀 프로바이더 추가 인라인 폼.
+struct CustomAgentForm {
+    id: gpui::Entity<gpui_component::input::InputState>,
+    name: gpui::Entity<gpui_component::input::InputState>,
+    command: gpui::Entity<gpui_component::input::InputState>,
+    env: gpui::Entity<gpui_component::input::TextareaState>,
+    status: Option<SharedString>,
 }
 
 /// SSH 호스트 카드의 최근 연결 상태(OWE-800).
@@ -3325,6 +3499,9 @@ impl SettingsView {
             feedback_input: None,
             feedback_status: None,
             agent_expanded: std::collections::BTreeSet::new(),
+            agent_preset_search: None,
+            agent_presets_show_all: false,
+            custom_agent_form: None,
             search_focus: search::SearchFocus::new(cx),
             search_pending: false,
             search_selected: 0,
@@ -3378,6 +3555,8 @@ impl SettingsView {
             .detach();
         cx.observe_global::<crate::accounts::installed::Installed>(|_, cx| cx.notify())
             .detach();
+        cx.observe_global::<crate::accounts::installed::InstalledAgents>(|_, cx| cx.notify())
+            .detach();
         view
     }
 
@@ -3416,8 +3595,113 @@ impl SettingsView {
 
     fn save_agent_edit(
         &mut self,
-        agent_id: &'static str,
+        agent_id: String,
+        cmd: String,
         args: String,
+        env: String,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = state_dir(cx);
+        let id_bg = agent_id.clone();
+        self.file_job(
+            "agent-edit",
+            move || {
+                let dir = dir.ok_or_else(|| text::NO_STATE_DIR.get().to_owned())?;
+                save_agent_profile_with_command(&dir, &id_bg, Some(&cmd), &args, &env)?;
+                Ok::<_, String>(read_agents_cache(&dir))
+            },
+            move |this, result, cx| {
+                let status = match result {
+                    Ok((cache, parsed)) => {
+                        this.agents_file_cache.0 = Some(cache);
+                        this.agents_parsed = Some(parsed);
+                        notify_agents_changed(cx);
+                        (text::AGENT_SAVED.get().into(), false)
+                    }
+                    Err(error) => (error.into(), true),
+                };
+                if let Some(edit) = this.agent_edits.get_mut(&agent_id) {
+                    edit.status = Some(status);
+                }
+            },
+            cx,
+        );
+    }
+
+    fn add_preset_agent(&mut self, agent_id: String, display_name: String, cx: &mut Context<Self>) {
+        let dir = state_dir(cx);
+        let id_bg = agent_id.clone();
+        self.file_job(
+            "agent-edit",
+            move || {
+                let dir = dir.ok_or_else(|| text::NO_STATE_DIR.get().to_owned())?;
+                add_preset_agent_profile(&dir, &id_bg)?;
+                Ok::<_, String>(read_agents_cache(&dir))
+            },
+            move |this, result, cx| match result {
+                Ok((cache, parsed)) => {
+                    this.agents_file_cache.0 = Some(cache);
+                    this.agents_parsed = Some(parsed);
+                    this.agent_edits.remove(&agent_id);
+                    this.skill_status = Some(
+                        text::AGENTS_ADDED_MSG
+                            .format(&[("name", &display_name)])
+                            .into(),
+                    );
+                    notify_agents_changed(cx);
+                }
+                Err(error) => {
+                    this.skill_status = Some(error.into());
+                }
+            },
+            cx,
+        );
+    }
+
+    fn remove_agent_profile(
+        &mut self,
+        agent_id: String,
+        display_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = state_dir(cx);
+        let id_bg = agent_id.clone();
+        self.file_job(
+            "agent-edit",
+            move || {
+                let dir = dir.ok_or_else(|| text::NO_STATE_DIR.get().to_owned())?;
+                remove_agent_profile_from_disk(&dir, &id_bg)?;
+                Ok::<_, String>(read_agents_cache(&dir))
+            },
+            move |this, result, cx| match result {
+                Ok((cache, parsed)) => {
+                    this.agents_file_cache.0 = Some(cache);
+                    this.agents_parsed = Some(parsed);
+                    this.agent_edits.remove(&agent_id);
+                    this.agent_expanded.remove(&agent_id);
+                    if current(cx).default_agent == agent_id {
+                        edit(cx, |s| "claude".clone_into(&mut s.default_agent));
+                    }
+                    this.skill_status = Some(
+                        text::AGENT_REMOVED
+                            .format(&[("name", &display_name)])
+                            .into(),
+                    );
+                    notify_agents_changed(cx);
+                }
+                Err(error) => {
+                    this.skill_status = Some(error.into());
+                }
+            },
+            cx,
+        );
+    }
+
+    fn submit_custom_agent(
+        &mut self,
+        raw_id: String,
+        name: String,
+        command: String,
         env: String,
         cx: &mut Context<Self>,
     ) {
@@ -3426,25 +3710,26 @@ impl SettingsView {
             "agent-edit",
             move || {
                 let dir = dir.ok_or_else(|| text::NO_STATE_DIR.get().to_owned())?;
-                save_agent_profile(&dir, agent_id, &args, &env)?;
-                let path = dir.join(krill_proto::agent::FILE_NAME);
-                let body = std::fs::read_to_string(&path).ok();
-                let parsed = std::sync::Arc::new(
-                    krill_proto::agent::Agents::load(body.as_deref()).unwrap_or_default(),
-                );
-                Ok::<_, String>(((modified(&path), body), parsed))
+                let (id, display_name) =
+                    add_custom_agent_profile(&dir, &raw_id, &name, &command, &env)?;
+                Ok::<_, String>((id, display_name, read_agents_cache(&dir)))
             },
-            move |this, result, _| {
-                let status = match result {
-                    Ok((cache, parsed)) => {
-                        this.agents_file_cache.0 = Some(cache);
-                        this.agents_parsed = Some(parsed);
-                        (text::AGENT_SAVED.get().into(), false)
+            move |this, result, cx| match result {
+                Ok((_id, display_name, (cache, parsed))) => {
+                    this.agents_file_cache.0 = Some(cache);
+                    this.agents_parsed = Some(parsed);
+                    this.custom_agent_form = None;
+                    this.skill_status = Some(
+                        text::AGENTS_ADDED_MSG
+                            .format(&[("name", &display_name)])
+                            .into(),
+                    );
+                    notify_agents_changed(cx);
+                }
+                Err(error) => {
+                    if let Some(form) = &mut this.custom_agent_form {
+                        form.status = Some(error.into());
                     }
-                    Err(error) => (error.into(), true),
-                };
-                if let Some(edit) = this.agent_edits.get_mut(agent_id) {
-                    edit.status = Some(status);
                 }
             },
             cx,
@@ -3815,8 +4100,22 @@ impl SettingsView {
             }
         }
         for edit in self.agent_edits.values() {
-            if crate::jump::entity_input_is_composing(&edit.args, window, app) {
-                return true;
+            for input in [&edit.cmd, &edit.args] {
+                if crate::jump::entity_input_is_composing(input, window, app) {
+                    return true;
+                }
+            }
+        }
+        if let Some((search, _)) = &self.agent_preset_search
+            && crate::jump::entity_input_is_composing(search, window, app)
+        {
+            return true;
+        }
+        if let Some(form) = &self.custom_agent_form {
+            for input in [&form.id, &form.name, &form.command] {
+                if crate::jump::entity_input_is_composing(input, window, app) {
+                    return true;
+                }
             }
         }
         if let Some(form) = &self.ssh_form {
@@ -3982,7 +4281,7 @@ impl SettingsView {
 
     fn displayed_account_error(&self) -> Option<SharedString> {
         if let Some(error) = &self.account_error {
-            return Some(error.clone());
+            return Some(SharedString::from(crate::i18n::cached_notice(error)));
         }
         self.accounts_snapshot
             .details
@@ -3990,9 +4289,9 @@ impl SettingsView {
             .iter()
             .find_map(|handoff| match handoff.outcome() {
                 krill_proto::usage::HandoffOutcome::RetryableFailure { message }
-                | krill_proto::usage::HandoffOutcome::RetainedReplacement { message, .. } => {
-                    Some(SharedString::from(message.to_owned()))
-                }
+                | krill_proto::usage::HandoffOutcome::RetainedReplacement { message, .. } => Some(
+                    SharedString::from(crate::i18n::sanitize_handoff_error(message)),
+                ),
                 krill_proto::usage::HandoffOutcome::Pending
                 | krill_proto::usage::HandoffOutcome::Completed { .. } => None,
             })
@@ -4251,7 +4550,8 @@ impl SettingsView {
                 let loaded = cx
                     .background_executor()
                     .spawn(async move {
-                        let target = target.ok_or_else(|| "remote host disconnected".to_owned())?;
+                        let target = target
+                            .ok_or_else(|| text::REMOTE_HOST_DISCONNECTED.get().to_owned())?;
                         let snapshot = crate::accounts::request_target(
                             &target,
                             &krill_proto::usage::UsageRequest::ListAccounts,
@@ -4538,7 +4838,8 @@ impl SettingsView {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let target = target.ok_or_else(|| "remote host disconnected".to_owned())?;
+                        let target = target
+                            .ok_or_else(|| text::REMOTE_HOST_DISCONNECTED.get().to_owned())?;
                         crate::accounts::orphans_target(
                             &target,
                             &krill_proto::usage::UsageRequest::PurgeOrphanProfiles,
@@ -4605,7 +4906,8 @@ impl SettingsView {
                         }
                         Err(error) => {
                             if is_current {
-                                this.account_error = Some(error.to_string().into());
+                                this.account_error =
+                                    Some(crate::errors::user_io_error(&error).into());
                             }
                         }
                     }
@@ -4619,7 +4921,8 @@ impl SettingsView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let paths = krill_proto::daemon::Paths::dev().map_err(|e| e.to_string())?;
+                    let paths = krill_proto::daemon::Paths::dev()
+                        .map_err(|e| crate::errors::user_io_error(&e))?;
                     crate::accounts::orphans_ipc(
                         &paths,
                         &krill_proto::usage::UsageRequest::PurgeOrphanProfiles,
@@ -4695,7 +4998,8 @@ impl SettingsView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let paths = krill_proto::daemon::Paths::dev().map_err(|e| e.to_string())?;
+                    let paths = krill_proto::daemon::Paths::dev()
+                        .map_err(|e| crate::errors::user_io_error(&e))?;
                     let (account, newly_added) = if let Some(account) = account {
                         (account, false)
                     } else {
@@ -4728,7 +5032,7 @@ impl SettingsView {
                             .accounts
                             .into_iter()
                             .find(|a| a.provider == provider && a.label == label)
-                            .ok_or_else(|| "new account missing from daemon reply".to_owned())?;
+                            .ok_or_else(|| text::ACCOUNTS_PROFILE_MISSING.get().to_owned())?;
                         // 그사이 같은 라벨이 생겨 기존 계정이 돌아왔으면, 로그인을 취소해도 정리(삭제)하지 않는다.
                         let newly_added = !existing.iter().any(|a| a.id == added.id);
                         (added, newly_added)
@@ -4946,17 +5250,20 @@ impl SettingsView {
         self.added_counter = n.saturating_add(1);
         let request = move || {
             let paths = if remote_target.is_none() && daemon {
-                Some(krill_proto::daemon::Paths::dev().map_err(|e| e.to_string())?)
+                Some(
+                    krill_proto::daemon::Paths::dev()
+                        .map_err(|e| crate::errors::user_io_error(&e))?,
+                )
             } else {
                 None
             };
             let send = |req: &UsageRequest| match &remote_target {
                 Some(Some(target)) => crate::accounts::request_target(target, req),
-                Some(None) => Err("remote host disconnected".to_owned()),
+                Some(None) => Err(text::REMOTE_HOST_DISCONNECTED.get().to_owned()),
                 None => match &paths {
                     Some(paths) => crate::accounts::request_ipc(paths, req),
                     None => crate::accounts::request_local(&home, dir.as_deref(), req)
-                        .map_err(|e| e.to_string()),
+                        .map_err(|e| crate::errors::user_io_error(&e)),
                 },
             };
             let snap = send(&UsageRequest::ListAccounts)?;
@@ -4984,7 +5291,7 @@ impl SettingsView {
                 .accounts
                 .into_iter()
                 .find(|a| a.provider == provider && a.label == label)
-                .ok_or_else(|| "new account profile missing".to_owned())?
+                .ok_or_else(|| text::ACCOUNTS_PROFILE_MISSING.get().to_owned())?
             };
             Ok::<_, String>((
                 send(&UsageRequest::ListAccounts)?,
@@ -5122,7 +5429,9 @@ impl SettingsView {
                         this.opencode_api_key_error = None;
                         this.opencode_api_key_input = None;
                     }
-                    Err(e) => this.opencode_api_key_error = Some(e.to_string().into()),
+                    Err(e) => {
+                        this.opencode_api_key_error = Some(crate::errors::user_io_error(&e).into());
+                    }
                 }
                 cx.notify();
             })
@@ -5150,7 +5459,9 @@ impl SettingsView {
                         this.opencode_api_key_configured = Some(false);
                         this.opencode_api_key_error = None;
                     }
-                    Err(e) => this.opencode_api_key_error = Some(e.to_string().into()),
+                    Err(e) => {
+                        this.opencode_api_key_error = Some(crate::errors::user_io_error(&e).into());
+                    }
                 }
                 cx.notify();
             })
@@ -5177,7 +5488,7 @@ impl SettingsView {
                 return;
             }
             let Some(target) = self.selected_account_target() else {
-                self.account_error = Some("remote host disconnected".into());
+                self.account_error = Some(text::REMOTE_HOST_DISCONNECTED.get().into());
                 cx.notify();
                 return;
             };
@@ -5229,7 +5540,8 @@ impl SettingsView {
                         }
                         Err(error) => {
                             if is_current {
-                                this.account_error = Some(error.to_string().into());
+                                this.account_error =
+                                    Some(crate::errors::user_io_error(&error).into());
                             }
                         }
                     }
@@ -5268,7 +5580,7 @@ impl SettingsView {
         let host = self.account_host.clone();
         let target = if host.is_remote() {
             let Some(target) = self.selected_account_target() else {
-                self.account_error = Some("remote host disconnected".into());
+                self.account_error = Some(text::REMOTE_HOST_DISCONNECTED.get().into());
                 cx.notify();
                 return;
             };
@@ -7444,7 +7756,7 @@ impl SettingsView {
             );
         if let Some(err) = self.opencode_api_key_error.clone() {
             card = card.child(
-                crate::ui::error_banner(p, err)
+                crate::ui::error_banner(p, crate::i18n::cached_notice(&err))
                     .id("admin-opencode-api-key-error")
                     .debug_selector(|| "admin-opencode-api-key-error".into()),
             );
@@ -9370,6 +9682,7 @@ impl SettingsView {
         // 사용자 인자가 늦게 도착해도 입력 상태에 반영되지 않는다.
         let loaded = dir.is_none() || self.agents_file_cache.0.is_some();
         let list = self.render_agent_list(&s.default_agent, loaded, window, cx);
+        let add_providers = self.render_add_providers_section(loaded, window, cx);
         div()
             .flex()
             .flex_col()
@@ -9382,6 +9695,7 @@ impl SettingsView {
             .child(crate::ui::group(p, [yolo_row, trust_row]))
             .children(trust_confirm)
             .child(list)
+            .child(add_providers)
             .children(self.skill_status.clone().map(|status| {
                 layout::card(p)
                     .debug_selector(|| "admin-agent-setup-status".into())
@@ -9512,15 +9826,24 @@ impl SettingsView {
     ) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
         let parsed = self.agents_parsed.clone();
+        let effective = parsed.as_deref().unwrap_or_else(|| builtin_agents());
         let checks = crate::onboarding::snapshot(cx).checks;
         let row_context = AgentRowContext {
             default_agent,
             loaded,
-            effective: parsed.as_deref().unwrap_or_else(|| builtin_agents()),
+            effective,
             checks: &checks,
         };
-        let rows = ["claude", "codex", "agy", "cursor", "opencode"]
-            .map(|agent_id| self.render_agent_catalog_row(agent_id, &row_context, window, cx));
+        let mut agent_ids: Vec<String> = effective.profiles.keys().cloned().collect();
+        agent_ids.sort_by(|a, b| {
+            krill_proto::agent::profile_rank(a)
+                .cmp(&krill_proto::agent::profile_rank(b))
+                .then_with(|| a.cmp(b))
+        });
+        let rows: Vec<_> = agent_ids
+            .iter()
+            .map(|agent_id| self.render_agent_catalog_row(agent_id, &row_context, window, cx))
+            .collect();
         self.search_focus.anchored(
             p,
             text::DEFAULT_AGENT_TITLE.get(),
@@ -9532,9 +9855,9 @@ impl SettingsView {
         )
     }
 
-    fn toggle_agent_row(&mut self, agent_id: &'static str, cx: &mut Context<Self>) {
+    fn toggle_agent_row(&mut self, agent_id: &str, cx: &mut Context<Self>) {
         if !self.agent_expanded.remove(agent_id) {
-            self.agent_expanded.insert(agent_id);
+            self.agent_expanded.insert(agent_id.to_owned());
         }
         cx.notify();
     }
@@ -9542,7 +9865,7 @@ impl SettingsView {
     #[inline(never)]
     fn render_agent_catalog_row(
         &mut self,
-        agent_id: &'static str,
+        agent_id: &str,
         row_context: &AgentRowContext<'_>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -9551,6 +9874,7 @@ impl SettingsView {
         use krill_proto::doctor::Status as DoctorStatus;
         use krill_proto::usage::ProviderKind;
         let p = crate::ui::palette(cx);
+        let agent_id_owned = agent_id.to_owned();
         let AgentRowContext {
             default_agent,
             loaded,
@@ -9558,7 +9882,12 @@ impl SettingsView {
             checks,
         } = *row_context;
         let builtin_prof = builtin_agents().profiles.get(agent_id);
-        let display_name = builtin_prof
+        let preset_prof = krill_proto::agent::preset_profiles().get(agent_id);
+        let eff_prof = effective.profiles.get(agent_id);
+        let is_builtin = builtin_prof.is_some();
+        let display_name = eff_prof
+            .or(builtin_prof)
+            .or(preset_prof)
             .map_or(agent_id, |prof| prof.name.as_str())
             .to_owned();
         let provider = ProviderKind::parse(agent_id);
@@ -9572,6 +9901,21 @@ impl SettingsView {
         let doctor_not_installed = checks
             .iter()
             .any(|c| c.id == hook_check_id && c.status == DoctorStatus::Skip);
+        let detected = if let Some(prov) = provider {
+            crate::accounts::installed::is_installed(cx, prov)
+        } else if cx
+            .try_global::<crate::accounts::installed::InstalledAgents>()
+            .and_then(|i| i.0.as_ref())
+            .is_none()
+        {
+            true
+        } else {
+            crate::accounts::installed::agent_detected(
+                cx,
+                agent_id,
+                eff_prof.and_then(krill_proto::agent::Profile::program),
+            )
+        };
         let is_installed = if doctor_version.is_some()
             || checks
                 .iter()
@@ -9581,7 +9925,7 @@ impl SettingsView {
         } else if doctor_not_installed {
             false
         } else {
-            provider.is_none_or(|prov| crate::accounts::installed::is_installed(cx, prov))
+            detected
         };
         let (badge_tone, badge_text) = if is_installed {
             let text = match &doctor_version {
@@ -9597,7 +9941,6 @@ impl SettingsView {
         };
         let badge_id = format!("admin-agent-installed-badge-{agent_id}");
 
-        let eff_prof = effective.profiles.get(agent_id);
         let cmd_name = eff_prof
             .and_then(krill_proto::agent::Profile::program)
             .unwrap_or(agent_id);
@@ -9662,41 +10005,132 @@ impl SettingsView {
                 None => format!("{display_name}, {profiles}"),
             };
             let summary_text = format!("{launch_summary}, {dir_info}");
-            let hook_cmd = format!("krill hook install {agent_id}");
-            let hook_id = format!("admin-agent-hook-{agent_id}");
-            let hook_copy = hook_cmd.clone();
-            let id_owned = agent_id.to_owned();
-            let default_args = builtin_prof
+            let hook_button = is_builtin.then(|| {
+                let hook_cmd = format!("krill hook install {agent_id}");
+                let hook_id = format!("admin-agent-hook-{agent_id}");
+                let hook_copy = hook_cmd.clone();
+                let id_owned = agent_id_owned.clone();
+                layout::secondary(
+                    gpui::ElementId::Name(hook_id.clone().into()),
+                    text::HOOK_INSTALL.get(),
+                )
+                .xsmall()
+                .debug_selector(move || hook_id.clone())
+                .tooltip(text::HOOK_INSTALL_TIP.format(&[("cmd", &hook_cmd)]))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(hook_copy.clone()));
+                    let base = if cfg!(test) {
+                        state_dir(cx).unwrap_or_else(crate::accounts::default_home)
+                    } else {
+                        crate::accounts::default_home()
+                    };
+                    let state = state_dir(cx).unwrap_or_else(|| base.clone());
+                    if id_owned == "codex" {
+                        queue_terminal_command(format!("{hook_copy} --yes"), cx);
+                        this.skill_status = Some(text::HOOK_QUEUED.get().into());
+                    } else {
+                        let id = id_owned.clone();
+                        let fallback = hook_copy.clone();
+                        this.file_job(
+                            "hook-install",
+                            move || install_agent_hook_at(&id, &base, &state),
+                            move |this, result, cx| {
+                                this.skill_status = Some(match result {
+                                    Ok(path) => text::SKILLS_INSTALLED
+                                        .format(&[("path", &path.display().to_string())])
+                                        .into(),
+                                    Err(error) => {
+                                        queue_terminal_command(format!("{fallback} --yes"), cx);
+                                        text::HOOK_INSTALL_FAILED
+                                            .format(&[("error", &error.to_string())])
+                                            .into()
+                                    }
+                                });
+                            },
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                }))
+            });
+            let docs_button = krill_proto::agent::agent_homepage(agent_id).map(|url| {
+                let docs_id = format!("admin-agent-docs-{agent_id}");
+                let sel = docs_id.clone();
+                layout::secondary(
+                    gpui::ElementId::Name(docs_id.into()),
+                    text::AGENT_DOCS.get(),
+                )
+                .xsmall()
+                .icon(gpui_component::IconName::ExternalLink)
+                .debug_selector(move || sel.clone())
+                .on_click(move |_, _, cx| cx.open_url(url))
+            });
+            let remove_button = (!is_builtin).then(|| {
+                let remove_id = format!("admin-agent-remove-{agent_id}");
+                let sel = remove_id.clone();
+                let rm_id = agent_id_owned.clone();
+                let rm_name = display_name.clone();
+                layout::secondary(
+                    gpui::ElementId::Name(remove_id.into()),
+                    text::AGENT_REMOVE.get(),
+                )
+                .xsmall()
+                .debug_selector(move || sel.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remove_agent_profile(rm_id.clone(), rm_name.clone(), cx);
+                }))
+            });
+            let base_prof = builtin_prof.or(preset_prof);
+            let default_cmd = base_prof
+                .and_then(krill_proto::agent::Profile::program)
+                .unwrap_or(cmd_name)
+                .to_owned();
+            let default_args = base_prof
                 .map(|p| p.launch.get(1..).unwrap_or_default().join(" "))
                 .unwrap_or_default();
-            let default_env = builtin_prof
+            let default_env = base_prof
                 .map(|p| krill_proto::agent::format_env_lines(&p.env))
                 .unwrap_or_default();
             // 입력 상태는 처음 펼칠 때 만든다.
-            let edit_state = self.agent_edits.entry(agent_id).or_insert_with(|| {
-                let args = eff_prof
-                    .map(|p| p.launch.get(1..).unwrap_or_default().join(" "))
-                    .unwrap_or_default();
-                let env = eff_prof
-                    .map(|p| krill_proto::agent::format_env_lines(&p.env))
-                    .unwrap_or_default();
-                AgentEdit {
-                    args: cx.new(|cx| {
-                        gpui_component::input::InputState::new(window, cx).default_value(args)
-                    }),
-                    env: cx.new(|cx| {
-                        gpui_component::input::TextareaState::new(window, cx)
-                            .auto_grow(2, 6)
-                            .default_value(env)
-                    }),
-                    status: None,
-                }
-            });
-            let (args_input, env_input) = (edit_state.args.clone(), edit_state.env.clone());
+            let edit_state = self
+                .agent_edits
+                .entry(agent_id_owned.clone())
+                .or_insert_with(|| {
+                    let cmd = cmd_name.to_owned();
+                    let args = eff_prof
+                        .map(|p| p.launch.get(1..).unwrap_or_default().join(" "))
+                        .unwrap_or_default();
+                    let env = eff_prof
+                        .map(|p| krill_proto::agent::format_env_lines(&p.env))
+                        .unwrap_or_default();
+                    AgentEdit {
+                        cmd: cx.new(|cx| {
+                            gpui_component::input::InputState::new(window, cx).default_value(cmd)
+                        }),
+                        args: cx.new(|cx| {
+                            gpui_component::input::InputState::new(window, cx).default_value(args)
+                        }),
+                        env: cx.new(|cx| {
+                            gpui_component::input::TextareaState::new(window, cx)
+                                .auto_grow(2, 6)
+                                .default_value(env)
+                        }),
+                        status: None,
+                    }
+                });
+            let (cmd_input, args_input, env_input) = (
+                edit_state.cmd.clone(),
+                edit_state.args.clone(),
+                edit_state.env.clone(),
+            );
             let status = edit_state.status.clone();
             let editor_id = format!("admin-agent-editor-{agent_id}");
+            let cmd_id = format!("admin-agent-cmd-{agent_id}");
             let save_id = format!("admin-agent-save-{agent_id}");
             let reset_id = format!("admin-agent-reset-{agent_id}");
+            let status_id = format!("admin-agent-status-{agent_id}");
+            let save_agent = agent_id_owned.clone();
+            let reset_agent = agent_id_owned.clone();
             Some(
                 div()
                     .id(gpui::ElementId::Name(editor_id.clone().into()))
@@ -9717,63 +10151,23 @@ impl SettingsView {
                             .child(summary_text),
                     )
                     .child(
-                        layout::controls().pb_1().children(body_install).child(
-                            layout::secondary(
-                                gpui::ElementId::Name(hook_id.clone().into()),
-                                text::HOOK_INSTALL.get(),
-                            )
-                            .xsmall()
-                            .debug_selector(move || hook_id.clone())
-                            .tooltip(text::HOOK_INSTALL_TIP.format(&[("cmd", &hook_cmd)]))
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        hook_copy.clone(),
-                                    ));
-                                    let base = if cfg!(test) {
-                                        state_dir(cx).unwrap_or_else(crate::accounts::default_home)
-                                    } else {
-                                        crate::accounts::default_home()
-                                    };
-                                    let state = state_dir(cx).unwrap_or_else(|| base.clone());
-                                    if id_owned == "codex" {
-                                        queue_terminal_command(format!("{hook_copy} --yes"), cx);
-                                        this.skill_status = Some(text::HOOK_QUEUED.get().into());
-                                    } else {
-                                        let id = id_owned.clone();
-                                        let fallback = hook_copy.clone();
-                                        this.file_job(
-                                            "hook-install",
-                                            move || install_agent_hook_at(&id, &base, &state),
-                                            move |this, result, cx| {
-                                                this.skill_status = Some(match result {
-                                                    Ok(path) => text::SKILLS_INSTALLED
-                                                        .format(&[(
-                                                            "path",
-                                                            &path.display().to_string(),
-                                                        )])
-                                                        .into(),
-                                                    Err(error) => {
-                                                        queue_terminal_command(
-                                                            format!("{fallback} --yes"),
-                                                            cx,
-                                                        );
-                                                        text::HOOK_INSTALL_FAILED
-                                                            .format(&[(
-                                                                "error",
-                                                                &error.to_string(),
-                                                            )])
-                                                            .into()
-                                                    }
-                                                });
-                                            },
-                                            cx,
-                                        );
-                                    }
-                                    cx.notify();
-                                },
-                            )),
-                        ),
+                        layout::controls()
+                            .pb_1()
+                            .children(body_install)
+                            .children(docs_button)
+                            .children(hook_button)
+                            .children(remove_button),
+                    )
+                    .child(
+                        div()
+                            .text_color(p.muted_foreground)
+                            .child(text::AGENT_CMD.get()),
+                    )
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(cmd_id.clone().into()))
+                            .debug_selector(move || cmd_id.clone())
+                            .child(gpui_component::input::Input::new(&cmd_input).small()),
                     )
                     .child(
                         div()
@@ -9790,7 +10184,7 @@ impl SettingsView {
                     .when_some(status, |d, (msg, is_err)| {
                         d.child(
                             div()
-                                .debug_selector(move || format!("admin-agent-status-{agent_id}"))
+                                .debug_selector(move || status_id.clone())
                                 .text_color(if is_err {
                                     p.destructive
                                 } else {
@@ -9809,13 +10203,15 @@ impl SettingsView {
                                 .debug_selector(move || save_id.clone())
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        let Some(edit) = this.agent_edits.get_mut(agent_id) else {
+                                        let Some(edit) = this.agent_edits.get(&save_agent) else {
                                             return;
                                         };
+                                        let cmd = edit.cmd.read(cx).value();
                                         let args = edit.args.read(cx).value();
                                         let env = edit.env.read(cx).value();
                                         this.save_agent_edit(
-                                            agent_id,
+                                            save_agent.clone(),
+                                            cmd.to_string(),
                                             args.to_string(),
                                             env.to_string(),
                                             cx,
@@ -9831,20 +10227,31 @@ impl SettingsView {
                                 .debug_selector(move || reset_id.clone())
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
-                                        let Some(edit) = this.agent_edits.get(agent_id) else {
+                                        let Some(edit) = this.agent_edits.get(&reset_agent) else {
                                             return;
                                         };
+                                        let cmd_entity = edit.cmd.clone();
                                         let args_entity = edit.args.clone();
                                         let env_entity = edit.env.clone();
+                                        let def_cmd = default_cmd.clone();
                                         let def_args = default_args.clone();
                                         let def_env = default_env.clone();
+                                        cmd_entity.update(cx, |s, cx| {
+                                            s.set_value(def_cmd.clone(), window, cx);
+                                        });
                                         args_entity.update(cx, |s, cx| {
                                             s.set_value(def_args.clone(), window, cx);
                                         });
                                         env_entity.update(cx, |s, cx| {
                                             s.set_value(def_env.clone(), window, cx);
                                         });
-                                        this.save_agent_edit(agent_id, def_args, def_env, cx);
+                                        this.save_agent_edit(
+                                            reset_agent.clone(),
+                                            def_cmd,
+                                            def_args,
+                                            def_env,
+                                            cx,
+                                        );
                                     },
                                 )),
                             ),
@@ -9865,6 +10272,9 @@ impl SettingsView {
         let toggle_id = format!("admin-agent-toggle-{agent_id}");
         let header_id = format!("admin-agent-header-{agent_id}");
         let card_id = format!("admin-agent-card-{agent_id}");
+        let default_target = agent_id_owned.clone();
+        let toggle_header_target = agent_id_owned.clone();
+        let toggle_btn_target = agent_id_owned.clone();
         div()
             .id(gpui::ElementId::Name(card_id.clone().into()))
             .debug_selector(move || card_id.clone())
@@ -9914,7 +10324,8 @@ impl SettingsView {
                                 )
                             })
                             .on_click(move |_, _, cx| {
-                                edit(cx, move |s| agent_id.clone_into(&mut s.default_agent));
+                                let next = default_target.clone();
+                                edit(cx, move |s| next.clone_into(&mut s.default_agent));
                             })
                             .child(
                                 div()
@@ -9943,9 +10354,10 @@ impl SettingsView {
                             .overflow_hidden()
                             .when(!is_installed, |d| d.opacity(0.75))
                             .when(loaded, |d| {
+                                let id = toggle_header_target.clone();
                                 d.cursor_pointer()
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_agent_row(agent_id, cx);
+                                        this.toggle_agent_row(&id, cx);
                                     }))
                             })
                             .child(
@@ -10019,11 +10431,442 @@ impl SettingsView {
                             .disabled(!loaded)
                             .debug_selector(move || toggle_id.clone())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_agent_row(agent_id, cx);
+                                this.toggle_agent_row(&toggle_btn_target, cx);
                             })),
                     ),
             )
             .children(body)
+    }
+
+    #[inline(never)]
+    fn render_add_providers_section(
+        &mut self,
+        loaded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        struct PresetCandidate<'a> {
+            id: &'static str,
+            name: &'a str,
+            program: &'a str,
+            detected: bool,
+        }
+
+        let p = crate::ui::palette(cx);
+        let search_input = self
+            .agent_preset_search
+            .get_or_insert_with(|| {
+                let inp = cx.new(|cx| {
+                    gpui_component::input::InputState::new(window, cx)
+                        .placeholder(text::AGENTS_SEARCH_PLACEHOLDER.get())
+                });
+                let sub = cx.subscribe(
+                    &inp,
+                    |_, _, event: &gpui_component::input::InputEvent, cx| {
+                        if matches!(event, gpui_component::input::InputEvent::Change) {
+                            cx.notify();
+                        }
+                    },
+                );
+                (inp, sub)
+            })
+            .0
+            .clone();
+        let query = search_input.read(cx).value().trim().to_ascii_lowercase();
+        let effective = self
+            .agents_parsed
+            .as_deref()
+            .unwrap_or_else(|| builtin_agents());
+        let presets = krill_proto::agent::preset_profiles();
+
+        let mut unadded = Vec::new();
+        for &id in krill_proto::agent::PRESET_ORDER {
+            if effective.profiles.contains_key(id) {
+                continue;
+            }
+            let Some(profile) = presets.get(id) else {
+                continue;
+            };
+            let program = profile.program().unwrap_or(id);
+            let detected = crate::accounts::installed::agent_detected(cx, id, Some(program));
+            unadded.push(PresetCandidate {
+                id,
+                name: profile.name.as_str(),
+                program,
+                detected,
+            });
+        }
+        let all_added = unadded.is_empty();
+        let mut matching: Vec<PresetCandidate<'_>> = unadded
+            .into_iter()
+            .filter(|item| {
+                query.is_empty()
+                    || item.id.contains(&query)
+                    || item.name.to_ascii_lowercase().contains(&query)
+                    || item.program.to_ascii_lowercase().contains(&query)
+            })
+            .collect();
+        matching.sort_by_key(|item| !item.detected);
+
+        let total_matches = matching.len();
+        let truncated = query.is_empty() && !self.agent_presets_show_all && total_matches > 8;
+        let visible = if truncated {
+            &matching[..8]
+        } else {
+            &matching[..]
+        };
+
+        let preset_list = if all_added {
+            div()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(p.muted_foreground)
+                .child(text::AGENTS_ALL_ADDED.get())
+                .into_any_element()
+        } else if visible.is_empty() {
+            div()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(p.muted_foreground)
+                .child(text::AGENTS_SEARCH_EMPTY.get())
+                .into_any_element()
+        } else {
+            crate::ui::group(
+                p,
+                visible.iter().map(|item| {
+                    Self::render_preset_add_row(
+                        item.id,
+                        item.name,
+                        item.program,
+                        item.detected,
+                        loaded,
+                        cx,
+                    )
+                }),
+            )
+            .into_any_element()
+        };
+
+        let toggle_all_btn = (query.is_empty() && total_matches > 8).then(|| {
+            let label: SharedString = if self.agent_presets_show_all {
+                text::AGENTS_SHOW_LESS.get().into()
+            } else {
+                text::AGENTS_SHOW_ALL
+                    .format(&[("count", &total_matches.to_string())])
+                    .into()
+            };
+            layout::ghost("admin-agents-presets-toggle-all", label)
+                .xsmall()
+                .debug_selector(|| "admin-agents-presets-toggle-all".into())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.agent_presets_show_all = !this.agent_presets_show_all;
+                    cx.notify();
+                }))
+        });
+
+        let custom_toggle_btn =
+            layout::secondary("admin-agents-custom-toggle", text::AGENTS_CUSTOM_BTN.get())
+                .xsmall()
+                .debug_selector(|| "admin-agents-custom-toggle".into())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if this.custom_agent_form.is_some() {
+                        this.custom_agent_form = None;
+                    } else {
+                        this.custom_agent_form = Some(CustomAgentForm {
+                            id: cx.new(|cx| {
+                                gpui_component::input::InputState::new(window, cx)
+                                    .placeholder(text::AGENTS_CUSTOM_ID_PLACEHOLDER.get())
+                            }),
+                            name: cx.new(|cx| {
+                                gpui_component::input::InputState::new(window, cx)
+                                    .placeholder(text::AGENTS_CUSTOM_NAME_PLACEHOLDER.get())
+                            }),
+                            command: cx.new(|cx| {
+                                gpui_component::input::InputState::new(window, cx)
+                                    .placeholder(text::AGENTS_CUSTOM_CMD_PLACEHOLDER.get())
+                            }),
+                            env: cx.new(|cx| {
+                                gpui_component::input::TextareaState::new(window, cx)
+                                    .auto_grow(2, 5)
+                            }),
+                            status: None,
+                        });
+                    }
+                    cx.notify();
+                }));
+
+        let custom_form = self.render_custom_agent_form(cx);
+
+        self.search_focus.anchored(
+            p,
+            text::AGENTS_ADD_SECTION_TITLE.get(),
+            crate::ui::card(p)
+                .id("admin-agents-add-card")
+                .debug_selector(|| "admin-agents-add-card".into())
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2p5()
+                .child(self.search_focus.label(
+                    p,
+                    text::AGENTS_ADD_SECTION_TITLE.get(),
+                    Some(text::AGENTS_ADD_SECTION_DESC.get()),
+                ))
+                .child(
+                    div()
+                        .id("admin-agents-preset-search")
+                        .debug_selector(|| "admin-agents-preset-search".into())
+                        .w_full()
+                        .min_w_0()
+                        .child(gpui_component::input::Input::new(&search_input).small()),
+                )
+                .child(preset_list)
+                .child(
+                    layout::controls()
+                        .children(toggle_all_btn)
+                        .child(custom_toggle_btn),
+                )
+                .children(custom_form),
+        )
+    }
+
+    fn render_preset_add_row(
+        id: &'static str,
+        name: &str,
+        program: &str,
+        detected: bool,
+        loaded: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = crate::ui::palette(cx);
+        let row_id = format!("admin-preset-row-{id}");
+        let row_sel = row_id.clone();
+        let add_id = format!("admin-preset-add-{id}");
+        let add_sel = add_id.clone();
+        let detected_id = format!("admin-preset-detected-{id}");
+        let detected_sel = detected_id.clone();
+        let docs_button = krill_proto::agent::agent_homepage(id).map(|url| {
+            let docs_id = format!("admin-preset-docs-{id}");
+            let docs_sel = docs_id.clone();
+            layout::ghost(
+                gpui::ElementId::Name(docs_id.into()),
+                text::AGENT_DOCS.get(),
+            )
+            .xsmall()
+            .icon(gpui_component::IconName::ExternalLink)
+            .debug_selector(move || docs_sel.clone())
+            .on_click(move |_, _, cx| cx.open_url(url))
+        });
+        let add_agent = id.to_owned();
+        let add_name = name.to_owned();
+        crate::ui::group_row()
+            .id(gpui::ElementId::Name(row_id.into()))
+            .debug_selector(move || row_sel.clone())
+            .min_h(px(34.))
+            .px_2p5()
+            .py(px(3.))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(20.))
+                            .rounded(crate::ui::RADIUS_SM)
+                            .bg(p.muted)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(crate::ui::icons::agent_brand_icon(
+                                id,
+                                crate::ui::ICON_MD,
+                                p.foreground,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_shrink_1()
+                            .truncate()
+                            .text_size(crate::ui::TEXT_SM)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(name.to_owned()),
+                    )
+                    .when(detected, |d| {
+                        d.child(
+                            crate::ui::badge(
+                                p,
+                                crate::ui::BadgeTone::Success,
+                                text::AGENTS_DETECTED_BADGE.get(),
+                            )
+                            .id(gpui::ElementId::Name(detected_id.into()))
+                            .debug_selector(move || detected_sel.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(crate::ui::FONT_MONO)
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(program.to_owned()),
+                    ),
+            )
+            .child(
+                layout::controls().children(docs_button).child(
+                    layout::secondary(
+                        gpui::ElementId::Name(add_id.into()),
+                        text::AGENTS_ADD_BTN.get(),
+                    )
+                    .xsmall()
+                    .disabled(!loaded)
+                    .debug_selector(move || add_sel.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.add_preset_agent(add_agent.clone(), add_name.clone(), cx);
+                    })),
+                ),
+            )
+    }
+
+    fn render_custom_agent_form(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let form = self.custom_agent_form.as_ref()?;
+        let p = crate::ui::palette(cx);
+        let id_input = form.id.clone();
+        let name_input = form.name.clone();
+        let cmd_input = form.command.clone();
+        let env_input = form.env.clone();
+        let status = form.status.clone();
+        Some(
+            crate::ui::card(p)
+                .id("admin-agents-custom-form")
+                .debug_selector(|| "admin-agents-custom-form".into())
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(crate::ui::TEXT_SM)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child(text::AGENTS_CUSTOM_TITLE.get()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(crate::ui::field_label(
+                            text::AGENTS_CUSTOM_ID_LABEL.get(),
+                            None,
+                            p,
+                        ))
+                        .child(
+                            div()
+                                .id("admin-custom-agent-id")
+                                .debug_selector(|| "admin-custom-agent-id".into())
+                                .child(gpui_component::input::Input::new(&id_input).small()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(crate::ui::field_label(
+                            text::AGENTS_CUSTOM_NAME_LABEL.get(),
+                            Some(crate::i18n::catalog::worktree::OPTIONAL.get()),
+                            p,
+                        ))
+                        .child(
+                            div()
+                                .id("admin-custom-agent-name")
+                                .debug_selector(|| "admin-custom-agent-name".into())
+                                .child(gpui_component::input::Input::new(&name_input).small()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(crate::ui::field_label(text::AGENT_CMD.get(), None, p))
+                        .child(
+                            div()
+                                .id("admin-custom-agent-cmd")
+                                .debug_selector(|| "admin-custom-agent-cmd".into())
+                                .child(gpui_component::input::Input::new(&cmd_input).small()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(crate::ui::field_label(
+                            text::AGENT_ENV.get(),
+                            Some(crate::i18n::catalog::worktree::OPTIONAL.get()),
+                            p,
+                        ))
+                        .child(
+                            div()
+                                .id("admin-custom-agent-env")
+                                .debug_selector(|| "admin-custom-agent-env".into())
+                                .child(gpui_component::input::Textarea::new(&env_input).small()),
+                        ),
+                )
+                .when_some(status, |d, msg| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "admin-custom-agent-status".into())
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.destructive)
+                            .child(msg),
+                    )
+                })
+                .child(
+                    layout::controls()
+                        .child(
+                            layout::primary(
+                                "admin-custom-agent-submit",
+                                text::AGENTS_ADD_BTN.get(),
+                            )
+                            .debug_selector(|| "admin-custom-agent-submit".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let Some(form) = &this.custom_agent_form else {
+                                    return;
+                                };
+                                let raw_id = form.id.read(cx).value().to_string();
+                                let name = form.name.read(cx).value().to_string();
+                                let command = form.command.read(cx).value().to_string();
+                                let env = form.env.read(cx).value().to_string();
+                                this.submit_custom_agent(raw_id, name, command, env, cx);
+                            })),
+                        )
+                        .child(
+                            layout::ghost("admin-custom-agent-cancel", text::SSH_EDIT_CANCEL.get())
+                                .debug_selector(|| "admin-custom-agent-cancel".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.custom_agent_form = None;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        )
     }
 
     fn ensure_workflow_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {

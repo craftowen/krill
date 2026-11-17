@@ -98,7 +98,10 @@ mod status_negotiation_tests {
             target_account_id: None,
         });
         let error = request_ipc(&paths, &req).unwrap_err();
-        assert!(error.contains("does not support"), "{error}");
+        assert_eq!(
+            error,
+            crate::i18n::catalog::settings::ACCOUNTS_DAEMON_RESTART_REQUIRED.get()
+        );
         worker.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -431,7 +434,7 @@ pub fn request(paths: Option<&Paths>, req: &UsageRequest) -> Result<AccountsSnap
             Some(parent)
         }
     });
-    request_local(&home, state_dir, req).map_err(|e| e.to_string())
+    request_local(&home, state_dir, req).map_err(|e| crate::errors::user_io_error(&e))
 }
 
 /// 데몬에만 묻는다(로컬 폴백 없음). 설정 화면이 데몬 연결 여부를 가릴 때 쓴다(OWE-697).
@@ -463,7 +466,9 @@ pub fn recover_account_input(
         UsageReply::Accounts(snapshot) => Ok(Some(snapshot)),
         UsageReply::Failed(krill_proto::control::Failure::Denied) => Ok(None),
         UsageReply::Failed(error) => Err(failure_text(error)),
-        _ => Err("unexpected account input recovery reply".into()),
+        _ => Err(crate::i18n::catalog::settings::ACCOUNTS_ACTION_FAILED
+            .get()
+            .to_owned()),
     }
 }
 
@@ -508,7 +513,9 @@ pub fn consume_reset_credit_target(
         UsageReply::Failed(e) => Err(reset_failure_text(
             krill_proto::usage::ResetConsumeError::from_failure(e),
         )),
-        _ => Err("unexpected account reply".to_owned()),
+        _ => Err(crate::i18n::catalog::settings::ACCOUNTS_ACTION_FAILED
+            .get()
+            .to_owned()),
     }
 }
 
@@ -559,7 +566,19 @@ fn failure_text(e: krill_proto::control::Failure) -> String {
             .get()
             .to_owned()
     } else {
-        e.to_string()
+        match e {
+            krill_proto::control::Failure::Os(code) => {
+                crate::errors::user_io_error(&io::Error::from_raw_os_error(code))
+            }
+            krill_proto::control::Failure::Denied => {
+                crate::i18n::catalog::settings::IO_PERMISSION_DENIED
+                    .get()
+                    .to_owned()
+            }
+            _ => crate::i18n::catalog::settings::ACCOUNTS_ACTION_FAILED
+                .get()
+                .to_owned(),
+        }
     }
 }
 
@@ -590,9 +609,15 @@ fn exchange_target_with_features(
         | krill_proto::usage::FEAT_USAGE_RESET
         | krill_proto::usage::FEAT_USAGE_REFRESH
         | krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH;
-    let mut conn = target.connect(&hello).map_err(|e| e.to_string())?;
+    let mut conn = target
+        .connect(&hello)
+        .map_err(|e| crate::errors::user_daemon_error(&e))?;
     if conn.negotiated.features & FEAT_USAGE == 0 {
-        return Err("FEAT_USAGE not negotiated".to_owned());
+        return Err(
+            crate::i18n::catalog::settings::ACCOUNTS_DAEMON_RESTART_REQUIRED
+                .get()
+                .to_owned(),
+        );
     }
     let required = req.required_features();
     let required = required
@@ -602,19 +627,31 @@ fn exchange_target_with_features(
             0
         };
     if conn.negotiated.features & required != required {
-        return Err("daemon does not support this account extension; restart daemon".to_owned());
+        return Err(
+            crate::i18n::catalog::settings::ACCOUNTS_DAEMON_RESTART_REQUIRED
+                .get()
+                .to_owned(),
+        );
     }
     let timeout = Some(req.ipc_timeout(Duration::from_secs(5)));
     conn.stream.set_read_timeout(timeout).ok();
     conn.stream.set_write_timeout(timeout).ok();
-    let encoded = req.encode().map_err(|e| e.to_string())?;
+    let encoded = req.encode().map_err(|_| {
+        crate::i18n::catalog::settings::ACCOUNTS_ACTION_FAILED
+            .get()
+            .to_owned()
+    })?;
     if let Err(err) = conn.stream.write_all(&encoded) {
         target.record_outcome(false, Some(&err));
-        return Err(err.to_string());
+        return Err(crate::errors::user_io_error(&err));
     }
     let (kind, body) = match ipc::read_frame(&mut conn.stream) {
         Ok(Some(frame)) => frame,
-        Ok(None) => return Err("daemon closed usage stream".to_owned()),
+        Ok(None) => {
+            return Err(crate::i18n::catalog::settings::IO_CONNECTION_LOST
+                .get()
+                .to_owned());
+        }
         Err(err) => {
             target.record_outcome(false, Some(&err));
             if matches!(req, UsageRequest::ConsumeResetCredit { .. })
@@ -627,10 +664,14 @@ fn exchange_target_with_features(
                     krill_proto::usage::ResetConsumeError::TimedOut,
                 ));
             }
-            return Err(err.to_string());
+            return Err(crate::errors::user_io_error(&err));
         }
     };
-    let reply = UsageReply::decode(kind, &body).map_err(|e| e.to_string())?;
+    let reply = UsageReply::decode(kind, &body).map_err(|_| {
+        crate::i18n::catalog::settings::ACCOUNTS_ACTION_FAILED
+            .get()
+            .to_owned()
+    })?;
     target.record_outcome(true, None);
     Ok((reply, conn.negotiated.features))
 }
@@ -641,15 +682,17 @@ pub fn request_local(
     req: &UsageRequest,
 ) -> io::Result<AccountsSnapshot> {
     match req {
-        UsageRequest::CancelAccountSwitch { .. } | UsageRequest::RecoverAccountInput { .. } => {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "account handoff cancellation requires the daemon",
-            ))
-        }
-        UsageRequest::SwitchSessionAccount { .. } => Err(io::Error::new(
+        UsageRequest::CancelAccountSwitch { .. }
+        | UsageRequest::RecoverAccountInput { .. }
+        | UsageRequest::SwitchSessionAccount { .. }
+        | UsageRequest::SetAdvancedPolicy(_)
+        | UsageRequest::SetDirectUsage(_)
+        | UsageRequest::ImportOrcaAntigravity { .. }
+        | UsageRequest::SetProvisioning(_)
+        | UsageRequest::GetProvisioning
+        | UsageRequest::ConsumeResetCredit { .. } => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "session account switching requires the daemon",
+            crate::i18n::catalog::settings::ACCOUNTS_DAEMON_REQUIRED.get(),
         )),
         UsageRequest::Get
         | UsageRequest::ListAccounts
@@ -817,26 +860,6 @@ pub fn request_local(
             }
             Ok(refresh_local(home, state_dir))
         }
-        UsageRequest::SetAdvancedPolicy(_) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "advanced policy requires daemon",
-        )),
-        UsageRequest::SetDirectUsage(_) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "direct usage requires daemon",
-        )),
-        UsageRequest::ImportOrcaAntigravity { .. } => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Orca account vault import requires daemon",
-        )),
-        UsageRequest::SetProvisioning(_) | UsageRequest::GetProvisioning => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "provisioning requires daemon",
-        )),
-        UsageRequest::ConsumeResetCredit { .. } => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "reset credits require daemon",
-        )),
         UsageRequest::SetAutoSwitch(policy) => set_auto_switch_local(home, state_dir, policy),
         UsageRequest::UpsertAutoSwitchRule(rule) => {
             let mut file = load_file_result(home, state_dir)?;
@@ -906,8 +929,11 @@ pub fn start_login_with_mode(
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
     let path = crate::onboarding::login_path(&shell)
         .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
-    let exe = krill_proto::agent::which(account.provider.as_str(), &path)
-        .ok_or_else(|| "provider executable not found".to_owned())?;
+    let exe = krill_proto::agent::which(account.provider.as_str(), &path).ok_or_else(|| {
+        crate::i18n::catalog::settings::PROVIDER_CLI_NOT_FOUND
+            .get()
+            .to_owned()
+    })?;
     let mut command =
         krill_proto::account_login::login_command(&exe, account.provider, login_dir(account))
             .ok_or_else(|| {
@@ -931,7 +957,7 @@ pub fn start_login_with_mode(
                 open_browser,
             );
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::errors::user_io_error(&e))?;
     Ok(cancel)
 }
 
@@ -1496,7 +1522,7 @@ pub fn provisioning_enabled(home: &Path, state_dir: Option<&Path>) -> bool {
 pub fn load_problem(home: &Path, state_dir: Option<&Path>) -> Option<String> {
     match load_file_result(home, state_dir) {
         Ok(_) => None,
-        Err(e) => Some(format!("{}: {e}", config_path(home, state_dir).display())),
+        Err(e) => Some(crate::errors::user_io_error(&e)),
     }
 }
 

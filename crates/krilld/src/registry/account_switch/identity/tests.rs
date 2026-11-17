@@ -134,22 +134,30 @@ fn agy_presence_beats_old_brain_handles_but_ambiguity_fails_closed() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        from_paths(
-            ProviderKind::Antigravity,
-            [
-                root.join("conversations/one.db"),
-                root.join("conversations/two.db")
-            ]
-        )
-        .is_err()
-    );
-    let wal_found = from_paths(
+    for startup_db_paths in [
+        vec![root.join("conversations/single.db")],
+        vec![
+            root.join("conversations/one.db"),
+            root.join("conversations/two.db"),
+        ],
+        vec![
+            root.join("conversations/wal-only.db-wal"),
+            root.join("conversations/wal-only.db-shm"),
+        ],
+    ] {
+        assert!(
+            from_paths(ProviderKind::Antigravity, startup_db_paths)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let wal_found = from_paths_with(
         ProviderKind::Antigravity,
         [
             root.join("conversations/wal-only.db-wal"),
             root.join("conversations/wal-only.db-shm"),
         ],
+        Some("wal-only"),
     )
     .unwrap()
     .unwrap();
@@ -222,12 +230,24 @@ fn resumed_agy_ignores_unrelated_open_conversation_dbs() {
         root.join("conversations/other-b.db-wal"),
         root.join("conversations/expected.db"),
     ];
-    // Blind discovery must still reject ambiguous open conversations.
-    assert_eq!(
+    // Blind discovery ignores startup `.db` handles without a held presence lock, and fails
+    // closed when multiple presence locks are held.
+    assert!(
         from_paths(ProviderKind::Antigravity, multi_db_paths.clone())
-            .err()
             .unwrap()
-            .kind(),
+            .is_none()
+    );
+    assert_eq!(
+        from_paths(
+            ProviderKind::Antigravity,
+            [
+                root.join("presence/one.lock"),
+                root.join("presence/two.lock"),
+            ],
+        )
+        .err()
+        .unwrap()
+        .kind(),
         io::ErrorKind::InvalidData
     );
     // Resumed discovery knows the target conversation ID and picks it out cleanly.
@@ -332,7 +352,7 @@ fn resumed_claude_ignores_unrelated_and_corrupt_transcripts() {
         from_paths_mode(
             ProviderKind::Antigravity,
             [PathBuf::from(
-                "/tmp/krill-agy-prefer/.gemini/antigravity-cli/conversations/bound.db"
+                "/tmp/krill-agy-prefer/.gemini/antigravity-cli/presence/bound.lock"
             )],
             ExpectedId::Prefer("wrong-conversation"),
         )
@@ -340,6 +360,17 @@ fn resumed_claude_ignores_unrelated_and_corrupt_transcripts() {
         .unwrap()
         .id,
         "bound"
+    );
+    assert!(
+        from_paths_mode(
+            ProviderKind::Antigravity,
+            [PathBuf::from(
+                "/tmp/krill-agy-prefer/.gemini/antigravity-cli/conversations/unrelated.db"
+            )],
+            ExpectedId::Prefer("wrong-conversation"),
+        )
+        .unwrap()
+        .is_none()
     );
     fs::remove_dir_all(root).unwrap();
 }

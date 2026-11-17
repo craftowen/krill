@@ -10,7 +10,12 @@ use krill_proto::usage::ProviderKind;
 
 mod brands;
 
-pub use brands::{ANTIGRAVITY_PNG, CLAUDE_SVG, CURSOR_PNG, OPENAI_SVG, OPENCODE_SVG, PI_SVG};
+pub use brands::{
+    AIDER_SVG, AMP_PNG, ANTIGRAVITY_PNG, CLAUDE_SVG, CLINE_PNG, CONTINUE_PNG, COPILOT_SVG,
+    CRUSH_PNG, CURSOR_PNG, DEVIN_PNG, DROID_PNG, DSH_PNG, GOOSE_PNG, GROK_PNG, HERMES_PNG,
+    KILO_PNG, KIMI_PNG, KIRO_PNG, MISTRAL_VIBE_PNG, MUSE_PNG, OMP_SVG, OPENAI_SVG, OPENCLAUDE_PNG,
+    OPENCODE_SVG, PI_SVG, QWEN_PNG, TRAE_PNG, ZCODE_PNG,
+};
 
 /// 커스텀 에이전트 메뉴용 중립 봇 마크. 특정 프로바이더 로고로 오인하지 않게 한다.
 pub const CUSTOM_AGENT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="7" width="16" height="14" rx="3"/><path d="M12 3v4M1 12v5M23 12v5M9 17h6"/><circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/></svg>"#;
@@ -146,7 +151,29 @@ pub fn agent_icon_bytes(agent_id: &str) -> &'static [u8] {
         "agy" => ANTIGRAVITY_PNG,
         "pi" => PI_SVG,
         "cursor" | "cursor-agent" => CURSOR_PNG,
-        "opencode" => OPENCODE_SVG,
+        "opencode" | "opencode2" => OPENCODE_SVG,
+        "copilot" => COPILOT_SVG,
+        "aider" => AIDER_SVG,
+        "omp" => OMP_SVG,
+        "amp" => AMP_PNG,
+        "cline" => CLINE_PNG,
+        "continue" => CONTINUE_PNG,
+        "crush" => CRUSH_PNG,
+        "devin" => DEVIN_PNG,
+        "droid" => DROID_PNG,
+        "dsh" => DSH_PNG,
+        "goose" => GOOSE_PNG,
+        "grok" => GROK_PNG,
+        "hermes" => HERMES_PNG,
+        "kilo" => KILO_PNG,
+        "kimi" => KIMI_PNG,
+        "kiro" => KIRO_PNG,
+        "mistral-vibe" => MISTRAL_VIBE_PNG,
+        "muse" => MUSE_PNG,
+        "openclaude" => OPENCLAUDE_PNG,
+        "qwen" => QWEN_PNG,
+        "trae" => TRAE_PNG,
+        "zcode" => ZCODE_PNG,
         _ => CUSTOM_AGENT_SVG,
     }
 }
@@ -181,7 +208,10 @@ pub fn agent_brand_color(agent_id: &str, fg: Hsla) -> Hsla {
     match krill_proto::agent::canonical_id(agent_id) {
         "claude" => rgb(CLAUDE_COLOR).into(),
         "agy" => rgb(ANTIGRAVITY_BLUE).into(),
-        "codex" | "opencode" | "cursor" | "cursor-agent" | "pi" => fg,
+        "codex" | "opencode" | "opencode2" | "cursor" | "cursor-agent" | "pi" | "copilot"
+        | "aider" | "omp" | "grok" | "muse" | "hermes" | "kimi" | "qwen" | "droid" | "kiro"
+        | "goose" | "amp" | "mistral-vibe" | "crush" | "cline" | "kilo" | "continue" | "devin"
+        | "trae" | "zcode" | "dsh" | "openclaude" => fg,
         _ => rgb(CUSTOM_AGENT_COLOR).into(),
     }
 }

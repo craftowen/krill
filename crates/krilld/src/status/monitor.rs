@@ -152,14 +152,14 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
             };
             let name = name.to_ascii_lowercase();
             let agent = !wrapped
-                && (matches!(
-                    name.as_str(),
-                    "claude" | "codex" | "opencode" | "cursor-agent" | "agy" | "antigravity" | "pi"
-                ) || (pid != root
-                    && (matches!(name.as_str(), "node" | "bun") && !status.agent.is_empty()
-                        || evidence
-                            .is_some_and(|e| e.source == krill_proto::control::Source::Title)
-                            && status.source != Some(krill_proto::control::Source::Process))));
+                && (krill_proto::agent::is_known_agent_process(&name)
+                    || (pid != root
+                        && (matches!(name.as_str(), "node" | "bun" | "python" | "python3")
+                            && !status.agent.is_empty()
+                            || evidence.is_some_and(|e| {
+                                e.source == krill_proto::control::Source::Title
+                            }) && status.source
+                                != Some(krill_proto::control::Source::Process))));
             if agent
                 && let Some(start) = identity
                 && t.process != Some((pid, start))

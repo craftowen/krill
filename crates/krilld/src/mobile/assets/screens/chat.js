@@ -2,6 +2,20 @@
 (() => {
   const M = (globalThis.KrillMobile ||= {});
   M.screens ||= {};
+  function cleanRpcError(err, t) {
+    const raw = String(err?.message || err || "").trim();
+    const tr = typeof t === "function" ? t : (s) => s;
+    if (!raw)
+      return tr("Request failed. Check the desktop connection and try again.");
+    if (
+      /os error|Broken pipe|Connection refused|Connection reset|unexpected control reply|unexpected daemon reply|unexpected daemon response|invalid mobile authentication or frame|\bbad request\b|Session \d+:|Usage API|\bHTTP\s*\d{3}\b|\/Users\/|\/home\/|\/var\/|\/tmp\/|\.sock\b/i.test(
+        raw,
+      )
+    ) {
+      return tr("Request failed. Check the desktop connection and try again.");
+    }
+    return tr(raw);
+  }
   const EFFORT_BARS = new Map([
     ["none", 0],
     ["minimal", 1],
@@ -1306,7 +1320,7 @@
       else
         Promise.resolve()
           .then(fn)
-          .catch((e) => ctx.error?.(e));
+          .catch((e) => ctx.error?.(Error(cleanRpcError(e, t))));
     }
     function updateComposer(sent) {
       updateStatus();
@@ -1403,7 +1417,7 @@
           entry.photo = {
             ...entry.photo,
             status: "error",
-            error: String(error?.message || error),
+            error: cleanRpcError(error, t),
           };
       }
       entry.notifyComposer?.();
@@ -1471,11 +1485,12 @@
             await ctx.refresh?.();
           }
         } catch (error) {
+          const message = cleanRpcError(error, t);
           if (entry.progress.phase === "sending") {
             entry.progress.phase = "error";
-            entry.progress.error = String(error?.message || error);
+            entry.progress.error = message;
           }
-          throw error;
+          throw Error(message);
         } finally {
           entry.sending = false;
           entry.notifyComposer?.();
@@ -1798,7 +1813,7 @@
           onSwitchTerm?.();
       } catch (error) {
         if (!disposed && panelOpen(panel)) {
-          panel.error = String(error?.message || error);
+          panel.error = cleanRpcError(error, t);
           renderReplyPanel(panel);
         }
       } finally {
@@ -2365,7 +2380,7 @@
           if (picks.some((i) => isWriteInLabel(question.choices[i]?.label)))
             onSwitchTerm?.();
         } catch (error) {
-          if (!disposed) cardError = String(error?.message || error);
+          if (!disposed) cardError = cleanRpcError(error, t);
         } finally {
           entry.questionSending = false;
           sendingIndex = -1;
@@ -2766,8 +2781,9 @@
       const when = lastSuccess
         ? new Date(lastSuccess).toTimeString().slice(0, 8)
         : t("never");
+      const detail = error ? cleanRpcError(error, t) : "";
       updateStatus();
-      pollText.textContent = `${t("Chat history update failed")} (${failures}). ${t("Last updated")}: ${when}. ${t("Retry or check Term.")} ${String(error?.message || error || "")}`;
+      pollText.textContent = `${t("Chat history update failed")} (${failures}). ${t("Last updated")}: ${when}. ${t("Retry or check Term.")}${detail ? ` ${detail}` : ""}`;
       restoreReader(anchor);
     }
     function sameItem(a, b) {

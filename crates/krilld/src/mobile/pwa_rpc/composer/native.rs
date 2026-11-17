@@ -123,7 +123,11 @@ impl Adapter for Codex {
                     set(models, "reason", "Wait for an idle Codex chat with an empty native composer. Direct model control needs Codex 0.164.0 or later.".into());
                 }
             }
-            Err(error) => set(models, "reason", error.to_string().into()),
+            Err(error) => set(
+                models,
+                "reason",
+                super::super::sanitize_tap_reason(&error).into(),
+            ),
         }
     }
 

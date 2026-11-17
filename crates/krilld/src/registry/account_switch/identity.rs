@@ -348,11 +348,6 @@ fn from_paths_mode(
     Ok(fallback)
 }
 
-fn is_agy_presence_lock(path: &Path) -> bool {
-    path.parent().is_some_and(|d| d.ends_with("presence"))
-        && path.extension().is_some_and(|e| e == "lock")
-}
-
 fn is_agy_conversation_db(path: &Path) -> bool {
     path.parent().is_some_and(|d| d.ends_with("conversations"))
         && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
@@ -394,7 +389,7 @@ fn agy_from_paths(
         let mut presence_match: Option<Identity> = None;
         let mut db_match: Option<Identity> = None;
         for path in &paths {
-            let is_presence = is_agy_presence_lock(path);
+            let is_presence = crate::agent_history::vault::is_agy_presence_lock(path);
             if !is_presence && !is_agy_conversation_db(path) {
                 continue;
             }
@@ -425,17 +420,13 @@ fn agy_from_paths(
             return Ok(None);
         }
     }
-    // agy also opens old brain directories. Its held presence lock identifies the live
-    // conversation; otherwise require one unambiguous open conversation database.
-    let presence = paths.iter().any(|p| is_agy_presence_lock(p));
+    // agy opens old brain directories and unrelated conversations/*.db* handles during startup
+    // cache reconciliation. Non-expected discovery only trusts a held presence/<id>.lock.
     let mut found: Option<Identity> = None;
-    for path in paths.iter().filter(|p| {
-        if presence {
-            is_agy_presence_lock(p)
-        } else {
-            is_agy_conversation_db(p)
-        }
-    }) {
+    for path in paths
+        .iter()
+        .filter(|p| crate::agent_history::vault::is_agy_presence_lock(p))
+    {
         let Some((home, id)) = crate::agent_history::vault::agy_root_and_id_from_path(path) else {
             continue;
         };

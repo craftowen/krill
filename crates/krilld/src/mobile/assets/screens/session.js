@@ -710,22 +710,71 @@
       ["M517.36 400 H634.72 V634.72 H517.36 Z"],
     ],
   ];
+  const PRESET_NAMES = {
+    grok: "Grok CLI",
+    muse: "Muse CLI",
+    copilot: "GitHub Copilot",
+    omp: "Oh My Pi",
+    hermes: "Hermes Agent",
+    kimi: "Kimi CLI",
+    qwen: "Qwen Code",
+    droid: "Droid",
+    kiro: "Kiro CLI",
+    aider: "Aider",
+    goose: "Goose",
+    amp: "Amp",
+    "mistral-vibe": "Mistral Vibe",
+    crush: "Crush",
+    cline: "Cline",
+    kilo: "Kilo CLI",
+    continue: "Continue",
+    devin: "Devin CLI",
+    trae: "Trae CLI",
+    zcode: "ZCode",
+    dsh: "Deep Agents",
+    openclaude: "OpenClaude",
+    opencode2: "OpenCode 2",
+  };
+  const PRESET_ALIASES = {
+    antigravity: "agy",
+    "cursor-agent": "cursor",
+    "π": "pi",
+    "grok-cli": "grok",
+    "muse-cli": "muse",
+    "github-copilot": "copilot",
+    "oh-my-pi": "omp",
+    "kimi-cli": "kimi",
+    "qwen-code": "qwen",
+    "kiro-cli": "kiro",
+    vibe: "mistral-vibe",
+    kilocode: "kilo",
+    cn: "continue",
+    "trae-cli": "trae",
+    deepagents: "dsh",
+    "open-claude": "openclaude",
+    "open-code-2": "opencode2",
+  };
   const agentKey = (a) => {
       const id = String(a || "").trim(),
         name = id
           .split(/[\\/]/)
           .pop()
-          .replace(/\.exe$/i, "")
+          .replace(/\.(?:exe|cmd|bat)$/i, "")
           .toLowerCase();
+      if (PRESET_ALIASES[name]) return PRESET_ALIASES[name];
+      if (name.startsWith("grok-")) return "grok";
+      if (name.startsWith("muse-bin-")) return "muse";
       return (
-        { antigravity: "agy", "cursor-agent": "cursor", π: "pi" }[name] ||
-        (BRANDS[name] && name) ||
+        ((BRANDS[name] || PRESET_NAMES[name]) && name) ||
         (/^(?:sh|bash|zsh|fish|nu|pwsh|powershell|cmd|shell)$/.test(name) &&
           name) ||
         id
       );
     },
-    agentName = (a) => BRANDS[agentKey(a)]?.[0] || agentKey(a);
+    agentName = (a) => {
+      const key = agentKey(a);
+      return BRANDS[key]?.[0] || PRESET_NAMES[key] || key;
+    };
   M.agentName = agentName;
 
   const cleanTitle = (title) =>
@@ -737,12 +786,35 @@
     if (id && !/^(?:sh|bash|zsh|fish|nu|pwsh|powershell|cmd|shell)$/i.test(id))
       return id;
     const foreground = agentKey(s.foreground);
-    if (BRANDS[foreground]) return foreground;
+    if (BRANDS[foreground] || PRESET_NAMES[foreground]) return foreground;
     const title = String(s.title || "").toLowerCase();
     return (
-      ["claude", "codex", "agy", "opencode", "cursor"].find((a) =>
-        title.includes(a === "agy" ? "antigravity" : a),
-      ) ||
+      [
+        "claude",
+        "codex",
+        "agy",
+        "opencode",
+        "cursor",
+        "grok",
+        "muse",
+        "copilot",
+        "hermes",
+        "kimi",
+        "qwen",
+        "droid",
+        "kiro",
+        "aider",
+        "goose",
+        "mistral-vibe",
+        "crush",
+        "cline",
+        "kilo",
+        "devin",
+        "trae",
+        "zcode",
+        "openclaude",
+        "opencode2",
+      ].find((a) => title.includes(a === "agy" ? "antigravity" : a)) ||
       (title
         .split(/[^\p{L}\p{N}_-]+/u)
         .some((word) => word === "pi" || word === "π") &&

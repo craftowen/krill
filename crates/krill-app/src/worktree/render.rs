@@ -162,29 +162,26 @@ impl Render for Dialog {
                             Some(text::OPTIONAL.get()),
                             p,
                         ))
-                        .child(
-                            div().flex().flex_wrap().gap_1().children(
-                                FAN_OUT_AGENTS.iter().enumerate().map(
-                                    |(idx, &(agent_id, label))| {
-                                        let selected =
-                                            selected_agents.iter().any(|a| a == agent_id);
-                                        let btn = Button::new(("worktree-agent", idx))
-                                            .debug_selector(move || {
-                                                format!("worktree-agent-{agent_id}")
-                                            })
-                                            .xsmall()
-                                            .icon(crate::ui::icons::agent_menu_icon(agent_id))
-                                            .label(label)
-                                            .selected(selected)
-                                            .toggled(selected);
-                                        let btn = btn.ghost();
-                                        btn.on_click(cx.listener(move |d, _, _, cx| {
-                                            d.toggle_agent(agent_id, cx);
-                                        }))
-                                    },
-                                ),
+                        .child(div().flex().flex_wrap().gap_1().children(
+                            self.fan_out_agents.iter().enumerate().map(
+                                |(idx, (agent_id, label))| {
+                                    let selected = selected_agents.iter().any(|a| a == agent_id);
+                                    let id_sel = agent_id.clone();
+                                    let id_click = agent_id.clone();
+                                    let btn = Button::new(("worktree-agent", idx))
+                                        .debug_selector(move || format!("worktree-agent-{id_sel}"))
+                                        .xsmall()
+                                        .icon(crate::ui::icons::agent_menu_icon(agent_id))
+                                        .label(label.clone())
+                                        .selected(selected)
+                                        .toggled(selected);
+                                    let btn = btn.ghost();
+                                    btn.on_click(cx.listener(move |d, _, _, cx| {
+                                        d.toggle_agent(&id_click, cx);
+                                    }))
+                                },
                             ),
-                        ),
+                        )),
                 )
                 .child(
                     Button::new("worktree-advanced")

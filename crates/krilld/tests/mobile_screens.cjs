@@ -353,9 +353,52 @@ async function accounts(){const data={accounts:[{id:'work',provider:'Claude',lab
  let refreshes=0,handoffState={accounts:[{id:'agy-2',provider:'Antigravity',label:'Agy 2',email:'agy2@example.test',profile_dir:'/agy2',active:false,stale:false,usage:{five_hour:null,seven_day:null}}],statuses:[],connections:{supported:true,accounts:[{account_id:'agy-2',status:'connected'}]},details:{handoffs:[]}};
  const h=fixture('accounts',{refresh:()=>{refreshes++;},rpc:req=>{if(req.action==='switch_account'){handoffState={...handoffState,accounts:[{...handoffState.accounts[0],active:true}],details:{handoffs:[{from:7,to:null,account_id:'agy-2',error:null}]}};return handoffState;}return handoffState;}});await h.flush();
  await h.find('.account-row').action();await h.flush();assert.equal(refreshes,1);assert(h.find('.account-trailing').querySelector('.spinner'),'pending session handoff shows spinner');
- handoffState={...handoffState,details:{handoffs:[{from:7,to:null,account_id:'agy-2',error:'Session 7: could not resume with selected account'}]}};;
+ handoffState={...handoffState,details:{handoffs:[{from:7,to:null,account_id:'agy-2',error:'Session 7: could not resume with selected account (os error 2)'}]}};
  for(const [id,t] of [...h.timers])if(!t.interval){h.timers.delete(id);t.fn();}await h.flush();
- assert.equal(refreshes,2,'settling handoff refreshes mobile snapshot');assert(h.root.textContent.includes('Session 7: could not resume with selected account'));h.abort.abort();
+ assert.equal(refreshes,2,'settling handoff refreshes mobile snapshot');
+ const handoffErr=h.find('.account-error');
+ assert(handoffErr,'settling handoff renders .account-error');
+ assert.equal(handoffErr.textContent,"Couldn't switch a running session to this account. Kept the original session.");
+ assert(!h.root.textContent.includes('Session 7'));
+ assert(!h.root.textContent.includes('os error'));
+ assert(!handoffErr.textContent.includes('('));
+ h.abort.abort();
+ const locale=vm.createContext({navigator:{language:'ko'}});vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),locale);const I=locale.KrillMobile.i18n;
+ const diagAccounts={
+  accounts:[
+   {id:'claude-401',provider:'Claude',label:'Claude 401',email:'claude@example.test',profile_dir:'/c401',active:false,stale:false,usage:{five_hour:null,seven_day:null}},
+   {id:'agy-2',provider:'Antigravity',label:'Agy 2',email:'agy2@example.test',profile_dir:'/agy2',active:false,stale:false,usage:{five_hour:null,seven_day:null}},
+   {id:'opencode-default',provider:'OpenCode',label:'OpenCode default',host_default:true,email:null,profile_dir:null,active:true,stale:false,usage:{five_hour:null,seven_day:null}},
+  ],
+  statuses:[
+   {account_id:'claude-401',status:'needs_login',detail:'Usage API rejected the sign-in (HTTP 401)'},
+   {account_id:'opencode-default',status:'error',detail:'Usage API denied access (HTTP 403)'},
+  ],
+  connections:{supported:true,accounts:[
+   {account_id:'claude-401',status:'needs_login'},
+   {account_id:'agy-2',status:'connected'},
+   {account_id:'opencode-default',status:'connected'},
+  ]},
+  details:{handoffs:[{from:41205,to:null,account_id:'agy-2',error:'Session 41205: could not resume with selected account'}]},
+ };
+ for(const [lang,tr] of [['en',s=>s],['ko',I.t]]){
+  const d=fixture('accounts',{t:tr,rpc:()=>diagAccounts});await d.flush();
+  const rows=d.root.querySelectorAll('.account-row');assert.equal(rows.length,3);
+  const [cRow,aRow,oRow]=rows;
+  assert.equal(cRow.querySelector('.account-error')?.textContent,tr('Sign in to this account again to check usage.'),lang+' 401 error');
+  assert.equal(aRow.querySelector('.account-error')?.textContent,tr("Couldn't switch a running session to this account. Kept the original session."),lang+' handoff 41205');
+  assert.equal(oRow.querySelector('.account-error'),null,lang+' OpenCode host_default 403 must not show .account-error');
+  assert(oRow.querySelector('.account-meta')?.textContent.includes(tr("Usage details aren't available for this account.")),lang+' OpenCode host_default 403 shows muted note');
+  assert(!oRow.textContent.includes(tr('Usage error')),lang+' OpenCode host_default 403 suppresses Usage error badge');
+  for(const raw of ['HTTP 401','HTTP 403','Usage API','Session 41205','41205'])assert(!d.root.textContent.includes(raw),lang+' hides '+raw);
+  if(lang==='ko'){
+   assert.notEqual(cRow.querySelector('.account-error').textContent,'Sign in to this account again to check usage.');
+   assert.notEqual(aRow.querySelector('.account-error').textContent,"Couldn't switch a running session to this account. Kept the original session.");
+  }
+  d.abort.abort();
+ }
+ assert.equal(A.formatUsageDetail({detail:'Usage API rate limited (HTTP 429) — last successful value'},{provider:'Claude',host_default:false},I.t).error,`${I.t('Usage check is temporarily rate-limited. Try again shortly.')} (${I.t('showing last known usage')})`);
+ assert.equal(A.formatHandoffDetail('Replacement session 99 was retained for manual selection',I.t),I.t('Kept the new session for manual selection after the original ended. Held input was not sent.'));
  console.log('PASS SC-A04/A05/A12: Accounts stable focus/scroll, action name and associated complete login/error/reset context, inline Retry');}
 async function quickCommandSettings(){
  const f=fixture('settings',{route:{subpage:'terminal'},rpc:req=>({quick_commands:req.commands?.map(c=>({...c,name:c.name.toUpperCase()}))})});

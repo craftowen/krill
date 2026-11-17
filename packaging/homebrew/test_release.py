@@ -117,22 +117,28 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn("bundle version does not match", wrong_version.stderr)
             brew = shutil.which("brew")
             self.assertIsNotNone(brew, "Homebrew is required for cask smoke")
+            brew_repo = Path(brew).resolve().parents[1]
             prefix = root / "brew"
             (prefix / "bin").mkdir(parents=True)
             # Copy the launcher: a symlink points Homebrew at its real repository
             # and allows automatic tap work outside the isolated prefix.
             shutil.copy2(brew, prefix / "bin/brew")
             (prefix / "Library").mkdir()
-            (prefix / "Library/Homebrew").symlink_to(Path(brew).resolve().parents[1] / "Library/Homebrew")
+            (prefix / "Library/Homebrew").symlink_to(brew_repo / "Library/Homebrew")
             run(["git", "init", "-q", prefix])
             # Homebrew's uninstall resolver expects core even for an absolute cask.
             # An empty local core fixture and disabled git transports keep this offline.
             core = prefix / "Library/Taps/homebrew/homebrew-core"
             (core / "Formula").mkdir(parents=True)
             run(["git", "init", "-q", core])
+            tap = prefix / "Library/Taps/owner/homebrew-krill"
+            tap.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(repo / "packaging/dist/homebrew-krill", tap)
+            run(["git", "init", "-q", tap])
             home = root / "home"; home.mkdir()
             (root / "temp").mkdir()
-            env = dict(os.environ, HOME=str(home), HOMEBREW_TEMP=str(root / "temp"),
+            base_env = {k: v for k, v in os.environ.items() if not k.startswith("HOMEBREW_")}
+            env = dict(base_env, HOME=str(home), HOMEBREW_TEMP=str(root / "temp"),
                        HOMEBREW_CACHE=str(root / "cache"), HOMEBREW_LOGS=str(root / "logs"),
                        HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_ANALYTICS="1",
                        HOMEBREW_NO_INSTALL_FROM_API="1", HOMEBREW_NO_INSTALL_CLEANUP="1",
@@ -142,12 +148,13 @@ class ReleaseTests(unittest.TestCase):
             brew = prefix / "bin/brew"
             self.assertEqual(Path(run([brew, "--prefix"], env=env).strip()), prefix)
             self.assertEqual(Path(run([brew, "--repository"], env=env).strip()), prefix)
-            cask = repo / "packaging/dist/homebrew-krill/Casks/krill.rb"
-            formula = repo / "packaging/dist/homebrew-krill/Formula/krill.rb"
-            info = json.loads(run([brew, "info", "--formula", "--json=v2", formula], env=env))
+            if (brew_repo / "Library/Homebrew/cmd/trust.rb").is_file():
+                run([brew, "trust", "owner/krill"], env=env)
+            pkg = "owner/krill/krill"
+            info = json.loads(run([brew, "info", "--formula", "--json=v2", pkg], env=env))
             self.assertEqual(info["formulae"][0]["name"], "krill")
             self.assertIn("rust", info["formulae"][0]["build_dependencies"])
-            install = [brew, "install", "--cask", cask, f"--appdir={root / 'apps'}"]
+            install = [brew, "install", "--cask", pkg, f"--appdir={root / 'apps'}"]
             # A foreign krill is never replaced, including a dangling symlink.
             cli = prefix / "bin/krill"
             cli.symlink_to(root / "foreign-krill")
@@ -206,13 +213,13 @@ else
   end
 end
 ''')
-            run([brew, "ruby", resolver, cask], env=env)
+            run([brew, "ruby", resolver, pkg], env=env)
             for path in managed:
                 self.assertFalse(path.exists(), str(path))
             self.assertEqual(sentinel.read_text(), "keep")
             self.assertEqual(len(list((home / "test-trash").iterdir())), len(managed))
             # Empty zap paths exercise Homebrew dispatch without touching the user's Trash.
-            run([brew, "uninstall", "--cask", "--zap", cask], env=env)
+            run([brew, "uninstall", "--cask", "--zap", pkg], env=env)
             self.assertFalse(cli.exists()); self.assertFalse(cli.is_symlink())
             self.assertFalse((root / "apps/Krill.app").exists())
             self.assertFalse((prefix / "Caskroom/krill").exists())

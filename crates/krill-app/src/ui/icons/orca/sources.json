@@ -33,6 +33,27 @@
       "sha256": "c8bcf9cfeb40bd21cc9d206afac48dfb04f80ccafa764e2a09045a878c6e5fac"
     },
     {
+      "file": "copilot.svg",
+      "source": "src/renderer/src/lib/agent-icon-glyphs.tsx",
+      "component": "CopilotIcon",
+      "modifications": "JSX converted to SVG; size and React/CSS attributes removed; geometry, fills and viewBox preserved",
+      "sha256": "01f7a5ecf761bc9b888a5c71fdb4cf3840818f937f8f7ce2d2f342c48d2129f3"
+    },
+    {
+      "file": "aider.svg",
+      "source": "src/renderer/src/lib/agent-icon-glyphs.tsx",
+      "component": "AiderIcon",
+      "modifications": "JSX converted to SVG; size and React/CSS attributes removed; geometry, fills and viewBox preserved",
+      "sha256": "4711d235ccafcc0b9f6943b395020a0d2bf1aba37135066e6ad85b944debcd5a"
+    },
+    {
+      "file": "omp.svg",
+      "source": "src/renderer/src/lib/agent-icon-glyphs.tsx",
+      "component": "OmpIcon",
+      "modifications": "JSX converted to SVG; oklch gradient stops converted to sRGB hex for gpui SVG rasterizer; geometry and viewBox preserved",
+      "sha256": "b359b8732553eefd67cebe9163defe6e80b5ba199bcab5dd5f608144854541cb"
+    },
+    {
       "file": "antigravity.png",
       "source": "src/shared/agent-icons/antigravity.png",
       "modifications": "none",
@@ -43,6 +64,120 @@
       "source": "src/shared/agent-icons/cursor.png",
       "modifications": "none",
       "sha256": "1910c1c724f7c7e33188885b237d2bc64a261a7d8afa38c88679cf6e42d9c432"
+    },
+    {
+      "file": "amp.png",
+      "source": "src/shared/agent-icons/amp.png",
+      "modifications": "none",
+      "sha256": "198387c8a1a445d37ba21d64f80509d08386ee4676a0af971fe19408dc8d6917"
+    },
+    {
+      "file": "cline.png",
+      "source": "src/shared/agent-icons/cline.png",
+      "modifications": "none",
+      "sha256": "6b336ccf89d444addbdf0ec8dc2863981619d1c45bd09f020365908d66bbe370"
+    },
+    {
+      "file": "continue.png",
+      "source": "src/shared/agent-icons/continue.png",
+      "modifications": "none",
+      "sha256": "deb002a878a055cf1313ffd1c648a77687b27a1de22ae7615ba2c418482a0c1e"
+    },
+    {
+      "file": "crush.png",
+      "source": "src/shared/agent-icons/crush.png",
+      "modifications": "none",
+      "sha256": "d5e18d2b2156caf9642ed46db2078c623b80cf06320eeaaefadc5e3a05221905"
+    },
+    {
+      "file": "devin.png",
+      "source": "src/shared/agent-icons/devin.png",
+      "modifications": "none",
+      "sha256": "e3baeba92f68b6eccf2cc7ce19bb003f838bbd61e71070ae4c5e4ba728a41c73"
+    },
+    {
+      "file": "droid.png",
+      "source": "src/shared/agent-icons/droid.png",
+      "modifications": "none",
+      "sha256": "d13379f67874bc498468f0ccca2beea70f1fc165355a68f3cd42a6247984c136"
+    },
+    {
+      "file": "dsh.png",
+      "source": "src/shared/agent-icons/dsh.png",
+      "modifications": "none",
+      "sha256": "8b56b0e4a07cd0fd48c21ef61f0ad9373dc824bc4c8a1da7234ae6b410dd4a1a"
+    },
+    {
+      "file": "goose.png",
+      "source": "src/shared/agent-icons/goose.png",
+      "modifications": "none",
+      "sha256": "a3abfdd2734de5b42ee2878cd446549ac14424d42fb2c06424a75aba78afa2ca"
+    },
+    {
+      "file": "grok.png",
+      "source": "src/shared/agent-icons/grok.png",
+      "modifications": "none",
+      "sha256": "1828c6052fef4186671b99100501cd9601073c444901741d6b2e52531f7c11e4"
+    },
+    {
+      "file": "hermes.png",
+      "source": "src/shared/agent-icons/hermes.png",
+      "modifications": "none",
+      "sha256": "e98359f8ebfc411aa0162fcacf8cd02bd20cd349ece9840c503995bc2f0ee793"
+    },
+    {
+      "file": "kilo.png",
+      "source": "src/shared/agent-icons/kilo.png",
+      "modifications": "none",
+      "sha256": "457e22cb3fbd42d111e02d9b22b57fd9fa9bf81cdc23b708b1bb29e084cfe317"
+    },
+    {
+      "file": "kimi.png",
+      "source": "src/shared/agent-icons/kimi.png",
+      "modifications": "none",
+      "sha256": "179d5d5014667ad5605c92cfeb72318e40683bc28001216582f8abc600877795"
+    },
+    {
+      "file": "kiro.png",
+      "source": "src/shared/agent-icons/kiro.png",
+      "modifications": "none",
+      "sha256": "357403d2cf34fadd85d3d3b8f4d35ab504f61b023a8f4037587bd90bcbabfa93"
+    },
+    {
+      "file": "mistral-vibe.png",
+      "source": "src/shared/agent-icons/mistral-vibe.png",
+      "modifications": "none",
+      "sha256": "629301790349c8423505f8ddc0ae28c2c3bd395a6d6e6da5b13ed4d71bde5a3d"
+    },
+    {
+      "file": "muse.png",
+      "source": "src/shared/agent-icons/muse.png",
+      "modifications": "none",
+      "sha256": "02f058114c3e79b0a9f3fa7b50cd88c3f9a1cff9860101b6b50513d81d4dc48b"
+    },
+    {
+      "file": "openclaude.png",
+      "source": "src/shared/agent-icons/openclaude.png",
+      "modifications": "none",
+      "sha256": "59bfe9bc385ad69f50793ce4a53397316d7a875a7148a63c16df9b674c6cda64"
+    },
+    {
+      "file": "qwen-code.png",
+      "source": "src/shared/agent-icons/qwen-code.png",
+      "modifications": "none",
+      "sha256": "f9a49592809c1357495bcbe97fd253d6cbaf6954027f09a040893ca1610c0e55"
+    },
+    {
+      "file": "trae.png",
+      "source": "src/shared/agent-icons/trae.png",
+      "modifications": "none",
+      "sha256": "cc5ebb57e1f1de4fb7132012915d1699c11dbfd8554ba9b2aab15922418bf182"
+    },
+    {
+      "file": "zcode.png",
+      "source": "src/shared/agent-icons/zcode.png",
+      "modifications": "none",
+      "sha256": "c8106add30b51df25f3c0b331b6b2607eb60161b2d3c41c2cbc2ba2fb7c809a7"
     }
   ]
 }

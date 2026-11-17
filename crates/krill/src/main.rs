@@ -323,7 +323,15 @@ fn agent_list() -> ExitCode {
                 agent::version(exe).as_deref().unwrap_or("version unknown"),
                 exe.display()
             ),
-            None => format!("not installed. install: {}", p.install_command()),
+            None => {
+                if !p.install_command().trim().is_empty() {
+                    format!("not installed. install: {}", p.install_command())
+                } else if let Some(url) = agent::agent_homepage(id) {
+                    format!("not installed. docs: {url}")
+                } else {
+                    "not installed".to_owned()
+                }
+            }
         };
         let badge = match (yolo, p.yolo_args.is_empty()) {
             (false, _) => "",
