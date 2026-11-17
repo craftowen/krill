@@ -1698,8 +1698,10 @@ fn record_time(v: &Value) -> String {
 }
 
 fn parse_claude_line(v: &Value, out: &mut Vec<ChatItem>) {
-    if v.get("isSidechain").and_then(Value::as_bool) == Some(true)
-        || v.get("isMeta").and_then(Value::as_bool) == Some(true)
+    // 압축 요약(`isCompactSummary`)은 모델용 컨텍스트라 Claude Code 화면에도 나오지 않는다.
+    if ["isSidechain", "isMeta", "isCompactSummary"]
+        .iter()
+        .any(|k| v.get(*k).and_then(Value::as_bool) == Some(true))
     {
         return;
     }
@@ -3454,6 +3456,7 @@ mod performance_tests {
         let claude_lines = [
             r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Base instructions for this skill: ..."}]}}"#,
             r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a1</task-id>\n</task-notification>"}}"#,
+            r#"{"type":"user","isVisibleInTranscriptOnly":true,"isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}"#,
             r#"{"type":"user","message":{"role":"user","content":"클로드 실제 프롬프트"}}"#,
         ];
         fs::write(&claude_path, format!("{}\n", claude_lines.join("\n"))).unwrap();
