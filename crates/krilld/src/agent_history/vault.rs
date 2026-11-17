@@ -1218,7 +1218,9 @@ impl Indexer {
                 sidechain = true;
                 return;
             }
-            if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
+            if v.get("isMeta").and_then(Value::as_bool) == Some(true)
+                || v.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+            {
                 return;
             }
             if id.is_empty()
