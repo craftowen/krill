@@ -357,6 +357,50 @@ pub(super) fn write_input(tap: &Tap, bytes: &[u8], peer: Option<BorrowedFd<'_>>)
     result
 }
 
+/// 모바일 정지 요청: 입력 잠금을 잡은 상태에서 열린 bracketed paste가 없고
+/// 세션이 여전히 작업 중일 때만 단일 Ctrl+C(`0x03`)를 쓴다.
+pub(super) fn write_interrupt(tap: &Tap, still_working: impl FnOnce() -> bool) -> io::Result<bool> {
+    if tap.pulse().closed {
+        return Ok(false);
+    }
+    let mut state = match turn(tap, None) {
+        Ok(state) => state,
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let owner = thread::current().id();
+    if state.orphaned(owner) {
+        state.finish(tap)?;
+        state.matched = 0;
+        state.peer = None;
+    }
+    if state.paste || state.matched != 0 || !still_working() {
+        return Ok(false);
+    }
+    {
+        let clients = tap
+            .0
+            .clients
+            .lock()
+            .map_err(|_| io::Error::other("terminal client state poisoned"))?;
+        if clients.sleeping {
+            return Ok(false);
+        }
+        let mut live = tap.0.live();
+        live.input_since_done = true;
+        live.last_input_ns = crate::status::now_ns();
+    }
+    state.owner = Some(owner);
+    state.peer = None;
+    let result = write_all(tap, b"\x03", None, &mut state);
+    state.owner = None;
+    match result {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 pub(super) fn finish_input(tap: &Tap) {
     let mut state = match tap.0.input.try_lock() {
         Ok(state) => state,

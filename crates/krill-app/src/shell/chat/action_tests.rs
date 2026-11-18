@@ -180,7 +180,7 @@ fn chat_prompt_failure_preserves_draft_and_success_clears_only_sent_value(cx: &m
             assert_eq!(input.read(cx).value().as_ref(), "draft");
             assert!(shell.chat.prompt_failed.contains(&local_key(SESSION)));
             input.update(cx, |state, cx| state.set_value("new draft", window, cx));
-            Shell::clear_sent_chat_draft(&input, "draft", window, cx);
+            shell.confirm_pending_prompt(&local_key(SESSION), 1);
             assert_eq!(input.read(cx).value().as_ref(), "new draft");
             let recorded = sent.clone();
             shell.chat.send_input = Some(Box::new(move |bytes| {
@@ -875,5 +875,222 @@ fn chat_partial_single_select_stale_frame_cannot_repeat_cursor_steps(cx: &mut Te
     assert_eq!(
         *sent.lock().unwrap(),
         vec![b"\x1b[B".to_vec(), b"\r".to_vec()]
+    );
+}
+
+fn set_session_state(
+    view: &gpui::Entity<Shell>,
+    cx: &mut gpui::VisualTestContext,
+    state: krill_proto::control::AgentState,
+    since_unix_ns: u64,
+) {
+    struct StateSource(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for StateSource {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let snap = krill_app::sidebar::Snapshot {
+        sessions: vec![krill_app::sidebar::Session {
+            id: SESSION,
+            status: krill_proto::control::AgentStatus {
+                state,
+                agent: "claude".into(),
+                since_unix_ns,
+                ..krill_proto::control::AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: None,
+        }],
+        trees: BTreeMap::new(),
+    };
+    view.update(cx, |shell, cx| {
+        shell.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(Arc::new(StateSource(snap)), cx);
+        });
+    });
+    cx.run_until_parked();
+}
+
+fn attach_live_test_pane(
+    shell: &mut Shell,
+    pane: super::super::PaneId,
+    session: SessionId,
+    cx: &mut Context<Shell>,
+) {
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    shell.attach_test(pane, session, ours, cx);
+    let live = shell.live.get_mut(&pane).unwrap();
+    live.sock = Some(theirs);
+    live.target = Some(krill_app::hosts::HostTarget::local(
+        krill_proto::daemon::Paths {
+            socket: "/fake/socket".into(),
+            holder: "/fake/holder".into(),
+            krilld: "/fake/krilld".into(),
+        },
+    ));
+}
+
+#[gpui::test]
+fn chat_working_stop_button_sends_single_interrupt_latches_turn_and_preserves_draft(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("chat-working-stop"));
+    let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let recorded = sent.clone();
+    let input = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            shell.layout.set_session(pane, SESSION);
+            shell.layout.set_chat_view(pane, true);
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value("unsent draft", window, cx));
+            shell.chat.draft_attachments.insert(
+                local_key(SESSION),
+                vec![super::DraftAttachment {
+                    display_name: "notes.txt".into(),
+                    path: std::path::PathBuf::from("/tmp/notes.txt"),
+                    byte_len: 12,
+                    is_image: false,
+                }],
+            );
+            shell.apply_chat_poll(
+                SESSION,
+                krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "claude".into(),
+                    bound: true,
+                    ..Default::default()
+                },
+            );
+            input
+        })
+    });
+    cx.run_until_parked();
+
+    // Idle with non-empty draft renders Send (`desktop-chat-send`) and not Stop.
+    assert!(cx.debug_bounds("desktop-chat-send").is_some());
+    assert!(cx.debug_bounds("desktop-chat-stop").is_none());
+
+    // Option A: Working + ready switches primary button to Stop even with draft + attachments.
+    set_session_state(&view, cx, krill_proto::control::AgentState::Working, 100);
+    assert!(cx.debug_bounds("desktop-chat-send").is_none());
+    let stop_bounds = cx
+        .debug_bounds("desktop-chat-stop")
+        .expect("Working session must show Stop button even with draft text");
+
+    // Rapid double click / repeated click must send b"\x03" only once and latch the turn.
+    cx.simulate_mouse_down(
+        stop_bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        stop_bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_down(
+        stop_bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        stop_bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    assert_eq!(*sent.lock().unwrap(), vec![b"\x03".to_vec()]);
+    cx.update(|_, app_cx| {
+        let shell = view.read(app_cx);
+        assert_eq!(input.read(app_cx).value(), "unsent draft");
+        assert_eq!(
+            shell.chat.draft_attachments[&local_key(SESSION)].len(),
+            1,
+            "interrupting must preserve staged draft attachments"
+        );
+        assert!(shell.is_chat_interrupt_latched(&local_key(SESSION), app_cx));
+    });
+
+    // Leaving Working clears the latch; a new Working turn re-enables Stop.
+    set_session_state(&view, cx, krill_proto::control::AgentState::Done, 200);
+    cx.update(|_, app_cx| {
+        assert!(
+            !view
+                .read(app_cx)
+                .is_chat_interrupt_latched(&local_key(SESSION), app_cx)
+        );
+    });
+    assert!(cx.debug_bounds("desktop-chat-send").is_some());
+
+    set_session_state(&view, cx, krill_proto::control::AgentState::Working, 300);
+    cx.update(|_, app_cx| {
+        assert!(
+            !view
+                .read(app_cx)
+                .is_chat_interrupt_latched(&local_key(SESSION), app_cx)
+        );
+    });
+    let stop_again = cx.debug_bounds("desktop-chat-stop").unwrap();
+    cx.simulate_click(stop_again.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![b"\x03".to_vec(), b"\x03".to_vec()]
+    );
+}
+
+#[gpui::test]
+fn chat_stop_is_blocked_while_prompt_is_in_flight(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = open(cx, state_path("chat-stop-blocked-in-flight"));
+    let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let recorded = sent.clone();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            shell.layout.set_session(pane, SESSION);
+            shell.layout.set_chat_view(pane, true);
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            shell.chat.prompt_delivery = Some(krill_proto::input::Delivery::Pending);
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&krill_proto::term_modes::Modes {
+                    flags: krill_proto::term_modes::Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value("hello", window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    set_session_state(&view, cx, krill_proto::control::AgentState::Working, 500);
+
+    // While a prompt delivery is still in-flight, Stop must NOT appear and interrupt_chat_turn refuses.
+    assert!(cx.debug_bounds("desktop-chat-stop").is_none());
+    assert!(cx.debug_bounds("desktop-chat-send").is_some());
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            assert!(!shell.interrupt_chat_turn(&local_key(SESSION), cx));
+        });
+    });
+    assert!(
+        !sent.lock().unwrap().iter().any(|bytes| bytes == b"\x03"),
+        "b\"\\x03\" must never be sent while prompt delivery is in flight"
     );
 }

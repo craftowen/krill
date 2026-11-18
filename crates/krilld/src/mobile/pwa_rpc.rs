@@ -193,6 +193,9 @@ enum Action {
         #[serde(default)]
         photo: Option<PreparedPhoto>,
     },
+    Interrupt {
+        session: u64,
+    },
     #[expect(
         dead_code,
         reason = "Legacy approval fields are decoded for compatibility but cannot authorize PTY input"
@@ -668,6 +671,11 @@ impl Backend {
                 }
                 result?;
                 Ok(json!({"sent":true}))
+            }
+            Action::Interrupt { session } => {
+                let registry = self.registry.upgrade().ok_or_else(invalid)?;
+                let interrupted = registry.mobile_interrupt(SessionId(session))?;
+                Ok(json!({"interrupted": interrupted}))
             }
             Action::Approve { .. } => {
                 // Transcript IDs and visible text cannot atomically prove the current PTY question.
@@ -1330,7 +1338,7 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_interrupt":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_value}),
         )
@@ -3260,6 +3268,225 @@ mod tests {
         child.kill().ok();
         child.wait().ok();
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mobile_interrupt_writes_ctrl_c_only_while_session_is_working() {
+        use crate::holder::{Holder, link::Link};
+        use crate::os::{AsFd as _, OwnedFd};
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+        use krill_proto::hook::{EventId, HookEvent, Input};
+        use std::io::Read as _;
+
+        struct Cleanup {
+            child: Option<std::process::Child>,
+            dir: std::path::PathBuf,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(child) = self.child.as_mut() {
+                    child.kill().ok();
+                    child.wait().ok();
+                }
+                fs::remove_dir_all(&self.dir).ok();
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("mk-pwa-interrupt-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let mut cleanup = Cleanup {
+            child: None,
+            dir: dir.clone(),
+        };
+        let state_dir = dir.join("state");
+        let repo_dir = dir.join("repo");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&repo_dir).unwrap();
+        let canonical_repo = fs::canonicalize(&repo_dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&canonical_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            state_dir.join("projects.toml"),
+            format!(
+                "[[projects]]\nid = \"repo\"\nname = \"Repo\"\npath = {:?}\n",
+                canonical_repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .current_dir(&canonical_repo)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        cleanup.child = Some(child);
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let registry = Arc::new(Registry::new(Some((holder, vec![])), Some(&state_dir)));
+        let reader_reg = Arc::clone(&registry);
+        let reader = std::thread::spawn(move || reader_reg.run_holder(link));
+        let holder_worker = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, .. } = ToHolder::decode(packet.frame()).unwrap() else {
+                panic!("expected Spawn");
+            };
+            let (master, pty) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned {
+                        req,
+                        id,
+                        pid: child_pid,
+                    }
+                    .encode()
+                    .unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            (holder_link, master, pty)
+        });
+
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&state_dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let repo_key = hex(canonical_repo.as_os_str().as_bytes());
+        let create_reply: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "create_terminal",
+                    "workspace": repo_key,
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        let (holder_link, master, mut pty) = holder_worker.join().unwrap();
+        drop(master);
+        pty.set_nonblocking(true).unwrap();
+
+        let session_id = create_reply["data"]["session"]
+            .as_u64()
+            .expect("session id");
+        let snap: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"snapshot"}"#)).unwrap();
+        assert_eq!(snap["data"]["capabilities"]["chat_interrupt"], true);
+
+        // Unknown / idle sessions must not receive Ctrl+C.
+        let mut buf = [0u8; 16];
+        let idle_reply: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "interrupt", "session": session_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            idle_reply,
+            json!({"ok": true, "data": {"interrupted": false}})
+        );
+        assert_eq!(
+            pty.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let missing_reply: Value = serde_json::from_str(
+            &backend
+                .request(&json!({"action": "interrupt", "session": session_id + 999}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            missing_reply,
+            json!({"ok": true, "data": {"interrupted": false}})
+        );
+
+        // Working session receives exactly b"\x03" and returns {"interrupted": true}.
+        registry
+            .record_test_hook(
+                SessionId(session_id),
+                &HookEvent {
+                    id: EventId {
+                        pid: child_pid,
+                        unix_ns: 1_000,
+                    },
+                    agent: "claude".into(),
+                    ppid: child_pid,
+                    input: Input::Complete,
+                    payload: br#"{"hook_event_name":"UserPromptSubmit"}"#.to_vec(),
+                },
+            )
+            .unwrap();
+        let working_reply: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "interrupt", "session": session_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            working_reply,
+            json!({"ok": true, "data": {"interrupted": true}})
+        );
+        let n = pty.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"\x03");
+
+        // Late interrupt arriving after Working finished (Done) writes 0 bytes and returns false.
+        registry
+            .record_test_hook(
+                SessionId(session_id),
+                &HookEvent {
+                    id: EventId {
+                        pid: child_pid,
+                        unix_ns: 2_000,
+                    },
+                    agent: "claude".into(),
+                    ppid: child_pid,
+                    input: Input::Complete,
+                    payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
+                },
+            )
+            .unwrap();
+        let late_reply: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "interrupt", "session": session_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            late_reply,
+            json!({"ok": true, "data": {"interrupted": false}})
+        );
+        assert_eq!(
+            pty.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::lock(&backend.git_inflight).is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(holder_link);
+        reader.join().unwrap();
+        drop(backend);
+        drop(registry);
     }
 
     #[test]

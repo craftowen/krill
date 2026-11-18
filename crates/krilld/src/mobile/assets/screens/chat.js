@@ -26,7 +26,34 @@
     ["max", 5],
     ["ultra", 5],
   ]);
+  const EFFORT_ORDER = new Map([
+    ["none", 0],
+    ["off", 0],
+    ["minimal", 1],
+    ["low", 2],
+    ["medium", 3],
+    ["high", 4],
+    ["xhigh", 5],
+    ["max", 6],
+    ["ultra", 7],
+  ]);
+  function sortEfforts(efforts) {
+    const list = Array.isArray(efforts) ? efforts : [],
+      ranked = list
+        .filter((e) => EFFORT_ORDER.has(String(e || "").toLowerCase()))
+        .sort(
+          (a, b) =>
+            EFFORT_ORDER.get(String(a).toLowerCase()) -
+            EFFORT_ORDER.get(String(b).toLowerCase()),
+        );
+    let next = 0;
+    return list.map((e) =>
+      EFFORT_ORDER.has(String(e || "").toLowerCase()) ? ranked[next++] : e,
+    );
+  }
   const EFFORT_LABELS = new Map([
+    ["none", "None"],
+    ["minimal", "Minimal"],
     ["low", "Low"],
     ["medium", "Medium"],
     ["high", "High"],
@@ -79,9 +106,273 @@
     }
     if (end < text.length) parent.append(el("span", text.slice(end)));
   }
-  function renderRichText(el, text) {
-    const wrap = el("div", undefined, "chat-md"),
-      blocks = String(text || "").split(/```/);
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const CHAT_SVG_SHAPES = {
+    stop: [{ tag: "rect", x: "6", y: "6", width: "12", height: "12", rx: "2" }],
+    textWrap: [
+      { tag: "path", d: "m16 16-3 3 3 3" },
+      { tag: "path", d: "M3 12h14.5a1 1 0 0 1 0 7H13" },
+      { tag: "path", d: "M3 19h6" },
+      { tag: "path", d: "M3 5h18" },
+    ],
+    brain: [
+      { tag: "path", d: "M12 18V5" },
+      { tag: "path", d: "M15 13a4.17 4.17 0 0 1-3-4 4.17 4.17 0 0 1-3 4" },
+      { tag: "path", d: "M17.598 6.5A3 3 0 1 0 12 5a3 3 0 1 0-5.598 1.5" },
+      { tag: "path", d: "M17.997 5.125a4 4 0 0 1 2.526 5.77" },
+      { tag: "path", d: "M18 18a4 4 0 0 0 2-7.464" },
+      { tag: "path", d: "M19.967 17.483A4 4 0 1 1 12 18a4 4 0 1 1-7.967-.517" },
+      { tag: "path", d: "M6 18a4 4 0 0 1-2-7.464" },
+      { tag: "path", d: "M6.003 5.125a4 4 0 0 0-2.526 5.77" },
+    ],
+    eye: [
+      {
+        tag: "path",
+        d: "M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0",
+      },
+      { tag: "circle", cx: "12", cy: "12", r: "3" },
+    ],
+    search: [
+      { tag: "path", d: "m21 21-4.34-4.34" },
+      { tag: "circle", cx: "11", cy: "11", r: "8" },
+    ],
+    folder: [
+      {
+        tag: "path",
+        d: "M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z",
+      },
+    ],
+    "square-terminal": [
+      { tag: "path", d: "m7 11 2-2-2-2" },
+      { tag: "path", d: "M11 13h4" },
+      { tag: "rect", width: "18", height: "18", x: "3", y: "3", rx: "2", ry: "2" },
+    ],
+    pencil: [
+      {
+        tag: "path",
+        d: "M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z",
+      },
+      { tag: "path", d: "m15 5 4 4" },
+    ],
+    globe: [
+      { tag: "circle", cx: "12", cy: "12", r: "10" },
+      { tag: "path", d: "M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" },
+      { tag: "path", d: "M2 12h20" },
+    ],
+    plug: [
+      { tag: "path", d: "M12 22v-5" },
+      { tag: "path", d: "M15 8V2" },
+      {
+        tag: "path",
+        d: "M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z",
+      },
+      { tag: "path", d: "M9 8V2" },
+    ],
+    bot: [
+      { tag: "path", d: "M12 8V4H8" },
+      { tag: "rect", width: "16", height: "12", x: "4", y: "8", rx: "2" },
+      { tag: "path", d: "M2 14h2" },
+      { tag: "path", d: "M20 14h2" },
+      { tag: "path", d: "M15 13v2" },
+      { tag: "path", d: "M9 13v2" },
+    ],
+    "list-checks": [
+      { tag: "path", d: "M13 5h8" },
+      { tag: "path", d: "M13 12h8" },
+      { tag: "path", d: "M13 19h8" },
+      { tag: "path", d: "m3 17 2 2 4-4" },
+      { tag: "path", d: "m3 7 2 2 4-4" },
+    ],
+    wrench: [
+      {
+        tag: "path",
+        d: "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.106-3.105c.32-.322.863-.22.983.218a6 6 0 0 1-8.259 7.057l-7.91 7.91a1 1 0 0 1-2.999-3l7.91-7.91a6 6 0 0 1 7.057-8.259c.438.12.54.662.219.984z",
+      },
+    ],
+    chevronRight: [{ tag: "path", d: "m9 18 6-6-6-6" }],
+    check: [{ tag: "path", d: "M20 6 9 17l-5-5" }],
+  };
+  function svgIcon(name) {
+    const doc = globalThis.document,
+      svg = doc?.createElementNS?.(SVG_NS, "svg");
+    if (!svg) return null;
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    if (name === "stop") {
+      svg.setAttribute("fill", "currentColor");
+    } else {
+      svg.setAttribute("fill", "none");
+      svg.setAttribute("stroke", "currentColor");
+      svg.setAttribute("stroke-width", "1.8");
+      svg.setAttribute("stroke-linecap", "round");
+      svg.setAttribute("stroke-linejoin", "round");
+    }
+    for (const shape of CHAT_SVG_SHAPES[name] || CHAT_SVG_SHAPES.wrench) {
+      const node = doc.createElementNS(SVG_NS, shape.tag);
+      for (const [k, v] of Object.entries(shape))
+        if (k !== "tag") node.setAttribute(k, v);
+      svg.append(node);
+    }
+    return svg;
+  }
+  const CODE_COPY_FEEDBACK_MS = 1500,
+    USER_FOLD_MAX_LINES = 8,
+    USER_FOLD_MAX_LENGTH = 600;
+  function userMessageFolds(text) {
+    const raw = String(text || "");
+    return (
+      raw.length > USER_FOLD_MAX_LENGTH ||
+      raw.split(/\r?\n/).length > USER_FOLD_MAX_LINES
+    );
+  }
+  const CODE_LANG_LABELS = new Map([
+    ["ts", "TypeScript"],
+    ["typescript", "TypeScript"],
+    ["tsx", "TSX"],
+    ["js", "JavaScript"],
+    ["javascript", "JavaScript"],
+    ["mjs", "JavaScript"],
+    ["cjs", "JavaScript"],
+    ["jsx", "JSX"],
+    ["py", "Python"],
+    ["python", "Python"],
+    ["rs", "Rust"],
+    ["rust", "Rust"],
+    ["sh", "Bash"],
+    ["bash", "Bash"],
+    ["shell", "Shell"],
+    ["zsh", "Zsh"],
+    ["yml", "YAML"],
+    ["yaml", "YAML"],
+    ["md", "Markdown"],
+    ["markdown", "Markdown"],
+    ["json", "JSON"],
+    ["jsonc", "JSONC"],
+    ["toml", "TOML"],
+    ["sql", "SQL"],
+    ["css", "CSS"],
+    ["scss", "SCSS"],
+    ["html", "HTML"],
+    ["xml", "XML"],
+    ["go", "Go"],
+    ["golang", "Go"],
+    ["rb", "Ruby"],
+    ["ruby", "Ruby"],
+    ["c", "C"],
+    ["cpp", "C++"],
+    ["c++", "C++"],
+    ["cxx", "C++"],
+    ["cs", "C#"],
+    ["csharp", "C#"],
+    ["java", "Java"],
+    ["kt", "Kotlin"],
+    ["kotlin", "Kotlin"],
+    ["swift", "Swift"],
+    ["php", "PHP"],
+    ["diff", "Diff"],
+    ["graphql", "GraphQL"],
+    ["gql", "GraphQL"],
+    ["mermaid", "Mermaid"],
+    ["ps1", "PowerShell"],
+    ["powershell", "PowerShell"],
+    ["dockerfile", "Dockerfile"],
+    ["docker", "Dockerfile"],
+    ["txt", "Plain text"],
+    ["text", "Plain text"],
+    ["plaintext", "Plain text"],
+  ]);
+  function fenceLang(info) {
+    const token = String(info || "")
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+      .trim()
+      .split(/\s+/)[0];
+    if (!token) return "Code";
+    return CODE_LANG_LABELS.get(token.toLowerCase()) || token;
+  }
+  function fenceLine(line) {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    return match
+      ? { char: match[1][0], length: match[1].length, info: match[2] }
+      : null;
+  }
+  function parseRichBlocks(text) {
+    const raw = String(text || "").replace(/\r\n?/g, "\n"),
+      lines = raw.split("\n"),
+      out = [];
+    let buffer = [],
+      opening = null,
+      blockIndex = 0;
+    for (const line of lines) {
+      const fence = fenceLine(line);
+      if (fence) {
+        if (opening) {
+          if (
+            fence.char === opening.char &&
+            fence.length >= opening.length &&
+            !fence.info.trim()
+          ) {
+            out.push({
+              kind: "code",
+              lang: opening.lang,
+              code: buffer.join("\n"),
+              blockIndex: blockIndex++,
+            });
+            buffer = [];
+            opening = null;
+            continue;
+          }
+        } else if (fence.char !== "`" || !fence.info.includes("`")) {
+          if (buffer.length) {
+            out.push({ kind: "prose", text: buffer.join("\n") });
+            buffer = [];
+          }
+          opening = {
+            char: fence.char,
+            length: fence.length,
+            lang: fenceLang(fence.info),
+          };
+          continue;
+        }
+      }
+      buffer.push(line);
+    }
+    if (opening) {
+      out.push({
+        kind: "code",
+        lang: opening.lang,
+        code: buffer.join("\n"),
+        blockIndex: blockIndex++,
+      });
+    } else if (buffer.length) {
+      out.push({ kind: "prose", text: buffer.join("\n") });
+    }
+    return out;
+  }
+  async function writeClipboardText(el, t, text) {
+    // 클립보드 권한이 거부되면(일부 웹뷰) 선택 복사로 한 번 더 시도한다.
+    let copied = false;
+    if (globalThis.isSecureContext && globalThis.navigator?.clipboard)
+      copied = await globalThis.navigator.clipboard.writeText(text).then(
+        () => true,
+        () => false,
+      );
+    if (!copied) {
+      const doc = globalThis.document,
+        area = el("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.className = "copy-buffer";
+      doc?.body?.append(area);
+      area.select?.();
+      const ok = !!doc?.execCommand?.("copy");
+      area.remove?.();
+      if (!ok) throw Error(t("Copy is not available in this browser"));
+    }
+  }
+  function renderRichText(el, text, richOpts) {
+    const translate = richOpts?.t || ((s) => s),
+      wrap = el("div", undefined, "chat-md"),
+      blocks = parseRichBlocks(text);
     const rich = (tag, value, cls) => {
       const node = el(tag, undefined, cls);
       renderInline(el, node, value);
@@ -96,17 +387,32 @@
         .map((s) => s.trim());
     const tableLine = (line) => /^\s*\|.*\|\s*$/.test(line),
       separator = (line) => cells(line).every((s) => /^:?-{3,}:?$/.test(s));
-    for (let i = 0; i < blocks.length; i++) {
-      const part = blocks[i];
-      if (i % 2 === 1) {
-        const nl = part.indexOf("\n"),
-          codeText = nl >= 0 ? part.slice(nl + 1) : part,
+    for (const block of blocks) {
+      if (block.kind === "code") {
+        const codeWrap = el("div", undefined, "chat-code-wrap"),
+          head = el("div", undefined, "chat-code-head"),
+          langEl = el(
+            "span",
+            block.lang === "Code" ? translate("Code") : block.lang,
+            "chat-code-lang",
+          ),
+          actions = el("div", undefined, "chat-code-actions"),
           pre = el("pre", undefined, "chat-code");
-        pre.append(el("code", codeText.replace(/\n$/, "")));
-        wrap.append(pre);
+        pre.append(el("code", block.code));
+        if (richOpts?.renderCodeWrap) {
+          const wrapBtn = richOpts.renderCodeWrap(block, pre);
+          if (wrapBtn) actions.append(wrapBtn);
+        }
+        if (richOpts?.renderCodeCopy) {
+          const copyBtn = richOpts.renderCodeCopy(block);
+          if (copyBtn) actions.append(copyBtn);
+        }
+        head.append(langEl, actions);
+        codeWrap.append(head, pre);
+        wrap.append(codeWrap);
         continue;
       }
-      const lines = part.split("\n");
+      const lines = block.text.split("\n");
       let list = null,
         quote = null;
       for (let n = 0; n < lines.length; n++) {
@@ -199,36 +505,174 @@
       firstNonEmptyLine(item.text)
     );
   }
+  const TOOL_CATEGORY_ICONS = {
+    read: "eye",
+    search: "search",
+    listFiles: "folder",
+    unknown: "square-terminal",
+    fileChange: "pencil",
+    webSearch: "globe",
+    mcpToolCall: "plug",
+    subAgentActivity: "bot",
+    todoList: "list-checks",
+    other: "wrench",
+  };
+  function toolCategory(name) {
+    const n = String(name || "")
+      .trim()
+      .toLowerCase();
+    if (!n) return "other";
+    if (n.startsWith("mcp__")) return "mcpToolCall";
+    if (/^(read|view|notebookread|read_file)$/.test(n)) return "read";
+    if (
+      /^(bash|sh|shell|exec|local_shell|command|run_command)$/.test(n) ||
+      /command/.test(n)
+    )
+      return "unknown";
+    if (/edit|write|patch|diff/.test(n)) return "fileChange";
+    if (/webfetch|web_search|websearch/.test(n)) return "webSearch";
+    if (/^(grep|glob|search|find)$/.test(n) || /search/.test(n))
+      return /web/.test(n) ? "webSearch" : "search";
+    if (/^(ls|list|list_dir|list_files)$/.test(n)) return "listFiles";
+    if (/^(task|agent|subagent)$/.test(n)) return "subAgentActivity";
+    if (/^(todowrite|update_plan)$/.test(n)) return "todoList";
+    return "other";
+  }
+  function toolLineLabel(item) {
+    const cat = toolCategory(item.tool_name),
+      icon = TOOL_CATEGORY_ICONS[cat] || "wrench",
+      rawPath = String(item.file_path || "").trim(),
+      baseName = rawPath
+        ? rawPath.split(/[\\/]/).filter(Boolean).pop() || rawPath
+        : "",
+      title = firstNonEmptyLine(item.title),
+      lineText = firstNonEmptyLine(item.text);
+    let verb = "",
+      target = "";
+    if (cat === "read") {
+      verb = "Read";
+      target = baseName || title || lineText;
+    } else if (cat === "fileChange") {
+      verb = "Edited";
+      target = baseName || title || lineText;
+    } else if (cat === "search") {
+      verb = "Searched";
+      target = title || rawPath || lineText;
+    } else if (cat === "listFiles") {
+      verb = "Listed";
+      target = title || rawPath || lineText;
+    } else if (cat === "unknown") {
+      verb = "Ran";
+      target = title || lineText;
+    } else if (cat === "webSearch") {
+      verb = /fetch/i.test(item.tool_name || "") ? "Fetched" : "Searched the web";
+      target = title || lineText;
+    } else if (cat === "subAgentActivity") {
+      verb = "Subagent";
+      target = title || lineText;
+    } else if (cat === "todoList") {
+      verb = "Updated the plan";
+      target = title || lineText;
+    } else if (cat === "mcpToolCall") {
+      verb = item.tool_name || "Used";
+      target = title || lineText;
+    } else {
+      verb = item.tool_name || "Used";
+      target = title || rawPath || lineText;
+    }
+    return { icon, verb, target };
+  }
+  const MAX_PREAMBLE_CHARS = 160;
   function isWorkItemKind(kind) {
     return (
       kind === "tool_call" || kind === "tool_result" || kind === "reasoning"
     );
   }
-  function workRunEnd(items, start) {
+  function isTurnBoundaryKind(kind) {
+    return kind === "user" || kind === "question" || kind === "permission";
+  }
+  function isFoldablePreamble(text) {
+    const trimmed = String(text || "").trim();
+    if (
+      !trimmed ||
+      Array.from(trimmed).length > MAX_PREAMBLE_CHARS ||
+      trimmed.includes("\n") ||
+      trimmed.includes("\r") ||
+      trimmed.includes("```")
+    )
+      return false;
+    return !/^(?:#{1,6} |[-*>] |\d+\. )/.test(trimmed);
+  }
+  function isToolItemKind(kind) {
+    return kind === "tool_call" || kind === "tool_result";
+  }
+  function computeFoldableNotes(items) {
+    const foldable = new Array(items.length).fill(false);
+    let seenToolInTurn = false;
+    for (let idx = items.length - 1; idx >= 0; idx--) {
+      const kind = items[idx]?.kind || "assistant";
+      if (isTurnBoundaryKind(kind)) seenToolInTurn = false;
+      else if (isToolItemKind(kind)) seenToolInTurn = true;
+      else if (
+        kind === "assistant" &&
+        seenToolInTurn &&
+        isFoldablePreamble(items[idx]?.text)
+      )
+        foldable[idx] = true;
+    }
+    return foldable;
+  }
+  function workRunEnd(items, start, foldable) {
     let tools = 0,
       thoughts = 0,
       idx = start;
-    while (idx < items.length && isWorkItemKind(items[idx]?.kind)) {
-      if (items[idx].kind === "reasoning") thoughts++;
-      else tools++;
+    while (
+      idx < items.length &&
+      (isWorkItemKind(items[idx]?.kind) || foldable?.[idx])
+    ) {
+      const kind = items[idx]?.kind;
+      if (kind === "reasoning") thoughts++;
+      else if (isWorkItemKind(kind)) tools++;
       idx++;
     }
     return tools >= 1 || thoughts >= 2 ? idx : 0;
+  }
+  function parseItemAtMs(at) {
+    if (at === undefined || at === null || at === "") return null;
+    if (typeof at === "number")
+      return Number.isFinite(at) && at > 0 ? at : null;
+    const raw = String(at).trim();
+    if (!raw) return null;
+    const ms = /^\d+$/.test(raw)
+      ? Number(raw) < 1e11
+        ? Number(raw) * 1000
+        : Number(raw)
+      : Date.parse(raw);
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
+  }
+  function formatElapsedSecs(secs) {
+    if (!Number.isFinite(secs) || secs < 1) return "";
+    const whole = Math.floor(secs);
+    if (whole < 60) return `${whole}s`;
+    const mins = Math.floor(whole / 60),
+      rem = String(whole % 60).padStart(2, "0");
+    return `${mins}m ${rem}s`;
   }
   const cacheLimit = 8,
     cacheByteLimit = 8 * 1024 * 1024,
     pageLimit = 2048,
     itemByteLimit = 2 * 1024 * 1024;
-  const pinned = (state, id, e) =>
-    e.mounts > 0 ||
-    e.sending ||
-    e.modelPending ||
-    e.questionSending ||
-    e.questionDraft?.changed ||
-    e.questionDraft?.selected?.length ||
-    e.photo ||
-    e.live ||
-    !!state.drafts?.get(id);
+  const isEntryPinned = (e) =>
+      e.mounts > 0 ||
+      e.sending ||
+      e.stopping ||
+      e.modelPending ||
+      e.questionSending ||
+      e.questionDraft?.changed ||
+      e.questionDraft?.selected?.length ||
+      e.photo ||
+      e.live,
+    pinned = (state, id, e) => isEntryPinned(e) || !!state.drafts?.get(id);
   function pruneCache(state) {
     const cache = state.chatCache;
     if (!cache) return;
@@ -459,12 +903,134 @@
       }
     });
     const cards = new Map(),
-      toolRuns = new Map();
+      noteCards = new Map(),
+      toolRuns = new Map(),
+      copiedCode = new Map(),
+      codeButtonsByCard = new Map();
+    function clearCopiedCode() {
+      for (const state of copiedCode.values()) clearTimeout(state.timer);
+      copiedCode.clear();
+      codeButtonsByCard.clear();
+    }
     let tailRun = null,
       renderedCount = 0,
       renderedItems = null,
       optimisticCard = null,
       optimisticShown = "";
+    function renderWorkNote(item) {
+      const trimmed = String(item.text || "").trim(),
+        note = el("div", undefined, "chat-card chat-work-note"),
+        badge = el("span", t("Note"), "badge"),
+        textNode = el("span", trimmed, "chat-work-note-text");
+      note.append(badge, textNode);
+      note._text = trimmed;
+      note._textNode = textNode;
+      return note;
+    }
+    function runCategoryIcon(targetRun) {
+      if (!targetRun.tools && targetRun.thoughts) return "brain";
+      if (targetRun.categories?.size === 1) {
+        const [only] = targetRun.categories;
+        return TOOL_CATEGORY_ICONS[only] || "wrench";
+      }
+      return "wrench";
+    }
+    function syncRunSummary(targetRun, isTail) {
+      if (!targetRun) return;
+      const sessState = state.sessions?.get(sessionId)?.state,
+        isActive = Boolean(
+          isTail &&
+            !entry.live &&
+            targetRun.endIndex === entry.items.length &&
+            sessState === "Working",
+        );
+      if (isActive) targetRun.details.dataset.active = "true";
+      else delete targetRun.details.dataset.active;
+      const progressCount =
+        targetRun.totalTools > 0
+          ? `${targetRun.completedTools}/${targetRun.totalTools}`
+          : targetRun.thoughts > 0
+            ? `${targetRun.thoughts}/${targetRun.thoughts}`
+            : "";
+      if (isActive && progressCount)
+        targetRun.details.dataset.progress = progressCount;
+      else delete targetRun.details.dataset.progress;
+      let elapsedBadge = "";
+      if (targetRun.minAtMs !== null) {
+        const endMs = isActive ? Date.now() : targetRun.maxAtMs;
+        if (endMs !== null && endMs >= targetRun.minAtMs)
+          elapsedBadge = formatElapsedSecs((endMs - targetRun.minAtMs) / 1000);
+      }
+      if (elapsedBadge) targetRun.details.dataset.elapsed = elapsedBadge;
+      else delete targetRun.details.dataset.elapsed;
+      const statusPart = targetRun.errors
+          ? t("Tool error")
+          : !targetRun.count && targetRun.tools
+            ? t("Tool activity")
+            : "",
+        stepParts = [
+          ...[...targetRun.steps].map(([step, n]) => t(step, n)),
+          !targetRun.tools && targetRun.thoughts
+            ? t("Thought {0} time(s)", targetRun.thoughts)
+            : !targetRun.tools && !targetRun.thoughts && targetRun.notes
+              ? t("Tool activity")
+              : "",
+        ].filter(Boolean);
+      let mainParts;
+      if (isActive) {
+        const pendingCall = targetRun.pending.at(-1)?.call,
+          inFlightDetail = pendingCall
+            ? toolDetail(pendingCall) ||
+              pendingCall.tool_name ||
+              t("Tool call")
+            : "",
+          currentDetail =
+            inFlightDetail ||
+            targetRun.activeDetail ||
+            targetRun.detail ||
+            targetRun.thoughtDetail ||
+            targetRun.noteDetail;
+        mainParts = [
+          t("Working"),
+          progressCount,
+          statusPart,
+          currentDetail,
+          ...stepParts,
+        ].filter(Boolean);
+      } else {
+        const finalDetail = targetRun.count
+          ? targetRun.detail
+          : targetRun.detail ||
+            targetRun.thoughtDetail ||
+            targetRun.noteDetail;
+        mainParts = [statusPart, ...stepParts, finalDetail].filter(Boolean);
+      }
+      const mainText = mainParts.join(" · "),
+        summaryNodes = [],
+        iconWrap = el("span", undefined, "chat-tool-summary-icon"),
+        glyph = svgIcon(runCategoryIcon(targetRun));
+      iconWrap.setAttribute("aria-hidden", "true");
+      if (glyph) iconWrap.append(glyph);
+      summaryNodes.push(iconWrap);
+      if (mainText)
+        summaryNodes.push(el("span", mainText, "chat-tool-summary-text"));
+      if (elapsedBadge) {
+        if (mainText)
+          summaryNodes.push(el("span", " · ", "chat-tool-summary-sep"));
+        summaryNodes.push(
+          el("span", elapsedBadge, "chat-tool-summary-elapsed"),
+        );
+      }
+      const caretWrap = el("span", undefined, "chat-tool-summary-caret"),
+        caretGlyph = svgIcon("chevronRight");
+      caretWrap.setAttribute("aria-hidden", "true");
+      if (caretGlyph) caretWrap.append(caretGlyph);
+      summaryNodes.push(caretWrap);
+      targetRun.summary.replaceChildren(...summaryNodes);
+    }
+    function syncTailRunSummary() {
+      if (tailRun) syncRunSummary(tailRun, true);
+    }
     function syncDraft() {
       if (!ownsEntry() || entry.sending) return;
       const current = drafts.get(sessionId) || "";
@@ -528,6 +1094,7 @@
       "plus",
     );
     const sendBtn = el("button", undefined, "primary composer-send");
+    sendBtn.dataset.mode = "send";
     sendBtn.type = "submit";
     sendBtn.setAttribute("aria-label", t("Send"));
     if (ctx.icon) sendBtn.append(ctx.icon("arrowUp"));
@@ -1040,12 +1607,13 @@
               : [],
           };
         });
-        const efforts =
+        const efforts = sortEfforts(
           models.find((model) => model.id === activeModelId)?.efforts ||
-          status?.models?.find((model) => model.id === activeModelId)
-            ?.efforts ||
-          status?.efforts ||
-          [];
+            status?.models?.find((model) => model.id === activeModelId)
+              ?.efforts ||
+            status?.efforts ||
+            [],
+        );
         if (effortSupported && efforts.length > 1)
           for (const effort of efforts)
             items.push({
@@ -1234,24 +1802,7 @@
     }
     function copyText(text, node) {
       run(async () => {
-        // 클립보드 권한이 거부되면(일부 웹뷰) 선택 복사로 한 번 더 시도한다.
-        let copied = false;
-        if (globalThis.isSecureContext && navigator.clipboard)
-          copied = await navigator.clipboard.writeText(text).then(
-            () => true,
-            () => false,
-          );
-        if (!copied) {
-          const area = el("textarea");
-          area.value = text;
-          area.setAttribute("readonly", "");
-          area.className = "copy-buffer";
-          document.body.append(area);
-          area.select();
-          const ok = document.execCommand("copy");
-          area.remove();
-          if (!ok) throw Error(t("Copy is not available in this browser"));
-        }
+        await writeClipboardText(el, t, text);
         if (!node) return;
         if (ctx.icon && String(node.className || "").includes("chat-copy")) {
           node.replaceChildren(ctx.icon("check"));
@@ -1261,7 +1812,7 @@
             node.replaceChildren(ctx.icon("copy"));
             node.setAttribute("aria-label", t("Copy"));
             delete node.dataset.copied;
-          }, 1500);
+          }, CODE_COPY_FEEDBACK_MS);
         } else {
           const prev = node.textContent;
           node.textContent = t("Copied");
@@ -1269,9 +1820,99 @@
           setTimeout(() => {
             node.textContent = prev;
             delete node.dataset.copied;
-          }, 1500);
+          }, CODE_COPY_FEEDBACK_MS);
         }
       });
+    }
+    function setCodeCopyState(btn, copied) {
+      if (!btn) return;
+      const label = t(copied ? "Copied" : "Copy");
+      btn.setAttribute("aria-label", label);
+      if (copied) {
+        btn.dataset.copied = "true";
+        const nodes = [],
+          checkIcon = ctx.icon ? ctx.icon("check") : svgIcon("check");
+        if (checkIcon) nodes.push(checkIcon);
+        nodes.push(el("span", label, "chat-code-copy-label"));
+        btn.replaceChildren(...nodes);
+      } else {
+        delete btn.dataset.copied;
+        btn.replaceChildren();
+        btn.textContent = label;
+      }
+    }
+    function copyCodeBlock(target, code) {
+      const id = `${target.key}\0${target.blockIndex}`;
+      run(async () => {
+        await writeClipboardText(el, t, code);
+        if (disposed) return;
+        const prev = copiedCode.get(id);
+        if (prev) clearTimeout(prev.timer);
+        const liveBtn = () =>
+          codeButtonsByCard.get(target.key)?.[target.blockIndex] || target.btn;
+        setCodeCopyState(liveBtn(), true);
+        const timer = setTimeout(() => {
+          copiedCode.delete(id);
+          if (!disposed) setCodeCopyState(liveBtn(), false);
+        }, CODE_COPY_FEEDBACK_MS);
+        copiedCode.set(id, { timer });
+      });
+    }
+    function setCodeWrapState(btn, pre, wrapped) {
+      const label = t(wrapped ? "Disable line wrap" : "Wrap lines");
+      btn.setAttribute("aria-pressed", String(wrapped));
+      btn.setAttribute("aria-label", label);
+      btn.title = label;
+      if (pre) {
+        if (wrapped) pre.dataset.wrapped = "true";
+        else delete pre.dataset.wrapped;
+      }
+    }
+    function richOptsFor(key) {
+      return {
+        t,
+        renderCodeWrap: (block, pre) => {
+          const wrapKey = `code-wrap:${key}:${block.blockIndex}`,
+            wrapBtn = button("", () => {
+              const next = !entry.disclosures?.get(wrapKey);
+              entry.disclosures ||= new Map();
+              if (next) entry.disclosures.set(wrapKey, true);
+              else entry.disclosures.delete(wrapKey);
+              setCodeWrapState(wrapBtn, pre, next);
+            }, "chat-code-wrap-btn");
+          wrapBtn.type = "button";
+          wrapBtn.setAttribute("type", "button");
+          const glyph = svgIcon("textWrap");
+          if (glyph) wrapBtn.append(glyph);
+          setCodeWrapState(
+            wrapBtn,
+            pre,
+            Boolean(entry.disclosures?.get(wrapKey)),
+          );
+          return wrapBtn;
+        },
+        renderCodeCopy: (block) => {
+          const copyBtn = button(
+            t("Copy"),
+            () =>
+              copyCodeBlock(
+                { key, blockIndex: block.blockIndex, btn: copyBtn },
+                block.code,
+              ),
+            "chat-code-copy",
+          );
+          copyBtn.type = "button";
+          copyBtn.setAttribute("type", "button");
+          let list = codeButtonsByCard.get(key);
+          if (!list) {
+            list = [];
+            codeButtonsByCard.set(key, list);
+          }
+          list[block.blockIndex] = copyBtn;
+          setCodeCopyState(copyBtn, copiedCode.has(`${key}\0${block.blockIndex}`));
+          return copyBtn;
+        },
+      };
     }
     // 오늘은 시각만, 다른 날은 날짜와 시각을 보인다(Orca 메시지 아래 표기).
     function formatTime(at) {
@@ -1322,6 +1963,32 @@
           .then(fn)
           .catch((e) => ctx.error?.(Error(cleanRpcError(e, t))));
     }
+    function syncStopLatch() {
+      const sess = state.sessions?.get(sessionId);
+      if (
+        entry.stopping &&
+        (sess?.state !== "Working" ||
+          (entry.stopStamp &&
+            sess?.state_since_unix_ns &&
+            sess.state_since_unix_ns !== entry.stopStamp))
+      ) {
+        entry.stopping = false;
+        entry.stopStamp = null;
+      }
+    }
+    function isStopMode() {
+      syncStopLatch();
+      return (
+        capability("chat_interrupt") &&
+        state.sessions?.get(sessionId)?.state === "Working" &&
+        !entry.sending
+      );
+    }
+    const stopDisabled = () =>
+      !!entry.stopping ||
+      !!entry.modelPending ||
+      !!liveQuestion ||
+      state.connection?.phase !== "ready";
     function updateComposer(sent) {
       updateStatus();
       let cleared = false;
@@ -1344,12 +2011,28 @@
         !!entry.modelPending ||
         entry.sending ||
         state.connection?.phase !== "ready";
-      sendBtn.disabled =
-        !!entry.modelPending ||
-        !!liveQuestion ||
-        entry.sending ||
-        entry.photo?.status === "pending" ||
-        entry.photo?.status === "error";
+      const stopMode = isStopMode(),
+        wantMode = stopMode ? "stop" : "send";
+      if (sendBtn.dataset.mode !== wantMode) {
+        sendBtn.dataset.mode = wantMode;
+        sendBtn.type = stopMode ? "button" : "submit";
+        const label = t(stopMode ? "Stop" : "Send");
+        sendBtn.setAttribute("aria-label", label);
+        const glyph = ctx.icon
+          ? stopMode
+            ? svgIcon("stop")
+            : ctx.icon("arrowUp")
+          : null;
+        if (glyph) sendBtn.replaceChildren(glyph);
+        else sendBtn.textContent = label;
+      }
+      sendBtn.disabled = stopMode
+        ? stopDisabled()
+        : !!entry.modelPending ||
+          !!liveQuestion ||
+          entry.sending ||
+          entry.photo?.status === "pending" ||
+          entry.photo?.status === "error";
       attachBtn.disabled = !!liveQuestion || entry.sending || !!entry.photo;
       attachment.replaceChildren();
       const photo = entry.photo;
@@ -1422,10 +2105,30 @@
       }
       entry.notifyComposer?.();
     }
+    sendBtn.addEventListener("click", (e) => {
+      if (!isStopMode()) return;
+      e.preventDefault();
+      if (e.detail > 1 || !active() || sendBtn.disabled || stopDisabled())
+        return;
+      entry.stopping = true;
+      entry.stopStamp =
+        state.sessions?.get(sessionId)?.state_since_unix_ns || null;
+      updateComposer();
+      run(async () => {
+        const res = await ctx.rpc({ action: "interrupt", session: sessionId });
+        if (res?.interrupted === false && ownsEntry()) {
+          await ctx.refresh?.();
+        } else if (!disposed) {
+          await pollNow();
+          await ctx.refresh?.();
+        }
+      });
+    });
     composer.addEventListener("submit", (e) => {
       e.preventDefault();
       if (
         !active() ||
+        isStopMode() ||
         liveQuestion ||
         entry.modelPending ||
         !suggestions.hidden ||
@@ -1924,18 +2627,54 @@
         feed.append(optimisticCard);
       }
       optimisticCard.dataset.phase = phase;
+      const meta = optimisticCard.children?.[1];
+      if (meta) {
+        const metaChildren = Array.from(meta.children || []),
+          timeEl = metaChildren.find((n) => n.className === "chat-time");
+        let statusEl = metaChildren.find(
+          (n) => n.className === "chat-optimistic-status",
+        );
+        if (phase === "sending") {
+          if (timeEl) timeEl.hidden = true;
+          if (!statusEl) {
+            statusEl = el("span", t("Sending…"), "chat-optimistic-status");
+            meta.append(statusEl);
+          }
+          statusEl.hidden = false;
+        } else {
+          if (statusEl) statusEl.remove();
+          if (timeEl) timeEl.hidden = false;
+        }
+      }
     }
     function renderItems(appendFrom) {
-      const anchor = readerAnchor();
-      const prevWasSoloThought =
-        !tailRun && entry.items[appendFrom - 1]?.kind === "reasoning";
-      const nextStartsWork = isWorkItemKind(entry.items[appendFrom]?.kind);
+      const anchor = readerAnchor(),
+        foldable = computeFoldableNotes(entry.items);
+      let prevPromotedToRun = false;
+      if (appendFrom > 0) {
+        if (
+          !tailRun &&
+          entry.items[appendFrom - 1]?.kind === "reasoning" &&
+          (isWorkItemKind(entry.items[appendFrom]?.kind) ||
+            foldable[appendFrom])
+        )
+          prevPromotedToRun = true;
+        for (let i = appendFrom - 1; !prevPromotedToRun && i >= 0; i--) {
+          const prevKind = entry.items[i]?.kind || "assistant";
+          if (isTurnBoundaryKind(prevKind)) break;
+          if (foldable[i] && cards.has(itemKey(entry.items[i], i))) {
+            prevPromotedToRun = true;
+            break;
+          }
+        }
+      }
       const incremental =
         appendFrom > 0 &&
         renderedItems === entry.items &&
         renderedCount === appendFrom &&
-        !(prevWasSoloThought && nextStartsWork);
+        !prevPromotedToRun;
       const wanted = new Set(),
+        wantedNotes = new Set(),
         wantedRuns = new Set(),
         nodes = [];
       let run = incremental ? tailRun : null,
@@ -1946,22 +2685,27 @@
         idx < entry.items.length;
         idx++
       ) {
-        const item = entry.items[idx];
-        const key = itemKey(item, idx);
-        wanted.add(key);
-        let card = cards.get(key);
-        if (!card) {
-          card = renderCard(item, key);
-          card.dataset.chatId = key;
-          cards.set(key, card);
-        } else if (!sameItem(card._item, item)) {
-          const next = renderCard(item, key);
-          card.replaceChildren(...Array.from(next.children));
-          card._syncQuestion = next._syncQuestion;
+        const item = entry.items[idx],
+          key = itemKey(item, idx),
+          isFoldedNote = Boolean(foldable[idx]);
+        let card = null;
+        if (!isFoldedNote) {
+          wanted.add(key);
+          card = cards.get(key);
+          if (!card) {
+            card = renderCard(item, key);
+            card.dataset.chatId = key;
+            cards.set(key, card);
+          } else if (!sameItem(card._item, item)) {
+            const next = renderCard(item, key);
+            card.replaceChildren(...Array.from(next.children));
+            card._syncQuestion = next._syncQuestion;
+          }
+          card._item = item;
         }
-        card._item = item;
-        if (!run && idx >= runEnd) runEnd = workRunEnd(entry.items, idx);
-        if (run ? isWorkItemKind(item.kind) : idx < runEnd) {
+        if (!run && idx >= runEnd)
+          runEnd = workRunEnd(entry.items, idx, foldable);
+        if (run ? isWorkItemKind(item.kind) || isFoldedNote : idx < runEnd) {
           if (!run) {
             let group = toolRuns.get(key);
             if (!group && !incremental) {
@@ -2022,27 +2766,61 @@
               nodeSet,
               activePairs,
               steps: new Map(),
+              categories: new Set(),
               calls: new Map(),
               pending: [],
               pairs: group.pairs,
               memberKeys: group.memberKeys,
               count: 0,
               tools: 0,
+              totalTools: 0,
+              completedTools: 0,
               thoughts: 0,
+              notes: 0,
               errors: 0,
               detail: "",
               thoughtDetail: "",
+              noteDetail: "",
+              activeDetail: "",
+              minAtMs: null,
+              maxAtMs: null,
+              endIndex: idx,
             };
             wantedRuns.add(key);
             nodes.push(run.details);
           }
           run.memberKeys.add(key);
+          run.endIndex = idx + 1;
+          const atMs = parseItemAtMs(item.at);
+          if (atMs !== null) {
+            if (run.minAtMs === null || atMs < run.minAtMs) run.minAtMs = atMs;
+            if (run.maxAtMs === null || atMs > run.maxAtMs) run.maxAtMs = atMs;
+          }
           let node = card;
-          if (item.kind === "reasoning") {
+          if (isFoldedNote) {
+            wantedNotes.add(key);
+            let noteNode = noteCards.get(key);
+            const trimmed = String(item.text || "").trim();
+            if (!noteNode) {
+              noteNode = renderWorkNote(item);
+              noteNode.dataset.chatId = key;
+              noteCards.set(key, noteNode);
+            } else if (noteNode._text !== trimmed) {
+              noteNode._text = trimmed;
+              if (noteNode._textNode) noteNode._textNode.textContent = trimmed;
+            }
+            run.notes++;
+            if (trimmed) {
+              run.noteDetail = trimmed;
+              run.activeDetail = trimmed;
+            }
+            node = noteNode;
+          } else if (item.kind === "reasoning") {
             run.thoughts++;
+            const thoughtLine = firstNonEmptyLine(item.text);
             if (!run.count)
-              run.thoughtDetail =
-                firstNonEmptyLine(item.text) || run.thoughtDetail;
+              run.thoughtDetail = thoughtLine || run.thoughtDetail;
+            run.activeDetail = thoughtLine || t("Reasoning");
           } else {
             run.tools++;
             // Pair results by the wire tool ID, with ordered fallback for older transcripts.
@@ -2052,21 +2830,30 @@
               pair = run.pairs.get(key) || {
                 node: el("div", undefined, "chat-tool-pair"),
                 call: item,
+                callCard: card,
               };
               pair.call = item;
+              pair.callCard = card;
               run.pairs.set(key, pair);
               run.activePairs.add(key);
               run.pending.push(pair);
               if (callId) run.calls.set(String(callId), pair);
               run.count++;
-              run.detail = toolDetail(item) || run.detail;
+              run.totalTools++;
+              const detail = toolDetail(item);
+              run.detail = detail || run.detail;
+              run.activeDetail = detail || item.tool_name || t("Tool call");
               const step = toolStep(item.tool_name);
               run.steps.set(step, (run.steps.get(step) || 0) + 1);
+              run.categories.add(toolCategory(item.tool_name));
             } else {
               pair = callId ? run.calls.get(String(callId)) : run.pending[0];
               if (pair) {
                 const index = run.pending.indexOf(pair);
                 if (index >= 0) run.pending.splice(index, 1);
+                run.completedTools++;
+                if (item.is_error && pair.callCard?.children?.[0])
+                  pair.callCard.children[0].dataset.error = "true";
                 const summary = card.children?.[0]?.children?.[0];
                 if (summary)
                   summary.textContent = [
@@ -2077,8 +2864,12 @@
                     .filter(Boolean)
                     .join(" · ");
               } else {
-                run.detail =
-                  toolDetail(item) || firstNonEmptyLine(item.text) || run.detail;
+                run.totalTools++;
+                run.completedTools++;
+                const orphanDetail =
+                  toolDetail(item) || firstNonEmptyLine(item.text);
+                run.detail = orphanDetail || run.detail;
+                run.activeDetail = orphanDetail || t("Tool activity");
               }
             }
             node = pair?.node || card;
@@ -2095,21 +2886,8 @@
             const at = run.body.children?.[run.nodes.length - 1];
             if (at !== node) run.body.insertBefore(node, at || null);
           }
-          run.summary.textContent = [
-            run.errors
-              ? t("Tool error")
-              : !run.count && run.tools
-                ? t("Tool activity")
-                : "",
-            ...[...run.steps].map(([step, n]) => t(step, n)),
-            !run.tools && run.thoughts
-              ? t("Thought {0} time(s)", run.thoughts)
-              : "",
-            run.count ? run.detail : run.detail || run.thoughtDetail,
-          ]
-            .filter(Boolean)
-            .join(" · ");
         } else {
+          if (run) syncRunSummary(run, false);
           run = null;
           runEnd = 0;
           nodes.push(card);
@@ -2147,15 +2925,29 @@
           card.remove();
           resize?.unobserve(card);
           cards.delete(key);
+          codeButtonsByCard.delete(key);
+        }
+      for (const [key, noteNode] of noteCards)
+        if (!incremental && !wantedNotes.has(key)) {
+          noteNode.remove();
+          noteCards.delete(key);
         }
       if (!incremental) {
         for (const child of Array.from(feed.children || []))
           if (child.className === "chat-empty") child.remove();
-        for (const key of entry.disclosures?.keys() || [])
-          if (!cards.has(key) && !toolRuns.has(key.replace(/^run:/, "")))
-            entry.disclosures.delete(key);
+        for (const dKey of entry.disclosures?.keys() || []) {
+          const keep =
+            cards.has(dKey) ||
+            (dKey.startsWith("run:") && toolRuns.has(dKey.slice(4))) ||
+            (dKey.startsWith("past:") && cards.has(dKey.slice(5))) ||
+            (dKey.startsWith("user:") && cards.has(dKey.slice(5))) ||
+            (dKey.startsWith("code-wrap:") &&
+              cards.has(dKey.slice(10).replace(/:\d+$/, "")));
+          if (!keep) entry.disclosures.delete(dKey);
+        }
       }
       tailRun = run;
+      syncTailRunSummary();
       renderedCount = entry.items.length;
       renderedItems = entry.items;
       if (!entry.items.length && entry.loaded && !optimisticText()) {
@@ -2205,56 +2997,105 @@
     }
     function renderCard(item, key) {
       const kind = item.kind || "assistant",
-        card = el("article", undefined, `chat-card chat-${kind}`);
-      if (kind === "user" || kind === "assistant") {
-        const role = el(
-          "header",
-          kind === "user"
-            ? t("My request")
-            : t("{0} reply", agentName(chatAgent()) || t("Agent")),
-          "chat-role",
-        );
-        if (kind === "assistant" && chatAgent() && agentIcon)
-          role.prepend(agentIcon(chatAgent()));
-        card.append(role, renderRichText(el, item.text), messageMeta(item));
-      } else if (kind === "reasoning" || kind === "tool_result") {
-        const details = el(
-          "details",
-          undefined,
-          kind === "reasoning" ? "chat-reasoning" : "chat-tool-result",
-        );
+        card = el("article", undefined, `chat-card chat-${kind}`),
+        richOpts = richOptsFor(key);
+      codeButtonsByCard.set(key, []);
+      if (kind === "user") {
+        const bubble = el("div", undefined, "chat-user-bubble"),
+          body = renderRichText(el, item.text, richOpts);
+        if (userMessageFolds(item.text)) {
+          const foldKey = `user:${key}`,
+            foldWrap = el("div", undefined, "chat-user-fold"),
+            toggleBtn = button(
+              "",
+              () => {
+                const nextOpen = !entry.disclosures?.get(foldKey);
+                entry.disclosures ||= new Map();
+                if (nextOpen) entry.disclosures.set(foldKey, true);
+                else entry.disclosures.delete(foldKey);
+                syncFold();
+              },
+              "ghost small chat-user-fold-toggle",
+            ),
+            syncFold = () => {
+              const open = Boolean(entry.disclosures?.get(foldKey)),
+                label = t(open ? "Show less" : "Show full message");
+              foldWrap.dataset.folded = String(!open);
+              toggleBtn.textContent = label;
+              toggleBtn.setAttribute("aria-expanded", String(open));
+              toggleBtn.setAttribute("aria-label", label);
+            };
+          foldWrap.append(body);
+          syncFold();
+          bubble.append(foldWrap, toggleBtn);
+        } else {
+          bubble.append(body);
+        }
+        card.append(bubble, messageMeta(item));
+      } else if (kind === "assistant") {
+        card.append(renderRichText(el, item.text, richOpts), messageMeta(item));
+      } else if (kind === "reasoning") {
+        const details = el("details", undefined, "chat-reasoning"),
+          summary = el("summary", undefined, "chat-reasoning-summary"),
+          iconWrap = el("span", undefined, "chat-reasoning-icon"),
+          brain = svgIcon("brain"),
+          headline = el(
+            "span",
+            t(item.status === "completed" ? "Thought" : "Reasoning"),
+            "chat-reasoning-headline",
+          ),
+          caretWrap = el("span", undefined, "chat-reasoning-caret"),
+          caret = svgIcon("chevronRight");
+        iconWrap.setAttribute("aria-hidden", "true");
+        if (brain) iconWrap.append(brain);
+        caretWrap.setAttribute("aria-hidden", "true");
+        if (caret) caretWrap.append(caret);
+        summary.append(iconWrap, headline, caretWrap);
+        rememberDetails(details, key);
+        details.append(summary);
+        lazyDetails(details, () => {
+          const body = el("div", undefined, "chat-reasoning-body");
+          body.append(renderRichText(el, item.text, richOpts));
+          details.append(body);
+        });
+        card.append(details);
+      } else if (kind === "tool_result") {
+        const details = el("details", undefined, "chat-tool-result");
         rememberDetails(details, key);
         details.append(
-          el(
-            "summary",
-            t(
-              kind === "reasoning"
-                ? "Reasoning"
-                : item.is_error
-                  ? "Tool error"
-                  : "Tool output",
-            ),
-          ),
+          el("summary", t(item.is_error ? "Tool error" : "Tool output")),
         );
         lazyDetails(details, () =>
-          details.append(
-            kind === "reasoning"
-              ? renderRichText(el, item.text)
-              : el("pre", item.text, "chat-code"),
-          ),
+          details.append(el("pre", item.text, "chat-code")),
         );
         card.append(details);
       } else if (kind === "tool_call") {
         const details = el("details", undefined, "chat-tool-call"),
-          head = el("summary", undefined, "chat-tool-head");
-        head.append(
-          el("span", item.tool_name || "tool", "badge"),
-          el(
-            "span",
-            item.title || item.file_path || t("Tool call"),
-            "chat-tool-title",
-          ),
+          head = el("summary", undefined, "chat-tool-head"),
+          line = toolLineLabel(item),
+          iconWrap = el("span", undefined, "chat-tool-icon"),
+          glyph = svgIcon(line.icon);
+        if (item.is_error) details.dataset.error = "true";
+        iconWrap.setAttribute("aria-hidden", "true");
+        if (glyph) iconWrap.append(glyph);
+        head.append(iconWrap);
+        if (line.verb) head.append(el("span", t(line.verb), "chat-tool-verb"));
+        if (line.target)
+          head.append(el("span", line.target, "chat-tool-title"));
+        else if (!line.verb)
+          head.append(
+            el("span", item.tool_name || t("Tool call"), "chat-tool-title"),
+          );
+        const hasDetail = Boolean(
+          item.file_path || (item.text && item.text !== item.file_path),
         );
+        if (hasDetail) {
+          const caretWrap = el("span", undefined, "chat-tool-caret"),
+            caret = svgIcon("chevronRight");
+          caretWrap.setAttribute("aria-hidden", "true");
+          if (caret) caretWrap.append(caret);
+          head.append(caretWrap);
+        }
         rememberDetails(details, key);
         details.append(head);
         if (item.file_path)
@@ -2687,6 +3528,7 @@
         .filter(Boolean)
         .join(" · ");
       statusLine.title = statusText.textContent;
+      syncTailRunSummary();
       syncAgent();
     }
     function normalizeItems(res, start) {
@@ -2697,18 +3539,22 @@
         _retainedBytes: JSON.stringify(item).length * 2,
       }));
     }
-    function clearTranscript() {
+    function clearTranscript(clearSessionState = true) {
       prefetchedEarlier = null; fillPages = 0;
       entry.composerStatus = null; entry.composerStatusAt = 0; entry.composerProbes = 0; statusFlight = null;
       entry.items = [];
       entry.retainedBytes = 0;
-      entry.disclosures?.clear();
+      if (clearSessionState) entry.disclosures?.clear();
       entry.pages = [];
       entry.live = null;
       entry.agent = "";
       entry.bound = false;
       cards.clear();
+      noteCards.clear();
+      codeButtonsByCard.clear();
+      if (clearSessionState) clearCopiedCode();
       toolRuns.clear();
+      tailRun = null;
       optimisticCard = null;
       optimisticShown = "";
       feed.replaceChildren();
@@ -2792,6 +3638,7 @@
         (b.id !== undefined && a.id !== b.id) ||
         a.kind !== b.kind ||
         a.text !== b.text ||
+        a.at !== b.at ||
         a.title !== b.title ||
         a.tool_name !== b.tool_name ||
         a.tool_id !== b.tool_id ||
@@ -2907,8 +3754,14 @@
               : null;
         if (res.reset && entry.progress && entry.progress.phase !== "sending")
           entry.progress.rendered = true;
+        const generationChanged = Boolean(
+          !res.bound ||
+            (entry.generation &&
+              res.generation &&
+              entry.generation !== res.generation),
+        );
         if (reset) {
-          clearTranscript();
+          clearTranscript(generationChanged);
           following = true;
         }
         entry.generation = res.generation || entry.generation;
@@ -3175,6 +4028,7 @@
         earlierQueued = false;
       }
       schedule();
+      syncTailRunSummary();
       if (isVisible()) {
         if (Date.now() - lastSuccess > 3000) refreshLatest = true;
         pinLatest();
@@ -3236,6 +4090,7 @@
         unsubscribeKeyboard?.();
         resize?.disconnect();
         pruneCache(state);
+        clearCopiedCode();
         clearTimeout(pollTimer);
         clearTimeout(appliedTimer);
         pollTimer = null;
@@ -3244,7 +4099,17 @@
       },
     };
   }
-  M.chat = { mount: mountChat, pruneCache, forgetSession, shortModel };
+  M.chat = {
+    mount: mountChat,
+    pruneCache,
+    forgetSession,
+    isEntryPinned,
+    shortModel,
+    sortEfforts,
+    fenceLang,
+    parseRichBlocks,
+    userMessageFolds,
+  };
   M.screens.chat = (root, ctx) => {
     const session = ctx.state.sessions.get(ctx.route.sessionId);
     if (!session) {

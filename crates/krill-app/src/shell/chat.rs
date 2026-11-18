@@ -37,6 +37,7 @@ pub(super) fn local_key(session: SessionId) -> ChatKey {
 
 mod actions;
 mod body;
+mod catalog;
 mod composer;
 mod prompt;
 #[cfg(test)]
@@ -76,6 +77,68 @@ pub(crate) struct ComposerMeta {
     pub pending: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DraftAttachment {
+    pub path: std::path::PathBuf,
+    pub display_name: String,
+    pub byte_len: u64,
+    pub is_image: bool,
+}
+
+impl DraftAttachment {
+    pub(super) fn from_path(path: std::path::PathBuf) -> Option<Self> {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let raw_bytes = path.as_os_str().as_bytes();
+        if raw_bytes.is_empty() || raw_bytes.iter().any(|&b| b < 0x20 || b == 0x7f) {
+            return None;
+        }
+        let byte_len = match std::fs::metadata(&path) {
+            Ok(meta) => {
+                if meta.is_dir() {
+                    return None;
+                }
+                meta.len()
+            }
+            Err(_) => 0,
+        };
+        let display_name = path
+            .file_name()
+            .map_or_else(
+                || path.to_string_lossy().into_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .collect::<String>();
+        if display_name.is_empty() {
+            return None;
+        }
+        let is_image = krill_term::paste::is_image_path(raw_bytes);
+        Some(Self {
+            path,
+            display_name,
+            byte_len,
+            is_image,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingStatus {
+    Sending,
+    ReviewRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingChatPrompt {
+    pub id: u64,
+    pub origin_item: usize,
+    pub submitted_payload: String,
+    pub display_text: String,
+    pub attachments: Vec<DraftAttachment>,
+    pub status: PendingStatus,
+}
+
 #[derive(Default)]
 pub(crate) struct SessionChatLog {
     pub agent: String,
@@ -87,6 +150,9 @@ pub(crate) struct SessionChatLog {
     pub meta: ComposerMeta,
     expanded_runs: BTreeSet<usize>,
     expanded_steps: BTreeSet<usize>,
+    expanded_user_messages: BTreeSet<usize>,
+    wrapped_code: BTreeSet<(usize, usize)>,
+    timing: work_run::WorkRunTimingState,
     cached_feed: Option<Arc<work_run::DisplayFeed>>,
     pub answered: BTreeSet<String>,
     binding: (String, String),
@@ -98,6 +164,7 @@ pub(crate) struct SessionChatLog {
     earlier: Option<u64>,
     submissions: BTreeMap<String, Submission>,
     pub multi_selected: BTreeMap<String, BTreeSet<usize>>,
+    consumed_user_indices: BTreeSet<usize>,
 }
 
 impl SessionChatLog {
@@ -109,6 +176,23 @@ impl SessionChatLog {
                 Arc::new(work_run::DisplayFeed::project(self.base_index, &self.items))
             }
         }))
+    }
+
+    pub(super) fn sync_timing(
+        &mut self,
+        agent_state: krill_proto::control::AgentState,
+        now: std::time::Instant,
+    ) {
+        let feed = self.display_feed();
+        self.timing.sync(&feed, agent_state, now);
+    }
+
+    pub(super) fn run_elapsed_secs(
+        &self,
+        run_start: usize,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        self.timing.elapsed_secs(run_start, now)
     }
 
     fn is_run_expanded(&self, span: work_run::RawSpan) -> bool {
@@ -136,6 +220,29 @@ impl SessionChatLog {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    pub(super) fn is_user_message_expanded(&self, abs_idx: usize) -> bool {
+        self.expanded_user_messages.contains(&abs_idx)
+    }
+
+    pub(super) fn toggle_user_message(&mut self, abs_idx: usize) {
+        if !self.expanded_user_messages.remove(&abs_idx) {
+            self.expanded_user_messages.insert(abs_idx);
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub(super) fn is_code_wrapped(&self, abs_idx: usize, code_idx: usize) -> bool {
+        self.wrapped_code.contains(&(abs_idx, code_idx))
+    }
+
+    pub(super) fn toggle_code_wrap(&mut self, abs_idx: usize, code_idx: usize) {
+        let key = (abs_idx, code_idx);
+        if !self.wrapped_code.remove(&key) {
+            self.wrapped_code.insert(key);
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub(super) fn reset_transcript(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.items.clear();
@@ -146,9 +253,13 @@ impl SessionChatLog {
         self.answered.clear();
         self.expanded_runs.clear();
         self.expanded_steps.clear();
+        self.expanded_user_messages.clear();
+        self.wrapped_code.clear();
+        self.timing.clear();
         self.cached_feed = None;
         self.multi_selected.clear();
         self.submissions.clear();
+        self.consumed_user_indices.clear();
     }
 
     pub(super) fn prepend_earlier(&mut self, older: Vec<ChatItem>, next_earlier: Option<u64>) {
@@ -170,28 +281,12 @@ impl SessionChatLog {
             let excess = self.items.len() - max_kept;
             let old_base = self.base_index;
             let base = old_base.saturating_add(excess);
-            if self
-                .items
-                .get(excess - 1)
-                .is_some_and(|item| work_run::is_work_kind(item.kind))
-                && self
-                    .items
-                    .get(excess)
-                    .is_some_and(|item| work_run::is_work_kind(item.kind))
+            let old_run_abs_start = work_run::straddling_run_rel_start(&self.items, excess)
+                .map(|run_rel| old_base.saturating_add(run_rel));
+            if let Some(old_start) = old_run_abs_start
+                && self.expanded_runs.range(old_start..base).next().is_some()
             {
-                let run_start = (0..excess)
-                    .rev()
-                    .take_while(|&idx| work_run::is_work_kind(self.items[idx].kind))
-                    .last()
-                    .unwrap_or(excess);
-                if self
-                    .expanded_runs
-                    .range((old_base + run_start)..base)
-                    .next()
-                    .is_some()
-                {
-                    self.expanded_runs.insert(base);
-                }
+                self.expanded_runs.insert(base);
             }
             self.items.drain(0..excess);
             self.base_index = base;
@@ -204,6 +299,10 @@ impl SessionChatLog {
                 .collect();
             self.expanded_runs.retain(|index| *index >= base);
             self.expanded_steps.retain(|index| *index >= base);
+            self.expanded_user_messages.retain(|index| *index >= base);
+            self.wrapped_code.retain(|(index, _)| *index >= base);
+            self.consumed_user_indices.retain(|index| *index >= base);
+            self.timing.migrate_head_drain(old_run_abs_start, base);
             self.answered.retain(|key| retained.contains(key));
             self.multi_selected.retain(|key, _| retained.contains(key));
             self.submissions.retain(|key, _| retained.contains(key));
@@ -211,9 +310,15 @@ impl SessionChatLog {
     }
 }
 
+pub(super) fn is_user_prompt_foldable(text: &str) -> bool {
+    text.chars().count() > 600 || text.lines().count() > 8
+}
+
 struct ChatList {
     host: krill_app::hosts::HostId,
     feed: Arc<work_run::DisplayFeed>,
+    pending_len: usize,
+    pending_rev: u64,
     revision: u64,
     epoch: u64,
     state: gpui::ListState,
@@ -223,11 +328,17 @@ impl ChatList {
     fn new(
         host: krill_app::hosts::HostId,
         feed: &Arc<work_run::DisplayFeed>,
+        pending_len: usize,
+        pending_rev: u64,
         revision: u64,
         epoch: u64,
         owner: gpui::WeakEntity<Shell>,
     ) -> Self {
-        let state = gpui::ListState::new(feed.len(), gpui::ListAlignment::Bottom, ui::SPACE_4);
+        let state = gpui::ListState::new(
+            feed.len() + pending_len,
+            gpui::ListAlignment::Bottom,
+            ui::SPACE_4,
+        );
         state.set_follow_mode(gpui::FollowMode::Tail);
         state.set_scroll_handler(move |_, _, cx| {
             owner.update(cx, |_, cx| cx.notify()).ok();
@@ -235,6 +346,8 @@ impl ChatList {
         Self {
             host,
             feed: Arc::clone(feed),
+            pending_len,
+            pending_rev,
             revision,
             epoch,
             state,
@@ -243,23 +356,36 @@ impl ChatList {
 
     fn near_top(&self, base_index: usize, raw_threshold: usize) -> bool {
         let top_row = self.state.logical_scroll_top().item_ix;
-        self.feed
-            .get(top_row)
-            .is_none_or(|row| row.span().start().saturating_sub(base_index) < raw_threshold)
+        match self.feed.get(top_row) {
+            Some(row) => row.span().start().saturating_sub(base_index) < raw_threshold,
+            None => self.feed.is_empty(),
+        }
     }
 
     // Straddling runs have end > cutoff, so partition_point leaves them in place to remeasure.
     fn sync(
         &mut self,
         feed: &Arc<work_run::DisplayFeed>,
+        pending_len: usize,
+        pending_rev: u64,
         revision: u64,
         epoch: u64,
     ) -> gpui::ListState {
         if epoch == self.epoch && Arc::ptr_eq(&self.feed, feed) {
-            if revision != self.revision {
+            let old_total = self.feed.len() + self.pending_len;
+            let new_total = feed.len() + pending_len;
+            if new_total > old_total {
+                self.state
+                    .splice(old_total..old_total, new_total - old_total);
+            } else if new_total < old_total {
+                self.state.splice(new_total..old_total, 0);
+            }
+            if revision != self.revision || pending_rev != self.pending_rev {
                 self.state.remeasure();
                 self.revision = revision;
+                self.pending_rev = pending_rev;
             }
+            self.pending_len = pending_len;
             return self.state.clone();
         }
         let prev = self.feed.rows();
@@ -270,6 +396,10 @@ impl ChatList {
                     && next_first.span().start() < prev_last.span().end()
                     && prev_first.span().start() < next_last.span().end() =>
             {
+                if self.pending_len != 0 {
+                    self.state
+                        .splice(prev.len()..(prev.len() + self.pending_len), 0);
+                }
                 let old_base = prev_first.span().start();
                 let new_base = next_first.span().start();
                 let removed = if new_base > old_base {
@@ -294,16 +424,21 @@ impl ChatList {
                 } else if next.len() < kept {
                     self.state.splice(next.len()..kept, 0);
                 }
-                if revision != self.revision {
+                if pending_len != 0 {
+                    self.state.splice(next.len()..next.len(), pending_len);
+                }
+                if revision != self.revision || pending_rev != self.pending_rev {
                     self.state.remeasure();
                 }
             }
             _ => {
-                self.state.reset(next.len());
+                self.state.reset(next.len() + pending_len);
                 self.state.set_follow_mode(gpui::FollowMode::Tail);
             }
         }
         self.feed = Arc::clone(feed);
+        self.pending_len = pending_len;
+        self.pending_rev = pending_rev;
         self.revision = revision;
         self.epoch = epoch;
         self.state.clone()
@@ -313,6 +448,12 @@ impl ChatList {
 enum ChatFocus {
     Composer(ChatKey),
     Terminal(ChatKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CopiedCodeTarget {
+    pub abs_idx: usize,
+    pub block_idx: usize,
 }
 
 #[derive(Default)]
@@ -327,6 +468,9 @@ pub(crate) struct ChatState {
     pub task: Option<Task<()>>,
     pub poll_generation: u64,
     pub copied_item: Option<(ChatKey, usize, std::time::Instant)>,
+    copied_item_timer: Option<Task<()>>,
+    pub(super) copied_code: Option<(ChatKey, CopiedCodeTarget)>,
+    copied_code_timer: Option<Task<()>>,
     pub quick_menu: BTreeSet<ChatKey>,
     pub model_picker: BTreeSet<ChatKey>,
     composer_tasks: BTreeMap<ChatKey, Task<()>>,
@@ -343,18 +487,42 @@ pub(crate) struct ChatState {
     prompt_tasks: BTreeMap<ChatKey, Task<()>>,
     prompt_review: BTreeSet<ChatKey>,
     multiline_blocked: BTreeSet<ChatKey>,
+    pub(super) interrupt_latched: std::collections::HashSet<ChatKey>,
+    interrupt_turn_since: std::collections::HashMap<ChatKey, u64>,
     #[cfg(test)]
     send_input: Option<Box<dyn FnMut(Vec<u8>) -> bool>>,
     #[cfg(test)]
     prompt_delivery: Option<krill_proto::input::Delivery>,
     #[cfg(test)]
     prompt_confirmed: Option<bool>,
+    pub pending_prompts: std::collections::HashMap<ChatKey, Vec<PendingChatPrompt>>,
+    pub draft_attachments: std::collections::HashMap<ChatKey, Vec<DraftAttachment>>,
+    pub pending_revision: u64,
+    next_pending_id: u64,
+    pending_epochs: std::collections::HashMap<(ChatKey, u64), u64>,
+    turn_tasks: BTreeMap<(ChatKey, u64), Task<()>>,
+    pub copied_pending: Option<(ChatKey, u64, std::time::Instant)>,
+    copied_pending_timer: Option<Task<()>>,
+    pub autocomplete: BTreeMap<ChatKey, catalog::AutocompleteState>,
+    attach_tasks: BTreeMap<ChatKey, Task<()>>,
 }
 
 impl ChatState {
     pub(super) fn review_pending_prompt(&mut self, key: &ChatKey) {
         if self.prompt_tasks.contains_key(key) {
             self.prompt_review.insert(key.clone());
+        } else if let Some(entries) = self.pending_prompts.get_mut(key) {
+            let mut changed = false;
+            for entry in entries.iter_mut() {
+                if entry.status == PendingStatus::Sending {
+                    entry.status = PendingStatus::ReviewRequired;
+                    self.turn_tasks.remove(&(key.clone(), entry.id));
+                    changed = true;
+                }
+            }
+            if changed {
+                self.pending_revision = self.pending_revision.wrapping_add(1);
+            }
         }
     }
 }
@@ -950,24 +1118,133 @@ impl Shell {
         chat.request_tasks.retain(|key, _| keep(key));
         chat.prompt_failed.retain(keep);
         chat.multiline_blocked.retain(keep);
+        chat.interrupt_latched.retain(keep);
+        chat.interrupt_turn_since.retain(|key, _| keep(key));
         let sending = &chat.prompt_tasks;
-        chat.prompt_review
-            .retain(|key| keep(key) || sending.contains_key(key));
+        let turn_tasks = &chat.turn_tasks;
+        let keep_flight = |key: &ChatKey| {
+            keep(key) || sending.contains_key(key) || turn_tasks.keys().any(|(k, _)| k == key)
+        };
+        chat.prompt_review.retain(keep_flight);
+        chat.draft_attachments.retain(|key, _| keep(key));
+        chat.autocomplete.retain(|key, _| keep(key));
+        chat.attach_tasks.retain(|key, _| keep(key));
+        chat.pending_prompts.retain(|key, _| keep_flight(key));
+        chat.pending_epochs.retain(|(key, _), _| keep_flight(key));
         if chat
             .copied_item
             .as_ref()
             .is_some_and(|(key, ..)| !keep(key))
         {
             chat.copied_item = None;
+            chat.copied_item_timer = None;
+        }
+        if chat.copied_code.as_ref().is_some_and(|(key, _)| !keep(key)) {
+            chat.copied_code = None;
+            chat.copied_code_timer = None;
+        }
+        if chat
+            .copied_pending
+            .as_ref()
+            .is_some_and(|(key, ..)| !keep(key))
+        {
+            chat.copied_pending = None;
+            chat.copied_pending_timer = None;
         }
     }
 
-    fn set_pane_chat_view(&mut self, pane: PaneId, chat: bool, cx: &mut Context<Self>) {
+    pub(super) fn session_agent_state(
+        &self,
+        host: &krill_app::hosts::HostId,
+        session: SessionId,
+        cx: &gpui::App,
+    ) -> krill_proto::control::AgentState {
+        self.sidebar
+            .read(cx)
+            .session_on(host, session)
+            .map_or(krill_proto::control::AgentState::Unknown, |s| {
+                s.status.state
+            })
+    }
+
+    pub(super) fn mark_chat_item_copied(
+        &mut self,
+        key: ChatKey,
+        abs_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let stamped = std::time::Instant::now();
+        self.chat.copied_item = Some((key.clone(), abs_idx, stamped));
+        self.chat.copied_item_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            this.update(cx, |this, cx| {
+                if this
+                    .chat
+                    .copied_item
+                    .as_ref()
+                    .is_some_and(|(k, idx, at)| *k == key && *idx == abs_idx && *at == stamped)
+                {
+                    this.chat.copied_item = None;
+                    this.chat.copied_item_timer = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    pub(super) fn copy_chat_code_block(
+        &mut self,
+        key: ChatKey,
+        abs_idx: usize,
+        block_idx: usize,
+        code: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let target = CopiedCodeTarget { abs_idx, block_idx };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.to_owned()));
+        self.chat.copied_code = Some((key.clone(), target));
+        self.chat.copied_code_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            this.update(cx, |this, cx| {
+                if this
+                    .chat
+                    .copied_code
+                    .as_ref()
+                    .is_some_and(|(k, t)| *k == key && *t == target)
+                {
+                    this.chat.copied_code = None;
+                    this.chat.copied_code_timer = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn set_pane_chat_view(&mut self, pane: PaneId, chat: bool, cx: &mut Context<Self>) {
         if self.layout.session(pane).is_none() {
             return;
         }
         self.layout.set_chat_view(pane, chat);
         self.save();
+        cx.notify();
+    }
+
+    pub(super) fn switch_pane_to_terminal(
+        &mut self,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_pane_chat_view(pane, false, cx);
+        self.chat.focus_pending = None;
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -1146,6 +1423,7 @@ impl Shell {
                     return;
                 }
                 this.chat.task = None;
+                this.sync_chat_interrupt_latches(cx);
                 if this.layout.host(pane) == &host
                     && this.layout.session(pane) == Some(session)
                     && this.is_pane_chat_view(pane, cx)
@@ -1154,9 +1432,11 @@ impl Shell {
                     if seeding {
                         this.chat.logs.entry(key.clone()).or_default().seeded = true;
                     }
+                    let agent_state = this.session_agent_state(&host, session, cx);
+                    let now = std::time::Instant::now();
                     if let Some(page) = page {
                         this.chat.poll_failed.remove(&key);
-                        this.apply_chat_tail(session, host, page, meta);
+                        this.apply_chat_tail(session, host, page, meta, agent_state, now);
                         this.refresh_chat_composer(&key, false, cx);
                     } else if let Some(Ok(Reply::AgentHistory(Response::ChatPolled(snapshot)))) =
                         reply
@@ -1169,7 +1449,14 @@ impl Shell {
                                 .get(&key)
                                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
                         this.chat.poll_failed.remove(&key);
-                        this.apply_chat_poll_for_host(session, host, snapshot, meta);
+                        this.apply_chat_poll_for_host_with_state(
+                            session,
+                            host,
+                            snapshot,
+                            meta,
+                            agent_state,
+                            now,
+                        );
                         if refresh_composer {
                             this.refresh_chat_composer(&key, false, cx);
                         }
@@ -1198,15 +1485,43 @@ impl Shell {
         host: krill_app::hosts::HostId,
         page: ChatPage,
         meta: Option<ComposerMeta>,
+        agent_state: krill_proto::control::AgentState,
+        now: std::time::Instant,
     ) {
         let key = (host.clone(), session);
         self.chat.logs.entry(key.clone()).or_default().binding = Default::default();
-        self.apply_chat_poll_for_host(session, host, page.snapshot, meta);
-        let log = self.chat.logs.entry(key).or_default();
+        self.apply_chat_poll_for_host_with_state(
+            session,
+            host,
+            page.snapshot,
+            meta,
+            agent_state,
+            now,
+        );
+        let log = self.chat.logs.entry(key.clone()).or_default();
+        let old_base = log.base_index;
         log.base_index = CHAT_BASE_ORIGIN;
         log.seeded = true;
         log.earlier = page.has_earlier.then_some(page.start);
         log.cached_feed = None;
+        log.sync_timing(agent_state, now);
+        if old_base < CHAT_BASE_ORIGIN {
+            let delta = CHAT_BASE_ORIGIN - old_base;
+            let epoch = log.epoch;
+            log.consumed_user_indices = std::mem::take(&mut log.consumed_user_indices)
+                .into_iter()
+                .map(|idx| idx.saturating_add(delta))
+                .collect();
+            if let Some(pending) = self.chat.pending_prompts.get_mut(&key) {
+                for entry in pending.iter_mut() {
+                    if self.chat.pending_epochs.get(&(key.clone(), entry.id)) == Some(&epoch)
+                        && entry.origin_item < CHAT_BASE_ORIGIN
+                    {
+                        entry.origin_item = entry.origin_item.saturating_add(delta);
+                    }
+                }
+            }
+        }
     }
 
     fn load_earlier_chat(&mut self, pane: super::PaneId, key: &ChatKey, cx: &mut Context<Self>) {
@@ -1281,12 +1596,32 @@ impl Shell {
         self.apply_chat_poll_for_host(session, host, snap, None);
     }
 
+    #[cfg(test)]
     pub(super) fn apply_chat_poll_for_host(
         &mut self,
         session: SessionId,
         host: krill_app::hosts::HostId,
         snap: ChatPollSnapshot,
         observed: Option<ComposerMeta>,
+    ) {
+        self.apply_chat_poll_for_host_with_state(
+            session,
+            host,
+            snap,
+            observed,
+            krill_proto::control::AgentState::Unknown,
+            std::time::Instant::now(),
+        );
+    }
+
+    pub(super) fn apply_chat_poll_for_host_with_state(
+        &mut self,
+        session: SessionId,
+        host: krill_app::hosts::HostId,
+        snap: ChatPollSnapshot,
+        observed: Option<ComposerMeta>,
+        agent_state: krill_proto::control::AgentState,
+        now: std::time::Instant,
     ) {
         let key = (host.clone(), session);
         let host = Some(host);
@@ -1308,6 +1643,24 @@ impl Shell {
         if reset {
             log.reset_transcript();
             self.chat.request_tasks.remove(&key);
+            if self
+                .chat
+                .copied_code
+                .as_ref()
+                .is_some_and(|(copied_key, _)| *copied_key == key)
+            {
+                self.chat.copied_code = None;
+                self.chat.copied_code_timer = None;
+            }
+            if self
+                .chat
+                .copied_item
+                .as_ref()
+                .is_some_and(|(copied_key, ..)| *copied_key == key)
+            {
+                self.chat.copied_item = None;
+                self.chat.copied_item_timer = None;
+            }
         }
         log.binding = binding;
         let is_local = host
@@ -1332,6 +1685,7 @@ impl Shell {
         if !snap.items.is_empty() {
             log.append_and_trim(snap.items, MAX_CHAT_KEPT);
         }
+        log.sync_timing(agent_state, now);
         log.offset = snap.next_offset;
         // A matching transcript result is evidence of a response; queue delivery is not.
         let resolved: Vec<_> = log
@@ -1347,10 +1701,11 @@ impl Shell {
             })
             .map(|(index, item)| format!("{}:{}", item.tool_id, log.base_index + index))
             .collect();
-        for key in resolved {
-            log.answered.insert(key.clone());
-            log.submissions.insert(key, Submission::Confirmed);
+        for resolved_key in resolved {
+            log.answered.insert(resolved_key.clone());
+            log.submissions.insert(resolved_key, Submission::Confirmed);
         }
+        self.reconcile_pending_prompts_on_poll(&key);
     }
 
     fn send_to_session(&mut self, key: &ChatKey, bytes: &[u8], cx: &mut Context<Self>) -> bool {
@@ -1427,6 +1782,9 @@ impl Shell {
 
     pub(super) fn toggle_chat_model_picker(&mut self, key: &ChatKey, cx: &mut Context<Self>) {
         self.chat.quick_menu.remove(key);
+        if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+            ac.dismiss_current();
+        }
         if self.chat.model_picker.contains(key) {
             self.chat.model_picker.remove(key);
         } else {
@@ -1645,7 +2003,7 @@ impl Shell {
         let sub = cx.subscribe_in(
             &input,
             window,
-            move |this, _state, ev: &InputEvent, _window, cx| match ev {
+            move |this, _state, ev: &InputEvent, window, cx| match ev {
                 InputEvent::Focus => {
                     if let Some(pane) = this.chat_pane(&focus_key)
                         && this.layout.focused() != Some(pane)
@@ -1656,7 +2014,11 @@ impl Shell {
                         cx.notify();
                     }
                 }
-                InputEvent::Change | InputEvent::Blur => {
+                InputEvent::Change => {
+                    this.sync_chat_autocomplete(&focus_key, window, cx);
+                    cx.notify();
+                }
+                InputEvent::Blur => {
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => {}
@@ -1717,22 +2079,34 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.chat.prompt_tasks.contains_key(key) || self.chat.prompt_review.contains(key) {
+        if self.chat.prompt_tasks.contains_key(key)
+            || self.chat.prompt_review.contains(key)
+            || self.session_agent_state(&key.0, key.1, cx)
+                == krill_proto::control::AgentState::Working
+            || self
+                .chat_pane(key)
+                .is_some_and(|pane| self.paste_queue.has_pending_for(pane))
+        {
             return;
         }
         let Some((input, _)) = self.chat.inputs.get(key) else {
             return;
         };
         let input = input.clone();
-        if input.update(cx, |state, cx| {
-            gpui::EntityInputHandler::marked_text_range(state, window, cx).is_some()
-        }) {
+        if Self::chat_input_is_composing(&input, window, cx) {
             return;
         }
-        let text = input.read(cx).value().to_string();
-        if text.trim().is_empty() {
+        let display_text = input.read(cx).value().to_string();
+        let attachments = self
+            .chat
+            .draft_attachments
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
+        let Some(submitted_payload) = build_submitted_chat_payload(&display_text, &attachments)
+        else {
             return;
-        }
+        };
         let Some(pane) = self.chat_pane(key) else {
             return;
         };
@@ -1743,49 +2117,77 @@ impl Shell {
             .map_or_else(Default::default, |live| live.pane.modes());
         // Use the terminal consumer's paste plan, then submit separately.
         // Unknown unbracketed consumers retain the multiline draft for review.
-        let krill_app::security::PastePlan::Immediate(mut bytes) =
-            self.plan_terminal_paste(pane, text.as_bytes(), modes, cx)
+        let krill_app::security::PastePlan::Immediate(bytes) =
+            self.plan_terminal_paste(pane, submitted_payload.as_bytes(), modes, cx)
         else {
             self.chat.multiline_blocked.insert(key.clone());
             cx.notify();
             return;
         };
         self.chat.multiline_blocked.remove(key);
-        if modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
-            || text.contains(['\n', '\r'])
-        {
-            self.start_chat_prompt(
-                prompt::ChatPrompt {
-                    pane,
-                    session,
-                    input,
-                    text,
-                    bytes,
-                },
-                window,
-                cx,
-            );
-            return;
+        let (origin_epoch, origin_item, opens_terminal) = self.chat.logs.get(key).map_or_else(
+            || {
+                (
+                    0,
+                    0,
+                    attachments.is_empty()
+                        && catalog::slash_command_opens_in_terminal("", &submitted_payload, false),
+                )
+            },
+            |l| {
+                (
+                    l.epoch,
+                    l.base_index.saturating_add(l.items.len()),
+                    attachments.is_empty()
+                        && catalog::slash_command_opens_in_terminal(
+                            &l.agent,
+                            &submitted_payload,
+                            l.meta.supported,
+                        ),
+                )
+            },
+        );
+        self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
+        let pending_id = self.chat.next_pending_id;
+        input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        self.chat.draft_attachments.remove(key);
+        if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+            ac.close();
+            ac.dismissed = None;
         }
-        bytes.push(b'\r');
-        if self.send_to_session(key, &bytes, cx) {
-            Self::clear_sent_chat_draft(&input, &text, window, cx);
-            self.chat.prompt_failed.remove(key);
-        } else {
-            self.chat.prompt_failed.insert(key.clone());
+        self.chat
+            .pending_prompts
+            .entry(key.clone())
+            .or_default()
+            .push(PendingChatPrompt {
+                id: pending_id,
+                origin_item,
+                submitted_payload: submitted_payload.clone(),
+                display_text,
+                attachments,
+                status: PendingStatus::Sending,
+            });
+        self.chat
+            .pending_epochs
+            .insert((key.clone(), pending_id), origin_epoch);
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        if let Some(list) = self.chat.lists.get_mut(&(pane, session)) {
+            list.state.set_follow_mode(gpui::FollowMode::Tail);
         }
-        cx.notify();
-    }
-
-    fn clear_sent_chat_draft(
-        input: &gpui::Entity<TextareaState>,
-        sent: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if input.read(cx).value().as_ref() == sent {
-            input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
-        }
+        self.dispatch_pending_chat_prompt(
+            PendingDispatch {
+                key: key.clone(),
+                pane,
+                session,
+                pending_id,
+                submitted_payload,
+                bytes,
+                modes,
+                opens_terminal,
+            },
+            window,
+            cx,
+        );
     }
 
     fn toggle_chat_multi_option(
@@ -1826,5 +2228,1110 @@ impl Shell {
             }
         }
         None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ComposerSubmissionState {
+    Ready,
+    InFlight,
+    ReviewRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ComposerPrimaryInput {
+    pub(super) agent_state: krill_proto::control::AgentState,
+    pub(super) submission: ComposerSubmissionState,
+    pub(super) draft_empty: bool,
+    pub(super) interrupt_latched: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ComposerPrimaryAction {
+    Send { enabled: bool },
+    Sending,
+    Stop { latched: bool },
+}
+
+pub(super) fn composer_primary_action(input: ComposerPrimaryInput) -> ComposerPrimaryAction {
+    if input.submission == ComposerSubmissionState::InFlight {
+        ComposerPrimaryAction::Sending
+    } else if input.agent_state == krill_proto::control::AgentState::Working {
+        // Option A: Krill PTY blocks mid-turn submit, so Working shows Stop even with a draft.
+        ComposerPrimaryAction::Stop {
+            latched: input.interrupt_latched,
+        }
+    } else {
+        ComposerPrimaryAction::Send {
+            enabled: !input.draft_empty && input.submission == ComposerSubmissionState::Ready,
+        }
+    }
+}
+
+impl Shell {
+    fn session_status(
+        &self,
+        key: &ChatKey,
+        cx: &gpui::App,
+    ) -> Option<(krill_proto::control::AgentState, u64)> {
+        self.sidebar
+            .read(cx)
+            .session_on(&key.0, key.1)
+            .map(|s| (s.status.state, s.status.since_unix_ns))
+    }
+
+    fn is_turn_still_latched(
+        turn_since: &std::collections::HashMap<ChatKey, u64>,
+        key: &ChatKey,
+        state: krill_proto::control::AgentState,
+        since: u64,
+    ) -> bool {
+        state == krill_proto::control::AgentState::Working
+            && turn_since
+                .get(key)
+                .is_none_or(|&latched_since| latched_since == since)
+    }
+
+    pub(super) fn is_chat_interrupt_latched(&self, key: &ChatKey, cx: &gpui::App) -> bool {
+        self.chat.interrupt_latched.contains(key)
+            && self.session_status(key, cx).is_some_and(|(state, since)| {
+                Self::is_turn_still_latched(&self.chat.interrupt_turn_since, key, state, since)
+            })
+    }
+
+    pub(super) fn sync_chat_interrupt_latches(&mut self, cx: &gpui::App) {
+        if self.chat.interrupt_latched.is_empty() && self.chat.interrupt_turn_since.is_empty() {
+            return;
+        }
+        let sidebar = self.sidebar.read(cx);
+        let turn_since = &self.chat.interrupt_turn_since;
+        self.chat.interrupt_latched.retain(|key| {
+            sidebar.session_on(&key.0, key.1).is_some_and(|s| {
+                Self::is_turn_still_latched(turn_since, key, s.status.state, s.status.since_unix_ns)
+            })
+        });
+        let latched = &self.chat.interrupt_latched;
+        self.chat
+            .interrupt_turn_since
+            .retain(|key, _| latched.contains(key));
+    }
+
+    pub(super) fn interrupt_chat_turn(&mut self, key: &ChatKey, cx: &mut Context<Self>) -> bool {
+        self.sync_chat_interrupt_latches(cx);
+        let Some((krill_proto::control::AgentState::Working, since_unix_ns)) =
+            self.session_status(key, cx)
+        else {
+            return false;
+        };
+        if self.chat.interrupt_latched.contains(key) || self.chat.prompt_tasks.contains_key(key) {
+            return false;
+        }
+        let Some(pane) = self.chat_pane(key) else {
+            return false;
+        };
+        if self.paste_queue.has_pending_for(pane) {
+            return false;
+        }
+        if !self.send_to_chat_pane(pane, key.1, b"\x03", cx) {
+            return false;
+        }
+        self.chat.interrupt_latched.insert(key.clone());
+        self.chat
+            .interrupt_turn_since
+            .insert(key.clone(), since_unix_ns);
+        cx.notify();
+        true
+    }
+}
+
+enum ChatClipboardContent {
+    Attachments(Vec<DraftAttachment>),
+    Text(String),
+    None,
+}
+
+fn classify_chat_clipboard_item(item: &gpui::ClipboardItem) -> ChatClipboardContent {
+    const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+    let has_valid_image = item.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            gpui::ClipboardEntry::Image(img)
+                if !img.bytes.is_empty() && img.bytes.len() <= MAX_IMAGE_BYTES
+        )
+    });
+    let mut skipped_dead_external_paths = false;
+    for entry in item.entries() {
+        if let gpui::ClipboardEntry::ExternalPaths(paths) = entry
+            && !paths.paths().is_empty()
+        {
+            if has_valid_image {
+                let existing: Vec<DraftAttachment> = paths
+                    .paths()
+                    .iter()
+                    .filter(|p| p.exists())
+                    .cloned()
+                    .filter_map(DraftAttachment::from_path)
+                    .collect();
+                if !existing.is_empty() {
+                    return ChatClipboardContent::Attachments(existing);
+                }
+                skipped_dead_external_paths = true;
+            } else {
+                let staged: Vec<DraftAttachment> = paths
+                    .paths()
+                    .iter()
+                    .cloned()
+                    .filter_map(DraftAttachment::from_path)
+                    .collect();
+                if !staged.is_empty() {
+                    return ChatClipboardContent::Attachments(staged);
+                }
+            }
+        }
+    }
+    if !skipped_dead_external_paths {
+        let has_usable_string = item.entries().iter().any(|entry| match entry {
+            gpui::ClipboardEntry::String(s) => {
+                if has_valid_image {
+                    !s.text().trim().is_empty()
+                } else {
+                    !s.text().is_empty()
+                }
+            }
+            _ => false,
+        });
+        if has_usable_string
+            && let Some(text) = item.text()
+            && !text.is_empty()
+        {
+            return ChatClipboardContent::Text(text);
+        }
+    }
+    for entry in item.entries() {
+        if let gpui::ClipboardEntry::Image(img) = entry
+            && !img.bytes.is_empty()
+            && img.bytes.len() <= MAX_IMAGE_BYTES
+            && let Ok(path) = super::security::save_clipboard_image(img)
+            && let Some(att) = DraftAttachment::from_path(path)
+        {
+            return ChatClipboardContent::Attachments(vec![att]);
+        }
+    }
+    ChatClipboardContent::None
+}
+
+pub(super) fn build_submitted_chat_payload(
+    display_text: &str,
+    attachments: &[DraftAttachment],
+) -> Option<String> {
+    use krill_proto::os::ffi::OsStrExt as _;
+    if attachments.is_empty() {
+        return (!display_text.trim().is_empty()).then(|| display_text.to_owned());
+    }
+    let escaped: Vec<String> = attachments
+        .iter()
+        .map(|att| {
+            let quoted = krill_term::paste::shell_quote(att.path.as_os_str().as_bytes());
+            String::from_utf8_lossy(&quoted).into_owned()
+        })
+        .collect();
+    let joined = escaped.join(" ");
+    if display_text.trim().is_empty() {
+        Some(joined)
+    } else {
+        Some(format!("{joined} {display_text}"))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PendingReview<'a> {
+    pub key: &'a ChatKey,
+    pub pending_id: u64,
+    pub immediate_send_failure: bool,
+}
+
+struct PendingDispatch {
+    key: ChatKey,
+    pane: super::PaneId,
+    session: SessionId,
+    pending_id: u64,
+    submitted_payload: String,
+    bytes: Vec<u8>,
+    modes: krill_proto::term_modes::Modes,
+    opens_terminal: bool,
+}
+
+struct UnbracketedWatch {
+    key: ChatKey,
+    pane: super::PaneId,
+    session: SessionId,
+    pending_id: u64,
+}
+
+impl Shell {
+    pub(super) fn mark_chat_pending_copied(
+        &mut self,
+        key: ChatKey,
+        pending_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let stamped = std::time::Instant::now();
+        self.chat.copied_pending = Some((key.clone(), pending_id, stamped));
+        self.chat.copied_pending_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            this.update(cx, |this, cx| {
+                if this
+                    .chat
+                    .copied_pending
+                    .as_ref()
+                    .is_some_and(|(k, id, at)| *k == key && *id == pending_id && *at == stamped)
+                {
+                    this.chat.copied_pending = None;
+                    this.chat.copied_pending_timer = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    pub(super) fn dismiss_open_composer_popover(&mut self, key: &ChatKey) -> bool {
+        if self
+            .chat
+            .autocomplete
+            .get(key)
+            .is_some_and(catalog::AutocompleteState::is_open)
+        {
+            if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+                ac.dismiss_current();
+            }
+            return true;
+        }
+        if self.chat.quick_menu.contains(key) || self.chat.model_picker.contains(key) {
+            self.chat.quick_menu.remove(key);
+            self.chat.model_picker.remove(key);
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn chat_input_is_composing(
+        input: &gpui::Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use gpui::Focusable as _;
+        input.update(cx, |state, cx| {
+            state.focus_handle(cx).is_focused(window)
+                && gpui::EntityInputHandler::marked_text_range(state, window, cx).is_some()
+        })
+    }
+
+    fn dispatch_pending_chat_prompt(
+        &mut self,
+        mut dispatch: PendingDispatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if dispatch
+            .modes
+            .contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
+            || dispatch.submitted_payload.contains(['\n', '\r'])
+        {
+            self.start_chat_prompt(
+                prompt::ChatPrompt {
+                    pane: dispatch.pane,
+                    session: dispatch.session,
+                    pending_id: dispatch.pending_id,
+                    bytes: dispatch.bytes,
+                    opens_terminal: dispatch.opens_terminal,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        dispatch.bytes.push(b'\r');
+        if self.send_to_session(&dispatch.key, &dispatch.bytes, cx) {
+            self.chat.prompt_failed.remove(&dispatch.key);
+            if dispatch.opens_terminal {
+                let origin = prompt::Origin {
+                    pane: dispatch.pane,
+                    session: dispatch.session,
+                    host: dispatch.key.0.clone(),
+                    target: self
+                        .live
+                        .get(&dispatch.pane)
+                        .and_then(|live| live.target.clone()),
+                    epoch: self.chat.logs.get(&dispatch.key).map_or(0, |log| log.epoch),
+                };
+                let Some(receipt) = self
+                    .live
+                    .get(&dispatch.pane)
+                    .map(|live| live.pane.input_receipt())
+                else {
+                    self.transition_pending_to_review_required(
+                        PendingReview {
+                            key: &dispatch.key,
+                            pending_id: dispatch.pending_id,
+                            immediate_send_failure: true,
+                        },
+                        Some(window),
+                        cx,
+                    );
+                    cx.notify();
+                    return;
+                };
+                match self.chat_prompt_delivery(&origin, receipt, cx) {
+                    krill_proto::input::Delivery::Applied => {
+                        self.confirm_pending_prompt(&dispatch.key, dispatch.pending_id);
+                        self.switch_pane_to_terminal(dispatch.pane, window, cx);
+                    }
+                    krill_proto::input::Delivery::Uncertain => {
+                        self.transition_pending_to_review_required(
+                            PendingReview {
+                                key: &dispatch.key,
+                                pending_id: dispatch.pending_id,
+                                immediate_send_failure: false,
+                            },
+                            Some(window),
+                            cx,
+                        );
+                    }
+                    krill_proto::input::Delivery::Pending => {
+                        self.spawn_unbracketed_terminal_switch_watcher(
+                            origin,
+                            dispatch.pending_id,
+                            receipt,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            } else {
+                self.spawn_unbracketed_turn_watcher(
+                    UnbracketedWatch {
+                        key: dispatch.key,
+                        pane: dispatch.pane,
+                        session: dispatch.session,
+                        pending_id: dispatch.pending_id,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        } else {
+            self.transition_pending_to_review_required(
+                PendingReview {
+                    key: &dispatch.key,
+                    pending_id: dispatch.pending_id,
+                    immediate_send_failure: true,
+                },
+                Some(window),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    fn spawn_unbracketed_terminal_switch_watcher(
+        &mut self,
+        origin: prompt::Origin,
+        pending_id: u64,
+        receipt: krill_proto::input::Receipt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task_key = origin.key();
+        let pane = origin.pane;
+        let map_key = (task_key.clone(), pending_id);
+        let task = cx.spawn_in(window, async move |this, cx| {
+            enum Step {
+                Wait,
+                Applied(bool),
+                Failed,
+            }
+            for _ in 0..prompt::RECEIPT_POLLS {
+                cx.background_executor().timer(prompt::POLL).await;
+                let Ok(step) = this.update_in(cx, |this, _, cx| {
+                    if !this.has_pending_prompt(&task_key, pending_id) {
+                        return Step::Applied(false);
+                    }
+                    match this.chat_prompt_delivery(&origin, receipt, cx) {
+                        krill_proto::input::Delivery::Applied => {
+                            Step::Applied(this.chat_prompt_current(&origin, cx))
+                        }
+                        krill_proto::input::Delivery::Uncertain => Step::Failed,
+                        krill_proto::input::Delivery::Pending => Step::Wait,
+                    }
+                }) else {
+                    return;
+                };
+                match step {
+                    Step::Wait => {}
+                    Step::Applied(current) => {
+                        this.update_in(cx, |this, window, cx| {
+                            this.confirm_pending_prompt(&task_key, pending_id);
+                            if current {
+                                this.switch_pane_to_terminal(pane, window, cx);
+                            } else {
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                        return;
+                    }
+                    Step::Failed => break,
+                }
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.transition_pending_to_review_required(
+                    PendingReview {
+                        key: &task_key,
+                        pending_id,
+                        immediate_send_failure: false,
+                    },
+                    Some(window),
+                    cx,
+                );
+            })
+            .ok();
+        });
+        self.chat.turn_tasks.insert(map_key, task);
+    }
+
+    fn spawn_unbracketed_turn_watcher(
+        &mut self,
+        watch: UnbracketedWatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const POLL: Duration = Duration::from_millis(20);
+        const TURN_POLLS: usize = 750;
+        let task_key = watch.key;
+        let pane = watch.pane;
+        let session = watch.session;
+        let pending_id = watch.pending_id;
+        let origin_epoch = self
+            .chat
+            .pending_epochs
+            .get(&(task_key.clone(), pending_id))
+            .copied()
+            .unwrap_or(0);
+        let map_key = (task_key.clone(), pending_id);
+        let task = cx.spawn_in(window, async move |this, cx| {
+            for step in 0..TURN_POLLS {
+                cx.background_executor().timer(POLL).await;
+                let Ok(outcome) = this.update_in(cx, |this, _, cx| {
+                    if !this.has_pending_prompt(&task_key, pending_id) {
+                        return Some(true);
+                    }
+                    let same_epoch =
+                        this.chat.logs.get(&task_key).map_or(0, |log| log.epoch) == origin_epoch;
+                    if !same_epoch || !this.is_pane_chat_view(pane, cx) {
+                        return Some(false);
+                    }
+                    #[cfg(test)]
+                    {
+                        if let Some(confirmed) = this.chat.prompt_confirmed {
+                            if confirmed {
+                                return Some(true);
+                            }
+                        } else if this.chat.send_input.is_some() && this.chat.poll_call.is_none() {
+                            return Some(true);
+                        }
+                    }
+                    if step % 5 == 0 {
+                        this.poll_session_chat(pane, session, cx);
+                    }
+                    None
+                }) else {
+                    return;
+                };
+                match outcome {
+                    Some(true) => {
+                        this.update_in(cx, |this, _, cx| {
+                            this.confirm_pending_prompt(&task_key, pending_id);
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                    Some(false) => break,
+                    None => {}
+                }
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.transition_pending_to_review_required(
+                    PendingReview {
+                        key: &task_key,
+                        pending_id,
+                        immediate_send_failure: false,
+                    },
+                    Some(window),
+                    cx,
+                );
+            })
+            .ok();
+        });
+        self.chat.turn_tasks.insert(map_key, task);
+    }
+
+    pub(super) fn has_pending_prompt(&self, key: &ChatKey, pending_id: u64) -> bool {
+        self.chat
+            .pending_prompts
+            .get(key)
+            .is_some_and(|list| list.iter().any(|p| p.id == pending_id))
+    }
+
+    pub(super) fn confirm_pending_prompt(&mut self, key: &ChatKey, pending_id: u64) {
+        self.chat.turn_tasks.remove(&(key.clone(), pending_id));
+        self.chat.pending_epochs.remove(&(key.clone(), pending_id));
+        if self
+            .chat
+            .copied_pending
+            .as_ref()
+            .is_some_and(|(k, id, _)| k == key && *id == pending_id)
+        {
+            self.chat.copied_pending = None;
+            self.chat.copied_pending_timer = None;
+        }
+        let mut removed = false;
+        if let Some(entries) = self.chat.pending_prompts.get_mut(key) {
+            let before = entries.len();
+            entries.retain(|p| p.id != pending_id);
+            removed = entries.len() != before;
+            if entries.is_empty() {
+                self.chat.pending_prompts.remove(key);
+            }
+        }
+        if removed {
+            self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        }
+    }
+
+    pub(super) fn reconcile_pending_prompts_on_poll(&mut self, key: &ChatKey) {
+        let Some(log) = self.chat.logs.get_mut(key) else {
+            return;
+        };
+        if !log.bound {
+            return;
+        }
+        let Some(entries) = self.chat.pending_prompts.get_mut(key) else {
+            return;
+        };
+        if entries.is_empty() {
+            return;
+        }
+        let mut matched_ids = Vec::new();
+        for entry in entries.iter() {
+            if self.chat.pending_epochs.get(&(key.clone(), entry.id)) != Some(&log.epoch) {
+                continue;
+            }
+            let target_norm = normalized(&entry.submitted_payload);
+            let found_abs = log.items.iter().enumerate().find_map(|(i, item)| {
+                let abs_idx = log.base_index.saturating_add(i);
+                (abs_idx >= entry.origin_item
+                    && !log.consumed_user_indices.contains(&abs_idx)
+                    && item.kind == ChatItemKind::User
+                    && normalized(&item.text) == target_norm)
+                    .then_some(abs_idx)
+            });
+            if let Some(abs_idx) = found_abs {
+                log.consumed_user_indices.insert(abs_idx);
+                matched_ids.push(entry.id);
+            }
+        }
+        if matched_ids.is_empty() {
+            return;
+        }
+        entries.retain(|entry| !matched_ids.contains(&entry.id));
+        if entries.is_empty() {
+            self.chat.pending_prompts.remove(key);
+        }
+        for id in matched_ids {
+            self.chat.pending_epochs.remove(&(key.clone(), id));
+            self.chat.turn_tasks.remove(&(key.clone(), id));
+            if self
+                .chat
+                .copied_pending
+                .as_ref()
+                .is_some_and(|(k, pid, _)| k == key && *pid == id)
+            {
+                self.chat.copied_pending = None;
+                self.chat.copied_pending_timer = None;
+            }
+        }
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+    }
+
+    pub(super) fn transition_pending_to_review_required(
+        &mut self,
+        review: PendingReview<'_>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let PendingReview {
+            key,
+            pending_id,
+            immediate_send_failure,
+        } = review;
+        self.chat.turn_tasks.remove(&(key.clone(), pending_id));
+        if !self.has_pending_prompt(key, pending_id) {
+            return;
+        }
+        let input_empty = self
+            .chat
+            .inputs
+            .get(key)
+            .is_none_or(|(inp, _)| inp.read(cx).value().is_empty());
+        let attachments_empty = self
+            .chat
+            .draft_attachments
+            .get(key)
+            .is_none_or(Vec::is_empty);
+
+        if input_empty
+            && attachments_empty
+            && let Some(window) = window
+        {
+            let removed = self.chat.pending_prompts.get_mut(key).and_then(|entries| {
+                let pos = entries.iter().position(|p| p.id == pending_id)?;
+                Some(entries.remove(pos))
+            });
+            if self
+                .chat
+                .pending_prompts
+                .get(key)
+                .is_some_and(Vec::is_empty)
+            {
+                self.chat.pending_prompts.remove(key);
+            }
+            self.chat.pending_epochs.remove(&(key.clone(), pending_id));
+            if let Some(entry) = removed {
+                if !entry.attachments.is_empty() {
+                    self.chat
+                        .draft_attachments
+                        .insert(key.clone(), entry.attachments);
+                }
+                if !entry.display_text.is_empty() {
+                    if let Some(trig) = catalog::detect_autocomplete_trigger(
+                        &entry.display_text,
+                        entry.display_text.len(),
+                    ) {
+                        self.chat
+                            .autocomplete
+                            .entry(key.clone())
+                            .or_default()
+                            .dismissed = Some((trig.kind, trig.replace_range.start, trig.query));
+                    }
+                    let input = self.ensure_chat_input(key.clone(), window, cx);
+                    let restored_text = entry.display_text;
+                    input.update(cx, |state, cx| state.set_value(restored_text, window, cx));
+                }
+                self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+            }
+            if immediate_send_failure {
+                self.chat.prompt_failed.insert(key.clone());
+            } else {
+                self.chat.prompt_review.insert(key.clone());
+            }
+            cx.notify();
+            return;
+        }
+
+        if let Some(entries) = self.chat.pending_prompts.get_mut(key)
+            && let Some(entry) = entries.iter_mut().find(|p| p.id == pending_id)
+            && entry.status != PendingStatus::ReviewRequired
+        {
+            entry.status = PendingStatus::ReviewRequired;
+            self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        }
+        if immediate_send_failure {
+            self.chat.prompt_failed.insert(key.clone());
+        }
+        cx.notify();
+    }
+
+    pub(super) fn retry_pending_chat_prompt(
+        &mut self,
+        key: &ChatKey,
+        pending_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chat.prompt_tasks.contains_key(key) {
+            return;
+        }
+        let Some((submitted_payload, no_attachments)) =
+            self.chat.pending_prompts.get(key).and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|p| p.id == pending_id && p.status == PendingStatus::ReviewRequired)
+                    .map(|p| (p.submitted_payload.clone(), p.attachments.is_empty()))
+            })
+        else {
+            return;
+        };
+        let Some(pane) = self.chat_pane(key) else {
+            return;
+        };
+        let session = key.1;
+        let modes = self
+            .live
+            .get(&pane)
+            .map_or_else(Default::default, |live| live.pane.modes());
+        let krill_app::security::PastePlan::Immediate(bytes) =
+            self.plan_terminal_paste(pane, submitted_payload.as_bytes(), modes, cx)
+        else {
+            self.chat.multiline_blocked.insert(key.clone());
+            cx.notify();
+            return;
+        };
+        self.chat.multiline_blocked.remove(key);
+        let (origin_epoch, origin_item, opens_terminal) = self.chat.logs.get(key).map_or_else(
+            || {
+                (
+                    0,
+                    0,
+                    no_attachments
+                        && catalog::slash_command_opens_in_terminal("", &submitted_payload, false),
+                )
+            },
+            |l| {
+                (
+                    l.epoch,
+                    l.base_index.saturating_add(l.items.len()),
+                    no_attachments
+                        && catalog::slash_command_opens_in_terminal(
+                            &l.agent,
+                            &submitted_payload,
+                            l.meta.supported,
+                        ),
+                )
+            },
+        );
+        if let Some(entries) = self.chat.pending_prompts.get_mut(key)
+            && let Some(entry) = entries.iter_mut().find(|p| p.id == pending_id)
+        {
+            entry.origin_item = origin_item;
+            entry.status = PendingStatus::Sending;
+        }
+        self.chat
+            .pending_epochs
+            .insert((key.clone(), pending_id), origin_epoch);
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        self.chat.prompt_failed.remove(key);
+        self.chat.prompt_review.remove(key);
+        self.dispatch_pending_chat_prompt(
+            PendingDispatch {
+                key: key.clone(),
+                pane,
+                session,
+                pending_id,
+                submitted_payload,
+                bytes,
+                modes,
+                opens_terminal,
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn stage_chat_attachments(
+        &mut self,
+        key: &ChatKey,
+        attachments: Vec<DraftAttachment>,
+        cx: &mut Context<Self>,
+    ) {
+        if attachments.is_empty() {
+            return;
+        }
+        let list = self.chat.draft_attachments.entry(key.clone()).or_default();
+        for att in attachments {
+            if !list.iter().any(|existing| existing.path == att.path) {
+                list.push(att);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn remove_chat_attachment(
+        &mut self,
+        key: &ChatKey,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(list) = self.chat.draft_attachments.get_mut(key) {
+            if index < list.len() {
+                list.remove(index);
+            }
+            if list.is_empty() {
+                self.chat.draft_attachments.remove(key);
+            }
+            cx.notify();
+        }
+    }
+
+    pub(super) fn attach_dropped_paths_to_chat(
+        &mut self,
+        key: &ChatKey,
+        paths: &gpui::ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let staged: Vec<DraftAttachment> = paths
+            .paths()
+            .iter()
+            .cloned()
+            .filter_map(DraftAttachment::from_path)
+            .collect();
+        self.stage_chat_attachments(key, staged, cx);
+        let input = self.ensure_chat_input(key.clone(), window, cx);
+        input.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    pub(super) fn prompt_for_chat_attachments(&mut self, key: &ChatKey, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(ctext::ATTACH_FILE.get().into()),
+        });
+        let task_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                this.update(cx, |this, _| {
+                    this.chat.attach_tasks.remove(&task_key);
+                })
+                .ok();
+                return;
+            };
+            let staged = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .filter_map(DraftAttachment::from_path)
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.chat.attach_tasks.remove(&task_key);
+                this.stage_chat_attachments(&task_key, staged, cx);
+            })
+            .ok();
+        });
+        self.chat.attach_tasks.insert(key.clone(), task);
+    }
+
+    pub(super) fn intercept_chat_clipboard_paste(
+        &mut self,
+        key: &ChatKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let read = cx.read_from_clipboard_async();
+        let task_key = key.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let item = read.await.ok().flatten();
+            #[cfg(not(test))]
+            let item = super::security::augment_clipboard_item_from_pasteboard(item);
+            let Some(item) = item else {
+                this.update_in(cx, |this, _, _| {
+                    this.chat.attach_tasks.remove(&task_key);
+                })
+                .ok();
+                return;
+            };
+            let classified = cx
+                .background_executor()
+                .spawn(async move { classify_chat_clipboard_item(&item) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.chat.attach_tasks.remove(&task_key);
+                match classified {
+                    ChatClipboardContent::Attachments(atts) => {
+                        this.stage_chat_attachments(&task_key, atts, cx);
+                        let input = this.ensure_chat_input(task_key.clone(), window, cx);
+                        input.update(cx, |state, cx| state.focus(window, cx));
+                    }
+                    ChatClipboardContent::Text(text) => {
+                        let input = this.ensure_chat_input(task_key.clone(), window, cx);
+                        input.update(cx, |state, cx| {
+                            state.focus(window, cx);
+                            gpui::EntityInputHandler::replace_text_in_range(
+                                state, None, &text, window, cx,
+                            );
+                        });
+                    }
+                    ChatClipboardContent::None => {}
+                }
+            })
+            .ok();
+        });
+        self.chat.attach_tasks.insert(key.clone(), task);
+    }
+
+    pub(super) fn sync_chat_autocomplete(
+        &mut self,
+        key: &ChatKey,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((input, _)) = self.chat.inputs.get(key) else {
+            return;
+        };
+        let (text, cursor) = {
+            let state = input.read(cx);
+            (state.value().to_string(), state.cursor())
+        };
+        let Some(trigger) = catalog::detect_autocomplete_trigger(&text, cursor) else {
+            if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+                ac.close();
+                ac.dismissed = None;
+            }
+            return;
+        };
+        {
+            let ac = self.chat.autocomplete.entry(key.clone()).or_default();
+            if ac.dismissed.as_ref()
+                == Some(&(
+                    trigger.kind,
+                    trigger.replace_range.start,
+                    trigger.query.clone(),
+                ))
+            {
+                ac.close();
+                return;
+            }
+            ac.dismissed = None;
+            if ac.trigger.as_ref() == Some(&trigger) && (!ac.items.is_empty() || ac.loading) {
+                return;
+            }
+        }
+        let is_local = key.0.is_local();
+        let cwd = if is_local {
+            self.chat_pane(key).and_then(|pane| self.pane_cwd(pane, cx))
+        } else {
+            None
+        };
+        if trigger.kind == catalog::AutocompleteKind::File && cwd.is_none() {
+            if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+                ac.close();
+            }
+            return;
+        }
+        let agent = self
+            .chat
+            .logs
+            .get(key)
+            .map(|l| l.agent.clone())
+            .unwrap_or_default();
+        let ac = self.chat.autocomplete.entry(key.clone()).or_default();
+        ac.generation = ac.generation.wrapping_add(1);
+        let generation = ac.generation;
+        let trigger_kind = trigger.kind;
+        let query = trigger.query.clone();
+        ac.trigger = Some(trigger);
+        ac.loading = true;
+        let home = if is_local {
+            catalog::user_home_dir()
+        } else {
+            None
+        };
+        let task_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let items = cx
+                .background_executor()
+                .spawn(async move {
+                    match trigger_kind {
+                        catalog::AutocompleteKind::File => match cwd {
+                            Some(dir) => catalog::scan_workspace_files(&dir, &query),
+                            None => Vec::new(),
+                        },
+                        catalog::AutocompleteKind::Slash => catalog::scan_slash_catalog(
+                            home.as_deref(),
+                            cwd.as_deref(),
+                            &agent,
+                            is_local,
+                            &query,
+                        ),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(ac) = this.chat.autocomplete.get_mut(&task_key) else {
+                    return;
+                };
+                if ac.generation != generation {
+                    return;
+                }
+                ac.loading = false;
+                ac.task = None;
+                ac.items = items;
+                if ac.selected >= ac.items.len() {
+                    ac.selected = 0;
+                }
+                if !ac.items.is_empty() {
+                    this.chat.quick_menu.remove(&task_key);
+                    this.chat.model_picker.remove(&task_key);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        ac.task = Some(task);
+    }
+
+    pub(super) fn accept_chat_autocomplete(
+        &mut self,
+        key: &ChatKey,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((input, _)) = self.chat.inputs.get(key) else {
+            return false;
+        };
+        let input = input.clone();
+        if Self::chat_input_is_composing(&input, window, cx) {
+            return false;
+        }
+        let Some((replace_range, insert_text)) =
+            self.chat.autocomplete.get_mut(key).and_then(|ac| {
+                let trigger = ac.trigger.as_ref()?;
+                let idx = index.unwrap_or(ac.selected);
+                let candidate = ac.items.get(idx)?;
+                let range = trigger.replace_range.clone();
+                let insert = candidate.insert_text.clone();
+                ac.close();
+                ac.dismissed = None;
+                Some((range, insert))
+            })
+        else {
+            return false;
+        };
+        input.update(cx, |state, cx| {
+            let current = state.value().to_string();
+            let start_u16 = catalog::utf8_to_utf16_offset(&current, replace_range.start);
+            let end_u16 = catalog::utf8_to_utf16_offset(&current, replace_range.end);
+            state.focus(window, cx);
+            gpui::EntityInputHandler::replace_text_in_range(
+                state,
+                Some(start_u16..end_u16),
+                &insert_text,
+                window,
+                cx,
+            );
+        });
+        if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+            ac.close();
+        }
+        cx.notify();
+        true
     }
 }

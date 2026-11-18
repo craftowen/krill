@@ -94,6 +94,9 @@ pub const SERVER_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="c
 /// Lucide `panels-top-left` 아이콘 SVG(ISC License). 상태바 플로팅 터미널 팝아웃 버튼(OWE-788).
 pub const PANELS_TOP_LEFT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>"#;
 
+/// Lucide `square` 채움 기반 정지 아이콘 SVG(ISC License). 채팅 컴포저 작업 중 정지 버튼(OWE-1349).
+pub const STOP_SQUARE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>"#;
+
 /// Lucide `rotate-ccw-clock` 아이콘 SVG(ISC License). 상태바 세션 히스토리 토글 버튼(OWE-788).
 pub const HISTORY_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>"#;
 
@@ -480,6 +483,7 @@ mod tests {
                 OPENCODE_SVG,
                 PI_SVG,
                 CUSTOM_AGENT_SVG,
+                STOP_SQUARE_SVG,
             ] {
                 cx.svg_renderer().parse_svg(bytes).expect("valid Orca SVG");
             }
@@ -688,7 +692,20 @@ mod tests {
                 "missing project icon asset for {name} ({path})"
             );
         }
-        for icon in [IconName::Clock, IconName::Lock, IconName::Package] {
+        for icon in [
+            IconName::Clock,
+            IconName::Lock,
+            IconName::Package,
+            IconName::Brain,
+            IconName::ListChecks,
+            IconName::MessageSquare,
+            IconName::MessageSquareMore,
+            IconName::Pencil,
+            IconName::Plug,
+            IconName::TextWrap,
+            IconName::Eye,
+            IconName::ArrowUp,
+        ] {
             let path = icon.path();
             assert!(
                 AppAssets.load(&path).unwrap().is_some(),
@@ -706,6 +723,7 @@ gpui_kit_assets::icon_assets!(
         Bot,
         Box,
         Braces,
+        Brain,
         Briefcase,
         Check,
         ChevronDown,
@@ -733,10 +751,13 @@ gpui_kit_assets::icon_assets!(
         Keyboard,
         Layers,
         Link,
+        ListChecks,
         Loader,
         LoaderCircle,
         Lock,
         MessageCircleQuestionMark,
+        MessageSquare,
+        MessageSquareMore,
         Minus,
         Monitor,
         Moon,
@@ -745,7 +766,9 @@ gpui_kit_assets::icon_assets!(
         PanelLeft,
         PanelRight,
         PanelRightClose,
+        Pencil,
         Play,
+        Plug,
         Plus,
         RefreshCw,
         Rocket,
@@ -758,6 +781,7 @@ gpui_kit_assets::icon_assets!(
         SquareTerminal,
         Star,
         StarFill,
+        TextWrap,
         TriangleAlert,
         User,
         Wrench
