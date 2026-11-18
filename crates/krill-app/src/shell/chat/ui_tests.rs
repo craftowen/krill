@@ -1272,3 +1272,309 @@ fn chat_composer_popovers_close_on_second_trigger_click_and_escape_and_expose_pl
     cx.run_until_parked();
     assert!(cx.debug_bounds("chat-model-picker").is_none());
 }
+
+#[gpui::test]
+fn chat_code_block_copy_feedback_conditional_header_and_line_wrap(cx: &mut TestAppContext) {
+    let code_body = format!("let value = \"{}\";", "segment_token_".repeat(12));
+    let (shell, cx) = fixture(
+        cx,
+        "chat-code-header-wrap",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: format!("Here:\n```rs\n{code_body}\n```"),
+            ..Default::default()
+        }],
+    );
+    cx.simulate_resize(size(px(320.), px(680.)));
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let header = cx.debug_bounds("chat-code-header").unwrap();
+    assert!(header.size.height <= px(34.));
+    assert!(header.left() >= overlay.left() && header.right() <= overlay.right());
+
+    let copy_before = cx.debug_bounds("chat-copy-code").unwrap();
+    let wrap_btn = cx.debug_bounds("chat-wrap-code").unwrap();
+    assert!(wrap_btn.left() >= overlay.left() && wrap_btn.right() <= overlay.right());
+
+    cx.simulate_click(copy_before.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| s.chat.copied_code.is_some()));
+    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), code_body);
+    let copy_during = cx.debug_bounds("chat-copy-code").unwrap();
+    assert_eq!(
+        copy_during.size.width, copy_before.size.width,
+        "reserved copy/copied width must prevent layout shift"
+    );
+
+    cx.executor().advance_clock(Duration::from_millis(1600));
+    cx.run_until_parked();
+    assert!(
+        shell.read_with(cx, |s, _| s.chat.copied_code.is_none()),
+        "1.5s timer must reset Copied feedback"
+    );
+
+    let wrap_btn = cx.debug_bounds("chat-wrap-code").unwrap();
+    cx.simulate_click(wrap_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| {
+        s.chat.logs[&local_key(SESSION)].is_code_wrapped(0, 0)
+    }));
+    let content = cx.debug_bounds("chat-code-content").unwrap();
+    assert!(content.left() >= overlay.left() && content.right() <= overlay.right());
+
+    // Language-less fence omits header bar and keeps corner actions inside bounds.
+    shell.update(cx, |shell, cx| {
+        let mut next = snapshot(vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: format!("```\n{code_body}\n```"),
+            ..Default::default()
+        }]);
+        next.reset = true;
+        shell.apply_chat_poll(SESSION, next);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-code-header").is_none(),
+        "unfenced/no-lang block must omit top header bar"
+    );
+    assert!(
+        shell.read_with(cx, |s, _| {
+            !s.chat.logs[&local_key(SESSION)].is_code_wrapped(0, 0)
+        }),
+        "wrap state must clear on transcript reset"
+    );
+    for target in ["chat-wrap-code", "chat-copy-code", "chat-code-content"] {
+        let b = cx.debug_bounds(target).unwrap();
+        assert!(b.left() >= overlay.left() && b.right() <= overlay.right());
+    }
+}
+
+#[gpui::test]
+fn chat_user_bubble_intrinsic_width_long_fold_and_assistant_footer(cx: &mut TestAppContext) {
+    let short_user = ChatItem {
+        kind: ChatItemKind::User,
+        text: "안녕".into(),
+        ..Default::default()
+    };
+    let (shell, cx) = fixture(cx, "chat-user-bubble", vec![short_user]);
+    cx.simulate_resize(size(px(800.), px(680.)));
+    cx.run_until_parked();
+
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    let bubble = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    assert!(
+        bubble.size.width < composer.size.width * 0.5,
+        "short user bubble must size to content rather than reading column: bubble={bubble:?}, composer={composer:?}"
+    );
+    assert!(
+        bubble.right() >= composer.right() - px(4.),
+        "short user bubble must right-align inside reading column: bubble={bubble:?}, composer={composer:?}"
+    );
+
+    // Long prompt folds to <= 176px height + toggle, and expands on click.
+    let long_prompt = (1..=14)
+        .map(|i| format!("Prompt detail line {i} explaining requirements clearly"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    shell.update(cx, |shell, cx| {
+        let mut next = snapshot(vec![ChatItem {
+            kind: ChatItemKind::User,
+            text: long_prompt,
+            ..Default::default()
+        }]);
+        next.reset = true;
+        shell.apply_chat_poll(SESSION, next);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let folded_bubble = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    let fold_btn = cx.debug_bounds("chat-user-fold").unwrap();
+    cx.simulate_click(fold_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let expanded_bubble = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    assert!(
+        expanded_bubble.size.height > folded_bubble.size.height,
+        "expanding folded user prompt must reveal full content: before={folded_bubble:?}, after={expanded_bubble:?}"
+    );
+
+    // Borderless assistant message renders footer copy + file + scroll-to-top without hover.
+    shell.update(cx, |shell, cx| {
+        let mut next = snapshot(vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "First paragraph.\n\nSecond paragraph.".into(),
+            file_path: "crates/krill-app/src/shell/chat/view.rs".into(),
+            ..Default::default()
+        }]);
+        next.reset = true;
+        shell.apply_chat_poll(SESSION, next);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let assistant_row = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    assert_eq!(assistant_row.left(), composer.left());
+    assert_eq!(assistant_row.size.width, composer.size.width);
+    assert!(cx.debug_bounds("chat-copy-item").is_some());
+    assert!(cx.debug_bounds("chat-open-file").is_some());
+    assert!(cx.debug_bounds("chat-scroll-top").is_some());
+}
+
+#[gpui::test]
+fn chat_borderless_work_run_guide_line_and_preamble_note(cx: &mut TestAppContext) {
+    let (_shell, cx) = fixture(
+        cx,
+        "chat-work-run-orca",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "Let me check Cargo.toml first.".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolCall,
+                tool_id: "r1".into(),
+                tool_name: "Read".into(),
+                file_path: "Cargo.toml".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolResult,
+                tool_id: "r1".into(),
+                text: "[workspace]".into(),
+                ..Default::default()
+            },
+        ],
+    );
+    cx.simulate_resize(size(px(320.), px(680.)));
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let toggle = cx.debug_bounds("chat-work-run-toggle").unwrap();
+    assert!(toggle.size.height < px(56.));
+    assert!(toggle.left() >= overlay.left() && toggle.right() <= overlay.right());
+    assert!(cx.debug_bounds("chat-work-note").is_none());
+
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    for target in [
+        "chat-work-note",
+        "chat-disclosure",
+        "chat-open-file",
+        "chat-copy-item",
+    ] {
+        let b = cx.debug_bounds(target).unwrap();
+        assert!(
+            b.left() >= overlay.left() && b.right() <= overlay.right(),
+            "{target} out of 320px bounds: {b:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn chat_top_right_term_pill_context_menu_turn_status_and_empty_state(cx: &mut TestAppContext) {
+    struct Memory(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (shell, cx) = open(cx, state_path("chat-chrome-overhaul"));
+    shell.update(cx, |shell, cx| {
+        shell.sidebar_collapsed = true;
+        shell.panel_collapsed = true;
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, SESSION);
+        shell.layout.set_chat_view(pane, true);
+        shell.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                bound: false,
+                ..Default::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.simulate_resize(size(px(320.), px(680.)));
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let switch_pill = cx.debug_bounds("chat-switch-terminal").unwrap();
+    assert!(switch_pill.left() >= overlay.left() && switch_pill.right() <= overlay.right());
+    assert!(
+        switch_pill.top() < overlay.center().y && switch_pill.right() > overlay.center().x,
+        "Term pill must float at top-right: {switch_pill:?} vs {overlay:?}"
+    );
+    assert!(cx.debug_bounds("chat-empty").is_some());
+    assert!(
+        cx.debug_bounds("chat-turn-status").is_none(),
+        "live turn status line must stay hidden when idle and no live status text exists"
+    );
+
+    // Working sidebar session shows live turn status line directly above composer.
+    shell.update(cx, |shell, cx| {
+        shell.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(Memory(krill_app::sidebar::Snapshot {
+                    sessions: vec![krill_app::sidebar::Session {
+                        id: SESSION,
+                        status: krill_proto::control::AgentStatus {
+                            state: krill_proto::control::AgentState::Working,
+                            agent: "claude".into(),
+                            ..krill_proto::control::AgentStatus::UNKNOWN
+                        },
+                        worktree: None,
+                        cwd: None,
+                        account: None,
+                    }],
+                    trees: BTreeMap::new(),
+                })),
+                cx,
+            );
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let status_line = cx.debug_bounds("chat-turn-status").unwrap();
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    assert!(status_line.bottom() <= composer.top() + px(1.));
+
+    // Right-click on chat overlay opens context menu with Continue with Terminal Agent.
+    let feed = cx.debug_bounds("desktop-chat-feed").unwrap();
+    cx.simulate_mouse_down(
+        feed.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        feed.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let menu_switch = cx.debug_bounds("chat-context-switch-terminal").unwrap();
+    cx.simulate_click(menu_switch.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("desktop-chat-overlay").is_none(),
+        "context menu item must switch pane back to Terminal"
+    );
+
+    // Top-right Term pill also switches back to Terminal.
+    shell.update(cx, Shell::toggle_chat_view);
+    cx.run_until_parked();
+    let switch_pill = cx.debug_bounds("chat-switch-terminal").unwrap();
+    cx.simulate_click(switch_pill.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
+}

@@ -87,6 +87,9 @@ pub(crate) struct SessionChatLog {
     pub meta: ComposerMeta,
     expanded_runs: BTreeSet<usize>,
     expanded_steps: BTreeSet<usize>,
+    expanded_user_messages: BTreeSet<usize>,
+    wrapped_code: BTreeSet<(usize, usize)>,
+    timing: work_run::WorkRunTimingState,
     cached_feed: Option<Arc<work_run::DisplayFeed>>,
     pub answered: BTreeSet<String>,
     binding: (String, String),
@@ -109,6 +112,23 @@ impl SessionChatLog {
                 Arc::new(work_run::DisplayFeed::project(self.base_index, &self.items))
             }
         }))
+    }
+
+    pub(super) fn sync_timing(
+        &mut self,
+        agent_state: krill_proto::control::AgentState,
+        now: std::time::Instant,
+    ) {
+        let feed = self.display_feed();
+        self.timing.sync(&feed, agent_state, now);
+    }
+
+    pub(super) fn run_elapsed_secs(
+        &self,
+        run_start: usize,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        self.timing.elapsed_secs(run_start, now)
     }
 
     fn is_run_expanded(&self, span: work_run::RawSpan) -> bool {
@@ -136,6 +156,29 @@ impl SessionChatLog {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    pub(super) fn is_user_message_expanded(&self, abs_idx: usize) -> bool {
+        self.expanded_user_messages.contains(&abs_idx)
+    }
+
+    pub(super) fn toggle_user_message(&mut self, abs_idx: usize) {
+        if !self.expanded_user_messages.remove(&abs_idx) {
+            self.expanded_user_messages.insert(abs_idx);
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub(super) fn is_code_wrapped(&self, abs_idx: usize, code_idx: usize) -> bool {
+        self.wrapped_code.contains(&(abs_idx, code_idx))
+    }
+
+    pub(super) fn toggle_code_wrap(&mut self, abs_idx: usize, code_idx: usize) {
+        let key = (abs_idx, code_idx);
+        if !self.wrapped_code.remove(&key) {
+            self.wrapped_code.insert(key);
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub(super) fn reset_transcript(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.items.clear();
@@ -146,6 +189,9 @@ impl SessionChatLog {
         self.answered.clear();
         self.expanded_runs.clear();
         self.expanded_steps.clear();
+        self.expanded_user_messages.clear();
+        self.wrapped_code.clear();
+        self.timing.clear();
         self.cached_feed = None;
         self.multi_selected.clear();
         self.submissions.clear();
@@ -170,28 +216,12 @@ impl SessionChatLog {
             let excess = self.items.len() - max_kept;
             let old_base = self.base_index;
             let base = old_base.saturating_add(excess);
-            if self
-                .items
-                .get(excess - 1)
-                .is_some_and(|item| work_run::is_work_kind(item.kind))
-                && self
-                    .items
-                    .get(excess)
-                    .is_some_and(|item| work_run::is_work_kind(item.kind))
+            let old_run_abs_start = work_run::straddling_run_rel_start(&self.items, excess)
+                .map(|run_rel| old_base.saturating_add(run_rel));
+            if let Some(old_start) = old_run_abs_start
+                && self.expanded_runs.range(old_start..base).next().is_some()
             {
-                let run_start = (0..excess)
-                    .rev()
-                    .take_while(|&idx| work_run::is_work_kind(self.items[idx].kind))
-                    .last()
-                    .unwrap_or(excess);
-                if self
-                    .expanded_runs
-                    .range((old_base + run_start)..base)
-                    .next()
-                    .is_some()
-                {
-                    self.expanded_runs.insert(base);
-                }
+                self.expanded_runs.insert(base);
             }
             self.items.drain(0..excess);
             self.base_index = base;
@@ -204,11 +234,18 @@ impl SessionChatLog {
                 .collect();
             self.expanded_runs.retain(|index| *index >= base);
             self.expanded_steps.retain(|index| *index >= base);
+            self.expanded_user_messages.retain(|index| *index >= base);
+            self.wrapped_code.retain(|(index, _)| *index >= base);
+            self.timing.migrate_head_drain(old_run_abs_start, base);
             self.answered.retain(|key| retained.contains(key));
             self.multi_selected.retain(|key, _| retained.contains(key));
             self.submissions.retain(|key, _| retained.contains(key));
         }
     }
+}
+
+pub(super) fn is_user_prompt_foldable(text: &str) -> bool {
+    text.chars().count() > 600 || text.lines().count() > 8
 }
 
 struct ChatList {
@@ -315,6 +352,12 @@ enum ChatFocus {
     Terminal(ChatKey),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CopiedCodeTarget {
+    pub abs_idx: usize,
+    pub block_idx: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct ChatState {
     poll_timer: Option<Task<()>>,
@@ -327,6 +370,9 @@ pub(crate) struct ChatState {
     pub task: Option<Task<()>>,
     pub poll_generation: u64,
     pub copied_item: Option<(ChatKey, usize, std::time::Instant)>,
+    copied_item_timer: Option<Task<()>>,
+    pub(super) copied_code: Option<(ChatKey, CopiedCodeTarget)>,
+    copied_code_timer: Option<Task<()>>,
     pub quick_menu: BTreeSet<ChatKey>,
     pub model_picker: BTreeSet<ChatKey>,
     composer_tasks: BTreeMap<ChatKey, Task<()>>,
@@ -959,15 +1005,106 @@ impl Shell {
             .is_some_and(|(key, ..)| !keep(key))
         {
             chat.copied_item = None;
+            chat.copied_item_timer = None;
+        }
+        if chat.copied_code.as_ref().is_some_and(|(key, _)| !keep(key)) {
+            chat.copied_code = None;
+            chat.copied_code_timer = None;
         }
     }
 
-    fn set_pane_chat_view(&mut self, pane: PaneId, chat: bool, cx: &mut Context<Self>) {
+    pub(super) fn session_agent_state(
+        &self,
+        host: &krill_app::hosts::HostId,
+        session: SessionId,
+        cx: &gpui::App,
+    ) -> krill_proto::control::AgentState {
+        self.sidebar
+            .read(cx)
+            .session_on(host, session)
+            .map_or(krill_proto::control::AgentState::Unknown, |s| {
+                s.status.state
+            })
+    }
+
+    pub(super) fn mark_chat_item_copied(
+        &mut self,
+        key: ChatKey,
+        abs_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let stamped = std::time::Instant::now();
+        self.chat.copied_item = Some((key.clone(), abs_idx, stamped));
+        self.chat.copied_item_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            this.update(cx, |this, cx| {
+                if this
+                    .chat
+                    .copied_item
+                    .as_ref()
+                    .is_some_and(|(k, idx, at)| *k == key && *idx == abs_idx && *at == stamped)
+                {
+                    this.chat.copied_item = None;
+                    this.chat.copied_item_timer = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    pub(super) fn copy_chat_code_block(
+        &mut self,
+        key: ChatKey,
+        abs_idx: usize,
+        block_idx: usize,
+        code: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let target = CopiedCodeTarget { abs_idx, block_idx };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.to_owned()));
+        self.chat.copied_code = Some((key.clone(), target));
+        self.chat.copied_code_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            this.update(cx, |this, cx| {
+                if this
+                    .chat
+                    .copied_code
+                    .as_ref()
+                    .is_some_and(|(k, t)| *k == key && *t == target)
+                {
+                    this.chat.copied_code = None;
+                    this.chat.copied_code_timer = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn set_pane_chat_view(&mut self, pane: PaneId, chat: bool, cx: &mut Context<Self>) {
         if self.layout.session(pane).is_none() {
             return;
         }
         self.layout.set_chat_view(pane, chat);
         self.save();
+        cx.notify();
+    }
+
+    pub(super) fn switch_pane_to_terminal(
+        &mut self,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_pane_chat_view(pane, false, cx);
+        self.chat.focus_pending = None;
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -1154,9 +1291,11 @@ impl Shell {
                     if seeding {
                         this.chat.logs.entry(key.clone()).or_default().seeded = true;
                     }
+                    let agent_state = this.session_agent_state(&host, session, cx);
+                    let now = std::time::Instant::now();
                     if let Some(page) = page {
                         this.chat.poll_failed.remove(&key);
-                        this.apply_chat_tail(session, host, page, meta);
+                        this.apply_chat_tail(session, host, page, meta, agent_state, now);
                         this.refresh_chat_composer(&key, false, cx);
                     } else if let Some(Ok(Reply::AgentHistory(Response::ChatPolled(snapshot)))) =
                         reply
@@ -1169,7 +1308,14 @@ impl Shell {
                                 .get(&key)
                                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
                         this.chat.poll_failed.remove(&key);
-                        this.apply_chat_poll_for_host(session, host, snapshot, meta);
+                        this.apply_chat_poll_for_host_with_state(
+                            session,
+                            host,
+                            snapshot,
+                            meta,
+                            agent_state,
+                            now,
+                        );
                         if refresh_composer {
                             this.refresh_chat_composer(&key, false, cx);
                         }
@@ -1198,15 +1344,25 @@ impl Shell {
         host: krill_app::hosts::HostId,
         page: ChatPage,
         meta: Option<ComposerMeta>,
+        agent_state: krill_proto::control::AgentState,
+        now: std::time::Instant,
     ) {
         let key = (host.clone(), session);
         self.chat.logs.entry(key.clone()).or_default().binding = Default::default();
-        self.apply_chat_poll_for_host(session, host, page.snapshot, meta);
+        self.apply_chat_poll_for_host_with_state(
+            session,
+            host,
+            page.snapshot,
+            meta,
+            agent_state,
+            now,
+        );
         let log = self.chat.logs.entry(key).or_default();
         log.base_index = CHAT_BASE_ORIGIN;
         log.seeded = true;
         log.earlier = page.has_earlier.then_some(page.start);
         log.cached_feed = None;
+        log.sync_timing(agent_state, now);
     }
 
     fn load_earlier_chat(&mut self, pane: super::PaneId, key: &ChatKey, cx: &mut Context<Self>) {
@@ -1281,12 +1437,32 @@ impl Shell {
         self.apply_chat_poll_for_host(session, host, snap, None);
     }
 
+    #[cfg(test)]
     pub(super) fn apply_chat_poll_for_host(
         &mut self,
         session: SessionId,
         host: krill_app::hosts::HostId,
         snap: ChatPollSnapshot,
         observed: Option<ComposerMeta>,
+    ) {
+        self.apply_chat_poll_for_host_with_state(
+            session,
+            host,
+            snap,
+            observed,
+            krill_proto::control::AgentState::Unknown,
+            std::time::Instant::now(),
+        );
+    }
+
+    pub(super) fn apply_chat_poll_for_host_with_state(
+        &mut self,
+        session: SessionId,
+        host: krill_app::hosts::HostId,
+        snap: ChatPollSnapshot,
+        observed: Option<ComposerMeta>,
+        agent_state: krill_proto::control::AgentState,
+        now: std::time::Instant,
     ) {
         let key = (host.clone(), session);
         let host = Some(host);
@@ -1308,6 +1484,24 @@ impl Shell {
         if reset {
             log.reset_transcript();
             self.chat.request_tasks.remove(&key);
+            if self
+                .chat
+                .copied_code
+                .as_ref()
+                .is_some_and(|(copied_key, _)| *copied_key == key)
+            {
+                self.chat.copied_code = None;
+                self.chat.copied_code_timer = None;
+            }
+            if self
+                .chat
+                .copied_item
+                .as_ref()
+                .is_some_and(|(copied_key, ..)| *copied_key == key)
+            {
+                self.chat.copied_item = None;
+                self.chat.copied_item_timer = None;
+            }
         }
         log.binding = binding;
         let is_local = host
@@ -1332,6 +1526,7 @@ impl Shell {
         if !snap.items.is_empty() {
             log.append_and_trim(snap.items, MAX_CHAT_KEPT);
         }
+        log.sync_timing(agent_state, now);
         log.offset = snap.next_offset;
         // A matching transcript result is evidence of a response; queue delivery is not.
         let resolved: Vec<_> = log

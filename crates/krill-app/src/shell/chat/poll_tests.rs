@@ -324,7 +324,7 @@ fn work_run_list_sync_preserves_anchor_across_boundary_prepend_head_drain_and_ta
             Arc::new(item(ChatItemKind::ToolResult, "contents a")),
             Arc::new(item(ChatItemKind::Assistant, "answer 1")),
             Arc::new(item(ChatItemKind::User, "anchor user message")),
-            Arc::new(item(ChatItemKind::Assistant, "answer 2")),
+            Arc::new(item(ChatItemKind::Assistant, "answer 2\ndetail")),
             Arc::new(item(ChatItemKind::ToolCall, "read b.rs")),
         ],
         ..Default::default()

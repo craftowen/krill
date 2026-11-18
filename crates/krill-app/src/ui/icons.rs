@@ -688,7 +688,20 @@ mod tests {
                 "missing project icon asset for {name} ({path})"
             );
         }
-        for icon in [IconName::Clock, IconName::Lock, IconName::Package] {
+        for icon in [
+            IconName::Clock,
+            IconName::Lock,
+            IconName::Package,
+            IconName::Brain,
+            IconName::ListChecks,
+            IconName::MessageSquare,
+            IconName::MessageSquareMore,
+            IconName::Pencil,
+            IconName::Plug,
+            IconName::TextWrap,
+            IconName::Eye,
+            IconName::ArrowUp,
+        ] {
             let path = icon.path();
             assert!(
                 AppAssets.load(&path).unwrap().is_some(),
@@ -706,6 +719,7 @@ gpui_kit_assets::icon_assets!(
         Bot,
         Box,
         Braces,
+        Brain,
         Briefcase,
         Check,
         ChevronDown,
@@ -733,10 +747,13 @@ gpui_kit_assets::icon_assets!(
         Keyboard,
         Layers,
         Link,
+        ListChecks,
         Loader,
         LoaderCircle,
         Lock,
         MessageCircleQuestionMark,
+        MessageSquare,
+        MessageSquareMore,
         Minus,
         Monitor,
         Moon,
@@ -745,7 +762,9 @@ gpui_kit_assets::icon_assets!(
         PanelLeft,
         PanelRight,
         PanelRightClose,
+        Pencil,
         Play,
+        Plug,
         Plus,
         RefreshCw,
         Rocket,
@@ -758,6 +777,7 @@ gpui_kit_assets::icon_assets!(
         SquareTerminal,
         Star,
         StarFill,
+        TextWrap,
         TriangleAlert,
         User,
         Wrench

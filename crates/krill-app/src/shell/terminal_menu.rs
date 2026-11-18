@@ -328,6 +328,69 @@ pub(super) fn build(
     }
 }
 
+pub(super) fn build_chat_overlay(
+    mut menu: PopupMenu,
+    shell: &WeakEntity<Shell>,
+    pane: PaneId,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let Some(entity) = shell.upgrade() else {
+        return menu;
+    };
+    let s = entity.read(cx);
+    let focus = s.focus.clone();
+    let fork_enabled = s
+        .peer_supports_fork(pane)
+        .then(|| s.can_fork_pane(pane, cx));
+    let can_continue = s.can_continue_pane(pane);
+
+    let weak = shell.clone();
+    let switch_item = PopupMenuItem::element(move |_, cx| {
+        let palette = krill_app::ui::palette(cx);
+        div()
+            .id("chat-context-switch-terminal")
+            .debug_selector(|| "chat-context-switch-terminal".into())
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                gpui_component::Icon::new(gpui_kit_assets::IconName::SquareTerminal)
+                    .with_size(krill_app::ui::ICON_SM)
+                    .text_color(palette.muted_foreground),
+            )
+            .child(text::CONTINUE_IN_TERMINAL.get())
+    })
+    .on_click(move |_, window, cx| {
+        weak.update(cx, |s, cx| {
+            if s.layout.focused() != Some(pane) {
+                s.change(true, cx, |l| l.focus(pane));
+            }
+            s.switch_pane_to_terminal(pane, window, cx);
+        })
+        .ok();
+    });
+
+    menu = menu
+        .action_context(focus)
+        .item(switch_item)
+        .separator()
+        .menu(text::SPLIT_RIGHT.get(), Box::new(SplitRight))
+        .menu(text::SPLIT_DOWN.get(), Box::new(SplitDown))
+        .menu(text::PANE_ZOOM_TOGGLE.get(), Box::new(ToggleZoomPane));
+    if let Some(can_fork) = fork_enabled {
+        menu = menu
+            .separator()
+            .menu_with_disabled(text::FORK_SESSION.get(), Box::new(ForkSession), !can_fork)
+            .menu_with_disabled(
+                text::CONTINUE_IN_NEW_SESSION.get(),
+                Box::new(ContinueInNewSession),
+                !can_continue,
+            );
+    }
+    menu.separator()
+        .menu(text::CLOSE_PANE.get(), Box::new(ClosePane))
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
