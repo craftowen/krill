@@ -815,3 +815,104 @@ fn user_prompt_fold_threshold_and_chat_log_wrap_state() {
     log.reset_transcript();
     assert!(!log.is_code_wrapped(6, 1));
 }
+
+#[test]
+fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
+    use krill_proto::control::AgentState;
+
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::InFlight,
+            draft_empty: true,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Sending,
+    );
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::InFlight,
+            draft_empty: false,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Sending,
+    );
+
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::ReviewRequired,
+            draft_empty: false,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Stop { latched: false },
+    );
+
+    // Option A: Working + ready shows Stop even when draft text or attachments exist.
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::Ready,
+            draft_empty: true,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Stop { latched: false },
+    );
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::Ready,
+            draft_empty: false,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Stop { latched: false },
+    );
+
+    // Latched Working keeps Stop disabled even when text is typed afterward.
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::Ready,
+            draft_empty: false,
+            interrupt_latched: true,
+        }),
+        ComposerPrimaryAction::Stop { latched: true },
+    );
+
+    for state in [
+        AgentState::Waiting,
+        AgentState::Blocked,
+        AgentState::Done,
+        AgentState::Exited,
+        AgentState::Unknown,
+    ] {
+        assert_eq!(
+            composer_primary_action(ComposerPrimaryInput {
+                agent_state: state,
+                submission: ComposerSubmissionState::Ready,
+                draft_empty: true,
+                interrupt_latched: false,
+            }),
+            ComposerPrimaryAction::Send { enabled: false },
+        );
+        assert_eq!(
+            composer_primary_action(ComposerPrimaryInput {
+                agent_state: state,
+                submission: ComposerSubmissionState::Ready,
+                draft_empty: false,
+                interrupt_latched: false,
+            }),
+            ComposerPrimaryAction::Send { enabled: true },
+        );
+        assert_eq!(
+            composer_primary_action(ComposerPrimaryInput {
+                agent_state: state,
+                submission: ComposerSubmissionState::ReviewRequired,
+                draft_empty: false,
+                interrupt_latched: false,
+            }),
+            ComposerPrimaryAction::Send { enabled: false },
+        );
+    }
+}

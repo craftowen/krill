@@ -1468,7 +1468,7 @@ fn clipboard_paste_payload_with_policy(
 }
 
 #[cfg(not(test))]
-fn augment_clipboard_item_from_pasteboard(
+pub(super) fn augment_clipboard_item_from_pasteboard(
     item: Option<gpui::ClipboardItem>,
 ) -> Option<gpui::ClipboardItem> {
     if let Some(ref existing) = item {

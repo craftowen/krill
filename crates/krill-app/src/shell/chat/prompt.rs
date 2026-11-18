@@ -1,44 +1,49 @@
 //! Paste submission waits for PTY receipts, then for the provider's user turn.
-use super::{ChatKey, Context, SessionId, Shell, TextareaState, Window};
+use super::{ChatKey, Context, SessionId, Shell, Window};
 use krill_proto::input::{Delivery, Receipt};
 use std::time::Duration;
 
-const POLL: Duration = Duration::from_millis(20);
-const RECEIPT_POLLS: usize = 500;
+pub(super) const POLL: Duration = Duration::from_millis(20);
+pub(super) const RECEIPT_POLLS: usize = 500;
 const TURN_POLLS: usize = 750;
 
 pub(super) struct ChatPrompt {
     pub pane: super::super::PaneId,
     pub session: SessionId,
-    pub input: gpui::Entity<TextareaState>,
-    pub text: String,
+    pub pending_id: u64,
     pub bytes: Vec<u8>,
+    pub opens_terminal: bool,
 }
 
-struct Origin {
-    pane: super::super::PaneId,
-    session: SessionId,
-    host: krill_app::hosts::HostId,
-    target: Option<krill_app::hosts::HostTarget>,
-    epoch: u64,
-    item: usize,
+pub(super) struct Origin {
+    pub pane: super::super::PaneId,
+    pub session: SessionId,
+    pub host: krill_app::hosts::HostId,
+    pub target: Option<krill_app::hosts::HostTarget>,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct FinishPrompt<'a> {
+    key: &'a ChatKey,
+    pending_id: u64,
+    confirmed: bool,
 }
 
 impl Origin {
-    fn key(&self) -> ChatKey {
+    pub(super) fn key(&self) -> ChatKey {
         (self.host.clone(), self.session)
     }
 }
 
 impl Shell {
-    fn chat_prompt_current(&self, origin: &Origin, cx: &Context<Self>) -> bool {
+    pub(super) fn chat_prompt_current(&self, origin: &Origin, cx: &Context<Self>) -> bool {
         let Origin {
             pane,
             session,
             host,
             target,
             epoch,
-            ..
         } = origin;
         self.is_pane_chat_view(*pane, cx)
             && self.layout.host(*pane) == host
@@ -58,7 +63,7 @@ impl Shell {
                 .is_some_and(krill_app::hosts::HostTarget::is_current)
     }
 
-    fn chat_prompt_delivery(
+    pub(super) fn chat_prompt_delivery(
         &self,
         origin: &Origin,
         receipt: Receipt,
@@ -78,35 +83,45 @@ impl Shell {
             })
     }
 
-    fn chat_prompt_confirmed(&self, origin: &Origin, text: &str) -> bool {
+    fn chat_prompt_confirmed(&mut self, origin: &Origin, pending_id: u64) -> bool {
         #[cfg(test)]
         if let Some(confirmed) = self.chat.prompt_confirmed {
             return confirmed;
         }
-        let found = self.chat.logs.get(&origin.key()).is_some_and(|log| {
-            log.bound
-                && log.epoch == origin.epoch
-                && log.items.iter().enumerate().any(|(i, item)| {
-                    log.base_index.saturating_add(i) >= origin.item
-                        && item.kind == krill_proto::agent_history::ChatItemKind::User
-                        && super::normalized(&item.text) == super::normalized(text)
-                })
-        });
-        #[cfg(test)]
-        if !found && self.chat.send_input.is_some() && self.chat.poll_call.is_none() {
+        let key = origin.key();
+        self.reconcile_pending_prompts_on_poll(&key);
+        if !self.has_pending_prompt(&key, pending_id) {
             return true;
         }
-        found
+        #[cfg(test)]
+        if self.chat.send_input.is_some() && self.chat.poll_call.is_none() {
+            return true;
+        }
+        false
     }
 
-    fn finish_chat_prompt(&mut self, key: &ChatKey, confirmed: bool, cx: &mut Context<Self>) {
-        self.chat.prompt_tasks.remove(key);
-        if confirmed {
-            self.chat.prompt_failed.remove(key);
+    fn finish_chat_prompt(
+        &mut self,
+        finish: FinishPrompt<'_>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat.prompt_tasks.remove(finish.key);
+        if finish.confirmed {
+            self.chat.prompt_failed.remove(finish.key);
+            self.confirm_pending_prompt(finish.key, finish.pending_id);
+            cx.notify();
         } else {
-            self.chat.prompt_review.insert(key.clone());
+            self.transition_pending_to_review_required(
+                super::PendingReview {
+                    key: finish.key,
+                    pending_id: finish.pending_id,
+                    immediate_send_failure: false,
+                },
+                window,
+                cx,
+            );
         }
-        cx.notify();
     }
 
     pub(super) fn start_chat_prompt(
@@ -118,9 +133,9 @@ impl Shell {
         let ChatPrompt {
             pane,
             session,
-            input,
-            text,
+            pending_id,
             bytes,
+            opens_terminal,
         } = prompt;
         let key = (self.layout.host(pane).clone(), session);
         let log = self.chat.logs.get(&key);
@@ -130,14 +145,29 @@ impl Shell {
             host: key.0.clone(),
             target: self.live.get(&pane).and_then(|live| live.target.clone()),
             epoch: log.map_or(0, |log| log.epoch),
-            item: log.map_or(0, |log| log.base_index.saturating_add(log.items.len())),
         };
         if !self.send_to_chat_pane(pane, session, &bytes, cx) {
-            self.chat.prompt_failed.insert(key);
-            cx.notify();
+            self.transition_pending_to_review_required(
+                super::PendingReview {
+                    key: &key,
+                    pending_id,
+                    immediate_send_failure: true,
+                },
+                Some(window),
+                cx,
+            );
             return;
         }
         let Some(receipt) = self.live.get(&pane).map(|live| live.pane.input_receipt()) else {
+            self.transition_pending_to_review_required(
+                super::PendingReview {
+                    key: &key,
+                    pending_id,
+                    immediate_send_failure: true,
+                },
+                Some(window),
+                cx,
+            );
             return;
         };
         self.chat.prompt_failed.remove(&key);
@@ -162,8 +192,16 @@ impl Shell {
                 }
             }
             if !applied {
-                this.update_in(cx, |this, _, cx| {
-                    this.finish_chat_prompt(&task_key, false, cx);
+                this.update_in(cx, |this, window, cx| {
+                    this.finish_chat_prompt(
+                        FinishPrompt {
+                            key: &task_key,
+                            pending_id,
+                            confirmed: false,
+                        },
+                        Some(window),
+                        cx,
+                    );
                 })
                 .ok();
                 return;
@@ -183,8 +221,16 @@ impl Shell {
                 .ok()
                 .flatten();
             let Some(enter) = enter else {
-                this.update_in(cx, |this, _, cx| {
-                    this.finish_chat_prompt(&task_key, false, cx);
+                this.update_in(cx, |this, window, cx| {
+                    this.finish_chat_prompt(
+                        FinishPrompt {
+                            key: &task_key,
+                            pending_id,
+                            confirmed: false,
+                        },
+                        Some(window),
+                        cx,
+                    );
                 })
                 .ok();
                 return;
@@ -205,11 +251,30 @@ impl Shell {
                     Delivery::Pending => cx.background_executor().timer(POLL).await,
                 }
             }
+            if applied && opens_terminal {
+                this.update_in(cx, |this, window, cx| {
+                    let current = this.chat_prompt_current(&origin, cx);
+                    this.finish_chat_prompt(
+                        FinishPrompt {
+                            key: &task_key,
+                            pending_id,
+                            confirmed: true,
+                        },
+                        Some(window),
+                        cx,
+                    );
+                    if current {
+                        this.switch_pane_to_terminal(pane, window, cx);
+                    }
+                })
+                .ok();
+                return;
+            }
             if applied {
                 for step in 0..TURN_POLLS {
                     let Ok((current, confirmed)) = this.update_in(cx, |this, _, cx| {
                         let current = this.chat_prompt_current(&origin, cx);
-                        let confirmed = current && this.chat_prompt_confirmed(&origin, &text);
+                        let confirmed = current && this.chat_prompt_confirmed(&origin, pending_id);
                         if current && !confirmed && step % 5 == 0 {
                             this.poll_session_chat(pane, session, cx);
                         }
@@ -222,8 +287,15 @@ impl Shell {
                     }
                     if confirmed {
                         this.update_in(cx, |this, window, cx| {
-                            Self::clear_sent_chat_draft(&input, &text, window, cx);
-                            this.finish_chat_prompt(&task_key, true, cx);
+                            this.finish_chat_prompt(
+                                FinishPrompt {
+                                    key: &task_key,
+                                    pending_id,
+                                    confirmed: true,
+                                },
+                                Some(window),
+                                cx,
+                            );
                         })
                         .ok();
                         return;
@@ -233,8 +305,16 @@ impl Shell {
             }
             // Applied only proves a PTY write, never provider consumption. Keep
             // the draft and require review rather than replaying or adding Enter.
-            this.update_in(cx, |this, _, cx| {
-                this.finish_chat_prompt(&task_key, false, cx);
+            this.update_in(cx, |this, window, cx| {
+                this.finish_chat_prompt(
+                    FinishPrompt {
+                        key: &task_key,
+                        pending_id,
+                        confirmed: false,
+                    },
+                    Some(window),
+                    cx,
+                );
             })
             .ok();
         });

@@ -1572,6 +1572,179 @@ impl Shell {
             .into_any_element()
     }
 
+    fn render_pending_chat_card(
+        &self,
+        key: ChatKey,
+        pane: PaneId,
+        pending: &super::PendingChatPrompt,
+        is_last_row: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let palette = ui::palette(cx);
+        let pending_id = pending.id;
+        let is_review = matches!(pending.status, super::PendingStatus::ReviewRequired);
+        let is_copied =
+            self.chat
+                .copied_pending
+                .as_ref()
+                .is_some_and(|(copied_key, copied_id, _)| {
+                    *copied_key == key && *copied_id == pending_id
+                });
+
+        let attachment_strip = (!pending.attachments.is_empty()).then(|| {
+            div().flex().flex_wrap().items_center().gap_1().children(
+                pending.attachments.iter().map(|attachment| {
+                    let badge = if attachment.is_image {
+                        format!(
+                            "{} ({}, {})",
+                            attachment.display_name,
+                            ctext::ATTACH_IMAGE_BADGE.get(),
+                            super::catalog::format_byte_len(attachment.byte_len)
+                        )
+                    } else {
+                        format!(
+                            "{} ({})",
+                            attachment.display_name,
+                            super::catalog::format_byte_len(attachment.byte_len)
+                        )
+                    };
+                    div()
+                        .max_w(gpui::px(260.))
+                        .rounded(ui::RADIUS_SM)
+                        .border_1()
+                        .border_color(palette.border)
+                        .bg(palette.card)
+                        .px_2()
+                        .py_0p5()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(palette.muted_foreground)
+                        .child(
+                            gpui_component::Icon::new(if attachment.is_image {
+                                IconName::Image
+                            } else {
+                                IconName::File
+                            })
+                            .size(gpui::px(ui::ICON_SM))
+                            .text_color(palette.muted_foreground),
+                        )
+                        .child(div().min_w_0().truncate().child(badge))
+                }),
+            )
+        });
+
+        let trimmed_text = pending.display_text.trim();
+        let text_block = (!trimmed_text.is_empty()).then(|| {
+            div()
+                .min_w_0()
+                .text_size(ui::TEXT_MD)
+                .text_color(palette.foreground)
+                .whitespace_normal()
+                .child(pending.display_text.clone())
+        });
+
+        let bubble = div()
+            .id(SharedString::from(format!(
+                "chat-pending-card-{pending_id}-{}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-pending-card".into())
+            .min_w_0()
+            .max_w(gpui::relative(0.80))
+            .overflow_hidden()
+            .rounded(ui::RADIUS_XL)
+            .border_1()
+            .border_color(palette.border)
+            .bg(palette.muted)
+            .px_3p5()
+            .py_2p5()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .children(attachment_strip)
+            .children(text_block);
+
+        let retry_key = key.clone();
+        let copy_key = key;
+        let copy_text = pending.display_text.clone();
+        let status_row = if is_review {
+            div()
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(palette.destructive)
+                        .child(ctext::PENDING_REVIEW_REQUIRED.get()),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "chat-pending-retry-{pending_id}-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-pending-retry".into())
+                    .label(ctext::PENDING_RETRY.get())
+                    .xsmall()
+                    .outline()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.retry_pending_chat_prompt(&retry_key, pending_id, window, cx);
+                    })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "chat-pending-copy-{pending_id}-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-pending-copy".into())
+                    .label(if is_copied {
+                        ctext::COPIED.get()
+                    } else {
+                        ctext::COPY.get()
+                    })
+                    .xsmall()
+                    .outline()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+                        this.mark_chat_pending_copied(copy_key.clone(), pending_id, cx);
+                    })),
+                )
+        } else {
+            div().w_full().flex().items_center().justify_end().child(
+                div()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(palette.muted_foreground)
+                    .child(ctext::PENDING_SENDING.get()),
+            )
+        };
+
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .pt_3()
+            .when(is_last_row, gpui::Styled::pb_4)
+            .child(
+                div()
+                    .w_full()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .min_w_0()
+                    .px_3()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap_1()
+                    .child(bubble)
+                    .child(status_row),
+            )
+            .into_any_element()
+    }
+
     pub(in crate::shell) fn render_pane_chat_overlay(
         &mut self,
         pane: super::super::PaneId,
@@ -1654,7 +1827,30 @@ impl Shell {
             .flex_col()
             .gap_2();
 
-        if display_feed.is_empty() {
+        let pending_slice = self
+            .chat
+            .pending_prompts
+            .get(&key)
+            .map_or(&[][..], Vec::as_slice);
+        let pending_cards: Arc<[super::PendingChatPrompt]> = Arc::from(pending_slice);
+        let pending_len = pending_cards.len();
+        let pending_rev = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for item in pending_slice {
+                item.id.hash(&mut hasher);
+                matches!(item.status, super::PendingStatus::ReviewRequired).hash(&mut hasher);
+                let copied = self
+                    .chat
+                    .copied_pending
+                    .as_ref()
+                    .is_some_and(|(ck, cid, _)| *ck == key && *cid == item.id);
+                copied.hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+
+        if display_feed.is_empty() && pending_len == 0 {
             let badge_bg = if poll_failed {
                 palette.destructive.opacity(0.1)
             } else {
@@ -1722,18 +1918,44 @@ impl Shell {
             );
         } else {
             let owner = cx.weak_entity();
-            let list = self
-                .chat
-                .lists
-                .entry((pane, session))
-                .or_insert_with(|| ChatList::new(host, &display_feed, revision, epoch, owner));
-            let list_state = list.sync(&display_feed, revision, epoch);
+            let list = self.chat.lists.entry((pane, session)).or_insert_with(|| {
+                ChatList::new(
+                    host,
+                    &display_feed,
+                    pending_len,
+                    pending_rev,
+                    revision,
+                    epoch,
+                    owner,
+                )
+            });
+            let list_state = list.sync(&display_feed, pending_len, pending_rev, revision, epoch);
             let owner = cx.weak_entity();
             let rows = Arc::clone(&display_feed);
-            let total_rows = rows.len();
+            let pending_rows = Arc::clone(&pending_cards);
+            let total_rows = rows.len() + pending_len;
             let list_state_for_rows = list_state.clone();
+            let pending_key = key.clone();
             feed = feed.child(
                 gpui::list(list_state.clone(), move |row_ix, _, cx| {
+                    if row_ix >= rows.len() {
+                        let Some(pending_item) = pending_rows.get(row_ix - rows.len()) else {
+                            return div().into_any_element();
+                        };
+                        let key_for_row = pending_key.clone();
+                        let is_last = row_ix + 1 == total_rows;
+                        return owner
+                            .update(cx, |this, cx| {
+                                this.render_pending_chat_card(
+                                    key_for_row,
+                                    pane,
+                                    pending_item,
+                                    is_last,
+                                    cx,
+                                )
+                            })
+                            .unwrap_or_else(|_| div().into_any_element());
+                    }
                     let Some(row) = rows.get(row_ix) else {
                         return div().into_any_element();
                     };
@@ -1902,6 +2124,12 @@ impl Shell {
                     }
                 }),
             )
+            .on_drop(cx.listener({
+                let drop_key = key.clone();
+                move |this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.attach_dropped_paths_to_chat(&drop_key, paths, window, cx);
+                }
+            }))
             .context_menu(move |menu, _, cx| {
                 super::super::terminal_menu::build_chat_overlay(menu, &overlay_weak, pane, cx)
             })

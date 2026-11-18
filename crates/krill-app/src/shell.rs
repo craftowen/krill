@@ -929,6 +929,7 @@ impl Shell {
                 this.launch_host = selected.0;
             }
             this.reconcile_workspace_sessions(cx);
+            this.sync_chat_interrupt_latches(cx);
             this.sync_diff_workspace(cx);
             this.refresh_jump(cx);
             cx.notify();
@@ -5935,8 +5936,15 @@ impl Shell {
         }
     }
 
-    fn paste(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page_open() || self.dashboard.is_some() {
+            return;
+        }
+        if self.is_active_chat_view_in(cx)
+            && let Some(pane) = self.layout.focused()
+            && let Some(key) = self.chat_key(pane)
+        {
+            self.intercept_chat_clipboard_paste(&key, window, cx);
             return;
         }
         self.paste_clipboard(window, cx);
@@ -7361,6 +7369,12 @@ impl Shell {
             }))
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
                 this.change(true, cx, |l| l.focus(id));
+                if this.is_pane_chat_view(id, cx)
+                    && let Some(key) = this.chat_key(id)
+                {
+                    this.attach_dropped_paths_to_chat(&key, paths, window, cx);
+                    return;
+                }
                 this.paste_dropped_paths(paths, window, cx);
             }));
         // 로컬 선택을 쓰는 패인에서는 지원하지 않는 마우스 모드여도 복사 메뉴를 연다.
