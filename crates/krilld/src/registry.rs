@@ -3032,7 +3032,7 @@ impl Registry {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn record_test_hook(
         &self,
         id: SessionId,
