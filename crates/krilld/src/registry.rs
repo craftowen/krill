@@ -2998,6 +2998,49 @@ impl Registry {
         self.status.get(id).state == control::AgentState::Working
     }
 
+    /// 모바일 정지 요청: 살아 있는 세션이 현재 `AgentState::Working`이고 열린 붙여넣기가 없을 때만
+    /// 단일 `Ctrl+C`(`\x03`)를 기록한다(OWE-1349). 이미 턴이 끝났으면 PTY에 아무것도 쓰지 않는다.
+    pub(crate) fn mobile_interrupt(&self, id: SessionId) -> io::Result<bool> {
+        let (tap, root, wrapped) = {
+            let st = lock(&self.state);
+            let Some(entry) = st.sessions.get(&id) else {
+                return Ok(false);
+            };
+            if st.exited.contains_key(&id)
+                || entry.session.is_closed()
+                || self.agents.account_binding_retiring(id)
+            {
+                return Ok(false);
+            }
+            let tap = entry.session.tap();
+            if tap.pulse().closed {
+                return Ok(false);
+            }
+            (tap, entry.pid, entry.wrapped)
+        };
+        if self
+            .resolve_session_status(id, root, false, &tap, wrapped)
+            .state
+            != control::AgentState::Working
+        {
+            return Ok(false);
+        }
+        tap.write_interrupt(|| {
+            !tap.pulse().closed
+                && !self.agents.account_binding_retiring(id)
+                && self.status.get(id).state == control::AgentState::Working
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_test_hook(
+        &self,
+        id: SessionId,
+        event: &krill_proto::hook::HookEvent,
+    ) -> io::Result<usize> {
+        self.status.hook(&[(id, event)])
+    }
+
     /// Read-only and not gated on the agent being idle, unlike [`Self::mobile_composer_tap`].
     pub(crate) fn session_capture(&self, id: SessionId) -> Option<krill_proto::screen::Screen> {
         let tap = lock(&self.state).sessions.get(&id)?.session.tap();

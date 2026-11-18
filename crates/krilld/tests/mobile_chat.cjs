@@ -8,7 +8,7 @@ class Element extends EventTarget {
   constructor(tag, text, cls) {
     super();
     this.tag = tag;
-    this.textContent = text;
+    this._text = text;
     this.className = cls;
     this.children = [];
     this.dataset = {};
@@ -17,6 +17,19 @@ class Element extends EventTarget {
     this.scrollTop = 0;
     this.clientHeight = 100;
     this.value = "";
+  }
+  get textContent() {
+    if (this.children.length)
+      return (
+        (this._text || "") +
+        this.children.map((c) => c.textContent ?? "").join("")
+      );
+    return this._text;
+  }
+  set textContent(v) {
+    for (const n of this.children) n.parentElement = null;
+    this.children = [];
+    this._text = v;
   }
   append(...nodes) {
     for (const n of nodes) {
@@ -35,6 +48,7 @@ class Element extends EventTarget {
   replaceChildren(...nodes) {
     for (const n of this.children) n.parentElement = null;
     this.children = [];
+    this._text = undefined;
     this.append(...nodes);
   }
   remove() {
@@ -103,7 +117,8 @@ function fixture(options = {}) {
       },
     },
     Date: options.Date || Date,
-    setTimeout: (fn) => {
+    setTimeout: (fn, ms) => {
+      fn.ms = ms;
       timers.set(++id, fn);
       return id;
     },
@@ -154,6 +169,7 @@ function fixture(options = {}) {
     el,
     state,
     ...(options.lang ? { t: sandbox.KrillMobile.i18n.t } : {}),
+    ...(options.icon ? { icon: options.icon } : {}),
     button(label, action, cls) {
       const b = el("button", label, cls);
       b.action = action;
@@ -3182,7 +3198,7 @@ async function workRunCoalescing() {
     next_offset: 8,
     items: [
       { id: "br0", kind: "reasoning", text: "Solo thought" },
-      { id: "ba1", kind: "assistant", text: "Interim message" },
+      { id: "ba1", kind: "assistant", text: "Interim message\nSecond line" },
       { id: "bc1", kind: "tool_call", tool_name: "Read", file_path: "x.rs" },
       {
         id: "bq1",
@@ -3218,13 +3234,25 @@ async function workRunCoalescing() {
   );
   assert(
     css.includes(
-      ".chat-tool-items>:is(.chat-card,.chat-tool-pair){border:0;border-top:1px solid var(--border);border-radius:0;padding:6px 2px;background:transparent}",
+      ".chat-tool-run{border:0;border-radius:0;color:var(--muted-foreground);background:transparent;padding:0}",
     ),
-    "work run items use flat hairline dividers",
+    "work run container is borderless",
   );
   assert(
     css.includes(
-      ".chat-tool-pair{display:flex;flex-direction:column;gap:4px;min-width:0}",
+      ".chat-tool-items{display:flex;flex-direction:column;gap:2px;margin-left:7px;margin-top:2px;padding:0 0 0 13px;border-left:1px solid var(--border)}",
+    ),
+    "work run items use Orca 1px left vertical guide line",
+  );
+  assert(
+    css.includes(
+      ".chat-tool-items>:is(.chat-card,.chat-tool-pair){border:0;border-radius:0;padding:2px 0;background:transparent}",
+    ),
+    "work run items drop heavy row dividers",
+  );
+  assert(
+    css.includes(
+      ".chat-tool-pair{display:flex;flex-direction:column;gap:2px;min-width:0}",
     ),
   );
   assert(
@@ -3240,14 +3268,769 @@ async function workRunCoalescing() {
     "44px touch target floor remains intact",
   );
   console.log(
-    "PASS work-run coalescing: interleaved thoughts/tools, streaming promotion, loadEarlier/trim DOM & anchor retention, question/permission boundaries and flat CSS",
+    "PASS work-run coalescing: interleaved thoughts/tools, streaming promotion, loadEarlier/trim DOM & anchor retention, question/permission boundaries and borderless guide-line CSS",
   );
 }
 
+async function codeBlockHeaderWrapAndCopy() {
+  const icon = (name) => {
+    const svg = new Element("svg"),
+      p = new Element("path");
+    p.setAttribute("d", name === "check" ? "M20 6 9 17l-5-5" : "");
+    svg.append(p);
+    return svg;
+  };
+  const f = fixture({ icon });
+  await flush();
+  assert.equal(f.M.chat.fenceLang("ts"), "TypeScript");
+  assert.equal(f.M.chat.fenceLang("tsx"), "TSX");
+  assert.equal(f.M.chat.fenceLang("js"), "JavaScript");
+  assert.equal(f.M.chat.fenceLang("py"), "Python");
+  assert.equal(f.M.chat.fenceLang("rs"), "Rust");
+  assert.equal(f.M.chat.fenceLang("rust"), "Rust");
+  assert.equal(f.M.chat.fenceLang("sh"), "Bash");
+  assert.equal(f.M.chat.fenceLang("bash"), "Bash");
+  assert.equal(f.M.chat.fenceLang("yml"), "YAML");
+  assert.equal(f.M.chat.fenceLang("yaml"), "YAML");
+  assert.equal(f.M.chat.fenceLang("md"), "Markdown");
+  assert.equal(
+    f.M.chat.fenceLang('  TypeScript\u0007 title="app.ts" {1,3}'),
+    "TypeScript",
+  );
+  assert.equal(f.M.chat.fenceLang(""), "Code");
+  assert.equal(f.M.chat.fenceLang("   \u001b\u0000 "), "Code");
+  assert.deepEqual(
+    Array.from(
+      f.M.chat.parseRichBlocks(
+        '서론\n````md\n```rust\nlet x = 1;\n```\n````\nuse ```inline``` safely\n~~~sh\nprintf "streaming"',
+      ),
+      (b) => ({ ...b }),
+    ),
+    [
+      { kind: "prose", text: "서론" },
+      {
+        kind: "code",
+        lang: "Markdown",
+        code: "```rust\nlet x = 1;\n```",
+        blockIndex: 0,
+      },
+      { kind: "prose", text: "use ```inline``` safely" },
+      {
+        kind: "code",
+        lang: "Bash",
+        code: 'printf "streaming"',
+        blockIndex: 1,
+      },
+    ],
+  );
+
+  const baseBlocks =
+    '안내 문장\n```rs\nfn first() -> i32 { 1 }\n```\n중간 설명\n```TypeScript title="app.ts"\nexport const answer = 42;\n```\n```\nplain snippet\n```\n```py\nprint("part 1")';
+  await f.poll({
+    generation: "g1",
+    agent: "claude",
+    bound: true,
+    next_offset: 1,
+    items: [{ id: "m1", kind: "assistant", text: baseBlocks }],
+  });
+  const wraps = () =>
+    f.root.descendants().filter((n) => n.className === "chat-code-wrap");
+  assert.equal(wraps().length, 4);
+  for (const wrap of wraps()) {
+    assert.equal(wrap.children[0].className, "chat-code-head");
+    assert.equal(wrap.children[0].children[0].className, "chat-code-lang");
+    assert.equal(wrap.children[0].children[1].className, "chat-code-actions");
+    assert.equal(
+      wrap.children[0].children[1].children[0].className,
+      "chat-code-wrap-btn",
+    );
+    assert.equal(
+      wrap.children[0].children[1].children[1].className,
+      "chat-code-copy",
+    );
+    assert.equal(wrap.children[1].tag, "pre");
+    assert.equal(wrap.children[1].className, "chat-code");
+    assert.equal(wrap.children[1].children[0].tag, "code");
+  }
+  assert.deepEqual(
+    wraps().map((w) => w.children[0].children[0].textContent),
+    ["Rust", "TypeScript", "Code", "Python"],
+  );
+  const wrapBtns = () =>
+    wraps().map((w) => w.children[0].children[1].children[0]);
+  const copyBtns = () =>
+    wraps().map((w) => w.children[0].children[1].children[1]);
+  assert.deepEqual(
+    copyBtns().map((b) => b.textContent),
+    ["Copy", "Copy", "Copy", "Copy"],
+  );
+  assert.equal(wrapBtns()[1].attrs["aria-pressed"], "false");
+  assert.equal(wrapBtns()[1].attrs["aria-label"], "Wrap lines");
+  assert.equal(wraps()[1].children[1].dataset.wrapped, undefined);
+
+  // Toggle line-wrap on block 1 and verify disclosure + data-wrapped persist across streaming & non-incremental polls.
+  wrapBtns()[1].click();
+  assert.equal(wrapBtns()[1].attrs["aria-pressed"], "true");
+  assert.equal(wrapBtns()[1].attrs["aria-label"], "Disable line wrap");
+  assert.equal(wraps()[1].children[1].dataset.wrapped, "true");
+  assert.equal(f.entry.disclosures.get("code-wrap:g1:m1:1"), true);
+
+  const timersBefore = new Set(f.timers.keys());
+  copyBtns()[1].click();
+  await flush();
+  assert.equal(
+    f.copied.at(-1),
+    "export const answer = 42;",
+    "clicking individual code copy copies only that block's code",
+  );
+  assert.equal(copyBtns()[1].dataset.copied, "true");
+  assert.equal(copyBtns()[1].textContent, "Copied");
+  assert.equal(copyBtns()[1].attrs["aria-label"], "Copied");
+  assert(
+    copyBtns()[1].descendants().some((n) => n.tag === "svg"),
+    "copied state renders check SVG mark",
+  );
+  assert.equal(copyBtns()[0].dataset.copied, undefined);
+  const addedTimers = [...f.timers.entries()].filter(
+    ([id]) => !timersBefore.has(id),
+  );
+  assert.equal(addedTimers.length, 1);
+  assert.equal(addedTimers[0][1].ms, 1500);
+
+  // Streaming incremental update + same-generation reset both preserve Copied and code-wrap by blockIndex.
+  await f.poll({
+    generation: "g1",
+    agent: "claude",
+    bound: true,
+    next_offset: 2,
+    items: [
+      {
+        id: "m1",
+        kind: "assistant",
+        text: baseBlocks + '\nprint("part 2")',
+      },
+    ],
+  });
+  assert.equal(copyBtns()[1].dataset.copied, "true");
+  assert.equal(wrapBtns()[1].attrs["aria-pressed"], "true");
+  assert.equal(wraps()[1].children[1].dataset.wrapped, "true");
+
+  await f.poll({
+    generation: "g1",
+    agent: "claude",
+    bound: true,
+    reset: true,
+    next_offset: 3,
+    items: [
+      {
+        id: "m1",
+        kind: "assistant",
+        text: baseBlocks + '\nprint("part 2")\n```\n완료',
+      },
+    ],
+  });
+  assert.equal(
+    copyBtns()[1].dataset.copied,
+    "true",
+    "same-generation streaming reset preserves Copied state by blockIndex",
+  );
+  assert.equal(
+    wraps()[1].children[1].dataset.wrapped,
+    "true",
+    "same-generation streaming reset preserves line-wrap disclosure by blockIndex",
+  );
+
+  // Non-incremental tail refresh keeps code-wrap disclosure in entry.disclosures.
+  f.setVisible(false);
+  f.setVisible(true);
+  await f.poll({
+    generation: "g1",
+    agent: "claude",
+    bound: true,
+    next_offset: 4,
+    items: [
+      {
+        id: "m1",
+        kind: "assistant",
+        text: baseBlocks + '\nprint("part 2")\n```\n완료',
+      },
+      { id: "m2", kind: "assistant", text: "trailing reply" },
+    ],
+  });
+  assert.equal(f.entry.disclosures.get("code-wrap:g1:m1:1"), true);
+
+  // Expiring the 1.5s timer reverts the post-stream live button in place.
+  const [copyTimerId, copyTimerFn] = addedTimers[0];
+  f.timers.delete(copyTimerId);
+  copyTimerFn();
+  assert.equal(copyBtns()[1].dataset.copied, undefined);
+  assert.equal(copyBtns()[1].textContent, "Copy");
+  assert.equal(copyBtns()[1].attrs["aria-label"], "Copy");
+  assert.equal(copyBtns()[1].children.length, 0);
+  f.dispose();
+
+  const ko = fixture({ lang: "ko", icon });
+  await flush();
+  await ko.poll({
+    generation: "g-ko",
+    agent: "claude",
+    bound: true,
+    next_offset: 1,
+    items: [{ id: "k1", kind: "assistant", text: "```\necho 안녕\n```" }],
+  });
+  const koLang = ko.find("chat-code-lang"),
+    koWrapBtn = ko.find("chat-code-wrap-btn"),
+    koBtn = ko.find("chat-code-copy");
+  assert.equal(koLang.textContent, "코드");
+  assert.equal(koWrapBtn.attrs["aria-label"], "줄 바꿈 켜기");
+  koWrapBtn.click();
+  assert.equal(koWrapBtn.attrs["aria-label"], "줄 바꿈 끄기");
+  assert.equal(koBtn.textContent, "복사");
+  koBtn.click();
+  await flush();
+  assert.equal(ko.copied.at(-1), "echo 안녕");
+  assert.equal(koBtn.dataset.copied, "true");
+  assert.equal(koBtn.textContent, "복사됨");
+  ko.dispose();
+  console.log(
+    "PASS mobile code block normalization, wrap toggle, individual copy, and streaming-preserved 1.5s Copied feedback",
+  );
+}
+
+async function messageRowsFoldingAndReasoning() {
+  const short8Lines = Array.from({ length: 8 }, (_, i) => `line ${i + 1}`).join(
+      "\n",
+    ),
+    long9Lines = Array.from({ length: 9 }, (_, i) => `line ${i + 1}`).join("\n"),
+    exact600 = "a".repeat(600),
+    over601 = "a".repeat(601);
+  const f = fixture({ lang: "en" });
+  await flush();
+  await f.poll({
+    generation: "g-rows",
+    agent: "claude",
+    bound: true,
+    next_offset: 6,
+    items: [
+      { id: "u-short", kind: "user", text: short8Lines },
+      { id: "u-exact", kind: "user", text: exact600 },
+      { id: "u-9lines", kind: "user", text: long9Lines },
+      { id: "u-601", kind: "user", text: over601 },
+      {
+        id: "r-1",
+        kind: "reasoning",
+        text: "Thinking step one",
+        status: "completed",
+      },
+      { id: "a-1", kind: "assistant", text: "Done." },
+    ],
+  });
+
+  // User & assistant rows never emit <header class="chat-role"> in DOM.
+  assert.equal(
+    f.root.descendants().filter((n) => n.className === "chat-role").length,
+    0,
+    "user and assistant cards emit no chat-role header in DOM",
+  );
+  const userCards = f.root
+    .descendants()
+    .filter((n) => n.className === "chat-card chat-user");
+  assert.equal(userCards.length, 4);
+  for (const card of userCards) {
+    assert.equal(card.children[0].className, "chat-user-bubble");
+    assert.equal(card.children[1].className, "chat-meta");
+  }
+  assert.equal(
+    userCards[0].descendants().some((n) => n.className === "chat-user-fold"),
+    false,
+    "8-line user prompt is not folded",
+  );
+  assert.equal(
+    userCards[1].descendants().some((n) => n.className === "chat-user-fold"),
+    false,
+    "600-char user prompt is not folded",
+  );
+  const fold9 = userCards[2]
+      .descendants()
+      .find((n) => n.className === "chat-user-fold"),
+    toggle9 = userCards[2]
+      .descendants()
+      .find((n) => n.className === "ghost small chat-user-fold-toggle"),
+    fold601 = userCards[3]
+      .descendants()
+      .find((n) => n.className === "chat-user-fold"),
+    toggle601 = userCards[3]
+      .descendants()
+      .find((n) => n.className === "ghost small chat-user-fold-toggle");
+  assert(fold9 && toggle9, "9-line user prompt folds");
+  assert(fold601 && toggle601, "601-char user prompt folds");
+  assert.equal(fold9.dataset.folded, "true");
+  assert.equal(toggle9.textContent, "Show full message");
+  assert.equal(toggle9.attrs["aria-expanded"], "false");
+  toggle9.click();
+  assert.equal(fold9.dataset.folded, "false");
+  assert.equal(toggle9.textContent, "Show less");
+  assert.equal(toggle9.attrs["aria-expanded"], "true");
+  assert.equal(f.entry.disclosures.get("user:g-rows:u-9lines"), true);
+
+  // Non-incremental update keeps user fold disclosure.
+  await f.poll({
+    generation: "g-rows",
+    agent: "claude",
+    bound: true,
+    reset: true,
+    next_offset: 7,
+    items: [
+      { id: "u-9lines", kind: "user", text: long9Lines },
+      {
+        id: "r-1",
+        kind: "reasoning",
+        text: "Thinking step one",
+        status: "completed",
+      },
+      { id: "a-2", kind: "assistant", text: "Follow-up" },
+    ],
+  });
+  const toggleAfter = f.find("ghost small chat-user-fold-toggle"),
+    foldAfter = f.find("chat-user-fold");
+  assert.equal(foldAfter.dataset.folded, "false");
+  assert.equal(toggleAfter.textContent, "Show less");
+
+  // Reasoning single-line disclosure (brain SVG + Thought/Reasoning + chevron) + 22px indented body.
+  const reasonCard = f.find("chat-card chat-reasoning"),
+    reasonDetails = f.find("chat-reasoning");
+  assert(reasonCard && reasonDetails && reasonDetails.tag === "details");
+  assert.equal(reasonDetails.children.length, 1);
+  assert.equal(
+    reasonDetails.children[0].children[0].className,
+    "chat-reasoning-icon",
+  );
+  assert(
+    reasonDetails.children[0].children[0]
+      .descendants()
+      .some((n) => n.tag === "svg"),
+  );
+  assert.equal(
+    reasonDetails.children[0].children[1].className,
+    "chat-reasoning-headline",
+  );
+  assert.equal(reasonDetails.children[0].children[1].textContent, "Thought");
+  assert.equal(
+    reasonDetails.children[0].children[2].className,
+    "chat-reasoning-caret",
+  );
+  reasonDetails.open = true;
+  reasonDetails.dispatchEvent(new Event("toggle"));
+  assert.equal(reasonDetails.children.length, 2);
+  assert.equal(reasonDetails.children[1].className, "chat-reasoning-body");
+  f.dispose();
+
+  // Korean labels and optimistic "Sending…" status.
+  const sending = deferred();
+  const ko = fixture({
+    lang: "ko",
+    handler: async (req) =>
+      req.action === "prompt"
+        ? sending.promise
+        : { generation: "g-k", agent: "claude", bound: true, items: [], next_offset: 0 },
+  });
+  await flush();
+  ko.input("가".repeat(601));
+  ko.submit();
+  const opt = ko.find("chat-card chat-user chat-optimistic");
+  assert.equal(opt.dataset.phase, "sending");
+  assert.equal(
+    opt.descendants().find((n) => n.className === "chat-optimistic-status")
+      ?.textContent,
+    "전송 중…",
+  );
+  assert.equal(
+    opt.descendants().find((n) => n.className === "ghost small chat-user-fold-toggle")
+      ?.textContent,
+    "전체 메시지 보기",
+  );
+  sending.resolve({ sent: true });
+  await flush();
+  assert.equal(opt.dataset.phase, "accepted");
+  assert.equal(
+    opt.descendants().find((n) => n.className === "chat-optimistic-status"),
+    undefined,
+  );
+  ko.dispose();
+  console.log(
+    "PASS Orca message rows: no role headers, intrinsic bubble folding, Sending… status, and quiet reasoning disclosure",
+  );
+}
+
+async function workRunProgressElapsedAndPreamble() {
+  // 1) Preamble folding (pre-run & mid-run <=160 scalar single-line) + Korean 160/161 boundary + final answer preservation.
+  const exact160Ko = "가".repeat(160),
+    over161Ko = "가".repeat(161);
+  const foldKo = fixture({ lang: "ko" });
+  await flush();
+  await foldKo.poll({
+    generation: "g1",
+    agent: "claude",
+    bound: true,
+    next_offset: 8,
+    items: [
+      { id: "fu1", kind: "user", text: "확인해서 고쳐줘" },
+      {
+        id: "fp0",
+        kind: "assistant",
+        text: "먼저 관련 파일을 읽고 확인하겠습니다.",
+        at: "2026-11-16T00:00:00Z",
+      },
+      {
+        id: "fc1",
+        kind: "tool_call",
+        tool_id: "ft1",
+        tool_name: "Read",
+        title: "Read chat.js",
+        at: "2026-11-16T00:00:01Z",
+      },
+      {
+        id: "fr1",
+        kind: "tool_result",
+        tool_id: "ft1",
+        text: "function renderItems() {}",
+        at: "2026-11-16T00:00:05Z",
+      },
+      {
+        id: "fp1",
+        kind: "assistant",
+        text: exact160Ko,
+        at: "2026-11-16T00:00:06Z",
+      },
+      {
+        id: "fc2",
+        kind: "tool_call",
+        tool_id: "ft2",
+        tool_name: "Edit",
+        title: "Edit chat.js",
+        at: "2026-11-16T00:00:07Z",
+      },
+      {
+        id: "fr2",
+        kind: "tool_result",
+        tool_id: "ft2",
+        text: "updated",
+        at: "2026-11-16T00:00:12Z",
+      },
+      {
+        id: "ff1",
+        kind: "assistant",
+        text: "모든 수정과 검증을 완료했습니다.",
+        at: "2026-11-16T00:00:13Z",
+      },
+    ],
+  });
+  const foldFeed = foldKo.find("chat-feed");
+  assert.deepEqual(
+    foldFeed.children.map((n) => n.className),
+    ["chat-card chat-user", "chat-tool-run", "chat-card chat-assistant"],
+    "short pre-run and mid-run preambles fold into one work run while final answer stays a body card",
+  );
+  const foldedRun = foldFeed.children[1],
+    finalCard = foldFeed.children[2];
+  assert.equal(foldedRun.dataset.active, undefined);
+  assert.equal(foldedRun.dataset.elapsed, "12s");
+  assert.equal(
+    foldedRun.children[0].textContent,
+    "파일 1개 확인 · 파일 1개 수정 · Edit chat.js · 12s",
+  );
+  assert.deepEqual(
+    foldedRun.children[1].children.map((n) => n.className),
+    [
+      "chat-card chat-work-note",
+      "chat-tool-pair",
+      "chat-card chat-work-note",
+      "chat-tool-pair",
+    ],
+  );
+  assert.equal(foldedRun.children[1].children[0].children[0].textContent, "메모");
+  assert.equal(
+    foldedRun.children[1].children[0].children[1].textContent,
+    "먼저 관련 파일을 읽고 확인하겠습니다.",
+  );
+  assert.equal(
+    foldedRun.children[1].children[2].children[1].textContent,
+    exact160Ko,
+  );
+  // ToolLine rows render inline icon + muted verb + target without badge pills.
+  const firstToolHead =
+    foldedRun.children[1].children[1].children[0].children[0].children[0];
+  assert.equal(firstToolHead.children[0].className, "chat-tool-icon");
+  assert.equal(firstToolHead.children[1].className, "chat-tool-verb");
+  assert.equal(firstToolHead.children[1].textContent, "확인");
+  assert.equal(firstToolHead.children[2].className, "chat-tool-title");
+  assert.equal(
+    firstToolHead.descendants().some((n) => n.className === "badge"),
+    false,
+  );
+  assert(
+    finalCard.descendants().some((n) => n.className === "chat-md"),
+    "final assistant card retains full chat-md body tone",
+  );
+  foldKo.dispose();
+
+  // 2) Reject folding for 161-scalar Korean, multiline, code fence, or markdown block starters.
+  const unfold = fixture({ lang: "en" });
+  await flush();
+  await unfold.poll({
+    generation: "g1",
+    bound: true,
+    next_offset: 9,
+    items: [
+      { id: "na1", kind: "assistant", text: over161Ko },
+      { id: "nc1", kind: "tool_call", tool_name: "Read", file_path: "a.rs" },
+      { id: "na2", kind: "assistant", text: "Check ```js\nx\n``` next" },
+      { id: "nc2", kind: "tool_call", tool_name: "Read", file_path: "b.rs" },
+      { id: "na3", kind: "assistant", text: "- bullet list item" },
+      { id: "nc3", kind: "tool_call", tool_name: "Read", file_path: "c.rs" },
+      { id: "na4", kind: "assistant", text: "# Heading block" },
+      { id: "nc4", kind: "tool_call", tool_name: "Read", file_path: "d.rs" },
+      { id: "na5", kind: "assistant", text: "1. Numbered step" },
+    ],
+  });
+  assert.deepEqual(
+    unfold.find("chat-feed").children.map((n) => n.className),
+    [
+      "chat-card chat-assistant",
+      "chat-tool-run",
+      "chat-card chat-assistant",
+      "chat-tool-run",
+      "chat-card chat-assistant",
+      "chat-tool-run",
+      "chat-card chat-assistant",
+      "chat-tool-run",
+      "chat-card chat-assistant",
+    ],
+    "161-char Korean, codefence, bullet, heading, and trailing solo assistant remain top-level cards",
+  );
+  unfold.dispose();
+
+  // 3) Live streaming: short preamble promotes when tool arrives, active Working header shows m/n + current tool title,
+  //    and completion shows 1m 04s elapsed (or omits elapsed when timestamps are missing/invalid/<1s).
+  let nowMs = Date.parse("2026-11-16T01:00:00Z");
+  class FakeDate extends Date {
+    static now() {
+      return nowMs;
+    }
+  }
+  const live = fixture({ lang: "en", Date: FakeDate });
+  live.state.sessions.get(7).state = "Working";
+  await flush();
+  await live.poll({
+    generation: "g1",
+    bound: true,
+    page_start: 0,
+    next_offset: 2,
+    items: [
+      { id: "lu1", kind: "user", text: "Fix header" },
+      {
+        id: "lp1",
+        kind: "assistant",
+        text: "Reading the chat screen source.",
+        at: "2026-11-16T01:00:00Z",
+      },
+    ],
+  });
+  const liveFeed = live.find("chat-feed");
+  assert.deepEqual(
+    liveFeed.children.map((n) => n.className),
+    ["chat-card chat-user", "chat-card chat-assistant"],
+  );
+
+  nowMs = Date.parse("2026-11-16T01:00:03Z");
+  await live.poll({
+    generation: "g1",
+    bound: true,
+    page_start: 2,
+    next_offset: 3,
+    items: [
+      {
+        id: "lc1",
+        kind: "tool_call",
+        tool_id: "lt1",
+        tool_name: "Read",
+        title: "Read screens/chat.js",
+        at: "2026-11-16T01:00:01Z",
+      },
+    ],
+  });
+  assert.deepEqual(
+    liveFeed.children.map((n) => n.className),
+    ["chat-card chat-user", "chat-tool-run"],
+    "streaming tool call absorbs preceding short preamble into active work run",
+  );
+  const liveRun = liveFeed.children[1];
+  assert.equal(liveRun.dataset.active, "true");
+  assert.equal(liveRun.dataset.progress, "0/1");
+  assert.equal(liveRun.dataset.elapsed, "3s");
+  assert.equal(
+    liveRun.children[0].textContent,
+    "Working · 0/1 · Read screens/chat.js · Read 1 file(s) · 3s",
+  );
+
+  nowMs = Date.parse("2026-11-16T01:00:15Z");
+  await live.poll({
+    generation: "g1",
+    bound: true,
+    page_start: 3,
+    next_offset: 5,
+    items: [
+      {
+        id: "lr1",
+        kind: "tool_result",
+        tool_id: "lt1",
+        text: "ok",
+        at: "2026-11-16T01:00:08Z",
+      },
+      {
+        id: "lc2",
+        kind: "tool_call",
+        tool_id: "lt2",
+        tool_name: "Edit",
+        title: "Edit screens/chat.js",
+        at: "2026-11-16T01:00:10Z",
+      },
+    ],
+  });
+  assert.equal(liveRun.dataset.active, "true");
+  assert.equal(liveRun.dataset.progress, "1/2");
+  assert.equal(liveRun.dataset.elapsed, "15s");
+  assert.equal(
+    liveRun.children[0].textContent,
+    "Working · 1/2 · Edit screens/chat.js · Read 1 file(s) · Changed 1 file(s) · 15s",
+  );
+
+  nowMs = Date.parse("2026-11-16T01:01:05Z");
+  live.state.sessions.get(7).state = "Done";
+  await live.poll({
+    generation: "g1",
+    bound: true,
+    page_start: 5,
+    next_offset: 7,
+    items: [
+      {
+        id: "lr2",
+        kind: "tool_result",
+        tool_id: "lt2",
+        text: "done",
+        at: "2026-11-16T01:01:04Z",
+      },
+      {
+        id: "lf1",
+        kind: "assistant",
+        text: "Header progress and elapsed time are ready.",
+        at: "2026-11-16T01:01:05Z",
+      },
+    ],
+  });
+  assert.deepEqual(
+    liveFeed.children.map((n) => n.className),
+    ["chat-card chat-user", "chat-tool-run", "chat-card chat-assistant"],
+  );
+  assert.equal(liveRun.dataset.active, undefined);
+  assert.equal(liveRun.dataset.progress, undefined);
+  assert.equal(liveRun.dataset.elapsed, "1m 04s");
+  assert.equal(
+    liveRun.children[0].textContent,
+    "Read 1 file(s) · Changed 1 file(s) · Edit screens/chat.js · 1m 04s",
+  );
+  live.dispose();
+
+  // 4) Invalid or sub-second timestamps omit elapsed badge cleanly.
+  const noElapsed = fixture({ lang: "en" });
+  await flush();
+  await noElapsed.poll({
+    generation: "g1",
+    bound: true,
+    next_offset: 2,
+    items: [
+      {
+        id: "ne1",
+        kind: "tool_call",
+        tool_id: "nt1",
+        tool_name: "Bash",
+        title: "git status",
+        at: "not-a-timestamp",
+      },
+      {
+        id: "ne2",
+        kind: "tool_result",
+        tool_id: "nt1",
+        text: "clean",
+        at: "2026-11-16T01:00:00.400Z",
+      },
+    ],
+  });
+  const neRun = noElapsed.find("chat-tool-run");
+  assert.equal(neRun.dataset.elapsed, undefined);
+  assert.equal(neRun.children[0].textContent, "Ran 1 command(s) · git status");
+  noElapsed.dispose();
+  console.log(
+    "PASS work-run progress, elapsed & preamble folding: 160-scalar boundary, active m/n + tool title, 12s/1m 04s elapsed and omission",
+  );
+}
+
+async function effortOrdering() {
+  const f = fixture({
+    capabilities: { chat_composer: true, composer_models: true, model_set: true },
+    handler: async (req) => {
+      if (req.action === "chat_composer")
+        return {
+          agent: "codex",
+          model: "gpt-6.1-sol",
+          effort: "high",
+          effort_supported: true,
+          models: [
+            {
+              id: "gpt-6.1-sol",
+              label: "GPT-6.1 Sol",
+              efforts: ["max", "xhigh", "high", "medium", "low"],
+            },
+          ],
+          efforts: [],
+        };
+      if (req.action === "composer_models")
+        return {
+          supported: true,
+          current: "gpt-6.1-sol",
+          items: [
+            {
+              id: "gpt-6.1-sol",
+              label: "GPT-6.1 Sol",
+              efforts: ["max", "xhigh", "high", "medium", "low"],
+            },
+          ],
+        };
+      return { generation: "g-eff", agent: "codex", bound: true, items: [], next_offset: 0 };
+    },
+  });
+  await flush();
+  f.find("composer-pill").action();
+  await flush();
+  const chips = f
+    .find("chat-composer-options")
+    .children.flatMap((row) => row.children || []);
+  assert.deepEqual(
+    chips.slice(1).map((c) => c.children[0].textContent),
+    ["Low", "Medium", "High", "Extra high", "Max"],
+    "effort chips sort lowest-to-highest even when backend reports highest-first",
+  );
+  f.dispose();
+  console.log("PASS effort chips sort lowest-to-highest");
+}
 
 async function main() {
+  await codeBlockHeaderWrapAndCopy();
+  await messageRowsFoldingAndReasoning();
+  await effortOrdering();
   await require("./chat_release_ui.cjs")({fixture,flush,deferred,scroll,historyPage});
   await workRunCoalescing();
+  await workRunProgressElapsedAndPreamble();
   await liveQuestionSheet();
   await recoveryPaint();
   await recoveryOwnership();
@@ -4268,6 +5051,151 @@ async function agyStartupAndModelApplyUx() {
   f.dispose();
   console.log(
     "PASS agy startup reload, 1.5s boot probe, cold picker Loading…/note, Applying… lock, and confirmed effort retention",
+  );
+
+  // OWE-1349: Working turns switch Send to Stop, send a single interrupt RPC, ignore double-taps, lock duplicate taps, and preserve drafts.
+  {
+    const stopChat = fixture({
+      capabilities: { chat_interrupt: true },
+      handler: async (req) => {
+        if (req.action === "chat_poll")
+          return {
+            generation: "g-stop",
+            agent: "claude",
+            bound: true,
+            items: [],
+            next_offset: req.offset,
+          };
+        if (req.action === "interrupt") return { interrupted: true };
+        return { sent: true };
+      },
+    });
+    await flush();
+    const sendBtn = stopChat.find("primary composer-send");
+    assert.equal(sendBtn.dataset.mode, "send");
+    assert.equal(sendBtn.type, "submit");
+    assert.equal(sendBtn.attrs["aria-label"], "Send");
+    assert.equal(sendBtn.textContent, "Send");
+
+    stopChat.input("작성 중인 모바일 초안");
+    stopChat.state.sessions.set(7, {
+      id: 7,
+      state: "Working",
+      state_since_unix_ns: "1001",
+      cwd: "/work",
+    });
+    stopChat.update();
+    await flush();
+
+    assert.equal(sendBtn.dataset.mode, "stop");
+    assert.equal(sendBtn.type, "button");
+    assert.equal(sendBtn.attrs["aria-label"], "Stop");
+    assert.equal(sendBtn.textContent, "Stop");
+    assert.equal(sendBtn.disabled, false);
+
+    // Submitting form while Working must be blocked and preserve the draft.
+    stopChat.submit();
+    await flush();
+    assert(!stopChat.calls.some((c) => c.action === "prompt"));
+    assert.equal(stopChat.find("chat-input").value, "작성 중인 모바일 초안");
+    assert.equal(stopChat.state.drafts.get(7), "작성 중인 모바일 초안");
+
+    // Double-tap (event.detail > 1) must be ignored before latching.
+    const dbl = new Event("click");
+    dbl.detail = 2;
+    sendBtn.dispatchEvent(dbl);
+    await flush();
+    assert.equal(
+      stopChat.calls.filter((c) => c.action === "interrupt").length,
+      0,
+    );
+    assert.equal(sendBtn.disabled, false);
+
+    // First Stop tap sends interrupt RPC once and locks duplicate taps for this Working turn.
+    sendBtn.dispatchEvent(new Event("click"));
+    await flush();
+    assert.equal(
+      stopChat.calls.filter((c) => c.action === "interrupt").length,
+      1,
+    );
+    assert.deepEqual(
+      { ...stopChat.calls.find((c) => c.action === "interrupt") },
+      { action: "interrupt", session: 7 },
+    );
+    assert.equal(sendBtn.disabled, true);
+    assert.equal(stopChat.find("chat-input").value, "작성 중인 모바일 초안");
+    assert.equal(stopChat.state.drafts.get(7), "작성 중인 모바일 초안");
+
+    // Duplicate taps while Working (including after remount) must NOT send a second interrupt.
+    sendBtn.dispatchEvent(new Event("click"));
+    await flush();
+    stopChat.remount();
+    await flush();
+    const remountedBtn = stopChat.find("primary composer-send");
+    assert.equal(remountedBtn.dataset.mode, "stop");
+    assert.equal(remountedBtn.disabled, true);
+    remountedBtn.dispatchEvent(new Event("click"));
+    await flush();
+    assert.equal(
+      stopChat.calls.filter((c) => c.action === "interrupt").length,
+      1,
+    );
+
+    // Leaving Working clears the stop latch and restores Send with the draft intact.
+    stopChat.state.sessions.set(7, {
+      id: 7,
+      state: "Waiting",
+      state_since_unix_ns: "2002",
+      cwd: "/work",
+    });
+    stopChat.update();
+    await flush();
+    assert.equal(remountedBtn.dataset.mode, "send");
+    assert.equal(remountedBtn.type, "submit");
+    assert.equal(remountedBtn.attrs["aria-label"], "Send");
+    assert.equal(remountedBtn.disabled, false);
+    assert.equal(stopChat.find("chat-input").value, "작성 중인 모바일 초안");
+
+    // Entering a new Working turn re-enables Stop for one fresh interrupt.
+    stopChat.state.sessions.set(7, {
+      id: 7,
+      state: "Working",
+      state_since_unix_ns: "3003",
+      cwd: "/work",
+    });
+    stopChat.update();
+    await flush();
+    assert.equal(remountedBtn.dataset.mode, "stop");
+    assert.equal(remountedBtn.disabled, false);
+    remountedBtn.dispatchEvent(new Event("click"));
+    await flush();
+    assert.equal(
+      stopChat.calls.filter((c) => c.action === "interrupt").length,
+      2,
+    );
+    stopChat.dispose();
+
+    // Korean i18n check for Stop label.
+    const koChat = fixture({
+      lang: "ko",
+      capabilities: { chat_interrupt: true },
+    });
+    koChat.state.sessions.set(7, {
+      id: 7,
+      state: "Working",
+      state_since_unix_ns: "4004",
+      cwd: "/work",
+    });
+    koChat.update();
+    await flush();
+    assert.equal(
+      koChat.find("primary composer-send").attrs["aria-label"],
+      "정지",
+    );
+    koChat.dispose();
+  }
+  console.log(
+    "PASS working stop button single interrupt, double-tap guard, duplicate tap latch, draft retention, and next-turn reset",
   );
 }
 main().catch((error) => {
