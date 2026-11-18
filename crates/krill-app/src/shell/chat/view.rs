@@ -1577,7 +1577,6 @@ impl Shell {
         key: ChatKey,
         pane: PaneId,
         pending: &super::PendingChatPrompt,
-        is_last_row: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let palette = ui::palette(cx);
@@ -1725,16 +1724,15 @@ impl Shell {
 
         div()
             .w_full()
+            .min_w_0()
             .flex()
             .justify_center()
-            .pt_3()
-            .when(is_last_row, gpui::Styled::pb_4)
             .child(
                 div()
                     .w_full()
-                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
                     .min_w_0()
-                    .px_3()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb_4()
                     .flex()
                     .flex_col()
                     .items_end()
@@ -1943,16 +1941,9 @@ impl Shell {
                             return div().into_any_element();
                         };
                         let key_for_row = pending_key.clone();
-                        let is_last = row_ix + 1 == total_rows;
                         return owner
                             .update(cx, |this, cx| {
-                                this.render_pending_chat_card(
-                                    key_for_row,
-                                    pane,
-                                    pending_item,
-                                    is_last,
-                                    cx,
-                                )
+                                this.render_pending_chat_card(key_for_row, pane, pending_item, cx)
                             })
                             .unwrap_or_else(|_| div().into_any_element());
                     }

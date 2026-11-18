@@ -1675,8 +1675,8 @@ fn chat_pending_card_renders_orca_intrinsic_bubble_confirms_fifo_and_rebases_acr
         composer.size.width
     );
     assert!(
-        pending_bounds.right() >= composer.right() - px(32.),
-        "pending bubble must align to the right edge of the feed"
+        pending_bounds.right() >= composer.right() - px(4.),
+        "pending bubble must align flush with the right edge of the composer"
     );
 
     // Queue a second optimistic prompt and confirm FIFO with a transcript poll + CHAT_BASE_ORIGIN rebase.
