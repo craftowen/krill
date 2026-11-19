@@ -591,11 +591,13 @@ impl ParsedQuery {
         if self.paths.is_empty() {
             return true;
         }
+        let clean_cwd = strip_windows_verbatim(cwd);
         self.paths.iter().any(|filter| {
-            if krill_proto::agent_history::is_absolute_history_path(filter) {
-                krill_proto::agent_history::path_inside_or_equal(cwd, filter)
+            let clean_filter = strip_windows_verbatim(filter);
+            if krill_proto::agent_history::is_absolute_history_path(&clean_filter) {
+                krill_proto::agent_history::path_inside_or_equal(&clean_cwd, &clean_filter)
             } else {
-                normalize_path(cwd)
+                normalize_path(&clean_cwd)
                     .to_lowercase()
                     .contains(&filter.to_lowercase())
             }
@@ -730,8 +732,65 @@ impl ParsedQuery {
 }
 
 /// Comparison only; never rewrite a transcript's stored filesystem path.
+pub(crate) fn strip_windows_verbatim(path: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = path.trim();
+    for unc_prefix in [r"\\?\", "//?/"] {
+        if let Some(after_qm) = trimmed.strip_prefix(unc_prefix)
+            && let Some((tag, rest)) = after_qm.split_at_checked(4)
+            && (tag.eq_ignore_ascii_case(r"unc\") || tag.eq_ignore_ascii_case("unc/"))
+        {
+            return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+        }
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix(r"\\?\")
+        .or_else(|| trimmed.strip_prefix("//?/"))
+    {
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    std::borrow::Cow::Borrowed(trimmed)
+}
+
+fn split_drive_tail(drive: u8, after_drive: &str) -> Option<String> {
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    let ch = char::from(drive);
+    if after_drive.is_empty() {
+        return Some(format!("{ch}:/"));
+    }
+    after_drive
+        .strip_prefix('/')
+        .or_else(|| after_drive.strip_prefix('\\'))
+        .map(|rest| format!("{ch}:/{rest}"))
+}
+
+/// Comparison only; maps MSYS (`/d/...`) or Cygwin (`/cygdrive/d/...`) drive paths to Windows syntax.
+pub(crate) fn msys_or_cygwin_to_windows(path: &str) -> Option<String> {
+    let s = path.trim();
+    if let Some((prefix, rest)) = s.split_at_checked(10)
+        && prefix.eq_ignore_ascii_case("/cygdrive/")
+    {
+        let drive = *rest.as_bytes().first()?;
+        let after = rest.get(1..)?;
+        return split_drive_tail(drive, after);
+    }
+    if let Some(rest) = s.strip_prefix('/') {
+        let drive = *rest.as_bytes().first()?;
+        let after = rest.get(1..)?;
+        return split_drive_tail(drive, after);
+    }
+    None
+}
+
+/// Comparison only; never rewrite a transcript's stored filesystem path.
 pub(crate) fn normalize_path(path: &str) -> String {
-    krill_proto::agent_history::normalize_path_for_comparison(path)
+    let stripped = strip_windows_verbatim(path);
+    #[cfg(windows)]
+    if let Some(win) = msys_or_cygwin_to_windows(&stripped) {
+        return krill_proto::agent_history::normalize_path_for_comparison(&win);
+    }
+    krill_proto::agent_history::normalize_path_for_comparison(&stripped)
 }
 
 fn one_line(s: &str) -> String {
@@ -3667,5 +3726,16 @@ mod injected_transcript_filter_tests {
         assert_eq!(live_title.as_deref(), Some("실제 질문"));
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn normalize_path_strips_windows_verbatim_prefixes_while_preserving_posix_case() {
+        assert_eq!(normalize_path(r"\\?\D:\work\App\"), "d:/work/app");
+        assert_eq!(
+            normalize_path(r"\\?\UNC\server\share\Repo\"),
+            "//server/share/repo"
+        );
+        assert_eq!(normalize_path("/work/App"), "/work/App");
+        assert_eq!(normalize_path("/work/app"), "/work/app");
     }
 }

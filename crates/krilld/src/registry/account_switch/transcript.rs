@@ -150,6 +150,7 @@ pub(super) fn prepare_bound(
     let to = Path::new(&target.profile_dir);
     // The same profile still has to hold the conversation; it only skips linking.
     let same_profile = from == to
+        || same_file::is_same_file(&from, to).unwrap_or(false)
         || from
             .canonicalize()
             .ok()
@@ -165,31 +166,23 @@ pub(super) fn prepare_bound(
             };
             let root = from.join(base);
             let bound = bound_path.map(Path::new).filter(|path| path.exists());
-            let path = if let Some(path) = bound {
-                let canonical = path.canonicalize()?;
-                if !canonical.starts_with(root.canonicalize()?)
-                    || file_session_id(path, provider)? != id
-                {
+            let (path, rel_sub) = if let Some(path) = bound {
+                let rel_sub = relative_under_root(path, &root)?;
+                if file_session_id(path, provider)? != id {
                     return Err(io::ErrorKind::InvalidData.into());
                 }
-                path.to_path_buf()
+                (path.to_path_buf(), rel_sub)
             } else {
-                find_transcript(&root, provider, id)?.ok_or_else(|| {
+                let path = find_transcript(&root, provider, id)?.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
                         "conversation transcript is not available yet",
                     )
-                })?
+                })?;
+                let rel_sub = relative_under_root(&path, &root)?;
+                (path, rel_sub)
             };
-            // A renamed profile may retain a symlink alias, while its hook reports the
-            // canonical path. Preserve the provider-relative layout in either spelling.
-            let canonical = path.canonicalize()?;
-            let provider_root = root.canonicalize()?;
-            let relative = Path::new(base).join(
-                canonical
-                    .strip_prefix(&provider_root)
-                    .map_err(io::Error::other)?,
-            );
+            let relative = Path::new(base).join(rel_sub);
             let destination = to.join(&relative);
             if !same_profile {
                 link_file(&path, &destination)?;
@@ -453,6 +446,71 @@ fn link_tree(from: &Path, to: &Path, budget: &mut usize) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn has_no_parent_dir(path: &Path) -> bool {
+    !path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+fn relative_under_root(path: &Path, root: &Path) -> io::Result<PathBuf> {
+    let provider_root = match root.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+        Err(e) => return Err(e),
+    };
+    let canonical = path.canonicalize()?;
+    if let Ok(rel) = canonical.strip_prefix(&provider_root) {
+        return Ok(rel.to_path_buf());
+    }
+    // Windows directory junctions (or nested symlinks inside `projects/`) resolve past
+    // `provider_root` during canonicalization even when the transcript resides inside `root`.
+    if !has_no_parent_dir(path)
+        || !has_no_parent_dir(root)
+        || fs::symlink_metadata(path)?.file_type().is_symlink()
+    {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let stripped_path = strip_verbatim_prefix(path);
+    for ancestor in stripped_path.ancestors().skip(1) {
+        if same_file::is_same_file(ancestor, root).unwrap_or(false)
+            && let Ok(rel) = stripped_path.strip_prefix(ancestor)
+        {
+            return Ok(rel.to_path_buf());
+        }
+    }
+    Err(io::ErrorKind::InvalidData.into())
+}
+
+fn copy_new_file(from: &Path, to: &Path) -> io::Result<()> {
+    let mut input = File::open(from)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)?;
+    if let Err(err) = io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
+        drop(output);
+        fs::remove_file(to).ok();
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn link_file(from: &Path, to: &Path) -> io::Result<()> {
     if !fs::symlink_metadata(from)?.is_file() {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -472,6 +530,8 @@ fn link_file(from: &Path, to: &Path) -> io::Result<()> {
                 Err(e)
             }
         }
+        // Profiles on separate Windows drives (`C:` vs `D:`) cannot share a hard link.
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => copy_new_file(from, to),
         Err(e) => Err(e),
     }
 }
@@ -978,6 +1038,89 @@ mod bound_path_tests {
         fs::write(&foreign, fs::read(&path).unwrap()).unwrap();
         assert!(
             matches!(prepare_bound(ProviderKind::Codex, &root, &source, &target, "known", b"", foreign.to_str()), Err(e) if e.kind() == io::ErrorKind::InvalidData)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bound_path_inside_project_junction_or_link_prepares_relative_layout() {
+        let root = std::env::temp_dir().join(format!("kas-proj-link-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let from = root.join("from");
+        let to = root.join("to");
+        let external = root.join("external-proj");
+        fs::create_dir_all(from.join("projects")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::create_dir_all(&external).unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, from.join("projects/proj-a")).unwrap();
+        #[cfg(not(unix))]
+        fs::create_dir_all(from.join("projects/proj-a")).unwrap();
+
+        let id = "11111111-2222-4333-8444-555555555555";
+        let path = from.join("projects/proj-a").join(format!("{id}.jsonl"));
+        fs::write(&path, format!("{{\"sessionId\":\"{id}\"}}\n")).unwrap();
+
+        let source = LaunchAccount {
+            id: "source".into(),
+            env_key: "CLAUDE_CONFIG_DIR".into(),
+            dir: from.display().to_string(),
+        };
+        let target = AccountInfo {
+            id: "target".into(),
+            provider: ProviderKind::Claude,
+            label: "Target".into(),
+            email: None,
+            profile_dir: to.display().to_string(),
+            active: true,
+            host_default: false,
+            stale: false,
+            usage: krill_proto::usage::Snapshot::default(),
+        };
+        prepare_bound(
+            ProviderKind::Claude,
+            &root,
+            &source,
+            &target,
+            id,
+            b"",
+            path.to_str(),
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            fs::read(to.join("projects/proj-a").join(format!("{id}.jsonl"))).unwrap()
+        );
+        // A file symlink claiming to sit under `projects/` must still be rejected.
+        #[cfg(unix)]
+        {
+            let outside = root.join("outside.jsonl");
+            fs::write(&outside, format!("{{\"sessionId\":\"{id}\"}}\n")).unwrap();
+            let symlinked = from.join("projects/proj-a/linked.jsonl");
+            std::os::unix::fs::symlink(&outside, &symlinked).unwrap();
+            assert!(matches!(
+                prepare_bound(
+                    ProviderKind::Claude,
+                    &root,
+                    &source,
+                    &target,
+                    id,
+                    b"",
+                    symlinked.to_str(),
+                ),
+                Err(e) if e.kind() == io::ErrorKind::InvalidData
+            ));
+        }
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\Users\alice\.claude\projects")),
+            Path::new(r"C:\Users\alice\.claude\projects")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\.claude")),
+            Path::new(r"\\server\share\.claude")
         );
         fs::remove_dir_all(root).unwrap();
     }

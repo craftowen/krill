@@ -282,6 +282,7 @@ async function main(){
  port.scrollLeft=50;const touch=(type,x,y)=>event(port,type,{touches:x==null?[]:[{clientX:x,clientY:y}]});
  touch('touchstart',200,400);let te=touch('touchmove',190,330);assert.equal(te.defaultPrevented,false);touch('touchmove',150,200);assert.equal(port.scrollLeft,50);touch('touchend');
  touch('touchstart',200,400);te=touch('touchmove',190,398);assert(te.defaultPrevented);te=touch('touchmove',120,390);assert(te.defaultPrevented);assert.equal(port.scrollLeft,130);touch('touchend');
+ handle.loadHistory();{const hr=T.reader(socket.sent.filter(a=>a[4]===0x12).at(-1).slice(5));socket.frame(0x26,T.v(hr.n()),T.v(0),T.v(0),T.v(0),T.v(0));}
  socket.frame(0x2b,Uint8Array.of(0),T.v(18));socket.autoAck=true;touch('touchstart',200,100);touch('touchmove',200,110);te=touch('touchmove',201,170);assert(te.defaultPrevented);touch('touchend');await flush();assert.match(inputs(socket).join(''),/^(\x1b\[<64;\d+;\d+M)+$/);socket.autoAck=false;socket.sent.length=0;socket.frame(0x2b,Uint8Array.of(0),T.v(0));
  te=event(port,'wheel',{deltaX:30,deltaY:2});assert(te.defaultPrevented);assert.equal(port.scrollLeft,160);event(port,'wheel',{deltaX:1,deltaY:40});assert.equal(port.scrollLeft,160);
  socket.autoAck=true;for(let i=0;i<5;i++){socket.screen(`flow ${i} `+'w'.repeat(70));await advance(16);}await handle.sendKey('enter');assert.equal(port.scrollLeft,160);
@@ -341,10 +342,148 @@ async function main(){
  await testTextLayer();
  await testLivePreviewAndHeldIme();
  // 스크롤 관성·휠 경로는 가상 시계를 performance.now에도 물려 결정적으로 검사한다.
- context.performance={now:()=>clock};try{await testTuiScrollRouting();await testShortCanvasScroll();await testScrollPhysics();await testHistoryRefreshMerge();await testInitialAndQueuedHistoryScroll();}finally{delete context.performance;}
+ context.performance={now:()=>clock};try{await testTuiScrollRouting();await testShortCanvasScroll();await testScrollPhysics();await testHistoryRefreshMerge();await testInitialAndQueuedHistoryScroll();await testFeedback2And5Regressions();}finally{delete context.performance;}
  await testKeyboardKeepsLiveView();
  await testFrozenRoleReply();
  console.log('All terminal adapter regression checks passed.');
+}
+async function testFeedback2And5Regressions(){
+ // Feedback #2: keyboardOpen=true (e.g. Android dynamic toolbar or another field) while THIS terminal's input is unfocused must still focus on tap.
+ {
+  const {root,handle,socket}=await mount(2201,{preferences:{inputMode:'direct',fitToPhone:false}});
+  socket.autoAck=true;
+  const capture=find(root,'live-capture'),live=find(root,'show-keyboard'),body={tagName:'BODY'};
+  let focused=0,blurred=0;
+  capture.addEventListener('focus',()=>{focused++;context.document.activeElement=capture;});
+  capture.addEventListener('blur',()=>{blurred++;context.document.activeElement=body;});
+  context.document.activeElement=body;
+  viewport.height=544;event(viewport,'resize');await advance(16);
+  assert.equal(root.dataset.keyboardOpen,'true');
+  assert.equal(live.getAttribute('aria-pressed'),'false');
+  event(live,'click');
+  assert.equal(focused,1,'tapping Show keyboard while keyboardOpen=true and unfocused must focus this terminal');
+  assert.equal(blurred,0);
+  assert.equal(live.getAttribute('aria-pressed'),'true');
+  event(live,'click');
+  assert.equal(blurred,1,'tapping Show keyboard while this terminal actually has focus blurs it');
+  context.document.activeElement=null;
+  viewport.height=844;event(viewport,'resize');await advance(16);
+  handle.unmount();
+ }
+ // Feedback #2: tapping Show keyboard before ready completes keeps input armed once ready arrives.
+ {
+  const root=new Element('div'),handle=context.mountFixture(root,2202,{preferences:{inputMode:'direct',fitToPhone:false}});
+  await flush();
+  const socket=context.sockets.at(-1),capture=find(root,'live-capture'),live=find(root,'show-keyboard');
+  event(live,'click');
+  socket.handshake();socket.screen('ready now');socket.autoAck=true;await flush();
+  capture.value='hi';event(capture,'input');await flush();
+  assert.deepEqual(inputs(socket),['hi'],'input tapped before ready must send once ready arrives without toggling Chat');
+  handle.unmount();
+ }
+ // Feedback #2: if capture stayed activeElement across hidden->visible or inputActive(false)->true, inputArmed re-arms on recovery.
+ {
+  const {root,handle,socket}=await mount(2203,{preferences:{inputMode:'direct',fitToPhone:false}});
+  socket.autoAck=true;
+  const capture=find(root,'live-capture');
+  context.document.visibilityState='hidden';
+  context.document.activeElement=capture;
+  capture.focus();
+  context.document.visibilityState='visible';
+  context.document.dispatchEvent(new Event('visibilitychange'));
+  await flush();
+  capture.value='ok';event(capture,'input');await flush();
+  assert.deepEqual(inputs(socket),['ok'],'capture focused while hidden re-arms once visible');
+  handle.setInputActive(false);
+  context.document.activeElement=capture;
+  handle.setInputActive(true);
+  capture.value='active';event(capture,'input');await flush();
+  assert.deepEqual(inputs(socket),['ok','active'],'capture retaining focus across setInputActive re-arms');
+  context.document.activeElement=null;
+  handle.unmount();
+ }
+ // Feedback #5a: normal screen (!alt) with SGR mouse enabled must NOT hijack vertical touch scroll when scrollable or history exists/can load.
+ {
+  const {root,handle,socket}=await mount(2204,{preferences:{fitToPhone:false}});
+  const port=find(root,'terminal-scroll');
+  port.clientHeight=400;port.scrollHeight=2000;port.scrollTop=1600;
+  socket.frame(0x2b,Uint8Array.of(0),T.v(4|16));
+  const beforeInputs=inputs(socket).length,beforeHist=socket.sent.filter(a=>a[4]===0x12).length;
+  event(port,'touchstart',{touches:[{clientX:150,clientY:100}]});
+  const mv1=event(port,'touchmove',{touches:[{clientX:150,clientY:102}]});
+  const mv2=event(port,'touchmove',{touches:[{clientX:150,clientY:160}]});
+  event(port,'touchend',{touches:[]});
+  assert.equal(mv1.defaultPrevented,false,'normal screen does not preventDefault before axis lock when scrollable/history exists');
+  assert.equal(mv2.defaultPrevented,false,'normal screen vertical touch does not hijack native scroll into SGR');
+  assert.equal(inputs(socket).length,beforeInputs,'no SGR wheel bytes sent in normal screen when history/scroll exists');
+  assert.equal(socket.sent.filter(a=>a[4]===0x12).length,beforeHist+1,'upward pull still requests history refresh');
+  handle.unmount();
+ }
+ // Feedback #5b: remoteScroll returning false (e.g. contextBlocked or !ready) must NOT count as reported===true or lock scroll.
+ {
+  const {root,handle,socket}=await mount(2205,{preferences:{fitToPhone:false}});
+  const port=find(root,'terminal-scroll'),capture=find(root,'live-capture');
+  port.clientHeight=400;port.scrollHeight=400;
+  socket.frame(0x2b,Uint8Array.of(0),T.v(4|16|64));
+  handle.focus();capture.value='a';event(capture,'input');
+  socket.frame(0x27,T.v(1),T.v(2));await flush();
+  event(port,'touchstart',{touches:[{clientX:150,clientY:100}]});
+  const mv1=event(port,'touchmove',{touches:[{clientX:150,clientY:102}]});
+  const mv2=event(port,'touchmove',{touches:[{clientX:150,clientY:160}]});
+  event(port,'touchend',{touches:[]});
+  assert.equal(mv1.defaultPrevented,false);
+  assert.equal(mv2.defaultPrevented,false,'contextBlocked remoteScroll false does not lock touch scroll');
+  const wh=event(port,'wheel',{deltaX:0,deltaY:-30,deltaMode:0});
+  assert.equal(wh.defaultPrevented,false,'contextBlocked wheelRemote does not swallow wheel');
+  handle.unmount();
+ }
+  // Feedback #5c: disconnect / visibility hidden / blur / send failure / routeChange clear stuck historyPending, historyReplacing, touching, pinching.
+ {
+  const {root,handle,socket}=await mount(2206,{preferences:{fitToPhone:false}});
+  const port=find(root,'terminal-scroll'),layer=find(root,'terminal-text'),canvas=find(root,'terminal-grid');
+  port.clientHeight=400;port.scrollHeight=1000;port.scrollTop=600;
+  event(port,'touchstart',{touches:[{clientX:100,clientY:150},{clientX:200,clientY:250}]});
+  event(port,'touchmove',{touches:[{clientX:50,clientY:100},{clientX:250,clientY:300}]});
+  event(globalEvents,'blur');
+  assert.equal(canvas.style.transform,'','window blur resets interrupted pinch transform');
+  event(port,'touchstart',{touches:[{clientX:150,clientY:200}]});
+  context.document.visibilityState='hidden';
+  context.document.dispatchEvent(new Event('visibilitychange'));
+  await flush();
+  context.document.visibilityState='visible';
+  context.document.dispatchEvent(new Event('visibilitychange'));
+  await flush();
+  socket.screen('after blur touch');await advance(16);
+  assert.match(layer.children[0].textContent,/^after blur touch/,'interrupted touch no longer freezes textLayer syncText');
+  handle.loadHistory(false,true);
+  socket.close();
+  // Send failure in loadHistory must not leave historyPending/historyReplacing wedged.
+  const sendErrRoot=new Element('div'),sendErrHandle=context.mountFixture(sendErrRoot,2208,{preferences:{fitToPhone:false}});
+  await flush();const errSock=context.sockets.at(-1);errSock.handshake();errSock.screen('s0');await flush();
+  const origSend=errSock.send.bind(errSock);let failHistory=true;
+  errSock.send=data=>{if(failHistory&&data instanceof Uint8Array&&data[4]===0x12)throw Error('boom');return origSend(data);};
+  assert.throws(()=>sendErrHandle.loadHistory(false,true),/boom/);
+  failHistory=false;
+  sendErrHandle.loadHistory();
+  assert.equal(errSock.sent.filter(a=>a[4]===0x12).length,1,'loadHistory recovers after synchronous send failure');
+  sendErrHandle.unmount();
+  // Reconnect via onRouteChange on the same Terminal instance while historyPending is in flight recovers loadHistory.
+  let triggerRoute;
+  const rcRoot=new Element('div'),rcHandle=context.mountFixture(rcRoot,2209,{preferences:{fitToPhone:false},onRouteChange:fn=>{triggerRoute=fn;return()=>{};}});
+  await flush();const rcSock1=context.sockets.at(-1);find(rcRoot,'terminal-scroll').clientHeight=400;
+  rcSock1.handshake();rcSock1.screen('s1');await flush();
+  assert.equal(rcSock1.sent.filter(a=>a[4]===0x12).length,1);
+  triggerRoute();await flush();
+  const rcSock2=context.sockets.at(-1);assert.notEqual(rcSock2,rcSock1);
+  rcSock2.handshake();rcSock2.screen('s2');await flush();
+  assert.equal(rcSock2.sent.filter(a=>a[4]===0x12).length,1,'reconnect clears previous historyPending so new connection loads history');
+  await advance(10001);
+  rcHandle.loadHistory();
+  assert.equal(rcSock2.sent.filter(a=>a[4]===0x12).length,2,'stale historyPending recovers after timeout');
+  rcHandle.unmount();
+  handle.unmount();
+ }
+ console.log('PASS Feedback #2 & #5 regressions: keyboard focus with inset, pre-ready/hidden focus, normal-screen scroll, false remoteScroll, gesture/history reset');
 }
 async function testKeyboardKeepsLiveView(){
  // 인라인 TUI가 화면 위쪽만 쓰면 키보드가 열려도 맨 아래(빈 행)로 갈 수 없다. 커서가 보이면 라이브다.
@@ -438,7 +577,7 @@ async function testTuiScrollRouting(){
  const offP=handle.fitToPhone(false);socket.frame(0x2c,T.v(0));await offP;
  port.clientHeight=432;top=0;
  modes(4|16);assert.equal(root.dataset.alt,'false');assert.equal(hist.hidden,false);assert.equal(controls.hidden,false);assert.equal(top,1832,'leaving ALT follows live output again');
- base=inputs(socket).length;drag(100,160);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){4}$/,'inline mouse TUI owns a gesture that starts on live output');assert.equal(requests().length,n);
+ base=inputs(socket).length;e=drag(100,160);assert.equal(e.defaultPrevented,false);assert.equal(since(base),'','normal screen with history keeps native scroll instead of sending SGR wheel');assert.equal(requests().length,n+1,'normal screen pull refreshes history');reply(5000,0,100);
  // At the bottom, a short live canvas can share the viewport with history.
  // Ownership follows the finger/wheel position, not just the viewport offset.
  grid.getBoundingClientRect=()=>({top:250,left:0});base=inputs(socket).length;
@@ -458,6 +597,7 @@ async function testShortCanvasScroll(){
   const {root,handle,socket}=await mount(2100+flags+extra,{preferences:{fitToPhone:false}}),port=find(root,'terminal-scroll');let top=0;
   port.clientHeight=432+extra;port.scrollHeight=port.clientHeight;Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,port.scrollHeight-port.clientHeight));}});
   if(fit){const pending=handle.fitToPhone(true);socket.frame(0x2c,T.v(0));await pending;}
+  if(!(flags&64)){handle.loadHistory();const hr=T.reader(socket.sent.filter(a=>a[4]===0x12).at(-1).slice(5));socket.frame(0x26,T.v(hr.n()),T.v(0),T.v(0),T.v(0),T.v(0));}
   socket.frame(0x2b,Uint8Array.of(0),T.v(flags));const n=inputs(socket).length;
   const touch=(type,y)=>event(port,type,{touches:y==null?[]:[{clientX:150,clientY:y}]});
   touch('touchstart',100);touch('touchmove',130);touch('touchend');touch('touchstart',150);touch('touchmove',120);touch('touchend');

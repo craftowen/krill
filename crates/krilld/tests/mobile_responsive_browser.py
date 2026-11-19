@@ -30,10 +30,14 @@ MEASURE = """(()=>{
  const controls=[...scope.querySelectorAll('button,summary,.key-label')].filter(visible).map(n=>({name:n.getAttribute('aria-label')||n.textContent.trim(),compact:!!n.closest('.session.screen>.page-header,.session-tabs,.chat-status-row,.command-dock,.quick-actions-manager,.quick-actions-list')||n.classList.contains('quick-command-add'),...rect(n)}));
  const reading=[...document.querySelectorAll('.home-list,.workspace-list,.settings-list,.detail-list,.connection-log')].filter(visible).map(n=>({name:n.className,...rect(n)}));
  const overflow=[...document.querySelectorAll('#route-root,.screen,.home-list,.workspace-list,.settings-list,.detail-list,.connection-log,.chat-view,.chat-feed,.command-dock')].filter(visible).filter(n=>n.scrollWidth>n.clientWidth+1).map(n=>({name:n.className||n.id,scroll:n.scrollWidth,client:n.clientWidth}));
+ const app=document.getElementById('mobile-app');
+ const tabBar=document.querySelector('.tab-bar');
+ const wsBar=document.querySelector('.workspace-bottom-bar');
  const dock=document.querySelector('.terminal-mount:not([hidden]) .command-dock');
+ const composer=document.querySelector('.chat-view:not([hidden]) .chat-composer');
  const conversation=document.querySelector('.chat-view');
  const headerControls=[...document.querySelectorAll('.page-header button,.home-topbar button')].filter(visible).map(rect);
- return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,controls,reading,overflow,headerControls,conversation:conversation?rect(conversation):null,sheet:dialog?.classList.contains('sheet')?rect(dialog):null,scanner:dialog?.classList.contains('scanner')?rect(dialog):null,dock:dock?rect(dock):null};
+ return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,controls,reading,overflow,headerControls,app:app?rect(app):null,tabBar:tabBar&&visible(tabBar)?rect(tabBar):null,wsBar:wsBar&&visible(wsBar)?rect(wsBar):null,composer:composer&&visible(composer)?rect(composer):null,conversation:conversation?rect(conversation):null,sheet:dialog?.classList.contains('sheet')?rect(dialog):null,scanner:dialog?.classList.contains('scanner')?rect(dialog):null,dock:dock?rect(dock):null};
 })()"""
 
 
@@ -60,6 +64,14 @@ def problems(m):
                     or abs(scanner['w'] - m['width']) > 1
                     or abs(scanner['h'] - m['height']) > 1):
         issues.append('scanner must fill the viewport')
+    if m.get('app') and m['app']['bottom'] > m['height'] + 1:
+        issues.append('app shell below viewport')
+    if m.get('tabBar') and m['tabBar']['bottom'] > m['height'] + 1:
+        issues.append('tab bar below viewport')
+    if m.get('wsBar') and m['wsBar']['bottom'] > m['height'] + 1:
+        issues.append('workspace bottom bar below viewport')
+    if m.get('composer') and m['composer']['bottom'] > m['height'] + 1:
+        issues.append('chat composer below viewport')
     if m['dock'] and m['dock']['bottom'] > m['height'] + 1:
         issues.append('terminal dock below viewport')
     if m.get('conversation') and m['conversation']['w'] > 1041:
@@ -133,6 +145,10 @@ def main():
                     m = evaluate(MEASURE)
                     m.update(viewport=f'{width}x{height}', screen=name)
                     m['issues'] = problems(m)
+                    if name in ('home-empty', 'home', 'accounts', 'settings', 'accounts-ko-large-light', 'settings-ko-large-light') and not m.get('tabBar'):
+                        m['issues'].append('missing tab bar')
+                    if name in ('workspaces', 'workspaces-ko-large-light') and not m.get('wsBar'):
+                        m['issues'].append('missing workspace bottom bar')
                     results.append(m)
                     folder = shots / m['viewport']
                     folder.mkdir(exist_ok=True)
