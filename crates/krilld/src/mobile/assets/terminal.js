@@ -491,6 +491,7 @@ globalThis.MkTerminalCodec = (() => {
         ? value
         : {};
     } catch {
+      // demock: allow corrupted or inaccessible localStorage falls back to empty UI preferences
       return {};
     }
   }
@@ -711,6 +712,10 @@ globalThis.MkTerminalCodec = (() => {
       this.full = true;
       this.inputId = 0;
       this.historyId = 0;
+      this.historyVersion = 0;
+      this.pan = null;
+      this.pinch = null;
+      this.pinchTimer = null;
       this.pendingInputs = new Map();
       this.pendingRoles = [];
       this.deferredKeys = [];
@@ -1059,13 +1064,12 @@ globalThis.MkTerminalCodec = (() => {
         this.setInputMode(this.inputMode === "direct" ? "buffered" : "direct"),
       );
       this.listen(this.live, "click", () => {
-        if (this.keyboardFocused || this.root.dataset.keyboardOpen === "true") {
+        if (this.hasKeyboardFocus()) {
           this.capture.blur();
           this.command.blur();
         } else this.focus();
       });
 
-      let pan;
       this.listen(
         this.port,
         "wheel",
@@ -1117,7 +1121,6 @@ globalThis.MkTerminalCodec = (() => {
         )
           this.focus();
       });
-      let pinch;
       const distance = (touches) =>
         Math.hypot(
           (touches[0].clientX ?? touches[0].x ?? 0) -
@@ -1146,7 +1149,8 @@ globalThis.MkTerminalCodec = (() => {
         (e) => {
           this.stopMomentum();
           const t = e.touches[0];
-          pan =
+          if (this.pinch && e.touches.length === 1) this.clearPinch();
+          this.pan =
             e.touches.length === 1
               ? {
                   x: t.clientX,
@@ -1155,7 +1159,10 @@ globalThis.MkTerminalCodec = (() => {
                   axis: null,
                   touch: true,
                   live: this.atBottom(),
-                  tui: this.ownsLive(t),
+                  tui:
+                    !this.canScrollHistory() &&
+                    this.canReport() &&
+                    this.ownsLive(t),
                   unscrollable:
                     this.port.scrollHeight > 0 &&
                     this.port.clientHeight > 0 &&
@@ -1166,10 +1173,11 @@ globalThis.MkTerminalCodec = (() => {
                   samples: [{ t: this.now(), x: t.clientX, y: t.clientY }],
                 }
               : null;
-          this.touching = !!pan;
+          this.touching = !!this.pan;
           if (e.touches.length === 2) {
+            this.clearPinch();
             const mid = midpoint(e.touches);
-            pinch = {
+            this.pinch = {
               distance: distance(e.touches),
               scale: this.fontScale,
               midX: mid.x,
@@ -1185,6 +1193,8 @@ globalThis.MkTerminalCodec = (() => {
         this.port,
         "touchmove",
         (e) => {
+          const pan = this.pan,
+            pinch = this.pinch;
           if (pinch && e.touches.length === 2) {
             e.preventDefault();
             const mid = midpoint(e.touches);
@@ -1209,12 +1219,24 @@ globalThis.MkTerminalCodec = (() => {
           pan.samples.push({ t: now, x: p.clientX, y: p.clientY });
           pan.samples = pan.samples.filter((s) => now - s.t <= 80);
 
-          if (!pan.axis && pan.tui && this.remoteRoute() && e.cancelable)
+          if (
+            !pan.axis &&
+            pan.tui &&
+            !this.canScrollHistory() &&
+            this.canReport() &&
+            this.remoteRoute() &&
+            e.cancelable
+          )
             e.preventDefault();
 
           if (!pan.axis && Math.hypot(dx, dy) > 6) {
             pan.axis = this.lockAxis(dx, dy);
-            if (pan.axis === "y" && pan.tui) {
+            if (
+              pan.axis === "y" &&
+              pan.tui &&
+              !this.canScrollHistory() &&
+              this.canReport()
+            ) {
               pan.route = this.claimRoute();
               pan.epoch = this.modeEpoch;
             }
@@ -1227,7 +1249,7 @@ globalThis.MkTerminalCodec = (() => {
             const d = p.clientY - pan.lastY;
             pan.lastY = p.clientY;
             pan.point = p;
-            pan.reported = this.remoteScroll(d, p, pan) !== null;
+            pan.reported = this.remoteScroll(d, p, pan) === true;
             if (pan.reported && e.cancelable) e.preventDefault();
           } else if (pan.axis === "y") {
             pan.lastY = p.clientY;
@@ -1251,7 +1273,7 @@ globalThis.MkTerminalCodec = (() => {
             } else if (
               dy > 6 &&
               !pan.pulled &&
-              !this.alt &&
+              this.canScrollHistory(pan.live) &&
               (pan.live || this.port.scrollTop < this.historyThreshold())
             ) {
               pan.pulled = true;
@@ -1269,8 +1291,9 @@ globalThis.MkTerminalCodec = (() => {
         { passive: false },
       );
       const finish = (e) => {
-        const g = pan;
-        pan = null;
+        const g = this.pan,
+          pinch = this.pinch;
+        this.pan = null;
         this.touching = false;
         if (g && e?.type === "touchend") this.fling(g);
         this.flushText();
@@ -1278,7 +1301,7 @@ globalThis.MkTerminalCodec = (() => {
         const { scale: prevScale, midX, midY } = pinch,
           left = this.port.scrollLeft,
           top = this.port.scrollTop;
-        pinch = null;
+        this.pinch = null;
         this.canvas.style.transform = this.textLayer.style.transform = "";
         this.setFontScale(this.previewScale || this.fontScale);
         const ratio = this.fontScale / prevScale;
@@ -1287,7 +1310,9 @@ globalThis.MkTerminalCodec = (() => {
           this.port.scrollTop = Math.max(0, (top + midY) * ratio - midY);
           this.stick = false;
         }
-        setTimeout(() => {
+        clearTimeout(this.pinchTimer);
+        this.pinchTimer = setTimeout(() => {
+          this.pinchTimer = null;
           this.pinching = false;
         }, 0);
       };
@@ -1663,6 +1688,46 @@ globalThis.MkTerminalCodec = (() => {
       return { lo, hi: Math.max(lo, Math.min(Math.max(top, raw), max)) };
     }
 
+    canScrollHistory(allowRefresh = true) {
+      return (
+        !this.alt &&
+        (!this.historyEnd ||
+          (this.port.scrollHeight || 0) > (this.port.clientHeight || 0) + 1 ||
+          (allowRefresh && this.historyLoadedVersion !== this.historyVersion))
+      );
+    }
+
+    canReport() {
+      return !(
+        this.disposed ||
+        this.retired ||
+        !this.ready ||
+        this.inputActive === false ||
+        !this.isVisible() ||
+        this.contextBlocked ||
+        this.pasteReview
+      );
+    }
+
+    clearPinch() {
+      if (this.pinch) {
+        this.pinch = null;
+        this.canvas.style.transform = this.textLayer.style.transform = "";
+      }
+      clearTimeout(this.pinchTimer);
+      this.pinchTimer = null;
+      this.pinching = false;
+    }
+
+    resetGestures() {
+      this.pan = null;
+      this.touching = false;
+      this.clearPinch();
+      this.wheelGesture = null;
+      this.stopMomentum();
+      this.flushText();
+    }
+
     ownsLive(point) {
       if (this.canvas.hidden) return false;
       if (this.historyElement.hidden) return true;
@@ -1754,20 +1819,11 @@ globalThis.MkTerminalCodec = (() => {
           : e.deltaMode === 2
             ? this.port.clientHeight || 0
             : 1;
-      return this.remoteScroll(-e.deltaY * unit, e, g) !== null;
+      return this.remoteScroll(-e.deltaY * unit, e, g) === true;
     }
 
     report(text) {
-      if (
-        this.disposed ||
-        this.retired ||
-        !this.ready ||
-        this.inputActive === false ||
-        !this.isVisible() ||
-        this.contextBlocked ||
-        this.pasteReview
-      )
-        return false;
+      if (!this.canReport()) return false;
       if (this.historyWindowed) this.returnToLive();
       const bytes = C.enc.encode(text);
       if (!bytes.length || bytes.length > 65536) return false;
@@ -1951,11 +2007,11 @@ globalThis.MkTerminalCodec = (() => {
       for (const input of [this.capture, this.command]) {
         this.listen(input, "focus", () => {
           this.keyboardFocused = true;
-          this.updateLiveInput();
+          this.updateLiveInput(true);
         });
         this.listen(input, "blur", () => {
           this.keyboardFocused = false;
-          this.updateLiveInput();
+          this.updateLiveInput(false);
         });
       }
       this.listen(this.capture, "focus", () => {
@@ -1971,11 +2027,7 @@ globalThis.MkTerminalCodec = (() => {
             .forEach((p) => p.reject(Error("Input target changed")));
         }
         this.resetCapture();
-        this.inputArmed =
-          this.inputActive !== false &&
-          !this.contextBlocked &&
-          !this.pasteReview &&
-          this.isVisible();
+        this.armDirectInput();
       });
       this.listen(this.capture, "blur", () => {
         if (
@@ -2253,7 +2305,9 @@ globalThis.MkTerminalCodec = (() => {
         };
         try {
           localStorage.setItem(UI_KEY, JSON.stringify(value));
-        } catch {}
+        } catch {
+          // demock: allow private browsing or quota errors must not abort input mode switching
+        }
         this.options.onPreferenceChange?.({
           inputMode: mode,
           sessionId: this.session,
@@ -2266,10 +2320,12 @@ globalThis.MkTerminalCodec = (() => {
       return this.inputMode;
     }
 
-    updateLiveInput() {
+    updateLiveInput(focusedOverride) {
       if (!this.liveSubtitle) return;
       const open =
-        !!this.keyboardFocused || this.root.dataset.keyboardOpen === "true";
+        typeof focusedOverride === "boolean"
+          ? focusedOverride
+          : this.hasKeyboardFocus();
       this.live.title = translate(open ? "Hide keyboard" : "Show keyboard");
       this.live.setAttribute("aria-label", this.live.title);
       this.live.setAttribute("aria-pressed", String(open));
@@ -2277,7 +2333,7 @@ globalThis.MkTerminalCodec = (() => {
       this.liveSubtitle.textContent =
         value ||
         translate(
-          this.root.dataset.keyboardOpen === "true"
+          open && this.root.dataset.keyboardOpen === "true"
             ? "Keystrokes send immediately"
             : "Tap to show keyboard",
         );
@@ -2375,9 +2431,9 @@ globalThis.MkTerminalCodec = (() => {
           await p;
         } catch (error) {
           if (generation === this.inputGeneration) {
-            this.contextBlocked = true;
+            const blocked = this.contextBlocked;
             this.invalidateInput();
-            this.recoverButton.hidden = false;
+            if (blocked) this.recoverButton.hidden = false;
           }
           throw error;
         }
@@ -2633,11 +2689,35 @@ globalThis.MkTerminalCodec = (() => {
       this.resetCapture();
       return this.input(bytes);
     }
+    hasKeyboardFocus() {
+      const active = globalThis.document?.activeElement;
+      return active
+        ? active === this.capture || active === this.command
+        : !!this.keyboardFocused;
+    }
+    armDirectInput() {
+      this.inputArmed =
+        !this.disposed &&
+        this.inputMode === "direct" &&
+        this.inputActive !== false &&
+        !this.contextBlocked &&
+        !this.pasteReview &&
+        this.isVisible();
+      return this.inputArmed;
+    }
+    syncFocusedInput() {
+      if (!this.hasKeyboardFocus()) return;
+      this.keyboardFocused = true;
+      if (this.inputMode === "direct") this.armDirectInput();
+      this.updateLiveInput(true);
+    }
     focus() {
-      if (!this.disposed && this.inputActive !== false)
+      if (!this.disposed && this.inputActive !== false) {
         (this.inputMode === "direct" ? this.capture : this.command).focus({
           preventScroll: true,
         });
+        this.syncFocusedInput();
+      }
     }
 
     setInputActive(active) {
@@ -2679,16 +2759,19 @@ globalThis.MkTerminalCodec = (() => {
         this.inactiveInputMode = null;
         this.setInputMode(mode, false);
       }
+      if (active) this.syncFocusedInput();
       this.syncQuestion();
     }
     invalidateInput() {
       this.inputGeneration++;
       this.inputArmed = false;
+      this.keyboardFocused = false;
       this.composing = false;
       this.cancelPaste();
       this.resetCapture();
       this.capture.blur();
       this.command.blur();
+      this.updateLiveInput(false);
       this.stopRepeat();
       this.stopMomentum();
       this.deferredKeys
@@ -2749,7 +2832,10 @@ globalThis.MkTerminalCodec = (() => {
       this.listen(globalThis.document || globalThis, "visibilitychange", () =>
         this.guard(() => this.syncVisibility()),
       );
-      this.listen(globalThis, "blur", () => this.stopRepeat());
+      this.listen(globalThis, "blur", () => {
+        this.stopRepeat();
+        this.resetGestures();
+      });
       viewport(MkKeyboard.inset());
       if (globalThis.ResizeObserver) {
         this.observer = new ResizeObserver(() => {
@@ -2802,7 +2888,7 @@ globalThis.MkTerminalCodec = (() => {
         version = (this.visibilityVersion = (this.visibilityVersion || 0) + 1);
       clearTimeout(this.fitTimer);
       if (!visible) {
-        this.stopMomentum();
+        this.resetGestures();
         this.invalidateInput();
         clearTimeout(this.labelTimer);
         this.labelTimer = null;
@@ -2813,10 +2899,15 @@ globalThis.MkTerminalCodec = (() => {
       } else {
         this.schedule(true);
         if (this.stick) this.scrollBottom();
+        this.expireStaleHistory();
         this.maybeLoadInitialHistory();
+        this.syncFocusedInput();
       }
       if (!this.ready) return;
-      if (this.resizePending) await this.resizePending.catch(() => {});
+      if (this.resizePending)
+        await this.resizePending.catch(() => {
+          // demock: allow caller handles resize errors; visibility sync only waits for settlement
+        });
       if (this.disposed || !this.ready || version !== this.visibilityVersion)
         return;
       if (!visible) {
@@ -3001,6 +3092,7 @@ globalThis.MkTerminalCodec = (() => {
                   this.ready = true;
                   this.previewPending = false;
                   this.updatePreview();
+                  this.syncFocusedInput();
                   this.maybeLoadInitialHistory();
                   if (first && this.autoFit && !this.fit && this.isVisible())
                     this.guard(() => this.fitToPhone(true, false));
@@ -3316,7 +3408,35 @@ globalThis.MkTerminalCodec = (() => {
         ),
       );
     }
+    clearPendingHistory() {
+      const pending = this.historyPending;
+      this.historyPending = null;
+      this.historyReplacing = false;
+      this.historyQueued = null;
+      if (
+        pending &&
+        !this.historyRows.length &&
+        !this.historyEnd &&
+        this.historyLoadedVersion < 0
+      )
+        this.historyNeedsInitialLoad = true;
+      if (this.historyButton) this.historyButton.disabled = this.historyEnd;
+      if (this.historyStatus)
+        this.historyStatus.textContent = translate(
+          this.historyEnd
+            ? "Beginning of saved output"
+            : "Scroll up for earlier output",
+        );
+    }
+    expireStaleHistory() {
+      if (
+        this.historyPending &&
+        this.now() - this.historyPending.started >= 10000
+      )
+        this.clearPendingHistory();
+    }
     maybeLoadInitialHistory() {
+      this.expireStaleHistory();
       if (
         this.historyNeedsInitialLoad &&
         this.ready &&
@@ -3380,6 +3500,7 @@ globalThis.MkTerminalCodec = (() => {
 
     loadHistory(reveal = false, refresh = false, count = 300) {
       if (!this.ready || this.disposed || (this.alt && reveal !== true)) return;
+      this.expireStaleHistory();
       if (this.historyPending) {
         if (reveal === true || refresh)
           this.historyQueued = {
@@ -3419,15 +3540,20 @@ globalThis.MkTerminalCodec = (() => {
       };
       this.historyButton.disabled = true;
       this.historyStatus.textContent = translate("Loading earlier output…");
-      this.send(
-        0x12,
-        C.concat(
-          T.v(req),
-          source === null ? T.v(0) : C.concat(T.v(1), T.v(source)),
-          T.v(skip),
-          T.v(count),
-        ),
-      );
+      try {
+        this.send(
+          0x12,
+          C.concat(
+            T.v(req),
+            source === null ? T.v(0) : C.concat(T.v(1), T.v(source)),
+            T.v(skip),
+            T.v(count),
+          ),
+        );
+      } catch (e) {
+        this.clearPendingHistory();
+        throw e;
+      }
     }
 
     historyRow(row, styled = true) {
@@ -3966,6 +4092,8 @@ globalThis.MkTerminalCodec = (() => {
       clearTimeout(this.fitTimer);
       clearTimeout(this.historyWarmTimer);
       this.historyWarmTimer = null;
+      this.resetGestures();
+      this.clearPendingHistory();
       this.generation++;
       this.ready = false;
       this.inputWaiting = false;
