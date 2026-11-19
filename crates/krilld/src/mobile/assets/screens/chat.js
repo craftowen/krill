@@ -1146,6 +1146,7 @@
     }
     // Snapshot identity changes clear private paint immediately; transient read failures do not.
     let pollQueued = false,
+      refreshPollQueued = false,
       appliedTimer = null;
     function syncReadScope() {
       const sess = state.sessions.get(sessionId),
@@ -1543,7 +1544,7 @@
       paintChoices(warm, warm.length ? undefined : t("Loading…"));
       try {
         const [, data] = await Promise.all([
-          refreshStatus(true).catch(() => {}),
+          refreshStatus(true).catch(() => { /* demock: allow refreshStatus already resets composerStatus/syncAgent; keep picker usable */ }),
           discover("composer_models"),
         ]);
         if (!active() || version !== suggestVersion || scope() !== context)
@@ -1554,7 +1555,7 @@
           !entry.composerStatus?.effort_supported &&
           !entry.composerStatus?.models?.length
         ) {
-          await refreshStatus(true).catch(() => {});
+          await refreshStatus(true).catch(() => { /* demock: allow best-effort effort metadata probe after model discovery */ });
           if (!active() || version !== suggestVersion || scope() !== context)
             return;
         }
@@ -1794,6 +1795,7 @@
       modelBtn.disabled =
         !!entry.modelPending ||
         entry.sending ||
+        !!liveQuestion ||
         state.connection?.phase !== "ready";
       const text = liveQuestion ? t("Answer the current question above") : agent
         ? t("Message {0}", agentName(agent))
@@ -3691,6 +3693,7 @@
         globalThis.document?.visibilityState !== "hidden" &&
         state.connection?.phase === "ready";
       inFlight = true;
+      refreshPollQueued = false;
       try {
         // v0.1.37 이하 데몬은 latest를 모르는 필드로 거부한다. chat_tail이 없는 데몬이 그렇게 거부하면 처음부터 이어 읽는다(빈 화면으로 남기지 않는다).
         if (entry.noTail && state.snapshot?.capabilities?.chat_tail === true)
@@ -3711,8 +3714,13 @@
           entry.generation &&
           res.generation &&
           entry.generation !== res.generation;
+        const canRecover = !!(entry.items.length || entry.latestRecovery);
         // Rebinding also opens at the tail. Keep the current paint until that window is ready.
-        if (!latest && !entry.noTail && (res.reset || changed || !res.bound)) {
+        if (
+          !latest &&
+          !entry.noTail &&
+          (res.reset || changed || (!res.bound && canRecover))
+        ) {
           requestLatest();
           res = await ctx.rpc({
             action: "chat_poll",
@@ -3837,6 +3845,9 @@
         if (retryWithoutTail) {
           retryWithoutTail = false;
           pollNow(initial);
+        } else if (refreshPollQueued) {
+          refreshPollQueued = false;
+          if (!disposed) pollNow();
         } else if (pollQueued) {
           pollQueued = false;
           if (canReadEarlier() && !entry.loaded) pollNow();
@@ -4031,7 +4042,9 @@
       syncTailRunSummary();
       if (isVisible()) {
         if (Date.now() - lastSuccess > 3000) refreshLatest = true;
+        sizeInput(true);
         pinLatest();
+        if (inFlight) refreshPollQueued = true;
         pollNow();
         prefetchEarlier(); refreshStatus();
       }

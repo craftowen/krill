@@ -1812,11 +1812,19 @@
         return;
 
       if (activePane === 1) {
+        if (viewMode === "chat") {
+          closeSplit();
+          go(
+            ctx.groupRoute(state.groups.get(target.groupKey) || group, target.id),
+          );
+          return;
+        }
         stopSecondary();
         splitSession = target;
       } else {
         chatHandle?.unmount();
         chatHandle = null;
+        chatMount.replaceChildren?.();
         session = target;
         selectedId = target.id;
         stateKey = ctx.sessionKey?.(target.id) ?? target.id;
@@ -1824,7 +1832,9 @@
         primaryPane.dataset.session = selectedId;
         refocus = false;
         retryDelay = 1000;
-        attach();
+        if (viewMode === "chat") closeSplit();
+        else attach();
+        syncViewMode();
       }
       syncSplit();
       persistSplit();

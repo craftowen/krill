@@ -1586,6 +1586,167 @@ function testSplitTabReplacement() {
     "PASS third tab replaces either active pane in place, cancels stale retries and preserves the inactive terminal and scroll",
   );
 }
+async function testSplitChatTabSwitchVisibility() {
+  const flush = async () => {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  };
+  const chatMounts = [];
+  const f = fixture(
+    [
+      { id: 7, state: "Working", agent: "claude", cwd: "D:\\work\\repo" },
+      { id: 8, state: "Waiting", agent: "claude", cwd: "D:\\work\\repo" },
+      { id: 9, state: "Done", agent: "claude", cwd: "D:\\work\\repo" },
+    ],
+    {
+      capabilities: { chat_tail: true, chat_composer: true },
+    },
+    true,
+    {},
+    { chat: true },
+  );
+  f.view.cleanup();
+  f.buttons.length = 0;
+  f.sheets.length = 0;
+  f.mounts.length = 0;
+  f.routes.length = 0;
+  f.sandbox.KrillMobile.chat = {
+    mount(mountRoot, opts) {
+      const view = new Element("div", undefined, "chat-view"),
+        feed = new Element("div", undefined, "chat-feed"),
+        composer = new Element("form", undefined, "chat-composer"),
+        input = new Element("textarea", undefined, "chat-input"),
+        send = new Element("button", "Send", "primary composer-send");
+      composer.append(input, send);
+      view.append(feed, composer);
+      mountRoot.replaceChildren(view);
+      const handle = {
+        mountRoot,
+        sessionId: opts.sessionId,
+        visible: !!opts.visible,
+        updates: 0,
+        unmounted: false,
+      };
+      chatMounts.push(handle);
+      return {
+        setVisible(v) {
+          handle.visible = !!v;
+        },
+        setQuestion() {},
+        update() {
+          handle.updates++;
+        },
+        unmount() {
+          handle.unmounted = true;
+        },
+      };
+    },
+  };
+  const root = new Element("main");
+  const view = f.sandbox.KrillMobile.screens.session(root, f.ctx);
+  assert.equal(chatMounts.length, 1);
+  assert.equal(chatMounts[0].sessionId, 7);
+  assert.equal(chatMounts[0].visible, false);
+
+  // Open split terminal (session 7 in pane 0, session 8 in pane 1), keep activePane === 0.
+  f.buttons.find((b) => b.textContent === "Split terminal").action();
+  f.sheets.at(-1)[0].action();
+  const panels = root
+    .descendants()
+    .find((n) => n.className === "session-panels");
+  panels.children[0].dispatchEvent(new Event("pointerdown"));
+
+  // Switching primary tab in split mode must remount chatHandle via syncViewMode()
+  // so chatMount is never left orphaned/empty when switching to Chat later.
+  const tabs = () => root.descendants().filter((n) => n.className === "session-tab");
+  tabs()
+    .find((n) => n.dataset.session === 9)
+    .action();
+  assert.equal(chatMounts[0].unmounted, true);
+  assert.equal(
+    chatMounts.length,
+    2,
+    "selectTab in split mode activePane===0 must remount chatHandle via syncViewMode",
+  );
+  assert.equal(chatMounts[1].sessionId, 9);
+  assert.equal(chatMounts[1].unmounted, false);
+
+  // Toggling to Chat must close split and show .chat-view + .chat-composer for session 9.
+  f.buttons.find((b) => b.textContent === "Chat").action();
+  const chatMount = chatMounts[1].mountRoot;
+  assert.equal(chatMount.hidden, false);
+  assert.equal(panels.hidden, true);
+  assert.equal(chatMounts[1].visible, true);
+  assert(chatMounts[1].updates >= 1);
+  assert(chatMount.descendants().some((n) => n.className === "chat-view"));
+  assert(chatMount.descendants().some((n) => n.className === "chat-composer"));
+  view.cleanup();
+
+  // Integration check with real chat.js: opening split, switching tab 7->9, and switching to Chat renders real composer & view even when unbound.
+  const realRoot = new Element("main");
+  const realSandbox = f.sandbox;
+  realSandbox.Event = Event;
+  realSandbox.navigator = { clipboard: { writeText: async () => {} } };
+  realSandbox.isSecureContext = true;
+  realSandbox.document.body = new Element("body");
+  realSandbox.document.hidden = false;
+  realSandbox.document.visibilityState = "visible";
+  vm.runInContext(
+    fs.readFileSync(
+      path.join(__dirname, "../src/mobile/assets/screens/chat.js"),
+      "utf8",
+    ),
+    realSandbox,
+  );
+  f.buttons.length = 0;
+  f.sheets.length = 0;
+  f.mounts.length = 0;
+  f.ctx.route = { groupKey: "g", sessionId: 7 };
+  f.ctx.rpc = async (req) =>
+    req.action === "chat_poll"
+      ? {
+          generation: "",
+          agent: "claude",
+          bound: false,
+          items: [],
+          next_offset: 0,
+          page_start: 0,
+          has_more: false,
+        }
+      : { supported: false };
+  f.ctx.act = (fn) => Promise.resolve().then(fn);
+  const realView = realSandbox.KrillMobile.screens.session(realRoot, f.ctx);
+  f.buttons.find((b) => b.textContent === "Split terminal").action();
+  f.sheets.at(-1)[0].action();
+  const realPanels = realRoot
+    .descendants()
+    .find((n) => n.className === "session-panels");
+  realPanels.children[0].dispatchEvent(new Event("pointerdown"));
+  realRoot
+    .descendants()
+    .filter((n) => n.className === "session-tab")
+    .find((n) => n.dataset.session === 9)
+    .action();
+  f.buttons.find((b) => b.textContent === "Chat").action();
+  await flush();
+  const realChatView = realRoot
+    .descendants()
+    .find((n) => n.className === "chat-view");
+  const realComposer = realRoot
+    .descendants()
+    .find((n) => n.className === "chat-composer");
+  assert(realChatView, "real .chat-view must exist after split tab switch + Chat");
+  assert(realComposer, "real .chat-composer must exist after split tab switch + Chat");
+  assert.equal(realChatView.parentElement.hidden, false);
+  assert(!realComposer.hidden);
+  assert.equal(
+    realRoot.descendants().find((n) => n.className === "primary composer-send").disabled,
+    false,
+  );
+  realView.cleanup();
+  console.log(
+    "PASS split primary tab switch calls syncViewMode and mounts visible .chat-view + .chat-composer",
+  );
+}
 async function main() {
   await testQuickActions();
   await testDefaultSessionView();
@@ -2485,6 +2646,7 @@ async function main() {
   await testPromptDraftAndInactiveMenu();
   await testHybridChatToggleAndQuestionCards();
   await testInstantCreate();
+  await testSplitChatTabSwitchVisibility();
   await require("./mobile_quick_commands.cjs").main(fixture);
   console.log(
     "PASS Hybrid Chat visibility, chat_poll cards, historical answers remain notes until Terminal review, and current diff modal",
