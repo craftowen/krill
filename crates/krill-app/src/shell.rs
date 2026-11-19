@@ -897,8 +897,8 @@ impl Shell {
             let projects = this.sync_live_cwds(sidebar.read(cx));
             if !projects.is_empty() {
                 sidebar.update(cx, |sidebar, cx| {
-                    for path in projects {
-                        sidebar.register_project(path, cx);
+                    for (host, path) in projects {
+                        sidebar.add_project_on(&host, path, cx);
                     }
                 });
             }
@@ -1693,7 +1693,10 @@ impl Shell {
     /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 재스폰용으로 따로 보관한다(OWE-842 시나리오 B).
     /// 일반 cd는 `layout.launches`의 폴더를 바꾸지 않는다. 프로젝트 생성 작업은 실제 성공 cwd를 확인한 뒤 전환한다.
     /// 재부팅 뒤에도 살아남도록 꼬리(`LayoutTail.respawn_cwds`)로 영속한다.
-    pub(super) fn sync_live_cwds(&mut self, sidebar: &sidebar::Sidebar) -> Vec<PathBuf> {
+    pub(super) fn sync_live_cwds(
+        &mut self,
+        sidebar: &sidebar::Sidebar,
+    ) -> Vec<(krill_app::hosts::HostId, PathBuf)> {
         let mut changed = false;
         let mut projects = std::collections::BTreeSet::new();
         let panes: Vec<PaneId> = (0..self.layout.tabs().len())
@@ -1703,10 +1706,9 @@ impl Shell {
             let Some(sid) = self.layout.session(pane) else {
                 continue;
             };
-            let host = self.layout.host(pane);
-            let is_local = host.is_local();
+            let host = self.layout.host(pane).clone();
             let Some(live_cwd) = sidebar
-                .session_on(host, sid)
+                .session_on(&host, sid)
                 .and_then(|s| s.cwd.as_deref())
                 .filter(|p| !p.as_os_str().is_empty())
             else {
@@ -1721,9 +1723,7 @@ impl Shell {
                 .launch(pane)
                 .and_then(|launch| folder::completed_project(launch, live_cwd))
             {
-                if is_local {
-                    projects.insert(live_cwd.to_path_buf());
-                }
+                projects.insert((host.clone(), live_cwd.to_path_buf()));
                 self.layout.set_launch(pane, completed);
                 changed = true;
             }

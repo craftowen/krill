@@ -587,6 +587,34 @@ pub fn register_project(state_dir: &Path, path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Resolve `(repo_root, worktree_or_folder_path, branch)` on a worker thread and
+/// persist `repo_root` to `<state_dir>/projects.toml` when `path` is an existing directory.
+/// Returns `Ok(Some(...))` even if the project was already registered in `projects.toml`.
+pub fn register_project_resolved(
+    state_dir: &Path,
+    path: &Path,
+) -> io::Result<Option<(PathBuf, PathBuf, Option<String>)>> {
+    let cleaned = path
+        .to_str()
+        .and_then(|s| {
+            krill_proto::orchestration::strip_workspace_instance(s).filter(|_| !path.exists())
+        })
+        .map(PathBuf::from);
+    let path = cleaned.as_deref().unwrap_or(path);
+    let wt_norm = normalize_project_path(path);
+    if wt_norm.is_empty() || !Path::new(&wt_norm).is_dir() {
+        return Ok(None);
+    }
+    let wt = PathBuf::from(&wt_norm);
+    let repo = main_worktree(&wt)
+        .map(|m| PathBuf::from(normalize_project_path(&m)))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| wt.clone());
+    let _ = register_project(state_dir, &wt)?;
+    let branch = super::ipc::branch(&wt);
+    Ok(Some((repo, wt, branch)))
+}
+
 /// linked git 워크트리면 주 워크트리 경로. `.git` 파일 → `gitdir` → `commondir`를 따라간다.
 /// 주 워크트리(`.git` 디렉터리)·서브모듈(`commondir` 없음)·git 아님은 `None`.
 fn main_worktree(path: &Path) -> Option<PathBuf> {

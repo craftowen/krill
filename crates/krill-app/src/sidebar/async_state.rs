@@ -24,7 +24,7 @@ pub(super) struct State {
     pub store: WorktreeStore,
     pub orchestration: OrchestrationStore,
     pub imported: Snapshot,
-    imported_meta: Meta,
+    pub imported_meta: Meta,
     pub folder_updated_at: BTreeMap<PathBuf, u64>,
     /// 워크트리 폴더 생성 시각(ms). `SortBy::Created` 정렬 키.
     pub worktree_created_at: BTreeMap<PathBuf, u64>,

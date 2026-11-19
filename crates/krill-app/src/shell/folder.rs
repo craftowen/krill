@@ -59,6 +59,29 @@ impl Shell {
         program: Program,
         cx: &mut Context<Self>,
     ) {
+        self.new_folder_tab_inner(host, folder, program, false, cx);
+    }
+
+    pub(super) fn open_project_tab_on(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        folder: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_dashboard(None, cx);
+        self.close_settings(None, cx);
+        self.launch_host = host.clone();
+        self.new_folder_tab_inner(host.clone(), folder, Program::Login, true, cx);
+    }
+
+    fn new_folder_tab_inner(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        folder: &std::path::Path,
+        program: Program,
+        add_project: bool,
+        cx: &mut Context<Self>,
+    ) {
         let is_remote = host.is_remote();
         let project_pending = project_destination(&program).is_some();
         let cleaned = (!is_remote)
@@ -72,6 +95,7 @@ impl Shell {
         if matches!(program, Program::Agent { .. }) {
             krill_app::star_nag::record_agent_start(cx);
         }
+        let add_host = (add_project && !project_pending).then(|| host.clone());
         self.change(true, cx, |l| {
             l.new_tab();
             if let Some(pane) = l.focused() {
@@ -90,9 +114,13 @@ impl Shell {
                 );
             }
         });
-        // OWE-852: 로컬 폴더를 열면 projects.toml에 영속 등록해 탭을 닫아도 사이드바에 남긴다.
-        // 원격 호스트 경로는 로컬 projects.toml에 넣지 않는다. 실패해도 탭 열기는 막지 않는다.
-        if !is_remote && !project_pending {
+        if let Some(add_host) = add_host {
+            self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.add_project_on(&add_host, folder.to_owned(), cx);
+            });
+        } else if !is_remote && !project_pending {
+            // OWE-852: 로컬 폴더를 열면 projects.toml에 영속 등록해 탭을 닫아도 사이드바에 남긴다.
+            // 원격 호스트 경로는 로컬 projects.toml에 넣지 않는다. 실패해도 탭 열기는 막지 않는다.
             self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.register_project(folder.to_owned(), cx);
             });
@@ -110,12 +138,7 @@ impl Shell {
             Ok(Ok(Some(paths))) => {
                 if let Some(folder) = paths.into_iter().next() {
                     this.update(cx, |this, cx| {
-                        this.new_folder_tab_on(
-                            krill_app::hosts::HostId::Local,
-                            &folder,
-                            Program::Login,
-                            cx,
-                        );
+                        this.open_project_tab_on(&krill_app::hosts::HostId::Local, &folder, cx);
                     })
                     .ok();
                 }
@@ -151,7 +174,7 @@ impl Shell {
                         }
                     }
                     add_project::Event::OpenPath(host, path) => {
-                        this.new_folder_tab_on(host.clone(), path, Program::Login, cx);
+                        this.open_project_tab_on(host, path, cx);
                     }
                     add_project::Event::Clone { host, url } => {
                         if host.is_local() {
@@ -169,6 +192,8 @@ impl Shell {
                             dir.as_bytes(),
                             parent.as_os_str().as_bytes(),
                         );
+                        this.sidebar
+                            .update(cx, |s, cx| s.reveal_host_filter(host, cx));
                         this.new_folder_tab_on(host.clone(), parent, program, cx);
                     }
                     add_project::Event::Create(host) => {
@@ -190,6 +215,8 @@ impl Shell {
                                 .parent()
                                 .map_or_else(|| PathBuf::from("/"), std::path::Path::to_path_buf),
                         };
+                        this.sidebar
+                            .update(cx, |s, cx| s.reveal_host_filter(host, cx));
                         this.new_folder_tab_on(host.clone(), &parent, program, cx);
                     }
                     add_project::Event::Close => {}
@@ -254,6 +281,9 @@ impl Shell {
                     parent.as_os_str().as_bytes(),
                 );
                 this.update(cx, |this, cx| {
+                    this.sidebar.update(cx, |s, cx| {
+                        s.reveal_host_filter(&krill_app::hosts::HostId::Local, cx);
+                    });
                     this.new_local_project_tab(&parent, program, cx);
                 })
                 .ok();
@@ -270,6 +300,9 @@ impl Shell {
             {
                 let program = init_program(TargetOs::local(), path.as_os_str().as_bytes());
                 this.update(cx, |this, cx| {
+                    this.sidebar.update(cx, |s, cx| {
+                        s.reveal_host_filter(&krill_app::hosts::HostId::Local, cx);
+                    });
                     this.new_local_project_tab(parent, program, cx);
                 })
                 .ok();
@@ -281,13 +314,13 @@ impl Shell {
 
 /// Add Project 명령이 실행될 OS(APP-RUNTIME-006).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TargetOs {
+pub(super) enum TargetOs {
     Unix,
     Windows,
 }
 
 impl TargetOs {
-    fn local() -> Self {
+    pub(super) fn local() -> Self {
         if cfg!(windows) {
             Self::Windows
         } else {
@@ -393,7 +426,7 @@ fn clone_program(target: TargetOs, url: &[u8], dir: &[u8], parent: &[u8]) -> Pro
 }
 
 /// 새 프로젝트 폴더 생성 + `git init`(`git init <경로>`는 폴더를 만든다).
-fn init_program(target: TargetOs, path: &[u8]) -> Program {
+pub(super) fn init_program(target: TargetOs, path: &[u8]) -> Program {
     match target {
         TargetOs::Unix => unix_project(
             r#"mkdir -- "$1" && git -C "$1" init && cd -- "$1""#,
@@ -461,6 +494,24 @@ fn project_destination(program: &Program) -> Option<Vec<u8>> {
         .collect()
 }
 
+fn trim_macos_private_prefix(p: &std::path::Path) -> Option<&std::path::Path> {
+    let rel = p
+        .strip_prefix("/private")
+        .or_else(|_| p.strip_prefix("/"))
+        .ok()?;
+    (rel.starts_with("tmp") || rel.starts_with("var") || rel.starts_with("etc")).then_some(rel)
+}
+
+fn same_completed_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if krill_proto::path::equivalent(a, b) {
+        return true;
+    }
+    matches!(
+        (trim_macos_private_prefix(a), trim_macos_private_prefix(b)),
+        (Some(ra), Some(rb)) if ra == rb
+    )
+}
+
 /// Git 작업이 실제 프로젝트로 이동한 뒤에만 영속 실행 폴더를 바꾼다. 실행 전에는 존재하는 상위 cwd가 필요하다.
 /// 일반 셸의 cd는 워크스페이스를 바꾸지 않는 기존 규칙을 유지한다.
 pub(super) fn completed_project(launch: &Create, live_cwd: &std::path::Path) -> Option<Create> {
@@ -472,7 +523,7 @@ pub(super) fn completed_project(launch: &Create, live_cwd: &std::path::Path) -> 
     } else {
         parent.join(folder)
     };
-    if !krill_proto::path::equivalent(&folder, live_cwd) {
+    if !same_completed_path(&folder, live_cwd) {
         return None;
     }
     let mut completed = launch.clone();
@@ -661,6 +712,12 @@ mod tests {
         for (target, parent, destination, observed) in [
             (TargetOs::Unix, "/work", "/work/new p", "/work/new p"),
             (TargetOs::Unix, "/work", "new p", "/work/new p"),
+            (
+                TargetOs::Unix,
+                "/var/folders/x",
+                "/var/folders/x/new p",
+                "/private/var/folders/x/new p",
+            ),
             (
                 TargetOs::Windows,
                 r"\\nas\share",
