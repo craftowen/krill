@@ -402,21 +402,55 @@ async function testFeedback2And5Regressions(){
   context.document.activeElement=null;
   handle.unmount();
  }
- // Feedback #5a: normal screen (!alt) with SGR mouse enabled must NOT hijack vertical touch scroll when scrollable or history exists/can load.
+ // Feedback #5a: normal screen without active TUI reporting, or with Shift / touch in history above live canvas, must NOT preventDefault or send SGR wheel bytes.
  {
   const {root,handle,socket}=await mount(2204,{preferences:{fitToPhone:false}});
   const port=find(root,'terminal-scroll');
   port.clientHeight=400;port.scrollHeight=2000;port.scrollTop=1600;
+  socket.frame(0x2b,Uint8Array.of(0),T.v(0));
+  const beforeInputs=inputs(socket).length,beforeHist=socket.sent.filter(a=>a[4]===0x12).length;
+  event(port,'touchstart',{touches:[{clientX:150,clientY:100}]});
+  const mv1=event(port,'touchmove',{touches:[{clientX:150,clientY:102}]});
+  const mv2=event(port,'touchmove',{touches:[{clientX:150,clientY:160}]});
+  event(port,'touchend',{touches:[]});
+  assert.equal(mv1.defaultPrevented,false,'normal screen without mouse reporting does not preventDefault before axis lock');
+  assert.equal(mv2.defaultPrevented,false,'normal screen without mouse reporting keeps native scroll');
+  assert.equal(inputs(socket).length,beforeInputs,'no SGR wheel bytes sent when mouse reporting is off');
+  assert.equal(socket.sent.filter(a=>a[4]===0x12).length,beforeHist+1,'upward pull still requests history refresh');
+  handle.unmount();
+ }
+ {
+  const {root,handle,socket}=await mount(22041,{preferences:{fitToPhone:false}});
+  const port=find(root,'terminal-scroll');
+  port.clientHeight=400;port.scrollHeight=2000;port.scrollTop=1600;
+  socket.frame(0x2b,Uint8Array.of(0),T.v(4|16));
+  handle.toggleShift(true);
+  const beforeInputs=inputs(socket).length,beforeHist=socket.sent.filter(a=>a[4]===0x12).length;
+  event(port,'touchstart',{touches:[{clientX:150,clientY:100}]});
+  const mv1=event(port,'touchmove',{touches:[{clientX:150,clientY:102}]});
+  const mv2=event(port,'touchmove',{touches:[{clientX:150,clientY:160}]});
+  event(port,'touchend',{touches:[]});
+  assert.equal(mv1.defaultPrevented,false,'Shift bypasses inline SGR before axis lock');
+  assert.equal(mv2.defaultPrevented,false,'Shift keeps native scroll in inline SGR mode');
+  assert.equal(inputs(socket).length,beforeInputs,'Shift sends no SGR wheel bytes');
+  assert.equal(socket.sent.filter(a=>a[4]===0x12).length,beforeHist+1,'Shift upward pull requests history refresh');
+  handle.unmount();
+ }
+ {
+  const {root,handle,socket}=await mount(22042,{preferences:{fitToPhone:false}});
+  const port=find(root,'terminal-scroll'),grid=find(root,'terminal-grid');
+  port.clientHeight=400;port.scrollHeight=2000;port.scrollTop=1600;
+  grid.getBoundingClientRect=()=>({top:250,left:0});
   socket.frame(0x2b,Uint8Array.of(0),T.v(4|16));
   const beforeInputs=inputs(socket).length,beforeHist=socket.sent.filter(a=>a[4]===0x12).length;
   event(port,'touchstart',{touches:[{clientX:150,clientY:100}]});
   const mv1=event(port,'touchmove',{touches:[{clientX:150,clientY:102}]});
   const mv2=event(port,'touchmove',{touches:[{clientX:150,clientY:160}]});
   event(port,'touchend',{touches:[]});
-  assert.equal(mv1.defaultPrevented,false,'normal screen does not preventDefault before axis lock when scrollable/history exists');
-  assert.equal(mv2.defaultPrevented,false,'normal screen vertical touch does not hijack native scroll into SGR');
-  assert.equal(inputs(socket).length,beforeInputs,'no SGR wheel bytes sent in normal screen when history/scroll exists');
-  assert.equal(socket.sent.filter(a=>a[4]===0x12).length,beforeHist+1,'upward pull still requests history refresh');
+  assert.equal(mv1.defaultPrevented,false,'touch above live canvas in history does not preventDefault');
+  assert.equal(mv2.defaultPrevented,false,'touch above live canvas keeps native scroll');
+  assert.equal(inputs(socket).length,beforeInputs,'touch above live canvas sends no SGR wheel bytes');
+  assert.equal(socket.sent.filter(a=>a[4]===0x12).length,beforeHist+1,'touch above live canvas upward pull requests history refresh');
   handle.unmount();
  }
  // Feedback #5b: remoteScroll returning false (e.g. contextBlocked or !ready) must NOT count as reported===true or lock scroll.
@@ -577,7 +611,7 @@ async function testTuiScrollRouting(){
  const offP=handle.fitToPhone(false);socket.frame(0x2c,T.v(0));await offP;
  port.clientHeight=432;top=0;
  modes(4|16);assert.equal(root.dataset.alt,'false');assert.equal(hist.hidden,false);assert.equal(controls.hidden,false);assert.equal(top,1832,'leaving ALT follows live output again');
- base=inputs(socket).length;e=drag(100,160);assert.equal(e.defaultPrevented,false);assert.equal(since(base),'','normal screen with history keeps native scroll instead of sending SGR wheel');assert.equal(requests().length,n+1,'normal screen pull refreshes history');reply(5000,0,100);
+ base=inputs(socket).length;drag(100,160);assert.match(since(base),/^(\x1b\[<64;\d+;\d+M){4}$/,'inline mouse TUI owns a gesture that starts on live output');assert.equal(requests().length,n);
  // At the bottom, a short live canvas can share the viewport with history.
  // Ownership follows the finger/wheel position, not just the viewport offset.
  grid.getBoundingClientRect=()=>({top:250,left:0});base=inputs(socket).length;

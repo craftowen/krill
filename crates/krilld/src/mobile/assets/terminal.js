@@ -1159,10 +1159,7 @@ globalThis.MkTerminalCodec = (() => {
                   axis: null,
                   touch: true,
                   live: this.atBottom(),
-                  tui:
-                    !this.canScrollHistory() &&
-                    this.canReport() &&
-                    this.ownsLive(t),
+                  tui: this.canReport() && this.ownsLive(t),
                   unscrollable:
                     this.port.scrollHeight > 0 &&
                     this.port.clientHeight > 0 &&
@@ -1222,7 +1219,6 @@ globalThis.MkTerminalCodec = (() => {
           if (
             !pan.axis &&
             pan.tui &&
-            !this.canScrollHistory() &&
             this.canReport() &&
             this.remoteRoute() &&
             e.cancelable
@@ -1231,12 +1227,7 @@ globalThis.MkTerminalCodec = (() => {
 
           if (!pan.axis && Math.hypot(dx, dy) > 6) {
             pan.axis = this.lockAxis(dx, dy);
-            if (
-              pan.axis === "y" &&
-              pan.tui &&
-              !this.canScrollHistory() &&
-              this.canReport()
-            ) {
+            if (pan.axis === "y" && pan.tui && this.canReport()) {
               pan.route = this.claimRoute();
               pan.epoch = this.modeEpoch;
             }
