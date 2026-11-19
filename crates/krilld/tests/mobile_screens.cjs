@@ -689,5 +689,80 @@ async function dropScreen(){
  const w=fixture('workspaces');assert(w.byText('Krill Drop').hidden,'older desktops without drop show no entry');w.state.snapshot.capabilities={drop:true};w.view.update();assert(!w.byText('Krill Drop').hidden);await w.byText('Krill Drop').action();assert.equal(w.routes.at(-1),'/drop');w.abort.abort();
  console.log('PASS Krill Drop screen: inbox path, chunked upload resumed after a lost reply, download shared as a file, remove, empty state and the capability-gated PC entry');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function tabBarAndLayoutContracts(){
+ const css=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.css'),'utf8');
+ const mobileAppRule=css.match(/#mobile-app\{([^}]*)\}/)?.[1]||'';
+ assert(/\bbottom:\s*0\b/.test(mobileAppRule),'#mobile-app anchors to bottom:0 instead of 100vh/100dvh');
+ assert(!/100d?vh/.test(mobileAppRule),'#mobile-app must not use 100vh or 100dvh');
+ assert(!css.includes('100dvh'),'app.css avoids 100dvh so overflow:hidden Android WebViews never inflate to 100lvh');
+ assert(/\.home-list\{[^}]*padding-bottom:\s*calc\(140px\s*\+\s*env\(safe-area-inset-bottom\)\)/.test(css),'.home-list clears .home-fab and .tab-bar');
+ assert(/\.workspace-bottom-bar\{[^}]*\bflex:\s*none\b/.test(css)&&/\.workspace-bottom-bar\{[^}]*\bflex-wrap:\s*nowrap\b/.test(css),'.workspace-bottom-bar stays flex:none and nowrap');
+ const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8'),renderStart=source.indexOf(' function render(){'),renderEnd=source.indexOf(' // IME',renderStart);
+ assert(renderStart>=0&&renderEnd>renderStart,'app.js render() slice markers must stay intact');
+ const renderSrc=source.slice(renderStart,renderEnd);
+ const makeSandbox=(routeFn,profilesFn,screens,loadScreenFn)=>{
+  const f=fixture('home'),E=f.root.constructor;
+  const root=new E('main'),banner=new E('div');
+  f.doc.body.append(banner,root);
+  const box={
+   root,banner,document:f.doc,location:{hash:'#/accounts'},activeRouteScreen:'home',routeKey:'',
+   state:{snapshot:null,cached:false,connection:{phase:'idle',message:'Not connected'},preferences:{}},
+   hostGeneration:1,transport:{ready:false},screen:null,abort:null,install:f.ctx.install,
+   endpoint:{profiles:profilesFn},routeAssets:{accounts:'screens/details.js',settings:'screens/settings.js',git:'screens/details.js'},
+   M:{screens},AbortController,matchMedia:()=>({matches:false}),parseRoute:routeFn,loadScreen:loadScreenFn,
+   el:(...v)=>new E(...v),header:title=>{const h=new E('header');h.append(new E('button'),new E('h1',title));return h;},
+   button:(label,action,cls='')=>{const b=new E('button',label,cls);b.setAttribute('aria-label',label);b.action=action;return b;},
+   t:s=>s,go(){},back(){},backTo(){},icon:()=>new E('svg'),dot:()=>new E('span'),rollup:()=>'Unknown',
+   groupRoute:()=>'/',linkRow:()=>new E('button'),sheet(){},closeSheet(){},longPress(){},savePreferences(){},
+   rememberSession(){},resumeLastSession(){},scanQr(){},pasteLink(){},newWorkspace(){},sessionKey:()=>'k',
+   selectHost(){},forgetHost(){},renameHost(){},hostRoute:()=>'/host/local',getConnections:()=>[],openRecent(){},
+   reconnectHost(){},photo(){},toast(){},error(){},act:fn=>fn(),createSession(){},creating:()=>null,syncTablet(){},
+   tabletList:null,tabletAbort:null,tabletContext:null,tabletShell:null,tabletBody:null,tabletSidebar:null,
+   tabletHost:null,tabletCollapsed:false,tabletCtxRef:null
+  };
+  vm.createContext(box);vm.runInContext(renderSrc+'\nglobalThis.render=render;',box);
+  return {box,root,f,cleanup:()=>{box.abort?.abort();f.abort.abort();}};
+ };
+ // 1) Lazy-loading top-level tabs keeps .tab-bar mounted during loading and on Retry failure.
+ let loadDeferred=deferred(),currentRoute={screen:'accounts'};
+ const loading=makeSandbox(()=>currentRoute,()=>[{id:'pc'}],{},()=>loadDeferred.promise);
+ loading.box.render();
+ assert(loading.root.querySelector('.screen'),'.screen exists while loading accounts');
+ assert(loading.root.querySelector('.detail-list'),'.detail-list guards snapshot() from clobbering loading screen');
+ assert(loading.root.querySelector('.tab-bar'),'.tab-bar stays visible while loading accounts');
+ assert.equal(loading.root.querySelectorAll('.tab-bar-item').find(b=>b.getAttribute('aria-current')==='page')?.textContent,'Usage');
+ loadDeferred.reject(Error('Network failed'));
+ await loading.f.flush();
+ assert(loading.root.querySelector('.tab-bar'),'.tab-bar remains visible on load error with Retry');
+ assert(loading.root.querySelectorAll('button').some(b=>b.textContent==='Retry'));
+ currentRoute={screen:'settings'};loading.box.location.hash='#/settings';loading.box.render();
+ assert(loading.root.querySelector('.tab-bar'),'.tab-bar stays visible while loading settings');
+ assert.equal(loading.root.querySelectorAll('.tab-bar-item').find(b=>b.getAttribute('aria-current')==='page')?.textContent,'Settings');
+ currentRoute={screen:'settings',subpage:'appearance'};loading.box.location.hash='#/settings/appearance';loading.box.render();
+ assert.equal(loading.root.querySelector('.tab-bar'),null,'settings subpages omit .tab-bar even while loading');
+ loading.cleanup();
+ // 2) Rapid tab switching while loadScreen is pending suppresses stale double-render.
+ const loads=[];let accountMounts=0;
+ currentRoute={screen:'accounts'};
+ const rapid=makeSandbox(()=>currentRoute,()=>[{id:'pc'}],{home:r=>{r.append(rapid.box.el('section','','home screen'));return {};}},()=>{const d=deferred();loads.push(d);return d.promise;});
+ rapid.box.location.hash='#/accounts';rapid.box.render();
+ currentRoute={screen:'home'};rapid.box.location.hash='#/';rapid.box.render();
+ currentRoute={screen:'accounts'};rapid.box.location.hash='#/accounts';rapid.box.render();
+ rapid.box.M.screens.accounts=r=>{accountMounts++;r.append(rapid.box.el('section','','accounts screen'));return {};};
+ loads[0].resolve();loads[1].resolve();
+ await rapid.f.flush();
+ assert.equal(accountMounts,1,'aborted loadScreen callback does not double-mount accounts');
+ assert.equal(rapid.root.querySelectorAll('.tab-bar').length,1);
+ rapid.cleanup();
+ // 3) Unpaired accounts route keeps .tab-bar and preserves .screen-fallback (no .detail-list).
+ const unpaired=makeSandbox(()=>({screen:'accounts'}),()=>[],{accounts:r=>{r.append(unpaired.box.el('section','','accounts screen'));return {};}},()=>Promise.resolve());
+ unpaired.box.render();
+ assert(unpaired.root.querySelector('.screen'),'.screen wraps unpaired accounts fallback');
+ assert(unpaired.root.querySelector('.tab-bar'),'.tab-bar remains visible on unpaired accounts route');
+ assert.equal(unpaired.root.querySelector('.detail-list'),null,'unpaired fallback avoids .detail-list so snapshot() can replace it');
+ assert(unpaired.root.querySelector('.screen-fallback'),'.screen-fallback stacks unpaired CTA cleanly above .tab-bar');
+ unpaired.cleanup();
+ console.log('PASS tab-bar and layout contracts: #mobile-app bottom:0, zero 100dvh, .home-list clearance, .tab-bar across loading/error/unpaired states');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};
