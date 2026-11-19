@@ -26,8 +26,8 @@ use crate::agent::control::StoredLaunch;
 
 use super::vault::{
     VaultRoots, agy_candidate_dirs, collect_roots, extract_agy_user_request,
-    extract_agy_workspace_from_record, is_injected_user_context, normalize_path,
-    opencode_candidate_bases, strip_injected_user_blocks,
+    extract_agy_workspace_from_record, is_injected_user_context, msys_or_cygwin_to_windows,
+    normalize_path, opencode_candidate_bases, strip_injected_user_blocks, strip_windows_verbatim,
 };
 
 /// 폴링 1회당 읽는 최대 바이트(512 KiB).
@@ -76,7 +76,7 @@ fn read_json_bounded(path: &Path, remaining: &mut u64) -> std::io::Result<Value>
     serde_json::from_slice(&bytes).map_err(std::io::Error::other)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn poll_session_in(
     roots: &VaultRoots,
     stored: Option<&StoredLaunch>,
@@ -159,8 +159,32 @@ pub(crate) fn poll_session_in_bounded(
     (snapshot, Some((path, session_id)))
 }
 
+fn parse_agent_profile(profile: &str) -> Option<VaultAgent> {
+    if let Some(agent) = VaultAgent::parse(profile) {
+        return Some(agent);
+    }
+    let tail = profile
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let stem = [".exe", ".cmd", ".bat"]
+        .iter()
+        .find_map(|ext| {
+            let split_at = tail.len().checked_sub(ext.len()).filter(|&n| n > 0)?;
+            let (head, suffix) = tail.split_at_checked(split_at)?;
+            suffix.eq_ignore_ascii_case(ext).then_some(head)
+        })
+        .unwrap_or(tail);
+    if stem.eq_ignore_ascii_case("claude-code") {
+        return Some(VaultAgent::Claude);
+    }
+    VaultAgent::parse(stem)
+}
+
 fn agent_for_session(stored: &StoredLaunch) -> Option<VaultAgent> {
-    VaultAgent::parse(&stored.profile)
+    parse_agent_profile(&stored.profile)
 }
 
 /// 트랜스크립트 파일 하나를 `offset` 바이트부터 증분 정규화해 읽는다.
@@ -1043,14 +1067,25 @@ fn resolve_transcript_uncached(
 
     let norm_cwd = normalize_path(cwd);
     // Claude keeps one folder per cwd. Look there first so a large `projects/` never hides the session.
-    let claude_dirs: Vec<PathBuf> = if agent == VaultAgent::Claude {
+    let mut claude_dirs: Vec<PathBuf> = if agent == VaultAgent::Claude {
         search_dirs
             .iter()
-            .filter_map(|root| claude_project_dir(root, cwd))
+            .flat_map(|root| claude_project_dirs(root, cwd))
             .collect()
     } else {
         Vec::new()
     };
+    if claude_dirs.len() > 1 {
+        let mut seen = Vec::with_capacity(claude_dirs.len());
+        claude_dirs.retain(|d| {
+            if seen.contains(d) {
+                false
+            } else {
+                seen.push(d.clone());
+                true
+            }
+        });
+    }
     if !sid.is_empty() {
         for dir in &claude_dirs {
             let cand = dir.join(format!("{sid}.jsonl"));
@@ -1101,20 +1136,170 @@ fn resolve_transcript_uncached(
 
 /// Claude Code's project folder: the cwd with every UTF-16 unit outside `[A-Za-z0-9]` replaced by `-`.
 /// Very long paths get a hashed name instead, so a miss falls back to the bounded scan.
-fn claude_project_dir(root: &Path, cwd: &str) -> Option<PathBuf> {
-    let cwd = cwd.trim().trim_end_matches(['/', '\\']);
-    if cwd.is_empty() {
+fn split_win_drive_path(s: &str) -> Option<(u8, &str)> {
+    let [drive, b':', ..] = s.as_bytes() else {
+        return None;
+    };
+    if !drive.is_ascii_alphabetic() {
         return None;
     }
-    let name: String = cwd
-        .encode_utf16()
+    let rest = s.get(2..)?.trim_start_matches(['/', '\\']);
+    Some((*drive, rest))
+}
+
+fn is_windows_norm_path(norm: &str) -> bool {
+    norm.starts_with("//")
+        || matches!(
+            norm.as_bytes(),
+            [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
+        )
+}
+
+fn is_win_drive_bare(s: &str) -> Option<u8> {
+    match s.as_bytes() {
+        [drive, b':'] if drive.is_ascii_alphabetic() => Some(*drive),
+        _ => None,
+    }
+}
+
+fn comparable_win_path(norm: &str) -> Option<String> {
+    if let Some(msys) = msys_or_cygwin_to_windows(norm) {
+        return Some(normalize_path(&msys));
+    }
+    if let Some(drive) = is_win_drive_bare(norm) {
+        return Some(format!("{}:/", char::from(drive.to_ascii_lowercase())));
+    }
+    is_windows_norm_path(norm).then(|| norm.to_owned())
+}
+
+fn cwds_match(lhs: &str, rhs: &str) -> bool {
+    let a = normalize_path(lhs);
+    let b = normalize_path(rhs);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    if (is_windows_norm_path(&a)
+        || is_windows_norm_path(&b)
+        || is_win_drive_bare(&a).is_some()
+        || is_win_drive_bare(&b).is_some()
+        || cfg!(windows))
+        && let (Some(wa), Some(wb)) = (comparable_win_path(&a), comparable_win_path(&b))
+    {
+        return wa == wb;
+    }
+    false
+}
+
+fn encode_claude_project_name(cwd: &str) -> String {
+    cwd.encode_utf16()
         .map(|unit| match u8::try_from(unit) {
             Ok(b) if b.is_ascii_alphanumeric() => char::from(b),
             _ => '-',
         })
-        .collect();
-    let dir = root.join("projects").join(name);
-    dir.is_dir().then_some(dir)
+        .collect()
+}
+
+fn push_win_drive_variants(raw_variants: &mut Vec<String>, drive: u8, rest: &str) {
+    let drive_upper = char::from(drive.to_ascii_uppercase());
+    let drive_lower = char::from(drive.to_ascii_lowercase());
+    if rest.is_empty() {
+        for cand in [
+            format!("{drive_upper}:\\"),
+            format!("{drive_lower}:\\"),
+            format!("{drive_upper}:"),
+            format!("{drive_lower}:"),
+            format!("/{drive_lower}"),
+            format!("/{drive_upper}"),
+            format!("/cygdrive/{drive_lower}"),
+        ] {
+            raw_variants.push(cand);
+        }
+    } else {
+        let win_rest = rest.replace('/', "\\");
+        let posix_rest = rest.replace('\\', "/");
+        for cand in [
+            format!("{drive_upper}:\\{win_rest}"),
+            format!("{drive_lower}:\\{win_rest}"),
+            format!("/{drive_lower}/{posix_rest}"),
+            format!("/{drive_upper}/{posix_rest}"),
+            format!("/cygdrive/{drive_lower}/{posix_rest}"),
+        ] {
+            raw_variants.push(cand);
+        }
+    }
+}
+
+fn claude_project_name_candidates(cwd: &str) -> (Vec<String>, bool) {
+    let stripped = strip_windows_verbatim(cwd);
+    let trimmed = stripped.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return (Vec::new(), false);
+    }
+    let mut raw_variants = vec![trimmed.to_owned()];
+    let mut win_or_msys = false;
+
+    if let Some((drive, rest)) = split_win_drive_path(trimmed) {
+        win_or_msys = true;
+        push_win_drive_variants(&mut raw_variants, drive, rest);
+    } else if let Some(win) = msys_or_cygwin_to_windows(trimmed)
+        && let Some((drive, rest)) = split_win_drive_path(&win)
+    {
+        win_or_msys = true;
+        push_win_drive_variants(&mut raw_variants, drive, rest);
+    }
+
+    let mut names = Vec::new();
+    for raw in raw_variants {
+        let encoded = encode_claude_project_name(&raw);
+        if !encoded.is_empty() && !names.contains(&encoded) {
+            names.push(encoded);
+        }
+    }
+    (names, win_or_msys)
+}
+
+fn claude_project_dirs(root: &Path, cwd: &str) -> Vec<PathBuf> {
+    let (names, win_or_msys) = claude_project_name_candidates(cwd);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let projects = root.join("projects");
+    let mut dirs = Vec::new();
+    for name in &names {
+        let dir = projects.join(name);
+        if dir.is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    if dirs.is_empty()
+        && (win_or_msys || cfg!(windows))
+        && let Ok(entries) = fs::read_dir(&projects)
+    {
+        for entry in entries.take(2048).flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(name_str) = file_name.to_str() else {
+                continue;
+            };
+            if names.iter().any(|cand| cand.eq_ignore_ascii_case(name_str)) {
+                let p = entry.path();
+                if !dirs.contains(&p) {
+                    dirs.push(p);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+#[cfg(test)]
+fn claude_project_dir(root: &Path, cwd: &str) -> Option<PathBuf> {
+    claude_project_dirs(root, cwd).into_iter().next()
 }
 
 /// Newest transcript in one Claude project folder whose recorded cwd matches. Only metadata is read for
@@ -1135,8 +1320,7 @@ fn newest_claude_in_dir(
     files.sort_unstable_by_key(|f| std::cmp::Reverse(f.0));
     files.into_iter().take(64).find_map(|(mtime, p)| {
         let (sid, file_cwd) = peek_jsonl_id_and_cwd(&p)?;
-        (normalize_path(&file_cwd) == norm_cwd && filter.allows(&p, &sid))
-            .then_some((mtime, p, sid))
+        (cwds_match(norm_cwd, &file_cwd) && filter.allows(&p, &sid)).then_some((mtime, p, sid))
     })
 }
 
@@ -1269,7 +1453,7 @@ fn find_newest_transcript_by_cwd(
             let Ok(projects) = fs::read_dir(root.join("projects")) else {
                 return None;
             };
-            for proj in projects.take(256).flatten() {
+            for proj in projects.take(512).flatten() {
                 if !budget.take() {
                     break;
                 }
@@ -1279,29 +1463,10 @@ fn find_newest_transcript_by_cwd(
                 {
                     continue;
                 }
-                let Ok(files) = fs::read_dir(proj.path()) else {
-                    continue;
-                };
-                for file in files.take(256).flatten() {
-                    if !budget.take() {
-                        break;
-                    }
-                    let p = file.path();
-                    if p.extension().is_none_or(|e| e != "jsonl") {
-                        continue;
-                    }
-                    let Some(mtime) = file_mtime(&p) else {
-                        continue;
-                    };
-                    if best.as_ref().is_some_and(|b| mtime <= b.0) {
-                        continue;
-                    }
-                    if let Some((sid, file_cwd)) = peek_jsonl_id_and_cwd(&p)
-                        && normalize_path(&file_cwd) == norm_cwd
-                        && filter.allows(&p, &sid)
-                    {
-                        best = Some((mtime, p, sid));
-                    }
+                if let Some((mtime, p, sid)) = newest_claude_in_dir(&proj.path(), norm_cwd, filter)
+                    && best.as_ref().is_none_or(|b| mtime > b.0)
+                {
+                    best = Some((mtime, p, sid));
                 }
             }
         }
@@ -1329,7 +1494,7 @@ fn find_newest_transcript_by_cwd(
                             && let Some(mtime) = file_mtime(&p)
                             && best.as_ref().is_none_or(|b| mtime > b.0)
                             && let Some((sid, file_cwd)) = peek_jsonl_id_and_cwd(&p)
-                            && normalize_path(&file_cwd) == norm_cwd
+                            && cwds_match(norm_cwd, &file_cwd)
                             && filter.allows(&p, &sid)
                         {
                             best = Some((mtime, p, sid));
@@ -1345,7 +1510,7 @@ fn find_newest_transcript_by_cwd(
                 }
                 if let Ok(batch) = super::opencode_sqlite::read(&path, None, false) {
                     for session in batch.sessions {
-                        if normalize_path(&session.cwd) == norm_cwd
+                        if cwds_match(norm_cwd, &session.cwd)
                             && !filter.claimed_ids.contains(&session.id)
                             && filter
                                 .min_birth_secs
@@ -1368,7 +1533,7 @@ fn find_newest_transcript_by_cwd(
                             && let Some(mtime) = file_mtime(&p)
                             && best.as_ref().is_none_or(|b| mtime > b.0)
                             && let Some((sid, file_cwd)) = peek_jsonl_id_and_cwd(&p)
-                            && normalize_path(&file_cwd) == norm_cwd
+                            && cwds_match(norm_cwd, &file_cwd)
                             && filter.allows(&p, &sid)
                         {
                             best = Some((mtime, p, sid));
@@ -1446,7 +1611,7 @@ fn walk_codex_for_cwd(
             && let Some(mtime) = file_mtime(&p)
             && best.as_ref().is_none_or(|b| mtime > b.0)
             && let Some((sid, file_cwd)) = peek_jsonl_id_and_cwd(&p)
-            && normalize_path(&file_cwd) == norm_cwd
+            && cwds_match(norm_cwd, &file_cwd)
             && filter.allows(&p, &sid)
         {
             *best = Some((mtime, p, sid));
@@ -1507,9 +1672,8 @@ fn scan_agy_brain_for_cwd(
         if best.as_ref().is_some_and(|b| mtime <= b.0) {
             break;
         }
-        if by_id.get(&conv_id).is_some_and(|w| w == norm_cwd)
-            || peek_agy_transcript_cwd(&p, &by_display)
-                .is_some_and(|w| normalize_path(&w) == norm_cwd)
+        if by_id.get(&conv_id).is_some_and(|w| cwds_match(norm_cwd, w))
+            || peek_agy_transcript_cwd(&p, &by_display).is_some_and(|w| cwds_match(norm_cwd, &w))
         {
             *best = Some((mtime, p, conv_id));
             break;
@@ -1594,7 +1758,7 @@ fn peek_agy_transcript_cwd(path: &Path, by_display: &BTreeMap<String, String>) -
 
 fn peek_jsonl_id_and_cwd(path: &Path) -> Option<(String, String)> {
     let file = File::open(path).ok()?;
-    let mut reader = BufReader::with_capacity(4096, file.take(32 * 1024));
+    let mut reader = BufReader::with_capacity(8192, file.take(256 * 1024));
     let mut line = Vec::new();
     let mut sid = path
         .file_stem()
@@ -1602,7 +1766,7 @@ fn peek_jsonl_id_and_cwd(path: &Path) -> Option<(String, String)> {
         .unwrap_or("")
         .to_owned();
     let mut cwd = String::new();
-    for _ in 0..16 {
+    for _ in 0..64 {
         line.clear();
         if reader.read_until(b'\n', &mut line).ok()? == 0 {
             break;
@@ -3171,6 +3335,154 @@ mod tests {
         assert_eq!(claude_snap.items[0].text, "앞쪽 리마인더 제거 후 질문");
         assert_eq!(claude_snap.items[1].kind, ChatItemKind::User);
         assert_eq!(claude_snap.items[1].text, "뒤쪽 리마인더 제거 전 질문");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cross_platform_tests {
+    use super::*;
+
+    #[test]
+    fn windows_and_msys_claude_path_matching_resolves_transcript() {
+        let dir = std::env::temp_dir().join(format!("chat-win-msys-claude-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+
+        // Case 1: Win32 cwd (`D:\work\App`), stored profile `"claude.exe"`, MSYS cwd inside transcript (`/d/work/App`),
+        // and Claude folder named `D--work-App` with >16 metadata lines and >32KB snapshot before first `cwd` record.
+        let root1 = dir.join("c1");
+        let proj1 = root1.join("projects/D--work-App");
+        fs::create_dir_all(&proj1).unwrap();
+        let deep_file = proj1.join("sid-deep.jsonl");
+        let mut lines = Vec::new();
+        for i in 0..20 {
+            lines.push(format!(r#"{{"type":"mode","index":{i}}}"#));
+        }
+        let big_pad = "x".repeat(40 * 1024);
+        lines.push(format!(
+            r#"{{"type":"file-history-snapshot","snapshot":{{"pad":"{big_pad}"}}}}"#
+        ));
+        lines.push(
+            r#"{"type":"user","sessionId":"sid-deep","cwd":"/d/work/App","message":{"role":"user","content":"hello from windows msys"}}"#
+                .to_owned(),
+        );
+        fs::write(&deep_file, format!("{}\n", lines.join("\n"))).unwrap();
+
+        assert_eq!(
+            peek_jsonl_id_and_cwd(&deep_file),
+            Some(("sid-deep".to_owned(), "/d/work/App".to_owned()))
+        );
+
+        let roots1 = VaultRoots {
+            claude: vec![root1.clone()],
+            ..VaultRoots::default()
+        };
+        let stored_exe = crate::agent::control::StoredLaunch {
+            profile: "claude.exe".into(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: None,
+            transcript_path: None,
+            cwd: Vec::new(),
+            hibernation_blocked: false,
+            account: None,
+        };
+        let snap1 = poll_session_in(&roots1, Some(&stored_exe), br"D:\work\App", 0);
+        assert!(
+            snap1.bound,
+            "D:\\work\\App + claude.exe must bind MSYS transcript"
+        );
+        assert_eq!(snap1.items.len(), 1);
+        assert_eq!(snap1.items[0].text, "hello from windows msys");
+        assert!(claude_project_dir(&root1, r"D:\work\App").is_some());
+
+        // Case 2: Verbatim Windows cwd `\\?\D:\work\App` matching lowercase `projects/d--work-App` or MSYS `projects/-d-work-App`.
+        let root2 = dir.join("c2");
+        let proj2 = root2.join("projects/-d-work-App");
+        fs::create_dir_all(&proj2).unwrap();
+        fs::write(
+            proj2.join("sid-msys-dir.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"sid-msys-dir\",\"cwd\":\"/d/work/App\",\"message\":{\"role\":\"user\",\"content\":\"msys dir hit\"}}\n",
+        )
+        .unwrap();
+        let roots2 = VaultRoots {
+            claude: vec![root2],
+            ..VaultRoots::default()
+        };
+        let stored_claude = crate::agent::control::StoredLaunch {
+            profile: "claude".into(),
+            ..stored_exe.clone()
+        };
+        let snap2 = poll_session_in(&roots2, Some(&stored_claude), br"\\?\D:\work\App", 0);
+        assert!(
+            snap2.bound,
+            "\\\\?\\D:\\work\\App must resolve projects/-d-work-App"
+        );
+        assert_eq!(snap2.items[0].text, "msys dir hit");
+
+        // Case 3: Reverse MSYS session cwd `/d/work/App` matching Windows `projects/D--work-App`,
+        // AND drive root `D:\` matching `projects/D--` or `projects/D-`.
+        let root3 = dir.join("c3");
+        let proj3 = root3.join("projects/D--work-App");
+        let proj_drive = root3.join("projects/D--");
+        fs::create_dir_all(&proj3).unwrap();
+        fs::create_dir_all(&proj_drive).unwrap();
+        fs::write(
+            proj3.join("sid-win-dir.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"sid-win-dir\",\"cwd\":\"D:\\\\work\\\\App\",\"message\":{\"role\":\"user\",\"content\":\"win dir from msys\"}}\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_drive.join("sid-drive-root.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"sid-drive-root\",\"cwd\":\"D:\\\\\",\"message\":{\"role\":\"user\",\"content\":\"drive root hit\"}}\n",
+        )
+        .unwrap();
+        let roots3 = VaultRoots {
+            claude: vec![root3],
+            ..VaultRoots::default()
+        };
+        let snap3 = poll_session_in(&roots3, Some(&stored_claude), b"/d/work/App", 0);
+        assert!(snap3.bound);
+        assert_eq!(snap3.items[0].text, "win dir from msys");
+        let snap_drive = poll_session_in(&roots3, Some(&stored_claude), br"D:\", 0);
+        assert!(snap_drive.bound);
+        assert_eq!(snap_drive.items[0].text, "drive root hit");
+
+        // Case 4: Fallback projects scan (>256 older `.jsonl` files must not hide the newest transcript by mtime).
+        let root4 = dir.join("c4");
+        let proj4 = root4.join("projects/custom-alias-dir");
+        fs::create_dir_all(&proj4).unwrap();
+        let old_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let new_time = old_time + std::time::Duration::from_secs(600);
+        for i in 0..270 {
+            let p = proj4.join(format!("{i:04}-empty.jsonl"));
+            let f = File::create(&p).unwrap();
+            f.set_times(fs::FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+        let newest_p = proj4.join("zzz-newest.jsonl");
+        fs::write(
+            &newest_p,
+            "{\"type\":\"user\",\"sessionId\":\"sid-fallback-newest\",\"cwd\":\"D:\\\\work\\\\FallbackProj\",\"message\":{\"role\":\"user\",\"content\":\"newest past 256\"}}\n",
+        )
+        .unwrap();
+        File::options()
+            .write(true)
+            .open(&newest_p)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(new_time))
+            .unwrap();
+        let roots4 = VaultRoots {
+            claude: vec![root4],
+            ..VaultRoots::default()
+        };
+        let snap4 = poll_session_in(&roots4, Some(&stored_claude), br"D:\work\FallbackProj", 0);
+        assert!(
+            snap4.bound,
+            "fallback projects scan must sort by mtime instead of missing transcripts after 256 older files"
+        );
+        assert_eq!(snap4.items[0].text, "newest past 256");
 
         fs::remove_dir_all(dir).unwrap();
     }
