@@ -26,6 +26,11 @@ fn automatic_sync_updates_the_bundle_and_leaves_identical_files_untouched() {
             let text = fs::read_to_string(entry.parent().unwrap().join(relative)).unwrap();
             assert_eq!(text, format!("{}\n{MARKER}\n", bundled.trim_end()));
         }
+        let artifacts_dir = dir.join("artifacts");
+        for (relative, bundled) in ARTIFACTS_REFERENCES {
+            let text = fs::read_to_string(artifacts_dir.join(relative)).unwrap();
+            assert_eq!(text, format!("{}\n{MARKER}\n", bundled.trim_end()));
+        }
     }
     let second = sync_builtin_skills_at(&home);
     assert!(second.failures.is_empty());

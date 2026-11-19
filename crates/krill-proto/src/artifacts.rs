@@ -141,6 +141,129 @@ pub struct ShareOutcome {
     pub expires_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_days: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Krill 기본 아티팩트 디자인 시스템(KADS) 문서 아키타입.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Archetype {
+    /// `68ch` 본문 + 우측 여백 주석 + 광폭 도표 기술 보고서(기본값).
+    #[default]
+    Report,
+    /// 1페이지 의사결정 요약·복습 노트(BLUF + 비교 맥락 KPI + 표/체크리스트).
+    Brief,
+    /// 정적 JSON 스냅샷 내장형 인터랙티브 탐색기·계산기.
+    Explorer,
+    /// 동일 데이터 배열을 공유하는 다중 시안(A~C) 비교 페이지.
+    Variants,
+    /// 16:9 키보드 내비게이션·인쇄 대응 발표 슬라이드.
+    Deck,
+}
+
+impl Archetype {
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "report" | "editorial" | "editorial-report" => Some(Self::Report),
+            "brief" | "exec-brief" | "recap" => Some(Self::Brief),
+            "explorer" | "interactive" | "dashboard" => Some(Self::Explorer),
+            "variants" | "decision-variants" | "mockup" => Some(Self::Variants),
+            "deck" | "slides" | "slide-deck" => Some(Self::Deck),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Report => "report",
+            Self::Brief => "brief",
+            Self::Explorer => "explorer",
+            Self::Variants => "variants",
+            Self::Deck => "deck",
+        }
+    }
+
+    /// 아키타입별 권장 기본 라이트/다크 토큰 쌍.
+    #[must_use]
+    pub const fn default_theme(self) -> ArtifactTheme {
+        match self {
+            Self::Report | Self::Brief | Self::Deck => ArtifactTheme::Paper,
+            Self::Explorer | Self::Variants => ArtifactTheme::Light,
+        }
+    }
+}
+
+/// KADS 베이스 팔레트(`Paper`+`Tokyo Night` 또는 `Light`+`Deep Sea`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactTheme {
+    /// 에디토리얼 미색(`#f7f4ee`) + `Tokyo Night`(`#1a1b26`).
+    #[default]
+    Paper,
+    /// 스튜디오 뉴트럴(`#ffffff`) + `Deep Sea`(`#0b0d13`).
+    Light,
+}
+
+impl ArtifactTheme {
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "paper" | "editorial" => Some(Self::Paper),
+            "light" | "studio" | "neutral" => Some(Self::Light),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Paper => "paper",
+            Self::Light => "light",
+        }
+    }
+}
+
+/// `init --json` 출력.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitOutcome {
+    pub path: String,
+    pub archetype: Archetype,
+    pub theme: ArtifactTheme,
+    pub byte_size: u64,
+}
+
+/// 정적 점검 심각도.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LintSeverity {
+    /// `Origin: null` 샌드박스 예외(`localStorage`)나 깨지는 상대경로 에셋.
+    Error,
+    /// 모바일 뷰포트·제목 누락, 초대형 번들 남용, 대표적 슬롭 상투구.
+    Warning,
+}
+
+/// 정적 점검 단일 항목.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LintIssue {
+    pub code: String,
+    pub severity: LintSeverity,
+    pub message: String,
+}
+
+/// `lint --json` 출력.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LintReport {
+    pub ok: bool,
+    pub errors: usize,
+    pub warnings: usize,
+    #[serde(default)]
+    pub issues: Vec<LintIssue>,
 }
 
 /// `status <file> --json` 출력. 네트워크 없이 로컬 공유 기록만 본다.
@@ -343,5 +466,43 @@ mod tests {
         };
         assert!(!html.is_markdown());
         assert_eq!(html.display_name(), "x");
+    }
+
+    #[test]
+    fn archetype_and_theme_parsers_and_wire_types_roundtrip() {
+        for (raw, arch, theme) in [
+            ("report", Archetype::Report, ArtifactTheme::Paper),
+            ("editorial-report", Archetype::Report, ArtifactTheme::Paper),
+            ("brief", Archetype::Brief, ArtifactTheme::Paper),
+            ("explorer", Archetype::Explorer, ArtifactTheme::Light),
+            ("variants", Archetype::Variants, ArtifactTheme::Light),
+            ("deck", Archetype::Deck, ArtifactTheme::Paper),
+        ] {
+            let parsed = Archetype::parse(raw).unwrap();
+            assert_eq!(parsed, arch);
+            assert_eq!(parsed.default_theme(), theme);
+            assert_eq!(Archetype::parse(parsed.as_str()), Some(parsed));
+        }
+        assert_eq!(Archetype::parse("unknown"), None);
+        assert_eq!(
+            ArtifactTheme::parse(ArtifactTheme::Paper.as_str()),
+            Some(ArtifactTheme::Paper)
+        );
+        assert_eq!(ArtifactTheme::parse("PAPER"), Some(ArtifactTheme::Paper));
+        assert_eq!(ArtifactTheme::parse("studio"), Some(ArtifactTheme::Light));
+        assert_eq!(ArtifactTheme::parse("invalid"), None);
+
+        let clean = ShareOutcome {
+            change: "created".into(),
+            slug: "s1".into(),
+            share_url: "https://share.krill.page/a/s1".into(),
+            expires_at: String::new(),
+            retention_days: Some(30),
+            warnings: Vec::new(),
+        };
+        let encoded = serde_json::to_string(&clean).unwrap();
+        assert!(!encoded.contains("warnings"), "{encoded}");
+        let round: ShareOutcome = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(round, clean);
     }
 }
