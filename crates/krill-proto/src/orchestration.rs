@@ -3823,8 +3823,8 @@ mod skills;
 #[cfg(test)]
 use skills::ORCA_SKILL_NAMES;
 pub use skills::{
-    BUILTIN_SKILLS, ORCHESTRATION_REFERENCES, SkillEntry, SkillSyncReport, builtin_skills,
-    install_skill, skill_directories, skill_references, sync_builtin_skills,
+    ARTIFACTS_REFERENCES, BUILTIN_SKILLS, ORCHESTRATION_REFERENCES, SkillEntry, SkillSyncReport,
+    builtin_skills, install_skill, skill_directories, skill_references, sync_builtin_skills,
     sync_builtin_skills_at,
 };
 
@@ -5309,6 +5309,22 @@ mod tests {
         let refs = skill_references("orchestration");
         assert!(!refs.is_empty());
         assert_eq!(skill_references("krill-orchestration").len(), refs.len());
+        let art_refs = skill_references("artifacts");
+        assert_eq!(art_refs.len(), 3);
+        assert_eq!(skill_references("krill-artifacts").len(), art_refs.len());
+        let art_skill = BUILTIN_SKILLS
+            .iter()
+            .find(|s| s.name == "artifacts")
+            .ok_or_else(|| not_found("artifacts skill"))?;
+        for term in [
+            "krill artifacts init",
+            "krill artifacts lint",
+            "references/design-system.md",
+            "references/writing-and-anti-slop.md",
+            "references/visualization-and-components.md",
+        ] {
+            assert!(art_skill.content.contains(term), "missing {term}");
+        }
         let orch_skill = BUILTIN_SKILLS
             .iter()
             .find(|s| s.name == "orchestration")

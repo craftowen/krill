@@ -22,12 +22,18 @@ Krill의 공식 소개·문서 사이트(`https://krill.page`)와 HTML·Markdown
 구현 위치: [`crates/krill/src/artifacts.rs`](../crates/krill/src/artifacts.rs)
 
 ```sh
+# 0. Krill 기본 아티팩트 디자인 시스템(KADS) 골격 생성 (네트워크·공개 게이트 불필요)
+krill artifacts init ./report.html [--archetype <report|brief|explorer|variants|deck>] [--theme <paper|light>] [--title "성능 리포트"] [--force] [--json]
+
+# 0-1. 발행 전 샌드박스(Origin: null)·상대경로 에셋·품질 정적 검사
+krill artifacts lint ./report.html [--strict] [--json]
+
 # 1. HTML 또는 Markdown 파일 공개 공유 (이미 공유된 파일이면 동일 링크를 자동 덮어씀)
-krill artifacts share ./report.html [--title "성능 리포트"] [--expires-in <days|never>] [--api-url <url>] [--json]
+krill artifacts share ./report.html [--title "성능 리포트"] [--expires-in <days|never>] [--strict] [--api-url <url>] [--json]
 krill artifacts share ./notes.md --json
 
 # 2. 이전에 공유한 로컬 파일의 아티팩트 강제 갱신
-krill artifacts update ./report.html [--title "새 제목"] [--expires-in <days|never>] [--api-url <url>] [--json]
+krill artifacts update ./report.html [--title "새 제목"] [--expires-in <days|never>] [--strict] [--api-url <url>] [--json]
 
 # 2-1. 파일을 재업로드하지 않고 기존 링크의 기한 변경
 krill artifacts retention <slug> --expires-in 90 --json
@@ -57,8 +63,15 @@ krill artifacts rm <slug> [--json]
 
 ### `--json` 출력
 
-- 성공 형태는 `krill_proto::artifacts`의 `ShareOutcome`(`share`·`update`), `LinkStatus`(`status`), `ListPage`(`list`, 서버 응답 그대로), `{deleted, slug}`(`unshare`·`delete`)다.
-- 실패도 stdout에 `{"error":{"code","message","nextSteps"?}}`로 내고 비0으로 끝난다. 코드: `artifact_sharing_disabled`, `not_shared`, `unsupported`, `empty`, `too_large`, `unreadable`, `invalid_argument`, 서버 오류 코드(없으면 `http_<status>`), 그 밖 `failed`.
+- 성공 형태는 `krill_proto::artifacts`의 `InitOutcome`(`init`), `LintReport`(`lint`), `ShareOutcome`(`share`·`update`), `LinkStatus`(`status`), `ListPage`(`list`, 서버 응답 그대로), `{deleted, slug}`(`unshare`·`delete`)다.
+- 실패도 stdout에 `{"error":{"code","message","nextSteps"?}}`로 내고 비0으로 끝난다. 코드: `artifact_sharing_disabled`, `already_exists`, `lint_failed`, `not_shared`, `unsupported`, `empty`, `too_large`, `unreadable`, `invalid_argument`, 서버 오류 코드(없으면 `http_<status>`), 그 밖 `failed`.
+
+### 기본 아티팩트 디자인 시스템(KADS) 및 샌드박스 작성 규약
+
+- 내장 `artifacts` 스킬([`crates/krill-proto/src/orchestration/skills/artifacts/`](../crates/krill-proto/src/orchestration/skills/artifacts/SKILL.md))은 3종의 레퍼런스(`references/design-system.md`, `references/writing-and-anti-slop.md`, `references/visualization-and-components.md`)를 에이전트 스킬 루트에 함께 동기화한다.
+- **팔레트 정합성**: [`docs/STYLEGUIDE.md`](STYLEGUIDE.md)의 정본 토큰을 CSS `color-scheme: light dark` + `light-dark(<color>, <color>)` 시맨틱 변수(`--ka-*`)로 이식한다. 에디토리얼 기본값(`paper`)은 `Krill Paper`(`#f7f4ee`)와 `Tokyo Night`(`#1a1b26`), 스튜디오 변형(`light`)은 `Krill Light`(`#ffffff`)와 `Deep Sea`(`#0b0d13`)를 쓰며, 주 강조색은 `preserve` 오션 블루(`#0369a1` / `#7dcfff`) 하나로 통일한다.
+- **5종 아키타입(`--archetype`)**: `report`(`68ch` 본문 + 우측 여백 주석 + 광폭 도표), `brief`(1페이지 요약 + 비교 맥락 KPI), `explorer`(정적 JSON 스냅샷 내장형 탐색기), `variants`(공유 데이터 기반 시안 A~B 비교), `deck`(16:9 키보드·인쇄 대응 슬라이드).
+- **샌드박스(`Origin: null`) 안전성**: `share.krill.page`는 `allow-same-origin`을 제외한 `sandbox` 헤더로 서빙하므로 무방비 `localStorage`·`sessionStorage`·`indexedDB`·`document.cookie` 호출은 `SecurityError` 예외를 일으킨다. `krill artifacts lint`가 이를 사전 차단하며, 테마·탭 상태는 메모리 변수나 순수 CSS(`:has(:checked)`)로 관리한다.
 
 ### 앱 UI
 

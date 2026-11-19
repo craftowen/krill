@@ -5,6 +5,9 @@
 //! `share`·`update`는 기기 단위 공개 게이트([`krill_proto::artifacts::sharing_enabled`], 기본 꺼짐)가
 //! 켜져 있을 때만 동작한다. `--json`이면 실패도 `{"error":{"code","message"}}`로 stdout에 낸다.
 
+mod lint;
+mod scaffold;
+
 use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -17,16 +20,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use krill_proto::artifacts::{
-    self as schema, ErrorDetail, ErrorOutput, LinkStatus, SHARING_DISABLED_CODE,
-    SHARING_DISABLED_NEXT_STEPS,
+    self as schema, Archetype, ArtifactTheme, ErrorDetail, ErrorOutput, LinkStatus,
+    SHARING_DISABLED_CODE, SHARING_DISABLED_NEXT_STEPS,
 };
 use krill_proto::daemon;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const USAGE: &str =
-    "usage: krill artifacts share <file> [--title <title>] [--expires-in <days|never>] [--api-url <url>] [--json]
-       krill artifacts update <file> [--title <title>] [--expires-in <days|never>] [--api-url <url>] [--json]
+    "usage: krill artifacts init <file> [--archetype <report|brief|explorer|variants|deck>] [--theme <paper|light>] [--title <title>] [--force] [--json]
+       krill artifacts lint <file> [--strict] [--json]
+       krill artifacts share <file> [--title <title>] [--expires-in <days|never>] [--strict] [--api-url <url>] [--json]
+       krill artifacts update <file> [--title <title>] [--expires-in <days|never>] [--strict] [--api-url <url>] [--json]
        krill artifacts retention <slug> --expires-in <days|never> [--api-url <url>] [--json]
        krill artifacts unshare <file> [--api-url <url>] [--json]
        krill artifacts status <file> [--api-url <url>] [--json]
@@ -65,6 +70,10 @@ struct Opts {
     api_url: Option<String>,
     cursor: Option<String>,
     retention_days: Option<u16>,
+    archetype: Option<Archetype>,
+    theme: Option<ArtifactTheme>,
+    force: bool,
+    strict: bool,
     json: bool,
 }
 
@@ -208,6 +217,21 @@ fn execute(ctx: &Ctx, raw: &[OsString]) -> Result<String, Error> {
             "--expires-in is only valid for share, update, or retention".into(),
         ));
     }
+    if (opts.archetype.is_some() || opts.theme.is_some() || opts.force) && cmd != "init" {
+        return Err(Error::Usage(
+            "--archetype, --theme, and --force are only valid for init".into(),
+        ));
+    }
+    if opts.strict && !matches!(cmd.as_str(), "lint" | "share" | "update") {
+        return Err(Error::Usage(
+            "--strict is only valid for lint, share, or update".into(),
+        ));
+    }
+    match cmd.as_str() {
+        "init" => return scaffold::init(&one("file")?, &opts),
+        "lint" => return lint::lint_file(&one("file")?, opts.strict, opts.json),
+        _ => {}
+    }
     // Hold the lock through the HTTP operation and the following read/modify/write.
     // A per-write lock would still lose another process's newly received edit token.
     let _lock = artifact_lock(&ctx.state_dir, "artifact-shares.lock")?;
@@ -234,8 +258,25 @@ fn parse(rest: &[String]) -> Result<Opts, Error> {
         };
         match arg.as_str() {
             "--json" => opts.json = true,
+            "--force" => opts.force = true,
+            "--strict" => opts.strict = true,
             "--title" => opts.title = Some(value("--title")?),
             "--api-url" => opts.api_url = Some(value("--api-url")?),
+            "--archetype" => {
+                let raw = value("--archetype")?;
+                opts.archetype = Some(Archetype::parse(&raw).ok_or_else(|| {
+                    Error::Usage(
+                        "--archetype must be report, brief, explorer, variants, or deck".into(),
+                    )
+                })?);
+            }
+            "--theme" => {
+                let raw = value("--theme")?;
+                opts.theme = Some(
+                    ArtifactTheme::parse(&raw)
+                        .ok_or_else(|| Error::Usage("--theme must be paper or light".into()))?,
+                );
+            }
             "--expires-in" => {
                 let raw = value("--expires-in")?;
                 opts.retention_days =
@@ -289,6 +330,11 @@ fn share(
         });
     }
     let (key, mut body) = read_artifact(file, opts.title.as_deref())?;
+    let warnings = lint::preflight_share(
+        &key,
+        body["content"].as_str().unwrap_or_default(),
+        opts.strict,
+    )?;
     if let Some(days) = opts.retention_days {
         body["retentionDays"] = json!(days);
     }
@@ -327,7 +373,7 @@ fn share(
             shares.insert(key, rec.clone());
             save_shares(&ctx.state_dir, &shares)?;
             returned_retention(&v, requested_retention)?;
-            return Ok(share_output(&rec, "updated", opts.json));
+            return Ok(share_output(&rec, "updated", &warnings, opts.json));
         }
         // 서버에서 만료·삭제됐다. 새로 만든다.
     }
@@ -397,7 +443,7 @@ fn share(
             .as_u64()
             .and_then(|days| u16::try_from(days).ok()),
     )?;
-    Ok(share_output(&rec, "created", opts.json))
+    Ok(share_output(&rec, "created", &warnings, opts.json))
 }
 
 fn unshare(ctx: &Ctx, api: &str, file: &str, opts: &Opts) -> Result<String, Error> {
@@ -565,17 +611,23 @@ fn delete(ctx: &Ctx, api: &str, slug: &str, opts: &Opts) -> Result<String, Error
     Ok(deleted_output(slug, opts.json))
 }
 
-fn share_output(rec: &Record, change: &str, as_json: bool) -> String {
+fn share_output(rec: &Record, change: &str, warnings: &[String], as_json: bool) -> String {
     if as_json {
-        json!({
+        let mut out = json!({
             "change": change,
             "slug": rec.slug,
             "shareUrl": rec.share_url,
             "expiresAt": rec.expires_at,
             "retentionDays": rec.retention_days,
-        })
-        .to_string()
+        });
+        if !warnings.is_empty() {
+            out["warnings"] = json!(warnings);
+        }
+        out.to_string()
     } else {
+        for w in warnings {
+            eprintln!("krill artifacts: warning: {w}");
+        }
         rec.share_url.clone()
     }
 }
@@ -1461,6 +1513,135 @@ printf '{"artifact":{"slug":"s1","expiresAt":"2026-11-01"},"shareUrl":"http://lo
             panic!("bad flag");
         };
         assert_eq!(e.detail().code, "invalid_argument");
+    }
+
+    #[test]
+    fn init_scaffolds_all_archetypes_passes_strict_lint_and_guards_overwrite() {
+        let env = Env::new("init-scaffold");
+        schema::disable_sharing(&env.ctx.state_dir).unwrap();
+
+        for (arch, expected_theme) in [
+            ("report", "paper"),
+            ("brief", "paper"),
+            ("explorer", "light"),
+            ("variants", "light"),
+            ("deck", "paper"),
+        ] {
+            let path = env.dir.join(format!("{arch}.html"));
+            let path_str = path.to_str().unwrap();
+            let out = env
+                .run(&[
+                    "init",
+                    path_str,
+                    "--archetype",
+                    arch,
+                    "--title",
+                    "A & B <2026>",
+                    "--json",
+                ])
+                .unwrap();
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["archetype"], arch);
+            assert_eq!(v["theme"], expected_theme);
+            let html = fs::read_to_string(&path).unwrap();
+            assert!(html.contains("A &amp; B &lt;2026&gt;"));
+            let lint_out = env.run(&["lint", path_str, "--strict", "--json"]).unwrap();
+            let lint_json: Value = serde_json::from_str(&lint_out).unwrap();
+            assert_eq!(lint_json["ok"], true);
+            assert_eq!(lint_json["errors"], 0);
+            assert_eq!(lint_json["warnings"], 0);
+        }
+
+        let target = env.dir.join("report.html");
+        let target_str = target.to_str().unwrap();
+        assert!(
+            matches!(env.run(&["init", target_str]), Err(Error::Coded { code, .. }) if code == "already_exists")
+        );
+        env.run(&["init", target_str, "--theme", "light", "--force"])
+            .unwrap();
+        assert!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .contains("data-ka-theme=\"light\"")
+        );
+
+        let md = env.dir.join("notes.md");
+        let md_str = md.to_str().unwrap();
+        env.run(&["init", md_str, "--archetype", "brief"]).unwrap();
+        assert_eq!(env.run(&["lint", md_str, "--strict"]).unwrap(), "ok");
+        assert!(env.log().is_empty());
+    }
+
+    #[test]
+    fn lint_catches_sandbox_storage_relative_assets_and_strict_share_gate() {
+        let env = Env::new("lint-hazards");
+
+        let unguarded = env.file(
+            "bad-storage.html",
+            "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width\"><title>T</title></head>\
+             <body><script>const x = localStorage.getItem('theme');</script></body></html>",
+        );
+        assert!(matches!(
+            env.run(&["lint", &unguarded]),
+            Err(Error::Coded { code, message, .. })
+                if code == "lint_failed" && message.contains("sandbox_storage")
+        ));
+
+        let guarded = env.file(
+            "ok-storage.html",
+            "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width\"><title>T</title></head>\
+             <body><script type=\"application/json\">{\"localStorage\":true}</script>\
+             <script>try { localStorage.getItem('k'); } catch (e) {}</script></body></html>",
+        );
+        assert_eq!(env.run(&["lint", &guarded, "--strict"]).unwrap(), "ok");
+
+        let rel_html = env.file(
+            "rel.html",
+            "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width\"><title>T</title></head>\
+             <body><img src=\"./chart.png\"></body></html>",
+        );
+        assert!(matches!(
+            env.run(&["lint", &rel_html]),
+            Err(Error::Coded { code, message, .. })
+                if code == "lint_failed" && message.contains("relative_asset")
+        ));
+
+        let rel_md = env.file("rel.md", "# Title\n\n![diagram](assets/flow.svg)\n");
+        assert!(matches!(
+            env.run(&["lint", &rel_md]),
+            Err(Error::Coded { code, message, .. })
+                if code == "lint_failed" && message.contains("relative_asset")
+        ));
+
+        let fenced_md = env.file("ok.md", "# Title\n\n```md\n![example](./local.png)\n```\n");
+        assert_eq!(env.run(&["lint", &fenced_md, "--strict"]).unwrap(), "ok");
+
+        let warn_only = env.file(
+            "slop.html",
+            "<!doctype html><html><head><title>T</title><style>body{background:#f4f1ea;color:#d97757}</style></head><body>Hi</body></html>",
+        );
+        let soft: Value =
+            serde_json::from_str(&env.run(&["lint", &warn_only, "--json"]).unwrap()).unwrap();
+        assert_eq!(soft["ok"], true);
+        assert_eq!(soft["errors"], 0);
+        assert!(soft["warnings"].as_u64().unwrap() >= 2);
+        assert!(
+            matches!(env.run(&["lint", &warn_only, "--strict"]), Err(Error::Coded { code, .. }) if code == "lint_failed")
+        );
+        assert!(
+            matches!(env.run(&["share", &warn_only, "--strict"]), Err(Error::Coded { code, .. }) if code == "lint_failed")
+        );
+        assert!(env.log().is_empty());
+
+        let shared: Value =
+            serde_json::from_str(&env.run(&["share", &unguarded, "--json"]).unwrap()).unwrap();
+        assert_eq!(shared["change"], "created");
+        assert!(
+            shared["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("sandbox_storage")
+        );
     }
 }
 

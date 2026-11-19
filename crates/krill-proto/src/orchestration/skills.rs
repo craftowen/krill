@@ -49,6 +49,21 @@ pub fn builtin_skills() -> &'static [SkillEntry] {
     BUILTIN_SKILLS
 }
 
+pub const ARTIFACTS_REFERENCES: &[(&str, &str)] = &[
+    (
+        "references/design-system.md",
+        include_str!("skills/artifacts/references/design-system.md"),
+    ),
+    (
+        "references/writing-and-anti-slop.md",
+        include_str!("skills/artifacts/references/writing-and-anti-slop.md"),
+    ),
+    (
+        "references/visualization-and-components.md",
+        include_str!("skills/artifacts/references/visualization-and-components.md"),
+    ),
+];
+
 pub const ORCHESTRATION_REFERENCES: &[(&str, &str)] = &[
     (
         "references/coordinator-loop.md",
@@ -82,6 +97,7 @@ pub const ORCHESTRATION_REFERENCES: &[(&str, &str)] = &[
 
 pub fn skill_references(name: &str) -> &'static [(&'static str, &'static str)] {
     match name.trim().trim_start_matches("krill-") {
+        "artifacts" => ARTIFACTS_REFERENCES,
         "orchestration" => ORCHESTRATION_REFERENCES,
         _ => &[],
     }
