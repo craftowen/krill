@@ -16,6 +16,31 @@ const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
 const PREVENT_USER_IDLE_SYSTEM_SLEEP: &str = "PreventUserIdleSystemSleep";
 
+/// 시스템 시간대의 `epoch` 순간 UTC 오프셋(초)을 돌려준다.
+pub(super) fn local_utc_offset_secs(epoch: i64) -> Option<i32> {
+    let time: libc::time_t = epoch;
+    let mut out = libc::tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 0,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: ptr::null_mut(),
+    };
+    // SAFETY: `time`과 `out`은 이 동기 `localtime_r` 호출 동안 살아 있는 스택 지역 변수이며
+    // 런타임에 프로세스 환경을 바꾸지 않는다(CONVENTIONS U8).
+    let result = unsafe { libc::localtime_r(&raw const time, &raw mut out) };
+    if result.is_null() {
+        return None;
+    }
+    i32::try_from(out.tm_gmtoff).ok()
+}
+
 thread_local! {
     static DOCK_BADGE: RefCell<Option<String>> = const { RefCell::new(None) };
 }

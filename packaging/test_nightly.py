@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """야간 배포의 실패 차단·커밋 고정·자산 출처 검증. 실제 빌드·원격 쓰기는 하지 않는다."""
 
+import fcntl
 import hashlib
 import io
 import os
@@ -140,6 +141,61 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("preflight", args[args.index("--command") + 1])
             self.assertNotIn("agent", args)
             self.assertEqual(json.loads((root / "dispatch.json").read_text())["terminal"], "test-terminal")
+
+    def test_dispatch_retries_after_transient_orca_runtime_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = {"orca_cli": "orca", "workspace": "id:repo::/w"}
+            ok = json.dumps({"ok": True, "result": {"terminal": {"handle": "term-2"}}})
+            side_effects = [
+                "{}",
+                nightly.NightlyError("command failed (1): orca terminal create"),
+                "{}",
+                ok,
+            ]
+            with patch.object(nightly, "command", side_effect=side_effects) as mocked, \
+                    patch.object(nightly.time, "sleep") as slept:
+                nightly.dispatch(config, root / "config.json")
+            self.assertEqual(mocked.call_count, 4)
+            slept.assert_called_once_with(nightly.DISPATCH_RETRY_DELAY)
+            saved = json.loads((root / "dispatch.json").read_text())
+            self.assertEqual(saved["terminal"], "term-2")
+            self.assertEqual(saved["attempt"], 2)
+
+    def test_dispatch_recovers_without_duplicate_when_run_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = {"orca_cli": "orca", "workspace": "id:repo::/w"}
+            with (root / "run.lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                side_effects = [
+                    "{}",
+                    nightly.NightlyError("command failed (1): orca terminal create"),
+                ]
+                with patch.object(nightly, "command", side_effect=side_effects) as mocked, \
+                        patch.object(nightly.time, "sleep") as slept:
+                    nightly.dispatch(config, root / "config.json")
+            self.assertEqual(mocked.call_count, 2)
+            slept.assert_not_called()
+            saved = json.loads((root / "dispatch.json").read_text())
+            self.assertEqual(saved["terminal"], "recovered-via-run-lock")
+            self.assertEqual(saved["attempt"], 1)
+
+    def test_dispatch_fails_after_exhausting_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = {"orca_cli": "orca", "workspace": "id:repo::/w"}
+            side_effects = [
+                "{}",
+                nightly.NightlyError("command failed (1): orca terminal create"),
+            ] * nightly.DISPATCH_ATTEMPTS
+            with patch.object(nightly, "command", side_effect=side_effects) as mocked, \
+                    patch.object(nightly.time, "sleep") as slept:
+                with self.assertRaises(nightly.NightlyError):
+                    nightly.dispatch(config, root / "config.json")
+            self.assertEqual(mocked.call_count, nightly.DISPATCH_ATTEMPTS * 2)
+            self.assertEqual(slept.call_count, nightly.DISPATCH_ATTEMPTS - 1)
+            self.assertFalse((root / "dispatch.json").exists())
 
     def test_release_commands_do_not_inherit_the_session_state_or_agent_config(self):
         session = {key: "/Users/u/real" for key in ("KRILL_STATE_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
