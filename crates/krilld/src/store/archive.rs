@@ -6,7 +6,7 @@ use krill_proto::screen::{Cell, MAX_HISTORY_ROWS};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 
-const PRIOR: &str = "prior";
+pub(super) const PRIOR: &str = "prior";
 const MAX_GENERATIONS: usize = 64;
 
 #[derive(Debug)]
@@ -54,8 +54,11 @@ impl Store {
             }
             seen.push(current);
             let dir = self.session_dir(current);
-            // ⌘K는 재개 전 이력도 가린다(seq 0인 경우까지 포함).
-            if !self.recording || dir.join(super::CLEARED_FILE).exists() {
+            // ⌘K는 재개 전 이력도 가린다(seq 0인 경우·일시중지 메모리 기준선 포함).
+            if !self.recording
+                || self.is_unpersisted_clear(current)
+                || dir.join(super::CLEARED_FILE).exists()
+            {
                 break;
             }
             let Some(bytes) = fs::read(dir.join(PRIOR))

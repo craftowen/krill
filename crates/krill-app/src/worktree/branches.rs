@@ -163,16 +163,16 @@ impl Dialog {
     }
 
     pub(super) fn filtered_bases(&self, cx: &App) -> Vec<String> {
-        let query = self.branch_query.read(cx).value().trim().to_lowercase();
+        let query = crate::jump::normalize_search_str(self.branch_query.read(cx).value().trim());
         let mut candidates = Vec::new();
         // The empty value is the project-default choice, never a fabricated Git ref.
-        if text::DEFAULT_BRANCH.get().to_lowercase().contains(&query) {
+        if crate::jump::normalize_search_str(text::DEFAULT_BRANCH.get()).contains(&query) {
             candidates.push(String::new());
         }
         candidates.extend(
             self.candidates
                 .iter()
-                .filter(|candidate| candidate.to_lowercase().contains(query.as_str()))
+                .filter(|candidate| crate::jump::normalize_search_str(candidate).contains(&query))
                 .cloned(),
         );
         candidates

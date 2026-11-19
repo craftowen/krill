@@ -65,6 +65,11 @@ fn details(error: &io::Error) -> Details {
     Details { code, errno }
 }
 
+/// The stable failure name; `io::ErrorKind` folds several daemon refusals into `InvalidInput`.
+pub(super) fn failure_code(error: &io::Error) -> &'static str {
+    details(error).code
+}
+
 /// Internal numeric context for a pane's connection attempt.
 #[derive(Clone, Copy, Debug)]
 pub struct StartAttempt {

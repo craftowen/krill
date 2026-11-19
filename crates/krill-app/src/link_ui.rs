@@ -53,8 +53,13 @@ pub enum LinkUiEvent {
 }
 
 /// "이 Mac에 다른 기기 접속 허용" 서버 패널.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent UI flags: copied feedback, busy, tab visibility, hub disclosure"
+)]
 pub struct ServerPanel {
-    page: PairingPage,
+    /// 접속 관리를 펼쳤는지. 접어 두면 초대 카운트다운이 보이지 않아 1초 갱신이 필요 없다.
+    hub_open: bool,
     backend: Arc<dyn LinkBackend>,
     qr_source: Option<Arc<dyn QrMatrixSource>>,
     status: ServerStatus,
@@ -113,7 +118,7 @@ impl ServerPanel {
     pub fn new(backend: Arc<dyn LinkBackend>, cx: &mut Context<Self>) -> Self {
         let mut panel = Self {
             backend,
-            page: PairingPage::All,
+            hub_open: true,
             qr_source: None,
             status: ServerStatus::default(),
             invite: None,
@@ -155,6 +160,20 @@ impl ServerPanel {
         }
     }
 
+    pub fn set_hub_open(&mut self, open: bool) {
+        self.hub_open = open;
+    }
+
+    /// 행을 접을 때 그 행의 2단계 확인과 이름 편집을 푼다.
+    pub fn clear_row_state(&mut self, cx: &mut Context<Self>) {
+        self.confirm_disconnect = None;
+        self.confirm_revoke = None;
+        self.confirmation_deadline = None;
+        self.renaming = None;
+        self.rename_return_focus = None;
+        cx.notify();
+    }
+
     fn start_clock(&mut self, cx: &mut Context<Self>) {
         self.clock_task = Some(cx.spawn(async move |this, cx| {
             let bg = cx.background_executor().clone();
@@ -171,16 +190,25 @@ impl ServerPanel {
                     {
                         return None;
                     }
-                    if panel
+                    let confirmation_expired = panel
                         .confirmation_deadline
-                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                    {
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+                    if confirmation_expired {
                         panel.confirm_revoke = None;
                         panel.confirm_disconnect = None;
                         panel.confirmation_deadline = None;
                     }
-                    panel.now_secs = current_epoch_secs();
-                    if panel.visible {
+                    let now = current_epoch_secs();
+                    // 카운트다운은 초마다, 기기 행의 경과 표시는 분마다 바뀐다. 그 밖에는 다시 그리지 않는다.
+                    let counting = panel
+                        .invite
+                        .as_ref()
+                        .is_some_and(|invite| !invite.is_expired(panel.now_secs));
+                    let new_minute = panel.now_secs / 60 != now / 60;
+                    panel.now_secs = now;
+                    if panel.visible
+                        && (confirmation_expired || (panel.hub_open && (counting || new_minute)))
+                    {
                         cx.notify();
                     }
                     (!panel.busy).then(|| (panel.backend.clone(), panel.generation))
@@ -203,16 +231,27 @@ impl ServerPanel {
                     if this
                         .update(cx, |panel, cx| {
                             if !panel.busy && panel.generation == generation {
+                                let mut changed = false;
+                                let all_ok =
+                                    snapshot.0.is_ok() && snapshot.1.is_ok() && snapshot.2.is_ok();
                                 if let Ok(status) = snapshot.0 {
+                                    changed |= panel.status != status;
                                     panel.status = status;
                                 }
                                 if let Ok(devices) = snapshot.1 {
+                                    changed |= panel.devices != devices;
                                     panel.devices = devices;
                                 }
                                 if let Ok(hosts) = snapshot.2 {
+                                    changed |= panel.remote_hosts != hosts;
                                     panel.remote_hosts = hosts;
                                 }
-                                cx.notify();
+                                if all_ok {
+                                    changed |= panel.error.take().is_some();
+                                }
+                                if changed {
+                                    cx.notify();
+                                }
                             }
                         })
                         .is_err()
@@ -268,11 +307,6 @@ impl ServerPanel {
         self.confirm_revoke.as_ref()
     }
 
-    #[must_use]
-    pub const fn now_secs(&self) -> u64 {
-        self.now_secs
-    }
-
     /// 현재 기준 시각(Unix epoch 초)을 갱신한다(초대 링크 만료 카운트다운 및 테스트용).
     pub fn set_now_secs(&mut self, now_secs: u64, cx: &mut Context<Self>) {
         self.now_secs = now_secs;
@@ -288,6 +322,7 @@ impl ServerPanel {
         self.busy = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
+        self.error = None;
         cx.notify();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let (status_res, devices_res, hosts_res) = cx
@@ -368,11 +403,6 @@ impl ServerPanel {
         }));
     }
 
-    /// 현재 서버 접속 허용 상태를 반전시킨다.
-    pub fn toggle_server(&mut self, cx: &mut Context<Self>) {
-        self.set_server_enabled(!self.status.enabled, cx);
-    }
-
     /// 새 1회용 초대 링크와 QR 코드 행렬을 백그라운드 실행기에서 생성한다.
     pub fn create_invite(&mut self, cx: &mut Context<Self>) {
         if self.busy {
@@ -440,6 +470,7 @@ impl ServerPanel {
     /// "연결 끊기(회수)" 버튼 무장을 푼다.
     pub fn cancel_revoke(&mut self, cx: &mut Context<Self>) {
         self.confirm_revoke = None;
+        self.confirmation_deadline = None;
         cx.notify();
     }
 
@@ -458,6 +489,7 @@ impl ServerPanel {
         let Some(target) = self.confirm_revoke.take() else {
             return;
         };
+        self.confirmation_deadline = None;
         let backend = self.backend.clone();
         let target_id = target.id.clone();
         self.busy = true;
@@ -494,6 +526,13 @@ impl ServerPanel {
         self.renaming.as_ref().map(|r| r.id.as_str())
     }
 
+    fn rename_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let app: &mut gpui::App = cx;
+        self.renaming.as_ref().is_some_and(|rename| {
+            crate::jump::entity_input_is_composing(&rename.input, window, app)
+        })
+    }
+
     /// 원격 Mac 행을 이름 입력칸으로 바꾼다. Enter는 저장, Escape는 취소.
     pub fn start_rename(&mut self, host: &PairedHost, window: &mut Window, cx: &mut Context<Self>) {
         self.rename_return_focus = window.focused(cx);
@@ -501,7 +540,9 @@ impl ServerPanel {
         input.update(cx, |input, cx| input.focus(window, cx));
         let subscription =
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !this.rename_is_composing(window, cx)
+                {
                     this.save_rename(window, cx);
                 }
             });
@@ -622,6 +663,7 @@ impl ServerPanel {
 
     fn cancel_disconnect(&mut self, cx: &mut Context<Self>) {
         self.confirm_disconnect = None;
+        self.confirmation_deadline = None;
         cx.notify();
     }
 
@@ -639,6 +681,7 @@ impl ServerPanel {
         let Some(host) = self.confirm_disconnect.take() else {
             return;
         };
+        self.confirmation_deadline = None;
         self.busy = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -672,8 +715,14 @@ impl ServerPanel {
 
     fn render_invite_section(&self, p: &crate::ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
         // 서버 카드 안에 또 카드를 얹지 않는다(STYLEGUIDE §8.4). 초대 영역은 카드 안
-        // 구분 구역으로 평탄하게 그린다.
-        let mut section = div().flex().flex_col().gap_2p5();
+        // 구분선으로 나눈 구역으로 평탄하게 그린다.
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .pt_3()
+            .border_t_1()
+            .border_color(p.border);
 
         let create_btn = crate::ui::primary("link-create-invite", text::CREATE_INVITE.get())
             .disabled(self.busy || !self.status.enabled)
@@ -823,245 +872,233 @@ impl ServerPanel {
         section
     }
 
-    fn render_remote_hosts(
+    /// 초대 링크로 연결한 머신의 일반 동작: 이름, 버전, 상태, 업데이트, 이름 바꾸기.
+    pub fn render_remote_route(
         &self,
         p: &crate::ui::Palette,
-        selected: Option<&[String]>,
+        id: &str,
         cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    ) -> Option<gpui::Stateful<gpui::Div>> {
         use crate::i18n::catalog::sidebar as labels;
-        let mut section = div()
-            .id("link-remote-hosts")
-            .debug_selector(|| "link-remote-hosts".into())
+        let host = self.remote_hosts.iter().find(|host| host.id == id)?;
+        let (color, label) = match host.status {
+            krill_hosts::HostStatus::Connected => (p.success, labels::HOST_CONNECTED.get()),
+            krill_hosts::HostStatus::Connecting => (p.warning, labels::HOST_CONNECTING.get()),
+            krill_hosts::HostStatus::Disconnected => {
+                (p.muted_foreground, labels::HOST_DISCONNECTED.get())
+            }
+        };
+        let outdated = host.status == krill_hosts::HostStatus::Connected
+            && host
+                .version
+                .as_deref()
+                .and_then(|v| krill_proto::control::is_newer(krill_proto::BUILD, v))
+                == Some(true);
+        let selector = format!("link-remote-host-{}", host.id);
+        let editing = self.renaming.as_ref().filter(|r| r.id == host.id);
+        let summary = div()
             .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .text_size(crate::ui::TEXT_SM)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(text::REMOTE_HOSTS_TITLE.get()),
-            );
-        if self.remote_hosts.is_empty() {
-            return section.child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::REMOTE_HOSTS_EMPTY.get()),
-            );
-        }
-        for host in self
-            .remote_hosts
-            .iter()
-            .filter(|host| selected.is_none_or(|ids| ids.contains(&host.id)))
-        {
-            let (color, label) = match host.status {
-                krill_hosts::HostStatus::Connected => (p.success, labels::HOST_CONNECTED.get()),
-                krill_hosts::HostStatus::Connecting => (p.warning, labels::HOST_CONNECTING.get()),
-                krill_hosts::HostStatus::Disconnected => {
-                    (p.muted_foreground, labels::HOST_DISCONNECTED.get())
-                }
-            };
-            let outdated = host.status == krill_hosts::HostStatus::Connected
-                && host
-                    .version
-                    .as_deref()
-                    .and_then(|v| krill_proto::control::is_newer(krill_proto::BUILD, v))
-                    == Some(true);
-            let selector = format!("link-remote-host-{}", host.id);
-            let button_id = format!("link-remote-disconnect-{}", host.id);
-            let button_selector = button_id.clone();
-            let target = host.clone();
-            let out_id = host.id.clone();
-            let armed = self
-                .confirm_disconnect
-                .as_ref()
-                .is_some_and(|target| target.id == host.id);
-            let editing = self.renaming.as_ref().filter(|r| r.id == host.id);
-            let name: gpui::AnyElement = match editing {
-                Some(rename) => div()
-                    .id("link-remote-rename-input")
-                    .debug_selector(|| "link-remote-rename-input".into())
-                    .flex_1()
-                    .min_w_0()
-                    .min_w(gpui::px(160.))
-                    .capture_action(cx.listener(
-                        |this, _: &gpui_component::input::Escape, window, cx| {
-                            cx.stop_propagation();
-                            this.cancel_rename(window, cx);
-                        },
-                    ))
-                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                        if event.keystroke.key == "escape" {
-                            cx.stop_propagation();
-                            this.cancel_rename(window, cx);
-                        }
-                    }))
-                    .child(Input::new(&rename.input).small())
-                    .into_any_element(),
-                None => div()
-                    .flex_1()
-                    .min_w_0()
-                    .min_w(gpui::px(160.))
-                    .truncate()
-                    .text_size(crate::ui::TEXT_SM)
-                    .child(host.name.clone())
-                    .into_any_element(),
-            };
-            let actions = if editing.is_some() {
-                crate::ui::controls()
-                    .child(
-                        crate::ui::ghost(
-                            "link-remote-rename-cancel",
-                            text::RENAME_HOST_CANCEL.get(),
+            .flex_wrap()
+            .items_center()
+            .gap_1p5()
+            .text_size(crate::ui::TEXT_XS)
+            .text_color(p.muted_foreground)
+            .child(text::ROUTE_SUMMARY.get())
+            .children(host.version.clone())
+            .child(div().text_color(color).child(label));
+        let actions = if let Some(rename) = editing {
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id("link-remote-rename-input")
+                        .debug_selector(|| "link-remote-rename-input".into())
+                        .flex_1()
+                        .min_w(gpui::px(160.))
+                        .capture_action(cx.listener(
+                            |this, _: &gpui_component::input::Escape, window, cx| {
+                                if this.rename_is_composing(window, cx) {
+                                    window.prevent_default();
+                                    return;
+                                }
+                                cx.stop_propagation();
+                                this.cancel_rename(window, cx);
+                            },
+                        ))
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape"
+                                && !window.default_prevented()
+                                && !this.rename_is_composing(window, cx)
+                            {
+                                cx.stop_propagation();
+                                this.cancel_rename(window, cx);
+                            }
+                        }))
+                        .child(Input::new(&rename.input).small()),
+                )
+                .child(
+                    crate::ui::controls()
+                        .child(
+                            crate::ui::ghost(
+                                "link-remote-rename-cancel",
+                                text::RENAME_HOST_CANCEL.get(),
+                            )
+                            .debug_selector(|| "link-remote-rename-cancel".into())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.cancel_rename(window, cx)),
+                            ),
                         )
-                        .debug_selector(|| "link-remote-rename-cancel".into())
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.cancel_rename(window, cx)),
-                        ),
-                    )
-                    .child(
-                        crate::ui::primary("link-remote-rename-save", text::RENAME_HOST_SAVE.get())
+                        .child(
+                            crate::ui::primary(
+                                "link-remote-rename-save",
+                                text::RENAME_HOST_SAVE.get(),
+                            )
                             .disabled(self.busy)
                             .debug_selector(|| "link-remote-rename-save".into())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.save_rename(window, cx)),
                             ),
-                    )
-            } else {
-                let button_id = format!("link-remote-rename-{}", host.id);
-                let button_selector = button_id.clone();
-                let target = host.clone();
-                crate::ui::controls().child(
-                    crate::ui::secondary(
-                        SharedString::from(button_id),
-                        text::RENAME_HOST_BUTTON.get(),
-                    )
-                    .disabled(self.busy)
-                    .debug_selector(move || button_selector.clone())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.start_rename(&target, window, cx);
-                    })),
+                        ),
                 )
-            };
-            section = section.child(
+        } else {
+            let button_id = format!("link-remote-rename-{}", host.id);
+            let button_selector = button_id.clone();
+            let target = host.clone();
+            let update = (outdated && !self.updating_hosts.contains(&host.id)).then(|| {
+                let update_id = format!("link-remote-update-{}", host.id);
+                let update_selector = update_id.clone();
+                let target_id = host.id.clone();
+                crate::ui::primary(
+                    SharedString::from(update_id),
+                    text::UPDATE_HOST_BUTTON.get(),
+                )
+                .disabled(self.busy)
+                .debug_selector(move || update_selector.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_host(target_id.clone(), cx);
+                }))
+            });
+            crate::ui::controls().children(update).child(
+                crate::ui::secondary(
+                    SharedString::from(button_id),
+                    text::RENAME_HOST_BUTTON.get(),
+                )
+                .disabled(self.busy)
+                .debug_selector(move || button_selector.clone())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_rename(&target, window, cx);
+                })),
+            )
+        };
+        let started = (outdated && editing.is_none() && self.updating_hosts.contains(&host.id))
+            .then(|| {
                 div()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .py_2()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
-                            .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))
-                            .child(name)
-                            .children(host.version.as_ref().map(|v| {
-                                div()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(v.clone())
-                            }))
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .text_color(color)
-                                    .child(label),
-                            )
-                            .when(outdated && editing.is_none(), |d| {
-                                if self.updating_hosts.contains(&host.id) {
-                                    return d.child(
-                                        div()
-                                            .text_size(crate::ui::TEXT_XS)
-                                            .text_color(p.muted_foreground)
-                                            .child(text::UPDATE_HOST_STARTED.get()),
-                                    );
-                                }
-                                let update_id = format!("link-remote-update-{}", host.id);
-                                let update_selector = update_id.clone();
-                                let target_id = host.id.clone();
-                                d.child(
-                                    crate::ui::controls().child(
-                                        crate::ui::primary(
-                                            SharedString::from(update_id),
-                                            text::UPDATE_HOST_BUTTON.get(),
-                                        )
-                                        .disabled(self.busy)
-                                        .debug_selector(move || update_selector.clone())
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.update_host(target_id.clone(), cx);
-                                            }),
-                                        ),
-                                    ),
-                                )
-                            })
-                            .child(actions)
-                            .when(editing.is_none(), |d| {
-                                d.child(
-                                    crate::ui::controls().child(
-                                        crate::ui::danger_confirm(
-                                            gpui::ElementId::Name(button_id.into()),
-                                            text::REVOKE_BUTTON.get(),
-                                            text::REVOKE_CONFIRM_AGAIN.get(),
-                                            armed,
-                                        )
-                                        .disabled(self.busy)
-                                        .debug_selector(move || button_selector.clone())
-                                        .when(armed, |button| {
-                                            button.on_mouse_down_out(cx.listener(
-                                                move |this, _, _, cx| {
-                                                    if this
-                                                        .confirm_disconnect
-                                                        .as_ref()
-                                                        .is_some_and(|h| h.id == out_id)
-                                                    {
-                                                        this.cancel_disconnect(cx);
-                                                    }
-                                                },
-                                            ))
-                                        })
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                if this
-                                                    .confirm_disconnect
-                                                    .as_ref()
-                                                    .is_some_and(|h| h.id == target.id)
-                                                {
-                                                    this.confirm_disconnect_now(cx);
-                                                } else {
-                                                    this.request_disconnect(target.clone(), cx);
-                                                }
-                                            }),
-                                        ),
-                                    ),
-                                )
-                            }),
-                    )
-                    .when(armed, |row| {
-                        row.child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(text::REMOTE_DISCONNECT_DETAIL.get()),
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::UPDATE_HOST_STARTED.get())
+            });
+        Some(
+            div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(summary)
+                .child(actions)
+                .children(started),
+        )
+    }
+
+    /// 초대 링크 연결을 끊는 위험 행. 결과 문구는 누르기 전부터 보인다.
+    pub fn render_remote_danger(
+        &self,
+        p: &crate::ui::Palette,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let host = self.remote_hosts.iter().find(|host| host.id == id)?;
+        let button_id = format!("link-remote-disconnect-{}", host.id);
+        let button_selector = button_id.clone();
+        let target = host.clone();
+        let out_id = host.id.clone();
+        let armed = self
+            .confirm_disconnect
+            .as_ref()
+            .is_some_and(|target| target.id == host.id);
+        Some(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(gpui::px(170.))
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::REMOTE_DISCONNECT_DETAIL.get()),
+                )
+                .child(
+                    crate::ui::controls().child(
+                        crate::ui::danger_confirm(
+                            gpui::ElementId::Name(button_id.into()),
+                            text::REVOKE_BUTTON.get(),
+                            text::REVOKE_CONFIRM_AGAIN.get(),
+                            armed,
                         )
-                    }),
-            );
-        }
-        section
+                        .disabled(self.busy)
+                        .debug_selector(move || button_selector.clone())
+                        .when(armed, |button| {
+                            button.on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                                if this
+                                    .confirm_disconnect
+                                    .as_ref()
+                                    .is_some_and(|h| h.id == out_id)
+                                {
+                                    this.cancel_disconnect(cx);
+                                }
+                            }))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this
+                                .confirm_disconnect
+                                .as_ref()
+                                .is_some_and(|h| h.id == target.id)
+                            {
+                                this.confirm_disconnect_now(cx);
+                            } else {
+                                this.request_disconnect(target.clone(), cx);
+                            }
+                        })),
+                    ),
+                ),
+        )
     }
 
     fn render_devices_section(&self, p: &crate::ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
-        let mut section = div().flex().flex_col().gap_2().child(
-            div()
-                .text_size(crate::ui::TEXT_SM)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(text::DEVICES_TITLE.get()),
-        );
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pt_3()
+            .border_t_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_SM)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(text::DEVICES_TITLE.get()),
+            );
 
         if self.devices.is_empty() {
             section = section.child(
@@ -1161,24 +1198,23 @@ impl ServerPanel {
     }
 }
 
-impl Render for ServerPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = crate::ui::palette(cx);
-        let local_content = !matches!(self.page, PairingPage::Details { local: false, .. });
+impl ServerPanel {
+    /// 원격 탭 맨 위 카드: 접속 허용 스위치와 안내는 늘 보이고, `toggle` 아래 초대와 기기는 펼쳤을 때만 만든다.
+    pub fn render_hub(
+        &self,
+        p: &crate::ui::Palette,
+        open: bool,
+        toggle: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let enabled = self.status.enabled;
-        let desc = if enabled {
-            text::SERVER_DESC_ON.get()
+        let (desc, toggle_label) = if enabled {
+            (text::SERVER_DESC_ON.get(), text::TOGGLE_ON.get())
         } else {
-            text::SERVER_DESC_OFF.get()
-        };
-
-        let toggle_label = if enabled {
-            text::TOGGLE_ON.get()
-        } else {
-            text::TOGGLE_OFF.get()
+            (text::SERVER_DESC_OFF.get(), text::TOGGLE_OFF.get())
         };
         let weak = cx.entity().downgrade();
-        let toggle = crate::ui::switch(
+        let switch = crate::ui::switch(
             p,
             "link-server-toggle",
             enabled,
@@ -1189,13 +1225,27 @@ impl Render for ServerPanel {
             },
         )
         .aria_label(text::SERVER_TITLE.get());
+        let summary = if enabled {
+            text::HUB_SUMMARY_ON.format(&[("count", &self.devices.len().to_string())])
+        } else {
+            text::HUB_SUMMARY_OFF.get().to_owned()
+        };
 
         crate::ui::card(p)
             .id("link-server-panel")
             .debug_selector(|| "link-server-panel".into())
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    if this.rename_is_composing(window, cx) {
+                        window.prevent_default();
+                    }
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if matches!(event.keystroke.key.as_str(), "tab" | "escape")
+                    && !(event.keystroke.key == "escape"
+                        && (window.default_prevented() || this.rename_is_composing(window, cx)))
                     && (this.confirm_revoke.is_some() || this.confirm_disconnect.is_some())
                 {
                     this.confirm_revoke = None;
@@ -1209,48 +1259,28 @@ impl Render for ServerPanel {
             }))
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_2p5()
             .text_color(p.card_foreground)
-            .when(local_content, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap_0p5()
-                                .child(
-                                    div()
-                                        .text_size(crate::ui::TEXT_SM)
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(text::SERVER_TITLE.get()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(crate::ui::TEXT_XS)
-                                        .text_color(p.muted_foreground)
-                                        .child(desc),
-                                ),
-                        )
-                        .child(
-                            crate::ui::controls()
-                                .child(
-                                    div()
-                                        .text_size(crate::ui::TEXT_XS)
-                                        .text_color(p.muted_foreground)
-                                        .child(toggle_label),
-                                )
-                                .child(toggle),
-                        ),
-                )
-            })
-            .when(local_content && !enabled, |d| {
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(crate::ui::label(p, text::SERVER_TITLE.get(), desc))
+                    .child(
+                        crate::ui::controls()
+                            .child(
+                                div()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(toggle_label),
+                            )
+                            .child(switch),
+                    ),
+            )
+            .when(!enabled, |d| {
                 d.child(
                     div()
                         .id("link-server-off-notice")
@@ -1270,22 +1300,45 @@ impl Render for ServerPanel {
                         .debug_selector(|| "link-server-error".into()),
                 )
             })
-            .when(local_content && enabled, |d| {
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1p5()
+                    .child(toggle)
+                    .child(
+                        div()
+                            .debug_selector(|| "link-hub-summary".into())
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(summary),
+                    ),
+            )
+            .when(open && enabled, |d| {
                 d.child(self.render_invite_section(p, cx))
             })
-            .when(local_content, |d| {
-                d.child(self.render_devices_section(p, cx))
-            })
-            .when(self.page == PairingPage::All, |d| {
-                d.child(self.render_remote_hosts(p, None, cx))
-            })
-            .when_some(
-                match &self.page {
-                    PairingPage::Details { routes, .. } if !routes.is_empty() => Some(routes),
-                    _ => None,
-                },
-                |d, routes| d.child(self.render_remote_hosts(p, Some(routes), cx)),
-            )
+            .when(open, |d| d.child(self.render_devices_section(p, cx)))
+    }
+}
+
+#[cfg(test)]
+impl Render for ServerPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = crate::ui::palette(cx);
+        let ids: Vec<String> = self
+            .remote_hosts
+            .iter()
+            .map(|host| host.id.clone())
+            .collect();
+        let hub = self.render_hub(p, true, div(), cx);
+        let mut routes = div().flex().flex_col().gap_2();
+        for id in &ids {
+            routes = routes
+                .children(self.render_remote_route(p, id, cx))
+                .children(self.render_remote_danger(p, id, cx));
+        }
+        div().child(hub).child(routes)
     }
 }
 
@@ -1349,27 +1402,42 @@ impl ClientDialog {
                 .placeholder(text::DEVICE_NAME_PLACEHOLDER.get())
                 .default_value(initial_name)
         });
-        let enter_link = cx.subscribe(&link_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. })
-                && !matches!(this.phase, ClientPhase::Connecting)
-            {
-                this.submit_pair(cx);
-            }
-        });
-        let enter_host_name = cx.subscribe(&host_name_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. })
-                && !matches!(this.phase, ClientPhase::Connecting)
-            {
-                this.submit_pair(cx);
-            }
-        });
-        let enter_name = cx.subscribe(&device_name_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. })
-                && !matches!(this.phase, ClientPhase::Connecting)
-            {
-                this.submit_pair(cx);
-            }
-        });
+        let enter_link = cx.subscribe_in(
+            &link_input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !matches!(this.phase, ClientPhase::Connecting)
+                    && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    this.submit_pair(cx);
+                }
+            },
+        );
+        let enter_host_name = cx.subscribe_in(
+            &host_name_input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !matches!(this.phase, ClientPhase::Connecting)
+                    && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    this.submit_pair(cx);
+                }
+            },
+        );
+        let enter_name = cx.subscribe_in(
+            &device_name_input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !matches!(this.phase, ClientPhase::Connecting)
+                    && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    this.submit_pair(cx);
+                }
+            },
+        );
         let clipboard_suggestion = None;
 
         let mut dialog = Self {
@@ -1451,20 +1519,6 @@ impl ClientDialog {
     ) {
         let val = value.into();
         self.host_name_input.update(cx, |input, cx| {
-            input.set_value(val, window, cx);
-        });
-        cx.notify();
-    }
-
-    /// 이 기기 이름 입력칸 값을 설정한다.
-    pub fn set_device_name_value(
-        &mut self,
-        value: impl Into<SharedString>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let val = value.into();
-        self.device_name_input.update(cx, |input, cx| {
             input.set_value(val, window, cx);
         });
         cx.notify();
@@ -1562,13 +1616,6 @@ impl ClientDialog {
                 .ok();
             }
         }));
-    }
-
-    /// 근처 Mac 항목을 선택해 초대 링크 입력칸에 채운다.
-    pub fn select_nearby(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(mac) = self.nearby.get(index).cloned() {
-            self.set_link_value(mac.invite_link, window, cx);
-        }
     }
 
     /// 근처 Mac 항목을 선택해 초대 링크를 채우고 즉시 페어링를 시작한다.
@@ -1935,44 +1982,16 @@ impl Render for ClientDialog {
     }
 }
 
-/// 서버 패널("이 Mac에 다른 기기 접속 허용")과 클라이언트 대화상자("다른 Mac 추가")를
-/// 한 화면에 묶어 보여주는 통합 뷰.
+/// 서버 패널("이 Mac에 다른 기기 접속 허용")과 클라이언트 대화상자("다른 Mac 추가")를 소유한다.
+/// 원격 탭이 서버 패널을 카드와 머신 행으로 나눠 그리고, 이 뷰 자체는 대화상자를 그린다.
 #[derive(Debug)]
 pub struct PairingView {
-    page: PairingPage,
     pub server: Entity<ServerPanel>,
     pub client: Entity<ClientDialog>,
     _events: Vec<Subscription>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum PairingPage {
-    #[default]
-    All,
-    Add,
-    Details {
-        local: bool,
-        routes: Vec<String>,
-    },
-}
-
 impl PairingView {
-    pub fn show(&mut self, page: PairingPage, cx: &mut Context<Self>) {
-        if self.page != page {
-            self.server.update(cx, |server, cx| {
-                server.page = page.clone();
-                server.confirm_disconnect = None;
-                server.confirm_revoke = None;
-                server.confirmation_deadline = None;
-                server.renaming = None;
-                server.rename_return_focus = None;
-                cx.notify();
-            });
-            self.page = page;
-            cx.notify();
-        }
-    }
-
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.server
             .update(cx, |server, cx| server.set_visible(visible, cx));
@@ -1993,7 +2012,6 @@ impl PairingView {
             }),
         ];
         Self {
-            page: PairingPage::All,
             server,
             client,
             _events: events,
@@ -2011,13 +2029,7 @@ impl Render for PairingView {
             .flex()
             .flex_col()
             .gap_4()
-            .when(self.page != PairingPage::Add, |d| {
-                d.child(self.server.clone())
-            })
-            .when(
-                matches!(self.page, PairingPage::All | PairingPage::Add),
-                |d| d.child(self.client.clone()),
-            )
+            .child(self.client.clone())
     }
 }
 

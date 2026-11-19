@@ -426,6 +426,16 @@ fn upgrade_keeps_sessions_lossless_and_one_generation() {
         assert_eq!(daemons(&sock), want);
         assert!(command_of(holder_pid).starts_with(to_holder.to_str().unwrap()));
         assert!(command_of(new_krilld).starts_with(to_krilld.to_str().unwrap()));
+        // exec 뒤 새 holder 이미지가 소켓 소유 락을 다시 잡았다(새 krilld는 그 뒤 이벤트 루프가 띄운다).
+        let mut owner = sock.clone().into_os_string();
+        owner.push(".holder.lock");
+        assert!(
+            matches!(
+                fs::File::open(owner).unwrap().try_lock(),
+                Err(fs::TryLockError::WouldBlock)
+            ),
+            "holder lost the socket owner lock across exec"
+        );
 
         // 같은 세션·pid가 살아 있고 출력은 처음부터 빠짐·중복 없이 이어진다.
         assert!(alive(root), "session died during upgrade");
@@ -838,6 +848,12 @@ fn upgrade_holder_loss_after_done_resumes_readers_and_keeps_output() {
             self.0.wait().ok();
         }
     }
+    struct KillOnDrop(u32);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            kill_process(pid(self.0), Signal::KILL).ok();
+        }
+    }
     fn send(link: &Link, m: &FromHolder, fds: &[std::os::fd::BorrowedFd<'_>]) {
         link.send(&m.encode().unwrap(), fds).unwrap();
     }
@@ -885,16 +901,22 @@ fn upgrade_holder_loss_after_done_resumes_readers_and_keeps_output() {
     // krilld가 holder 쪽 끝(`ours`)의 사본을 물려받으면 링크를 닫아도 EOF가 나지 않는다(진짜 holder와 같은 CLOEXEC).
     rustix::io::fcntl_setfd(&ours, rustix::io::FdFlags::CLOEXEC).unwrap();
     rustix::io::fcntl_setfd(&theirs, rustix::io::FdFlags::CLOEXEC).unwrap();
-    let krilld = Guard(
-        Command::new(KRILLD)
-            .arg(&sock)
-            .env("KRILL_STATE_DIR", &dir)
-            .stdin(Stdio::from(theirs))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    // 진짜 holder 상실처럼 링크를 닫는 쪽이 krilld의 부모가 아니어야 한다. 부모가 살아 있는데 링크만 닫히면
+    // krilld는 고아를 선언하지 않고 끝난다(`rejoin::link_lost`). 중간 셸이 krilld를 띄우고 바로 끝나 launchd가 부모가 된다.
+    let mut launcher = Command::new("/bin/sh")
+        .args(["-c", "\"$0\" \"$1\" <&0 >/dev/null 2>&1 & echo $!"])
+        .arg(KRILLD)
+        .arg(&sock)
+        .env("KRILL_STATE_DIR", &dir)
+        .stdin(Stdio::from(theirs))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut launched = String::new();
+    std::io::Read::read_to_string(&mut launcher.stdout.take().unwrap(), &mut launched).unwrap();
+    assert!(launcher.wait().unwrap().success());
+    let krilld = KillOnDrop(launched.trim().parse().unwrap());
 
     let session = SessionId(7);
     let controller = pty.controller;
@@ -915,6 +937,7 @@ fn upgrade_holder_loss_after_done_resumes_readers_and_keeps_output() {
                 id: session,
                 pid: child_pid,
                 status: None,
+                size: None,
             },
             &[controller.as_fd()],
         );
@@ -922,10 +945,13 @@ fn upgrade_holder_loss_after_done_resumes_readers_and_keeps_output() {
         // 요청마다 `Done`. `UpgradeKrilld`의 `Done` 뒤 링크를 닫는다: 리더 정지 중 holder 상실.
         while let Ok(Some(p)) = link.recv() {
             let m = ToHolder::decode(p.frame()).unwrap();
-            send(&link, &FromHolder::Done { req: m.req() }, &[]);
+            let done = FromHolder::Done { req: m.req() }.encode().unwrap();
             if matches!(m, ToHolder::UpgradeKrilld { .. }) {
-                break;
+                link.send(&done, &[]).unwrap();
+                drop(link);
+                return controller;
             }
+            link.send(&done, &[]).unwrap();
         }
         drop(link);
         controller

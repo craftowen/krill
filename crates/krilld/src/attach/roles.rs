@@ -31,10 +31,6 @@ struct Entry {
 }
 
 impl Clients {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     fn owner(&self) -> Option<&Entry> {
         self.entries
             .iter()
@@ -53,7 +49,7 @@ impl Clients {
     ) -> io::Result<()> {
         let size = self.owner().map(|e| e.size).or(self.mobile_fallback);
         if let Some(size) = size
-            && self.applied != Some(size)
+            && (self.applied != Some(size) || tap.size().ok() != Some(size))
         {
             // 오류가 OS 변경 뒤에 올 수도 있다. 다음 소유자는 실제 크기를 다시 적용해야 한다.
             self.applied = None;
@@ -112,9 +108,6 @@ impl Client {
         let mut e = clients.entries.remove(at);
         let acquire = matches!(request, Request::Resize { .. })
             && matches!(e.role, Role::InteractiveWithSize { owns_size: false });
-        if acquire && clients.mobile_fallback.is_none() {
-            clients.mobile_fallback = self.tap.size().ok();
-        }
         match request {
             Request::Set(role) => {
                 if e.role != role {
@@ -130,6 +123,9 @@ impl Client {
                 if cols == 0 || rows == 0 || cols > MAX_COLS || rows > MAX_LINES {
                     clients.entries.insert(at, e);
                     return Ack::Invalid;
+                }
+                if acquire && clients.mobile_fallback.is_none() {
+                    clients.mobile_fallback = self.tap.size().ok();
                 }
                 e.size = WinSize { cols, rows };
                 if matches!(e.role, Role::InteractiveWithSize { .. }) {

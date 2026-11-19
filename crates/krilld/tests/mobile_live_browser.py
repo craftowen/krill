@@ -81,6 +81,7 @@ def main():
                 terminal = config['terminalSession']
                 assert len([line for line in cli('ls').splitlines() if line.split('\t')[0].isdigit()]) == expected_ptys
                 # Select via its actual card, then render the real screen stream.
+                wait(f'KrillMobile.store.sessions.has({terminal})')
                 evaluate(f'KrillMobile.app.navigate("/host/local/group/"+encodeURIComponent(KrillMobile.store.sessions.get({terminal}).groupKey)+"/s/{terminal}");true')
                 wait('document.querySelector(".terminal-grid").getAttribute("aria-label").includes("LIVE RED")')
                 original = size()
@@ -138,6 +139,7 @@ def main():
                 second('open',second_offer)
                 second('set','viewport','390','844')
                 second('wait','--fn','KrillMobile.store.connection.phase==="ready"')
+                second('wait','--fn',f'KrillMobile.store.sessions.has({terminal})')
                 second('eval',f'KrillMobile.app.navigate("/host/local/group/"+encodeURIComponent(KrillMobile.store.sessions.get({terminal}).groupKey)+"/s/{terminal}");true')
                 second('wait','--fn','document.querySelector(".terminal-grid")?.getAttribute("aria-label").includes("KEYS:15") && document.querySelectorAll(".terminal-history-row").length>=900')
                 two_mobile = footprint(config['daemon'],'daemon-two-mobile')

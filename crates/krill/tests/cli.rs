@@ -58,7 +58,6 @@ impl Daemon {
         let holder = Command::new(bin.join("krill-holder"))
             .arg(bin.join("krilld"))
             .arg(&socket)
-            .env("KRILL_CLOUDFLARED_BIN", dir.join("cloudflared-test"))
             // 외부 릴레이·공개 PWA 배포 상태에 의존하지 않는 격리된 모바일 게이트웨이.
             .env("KRILL_MOBILE_ORIGIN", "http://127.0.0.1:0")
             .env("KRILL_STATE_DIR", &dir)
@@ -87,7 +86,6 @@ impl Daemon {
             .env_remove("MK_MAX_WORKER_DEPTH")
             .env_remove("KRILL_WORKTREES_DIR")
             .env_remove("KRILL_ORCA_DIR")
-            .env_remove("KRILL_COMPUTER_OSASCRIPT_BIN")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -108,7 +106,11 @@ impl Daemon {
         }
     }
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(MK)
+        self.command(args).output().unwrap()
+    }
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(MK);
+        command
             .args(args)
             .env("KRILL_STATE_DIR", &self.dir)
             .env_remove("KRILL_SESSION_ID")
@@ -120,13 +122,18 @@ impl Daemon {
             .env_remove("KRILL_ORCH_MAX_DEPTH")
             .env_remove("MK_MAX_WORKER_DEPTH")
             .env_remove("KRILL_WORKTREES_DIR")
-            .env_remove("KRILL_ORCA_DIR")
-            .env_remove("KRILL_COMPUTER_OSASCRIPT_BIN")
-            .output()
-            .unwrap()
+            .env_remove("KRILL_ORCA_DIR");
+        command
     }
     fn ok(&self, args: &[&str]) -> String {
-        let out = self.run(args);
+        Self::ok_output(self.run(args), args)
+    }
+    /// Runs the CLI as an agent inside session `pane` would (`MK_PANE_ID`).
+    fn ok_in(&self, pane: &str, args: &[&str]) -> String {
+        let out = self.command(args).env("MK_PANE_ID", pane).output().unwrap();
+        Self::ok_output(out, args)
+    }
+    fn ok_output(out: Output, args: &[&str]) -> String {
         assert!(
             out.status.success(),
             "{args:?}: {}",
@@ -943,6 +950,205 @@ fn session_checkpoint_references_and_release_preserve_the_selected_worktree_and_
     d.ok(&["kill", &borrowed_id]);
 }
 
+/// A session whose agent finished its turn (`Stop` hook) and echoes whatever is typed into it.
+fn idle_echo_session(d: &Daemon, ready: &str) -> String {
+    let script = format!(
+        "printf '%s' '{{\"hook_event_name\":\"Stop\"}}' | KRILL_STATE_DIR='{}' '{MK}' hook claude >/dev/null; \
+         printf '{ready}\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+        d.dir.display()
+    );
+    let id = d
+        .ok(&["new", "--", "/bin/sh", "-c", &script])
+        .trim()
+        .to_owned();
+    d.wait_text(&id, ready);
+    d.ok(&[
+        "wait",
+        &id,
+        "--for",
+        "idle",
+        "--quiet-ms",
+        "0",
+        "--timeout",
+        "5",
+    ]);
+    id
+}
+
+#[test]
+fn run_created_from_a_pane_wakes_its_idle_coordinator() {
+    let d = Daemon::new("coordinator-wake");
+    let coordinator = idle_echo_session(&d, "coordinator-ready");
+    let run: serde_json::Value = serde_json::from_str(&d.ok_in(
+        &coordinator,
+        &["orchestration", "run-create", "--title", "Wake", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(
+        run["coordinator_session_id"]
+            .as_u64()
+            .map(|n| n.to_string()),
+        Some(coordinator.clone())
+    );
+    let run = run["id"].as_str().unwrap();
+    d.ok(&[
+        "orchestration",
+        "send",
+        "--from",
+        "reporter",
+        "--to",
+        "coordinator",
+        "--run",
+        run,
+        "--summary",
+        "progress",
+    ]);
+    let screen = d.wait_text(&coordinator, "got:[Krill orchestration] Unread mail.");
+    assert!(screen.contains(&format!("--run '{run}'")), "{screen}");
+}
+
+#[test]
+fn acknowledged_worker_done_releases_idle_created_workers_only() {
+    let d = Daemon::new("auto-release");
+    // Ready (Stop) at launch; a prompt line containing MAKE-BUSY starts a new turn (Working).
+    let hook = |event: &str| {
+        format!(
+            "printf '%s' '{{\"hook_event_name\":\"{event}\"}}' | KRILL_STATE_DIR='{}' '{MK}' hook claude >/dev/null",
+            d.dir.display()
+        )
+    };
+    let script = format!(
+        "stty -echo; {}; printf 'auto-marker\\n> '; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; \
+         case \"$line\" in *MAKE-BUSY*) {};; esac; done",
+        hook("Stop"),
+        hook("UserPromptSubmit")
+    );
+    fs::write(
+        d.dir.join("agents.toml"),
+        format!(
+            "[agent.auto_fixture]\nname = \"Auto fixture\"\nlaunch = [\"/bin/sh\", \"-c\", {}]\n",
+            serde_json::to_string(&script).unwrap()
+        ),
+    )
+    .unwrap();
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "Auto release",
+        "--json",
+    ]))
+    .unwrap();
+    let run = run["id"].as_str().unwrap();
+    let cwd = d.dir.to_str().unwrap();
+    let mut workers = Vec::new();
+    for (worker, prompt, state, wait_extra) in [
+        ("auto-idle", "Work", "idle", &["--quiet-ms", "0"][..]),
+        ("auto-kept", "Work", "idle", &["--quiet-ms", "0"]),
+        ("auto-busy", "Work MAKE-BUSY", "working", &[]),
+    ] {
+        let started: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run,
+            "--worker",
+            worker,
+            "--agent",
+            "auto_fixture",
+            "--cwd",
+            cwd,
+            "--prompt",
+            prompt,
+            "--json",
+        ]))
+        .unwrap();
+        let dispatch = started["id"].as_str().unwrap().to_owned();
+        let session = started["session_id"].as_u64().unwrap().to_string();
+        d.wait_text(&session, "auto-marker");
+        d.ok(&[
+            &["wait", &session, "--for", state, "--timeout", "5"],
+            wait_extra,
+        ]
+        .concat());
+        d.ok(&[
+            "orchestration",
+            "send",
+            "--from",
+            worker,
+            "--type",
+            "worker_done",
+            "--dispatch",
+            &dispatch,
+            "--summary",
+            "Result summary",
+        ]);
+        workers.push((dispatch, session));
+    }
+    let [
+        (idle, idle_session),
+        (kept, kept_session),
+        (_, busy_session),
+    ] = &workers[..]
+    else {
+        unreachable!()
+    };
+    d.ok(&["orchestration", "worker-retain", kept]);
+    let peek: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "check",
+        "--to",
+        "coordinator",
+        "--run",
+        run,
+        "--unread",
+        "--json",
+    ]))
+    .unwrap();
+    assert!(peek.get("auto_released").is_none(), "{peek}");
+    assert_eq!(peek["messages"].as_array().unwrap().len(), 3);
+    let ls = d.ok(&["ls"]);
+    for (_, session) in &workers {
+        assert!(
+            ls_has_session(&ls, session),
+            "peek must not release {session}"
+        );
+    }
+    let acked: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "check",
+        "--to",
+        "coordinator",
+        "--run",
+        run,
+        "--ack",
+        peek["delivery"]["id"].as_str().unwrap(),
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(acked["auto_released"], serde_json::json!([idle]));
+    assert!(
+        acked["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["acked"] == true)
+    );
+    let ls = d.ok(&["ls"]);
+    assert!(!ls_has_session(&ls, idle_session));
+    assert!(ls_has_session(&ls, kept_session));
+    assert!(ls_has_session(&ls, busy_session));
+    let released: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "worker-show", idle, "--json"])).unwrap();
+    assert_eq!(released["release_state"], "released");
+    assert!(
+        released["archived_output"]
+            .as_str()
+            .unwrap()
+            .contains("auto-marker")
+    );
+}
+
 #[test]
 fn kill_and_close_wait_for_termination_including_signal_escalation() {
     let d = Daemon::new("close-wait");
@@ -1561,8 +1767,7 @@ fn orchestration_agy_full_and_minimal_workers_read_guide_ask_and_report() {
 }
 
 #[test]
-fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
-    use std::os::unix::fs::PermissionsExt;
+fn mobile_cli_pair_list_revoke_and_relay_contract() {
     let d = Daemon::new("mobile");
     assert_eq!(d.ok(&["mobile", "devices", "--json"]).trim(), "[]");
     assert!(d.ok(&["mobile", "--help"]).contains("krill mobile"));
@@ -1589,14 +1794,7 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
     assert!(url.contains("/#pair=") && url.contains("&key="));
     assert!(!url.split('#').next().unwrap().contains("key="));
     d.ok(&["mobile", "revoke", "--all", "--json"]);
-    let script = d.dir.join("cloudflared-test");
-    fs::write(
-        &script,
-        "#!/bin/sh\n: > \"${0%/*}/cloudflared-started\"\nprintf 'https://cli-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 120\n",
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    // 로그인 전에는 릴레이 접속을 거부하고, 설치된 퀵터널로 폴백하지 않는다.
+    // 로그인 전에는 릴레이 접속을 거부한다.
     let out = d.run(&["mobile", "pair", "--tunnel", "--json"]);
     assert!(!out.status.success());
     assert!(
@@ -1615,273 +1813,7 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
             ..
         }
     ));
-    assert!(!d.dir.join("cloudflared-started").exists());
     d.ok(&["mobile", "revoke", "--all"]);
-}
-
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "macOS 전용: krill computer(접근성 API)"
-)]
-fn computer_cli_subcommands_and_skill_work_offline() {
-    let dir = std::env::temp_dir().join(format!("m13-computer-contract-{}", std::process::id()));
-    fs::remove_dir_all(&dir).ok();
-    fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("krill-bin");
-    fs::copy(MK, &bin).unwrap();
-    let run = |args: &[&str]| {
-        Command::new(&bin)
-            .args(args)
-            .env("KRILL_STATE_DIR", &dir)
-            .env("KRILL_TEST_OFFLINE", "1")
-            .output()
-            .unwrap()
-    };
-    let ok = |args: &[&str]| {
-        let out = run(args);
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
-    };
-    let tree = serde_json::json!({"role":"AXWindow","title":"Fixture","bounds":{"x":0,"y":0,"width":400,"height":300},
-    "children":[
-        {"role":"AXTextField","title":"Input","value":"initial","focused":true,
-         "bounds":{"x":10,"y":20,"width":200,"height":30},"actions":["AXConfirm"]},
-        {"role":"AXButton","title":"Save","bounds":{"x":220,"y":20,"width":60,"height":30},"actions":["AXPress"]}
-    ]});
-    let initial = serde_json::json!({"clipboard":"private clipboard secret","clipboardRestoreCount":0,
-        "apps":[{"name":"Fixture","pid":7777,"isActive":true,"windows":[{
-            "id":"101","title":"Fixture","bounds":{"x":0,"y":0,"width":400,"height":300},"root":tree}]}]});
-    let path = dir.join("computer-mock.json");
-    let save =
-        |value: &serde_json::Value| fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
-    save(&initial);
-    assert!(
-        !run(&[
-            "computer",
-            "click",
-            "--app",
-            "Fixture",
-            "--element",
-            "1",
-            "--json"
-        ])
-        .status
-        .success()
-    );
-    let skill = run(&["skills", "get", "computer-use"]);
-    assert!(skill.status.success());
-    assert!(String::from_utf8_lossy(&skill.stdout).contains("get-app-state"));
-    let capabilities = ok(&["computer", "capabilities", "--json"]);
-    assert_eq!(capabilities["contract"], "computer/2");
-    assert_eq!(capabilities["batchSupported"], false);
-    assert!(
-        capabilities["guideHash"]
-            .as_str()
-            .unwrap()
-            .starts_with("fnv1a64:")
-    );
-    let permissions = ok(&["computer", "permissions", "--json"]);
-    assert!(permissions["supported"].as_bool().unwrap());
-    let apps = ok(&["computer", "list-apps", "--json"]);
-    assert!(
-        apps["apps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|app| app["pid"] == 7777)
-    );
-    let windows = ok(&["computer", "list-windows", "--app", "Fixture", "--json"]);
-    assert_eq!(windows["windows"][0]["id"], "101");
-    let snapshot = ok(&[
-        "computer",
-        "get-app-state",
-        "--app",
-        "Fixture",
-        "--no-screenshot",
-        "--json",
-    ]);
-    let id = snapshot["snapshotId"].as_str().unwrap();
-    let snapshot_again = ok(&[
-        "computer",
-        "get-app-state",
-        "--app",
-        "Fixture",
-        "--no-screenshot",
-        "--json",
-    ]);
-    assert_ne!(snapshot["snapshotId"], snapshot_again["snapshotId"]);
-    let long = format!("{}tail", "가".repeat(900));
-    let set = ok(&[
-        "computer",
-        "set-value",
-        "--snapshot",
-        id,
-        "--element",
-        "1",
-        "--value",
-        &long,
-        "--no-screenshot",
-        "--json",
-    ]);
-    assert_eq!(set["verification"]["status"], "verified");
-    assert_eq!(set["delivery"], "submitted");
-    assert_eq!(set["observation"]["status"], "observed");
-    let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    assert_eq!(
-        stored["apps"][0]["windows"][0]["root"]["children"][0]["value"],
-        long
-    );
-    let paste = ok(&[
-        "computer",
-        "paste-text",
-        "--element",
-        "1",
-        "--text",
-        " pasted",
-        "--no-screenshot",
-        "--json",
-    ]);
-    assert_eq!(paste["clipboard"]["preserved"], true);
-    assert_eq!(paste["clipboard"]["restored"], true);
-    assert_eq!(paste["cleanup"], "completed");
-    assert!(paste["clipboard"].get("previousText").is_none());
-    assert!(
-        !serde_json::to_string(&paste)
-            .unwrap()
-            .contains("private clipboard secret")
-    );
-    let click = ok(&[
-        "computer",
-        "click",
-        "--element",
-        "2",
-        "--no-screenshot",
-        "--json",
-    ]);
-    assert_eq!(click["verification"]["status"], "unverified");
-    assert_eq!(click["verification"]["retried"], false);
-    assert_eq!(click["delivery"], "submitted");
-    assert!(
-        !run(&["computer", "click", "--x", "999", "--y", "999", "--json"])
-            .status
-            .success()
-    );
-
-    // Keep the legacy public actions and aliases executable through the real CLI.
-    // Each command gets fresh immutable evidence, so this is not stale-index reuse.
-    for action in [
-        vec![
-            "perform-secondary-action",
-            "--element-index",
-            "1",
-            "--action",
-            "AXConfirm",
-        ],
-        vec!["type-text", "--element-index", "1", "--text", "typed"],
-        vec!["press-key", "--key", "return", "--repeat", "2"],
-        vec!["hotkey", "--key", "cmd+shift+p"],
-        vec![
-            "scroll",
-            "--element-index",
-            "2",
-            "--direction",
-            "down",
-            "--pages",
-            "1",
-        ],
-        vec![
-            "drag",
-            "--from-element-index",
-            "1",
-            "--to-element-index",
-            "2",
-        ],
-        vec!["click", "--x", "250", "--y", "35", "--mouse-button", "left"],
-    ] {
-        save(&initial);
-        ok(&[
-            "computer",
-            "get-app-state",
-            "--app",
-            "Fixture",
-            "--format",
-            "full",
-            "--json",
-        ]);
-        let mut arguments = vec!["computer"];
-        arguments.extend(action);
-        arguments.extend(["--no-screenshot", "--json"]);
-        let result = ok(&arguments);
-        assert_eq!(result["delivery"], "submitted", "{arguments:?}: {result}");
-        assert_eq!(result["verification"]["status"], "unverified");
-        assert_eq!(result["verification"]["retried"], false);
-    }
-
-    // Each rejected stale/ambiguous ref must leave the effect journal untouched.
-    for adversary in ["reorder", "ambiguous", "window_replaced", "disabled"] {
-        save(&initial);
-        let before = ok(&[
-            "computer",
-            "get-app-state",
-            "--app",
-            "Fixture",
-            "--no-screenshot",
-            "--json",
-        ]);
-        let token = before["snapshotId"].as_str().unwrap();
-        let mut changed = initial.clone();
-        let children = changed["apps"][0]["windows"][0]["root"]["children"]
-            .as_array_mut()
-            .unwrap();
-        match adversary {
-            "reorder" => children.swap(0, 1),
-            "ambiguous" => children.push(children[0].clone()),
-            "disabled" => children[0]["enabled"] = serde_json::json!(false),
-            _ => changed["apps"][0]["windows"][0]["id"] = serde_json::json!("102"),
-        }
-        save(&changed);
-        let out = run(&[
-            "computer",
-            "click",
-            "--snapshot",
-            token,
-            "--element",
-            "1",
-            "--no-screenshot",
-            "--json",
-        ]);
-        assert!(
-            !out.status.success(),
-            "{adversary}: {}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(after["lastAction"].is_null(), "{adversary} mutated target");
-    }
-    let mut host = initial.clone();
-    host["apps"][0]["name"] = serde_json::json!("krill-app");
-    host["apps"][0]["isHidden"] = serde_json::json!(true);
-    save(&host);
-    assert!(
-        !run(&[
-            "computer",
-            "get-app-state",
-            "--app",
-            "krill-app",
-            "--restore-window",
-            "--json"
-        ])
-        .status
-        .success()
-    );
-    let host_after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    assert_eq!(host_after["apps"][0]["isHidden"], true);
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

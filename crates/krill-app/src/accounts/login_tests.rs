@@ -339,3 +339,183 @@ fn copy_link_mode_captures_authorize_url_without_opening_browser() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn encode_b64url(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let (mut bits, mut count) = (0_u32, 0_u32);
+    let mut out = String::new();
+    for &byte in bytes {
+        bits = (bits << 8) | u32::from(byte);
+        count += 8;
+        while count >= 6 {
+            count -= 6;
+            let idx = usize::try_from((bits >> count) & 63).unwrap();
+            out.push(char::from(TABLE[idx]));
+        }
+    }
+    if count > 0 {
+        let idx = usize::try_from((bits << (6 - count)) & 63).unwrap();
+        out.push(char::from(TABLE[idx]));
+    }
+    out
+}
+
+#[test]
+fn codex_browser_login_renames_auto_profile_from_auth_json_and_requests_usage_refresh() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use krill_proto::ipc::{self, ClientHello, ServerHello};
+    use krill_proto::screen::Msg as _;
+    use krill_proto::usage::{
+        AccountInfo, AccountsSnapshot, FEAT_ACCOUNT_CONNECTION, FEAT_PROVIDER_DETAILS, FEAT_USAGE,
+        FEAT_USAGE_MANAGE, FEAT_USAGE_REFRESH, FEAT_USAGE_STATUS, Snapshot, UsageReply,
+        UsageRequest,
+    };
+
+    let root =
+        std::env::temp_dir().join(format!("krill-codex-login-rename-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let profile = root.join("profile");
+    std::fs::create_dir_all(&profile).unwrap();
+
+    let id_payload = encode_b64url(
+        &serde_json::to_vec(&serde_json::json!({
+            "email": "beta@example.test",
+            "iat": 1_794_147_864_i64,
+            "exp": 1_794_151_464_i64,
+        }))
+        .unwrap(),
+    );
+    let auth_json = serde_json::json!({
+        "tokens": {
+            "id_token": format!("eyJhbGciOiJub25lIn0.{id_payload}.sig"),
+            "access_token": "acc-tok",
+            "account_id": "acc-beta",
+        }
+    })
+    .to_string();
+
+    let fake_codex = root.join("codex");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then\n  [ -f \"$CODEX_HOME/auth.json\" ] && printf 'Logged in using ChatGPT\\n' && exit 0\n  exit 1\nfi\nif [ \"$1\" = \"login\" ]; then\n  printf '%s\\n' '{auth_json}' > \"$CODEX_HOME/auth.json\"\n  exit 0\nfi\nexit 2\n"
+    );
+    std::fs::write(&fake_codex, script).unwrap();
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let paths = krill_proto::daemon::Paths {
+        socket: root.join("daemon.sock"),
+        holder: root.join("unused-holder"),
+        krilld: root.join("unused-daemon"),
+    };
+    let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_bg = done.clone();
+    let server = std::thread::spawn(move || {
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: FEAT_USAGE
+                | FEAT_USAGE_MANAGE
+                | FEAT_USAGE_REFRESH
+                | FEAT_USAGE_STATUS
+                | FEAT_ACCOUNT_CONNECTION
+                | FEAT_PROVIDER_DETAILS,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        let encoded_hello = hello.encode().unwrap();
+        let mut requests = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    conn.set_nonblocking(false).unwrap();
+                    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    conn.write_all(&encoded_hello).unwrap();
+                    let (kind, body) = ipc::read_frame(&mut conn).unwrap().unwrap();
+                    let client = ClientHello::decode(kind, &body).unwrap();
+                    let features = ipc::negotiate(&hello, &client).unwrap().features;
+                    if let Some((kind, body)) = ipc::read_frame(&mut conn).unwrap() {
+                        let req = UsageRequest::decode(kind, &body).unwrap();
+                        requests.push(req);
+                        let reply = UsageReply::Accounts(AccountsSnapshot::default())
+                            .for_features(features);
+                        conn.write_all(&reply.encode().unwrap()).unwrap();
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_bg.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+        requests
+    });
+
+    let account = AccountInfo {
+        id: "codex-codex-profile-1".into(),
+        provider: ProviderKind::Codex,
+        label: "Codex Profile #1".into(),
+        email: None,
+        profile_dir: profile.display().to_string(),
+        active: false,
+        host_default: false,
+        stale: false,
+        usage: Snapshot::default(),
+    };
+    let mut command =
+        krill_proto::account_login::login_command(&fake_codex, ProviderKind::Codex, Some(&profile))
+            .unwrap();
+    command.env(
+        "PATH",
+        std::env::join_paths([root.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap(),
+    );
+
+    run_browser_login_with_mode(
+        &paths,
+        &account,
+        true,
+        command,
+        &AtomicBool::new(false),
+        false,
+    );
+
+    done.store(true, Ordering::Release);
+    let requests = server.join().unwrap();
+    std::fs::remove_dir_all(&root).ok();
+
+    assert_eq!(
+        take_login_outcome(&account.id),
+        Some(LoginOutcome::Succeeded)
+    );
+    let expected_rename = UsageRequest::RenameAccount {
+        provider: ProviderKind::Codex,
+        account_id: "codex-codex-profile-1".into(),
+        label: "beta@example.test".into(),
+        email: Some("beta@example.test".into()),
+    };
+    let rename_pos = requests.iter().position(|r| r == &expected_rename);
+    let refresh_pos = requests
+        .iter()
+        .position(|r| r == &UsageRequest::RefreshUsage);
+    assert!(
+        rename_pos.is_some(),
+        "expected RenameAccount in {requests:?}"
+    );
+    assert!(
+        refresh_pos.is_some(),
+        "expected RefreshUsage in {requests:?}"
+    );
+    assert!(
+        rename_pos.unwrap() < refresh_pos.unwrap(),
+        "expected RefreshUsage after RenameAccount in {requests:?}"
+    );
+}

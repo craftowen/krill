@@ -18,10 +18,8 @@ pub(super) fn prepare(home: &Path, source: &Path) -> io::Result<PathBuf> {
     if canonical.as_os_str().len() <= profiles::MAX_CODEX_HOME_BYTES {
         return Ok(source.into());
     }
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(canonical.as_os_str().as_encoded_bytes())
-    );
+    let digest =
+        crate::mobile::devices::hex(&Sha256::digest(canonical.as_os_str().as_encoded_bytes()));
     let key = format!("i-{}", digest.get(..10).unwrap_or(&digest));
     let target = profiles::short_codex_profile_dir(home, &key);
     // Very long user homes need an explicit, private short location; never use a shared /tmp home.

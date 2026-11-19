@@ -1186,3 +1186,184 @@ fn windows_command_output_status_and_timeout_are_bounded() {
         io::ErrorKind::TimedOut
     );
 }
+
+#[gpui::test]
+fn short_pr_dialog_keeps_footer_inside_viewport(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let service = Arc::new(Service::new(Arc::new(Fake(AtomicUsize::new(0)))));
+    let (dialog, visual) = cx.add_window_view(|window, cx| {
+        Dialog::new(
+            PathBuf::from("/repo"),
+            "long-branch/".repeat(20),
+            service,
+            window,
+            cx,
+        )
+    });
+    visual.simulate_resize(gpui::size(px(540.), px(320.)));
+    dialog.update(visual, |dialog, cx| {
+        dialog.error = Some("A server rejected the pull request. ".repeat(30));
+        cx.notify();
+    });
+    visual.run_until_parked();
+    let card = visual.debug_bounds("pr-dialog").unwrap();
+    assert!(card.top() >= crate::ui::SPACE_4);
+    assert!(card.bottom() <= px(320.) - crate::ui::SPACE_4);
+    for selector in ["pr-dialog-close", "pr-dialog-submit"] {
+        let button = visual.debug_bounds(selector).unwrap();
+        assert!(button.top() >= card.top());
+        assert!(button.bottom() <= card.bottom());
+        assert!(button.left() >= card.left());
+        assert!(button.right() <= card.right());
+    }
+}
+
+struct PrDialogHost {
+    outside: FocusHandle,
+    dialog: Entity<Dialog>,
+}
+
+impl Render for PrDialogHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .child(
+                div()
+                    .id("outside-stop")
+                    .track_focus(&self.outside)
+                    .tab_index(0),
+            )
+            .child(self.dialog.clone())
+    }
+}
+
+#[gpui::test]
+fn pr_dialog_traps_tab_exposes_dialog_role_and_guards_submitting_and_ime_escape(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::{Element as _, EntityInputHandler as _};
+
+    cx.update(gpui_component::init);
+    let service = Arc::new(Service::new(Arc::new(Fake(AtomicUsize::new(0)))));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let (host, visual) = cx.add_window_view(|window, cx| {
+        let dialog = cx.new(|cx| {
+            Dialog::new(
+                PathBuf::from("/repo"),
+                "feat/modal-guards".into(),
+                service,
+                window,
+                cx,
+            )
+        });
+        cx.subscribe(&dialog, move |_, _, e: &Event, _| {
+            sink.lock().unwrap().push(e.clone());
+        })
+        .detach();
+        PrDialogHost {
+            outside: cx.focus_handle().tab_stop(true),
+            dialog,
+        }
+    });
+    visual.simulate_resize(gpui::size(px(720.), px(560.)));
+    visual.run_until_parked();
+
+    visual.update(|window, cx| {
+        let dialog = host.read(cx).dialog.clone();
+        let card = dialog.update(cx, |d, cx| d.render_card(window, cx));
+        let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+        card.write_a11y_info(&mut node);
+        assert_eq!(card.a11y_role(), Some(gpui::Role::Dialog));
+        assert_eq!(node.label(), Some(text::MODAL_TITLE.get()));
+    });
+
+    for key in [
+        "tab",
+        "tab",
+        "tab",
+        "tab",
+        "tab",
+        "shift-tab",
+        "shift-tab",
+        "shift-tab",
+    ] {
+        visual.simulate_keystrokes(key);
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            let state = host.read(cx);
+            assert!(
+                !state.outside.is_focused(window),
+                "focus escaped PR dialog to background on {key}"
+            );
+            assert!(
+                state.dialog.read(cx).focus.contains_focused(window, cx),
+                "focus left PR dialog scope on {key}"
+            );
+        });
+    }
+
+    visual.update(|window, cx| {
+        let dialog = host.read(cx).dialog.clone();
+        dialog.update(cx, |d, cx| {
+            d.title.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    visual.run_until_parked();
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert!(events.lock().unwrap().is_empty());
+
+    visual.update(|window, cx| {
+        let dialog = host.read(cx).dialog.clone();
+        dialog.update(cx, |d, cx| {
+            d.title
+                .update(cx, |input, cx| input.unmark_text(window, cx));
+            d.body.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "한", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    visual.run_until_parked();
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert!(events.lock().unwrap().is_empty());
+
+    visual.update(|window, cx| {
+        let dialog = host.read(cx).dialog.clone();
+        dialog.update(cx, |d, cx| {
+            d.body.update(cx, |input, cx| input.unmark_text(window, cx));
+            d.submitting = true;
+            cx.notify();
+        });
+    });
+    visual.run_until_parked();
+    visual.simulate_keystrokes("escape");
+    visual.simulate_click(gpui::point(px(2.), px(2.)), gpui::Modifiers::default());
+    let close_btn = visual.debug_bounds("pr-dialog-close").unwrap();
+    visual.simulate_click(close_btn.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "submitting dialog must ignore escape, backdrop click, and close button"
+    );
+
+    visual.update(|window, cx| {
+        let dialog = host.read(cx).dialog.clone();
+        dialog.update(cx, |d, cx| {
+            d.submitting = false;
+            d.title.update(cx, |input, cx| input.focus(window, cx));
+            cx.notify();
+        });
+    });
+    visual.run_until_parked();
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert_eq!(*events.lock().unwrap(), [Event::Close]);
+}

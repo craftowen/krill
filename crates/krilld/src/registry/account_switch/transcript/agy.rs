@@ -2,8 +2,9 @@
 //! SQLite derives `-wal`/`-shm` from the name it opened, so a second hard-link name gives one
 //! database two WAL files: frames written through one name are invisible to, or replayed over,
 //! the other. The bridge therefore never aliases the database. It publishes an independent copy
-//! taken only while the source is cleanly closed (no `-wal`/`-shm`/`-journal`) and unchanged
-//! across the copy. A brain folder without its database is never reported as resumable.
+//! of the database and its `-wal`, taken while no rollback journal exists and unchanged across
+//! the copy. macOS SQLite keeps `-wal`/`-shm` after a clean close and a live agy holds them, so
+//! their presence never means busy. A brain folder without its database is never resumable.
 
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
@@ -18,8 +19,8 @@ use sha2::{Digest as _, Sha256};
 use crate::agent::control::valid_session_id;
 
 const MAGIC: &[u8] = b"SQLite format 3\0";
-/// Any of these next to a database means a connection is open or did not close cleanly.
-const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+/// Moved with a parked database so a new file never inherits another file's WAL frames.
+const SIDECARS: [&str; 2] = ["-wal", "-shm"];
 const MAX_DB_BYTES: u64 = 4 << 30;
 const MAX_AUX_ENTRIES: usize = 4096;
 /// Krill-owned bookkeeping inside an Antigravity home. Antigravity does not read it.
@@ -30,23 +31,33 @@ fn busy() -> io::Error {
     io::Error::from_raw_os_error(libc::EBUSY)
 }
 
+/// The database and its WAL. A turn or checkpoint by the original changes one of them.
 #[derive(PartialEq, Eq)]
 struct Stamp {
     len: u64,
     modified: SystemTime,
     handle: same_file::Handle,
+    wal: Option<(u64, SystemTime)>,
 }
 
 impl Stamp {
     fn of(path: &Path) -> io::Result<Self> {
+        no_journal(path)?;
         let meta = fs::symlink_metadata(path)?;
         if !meta.is_file() {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        let wal = match fs::symlink_metadata(sidecar(path, "-wal")) {
+            Ok(wal) if wal.is_file() => Some((wal.len(), wal.modified()?)),
+            Ok(_) => return Err(io::ErrorKind::InvalidInput.into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             len: meta.len(),
             modified: meta.modified()?,
             handle: same_file::Handle::from_path(path)?,
+            wal,
         })
     }
 }
@@ -76,11 +87,10 @@ impl Bridge {
             ));
         }
         check_header(&self.target_db)?;
-        if let Some((path, stamp)) = &self.source {
-            closed(path)?;
-            if Stamp::of(path)? != *stamp {
-                return Err(busy());
-            }
+        if let Some((path, stamp)) = &self.source
+            && Stamp::of(path)? != *stamp
+        {
+            return Err(busy());
         }
         Ok(())
     }
@@ -109,19 +119,23 @@ pub(super) fn prepare(
                 source: None,
             });
         }
-        // A hard-link alias left by an earlier bridge. Drop only the extra name while both
-        // names are closed; the inode keeps its source name, so nothing is lost.
-        closed(&source_db)?;
-        closed(&target_db)?;
+        // A hard-link alias left by an earlier bridge. Drop only the extra name while neither
+        // name holds unmerged frames; the inode keeps its source name, so nothing is lost.
+        settled(&source_db)?;
+        settled(&target_db)?;
         fs::remove_file(&target_db)?;
+        park_sidecars(
+            &target_db,
+            &target_root
+                .join(BRIDGE)
+                .join("archive")
+                .join(unique_suffix()),
+        )?;
     }
-    closed(&source_db)?;
     let before = Stamp::of(&source_db)?;
     let scratch = target_root.join(BRIDGE).join("tmp");
-    let staged = Staged::copy(&source_db, &scratch)?;
+    let staged = Staged::copy_db(&source_db, &scratch)?;
     let hash = digest(staged.path())?;
-    // WAL writers create `-wal` before touching the database, and a checkpoint moves mtime.
-    closed(&source_db)?;
     if Stamp::of(&source_db)? != before || digest(&source_db)? != hash {
         return Err(busy());
     }
@@ -137,7 +151,7 @@ pub(super) fn prepare(
             if !meta.is_file() {
                 return Err(io::ErrorKind::InvalidInput.into());
             }
-            closed(&target_db)?;
+            no_journal(&target_db)?;
             let existing = digest(&target_db)?;
             if existing == hash {
                 // An identical independent copy is already in place.
@@ -159,13 +173,19 @@ pub(super) fn prepare(
             }
             let parked = archive.join("conversations").join(format!("{id}.db"));
             fs::create_dir_all(parked.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+            // ponytail: an agy already running this conversation in the selected home keeps
+            // writing to the parked file; refuse here if Krill ever tracks such live readers.
             fs::rename(&target_db, &parked)?;
+            park_sidecars(&target_db, &parked)?;
             displaced = Some(parked);
         }
     }
-    if let Err(error) = staged.publish(&target_db) {
+    if let Err(error) = staged.publish_db(&target_db) {
         if let Some(parked) = displaced {
-            fs::rename(parked, &target_db).ok();
+            fs::rename(&parked, &target_db).ok();
+            for suffix in SIDECARS {
+                fs::rename(sidecar(&parked, suffix), sidecar(&target_db, suffix)).ok();
+            }
         }
         return Err(error);
     }
@@ -230,12 +250,37 @@ fn sidecar(db: &Path, suffix: &str) -> PathBuf {
     name.into()
 }
 
-fn closed(db: &Path) -> io::Result<()> {
+/// A rollback journal means a write transaction is open or must be recovered first.
+fn no_journal(db: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(sidecar(db, "-journal")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(busy()),
+    }
+}
+
+/// No journal and no WAL frames that are not yet in the database file.
+fn settled(db: &Path) -> io::Result<()> {
+    no_journal(db)?;
+    match fs::symlink_metadata(sidecar(db, "-wal")) {
+        Ok(wal) if wal.len() > 0 => Err(busy()),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn park_sidecars(db: &Path, parked: &Path) -> io::Result<()> {
     for suffix in SIDECARS {
-        match fs::symlink_metadata(sidecar(db, suffix)) {
+        let from = sidecar(db, suffix);
+        match fs::symlink_metadata(&from) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
-            Ok(_) => return Err(busy()),
+            Ok(_) => {
+                let to = sidecar(parked, suffix);
+                fs::create_dir_all(to.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+                fs::rename(from, to)?;
+            }
         }
     }
     Ok(())
@@ -260,23 +305,19 @@ fn check_header(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Hash of a database together with its WAL frames: the conversation SQLite will read.
 fn digest(path: &Path) -> io::Result<String> {
-    let mut reader = File::open(path)?.take(MAX_DB_BYTES + 1);
     let mut hasher = Sha256::new();
-    let mut buf = vec![0_u8; 64 * 1024];
     let mut total = 0_u64;
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        };
-        total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
-        if total > MAX_DB_BYTES {
-            return Err(io::ErrorKind::FileTooLarge.into());
+    hash_file(File::open(path)?, &mut hasher, &mut total)?;
+    match File::open(sidecar(path, "-wal")) {
+        Ok(wal) if wal.metadata()?.len() > 0 => {
+            hasher.update(b"\0wal\0");
+            hash_file(wal, &mut hasher, &mut total)?;
         }
-        hasher.update(buf.get(..n).ok_or(io::ErrorKind::InvalidData)?);
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     let bytes: [u8; 32] = hasher.finalize().into();
     let mut hex = String::with_capacity(64);
@@ -284,6 +325,25 @@ fn digest(path: &Path) -> io::Result<String> {
         write!(hex, "{byte:02x}").ok();
     }
     Ok(hex)
+}
+
+fn hash_file(file: File, hasher: &mut Sha256, total: &mut u64) -> io::Result<()> {
+    let mut reader = file.take(MAX_DB_BYTES + 1);
+    let mut buf = vec![0_u8; 64 * 1024];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        *total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        if *total > MAX_DB_BYTES {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        hasher.update(buf.get(..n).ok_or(io::ErrorKind::InvalidData)?);
+    }
+    Ok(())
 }
 
 fn seed_path(root: &Path, id: &str) -> PathBuf {
@@ -347,28 +407,17 @@ impl Staged {
     fn copy(source: &Path, scratch: &Path) -> io::Result<Self> {
         fs::create_dir_all(scratch)?;
         let staged = Self(scratch.join(format!("{}.tmp", unique_suffix())));
-        fs::copy(source, &staged.0)?;
-        #[cfg(windows)]
-        {
-            // Only this private copy becomes writable, so the selected account
-            // can append turns and failed staging can be removed on Windows.
-            let mut permissions = fs::metadata(&staged.0)?.permissions();
-            if permissions.readonly() {
-                #[expect(
-                    clippy::permissions_set_readonly_false,
-                    reason = "Windows attribute on our owned staging copy; Unix permissions are preserved"
-                )]
-                permissions.set_readonly(false);
-                fs::set_permissions(&staged.0, permissions)?;
-            }
+        copy_file(source, &staged.0)?;
+        Ok(staged)
+    }
+
+    /// The database and its non-empty WAL; SQLite rebuilds `-shm` when the copy is opened.
+    fn copy_db(source: &Path, scratch: &Path) -> io::Result<Self> {
+        let staged = Self::copy(source, scratch)?;
+        let wal = sidecar(source, "-wal");
+        if fs::symlink_metadata(&wal).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            copy_file(&wal, &sidecar(&staged.0, "-wal"))?;
         }
-        // FlushFileBuffers requires write access on Windows. Unix also permits
-        // syncing a read-only copy, whose permissions fs::copy preserves.
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(windows)]
-        options.write(true);
-        options.open(&staged.0)?.sync_all()?;
         Ok(staged)
     }
 
@@ -382,11 +431,54 @@ impl Staged {
         fs::create_dir_all(destination.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
         fs::hard_link(&self.0, destination)
     }
+
+    /// The WAL lands first so the database never appears without the frames it needs.
+    fn publish_db(self, destination: &Path) -> io::Result<()> {
+        fs::create_dir_all(destination.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        let staged_wal = sidecar(&self.0, "-wal");
+        let wal = sidecar(destination, "-wal");
+        let linked_wal = staged_wal.is_file();
+        if linked_wal {
+            fs::hard_link(&staged_wal, &wal)?;
+        }
+        fs::hard_link(&self.0, destination).inspect_err(|_| {
+            if linked_wal {
+                fs::remove_file(&wal).ok();
+            }
+        })
+    }
+}
+
+fn copy_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::copy(source, destination)?;
+    #[cfg(windows)]
+    {
+        // Only this private copy becomes writable, so the selected account
+        // can append turns and failed staging can be removed on Windows.
+        let mut permissions = fs::metadata(destination)?.permissions();
+        if permissions.readonly() {
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows attribute on our owned staging copy; Unix permissions are preserved"
+            )]
+            permissions.set_readonly(false);
+            fs::set_permissions(destination, permissions)?;
+        }
+    }
+    // FlushFileBuffers requires write access on Windows. Unix also permits
+    // syncing a read-only copy, whose permissions fs::copy preserves.
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    options.open(destination)?.sync_all()?;
+    Ok(())
 }
 
 impl Drop for Staged {
     fn drop(&mut self) {
         fs::remove_file(&self.0).ok();
+        fs::remove_file(sidecar(&self.0, "-wal")).ok();
     }
 }
 
@@ -631,17 +723,47 @@ mod tests {
     }
 
     #[test]
-    fn open_or_uncleanly_closed_source_is_not_copied() {
-        for suffix in SIDECARS {
-            let f = Fixture::new(&format!("busy{suffix}"));
-            Fixture::write_db(&f.source, b"turns");
-            fs::write(sidecar(&Fixture::db(&f.source), suffix), b"frames").unwrap();
-            assert_eq!(
-                os_error(prepare(None, &f.roots(), &f.target, ID)),
-                Some(libc::EBUSY)
-            );
-            assert!(!Fixture::db(&f.target).exists());
-        }
+    fn rollback_journal_source_is_not_copied() {
+        let f = Fixture::new("journal");
+        Fixture::write_db(&f.source, b"turns");
+        fs::write(sidecar(&Fixture::db(&f.source), "-journal"), b"pages").unwrap();
+        assert_eq!(
+            os_error(prepare(None, &f.roots(), &f.target, ID)),
+            Some(libc::EBUSY)
+        );
+        assert!(!Fixture::db(&f.target).exists());
+    }
+
+    #[test]
+    fn live_source_wal_travels_with_the_copy_and_a_later_turn_blocks_commit() {
+        let f = Fixture::new("live-wal");
+        Fixture::write_db(&f.source, b"turns");
+        let source_wal = sidecar(&Fixture::db(&f.source), "-wal");
+        fs::write(&source_wal, b"frames").unwrap();
+        fs::write(sidecar(&Fixture::db(&f.source), "-shm"), b"index").unwrap();
+        let bridge = prepare(None, &f.roots(), &f.target, ID).unwrap();
+        let target_db = Fixture::db(&f.target);
+        assert_eq!(fs::read(sidecar(&target_db, "-wal")).unwrap(), b"frames");
+        assert!(!sidecar(&target_db, "-shm").exists());
+        bridge.verify().unwrap();
+        fs::write(&source_wal, b"frames and a new turn").unwrap();
+        assert_eq!(
+            bridge.verify().err().and_then(|e| e.raw_os_error()),
+            Some(libc::EBUSY)
+        );
+    }
+
+    #[test]
+    fn closed_source_leftover_sidecars_do_not_block_the_copy() {
+        let f = Fixture::new("leftover");
+        Fixture::write_db(&f.source, b"turns");
+        fs::write(sidecar(&Fixture::db(&f.source), "-wal"), b"").unwrap();
+        fs::write(sidecar(&Fixture::db(&f.source), "-shm"), b"index").unwrap();
+        prepare(None, &f.roots(), &f.target, ID)
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert!(!sidecar(&Fixture::db(&f.target), "-wal").exists());
     }
 
     #[test]
@@ -679,14 +801,17 @@ mod tests {
     }
 
     #[test]
-    fn open_target_copy_is_not_replaced() {
-        let f = Fixture::new("target-open");
-        Fixture::write_db(&f.source, b"source turns");
-        Fixture::write_db(&f.target, b"target turns");
-        fs::write(sidecar(&Fixture::db(&f.target), "-wal"), b"frames").unwrap();
+    fn target_wal_frames_count_as_divergent_turns() {
+        let f = Fixture::new("target-wal");
+        Fixture::write_db(&f.source, b"a1");
+        drop(prepare(None, &f.roots(), &f.target, ID).unwrap());
+        fs::write(sidecar(&Fixture::db(&f.source), "-wal"), b"a2").unwrap();
+        fs::write(sidecar(&Fixture::db(&f.target), "-wal"), b"b2").unwrap();
+        let error = prepare(None, &f.roots(), &f.target, ID).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(
-            os_error(prepare(None, &f.roots(), &f.target, ID)),
-            Some(libc::EBUSY)
+            fs::read(sidecar(&Fixture::db(&f.target), "-wal")).unwrap(),
+            b"b2"
         );
     }
 
@@ -697,6 +822,8 @@ mod tests {
         drop(prepare(None, &f.roots(), &f.target, ID).unwrap());
         // The selected home takes more turns, then the user switches back.
         Fixture::write_db(&f.target, b"a1 b2");
+        // The retired original left its persistent index behind.
+        fs::write(sidecar(&Fixture::db(&f.source), "-shm"), b"stale index").unwrap();
         let back = prepare(None, std::slice::from_ref(&f.target), &f.source, ID).unwrap();
         assert!(
             fs::read(Fixture::db(&f.source))
@@ -711,6 +838,11 @@ mod tests {
             .collect();
         assert_eq!(archived.len(), 1);
         assert!(fs::read(&archived[0]).unwrap().ends_with(b"a1"));
+        assert_eq!(
+            fs::read(sidecar(&archived[0], "-shm")).unwrap(),
+            b"stale index"
+        );
+        assert!(!sidecar(&Fixture::db(&f.source), "-shm").exists());
         // And forward again without either side diverging.
         drop(prepare(None, std::slice::from_ref(&f.source), &f.target, ID).unwrap());
     }

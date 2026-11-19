@@ -252,7 +252,10 @@ fn concurrent_request_run_now_and_take_run_now_never_lose_triggers() {
     let writer = std::thread::spawn(move || {
         writer_barrier.wait();
         for i in 0..count {
-            request_run_now(&writer_dir, &format!("job-{i}")).unwrap();
+            // A slow disk can spend the lock budget. The refused trigger was not recorded.
+            while let Err(error) = request_run_now(&writer_dir, &format!("job-{i}")) {
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+            }
         }
     });
 
@@ -262,8 +265,9 @@ fn concurrent_request_run_now_and_take_run_now_never_lose_triggers() {
         reader_barrier.wait();
         let mut collected = HashSet::new();
         for _ in 0..count.saturating_mul(2) {
-            for id in take_run_now(&reader_dir).unwrap() {
-                collected.insert(id);
+            match take_run_now(&reader_dir) {
+                Ok(ids) => collected.extend(ids),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}"),
             }
         }
         collected
@@ -426,6 +430,18 @@ fn optional_fields_validate_and_legacy_defaults_roundtrip() {
     assert_eq!(entry.effective_precheck_timeout_secs(), 60);
     assert_eq!(entry.display_name(), "job");
     assert_eq!(entry.resolved_agent(), Some("claude"));
+    for (program, agent) in [
+        (r"C:\Users\u\AppData\Roaming\npm\claude.cmd", Some("claude")),
+        (r"C:\Tools\Codex.EXE", Some("codex")),
+        ("/opt/bin/cursor-agent", Some("cursor")),
+        ("claude.exe.backup", None),
+    ] {
+        let entry = Schedule {
+            command: vec![program.into()],
+            ..entry.clone()
+        };
+        assert_eq!(entry.resolved_agent(), agent, "{program}");
+    }
     let entry = Schedule {
         cwd: TEST_CWD.into(),
         ..entry

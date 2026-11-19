@@ -2,7 +2,7 @@
 
 use gpui::WeakEntity;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use krill_app::i18n::catalog::{diff as dtext, file_format as ftext, security as stext};
+use krill_app::i18n::catalog::{diff as dtext, security as stext};
 use krill_app::terminal::path_link::{Cache, PathLink};
 
 use super::*;
@@ -44,35 +44,30 @@ impl Shell {
         };
         match action {
             FileAction::Open => self.open_path_link(link, cx),
-            FileAction::OpenDefault => krill_app::file_format::view::spawn_open_on(
-                link.path,
-                remote,
-                krill_app::file_format::open_default_command,
-                cx,
-            ),
-            FileAction::Reveal => {
-                if let Some((host, target)) = remote {
-                    let path = link.path;
-                    cx.spawn(async move |_, cx| {
-                        let staged = cx
-                            .background_executor()
-                            .spawn(async move {
-                                krill_app::remote_fs::stage_to_local_cache(
-                                    &target,
-                                    &host,
-                                    &path,
-                                    krill_app::remote_fs::MAX_STAGE_BYTES,
-                                )
-                            })
-                            .await;
-                        if let Ok((local, _)) = staged {
-                            cx.update(|cx| cx.reveal_path(&local));
-                        }
-                    })
-                    .detach();
-                } else {
+            FileAction::OpenDefault | FileAction::Reveal => {
+                if matches!(action, FileAction::Reveal) && remote.is_none() {
                     cx.reveal_path(&link.path);
+                    return;
                 }
+                let command = if matches!(action, FileAction::Reveal) {
+                    krill_app::file_format::reveal_command
+                } else {
+                    krill_app::file_format::open_default_command
+                };
+                let weak = cx.weak_entity();
+                krill_app::file_format::view::spawn_open_on_reported(
+                    link.path,
+                    remote,
+                    command,
+                    move |msg, cx| {
+                        weak.update(cx, |s, cx| {
+                            s.notice = Some(msg);
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                    cx,
+                );
             }
             FileAction::CopyPath => {
                 cx.write_to_clipboard(ClipboardItem::new_string(link.path.display().to_string()));
@@ -83,6 +78,7 @@ impl Shell {
 
 struct MenuState {
     pane: PaneId,
+    is_remote: bool,
     focus: FocusHandle,
     has_selection: bool,
     fork_enabled: Option<bool>,
@@ -135,14 +131,12 @@ impl MenuState {
                 ),
                 (
                     "terminal-file-open-default",
-                    ftext::OPEN_DEFAULT.get(),
+                    krill_app::file_format::view::open_action_label(self.is_remote),
                     FileAction::OpenDefault,
                 ),
                 (
                     "terminal-file-reveal",
-                    ftext::REVEAL
-                        .mac_or(krill_app::i18n::catalog::other_os::REVEAL)
-                        .get(),
+                    krill_app::file_format::view::reveal_action_label(self.is_remote),
                     FileAction::Reveal,
                 ),
                 (
@@ -254,6 +248,7 @@ pub(super) fn build(
     let s = entity.read(cx);
     let state = MenuState {
         pane,
+        is_remote: s.layout.host(pane).is_remote(),
         focus: s.focus.clone(),
         has_selection: s.live.get(&pane).is_some_and(|l| l.selection.is_some()),
         fork_enabled: s
@@ -331,6 +326,69 @@ pub(super) fn build(
     } else {
         state.fill(menu, shell, None, None)
     }
+}
+
+pub(super) fn build_chat_overlay(
+    mut menu: PopupMenu,
+    shell: &WeakEntity<Shell>,
+    pane: PaneId,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let Some(entity) = shell.upgrade() else {
+        return menu;
+    };
+    let s = entity.read(cx);
+    let focus = s.focus.clone();
+    let fork_enabled = s
+        .peer_supports_fork(pane)
+        .then(|| s.can_fork_pane(pane, cx));
+    let can_continue = s.can_continue_pane(pane);
+
+    let weak = shell.clone();
+    let switch_item = PopupMenuItem::element(move |_, cx| {
+        let palette = krill_app::ui::palette(cx);
+        div()
+            .id("chat-context-switch-terminal")
+            .debug_selector(|| "chat-context-switch-terminal".into())
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                gpui_component::Icon::new(gpui_kit_assets::IconName::SquareTerminal)
+                    .with_size(krill_app::ui::ICON_SM)
+                    .text_color(palette.muted_foreground),
+            )
+            .child(text::CONTINUE_IN_TERMINAL.get())
+    })
+    .on_click(move |_, window, cx| {
+        weak.update(cx, |s, cx| {
+            if s.layout.focused() != Some(pane) {
+                s.change(true, cx, |l| l.focus(pane));
+            }
+            s.switch_pane_to_terminal(pane, window, cx);
+        })
+        .ok();
+    });
+
+    menu = menu
+        .action_context(focus)
+        .item(switch_item)
+        .separator()
+        .menu(text::SPLIT_RIGHT.get(), Box::new(SplitRight))
+        .menu(text::SPLIT_DOWN.get(), Box::new(SplitDown))
+        .menu(text::PANE_ZOOM_TOGGLE.get(), Box::new(ToggleZoomPane));
+    if let Some(can_fork) = fork_enabled {
+        menu = menu
+            .separator()
+            .menu_with_disabled(text::FORK_SESSION.get(), Box::new(ForkSession), !can_fork)
+            .menu_with_disabled(
+                text::CONTINUE_IN_NEW_SESSION.get(),
+                Box::new(ContinueInNewSession),
+                !can_continue,
+            );
+    }
+    menu.separator()
+        .menu(text::CLOSE_PANE.get(), Box::new(ClosePane))
 }
 
 #[cfg(test)]

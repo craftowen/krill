@@ -598,3 +598,123 @@ fn open_default_judges_symlinks_by_target() {
     assert!(!revealed("doc.txt"));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[gpui::test]
+fn narrow_image_preview_keeps_zoom_controls_inside_toolbar(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (_, visual) = cx.add_window_view(|_, _| {
+        view::ImageView::new(
+            "/tmp/missing.png".into(),
+            Some(Dimensions {
+                width: 10,
+                height: 10,
+            }),
+        )
+    });
+    visual.simulate_resize(gpui::size(gpui::px(160.), gpui::px(300.)));
+    visual.run_until_parked();
+    let toolbar = visual.debug_bounds("image-toolbar").unwrap();
+    for selector in [
+        "image-fit-button",
+        "image-actual-button",
+        "image-zoom-out",
+        "image-zoom-in",
+    ] {
+        let control = visual.debug_bounds(selector).unwrap();
+        assert!(control.left() >= toolbar.left());
+        assert!(control.right() <= toolbar.right());
+        assert!(control.bottom() <= toolbar.bottom());
+    }
+}
+
+#[gpui::test]
+fn remote_placeholder_uses_this_pc_labels_and_keeps_button_bounds_stable_during_stage(
+    cx: &mut gpui::TestAppContext,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use gpui::{IntoElement, Modifiers, Render};
+
+    struct Host {
+        staging: Option<u8>,
+        cancelled: Arc<AtomicBool>,
+    }
+    impl Render for Host {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let cancelled = self.cancelled.clone();
+            let stage = self.staging.map(|percent| view::PlaceholderStage {
+                percent,
+                on_cancel: Box::new(move |_, _| {
+                    cancelled.store(true, Ordering::SeqCst);
+                }),
+            });
+            view::placeholder_interactive(
+                Path::new("/remote/output/joseon_hangae_deo_v11_clean.mp4"),
+                true,
+                Kind::Media,
+                270_200_000,
+                stage,
+                |_, _| {},
+                |_, _| {},
+                cx,
+            )
+        }
+    }
+
+    assert_ne!(
+        view::open_action_label(true),
+        view::open_action_label(false)
+    );
+    assert_ne!(
+        view::reveal_action_label(true),
+        view::reveal_action_label(false)
+    );
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    cx.update(gpui_component::init);
+    let (host, visual) = cx.add_window_view(|_, _| Host {
+        staging: None,
+        cancelled: cancelled.clone(),
+    });
+    visual.run_until_parked();
+    let idle_open = visual.debug_bounds("file-open-default").unwrap();
+    let idle_reveal = visual.debug_bounds("file-reveal").unwrap();
+    assert!(visual.debug_bounds("file-stage-progress").is_none());
+    assert!(visual.debug_bounds("file-stage-cancel").is_none());
+
+    host.update(visual, |h, cx| {
+        h.staging = Some(0);
+        cx.notify();
+    });
+    visual.run_until_parked();
+    let busy_open = visual.debug_bounds("file-open-default").unwrap();
+    let busy_reveal = visual.debug_bounds("file-reveal").unwrap();
+    assert_eq!(
+        idle_open.top(),
+        busy_open.top(),
+        "progress row must not shift action buttons vertically"
+    );
+    assert_eq!(idle_reveal.top(), busy_reveal.top());
+    assert!(visual.debug_bounds("file-stage-progress").is_some());
+    let cancel_at_0 = visual.debug_bounds("file-stage-cancel").unwrap();
+
+    host.update(visual, |h, cx| {
+        h.staging = Some(100);
+        cx.notify();
+    });
+    visual.run_until_parked();
+    let cancel_at_100 = visual.debug_bounds("file-stage-cancel").unwrap();
+    assert_eq!(
+        cancel_at_0.left(),
+        cancel_at_100.left(),
+        "cancel button must not shift horizontally as percentage digits grow"
+    );
+    visual.simulate_click(cancel_at_100.center(), Modifiers::default());
+    visual.run_until_parked();
+    assert!(cancelled.load(Ordering::SeqCst));
+}

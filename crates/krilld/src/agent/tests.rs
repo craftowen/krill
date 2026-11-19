@@ -432,6 +432,7 @@ fn second_codex_trust_check_waits_for_the_one_in_progress() {
 fn pane_env_has_pane_id() {
     let env = pane_env(krill_proto::SessionId(42));
     assert_eq!(env[0], kv("MK_PANE_ID", "42"));
+    assert!(env.contains(&kv("HERDR_ENV", "1")));
 }
 
 #[test]
@@ -2013,9 +2014,10 @@ fn pane_env_propagates_only_explicit_socket_override() {
         Some(Path::new("/state")),
         Some(OsStr::new("/private/socket-root")),
     );
+    assert!(env.contains(&kv("HERDR_ENV", "1")));
     assert!(env.contains(&kv("KRILL_SOCKET_DIR", "/private/socket-root")));
     assert!(env.contains(&kv("KRILL_STATE_DIR", "/state")));
-    assert_eq!(env.len(), 4); // Pane ID, CLI, state, socket root; no arbitrary parent env.
+    assert_eq!(env.len(), 5); // Pane ID, HERDR_ENV, CLI, state, socket root; no arbitrary parent env.
     // Preserve invalid overrides too: consumers must report them, never use the old endpoint.
     let env = pane_env_with_socket(
         krill_proto::SessionId(7),

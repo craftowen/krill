@@ -12,16 +12,18 @@
     reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"
 )]
 
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
+use krill_holder::link::Link;
 use krill_proto::SessionId;
 use krill_proto::control::{Create, Failure, Info, Program, Reply, Request};
 use krill_proto::daemon::{self, HolderStatus, client_hello};
-use krill_proto::holder::STATUS_UNKNOWN;
+use krill_proto::holder::{FromHolder, STATUS_UNKNOWN, VERSION};
 use krill_proto::input::{Input, InputAck, InputId, InputResult};
 use krill_proto::ipc::{self, ClientRole, ServerHello};
 use krill_proto::screen::{Attach, Attached, Msg, Seq, Stream, decode_output, kind};
@@ -43,7 +45,8 @@ fn alive(p: u32) -> bool {
 #[derive(Default)]
 struct Kids {
     holders: Vec<Child>,
-    detached_holders: Vec<u32>,
+    /// 클라이언트(`krill doctor`)가 이 소켓에 띄우는 holder·krilld. pid를 알아내기 전에 테스트가 실패해도 남기지 않는다.
+    socket: Option<PathBuf>,
     pids: Vec<u32>,
 }
 
@@ -54,37 +57,45 @@ impl Drop for Kids {
             h.kill().ok();
             h.wait().ok();
         }
-        for &p in &self.detached_holders {
-            kill_process(pid(p), Signal::KILL).ok();
-        }
         for &p in &self.pids {
             kill_process(pid(p), Signal::KILL).ok();
         }
-        // holder가 죽었으므로 재기동은 없다. 고아 krilld가 사라질 때까지.
+        // 소켓의 holder와 krilld는 순서 없이 잡히므로 재기동된 krilld까지 빌 때까지 다시 찾아 죽인다.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while self
-            .detached_holders
-            .iter()
-            .chain(&self.pids)
-            .any(|p| alive(*p))
-            && Instant::now() < deadline
-        {
+        loop {
+            let left = self.socket.as_deref().map(on_socket).unwrap_or_default();
+            for &p in &left {
+                kill_process(pid(p), Signal::KILL).ok();
+            }
+            let done = left.is_empty() && !self.pids.iter().any(|p| alive(*p));
+            if done || Instant::now() >= deadline {
+                break;
+            }
             thread::sleep(Duration::from_millis(20));
         }
     }
 }
 
-/// 이 소켓 경로를 인자로 가진 holder 프로세스가 0개인지 확인한다(OWE-604).
-/// `Kids`를 명시 drop한 뒤 부른다(Drop 안에서는 단언하지 않는다).
-fn assert_no_holders(sock: &Path) {
-    let out = Command::new("/usr/bin/pgrep")
+/// 이 소켓 경로를 인자로 가진 프로세스. Drop에서도 부르므로 실패해도 패닉하지 않는다.
+fn on_socket(sock: &Path) -> Vec<u32> {
+    Command::new("/usr/bin/pgrep")
         .arg("-f")
         .arg(sock)
         .output()
-        .unwrap();
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 이 소켓 경로를 인자로 가진 holder 프로세스가 0개인지 확인한다(OWE-604).
+/// `Kids`를 명시 drop한 뒤 부른다(Drop 안에서는 단언하지 않는다).
+fn assert_no_holders(sock: &Path) {
     let mut holders = Vec::new();
-    for line in String::from_utf8(out.stdout).unwrap().lines() {
-        let pid: u32 = line.trim().parse().unwrap();
+    for pid in on_socket(sock) {
         let cmd = Command::new("/bin/ps")
             .args(["-o", "command=", "-p", &pid.to_string()])
             .output()
@@ -240,6 +251,108 @@ fn tmp(name: &str) -> PathBuf {
     dir
 }
 
+/// 소켓을 게시하지 못한 이유가 로그에 남는다. `PermissionDenied`만으로는 폴더 권한·OS 거부를 가릴 수 없었다
+/// (2026-11-03 운영 로그 629건).
+#[test]
+fn listener_failure_logs_the_reason() {
+    let dir = tmp("listener-reason");
+    let run = dir.join("run");
+    fs::create_dir(&run).unwrap();
+    fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let status = fixture_command(KRILLD, &dir)
+        .arg(run.join("krilld.sock"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+    let log = fs::read_to_string(dir.join("logs/krilld.log")).unwrap();
+    assert!(
+        log.contains("socket directory must be a 0700 directory"),
+        "{log}"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+/// 링크만 끊기고 holder(이 테스트 프로세스)가 살아 있으면 krilld는 고아를 선언하지 않고 끝난다. 고아를 선언하면
+/// 클라이언트가 holder를 하나 더 띄워 같은 PTY를 쥔 holder 둘이 남는다(2026-11-04 운영 사례).
+#[test]
+fn link_loss_with_live_holder_exits_instead_of_orphaning() {
+    let dir = tmp("live-holder");
+    let run = dir.join("run");
+    fs::create_dir(&run).unwrap();
+    fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let sock = run.join("krilld.sock");
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let link = Link::new(OwnedFd::from(ours));
+    for m in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: std::process::id(),
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    let mut krilld = fixture_command(KRILLD, &dir)
+        .arg(&sock)
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut kids = Kids::default();
+    kids.pids.push(krilld.id());
+    wait_until("krilld accepting", || connect(&sock).is_some());
+    link.send(&[0xff; 16], &[]).unwrap();
+    // 깨진 링크는 바로 닫는다(A-01). 열어 두면 살아 있는 holder는 끊김을 몰라 krilld를 다시 띄우지 않는다.
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut link = link;
+        while let Ok(Some(_)) = link.recv() {}
+        tx.send(()).ok();
+    });
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("krilld kept the broken link open; a live holder would never restart it");
+    let handoff = run.join("krilld.sock.hnd");
+    let deadline = Instant::now() + WAIT;
+    let status = loop {
+        assert!(!handoff.exists(), "krilld declared itself an orphan");
+        if let Some(status) = krilld.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "krilld kept running without a holder link"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.code().is_some(),
+        "krilld exited on its own, not by signal: {status}"
+    );
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}
+
+/// 2026-11-06: `krill doctor`가 띄운 holder의 pid를 등록하기 전에 단언이 실패하면 holder·krilld가 테스트 뒤에도 남았다.
+#[test]
+fn kids_reap_a_holder_launched_before_its_pid_is_known() {
+    let dir = tmp("unregistered");
+    let sock = dir.join("run/krilld.sock");
+    let mut kids = Kids::default();
+    kids.socket = Some(sock.clone());
+    let krill = Path::new(KRILLD).with_file_name("krill");
+    assert!(krill.is_file(), "krill must be built next to krilld");
+    fixture_command(krill, &dir).arg("doctor").output().unwrap();
+    wait_until("client-launched daemon", || connect(&sock).is_some());
+    drop(kids);
+    assert_no_holders(&sock);
+    fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn holder_crash_orphan_then_rejoin() {
     rejoin_round(false);
@@ -262,6 +375,7 @@ fn rejoin_round(failed_receiver: bool) {
     });
     let sock = dir.join("run/krilld.sock");
     let mut kids = Kids::default();
+    kids.socket = Some(sock.clone());
     kids.holders.push(holder(&dir, &sock));
     let (mut c, k1) = wait_daemon(&sock, 0);
     kids.pids.push(k1);
@@ -365,16 +479,6 @@ fn rejoin_round(failed_receiver: bool) {
     let recovered = daemon::handshake(&sock, &watch_hello, WAIT).unwrap();
     assert_eq!(recovered.holder_status, Some(HolderStatus::Linked));
     let k2 = u32::try_from(recovered.server.instance_id).unwrap();
-    let parent = Command::new("/bin/ps")
-        .args(["-o", "ppid=", "-p", &k2.to_string()])
-        .output()
-        .unwrap();
-    let h2 = String::from_utf8(parent.stdout)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    kids.detached_holders.push(h2);
     kids.pids.push(k2);
     let (mut c, _) = wait_daemon(&sock, u64::from(k1));
     wait_until("orphan krilld gone", || !alive(k1));
@@ -537,4 +641,242 @@ fn fixture_command(program: impl AsRef<std::ffi::OsStr>, dir: &Path) -> Command 
         command.env_remove(name);
     }
     command
+}
+
+/// `<sock><suffix>` 경로.
+fn beside(sock: &Path, suffix: &str) -> PathBuf {
+    let mut s = sock.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// C-2: 고아 krilld는 있는데 인계 전송이 끊기면 중복 기동으로 끝내지 않는다. 같은 holder가 krilld를 다시 띄워
+/// 재시도하고, 두 번째 인계가 끝나면 소켓을 게시한다.
+#[test]
+fn failed_handover_transfer_is_retried_under_the_same_holder() {
+    use krill_proto::holder::{FromHolder, VERSION};
+    use krilld::holder::link::Link;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+
+    let dir = tmp("transfer-retry");
+    let sock = dir.join("run/k.sock");
+    fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    fs::set_permissions(sock.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    // 고아 krilld 흉내: 소켓 락을 쥐고 인계 소켓에서 기다린다.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(beside(&sock, ".lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let hnd = UnixListener::bind(beside(&sock, ".hnd")).unwrap();
+    hnd.set_nonblocking(true).unwrap();
+    let accept = || {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match hnd.accept() {
+                Ok((s, _)) => {
+                    s.set_nonblocking(false).unwrap();
+                    return s;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no handover attempt");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    };
+    let mut kids = Kids::default();
+    kids.holders.push(holder(&dir, &sock));
+    drop(accept()); // 첫 시도: Ready 전에 끊는다
+    let mut link = Link::new(OwnedFd::from(accept()));
+    let hello = FromHolder::Hello {
+        version: VERSION,
+        holder_pid: std::process::id(),
+        inbox: false,
+    };
+    for m in [hello, FromHolder::Ready] {
+        link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    let p = link.recv().unwrap().unwrap();
+    assert_eq!(FromHolder::decode(p.frame()).unwrap(), FromHolder::Ready);
+    drop(lock);
+    drop(link);
+    let (_c, krilld) = wait_daemon(&sock, 0);
+    kids.pids.push(krilld);
+    assert!(
+        kids.holders[0].try_wait().unwrap().is_none(),
+        "holder gave up after a failed transfer"
+    );
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}
+
+/// 경로 B: krilld가 재기동을 기다리는 동안(소켓 락이 비었다) 클라이언트가 holder를 하나 더 띄워도 그 krilld는 살아
+/// 있는 holder의 소켓을 덮어쓰지 않는다. 새 holder는 중복으로 끝나고, 원래 holder가 krilld를 다시 띄워 세션을
+/// 그대로 돌려준다. 덮어쓰면 원래 holder의 세션에는 아무도 붙지 못한다.
+#[test]
+fn second_holder_cannot_take_the_socket_while_its_owner_restarts_krilld() {
+    let dir = tmp("owner-lock");
+    let sock = dir.join("run/k.sock");
+    let mut kids = Kids::default();
+    kids.holders.push(holder(&dir, &sock));
+    let (mut c, first) = wait_daemon(&sock, 0);
+    kids.pids.push(first);
+    let Reply::Created {
+        session,
+        pid: shell,
+    } = create(&mut c, &dir, "sleep 60")
+    else {
+        unreachable!("create failed")
+    };
+    kids.pids.push(shell);
+    drop(c);
+    // 원래 holder를 멈춰 krilld 재기동 대기를 붙잡아 둔다.
+    let owner = Pid::from_child(&kids.holders[0]);
+    kill_process(owner, Signal::STOP).unwrap();
+    kill_process(pid(first), Signal::KILL).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(beside(&sock, ".lock"))
+        .unwrap();
+    wait_until("krilld released the socket lock", || {
+        lock.try_lock().is_ok()
+    });
+    drop(lock);
+    kids.holders.push(holder(&dir, &sock));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = kids.holders[1].try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second holder took over a socket whose holder is alive"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "second holder: {status}");
+    kill_process(owner, Signal::CONT).unwrap();
+    let (mut c, next) = wait_daemon(&sock, u64::from(first));
+    kids.pids.push(next);
+    assert_eq!(
+        list(&mut c),
+        vec![Info {
+            session,
+            pid: shell,
+            status: None
+        }]
+    );
+    drop(c);
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}
+
+/// 소켓을 맡은 holder가 krilld를 다시 띄우는 순간 다른 krilld의 bind 탐침이 `.lock`을 잠깐 쥐면 새 krilld는 중복으로
+/// 끝난다. 그 holder가 owner 락과 listener를 쥔 채 멈추면 아무도 소켓을 받지 못해 세션에 영영 붙지 못한다.
+/// 탐침이 끝나면 krilld를 다시 띄워 세션을 돌려줘야 한다.
+#[test]
+fn socket_owner_restarts_krilld_after_a_lock_probe_overlaps() {
+    let dir = tmp("owner-probe");
+    let sock = dir.join("run/k.sock");
+    let mut kids = Kids::default();
+    kids.holders.push(holder(&dir, &sock));
+    let (mut c, first) = wait_daemon(&sock, 0);
+    kids.pids.push(first);
+    let Reply::Created {
+        session,
+        pid: shell,
+    } = create(&mut c, &dir, "sleep 60")
+    else {
+        unreachable!("create failed")
+    };
+    kids.pids.push(shell);
+    drop(c);
+    let owner = Pid::from_child(&kids.holders[0]);
+    kill_process(owner, Signal::STOP).unwrap();
+    kill_process(pid(first), Signal::KILL).unwrap();
+    let probe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(beside(&sock, ".lock"))
+        .unwrap();
+    wait_until("krilld released the socket lock", || {
+        probe.try_lock().is_ok()
+    });
+    // 실제 탐침은 수십 µs다. owner가 다시 띄우는 동안 쥐고 있어 겹침을 고정한다.
+    kill_process(owner, Signal::CONT).unwrap();
+    thread::sleep(Duration::from_secs(1));
+    drop(probe);
+    let (mut c, next) = wait_daemon(&sock, u64::from(first));
+    kids.pids.push(next);
+    assert_eq!(
+        list(&mut c),
+        vec![Info {
+            session,
+            pid: shell,
+            status: None
+        }]
+    );
+    drop(c);
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}
+
+/// 고아 krilld의 인계 전송이 계속 실패하면(상대를 1초 넘게 기다린 뒤 끊김) holder는 krilld를 백오프 없이 다시 띄우지
+/// 않는다. 그러면 시도마다 고아의 리더를 멈추고, 세션 없는 holder는 영영 포기하지 못한다. 세션 없는 holder는 끝난다.
+#[test]
+fn empty_holder_gives_up_when_handover_keeps_failing() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+
+    let dir = tmp("transfer-gives-up");
+    let sock = dir.join("run/k.sock");
+    fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    fs::set_permissions(sock.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    // 고아 krilld 흉내: 소켓 락을 쥐고, 인계 시도마다 1초 넘게 붙잡았다가 Ready 없이 끊는다.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(beside(&sock, ".lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let hnd = UnixListener::bind(beside(&sock, ".hnd")).unwrap();
+    hnd.set_nonblocking(true).unwrap();
+    let mut kids = Kids::default();
+    kids.holders.push(holder(&dir, &sock));
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut attempts = 0;
+    let status = loop {
+        if let Some(s) = kids.holders[0].try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder kept restarting krilld after {attempts} failed handovers"
+        );
+        match hnd.accept() {
+            Ok((s, _)) => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(1200));
+                drop(s);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert!(status.success(), "holder: {status}");
+    drop(lock);
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
 }

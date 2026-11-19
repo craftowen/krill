@@ -303,6 +303,7 @@ fn login(provider: &str, id: &str) -> Result<(), String> {
         .ok();
         println!("{}", identity.email);
     }
+    request(&UsageRequest::RefreshUsage).ok();
     println!("account: login verified");
     Ok(())
 }
@@ -595,7 +596,7 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
     if conn.negotiated.features & required != required {
         return Err("daemon does not support this account extension; restart daemon".to_owned());
     }
-    let timeout = Some(Duration::from_secs(15));
+    let timeout = Some(req.ipc_timeout(Duration::from_secs(15)));
     conn.stream
         .set_read_timeout(timeout)
         .map_err(|e| e.to_string())?;
@@ -605,10 +606,25 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
     conn.stream
         .write_all(&req.encode().map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-    let (kind, body) = ipc::read_frame(&mut conn.stream)
-        .map_err(|e| e.to_string())?
-        .ok_or("krilld disconnected")?;
+    let (kind, body) = match ipc::read_frame(&mut conn.stream) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return Err("krilld disconnected".to_owned()),
+        Err(err) => {
+            if matches!(req, UsageRequest::ConsumeResetCredit { .. })
+                && matches!(
+                    err.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            {
+                return Err(krill_proto::usage::ResetConsumeError::TimedOut.to_string());
+            }
+            return Err(err.to_string());
+        }
+    };
     match UsageReply::decode(kind, &body).map_err(|e| e.to_string())? {
+        UsageReply::Failed(e) if matches!(req, UsageRequest::ConsumeResetCredit { .. }) => {
+            Err(krill_proto::usage::ResetConsumeError::from_failure(e).to_string())
+        }
         UsageReply::Failed(e) => Err(e.to_string()),
         reply => Ok(reply),
     }
@@ -681,7 +697,7 @@ fn print_snapshot(snap: &AccountsSnapshot) {
             h5,
             d7,
             a.profile_dir,
-            snap.connection_for(&a.id).label_ko(),
+            snap.connection_for(&a.id).label(),
             a.email
                 .as_deref()
                 .filter(|email| !email.trim().is_empty())
@@ -939,7 +955,7 @@ fn parse_advanced_policy(
 
 fn format_history(history: &[krill_proto::usage::SwitchRecord]) -> String {
     if history.is_empty() {
-        return "자동전환 이력 없음".into();
+        return "No automatic switches yet".into();
     }
     history
         .iter()
@@ -952,9 +968,9 @@ fn format_history(history: &[krill_proto::usage::SwitchRecord]) -> String {
                 r.event.to_label,
                 r.event.reason_percent,
                 if r.predicted {
-                    "소진 예측"
+                    "predicted exhaustion"
                 } else {
-                    "임계치/한도"
+                    "threshold or limit"
                 }
             )
         })
@@ -989,6 +1005,6 @@ mod policy_tests {
         assert!(p.predict_exhaustion);
         assert!(parse_advanced_policy("cooldown", &u64::MAX.to_string(), old.clone()).is_err());
         assert!(parse_advanced_policy("predict", "maybe", old).is_err());
-        assert!(format_history(&[]).contains("없음"));
+        assert!(format_history(&[]).contains("No automatic switches"));
     }
 }

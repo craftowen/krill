@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
+use gpui::{Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
 use gpui_component::button::ButtonVariants as _;
 use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable as _, Sizable as _};
@@ -116,31 +116,33 @@ pub fn highlight_spans(text: &str, query: &str) -> Vec<(String, bool)> {
         .filter(|tok| {
             !tok.starts_with("agent:") && !tok.starts_with("path:") && !tok.starts_with("repo:")
         })
-        .map(|tok| {
-            tok.chars()
-                .flat_map(char::to_lowercase)
-                .collect::<Vec<char>>()
-        })
+        .map(crate::jump::normalize_search_chars)
         .filter(|t| !t.is_empty())
         .collect();
     if terms.is_empty() || text.is_empty() {
         return vec![(text.to_owned(), false)];
     }
     let orig_chars: Vec<char> = text.chars().collect();
-    let lower_chars: Vec<char> = orig_chars
-        .iter()
-        .map(|c| c.to_lowercase().next().unwrap_or(*c))
-        .collect();
+    let norm = crate::jump::normalize_search_chars_with_ranges(text);
     let mut matched = vec![false; orig_chars.len()];
     for term in &terms {
         let tlen = term.len();
-        if tlen == 0 || tlen > lower_chars.len() {
+        if tlen == 0 || tlen > norm.len() {
             continue;
         }
-        for start in 0..=lower_chars.len().saturating_sub(tlen) {
-            if lower_chars.get(start..start + tlen) == Some(term.as_slice()) {
-                for flag in matched.iter_mut().skip(start).take(tlen) {
-                    *flag = true;
+        for start in 0..=norm.len().saturating_sub(tlen) {
+            if norm
+                .get(start..start + tlen)
+                .is_some_and(|slice| slice.iter().map(|(c, _)| *c).eq(term.iter().copied()))
+            {
+                for (_, orig_range) in &norm[start..start + tlen] {
+                    for flag in matched
+                        .iter_mut()
+                        .take(orig_range.end)
+                        .skip(orig_range.start)
+                    {
+                        *flag = true;
+                    }
                 }
             }
         }
@@ -388,16 +390,6 @@ impl Panel {
     }
 
     #[must_use]
-    pub fn scope(&self) -> VaultScope {
-        self.scope
-    }
-
-    #[must_use]
-    pub fn agent_filter(&self) -> Option<VaultAgent> {
-        self.agent_filter
-    }
-
-    #[must_use]
     pub fn query(&self) -> &str {
         &self.query
     }
@@ -538,7 +530,8 @@ impl Panel {
             .filter(|tok| {
                 !tok.starts_with("agent:") && !tok.starts_with("path:") && !tok.starts_with("repo:")
             })
-            .map(str::to_lowercase)
+            .map(crate::jump::normalize_search_str)
+            .filter(|t| !t.is_empty())
             .collect();
         base.iter()
             .filter(|hit| self.agent_filter.is_none_or(|a| hit.agent == a))
@@ -549,16 +542,23 @@ impl Panel {
                 }
                 let hay = format!(
                     "{} {} {} {} {}",
-                    hit.title.to_lowercase(),
-                    hit.summary.to_lowercase(),
-                    hit.snippet.to_lowercase(),
-                    hit.cwd.to_lowercase(),
-                    hit.id.to_lowercase()
+                    crate::jump::normalize_search_str(&hit.title),
+                    crate::jump::normalize_search_str(&hit.summary),
+                    crate::jump::normalize_search_str(&hit.snippet),
+                    crate::jump::normalize_search_str(&hit.cwd),
+                    crate::jump::normalize_search_str(&hit.id)
                 );
                 terms.iter().all(|t| hay.contains(t))
             })
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let app: &mut gpui::App = cx;
+        self.input
+            .as_ref()
+            .is_some_and(|input| crate::jump::entity_input_is_composing(input, window, app))
     }
 
     /// 상태바 토글 버튼(OWE-856: 버튼 역할·이름 노출).
@@ -597,16 +597,6 @@ impl Panel {
                 crate::ui::tooltip_view("agent-history-toggle", tooltip_text.clone(), window, cx)
             })
             .on_click(cx.listener(|_, _, _, cx| cx.emit(Toggle)))
-    }
-
-    /// OWE-857: 열린 패널의 검색창에 포커스를 둔다. 입력 엔티티가 아직
-    /// 없으면 다음 렌더의 `focus_on_open` 소비가 대신 수행한다.
-    pub fn focus_search(&self, window: &mut Window, cx: &mut App) {
-        if self.open
-            && let Some(input) = &self.input
-        {
-            input.update(cx, |s, cx| s.focus(window, cx));
-        }
     }
 
     /// OWE-652: 열림 상태(셸·테스트에서 읽는다).
@@ -957,8 +947,19 @@ impl Render for Panel {
             div()
                 .id("agent-history-panel")
                 .debug_selector(|| "agent-history-panel".into())
-                .capture_key_down(cx.listener(|_, e: &gpui::KeyDownEvent, _, cx| {
-                    if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                .capture_action(cx.listener(
+                    |this, _: &gpui_component::input::Escape, window, cx| {
+                        if this.input_is_composing(window, cx) {
+                            window.prevent_default();
+                        }
+                    },
+                ))
+                .capture_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
+                    if e.keystroke.key == "escape"
+                        && !e.keystroke.modifiers.modified()
+                        && !window.default_prevented()
+                        && !this.input_is_composing(window, cx)
+                    {
                         cx.stop_propagation();
                         cx.emit(Toggle);
                     }

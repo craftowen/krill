@@ -54,9 +54,23 @@ impl Adapter for Claude {
     }
 
     fn control(&self, context: &Context, live: &Live<'_>, catalog: &mut Value) {
-        match live.tap().and_then(|tap| models(context, &tap)) {
+        let tap = match live.tap() {
+            Ok(tap) => tap,
+            Err(error) => {
+                return set(
+                    catalog,
+                    "reason",
+                    super::super::sanitize_tap_reason(&error).into(),
+                );
+            }
+        };
+        match models(context, &tap) {
             Ok(native) => *catalog = native,
-            Err(error) => set(catalog, "reason", error.to_string().into()),
+            Err(error) => set(
+                catalog,
+                "reason",
+                super::super::sanitize_tap_reason(&error).into(),
+            ),
         }
     }
 

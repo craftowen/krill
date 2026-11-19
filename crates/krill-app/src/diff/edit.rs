@@ -555,6 +555,94 @@ fn parse_hunk_header_starts(header_line: &str) -> Option<(usize, usize, String)>
     Some((old_start, new_start, suffix.to_owned()))
 }
 
+fn rewrite_partial_file_mode_header(
+    header: &str,
+    has_old_lines: bool,
+    has_new_lines: bool,
+) -> String {
+    let convert_new_file = has_old_lines
+        && header.lines().any(|l| {
+            l.starts_with("new file mode ") || l.trim_end_matches('\r') == "--- /dev/null"
+        });
+    let convert_deleted_file = has_new_lines
+        && header.lines().any(|l| {
+            l.starts_with("deleted file mode ") || l.trim_end_matches('\r') == "+++ /dev/null"
+        });
+    if !convert_new_file && !convert_deleted_file {
+        return header.to_owned();
+    }
+    let old_marker = convert_new_file.then(|| {
+        counterpart_marker(header, "+++ ", 'b', "--- ", 'a')
+            .unwrap_or_else(|| "--- /dev/null".to_owned())
+    });
+    let new_marker = convert_deleted_file.then(|| {
+        counterpart_marker(header, "--- ", 'a', "+++ ", 'b')
+            .unwrap_or_else(|| "+++ /dev/null".to_owned())
+    });
+    let mut out = String::with_capacity(header.len());
+    for raw_line in header.split_inclusive('\n') {
+        let trimmed = raw_line.trim_end_matches(['\r', '\n']);
+        if convert_new_file && trimmed.starts_with("new file mode ") {
+            continue;
+        }
+        if convert_deleted_file && trimmed.starts_with("deleted file mode ") {
+            continue;
+        }
+        if trimmed == "--- /dev/null"
+            && let Some(ref repl) = old_marker
+        {
+            push_patch_line(&mut out, repl);
+            continue;
+        }
+        if trimmed == "+++ /dev/null"
+            && let Some(ref repl) = new_marker
+        {
+            push_patch_line(&mut out, repl);
+            continue;
+        }
+        push_patch_line(&mut out, raw_line);
+    }
+    out
+}
+
+fn counterpart_marker(
+    header: &str,
+    from_prefix: &str,
+    from_side: char,
+    to_prefix: &str,
+    to_side: char,
+) -> Option<String> {
+    for raw_line in header.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        let Some(rest) = line.strip_prefix(from_prefix) else {
+            continue;
+        };
+        if let Some(rel) = rest
+            .strip_prefix(from_side)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            return Some(format!("{to_prefix}{to_side}/{rel}"));
+        }
+        if let Some(rel) = rest
+            .strip_prefix('"')
+            .and_then(|s| s.strip_prefix(from_side))
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            return Some(format!("{to_prefix}\"{to_side}/{rel}"));
+        }
+    }
+    for raw_line in header.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("diff --git a/")
+            && let Some((a_path, b_path)) = rest.split_once(" b/")
+            && a_path == b_path
+        {
+            return Some(format!("{to_prefix}{to_side}/{a_path}"));
+        }
+    }
+    None
+}
+
 #[must_use]
 pub fn build_line_patch(
     raw_patch: &str,
@@ -573,6 +661,8 @@ pub fn build_line_patch(
         return None;
     }
     let mut out_hunks = Vec::new();
+    let mut has_old_lines = false;
+    let mut has_new_lines = false;
     for hunk in &hunks {
         // `\n`만 떼고 `\r`은 본문의 일부로 남긴다(CRLF 보존).
         let mut lines = hunk
@@ -708,8 +798,20 @@ pub fn build_line_patch(
             .iter()
             .filter(|l| l.starts_with(' ') || l.starts_with('+'))
             .count();
+        has_old_lines |= old_count > 0;
+        has_new_lines |= new_count > 0;
+        let hunk_old_start = if old_start == 0 && old_count > 0 {
+            1
+        } else {
+            old_start
+        };
+        let hunk_new_start = if new_start == 0 && new_count > 0 {
+            1
+        } else {
+            new_start
+        };
         let mut hunk_out =
-            format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}\n");
+            format!("@@ -{hunk_old_start},{old_count} +{hunk_new_start},{new_count} @@{suffix}\n");
         for bl in body_lines {
             hunk_out.push_str(&bl);
             hunk_out.push('\n');
@@ -719,7 +821,7 @@ pub fn build_line_patch(
     if out_hunks.is_empty() {
         return None;
     }
-    let mut out = header;
+    let mut out = rewrite_partial_file_mode_header(&header, has_old_lines, has_new_lines);
     for h in out_hunks {
         out.push_str(&h);
     }
@@ -859,6 +961,7 @@ pub(super) struct State {
     pub note: String,
     task: Option<Task<()>>,
     sync_task: Option<Task<()>>,
+    pr_task: Option<Task<()>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -881,6 +984,7 @@ impl Default for State {
             note: String::new(),
             task: None,
             sync_task: None,
+            pr_task: None,
         }
     }
 }
@@ -915,6 +1019,24 @@ impl State {
             ..Self::default()
         };
     }
+}
+
+/// The branch a PR would be opened from, or why it cannot be. Runs git, so call it off the UI thread.
+fn pr_branch(repo: &Path, custom: Option<&str>) -> Result<String, crate::i18n::Message> {
+    use crate::i18n::catalog::pull_request as pr;
+    let usable = |name: &str| !name.is_empty() && name != "HEAD";
+    let branch = match custom.map(str::trim).filter(|name| usable(name)) {
+        Some(name) => name.to_owned(),
+        None => crate::pull_request::git_output(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .ok()
+            .map(|out| out.trim().to_owned())
+            .filter(|name| usable(name))
+            .ok_or(pr::DETACHED_HEAD_DESC)?,
+    };
+    if crate::pull_request::is_default_branch(repo, &branch) {
+        return Err(pr::DEFAULT_BRANCH_DESC);
+    }
+    Ok(branch)
 }
 
 impl Panel {
@@ -1392,32 +1514,31 @@ impl Panel {
             cx.notify();
             return;
         }
-        let branch = if let Some(custom) = self.checks.branch_override.as_deref()
-            && !custom.trim().is_empty()
-            && custom.trim() != "HEAD"
-        {
-            custom.trim().to_owned()
-        } else if let Ok(out) =
-            crate::pull_request::git_output(&self.repo, &["rev-parse", "--abbrev-ref", "HEAD"])
-            && let trimmed = out.trim()
-            && !trimmed.is_empty()
-            && trimmed != "HEAD"
-        {
-            trimmed.to_owned()
-        } else {
-            self.editing.note = crate::i18n::catalog::pull_request::DETACHED_HEAD_DESC
-                .get()
-                .into();
-            cx.notify();
-            return;
-        };
-        if crate::pull_request::is_default_branch(&self.repo, &branch) {
-            self.editing.note = crate::i18n::catalog::pull_request::DEFAULT_BRANCH_DESC
-                .get()
-                .into();
-            cx.notify();
-            return;
-        }
+        let repo = self.repo.clone();
+        let custom = self.checks.branch_override.clone();
+        self.editing.pr_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let probe = repo.clone();
+            let branch = cx
+                .background_executor()
+                .spawn(async move { pr_branch(&probe, custom.as_deref()) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if this.repo != repo {
+                    return;
+                }
+                match branch {
+                    Ok(branch) => this.show_pr_dialog(branch, window, cx),
+                    Err(note) => {
+                        this.editing.note = note.get().into();
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn show_pr_dialog(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
         let repo = self.repo.clone();
         let service = Arc::clone(&self.editing.pr_service);
         let dialog =

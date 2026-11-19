@@ -13,13 +13,13 @@ pub enum ConnectionStatus {
 }
 
 impl ConnectionStatus {
-    pub const fn label_ko(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            Self::Checking => "확인 중",
-            Self::Connected => "연결됨",
-            Self::NeedsLogin => "로그인 필요",
-            Self::NotInstalled => "설치 안 됨",
-            Self::CheckFailed => "확인 실패",
+            Self::Checking => "Checking",
+            Self::Connected => "Connected",
+            Self::NeedsLogin => "Login required",
+            Self::NotInstalled => "Not installed",
+            Self::CheckFailed => "Check failed",
         }
     }
 }

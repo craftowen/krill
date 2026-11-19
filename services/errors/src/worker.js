@@ -2,6 +2,7 @@ import {timingSafeEqual} from 'node:crypto';
 import {CODES, HEX32, HttpError, KINDS, PROCESSES, readBody, validate, validRelease} from './validation.js';
 import {cleanup, eventDetail, health, ingest, listEvents, stats} from './storage.js';
 import {MOBILE_CODES, mobileAdmission, mobileCors, validateMobile} from './mobile.js';
+import {storeFeedback, validateFeedback} from './feedback.js';
 const SECURITY = {
   'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
   'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
@@ -73,6 +74,17 @@ export async function handle(request, env, now = Math.floor(Date.now() / 1000)) 
     const count = ack.accepted_ids.length + ack.duplicate_ids.length;
     if (!count) return json({error: 'admission quota exceeded'}, 429, {'retry-after': '60'});
     return json(ack, 200, count < events.length ? {'retry-after': '60'} : {});
+  }
+  if (url.pathname === '/v1/feedback') {
+    if (request.method !== 'POST') return json({error: 'method not allowed'}, 405, {allow: 'POST'});
+    if (url.search) throw new HttpError(400, 'query parameters unsupported');
+    if (typeof env.INGEST_RATE_LIMITER?.limit !== 'function')
+      throw new HttpError(503, 'rate limiter unconfigured');
+    const rate = await env.INGEST_RATE_LIMITER.limit({key: 'v1/feedback'});
+    if (rate?.success === false) return json({error: 'rate limited'}, 429, {'retry-after': '60'});
+    if (rate?.success !== true) throw new HttpError(503, 'rate limiter unavailable');
+    await storeFeedback(env.DB, validateFeedback(await readBody(request)), now);
+    return json({ok: true});
   }
   if (url.pathname === '/health') {
     if (request.method !== 'GET') return json({error: 'method not allowed'}, 405, {allow: 'GET'});

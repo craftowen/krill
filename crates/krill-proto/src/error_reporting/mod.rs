@@ -34,6 +34,7 @@ pub use types::{
 };
 
 use types::{hex, valid_source_loc};
+pub(crate) use types::{is_hex32, random_id};
 
 const INSTALL_HASH_DOMAIN: &str = "krill.error-reporting.install-hash.v1";
 

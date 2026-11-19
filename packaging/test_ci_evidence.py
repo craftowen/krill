@@ -2,6 +2,7 @@
 """CI 캐시와 구분되는 필수 검사 증거·동일 SHA 재사용의 신뢰 경계 회귀."""
 
 import copy
+import io
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -12,7 +13,7 @@ import textwrap
 import unittest
 from unittest.mock import patch
 
-from ci_evidence import CANDIDATE_BRANCH, CHECKS, Evidence, EvidenceError, Pending, main
+from ci_evidence import CANDIDATE_BRANCH, CHECKS, Evidence, EvidenceError, Pending, main, report_flaky
 
 SHA = "a" * 40
 NOW = datetime(2026, 10, 21, 12, tzinfo=timezone.utc)
@@ -161,6 +162,16 @@ class ProofTests(unittest.TestCase):
             evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
 
 
+    def test_any_release_branch_push_is_a_reusable_candidate_but_other_branches_are_not(self):
+        # Full CI runs on every release/** push; release/vX-topic candidates must not run macOS twice.
+        for branch in ("release/v0.2.48", "release/afternoon-20261031"):
+            with self.subTest(branch=branch):
+                fixture = Fixture(branch=branch)
+                self.assertEqual(fixture.evidence().reusable(fixture.filename, SHA)["branch"], branch)
+        fixture = Fixture(branch="feat/x")
+        with self.assertRaises(Pending):
+            fixture.evidence().reusable(fixture.filename, SHA)
+
 class MacosGateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -214,6 +225,41 @@ class ReuseCommandTests(unittest.TestCase):
                         main()
                 self.assertEqual(output.read_text(), "reuse=false\n")
                 self.assertEqual(mocked.call_count, 1 if event == "push" else 0)
+
+
+class FlakyTests(unittest.TestCase):
+    JUNIT = """<testsuites><testsuite name="krilld">
+      <testcase classname="krilld" name="known_flake"><flakyFailure message="x"/></testcase>
+      <testcase classname="krill::status" name="new_flake"><flakyFailure message="y"/></testcase>
+      <testcase classname="krilld" name="steady"/>
+      <testcase classname="krilld" name="real_failure"><failure message="z"/></testcase>
+    </testsuite></testsuites>"""
+
+    def run_report(self, known):
+        with tempfile.TemporaryDirectory() as temporary:
+            junit, listing, summary = (Path(temporary) / name for name in ("junit.xml", "known.txt", "summary.md"))
+            junit.write_text(self.JUNIT)
+            listing.write_text(known)
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}), \
+                    patch("sys.stdout", new_callable=io.StringIO) as out, patch("sys.stderr", new_callable=io.StringIO):
+                code = report_flaky(junit, listing)
+            return code, out.getvalue(), summary.read_text()
+
+    def test_every_flaky_pass_is_reported_and_only_unknown_ones_fail(self):
+        code, out, summary = self.run_report("# comment\nkrilld known_flake  # issue\n")
+        self.assertEqual(code, 1)
+        self.assertIn("::warning title=FLAKY::krilld known_flake", out)
+        self.assertIn("::error title=FLAKY::krill::status new_flake", out)
+        self.assertNotIn("steady", out + summary)
+        self.assertNotIn("real_failure", out + summary)
+        self.assertIn("FLAKY (passed only on retry): 2, new: 1", summary)
+        code, _, _ = self.run_report("krilld known_flake\nkrill::status new_flake\n")
+        self.assertEqual(code, 0)
+
+    def test_repository_list_is_parseable(self):
+        listing = Path(__file__).resolve().parents[1] / ".config/known-flaky.txt"
+        entries = [line.split("#", 1)[0].strip() for line in listing.read_text().splitlines()]
+        self.assertTrue(all(len(entry.split(" ")) == 2 for entry in entries if entry))
 
 
 if __name__ == "__main__":

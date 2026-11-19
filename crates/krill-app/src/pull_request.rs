@@ -8,7 +8,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use gpui::{Context, Entity, EventEmitter, Task, Window, div, prelude::*, px};
+use gpui::{
+    Context, Entity, EventEmitter, FocusHandle, Focusable as _, Task, Window, div, prelude::*, px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_component::{Disableable as _, Icon, Sizable as _};
@@ -648,7 +650,7 @@ fn create_command(folder: &Path, branch: &str, title: &str, body: &str) -> Comma
 
 pub fn merge_command(folder: &Path, branch: &str, method: PrMergeMethod) -> Command {
     let executable = find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
-    let mut cmd = Command::new(executable);
+    let mut cmd = crate::platform::background_command(executable);
     cmd.current_dir(folder)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -683,7 +685,7 @@ pub fn confirmed_merge_command(
 
 pub fn ready_command(folder: &Path, branch: &str, to_draft: bool) -> Command {
     let executable = find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
-    let mut cmd = Command::new(executable);
+    let mut cmd = crate::platform::background_command(executable);
     cmd.current_dir(folder)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -1219,6 +1221,7 @@ pub struct Dialog {
     branch: String,
     pub(crate) title: Entity<InputState>,
     pub(crate) body: Entity<TextareaState>,
+    pub(crate) focus: FocusHandle,
     service: Arc<Service>,
     pub(crate) generating: bool,
     pub(crate) submitting: bool,
@@ -1252,6 +1255,7 @@ impl Dialog {
             cx.new(|cx| InputState::new(window, cx).placeholder(text::TITLE_PLACEHOLDER.get()));
         let body =
             cx.new(|cx| TextareaState::new(window, cx).placeholder(text::BODY_PLACEHOLDER.get()));
+        let focus = cx.focus_handle();
         title.update(cx, |input, cx| input.focus(window, cx));
         Self {
             language: crate::i18n::language(),
@@ -1259,6 +1263,7 @@ impl Dialog {
             branch,
             title,
             body,
+            focus,
             service,
             generating: false,
             submitting: false,
@@ -1342,10 +1347,24 @@ impl Dialog {
             .ok();
         }));
     }
-}
 
-impl Render for Dialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let title_composing = self.title.update(cx, |input, cx| {
+            input.focus_handle(cx).is_focused(window)
+                && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+        });
+        title_composing
+            || self.body.update(cx, |input, cx| {
+                input.focus_handle(cx).is_focused(window)
+                    && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+            })
+    }
+
+    pub(crate) fn render_card(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         if self.language != crate::i18n::language() {
             self.language = crate::i18n::language();
             self.title.update(cx, |input, cx| {
@@ -1360,9 +1379,13 @@ impl Render for Dialog {
         let card = div()
             .id("pr-dialog")
             .debug_selector(|| "pr-dialog".into())
+            .role(gpui::Role::Dialog)
+            .aria_label(text::MODAL_TITLE.get())
             .occlude()
             .w(crate::ui::DIALOG_WIDTH)
-            .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
+            .max_w((window.viewport_size().width - crate::ui::SPACE_4 * 2.).max(px(0.)))
+            .max_h((window.viewport_size().height - crate::ui::SPACE_4 * 2.).max(px(0.)))
+            .overflow_hidden()
             .p_6()
             .rounded(crate::ui::RADIUS_LG)
             .bg(p.popover)
@@ -1375,22 +1398,41 @@ impl Render for Dialog {
             .flex()
             .flex_col()
             .gap_4()
-            .capture_key_down(cx.listener(|_, e: &gpui::KeyDownEvent, _, cx| {
-                if e.keystroke.key == "escape" {
+            .capture_action(
+                cx.listener(|d, _: &gpui_component::input::Escape, window, cx| {
+                    if d.input_is_composing(window, cx) {
+                        window.prevent_default();
+                    }
+                }),
+            )
+            .capture_key_down(cx.listener(|d, e: &gpui::KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                    if window.default_prevented() || d.input_is_composing(window, cx) {
+                        return;
+                    }
                     cx.stop_propagation();
+                    if !d.submitting {
+                        cx.emit(Event::Close);
+                    }
+                }
+            }))
+            .on_mouse_down_out(cx.listener(|d, _, _, cx| {
+                if !d.submitting {
                     cx.emit(Event::Close);
                 }
             }))
-            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(Event::Close)))
             .child(
                 div()
+                    .flex_none()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_2()
                     .child(
                         div()
                             .flex_1()
+                            .flex_basis(crate::ui::DIALOG_WIDTH / 2.)
                             .min_w_0()
                             .flex()
                             .flex_col()
@@ -1428,6 +1470,9 @@ impl Render for Dialog {
             )
             .child(
                 div()
+                    .id("pr-dialog-body")
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -1455,6 +1500,7 @@ impl Render for Dialog {
             )
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_wrap()
                     .justify_end()
@@ -1464,7 +1510,12 @@ impl Render for Dialog {
                             .debug_selector(|| "pr-dialog-close".into())
                             .ghost()
                             .label(text::CLOSE.get())
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
+                            .disabled(self.submitting)
+                            .on_click(cx.listener(|d, _, _, cx| {
+                                if !d.submitting {
+                                    cx.emit(Event::Close);
+                                }
+                            })),
                     )
                     .child(
                         crate::ui::button_with_reserved_label(
@@ -1479,7 +1530,13 @@ impl Render for Dialog {
                         .on_click(cx.listener(|d, _, _, cx| d.submit(cx))),
                     ),
             );
-        crate::ui::modal_backdrop(window.viewport_size(), card)
+        crate::ui::modal_focus_scope(card, &self.focus)
+    }
+}
+
+impl Render for Dialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::ui::modal_backdrop(window.viewport_size(), self.render_card(window, cx))
     }
 }
 

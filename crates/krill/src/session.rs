@@ -1,9 +1,5 @@
 //! MK-045: direct daemon commands. Text shown by these commands is kept here.
 
-#[cfg(unix)]
-mod terminal;
-#[cfg(windows)]
-#[path = "session/terminal_windows.rs"]
 mod terminal;
 mod wait;
 
@@ -11,7 +7,7 @@ use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::os::net::UnixStream;
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal as _, Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -92,28 +88,104 @@ fn is_help_flag(s: &OsString) -> bool {
     matches!(s.to_str(), Some("-h" | "--help" | "help"))
 }
 
-/// 도움말 판정: 서브커맨드 자리(`ls --help`, `--help`)와 `--` 앞의 전역 플래그만 본다.
-/// 세션 ID·전송 텍스트(`send 1 help`, `send 1 --text --help`)·`--` 뒤 리터럴은 도움말이 아니다.
+fn option_takes_value(cmd: &str, flag: &str) -> bool {
+    match cmd {
+        "ls" => matches!(flag, "--worktree" | "--cwd"),
+        "new" => matches!(
+            flag,
+            "--worktree"
+                | "--cwd"
+                | "--cols"
+                | "--rows"
+                | "--account"
+                | "--prompt"
+                | "--model"
+                | "--effort"
+                | "--agent"
+        ),
+        "fork" => matches!(flag, "--from" | "--cwd" | "--cols" | "--rows" | "--prompt"),
+        "read" => flag == "--lines",
+        "wait" => matches!(
+            flag,
+            "--for" | "--pattern" | "--quiet-ms" | "--idle-ms" | "--timeout"
+        ),
+        _ => false,
+    }
+}
+
+/// 도움말 판정: 서브커맨드·옵션 위치의 `-h`/`--help`와 베어 `help`만 보고, 옵션 값·`send` 본문·`--` 뒤 리터럴은 제외한다.
 fn has_help_before_literal(args: &[OsString]) -> bool {
-    let mut it = args.iter();
     // `--host`는 extract_host가 이미 걷어냈으나, 직접 호출(run_with_target) 경로를 위해 여기서도 건너뛴다.
-    let first = if args.first().is_some_and(|a| a == "--host") {
-        it.next();
-        it.next();
-        it.next()
-    } else {
-        it.next()
+    let rest = match args {
+        [first, _, tail @ ..] if first == "--host" => tail,
+        _ => args,
     };
-    let Some(cmd) = first else {
+    let Some((cmd, tail)) = rest.split_first() else {
         return false;
     };
     // 베어 `--help` (서브커맨드 없음)
     if is_help_flag(cmd) {
         return true;
     }
-    // 서브커맨드 직후 플래그만 본다. 그 뒤는 각 명령의 인자(ID·텍스트·쿼리)다.
-    matches!(it.next().and_then(|s| s.to_str()), Some("-h" | "--help"))
-        || matches!(cmd.to_str(), Some("-h" | "--help" | "help"))
+    if tail
+        .first()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| matches!(s, "-h" | "--help"))
+    {
+        return true;
+    }
+    let Some(cmd_name) = cmd.to_str() else {
+        return false;
+    };
+    if cmd_name == "send" {
+        let mut seen_id = false;
+        let mut it = tail.iter();
+        while let Some(arg) = it.next() {
+            let s = arg.to_str();
+            if s == Some("--") {
+                return false;
+            }
+            if !seen_id {
+                if matches!(s, Some("-h" | "--help")) {
+                    return true;
+                }
+                seen_id = true;
+                continue;
+            }
+            match s {
+                Some("--text") => {
+                    it.next();
+                }
+                Some("--enter" | "--wait-submit" | "--stdin") => {}
+                Some("--help") => return true,
+                Some(flag) if flag.starts_with("--") => {}
+                _ => return false,
+            }
+        }
+        return false;
+    }
+    if !matches!(
+        cmd_name,
+        "ls" | "new" | "fork" | "read" | "wait" | "attach" | "kill" | "close"
+    ) {
+        return false;
+    }
+    let mut it = tail.iter();
+    while let Some(arg) = it.next() {
+        let Some(s) = arg.to_str() else {
+            continue;
+        };
+        if s == "--" {
+            return false;
+        }
+        if matches!(s, "-h" | "--help") {
+            return true;
+        }
+        if option_takes_value(cmd_name, s) {
+            it.next();
+        }
+    }
+    false
 }
 
 pub(crate) fn run_with_target(target: &Target, rest: &[OsString]) -> ExitCode {
@@ -182,6 +254,14 @@ fn request(c: &mut UnixStream, r: &Request) -> Result<Reply> {
     Ok(reply)
 }
 
+/// `ls`의 WORKTREE 값. 저장 키(`worktree_key`)는 Windows에서 `\\?\C:\...`지만 daemon이 알려 주는
+/// 저장소·CWD는 보통 경로라, 보여 주고 비교할 때는 접두를 뗀다.
+fn shown_worktree(path: &std::path::Path) -> String {
+    krill_proto::os::shell_path(&crate::set::resolve_worktree(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// OWE-684: 세션 목록에 붙는 holder 상실 경고. 정상이면 `None`(기본 출력 그대로).
 fn holder_loss_warning(orphan: bool) -> Option<&'static str> {
     orphan.then_some(
@@ -198,6 +278,19 @@ fn probe_holder_orphan(target: &Target) -> bool {
         .ok()
         .and_then(|c| c.holder_status)
         .is_some_and(|s| s == daemon::HolderStatus::Orphan)
+}
+
+fn resolve_list_worktree_filter(remote: bool, raw: &str) -> Result<String> {
+    if remote {
+        if !crate::remote::is_remote_absolute_path(raw.as_bytes()) {
+            return Err(remote_usage(
+                "remote --worktree must be an absolute path on the remote host",
+            ));
+        }
+        Ok(raw.to_owned())
+    } else {
+        Ok(shown_worktree(std::path::Path::new(raw)))
+    }
 }
 
 fn list(target: &Target, args: &[OsString]) -> Result<()> {
@@ -225,14 +318,7 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
                     .and_then(|s| s.to_str())
                     .filter(|s| !s.is_empty())
                     .ok_or_else(usage)?;
-                let resolved = if target.is_remote() {
-                    raw.to_owned()
-                } else {
-                    crate::set::resolve_worktree(std::path::Path::new(raw))
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                worktree_filter = Some(resolved);
+                worktree_filter = Some(resolve_list_worktree_filter(target.is_remote(), raw)?);
             }
             _ => return Err(usage()),
         }
@@ -285,9 +371,7 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
             })
             .unwrap_or_default();
         if worktree.is_empty() && !cwd.is_empty() && !target.is_remote() {
-            worktree = crate::set::resolve_worktree(std::path::Path::new(&cwd))
-                .to_string_lossy()
-                .into_owned();
+            worktree = shown_worktree(std::path::Path::new(&cwd));
         }
         if let Some(filter) = &worktree_filter {
             let matches_wt = worktree == *filter || crate::remote::is_path_within(&cwd, filter);
@@ -352,28 +436,63 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
         }
         return Ok(());
     }
-    println!("ID\tPID\tPROCESS\tSTATE\tAGENT\tACCOUNT\tWORKTREE\tCWD");
+    let dash = |v: String| if v.is_empty() { "-".to_owned() } else { v };
+    let mut rows = vec![
+        [
+            "ID", "PID", "PROCESS", "STATE", "AGENT", "ACCOUNT", "WORKTREE", "CWD",
+        ]
+        .map(str::to_owned),
+    ];
     for s in enriched {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            s.id,
-            s.pid,
-            s.process,
-            s.state,
-            s.agent.as_deref().unwrap_or("-"),
-            s.account.as_deref().unwrap_or("-"),
-            if s.worktree.is_empty() {
-                "-"
-            } else {
-                &s.worktree
-            },
-            if s.cwd.is_empty() { "-" } else { &s.cwd },
-        );
+        rows.push([
+            s.id.to_string(),
+            s.pid.to_string(),
+            s.process.to_owned(),
+            s.state.to_owned(),
+            s.agent.unwrap_or_else(|| "-".to_owned()),
+            s.account.unwrap_or_else(|| "-".to_owned()),
+            dash(s.worktree),
+            dash(s.cwd),
+        ]);
     }
+    print!("{}", table(&rows, io::stdout().is_terminal()));
     if let Some(warning) = holder_loss_warning(orphan) {
         eprintln!("{warning}");
     }
     Ok(())
+}
+
+/// `ls` 표. 파이프에는 탭 구분(스크립트가 `split('\t')`로 읽는다), 터미널에는 표시 폭(한글 2칸)으로 맞춘 공백 정렬.
+fn table<const N: usize>(rows: &[[String; N]], aligned: bool) -> String {
+    use unicode_width::UnicodeWidthStr as _;
+    let mut widths = [0; N];
+    for row in rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.width());
+        }
+    }
+    let mut out = String::new();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            out.push_str(cell);
+            if i + 1 == N {
+                break;
+            }
+            if aligned {
+                let pad = widths
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(cell.width())
+                    + 2;
+                out.extend(std::iter::repeat_n(' ', pad));
+            } else {
+                out.push('\t');
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn create(target: &Target, args: &[OsString]) -> Result<()> {
@@ -632,6 +751,7 @@ fn parse_fork_args(
     }
     let from = match from {
         Some(sid) => sid,
+        None if remote => return Err(remote_usage("remote session fork requires --from <id>")),
         None => id(&env_pane.ok_or_else(usage)?)?,
     };
     Ok(ForkArgs {
@@ -817,6 +937,20 @@ fn raw(target: &Target, session: SessionId, from: Seq) -> Result<Connection> {
     Ok(c)
 }
 
+/// Windows pipes end lines with CRLF; a terminal reads CR as Enter. Send the LF a Unix pipe
+/// would carry so `--stdin` never submits early (submission stays with `--enter`).
+fn lf_lines(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut it = bytes.iter().peekable();
+    while let Some(&byte) = it.next() {
+        if byte == b'\r' && it.peek() == Some(&&b'\n') {
+            continue;
+        }
+        out.push(byte);
+    }
+    out
+}
+
 fn send(target: &Target, args: &[OsString]) -> Result<()> {
     let (session, args) = args.split_first().ok_or_else(usage)?;
     let session = id(session)?;
@@ -859,6 +993,9 @@ fn send(target: &Target, args: &[OsString]) -> Result<()> {
             .take(u64::try_from(MAX_INPUT + 1).map_err(fail)?)
             .read_to_end(&mut text)
             .map_err(fail)?;
+        if cfg!(windows) {
+            text = lf_lines(&text);
+        }
     }
     let total_bytes = text.len().saturating_add(usize::from(enter));
     if total_bytes == 0 || total_bytes > MAX_INPUT {
@@ -1265,7 +1402,7 @@ pub(crate) fn send_session_line(
     session_id: u64,
     line: &str,
 ) -> std::result::Result<(), String> {
-    send(target, &session_line_args(session_id, line, false)).map_err(|e| e.text)
+    send(target, &session_line_args(session_id, line, true)).map_err(|e| e.text)
 }
 
 fn session_line_args(session_id: u64, line: &str, wait_submit: bool) -> Vec<OsString> {
@@ -1372,8 +1509,49 @@ pub fn resolve_session_cwd(id: u64) -> io::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ls_table_aligns_by_display_width_only_on_a_terminal() {
+        let rows = [
+            ["ID", "CWD", "X"].map(str::to_owned),
+            ["1", "C:\\Users\\홍길동", "a"].map(str::to_owned),
+            ["12", "C:\\Users\\tester", "b"].map(str::to_owned),
+        ];
+        assert_eq!(
+            super::table(&rows, false),
+            "ID\tCWD\tX\n1\tC:\\Users\\홍길동\ta\n12\tC:\\Users\\tester\tb\n"
+        );
+        // 홍길동은 6칸, tester와 같다.
+        assert_eq!(
+            super::table(&rows, true),
+            "ID  CWD              X\n1   C:\\Users\\홍길동  a\n12  C:\\Users\\tester  b\n"
+        );
+    }
+
     use super::*;
     use krill_proto::agent::rules::ScreenRules;
+
+    #[cfg(windows)]
+    #[test]
+    fn ls_worktree_has_no_verbatim_prefix() {
+        let dir = std::env::temp_dir().join(format!("krill-ls-wt-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let key = crate::set::resolve_worktree(&dir);
+        let shown = shown_worktree(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(key.to_string_lossy().starts_with(r"\\?\"), "{key:?}");
+        assert_eq!(shown, krill_proto::os::shell_path(&key).to_string_lossy());
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+    }
+
+    #[test]
+    fn windows_stdin_crlf_becomes_unix_lf() {
+        assert_eq!(
+            lf_lines(b"line 1\r\n\xed\x95\x9c\r\n"),
+            b"line 1\n\xed\x95\x9c\n"
+        );
+        assert_eq!(lf_lines(b"a\rb\r"), b"a\rb\r");
+        assert_eq!(lf_lines(b"\r\r\n"), b"\r\n");
+    }
 
     #[test]
     fn lone_separator_is_usage_and_create_error_names_program() {
@@ -1612,16 +1790,27 @@ mod tests {
         assert!(is_help_flag(&OsString::from("help")));
         assert!(!is_help_flag(&OsString::from("--hel")));
         assert!(help(&["send", "--help"]));
+        assert!(help(&["send", "1", "--enter", "--help"]));
         assert!(help(&["ls", "--help"]));
+        assert!(help(&["ls", "--json", "-h"]));
+        assert!(help(&["new", "--cwd", "/tmp", "--help"]));
+        assert!(help(&["wait", "1", "--help"]));
+        assert!(help(&["wait", "1", "--pattern", "READY", "-h"]));
+        assert!(help(&["read", "1", "--help"]));
+        assert!(help(&["kill", "1", "--help"]));
         assert!(help(&["--help"]));
         assert!(!help(&["send", "--", "--help"]));
         assert!(!help(&["send", "1", "--", "--help"]));
-        // 세션 ID·전송 텍스트 자리의 `help`는 도움말이 아니다.
+        assert!(!help(&["new", "--", "cmd", "--help"]));
+        // 세션 ID·전송 텍스트 자리의 `help`·`-h`·옵션 값은 도움말이 아니다.
         assert!(!help(&["send", "1", "help"]));
+        assert!(!help(&["send", "1", "-h"]));
+        assert!(!help(&["send", "1", "echo", "--help"]));
         assert!(!help(&["send", "1", "--text", "--help"]));
+        assert!(!help(&["wait", "1", "--pattern", "--help"]));
         // 없는 서브커맨드 뒤 `--help`도 usage를 보여준다(오타 탐색 친화적).
         assert!(help(&["search-is-not-a-session-cmd", "--help"]));
-        // `read 1 --lines --help`에서 --help는 --lines 값 자리가 아니라 오인 방지를 위해 도움말이 아니다.
+        // `read 1 --lines --help`에서 --help는 --lines 값 자리이므로 도움말이 아니다.
         assert!(!help(&["read", "1", "--lines", "--help"]));
     }
 
@@ -1641,5 +1830,16 @@ mod tests {
         assert!(err.text.contains("update the daemon"), "{}", err.text);
         drop(client);
         assert!(ipc::read_frame(&mut server).unwrap().is_none());
+    }
+
+    #[test]
+    fn remote_list_and_fork_reject_implicit_local_repo_or_pane_env() {
+        assert!(resolve_list_worktree_filter(true, "relative/repo").is_err());
+        assert_eq!(
+            resolve_list_worktree_filter(true, "/srv/repo").unwrap(),
+            "/srv/repo"
+        );
+        let parsed = parse_fork_args(&[], true, Some(OsString::from("9")), (80, 24));
+        assert!(parsed.is_err());
     }
 }

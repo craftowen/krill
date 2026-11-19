@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use krill_proto::account_login::AuthStatus;
-use krill_proto::usage::{ProviderKind, ResetConsumeOutcome};
+use krill_proto::usage::{ProviderKind, ResetConsumeError, ResetConsumeOutcome};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
@@ -24,6 +24,8 @@ type Key = (PathBuf, ProviderKind, PathBuf);
 type Credentials = (Zeroizing<String>, Option<String>);
 static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
 static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
+static CREDENTIAL_DIGESTS: Mutex<BTreeMap<Key, Option<[u8; 32]>>> = Mutex::new(BTreeMap::new());
+static AUTH_REJECTED: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
 /// 실패·429 뒤 다음 조회 가능 시각과 연속 실패 수. 이 시각 전에는 같은 프로필을 다시 조회하지 않는다.
 static RETRY: Mutex<BTreeMap<Key, Retry>> = Mutex::new(BTreeMap::new());
 // 아래 값은 Orca(MIT) rate-limits/service/service-types.ts·usage-retry-after.ts를 따른다.
@@ -44,18 +46,83 @@ const RATE_LIMIT_RETRY: Duration = Duration::from_mins(5);
 /// 손상된 Retry-After가 며칠씩 조회를 막지 않게 하는 상한. 429 동안 마지막 정상 값도 이만큼 유지한다.
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_hours(24);
 const MAX_BYTES: u64 = 512 * 1024;
+const DEFAULT_HTTP_TIMEOUT_SECS: &str = "10";
+const CODEX_CONSUME_TIMEOUT_SECS: &str = "30";
+const CLAUDE_CONSUME_TIMEOUT_SECS: &str = "15";
 
-/// 소진 직후 스냅샷이 소진 전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
+/// 소진 직후나 호스트 자격증명 교체 직후 스냅샷이 이전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
 /// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다.
-pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
-    lock(&CACHE).remove(&(home.to_path_buf(), provider, dir.to_path_buf()));
+pub(crate) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
+    let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    lock(&CACHE).remove(&key);
+    lock(&RETRY).remove(&key);
+    lock(&CREDENTIAL_DIGESTS).remove(&key);
+    lock(&AUTH_REJECTED).remove(&key);
+    if provider == ProviderKind::Antigravity {
+        agy::evict_profile(home, dir);
+    }
     super::meters::evict_profile(home, provider, dir);
+}
+
+fn credential_digest(provider: ProviderKind, dir: &Path, host: bool) -> Option<[u8; 32]> {
+    let cred = match provider {
+        ProviderKind::Antigravity if host => read_file(&dir.join("antigravity-oauth-token")),
+        ProviderKind::Antigravity => {
+            read_file(&dir.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+        }
+        ProviderKind::Codex => read_file(&dir.join("auth.json")),
+        ProviderKind::Claude => read_file(&dir.join(".credentials.json"))
+            .or_else(|| read_file(&dir.join("credentials.json"))),
+        ProviderKind::OpenCode if host => read_file(&dir.join("auth.json")),
+        ProviderKind::OpenCode => read_file(&dir.join("data/opencode/auth.json")),
+        ProviderKind::Gemini => return None,
+    };
+    let login_ns = std::fs::symlink_metadata(dir.join(".krill-login-completed"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    if cred.is_none() && login_ns.is_none() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    if let Some(bytes) = cred {
+        hasher.update(b"cred\0");
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    if let Some(ns) = login_ns {
+        hasher.update(b"login\0");
+        hasher.update(ns.to_le_bytes());
+    }
+    Some(hasher.finalize().into())
+}
+
+fn evict_if_credentials_changed(home: &Path, provider: ProviderKind, dir: &Path, host: bool) {
+    let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    let recorded = lock(&CREDENTIAL_DIGESTS).get(&key).copied();
+    if let Some(prev) = recorded
+        && credential_digest(provider, dir, host) != prev
+    {
+        evict_profile(home, provider, dir);
+        accounts::evict_login_profile(provider, dir);
+    }
+}
+
+pub(super) fn has_auth_failure(home: &Path, provider: ProviderKind, dir: &Path) -> bool {
+    let host = dir == accounts::host_default_dir(home, provider);
+    evict_if_credentials_changed(home, provider, dir, host);
+    let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    lock(&AUTH_REJECTED).contains(&key)
+        && lock(&CACHE).get(&key).is_some_and(|(at, u)| alive(*at, u))
 }
 
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
     if provider == ProviderKind::Antigravity {
         return agy::cached(home, dir);
     }
+    let host = dir == accounts::host_default_dir(home, provider);
+    evict_if_credentials_changed(home, provider, dir, host);
     lock(&CACHE)
         .get(&(home.to_path_buf(), provider, dir.to_path_buf()))
         .filter(|(at, usage)| alive(*at, usage))
@@ -92,6 +159,7 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
     if cfg!(test) || (cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some()) {
         return;
     } // 실제 자격증명·네트워크는 단위 테스트에서 금지.
+    accounts::agy_native::migrate_codex_host_once(home, state, &file.accounts);
     agy::refresh(home, state, &file, interval);
     let profiles = [
         ProviderKind::Claude,
@@ -115,6 +183,7 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
         {
             continue;
         }
+        evict_if_credentials_changed(home, provider, &dir, host);
         let key = (home.to_path_buf(), provider, dir);
         // 실패·429는 `RETRY` 시각만 보고, 정상 값은 주기(`interval`)만 본다.
         if !force
@@ -139,9 +208,16 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
     let launched = std::thread::Builder::new()
         .name("account-usage".into())
         .spawn(move || {
+            let before = credential_digest(job.1, &job.2, host);
             let result =
                 std::panic::catch_unwind(|| fetch(job.1, &job.2, host, &job.0, state.as_deref()))
                     .unwrap_or(Fetched::Failed(Failure::Internal));
+            let after = credential_digest(job.1, &job.2, host);
+            if before.is_some() && after.is_some() && before != after {
+                lock(&PENDING).remove(&job);
+                return;
+            }
+            lock(&CREDENTIAL_DIGESTS).insert(job.clone(), after);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
@@ -150,6 +226,8 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
                 let mut cache = lock(&CACHE);
                 cache.retain(|_, (at, u)| alive(*at, u));
                 cache.insert(job.clone(), (Instant::now(), usage));
+                let mut rejected = lock(&AUTH_REJECTED);
+                rejected.retain(|k| cache.contains_key(k));
             }
             lock(&PENDING).remove(&job);
         });
@@ -161,6 +239,7 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
 fn apply_result(job: &Key, result: Fetched, now: Option<u64>) -> Option<ProfileUsage> {
     match result {
         Fetched::Usage(usage, meters) => {
+            lock(&AUTH_REJECTED).remove(job);
             if lock(&RETRY)
                 .remove(job)
                 .is_some_and(|retry| retry.reason.is_some())
@@ -176,6 +255,7 @@ fn apply_result(job: &Key, result: Fetched, now: Option<u64>) -> Option<ProfileU
         }
         // 429는 오류가 아니다: 서버가 말한 시각까지 쉬고 마지막 정상 값을 오래됨으로 유지한다.
         Fetched::RateLimited(wait) => {
+            lock(&AUTH_REJECTED).remove(job);
             let mut retry = lock(&RETRY);
             let entry = retry.entry(job.clone()).or_insert_with(Retry::new);
             entry.until =
@@ -185,6 +265,11 @@ fn apply_result(job: &Key, result: Fetched, now: Option<u64>) -> Option<ProfileU
             None
         }
         Fetched::Failed(reason) => {
+            if job.1 == ProviderKind::Codex && reason == Failure::Http(401) {
+                lock(&AUTH_REJECTED).insert(job.clone());
+            } else {
+                lock(&AUTH_REJECTED).remove(job);
+            }
             let mut retry = lock(&RETRY);
             if retry
                 .entry(job.clone())
@@ -222,17 +307,20 @@ enum Failure {
 impl Failure {
     fn detail(self) -> String {
         match self {
-            Self::Credentials => "사용량 자격증명 읽기 실패".into(),
+            Self::Credentials => "Failed to read usage credentials".into(),
             Self::Expired => {
-                "사용량 자격증명 만료 — 해당 계정 CLI에서 갱신하거나 다시 로그인하세요".into()
+                "Usage credentials expired. Refresh them in that account's CLI or sign in again"
+                    .into()
             }
-            Self::Request => "사용량 요청 구성 실패".into(),
-            Self::Transport => "사용량 API 연결·전송 실패".into(),
-            Self::Http(401) => "사용량 API 인증 거절(HTTP 401) — 계정 로그인을 확인하세요".into(),
-            Self::Http(403) => "사용량 API 접근 거절(HTTP 403)".into(),
-            Self::Http(code) => format!("사용량 API 응답 오류(HTTP {code})"),
-            Self::Response => "사용량 API 응답 해석 실패".into(),
-            Self::Internal => "사용량 조회 작업 실패".into(),
+            Self::Request => "Failed to build the usage request".into(),
+            Self::Transport => "Usage API connection failed".into(),
+            Self::Http(401) => {
+                "Usage API rejected the sign-in (HTTP 401). Check the account login".into()
+            }
+            Self::Http(403) => "Usage API denied access (HTTP 403)".into(),
+            Self::Http(code) => format!("Usage API error (HTTP {code})"),
+            Self::Response => "Failed to read the usage API response".into(),
+            Self::Internal => "Usage lookup failed".into(),
         }
     }
 }
@@ -268,16 +356,16 @@ impl Retry {
 
 /// Stable diagnostic identifier without paths, account emails or credential material.
 fn profile_id(dir: &Path) -> String {
-    format!("{:x}", Sha256::digest(dir.as_os_str().as_encoded_bytes()))
+    crate::mobile::devices::hex(&Sha256::digest(dir.as_os_str().as_encoded_bytes()))
         .chars()
         .take(12)
         .collect()
 }
 
-/// 실행 중인 Claude 세션이 statusline으로 방금 사용량을 남겼는가. 같은 값을 API로 또 받지 않는다.
+/// 이 프로필의 Claude 세션이 statusline으로 방금 사용량을 남겼는가. 같은 값을 API로 또 받지 않는다.
 fn live_fresh(provider: ProviderKind, dir: &Path) -> bool {
     provider == ProviderKind::Claude
-        && accounts::claude_statusline_usage(dir)
+        && accounts::claude_recorded_usage(dir)
             .and_then(|u| u.updated_at)
             .is_some_and(|at| {
                 SystemTime::now()
@@ -305,7 +393,7 @@ fn mark_rate_limited(
         Some((at, u)) if alive(*at, u) && !u.usage.is_empty() => {
             u.stale = true;
             u.error = None;
-            u.detail = Some("사용량 API 요청 제한(429) — 마지막 성공 값".into());
+            u.detail = Some("Usage API rate limited (429) — last successful value".into());
         }
         _ => {
             cache.insert(
@@ -313,8 +401,8 @@ fn mark_rate_limited(
                 (
                     Instant::now(),
                     ProfileUsage {
-                        error: Some("요청 제한".into()),
-                        detail: Some("사용량 API 요청 제한(429)".into()),
+                        error: Some("Rate limited".into()),
+                        detail: Some("Usage API rate limited (429)".into()),
                         updated_at: now,
                         ..ProfileUsage::default()
                     },
@@ -338,8 +426,8 @@ fn mark_failed(
         && !usage.usage.is_empty()
     {
         usage.stale = true;
-        usage.error = Some("갱신 실패".into());
-        usage.detail = Some(format!("{} — 마지막 성공 값", reason.detail()));
+        usage.error = Some("Refresh failed".into());
+        usage.detail = Some(format!("{} — last successful value", reason.detail()));
         return;
     }
     cache.insert(
@@ -347,7 +435,7 @@ fn mark_failed(
         (
             Instant::now(),
             ProfileUsage {
-                error: Some("갱신 실패".into()),
+                error: Some("Refresh failed".into()),
                 detail: Some(reason.detail()),
                 updated_at: now,
                 ..ProfileUsage::default()
@@ -359,7 +447,10 @@ fn mark_failed(
 /// 테스트용: 직접 조회가 401로 실패한 상태를 만든다(이전 정상값 없음).
 #[cfg(all(test, unix))]
 pub(super) fn fail_for_tests(home: &Path, provider: ProviderKind, dir: &Path) {
+    let host = dir == accounts::host_default_dir(home, provider);
     let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    lock(&CREDENTIAL_DIGESTS).insert(key.clone(), credential_digest(provider, dir, host));
+    lock(&AUTH_REJECTED).insert(key.clone());
     mark_failed(&mut lock(&CACHE), &key, None, Failure::Http(401));
 }
 
@@ -405,7 +496,7 @@ fn fetch(
     Fetched::Usage(usage, meters)
 }
 
-type HttpResponse = (u16, Option<Duration>, Zeroizing<Vec<u8>>);
+pub(super) type HttpResponse = (u16, Option<Duration>, Zeroizing<Vec<u8>>);
 
 fn fetch_usage(
     provider: ProviderKind,
@@ -435,7 +526,8 @@ fn fetch_usage(
 }
 
 /// curl GET 전송. 설정·본문에 비밀(토큰)은 로그에 남기지 않는다.
-pub(super) fn get_text(config: &str) -> Option<Zeroizing<Vec<u8>>> {
+#[cfg(not(test))]
+fn get_text(config: &str) -> Option<Zeroizing<Vec<u8>>> {
     pipe_command(
         system_curl(),
         &[
@@ -497,28 +589,26 @@ pub(crate) fn consume_reset_credit(
     host: bool,
     home: &Path,
     state: Option<&Path>,
-) -> Option<(ResetConsumeOutcome, u64)> {
+) -> Result<(ResetConsumeOutcome, u64), ResetConsumeError> {
     if provider != ProviderKind::Codex {
-        return None;
+        return Err(ResetConsumeError::InvalidTarget);
     }
-    let (token, account) = credentials(provider, dir, host, home, state)?;
-    let redeem_id = redeem_request_id()?;
+    let key = (home.to_path_buf(), provider, dir.to_path_buf());
+    let now = now_epoch_u64();
+    let (token, account) = match usage_credentials(provider, dir, host, home, state) {
+        Ok(creds) => creds,
+        Err(reason) => {
+            record_failure(&key, reason, now);
+            return Err(ResetConsumeError::AuthRequired);
+        }
+    };
+    let redeem_id = redeem_request_id().ok_or(ResetConsumeError::UpstreamRejected)?;
     consume_request(provider, &token, account.as_deref(), &redeem_id, |config| {
-        pipe_command(
-            system_curl(),
-            &[
-                "-q",
-                "--config",
-                "-",
-                "--silent",
-                "--fail",
-                "--max-time",
-                "8",
-                "--max-filesize",
-                "524288",
-            ],
-            config.as_bytes(),
-        )
+        let res = curl_exchange(config, CODEX_CONSUME_TIMEOUT_SECS);
+        if let Ok((code, retry_after, _)) = &res {
+            record_reset_http(&key, *code, *retry_after, now);
+        }
+        res
     })
 }
 
@@ -527,14 +617,29 @@ fn consume_request(
     token: &str,
     account: Option<&str>,
     redeem_id: &str,
-    send: impl FnOnce(&str) -> Option<Zeroizing<Vec<u8>>>,
-) -> Option<(ResetConsumeOutcome, u64)> {
-    let config = consume_config(provider, token, account, redeem_id)?;
-    let body = send(&config)?;
-    parse_consume_response(std::str::from_utf8(&body).ok()?)
+    send: impl FnOnce(&str) -> Result<HttpResponse, CurlError>,
+) -> Result<(ResetConsumeOutcome, u64), ResetConsumeError> {
+    let config = consume_config(provider, token, account, redeem_id)
+        .ok_or(ResetConsumeError::InvalidTarget)?;
+    let (status, _, body) = send(&config).map_err(CurlError::into_reset_error)?;
+    match status {
+        401 | 403 => Err(ResetConsumeError::AuthRequired),
+        429 => Err(ResetConsumeError::RateLimited),
+        200..=299 => std::str::from_utf8(&body)
+            .ok()
+            .and_then(parse_consume_response)
+            .ok_or(ResetConsumeError::UpstreamRejected),
+        400 | 409 | 422 => std::str::from_utf8(&body)
+            .ok()
+            .and_then(parse_consume_response)
+            .filter(|(outcome, _)| *outcome != ResetConsumeOutcome::Reset)
+            .ok_or(ResetConsumeError::UpstreamRejected),
+        _ => Err(ResetConsumeError::UpstreamRejected),
+    }
 }
 
-/// 소진 요청 curl 설정. `data`는 JSON 큰따옴표와 겹치지 않게 작은따옴표로 감싼다.
+/// 소진 요청 curl 설정. `curl --config`는 큰따옴표(`"..."`)만 인용 부호로 해석하고
+/// 작은따옴표는 공백에서 값을 잘라 버리므로 JSON 큰따옴표는 `\"`로 이스케이프한다.
 fn consume_config(
     provider: ProviderKind,
     token: &str,
@@ -559,9 +664,9 @@ fn consume_config(
         config.push_str(account);
         config.push_str("\"\n");
     }
-    config.push_str("data = '{\"redeem_request_id\": \"");
+    config.push_str("data = \"{\\\"redeem_request_id\\\": \\\"");
     config.push_str(redeem_id);
-    config.push_str("\"}'\n");
+    config.push_str("\\\"}\"\n");
     Some(config)
 }
 
@@ -676,7 +781,7 @@ fn reset_expiry(raw: &serde_json::Value) -> Option<i64> {
 #[expect(clippy::option_option, reason = "프로브 실패와 제공 없음을 구분한다")]
 pub(super) fn claude_offered_program(
     token: &str,
-    send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
+    mut send: impl FnMut(&str) -> Option<Zeroizing<Vec<u8>>>,
 ) -> Option<Option<ClaudeResetProgram>> {
     let juniper = claude_probe_config(token, ClaudeResetProbe::Juniper)
         .and_then(|cfg| send(&cfg))
@@ -779,32 +884,140 @@ fn parse_cedar_grants(text: &str, now: i64) -> Option<Vec<(u64, Option<i64>)>> {
     Some(grants)
 }
 
-/// 소진 경로용 Claude 토큰. 프로필·프로브·소진이 같은 자격증명을 쓴다.
-pub(super) fn claude_token(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CurlError {
+    TimedOut,
+    Transport,
+}
+
+impl CurlError {
+    const fn into_reset_error(self) -> ResetConsumeError {
+        match self {
+            Self::TimedOut => ResetConsumeError::TimedOut,
+            Self::Transport => ResetConsumeError::Transport,
+        }
+    }
+}
+
+fn now_epoch_u64() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn record_failure(key: &Key, reason: Failure, now: Option<u64>) {
+    let host = key.2 == accounts::host_default_dir(&key.0, key.1);
+    lock(&CREDENTIAL_DIGESTS).insert(key.clone(), credential_digest(key.1, &key.2, host));
+    if key.1 == ProviderKind::Codex && reason == Failure::Http(401) {
+        lock(&AUTH_REJECTED).insert(key.clone());
+    } else {
+        lock(&AUTH_REJECTED).remove(key);
+    }
+    let mut retry = lock(&RETRY);
+    retry
+        .entry(key.clone())
+        .or_insert_with(Retry::new)
+        .fail(reason, Instant::now());
+    drop(retry);
+    mark_failed(&mut lock(&CACHE), key, now, reason);
+}
+
+fn record_reset_http(key: &Key, status: u16, retry_after: Option<Duration>, now: Option<u64>) {
+    if status == 429 {
+        let mut retry = lock(&RETRY);
+        let entry = retry.entry(key.clone()).or_insert_with(Retry::new);
+        entry.until = Instant::now()
+            + retry_after
+                .unwrap_or(RATE_LIMIT_RETRY)
+                .min(MAX_RATE_LIMIT_WAIT);
+        drop(retry);
+        mark_rate_limited(&mut lock(&CACHE), key, now);
+    } else if status == 401 || status == 403 {
+        record_failure(key, Failure::Http(status), now);
+    }
+}
+
+pub(super) fn consume_claude_reset_credit(
     dir: &Path,
     host: bool,
     home: &Path,
     state: Option<&Path>,
-) -> Option<Zeroizing<String>> {
-    credentials(ProviderKind::Claude, dir, host, home, state).map(|(token, _)| token)
+) -> Result<(ResetConsumeOutcome, u64), ResetConsumeError> {
+    let key = (home.to_path_buf(), ProviderKind::Claude, dir.to_path_buf());
+    let now = now_epoch_u64();
+    let (token, _) = match usage_credentials(ProviderKind::Claude, dir, host, home, state) {
+        Ok(creds) => creds,
+        Err(reason) => {
+            record_failure(&key, reason, now);
+            return Err(ResetConsumeError::AuthRequired);
+        }
+    };
+    let send_probe = |config: &str| -> Result<Zeroizing<Vec<u8>>, ResetConsumeError> {
+        let (status, retry_after, body) = curl_exchange(config, DEFAULT_HTTP_TIMEOUT_SECS)
+            .map_err(CurlError::into_reset_error)?;
+        record_reset_http(&key, status, retry_after, now);
+        match status {
+            401 | 403 => Err(ResetConsumeError::AuthRequired),
+            429 => Err(ResetConsumeError::RateLimited),
+            200..=299 => Ok(body),
+            _ => Err(ResetConsumeError::UpstreamRejected),
+        }
+    };
+    let org = claude_org_uuid_checked(&token, send_probe)?;
+    let mut last_probe_err = None;
+    let offered = claude_offered_program(&token, |cfg| match send_probe(cfg) {
+        Ok(body) => Some(body),
+        Err(err) => {
+            last_probe_err = Some(err);
+            None
+        }
+    });
+    match offered {
+        Some(Some(program)) => claude_claim_reset(&token, &org, program, |cfg| {
+            let res = curl_exchange(cfg, CLAUDE_CONSUME_TIMEOUT_SECS);
+            if let Ok((code, retry_after, _)) = &res {
+                record_reset_http(&key, *code, *retry_after, now);
+            }
+            res
+        }),
+        Some(None) => Ok((ResetConsumeOutcome::NoCredit, 0)),
+        None => Err(last_probe_err.unwrap_or(ResetConsumeError::UpstreamRejected)),
+    }
 }
 
-/// Claude OAuth 프로필의 조직 UUID. 소진 POST 경로에 쓴다.
-pub(super) fn claude_org_uuid(
+fn claude_org_uuid_checked(
     token: &str,
-    send: impl FnOnce(&str) -> Option<Zeroizing<Vec<u8>>>,
-) -> Option<String> {
+    send: impl FnOnce(&str) -> Result<Zeroizing<Vec<u8>>, ResetConsumeError>,
+) -> Result<String, ResetConsumeError> {
     if !check_credential_text(token, None) {
-        return None;
+        return Err(ResetConsumeError::InvalidTarget);
     }
     let config = Zeroizing::new(format!(
         "url = \"https://api.anthropic.com/api/oauth/profile\"\nrequest = \"GET\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: claude-code/2.1.0\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"Accept: application/json\"\n"
     ));
     let body = send(&config)?;
-    let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
-    let uuid = json.pointer("/organization/uuid")?.as_str()?;
-    (!uuid.is_empty() && uuid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
-        .then(|| uuid.to_owned())
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| ResetConsumeError::UpstreamRejected)?;
+    let uuid = json
+        .pointer("/organization/uuid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ResetConsumeError::UpstreamRejected)?;
+    if uuid.is_empty() || !uuid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(ResetConsumeError::UpstreamRejected);
+    }
+    Ok(uuid.to_owned())
+}
+
+#[cfg(test)]
+pub(super) fn claude_org_uuid(
+    token: &str,
+    send: impl FnOnce(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> Option<String> {
+    claude_org_uuid_checked(token, |cfg| {
+        send(cfg).ok_or(ResetConsumeError::UpstreamRejected)
+    })
+    .ok()
 }
 
 /// Claude 리셋 소진. 성공하면 `(결과, 초기화된 창 수)`. 멱등 키가 없어 재시도 금지:
@@ -813,69 +1026,104 @@ pub(super) fn claude_claim_reset(
     token: &str,
     org_uuid: &str,
     program: ClaudeResetProgram,
-    send: impl FnOnce(&str) -> Option<(u16, Zeroizing<Vec<u8>>)>,
-) -> Option<(ResetConsumeOutcome, u64)> {
+    send: impl FnOnce(&str) -> Result<HttpResponse, CurlError>,
+) -> Result<(ResetConsumeOutcome, u64), ResetConsumeError> {
     if !check_credential_text(token, None) {
-        return None;
+        return Err(ResetConsumeError::InvalidTarget);
     }
     if org_uuid.is_empty()
         || !org_uuid
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
     {
-        return None;
+        return Err(ResetConsumeError::InvalidTarget);
     }
     let config = Zeroizing::new(format!(
-        "url = \"https://api.anthropic.com/api/organizations/{org_uuid}/reset_rate_limits\"\nrequest = \"POST\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: claude-code/2.1.0\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"Content-Type: application/json\"\nheader = \"Accept: application/json\"\ndata = '{{\"program\": \"{}\"}}'\n",
+        "url = \"https://api.anthropic.com/api/organizations/{org_uuid}/reset_rate_limits\"\nrequest = \"POST\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: claude-code/2.1.0\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"Content-Type: application/json\"\nheader = \"Accept: application/json\"\ndata = \"{{\\\"program\\\": \\\"{}\\\"}}\"\n",
         program.as_str()
     ));
-    let (status, body) = send(&config)?;
-    if status == 429 || status == 401 || status == 403 {
-        return None;
+    let (status, _, body) = send(&config).map_err(CurlError::into_reset_error)?;
+    match status {
+        401 | 403 => return Err(ResetConsumeError::AuthRequired),
+        429 => return Err(ResetConsumeError::RateLimited),
+        200..=299 | 400 | 409 | 422 => {}
+        _ => return Err(ResetConsumeError::UpstreamRejected),
     }
-    if !(200..300).contains(&status) {
-        return None;
-    }
-    match serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()?
-        .get("result")?
-        .as_str()?
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| match v.get("result")?.as_str()? {
+            "reset" if (200..300).contains(&status) => Some((ResetConsumeOutcome::Reset, 1)),
+            "already_used" => Some((ResetConsumeOutcome::AlreadyRedeemed, 0)),
+            "not_limited" => Some((ResetConsumeOutcome::NothingToReset, 0)),
+            "ineligible" | "unavailable" => Some((ResetConsumeOutcome::NoCredit, 0)),
+            _ => None,
+        });
+    parsed.ok_or(ResetConsumeError::UpstreamRejected)
+}
+
+#[cfg(not(test))]
+fn curl_response(config: &str) -> Option<HttpResponse> {
+    curl_exchange(config, DEFAULT_HTTP_TIMEOUT_SECS).ok()
+}
+
+pub(super) fn curl_exchange(config: &str, max_time_secs: &str) -> Result<HttpResponse, CurlError> {
+    let mut command = Command::new(system_curl());
+    #[cfg(windows)]
     {
-        "reset" => Some((ResetConsumeOutcome::Reset, 1)),
-        "already_used" => Some((ResetConsumeOutcome::AlreadyRedeemed, 0)),
-        "not_limited" => Some((ResetConsumeOutcome::NothingToReset, 0)),
-        "ineligible" | "unavailable" => Some((ResetConsumeOutcome::NoCredit, 0)),
-        _ => None,
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
     }
-}
-
-/// curl 전송 후 `(상태 코드, 본문)`. `--fail`을 쓰지 않아 429·401도 구분한다.
-pub(super) fn curl_status(config: &str) -> Option<(u16, Zeroizing<Vec<u8>>)> {
-    curl_response(config).map(|(code, _, body)| (code, body))
-}
-
-/// `curl_status`에 초 단위 Retry-After를 더한다.
-fn curl_response(config: &str) -> Option<(u16, Option<Duration>, Zeroizing<Vec<u8>>)> {
-    let out = pipe_command(
-        system_curl(),
-        &[
+    let mut child = command
+        .args([
             "-q",
             "--config",
             "-",
             "--silent",
             "--max-time",
-            "10",
+            max_time_secs,
             "--max-filesize",
             "524288",
             "-w",
             "\n%{http_code} %header{retry-after}",
-        ],
-        config.as_bytes(),
-    )?;
-    let split = out.iter().rposition(|&b| b == b'\n')?;
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| CurlError::Transport)?;
+    let write = child
+        .stdin
+        .take()
+        .ok_or(CurlError::Transport)?
+        .write_all(config.as_bytes());
+    if write.is_err() {
+        child.kill().ok();
+        child.wait().ok();
+        return Err(CurlError::Transport);
+    }
+    let output = child.wait_with_output().map_err(|_| CurlError::Transport)?;
+    if !output.status.success() {
+        return Err(if output.status.code() == Some(28) {
+            CurlError::TimedOut
+        } else {
+            CurlError::Transport
+        });
+    }
+    if !u64::try_from(output.stdout.len()).is_ok_and(|len| len <= MAX_BYTES) {
+        return Err(CurlError::Transport);
+    }
+    let out = Zeroizing::new(output.stdout);
+    let split = out
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .ok_or(CurlError::Transport)?;
     let (body, tail) = out.split_at(split);
-    let (code, retry_after) = parse_status_tail(std::str::from_utf8(tail).ok()?)?;
-    Some((code, retry_after, Zeroizing::new(body.to_vec())))
+    let tail_str = std::str::from_utf8(tail).map_err(|_| CurlError::Transport)?;
+    let (code, retry_after) = parse_status_tail(tail_str).ok_or(CurlError::Transport)?;
+    if code == 0 {
+        return Err(CurlError::Transport);
+    }
+    Ok((code, retry_after, Zeroizing::new(body.to_vec())))
 }
 
 /// `-w` 꼬리(`429 191`)를 푼다. Retry-After는 초 단위만 읽고 HTTP-date·빈 값은 `None`이다.
@@ -1041,6 +1289,7 @@ fn other_credentials(
     parse_credentials(provider, &read_file(&dir.join("auth.json"))?)
 }
 
+#[cfg(test)]
 fn credentials(
     provider: ProviderKind,
     dir: &Path,
@@ -1250,7 +1499,7 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
     };
     #[cfg(not(target_os = "macos"))]
     let normalized = path.as_bytes().to_vec();
-    let digest = format!("{:x}", Sha256::digest(&normalized));
+    let digest = crate::mobile::devices::hex(&Sha256::digest(&normalized));
     Some(format!(
         "Claude Code-credentials-{}",
         digest.chars().take(8).collect::<String>()
@@ -1328,7 +1577,7 @@ fn pipe_command(
         .then(|| Zeroizing::new(output.stdout))
 }
 
-pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
+pub(super) fn antigravity_auth_file(dir: &Path, host: bool) -> Option<AuthStatus> {
     if !host {
         // 로그인 판정은 krill-proto와 공유한다. 신원은 로그인된 프로필에서만 읽는다.
         let logged_in = krill_proto::account_login::agy_token_logged_in(dir);
@@ -1344,14 +1593,6 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
                 .flatten(),
         });
     }
-    // 호스트(OWE-901): 키체인 파싱 → 토큰 파일 존재 순(코디네이터 결정: 마커 검사 없음).
-    // 로그인은 존재·크기로 판정하고, 표시용 이메일만 상한 있는 읽기로 얻는다. 호스트 `dir`은 이미
-    // `~/.gemini/antigravity-cli`라 토큰 파일명을 직접 붙인다(프로필 헬퍼와 다름).
-    if let Some(raw) = keychain("gemini", "antigravity")
-        && let Some(status) = parse_antigravity_auth(&raw)
-    {
-        return Some(status);
-    }
     let token = dir.join("antigravity-oauth-token");
     if std::fs::symlink_metadata(&token)
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.len() > 0)
@@ -1362,6 +1603,24 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
                 accounts::identity_from_credentials(ProviderKind::Antigravity, &raw)
             }),
         });
+    }
+    None
+}
+
+pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
+    if !host {
+        return antigravity_auth_file(dir, false);
+    }
+    // 호스트(OWE-901): `antigravity-oauth-token` 파일이 있으면 `agy -p /usage`가
+    // `SSH_CONNECTION=krill`로 파일 토큰을 읽으므로 신원 판정도 같은 파일 토큰을 먼저 본다.
+    // 파일이 없을 때만 키체인 로그인을 확인한다.
+    if let Some(status) = antigravity_auth_file(dir, true) {
+        return Some(status);
+    }
+    if let Some(raw) = keychain("gemini", "antigravity")
+        && let Some(status) = parse_antigravity_auth(&raw)
+    {
+        return Some(status);
     }
     None
 }
@@ -1485,6 +1744,12 @@ pub(crate) mod agy {
         lock(&VERSION_TEXT_CACHE).clear();
     }
 
+    pub(super) fn evict_profile(home: &Path, dir: &Path) {
+        let key = (home.to_path_buf(), dir.to_path_buf());
+        lock(&CACHE).remove(&key);
+        lock(&FAILED).remove(&key);
+    }
+
     pub(super) fn cached(home: &Path, dir: &Path) -> Option<ProfileUsage> {
         if latched() {
             return None;
@@ -1515,7 +1780,6 @@ pub(crate) mod agy {
         interval: Duration,
         mut schedule: impl FnMut(&Key, bool, Option<PathBuf>),
     ) {
-        accounts::agy_native::reconcile_host_to_profiles(home, &file.accounts);
         let mut profiles = vec![(
             accounts::host_default_dir(home, ProviderKind::Antigravity),
             true,
@@ -1581,12 +1845,18 @@ pub(crate) mod agy {
                     lock(&PENDING).remove(&job);
                     return;
                 }
+                let before = super::credential_digest(ProviderKind::Antigravity, &job.1, host);
                 let usage = std::panic::catch_unwind(|| {
                     let exe = super::agy_exe()?;
                     fetch(&exe, &job.1, host)
                 })
                 .ok()
                 .flatten();
+                let after = super::credential_digest(ProviderKind::Antigravity, &job.1, host);
+                if before.is_some() && after.is_some() && before != after {
+                    lock(&PENDING).remove(&job);
+                    return;
+                }
                 if let Some((usage, meters)) = usage {
                     lock(&FAILED).remove(&job);
                     super::super::meters::remember(
@@ -2251,7 +2521,7 @@ pub(crate) mod agy {
             assert_eq!(
                 std::fs::read(&token).unwrap(),
                 b"fixture-only-exists",
-                "판정은 내용을 읽지 않는다"
+                "the check must not read the contents"
             );
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -2272,7 +2542,7 @@ pub(crate) fn agy_exe() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod failure_tests;
+pub(crate) mod failure_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2429,7 +2699,7 @@ mod tests {
             assert_eq!(kept.usage, good.usage);
             assert_eq!(kept.updated_at, Some(100));
             assert!(kept.stale);
-            assert_eq!(kept.error.as_deref(), Some("갱신 실패"));
+            assert_eq!(kept.error.as_deref(), Some("Refresh failed"));
         }
         // 반복 실패는 마지막 성공 시각을 갱신하거나 정상 TTL을 하루로 늘리지 않는다.
         let expired_at = at.checked_sub(CACHE_TTL + Duration::from_secs(1)).unwrap();
@@ -2438,7 +2708,7 @@ mod tests {
         mark_failed(&mut cache, &key, Some(400), Failure::Internal);
         assert!(cache[&key].1.usage.is_empty());
         assert_eq!(cache[&key].1.updated_at, Some(400));
-        assert_eq!(cache[&key].1.error.as_deref(), Some("갱신 실패"));
+        assert_eq!(cache[&key].1.error.as_deref(), Some("Refresh failed"));
     }
 
     #[test]
@@ -2458,7 +2728,10 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(lock(&CACHE)[&key].1.error.as_deref(), Some("갱신 실패"));
+        assert_eq!(
+            lock(&CACHE)[&key].1.error.as_deref(),
+            Some("Refresh failed")
+        );
         assert!(lock(&RETRY).contains_key(&key));
         lock(&CACHE).remove(&key);
         lock(&RETRY).remove(&key);
@@ -2587,7 +2860,9 @@ mod tests {
         assert!(consume.contains("rate-limit-reset-credits/consume"));
         assert!(consume.contains("request = \"POST\""));
         assert!(consume.contains("ChatGPT-Account-Id: acct-1"));
-        assert!(consume.contains("\"redeem_request_id\": \"55cbe0c1-71ab-4c52-b855-70746ff52\""));
+        assert!(consume.contains(
+            "data = \"{\\\"redeem_request_id\\\": \\\"55cbe0c1-71ab-4c52-b855-70746ff52\\\"}\""
+        ));
         assert!(consume_config(ProviderKind::Claude, &token, None, "k").is_none());
         assert!(consume_config(ProviderKind::Codex, &token, None, "bad id!").is_none());
         for invalid in ["token\r\ninjected", "token\"", "token\\"] {
@@ -2600,9 +2875,10 @@ mod tests {
             claude_service(None).as_deref(),
             Some("Claude Code-credentials")
         );
-        assert_ne!(
-            claude_service(Some(Path::new("/tmp/a"))),
-            claude_service(None)
+        // 기대값은 Python `hashlib.sha256(b"/tmp/a").hexdigest()[:8]`. Claude Code가 찾는 키체인 이름이다.
+        assert_eq!(
+            claude_service(Some(Path::new("/tmp/a"))).as_deref(),
+            Some("Claude Code-credentials-d9b741ea")
         );
     }
 
@@ -2711,33 +2987,78 @@ mod tests {
 
     #[test]
     fn consume_response_codes_map_to_outcomes_without_network() {
-        let ok = |code: &str, windows: u64| {
+        let send_json = |status: u16, code: &str, windows: u64| {
             consume_request(
                 ProviderKind::Codex,
                 "fixture-only",
                 Some("acct-1"),
                 "k",
                 |_| {
-                    Some(Zeroizing::new(
-                        format!("{{\"code\":\"{code}\",\"windows_reset\":{windows}}}").into_bytes(),
+                    Ok((
+                        status,
+                        None,
+                        Zeroizing::new(
+                            format!("{{\"code\":\"{code}\",\"windows_reset\":{windows}}}")
+                                .into_bytes(),
+                        ),
                     ))
                 },
             )
         };
-        assert_eq!(ok("reset", 2), Some((ResetConsumeOutcome::Reset, 2)));
         assert_eq!(
-            ok("nothing_to_reset", 0),
-            Some((ResetConsumeOutcome::NothingToReset, 0))
+            send_json(200, "reset", 2),
+            Ok((ResetConsumeOutcome::Reset, 2))
         );
-        assert_eq!(ok("no_credit", 0), Some((ResetConsumeOutcome::NoCredit, 0)));
         assert_eq!(
-            ok("already_redeemed", 1),
-            Some((ResetConsumeOutcome::AlreadyRedeemed, 1))
+            send_json(200, "nothing_to_reset", 0),
+            Ok((ResetConsumeOutcome::NothingToReset, 0))
         );
-        assert!(ok("bogus", 0).is_none());
-        assert!(
-            consume_request(ProviderKind::Codex, "fixture-only", None, "k", |_| None).is_none()
+        assert_eq!(
+            send_json(200, "no_credit", 0),
+            Ok((ResetConsumeOutcome::NoCredit, 0))
         );
+        assert_eq!(
+            send_json(400, "no_credit", 0),
+            Ok((ResetConsumeOutcome::NoCredit, 0))
+        );
+        assert_eq!(
+            send_json(409, "already_redeemed", 1),
+            Ok((ResetConsumeOutcome::AlreadyRedeemed, 1))
+        );
+        assert_eq!(
+            send_json(200, "bogus", 0),
+            Err(ResetConsumeError::UpstreamRejected)
+        );
+        for status in [401_u16, 403] {
+            assert_eq!(
+                send_json(status, "reset", 0),
+                Err(ResetConsumeError::AuthRequired)
+            );
+        }
+        assert_eq!(
+            send_json(429, "reset", 0),
+            Err(ResetConsumeError::RateLimited)
+        );
+        assert_eq!(
+            consume_request(ProviderKind::Codex, "fixture-only", None, "k", |_| {
+                Err(CurlError::TimedOut)
+            }),
+            Err(ResetConsumeError::TimedOut)
+        );
+        assert_eq!(
+            consume_request(ProviderKind::Codex, "fixture-only", None, "k", |_| {
+                Err(CurlError::Transport)
+            }),
+            Err(ResetConsumeError::Transport)
+        );
+        let retry_key = (
+            PathBuf::from("/tmp/krill-evict-test"),
+            ProviderKind::Codex,
+            PathBuf::from("/tmp/krill-evict-test/.codex"),
+        );
+        lock(&RETRY).insert(retry_key.clone(), Retry::new());
+        evict_profile(&retry_key.0, retry_key.1, &retry_key.2);
+        assert!(!lock(&RETRY).contains_key(&retry_key));
         // 멱등 키는 UUID v4 형태다(서버는 불투명 키로 취급한다).
         let id = redeem_request_id().unwrap();
         assert_eq!(id.len(), 36);
@@ -2750,6 +3071,95 @@ mod tests {
             parts
                 .iter()
                 .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut received = Vec::with_capacity(3);
+            for (status_line, reply) in [
+                (
+                    "HTTP/1.1 200 OK",
+                    br#"{"code":"reset","windows_reset":2}"#.as_slice(),
+                ),
+                ("HTTP/1.1 200 OK", br#"{"result":"reset"}"#.as_slice()),
+                (
+                    "HTTP/1.1 401 Unauthorized",
+                    br#"{"detail":"expired"}"#.as_slice(),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = req
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b.to_owned())
+                    .unwrap_or_default();
+                received.push(body);
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.write_all(reply).unwrap();
+            }
+            received
+        });
+        let codex_res = consume_request(
+            ProviderKind::Codex,
+            "fixture-only",
+            Some("acct-1"),
+            &id,
+            |config| {
+                let config = Zeroizing::new(config.replace(
+                    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+                    &format!("http://{addr}/consume"),
+                ));
+                curl_exchange(&config, "2")
+            },
+        );
+        assert_eq!(codex_res, Ok((ResetConsumeOutcome::Reset, 2)));
+        let claude_res = claude_claim_reset(
+            "fixture-only",
+            "12345678-1234-1234-1234-1234567890ab",
+            ClaudeResetProgram::Juniper,
+            |config| {
+                let config = Zeroizing::new(config.replace(
+                    "https://api.anthropic.com/api/organizations/12345678-1234-1234-1234-1234567890ab/reset_rate_limits",
+                    &format!("http://{addr}/reset_rate_limits"),
+                ));
+                curl_exchange(&config, "2")
+            },
+        );
+        assert_eq!(claude_res, Ok((ResetConsumeOutcome::Reset, 1)));
+        let codex_401 = consume_request(
+            ProviderKind::Codex,
+            "fixture-only",
+            Some("acct-1"),
+            &id,
+            |config| {
+                let config = Zeroizing::new(config.replace(
+                    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+                    &format!("http://{addr}/consume"),
+                ));
+                curl_exchange(&config, "2")
+            },
+        );
+        assert_eq!(codex_401, Err(ResetConsumeError::AuthRequired));
+        let bodies = server.join().unwrap();
+        let codex_json: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(
+            codex_json.get("redeem_request_id").and_then(|v| v.as_str()),
+            Some(id.as_str())
+        );
+        let claude_json: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(
+            claude_json.get("program").and_then(|v| v.as_str()),
+            Some("juniper_tide")
         );
     }
 
@@ -2907,47 +3317,73 @@ mod tests {
                 "fixture-only",
                 "12345678-1234-1234-1234-1234567890ab",
                 ClaudeResetProgram::Juniper,
-                |_| Some((status, body.as_bytes().to_vec().into())),
+                |_| Ok((status, None, body.as_bytes().to_vec().into())),
             )
         };
         assert_eq!(
             claim(200, r#"{"result":"reset"}"#),
-            Some((ResetConsumeOutcome::Reset, 1))
+            Ok((ResetConsumeOutcome::Reset, 1))
         );
         assert_eq!(
             claim(200, r#"{"result":"already_used"}"#),
-            Some((ResetConsumeOutcome::AlreadyRedeemed, 0))
+            Ok((ResetConsumeOutcome::AlreadyRedeemed, 0))
         );
         assert_eq!(
             claim(200, r#"{"result":"not_limited"}"#),
-            Some((ResetConsumeOutcome::NothingToReset, 0))
+            Ok((ResetConsumeOutcome::NothingToReset, 0))
         );
         assert_eq!(
             claim(200, r#"{"result":"ineligible"}"#),
-            Some((ResetConsumeOutcome::NoCredit, 0))
+            Ok((ResetConsumeOutcome::NoCredit, 0))
         );
         assert_eq!(
             claim(200, r#"{"result":"unavailable"}"#),
-            Some((ResetConsumeOutcome::NoCredit, 0))
+            Ok((ResetConsumeOutcome::NoCredit, 0))
         );
-        assert!(claim(200, r#"{"result":"bogus"}"#).is_none());
-        assert!(claim(200, "{}").is_none());
-        assert!(claim(500, r#"{"result":"reset"}"#).is_none());
-        assert!(claim(429, "{}").is_none());
-        assert!(claim(401, "{}").is_none());
-        assert!(
-            claude_claim_reset("bad\ntoken", "org", ClaudeResetProgram::Cedar, |_| None,).is_none()
+        assert_eq!(
+            claim(409, r#"{"result":"already_used"}"#),
+            Ok((ResetConsumeOutcome::AlreadyRedeemed, 0))
         );
-        assert!(
+        assert_eq!(
+            claim(200, r#"{"result":"bogus"}"#),
+            Err(ResetConsumeError::UpstreamRejected)
+        );
+        assert_eq!(claim(200, "{}"), Err(ResetConsumeError::UpstreamRejected));
+        assert_eq!(
+            claim(500, r#"{"result":"reset"}"#),
+            Err(ResetConsumeError::UpstreamRejected)
+        );
+        assert_eq!(claim(429, "{}"), Err(ResetConsumeError::RateLimited));
+        assert_eq!(claim(401, "{}"), Err(ResetConsumeError::AuthRequired));
+        assert_eq!(
+            claude_claim_reset("bad\ntoken", "org", ClaudeResetProgram::Cedar, |_| Err(
+                CurlError::Transport
+            ),),
+            Err(ResetConsumeError::InvalidTarget)
+        );
+        assert_eq!(
             claude_claim_reset(
                 "fixture-only",
                 "bad uuid!",
                 ClaudeResetProgram::Cedar,
-                |_| None
-            )
-            .is_none()
+                |_| Err(CurlError::Transport),
+            ),
+            Err(ResetConsumeError::InvalidTarget)
         );
-        // 조직 UUID 조회: 경로·형식 검증.
+        let mut claim_cfg = String::new();
+        assert_eq!(
+            claude_claim_reset(
+                "fixture-only",
+                "12345678-1234-1234-1234-1234567890ab",
+                ClaudeResetProgram::Juniper,
+                |cfg| {
+                    claim_cfg = cfg.to_owned();
+                    Ok((200, None, br#"{"result":"reset"}"#.to_vec().into()))
+                },
+            ),
+            Ok((ResetConsumeOutcome::Reset, 1))
+        );
+        assert!(claim_cfg.contains("data = \"{\\\"program\\\": \\\"juniper_tide\\\"}\""));
         let org = |body: &str| {
             claude_org_uuid("fixture-only", |_| {
                 Some(Zeroizing::new(body.as_bytes().to_vec()))
@@ -3063,10 +3499,10 @@ mod tests {
         // 정상 값이 없으면 지어낸 값 없이 요청 제한 오류(조회 오류 표시)로 남는다.
         let (_, limited) = &cache[&key];
         assert!(limited.usage.is_empty() && limited.updated_at == Some(203));
-        assert_eq!(limited.error.as_deref(), Some("요청 제한"));
+        assert_eq!(limited.error.as_deref(), Some("Rate limited"));
         cache.clear();
         mark_rate_limited(&mut cache, &key, None);
-        assert_eq!(cache[&key].1.error.as_deref(), Some("요청 제한"));
+        assert_eq!(cache[&key].1.error.as_deref(), Some("Rate limited"));
     }
 
     /// Orca 패리티: 방금 쓴 statusline 값이 있으면 자동 조회를 건너뛰고, 직접 조회 값보다 새롭거나
@@ -3078,8 +3514,8 @@ mod tests {
         let dir = home.join(".claude");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("statusline_cache.json"),
-            r#"{"five_hour":{"utilization":44,"resets_at":"2026-10-23T10:30:00.000Z"}}"#,
+            dir.join(krill_proto::statusline::CACHE_FILE),
+            r#"{"rate_limits":{"five_hour":{"used_percentage":44,"resets_at":"2026-10-23T10:30:00.000Z"}}}"#,
         )
         .unwrap();
         assert!(live_fresh(ProviderKind::Claude, &dir));
@@ -3111,7 +3547,7 @@ mod tests {
         lock(&CACHE).insert(key.clone(), (Instant::now(), direct(2, now + 600)));
         assert_eq!(five_hour(), Some(2));
         let failed = ProfileUsage {
-            error: Some("갱신 실패".into()),
+            error: Some("Refresh failed".into()),
             updated_at: Some(now + 600),
             ..ProfileUsage::default()
         };

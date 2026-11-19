@@ -5,10 +5,8 @@ use std::fmt;
 use std::io;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::Path;
-use std::sync::Arc;
-#[cfg(target_os = "macos")]
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ring::{
     aead, hkdf,
@@ -30,8 +28,11 @@ pub(super) const SALT_LEN: usize = 32;
 // Keychain의 UI 허용 상태는 프로세스 단위다. 이 모듈의 동시 조회를 직렬화한다.
 #[cfg(target_os = "macos")]
 static KEYCHAIN_GATE: Mutex<()> = Mutex::new(());
+/// Linux·Windows 파일 기반 키 로드의 프로세스 내 직렬화.
+#[cfg(any(test, target_os = "linux", windows))]
+static KEY_FILE_LOCK: Mutex<()> = Mutex::new(());
 /// Linux·Windows 키 파일 이름(상태 디렉터리 바로 아래).
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", windows))]
 const KEY_FILE: &str = "segment.key";
 
 pub(super) struct Key(Zeroizing<[u8; 32]>);
@@ -44,7 +45,10 @@ impl fmt::Debug for Key {
 
 impl Key {
     #[cfg(target_os = "macos")]
-    pub(super) fn load(root: &Path, existing: bool) -> io::Result<Arc<Self>> {
+    pub(super) fn load(
+        root: &Path,
+        existing: impl FnOnce() -> io::Result<bool>,
+    ) -> io::Result<Arc<Self>> {
         let _gate = crate::session::lock(&KEYCHAIN_GATE);
         let _ui = if SecKeychain::user_interaction_allowed().map_err(keychain_error)? {
             Some(SecKeychain::disable_user_interaction().map_err(keychain_error)?)
@@ -59,35 +63,61 @@ impl Key {
     /// Windows는 같은 파일에 DPAPI(현재 사용자 범위)로 봉인한 blob을 둔다. 다른 사용자·다른 기기에서는 풀리지 않는다.
     /// 임시 파일을 다 쓴 뒤 `link`로 자리에 놓아, 경쟁하는 생성자가 반쯤 쓴 키를 읽거나 기존 키를 덮어쓰지 않는다.
     #[cfg(any(target_os = "linux", windows))]
-    pub(super) fn load(root: &Path, existing: bool) -> io::Result<Arc<Self>> {
+    pub(super) fn load(
+        root: &Path,
+        existing: impl FnOnce() -> io::Result<bool>,
+    ) -> io::Result<Arc<Self>> {
+        Self::load_from_file(root, existing, seal, Self::unseal)
+    }
+
+    /// 파일 기반 키 로드/생성(프로세스 내 `KEY_FILE_LOCK` + 128비트 랜덤 임시 파일로 동시 경쟁 방지).
+    #[cfg(any(test, target_os = "linux", windows))]
+    pub(super) fn load_from_file(
+        root: &Path,
+        existing: impl FnOnce() -> io::Result<bool>,
+        seal_fn: impl FnOnce(&[u8]) -> io::Result<Vec<u8>>,
+        unseal_fn: impl FnOnce(Vec<u8>) -> io::Result<Self>,
+    ) -> io::Result<Arc<Self>> {
         use krill_proto::os::fs::OpenOptionsExt as _;
         use std::io::Write as _;
+        let _lock = KEY_FILE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = root.join(KEY_FILE);
         match std::fs::read(&path) {
-            Ok(bytes) => return Self::unseal(bytes).map(Arc::new),
-            Err(e) if e.kind() == io::ErrorKind::NotFound && !existing => {}
+            Ok(bytes) => return unseal_fn(bytes).map(Arc::new),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !existing()? => {}
             Err(e) => return Err(unavailable(&e)),
         }
         let mut bytes = Zeroizing::new([0; 32]);
-        SystemRandom::new()
-            .fill(bytes.as_mut())
-            .map_err(crypto_error)?;
-        let tmp = root.join(format!(".{KEY_FILE}.{}", std::process::id()));
-        std::fs::remove_file(&tmp).ok();
+        let rng = SystemRandom::new();
+        rng.fill(bytes.as_mut()).map_err(crypto_error)?;
+        // 봉인부터 한다. DPAPI가 없는 로그온(SSH 키 인증 등)에서 실패해도 빈 임시 파일을 남기지 않는다.
+        let sealed = seal_fn(bytes.as_ref())?;
+        let mut suffix = [0u8; 16];
+        rng.fill(&mut suffix).map_err(crypto_error)?;
+        let tmp = root.join(format!(
+            ".{KEY_FILE}.{}.{}",
+            std::process::id(),
+            crate::mobile::devices::hex(&suffix)
+        ));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.write_all(&seal(bytes.as_ref())?)?;
-        file.sync_all()?;
+        if let Err(e) = file.write_all(&sealed).and_then(|()| file.sync_all()) {
+            drop(file);
+            std::fs::remove_file(&tmp).ok();
+            return Err(e);
+        }
         drop(file);
         let placed = std::fs::hard_link(&tmp, &path);
         std::fs::remove_file(&tmp).ok();
         match placed {
             Ok(()) => Ok(Arc::new(Self(bytes))),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                Self::unseal(std::fs::read(&path)?).map(Arc::new)
+                unseal_fn(std::fs::read(&path)?).map(Arc::new)
             }
             Err(e) => Err(e),
         }
@@ -106,17 +136,16 @@ impl Key {
     #[cfg(target_os = "macos")]
     pub(super) fn load_from(
         root: &Path,
-        existing: bool,
+        existing: impl FnOnce() -> io::Result<bool>,
         keychain: &SecKeychain,
     ) -> io::Result<Arc<Self>> {
-        let account = format!(
-            "{:x}",
-            Sha256::digest(root.canonicalize()?.as_os_str().as_bytes())
-        );
+        let account = crate::mobile::devices::hex(&Sha256::digest(
+            root.canonicalize()?.as_os_str().as_bytes(),
+        ));
         let found = keychain.find_generic_password(SERVICE, &account);
         match found {
             Ok((bytes, _)) => Self::from_slice(bytes.as_ref()).map(Arc::new),
-            Err(e) if e.code() == NOT_FOUND && !existing => {
+            Err(e) if e.code() == NOT_FOUND && !existing()? => {
                 let mut bytes = Zeroizing::new([0; 32]);
                 SystemRandom::new()
                     .fill(bytes.as_mut())
@@ -162,7 +191,7 @@ fn keychain_error(e: security_framework::base::Error) -> io::Error {
     )
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", windows))]
 fn unavailable(e: &io::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -180,6 +209,48 @@ fn seal(key: &[u8]) -> io::Result<Vec<u8>> {
 #[cfg(windows)]
 fn seal(key: &[u8]) -> io::Result<Vec<u8>> {
     crate::sys::protect(key)
+}
+
+/// 세그먼트 키. 암호화가 꺼진 기록기는 기동 때 `sessions/`를 전수로 열어 v2를 찾지 않고,
+/// v2 세그먼트를 처음 읽을 때 기존 키만 찾는다(새로 만들지 않는다). 찾지 못한 결과도 기억해
+/// 읽을 때마다 키체인을 다시 부르지 않는다.
+#[derive(Debug)]
+pub(super) struct Keyring {
+    root: PathBuf,
+    key: OnceLock<Option<Arc<Key>>>,
+}
+
+impl Keyring {
+    pub(super) fn ready(key: Arc<Key>) -> Arc<Self> {
+        Arc::new(Self {
+            root: PathBuf::new(),
+            key: OnceLock::from(Some(key)),
+        })
+    }
+
+    pub(super) fn existing(root: &Path) -> Arc<Self> {
+        Arc::new(Self {
+            root: root.to_path_buf(),
+            key: OnceLock::new(),
+        })
+    }
+
+    pub(super) fn get(&self) -> io::Result<&Key> {
+        self.key
+            .get_or_init(|| {
+                Key::load(&self.root, || Ok(true))
+                    .inspect_err(|e| {
+                        tracing::warn!(kind = ?e.kind(), "encrypted history found without a segment key");
+                    })
+                    .ok()
+            })
+            .as_deref()
+            .ok_or_else(key_unavailable)
+    }
+}
+
+pub(super) fn key_unavailable() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "segment key unavailable")
 }
 
 fn crypto_error(_: ring::error::Unspecified) -> io::Error {
@@ -250,22 +321,72 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
         assert!(
-            Key::load(&root, true).is_err(),
+            Key::load(&root, || Ok(true)).is_err(),
             "데이터가 있는데 키가 없으면 새로 만들지 않는다"
         );
-        let first = Key::load(&root, false).unwrap();
+        if crate::sys::user_dpapi_unavailable() {
+            // DPAPI가 없는 로그온(SSH 키 인증 등): 키 생성은 실패하고, 평문 키·빈 임시 파일을 남기지 않는다.
+            assert!(Key::load(&root, || Ok(false)).is_err());
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            eprintln!(
+                "user DPAPI unavailable in this logon (SSH key auth?): sealed key path not exercised"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let first = Key::load(&root, || Ok(false)).unwrap();
         let sealed = std::fs::read(root.join(KEY_FILE)).unwrap();
         assert!(sealed.len() > 32, "평문 32바이트가 아니라 DPAPI blob이다");
         assert!(!sealed.windows(32).any(|w| w == first.0.as_ref()));
-        let second = Key::load(&root, true).unwrap();
+        let second = Key::load(&root, || Ok(true)).unwrap();
         assert_eq!(first.0.as_ref(), second.0.as_ref());
         let mut bad = sealed;
         if let Some(b) = bad.get_mut(40) {
             *b ^= 1;
         }
         std::fs::write(root.join(KEY_FILE), bad).unwrap();
-        let err = Key::load(&root, true).unwrap_err();
+        let err = Key::load(&root, || Ok(true)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod concurrent_file_key_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_file_key_initialization_returns_single_key() {
+        let root = Arc::new(
+            std::env::temp_dir().join(format!("krilld-file-key-race-{}", std::process::id())),
+        );
+        std::fs::remove_dir_all(root.as_ref()).ok();
+        std::fs::create_dir_all(root.as_ref()).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Key::load_from_file(
+                        &root,
+                        || Ok(false),
+                        |b| Ok(b.to_vec()),
+                        |b| Key::from_slice(&b),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+
+        let keys: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let disk = std::fs::read(root.join(KEY_FILE)).unwrap();
+        assert_eq!(disk.len(), 32);
+        for key in &keys {
+            assert_eq!(key.0.as_ref(), disk.as_slice());
+        }
+        std::fs::remove_dir_all(root.as_ref()).ok();
     }
 }

@@ -556,6 +556,115 @@ fn hibernation_auto_resume_keeps_conversation_and_is_idempotent() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// 셸에서 `codex --fixture-yolo`처럼 직접 띄운 에이전트는 훅으로 묶일 때 실제 argv의 권한을 기록한다.
+/// 재부팅 뒤 재개도 같은 YOLO 인자로 뜬다.
+#[test]
+fn shell_launched_yolo_agent_resumes_with_yolo_args() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = env::temp_dir().join(format!("shell-yolo-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(dir.join("bin")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let fake = dir.join("bin/codex");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nprintf 'SHELL_YOLO_ARGS:%s\\n' \"$*\"\n/bin/cat\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        dir.join("agents.toml"),
+        format!(
+            "permission = 'yolo'\n[agent.codex]\nname = 'fixture'\nlaunch = ['{}']\nyolo_args = ['--fixture-yolo']\n",
+            fake.display()
+        ),
+    )
+    .unwrap();
+    let (daemon, mut c) = Daemon::start(&dir);
+    let create = Create {
+        account: None,
+        program: Program::Custom {
+            program: fake.as_os_str().as_encoded_bytes().to_vec(),
+            args: vec![b"--fixture-yolo".to_vec()],
+        },
+        cwd: dir.as_os_str().as_encoded_bytes().to_vec(),
+        cols: 200,
+        rows: 24,
+    };
+    let Reply::Created {
+        session: old,
+        pid: old_pid,
+    } = request(&mut c, &Request::Create(create))
+    else {
+        panic!("create");
+    };
+    let deadline = Instant::now() + WAIT;
+    while !cold(&mut c, old)
+        .is_some_and(|(rows, _)| rows.iter().any(|r| r.contains("SHELL_YOLO_ARGS")))
+    {
+        assert!(Instant::now() < deadline, "fixture never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut hook = connect(&daemon.sock).unwrap().0;
+    let event = krill_proto::hook::HookEvent {
+        id: krill_proto::hook::EventId {
+            pid: old_pid,
+            unix_ns: 1,
+        },
+        agent: "codex".into(),
+        ppid: old_pid,
+        input: krill_proto::hook::Input::Complete,
+        payload:
+            br#"{"hook_event_name":"UserPromptSubmit","session_id":"shell-yolo-conversation"}"#
+                .to_vec(),
+    };
+    hook.write_all(&event.encode().unwrap()).unwrap();
+    ipc::read_frame(&mut hook).unwrap().unwrap();
+    rustix::process::kill_process_group(pid(old_pid), Signal::TERM).unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Reply::Sessions(rows) = request(&mut c, &Request::List)
+            && rows.iter().any(|r| r.session == old && r.status.is_some())
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fixture never exited");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let Reply::Resumed { session: new, .. } = request(
+        &mut c,
+        &Request::Resume {
+            session: old,
+            create: Create {
+                account: None,
+                program: Program::Login,
+                cwd: vec![],
+                cols: 200,
+                rows: 24,
+            },
+        },
+    ) else {
+        panic!("resume");
+    };
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some((rows, _)) = cold(&mut c, new)
+            && let Some(line) = rows.iter().find(|r| r.contains("SHELL_YOLO_ARGS"))
+        {
+            assert!(line.contains("--fixture-yolo"), "{line}");
+            assert!(line.contains("resume shell-yolo-conversation"), "{line}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "resume output not found");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let sock = daemon.sock.clone();
+    drop((hook, c, daemon));
+    assert_no_holders(&sock);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// MK-082: 과거 transcript 스캔 → 두 CLI 재개 → 저장한 대화 ID·cwd 검증. 실제 에이전트 대신
 /// 인자를 찍고 종료하는 fixture만 실행하며 사용자 설정·인증·네트워크를 건드리지 않는다.
 #[test]

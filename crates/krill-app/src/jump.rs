@@ -85,7 +85,7 @@ impl Item {
                 .and_then(|n| n.to_str())
                 .unwrap_or(&label),
         );
-        let chars = label.chars().flat_map(char::to_lowercase).collect();
+        let chars = lower_chars(&label);
         Self {
             id,
             host: HostId::Local,
@@ -109,12 +109,6 @@ impl Item {
         }
     }
 
-    #[must_use]
-    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
-        self.agent = agent.into();
-        self
-    }
-
     pub fn rebuild_search_chars(&mut self) {
         self.filename_chars = lower_chars(
             Path::new(&self.label)
@@ -135,7 +129,7 @@ impl Item {
             self.cwd,
             self.worktree_path
         );
-        self.chars = combined.chars().flat_map(char::to_lowercase).collect();
+        self.chars = lower_chars(&combined);
     }
 }
 
@@ -180,7 +174,7 @@ impl WorktreeItem {
             "{name} {branch} {repo_name} {host_label} {}",
             path.display()
         );
-        let chars = combined.chars().flat_map(char::to_lowercase).collect();
+        let chars = lower_chars(&combined);
         Self {
             path,
             host: HostId::Local,
@@ -406,12 +400,13 @@ fn rank<'a>(
 }
 
 fn query_chars(query: &str, files: bool) -> Vec<char> {
-    query
-        .trim()
-        .chars()
-        .filter(|c| files || !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
+    let mut out = Vec::with_capacity(query.len());
+    push_normalized_chars(query.trim(), |ch| {
+        if files || !ch.is_whitespace() {
+            out.push(ch);
+        }
+    });
+    out
 }
 
 /// 일치하는 항목의 인덱스. 점수 높은 순, 같으면 입력 대기 세션 먼저, 그다음 원래 순서. 공백은 무시한다.
@@ -479,7 +474,84 @@ fn search_items(
 }
 
 fn lower_chars(text: &str) -> Vec<char> {
-    text.chars().flat_map(char::to_lowercase).collect()
+    normalize_search_chars(text)
+}
+
+/// macOS APFS/HFS+ NFD 한글 자모(`L` `0x1100..=0x1112`, `V` `0x1161..=0x1175`, 선택 `T` `0x11A8..=0x11C2`)를
+/// 완성형 음절(`0xAC00..=0xD7A3`)로 합성하고 유니코드 소문자 폴딩을 적용한다.
+pub(crate) fn normalize_search_chars(text: &str) -> Vec<char> {
+    let mut out = Vec::with_capacity(text.len());
+    push_normalized_chars(text, |ch| out.push(ch));
+    out
+}
+
+pub(crate) fn normalize_search_str(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    push_normalized_chars(text, |ch| out.push(ch));
+    out
+}
+
+pub(crate) fn normalize_search_chars_with_ranges(
+    text: &str,
+) -> Vec<(char, std::ops::Range<usize>)> {
+    let mut out = Vec::with_capacity(text.len());
+    push_normalized_chars_with_ranges(text, |ch, range| out.push((ch, range)));
+    out
+}
+
+fn push_normalized_chars(text: &str, mut push: impl FnMut(char)) {
+    push_normalized_chars_with_ranges(text, |ch, _| push(ch));
+}
+
+fn push_normalized_chars_with_ranges(
+    text: &str,
+    mut push: impl FnMut(char, std::ops::Range<usize>),
+) {
+    let mut chars = text.chars().enumerate().peekable();
+    while let Some((start, ch)) = chars.next() {
+        let mut end = start + 1;
+        if ch.is_ascii() {
+            push(ch.to_ascii_lowercase(), start..end);
+            continue;
+        }
+        let code = u32::from(ch);
+        if (0x1100..=0x1112).contains(&code)
+            && let Some(&(v_idx, next_v)) = chars.peek()
+            && (0x1161..=0x1175).contains(&u32::from(next_v))
+        {
+            chars.next();
+            end = v_idx + 1;
+            let l = code - 0x1100;
+            let v = u32::from(next_v) - 0x1161;
+            let t = chars
+                .peek()
+                .copied()
+                .filter(|&(_, ch_t)| (0x11A8..=0x11C2).contains(&u32::from(ch_t)))
+                .map_or(0, |(t_idx, ch_t)| {
+                    chars.next();
+                    end = t_idx + 1;
+                    u32::from(ch_t) - 0x11A7
+                });
+            if let Some(composed) = char::from_u32(0xAC00 + l * 588 + v * 28 + t) {
+                push(composed, start..end);
+                continue;
+            }
+        } else if (0xAC00..0xAC00 + 11_172).contains(&code)
+            && (code - 0xAC00) % 28 == 0
+            && let Some(&(t_idx, next_t)) = chars.peek()
+            && (0x11A8..=0x11C2).contains(&u32::from(next_t))
+        {
+            chars.next();
+            end = t_idx + 1;
+            if let Some(composed) = char::from_u32(code + (u32::from(next_t) - 0x11A7)) {
+                push(composed, start..end);
+                continue;
+            }
+        }
+        for lower in ch.to_lowercase() {
+            push(lower, start..end);
+        }
+    }
 }
 
 /// 워크트리 목록에서 `query`와 일치하는 인덱스(점수 높은 순, 원래 순서는 유지).
@@ -654,7 +726,7 @@ fn filter_vault(
         .filter(|tok| {
             !tok.starts_with("agent:") && !tok.starts_with("path:") && !tok.starts_with("repo:")
         })
-        .map(str::to_lowercase)
+        .map(normalize_search_str)
         .collect();
     hits.iter()
         .enumerate()
@@ -684,11 +756,11 @@ fn filter_vault(
             }
             let hay = format!(
                 "{} {} {} {} {}",
-                hit.title.to_lowercase(),
-                hit.summary.to_lowercase(),
-                hit.snippet.to_lowercase(),
-                hit.cwd.to_lowercase(),
-                hit.id.to_lowercase()
+                normalize_search_str(&hit.title),
+                normalize_search_str(&hit.summary),
+                normalize_search_str(&hit.snippet),
+                normalize_search_str(&hit.cwd),
+                normalize_search_str(&hit.id)
             );
             terms.iter().all(|t| hay.contains(t))
         })
@@ -881,6 +953,10 @@ impl Palette {
         self.input.update(cx, |input, cx| input.focus(window, cx));
     }
 
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        entity_input_is_composing(&self.input, window, cx)
+    }
+
     /// 지금 보이는 순서의 일치 항목.
     pub fn matches(&self) -> impl Iterator<Item = &Item> {
         self.matches.iter().filter_map(|&i| self.items.get(i))
@@ -914,37 +990,8 @@ impl Palette {
     }
 
     #[must_use]
-    pub fn worktree(&self, index: usize) -> Option<&WorktreeItem> {
-        self.worktrees.get(index)
-    }
-
-    #[must_use]
     pub fn worktree_entry(&self, index: usize) -> Option<&WorktreeItem> {
         self.worktrees.get(index)
-    }
-
-    /// 지금 필터에 일치하는 빠른 액션.
-    pub fn action_matches(&self) -> impl Iterator<Item = &ActionEntry> {
-        self.action_matches
-            .iter()
-            .filter_map(|&i| self.actions.get(i))
-    }
-
-    /// 지금 필터에 일치하는 빠른 명령.
-    pub fn quick_matches(&self) -> impl Iterator<Item = &crate::commands::QuickCommand> {
-        self.quick_matches
-            .iter()
-            .filter_map(|&i| self.quick_commands.get(i))
-    }
-
-    #[must_use]
-    pub fn scope(&self) -> VaultScope {
-        self.scope
-    }
-
-    #[must_use]
-    pub fn agent_filter(&self) -> Option<VaultAgent> {
-        self.agent_filter
     }
 
     #[must_use]
@@ -1543,6 +1590,17 @@ impl Palette {
         }
         self.projects = names;
     }
+}
+
+pub(crate) fn entity_input_is_composing(
+    input: &Entity<InputState>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> bool {
+    input.update(cx, |input, cx| {
+        input.focus_handle(cx).is_focused(window)
+            && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+    })
 }
 
 fn render_vault_highlight(text_str: &str, query: &str, p: &crate::ui::Palette) -> gpui::Div {
@@ -2735,12 +2793,19 @@ impl Render for Palette {
         let max_h = (viewport.height - top_offset - crate::ui::SPACE_4).max(px(0.));
         let entity = cx.entity();
 
-        // 키는 입력칸보다 먼저(capture) 잡아 단일 행 입력의 위·아래·Enter·Esc·Tab 처리를 대신한다.
+        // 키는 입력칸보다 먼저(capture) 잡아 단일 행 입력의 위·아래·Enter·Esc·Tab/Shift+Tab 처리를 대신한다.
+        let dialog_label = self.mode.placeholder();
+        let input_focus = self.input.read(cx).focus_handle(cx);
+        let entity_tab = entity.clone();
+        let focus_tab = input_focus.clone();
         let palette = div()
             .id("jump-palette")
             .debug_selector(|| "jump-palette".into())
+            .occlude()
             .role(gpui::Role::Dialog)
-            .track_focus(&self.input.read(cx).focus_handle(cx))
+            .aria_label(dialog_label)
+            .track_focus(&input_focus)
+            .tab_group()
             .w(crate::ui::COMMAND_PALETTE_WIDTH)
             .max_w(max_w)
             .max_h(max_h)
@@ -2755,30 +2820,50 @@ impl Render for Palette {
             .border_color(border)
             .rounded(crate::ui::RADIUS_XL)
             .shadow_lg()
-            .capture_action(cx.listener(|p, _: &MoveUp, _, cx| {
+            .capture_action(cx.listener(|p, _: &MoveUp, window, cx| {
+                if p.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 p.step(-1, cx);
             }))
-            .capture_action(cx.listener(|p, _: &MoveDown, _, cx| {
+            .capture_action(cx.listener(|p, _: &MoveDown, window, cx| {
+                if p.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 p.step(1, cx);
             }))
-            .capture_action(cx.listener(|p, _: &Enter, _, cx| {
+            .capture_action(cx.listener(|p, _: &Enter, window, cx| {
+                if p.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 p.confirm(cx);
             }))
-            .capture_action(cx.listener(|_, _: &Escape, _, cx| {
+            .capture_action(cx.listener(|p, _: &Escape, window, cx| {
+                if p.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 cx.emit(Event::Dismiss);
             }))
-            .on_key_down(move |e: &KeyDownEvent, _, cx| {
-                if e.keystroke.key == "tab" && !e.keystroke.modifiers.modified() {
+            .capture_key_down(move |e: &KeyDownEvent, window, cx| {
+                let m = e.keystroke.modifiers;
+                if e.keystroke.key == "tab" && !m.control && !m.alt && !m.platform && !m.function {
                     cx.stop_propagation();
-                    entity.update(cx, |p, cx| {
-                        p.filter_open = !p.filter_open;
-                        cx.notify();
-                    });
-                } else if e.keystroke.modifiers.platform
+                    window.prevent_default();
+                    if !m.shift {
+                        entity_tab.update(cx, |p, cx| {
+                            p.filter_open = !p.filter_open;
+                            cx.notify();
+                        });
+                    }
+                    window.focus(&focus_tab, cx);
+                }
+            })
+            .on_key_down(move |e: &KeyDownEvent, _, cx| {
+                if e.keystroke.modifiers.platform
                     && !e.keystroke.modifiers.alt
                     && !e.keystroke.modifiers.control
                     && !e.keystroke.modifiers.shift
@@ -2802,6 +2887,8 @@ impl Render for Palette {
         deferred(
             div()
                 .id("jump-backdrop")
+                .debug_selector(|| "jump-backdrop".into())
+                .occlude()
                 .absolute()
                 .top_0()
                 .left_0()
@@ -2813,6 +2900,7 @@ impl Render for Palette {
                 .pt(top_offset)
                 .child(palette),
         )
+        .with_priority(1)
     }
 }
 

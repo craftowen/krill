@@ -88,17 +88,63 @@ pub fn normalize_path_for_comparison(path: &str) -> String {
     normalized
 }
 
+fn has_parent_dir(path: &str) -> bool {
+    if windows_path(path) {
+        return path.split(['/', '\\']).any(|seg| seg == "..");
+    }
+    std::path::Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_candidate(candidate: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(candidate);
+    if let Ok(canon) = path.canonicalize() {
+        return Some(canon);
+    }
+    let mut suffix = Vec::new();
+    let mut cur = path;
+    while let Some(name) = cur.file_name() {
+        suffix.push(name.to_os_string());
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if let Ok(mut base) = parent.canonicalize() {
+            for seg in suffix.into_iter().rev() {
+                base.push(seg);
+            }
+            return Some(base);
+        }
+        cur = parent;
+    }
+    None
+}
+
 /// Match a root or a descendant at a directory boundary. On macOS the filesystem
 /// itself resolves NFC/NFD and symlink aliases; this does not conflate distinct names
 /// on case-sensitive remote hosts or volumes.
 #[must_use]
 pub fn path_inside_or_equal(candidate: &str, root: &str) -> bool {
+    if has_parent_dir(candidate) || has_parent_dir(root) {
+        return false;
+    }
     #[cfg(windows)]
     if windows_path(candidate)
         && windows_path(root)
         && let Some(inside) = native_windows_scope(candidate, root)
     {
         return inside;
+    }
+    #[cfg(target_os = "macos")]
+    if !windows_path(candidate)
+        && !windows_path(root)
+        && let (Ok(root_canon), Some(cand_canon)) = (
+            std::path::Path::new(root).canonicalize(),
+            resolve_macos_candidate(candidate),
+        )
+    {
+        return cand_canon == root_canon || cand_canon.starts_with(&root_canon);
     }
     let candidate_key = normalize_path_for_comparison(candidate);
     let root_key = normalize_path_for_comparison(root);
@@ -116,8 +162,10 @@ pub fn path_inside_or_equal(candidate: &str, root: &str) -> bool {
     #[cfg(target_os = "macos")]
     if !windows_path(candidate) && !windows_path(root) {
         use std::os::unix::fs::MetadataExt as _;
-        if let Ok(root_meta) = std::fs::metadata(root) {
-            for ancestor in std::path::Path::new(candidate).ancestors() {
+        if let Ok(root_meta) = std::fs::metadata(root)
+            && let Some(resolved) = resolve_macos_candidate(candidate)
+        {
+            for ancestor in resolved.ancestors() {
                 if std::fs::metadata(ancestor).is_ok_and(|meta| {
                     meta.dev() == root_meta.dev() && meta.ino() == root_meta.ino()
                 }) {
@@ -255,6 +303,35 @@ mod tests {
         assert!(path_inside_or_equal(
             &composed.display().to_string(),
             &decomposed.display().to_string()
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parent_traversal_is_rejected_even_before_lexical_prefix_match() {
+        assert!(!path_inside_or_equal(
+            "/work/Case/../Outside/sub",
+            "/work/Case"
+        ));
+        assert!(!path_inside_or_equal(
+            "/work/Case/sub",
+            "/work/Case/../Case"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_symlinked_parent_escape_with_missing_leaf_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("krill-vault-sym-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let scope = dir.join("scope");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&scope).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, scope.join("link_out")).unwrap();
+        assert!(!path_inside_or_equal(
+            &scope.join("link_out/missing_child").display().to_string(),
+            &scope.display().to_string(),
         ));
         std::fs::remove_dir_all(dir).unwrap();
     }

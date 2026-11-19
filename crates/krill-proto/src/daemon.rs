@@ -5,8 +5,10 @@
 //! - **개발 빌드(ad hoc 서명)**: 실행 파일 옆의 `krill-holder --detach <krilld> <소켓>`을 std `Command`(macOS에서는
 //!   `posix_spawn`)로 띄운다. holder가 `--detach`를 보고 스스로 `setsid`해 띄운 쪽의 제어 터미널·프로세스
 //!   그룹에서 떨어진다. TCC 귀속은 띄운 앱을 따라가 불안정하다(T2 §3.4 기동 경로 4).
-//! - **서명 빌드**: [`holder_plist`]로 만든 launchd 비지속 잡(MK-106에서 전환·검증). launchd가 띄운 holder는
-//!   자기 `setsid` 금지(CONVENTIONS A1)라 plist에는 `--detach`가 없다.
+//! - **서명·정식 설치 빌드**: [`holder_plist`]로 만든 launchd 비지속 잡(`RunAtLoad=true`, `KeepAlive=false`)을
+//!   `~/Library/LaunchAgents/dev.krill.app.holder.plist`에 등록해 로그인·부팅 시 자동 기동하고, 콜드 스타트 시
+//!   `launchctl bootstrap gui/<uid>`로 띄운다(Windows는 `HKCU\...\Run`에 `--bootstrap` 등록). launchd가 띄운
+//!   holder는 자기 `setsid` 금지(CONVENTIONS A1)라 plist에는 `--detach`가 없다.
 //!
 //! 단일 인스턴스는 krilld의 소켓 락(MK-022)과 holder가 쥔 listen 소켓(OWE-491)이 보장한다. holder가 살아 있으면
 //! krilld가 재기동 중이어도 소켓이 연결을 받아 두므로(`ConnectionRefused`가 아님) holder를 새로 띄우지 않는다.
@@ -30,9 +32,12 @@
 //!   살아 있으면 연결은 backlog에서 krilld를 기다렸다 붙는다. 고아 상태도 초기 감시 프레임으로 확인해 holder를
 //!   다시 띄운다. 앱 없이 실행한 `krill`도 같은 경로로 복구한다.
 
+mod autostart;
+
 use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use crate::os::net::UnixStream;
-use std::ffi::OsString;
+pub use autostart::{ensure_autostart, is_autostart_registered};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
@@ -53,6 +58,10 @@ pub const FEAT_HOLDER_WATCH: u64 = 1 << 7;
 /// 이미 건강한 데몬이 떠 있는 중복 기동이다. 정상(0)·실패(1)·인자 오류(2)와 구별해 holder가 재기동 없이
 /// 끝낸다. 직접 실행한 krilld는 MK-022대로 0으로 끝낸다.
 pub const KRILLD_DUPLICATE: u8 = 3;
+/// holder 아래에서 뜬 krilld가 고아 krilld에게서 세션을 넘겨받지 못하고 끝날 때의 종료 코드. 상대를 기다리느라 1초
+/// 넘게 살았어도 holder는 뜨자마자 죽은 것으로 세어 백오프한다. 바로 다시 띄우면 시도마다 고아의 리더가 멈추고
+/// 세션 없는 holder는 포기하지 못한다. 이 코드를 모르는 holder는 일반 실패로 본다.
+pub const KRILLD_HANDOVER_FAILED: u8 = 4;
 /// EOF 없이 멈춘 데몬을 감지하는 감시 연결 확장(OWE-586, ARCHITECTURE §4.3).
 pub const FEAT_HEARTBEAT: u64 = 1 << 45;
 /// 데몬→클라이언트 holder 상태 프레임(ARCHITECTURE §4.3).
@@ -238,6 +247,9 @@ pub const SUN_PATH_MAX: usize = 108;
 const NOFILE: u32 = 10_240;
 /// 띄운 뒤 소켓이 생길 때까지 기다리는 최대 시간.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// 실패한 기동의 holder가 SIGTERM으로 끝나기를 기다리는 최대 시간(세션을 새 krilld에 넘기는 시간 포함).
+#[cfg(unix)]
+const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
 /// 붙은 뒤 `ServerHello`를 기다리는 최대 시간. krilld가 멈춰 있어도 앱·CLI가 붙잡히지 않게 한다.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -276,6 +288,19 @@ pub const LINUX_STATE_PARENT: &str = ".local/share";
 /// 상태 디렉터리 재정의 환경변수(`KRILL_STATE_DIR`, 개발·테스트 격리). 상태 디렉터리 재정의 여부는 모두 이 함수로 판단한다.
 pub fn state_dir_override() -> Option<OsString> {
     std::env::var_os("KRILL_STATE_DIR")
+}
+
+/// 상태 디렉터리가 기본 위치 밖으로 격리됐는지(테스트·임시 실행). Krill 세션 셸은 기본 경로를 그대로
+/// `KRILL_STATE_DIR`로 내보내므로 값이 있다는 것만으로는 격리가 아니다.
+pub fn state_dir_isolated() -> bool {
+    is_isolated(
+        state_dir_override().as_deref(),
+        default_state_dir().as_deref(),
+    )
+}
+
+fn is_isolated(state_override: Option<&OsStr>, default: Option<&Path>) -> bool {
+    state_override.is_some_and(|dir| Some(Path::new(dir)) != default)
 }
 
 /// 상태 디렉터리. [`state_dir_override`]가 있으면 그것, 없으면 `~/Library/Application Support/<번들 id>`
@@ -431,7 +456,7 @@ fn is_temp_home(home: &Path) -> bool {
 /// 임시 `HOME`(`HOME=/tmp/...` 등)에서는 호스트에 설치된 운영 `/Applications/Krill.app`의 헬퍼를
 /// 띄워 고아 holder·krilld를 남기지 않도록 제외한다.
 fn allow_installed_apps(exe: &Path, home: Option<&Path>) -> bool {
-    if cfg!(test) || state_dir_override().is_some() {
+    if cfg!(test) || state_dir_isolated() {
         return false;
     }
     if !allow_installed_apps_for_paths(exe, home) {
@@ -551,6 +576,9 @@ pub enum Error {
     Timeout,
     /// 다른 기동자가 [`LOCK_TIMEOUT`] 넘게 `<소켓>.launch` 락을 쥐고 있다.
     LockTimeout,
+    /// 이 프로세스의 직전 holder 기동이 실패해 [`launch_backoff`]가 끝날 때까지 다시 띄우지 않는다.
+    /// 직전 실패 문구와 holder 종료 코드를 담는다.
+    Backoff { last: String, code: Option<i32> },
     /// 연결·협상 실패(버전 불일치는 `InvalidData`).
     Io(io::Error),
 }
@@ -581,12 +609,56 @@ impl fmt::Display for Error {
                 "another launcher held the launch lock for over {}s",
                 LOCK_TIMEOUT.as_secs()
             ),
+            Self::Backoff { last, .. } => write!(f, "{last}"),
             Self::Io(e) => write!(f, "cannot talk to krilld: {e}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// Windows holder bootstrap이 Job 밖으로 나가지 못해(breakaway 거부, 작업 스케줄러 등) 끝날 때의 종료 코드
+/// (`ERROR_ACCESS_DENIED`). 같은 프로세스에서는 다시 띄워도 소용없다. krill-holder bootstrap과 같은 값이어야 한다.
+pub const HOLDER_JOB_DENIED: i32 = 5;
+
+/// Windows: [`HOLDER_JOB_DENIED`]로 끝난 bootstrap을 호출자 Job 밖에서 다시 띄우는 기동기
+/// (`holder`, 인수, 작업 폴더). 요청만 하고 돌아온다. 앱이 Explorer로 등록하고, 등록이 없으면 지금처럼 안내로 끝난다.
+#[cfg(windows)]
+pub type JobEscape = fn(&Path, &[&std::ffi::OsStr], Option<&Path>) -> io::Result<()>;
+
+#[cfg(windows)]
+static JOB_ESCAPE: std::sync::OnceLock<JobEscape> = std::sync::OnceLock::new();
+
+/// [`JobEscape`]를 프로세스에 한 번 등록한다(두 번째부터는 무시).
+#[cfg(windows)]
+pub fn set_job_escape(escape: JobEscape) {
+    JOB_ESCAPE.set(escape).ok();
+}
+
+fn can_escape_job() -> bool {
+    #[cfg(windows)]
+    return JOB_ESCAPE.get().is_some();
+    #[cfg(not(windows))]
+    false
+}
+
+impl Error {
+    /// holder가 krilld 전에 끝난 종료 코드(직전 실패로 기동을 미룬 경우 포함).
+    #[must_use]
+    pub fn holder_exit_code(&self) -> Option<i32> {
+        match self {
+            Self::HolderExited(status) => status.code(),
+            Self::Backoff { code, .. } => *code,
+            _ => None,
+        }
+    }
+
+    /// Windows에서 Job 제한 때문에 세션 데몬을 띄울 수 없다([`HOLDER_JOB_DENIED`]).
+    #[must_use]
+    pub fn is_job_restricted(&self) -> bool {
+        cfg!(windows) && self.holder_exit_code() == Some(HOLDER_JOB_DENIED)
+    }
+}
 
 /// 이 빌드의 프로토콜 범위로 만든 [`ClientHello`].
 pub fn client_hello(role: ClientRole, name: &str) -> ClientHello {
@@ -756,7 +828,10 @@ fn upgrade_as_on(
         .ok_or(io::ErrorKind::TimedOut)?;
     loop {
         match handshake(&paths.socket, &control, HELLO_TIMEOUT) {
-            Ok(n) if n.server.instance_id != old => return Ok(Some(n.server)),
+            Ok(n) if n.server.instance_id != old => {
+                ensure_autostart(paths);
+                return Ok(Some(n.server));
+            }
             Ok(_) => {}
             Err(e) if is_absent(&e) || is_transition(&e) => {}
             Err(e) => return Err(e),
@@ -788,8 +863,68 @@ pub fn reconnect_until(paths: &Paths, hello: &ClientHello) -> Connection {
     }
 }
 
+/// 소켓별 연속 holder 기동 실패. 앱의 여러 연결(감시·칸·사이드바)이 각자 재시도해도 실패한 holder를
+/// 1분에 수백 번 다시 띄우지 않게 프로세스 전역으로 둔다.
+struct LaunchFailure {
+    socket: PathBuf,
+    count: u32,
+    at: Instant,
+    last: String,
+    code: Option<i32>,
+}
+
+static LAUNCH_FAILURE: std::sync::Mutex<Option<LaunchFailure>> = std::sync::Mutex::new(None);
+
+/// `failures`번 연속 기동에 실패한 뒤 다음 기동까지 기다릴 시간: 1초에서 두 배씩, 상한 60초.
+fn launch_backoff(failures: u32) -> Duration {
+    Duration::from_secs(1)
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(6))
+        .min(Duration::from_secs(60))
+}
+
 /// krilld에 붙는다. 소켓이 없거나 죽어 있거나 고아 상태면 holder를 띄우고 재결합까지 기다린다.
+/// 직전 기동이 실패했으면 [`launch_backoff`] 동안(Job 제한이면 계속) 띄우지 않고 [`Error::Backoff`]를 돌려준다.
 pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> {
+    let result = connect_or_launch(paths, hello);
+    let mut failure = LAUNCH_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = failure.as_ref().filter(|f| f.socket == paths.socket);
+    match &result {
+        Ok(_) if previous.is_some() => *failure = None,
+        Err(e @ (Error::Spawn(_) | Error::HolderExited(_) | Error::Timeout)) => {
+            *failure = Some(LaunchFailure {
+                socket: paths.socket.clone(),
+                count: previous.map_or(0, |f| f.count).saturating_add(1),
+                at: Instant::now(),
+                last: e.to_string(),
+                code: e.holder_exit_code(),
+            });
+        }
+        _ => {}
+    }
+    result
+}
+
+fn launch_gate(socket: &Path) -> Result<(), Error> {
+    let failure = LAUNCH_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match failure.as_ref().filter(|f| f.socket == socket) {
+        Some(f)
+            if (cfg!(windows) && f.code == Some(HOLDER_JOB_DENIED) && !can_escape_job())
+                || f.at.elapsed() < launch_backoff(f.count) =>
+        {
+            Err(Error::Backoff {
+                last: f.last.clone(),
+                code: f.code,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+fn connect_or_launch(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> {
     // krilld는 `<소켓>.tmp`에 bind한다.
     let mut tmp = paths.socket.clone().into_os_string();
     tmp.push(".tmp");
@@ -797,7 +932,10 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
         return Err(Error::PathTooLong(paths.socket.clone()));
     }
     match ready_handshake(&paths.socket, hello) {
-        Ok(Some(c)) => return Ok(c),
+        Ok(Some(c)) => {
+            ensure_autostart(paths);
+            return Ok(c);
+        }
         Ok(None) => {}
         Err(e) if is_absent(&e) || is_transition(&e) => {}
         Err(e) => return Err(Error::Io(e)),
@@ -810,69 +948,155 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
     let _launch = launch_lock(&paths.socket, LOCK_TIMEOUT)?;
     // 락을 기다리는 동안 다른 클라이언트가 띄웠을 수 있다.
     match ready_handshake(&paths.socket, hello) {
-        Ok(Some(c)) => return Ok(c),
+        Ok(Some(c)) => {
+            ensure_autostart(paths);
+            return Ok(c);
+        }
         Ok(None) => {}
         Err(e) if is_absent(&e) => {}
         Err(e) if is_transition(&e) => {
             if let Some(c) = await_successor(&paths.socket, hello, e)? {
+                ensure_autostart(paths);
                 return Ok(c);
             }
         }
         Err(e) => return Err(Error::Io(e)),
     }
-    let mut command = Command::new(&paths.holder);
-    #[cfg(unix)]
-    command.arg(DETACH_ARG);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        // Short-lived bootstrap only. The holder FFI boundary creates the real
-        // holder with bInheritHandles=false and explicit Job breakaway.
-        command
-            .arg("--bootstrap")
-            .creation_flags(0x0000_0008 | 0x0000_0200);
-    }
-    let mut holder = command
-        .arg(&paths.krilld)
-        .arg(&paths.socket)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(Error::Spawn)?;
-    let deadline = Instant::now()
+    launch_gate(&paths.socket)?;
+    ensure_autostart(paths);
+    #[cfg(target_os = "macos")]
+    let bootstrapped = autostart::try_bootstrap(paths);
+    #[cfg(not(target_os = "macos"))]
+    let bootstrapped = false;
+    let mut holder = if bootstrapped {
+        None
+    } else {
+        let mut command = Command::new(&paths.holder);
+        #[cfg(unix)]
+        command.arg(DETACH_ARG);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            // Short-lived bootstrap only. The holder FFI boundary creates the real
+            // holder with bInheritHandles=false and explicit Job breakaway.
+            command
+                .arg("--bootstrap")
+                .creation_flags(0x0000_0008 | 0x0000_0200);
+            // holder와 그 krilld는 이 cwd를 물려받아 세션 내내 쥔다. Windows는 프로세스의 현재 폴더를
+            // 지우거나 이름을 바꾸지 못하게 하므로, 띄운 곳(워크트리·설치 폴더) 대신 소켓 폴더를 쥔다.
+            // `launch_lock`이 이 폴더를 이미 만들었다.
+            if let Some(dir) = paths.socket.parent().filter(|d| !d.as_os_str().is_empty()) {
+                command.current_dir(dir);
+            }
+        }
+        Some(
+            command
+                .arg(&paths.krilld)
+                .arg(&paths.socket)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(Error::Spawn)?,
+        )
+    };
+    #[cfg_attr(
+        not(windows),
+        expect(unused_mut, reason = "Job 밖 기동은 Windows만 기한을 늘린다")
+    )]
+    let mut deadline = Instant::now()
         .checked_add(LAUNCH_TIMEOUT)
         .ok_or(Error::Timeout)?;
-    loop {
+    #[cfg(windows)]
+    let mut escaped = false;
+    let ready = loop {
         match ready_handshake(&paths.socket, hello) {
-            Ok(Some(c)) => {
-                // ponytail: holder는 띄운 프로세스의 자식으로 남는다(앱이 먼저 끝나면 launchd가 거둔다).
-                // 앱보다 먼저 죽으면 앱이 끝날 때까지 좀비 하나가 남는다. 거슬리면 앱에서 waitpid 스레드.
-                return Ok(Connection {
-                    launched: true,
-                    ..c
-                });
-            }
+            Ok(Some(c)) => break Ok(c),
             Ok(None) => {}
             Err(e) if is_absent(&e) || is_transition(&e) => {}
-            Err(e) => return Err(Error::Io(e)),
+            Err(e) => break Err(Error::Io(e)),
         }
-        if let Some(status) = holder.try_wait().map_err(Error::Io)? {
-            #[cfg(unix)]
-            return Err(Error::HolderExited(status));
-            #[cfg(windows)]
-            if !status.success() {
-                return Err(Error::HolderExited(status));
+        if let Some(holder) = holder.as_mut() {
+            match holder.try_wait() {
+                #[cfg(unix)]
+                Ok(Some(status)) => break Err(Error::HolderExited(status)),
+                #[cfg(windows)]
+                Ok(Some(status)) if !status.success() && !escaped => {
+                    escaped = status.code() == Some(HOLDER_JOB_DENIED) && escape_job(paths);
+                    if !escaped {
+                        break Err(Error::HolderExited(status));
+                    }
+                    match Instant::now().checked_add(LAUNCH_TIMEOUT) {
+                        Some(d) => deadline = d,
+                        None => break Err(Error::Timeout),
+                    }
+                }
+                Err(e) => break Err(Error::Io(e)),
+                _ => {}
             }
         }
         if Instant::now() >= deadline {
-            // 백오프로 krilld를 계속 다시 띄우는 holder를 남기지 않는다.
-            holder.kill().ok();
-            holder.wait().ok();
-            return Err(Error::Timeout);
+            // Job 밖 기동도 제때 붙지 않았으면 처음 거부를 그대로 돌려준다(백오프 뒤 다시 시도).
+            #[cfg(windows)]
+            if let Some(holder) = holder.as_mut()
+                && let Ok(Some(status)) = holder.try_wait()
+                && !status.success()
+            {
+                break Err(Error::HolderExited(status));
+            }
+            break Err(Error::Timeout);
         }
         thread::sleep(POLL);
+    };
+    // 실패한 기동의 holder를 남기면 krilld를 백오프로 영구 재기동한다(A-05). Windows에서 띄운 것은 곧바로 끝나는
+    // bootstrap이라 실제 holder에 닿지 않는다. 그 holder는 세션이 없으면 스스로 포기한다.
+    #[cfg(unix)]
+    if ready.is_err() {
+        if let Some(holder) = holder.as_mut() {
+            stop_launched(holder);
+        }
+        #[cfg(target_os = "macos")]
+        if bootstrapped {
+            autostart::bootout();
+        }
     }
+    // ponytail: 붙으면 holder는 띄운 프로세스의 자식으로 남는다(앱이 먼저 끝나면 launchd가 거둔다).
+    // 앱보다 먼저 죽으면 앱이 끝날 때까지 좀비 하나가 남는다. 거슬리면 앱에서 waitpid 스레드.
+    ready.map(|c| Connection {
+        launched: true,
+        ..c
+    })
+}
+
+/// 띄운 holder를 SIGTERM으로 끝낸다. 그 holder는 고아 krilld에게서 세션을 넘겨받아 master 마지막 사본을 쥐고 있을 수
+/// 있어 SIGKILL하지 않는다. SIGTERM이면 holder가 세션을 krilld에 넘기고 끝난다. [`STOP_TIMEOUT`] 안에 끝나지 않는
+/// holder는 세션이 있는지 알 수 없어 그대로 둔다.
+#[cfg(unix)]
+fn stop_launched(holder: &mut std::process::Child) {
+    use rustix::process::{Pid, Signal, kill_process};
+    // 아직 거두지 않은 자식이라 pid가 재사용되지 않았다.
+    if let Some(pid) = i32::try_from(holder.id()).ok().and_then(Pid::from_raw) {
+        kill_process(pid, Signal::TERM).ok();
+    }
+    let deadline = Instant::now().checked_add(STOP_TIMEOUT);
+    while matches!(holder.try_wait(), Ok(None)) && deadline.is_some_and(|d| Instant::now() < d) {
+        thread::sleep(POLL);
+    }
+}
+
+/// 등록된 [`JobEscape`]로 같은 bootstrap을 Job 밖에서 띄운다. 요청했으면 `true`.
+#[cfg(windows)]
+fn escape_job(paths: &Paths) -> bool {
+    let Some(escape) = JOB_ESCAPE.get() else {
+        return false;
+    };
+    let args = [
+        std::ffi::OsStr::new("--bootstrap"),
+        paths.krilld.as_os_str(),
+        paths.socket.as_os_str(),
+    ];
+    let dir = paths.socket.parent().filter(|d| !d.as_os_str().is_empty());
+    escape(&paths.holder, &args, dir).is_ok()
 }
 
 /// 소켓은 살아 있는데 Hello 전에 닫혔다(업그레이드로 끝나는 구 krilld, 재결합 중 닫힌 구 krilld, 막 뜬 뒤 죽은

@@ -46,6 +46,7 @@ fn fixture() -> (OwnedFd, Tap) {
             generation: 0,
         }),
         changed: Condvar::new(),
+        shown: Condvar::new(),
         paused: AtomicBool::new(false),
         store: None,
         reader: Mutex::new(None),
@@ -221,7 +222,7 @@ fn poisoned_input_refuses_writes_and_cleanup_without_closing_pty() {
 }
 
 #[test]
-fn poisoned_roles_deny_mutations_and_hibernation_but_keep_output() {
+fn poisoned_roles_deny_mutations_but_keep_output() {
     use crate::attach::roles::Client;
     use krill_proto::roles::{Ack, Request, Role};
 
@@ -238,7 +239,6 @@ fn poisoned_roles_deny_mutations_and_hibernation_but_keep_output() {
     assert_eq!(client.request(Request::Focus), Ack::Closed);
     assert!(Client::new(tap.clone(), Role::Interactive).is_err());
     assert!(tap.write_input(b"DENIED", Some(peer.as_fd())).is_err());
-    assert!(tap.hibernation_guard(0, Duration::ZERO).is_none());
     drop(client);
     let mut bytes = [0; 16];
     assert_eq!(read(&slave, &mut bytes), Err(Errno::AGAIN));

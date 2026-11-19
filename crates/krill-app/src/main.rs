@@ -25,7 +25,8 @@ actions!(
         ZoomWindow,
         ToggleFullscreen,
         BringAllToFront,
-        ShowShortcuts
+        ShowShortcuts,
+        SendFeedback
     ]
 );
 
@@ -46,9 +47,6 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     krill_proto::diag::install_panic_hook("krill-app");
-    if let Some(code) = krill_app::platform::computer::maybe_run_worker() {
-        return code;
-    }
     if std::env::args().any(|a| a == "--crash-test") {
         crash_test();
     }
@@ -57,16 +55,6 @@ fn main() -> std::process::ExitCode {
     }
     if let Some(code) = krill_app::updater::maybe_run_update_cli() {
         return std::process::ExitCode::from(u8::try_from(code).unwrap_or(1));
-    }
-    if let Some(mode) =
-        std::env::args().find_map(|a| a.strip_prefix("--popout-bench=").map(str::to_owned))
-    {
-        return shell::popout::bench::run(mode);
-    }
-    if let Some(dir) =
-        std::env::args().find_map(|a| a.strip_prefix("--files-bench=").map(PathBuf::from))
-    {
-        return shell::files::bench::run(&dir);
     }
     // Windows는 X로 닫아도 트레이에 남고 재실행해도 OS가 기존 앱을 깨우지 않는다(on_reopen 미호출).
     // 같은 상태 폴더의 앱이 있으면 그 앱에 창 열기를 넘기고 끝낸다. 업데이트 health 확인 실행은
@@ -82,6 +70,9 @@ fn main() -> std::process::ExitCode {
     };
     #[cfg(windows)]
     let opens = instance.take_opens();
+    // 작업 스케줄러처럼 breakaway를 막는 Job에서 실행되면 세션 데몬을 Explorer가 Job 밖에서 띄우게 한다.
+    #[cfg(windows)]
+    krill_proto::daemon::set_job_escape(krill_app::platform::launch_outside_job);
     // OWE-576: gpui-component 아이콘 자산은 재열기·새 창에서도 같은 소스를 쓴다.
     let application = gpui_platform::application().with_assets(krill_app::ui::icons::AppAssets);
     application.on_reopen(|cx| request_open_from_menu(None, cx));
@@ -311,6 +302,10 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
         );
     let options = WindowOptions {
         window_bounds: Some(window_bounds),
+        window_min_size: Some(size(
+            px(krill_app::layout::MIN_WINDOW_WIDTH),
+            px(krill_app::layout::MIN_WINDOW_HEIGHT),
+        )),
         titlebar: Some(krill_app::ui::titlebar(
             krill_app::i18n::catalog::security::APP_MENU.get(),
         )),
@@ -480,6 +475,9 @@ fn init(cx: &mut App) {
     });
     cx.on_action(|_: &ShowShortcuts, cx| {
         krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Shortcuts, cx);
+    });
+    cx.on_action(|_: &SendFeedback, cx| {
+        krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Feedback, cx);
     });
     cx.on_action(|_: &CloseWindow, cx| {
         if let Some(window) = cx
@@ -654,11 +652,17 @@ fn refresh_menus(cx: &mut App) {
                 BringAllToFront,
             ),
         ]),
-        // OWE-864: 도움말 메뉴. 단축키 탭으로 바로 가는 실제 항목만 둔다.
-        Menu::new(krill_app::i18n::catalog::general::HELP.get()).items([MenuItem::action(
-            krill_app::i18n::catalog::general::SHORTCUTS_HELP.get(),
-            ShowShortcuts,
-        )]),
+        // OWE-864: 도움말 메뉴. 실제 동작하는 항목만 둔다.
+        Menu::new(krill_app::i18n::catalog::general::HELP.get()).items([
+            MenuItem::action(
+                krill_app::i18n::catalog::general::SHORTCUTS_HELP.get(),
+                ShowShortcuts,
+            ),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::SEND_FEEDBACK.get(),
+                SendFeedback,
+            ),
+        ]),
     ]);
 }
 

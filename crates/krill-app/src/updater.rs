@@ -18,6 +18,7 @@
 
 pub mod ed25519;
 mod relaunch;
+pub mod release_notes;
 mod rename;
 mod restart;
 
@@ -83,6 +84,80 @@ const BUNDLE_INFO: &str = if cfg!(windows) {
 const JOURNAL_FILE: &str = "journal.json";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
+const MIN_DOWNLOAD_FREE_BYTES: u64 = 256 * 1024 * 1024;
+const MIN_UNPACK_FREE_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TempKind {
+    DownloadZip,
+    UnpackTmp,
+    Candidate,
+    StagePublishTmp,
+}
+
+impl TempKind {
+    const ALL: [Self; 4] = [
+        Self::DownloadZip,
+        Self::UnpackTmp,
+        Self::Candidate,
+        Self::StagePublishTmp,
+    ];
+
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::DownloadZip => "download.zip",
+            Self::UnpackTmp => "unpack.tmp",
+            Self::Candidate => "candidate",
+            Self::StagePublishTmp => "stage-publish.tmp",
+        }
+    }
+
+    fn matches_suffix(s: &str) -> bool {
+        Self::ALL.iter().any(|k| k.suffix() == s)
+    }
+}
+
+fn ensure_free_disk_space_with(
+    target: &Path,
+    required_bytes: u64,
+    probe: impl FnOnce(&Path) -> io::Result<u64>,
+) -> Result<(), Error> {
+    if let Ok(avail) = probe(target)
+        && avail < required_bytes
+    {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::StorageFull,
+            format!(
+                "insufficient disk space ({avail} bytes available, {required_bytes} bytes required)"
+            ),
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_free_disk_space(target: &Path, required_bytes: u64) -> Result<(), Error> {
+    ensure_free_disk_space_with(
+        target,
+        required_bytes,
+        crate::platform::available_disk_bytes,
+    )
+}
+
+fn temp_leaf_prefix(bundle: &Path) -> Option<String> {
+    let name = bundle.file_name()?;
+    if let Some(s) = name.to_str()
+        && !s.is_empty()
+        && s.is_ascii()
+    {
+        return Some(format!("{s}."));
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    Some(format!(".krill-upd-{hash:016x}."))
+}
 
 /// 스테이징 완료된 업데이트 정보(MK-155, MK-156).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,12 +171,6 @@ pub struct StagedUpdate {
 }
 
 impl StagedUpdate {
-    /// 분리된 relauncher 프로세스를 띄워 번들 스왑·재실행·헬스체크를 수행하게 한다.
-    /// 호출자는 이 함수가 성공한 직후 앱을 종료(`cx.quit()`)해야 한다.
-    pub fn spawn_relauncher(&self) -> Result<(), Error> {
-        self.spawn_relauncher_child().map(drop)
-    }
-
     pub(super) fn spawn_relauncher_child(&self) -> Result<std::process::Child, Error> {
         let exe = std::env::current_exe()?;
         spawn_detached_relauncher(
@@ -113,16 +182,6 @@ impl StagedUpdate {
             Some(std::process::id()),
             DEFAULT_HEALTH_TIMEOUT,
         )
-    }
-
-    /// 매니페스트 URL이 GitHub Releases 자산 URL이면 해당 버전의 릴리스 노트 페이지 URL을 돌려준다.
-    #[must_use]
-    pub fn release_notes_url(&self) -> Option<String> {
-        let (repo, _, _) = parse_github_release_asset(&self.manifest_url)?;
-        Some(format!(
-            "https://github.com/{repo}/releases/tag/v{}",
-            self.to_version
-        ))
     }
 }
 
@@ -435,9 +494,47 @@ impl Clone for Error {
             Self::Unpack(v) => Self::Unpack(v.clone()),
             Self::NoBackup(v) => Self::NoBackup(v.clone()),
             Self::NoJournal => Self::NoJournal,
-            Self::Io(v) => Self::Io(io::Error::new(v.kind(), v.to_string())),
+            Self::Io(v) => Self::Io(v.raw_os_error().map_or_else(
+                || io::Error::new(v.kind(), v.to_string()),
+                io::Error::from_raw_os_error,
+            )),
         }
     }
+}
+
+impl Error {
+    /// Disk exhaustion should not cause rapid automatic retries.
+    pub fn is_disk_full(&self) -> bool {
+        match self {
+            Self::Io(error) => {
+                error.kind() == io::ErrorKind::StorageFull
+                    || matches!(error.raw_os_error(), Some(28 | 39 | 112))
+                    || mentions_disk_full(&error.to_string())
+            }
+            Self::Unpack(msg) => mentions_disk_full(msg),
+            _ => false,
+        }
+    }
+}
+
+fn mentions_disk_full(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "no space left on device",
+        "not enough space on the disk",
+        "disk full",
+        "os error 112",
+        "os error 28",
+        "os error 39",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn should_report_update_failure(error: &Error) -> bool {
+    !matches!(error, Error::Http(_))
+        && !matches!(error, Error::Io(io_err) if io_err.kind() == io::ErrorKind::TimedOut)
+        && !error.is_disk_full()
 }
 
 impl fmt::Display for Error {
@@ -708,9 +805,23 @@ pub fn validate_bundle_layout(app_bundle: &Path) -> Result<Vec<PathBuf>, Error> 
     Ok(binaries)
 }
 
-/// Windows 설치 폴더의 필수 구조(`Krill.json`, 실행 파일 4개, 번들 ConPTY)를 확인하고 실행 파일 목록을 돌려준다.
-/// `krill-link.exe`는 선택이다. 새 세션은 고정된 번들 `ConPTY` ABI를 요구한다.
-pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+fn is_windows_arm64_arch(wow64_arch: Option<&str>, native_arch: Option<&str>) -> bool {
+    wow64_arch
+        .map(str::trim)
+        .filter(|arch| !arch.is_empty())
+        .or_else(|| native_arch.map(str::trim))
+        .is_some_and(|arch| arch.eq_ignore_ascii_case("ARM64"))
+}
+
+fn is_windows_arm64_host() -> bool {
+    cfg!(all(windows, target_arch = "aarch64"))
+        || is_windows_arm64_arch(
+            std::env::var("PROCESSOR_ARCHITEW6432").ok().as_deref(),
+            std::env::var("PROCESSOR_ARCHITECTURE").ok().as_deref(),
+        )
+}
+
+fn validate_install_layout_for_arch(dir: &Path, arm64_host: bool) -> Result<Vec<PathBuf>, Error> {
     let mut binaries = Vec::new();
     for name in [
         "krill-holder.exe",
@@ -733,7 +844,12 @@ pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
             dir.display()
         )));
     }
-    for name in ["conpty.dll", "x64/OpenConsole.exe"] {
+    let required_conpty: &[&str] = if arm64_host {
+        &["conpty.dll", "x64/OpenConsole.exe", "arm64/OpenConsole.exe"]
+    } else {
+        &["conpty.dll", "x64/OpenConsole.exe"]
+    };
+    for name in required_conpty {
         if !dir.join(name).is_file() {
             return Err(Error::BundleStructure(format!(
                 "missing {name} in {}",
@@ -744,11 +860,18 @@ pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(binaries)
 }
 
+/// Windows 설치 폴더의 필수 구조(`Krill.json`, 실행 파일 4개, 번들 ConPTY)를 확인하고 실행 파일 목록을 돌려준다.
+/// `krill-link.exe`는 선택이다. 새 세션은 고정된 번들 `ConPTY` ABI를 요구한다.
+pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    validate_install_layout_for_arch(dir, is_windows_arm64_host())
+}
+
 #[cfg(test)]
 #[test]
 fn windows_install_layout_requires_both_conpty_components() {
     let dir = std::env::temp_dir().join(format!("krill-conpty-layout-{}", std::process::id()));
     fs::create_dir_all(dir.join("x64")).unwrap();
+    fs::create_dir_all(dir.join("arm64")).unwrap();
     for name in [
         "Krill.json",
         "krill-holder.exe",
@@ -757,6 +880,7 @@ fn windows_install_layout_requires_both_conpty_components() {
         "krill-app.exe",
         "conpty.dll",
         "x64/OpenConsole.exe",
+        "arm64/OpenConsole.exe",
     ] {
         fs::write(dir.join(name), b"fixture").unwrap();
     }
@@ -769,6 +893,47 @@ fn windows_install_layout_requires_both_conpty_components() {
         ));
         fs::write(dir.join(name), b"fixture").unwrap();
     }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn windows_install_layout_requires_arm64_openconsole_on_arm64_host() {
+    assert!(is_windows_arm64_arch(Some("ARM64"), Some("AMD64")));
+    assert!(is_windows_arm64_arch(Some(""), Some("arm64")));
+    assert!(is_windows_arm64_arch(None, Some("Arm64")));
+    assert!(!is_windows_arm64_arch(None, Some("AMD64")));
+    assert!(!is_windows_arm64_arch(None, None));
+
+    let dir =
+        std::env::temp_dir().join(format!("krill-conpty-arm64-layout-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(dir.join("x64")).unwrap();
+    fs::create_dir_all(dir.join("arm64")).unwrap();
+    for name in [
+        "Krill.json",
+        "krill-holder.exe",
+        "krilld.exe",
+        "krill.exe",
+        "krill-app.exe",
+        "conpty.dll",
+        "x64/OpenConsole.exe",
+    ] {
+        fs::write(dir.join(name), b"fixture").unwrap();
+    }
+    assert_eq!(
+        validate_install_layout_for_arch(&dir, false).unwrap().len(),
+        4
+    );
+    assert!(matches!(
+        validate_install_layout_for_arch(&dir, true),
+        Err(Error::BundleStructure(msg)) if msg.contains("arm64/OpenConsole.exe")
+    ));
+    fs::write(dir.join("arm64/OpenConsole.exe"), b"fixture").unwrap();
+    assert_eq!(
+        validate_install_layout_for_arch(&dir, true).unwrap().len(),
+        4
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -828,39 +993,56 @@ fn run_codesign(args: &[&str], target: &Path) -> Result<(), Error> {
 /// URL에서 바이트를 내려받는다(`https://` 또는 로컬 루프백 `http://`만 허용).
 /// 1차 `/usr/bin/curl`이 실패하고 URL이 GitHub Releases 자산 형식이면 로컬 `gh release download`로 폴백한다(MK-155).
 pub fn fetch_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, Error> {
-    validate_url(url)?;
-    let max_str = max_bytes.to_string();
-    let out = crate::settings::child::output(
-        crate::platform::background_command(system_tool("curl")).args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time",
-            "30",
-            "--max-filesize",
-            &max_str,
-            "--proto",
-            "=https,http",
-            "--proto-redir",
-            "=https",
-            url,
-        ]),
-        Duration::from_secs(40),
-        u64::try_from(max_bytes).unwrap_or(u64::MAX),
-    )?;
-    if out.status.success() {
-        if out.stdout.len() > max_bytes {
-            return Err(Error::Http(format!(
-                "response exceeded max size ({max_bytes} bytes)"
-            )));
-        }
-        return Ok(out.stdout);
-    }
+    fetch_bytes_with(
+        url,
+        max_bytes,
+        |url, max_bytes| {
+            let max_str = max_bytes.to_string();
+            crate::settings::child::output(
+                crate::platform::background_command(system_tool("curl")).args([
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--max-time",
+                    "30",
+                    "--max-filesize",
+                    &max_str,
+                    "--proto",
+                    "=https,http",
+                    "--proto-redir",
+                    "=https",
+                    url,
+                ]),
+                Duration::from_secs(40),
+                u64::try_from(max_bytes).unwrap_or(u64::MAX),
+            )
+        },
+        fetch_github_release_asset,
+    )
+}
 
-    let curl_err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+fn fetch_bytes_with(
+    url: &str,
+    max_bytes: usize,
+    run_curl: impl FnOnce(&str, usize) -> io::Result<std::process::Output>,
+    run_gh: impl FnOnce(&str, Option<&str>, &str, usize) -> Result<Vec<u8>, Error>,
+) -> Result<Vec<u8>, Error> {
+    validate_url(url)?;
+    let curl_err = match run_curl(url, max_bytes) {
+        Ok(out) if out.status.success() => {
+            if out.stdout.len() > max_bytes {
+                return Err(Error::Http(format!(
+                    "response exceeded max size ({max_bytes} bytes)"
+                )));
+            }
+            return Ok(out.stdout);
+        }
+        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        Err(error) => error.to_string(),
+    };
     if let Some((repo, tag, asset)) = parse_github_release_asset(url)
-        && let Ok(bytes) = fetch_github_release_asset(&repo, tag.as_deref(), &asset, max_bytes)
+        && let Ok(bytes) = run_gh(&repo, tag.as_deref(), &asset, max_bytes)
     {
         return Ok(bytes);
     }
@@ -1020,28 +1202,56 @@ pub fn stage_verified_archive(
     verifier: &dyn CodeVerifier,
 ) -> Result<PathBuf, Error> {
     manifest.verify_signature(public_key)?;
-    let path = unique_update_path(app_bundle, "download.zip");
     if archive_bytes.len() > MAX_ARCHIVE_BYTES {
         return Err(Error::Http("archive exceeded size limit".into()));
     }
+    ensure_free_disk_space(
+        app_bundle,
+        u64::try_from(archive_bytes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4)
+            .max(MIN_UNPACK_FREE_BYTES),
+    )?;
+    let path = unique_update_path(app_bundle, TempKind::DownloadZip);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)?
-        .write_all(archive_bytes)?;
-    let result = stage_verified_file(manifest, public_key, &path, app_bundle, verifier);
-    fs::remove_file(path).ok();
+    let result = (|| {
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?
+            .write_all(archive_bytes)?;
+        stage_verified_file(manifest, public_key, &path, app_bundle, verifier)
+    })();
+    remove_update_temp(&path, false);
     result
 }
 
-fn unique_update_path(bundle: &Path, suffix: &str) -> PathBuf {
+fn remove_update_temp(path: &Path, directory: bool) {
+    let result = if directory {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    if let Err(error) = result
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(kind = ?error.kind(), "updater temporary file cleanup failed");
+    }
+}
+
+fn unique_update_path(bundle: &Path, kind: TempKind) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    append_ext(bundle, &format!("{}-{serial}-{suffix}", std::process::id()))
+    let pid = std::process::id();
+    let suffix = kind.suffix();
+    if let (Some(parent), Some(prefix)) = (bundle.parent(), temp_leaf_prefix(bundle)) {
+        parent.join(format!("{prefix}{pid}-{serial}-{suffix}"))
+    } else {
+        append_ext(bundle, &format!("{pid}-{serial}-{suffix}"))
+    }
 }
 
 fn archive_sha(path: &Path) -> Result<String, Error> {
@@ -1073,6 +1283,24 @@ fn stage_verified_file(
     app_bundle: &Path,
     verifier: &dyn CodeVerifier,
 ) -> Result<PathBuf, Error> {
+    stage_verified_file_with_probe(
+        manifest,
+        public_key,
+        archive,
+        app_bundle,
+        verifier,
+        crate::platform::available_disk_bytes,
+    )
+}
+
+fn stage_verified_file_with_probe(
+    manifest: &Manifest,
+    public_key: &PublicKey,
+    archive: &Path,
+    app_bundle: &Path,
+    verifier: &dyn CodeVerifier,
+    disk_probe: fn(&Path) -> io::Result<u64>,
+) -> Result<PathBuf, Error> {
     manifest.verify_signature(public_key)?;
     let actual_sha = archive_sha(archive)?;
     if !actual_sha.eq_ignore_ascii_case(&manifest.sha256) {
@@ -1081,23 +1309,32 @@ fn stage_verified_file(
             actual: actual_sha,
         });
     }
+    let archive_len = fs::metadata(archive)?.len();
+    let required = archive_len.saturating_mul(4).max(MIN_UNPACK_FREE_BYTES);
+    ensure_free_disk_space_with(app_bundle, required, disk_probe)?;
     let parent = app_bundle
         .parent()
         .ok_or_else(|| Error::BundleStructure("bundle has no parent".into()))?;
     fs::create_dir_all(parent)?;
     let _lock = staging_lock(app_bundle)?;
     recover_stage_publish_locked(app_bundle)?;
-    let unpack = unique_update_path(app_bundle, "unpack.tmp");
-    let candidate = unique_update_path(app_bundle, "candidate");
+    let unpack = unique_update_path(app_bundle, TempKind::UnpackTmp);
+    let candidate = unique_update_path(app_bundle, TempKind::Candidate);
     let staging = staging_path(app_bundle);
     let incoming = append_ext(app_bundle, "staging.incoming");
     let backup = append_ext(app_bundle, "staging.previous");
     let result = (|| {
-        unpack_with_ditto(archive, &unpack, &candidate)?;
+        if let Err(error) = unpack_with_ditto(archive, &unpack, &candidate) {
+            ensure_free_disk_space_with(app_bundle, required, disk_probe)?;
+            return Err(error);
+        }
         verifier.verify(&candidate)?;
         fs::remove_dir_all(&incoming).ok();
         fs::rename(&candidate, &incoming)?;
-        write_stage_marker(app_bundle)?;
+        if let Err(error) = write_stage_marker(app_bundle) {
+            remove_update_temp(&incoming, true);
+            return Err(error.into());
+        }
         if staging.exists() {
             fs::rename(&staging, &backup)?;
         }
@@ -1109,10 +1346,13 @@ fn stage_verified_file(
         fs::remove_file(append_ext(app_bundle, "stage-publish"))?;
         sync_stage_parent(app_bundle)?;
         fs::remove_dir_all(&backup).ok();
+        let marker = serde_json::to_vec(&(manifest.version.as_str(), manifest.sha256.as_str()))
+            .map_err(|error| Error::Json(error.to_string()))?;
+        write_private_file(&append_ext(app_bundle, "staging.verified"), &marker)?;
         Ok(staging)
     })();
-    fs::remove_dir_all(&unpack).ok();
-    fs::remove_dir_all(&candidate).ok();
+    remove_update_temp(&unpack, true);
+    remove_update_temp(&candidate, true);
     result
 }
 
@@ -1154,15 +1394,22 @@ fn sync_stage_parent(app_bundle: &Path) -> io::Result<()> {
 }
 fn write_stage_marker(app_bundle: &Path) -> io::Result<()> {
     let path = append_ext(app_bundle, "stage-publish");
-    let temporary = unique_update_path(app_bundle, "stage-publish.tmp");
+    let temporary = unique_update_path(app_bundle, TempKind::StagePublishTmp);
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&temporary)?;
-    file.write_all(b"krill-stage-publish-v1\n")?;
-    file.sync_all()?;
-    fs::rename(&temporary, &path)?;
+    let publish = (|| {
+        file.write_all(b"krill-stage-publish-v1\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &path)
+    })();
+    if let Err(error) = publish {
+        remove_update_temp(&temporary, false);
+        return Err(error);
+    }
     sync_stage_parent(app_bundle)
 }
 fn recover_stage_publish_locked(app_bundle: &Path) -> io::Result<()> {
@@ -1205,17 +1452,89 @@ fn recover_stage_publish_locked(app_bundle: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Only old, precisely named files belonging to absent processes are candidates.
+fn cleanup_update_orphans(bundle: &Path) -> io::Result<()> {
+    let parent = bundle
+        .parent()
+        .ok_or_else(|| io::Error::other("bundle has no parent"))?;
+    let Some(prefix) = temp_leaf_prefix(bundle) else {
+        return Ok(());
+    };
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        sysinfo::ProcessRefreshKind::new(),
+    );
+    if system
+        .process(sysinfo::Pid::from_u32(std::process::id()))
+        .is_none()
+    {
+        return Err(io::Error::other("cannot inspect updater processes"));
+    }
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let Some((pid, tail)) = rest.split_once('-') else {
+            continue;
+        };
+        let Some((serial, suffix)) = tail.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if serial.parse::<u64>().is_err()
+            || !TempKind::matches_suffix(suffix)
+            || pid == std::process::id()
+            || system.process(sysinfo::Pid::from_u32(pid)).is_some()
+        {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(kind = ?error.kind(), "updater temporary file metadata failed");
+                continue;
+            }
+        };
+        if metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.elapsed().ok())
+            .is_none_or(|age| age < Duration::from_hours(24))
+        {
+            continue;
+        }
+        let result = if metadata.is_dir() {
+            fs::remove_dir_all(entry.path())
+        } else {
+            fs::remove_file(entry.path())
+        };
+        if let Err(error) = result {
+            tracing::warn!(kind = ?error.kind(), "updater temporary file cleanup failed");
+        }
+    }
+    Ok(())
+}
+
 /// Recover interrupted staging publication off the event loop before normal update rollback recovery.
 pub fn on_startup(state_dir: PathBuf, window: &mut gpui::Window, cx: &mut gpui::App) {
     let handle = window.window_handle();
     let work = cx.background_spawn(async move {
         if let Ok(exe) = std::env::current_exe() {
             let configured = std::env::var("KRILL_UPDATE_BUNDLE_PATH").ok();
-            if let Some(bundle) = current_app_bundle_in(configured.as_deref(), &exe)
-                && append_ext(&bundle, "stage-publish").exists()
-                && let Ok(_lock) = staging_lock(&bundle)
-            {
-                recover_stage_publish_locked(&bundle).ok();
+            if let Some(bundle) = current_app_bundle_in(configured.as_deref(), &exe) {
+                if let Err(error) = cleanup_update_orphans(&bundle) {
+                    tracing::warn!(kind = ?error.kind(), "updater temporary file scan failed");
+                }
+                if append_ext(&bundle, "stage-publish").exists()
+                    && let Ok(_lock) = staging_lock(&bundle)
+                {
+                    recover_stage_publish_locked(&bundle).ok();
+                }
             }
         }
     });
@@ -1233,7 +1552,7 @@ pub fn on_startup(state_dir: PathBuf, window: &mut gpui::Window, cx: &mut gpui::
 /// Stream stdout to a private file. A descendant holding a pipe cannot extend the total deadline.
 fn stream_download(cmd: &mut std::process::Command, path: &Path) -> Result<(), Error> {
     use std::process::Stdio;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(210);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1338,20 +1657,27 @@ fn stream_download(cmd: &mut std::process::Command, path: &Path) -> Result<(), E
     result.map_err(Error::Io)
 }
 
-fn fetch_archive(url: &str, bundle: &Path) -> Result<PathBuf, Error> {
+fn fetch_archive_with_probe(
+    url: &str,
+    bundle: &Path,
+    disk_probe: fn(&Path) -> io::Result<u64>,
+) -> Result<PathBuf, Error> {
     validate_url(url)?;
+    ensure_free_disk_space_with(bundle, MIN_DOWNLOAD_FREE_BYTES, disk_probe)?;
     if let Some(parent) = bundle.parent() {
         fs::create_dir_all(parent)?;
     }
-    let path = unique_update_path(bundle, "download.zip");
+    let path = unique_update_path(bundle, TempKind::DownloadZip);
     let mut curl = crate::platform::background_command(system_tool("curl"));
     curl.args([
         "--fail",
         "--silent",
         "--show-error",
         "--location",
+        "--connect-timeout",
+        "15",
         "--max-time",
-        "30",
+        "180",
         "--max-filesize",
         &MAX_ARCHIVE_BYTES.to_string(),
         "--proto",
@@ -1363,8 +1689,9 @@ fn fetch_archive(url: &str, bundle: &Path) -> Result<PathBuf, Error> {
     match stream_download(&mut curl, &path) {
         Ok(()) => Ok(path),
         Err(error) => {
-            fs::remove_file(&path).ok();
-            if let Some((repo, tag, asset)) = parse_github_release_asset(url)
+            remove_update_temp(&path, false);
+            if !error.is_disk_full()
+                && let Some((repo, tag, asset)) = parse_github_release_asset(url)
                 && let Some(gh) = find_gh_binary()
             {
                 let mut cmd = crate::platform::background_command(gh);
@@ -1373,10 +1700,16 @@ fn fetch_archive(url: &str, bundle: &Path) -> Result<PathBuf, Error> {
                     cmd.arg(tag);
                 }
                 cmd.args(["--repo", &repo, "--pattern", &asset, "--output", "-"]);
-                if stream_download(&mut cmd, &path).is_ok() {
+                let fallback = stream_download(&mut cmd, &path);
+                if fallback.is_ok() {
                     return Ok(path);
                 }
-                fs::remove_file(&path).ok();
+                remove_update_temp(&path, false);
+                if let Err(fallback_error) = fallback
+                    && fallback_error.is_disk_full()
+                {
+                    return Err(fallback_error);
+                }
             }
             Err(error)
         }
@@ -1406,6 +1739,32 @@ pub fn download_and_stage(
     verifier: &dyn CodeVerifier,
     rollout_bucket: u8,
 ) -> Result<Option<PathBuf>, Error> {
+    download_and_stage_with_probe(
+        manifest,
+        public_key,
+        current_version,
+        channel,
+        app_bundle,
+        verifier,
+        rollout_bucket,
+        crate::platform::available_disk_bytes,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "내부 스테이징 경로가 디스크 여유 공간 프로브를 주입받는다"
+)]
+fn download_and_stage_with_probe(
+    manifest: &Manifest,
+    public_key: &PublicKey,
+    current_version: &str,
+    channel: Channel,
+    app_bundle: &Path,
+    verifier: &dyn CodeVerifier,
+    rollout_bucket: u8,
+    disk_probe: fn(&Path) -> io::Result<u64>,
+) -> Result<Option<PathBuf>, Error> {
     let decision = manifest.evaluate(
         public_key,
         current_version,
@@ -1416,9 +1775,33 @@ pub fn download_and_stage(
     if decision != Decision::Available {
         return Ok(None);
     }
-    let archive = fetch_archive(&manifest.url, app_bundle)?;
-    let staged = stage_verified_file(manifest, public_key, &archive, app_bundle, verifier);
-    fs::remove_file(archive).ok();
+    // The marker records an already authenticated archive; it is not a security boundary
+    // against a user who can modify the installation and the marker together.
+    {
+        let _lock = staging_lock(app_bundle)?;
+        recover_stage_publish_locked(app_bundle)?;
+        let staged = staging_path(app_bundle);
+        let marker = fs::File::open(append_ext(app_bundle, "staging.verified"))
+            .ok()
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(1024).read_to_end(&mut bytes).ok()?;
+                serde_json::from_slice::<(String, String)>(&bytes).ok()
+            });
+        if marker.as_ref().is_some_and(|(version, sha)| {
+            version == &manifest.version && sha.eq_ignore_ascii_case(&manifest.sha256)
+        }) && bundle_short_version(&staged)
+            .is_some_and(|version| same_version(&version, &manifest.version))
+            && verifier.verify(&staged).is_ok()
+        {
+            return Ok(Some(staged));
+        }
+    }
+    let archive = fetch_archive_with_probe(&manifest.url, app_bundle, disk_probe)?;
+    let staged = stage_verified_file_with_probe(
+        manifest, public_key, &archive, app_bundle, verifier, disk_probe,
+    );
+    remove_update_temp(&archive, false);
     staged.map(Some)
 }
 
@@ -1426,12 +1809,31 @@ pub fn download_and_stage(
 /// 채널 불일치는 `None`에 묻히지 않고 [`CheckStatus::ChannelMismatch`]로 돌려준다.
 /// `skip_rolled_back`이면 시작 확인에 실패해 롤백된 버전을 다시 받지 않는다. 자동 점검이 그 버전을
 /// 곧바로 다시 스테이징해 자동 재시작·롤백을 되풀이했다(v0.2.29). 사용자가 직접 점검하면 다시 시도한다.
+#[cfg(all(test, unix))]
 fn decide_and_stage(
     cfg: &Config,
     manifest: &Manifest,
     app_bundle: &Path,
     state_dir: &Path,
     skip_rolled_back: bool,
+) -> Result<CheckStatus, Error> {
+    decide_and_stage_with_probe(
+        cfg,
+        manifest,
+        app_bundle,
+        state_dir,
+        skip_rolled_back,
+        crate::platform::available_disk_bytes,
+    )
+}
+
+fn decide_and_stage_with_probe(
+    cfg: &Config,
+    manifest: &Manifest,
+    app_bundle: &Path,
+    state_dir: &Path,
+    skip_rolled_back: bool,
+    disk_probe: fn(&Path) -> io::Result<u64>,
 ) -> Result<CheckStatus, Error> {
     let pk = cfg.public_key_bytes()?;
     let from_version = effective_version(Some(app_bundle));
@@ -1480,28 +1882,43 @@ fn decide_and_stage(
                 .format(&[("version", &manifest.version)]),
         ));
     }
-    let verifier = CodesignVerifier::from_config(cfg);
-    let staged = download_and_stage(
-        manifest,
-        &pk,
-        &from_version,
-        cfg.channel,
-        app_bundle,
-        &verifier,
-        bucket,
-    )?;
-    Ok(match staged {
-        Some(_) => CheckStatus::Ready(StagedUpdate {
-            state_dir: state_dir.to_path_buf(),
-            app_bundle: app_bundle.to_path_buf(),
-            from_version,
-            to_version: manifest.version.clone(),
-            manifest_url: cfg.url.clone(),
-            relaunched: false,
-        }),
-        None => CheckStatus::UpToDate {
-            version: from_version,
-        },
+    let bundle = app_bundle
+        .canonicalize()
+        .unwrap_or_else(|_| app_bundle.to_owned());
+    #[expect(
+        clippy::unnecessary_debug_formatting,
+        reason = "Escaped paths keep staging-flight keys unambiguous"
+    )]
+    let key = format!(
+        "stage|{bundle:?}|{state_dir:?}|{}|{}|{}|{}|{:?}",
+        manifest.version, manifest.sha256, cfg.public_key, cfg.url, cfg.designated_requirement
+    );
+    // Rollback policy is checked above per caller; only the actual download is shared.
+    single_flight(&key, || {
+        let verifier = CodesignVerifier::from_config(cfg);
+        let staged = download_and_stage_with_probe(
+            manifest,
+            &pk,
+            &from_version,
+            cfg.channel,
+            app_bundle,
+            &verifier,
+            bucket,
+            disk_probe,
+        )?;
+        Ok(match staged {
+            Some(_) => CheckStatus::Ready(StagedUpdate {
+                state_dir: state_dir.to_path_buf(),
+                app_bundle: app_bundle.to_path_buf(),
+                from_version,
+                to_version: manifest.version.clone(),
+                manifest_url: cfg.url.clone(),
+                relaunched: false,
+            }),
+            None => CheckStatus::UpToDate {
+                version: from_version,
+            },
+        })
     })
 }
 
@@ -1606,6 +2023,24 @@ fn check_and_stage_with(
     state_dir: &Path,
     skip_rolled_back: bool,
 ) -> Result<CheckStatus, Error> {
+    check_and_stage_with_probe(
+        manifest_url,
+        app_bundle,
+        state_dir,
+        skip_rolled_back,
+        crate::platform::available_disk_bytes,
+        &krill_proto::error_reporting::Env::live(),
+    )
+}
+
+fn check_and_stage_with_probe(
+    manifest_url: Option<&str>,
+    app_bundle: &Path,
+    state_dir: &Path,
+    skip_rolled_back: bool,
+    disk_probe: fn(&Path) -> io::Result<u64>,
+    error_env: &krill_proto::error_reporting::Env,
+) -> Result<CheckStatus, Error> {
     if append_ext(app_bundle, "stage-publish").exists() {
         let _lock = staging_lock(app_bundle)?;
         recover_stage_publish_locked(app_bundle)?;
@@ -1635,14 +2070,13 @@ fn check_and_stage_with(
         let manifest = match fetch_manifest(&cfg.url) {
             Ok(manifest) => manifest,
             Err(error) => {
-                if !matches!(error, Error::Http(_)) {
+                if should_report_update_failure(&error) {
                     let detail = error.to_string();
-                    krill_proto::error_reporting::capture_detailed_at(
+                    crate::errors::record_app_error_with_env(
                         state_dir,
-                        krill_proto::error_reporting::Process::App,
+                        error_env,
                         krill_proto::error_reporting::Code::UpdateFailed,
-                        Some(&detail),
-                        &[],
+                        &detail,
                         file!(),
                         line!(),
                     );
@@ -1650,20 +2084,27 @@ fn check_and_stage_with(
                 return Err(error);
             }
         };
-        decide_and_stage(&cfg, &manifest, app_bundle, state_dir, skip_rolled_back).inspect_err(
-            |error| {
+        decide_and_stage_with_probe(
+            &cfg,
+            &manifest,
+            app_bundle,
+            state_dir,
+            skip_rolled_back,
+            disk_probe,
+        )
+        .inspect_err(|error| {
+            if should_report_update_failure(error) {
                 let detail = error.to_string();
-                krill_proto::error_reporting::capture_detailed_at(
+                crate::errors::record_app_error_with_env(
                     state_dir,
-                    krill_proto::error_reporting::Process::App,
+                    error_env,
                     krill_proto::error_reporting::Code::UpdateFailed,
-                    Some(&detail),
-                    &[],
+                    &detail,
                     file!(),
                     line!(),
                 );
-            },
-        )
+            }
+        })
     })
 }
 
@@ -2071,7 +2512,7 @@ pub fn current_app_bundle_in(bundle_path: Option<&str>, exe: &Path) -> Option<Pa
 }
 
 /// OS 기본 도구의 절대 경로(PATH 가로채기 방지). Windows 10 1803+는 `System32`에 `curl.exe`·`tar.exe`가 있다.
-fn system_tool(name: &str) -> PathBuf {
+pub(crate) fn system_tool(name: &str) -> PathBuf {
     if cfg!(windows) {
         std::env::var_os("SystemRoot")
             .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
@@ -2087,7 +2528,28 @@ fn unpack_with_ditto(zip_path: &Path, unpack_tmp: &Path, staging: &Path) -> Resu
     fs::create_dir_all(unpack_tmp)?;
     let mut cmd = if cfg!(windows) {
         let mut c = crate::platform::background_command(system_tool("tar"));
-        c.arg("-xf").arg(zip_path).arg("-C").arg(unpack_tmp);
+        let relative =
+            zip_path
+                .parent()
+                .zip(unpack_tmp.parent())
+                .and_then(|(parent, dest_parent)| {
+                    let archive = zip_path.file_name()?;
+                    let dest = unpack_tmp.file_name()?;
+                    (parent == dest_parent
+                        && !parent.as_os_str().is_empty()
+                        && archive.to_str().is_some_and(str::is_ascii)
+                        && dest.to_str().is_some_and(str::is_ascii))
+                    .then_some((parent, archive, dest))
+                });
+        if let Some((parent, archive, dest)) = relative {
+            c.current_dir(parent)
+                .arg("-xf")
+                .arg(archive)
+                .arg("-C")
+                .arg(dest);
+        } else {
+            c.arg("-xf").arg(zip_path).arg("-C").arg(unpack_tmp);
+        }
         c
     } else {
         let mut c = crate::platform::background_command(system_tool("ditto"));
@@ -2189,5 +2651,143 @@ fn windows_bundle_without_update_url_uses_windows_manifest() {
         "https://github.com/craftowen/krill/releases/latest/download/latest-windows.json"
     );
     assert_eq!(effective_version(Some(&bundle)), "0.2.6");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn disk_full_survives_single_flight_error_cloning() {
+    let error = Error::Io(io::Error::from_raw_os_error(112));
+    assert!(error.is_disk_full());
+    assert!(error.clone().is_disk_full());
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn verified_staging_is_reused_only_for_matching_signed_manifest() {
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    #[derive(Debug)]
+    struct Accept;
+    impl CodeVerifier for Accept {
+        fn verify(&self, _: &Path) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let root = std::env::temp_dir().join(format!("krill-reuse-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let bundle = root.join("Krill");
+    let staging = staging_path(&bundle);
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(
+        staging.join("Krill.json"),
+        r#"{"CFBundleShortVersionString":"0.2.0"}"#,
+    )
+    .unwrap();
+    let key = Ed25519KeyPair::from_seed_unchecked(&[42; 32]).unwrap();
+    let public_key: PublicKey = key.public_key().as_ref().try_into().unwrap();
+    let mut manifest = Manifest {
+        version: "0.2.0".into(),
+        url: "http://127.0.0.1:1/missing.zip".into(),
+        sha256: "a".repeat(64),
+        ed25519_sig: String::new(),
+        min_daemon_protocol: 1,
+        channel: Channel::Stable,
+        rollout_pct: 100,
+    };
+    manifest.ed25519_sig = ed25519::encode_hex(key.sign(&manifest.signing_payload()).as_ref());
+    fs::write(
+        append_ext(&bundle, "staging.verified"),
+        serde_json::to_vec(&(&manifest.version, &manifest.sha256)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        download_and_stage(
+            &manifest,
+            &public_key,
+            "0.1.0",
+            Channel::Stable,
+            &bundle,
+            &Accept,
+            0
+        )
+        .unwrap(),
+        Some(staging)
+    );
+    fs::write(append_ext(&bundle, "staging.verified"), b"invalid").unwrap();
+    assert!(
+        download_and_stage(
+            &manifest,
+            &public_key,
+            "0.1.0",
+            Channel::Stable,
+            &bundle,
+            &Accept,
+            0
+        )
+        .is_err()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn orphan_cleanup_preserves_live_fresh_and_unrelated_paths() {
+    let root = std::env::temp_dir().join(format!("krill-clean-orphans-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let bundle = root.join("Krill");
+    let orphan = root.join("Krill.4294967295-1-download.zip");
+    let current = root.join(format!("Krill.{}-1-download.zip", std::process::id()));
+    let fresh = root.join("Krill.4294967295-2-download.zip");
+    let other = root.join("Krill.4294967295-1-other");
+    for path in [&orphan, &current, &fresh, &other] {
+        fs::write(path, b"test").unwrap();
+    }
+    for path in [&orphan, &current, &other] {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_hours(25)),
+            )
+            .unwrap();
+    }
+    cleanup_update_orphans(&bundle).unwrap();
+    assert!(!orphan.exists());
+    assert!(current.exists() && fresh.exists() && other.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn system_curl_is_available_for_icon_fetches() {
+    let output = crate::platform::background_command(system_tool("curl"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_unpack_zip_in_unicode_directory() {
+    let root = std::env::temp_dir().join(format!("krill 한글 경로 zip {}", std::process::id()));
+    let source = root.join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join(BUNDLE_INFO), b"{}").unwrap();
+    let status = std::process::Command::new(system_tool("tar"))
+        .current_dir(&root)
+        .args(["-a", "-cf", "archive.zip", "-C", "source", BUNDLE_INFO])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    unpack_with_ditto(
+        &root.join("archive.zip"),
+        &root.join("unpack"),
+        &root.join("staging"),
+    )
+    .unwrap();
+    assert!(root.join("staging").join(BUNDLE_INFO).is_file());
     fs::remove_dir_all(root).unwrap();
 }

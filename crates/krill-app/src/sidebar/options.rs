@@ -34,13 +34,6 @@ pub enum GroupBy {
 }
 
 impl GroupBy {
-    pub const ALL: [Self; 4] = [
-        Self::Repo,
-        Self::WorkspaceStatus,
-        Self::PrStatus,
-        Self::None,
-    ];
-
     /// Orca `SidebarGroupByToggle` 세그먼트 순서(없음 · 상태 · PR · 프로젝트).
     pub const SEGMENT_ORDER: [Self; 4] = [
         Self::None,
@@ -48,16 +41,6 @@ impl GroupBy {
         Self::PrStatus,
         Self::Repo,
     ];
-
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Repo => text::GROUP_BY_REPO.get(),
-            Self::WorkspaceStatus => text::GROUP_BY_STATUS.get(),
-            Self::PrStatus => text::GROUP_BY_PR.get(),
-            Self::None => text::GROUP_BY_NONE.get(),
-        }
-    }
 
     #[must_use]
     pub fn short_label(self) -> &'static str {
@@ -263,11 +246,6 @@ impl CardProperties {
 
     pub const fn toggle(&mut self, prop: CardProperty) {
         self.set(prop, !self.get(prop));
-    }
-
-    #[must_use]
-    pub const fn all_enabled(self) -> bool {
-        self.issue && self.pr && self.comment && self.ports && self.branch && self.host
     }
 
     #[must_use]
@@ -745,7 +723,7 @@ fn push_worktree_and_sessions(
         && let Some(list) = sessions_by_wt.get(tree.as_path())
     {
         for &s in list {
-            out.push(Row::Session(s.clone(), true));
+            out.push(Row::Session(Box::new(s.clone()), true));
         }
     }
 }
@@ -857,7 +835,7 @@ pub(super) fn rows_with_options<'a>(
     if options.group_by != GroupBy::Repo && waiting.peek().is_some() {
         out.push(Row::NeedsYou);
         for s in waiting {
-            out.push(Row::Session(s.clone(), false));
+            out.push(Row::Session(Box::new(s.clone()), false));
         }
     }
     let filters_active = options.filters.active_count() > 0;
@@ -1125,7 +1103,7 @@ pub(super) fn rows_with_options<'a>(
             folders
                 .entry(cwd)
                 .or_default()
-                .push(Row::Session(s.clone(), true));
+                .push(Row::Session(Box::new(s.clone()), true));
         }
     }
     for (folder, sessions) in folders {
@@ -1144,7 +1122,11 @@ pub(super) fn rows_with_options<'a>(
         .collect();
     if !loose.is_empty() {
         out.push(Row::Loose);
-        out.extend(loose.into_iter().map(|s| Row::Session(s.clone(), false)));
+        out.extend(
+            loose
+                .into_iter()
+                .map(|s| Row::Session(Box::new(s.clone()), false)),
+        );
     }
     out
 }
@@ -1449,6 +1431,7 @@ impl Sidebar {
 
     pub fn clear_repo_filters(&mut self, cx: &mut Context<Self>) {
         if !self.disk.initialized {
+            self.disk.startup.added_repos.clear();
             self.disk.startup.touch("repos.clear");
         }
         if !self.options.filters.repos.is_empty() || !self.disk.initialized {
@@ -1458,12 +1441,26 @@ impl Sidebar {
     }
 
     pub fn toggle_host_filter(&mut self, host: &HostId, cx: &mut Context<Self>) {
-        self.options.filters.toggle_host(host);
+        if !self.options.filters.hosts.is_empty() && self.host_filter_matches(host) {
+            let identity = self.machine_identities.get(host).copied();
+            self.options.filters.hosts.retain(|key| {
+                key != host.as_key()
+                    && identity.is_none_or(|target| {
+                        !self
+                            .machine_identities
+                            .iter()
+                            .any(|(other, id)| id == &target && other.as_key() == key)
+                    })
+            });
+        } else {
+            self.options.filters.toggle_host(host);
+        }
         self.persist(cx);
     }
 
     pub fn clear_host_filters(&mut self, cx: &mut Context<Self>) {
         if !self.disk.initialized {
+            self.disk.startup.added_hosts.clear();
             self.disk.startup.touch("hosts.clear");
         }
         if !self.options.filters.hosts.is_empty() || !self.disk.initialized {
@@ -1711,17 +1708,27 @@ fn host_status_label(status: HostStatus) -> &'static str {
     }
 }
 
+#[cfg(all(test, unix))]
 #[must_use]
 pub(super) fn host_visibility_summary(
     filters: &WorkspaceFilters,
     hosts: &[(HostId, String)],
+) -> String {
+    host_visibility_summary_with(filters, hosts, |id| filters.hosts.contains(id.as_key()))
+}
+
+#[must_use]
+fn host_visibility_summary_with(
+    filters: &WorkspaceFilters,
+    hosts: &[(HostId, String)],
+    mut is_selected: impl FnMut(&HostId) -> bool,
 ) -> String {
     if filters.hosts.is_empty() || hosts.is_empty() {
         return text::ALL_HOSTS.get().to_owned();
     }
     let selected: Vec<&str> = hosts
         .iter()
-        .filter(|(id, _)| filters.hosts.contains(id.as_key()))
+        .filter(|(id, _)| is_selected(id))
         .map(|(_, label)| label.as_str())
         .collect();
     if selected.is_empty() || selected.len() == hosts.len() {
@@ -1786,7 +1793,7 @@ fn build_options_menu(
         .min_w(px(284.))
         .max_w(px(296.))
         .scrollable(true)
-        .max_h(px(540.))
+        .max_h(px(540.).min((window.viewport_size().height - ui::SPACE_4 * 2.).max(px(0.))))
         .item(
             PopupMenuItem::element(|_, cx| {
                 div()
@@ -1861,7 +1868,7 @@ fn add_options_submenu(
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let sb = sidebar.clone();
-    let submenu = PopupMenu::build(window, cx, move |menu, _, cx| {
+    let submenu = PopupMenu::build(window, cx, move |menu, window, cx| {
         if let Some(sidebar) = sb.upgrade() {
             cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
         }
@@ -1870,7 +1877,7 @@ fn add_options_submenu(
         menu.min_w(px(260.))
             .max_w(px(296.))
             .scrollable(true)
-            .max_h(px(360.))
+            .max_h(px(360.).min((window.viewport_size().height - ui::SPACE_4 * 2.).max(px(0.))))
             .item(
                 PopupMenuItem::element(move |_, cx| render_options_submenu(target, &sb, &mn, cx))
                     .disabled(true),
@@ -1892,13 +1899,13 @@ fn add_options_submenu(
                         ))
                         .chain(
                             sidebar
-                                .remote_hosts
-                                .iter()
-                                .filter(|h| h.status == HostStatus::Connected)
+                                .connected_remote_hosts()
                                 .map(|h| (HostId::Remote(h.id.clone()), h.label.clone())),
                         )
                         .collect::<Vec<_>>();
-                        host_visibility_summary(&sidebar.options.filters, &hosts)
+                        host_visibility_summary_with(&sidebar.options.filters, &hosts, |id| {
+                            sidebar.host_filter_matches(id)
+                        })
                     }
                     OptionsSubmenu::Projects => project_visibility_summary(
                         &sidebar.options.filters,
@@ -1962,18 +1969,13 @@ fn render_options_submenu(
                     .to_owned(),
                 status_label: host_status_label(s.local_status),
             })
-            .chain(
-                s.remote_hosts
-                    .iter()
-                    .filter(|h| h.status == HostStatus::Connected)
-                    .map(|h| HostMenuEntry {
-                        id: HostId::Remote(h.id.clone()),
-                        label: h.label.clone(),
-                        status_label: host_status_label(h.status),
-                    }),
-            )
+            .chain(s.connected_remote_hosts().map(|h| HostMenuEntry {
+                id: HostId::Remote(h.id.clone()),
+                label: h.label.clone(),
+                status_label: host_status_label(h.status),
+            }))
             .collect::<Vec<_>>();
-            render_hosts_panel(sidebar, menu, &s.options.filters, &hosts, p)
+            render_hosts_panel(sidebar, menu, s, &hosts, p)
         }
         OptionsSubmenu::Projects => {
             let repos = s.filterable_project_repos();
@@ -1992,11 +1994,11 @@ fn render_options_submenu(
 fn render_hosts_panel(
     sidebar_weak: &gpui::WeakEntity<Sidebar>,
     menu_weak: &gpui::WeakEntity<PopupMenu>,
-    filters: &WorkspaceFilters,
+    s: &Sidebar,
     hosts: &[HostMenuEntry],
     p: &'static ui::Palette,
 ) -> gpui::Stateful<gpui::Div> {
-    let all_checked = filters.hosts.is_empty();
+    let all_checked = s.options.filters.hosts.is_empty();
     let clear_sidebar = sidebar_weak.clone();
     let clear_menu = menu_weak.clone();
     let mut panel = submenu_panel_frame("sidebar-hosts-panel", p)
@@ -2040,7 +2042,7 @@ fn render_hosts_panel(
         .child(menu_separator(p));
 
     for host in hosts {
-        let checked = !filters.hosts.is_empty() && filters.hosts.contains(host.id.as_key());
+        let checked = !s.options.filters.hosts.is_empty() && s.host_filter_matches(&host.id);
         let row_id = format!("sidebar-host-item-{}", host.id.as_key());
         let debug_id = row_id.clone();
         let target_host = host.id.clone();

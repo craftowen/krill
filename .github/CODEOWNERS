@@ -1,5 +1,5 @@
-# 하네스 파일(AGENTS.md 규칙 8)은 메인테이너 리뷰가 필요하다.
-# 효력은 main ruleset에서 "Require review from Code Owners"를 켜야 생긴다(원격 설정은 사람이 한다).
+# 하네스 파일(AGENTS.md 규칙 8)의 유일한 목록. .claude/hooks/guard.sh가 이 줄들을 읽어 에이전트 편집을 막는다.
+# GitHub 리뷰 강제는 main ruleset의 "Require review from Code Owners"를 켜야 생긴다(원격 설정은 사람이 한다).
 /AGENTS.md               @craftowen
 /CLAUDE.md               @craftowen
 /docs/CONVENTIONS.md     @craftowen
@@ -8,7 +8,12 @@
 /clippy.toml             @craftowen
 /rustfmt.toml            @craftowen
 /deny.toml               @craftowen
-/.config/nextest.toml    @craftowen
+/.config/                @craftowen
 /.cargo/                @craftowen
 /.github/                @craftowen
-/.claude/                @craftowen
+/.claude/settings.json   @craftowen
+/.claude/hooks/          @craftowen
+/.gitleaks.toml          @craftowen
+/packaging/release_check.py   @craftowen
+/packaging/publish-github.sh  @craftowen
+/packaging/ci_evidence.py     @craftowen

@@ -8,9 +8,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use krill_link::{
-    ConnectOptions, Error, LinkConfig, RelaySetting, ServeOptions, create_invite_command,
-    host_status, load_devices, pair_with_server, resolve_state_dir, revoke_device_command,
-    start_server, start_tunnel, status_report,
+    ConnectOptions, DEFAULT_INVITE_TTL, Error, LinkConfig, RelaySetting, ServeOptions,
+    create_invite_command, host_status, load_devices, pair_with_server, resolve_state_dir,
+    revoke_device_command, start_server, start_tunnel, status_report,
 };
 
 #[tokio::main]
@@ -18,7 +18,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            writeln!(io::stderr(), "오류 (Error): {e}").ok();
+            writeln!(io::stderr(), "Error: {e}").ok();
             ExitCode::FAILURE
         }
     }
@@ -66,14 +66,14 @@ async fn run() -> Result<(), String> {
 
 fn usage() -> String {
     [
-        "사용법 (Usage):",
+        "Usage:",
         "  krill-link serve [--socket <krilld.sock>] [--state-dir <dir>]",
         "  krill-link enable | disable",
         "  krill-link invite [--ttl-secs <secs>] [--no-qr] [--json]",
-        "  krill-link pair <krill://pair?...> --name <기기 이름 / device name> [--json]",
+        "  krill-link pair <krill://pair?...> --name <device name> [--json]",
         "  krill-link devices [--json]",
-        "  krill-link revoke <기기 ID 또는 이름 / device id or name> [--json]",
-        "  krill-link connect <호스트 ID / host id>",
+        "  krill-link revoke <device id or name> [--json]",
+        "  krill-link connect <host id>",
         "  krill-link status [--host <id>] [--json]",
         "  krill-link config [--relay <n0|off|https://...>] [--server-name <name>] [--bind-port <port>] [--resume-grace-ms <ms>] [--replay-buffer-bytes <bytes>] [--json]",
     ]
@@ -149,7 +149,7 @@ async fn cmd_serve(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     let mut handle = start_server(opts).await?;
     writeln!(
         io::stdout(),
-        "원격 연결 서버 실행 중 (Remote link server listening): node_id={}",
+        "Remote link server listening: node_id={}",
         handle.node_id()
     )
     .ok();
@@ -175,7 +175,7 @@ fn cmd_enable(state_dir: &Path) -> Result<(), Error> {
     krill_link::service::enable_server(&exe, state_dir)?;
     writeln!(
         io::stdout(),
-        "원격 연결 백그라운드 서비스 켜짐 (Remote link server enabled): {}",
+        "Remote link server enabled: {}",
         state_dir.display()
     )
     .ok();
@@ -186,14 +186,21 @@ fn cmd_disable(state_dir: &Path) -> Result<(), Error> {
     krill_link::service::disable_server(state_dir)?;
     writeln!(
         io::stdout(),
-        "원격 연결 백그라운드 서비스 꺼짐 (Remote link server disabled): {}",
+        "Remote link server disabled: {}",
         state_dir.display()
     )
     .ok();
     Ok(())
 }
 
-async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InviteArgs {
+    ttl_secs: Option<u64>,
+    no_qr: bool,
+    json: bool,
+}
+
+fn parse_invite_args(args: &[String]) -> Result<InviteArgs, Error> {
     let mut ttl_secs: Option<u64> = None;
     let mut no_qr = false;
     let mut json = false;
@@ -206,10 +213,15 @@ async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
                 let val = args.get(i).ok_or_else(|| {
                     Error::InvalidConfig("--ttl-secs requires a value".to_owned())
                 })?;
-                ttl_secs =
-                    Some(val.parse().map_err(|e| {
-                        Error::InvalidConfig(format!("invalid --ttl-secs value: {e}"))
-                    })?);
+                let secs: u64 = val
+                    .parse()
+                    .map_err(|e| Error::InvalidConfig(format!("invalid --ttl-secs value: {e}")))?;
+                if secs == 0 {
+                    return Err(Error::InvalidConfig(
+                        "--ttl-secs must be greater than 0".to_owned(),
+                    ));
+                }
+                ttl_secs = Some(secs);
             }
             "--no-qr" => no_qr = true,
             "--json" => json = true,
@@ -222,24 +234,55 @@ async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
         i += 1;
     }
 
-    let out = create_invite_command(state_dir, ttl_secs.map(Duration::from_secs)).await?;
-    if json {
+    Ok(InviteArgs {
+        ttl_secs,
+        no_qr,
+        json,
+    })
+}
+
+fn format_invite_ttl(ttl: Duration) -> String {
+    let secs = ttl.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    match (h, m, s) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, 0) => format!("{m}m"),
+        (0, m, s) => format!("{m}m{s}s"),
+        (h, 0, 0) => format!("{h}h"),
+        (h, m, 0) => format!("{h}h{m}m"),
+        (h, 0, s) => format!("{h}h{s}s"),
+        (h, m, s) => format!("{h}h{m}m{s}s"),
+    }
+}
+
+async fn cmd_invite(state_dir: &Path, args: &[String]) -> Result<(), Error> {
+    let parsed = parse_invite_args(args)?;
+    let effective_ttl = parsed
+        .ttl_secs
+        .map_or(DEFAULT_INVITE_TTL, Duration::from_secs);
+    let out = create_invite_command(state_dir, parsed.ttl_secs.map(Duration::from_secs)).await?;
+    if parsed.json {
         let mut value =
             serde_json::to_value(&out).map_err(|e| Error::InvalidConfig(e.to_string()))?;
-        if no_qr && let Some(fields) = value.as_object_mut() {
+        if parsed.no_qr
+            && let Some(fields) = value.as_object_mut()
+        {
             fields.remove("qr_unicode");
         }
         let s = serde_json::to_string_pretty(&value)
             .map_err(|e| Error::InvalidConfig(e.to_string()))?;
         writeln!(io::stdout(), "{s}").ok();
     } else {
+        let ttl_label = format_invite_ttl(effective_ttl);
         writeln!(
             io::stdout(),
-            "초대 링크 (10분간 1회 유효 — 다른 컴퓨터에서 붙여넣으세요 / Invite link, valid once for 10m):\n{}",
+            "Invite link, valid once for {ttl_label}. Paste it on the other computer:\n{}",
             out.link
         )
         .ok();
-        if !no_qr {
+        if !parsed.no_qr {
             writeln!(io::stdout(), "\n{}", out.qr_unicode).ok();
         }
     }
@@ -287,7 +330,7 @@ async fn cmd_pair(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "페어링 완료 (Paired successfully): id={} name={} node_id={}",
+            "Paired successfully: id={} name={} node_id={}",
             host.id,
             host.name,
             host.node_id
@@ -305,11 +348,7 @@ fn cmd_devices(state_dir: &Path, args: &[String]) -> Result<(), Error> {
             .map_err(|e| Error::InvalidConfig(e.to_string()))?;
         writeln!(io::stdout(), "{s}").ok();
     } else if devices.is_empty() {
-        writeln!(
-            io::stdout(),
-            "등록된 허용 기기가 없습니다 (No paired devices)."
-        )
-        .ok();
+        writeln!(io::stdout(), "No paired devices.").ok();
     } else {
         writeln!(io::stdout(), "ID\tNAME\tADDED_AT\tNODE_ID").ok();
         for d in devices {
@@ -351,7 +390,7 @@ async fn cmd_revoke(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "기기 연결 권한 해제됨 (Device revoked): id={} name={}",
+            "Device revoked: id={} name={}",
             removed.id,
             removed.name
         )
@@ -373,7 +412,7 @@ async fn cmd_connect(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     .await?;
     writeln!(
         io::stdout(),
-        "원격 호스트 터널 준비됨 (Remote host tunnel listening): {}",
+        "Remote host tunnel listening: {}",
         handle.socket_path().display()
     )
     .ok();
@@ -416,7 +455,7 @@ fn cmd_status(state_dir: &Path, args: &[String]) -> Result<(), Error> {
         } else {
             writeln!(
                 io::stdout(),
-                "호스트 (Host): {} ({})\n상태 (State): {:?}\n경로 (Route): {:?}\nRTT: {:?} ms\n소켓 (Socket): {}",
+                "Host: {} ({})\nState: {:?}\nRoute: {:?}\nRTT: {:?} ms\nSocket: {}",
                 st.host_name,
                 st.host_id,
                 st.state,
@@ -437,7 +476,7 @@ fn cmd_status(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     } else {
         writeln!(
             io::stdout(),
-            "내 기기 ID (Node ID): {}\n중계 설정 (Relay mode): {}\n서버 실행 중 (Server running): {}\n허용 기기 수 (Allowed devices): {}",
+            "Node ID: {}\nRelay mode: {}\nServer running: {}\nAllowed devices: {}",
             report.node_id,
             report.relay_mode,
             report.serve_running,
@@ -511,17 +550,11 @@ fn cmd_config(state_dir: &Path, args: &[String]) -> Result<(), Error> {
                 })?;
                 if field == "--resume-grace-ms" {
                     cfg.resume_grace_ms = value.parse().map_err(|_| {
-                        Error::InvalidConfig(
-                            "유예 시간은 밀리초 숫자로 입력하세요 (invalid grace period)"
-                                .to_owned(),
-                        )
+                        Error::InvalidConfig("invalid grace period: enter milliseconds".to_owned())
                     })?;
                 } else {
                     cfg.replay_buffer_bytes = value.parse().map_err(|_| {
-                        Error::InvalidConfig(
-                            "보관 용량은 바이트 숫자로 입력하세요 (invalid buffer limit)"
-                                .to_owned(),
-                        )
+                        Error::InvalidConfig("invalid buffer limit: enter bytes".to_owned())
                     })?;
                 }
                 modified = true;
@@ -556,4 +589,52 @@ fn cmd_config(state_dir: &Path, args: &[String]) -> Result<(), Error> {
         writeln!(io::stdout(), "{}", cfg.to_toml_string()?).ok();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_invite_args_validates_ttl_and_flags() {
+        let defaults = parse_invite_args(&[]).unwrap();
+        assert_eq!(
+            defaults,
+            InviteArgs {
+                ttl_secs: None,
+                no_qr: false,
+                json: false,
+            }
+        );
+
+        let custom = parse_invite_args(&[
+            "--ttl-secs".to_owned(),
+            "90".to_owned(),
+            "--no-qr".to_owned(),
+            "--json".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(
+            custom,
+            InviteArgs {
+                ttl_secs: Some(90),
+                no_qr: true,
+                json: true,
+            }
+        );
+
+        assert!(parse_invite_args(&["--ttl-secs".to_owned(), "0".to_owned()]).is_err());
+        assert!(parse_invite_args(&["--ttl-secs".to_owned()]).is_err());
+        assert!(parse_invite_args(&["--bogus".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn format_invite_ttl_matches_duration_units() {
+        assert_eq!(format_invite_ttl(DEFAULT_INVITE_TTL), "10m");
+        assert_eq!(format_invite_ttl(Duration::from_secs(45)), "45s");
+        assert_eq!(format_invite_ttl(Duration::from_secs(60)), "1m");
+        assert_eq!(format_invite_ttl(Duration::from_secs(90)), "1m30s");
+        assert_eq!(format_invite_ttl(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_invite_ttl(Duration::from_secs(3665)), "1h1m5s");
+    }
 }

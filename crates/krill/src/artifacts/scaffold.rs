@@ -161,10 +161,7 @@ pub(super) fn init(file: &str, opts: &Opts) -> Result<String, Error> {
         ));
     }
     let arch = opts.archetype.unwrap_or_default();
-    let chosen_theme = match opts.theme {
-        Some(t) => t,
-        None => arch.default_theme(),
-    };
+    let chosen_theme = opts.theme.unwrap_or_else(|| arch.default_theme());
     let resolved_title = opts
         .title
         .as_deref()
@@ -240,8 +237,8 @@ fn escape_html(raw: &str) -> String {
 }
 
 fn render_markdown(title: &str, arch: Archetype) -> String {
-    match arch {
-        Archetype::Brief => format!(
+    if arch == Archetype::Brief {
+        format!(
             "# {title}\n\n\
              **핵심 결론:** 독자가 첫 문장에서 결정 사항과 수치 변화를 파악할 수 있도록 한 문장 결론을 적는다.\n\n\
              ## 주요 지표 변화\n\n\
@@ -250,8 +247,9 @@ fn render_markdown(title: &str, arch: Archetype) -> String {
              | 응답 지연 (p99) | 28 ms | -41.7% (▼ 20 ms) | 실측 기준 명시 |\n\n\
              ## 다음 실행 항목\n\n\
              - [ ] 담당자와 완료 기준이 드러나는 동사형 할 일을 적는다.\n"
-        ),
-        _ => format!(
+        )
+    } else {
+        format!(
             "# {title}\n\n\
              **요약:** 이 문서가 답하는 질문과 검증된 결론을 2~3문장으로 먼저 제시한다.\n\n\
              ## 1. 결론형 소제목을 적어 독자가 제목만 읽어도 논지를 따라가게 한다\n\n\
@@ -259,7 +257,7 @@ fn render_markdown(title: &str, arch: Archetype) -> String {
              | 비교 항목 | 대안 A | 대안 B | 판정 근거 |\n\
              |---|---:|---:|---|\n\
              | 상주 메모리 | 42 MB | 96 MB | 동일 워크로드 실측 |\n"
-        ),
+        )
     }
 }
 

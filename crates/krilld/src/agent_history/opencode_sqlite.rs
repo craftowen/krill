@@ -538,6 +538,11 @@ mod tests {
 
     #[test]
     fn large_transcript_pages_reach_end_and_then_show_new_appends() {
+        // The time budget has its own tests in prefix_budget. Here it would only measure machine load.
+        test_clock::run(usize::MAX, large_transcript_pages_contract);
+    }
+
+    fn large_transcript_pages_contract() {
         let (root, path, mut db) = fixture("bounds");
         let tx = db.transaction().unwrap();
         for index in 0..MAX_MESSAGES {
@@ -601,6 +606,11 @@ mod tests {
 
     #[test]
     fn independent_2307_rows_order_history_reset_wal_rollback_and_rebind() {
+        // The time budget has its own tests in prefix_budget. Here it would only measure machine load.
+        test_clock::run(usize::MAX, independent_2307_rows_contract);
+    }
+
+    fn independent_2307_rows_contract() {
         let (root, path, mut db) = fixture("independent-large");
         let tx = db.transaction().unwrap();
         tx.execute_batch("DELETE FROM part; DELETE FROM message;")

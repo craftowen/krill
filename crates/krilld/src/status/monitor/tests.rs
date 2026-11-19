@@ -65,3 +65,26 @@ fn reaped_process_is_detected_when_no_exit_watch_is_available() {
     let mut agent = tracked(child.id(), identity.unwrap());
     assert!(agent.ended(&[], Instant::now(), crate::sys::start_us));
 }
+
+#[test]
+fn known_agent_process_recognition_covers_orca_presets() {
+    for proc_name in [
+        "grok",
+        "muse-bin-1.0.3",
+        "vibe",
+        "aider",
+        "cursor-agent",
+        "antigravity",
+    ] {
+        assert!(
+            krill_proto::agent::is_known_agent_process(proc_name),
+            "{proc_name} should be recognized"
+        );
+    }
+    for non_agent in ["zsh", "vim"] {
+        assert!(
+            !krill_proto::agent::is_known_agent_process(non_agent),
+            "{non_agent} should not be recognized"
+        );
+    }
+}

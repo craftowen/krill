@@ -82,7 +82,7 @@ fn raw_limit_recovery_preserves_original_file_and_retries_after_repair() {
             Limits::default(),
             true,
             encrypted,
-            key.clone(),
+            key.clone().map(super::super::crypto::Keyring::ready),
         );
         let dir = store.session_dir(ID);
         fs::create_dir_all(&dir).unwrap();
@@ -104,7 +104,14 @@ fn raw_limit_recovery_preserves_original_file_and_retries_after_repair() {
         recorder.seal();
         let paths = crate::store::segments(&dir).unwrap();
         assert_eq!(paths.len(), 2);
-        let next = read(&paths[1], key.as_deref()).unwrap().unwrap();
+        let next = read(
+            &paths[1],
+            key.clone()
+                .map(super::super::crypto::Keyring::ready)
+                .as_deref(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(next.header.start_seq, MAX_RAW - 5);
         assert_eq!(next.records, vec![Record::Data(b"after repair".to_vec())]);
         drop(recorder);

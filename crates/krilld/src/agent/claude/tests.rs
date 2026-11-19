@@ -279,6 +279,28 @@ fn probe_uses_login_environment_and_version_args_only() {
 }
 
 #[test]
+fn probe_reuses_the_version_until_the_binary_changes() {
+    let tmp = Temp::new();
+    let runs = tmp.0.join("claude.runs");
+    let body =
+        |v: &str| format!("#!/bin/sh\nprintf x >> \"$0.runs\"\nprintf '{v} (Claude Code)\\n'\n");
+    let exe = tmp.script("claude", &body("2.1.300"));
+    let profile = profile(&exe);
+    for _ in 0..3 {
+        assert_eq!(
+            probe(&profile, &tmp.login()).as_deref(),
+            Some("2.1.300 (Claude Code)")
+        );
+    }
+    assert_eq!(fs::read_to_string(&runs).unwrap(), "x");
+    tmp.script("claude", &body("2.1.3000"));
+    assert_eq!(
+        probe(&profile, &tmp.login()).as_deref(),
+        Some("2.1.3000 (Claude Code)")
+    );
+}
+
+#[test]
 fn resume_and_session_id_roundtrip() {
     let tmp = Temp::new();
     let krill = tmp.script("krill", "#!/bin/sh\nexit 0\n");

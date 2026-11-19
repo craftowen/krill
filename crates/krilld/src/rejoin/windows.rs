@@ -62,11 +62,20 @@ impl SocketLink {
             let packet = self.recv()?.ok_or(io::ErrorKind::UnexpectedEof)?;
             match holder::decode(packet)? {
                 Some((FromHolder::Hello { version, .. }, _)) if version >= 4 => hello = true,
-                Some((FromHolder::Session { id, pid, status }, Some(master))) if hello => {
+                Some((
+                    FromHolder::Session {
+                        id,
+                        pid,
+                        status,
+                        size,
+                    },
+                    Some(master),
+                )) if hello => {
                     sessions.push(Kept {
                         id,
                         pid,
                         status,
+                        size: size.filter(|s| s.cols > 0 && s.rows > 0),
                         master,
                     });
                 }

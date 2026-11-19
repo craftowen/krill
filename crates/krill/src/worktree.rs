@@ -474,7 +474,7 @@ fn run_list(args: &[OsString]) -> ExitCode {
                     "comment": cp.comment,
                     "pr": cp.pr,
                     "issue": cp.issue,
-                    "parent": cp.parent,
+                    "parent": cp.parent.as_deref().map(shown),
                     "unread": cp.unread,
                 })
             })
@@ -559,6 +559,13 @@ fn run_show(args: &[OsString]) -> ExitCode {
     show_worktree_info(&root, json)
 }
 
+/// Stored keys keep the Windows `\\?\` prefix for compatibility; output shows the ordinary path.
+fn shown(key: &str) -> String {
+    krill_proto::os::shell_path(std::path::Path::new(key))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
     let key = krill_proto::orchestration::worktree_key(root);
     let branch = std::process::Command::new("git")
@@ -578,13 +585,13 @@ fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
     let cp = store.checkpoint(&key);
     if json {
         let payload = serde_json::json!({
-            "worktree": key,
+            "worktree": shown(&key),
             "branch": branch,
             "workspace_status": cp.workspace_status,
             "comment": cp.comment,
             "pr": cp.pr,
             "issue": cp.issue,
-            "parent": cp.parent,
+            "parent": cp.parent.as_deref().map(shown),
             "references": cp.references,
             "unread": cp.unread,
             "updated_at_ms": cp.updated_at_ms,
@@ -597,7 +604,7 @@ fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
             }
         }
     } else {
-        println!("worktree:   {key}");
+        println!("worktree:   {}", shown(&key));
         println!("branch:     {branch}");
         println!(
             "status:     {}",
@@ -609,9 +616,35 @@ fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
             cp.pr.map_or_else(|| "-".to_owned(), |n| format!("#{n}"))
         );
         println!("issue:      {}", cp.issue.as_deref().unwrap_or("-"));
-        println!("parent:     {}", cp.parent.as_deref().unwrap_or("-"));
+        println!(
+            "parent:     {}",
+            cp.parent.as_deref().map_or_else(|| "-".to_owned(), shown)
+        );
     }
     ExitCode::SUCCESS
+}
+
+fn resolve_ps_worktree(remote: bool, wt: Option<OsString>) -> Result<OsString, ExitCode> {
+    if remote {
+        let Some(w) = wt else {
+            eprintln!("remote worktree ps requires --worktree <remote-path>\n{USAGE}");
+            return Err(ExitCode::from(2));
+        };
+        if !crate::remote::is_remote_absolute_path(w.as_os_str().as_bytes()) {
+            eprintln!("remote --worktree must be an absolute path on the remote host\n{USAGE}");
+            return Err(ExitCode::from(2));
+        }
+        return Ok(w);
+    }
+    match wt {
+        Some(w) => Ok(w),
+        None => std::env::current_dir()
+            .map(|c| crate::set::resolve_worktree(&c).into_os_string())
+            .map_err(|e| {
+                eprintln!("worktree ps: {e}");
+                ExitCode::FAILURE
+            }),
+    }
 }
 
 fn run_ps(target: &Target, args: &[OsString]) -> ExitCode {
@@ -639,15 +672,9 @@ fn run_ps(target: &Target, args: &[OsString]) -> ExitCode {
             }
         }
     }
-    let wt_arg = match wt {
-        Some(w) => w,
-        None => match std::env::current_dir() {
-            Ok(c) => crate::set::resolve_worktree(&c).into_os_string(),
-            Err(e) => {
-                eprintln!("worktree ps: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
+    let wt_arg = match resolve_ps_worktree(target.is_remote(), wt) {
+        Ok(w) => w,
+        Err(code) => return code,
     };
     let mut ls_args = vec![OsString::from("ls"), OsString::from("--worktree"), wt_arg];
     if json {
@@ -1118,5 +1145,18 @@ mod tests {
         let saved = std::fs::read_to_string(dir.join("setup-trust")).unwrap();
         assert_eq!(saved, format!("{}\n", "a".repeat(64)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remote_ps_requires_explicit_absolute_worktree_path() {
+        assert_eq!(resolve_ps_worktree(true, None), Err(ExitCode::from(2)));
+        assert_eq!(
+            resolve_ps_worktree(true, Some(OsString::from("relative/path"))),
+            Err(ExitCode::from(2))
+        );
+        assert_eq!(
+            resolve_ps_worktree(true, Some(OsString::from("/srv/repo"))),
+            Ok(OsString::from("/srv/repo"))
+        );
     }
 }

@@ -10,6 +10,7 @@ zip 안 레이아웃(업데이터 updater.rs·rename.rs와 holder sys/windows.rs
   Krill\krill-app.exe, krill.exe, krilld.exe, krill-holder.exe, [krill-link.exe]
   Krill\conpty.dll               필수: holder가 자기 exe 옆에서 로드한다
   Krill\x64\OpenConsole.exe      (B안) conpty.dll이 <dll 폴더>\x64\OpenConsole.exe를 띄운다
+  Krill\arm64\OpenConsole.exe    ARM64 PC(Windows 11 x64 에뮬레이션)에서 conpty.dll이 띄우는 네이티브 콘솔 호스트
   Krill\THIRD_PARTY_NOTICES.txt  ConPTY MIT 고지
 
 OpenConsole 바이너리는 저장소에 넣지 않는다. NuGet Microsoft.Windows.Console.ConPTY 1.25.260930003을 내려받아
@@ -30,10 +31,13 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-# NuGet Microsoft.Windows.Console.ConPTY 1.25.260930003 (MIT) x64 파일과 SHA-256(OWE-826에서 받은 패키지 실측).
+# NuGet Microsoft.Windows.Console.ConPTY 1.25.260930003 (MIT) 파일과 SHA-256(OWE-826에서 받은 패키지 실측).
+# conpty.dll은 OS 네이티브 아키텍처 폴더의 OpenConsole.exe를 띄운다. ARM64 PC(x64 에뮬레이션)는 arm64 폴더를 찾고,
+# 없으면 내장 conhost로 넘어가 세션 입력이 실패한다(windows-11-arm 실측). 그래서 arm64 OpenConsole도 함께 묶는다.
 $ConptyPins = [ordered]@{
-    'runtimes\win-x64\native\conpty.dll'        = @('conpty.dll', 'feeef341d891643c62d30b6b07800bc70f0bc148f44cb8c3bee84aa557ae805a')
-    'build\native\runtimes\x64\OpenConsole.exe' = @('x64\OpenConsole.exe', '3d66b23d0a71bb8eed2b77edc8b9df9bf54ce6c8fb74c863a30e760997f80586')
+    'runtimes\win-x64\native\conpty.dll'          = @('conpty.dll', 'feeef341d891643c62d30b6b07800bc70f0bc148f44cb8c3bee84aa557ae805a')
+    'build\native\runtimes\x64\OpenConsole.exe'   = @('x64\OpenConsole.exe', '3d66b23d0a71bb8eed2b77edc8b9df9bf54ce6c8fb74c863a30e760997f80586')
+    'build\native\runtimes\arm64\OpenConsole.exe' = @('arm64\OpenConsole.exe', '4313825a3ba634d113cc6ed3bc8ce735e3c19d360cecd985794787479469f91f')
 }
 
 # New sessions require the pinned backend; never produce a valid-looking ZIP

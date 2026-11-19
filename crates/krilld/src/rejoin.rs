@@ -26,13 +26,12 @@ use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
-#[cfg(unix)]
-use krill_proto::holder::ToHolder;
-use krill_proto::holder::{FromHolder, STATUS_UNKNOWN};
+use krill_proto::holder::{FromHolder, STATUS_UNKNOWN, ToHolder, WinSize};
 use krill_proto::os::net::{UnixListener, UnixStream};
 
 use crate::holder;
@@ -59,6 +58,11 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 const HALT_TIMEOUT: Duration = Duration::from_secs(2);
 /// krilld#1이 끝나 소켓 락이 풀리기를 기다리는 최대 시간.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 링크가 끊긴 뒤 holder가 정말 끝났는지 보는 시간. holder가 끝나면 링크 EOF가 재부모화(Unix ppid 1,
+/// Windows 부모 pid 0)보다 먼저 보일 수 있다. Windows 프로세스 스냅숏 캐시(500ms)보다 길다.
+const HOLDER_EXIT_GRACE: Duration = Duration::from_secs(1);
+/// accept 오류 뒤 다시 받기 전 쉬는 시간(모바일 게이트웨이와 같은 값).
+pub const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 
 #[cfg(all(test, unix))]
 mod tests;
@@ -67,9 +71,55 @@ fn handoff_path(sock: &Path) -> PathBuf {
     with_suffix(sock, SUFFIX)
 }
 
-/// holder 링크가 끊긴 뒤(리더 스레드에서) 부른다. 세션 종료 감시를 걸고 다음 krilld를 기다린다. 세션을 넘겼으면
+/// holder pid. holder는 krilld의 부모이고 exec 업그레이드 뒤에도 pid가 같다. 링크를 읽기 전에 부른다.
+pub fn holder_pid() -> Option<u32> {
+    sys::parent_pid(std::process::id())
+        .ok()
+        .filter(|&pid| pid > 1)
+}
+
+/// holder 링크가 끊긴 뒤(리더 스레드에서) 부른다. 끝낼 때가 되면 `done`으로 알린다.
+///
+/// holder가 살아 있는데 링크만 끊겼으면 고아를 선언하지 않는다. 고아 선언을 받은 클라이언트는 holder를 하나 더
+/// 띄우고, 두 holder가 같은 PTY를 쥔 채 진 쪽이 krilld를 끝없이 다시 띄운다(2026-10-31, 11-04 운영 사례).
+/// 대신 리더를 멈춰(기록 봉인) 끝난다. holder는 이를 krilld 크래시로 보고 세션과 소켓을 새 krilld에 넘긴다.
+pub fn link_lost(reg: &Arc<Registry>, sock: &Path, holder: Option<u32>, done: &Sender<()>) {
+    if let Some(pid) = holder
+        && holder_alive(pid)
+    {
+        tracing::warn!(
+            holder = pid,
+            "holder link lost but holder alive; exiting for restart"
+        );
+        let _parked = halt_all(reg)
+            .inspect_err(|e| tracing::warn!(kind = ?e.kind(), "readers not parked before exit"))
+            .ok();
+        done.send(()).ok();
+        // 프로세스가 끝날 때까지 리더를 멈춰 둔다. `_parked`를 놓으면 리더가 다시 읽는다.
+        loop {
+            thread::park();
+        }
+    }
+    tracing::warn!("holder link lost and holder gone; serving as orphan");
+    if orphan(reg, sock).is_ok() {
+        done.send(()).ok();
+    }
+}
+
+fn holder_alive(holder: u32) -> bool {
+    let deadline = Instant::now() + HOLDER_EXIT_GRACE;
+    while sys::parent_pid(std::process::id()).ok() == Some(holder) {
+        if Instant::now() >= deadline {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// 세션 종료 감시를 걸고 다음 krilld를 기다린다. 세션을 넘겼으면
 /// `Ok` — 호출자는 프로세스를 끝낸다. 인계 소켓을 열지 못하면 오류(고아 운영만 계속한다).
-pub fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
+fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
     watch_exits(reg);
     let path = handoff_path(sock);
     // 소켓 락을 쥔 이 krilld만 이 이름을 쓴다. 남은 파일은 고아인 채 죽은 이전 krilld의 것이다.
@@ -83,7 +133,10 @@ pub fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
     reg.holder_lost();
     let uid = crate::os::euid();
     loop {
-        let Ok((s, _)) = lis.accept() else { continue };
+        let Ok((s, _)) = lis.accept() else {
+            thread::sleep(ACCEPT_RETRY); // EMFILE 같은 오류가 이어지면 쉬지 않고 돈다(C-4)
+            continue;
+        };
         if sys::peer_uid(s.as_fd()).ok() != Some(uid) {
             continue;
         }
@@ -149,7 +202,12 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
             if let Some(pause) = pause.take() {
                 pause.commit();
             }
-            let m = FromHolder::Session { id, pid, status };
+            let m = FromHolder::Session {
+                id,
+                pid,
+                status,
+                size: session.tap().size().ok(),
+            };
             sent = send(&link, &m, Some(session));
         }
     });
@@ -197,6 +255,14 @@ fn send(link: &HandoffLink, m: &FromHolder, with: Option<&crate::Session>) -> io
         Some(s) => link.send_session(m, s.master()),
         None => link.send(&frame, &[]),
     }
+}
+
+#[derive(Debug)]
+pub struct Adopt {
+    id: SessionId,
+    pid: u32,
+    reported_size: Option<WinSize>,
+    master: Master,
 }
 
 /// krilld#2 쪽: 고아 krilld에게서 받은 세션. [`Handover::merge`] → 레지스트리 생성 → [`adopt`] →
@@ -281,14 +347,19 @@ impl Handover {
     ///
     /// # Errors
     /// master fd 복제 실패.
-    pub fn merge(&mut self, kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, Master)>> {
+    pub fn merge(&mut self, kept: &mut Vec<Kept>) -> io::Result<Vec<Adopt>> {
         let mut adopt = Vec::new();
         for k in self.sessions.drain(..) {
             if kept.iter().any(|h| h.id == k.id) {
                 continue;
             }
             if k.status.is_none() {
-                adopt.push((k.id, k.pid, k.master.try_clone()?));
+                adopt.push(Adopt {
+                    id: k.id,
+                    pid: k.pid,
+                    reported_size: k.size,
+                    master: k.master.try_clone()?,
+                });
             }
             kept.push(k);
         }
@@ -318,17 +389,43 @@ impl Handover {
 /// 넘겨받은 세션을 holder에 `Adopt`로 맡긴다(holder 리더 스레드가 돈 뒤). 그새 끝난 세션(`ESRCH`)은 끝난 것으로
 /// 표시한다.
 // A failed Adopt must not acknowledge handover: the old daemon keeps its handles for a retry.
-pub fn adopt(reg: &Registry, sessions: Vec<(SessionId, u32, Master)>) -> io::Result<()> {
+pub fn adopt(reg: &Registry, sessions: Vec<Adopt>) -> io::Result<()> {
     let h = reg.holder().ok_or(io::ErrorKind::NotConnected)?;
-    for (id, pid, master) in sessions {
+    for a in sessions {
+        let resolved = reg.session_size(a.id);
+        let size = resolved.or(a.reported_size);
         #[cfg(windows)]
-        let r = h.adopt(id, pid, &master);
+        let r = h.adopt(a.id, a.pid, size, &a.master);
         #[cfg(unix)]
-        let r = h.request_with(|req| ToHolder::Adopt { req, id, pid }, &[master.as_fd()]);
+        let r = {
+            let _ = size;
+            h.request_with(
+                |req| ToHolder::Adopt {
+                    req,
+                    id: a.id,
+                    pid: a.pid,
+                    size: None,
+                },
+                &[a.master.as_fd()],
+            )
+        };
         match r? {
-            (FromHolder::Done { .. }, _) => {}
+            (FromHolder::Done { .. }, _) => {
+                #[cfg(windows)]
+                if a.reported_size != resolved
+                    && let Some(sz) = resolved
+                    && h.version() >= 4
+                {
+                    h.request(|req| ToHolder::Resize {
+                        req,
+                        id: a.id,
+                        size: sz,
+                    })
+                    .ok();
+                }
+            }
             (FromHolder::Failed { errno, .. }, _) if errno == libc::ESRCH => {
-                reg.on_exited(id, STATUS_UNKNOWN);
+                reg.on_exited(a.id, STATUS_UNKNOWN);
             }
             (FromHolder::Failed { errno, .. }, _) => {
                 return Err(io::Error::from_raw_os_error(errno));

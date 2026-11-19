@@ -16,3 +16,4 @@ docs/boost-*.md
 /docs/deep-research-*.md
 /docs/research/*
 !/docs/research/orca-mobile-ui-spec.md
+.krig/

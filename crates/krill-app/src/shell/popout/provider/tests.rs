@@ -73,6 +73,53 @@ fn grouping_preserves_profiles_and_uses_active_profile_without_combining_usage()
 }
 
 #[test]
+fn inactive_group_prefers_registered_profile_over_mirrored_host_default() {
+    let mut host = profile("agy-host", Some("first@example.com"));
+    host.provider = ProviderKind::Antigravity;
+    host.host_default = true;
+    host.usage.seven_day = Some(UsageWindow {
+        percent: 61,
+        resets_at: None,
+    });
+    let mut first = profile("agy-profile-1", Some("first@example.com"));
+    first.provider = ProviderKind::Antigravity;
+    first.usage.seven_day = Some(UsageWindow {
+        percent: 89,
+        resets_at: None,
+    });
+    let mut second = profile("agy-profile-2", Some("second@example.com"));
+    second.provider = ProviderKind::Antigravity;
+    second.active = true;
+    second.usage.seven_day = Some(UsageWindow {
+        percent: 61,
+        resets_at: None,
+    });
+    let snap = AccountsSnapshot {
+        accounts: vec![host, first, second],
+        ..Default::default()
+    };
+    let groups = account_groups(&snap, ProviderKind::Antigravity);
+    assert_eq!(groups.len(), 2);
+    let inactive_selected = groups[0].selected().unwrap();
+    assert_eq!(inactive_selected.id, "agy-profile-1");
+    assert!(!inactive_selected.host_default);
+    assert_eq!(
+        comparison_window(&snap, inactive_selected, "7d")
+            .unwrap()
+            .percent,
+        89
+    );
+    let active_selected = groups[1].selected().unwrap();
+    assert_eq!(active_selected.id, "agy-profile-2");
+    assert_eq!(
+        comparison_window(&snap, active_selected, "7d")
+            .unwrap()
+            .percent,
+        61
+    );
+}
+
+#[test]
 fn comparison_keeps_missing_windows_unknown_and_preserves_provider_specific_pools() {
     let mut a = profile("a", Some("a@example.com"));
     a.usage.five_hour = Some(UsageWindow {
@@ -206,6 +253,12 @@ fn comparison_opens_side_details_on_hover_and_click_without_switching(
                             resets_at: None,
                         }),
                     })
+                    .chain(std::iter::once(UsageMeter {
+                        key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
+                        label: "Reset credits".into(),
+                        value: Some("1".into()),
+                        window: None,
+                    }))
                     .collect(),
             });
         cx.notify();
@@ -1354,6 +1407,12 @@ fn short_window_detail_reset_confirmation_stays_reachable(cx: &mut gpui::TestApp
                         resets_at: None,
                     }),
                 })
+                .chain(std::iter::once(UsageMeter {
+                    key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
+                    label: "Reset credits".into(),
+                    value: Some("1".into()),
+                    window: None,
+                }))
                 .collect(),
         }];
         cx.notify();
@@ -1494,4 +1553,110 @@ fn every_provider_popup_fits_short_windows_at_supported_zoom(cx: &mut gpui::Test
             visual.run_until_parked();
         }
     }
+}
+
+#[gpui::test]
+fn detail_flyout_keeps_outer_gap_and_comfortable_inner_padding(cx: &mut gpui::TestAppContext) {
+    use gpui::VisualTestContext;
+    let (shell, handle) = super::super::tests::open(cx);
+    shell.update(cx, |s, cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::Codex,
+        ])));
+        let mut host = profile("host", Some("host@example.com"));
+        host.host_default = true;
+        host.active = true;
+        let snap = std::sync::Arc::make_mut(&mut s.accounts_snapshot);
+        snap.accounts = vec![host];
+        snap.details.accounts = vec![AccountMeters {
+            account_id: "host".into(),
+            plan: Some("plus".into()),
+            meters: vec![
+                UsageMeter {
+                    key: "5h".into(),
+                    label: "5h".into(),
+                    value: None,
+                    window: Some(UsageWindow {
+                        percent: 17,
+                        resets_at: None,
+                    }),
+                },
+                UsageMeter {
+                    key: "7d".into(),
+                    label: "7d".into(),
+                    value: None,
+                    window: Some(UsageWindow {
+                        percent: 65,
+                        resets_at: None,
+                    }),
+                },
+            ],
+        }];
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(handle, cx);
+    visual.simulate_resize(gpui::size(px(1280.), px(800.)));
+    visual.run_until_parked();
+    let pill = visual.debug_bounds("status-provider-pill-codex").unwrap();
+    visual.simulate_click(pill.center(), gpui::Modifiers::default());
+    visual.run_until_parked();
+    let header = visual.debug_bounds("status-provider-table-header").unwrap();
+    let row = visual
+        .debug_bounds("status-provider-account-codex-host")
+        .unwrap();
+    visual.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    visual.run_until_parked();
+    let scroll = visual
+        .debug_bounds("status-provider-detail-scroll")
+        .unwrap();
+    let detail = visual.debug_bounds("status-provider-details-host").unwrap();
+    let meter = visual
+        .debug_bounds("status-provider-detail-host-5h")
+        .unwrap();
+    let menu_right = header.origin.x - px(12.) + px(368.);
+    let outer_gap = scroll.origin.x - menu_right;
+    let left_pad = meter.origin.x - detail.origin.x;
+    let right_pad = detail.right() - meter.right();
+    assert!(
+        outer_gap >= ui::SPACE_3,
+        "provider detail flyout collided with menu edge: outer_gap={outer_gap:?}, menu_right={menu_right:?}, scroll={scroll:?}, left_pad={left_pad:?}, right_pad={right_pad:?}"
+    );
+    assert!(
+        left_pad >= ui::SPACE_4 && right_pad >= ui::SPACE_4,
+        "provider detail content lacked 16px horizontal padding: left_pad={left_pad:?}, right_pad={right_pad:?}, detail={detail:?}, meter={meter:?}"
+    );
+}
+
+#[test]
+fn detail_flyout_origin_uses_symmetric_gap_on_right_left_flip_and_zoom() {
+    let detail_size = gpui::size(px(288.), px(260.));
+    let viewport = gpui::size(px(1280.), px(800.));
+
+    let right_origin = compute_detail_flyout_origin(
+        gpui::point(px(24.), px(476.)),
+        px(368.),
+        px(16.),
+        detail_size,
+        viewport,
+    );
+    assert_eq!(right_origin, gpui::point(px(392.), px(476.)));
+
+    let flipped_origin = compute_detail_flyout_origin(
+        gpui::point(px(760.), px(476.)),
+        px(368.),
+        px(16.),
+        detail_size,
+        viewport,
+    );
+    assert_eq!(flipped_origin, gpui::point(px(448.), px(476.)));
+
+    let zoomed_origin = compute_detail_flyout_origin(
+        gpui::point(px(30.), px(476.)),
+        px(368.),
+        px(24.),
+        detail_size,
+        viewport,
+    );
+    assert_eq!(zoomed_origin, gpui::point(px(392.), px(476.)));
 }

@@ -141,7 +141,7 @@ fn read_stdin(deadline: Instant) -> (Input, Vec<u8>) {
             })
             .ok();
     }
-    (input, buf)
+    (input, hook::strip_utf8_bom(buf))
 }
 
 /// `fd`를 main 스레드에서 `poll`로 기다려 EOF까지 읽는다. 스케줄러 선점으로 `deadline`이 지났어도 커널 버퍼에 이미

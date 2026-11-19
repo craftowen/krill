@@ -613,6 +613,34 @@ fn fit_sends_resize_and_focus_once_per_size_and_on_relink() {
     out(&mut p).clear();
     assert!(p.fit(120, 40).is_none());
     assert!(out(&mut p).is_empty());
+    // 보이는 동안 다른 클라이언트가 크기를 바꾸면 그대로 둔다. 칸이 다시 보이게 되면 한 번 되찾는다.
+    update(
+        &mut p,
+        1,
+        vec![Op::Reset {
+            cols: 80,
+            lines: 24,
+        }],
+    );
+    assert!(p.fit(120, 40).is_none());
+    assert!(out(&mut p).is_empty());
+    p.show();
+    assert!(p.fit(120, 40).is_none());
+    assert_eq!(role_requests(out(&mut p)), [resize, Focus]);
+    out(&mut p).clear();
+    assert!(p.fit(120, 40).is_none());
+    assert!(out(&mut p).is_empty());
+    update(
+        &mut p,
+        2,
+        vec![Op::Reset {
+            cols: 120,
+            lines: 40,
+        }],
+    );
+    out(&mut p).clear();
+    assert!(p.fit(120, 40).is_none());
+    assert!(out(&mut p).is_empty());
     assert!(p.fit(90, 20).is_none());
     assert_eq!(
         role_requests(out(&mut p)),
@@ -638,6 +666,50 @@ fn fit_sends_resize_and_focus_once_per_size_and_on_relink() {
     p.link(SessionId(1), 1, Vec::new(), input::FEAT_INPUT, Now::get());
     assert!(p.fit(70, 10).is_none());
     assert!(role_requests(out(&mut p)).is_empty());
+}
+
+/// 두 기기의 앱이 한 세션을 서로 다른 크기로 보고 있으면, 다시 그릴 때마다 크기를 뺏어 오지 않는다. 뺏으면 PTY 크기가
+/// 0.1초마다 번갈아 바뀌고 에이전트가 화면을 다시 그려 칸이 위아래로 흔들린다.
+#[test]
+fn two_panes_on_one_session_do_not_take_the_size_from_each_other_on_repaint() {
+    let grids = [(153, 54), (191, 49)];
+    let mut panes = grids.map(|(cols, rows)| {
+        let mut p = Pane::default();
+        assert!(p.fit(cols, rows).is_none());
+        p.link(
+            SessionId(1),
+            1,
+            Vec::new(),
+            input::FEAT_INPUT | FEAT_ROLES,
+            Now::get(),
+        );
+        p.show();
+        p
+    });
+    let mut pty = None;
+    let mut changes = 0;
+    for rev in 1..=20 {
+        for p in &mut panes {
+            for request in role_requests(&std::mem::take(out(p))) {
+                if let roles::Request::Resize { cols, rows } = request
+                    && pty != Some((cols, rows))
+                {
+                    pty = Some((cols, rows));
+                    changes += 1;
+                }
+            }
+        }
+        let (cols, lines) = pty.unwrap();
+        for (p, (grid_cols, grid_rows)) in panes.iter_mut().zip(grids) {
+            update(p, rev, vec![Op::Reset { cols, lines }]);
+            assert!(p.fit(grid_cols, grid_rows).is_none());
+        }
+    }
+    // 붙을 때 둘 다 보내고, 처음 보인 칸이 한 번 되찾는다.
+    assert!(
+        changes <= 3,
+        "PTY size changed {changes} times in 20 repaints"
+    );
 }
 
 /// OWE-579: 쓰기가 실패하면 연결을 닫는다(읽는 쪽이 EOF를 받아 셸이 다시 붙는다). 열어 두면 krilld는 붙은 줄 알고 입력은
@@ -1186,6 +1258,61 @@ fn search_highlights_all_visible_matches() {
             },
         ]
     );
+
+    // Changing query or search options immediately clears stale highlights from the prior query,
+    // even before the next search response arrives or when disconnected.
+    assert!(p.search("other", Direction::Next));
+    assert_eq!(p.highlight(), None);
+    assert!(p.highlights().is_empty());
+    assert!(p.search_result().is_none());
+
+    // Simulate a screen hit for "other", then change query while unlinked.
+    let req2 = {
+        let frames = sent(out(&mut p));
+        SearchRequest::decode(frames[0].0, &frames[0].1).unwrap()
+    };
+    update(
+        &mut p,
+        2,
+        vec![Op::Line {
+            line: 1,
+            cells: row("other"),
+        }],
+    );
+    let res2 = SearchResult {
+        req: req2.req,
+        snapshot: Snapshot {
+            revision: Revision(2),
+            seq: Seq(2),
+            ..Snapshot::default()
+        },
+        total: 1,
+        hit: Some(Hit {
+            index: 0,
+            source: SearchSource::Screen,
+            row: 1,
+            total_rows: 3,
+            column: 0,
+            cols: 5,
+            cells: row("other"),
+        }),
+        wrapped: false,
+        stale: false,
+        incomplete: false,
+        approximate: false,
+    };
+    assert!(feed(&mut p, &res2.encode().unwrap()).redraw);
+    assert!(p.highlight().is_some());
+    assert!(!p.highlights().is_empty());
+
+    p.unlink();
+    assert!(!p.search_with_options(
+        "alpha",
+        Direction::Next,
+        krill_proto::search::Options::default(),
+    ));
+    assert_eq!(p.highlight(), None);
+    assert!(p.highlights().is_empty());
 }
 
 #[test]
@@ -2053,7 +2180,7 @@ fn only_daemon_no_session_reply_is_session_gone() {
 }
 
 #[test]
-fn attach_metadata_failure_preserves_identity_without_changing_retry_policy() {
+fn attach_metadata_failure_preserves_identity_and_only_no_session_is_permanent() {
     use krill_proto::control::Failure;
     for failure in [
         Failure::NoHolder,
@@ -2081,7 +2208,14 @@ fn attach_metadata_failure_preserves_identity_without_changing_retry_policy() {
         );
         let error = attach(&paths, SessionId(7), None).err().unwrap();
         assert_eq!(diagnostics::control_failure(&error), Some(failure));
-        assert_eq!(error.kind(), io::ErrorKind::Other);
+        // Only NoSession is permanent; the others stay retryable. It is still not `gone`:
+        // attach refusal alone never removes a pane, the Resume reply decides.
+        let kind = if failure == Failure::NoSession {
+            io::ErrorKind::NotFound
+        } else {
+            io::ErrorKind::Other
+        };
+        assert_eq!(error.kind(), kind, "{failure:?}");
         assert_eq!(error.to_string(), failure.to_string());
         assert_eq!(error.raw_os_error(), None);
         assert!(!is_session_gone(&error));
@@ -2289,6 +2423,186 @@ fn reattach_refreshes_agent_launch_after_shell_hook_and_rebind() {
         drop(linked);
         release.send(()).unwrap();
     }
+    server.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fresh_create_and_attach_with_launch_reuse_control_socket_without_extra_roundtrips() {
+    use krill_proto::os::net::UnixListener;
+    use krill_proto::screen::Attached;
+
+    let dir = std::env::temp_dir().join(format!("mk-fast-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("s.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let expected_agent = AgentLaunch {
+        profile: "codex".into(),
+        permission: Permission::Manual,
+    };
+    let server_agent = expected_agent.clone();
+    let (release, keep_open) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let handshake = || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(
+                    &ipc::ServerHello {
+                        proto_min: ipc::PROTO_MIN,
+                        proto_max: ipc::PROTO_MAX,
+                        features: FEAT_SCREEN | FEAT_CONTROL | FEAT_AGENTS,
+                        build: "test".into(),
+                        instance_id: 11,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            let (kind, body) = read(&mut stream).unwrap();
+            ipc::ClientHello::decode(kind, &body).unwrap();
+            stream
+        };
+
+        // 1) Login shell: Create on socket #1 (zero AgentLaunch frames), Attach on socket #2.
+        let mut control = handshake();
+        let (kind, body) = read(&mut control).unwrap();
+        assert!(matches!(
+            Request::decode(kind, &body).unwrap(),
+            Request::Create(Create {
+                program: Program::Login,
+                cols: 132,
+                rows: 43,
+                ..
+            })
+        ));
+        control
+            .write_all(
+                &Reply::Created {
+                    session: SessionId(77),
+                    pid: 1001,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        drop(control);
+
+        let mut screen = handshake();
+        let (kind, body) = read(&mut screen).unwrap();
+        assert_eq!(
+            Attach::decode(kind, &body).unwrap(),
+            Attach {
+                session: SessionId(77),
+                stream: Stream::Screen { known: None }
+            }
+        );
+        screen
+            .write_all(
+                &Attached {
+                    seq: Seq(0),
+                    revision: Revision(0),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        keep_open.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(screen);
+
+        // 2) Agent session: Create + AgentLaunch share socket #3, Attach uses socket #4.
+        let mut control = handshake();
+        let (kind, body) = read(&mut control).unwrap();
+        assert!(matches!(
+            Request::decode(kind, &body).unwrap(),
+            Request::Create(Create {
+                program: Program::Agent { .. },
+                cols: 132,
+                rows: 43,
+                ..
+            })
+        ));
+        control
+            .write_all(
+                &Reply::Created {
+                    session: SessionId(78),
+                    pid: 1002,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        let (kind, body) = read(&mut control).unwrap();
+        assert_eq!(
+            Request::decode(kind, &body).unwrap(),
+            Request::AgentLaunch {
+                session: SessionId(78)
+            }
+        );
+        control
+            .write_all(&Reply::AgentLaunch(Some(server_agent)).encode().unwrap())
+            .unwrap();
+        drop(control);
+
+        let mut screen = handshake();
+        let (kind, body) = read(&mut screen).unwrap();
+        assert_eq!(
+            Attach::decode(kind, &body).unwrap(),
+            Attach {
+                session: SessionId(78),
+                stream: Stream::Screen { known: None }
+            }
+        );
+        screen
+            .write_all(
+                &Attached {
+                    seq: Seq(0),
+                    revision: Revision(0),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        keep_open.recv_timeout(Duration::from_secs(2)).unwrap();
+    });
+
+    let target = HostTarget::remote("fixture", socket);
+    let login_create = Create {
+        cwd: Vec::new(),
+        cols: 132,
+        rows: 43,
+        program: Program::Login,
+        account: None,
+    };
+    let (found, preloaded) = ensure_session_with_launch(&target, None, &login_create).unwrap();
+    assert!(matches!(found, Found::Live(SessionId(77), true)));
+    assert_eq!(preloaded, Some(PreloadedLaunch(None)));
+    let linked = attach_with_launch(&target, SessionId(77), None, preloaded).unwrap();
+    assert_eq!(linked.launch, None);
+    drop(linked);
+    release.send(()).unwrap();
+
+    let agent_create = Create {
+        cwd: Vec::new(),
+        cols: 132,
+        rows: 43,
+        program: Program::Agent { id: "codex".into() },
+        account: None,
+    };
+    let (found, preloaded) = ensure_session_with_launch(&target, None, &agent_create).unwrap();
+    assert!(matches!(found, Found::Live(SessionId(78), true)));
+    assert_eq!(
+        preloaded,
+        Some(PreloadedLaunch(Some(expected_agent.clone())))
+    );
+    let linked = attach_with_launch(&target, SessionId(78), None, preloaded).unwrap();
+    assert_eq!(linked.launch, Some(expected_agent));
+    drop(linked);
+    release.send(()).unwrap();
+
     server.join().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }

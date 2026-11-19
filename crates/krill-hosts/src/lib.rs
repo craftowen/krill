@@ -300,7 +300,6 @@ impl HostTarget {
             Some(c) => match (c.ensure_socket)() {
                 Ok(sock) => sock,
                 Err(err) => {
-                    (c.on_outcome)(false, Some(&err));
                     let err = match &c.map_error {
                         Some(mapper) => mapper(err),
                         None => normalize_remote_io_error(err),

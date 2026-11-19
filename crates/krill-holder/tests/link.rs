@@ -54,6 +54,7 @@ fn fds_stay_with_their_frames() {
                     id: krill_proto::SessionId(u64::try_from(i).unwrap()),
                     pid: 1,
                     status: None,
+                    size: None,
                 }
             };
             let fds = if m.fds() == 1 {

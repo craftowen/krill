@@ -17,7 +17,7 @@ use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 use serde::Serialize;
 
-const USAGE: &str = "usage: krill search <query> [--agent <claude|codex|agy|opencode>] [--path <worktree>] [--limit <n>] [--json]";
+const USAGE: &str = "usage: krill search [--] <query> [--agent <claude|codex|agy|opencode>] [--path <worktree>] [--limit <n>] [--json]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedArgs {
@@ -47,8 +47,8 @@ struct JsonHit {
 }
 
 pub fn run(raw: &[OsString]) -> ExitCode {
-    // 검색어 `help`와 구분하기 위해 `-h`/`--help`만 도움말로 본다. 베어 `help`는 검색어다.
-    if matches!(raw.first().and_then(|a| a.to_str()), Some("-h" | "--help")) {
+    // 검색어 `help`와 구분하기 위해 `--` 앞의 `-h`/`--help`만 도움말로 본다. 베어 `help`는 검색어다.
+    if has_help_before_separator(raw) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -84,6 +84,23 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     }
 }
 
+fn has_help_before_separator(raw: &[OsString]) -> bool {
+    let mut idx = 0usize;
+    while let Some(arg) = raw.get(idx) {
+        match arg.to_str() {
+            Some("--") => return false,
+            Some("-h" | "--help") => return true,
+            Some("--agent" | "-a" | "--path" | "-p" | "--cwd" | "--limit" | "-n") => {
+                idx = idx.saturating_add(2);
+            }
+            _ => {
+                idx = idx.saturating_add(1);
+            }
+        }
+    }
+    false
+}
+
 fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
     if args.is_empty() {
         return Err(USAGE.to_owned());
@@ -97,6 +114,12 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 
     while let Some(arg) = args.get(idx) {
         match arg.as_str() {
+            "--" => {
+                for word in args.get(idx.saturating_add(1)..).unwrap_or_default() {
+                    query_parts.push(word.clone());
+                }
+                break;
+            }
             "-h" | "--help" => return Err(USAGE.to_owned()),
             "--json" => {
                 json = true;
@@ -288,8 +311,39 @@ mod tests {
     fn help_returns_zero() {
         assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
         assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        assert_eq!(
+            run(&[OsString::from("foo"), OsString::from("--help")]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(&[
+                OsString::from("--agent"),
+                OsString::from("claude"),
+                OsString::from("-h"),
+            ]),
+            ExitCode::SUCCESS
+        );
+        assert!(!has_help_before_separator(&[
+            OsString::from("--"),
+            OsString::from("--help"),
+        ]));
+        assert!(!has_help_before_separator(&[
+            OsString::from("--path"),
+            OsString::from("--help"),
+        ]));
         // 베어 `help`는 검색어다. 실제 데몬 실행은 CLI 통합 테스트에서 검증한다.
         assert_eq!(parse_args(&vec_str(&["help"])).unwrap().query.query, "help");
+    }
+
+    #[test]
+    fn parse_args_accepts_double_dash_for_hyphenated_queries() {
+        let parsed = parse_args(&vec_str(&[
+            "--agent", "claude", "--", "--resume", "-h", "-e", "pattern",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.query.agents, vec![VaultAgent::Claude]);
+        assert_eq!(parsed.query.query, "--resume -h -e pattern");
+        assert!(parse_args(&vec_str(&["--"])).is_err());
     }
 
     #[test]

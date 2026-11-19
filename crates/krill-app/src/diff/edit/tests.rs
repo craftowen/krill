@@ -622,10 +622,14 @@ fn discard_worktree_file_restores_tracked_changes_and_trashes_untracked_files() 
     )
     .unwrap();
     assert!(!repo.join("untracked.txt").exists());
+    // macOS는 `~/.Trash`로 옮기고, Windows는 시스템 휴지통(Recycle Bin)으로 보낸다(`move_path_to_trash`).
+    #[cfg(not(windows))]
     assert_eq!(
         std::fs::read_to_string(home.join(".Trash/untracked.txt")).unwrap(),
         "scratch\n"
     );
+    #[cfg(windows)]
+    assert!(!home.join(".Trash").exists());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1200,4 +1204,166 @@ fn lossy_hunk_does_not_block_clean_hunks_of_the_same_file() {
     assert!(build_hunk_patch(&raw, 1).is_some());
     assert!(build_line_patch(&raw, false, 10, 10, true).is_some());
     assert!(build_line_patch(&raw, false, 1, 1, true).is_none());
+}
+
+#[gpui::test]
+fn create_pr_click_runs_git_off_the_ui_thread(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-pr-dialog-test-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q", "-b", "feature-x"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    let repo = dir.clone();
+    let (panel, cx) = cx.add_window_view(|_, cx| Panel::unconnected(repo, cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| panel.update(cx, |p, cx| p.open_pr_dialog(window, cx)));
+    assert!(
+        cx.update(|_, cx| panel.read(cx).editing.pr_dialog.is_none()),
+        "the click handler must not wait for git"
+    );
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| panel.read(cx).editing.pr_dialog.is_some()));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn partial_unstage_on_staged_new_file_applies_cleanly() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-partial-unstage-new-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "test@example.com"],
+        &["config", "user.name", "Test"],
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(dir.join("added.txt"), "one\ntwo\nthree\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["add", "added.txt"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = ChangedFile {
+        path: b"added.txt".to_vec(),
+        old_path: None,
+        status: *b"A.",
+        staged: None,
+        unstaged: None,
+    };
+    let idx_patch = super::super::raw_patch(&dir, &file, Comparison::Index).unwrap();
+    assert!(idx_patch.contains("new file mode "));
+
+    // Unstage only line 2 from the newly staged file.
+    let unstage_line2 = build_line_patch(&idx_patch, true, 2, 2, true).unwrap();
+    assert!(!unstage_line2.contains("new file mode "));
+    assert!(unstage_line2.contains("--- a/added.txt"));
+    apply_git_patch(&dir, &unstage_line2, true, true).unwrap();
+
+    let staged = Command::new("git")
+        .args(["show", ":added.txt"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(staged.status.success());
+    assert_eq!(String::from_utf8_lossy(&staged.stdout), "one\nthree\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("added.txt")).unwrap(),
+        "one\ntwo\nthree\n"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn partial_stage_on_deleted_file_applies_cleanly() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-partial-stage-del-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "test@example.com"],
+        &["config", "user.name", "Test"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(dir.join("removed.txt"), "one\ntwo\nthree\n").unwrap();
+    for args in [&["add", "removed.txt"][..], &["commit", "-q", "-m", "init"]] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::remove_file(dir.join("removed.txt")).unwrap();
+    let file = ChangedFile {
+        path: b"removed.txt".to_vec(),
+        old_path: None,
+        status: *b".D",
+        staged: None,
+        unstaged: None,
+    };
+    let wt_patch = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
+    assert!(wt_patch.contains("deleted file mode "));
+
+    // Stage deletion of line 2 only, keeping lines 1 and 3 in the index.
+    let stage_line2 = build_line_patch(&wt_patch, false, 2, 2, false).unwrap();
+    assert!(!stage_line2.contains("deleted file mode "));
+    assert!(stage_line2.contains("+++ b/removed.txt"));
+    apply_git_patch(&dir, &stage_line2, true, false).unwrap();
+
+    let staged = Command::new("git")
+        .args(["show", ":removed.txt"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(staged.status.success());
+    assert_eq!(String::from_utf8_lossy(&staged.stdout), "one\nthree\n");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

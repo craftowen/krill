@@ -76,15 +76,47 @@ export async function stats(db, now, days) {
       FROM events WHERE ${within}`).bind(start, now),
     db.prepare(`SELECT date(received_at, 'unixepoch') AS day, count(*) AS rows FROM events
       WHERE ${within} GROUP BY day ORDER BY day`).bind(start, now),
-    db.prepare(`SELECT json_extract(event_json, '$.kind') AS kind,
-      json_extract(event_json, '$.error_code') AS error_code,
-      json_extract(event_json, '$.process') AS process, count(*) AS rows,
-      count(DISTINCT json_extract(event_json, '$.install_hash')) AS affected_installs,
-      count(DISTINCT coalesce(json_extract(event_json, '$.diagnostics.attempt_id'), event_id)) AS distinct_attempts,
-      coalesce(max(json_extract(event_json, '$.detail')), max(json_extract(event_json, '$.diagnostics.reason'))) AS sample_detail,
-      max(json_extract(event_json, '$.source_loc')) AS sample_source_loc
-      FROM events
-      WHERE ${within} GROUP BY kind, error_code, process ORDER BY rows DESC, kind, error_code, process`).bind(start, now),
+    db.prepare(`WITH base AS (
+      SELECT event_id, received_at,
+        json_extract(event_json, '$.kind') AS kind,
+        json_extract(event_json, '$.error_code') AS error_code,
+        json_extract(event_json, '$.process') AS process,
+        json_extract(event_json, '$.install_hash') AS install_hash,
+        coalesce(json_extract(event_json, '$.diagnostics.attempt_id'), event_id) AS attempt_key,
+        coalesce(json_extract(event_json, '$.detail'), json_extract(event_json, '$.diagnostics.reason')) AS detail_val,
+        json_extract(event_json, '$.source_loc') AS source_loc
+      FROM events WHERE ${within}
+    ),
+    grouped AS (
+      SELECT kind, error_code, process, count(*) AS rows,
+        count(DISTINCT install_hash) AS affected_installs,
+        count(DISTINCT attempt_key) AS distinct_attempts
+      FROM base GROUP BY kind, error_code, process
+    ),
+    ranked_detail AS (
+      SELECT kind, error_code, process, detail_val,
+        row_number() OVER (
+          PARTITION BY kind, error_code, process
+          ORDER BY count(*) DESC, (detail_val = 'unknown') ASC, max(received_at) DESC, detail_val ASC
+        ) AS rn
+      FROM base WHERE detail_val IS NOT NULL
+      GROUP BY kind, error_code, process, detail_val
+    ),
+    ranked_source AS (
+      SELECT kind, error_code, process, source_loc,
+        row_number() OVER (
+          PARTITION BY kind, error_code, process
+          ORDER BY count(*) DESC, max(received_at) DESC, source_loc ASC
+        ) AS rn
+      FROM base WHERE source_loc IS NOT NULL
+      GROUP BY kind, error_code, process, source_loc
+    )
+    SELECT g.kind, g.error_code, g.process, g.rows, g.affected_installs, g.distinct_attempts,
+      d.detail_val AS sample_detail, s.source_loc AS sample_source_loc
+    FROM grouped g
+    LEFT JOIN ranked_detail d ON d.kind IS g.kind AND d.error_code IS g.error_code AND d.process IS g.process AND d.rn = 1
+    LEFT JOIN ranked_source s ON s.kind IS g.kind AND s.error_code IS g.error_code AND s.process IS g.process AND s.rn = 1
+    ORDER BY g.rows DESC, g.kind, g.error_code, g.process`).bind(start, now),
     db.prepare(`SELECT json_extract(event_json, '$.release') AS release, count(*) AS rows FROM events
       WHERE ${within} GROUP BY release ORDER BY rows DESC, release LIMIT 20`).bind(start, now),
     db.prepare('SELECT stored_rows, stored_bytes FROM service_state WHERE id = 1'),

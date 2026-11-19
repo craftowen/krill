@@ -61,7 +61,8 @@ struct Rig {
 }
 
 impl Rig {
-    fn new(bundled: bool) -> Self {
+    /// Starts holder+krilld on private install/state dirs without creating a session.
+    fn boot(bundled: bool) -> (Cleanup, PathBuf, PathBuf, PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "krill-update-{}-{}",
             std::process::id(),
@@ -143,20 +144,27 @@ impl Rig {
                 .spawn()
                 .unwrap(),
         );
+        (cleanup, root, install, socket, transcript)
+    }
+
+    fn create_fixture(root: &Path) -> Request {
+        Request::Create(Create {
+            account: None,
+            program: Program::Agent {
+                id: "update-fixture".into(),
+            },
+            cwd: root.to_str().unwrap().as_bytes().to_vec(),
+            cols: 120,
+            rows: 30,
+        })
+    }
+
+    fn new(bundled: bool) -> Self {
+        let (cleanup, root, install, socket, transcript) = Self::boot(bundled);
         let (mut conn, _) = connect(&socket, None);
-        let Reply::Created { session, pid } = request(
-            &mut conn,
-            &Request::Create(Create {
-                account: None,
-                program: Program::Agent {
-                    id: "update-fixture".into(),
-                },
-                cwd: root.to_str().unwrap().as_bytes().to_vec(),
-                cols: 120,
-                rows: 30,
-            }),
-        ) else {
-            panic!("fixture creation failed")
+        let reply = request(&mut conn, &Self::create_fixture(&root));
+        let Reply::Created { session, pid } = reply else {
+            panic!("fixture creation failed: {reply:?}")
         };
         let metadata = AgentLaunch {
             profile: "update-fixture".into(),
@@ -334,17 +342,23 @@ fn wait_screen(conn: &mut UnixStream, session: SessionId, marker: &str) -> Strin
     }
 }
 
+/// Since 85b82000 the holder refuses new sessions on the opaque inbox `ConPTY` (no bundled
+/// conpty.dll and x64/OpenConsole.exe) with `ERROR_MOD_NOT_FOUND`, so no live inbox session can be
+/// created here. krilld must report that failure and keep serving the same daemon generation.
 #[test]
-fn live_inbox_update_refusal_preserves_agent_pid_metadata_transcript_and_input() {
-    let rig = Rig::new(false);
-    let (mut conn, before) = connect(&rig.socket, None);
+fn inbox_conpty_rejects_new_sessions_and_keeps_daemon_serving() {
+    let (_cleanup, root, _, socket, _) = Rig::boot(false);
+    let (mut conn, before) = connect(&socket, None);
     assert_eq!(
-        request(&mut conn, &rig.upgrade()),
-        Reply::Failed(Failure::Os(16))
+        request(&mut conn, &Rig::create_fixture(&root)),
+        Reply::Failed(Failure::Os(126))
     );
-    let (mut conn, after) = connect(&rig.socket, None);
+    assert_eq!(
+        request(&mut conn, &Request::List),
+        Reply::Sessions(Vec::new())
+    );
+    let (_, after) = connect(&socket, None);
     assert_eq!(before.instance_id, after.instance_id);
-    rig.check(&mut conn, "after-refused-update");
 }
 
 #[test]

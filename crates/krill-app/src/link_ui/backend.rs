@@ -282,38 +282,10 @@ impl MockLinkBackend {
         }
     }
 
-    /// 모의 백엔드의 현재 기준 시각(Unix epoch 초)을 읽는다.
-    #[must_use]
-    pub fn now_secs(&self) -> u64 {
-        self.state
-            .lock()
-            .map_or_else(|e| e.into_inner().now_secs, |g| g.now_secs)
-    }
-
     /// 모의 백엔드의 기준 시각을 설정한다(만료 테스트용).
     pub fn set_now_secs(&self, now_secs: u64) {
         if let Ok(mut guard) = self.state.lock() {
             guard.now_secs = now_secs;
-        }
-    }
-
-    /// 모의 백엔드의 기준 시각을 `delta_secs`만큼 앞으로 감는다.
-    pub fn advance_secs(&self, delta_secs: u64) {
-        if let Ok(mut guard) = self.state.lock() {
-            guard.now_secs = guard.now_secs.saturating_add(delta_secs);
-        }
-    }
-
-    /// 마지막으로 발급된 활성 초대 링크를 돌려준다.
-    #[must_use]
-    pub fn active_invite(&self) -> Option<Invite> {
-        self.state.lock().ok().and_then(|g| g.active_invite.clone())
-    }
-
-    /// 다음 `pair()` 호출에 대해 강제 결과를 지정한다(테스트용).
-    pub fn set_next_pair_outcome(&self, outcome: Option<PairOutcome>) {
-        if let Ok(mut guard) = self.state.lock() {
-            guard.forced_outcome = outcome;
         }
     }
 

@@ -4,6 +4,7 @@
 use std::io;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,115 @@ use crate::i18n::catalog::settings as text;
 
 const POLL: Duration = Duration::from_secs(60);
 const HELPER_DEADLINE: Duration = Duration::from_secs(45);
+pub const DAEMON_CONNECT_REPORT_GRACE: Duration = Duration::from_secs(10);
+
+#[must_use]
+#[derive(Debug)]
+pub struct PendingConnectFailure {
+    cancelled: Arc<AtomicBool>,
+    _task: Task<()>,
+}
+
+impl Drop for PendingConnectFailure {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) fn record_app_error_with_env(
+    state: &Path,
+    env: &error_reporting::Env,
+    code: Code,
+    detail: &str,
+    file: &str,
+    line: u32,
+) {
+    let Ok(Some(consent)) = error_reporting::consent_with(state, env) else {
+        return;
+    };
+    let loc = error_reporting::source_location(file, line);
+    let Ok(mut event) = Event::new(Process::App, code, loc) else {
+        return;
+    };
+    event.detail = error_reporting::sanitize_detail(detail);
+    error_reporting::record_with_consent(state, event, &consent).ok();
+}
+
+#[track_caller]
+pub fn defer_daemon_connection_failed(
+    cx: &mut App,
+    error: &dyn std::fmt::Display,
+) -> PendingConnectFailure {
+    defer_daemon_connection_failed_with(
+        cx,
+        crate::settings::state_dir(cx),
+        error_reporting::Env::live(),
+        DAEMON_CONNECT_REPORT_GRACE,
+        &error.to_string(),
+        std::panic::Location::caller(),
+    )
+}
+
+#[cfg(test)]
+fn defer_daemon_connection_failed_at(
+    cx: &mut App,
+    state_dir: Option<std::path::PathBuf>,
+    grace: Duration,
+    detail: &str,
+    loc: &'static std::panic::Location<'static>,
+) -> PendingConnectFailure {
+    defer_daemon_connection_failed_with(
+        cx,
+        state_dir,
+        error_reporting::Env::stub(&[]),
+        grace,
+        detail,
+        loc,
+    )
+}
+
+fn defer_daemon_connection_failed_with(
+    cx: &mut App,
+    state_dir: Option<std::path::PathBuf>,
+    env: error_reporting::Env,
+    grace: Duration,
+    detail: &str,
+    loc: &'static std::panic::Location<'static>,
+) -> PendingConnectFailure {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let detail = detail.to_owned();
+    let file = loc.file();
+    let line = loc.line();
+    let task_cancelled = Arc::clone(&cancelled);
+    let task = cx.spawn(async move |cx| {
+        cx.background_executor().timer(grace).await;
+        if task_cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(state) = state_dir else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                if task_cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                record_app_error_with_env(
+                    &state,
+                    &env,
+                    Code::DaemonConnectFailed,
+                    &detail,
+                    file,
+                    line,
+                );
+            })
+            .await;
+    });
+    PendingConnectFailure {
+        cancelled,
+        _task: task,
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct Panel {
@@ -61,18 +171,23 @@ struct Reporter {
 impl Global for Reporter {}
 
 /// Capture the failed connection boundary without running disk work on GPUI.
-pub fn daemon_connection_failed(cx: &mut App) {
+#[track_caller]
+pub fn daemon_connection_failed(cx: &mut App, error: &dyn std::fmt::Display) {
+    let loc = std::panic::Location::caller();
+    let detail = error.to_string();
     let Some(state) = crate::settings::state_dir(cx) else {
         return;
     };
     cx.background_spawn(async move {
-        if let Ok(event) = Event::new(
+        error_reporting::capture_detailed_at(
+            &state,
             Process::App,
             Code::DaemonConnectFailed,
-            error_reporting::source_location(file!(), line!()),
-        ) {
-            error_reporting::record_at(&state, event).ok();
-        }
+            Some(&detail),
+            &[],
+            loc.file(),
+            loc.line(),
+        );
     })
     .detach();
 }
@@ -203,10 +318,157 @@ fn send_pending(state: &Path) -> io::Result<()> {
     }
 }
 
+pub(crate) fn user_io_error_in(err: &io::Error, lang: crate::i18n::Language) -> String {
+    let raw = err.to_string();
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.contains("remote host disconnected") {
+        return text::REMOTE_HOST_DISCONNECTED.in_language(lang).to_owned();
+    }
+    if lower.contains("provider executable not found") {
+        return text::PROVIDER_CLI_NOT_FOUND.in_language(lang).to_owned();
+    }
+    if lower.contains("requires the daemon")
+        || lower.contains("requires daemon")
+        || lower.contains("require daemon")
+        || trimmed == text::ACCOUNTS_DAEMON_REQUIRED.in_language(crate::i18n::Language::Ko)
+        || trimmed == text::ACCOUNTS_DAEMON_REQUIRED.in_language(crate::i18n::Language::En)
+    {
+        return text::ACCOUNTS_DAEMON_REQUIRED.in_language(lang).to_owned();
+    }
+    if lower.contains("feat_")
+        || lower.contains("not negotiated")
+        || lower.contains("does not support")
+    {
+        return text::ACCOUNTS_DAEMON_RESTART_REQUIRED
+            .in_language(lang)
+            .to_owned();
+    }
+    if lower.contains("closed usage stream")
+        || lower.contains("broken pipe")
+        || lower.contains("not connected")
+    {
+        return text::IO_CONNECTION_LOST.in_language(lang).to_owned();
+    }
+    if lower.contains("connection refused") || err.kind() == io::ErrorKind::ConnectionRefused {
+        return text::IO_CONNECTION_REFUSED.in_language(lang).to_owned();
+    }
+    if matches!(
+        err.kind(),
+        io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    ) {
+        return text::IO_CONNECTION_LOST.in_language(lang).to_owned();
+    }
+    if matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) || lower.contains("timed out")
+    {
+        return text::IO_TIMED_OUT.in_language(lang).to_owned();
+    }
+    if err.kind() == io::ErrorKind::PermissionDenied || lower.contains("permission denied") {
+        return text::IO_PERMISSION_DENIED.in_language(lang).to_owned();
+    }
+    if err.kind() == io::ErrorKind::NotFound || lower.contains("no such file") {
+        return text::IO_NOT_FOUND.in_language(lang).to_owned();
+    }
+    if let Some(msg) = crate::i18n::translate_daemon_notice_in(trimmed, lang) {
+        return msg;
+    }
+    text::IO_GENERIC.in_language(lang).to_owned()
+}
+
+/// Format an `io::Error` into calm, localized copy suitable for user-facing UI surfaces.
+pub fn user_io_error(err: &io::Error) -> String {
+    user_io_error_in(err, crate::i18n::language())
+}
+
+pub(crate) fn user_daemon_error_in(
+    err: &krill_proto::daemon::Error,
+    lang: crate::i18n::Language,
+) -> String {
+    use krill_proto::daemon::Error;
+    match err {
+        Error::Spawn(io_err) | Error::Io(io_err) => user_io_error_in(io_err, lang),
+        Error::Missing(_) => text::IO_NOT_FOUND.in_language(lang).to_owned(),
+        Error::Timeout | Error::LockTimeout => text::IO_TIMED_OUT.in_language(lang).to_owned(),
+        Error::PathTooLong(_) | Error::HolderExited(_) | Error::Backoff { .. } => {
+            text::IO_CONNECTION_REFUSED.in_language(lang).to_owned()
+        }
+    }
+}
+
+/// Format a daemon connection error into calm, localized copy suitable for user-facing UI surfaces.
+pub fn user_daemon_error(err: &krill_proto::daemon::Error) -> String {
+    user_daemon_error_in(err, crate::i18n::language())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Language::{En, Ko};
     use std::sync::mpsc;
+
+    #[test]
+    fn user_io_error_sanitizes_kinds_sockets_and_features() {
+        for lang in [Ko, En] {
+            let not_connected = io::Error::from(io::ErrorKind::NotConnected);
+            assert_eq!(
+                user_io_error_in(&not_connected, lang),
+                text::IO_CONNECTION_LOST.in_language(lang)
+            );
+
+            let broken_pipe = io::Error::from(io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                user_io_error_in(&broken_pipe, lang),
+                text::IO_CONNECTION_LOST.in_language(lang)
+            );
+
+            let refused = io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "/Users/alice/.krill/krilld.sock: connection refused (os error 61)",
+            );
+            let refused_msg = user_io_error_in(&refused, lang);
+            assert_eq!(refused_msg, text::IO_CONNECTION_REFUSED.in_language(lang));
+            assert!(!refused_msg.contains("krilld.sock") && !refused_msg.contains("os error"));
+
+            let timed_out = io::Error::from(io::ErrorKind::TimedOut);
+            assert_eq!(
+                user_io_error_in(&timed_out, lang),
+                text::IO_TIMED_OUT.in_language(lang)
+            );
+
+            let perm = io::Error::from(io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                user_io_error_in(&perm, lang),
+                text::IO_PERMISSION_DENIED.in_language(lang)
+            );
+
+            let not_found = io::Error::from(io::ErrorKind::NotFound);
+            assert_eq!(
+                user_io_error_in(&not_found, lang),
+                text::IO_NOT_FOUND.in_language(lang)
+            );
+
+            let feat = io::Error::other("FEAT_USAGE not negotiated");
+            let feat_msg = user_io_error_in(&feat, lang);
+            assert_eq!(
+                feat_msg,
+                text::ACCOUNTS_DAEMON_RESTART_REQUIRED.in_language(lang)
+            );
+            assert!(!feat_msg.contains("FEAT_"));
+
+            let raw_sock = io::Error::other("/tmp/krill-999.sock: broken (os error 54)");
+            let sock_msg = user_io_error_in(&raw_sock, lang);
+            assert_eq!(sock_msg, text::IO_GENERIC.in_language(lang));
+            assert!(!sock_msg.contains(".sock") && !sock_msg.contains("os error"));
+        }
+    }
 
     #[test]
     fn error_reporting_quit_waits_for_refresh_and_fences_late_refresh() {
@@ -235,6 +497,91 @@ mod tests {
         let slot = slot.lock().unwrap();
         assert!(slot.guard.is_none());
         assert!(slot.generation.is_none());
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    fn drain_events(state: &Path) -> Vec<Event> {
+        let consent = error_reporting::consent_with(state, &error_reporting::Env::stub(&[]))
+            .unwrap()
+            .unwrap();
+        let lock = error_reporting::UploadLock::try_acquire(state)
+            .unwrap()
+            .unwrap();
+        let mut events = Vec::new();
+        error_reporting::flush(state, &consent, &lock, |body| {
+            let req: error_reporting::Request = serde_json::from_slice(body).unwrap();
+            let ack = error_reporting::Ack {
+                schema_version: error_reporting::SCHEMA_VERSION,
+                accepted_ids: req.events.iter().map(|e| e.event_id.clone()).collect(),
+                duplicate_ids: Vec::new(),
+            };
+            events.extend(req.events);
+            error_reporting::Reply::Http {
+                status: 200,
+                retry_after_secs: None,
+                body: serde_json::to_vec(&ack).unwrap(),
+            }
+        })
+        .unwrap();
+        events
+    }
+
+    #[gpui::test]
+    fn defer_daemon_connect_failure_respects_grace_and_redacts_detail(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state =
+            std::env::temp_dir().join(format!("krill-defer-daemon-err-{}", std::process::id()));
+        std::fs::remove_dir_all(&state).ok();
+        error_reporting::enable(&state).unwrap();
+        let grace = Duration::from_millis(80);
+        let raw_error = "/Users/alice/.krill/krilld.sock: connection refused (os error 61)";
+
+        let pending = cx.update(|cx| {
+            defer_daemon_connection_failed_at(
+                cx,
+                Some(state.clone()),
+                grace,
+                raw_error,
+                std::panic::Location::caller(),
+            )
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(40));
+        cx.run_until_parked();
+        drop(pending);
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(
+            drain_events(&state).is_empty(),
+            "connect failure recovered within grace must record 0 events"
+        );
+
+        let pending = cx.update(|cx| {
+            defer_daemon_connection_failed_at(
+                cx,
+                Some(state.clone()),
+                grace,
+                raw_error,
+                std::panic::Location::caller(),
+            )
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(grace);
+        cx.run_until_parked();
+        let events = drain_events(&state);
+        drop(pending);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].process, Process::App);
+        assert_eq!(events[0].error_code, Code::DaemonConnectFailed);
+        let detail = events[0].detail.as_deref().expect("redacted detail");
+        assert!(detail.contains("[USER]"), "{detail}");
+        assert!(!detail.contains("alice"), "{detail}");
+        let source_loc = events[0].source_loc.as_deref().expect("source_loc");
+        assert!(
+            source_loc.starts_with("crates/krill-app/src/"),
+            "{source_loc}"
+        );
         std::fs::remove_dir_all(state).unwrap();
     }
 }

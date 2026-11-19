@@ -1,8 +1,5 @@
 //! Local IPC account operations. Network calls run outside the gateway lock.
-use super::{
-    ConnectMode, Gateway, hex, invalid, io, lock, named_tunnel, now_ms, random, relay_on,
-    save_intent, ws,
-};
+use super::{ConnectMode, Gateway, hex, invalid, io, lock, now_ms, random, save_intent, ws};
 use crate::mobile::relay_auth::{Pending, Session, post};
 use serde_json::{Value, json};
 
@@ -17,7 +14,7 @@ impl Gateway {
                     .as_ref()
                     .filter(|s| s.valid(&state.publication.origin, now_ms()));
                 Ok(
-                    json!({"requires_sign_in":relay_on(&state) && named_tunnel(&state).is_none(),"signed_in":session.is_some(),"email":session.map(|s| &s.email),"expires_at_ms":session.map(|s| s.expires_at_ms),"pending":state.account.pending.as_ref().is_some_and(|p| p.expires_at_ms > now_ms())}),
+                    json!({"requires_sign_in":true,"signed_in":session.is_some(),"email":session.map(|s| &s.email),"expires_at_ms":session.map(|s| s.expires_at_ms),"pending":state.account.pending.as_ref().is_some_and(|p| p.expires_at_ms > now_ms())}),
                 )
             }
             "relay_auth_start" => self.relay_login_start(),

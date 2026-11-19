@@ -554,3 +554,32 @@ fn minimum_contrast_rescues_dark_bg_and_preserves_powerline_and_block_glyphs() {
     assert_eq!(s.colors[2].1, near_dark);
     assert_eq!(s.colors[3].1, near_dark);
 }
+
+#[test]
+fn standalone_wrap_spacer_preserves_background_and_underline_at_end_of_row() {
+    let mut cells = vec![
+        styled('a', Color::Default, Color::Rgb(RED), Flags::UNDERLINE),
+        styled('b', Color::Default, Color::Rgb(RED), Flags::UNDERLINE),
+    ];
+    let expected_underline = plan_row(&cells, &DEFAULT).underlines[0].color;
+    let mut leading_spacer = styled(' ', Color::Default, Color::Rgb(RED), Flags::UNDERLINE);
+    leading_spacer.flags |= Flags::SPACER;
+    cells.push(leading_spacer);
+    let plan = plan_row(&cells, &DEFAULT);
+    assert_eq!(
+        plan.bg,
+        [Span {
+            column: 0,
+            cols: 3,
+            color: RED
+        }]
+    );
+    assert_eq!(
+        plan.underlines,
+        [Span {
+            column: 0,
+            cols: 3,
+            color: expected_underline,
+        }]
+    );
+}

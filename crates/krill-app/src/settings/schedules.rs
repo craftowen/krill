@@ -18,14 +18,8 @@ use super::{SettingsView, layout, open_file, state_dir, text};
 
 mod editor;
 pub(super) mod model;
-mod page;
-pub(super) use model::SchedulesState;
 pub use model::run_outcome_badge_spec;
-use model::{
-    AutomationsSubView, DetailTab, OutcomeFilter, RunOutcome, RunsStatusFilter, ScheduleSortField,
-    StatusFilter, TEMPLATES, Template, latest_run, matches_run, matches_schedule, next_run,
-    now_minute, retained_count,
-};
+use model::{TEMPLATES, Template};
 
 /// 스케줄 추가/편집 모달 입력 상태.
 pub(super) struct ScheduleModal {
@@ -901,7 +895,7 @@ impl SettingsView {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .child(layout::label(
+                    .child(self.search_focus.label(
                         p,
                         text::SCHEDULES_TITLE.get(),
                         Some(text::SCHEDULES_DESC.get()),
@@ -1077,7 +1071,7 @@ impl SettingsView {
                                     .debug_selector(move || toggle_id.clone()),
                                 )
                                 .child(
-                                    layout::primary(
+                                    layout::secondary(
                                         gpui::ElementId::Name(run_now_id.clone().into()),
                                         text::SCHEDULE_RUN_NOW.get(),
                                     )
@@ -1104,18 +1098,12 @@ impl SettingsView {
                                         },
                                     )),
                                 )
-                                .child(
-                                    layout::ghost(
-                                        gpui::ElementId::Name(rm_id.clone().into()),
-                                        text::SCHEDULE_REMOVE.get(),
-                                    )
-                                    .debug_selector(move || rm_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.remove_schedule(&id_for_rm, cx);
-                                        },
-                                    )),
-                                )
+                                .child(self.confirm_button(
+                                    rm_id,
+                                    text::SCHEDULE_REMOVE.get(),
+                                    cx,
+                                    move |this, cx| this.remove_schedule(&id_for_rm, cx),
+                                ))
                         }),
                 );
             }

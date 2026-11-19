@@ -115,8 +115,6 @@ pub const NOTIFICATIONS_ID: &str = "app.notifications";
 pub const QUARANTINE_ID: &str = "app.quarantine";
 pub const FOLDERS_ID: &str = "app.folders";
 pub const FULL_DISK_ID: &str = "app.full_disk";
-pub const ACCESSIBILITY_ID: &str = "app.accessibility";
-pub const SCREEN_RECORDING_ID: &str = "app.screen_recording";
 
 /// 폴더 접근 거부 시 여는 설정 화면.
 pub const FOLDERS_SETTINGS_URL: &str =
@@ -124,12 +122,6 @@ pub const FOLDERS_SETTINGS_URL: &str =
 /// 전체 디스크 접근 거부 시 여는 설정 화면.
 pub const FULL_DISK_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
-/// 손쉬운 사용(Accessibility) 권한 설정 화면(MK-187 Computer Use).
-pub const ACCESSIBILITY_SETTINGS_URL: &str =
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
-/// 화면 기록(Screen Recording) 권한 설정 화면(MK-187 Computer Use).
-pub const SCREEN_RECORDING_SETTINGS_URL: &str =
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
 /// 자동화 접근이 거부됐을 때 여는 설정 화면.
 pub const AUTOMATION_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation";
@@ -566,104 +558,6 @@ pub fn probe_folders(timeout: Duration) -> Vec<(FolderKind, bool)> {
 /// `FolderKind`의 검사 경로. `HOME`이 없으면 `None`이다.
 pub fn folder_path(kind: FolderKind) -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(kind.subdir()))
-}
-
-/// Computer Use TCC 권한 종류(MK-187).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComputerUsePermissionKind {
-    Accessibility,
-    Screenshots,
-}
-
-impl ComputerUsePermissionKind {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim() {
-            "accessibility" => Some(Self::Accessibility),
-            "screenshots" | "screen" | "screen-recording" => Some(Self::Screenshots),
-            _ => None,
-        }
-    }
-
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Accessibility => "accessibility",
-            Self::Screenshots => "screenshots",
-        }
-    }
-
-    pub const fn settings_url(self) -> &'static str {
-        match self {
-            Self::Accessibility => ACCESSIBILITY_SETTINGS_URL,
-            Self::Screenshots => SCREEN_RECORDING_SETTINGS_URL,
-        }
-    }
-}
-
-/// Computer Use TCC 권한 스냅샷(MK-187).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ComputerUsePermissions {
-    pub accessibility: bool,
-    pub screenshots: bool,
-}
-
-impl ComputerUsePermissions {
-    pub const fn is_granted(self, kind: ComputerUsePermissionKind) -> bool {
-        match kind {
-            ComputerUsePermissionKind::Accessibility => self.accessibility,
-            ComputerUsePermissionKind::Screenshots => self.screenshots,
-        }
-    }
-
-    pub const fn all_granted(self) -> bool {
-        self.accessibility && self.screenshots
-    }
-}
-
-/// 손쉬운 사용(Accessibility) TCC 권한 허용 여부(`AXIsProcessTrusted`, 프롬프트 없음).
-#[cfg(target_os = "macos")]
-pub fn probe_accessibility() -> bool {
-    // SAFETY: `ApplicationServices`의 `AXIsProcessTrusted`는 인자 없는 읽기 전용 C 함수다.
-    unsafe { AXIsProcessTrusted() != 0 }
-}
-#[cfg(not(target_os = "macos"))]
-pub fn probe_accessibility() -> bool {
-    false
-}
-
-/// 화면 기록(Screen Recording) TCC 권한 허용 여부(`CGPreflightScreenCaptureAccess`, 프롬프트 없음).
-#[cfg(target_os = "macos")]
-pub fn probe_screen_recording() -> bool {
-    // SAFETY: `CoreGraphics`의 `CGPreflightScreenCaptureAccess`는 인자 없는 읽기 전용 C 함수다.
-    unsafe { CGPreflightScreenCaptureAccess() }
-}
-#[cfg(not(target_os = "macos"))]
-pub fn probe_screen_recording() -> bool {
-    false
-}
-
-/// Computer Use에 필요한 두 TCC 권한(손쉬운 사용·화면 기록)을 프롬프트 없이 조회한다.
-pub fn probe_computer_use_permissions() -> ComputerUsePermissions {
-    ComputerUsePermissions {
-        accessibility: probe_accessibility(),
-        screenshots: probe_screen_recording(),
-    }
-}
-
-/// 지정한 Computer Use 권한의 시스템 설정 화면을 연다.
-pub fn open_computer_use_settings(kind: ComputerUsePermissionKind) -> bool {
-    open_first_available(&[kind.settings_url(), SETTINGS_ROOT_URL])
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "ApplicationServices", kind = "framework")]
-unsafe extern "C" {
-    fn AXIsProcessTrusted() -> u8;
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGPreflightScreenCaptureAccess() -> bool;
 }
 
 #[cfg(test)]

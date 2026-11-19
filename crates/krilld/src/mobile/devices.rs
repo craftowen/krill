@@ -3,6 +3,7 @@ use super::e2ee::{invalid, random};
 use krill_proto::mobile::{PairedMobileDevice, PairingTicket};
 use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
 use ring::{digest, hmac};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -32,13 +33,27 @@ pub struct Devices {
     path: Option<PathBuf>,
     entries: Vec<PairedMobileDevice>,
     ticket: Option<PairingTicket>,
-    failures: u8,
-    retry_at: u64,
+    /// 인증 실패 예산. 활성 기기는 기기별, 페어링·모르는·회수된 기기는 `None` 하나를 같이 쓴다.
+    budgets: HashMap<Option<String>, Budget>,
     /// 마지막으로 성공한 저장 시각(ms). 0이면 이 프로세스에서 아직 저장하지 않았다.
     saved_at: u64,
 }
 impl Devices {
     pub fn open(dir: Option<&Path>) -> io::Result<Self> {
+        if let Some(d) = dir
+            && let Ok(entries) = fs::read_dir(d)
+        {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str()
+                    && name.starts_with(".mobile-")
+                    && std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+                {
+                    fs::remove_file(entry.path()).ok();
+                }
+            }
+        }
         let path = dir.map(|d| d.join("mobile-devices.json"));
         let devices = match path.as_deref().map(read_private).transpose()?.flatten() {
             Some(bytes) => {
@@ -58,8 +73,7 @@ impl Devices {
             path,
             entries: devices,
             ticket: None,
-            failures: 0,
-            retry_at: 0,
+            budgets: HashMap::new(),
             saved_at: 0,
         })
     }
@@ -98,28 +112,40 @@ impl Devices {
         self.ticket = Some(ticket.clone());
         Ok(ticket)
     }
-    /// 실패 예산은 ticket 회전으로 초기화하지 않는다. 전체 게이트웨이에 적용해 주소 우회를 막는다.
-    pub fn attempt(&mut self, now: u64) -> io::Result<()> {
-        self.check_cooldown(now)?;
-        self.failures = self.failures.saturating_add(1);
-        if self.failures >= 5 {
-            self.retry_at = now.saturating_add(60_000);
+    /// 실패 예산은 ticket 회전으로 초기화하지 않는다. 주소가 아니라 주장한 인증 주체별로 세어 주소 우회를 막고,
+    /// 한 기기(회수된 폰 포함)의 실패가 다른 기기의 재접속을 막지 않게 한다.
+    pub fn attempt(&mut self, now: u64, device_id: Option<&str>) -> io::Result<()> {
+        self.check_cooldown(now, device_id)?;
+        let budget = self.budget(device_id);
+        budget.failures = budget.failures.saturating_add(1);
+        if budget.failures >= 5 {
+            budget.retry_at = now.saturating_add(60_000);
         }
         Ok(())
     }
     /// 연결 성공·전송 중단은 실패 예산을 소모하지 않는다.
-    pub fn check_cooldown(&mut self, now: u64) -> io::Result<()> {
-        if now < self.retry_at {
+    pub fn check_cooldown(&mut self, now: u64, device_id: Option<&str>) -> io::Result<()> {
+        let budget = self.budget(device_id);
+        if now < budget.retry_at {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 AuthRejection::Cooldown,
             ));
         }
-        if self.retry_at != 0 {
-            self.failures = 0;
-            self.retry_at = 0;
+        if budget.retry_at != 0 {
+            *budget = Budget::default();
         }
         Ok(())
+    }
+    fn budget(&mut self, device_id: Option<&str>) -> &mut Budget {
+        let key = device_id
+            .filter(|id| {
+                self.entries
+                    .iter()
+                    .any(|d| d.device_id == *id && d.revoked_at_ms.is_none())
+            })
+            .map(str::to_owned);
+        self.budgets.entry(key).or_default()
     }
     pub fn pairing_secret(&self, token: &[u8; 32], now: u64) -> io::Result<[u8; 32]> {
         let ticket = self.ticket(now).ok_or_else(invalid)?;
@@ -171,8 +197,7 @@ impl Devices {
         self.saved_at = now;
         self.entries = next;
         self.ticket = None;
-        self.failures = 0;
-        self.retry_at = 0;
+        self.budgets.remove(&None);
         let mut public = device;
         public.shared_secret_hash.clear();
         Ok((public, credential))
@@ -192,8 +217,7 @@ impl Devices {
                 Err(error) => tracing::warn!(kind=?error.kind(), "mobile last_seen save failed"),
             }
         }
-        self.failures = 0;
-        self.retry_at = 0;
+        self.budgets.remove(&Some(id.to_owned()));
         Ok(())
     }
     pub fn revoke(&mut self, id: Option<&str>, all: bool, now: u64) -> io::Result<usize> {
@@ -211,6 +235,14 @@ impl Devices {
         self.save(&next)?;
         self.saved_at = now;
         self.entries = next;
+        let active = &self.entries;
+        self.budgets.retain(|key, _| {
+            key.as_ref().is_none_or(|id| {
+                active
+                    .iter()
+                    .any(|d| &d.device_id == id && d.revoked_at_ms.is_none())
+            })
+        });
         // 전체 회수는 대기 QR도 폐기해야 즉시 노출이 끝난다.
         if all {
             self.clear_ticket();
@@ -226,6 +258,11 @@ impl Devices {
             &serde_json::to_vec(devices).map_err(io::Error::other)?,
         )
     }
+}
+#[derive(Debug, Default)]
+struct Budget {
+    failures: u8,
+    retry_at: u64,
 }
 /// 본인 소유·0600·심볼릭 링크 아님을 확인하고 읽는다. 없으면 `None`.
 pub(super) fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -310,3 +347,24 @@ pub fn decode_hex<const N: usize>(value: &str) -> io::Result<[u8; N]> {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+#[cfg(unix)]
+mod orphan_tmp_tests {
+    use super::*;
+
+    #[test]
+    fn open_sweeps_stale_mobile_tmp_files() {
+        let random_bytes = random().unwrap_or([0; 32]);
+        let dir = std::env::temp_dir().join(format!("mk-mobile-tmp-{}", hex(&random_bytes)));
+        assert!(fs::create_dir_all(&dir).is_ok());
+        let stale = dir.join(".mobile-0123456789abcdef.tmp");
+        let keep = dir.join("other.tmp");
+        assert!(fs::write(&stale, b"partial").is_ok());
+        assert!(fs::write(&keep, b"keep").is_ok());
+        assert!(Devices::open(Some(&dir)).is_ok());
+        assert!(!stale.exists());
+        assert!(keep.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+}

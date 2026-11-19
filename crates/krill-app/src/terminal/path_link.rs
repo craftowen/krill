@@ -391,7 +391,7 @@ fn candidates_at(row: &[Cell], column: u16) -> Vec<Candidate> {
         .collect();
     starts.sort_by_key(|&start| {
         (
-            !matches!(chars[start].1, '/' | '~'),
+            !starts_with_root_or_home(&chars, start),
             std::cmp::Reverse(start),
         )
     });
@@ -408,7 +408,7 @@ fn candidates_at(row: &[Cell], column: u16) -> Vec<Candidate> {
     // 절대·홈 경로를 우선하고 같은 시작점에서는 가장 긴 실재 경로를 고른다.
     ranges.sort_by_key(|&(start, end)| {
         (
-            !matches!(chars[start].1, '/' | '~'),
+            !starts_with_root_or_home(&chars, start),
             std::cmp::Reverse(end - start),
         )
     });
@@ -477,14 +477,42 @@ pub(super) fn valid_raw_candidate(path: &str) -> bool {
         && !path.chars().any(|c| c.is_control() || is_bidi_control(c))
 }
 
+fn starts_with_root_or_home(chars: &[(u16, char, u16)], start: usize) -> bool {
+    if chars
+        .get(start)
+        .is_some_and(|&(_, ch, _)| matches!(ch, '/' | '~'))
+    {
+        return true;
+    }
+    if matches!(
+        chars.get(start..start + 2),
+        Some(&[(_, '\\', _), (_, '\\', _)])
+    ) {
+        return true;
+    }
+    matches!(
+        chars.get(start..start + 3),
+        Some(&[(_, drive, _), (_, ':', _), (_, '\\' | '/', _)]) if drive.is_ascii_alphabetic()
+    )
+}
+
+fn is_abs_or_win_root(path: &str) -> bool {
+    path.starts_with('/')
+        || path.starts_with(r"\\")
+        || matches!(
+            path.as_bytes(),
+            [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()
+        )
+}
+
 fn resolve(path: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
     if !valid_raw_candidate(path) {
         return Vec::new();
     }
-    if path.starts_with('/') {
+    if is_abs_or_win_root(path) {
         return vec![PathBuf::from(path)];
     }
-    if let Some(rest) = path.strip_prefix("~/") {
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix(r"~\")) {
         return home.map(|h| h.join(rest)).into_iter().collect();
     }
     let Some(cwd) = cwd else {
@@ -749,3 +777,44 @@ fn lookup_remote(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod windows_path_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_windows_drive_unc_and_tilde_backslash_paths() {
+        assert_eq!(
+            resolve(r"C:\src\main.rs", None, None),
+            vec![PathBuf::from(r"C:\src\main.rs")]
+        );
+        assert_eq!(
+            resolve("d:/repo/src/lib.rs", None, None),
+            vec![PathBuf::from("d:/repo/src/lib.rs")]
+        );
+        assert_eq!(
+            resolve(r"\\server\share\main.rs", None, None),
+            vec![PathBuf::from(r"\\server\share\main.rs")]
+        );
+        assert_eq!(
+            resolve(r"~\.claude\settings.json", None, Some(Path::new("/home/u"))),
+            vec![Path::new("/home/u").join(r".claude\settings.json")]
+        );
+
+        let cells: Vec<Cell> = r"error at C:\Program Files\App\main.rs:12"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        let cands = candidates_at(&cells, 25);
+        assert!(
+            cands.first().is_some_and(|c| {
+                let s: String = c.chars.iter().collect();
+                s.starts_with(r"C:\Program Files\App\main.rs")
+            }),
+            "Windows drive path should be prioritized first: {cands:?}"
+        );
+    }
+}

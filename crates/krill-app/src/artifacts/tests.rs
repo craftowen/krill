@@ -284,3 +284,396 @@ fn escape_clears_query_then_closes_drawer_then_emits_close_and_delete_removes_it
     view.update(cx, |v, cx| v.handle_escape(None, cx));
     assert_eq!(*closed.lock().unwrap(), 1);
 }
+
+#[gpui::test]
+fn narrow_library_keeps_table_actions_reachable_with_horizontal_scroll(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (_, visual) =
+        cx.add_window_view(|_, cx| View::with_call(Arc::new(|_| Ok(page("one", None))), cx));
+    visual.simulate_resize(gpui::size(px(640.), px(480.)));
+    visual.run_until_parked();
+    let viewport = visual.debug_bounds("artifacts-table-scroll").unwrap();
+    let table = visual.debug_bounds("artifacts-table").unwrap();
+    assert!(viewport.size.width > px(0.));
+    assert!(table.size.width > viewport.size.width);
+    let action_before = visual.debug_bounds("artifact-copy-0").unwrap();
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: viewport.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(-2000.), px(0.))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    let action_after = visual.debug_bounds("artifact-copy-0").unwrap();
+    assert!(action_after.left() < action_before.left());
+    assert!(action_after.left() >= viewport.left());
+    assert!(action_after.right() <= viewport.right());
+}
+
+#[gpui::test]
+fn narrow_artifact_drawer_keeps_actions_inside_page(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, visual) =
+        cx.add_window_view(|_, cx| View::with_call(Arc::new(|_| Ok(page("one", None))), cx));
+    visual.simulate_resize(gpui::size(px(360.), px(600.)));
+    visual.run_until_parked();
+    view.update(visual, |view, cx| view.select_slug(Some("one".into()), cx));
+    visual.run_until_parked();
+    let drawer = visual.debug_bounds("artifact-detail-drawer").unwrap();
+    assert!(drawer.size.width > px(180.));
+    assert!(drawer.left() >= px(0.));
+    assert!(drawer.right() <= px(360.));
+    for selector in [
+        "artifact-detail-copy",
+        "artifact-detail-open",
+        "artifact-detail-delete",
+        "artifact-detail-close",
+    ] {
+        let action = visual.debug_bounds(selector).unwrap();
+        assert!(action.left() >= drawer.left());
+        assert!(action.right() <= drawer.right());
+    }
+}
+
+#[gpui::test]
+fn detail_drawer_reads_local_source_once_per_selection(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-artifact-local-source-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    krill_proto::artifacts::enable_sharing(&dir).unwrap();
+    let source = dir.join("plan.md");
+    let body = format!("line {}\n", "x".repeat(40)).repeat(5_000);
+    std::fs::write(&source, body).unwrap();
+    let shares = dir.join("artifact-shares.json");
+    std::fs::write(
+        &shares,
+        serde_json::json!({"files": {source.to_string_lossy(): {"slug": "one"}}}).to_string(),
+    )
+    .unwrap();
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        View::with_calls(
+            Arc::new(|_| Ok(page("one", None))),
+            Arc::new(|_| Ok(())),
+            Some(dir.clone()),
+            cx,
+        )
+    });
+    vcx.simulate_resize(gpui::size(px(900.), px(900.)));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| v.select_slug(Some("one".into()), cx));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("artifact-local-source").is_some());
+
+    std::fs::remove_file(&source).unwrap();
+    std::fs::remove_file(&shares).unwrap();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("artifact-local-source").is_some(),
+        "a redraw must not read the source again"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[gpui::test]
+fn artifact_delete_requires_second_click_and_keeps_neighbor_bounds(cx: &mut TestAppContext) {
+    let deleted = Arc::new(Mutex::new(Vec::new()));
+    let deleted_seen = Arc::clone(&deleted);
+    let call: Call = Arc::new(|_| {
+        Ok(serde_json::from_value(serde_json::json!({
+            "artifacts": [
+                {
+                    "artifact": {"slug": "one", "originalFileName": "one.html"},
+                    "shareUrl": "https://share.krill.page/a/one"
+                },
+                {
+                    "artifact": {"slug": "two", "originalFileName": "two.html"},
+                    "shareUrl": "https://share.krill.page/a/two"
+                }
+            ],
+            "nextCursor": null
+        }))
+        .unwrap())
+    });
+    let delete_call: DeleteCall = Arc::new(move |slug| {
+        deleted_seen.lock().unwrap().push(slug);
+        Ok(())
+    });
+    let closed = Arc::new(Mutex::new(0usize));
+    let closed_seen = Arc::clone(&closed);
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let v = View::with_calls(call, delete_call, None, cx);
+        cx.subscribe(&cx.entity(), move |_, _, _: &Close, _| {
+            *closed_seen.lock().unwrap() += 1;
+        })
+        .detach();
+        v
+    });
+    vcx.simulate_resize(gpui::size(px(960.), px(640.)));
+    vcx.run_until_parked();
+
+    let open_before = vcx.debug_bounds("artifact-open-0").unwrap();
+    let del_before = vcx.debug_bounds("artifact-delete-0").unwrap();
+
+    vcx.simulate_click(del_before.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(deleted.lock().unwrap().is_empty());
+    assert_eq!(vcx.debug_bounds("artifact-open-0"), Some(open_before));
+    assert_eq!(vcx.debug_bounds("artifact-delete-0"), Some(del_before));
+
+    // Escape disarms without emitting Close.
+    view.update(vcx, |v, cx| v.handle_escape(None, cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| assert!(v.armed_delete.is_none()));
+    assert_eq!(*closed.lock().unwrap(), 0);
+
+    // Two clicks on row delete confirm deletion.
+    let del_btn = vcx.debug_bounds("artifact-delete-0").unwrap();
+    vcx.simulate_click(del_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let del_btn = vcx.debug_bounds("artifact-delete-0").unwrap();
+    vcx.simulate_click(del_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(deleted.lock().unwrap().as_slice(), &["one"]);
+
+    // Detail drawer delete also requires two clicks and keeps sibling bounds even while row is mounted.
+    view.update(vcx, |v, cx| v.select_slug(Some("two".into()), cx));
+    vcx.run_until_parked();
+    let detail_open_before = vcx.debug_bounds("artifact-detail-open").unwrap();
+    let detail_del_before = vcx.debug_bounds("artifact-detail-delete").unwrap();
+
+    vcx.simulate_click(detail_del_before.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(deleted.lock().unwrap().as_slice(), &["one"]);
+    assert_eq!(
+        vcx.debug_bounds("artifact-detail-open"),
+        Some(detail_open_before)
+    );
+    assert_eq!(
+        vcx.debug_bounds("artifact-detail-delete"),
+        Some(detail_del_before)
+    );
+
+    let detail_del = vcx.debug_bounds("artifact-detail-delete").unwrap();
+    vcx.simulate_click(detail_del.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(deleted.lock().unwrap().as_slice(), &["one", "two"]);
+    view.read_with(vcx, |v, _| {
+        assert!(v.items.is_empty());
+        assert_eq!(v.selected_slug(), None);
+    });
+}
+
+#[gpui::test]
+fn artifacts_dynamic_labels_reserve_width_and_icon_buttons_expose_tooltips(
+    cx: &mut TestAppContext,
+) {
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir().join(format!(
+        "krill-artifact-reserved-tooltips-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    krill_proto::artifacts::enable_sharing(&dir).unwrap();
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        View::with_calls(
+            Arc::new(|_| Ok(page("one", None))),
+            Arc::new(|_| Ok(())),
+            Some(dir.clone()),
+            cx,
+        )
+    });
+    vcx.simulate_resize(gpui::size(px(960.), px(640.)));
+    vcx.run_until_parked();
+
+    let sharing_on_bounds = vcx.debug_bounds("artifacts-sharing-toggle").unwrap();
+    view.update(vcx, |v, cx| v.toggle_sharing(false, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.debug_bounds("artifacts-sharing-toggle"),
+        Some(sharing_on_bounds)
+    );
+
+    view.update(vcx, |v, cx| {
+        v.query = "계획".into();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let clear_btn = vcx.debug_bounds("artifacts-search-clear").unwrap();
+    vcx.simulate_mouse_move(clear_btn.center(), None, gpui::Modifiers::default());
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tooltip:artifacts-search-clear").is_some());
+
+    view.update(vcx, |v, cx| v.clear_search(None, cx));
+    vcx.run_until_parked();
+
+    let row_del = vcx.debug_bounds("artifact-delete-0").unwrap();
+    vcx.simulate_mouse_move(row_del.center(), None, gpui::Modifiers::default());
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tooltip:artifact-delete-0").is_some());
+
+    view.update(vcx, |v, cx| v.select_slug(Some("one".into()), cx));
+    vcx.run_until_parked();
+    let copy_before = vcx.debug_bounds("artifact-detail-copy").unwrap();
+    vcx.simulate_click(copy_before.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(vcx.debug_bounds("artifact-detail-copy"), Some(copy_before));
+
+    let close_btn = vcx.debug_bounds("artifact-detail-close").unwrap();
+    vcx.simulate_mouse_move(close_btn.center(), None, gpui::Modifiers::default());
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tooltip:artifact-detail-close").is_some());
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[gpui::test]
+fn selecting_row_switches_to_full_width_detail_without_side_panel_compression(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (_, vcx) =
+        cx.add_window_view(|_, cx| View::with_call(Arc::new(|_| Ok(page("one", None))), cx));
+    vcx.simulate_resize(gpui::size(px(960.), px(640.)));
+    vcx.run_until_parked();
+
+    let page_bounds = vcx.debug_bounds("artifacts-page").unwrap();
+    let list_bounds = vcx.debug_bounds("artifact-list").unwrap();
+    assert!(vcx.debug_bounds("artifact-detail-drawer").is_none());
+
+    let row = vcx.debug_bounds("artifact-row-0").unwrap();
+    vcx.simulate_click(row.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    let drawer_bounds = vcx.debug_bounds("artifact-detail-drawer").unwrap();
+    assert_eq!(drawer_bounds.size.width, page_bounds.size.width);
+    assert!(vcx.debug_bounds("artifact-list").is_none());
+
+    let back_btn = vcx.debug_bounds("artifact-detail-close").unwrap();
+    vcx.simulate_click(back_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    assert!(vcx.debug_bounds("artifact-detail-drawer").is_none());
+    let restored_list = vcx.debug_bounds("artifact-list").unwrap();
+    assert_eq!(restored_list.size.width, list_bounds.size.width);
+}
+
+#[gpui::test]
+fn flat_cli_shares_file_and_markdown_preview_render_in_modal(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("krill-artifact-flat-md-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    krill_proto::artifacts::enable_sharing(&dir).unwrap();
+    let doc = dir.join("spec.md");
+    std::fs::write(&doc, "# Heading\n\n- bullet item\n").unwrap();
+    std::fs::write(
+        dir.join("artifact-shares.json"),
+        serde_json::json!({
+            doc.to_string_lossy(): {
+                "slug": "spec",
+                "edit_token": "e1",
+                "share_url": "https://share.krill.page/a/spec",
+                "api_origin": "https://share.krill.page"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let call: Call = Arc::new(|_| {
+        Ok(serde_json::from_value(serde_json::json!({
+            "artifacts": [{
+                "artifact": {
+                    "slug": "spec",
+                    "originalFileName": "spec.md",
+                    "sourceContentType": "text/markdown"
+                },
+                "shareUrl": "https://share.krill.page/a/spec"
+            }],
+            "nextCursor": null
+        }))
+        .unwrap())
+    });
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        View::with_calls(call, Arc::new(|_| Ok(())), Some(dir.clone()), cx)
+    });
+    vcx.simulate_resize(gpui::size(px(960.), px(640.)));
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| v.select_slug(Some("spec".into()), cx));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("artifact-local-source").is_some());
+    assert!(vcx.debug_bounds("artifact-detail-open-local").is_some());
+
+    let source_tab = vcx.debug_bounds("artifact-tab-source").unwrap();
+    vcx.simulate_click(source_tab.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.detail.as_ref().map(|d| d.tab),
+            Some(detail::DetailTab::Source)
+        );
+    });
+
+    let preview_tab = vcx.debug_bounds("artifact-tab-preview").unwrap();
+    vcx.simulate_click(preview_tab.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.detail.as_ref().map(|d| d.tab),
+            Some(detail::DetailTab::Preview)
+        );
+    });
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[gpui::test]
+fn disk_list_cache_seeds_items_before_network_completes(cx: &mut TestAppContext) {
+    let dir =
+        std::env::temp_dir().join(format!("krill-artifact-seed-cache-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    krill_proto::artifacts::enable_sharing(&dir).unwrap();
+    std::fs::write(
+        dir.join("artifact-list-cache.json"),
+        serde_json::json!({
+            "apiOrigin": "https://share.krill.page",
+            "artifacts": [{
+                "artifact": { "slug": "cached-1", "title": "Cached Item" },
+                "shareUrl": "https://share.krill.page/a/cached-1"
+            }],
+            "nextCursor": "c2"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let view = cx.new(|cx| {
+        View::with_calls(
+            Arc::new(|_| Err("network pending".into())),
+            Arc::new(|_| Ok(())),
+            Some(dir.clone()),
+            cx,
+        )
+    });
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.items.len(), 1);
+        assert_eq!(v.items[0].artifact.slug, "cached-1");
+        assert_eq!(v.rows[0].title, "Cached Item");
+        assert_eq!(v.next.as_deref(), Some("c2"));
+    });
+
+    std::fs::remove_dir_all(dir).unwrap();
+}

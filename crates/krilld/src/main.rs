@@ -28,7 +28,7 @@ use krill_proto::ipc::{FEATURES, PROTO_MAX, PROTO_MIN, ServerHello};
 use krilld::holder::Holder;
 use krilld::ipc::Listener;
 use krilld::registry::Registry;
-use krilld::rejoin::{self, Handover};
+use krilld::rejoin::{self, Handover, TakeError};
 #[cfg(unix)]
 use rustix::fs::{FileType, fstat};
 
@@ -72,6 +72,8 @@ fn main() -> ExitCode {
             .and_then(|pid| pid.parse().ok())
             .map_or(ExitCode::from(2), krilld::run_console_probe);
     }
+    #[cfg(windows)]
+    krilld::set_hard_error_dialogs(false);
     let path = PathBuf::from(argument);
     krill_log::init(krill_log::Component::Daemon).ok();
     tracing::info!("daemon starting");
@@ -111,12 +113,31 @@ fn main() -> ExitCode {
                 Some(Ok(h)) => Err(h),
                 // 중복 기동: 건강한 데몬이 소켓을 쥐고 있고 인계 상대도 없다. holder가 재기동하지
                 // 않게 전용 코드로 끝낸다. 직접 실행은 MK-022대로 조용히 0으로 끝낸다.
-                Some(Err(_)) => return ExitCode::from(daemon::KRILLD_DUPLICATE),
+                Some(Err(TakeError::Unavailable(_))) => {
+                    tracing::warn!("socket owned by a healthy daemon; exiting as duplicate");
+                    return ExitCode::from(daemon::KRILLD_DUPLICATE);
+                }
+                // 고아 krilld는 있는데 전송이 끊겼다. holder가 백오프로 다시 띄워 재시도한다(중복으로 끝내면
+                // 고아의 멈춘 리더가 다음 접속까지 출력을 못 읽는다).
+                Some(Err(TakeError::Transfer(error))) => {
+                    tracing::warn!(kind = ?error.kind(), "handover transfer failed");
+                    return ExitCode::from(daemon::KRILLD_HANDOVER_FAILED);
+                }
                 None => return ExitCode::SUCCESS,
             }
         }
         Err(error) => {
-            tracing::error!(kind = ?error.kind(), "listener failed");
+            let reason = (error.kind() == io::ErrorKind::PermissionDenied
+                && error
+                    .to_string()
+                    .contains("socket directory must be a 0700 directory"))
+            .then_some("socket directory must be a 0700 directory");
+            tracing::error!(
+                kind = ?error.kind(),
+                errno = error.raw_os_error(),
+                reason,
+                "listener failed"
+            );
             krill_proto::error_reporting::capture(
                 krill_proto::error_reporting::Process::Daemon,
                 krill_proto::error_reporting::Code::DaemonListenerFailed,
@@ -157,10 +178,9 @@ fn main() -> ExitCode {
             .stack_size(256 * 1024)
             .spawn(move || {
                 krilld::alloc::mobile_thread().ok();
+                let holder = rejoin::holder_pid();
                 r.run_holder(link);
-                if rejoin::orphan(&r, &path).is_ok() {
-                    done.send(()).ok();
-                }
+                rejoin::link_lost(&r, &path, holder, &done);
             });
         if reader.is_err() {
             return ExitCode::FAILURE; // 답을 나눠 줄 리더가 없으면 holder 요청이 끝나지 않는다
@@ -331,6 +351,10 @@ fn main() -> ExitCode {
                     Err(error) => {
                         if rejected.replace(error.kind()) != Some(error.kind()) {
                             tracing::warn!(kind = ?error.kind(), "connection closed before hello");
+                        }
+                        // 피어 UID 거부는 연결 하나의 일이다. EMFILE 같은 오류는 바로 다시 받아도 같아 쉬지 않고 돈다(C-4).
+                        if error.kind() != io::ErrorKind::PermissionDenied {
+                            thread::sleep(rejoin::ACCEPT_RETRY);
                         }
                         continue;
                     }

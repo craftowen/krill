@@ -139,7 +139,8 @@ fn command_output(command: &mut Command) -> io::Result<Output> {
     result
 }
 fn tailscale_command(binary: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(binary);
+    // krilld는 콘솔이 없어(DETACHED) 숨기지 않으면 Windows가 호출마다 콘솔 창을 새로 띄운다.
+    let mut command = krill_proto::os::background_command(binary);
     command.env("TAILSCALE_BE_CLI", "1");
     command
 }
@@ -231,7 +232,7 @@ fn trusted_websocket(origin: &str, mobile_origin: &str) -> bool {
     let Some(nonce) = nonce.get(..16) else {
         return false;
     };
-    let Ok(output) = command_output(Command::new("curl").args([
+    let Ok(output) = command_output(krill_proto::os::background_command("curl").args([
         "--silent",
         "--show-error",
         "--http1.1",
@@ -319,7 +320,7 @@ fn serve(
             "The krilld Serve guard is unavailable in this process",
         ));
     }
-    let mut guard = Command::new(executable)
+    let mut guard = krill_proto::os::background_command(executable)
         .arg("--mobile-tailscale-serve-guard")
         .arg(cli)
         .arg(https_port.to_string())

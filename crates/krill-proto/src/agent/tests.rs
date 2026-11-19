@@ -330,3 +330,231 @@ fn launch_overrides_encode_decode_and_apply_across_providers() {
         .is_err()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn version_in_resolves_env_shebang_interpreter_and_which_all_preserves_order() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::env::temp_dir().join(format!("krill-agent-version-in-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let interp_dir = root.join("interp");
+    let first_dir = root.join("first");
+    let second_dir = root.join("second");
+    std::fs::create_dir_all(&interp_dir).unwrap();
+    std::fs::create_dir_all(&first_dir).unwrap();
+    std::fs::create_dir_all(&second_dir).unwrap();
+
+    let interp_name = format!("krill-test-node-{}", std::process::id());
+    let interp_bin = interp_dir.join(&interp_name);
+    std::fs::write(&interp_bin, "#!/bin/sh\necho 'codex-cli 0.167.2'\n").unwrap();
+    std::fs::set_permissions(&interp_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let first_bin = first_dir.join("codex");
+    std::fs::write(&first_bin, format!("#!/usr/bin/env {interp_name}\n")).unwrap();
+    std::fs::set_permissions(&first_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let second_bin = second_dir.join("codex");
+    std::fs::write(&second_bin, "#!/bin/sh\necho 'codex-cli 0.160.0'\n").unwrap();
+    std::fs::set_permissions(&second_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let search_path = std::env::join_paths([
+        first_dir.as_path(),
+        second_dir.as_path(),
+        first_dir.as_path(),
+        interp_dir.as_path(),
+    ])
+    .unwrap();
+    assert_eq!(
+        which_all("codex", &search_path),
+        vec![first_bin.clone(), second_bin]
+    );
+    assert_eq!(
+        version_in(&first_bin, &search_path).as_deref(),
+        Some("codex-cli 0.167.2")
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn package_version_reads_homebrew_caskroom_and_scoped_npm_metadata() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!("krill-agent-pkg-ver-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+
+    let cask_bin = root.join("brew/Caskroom/codex/0.167.2/bin/codex");
+    let brew_bin_dir = root.join("brew/bin");
+    std::fs::create_dir_all(cask_bin.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&brew_bin_dir).unwrap();
+    std::fs::write(&cask_bin, "#!/bin/sh\nexit 1\n").unwrap();
+    let cask_link = brew_bin_dir.join("codex");
+    symlink(&cask_bin, &cask_link).unwrap();
+    assert_eq!(package_version(&cask_link).as_deref(), Some("0.167.2"));
+
+    let npm_pkg = root.join("npm/lib/node_modules/@openai/codex");
+    let npm_js = npm_pkg.join("bin/codex.js");
+    let npm_bin_dir = root.join("npm/bin");
+    std::fs::create_dir_all(npm_js.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&npm_bin_dir).unwrap();
+    std::fs::write(&npm_js, "#!/usr/bin/env node\n").unwrap();
+    std::fs::write(
+        npm_pkg.join("package.json"),
+        r#"{"name":"@openai/codex","version":"0.168.0"}"#,
+    )
+    .unwrap();
+    let npm_link = npm_bin_dir.join("codex");
+    symlink(&npm_js, &npm_link).unwrap();
+    assert_eq!(package_version(&npm_link).as_deref(), Some("0.168.0"));
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn presets_match_preset_order_with_unique_ranks_and_homepages() {
+    let presets = preset_profiles();
+    let expected: std::collections::BTreeSet<&str> = PRESET_ORDER.iter().copied().collect();
+    assert_eq!(presets.len(), PRESET_ORDER.len());
+    assert_eq!(presets.len(), 24);
+    for id in PRESET_ORDER {
+        assert!(presets.contains_key(*id), "missing preset {id}");
+        assert!(agent_homepage(id).is_some(), "missing homepage for {id}");
+    }
+    for key in presets.keys() {
+        assert!(
+            expected.contains(key.as_str()),
+            "missing {key} in PRESET_ORDER"
+        );
+    }
+    for builtin in ["claude", "codex", "agy", "cursor", "opencode"] {
+        assert!(agent_homepage(builtin).is_some());
+    }
+    assert!(profile_rank("claude") < profile_rank("opencode"));
+    assert!(profile_rank("opencode") < profile_rank("grok"));
+    assert!(profile_rank("grok") < profile_rank("muse"));
+    assert!(profile_rank("muse") < profile_rank("custom-x"));
+    assert_eq!(profile_rank("custom-x"), u8::MAX);
+}
+
+#[test]
+fn grok_muse_and_preset_launch_overrides_and_process_recognition() {
+    let agents = Agents::load(None).unwrap();
+    let (grok_id, grok) = agents.resolve("grok").unwrap();
+    assert_eq!(grok_id, "grok");
+    assert_eq!(
+        grok.argv(Permission::Yolo),
+        ["grok", "--permission-mode", "bypassPermissions"]
+    );
+
+    let (muse_id, muse) = agents.resolve("muse").unwrap();
+    assert_eq!(muse_id, "muse");
+    assert_eq!(muse.argv(Permission::Yolo), ["muse", "--yolo"]);
+
+    let (vibe_id, _) = agents.resolve("vibe").unwrap();
+    assert_eq!(vibe_id, "mistral-vibe");
+
+    let mut grok_profile = grok.clone();
+    apply_launch_overrides(
+        "grok",
+        &mut grok_profile,
+        &LaunchOverrides {
+            model: Some("grok-4.7".to_owned()),
+            effort: Some("XHIGH".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        grok_profile.argv(Permission::Yolo),
+        [
+            "grok",
+            "-m",
+            "grok-4.7",
+            "--reasoning-effort",
+            "xhigh",
+            "--permission-mode",
+            "bypassPermissions",
+        ]
+    );
+    assert!(
+        validate_launch_overrides(
+            "grok",
+            &grok_profile,
+            &LaunchOverrides {
+                model: None,
+                effort: Some("high".to_owned()),
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        validate_launch_overrides(
+            "grok",
+            grok,
+            &LaunchOverrides {
+                model: None,
+                effort: Some("max".to_owned()),
+            }
+        )
+        .is_err()
+    );
+
+    for known in [
+        "claude",
+        "codex-aarch64-ap",
+        "grok",
+        "grok-4.7",
+        "muse",
+        "muse-bin-1.0.3-R",
+        "kiro-cli",
+        "vibe",
+        "cn",
+        "traecli",
+        "dsh-tui",
+        "zcode-cli",
+        "openclaude",
+        "opencode2",
+    ] {
+        assert!(
+            is_known_agent_process(known),
+            "{known} should be recognized"
+        );
+    }
+    assert_eq!(executable_id("grok-4.7"), "grok");
+    assert_eq!(executable_id("muse-bin-1.0.3"), "muse");
+    assert_eq!(executable_id("vibe"), "mistral-vibe");
+    assert!(!is_known_agent_process("zsh"));
+    assert!(!is_known_agent_process("bash"));
+}
+
+#[test]
+fn remove_user_profile_and_validate_custom_agent_id() {
+    let user = r#"# top comment
+permission = "yolo"
+
+[agent.grok]
+name = "Grok"
+launch = ["grok"]
+
+[agent.mine]
+name = "Mine"
+launch = ["mine"]
+future_key = 42
+"#;
+    let updated = remove_user_profile(Some(user), "grok").unwrap();
+    assert!(updated.contains("# top comment"), "{updated}");
+    assert!(updated.contains("future_key = 42"), "{updated}");
+    let parsed: Agents = toml::from_str(&updated).unwrap();
+    assert!(!parsed.profiles.contains_key("grok"));
+    assert_eq!(parsed.profiles["mine"].launch, ["mine"]);
+
+    assert_eq!(
+        validate_custom_agent_id(" My-Agent_1 "),
+        Ok("my-agent_1".to_owned())
+    );
+    assert!(validate_custom_agent_id("").is_err());
+    assert!(validate_custom_agent_id("-bad").is_err());
+    assert!(validate_custom_agent_id("bad space").is_err());
+    assert!(validate_custom_agent_id("gemini").is_err());
+    assert!(validate_custom_agent_id(&"a".repeat(49)).is_err());
+}

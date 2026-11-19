@@ -19,9 +19,8 @@ macro_rules! println {
 mod account;
 mod artifacts;
 mod changes;
-#[cfg(target_os = "macos")]
-mod computer;
 mod doctor;
+mod drop;
 mod errors;
 mod file;
 mod history;
@@ -51,23 +50,7 @@ use std::process::ExitCode;
 use krill_proto::agent::{self, Agents, Permission};
 use krill_proto::daemon;
 
-#[cfg(target_os = "macos")]
-macro_rules! computer_usage {
-    () => {
-        " | krill computer <cmd>"
-    };
-}
-#[cfg(not(target_os = "macos"))]
-macro_rules! computer_usage {
-    () => {
-        ""
-    };
-}
-
-const USAGE: &str = concat!(
-    "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts init|lint|share|update|retention|unshare|status|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable|flush [--json] | krill errors status|enable|disable|flush [--json] | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]",
-    computer_usage!()
-);
+const USAGE: &str = "usage: krill mobile pair/devices/revoke/serve | krill drop <file>...|ls|rm <id> [--json] | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts init|lint|share|update|retention|unshare|status|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable|flush [--json] | krill errors status|enable|disable|flush [--json] | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>] | krill --version";
 
 fn main() -> ExitCode {
     run(std::env::args_os().skip(1).collect())
@@ -77,8 +60,19 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
     if matches!(
         raw.as_slice(),
         [flag] if matches!(flag.to_str(), Some("-h" | "--help" | "help"))
+    ) || matches!(
+        raw.as_slice(),
+        [host, _, flag]
+            if host == "--host" && matches!(flag.to_str(), Some("-h" | "--help" | "help"))
     ) {
         println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if matches!(
+        raw.as_slice(),
+        [flag] if matches!(flag.to_str(), Some("-V" | "--version" | "version"))
+    ) {
+        println!("krill {}", krill_proto::BUILD);
         return ExitCode::SUCCESS;
     }
     if raw.is_empty() {
@@ -101,16 +95,29 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
             .is_some_and(|s| s == "install" || s == "uninstall");
     if !hook_run && !statusline_run {
         krill_log::init(krill_log::Component::Cli).ok();
-        tracing::info!("cli starting");
+        // 앱의 60초 `errors flush`, 에이전트의 `read` 폴링 같은 호출마다 줄을 남기면 5개 회전 파일이 몇 분 만에 밀려나
+        // 실제 진단이 사라진다(2026-11-05). 사람이 드물게 실행해 되짚을 가치가 있는 명령만 이름과 함께 남긴다.
+        if let Some(command) = [
+            "account",
+            "doctor",
+            "hook",
+            "import",
+            "mobile",
+            "statusline",
+            "update",
+        ]
+        .into_iter()
+        .find(|command| raw.first().is_some_and(|first| first == command))
+        {
+            tracing::info!(command, "cli starting");
+        }
         // Hook/statusline hot paths and isolated runtimes must not mutate the host's skills.
         if !cfg!(test)
             && daemon::state_dir_override().is_none()
             && let Some(home) = krill_proto::os::home_dir()
         {
             let report = krill_proto::orchestration::sync_builtin_skills_at(&home);
-            for error in report.failures {
-                tracing::warn!(%error, "built-in skill synchronization skipped a target");
-            }
+            log_skill_sync_failures(&report.failures);
         }
     }
     if raw.first().is_some_and(|s| s == "__forward") {
@@ -160,6 +167,9 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
     }
     if raw.first().is_some_and(|s| s == "mobile") {
         return mobile::run(&raw[1..]);
+    }
+    if raw.first().is_some_and(|s| s == "drop") {
+        return drop::run(&raw[1..]);
     }
     if raw.first().is_some_and(|s| s == "search") {
         return search::run(&raw[1..]);
@@ -214,10 +224,6 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
     }
     if raw.first().is_some_and(|s| s == "skills") {
         return skills::run_skills(&raw[1..]);
-    }
-    #[cfg(target_os = "macos")]
-    if raw.first().is_some_and(|s| s == "computer") {
-        return computer::run(&raw[1..]);
     }
     if raw.first().is_some_and(|s| s == "handoff") {
         return skills::run_handoff(&raw[1..]);
@@ -317,7 +323,15 @@ fn agent_list() -> ExitCode {
                 agent::version(exe).as_deref().unwrap_or("version unknown"),
                 exe.display()
             ),
-            None => format!("not installed. install: {}", p.install_command()),
+            None => {
+                if !p.install_command().trim().is_empty() {
+                    format!("not installed. install: {}", p.install_command())
+                } else if let Some(url) = agent::agent_homepage(id) {
+                    format!("not installed. docs: {url}")
+                } else {
+                    "not installed".to_owned()
+                }
+            }
         };
         let badge = match (yolo, p.yolo_args.is_empty()) {
             (false, _) => "",
@@ -329,19 +343,118 @@ fn agent_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Emit at most one privacy-safe summary warning when built-in skill sync skips targets.
+/// `krill-log` forbids filesystem paths and error `Display` strings at `tracing` call sites.
+fn log_skill_sync_failures(failures: &[String]) {
+    let skipped_count = failures.len();
+    if skipped_count > 0 {
+        tracing::warn!(
+            skipped_count,
+            "built-in skill synchronization skipped target(s)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::fmt;
     use std::process::ExitCode;
+    use std::sync::{Arc, Mutex};
 
-    use super::{USAGE, run};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    use super::{USAGE, log_skill_sync_failures, run};
+
+    #[derive(Default)]
+    struct RecordedEvents {
+        lines: Vec<String>,
+    }
+
+    struct CaptureVisitor<'a> {
+        out: &'a mut String,
+    }
+
+    impl Visit for CaptureVisitor<'_> {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            fmt::Write::write_fmt(self.out, format_args!("{}={value} ", field.name())).ok();
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            fmt::Write::write_fmt(self.out, format_args!("{}={value:?} ", field.name())).ok();
+        }
+    }
+
+    struct CaptureSubscriber(Arc<Mutex<RecordedEvents>>);
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut line = String::new();
+            let mut visitor = CaptureVisitor { out: &mut line };
+            event.record(&mut visitor);
+            if let Ok(mut guard) = self.0.lock() {
+                guard.lines.push(line);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[test]
+    fn skill_sync_warning_logs_count_without_paths_or_error_display() {
+        let recorded = Arc::new(Mutex::new(RecordedEvents::default()));
+        let subscriber = CaptureSubscriber(Arc::clone(&recorded));
+        let failures = vec![
+            "artifacts (/Users/alice/.claude/skills): Operation not permitted (os error 1)"
+                .to_owned(),
+            "krill (/Users/alice/.codex/skills): Permission denied (os error 13)".to_owned(),
+        ];
+        tracing::subscriber::with_default(subscriber, || {
+            log_skill_sync_failures(&[]);
+            log_skill_sync_failures(&failures);
+        });
+        let lines = recorded.lock().unwrap().lines.clone();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("skipped_count=2"));
+        assert!(!lines[0].contains("/Users/alice"));
+        assert!(!lines[0].contains("Operation not permitted"));
+        assert!(!lines[0].contains("Permission denied"));
+    }
 
     #[test]
     fn top_level_help_exits_zero_and_empty_args_exits_two() {
         for flag in ["-h", "--help", "help"] {
             assert_eq!(run(vec![OsString::from(flag)]), ExitCode::SUCCESS, "{flag}");
+            assert_eq!(
+                run(vec![
+                    OsString::from("--host"),
+                    OsString::from("prod"),
+                    OsString::from(flag),
+                ]),
+                ExitCode::SUCCESS,
+                "--host prod {flag}"
+            );
         }
         assert_eq!(run(Vec::new()), ExitCode::from(2));
+        for flag in ["-V", "--version", "version"] {
+            assert_eq!(run(vec![OsString::from(flag)]), ExitCode::SUCCESS, "{flag}");
+        }
     }
 
     #[test]
@@ -353,8 +466,7 @@ mod tests {
             vec!["update", "--help"],
             vec!["search", "--help"],
             vec!["mobile", "pair", "--help"],
-            #[cfg(target_os = "macos")]
-            vec!["computer", "--help"],
+            vec!["drop", "--help"],
             vec!["ls", "--help"],
             vec!["new", "--help"],
             vec!["send", "--help"],
@@ -382,11 +494,6 @@ mod tests {
             assert_eq!(run(raw.clone()), ExitCode::SUCCESS, "{raw:?}");
         }
         // send -- --help는 리터럴이므로 도움말이 아니다(세션 모듈 단위 테스트에서 보장).
-    }
-
-    #[test]
-    fn computer_command_is_advertised_only_on_macos() {
-        assert_eq!(USAGE.contains("krill computer"), cfg!(target_os = "macos"));
     }
 
     #[test]

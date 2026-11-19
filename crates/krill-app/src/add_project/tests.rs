@@ -194,3 +194,139 @@ fn add_project_clone_actions_stay_inside_small_viewport_at_large_zoom(cx: &mut T
         "{submit:?} outside {card:?}"
     );
 }
+
+#[gpui::test]
+fn add_project_ignores_escape_during_ime_preedit(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+
+    cx.update(gpui_component::init);
+    let remote = HostId::Remote("mini".to_owned());
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new_with_hosts(
+            window,
+            cx,
+            vec![
+                (HostId::Local, "local".to_owned()),
+                (remote.clone(), "mini".to_owned()),
+            ],
+            remote,
+        )
+    });
+    cx.run_until_parked();
+
+    // Clone step: url & dest IME preedit must not return to Step::Start on Escape.
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.show_clone(window, cx);
+            d.url.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(dialog.read(cx).step, Step::Clone));
+
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.url.update(cx, |input, cx| input.unmark_text(window, cx));
+            d.dest.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "한", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(dialog.read(cx).step, Step::Clone));
+
+    // RemotePath step: remote_path IME preedit must not return to Step::Start on Escape.
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.dest.update(cx, |input, cx| input.unmark_text(window, cx));
+            d.show_start(window, cx);
+            d.browse_activated(window, cx);
+            d.remote_path.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "경", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(dialog.read(cx).step, Step::RemotePath(RemoteMode::Browse));
+    });
+
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.remote_path
+                .update(cx, |input, cx| input.unmark_text(window, cx));
+            assert!(!d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(dialog.read(cx).step, Step::Start));
+}
+
+#[gpui::test]
+fn tab_focused_host_chip_and_action_cards_activate_on_enter_and_space(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let remote = HostId::Remote("mini".to_owned());
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new_with_hosts(
+            window,
+            cx,
+            vec![
+                (HostId::Local, "local".to_owned()),
+                (remote.clone(), "mini".to_owned()),
+            ],
+            HostId::Local,
+        )
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&dialog, move |_, e: &Event, _| {
+            sink.lock().unwrap().push(e.clone());
+        })
+        .detach();
+    });
+    cx.run_until_parked();
+
+    // Tab 1: close button, Tab 2: local host chip, Tab 3: remote host chip ("mini")
+    cx.simulate_keystrokes("tab tab tab space");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(dialog.read(cx).host(), &remote);
+    });
+
+    // Tab 4: Browse card -> Enter opens RemotePath(Browse) for remote host
+    cx.simulate_keystrokes("tab enter");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(dialog.read(cx).step, Step::RemotePath(RemoteMode::Browse));
+    });
+
+    // Escape returns to Start, then Tab to Clone card (close=1, local=2, mini=3, browse=4, clone=5) and press Space
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(dialog.read(cx).step, Step::Start);
+    });
+    cx.simulate_keystrokes("tab tab tab tab tab space");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(dialog.read(cx).step, Step::Clone);
+    });
+    assert!(events.lock().unwrap().is_empty());
+}

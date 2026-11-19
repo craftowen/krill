@@ -43,6 +43,22 @@ const key=(root,id)=>find(root,'keybar').children.find(el=>el.dataset.keyId===id
 const flush=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
 async function advance(ms){const end=clock+ms;for(;;){const next=[...timers].filter(([,t])=>t.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];if(!next)break;clock=next[1].at;timers.delete(next[0]);next[1].fn();await flush();}clock=end;await flush();}
 const inputs=socket=>Array.from(socket.sent).filter(a=>a instanceof Uint8Array&&a[4]===0x13).map(a=>{const r=T.reader(a.slice(5));r.n();return r.text();});
+async function testFrozenRoleReply(){
+ // iOS freezes a hidden home-screen app: the hide-time role request must not time out on the frozen clock,
+ // yet a terminal socket that really died in the background is still found one role window after returning.
+ const doc=context.document,hide=async()=>{doc.hidden=true;doc.visibilityState='hidden';doc.dispatchEvent(new Event('visibilitychange'));await flush();},show=async()=>{doc.hidden=false;doc.visibilityState='visible';doc.dispatchEvent(new Event('visibilitychange'));await flush();};
+ let {root,handle,socket}=await mount(2101,{preferences:{fitToPhone:false}});
+ const roles=()=>socket.sent.filter(a=>a[4]===0x17).length,before=roles();
+ await hide();assert.equal(roles(),before+1,'hiding releases the terminal size');
+ await advance(30000);assert.equal(socket.readyState,1,'time frozen in the background is not a terminal timeout');
+ await show();assert.equal(roles(),before+2,'returning asks the daemon once more');
+ socket.frame(0x2c,T.v(0));socket.frame(0x2c,T.v(0));await flush();await advance(6000);
+ assert.equal(socket.readyState,1);assert.notEqual(root.dataset.phase,'disconnected');handle.unmount();
+ ({root,handle,socket}=await mount(2102,{preferences:{fitToPhone:false}}));
+ await hide();await advance(30000);await show();await advance(4900);assert.equal(socket.readyState,1);
+ await advance(200);assert.notEqual(socket.readyState,1,'a dead socket is found within one role window');assert.equal(root.dataset.phase,'disconnected');handle.unmount();
+ delete doc.hidden;
+}
 async function mount(id=7,extra={}){const root=new Element('div'),handle=context.mountFixture(root,id,extra);await flush();const socket=context.sockets.at(-1);socket.handshake();socket.screen();await flush();return {root,handle,socket};}
 async function testHiddenPaint(){
  const hidden=await mount(1901,{visible:false,preferences:{fitToPhone:false}});
@@ -141,6 +157,34 @@ async function testChatQuestionReplies(){
  socket.screen('Working');socket.question(menu(false,false));const timeout=handle.replyQuestion(handle.getQuestion().token,[1]);const expired=assert.rejects(timeout,/Could not confirm/);await flush();await advance(3000);await expired;assert.equal(inputs(socket).at(-1),'\x1b[B ','unconfirmed checkbox state never submits');
  socket.screen('Working');socket.question(menu(false,false));const lost=handle.replyQuestion(handle.getQuestion().token,[0]);const disconnected=assert.rejects(lost,/question changed|uncertain/i);await flush();socket.close();await disconnected;assert.equal(handle.getQuestion(),null);handle.unmount();
  assert(snapshots.some(q=>q?.multiple)&&snapshots.at(-1)===null);
+ // Real Claude Code AskUserQuestion layout: top rule, ☐ header chip, divider before Chat about this, wrapped footer and non-alt TERM_MODES update.
+ const c2=await mount(1972,{visible:false,questionActive:true,preferences:{fitToPhone:false}});c2.socket.autoAck=true;
+ c2.socket.question([
+  '────────────────────────────────────────────────────────',
+  ' ☐ 캡처',
+  '',
+  '│ 캡처는 이 맥에서 찍을 수 있습니다.',
+  '│ 지금 찍을까요?',
+  '',
+  '❯ 1. 지금 찍어 (Recommended)',
+  '     10초쯤 기다려 주시면 찍어 둡니다',
+  '  2. 찍지 마',
+  '     글 초안만 쓰고 캡처는 하지 않습니다',
+  '  3. Type something.',
+  '────────────────────────────────────────────────────────',
+  '  4. Chat about this',
+  '',
+  'Enter to select · ↑/↓ to navigate · Esc to',
+  'cancel',
+ ]);
+ let cq=c2.handle.getQuestion();assert(cq?.enabled,'divider before Chat about this and wrapped footer still recognize live question');
+ assert.equal(cq.choices.length,4);assert.equal(cq.title,'캡처는 이 맥에서 찍을 수 있습니다.\n지금 찍을까요?');
+ c2.socket.frame(0x2b,Uint8Array.of(0),T.v(32));cq=c2.handle.getQuestion();assert(cq?.enabled,'non-alt TERM_MODES frame without new grid diff keeps screenComplete live');
+ await c2.handle.replyQuestion(cq.token,[1]);assert.deepEqual(inputs(c2.socket),['\x1b[B\r']);
+ c2.socket.screen('Working');
+ c2.socket.question(['Pick checks', '❯ 1. [ ] Lint', '  2. [✔] Tests', '  3. [ ] Type something', '────────────────────', '  4. Chat about this', 'Enter to select · ↑/↓ to navigate · Esc to cancel']);
+ cq=c2.handle.getQuestion();assert(cq?.enabled&&cq.multiple);assert.equal(cq.choices.length,3);assert.equal(cq.choices[1].checked,true);
+ c2.handle.unmount();
  console.log('PASS Chat live replies: hidden single submit, native-key guard, stale/generation/background/partial/duplicate validation, authoritative multi-select pacing, timeout and disconnect never submit');
 }
 
@@ -212,6 +256,16 @@ async function main(){
  update(cursor(2,0));assert.equal((await drawn()).text,2);
  // 후행 cursor_explicit 바이트(0x01)와 미래 확장 바이트가 붙은 Update도 해독해야 한다(v0.2.25부터 모바일 터미널이 'Trailing screen data'로 안 뜬 회귀).
  socket.frame(0x21,T.v(2),T.v(2),T.v(1),T.v(1),line(1,'zz'),Uint8Array.of(1,9));assert.deepEqual(await drawn(),{text:1,font:0,draws:1},'update with optional postfix still draws');
+ // Bytes written by the Rust encoder (krill-proto screen tests keep mobile_wire.txt equal to its output): every op and tail decodes here.
+ {const wire=Object.fromEntries(fs.readFileSync(path.join(__dirname,'../../krill-proto/src/screen/mobile_wire.txt'),'utf8').split('\n').filter(l=>l&&!l.startsWith('#')).map(l=>l.split(' ')));
+  const body=(name,kind)=>{const b=Uint8Array.from(Buffer.from(wire[name],'hex'));assert.equal(new DataView(b.buffer).getUint32(0,true),b.length-4,name);assert.equal(b[4],kind,name);return b.slice(5);};
+  const model={},result=T.update(body('update',0x21),model),json=JSON.stringify;
+  assert.equal(result.done,true);assert.equal(model.revision,300n);assert.equal(model.seq,70000n);assert.equal(model.cols,80);assert.equal(model.lines,24);
+  assert.equal(json(model.rows[3].map(c=>c.text)),json(['a','한‍'.normalize('NFC')]));assert.equal(json(model.cursor),json({line:3,column:2,visible:true}));
+  assert.equal(model.title,'빌드 – zsh');assert.equal(json(model.cursorStyle),json({shape:2,blink:true}));assert.equal(model.cursorExplicit,true,'Update cursor_explicit tail');
+  const rows=T.history(body('history_rows',0x26));
+  assert.equal(json([rows.req,rows.total,rows.pages,rows.skip]),json([9,1000,3,10]));assert.equal(json(rows.rows.map(r=>r.map(c=>c.ch))),json([['x','한'],[]]));
+  console.log('PASS Rust-encoded screen wire fixture: Update with every op and the cursor tail, HistoryRows read to the end');}
  update(line(0,'a'));update(line(2,'g'));assert.deepEqual(await drawn(),{text:2,font:0,draws:1});
  update(C.concat(T.v(0),T.v(80),T.v(24)),line(0,'abc'),line(3,'jk'));assert.equal((await drawn()).text,2);
  handle.setFontScale(1.25);assert.deepEqual(await drawn(),{text:2,font:1,draws:1});assert.equal(canvas.width,Math.round(80*8*16/13));
@@ -289,6 +343,7 @@ async function main(){
  // 스크롤 관성·휠 경로는 가상 시계를 performance.now에도 물려 결정적으로 검사한다.
  context.performance={now:()=>clock};try{await testTuiScrollRouting();await testShortCanvasScroll();await testScrollPhysics();await testHistoryRefreshMerge();await testInitialAndQueuedHistoryScroll();}finally{delete context.performance;}
  await testKeyboardKeepsLiveView();
+ await testFrozenRoleReply();
  console.log('All terminal adapter regression checks passed.');
 }
 async function testKeyboardKeepsLiveView(){

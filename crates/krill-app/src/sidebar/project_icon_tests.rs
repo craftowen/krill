@@ -2,6 +2,24 @@ use super::*;
 
 const ICO: &[u8] = include_bytes!("../../../../packaging/macos/favicon.ico");
 
+/// Vite 기본 파비콘은 `style="fill:#863bff;fill:color(display-p3 .5252 .23 1)"`을 쓴다. usvg는 뒤 선언을 못 읽어
+/// 앞의 sRGB 값까지 버리고 검게 칠했다(운영 로그 `Failed to parse fill value`).
+#[test]
+fn display_p3_fill_renders_in_color_instead_of_black() {
+    let renderer = gpui::SvgRenderer::new(std::sync::Arc::new(()));
+    for shape in [
+        r##"fill="#863bff" style="fill:#863bff;fill:color(display-p3 .5252 .23 1);fill-opacity:1""##,
+        r#"fill="color(display-p3 .5252 .23 1)""#,
+    ] {
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" {shape}/></svg>"#
+        );
+        let image = renderer.render_single_frame(svg.as_bytes(), 1.0).unwrap();
+        let bgra = image.as_bytes(0).unwrap().get(..4).unwrap();
+        assert_eq!(bgra, [0xff, 0x3b, 0x86, 0xff], "{shape}");
+    }
+}
+
 #[test]
 fn imported_github_avatar_does_not_hide_service_favicon() {
     use crate::ui::icons::ProjectIcon;

@@ -740,23 +740,27 @@ impl Wizard {
             .pt_4()
             .pb_3()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .child(
                 div()
                     .flex_1()
+                    .flex_basis(ui::DIALOG_WIDTH / 2.)
                     .min_w_0()
                     .flex()
                     .flex_col()
                     .gap_1()
                     .child(
                         div()
+                            .truncate()
                             .text_size(ui::TEXT_LG)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(text::CHECKS_TITLE.get()),
                     )
                     .child(
                         div()
+                            .truncate()
                             .text_size(ui::TEXT_XS)
                             .text_color(p.muted_foreground)
                             .child(self.summary_line()),
@@ -765,7 +769,9 @@ impl Wizard {
             .child(
                 div()
                     .flex_none()
+                    .max_w_full()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .child(

@@ -247,6 +247,26 @@ fn preparation_only_while_dialog_open_base_change_and_explicit_cancel(cx: &mut T
 }
 
 #[gpui::test]
+fn ready_preparation_stops_fast_polling(cx: &mut TestAppContext) {
+    let fake = Arc::new(Fake::default());
+    fake.prep_supported.store(true, Ordering::Release);
+    cx.update(gpui_component::init);
+    let (dialog, cx) =
+        cx.add_window_view(|window, cx| Dialog::new("/repo".into(), fake.clone(), window, cx));
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| dialog.read(cx).preparation_ready));
+    let ready = fake.preparations.lock().unwrap().len();
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(
+        fake.preparations.lock().unwrap().len(),
+        ready,
+        "a ready checkout is not re-polled every 250ms"
+    );
+}
+
+#[gpui::test]
 fn closing_dialog_cancels_its_preparation(cx: &mut TestAppContext) {
     let fake = Arc::new(Fake::default());
     fake.prep_supported.store(true, Ordering::Release);
@@ -1145,4 +1165,88 @@ fn non_git_folder_shows_notice_instead_of_base_refs(cx: &mut TestAppContext) {
     let req = vcx.update(|_, cx| dialog.update(cx, |d, cx| d.request(Setup::Ask, cx).unwrap()));
     assert_eq!(req.base, None);
     std::fs::remove_dir_all(temp).ok();
+}
+
+#[gpui::test]
+fn preparation_status_reserves_width_so_cancel_button_never_shifts(cx: &mut TestAppContext) {
+    let fake = Arc::new(Fake::default());
+    fake.prep_supported.store(true, Ordering::Release);
+    cx.update(gpui_component::init);
+    let (dialog, vcx) =
+        cx.add_window_view(|window, cx| Dialog::new("/repo".into(), fake.clone(), window, cx));
+    vcx.simulate_resize(gpui::size(px(640.), px(640.)));
+    vcx.executor().advance_clock(Duration::from_millis(300));
+    vcx.run_until_parked();
+
+    dialog.update(vcx, |d, cx| {
+        assert!(d.preparation.is_some());
+        d.advanced_open = true;
+        d.preparation_ready = false;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let preparing_bounds = vcx.debug_bounds("cancel-preparation").unwrap();
+
+    dialog.update(vcx, |d, cx| {
+        d.preparation_ready = true;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let prepared_bounds = vcx.debug_bounds("cancel-preparation").unwrap();
+    assert_eq!(
+        prepared_bounds, preparing_bounds,
+        "cancel-preparation button must not jump when preparation finishes"
+    );
+}
+
+#[gpui::test]
+fn nfd_hangul_matches_pick_item_branches_and_fanout_rejects_long_names_and_host_repo_change_resets(
+    cx: &mut TestAppContext,
+) {
+    let pick = PickItem {
+        value: "id".to_owned(),
+        title: "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1161}\u{11BC}".into(),
+        detail: "".into(),
+    };
+    assert!(pick.matches("한강"));
+
+    let fake = Arc::new(Fake::default());
+    cx.update(gpui_component::init);
+    let (dialog, vcx) =
+        cx.add_window_view(|window, cx| Dialog::new("/repo-a".into(), fake.clone(), window, cx));
+    vcx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_branch_candidates(
+                vec!["feature/\u{1112}\u{1161}\u{11AB}\u{1100}\u{1161}\u{11BC}".to_owned()],
+                cx,
+            );
+            d.branch_query
+                .update(cx, |input, cx| input.set_value("한강", window, cx));
+            assert_eq!(
+                d.filtered_bases(cx),
+                vec!["feature/\u{1112}\u{1161}\u{11AB}\u{1100}\u{1161}\u{11BC}".to_owned()]
+            );
+
+            d.name
+                .update(cx, |input, cx| input.set_value("a".repeat(253), window, cx));
+            d.selected_agents = vec!["claude".to_owned(), "codex".to_owned()];
+            assert!(d.fan_out_requests(Setup::Ask, cx).is_err());
+
+            d.set_host_options(
+                HostId::Local,
+                vec![WorktreeHostOption {
+                    host: HostId::Local,
+                    label: "local".to_owned(),
+                    source: fake.clone(),
+                    repos: vec![WorktreeRepoOption {
+                        path: "/repo-b".into(),
+                        label: "repo-b".to_owned(),
+                        branch: Some("main".to_owned()),
+                    }],
+                }],
+                cx,
+            );
+            assert_eq!(d.repo(), std::path::Path::new("/repo-b"));
+        });
+    });
 }

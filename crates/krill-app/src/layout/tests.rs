@@ -1206,9 +1206,8 @@ fn startup_edits_are_appended_to_the_restored_layout() {
     edited.panel_width = 428.0;
 
     let empty_panes = BTreeSet::new();
-    let empty_tabs = BTreeSet::new();
     let mut merged = saved.clone();
-    let tab_map = merged.absorb_startup_edits(&baseline, &edited, &empty_panes, &empty_tabs);
+    let tab_map = merged.absorb_startup_edits(&baseline, &edited, &empty_panes);
     assert!(merged.is_valid());
     assert_eq!(merged.tabs().len(), expected_tab_count + 2);
     assert_eq!(tab_map.get(&1).copied(), Some(expected_tab_count));
@@ -1271,14 +1270,14 @@ fn startup_edits_are_appended_to_the_restored_layout() {
 
     // 아무것도 하지 않았으면(placeholder 탭만) 저장본이 그대로다.
     let mut untouched = saved.clone();
-    let map = untouched.absorb_startup_edits(&baseline, &baseline, &empty_panes, &empty_tabs);
+    let map = untouched.absorb_startup_edits(&baseline, &baseline, &empty_panes);
     assert!(map.is_empty());
     assert_eq!(untouched, saved);
 
     // placeholder 탭에 초기 입력/런타임 의도가 걸려 있으면 버리지 않고 원래 PaneId(0) 그대로 뒤에 남긴다.
     let retained_panes = BTreeSet::from([PaneId(0)]);
     let mut with_input = saved.clone();
-    let map = with_input.absorb_startup_edits(&baseline, &baseline, &retained_panes, &empty_tabs);
+    let map = with_input.absorb_startup_edits(&baseline, &baseline, &retained_panes);
     assert!(with_input.is_valid());
     assert_eq!(map.get(&0).copied(), Some(expected_tab_count));
     assert_eq!(with_input.tab_panes(expected_tab_count), vec![PaneId(0)]);
@@ -1288,7 +1287,42 @@ fn startup_edits_are_appended_to_the_restored_layout() {
     let mut closed = baseline.clone();
     closed.close_tab(0);
     let mut kept = saved.clone();
-    kept.absorb_startup_edits(&baseline, &closed, &empty_panes, &empty_tabs);
+    kept.absorb_startup_edits(&baseline, &closed, &empty_panes);
     assert_eq!(kept.tabs(), saved.tabs());
     assert_eq!(kept.active(), saved.active());
+}
+
+#[test]
+fn zoom_clears_when_sibling_closes_to_single_pane_or_when_splitting() {
+    // 1) Closing the non-zoomed pane leaves one leaf: stale zoom must not survive or hide a future split.
+    let mut l = Layout::default();
+    l.split(Axis::Horizontal); // PaneId(0) | PaneId(1), focused = 1
+    l.focus(PaneId(0));
+    l.set_zoomed_pane(Some(PaneId(0)));
+    assert_eq!(l.zoomed_pane(), Some(PaneId(0)));
+
+    l.focus(PaneId(1));
+    l.close_pane();
+    assert_eq!(l.visible(), vec![PaneId(0)]);
+    assert_eq!(
+        l.zoomed_pane(),
+        None,
+        "single-pane tab must not retain stale zoom"
+    );
+
+    l.split(Axis::Vertical);
+    assert_eq!(l.visible().len(), 2);
+    assert_eq!(l.zoomed_pane(), None);
+
+    // 2) Splitting a zoomed multi-pane tab clears zoom so the newly focused pane is visible.
+    l.set_zoomed_pane(Some(PaneId(0)));
+    assert_eq!(l.zoomed_pane(), Some(PaneId(0)));
+    l.focus(PaneId(0));
+    l.split(Axis::Horizontal);
+    assert_eq!(l.visible().len(), 3);
+    assert_eq!(
+        l.zoomed_pane(),
+        None,
+        "splitting while zoomed must reveal the newly created pane"
+    );
 }

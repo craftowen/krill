@@ -39,6 +39,8 @@ to `check` as well, and validate every message's run/task/dispatch before acting
 
 For immediate related follow-up, inspect `worker-show <old-dispatch-id> --json`
 and confirm the original assignment settled and the agent is ready for input.
+Run `worker-retain <old-dispatch-id>` before acknowledging its `worker_done`;
+the acknowledgment otherwise releases and closes that session.
 Then bind a new Task and Dispatch to the existing numeric session:
 
 ```text

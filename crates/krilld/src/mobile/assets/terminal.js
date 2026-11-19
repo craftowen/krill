@@ -550,13 +550,13 @@ globalThis.MkTerminalCodec = (() => {
       items = [];
     for (let y = 0; y < lines.length; y++) {
       const m =
-        /^(\s*)([❯›>→])?\s*(?:(\d{1,2})[.)]\s+(\S.*)|(\[[ xX✓]\]|[☐☑])\s+(\S.*))$/.exec(
+        /^(\s*)([❯›>→])?\s*(?:(\d{1,2})[.)]\s+(\S.*)|(\[[ xX✓✔]\]|[☐☑☒])\s+(\S.*))$/.exec(
           lines[y],
         );
       if (!m) continue;
       let label = m[4] || m[6],
         box = m[5];
-      const check = /^(\[[ xX✓]\]|[☐☑])\s+(\S.*)$/.exec(label);
+      const check = /^(\[[ xX✓✔]\]|[☐☑☒])\s+(\S.*)$/.exec(label);
       if (check) {
         box = check[1];
         label = check[2];
@@ -565,12 +565,13 @@ globalThis.MkTerminalCodec = (() => {
         label,
         number: m[3] ? Number(m[3]) : null,
         focused: !!m[2],
-        checked: box ? /[xX✓☑]/.test(box) : null,
+        checked: box ? /[xX✓✔☑☒]/.test(box) : null,
         line: y,
         indent: lines[y].indexOf(label),
       });
     }
 
+    const rule = /^[\s─━╭╮╰╯┌┐└┘┴┬┼+\-]+$/;
     const first = items.findLastIndex((item) => item.number === 1);
     if (first > 0) items.splice(0, first);
     if (
@@ -579,6 +580,18 @@ globalThis.MkTerminalCodec = (() => {
       items.filter((i) => i.focused).length !== 1
     )
       return null;
+    const endItem = items.at(-1);
+    if (items.length > 2 && items[0].checked !== null) {
+      const split = items.findIndex((item) => item.checked === null);
+      if (
+        split >= 2 &&
+        items.slice(split).every((i) => i.checked === null && !i.focused) &&
+        lines
+          .slice(items[split - 1].line + 1, items[split].line)
+          .some((l) => l.trim() && rule.test(l))
+      )
+        items.splice(split);
+    }
     const multiple = items.every((i) => i.checked !== null);
     if (!multiple && items.some((i) => i.checked !== null)) return null;
     if (items.some((item, i) => item.number !== null && item.number !== i + 1))
@@ -586,45 +599,56 @@ globalThis.MkTerminalCodec = (() => {
     const hint = /(?:enter|return|↵|엔터)/i,
       action = /(?:select|confirm|submit|continue|선택|확인|제출|계속)/i;
     const last = items.at(-1),
-      after = lines.slice(last.line + 1);
+      after = lines.slice(endItem.line + 1);
     while (
       after.length &&
       (!after[0].trim() ||
-        (!hint.test(after[0]) && after[0].search(/\S/) >= last.indent))
+        (!rule.test(after[0]) &&
+          !hint.test(after[0]) &&
+          after[0].search(/\S/) >= endItem.indent))
     ) {
       const line = after.shift();
-      if (line.trim()) last.label += " " + line.trim();
+      if (line.trim() && endItem === last) last.label += " " + line.trim();
     }
-    const tail = after.filter(
-      (line) => line.trim() && !/^[\s─━╭╮╰╯┌┐└┘┴┬┼+\-]+$/.test(line),
-    );
-    if (!tail.some((line) => hint.test(line) && action.test(line))) return null;
+    const tail = after.filter((line) => line.trim() && !rule.test(line)),
+      tailText = tail.join(" ");
+    if (!hint.test(tailText) || !action.test(tailText)) return null;
     if (
       tail.some(
         (line) =>
-          !/(?:enter|return|esc|tab|arrow|space|↑|↓|←|→|↵|엔터|선택|취소)/i.test(
+          /^\s*[$%#]\s+\S/.test(line) ||
+          !/(?:enter|return|esc|escape|cancel|navigate|confirm|submit|select|continue|tab|arrow|space|ctrl\+|auto-continue|↑|↓|←|→|↵|엔터|선택|확인|제출|계속|취소|이동)/i.test(
             line,
           ),
       )
     )
       return null;
-    if (
-      !multiple &&
-      tail.some((line) => /space.*select|스페이스.*선택/i.test(line))
-    )
+    if (!multiple && /space.*select|스페이스.*선택/i.test(tailText))
       return null;
     for (let i = 0; i < items.length - 1; i++)
       for (const line of lines.slice(items[i].line + 1, items[i + 1].line)) {
-        if (!line.trim()) continue;
+        if (!line.trim() || rule.test(line)) continue;
         if (line.search(/\S/) < items[i].indent) return null;
         items[i].label += " " + line.trim();
       }
+    let contextStart = Math.max(0, items[0].line - 4);
+    for (let y = items[0].line - 1; y >= Math.max(0, items[0].line - 12); y--) {
+      if (lines[y].trim() && rule.test(lines[y])) {
+        contextStart = y + 1;
+        break;
+      }
+    }
     const active = items.findIndex((i) => i.focused),
       choices = items.map(({ label, checked }) => ({ label, checked })),
-      context = lines.slice(Math.max(0, items[0].line - 4), items[0].line);
+      context = lines.slice(contextStart, items[0].line);
     const title = context
       .map((line) => line.trim())
-      .filter((line) => line && !/^[─━╭╮╰╯┌┐└┘+\-]+$/.test(line))
+      .filter(
+        (line) =>
+          line &&
+          !rule.test(line) &&
+          !(contextStart < items[0].line - 4 && /^[☐☑☒✓✔]\s+\S/.test(line)),
+      )
       .join("\n");
     return {
       choices,
@@ -635,6 +659,23 @@ globalThis.MkTerminalCodec = (() => {
       key: JSON.stringify([context, choices, active]),
     };
   }
+  // iOS freezes a hidden home-screen app, so a reply timer that ran while hidden measured the freeze,
+  // not the desktop. A frozen page also fires timers late, possibly before visibilitychange on return:
+  // that earns one fresh window. The callback runs only after a full window of visible, on-time waiting.
+  const patient = (fn, ms) => {
+    const handle = { id: 0, clear: () => clearTimeout(handle.id) };
+    let late = false;
+    const arm = (wait) => {
+      const due = Date.now() + wait;
+      handle.id = setTimeout(() => {
+        if (globalThis.document?.hidden) return arm(ms);
+        if (Date.now() - due > 1000 && !late) return ((late = true), arm(ms));
+        fn();
+      }, wait);
+    };
+    arm(ms);
+    return handle;
+  };
   class Terminal {
     constructor(root, options) {
       if (
@@ -1062,6 +1103,20 @@ globalThis.MkTerminalCodec = (() => {
         },
         { passive: false },
       );
+      // Touch taps keep the software keyboard closed; a mouse click is a PC
+      // user who expects to type right away.
+      let mouseDown = false;
+      this.listen(this.port, "pointerdown", (e) => {
+        mouseDown = e.pointerType === "mouse" && e.button === 0;
+      });
+      this.listen(this.port, "click", (e) => {
+        if (
+          mouseDown &&
+          !e.target.closest?.("button") &&
+          globalThis.getSelection?.()?.isCollapsed !== false
+        )
+          this.focus();
+      });
       let pinch;
       const distance = (touches) =>
         Math.hypot(
@@ -1804,7 +1859,7 @@ globalThis.MkTerminalCodec = (() => {
         was = this.alt;
       this.alt = alt;
       this.root.dataset.alt = String(alt);
-      this.screenComplete = false;
+      if (alt !== was) this.screenComplete = false;
       this.syncQuestion();
       if (alt === was) return;
       if (alt) {
@@ -2768,8 +2823,11 @@ globalThis.MkTerminalCodec = (() => {
         await this.role(Uint8Array.from([0, 2, 0]));
         return;
       }
+      // Every branch asks the daemon something with a reply deadline, so a socket that died while the app
+      // was in the background is found within one role window after returning.
       if (this.autoFit && !this.fit) await this.fitToPhone(true, false);
       else if (this.fit) await this.resize(true);
+      else this.guard(() => this.role(Uint8Array.from([0, 2, 0])));
       this.maybeLoadInitialHistory();
     }
     queueFit() {
@@ -2979,7 +3037,7 @@ globalThis.MkTerminalCodec = (() => {
                 pending = this.pendingInputs.get(id);
               if (!pending) break;
               this.pendingInputs.delete(id);
-              clearTimeout(pending.timer);
+              pending.timer.clear();
               clearTimeout(pending.slowTimer);
               if (result) {
                 this.inputWaiting = false;
@@ -3017,7 +3075,7 @@ globalThis.MkTerminalCodec = (() => {
               const result = r.n(3),
                 pending = this.pendingRoles.shift();
               if (pending) {
-                clearTimeout(pending.timer);
+                pending.timer.clear();
                 if (result) pending.reject(Error("Terminal resize rejected"));
                 else pending.resolve();
               } else if (result) throw Error("Terminal role rejected");
@@ -3117,7 +3175,7 @@ globalThis.MkTerminalCodec = (() => {
               this.status("ready", "Waiting for input confirmation…");
             }
           }, 1000),
-          timer: setTimeout(() => {
+          timer: patient(() => {
             if (this.pendingInputs.has(id))
               this.disconnect("disconnected", "Input confirmation timed out");
           }, 10000),
@@ -3129,7 +3187,7 @@ globalThis.MkTerminalCodec = (() => {
           this.send(0x13, C.concat(T.v(id), T.v(bytes.length), bytes));
         } catch (e) {
           this.pendingInputs.delete(id);
-          clearTimeout(pending.timer);
+          pending.timer.clear();
           clearTimeout(pending.slowTimer);
           this.contextBlocked = true;
           this.invalidateInput();
@@ -3143,7 +3201,7 @@ globalThis.MkTerminalCodec = (() => {
         const pending = {
           resolve,
           reject,
-          timer: setTimeout(() => {
+          timer: patient(() => {
             this.socket?.close();
             this.disconnect("disconnected", "Terminal resize timed out");
           }, 5000),
@@ -3153,7 +3211,7 @@ globalThis.MkTerminalCodec = (() => {
           this.send(0x17, body);
         } catch (e) {
           this.pendingRoles.pop();
-          clearTimeout(pending.timer);
+          pending.timer.clear();
           reject(e);
         }
       });
@@ -3928,13 +3986,13 @@ globalThis.MkTerminalCodec = (() => {
         this.contextBlocked = true;
       }
       for (const pending of this.pendingInputs.values()) {
-        clearTimeout(pending.timer);
+        pending.timer.clear();
         clearTimeout(pending.slowTimer);
         pending.reject(error);
       }
       this.pendingInputs.clear();
       for (const pending of this.pendingRoles.splice(0)) {
-        clearTimeout(pending.timer);
+        pending.timer.clear();
         pending.reject(Error("Terminal disconnected"));
       }
       this.channel = null;

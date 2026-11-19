@@ -65,14 +65,26 @@ fn vs16_single(text: &str) -> bool {
     text.contains(VS16) && !text.contains(ZWJ)
 }
 
-/// 행의 칸들을 셰이핑 묶음으로 나눈다. 자리(`SPACER`) 칸은 묶음에 딸려 가고 따로 내지 않는다.
+fn is_trailing_wide_spacer(row: &[Cell], idx: usize) -> bool {
+    row.get(idx)
+        .is_some_and(|c| c.flags.contains(Flags::SPACER))
+        && idx > 0
+        && row
+            .get(idx - 1)
+            .is_some_and(|prev| prev.flags.contains(Flags::WIDE))
+}
+
+/// 행의 칸들을 셰이핑 묶음으로 나눈다. 앞이 `WIDE`인 꼬리(`SPACER`) 칸만 묶음에 딸려 가고,
+/// 줄바꿈 앞에 혼자 놓인 선행 자리 채움 `SPACER`는 1칸으로 남긴다.
 /// 빈칸 여부(`is_blank`)는 넘침 판정에만 쓴다.
 /// AS-14: 65,535칸을 넘는 행도 panic 없이 `u16::MAX`에서 자른다(정상 krilld는 2048칸으로 자름).
 pub fn clusters(row: &[Cell]) -> Vec<Cluster> {
-    // 자리 칸을 건너뛴 (열, 칸) 목록. 열은 u32로 세고 `u16::MAX`를 넘는 칸은 버린다.
+    // 꼬리 WIDE SPACER만 건너뛴 (열, 칸) 목록. 열은 u32로 세고 `u16::MAX`를 넘는 칸은 버린다.
     let cells: Vec<(u16, &Cell)> = (0u32..)
         .zip(row)
-        .filter(|(_, c)| !c.flags.contains(Flags::SPACER))
+        .enumerate()
+        .filter(|(idx, _)| !is_trailing_wide_spacer(row, *idx))
+        .map(|(_, pair)| pair)
         .take_while(|(col, _)| u16::try_from(*col).is_ok())
         .filter_map(|(col, c)| u16::try_from(col).ok().map(|col| (col, c)))
         .collect();

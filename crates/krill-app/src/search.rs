@@ -174,6 +174,10 @@ impl Bar {
         cx.emit(Event::Step(direction));
     }
 
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        crate::jump::entity_input_is_composing(&self.input, window, cx)
+    }
+
     fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.debounce = None;
         cx.emit(Event::Dismiss);
@@ -187,7 +191,11 @@ impl Render for Bar {
             self.input.update(cx, |input, cx| {
                 input.set_placeholder(text::PLACEHOLDER.get(), window, cx);
             });
-            self.status = status_text(self.result.as_ref()).into();
+            self.status = if self.options.regex && self.options.compile(&self.query).is_err() {
+                text::INVALID_REGEX.get().into()
+            } else {
+                status_text(self.result.as_ref()).into()
+            };
         }
         let pal = crate::ui::palette(cx);
         let (bg, fg, border, muted) = (
@@ -215,15 +223,24 @@ impl Render for Bar {
             .border_color(border)
             .rounded(crate::ui::RADIUS_MD)
             .shadow_lg()
-            .capture_action(cx.listener(|bar, _: &MoveUp, _, cx| {
+            .capture_action(cx.listener(|bar, _: &MoveUp, window, cx| {
+                if bar.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 bar.step(Direction::Previous, cx);
             }))
-            .capture_action(cx.listener(|bar, _: &MoveDown, _, cx| {
+            .capture_action(cx.listener(|bar, _: &MoveDown, window, cx| {
+                if bar.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 bar.step(Direction::Next, cx);
             }))
             .capture_action(cx.listener(|bar, _: &Enter, window, cx| {
+                if bar.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 // OWE-868: ⇧Enter는 이전 찾기(표준 단축키). Enter·↓는 다음, ↑는 이전이다.
                 if window.modifiers().shift {
@@ -232,7 +249,10 @@ impl Render for Bar {
                     bar.step(Direction::Next, cx);
                 }
             }))
-            .capture_action(cx.listener(|bar, _: &Escape, _, cx| {
+            .capture_action(cx.listener(|bar, _: &Escape, window, cx| {
+                if bar.input_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 bar.dismiss(cx);
             }))

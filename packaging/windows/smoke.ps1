@@ -24,7 +24,7 @@ New-Item -ItemType Directory -Force $base | Out-Null
 try {
     & (Join-Path $PSScriptRoot 'install.ps1') -Zip $zipPath -Dest $dest -NoShortcut
     $info = Get-Content -Raw (Join-Path $dest 'Krill.json') | ConvertFrom-Json
-    foreach ($f in 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64\OpenConsole.exe') {
+    foreach ($f in 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64\OpenConsole.exe', 'arm64\OpenConsole.exe') {
         if (-not (Test-Path (Join-Path $dest $f))) { throw "missing $f" }
     }
 

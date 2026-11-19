@@ -985,7 +985,7 @@ impl OrchestrationStore {
                 self.runs.len()
             )));
         }
-        atomic_write(&state_dir.join(ORCH_FILE), body.as_bytes())
+        crate::os::write_atomic_0600(&state_dir.join(ORCH_FILE), body.as_bytes())
     }
 
     pub fn mutate<T, F>(state_dir: &Path, f: F) -> io::Result<T>
@@ -1264,6 +1264,14 @@ impl OrchestrationStore {
         if let Some(sid) = session_id {
             if let Some(ref id) = selected {
                 self.session_runs.insert(sid, id.clone());
+                // A worker selecting its own Run must not redirect coordinator mail to itself.
+                let worker = self
+                    .dispatches
+                    .iter()
+                    .any(|d| &d.run_id == id && d.session_id == Some(u64::from(sid)));
+                if !worker && let Some(run) = self.runs.iter_mut().find(|r| &r.id == id) {
+                    run.coordinator_session_id = Some(u64::from(sid));
+                }
             } else {
                 self.session_runs.remove(&sid);
             }
@@ -1616,6 +1624,12 @@ impl OrchestrationStore {
         }
 
         let msg_id = self.alloc_id("msg");
+        if let Some(sid) = session_id {
+            self.idle_mail_notified
+                .entry(sid)
+                .or_default()
+                .insert(msg_id.clone());
+        }
         self.messages.push(OrchMessage {
             id: msg_id,
             run_id: Some(run_id.to_owned()),
@@ -1774,14 +1788,39 @@ impl OrchestrationStore {
                 && run_id.is_none_or(|rid| m.run_id.as_deref() == Some(rid))
                 && (types.is_empty() || types.contains(&m.msg_type))
         };
-        // Other consumers (reply/answer waits) may have already consumed an entire batch.
+        // Other consumers (reply/answer waits) may have already consumed part or all of a batch.
+        let acked_ids: BTreeSet<String> = self
+            .messages
+            .iter()
+            .filter(|m| m.acked)
+            .map(|m| m.id.clone())
+            .collect();
         for delivery in &mut self.deliveries {
-            if delivery
-                .message_ids
-                .iter()
-                .all(|id| self.messages.iter().any(|m| &m.id == id && m.acked))
-            {
+            if delivery_id.is_none() && !delivery.acked {
+                delivery.message_ids.retain(|id| !acked_ids.contains(id));
+            }
+            if delivery.message_ids.iter().all(|id| acked_ids.contains(id)) {
                 delivery.acked = true;
+            }
+        }
+        if delivery_id.is_none() && !types.is_empty() {
+            for delivery in &mut self.deliveries {
+                if delivery.acked
+                    || recipient.is_some_and(|to| delivery.to != to)
+                    || run_id.is_some_and(|id| delivery.run_id.as_deref() != Some(id))
+                {
+                    continue;
+                }
+                let matches_id = |id: &String| {
+                    self.messages
+                        .iter()
+                        .any(|m| &m.id == id && (!unread_only || !m.acked) && matches(m))
+                };
+                let has_match = delivery.message_ids.iter().any(matches_id);
+                let has_other = delivery.message_ids.iter().any(|id| !matches_id(id));
+                if has_match && has_other {
+                    delivery.message_ids.retain(|id| !matches_id(id));
+                }
             }
         }
         let selected = if let Some(id) = delivery_id {
@@ -3074,7 +3113,8 @@ pub fn validate_symlink_path(raw: &str) -> io::Result<String> {
                 "symlink path must not contain '.' or '..' traversal segments",
             ));
         }
-        if part == ".git" {
+        let trimmed_part = part.trim_end_matches(['.', ' ']);
+        if trimmed_part.eq_ignore_ascii_case(".git") || trimmed_part.eq_ignore_ascii_case("git~1") {
             return Err(invalid("symlink path must not target '.git'"));
         }
         parts.push(part);
@@ -3253,7 +3293,7 @@ impl WorktreeStore {
         if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_COMMENTS_BYTES {
             return Err(invalid("worktree-comments.toml exceeds size limit"));
         }
-        atomic_write(&state_dir.join(COMMENTS_FILE), body.as_bytes())?;
+        crate::os::write_atomic_0600(&state_dir.join(COMMENTS_FILE), body.as_bytes())?;
         if let Ok(mut guard) = WORKTREE_STORE_CACHE.lock() {
             *guard = None;
         }
@@ -3819,13 +3859,20 @@ pub fn probe_port(port: u16) -> bool {
 // Built-in Agent Skills Registry (MK-115)
 // ============================================================================
 
+pub mod agent_desktop;
 mod skills;
+pub use agent_desktop::{
+    AGENT_DESKTOP_VERSION, AgentDesktopAsset, AgentDesktopLinkStatus, AgentDesktopReport,
+    AgentDesktopSource, AgentDesktopTarget, current_agent_desktop_asset,
+    ensure_agent_desktop_cli_link, ensure_agent_desktop_installed,
+    ensure_agent_desktop_installed_with_path, stage_agent_desktop, verify_archive_sha256,
+};
 #[cfg(test)]
 use skills::ORCA_SKILL_NAMES;
 pub use skills::{
     ARTIFACTS_REFERENCES, BUILTIN_SKILLS, ORCHESTRATION_REFERENCES, SkillEntry, SkillSyncReport,
-    builtin_skills, install_skill, skill_directories, skill_references, sync_builtin_skills,
-    sync_builtin_skills_at,
+    builtin_skills, canonical_skill_name, install_skill, skill_directories, skill_references,
+    sync_builtin_skills, sync_builtin_skills_at,
 };
 
 // ============================================================================
@@ -3844,30 +3891,6 @@ pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("state");
-    let tmp = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let mut f = opts.open(&tmp)?;
-    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-        fs::remove_file(&tmp).ok();
-        return Err(e);
-    }
-    drop(f);
-    if let Err(e) = fs::rename(&tmp, target) {
-        fs::remove_file(&tmp).ok();
-        return Err(e);
-    }
-    Ok(())
 }
 
 struct LockGuard {
@@ -4976,21 +4999,17 @@ mod tests {
             .iter()
             .find(|s| s.name == "computer-use")
             .ok_or_else(|| not_found("computer-use skill"))?;
+        assert!(!computer.content.contains("krill computer"));
         for sub in [
-            "krill computer capabilities",
-            "krill computer permissions",
-            "krill computer list-apps",
-            "krill computer list-windows",
-            "krill computer get-app-state",
-            "krill computer click",
-            "krill computer perform-secondary-action",
-            "krill computer set-value",
-            "krill computer type-text",
-            "krill computer press-key",
-            "krill computer hotkey",
-            "krill computer paste-text",
-            "krill computer scroll",
-            "krill computer drag",
+            "agent-desktop status",
+            "agent-desktop skills get platform",
+            "agent-desktop skills get desktop",
+            "agent-desktop snapshot",
+            "agent-desktop click",
+            "commands-observation",
+            "commands-interaction",
+            "commands-system",
+            "workflows",
         ] {
             assert!(computer.content.contains(sub), "{sub}");
         }
@@ -5564,6 +5583,32 @@ mod mailbox_and_worker_safety_tests {
             outcome: None,
             reply_to: None,
         }
+    }
+
+    #[test]
+    fn selecting_a_run_claims_its_coordinator_except_from_its_own_worker() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("claimed later", None)?;
+        let other = store.create_run("other", None)?;
+        let coordinator = |s: &OrchestrationStore, id: &str| {
+            s.runs
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.coordinator_session_id)
+        };
+        store.set_session_run(Some(5), Some(&run.id))?;
+        assert_eq!(coordinator(&store, &run.id), Some(5));
+        store.set_session_run(Some(6), Some(&run.id))?;
+        assert_eq!(coordinator(&store, &run.id), Some(6));
+        store.start_worker(&run.id, None, "w", "codex", Some(7), "/tmp", "p")?;
+        store.set_session_run(Some(7), Some(&run.id))?;
+        assert_eq!(coordinator(&store, &run.id), Some(6));
+        // A worker of one Run may still coordinate another (nested supervision).
+        store.set_session_run(Some(7), Some(&other.id))?;
+        assert_eq!(coordinator(&store, &other.id), Some(7));
+        store.set_session_run(Some(6), None)?;
+        assert_eq!(coordinator(&store, &run.id), Some(6));
+        Ok(())
     }
 
     #[test]
@@ -6707,5 +6752,145 @@ mod frame_bound_tests {
             snapshot_page(b"abc", None, 0),
             OrchResponse::SnapshotPage { total: 3, offset: 0, bytes, .. } if bytes == b"abc"
         ));
+    }
+
+    #[test]
+    fn start_worker_with_bound_session_marks_dispatch_mail_notified() {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("bound session run", Some(1)).unwrap();
+        let dispatch = store
+            .start_worker_with_depth(
+                &run.id,
+                None,
+                "worker-bound",
+                "claude",
+                Some(77),
+                "/tmp",
+                "inspect and report",
+                0,
+                DEFAULT_MAX_WORKER_DEPTH,
+            )
+            .unwrap();
+        assert_eq!(dispatch.session_id, Some(77));
+        let msg = store
+            .messages
+            .iter()
+            .find(|m| m.dispatch_id.as_deref() == Some(dispatch.id.as_str()))
+            .expect("dispatch message created");
+        assert!(
+            store
+                .idle_mail_notified
+                .get(&77)
+                .is_some_and(|ids| ids.contains(&msg.id)),
+            "bound session dispatch message must be pre-marked in idle_mail_notified"
+        );
+    }
+
+    #[test]
+    fn typed_check_does_not_starve_after_unfiltered_peek_and_partial_ack_prunes_batch()
+    -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("check-split", None)?;
+        let dispatch = store.start_worker_with_depth(
+            &run.id,
+            None,
+            "worker-1",
+            "claude",
+            Some(77),
+            "/tmp",
+            "inspect",
+            0,
+            DEFAULT_MAX_WORKER_DEPTH,
+        )?;
+        store.send_message(&SendParams {
+            from: "worker-1".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Status,
+            summary: "working".into(),
+            body: String::new(),
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            dispatch_id: Some(dispatch.id.clone()),
+            outcome: None,
+            reply_to: None,
+        })?;
+        store.send_message(&SendParams {
+            from: "worker-1".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "done".into(),
+            body: String::new(),
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            dispatch_id: Some(dispatch.id.clone()),
+            outcome: Some("succeeded".into()),
+            reply_to: None,
+        })?;
+        // Unfiltered peek reserves [Status, WorkerDone] into an unacked delivery.
+        let (_, peeked) =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&run.id), None)?;
+        assert_eq!(peeked.len(), 2);
+
+        // Filtered typed check must split out WorkerDone instead of starving.
+        let (typed_del, typed_msgs) = store.check_delivery(
+            Some("coordinator"),
+            &[MessageType::WorkerDone],
+            true,
+            true,
+            Some(&run.id),
+            None,
+        )?;
+        assert!(typed_del.is_some());
+        assert_eq!(typed_msgs.len(), 1);
+        assert_eq!(typed_msgs[0].msg_type, MessageType::WorkerDone);
+        // The remaining Status stays in its batch and is delivered when polled unfiltered.
+        let (status_del, status_msgs) =
+            store.check_delivery(Some("coordinator"), &[], true, true, Some(&run.id), None)?;
+        assert!(status_del.is_some());
+        assert_eq!(status_msgs.len(), 1);
+        assert_eq!(status_msgs[0].msg_type, MessageType::Status);
+
+        // Partial ack via reply_message must prune the answered question from an unacked batch.
+        let q = store.send_message(&SendParams {
+            from: "worker-2".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Question,
+            summary: "q?".into(),
+            body: String::new(),
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            dispatch_id: None,
+            outcome: None,
+            reply_to: None,
+        })?;
+        store.send_message(&SendParams {
+            from: "worker-2".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::Escalation,
+            summary: "blocked".into(),
+            body: String::new(),
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            dispatch_id: None,
+            outcome: None,
+            reply_to: None,
+        })?;
+        let (_, mixed) =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&run.id), None)?;
+        assert_eq!(mixed.len(), 2);
+        let q_id = q[0].id.clone();
+        store.reply_message(&q_id, "coordinator", "yes")?;
+        let (_, remaining) =
+            store.check_delivery(Some("coordinator"), &[], true, false, Some(&run.id), None)?;
+        assert_eq!(remaining.len(), 1);
+        assert_ne!(remaining[0].id, q_id);
+        Ok(())
+    }
+
+    #[test]
+    fn validate_symlink_path_rejects_case_and_short_name_dot_git() {
+        for bad in [".GIT", ".Git/hooks", ".git.", "GIT~1", "sub/.GIT/config"] {
+            assert!(validate_symlink_path(bad).is_err(), "{bad}");
+        }
     }
 }

@@ -82,7 +82,11 @@ pub fn edit_toml_aliases<T: Serialize + DeserializeOwned>(
         }
     }
     patch_toml(document.as_item_mut(), &before, &after)?;
-    let output = document.to_string();
+    let mut output = document.to_string();
+    if toml::from_str::<T>(&output).is_err() {
+        materialize_empty_arrays_of_tables(document.as_table_mut());
+        output = document.to_string();
+    }
     let roundtrip: T = toml::from_str(&output).map_err(invalid)?;
     if toml::to_string(&roundtrip).map_err(invalid)? != toml::to_string(updated).map_err(invalid)? {
         return Err(invalid("TOML edit does not match the requested values"));
@@ -308,6 +312,36 @@ fn patch_toml(raw: &mut Item, before: &Toml, after: &Toml) -> io::Result<()> {
     Ok(())
 }
 
+fn materialize_empty_arrays_of_tables(table: &mut toml_edit::Table) {
+    let empty_keys: Vec<String> = table
+        .iter()
+        .filter_map(|(k, item)| {
+            item.as_array_of_tables()
+                .filter(|aot| aot.is_empty())
+                .map(|_| k.to_owned())
+        })
+        .collect();
+    for key in empty_keys {
+        let mut empty = toml_edit::Value::Array(toml_edit::Array::new());
+        empty.decor_mut().set_prefix(" ");
+        if let Some(entry) = table.get_mut(&key) {
+            *entry = Item::Value(empty);
+        }
+        if let Some(mut key_mut) = table.key_mut(&key) {
+            key_mut.leaf_decor_mut().set_suffix(" ");
+        }
+    }
+    for (_, item) in table.iter_mut() {
+        if let Some(sub) = item.as_table_mut() {
+            materialize_empty_arrays_of_tables(sub);
+        } else if let Some(aot) = item.as_array_of_tables_mut() {
+            for sub in aot.iter_mut() {
+                materialize_empty_arrays_of_tables(sub);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +442,35 @@ mod tests {
             proptest::prop_assert_eq!(value.get("future").unwrap().get("nested").unwrap(), &Json::from(future));
             proptest::prop_assert_eq!(value.get("entries").unwrap().as_array().unwrap().first().unwrap().get("future").unwrap(), &Json::from(future));
         }
+    }
+
+    #[test]
+    fn clearing_array_of_tables_keeps_empty_array_key() {
+        let raw = "# header\n[[entries]]\nid = 'one'\nlabel = 'old'\n";
+        let cleared = File {
+            entries: Vec::new(),
+        };
+        let output = edit_toml(raw, &cleared).unwrap();
+        assert!(output.contains("entries = []"), "{output}");
+        let reparsed: File = toml::from_str(&output).unwrap();
+        assert!(reparsed.entries.is_empty());
+    }
+
+    #[test]
+    fn clearing_defaulted_array_of_tables_preserves_preceding_sections() {
+        #[derive(Debug, Serialize, Deserialize)]
+        struct DefaultedFile {
+            #[serde(default)]
+            entries: Vec<Entry>,
+        }
+        let preserved = "# keep\n[[webhooks]]\nurl = 'https://example.test/hook'\n";
+        let raw = format!("{preserved}\n[[entries]]\nid = 'one'\nlabel = 'old'\n");
+        let cleared = DefaultedFile {
+            entries: Vec::new(),
+        };
+        let output = edit_toml(&raw, &cleared).unwrap();
+        assert!(output.starts_with(preserved), "{output}");
+        let reparsed: DefaultedFile = toml::from_str(&output).unwrap();
+        assert!(reparsed.entries.is_empty());
     }
 }

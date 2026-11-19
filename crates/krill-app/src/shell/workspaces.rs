@@ -25,6 +25,34 @@ impl PartialEq for Workspace {
 impl Shell {
     /// Reconcile daemon IDs, never launches. Appending inactive tabs preserves
     /// existing indices, split trees, focused panes and custom tab properties.
+    /// 에이전트가 끝나고 셸이 남은 칸은 이제 일반 터미널이다. 탭 이름·아이콘과 복원이 에이전트를 따르지 않게 한다.
+    fn forget_ended_agent_launches(&mut self, cx: &App) {
+        let ended: Vec<PaneId> = (0..self.layout.tabs().len())
+            .flat_map(|i| self.layout.tab_panes(i))
+            .filter(|&pane| {
+                matches!(
+                    self.layout.launch(pane).map(|launch| &launch.program),
+                    Some(Program::Agent { .. })
+                ) && self.layout.session(pane).is_some_and(|session| {
+                    self.sidebar
+                        .read(cx)
+                        .session_on(self.layout.host(pane), session)
+                        .is_some_and(sidebar::Session::agent_ended)
+                })
+            })
+            .collect();
+        for &pane in &ended {
+            if let Some(mut launch) = self.layout.launch(pane).cloned() {
+                launch.program = Program::Login;
+                launch.account = None;
+                self.layout.set_launch(pane, launch);
+            }
+        }
+        if !ended.is_empty() {
+            self.save();
+        }
+    }
+
     pub(super) fn reconcile_workspace_sessions(&mut self, cx: &mut Context<Self>) {
         if self.layout_loading || self.role != WindowRole::Main {
             return;
@@ -33,6 +61,7 @@ impl Shell {
         for (host, session) in connected {
             self.observed_sessions.insert((host, session));
         }
+        self.forget_ended_agent_launches(cx);
         let stale_panes: Vec<PaneId> = (0..self.layout.tabs().len())
             .flat_map(|i| self.layout.tab_panes(i))
             .filter(|&pane| {
@@ -45,6 +74,10 @@ impl Shell {
                     && (sidebar
                         .session_on(host, session)
                         .is_some_and(sidebar::Session::is_exited)
+                        || sidebar.is_session_closed_on(host, session)
+                            && sidebar
+                                .session_on(host, session)
+                                .is_none_or(sidebar::Session::is_exited)
                         // krilld가 닫힘·이미 재개됨(`NoSession`)으로 확정한 세션: 목록 부재와 달리 증거가 있다.
                         || self.gone_sessions.contains(&(host.clone(), session))
                             && sidebar
@@ -53,17 +86,13 @@ impl Shell {
                         // A local daemon restarting for an update may briefly
                         // publish an incomplete list. Absence is not proof of
                         // PTY exit; keep saved tabs until an explicit exit.
-                        || host.is_remote() && sidebar.host_has_trees(host)
+                        || host.is_remote()
+                            && sidebar.host_has_trees(host)
                             && self.observed_sessions.contains(&(host.clone(), session))
                             && sidebar.session_on(host, session).is_none())
                     && !self.restoring_sessions.contains(&session)
                     && !self.restarting_panes.contains(&pane)
-                    && !self
-                        .accounts_for_host(host)
-                        .details
-                        .handoffs
-                        .iter()
-                        .any(|h| h.from == session || h.to == Some(session))
+                    && !self.blocks_session_prune(pane, host, session, cx)
             })
             .collect();
         if !stale_panes.is_empty() {
@@ -355,8 +384,20 @@ impl Shell {
                         if !pane::supports_resume_history(&target)? {
                             return Ok(None);
                         }
-                        let (session, created) =
-                            pane::ensure_live_session_in(&target, Some(old), &launch)?;
+                        let (session, created) = pane::ensure_live_session_in(
+                            &target,
+                            Some(old),
+                            &launch,
+                        )
+                        .inspect_err(|error| {
+                            let attempt = pane::StartAttempt {
+                                pane: pane_id.get(),
+                                wanted_session: Some(old),
+                                attempt: 0,
+                                remote: false,
+                            };
+                            pane::record_start_failure("restore_hidden", error, Some(attempt));
+                        })?;
                         if created && !close::Creation::publish(&creation, session) {
                             close::send(
                                 &krill_app::resources::daemon_call_for(Some(target)),
@@ -413,11 +454,49 @@ impl Shell {
                                 for rebound in this.layout.rebind_session(&HostId::Local, old, new)
                                 {
                                     this.drop_stale_pastes_for_pane(rebound, Some(new), cx);
+                                    if this
+                                        .live
+                                        .get(&rebound)
+                                        .is_some_and(|l| !l.pane.keep_account_input())
+                                        && let Some(rebound_target) = this.target_for_pane(rebound)
+                                    {
+                                        let task =
+                                            Self::spawn_pane(rebound, rebound_target, None, cx);
+                                        if let Some(live) = this.live.get_mut(&rebound) {
+                                            live.cut();
+                                            live.pane.unlink();
+                                            live.task = task;
+                                            live.error = None;
+                                        }
+                                    }
                                 }
                                 this.sync_sidebar_tab_state(cx);
                                 this.save();
                             }
                             new
+                        }
+                        Err(ref e) if pane::is_session_gone(e) => {
+                            this.restore_attempted.insert(old);
+                            if this.layout.pane_exists(pane_id)
+                                && this.layout.session(pane_id) == Some(old)
+                            {
+                                this.gone_sessions.insert((HostId::Local, old));
+                                if this
+                                    .sidebar
+                                    .read(cx)
+                                    .session_on(&HostId::Local, old)
+                                    .is_some_and(|s| !s.is_exited())
+                                    || this.sidebar.read(cx).is_unread(old)
+                                {
+                                    this.sidebar.update(cx, |s, cx| {
+                                        s.mark_session_exited_on(&HostId::Local, old, cx);
+                                    });
+                                }
+                                if this.sidebar.read(cx).has_source(&HostId::Local) {
+                                    this.reconcile_workspace_sessions(cx);
+                                }
+                            }
+                            old
                         }
                         // 실패·구 데몬이면 옛 ID를 유지한다. 선택돼 있었다면 콜드 폴백을 보여준다.
                         _ => old,

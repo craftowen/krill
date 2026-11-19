@@ -130,7 +130,12 @@ pub enum ToHolder {
     /// holder가 `path`로 exec 핸드오프한다(PID·자식·fd 유지).
     UpgradeHolder { req: u32, path: Vec<u8> },
     /// (v2) 이미 도는 세션 `pid`와 그 master fd(1개)를 맡긴다. 종료 코드는 받을 수 없다([`STATUS_UNKNOWN`]).
-    Adopt { req: u32, id: SessionId, pid: u32 },
+    Adopt {
+        req: u32,
+        id: SessionId,
+        pid: u32,
+        size: Option<WinSize>,
+    },
     /// (v3) 세션 프로세스 그룹과 빠져나간 후손을 SIGHUP → SIGTERM → SIGKILL 단계로 끝낸다.
     Terminate { req: u32, id: SessionId },
     /// (v4) 세션 PTY 크기를 바꾼다. Windows 전용(Unix holder는 `ENOSYS`).
@@ -155,6 +160,7 @@ pub enum FromHolder {
         id: SessionId,
         pid: u32,
         status: Option<i32>,
+        size: Option<WinSize>,
     },
     /// 맡겨 둔 listen 소켓(+fd). (Windows) fd 대신 `info`(krilld 앞 `WSAPROTOCOL_INFOW`).
     Listener {
@@ -381,9 +387,10 @@ impl ToHolder {
                 w.bytes(path)?;
                 kind::UPGRADE_HOLDER
             }
-            Self::Adopt { id, pid, .. } => {
+            Self::Adopt { id, pid, size, .. } => {
                 w.u64(id.0);
                 w.u32(*pid);
+                w.opt_size(*size);
                 kind::ADOPT
             }
             Self::Terminate { id, .. } => {
@@ -459,6 +466,7 @@ impl ToHolder {
                 req,
                 id: SessionId(r.u64()?),
                 pid: r.u32()?,
+                size: r.opt_size()?,
             },
             kind::TERMINATE => Self::Terminate {
                 req,
@@ -534,7 +542,12 @@ impl FromHolder {
                 }
                 kind::HELLO
             }
-            Self::Session { id, pid, status } => {
+            Self::Session {
+                id,
+                pid,
+                status,
+                size,
+            } => {
                 w.u64(id.0);
                 w.u32(*pid);
                 match status {
@@ -544,6 +557,7 @@ impl FromHolder {
                         w.i32(*s);
                     }
                 }
+                w.opt_size(*size);
                 kind::SESSION
             }
             Self::Listener { info } => {
@@ -597,6 +611,7 @@ impl FromHolder {
                     1 => Some(r.i32()?),
                     t => return Err(Error::BadTag(t)),
                 },
+                size: r.opt_size()?,
             },
             kind::LISTENER => Self::Listener { info: r.tail()? },
             kind::READY => Self::Ready,
@@ -680,6 +695,12 @@ impl Writer {
     fn tail(&mut self, v: &[u8]) -> Result<(), Error> {
         if v.is_empty() { Ok(()) } else { self.bytes(v) }
     }
+    fn opt_size(&mut self, size: Option<WinSize>) {
+        if let Some(s) = size {
+            self.u16(s.cols);
+            self.u16(s.rows);
+        }
+    }
     fn finish(mut self, kind: u8, fds: u8) -> Result<Vec<u8>, Error> {
         let n = self.0.len().saturating_sub(4);
         if n > MAX_FRAME {
@@ -730,6 +751,15 @@ impl Reader<'_> {
         } else {
             self.bytes()
         }
+    }
+    fn opt_size(&mut self) -> Result<Option<WinSize>, Error> {
+        if self.0.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(WinSize {
+            cols: self.u16()?,
+            rows: self.u16()?,
+        }))
     }
 }
 

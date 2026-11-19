@@ -159,3 +159,96 @@ fn continue_modal_keeps_submit_visible_with_many_agents_at_large_zoom(cx: &mut T
             > gpui::px(0.)
     );
 }
+
+#[gpui::test]
+fn continue_session_ignores_enter_and_escape_during_ime_preedit(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+
+    let (dialog, events, cx) = open(cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.prompt.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "IME Enter confirmation must not submit continue_session dialog"
+    );
+
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.prompt.update(cx, |input, cx| {
+                input.replace_and_mark_text_in_range(None, "한", None, window, cx);
+            });
+            assert!(d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "IME Escape cancellation must not close continue_session dialog"
+    );
+
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.prompt
+                .update(cx, |input, cx| input.unmark_text(window, cx));
+            assert!(!d.input_is_composing(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(*events.lock().unwrap(), [Event::Close]);
+}
+
+#[gpui::test]
+fn keyboard_space_and_enter_select_agent_chip(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new(
+            SessionId(7),
+            vec![
+                ("claude".to_owned(), "Claude".to_owned()),
+                ("codex".to_owned(), "Codex".to_owned()),
+            ],
+            Some("claude"),
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            assert_eq!(d.selected_agent, "claude");
+            window.focus(&d.agent_focus[1], cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.selected_agent, "codex");
+    });
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            window.focus(&d.agent_focus[0], cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.selected_agent, "claude");
+    });
+}

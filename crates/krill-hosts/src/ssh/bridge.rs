@@ -164,12 +164,7 @@ pub(crate) fn reached_remote(status: std::process::ExitStatus) -> bool {
 /// 원격이 Windows로 보이지만 krill이 없거나 중계를 모르거나(구버전) 원격 krilld가 꺼져 있을 때 원인을 담는다.
 pub(crate) fn probe(opts: &SshOptions, ssh_bin: &OsStr) -> io::Result<Option<Probe>> {
     let mut args = opts.common_args(5);
-    args.extend([
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        opts.destination.clone(),
-        format!("{COMMAND} {PROBE_FLAG}"),
-    ]);
+    args.extend([opts.destination.clone(), format!("{COMMAND} {PROBE_FLAG}")]);
     let out = super::run_ssh_output(ssh_bin, &args, PROBE_TIMEOUT)?;
     classify(
         &String::from_utf8_lossy(&out.stdout),
@@ -223,29 +218,48 @@ pub(crate) struct Relay {
 }
 
 #[cfg(unix)]
+fn cleanup_failed_master(child: &mut Child, control: Option<&std::path::Path>) {
+    drop(child.stdin.take());
+    child.kill().ok();
+    child.wait().ok();
+    if let Some(control) = control {
+        super::remove_control_socket(control);
+    }
+}
+
+#[cfg(unix)]
 impl Relay {
     /// keepalive ssh를 띄워 원격 중계가 준비됐는지 확인한 뒤 `listener`의 연결마다 중계 ssh를 잇는다.
     /// 돌려준 `Child`(keepalive)의 stdin 파이프가 닫히면 원격 `krill __bridge --probe`와 ssh가 끝난다.
     pub(crate) fn start(
         opts: &SshOptions,
         listener: UnixListener,
-        control: Option<PathBuf>,
+        control: Option<&std::path::Path>,
         ssh_bin: &OsStr,
+    ) -> io::Result<(Child, Self)> {
+        Self::start_with_timeout(opts, listener, control, ssh_bin, READY_TIMEOUT)
+    }
+
+    pub(crate) fn start_with_timeout(
+        opts: &SshOptions,
+        listener: UnixListener,
+        control: Option<&std::path::Path>,
+        ssh_bin: &OsStr,
+        ready_timeout: Duration,
     ) -> io::Result<(Child, Self)> {
         listener.set_nonblocking(true)?;
         let mut child = Command::new(ssh_bin)
-            .args(keepalive_args(opts, control.as_deref()))
+            .args(keepalive_args(opts, control))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
         let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
-            child.kill().ok();
-            child.wait().ok();
+            cleanup_failed_master(&mut child, control);
             return Err(io::Error::other("ssh stdio pipes are missing"));
         };
         let (tx, rx) = mpsc::sync_channel(1);
-        thread::Builder::new()
+        if let Err(e) = thread::Builder::new()
             .name("bridge-ready".into())
             .spawn(move || {
                 let mut reader = io::BufReader::new(stdout);
@@ -261,17 +275,27 @@ impl Relay {
                 }
                 tx.send(seen).ok();
                 io::copy(&mut reader, &mut io::sink()).ok();
-            })?;
-        let errors = thread::Builder::new()
+            })
+        {
+            cleanup_failed_master(&mut child, control);
+            return Err(e);
+        }
+        let errors = match thread::Builder::new()
             .name("bridge-stderr".into())
             .spawn(move || {
                 let mut text = Vec::new();
                 (&mut stderr).take(64 * 1024).read_to_end(&mut text).ok();
                 io::copy(&mut stderr, &mut io::sink()).ok();
                 String::from_utf8_lossy(&text).into_owned()
-            })?;
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                cleanup_failed_master(&mut child, control);
+                return Err(e);
+            }
+        };
         let host = &opts.destination;
-        let ready = match rx.recv_timeout(READY_TIMEOUT) {
+        let ready = match rx.recv_timeout(ready_timeout) {
             Ok(seen) if seen.lines().any(|line| line.trim() == OK_LINE) => {
                 Ok(classify(&seen, "", None)
                     .ok()
@@ -279,20 +303,22 @@ impl Relay {
                     .map(|probe| probe.os)
                     .unwrap_or_default())
             }
-            Ok(seen) => {
-                let status = child.wait()?;
-                let stderr = errors.join().unwrap_or_default();
-                Err(classify(&seen, &stderr, status.code())
-                    .err()
-                    .unwrap_or_else(|| {
-                        let detail = stderr.trim();
-                        io::Error::other(if detail.is_empty() {
-                            format!("ssh bridge to {host} failed ({status})")
-                        } else {
-                            format!("ssh bridge to {host} failed: {detail}")
-                        })
-                    }))
-            }
+            Ok(seen) => match child.wait() {
+                Ok(status) => {
+                    let stderr = errors.join().unwrap_or_default();
+                    Err(classify(&seen, &stderr, status.code())
+                        .err()
+                        .unwrap_or_else(|| {
+                            let detail = stderr.trim();
+                            io::Error::other(if detail.is_empty() {
+                                format!("ssh bridge to {host} failed ({status})")
+                            } else {
+                                format!("ssh bridge to {host} failed: {detail}")
+                            })
+                        }))
+                }
+                Err(e) => Err(e),
+            },
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("ssh bridge to {host} timed out"),
@@ -301,8 +327,7 @@ impl Relay {
         let os = match ready {
             Ok(os) => os,
             Err(e) => {
-                child.kill().ok();
-                child.wait().ok();
+                cleanup_failed_master(&mut child, control);
                 return Err(e);
             }
         };
@@ -310,9 +335,10 @@ impl Relay {
         let stop = Arc::clone(&stopped);
         let opts = opts.clone();
         let program = ssh_bin.to_owned();
+        let accept_control = control.map(std::path::Path::to_path_buf);
         let worker = thread::Builder::new()
             .name("bridge-accept".into())
-            .spawn(move || accept(&listener, &opts, control.as_deref(), &program, &stop));
+            .spawn(move || accept(&listener, &opts, accept_control.as_deref(), &program, &stop));
         match worker {
             Ok(worker) => Ok((
                 child,
@@ -323,8 +349,7 @@ impl Relay {
                 },
             )),
             Err(e) => {
-                child.kill().ok();
-                child.wait().ok();
+                cleanup_failed_master(&mut child, control);
                 Err(e)
             }
         }
@@ -359,7 +384,14 @@ pub(crate) fn control_path(local: &std::path::Path) -> Option<PathBuf> {
     let path = local
         .parent()?
         .join(format!("c-{}-{seq}", std::process::id()));
-    (path.as_os_str().len() + CONTROL_SUFFIX < daemon::SUN_PATH_MAX).then_some(path)
+    let text = path.to_str()?;
+    if text.chars().any(char::is_control)
+        || text.contains(['"', '\'', '$', '\\'])
+        || path.as_os_str().len() + CONTROL_SUFFIX >= daemon::SUN_PATH_MAX
+    {
+        return None;
+    }
+    Some(path)
 }
 
 /// `-o ControlPath=…` 값. 상태 디렉터리 경로의 공백은 따옴표로, ssh 토큰 문자 `%`는 `%%`로 지킨다.

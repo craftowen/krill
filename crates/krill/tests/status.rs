@@ -93,8 +93,9 @@ fn status(c: &mut UnixStream, session: SessionId) -> AgentStatus {
         .find(|s: &SessionStatus| s.session == session)
         .unwrap()
         .status;
-    // 관측된 루트 셸은 이 테스트가 보는 훅 상태와 무관하다.
+    // 관측된 루트 셸과 질의 때마다 새로 읽는 포그라운드 프로세스는 이 테스트가 보는 훅 상태와 무관하다.
     status.root_shell = None;
+    status.foreground = None;
     status
 }
 

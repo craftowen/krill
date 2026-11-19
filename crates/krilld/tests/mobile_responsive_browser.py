@@ -182,11 +182,9 @@ def main():
                     capture('workspace-options', width, height)
                     click('.workspace-toolbar .filter-chip')
                     assert evaluate('document.querySelector(".workspace-options").hidden')
-                    named('Search')
                     browser('fill', 'input[type=search]', 'no-matching-workspace')
                     capture('workspace-search-empty', width, height)
                     browser('fill', 'input[type=search]', '')
-                    named('Search')
                     navigate(route)
                     wait('!!KrillMobile.activeTerminal && document.querySelector(".terminal-mount:not([hidden])")?.dataset.phase==="ready"')
                     evaluate('KrillMobile.activeTerminal.setInputMode("direct");true')
@@ -249,8 +247,9 @@ def main():
                     click('.file-row')
                     wait('document.querySelector("#git-patch").textContent.includes("+after")')
                     capture('git', width, height)
-                    for subpage, name in [('', 'settings'), ('/terminal', 'terminal-settings'),
-                                          ('/about', 'about')]:
+                    for subpage, name in [('', 'settings'), ('/appearance', 'appearance-settings'),
+                                          ('/chat', 'chat-settings'), ('/privacy', 'privacy-settings'),
+                                          ('/terminal', 'terminal-settings'), ('/about', 'about')]:
                         navigate('/settings' + subpage)
                         capture(name, width, height)
                     navigate('/settings')
@@ -348,13 +347,14 @@ def main():
                 other = cfg['extraSessions'][0]
                 if args.phase == 'after':
                     # Readability and wrapping also survive localized large text.
-                    navigate('/settings')
+                    navigate('/settings/appearance')
                     click('[data-focus-key="preference-language-ko"]')
                     click('[data-focus-key="preference-appearance-light"]')
                     click('[data-focus-key="preference-uiTextScale-1.5"]')
                     for width, height in VIEWPORTS:
                         browser('set', 'viewport', str(width), str(height))
-                        for path, name in [('/settings', 'settings'), ('/settings/terminal', 'terminal-settings'),
+                        for path, name in [('/settings', 'settings'), ('/settings/appearance', 'appearance-settings'),
+                                           ('/settings/terminal', 'terminal-settings'),
                                            ('/settings/about', 'about'), ('/host/local', 'workspaces'),
                                            ('/accounts', 'accounts'), (route, 'session')]:
                             navigate(path)
@@ -380,7 +380,7 @@ def main():
                         close()
                         click('.session .mode-toggle')
                 # Keep the viewport captures before any split reload or new input.
-                navigate('/settings')
+                navigate('/settings/appearance')
                 click('[data-focus-key="preference-language-en"]')
                 click('[data-focus-key="preference-appearance-dark"]')
                 click('[data-focus-key="preference-uiTextScale-1"]')

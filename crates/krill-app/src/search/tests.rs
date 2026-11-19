@@ -354,3 +354,82 @@ fn terminal_find_wraps_controls_inside_narrow_viewport(cx: &mut TestAppContext) 
         "{close:?} outside {bar:?}"
     );
 }
+
+#[gpui::test]
+fn ime_preedit_ignores_step_enter_and_escape_and_language_switch_preserves_invalid_regex(
+    cx: &mut TestAppContext,
+) {
+    use gpui::EntityInputHandler as _;
+    struct Host(Entity<Bar>);
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().relative().child(self.0.clone())
+        }
+    }
+    cx.update(gpui_component::init);
+    let original = crate::i18n::language();
+    let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Bar::new(window, cx))));
+    let view = vcx.update(|_, cx| host.read(cx).0.clone());
+    let events: Rc<RefCell<Vec<Event>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = events.clone();
+    vcx.update(|window, cx| {
+        cx.subscribe(&view, move |_, e, _| sink.borrow_mut().push(e.clone()))
+            .detach();
+        view.update(cx, |bar, cx| {
+            bar.focus(window, cx);
+            bar.input().update(cx, |input, cx| {
+                input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+            assert!(bar.input_is_composing(window, cx));
+        });
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("up down enter");
+    vcx.run_until_parked();
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, Event::Step(_) | Event::Dismiss)),
+        "IME preedit up/down/enter must not step or dismiss search bar: {:?}",
+        *events.borrow()
+    );
+    events.borrow_mut().clear();
+    vcx.update(|window, cx| {
+        view.update(cx, |bar, cx| {
+            bar.input().update(cx, |input, cx| {
+                input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+            assert!(bar.input_is_composing(window, cx));
+        });
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, Event::Step(_) | Event::Dismiss)),
+        "IME preedit escape must not step or dismiss search bar: {:?}",
+        *events.borrow()
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |bar, cx| {
+            bar.input()
+                .update(cx, |input, cx| input.unmark_text(window, cx));
+            bar.set_options_supported(true);
+            bar.set_query("[", window, cx);
+            bar.toggle_option(true, cx);
+        });
+        crate::i18n::set_language(crate::i18n::Language::En, cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).status().to_owned()),
+        text::INVALID_REGEX.in_language(crate::i18n::Language::En)
+    );
+    vcx.update(|_, cx| crate::i18n::set_language(original, cx));
+}

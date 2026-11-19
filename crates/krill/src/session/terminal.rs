@@ -1,105 +1,44 @@
-//! Host terminal adapter: safe termios, bounded stream, no terminal engine in krill.
+//! Shared attach protocol; platform adapters own the host terminal and readiness.
 
 mod presenter;
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+pub(super) fn size() -> Option<(u16, u16)> {
+    host::size()
+}
+#[cfg(unix)]
+use unix as host;
+#[cfg(windows)]
+use windows as host;
 
 use std::collections::BTreeMap;
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::io::Write as _;
 use std::time::Instant;
 
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::termios::{self, OptionalActions, Termios};
-
-use super::{Result, capture, connect, fail, frame, raw, request};
+use super::{Result, capture, connect, fail, raw, request};
 use crate::remote::Target;
 use krill_proto::SessionId;
 use krill_proto::control::{CaptureFormat, FEAT_CLI, FEAT_CONTROL, Reply, Request};
 use krill_proto::input::{self, Input, InputAck, InputId, InputResult};
-use krill_proto::ipc;
+use krill_proto::os::net::UnixStream;
 use krill_proto::roles;
 use krill_proto::screen::{self, Msg};
 use presenter::Presenter;
-use std::io;
-use std::os::unix::net::UnixStream;
 
 const RESET: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[=0u\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?2004l\x1b[?1049l";
+
+enum Event {
+    Frame(u8, Vec<u8>),
+    Input(Vec<u8>),
+    Tick,
+}
 
 #[derive(PartialEq, Eq)]
 enum InputMode {
     Reading,
     Detaching,
-}
-
-struct AckReader<'a> {
-    stream: &'a mut UnixStream,
-    deadline: Instant,
-}
-
-impl io::Read for AckReader<'_> {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            let remaining = self
-                .deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or(io::ErrorKind::TimedOut)?;
-            let timeout = Timespec::try_from(remaining).map_err(io::Error::other)?;
-            let ready = {
-                let mut fds = [PollFd::new(&*self.stream, PollFlags::IN)];
-                poll(&mut fds, Some(&timeout))
-            };
-            match ready {
-                Ok(0) => return Err(io::ErrorKind::TimedOut.into()),
-                Ok(_) => return self.stream.read(bytes),
-                Err(rustix::io::Errno::INTR) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-}
-
-struct Host {
-    original: Option<Termios>,
-}
-impl Host {
-    fn enter() -> Result<Self> {
-        let original = if io::stdin().is_terminal() {
-            let original = termios::tcgetattr(io::stdin()).map_err(fail)?;
-            let mut raw = original.clone();
-            raw.make_raw();
-            termios::tcsetattr(io::stdin(), OptionalActions::Now, &raw).map_err(fail)?;
-            Some(original)
-        } else {
-            None
-        };
-        let host = Self { original };
-        if io::stdout().is_terminal() {
-            io::stdout().write_all(b"\x1b[?1049h").map_err(fail)?;
-        }
-        Ok(host)
-    }
-}
-impl Drop for Host {
-    fn drop(&mut self) {
-        if let Some(original) = &self.original {
-            termios::tcsetattr(io::stdin(), OptionalActions::Now, original).ok();
-        }
-        if io::stdout().is_terminal() {
-            let mut out = io::stdout().lock();
-            out.write_all(RESET).ok();
-            out.flush().ok();
-        }
-    }
-}
-
-pub(super) fn size() -> Option<(u16, u16)> {
-    let s = termios::tcgetwinsize(io::stdin()).ok()?;
-    (s.ws_col > 0 && s.ws_row > 0).then_some((
-        s.ws_col.min(screen::MAX_COLS),
-        s.ws_row.min(screen::MAX_LINES),
-    ))
 }
 
 fn resize(c: &mut UnixStream, session: SessionId, size: (u16, u16)) -> Result<()> {
@@ -142,8 +81,9 @@ pub(super) fn attach(target: &Target, session: SessionId) -> Result<()> {
         role_resize(&mut connection.stream, size)?;
     }
     drop(control);
-    let _host = Host::enter()?;
-    let mut output = io::stdout();
+    let _host = host::Host::enter()?;
+    let mut events = host::Events::new(&connection.stream)?;
+    let mut output = host::output();
     output.write_all(&bytes).map_err(fail)?;
     output.flush().map_err(fail)?;
     let mut presenter = Presenter::default();
@@ -152,35 +92,16 @@ pub(super) fn attach(target: &Target, session: SessionId) -> Result<()> {
     let mut mode = InputMode::Reading;
     let result = (|| {
         loop {
-            let stdin = io::stdin();
-            let mut fds = [
-                PollFd::new(&connection.stream, PollFlags::IN),
-                PollFd::new(&stdin, PollFlags::IN),
-            ];
-            let timeout = Timespec {
-                tv_sec: 0,
-                tv_nsec: 100_000_000,
-            };
-            let count = if mode == InputMode::Reading { 2 } else { 1 };
-            match poll(&mut fds[..count], Some(&timeout)) {
-                Ok(_) => {}
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => return Err(fail(e)),
-            }
-            let input_ready = mode == InputMode::Reading && !fds[1].revents().is_empty();
-            let daemon_ready = !fds[0].revents().is_empty();
-            if daemon_ready {
-                let (kind, body) = if let Some(sent) = pending.values().min() {
-                    ipc::read_frame(&mut AckReader {
-                        stream: &mut connection.stream,
-                        deadline: *sent + input::PROBE,
-                    })
-                    .map_err(fail)?
-                    .ok_or_else(|| fail("krilld disconnected"))?
-                } else {
-                    frame(&mut connection.stream)?
-                };
-                match kind {
+            let event = events.next(
+                &mut connection.stream,
+                mode == InputMode::Reading,
+                pending.values().min().map(|sent| *sent + input::PROBE),
+            )?;
+            let mut input_bytes = None;
+            match event {
+                Event::Tick => {}
+                Event::Input(bytes) => input_bytes = Some(bytes),
+                Event::Frame(kind, body) => match kind {
                     screen::kind::OUTPUT => {
                         let (_, bytes) = screen::decode_output(kind, &body).map_err(fail)?;
                         let bytes = presenter.push(bytes);
@@ -216,7 +137,7 @@ pub(super) fn attach(target: &Target, session: SessionId) -> Result<()> {
                         }
                     }
                     _ => return Err(fail("unexpected attach reply")),
-                }
+                },
             }
             if mode == InputMode::Reading {
                 let current = size();
@@ -227,10 +148,8 @@ pub(super) fn attach(target: &Target, session: SessionId) -> Result<()> {
                     dimensions = current;
                 }
             }
-            if input_ready && mode == InputMode::Reading {
-                let mut bytes = [0u8; 4096];
-                let n = io::stdin().read(&mut bytes).map_err(fail)?;
-                let bytes = &bytes[..n];
+            if let Some(bytes) = input_bytes.filter(|_| mode == InputMode::Reading) {
+                let n = bytes.len();
                 let end = bytes.iter().position(|b| *b == 0x1d).unwrap_or(n);
                 if end > 0 {
                     if pending.len() >= 16 {

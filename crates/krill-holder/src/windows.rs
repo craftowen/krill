@@ -6,9 +6,9 @@ use crate::{
 };
 use krill_proto::{
     SessionId,
-    daemon::KRILLD_DUPLICATE,
+    daemon::{KRILLD_DUPLICATE, KRILLD_HANDOVER_FAILED},
     holder::{
-        FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION,
+        FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION, WinSize,
         request_id,
     },
 };
@@ -17,6 +17,10 @@ use std::io::{self, Write};
 use std::os::windows::io::{AsHandle, AsSocket, BorrowedHandle, OwnedHandle, OwnedSocket};
 use std::time::{Duration, Instant};
 
+fn non_zero(size: Option<WinSize>) -> Option<WinSize> {
+    size.filter(|s| s.cols > 0 && s.rows > 0)
+}
+
 #[derive(Debug)]
 struct Session {
     id: SessionId,
@@ -24,6 +28,7 @@ struct Session {
     console: Console,
     job: Job,
     status: Option<i32>,
+    size: Option<WinSize>,
     deadline: Option<Instant>,
 }
 impl Session {
@@ -41,6 +46,7 @@ impl Session {
         id: SessionId,
         pid: u32,
         status: Option<i32>,
+        size: Option<WinSize>,
         mut handles: Vec<OwnedHandle>,
     ) -> io::Result<Self> {
         if handles.len() != 8 {
@@ -67,8 +73,15 @@ impl Session {
             console,
             job: Job { handle, port },
             status,
+            size: non_zero(size),
             deadline: None,
         })
+    }
+    /// `OpenConsole`을 끝내 콘솔을 끊고, 남은 트리는 deadline에 Job째 끝낸다. 반복 요청은 첫 deadline을 유지한다.
+    fn hang_up(&mut self) {
+        self.console.stop_host().ok();
+        self.deadline
+            .get_or_insert(Instant::now() + Duration::from_secs(5));
     }
 }
 struct Daemon {
@@ -88,13 +101,27 @@ struct Holder {
     previous: Option<OsString>,
     upgrading: bool,
     listener: Option<OwnedSocket>,
+    /// 재기동을 멈췄다. 쥔 세션이 모두 끝나면 나간다.
+    parked: bool,
 }
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
+    sys::suppress_hard_error_dialogs();
     let path = args.next().ok_or(io::ErrorKind::InvalidInput)?;
     if path == "--bootstrap" {
-        return sys::bootstrap(&args.collect::<Vec<_>>());
+        let result = sys::bootstrap(&args.collect::<Vec<_>>());
+        // A Job that forbids breakaway (Task Scheduler) refuses the holder with ERROR_ACCESS_DENIED.
+        // Staying in it would tie every session to that Job, so exit with the Win32 code instead.
+        if let Some(code) = result.as_ref().err().and_then(io::Error::raw_os_error) {
+            #[expect(
+                clippy::exit,
+                reason = "the caller reads the Win32 error from the exit status"
+            )]
+            std::process::exit(code);
+        }
+        return result;
     }
     krill_log::init(krill_log::Component::Holder).ok();
+    sys::enable_ctrl_c();
     let mut h = Holder {
         path,
         args: args.collect(),
@@ -106,6 +133,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
         previous: None,
         upgrading: false,
         listener: None,
+        parked: false,
     };
     if let Some((metadata, handles, mut ack, listener)) = sys::take_handoff()? {
         let req = h.restore(&metadata, handles)?;
@@ -151,6 +179,7 @@ impl Holder {
                         id: s.id,
                         pid: s.process.pid,
                         status: s.status,
+                        size: s.size,
                     },
                     &s.handles(),
                     target.as_handle(),
@@ -185,7 +214,7 @@ impl Holder {
             )
     }
     fn poll(&mut self) -> bool {
-        if self.daemon.is_none() && Instant::now() >= self.restart {
+        if self.daemon.is_none() && !self.parked && Instant::now() >= self.restart {
             match self.start() {
                 Ok(d) => self.daemon = Some(d),
                 Err(error) => {
@@ -241,27 +270,44 @@ impl Holder {
             }
         }
         let mut events = Vec::new();
-        for s in &mut self.sessions {
-            if s.status.is_none() && s.job.empty().unwrap_or(false) {
-                let status = s.process.status().ok().flatten().unwrap_or(STATUS_UNKNOWN);
-                s.status = Some(status);
-                s.console.stop_host().ok();
-                s.console.close();
-                events.push(FromHolder::Exited { id: s.id, status });
-            }
+        for s in self.sessions.iter_mut().filter(|s| s.status.is_none()) {
+            // Also drains the Job's IOCP notifications so they never pile up.
+            let empty = s.job.empty().unwrap_or(false);
+            // As on Unix the session ends with its leader (shell). Apps it launched (GUI,
+            // new console) keep running, as in Windows Terminal. A teardown waits for the
+            // rest of the Job or its deadline.
+            let status = match s.process.status() {
+                Ok(Some(status)) if s.deadline.is_none() || empty => status,
+                Err(_) if empty => STATUS_UNKNOWN,
+                _ => continue,
+            };
+            s.status = Some(status);
+            s.deadline = None;
+            s.console.stop_host().ok();
+            s.console.close();
+            events.push(FromHolder::Exited { id: s.id, status });
         }
         for m in events {
             self.send(&m, None).ok();
         }
-        false
+        self.idle()
+    }
+    fn idle(&self) -> bool {
+        self.parked && self.sessions.iter().all(|s| s.status.is_some())
     }
     fn daemon_exited(&mut self, status: i32, uptime: Duration) -> bool {
-        if status == i32::from(KRILLD_DUPLICATE) && self.sessions.is_empty() {
+        if status == i32::from(KRILLD_DUPLICATE) {
+            // Another daemon owns the socket, so a restart only repeats this every 30 seconds
+            // (A-01). Keep each session's console until it ends.
             self.daemon = None;
-            return true;
+            self.parked = true;
+            return self.idle();
         }
+        tracing::warn!(status = %format_args!("{status:#010x}"), ?uptime, "krilld exited");
         let upgrading = std::mem::take(&mut self.upgrading);
-        if uptime >= Duration::from_secs(1) && !upgrading {
+        let stable =
+            uptime >= Duration::from_secs(1) && status != i32::from(KRILLD_HANDOVER_FAILED);
+        if stable && !upgrading {
             self.streak = 0;
             self.previous = None;
         }
@@ -274,10 +320,12 @@ impl Holder {
         } else {
             self.failed();
         }
-        false
+        self.idle()
     }
     fn failed(&mut self) {
         self.streak = self.streak.saturating_add(1);
+        // A daemon that keeps dying at start with no sessions (a bind permission error) never recovers.
+        self.parked |= self.sessions.is_empty() && self.streak >= 5;
         if self.streak >= 3
             && let Some(path) = self.previous.take()
         {
@@ -299,30 +347,20 @@ impl Holder {
     fn request(&mut self, packet: Packet, handoff_allowed: bool) -> bool {
         let req = request_id(&packet.body).unwrap_or(0);
         let decoded = ToHolder::decode(packet.frame());
-        if let Ok(ToHolder::UpgradeHolder { req, ref path }) = decoded {
-            // Extracted packets are no longer visible to Link::has_pending(). A successful
-            // handoff here would discard them, so let the caller retry after they are served.
-            let result = if handoff_allowed {
-                text(path.clone()).and_then(|path| self.upgrade(&path, req))
-            } else {
-                Err(io::Error::from_raw_os_error(16))
-            };
-            match result {
-                Ok(()) => return true,
-                Err(e) => {
-                    self.send(
-                        &FromHolder::Failed {
-                            req,
-                            errno: e.raw_os_error().unwrap_or(5),
-                        },
-                        None,
-                    )
-                    .ok();
-                    return false;
+        let result = match decoded {
+            Ok(ToHolder::UpgradeHolder { req, path }) => {
+                // Extracted packets are no longer visible to Link::has_pending(). A successful
+                // handoff here would discard them, so let the caller retry after they are served.
+                let result = if handoff_allowed {
+                    text(path).and_then(|path| self.upgrade(&path, req))
+                } else {
+                    Err(io::Error::from_raw_os_error(16))
+                };
+                match result {
+                    Ok(()) => return true,
+                    Err(e) => Err(e),
                 }
             }
-        }
-        let result = match decoded {
             Ok(m) => self.handle(m, packet.fds),
             Err(_) => Err(io::Error::from_raw_os_error(38)),
         };
@@ -410,6 +448,7 @@ impl Holder {
                     console,
                     job,
                     status: None,
+                    size: Some(size),
                     deadline: None,
                 };
                 let message = FromHolder::Spawned {
@@ -419,24 +458,32 @@ impl Holder {
                 };
                 // 전송 실패해도 세션은 holder에 남고 다음 krilld가 받는다.
                 self.sessions.push(session);
-                self.send(&message, self.sessions.last())?;
+                if self.send(&message, self.sessions.last()).is_err()
+                    && let Some(d) = &mut self.daemon
+                {
+                    sys::terminate(&d.process).ok();
+                    d.link = None;
+                }
                 return Ok(None);
             }
-            ToHolder::Resize { id, size, .. } => self.live(id)?.console.resize(size)?,
-            ToHolder::Terminate { id, .. } => {
+            ToHolder::Resize { id, size, .. } => {
                 let s = self.live(id)?;
-                s.console.stop_host().ok();
+                s.console.resize(size)?;
+                s.size = Some(size);
+            }
+            ToHolder::Terminate { id, .. } => {
+                // Job을 먼저 끝낸다. 콘솔부터 끊으면 pwsh 7이 콘솔 오류를 처리하지 못하고
+                // .NET 미처리 예외(0xE0434352)로 죽어 WER 보고를 남긴다(v0.2.51과 같은 즉시 종료).
+                let s = self.live(id)?;
                 s.job.terminate().ok();
-                s.deadline = Some(Instant::now() + Duration::from_secs(5));
+                s.hang_up();
             }
             ToHolder::Kill { id, signal, .. } => {
                 let s = self.live(id)?;
-                s.console.stop_host().ok();
                 if signal == 9 {
                     s.job.terminate().ok();
-                } else {
-                    s.deadline = Some(Instant::now() + Duration::from_secs(5));
                 }
+                s.hang_up();
             }
             ToHolder::Release { id, .. } => {
                 if self
@@ -464,10 +511,10 @@ impl Holder {
             ToHolder::HoldListener { info, .. } => {
                 self.listener = Some(sys::restore_socket(&info)?);
             }
-            ToHolder::Adopt { id, pid, .. } => {
+            ToHolder::Adopt { id, pid, size, .. } => {
                 if !self.sessions.iter().any(|s| s.id == id) {
                     self.sessions
-                        .push(Session::restore(self.api, id, pid, None, handles)?);
+                        .push(Session::restore(self.api, id, pid, None, size, handles)?);
                 }
             }
             ToHolder::UpgradeHolder { .. } => {
@@ -498,16 +545,7 @@ impl Holder {
             link.output.as_handle(),
         ];
         for s in &self.sessions {
-            use std::fmt::Write as _;
-            writeln!(
-                metadata,
-                "{} {} {}",
-                s.id.0,
-                s.process.pid,
-                s.status
-                    .map_or_else(|| "live".to_owned(), |v| v.to_string())
-            )
-            .map_err(io::Error::other)?;
+            format_handoff_session(&mut metadata, s.id, s.process.pid, s.status, s.size)?;
             handles.push(s.process.handle.as_handle());
             handles.extend(s.console.pty.handles());
             handles.extend([s.job.handle.as_handle(), s.job.port.as_handle()]);
@@ -528,13 +566,7 @@ impl Holder {
         Ok(())
     }
     fn restore(&mut self, metadata: &str, handles: Vec<OwnedHandle>) -> io::Result<u32> {
-        let mut words = metadata.split_whitespace();
-        let req = number(words.next())?;
-        let pid = number(words.next())?;
-        let remaining = words.clone().count();
-        if !remaining.is_multiple_of(3) || handles.len() != 4 + remaining / 3 * 8 {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
+        let (req, pid, entries) = parse_handoff(metadata, handles.len())?;
         let mut handles = handles.into_iter();
         let mut next = || handles.next().ok_or(io::ErrorKind::InvalidData.into());
         let process = Process {
@@ -549,22 +581,14 @@ impl Holder {
             link: Some(link),
             started: Instant::now(),
         });
-        while let Some(id) = words.next() {
-            let id = SessionId(number(Some(id))?);
-            let pid = number(words.next())?;
-            let status = words.next().ok_or(io::ErrorKind::InvalidData)?;
-            let status = if status == "live" {
-                None
-            } else {
-                Some(number(Some(status))?)
-            };
+        for (id, pid, status, size) in entries {
             let mut session = (0..8).map(|_| next()).collect::<io::Result<Vec<_>>>()?;
             session
                 .get_mut(..6)
                 .ok_or(io::ErrorKind::InvalidData)?
                 .rotate_left(1);
             self.sessions
-                .push(Session::restore(self.api, id, pid, status, session)?);
+                .push(Session::restore(self.api, id, pid, status, size, session)?);
         }
         if handles.next().is_some() {
             return Err(io::ErrorKind::InvalidData.into());
@@ -607,6 +631,67 @@ fn number<T: std::str::FromStr>(word: Option<&str>) -> io::Result<T> {
         .map_err(|_| io::ErrorKind::InvalidData.into())
 }
 
+type HandoffSession = (SessionId, u32, Option<i32>, Option<WinSize>);
+
+fn format_handoff_session(
+    metadata: &mut String,
+    id: SessionId,
+    pid: u32,
+    status: Option<i32>,
+    size: Option<WinSize>,
+) -> io::Result<()> {
+    use std::fmt::Write as _;
+    let (cols, rows) = non_zero(size).map_or((0, 0), |sz| (sz.cols, sz.rows));
+    writeln!(
+        metadata,
+        "{} {pid} {} {cols} {rows}",
+        id.0,
+        status.map_or_else(|| "live".to_owned(), |v| v.to_string()),
+    )
+    .map_err(io::Error::other)
+}
+
+fn parse_handoff(
+    metadata: &str,
+    handle_count: usize,
+) -> io::Result<(u32, u32, Vec<HandoffSession>)> {
+    if handle_count < 4 || !(handle_count - 4).is_multiple_of(8) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let count = (handle_count - 4) / 8;
+    let mut words = metadata.split_whitespace();
+    let req = number(words.next())?;
+    let pid = number(words.next())?;
+    let remaining = words.clone().count();
+    let has_size = if remaining == count * 5 {
+        true
+    } else if remaining == count * 3 {
+        false
+    } else {
+        return Err(io::ErrorKind::InvalidData.into());
+    };
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = SessionId(number(words.next())?);
+        let session_pid = number(words.next())?;
+        let status = words.next().ok_or(io::ErrorKind::InvalidData)?;
+        let status = if status == "live" {
+            None
+        } else {
+            Some(number(Some(status))?)
+        };
+        let size = if has_size {
+            let cols = number(words.next())?;
+            let rows = number(words.next())?;
+            non_zero(Some(WinSize { cols, rows }))
+        } else {
+            None
+        };
+        entries.push((id, session_pid, status, size));
+    }
+    Ok((req, pid, entries))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +709,7 @@ mod tests {
             previous: None,
             upgrading: false,
             listener: None,
+            parked: false,
         }
     }
 
@@ -772,6 +858,27 @@ mod tests {
         ));
     }
 
+    /// A-05: 세션 없이 뜨자마자 계속 끝나는 krilld는 다섯 번째에 포기하고 holder가 나간다.
+    #[test]
+    fn empty_holder_gives_up_after_repeated_start_failures() {
+        let mut h = holder();
+        for _ in 0..4 {
+            assert!(!h.daemon_exited(1, Duration::ZERO));
+        }
+        assert!(h.daemon_exited(1, Duration::ZERO));
+    }
+
+    /// 인계 전송 실패는 상대를 기다리느라 오래 살았어도 짧은 실패로 센다(Unix `reap`과 같은 계약).
+    #[test]
+    fn empty_holder_gives_up_after_repeated_handover_failures() {
+        let mut h = holder();
+        let code = i32::from(KRILLD_HANDOVER_FAILED);
+        for _ in 0..4 {
+            assert!(!h.daemon_exited(code, Duration::from_secs(2)));
+        }
+        assert!(h.daemon_exited(code, Duration::from_secs(2)));
+    }
+
     #[test]
     fn queued_listener_is_kept_before_reaping_dead_daemon() {
         use std::os::windows::process::CommandExt as _;
@@ -856,6 +963,7 @@ mod tests {
             previous: None,
             upgrading: false,
             listener: None,
+            parked: false,
         };
         let mut frames = ToHolder::UpgradeHolder {
             req: 1,
@@ -884,5 +992,54 @@ mod tests {
             FromHolder::decode(packet.frame()).unwrap(),
             FromHolder::Failed { req: 2, errno: 3 }
         );
+    }
+
+    #[test]
+    fn handoff_metadata_preserves_five_word_size_and_accepts_three_word_legacy() {
+        let mut metadata = String::from("9 4242\n");
+        format_handoff_session(
+            &mut metadata,
+            SessionId(7),
+            101,
+            None,
+            Some(WinSize {
+                cols: 160,
+                rows: 45,
+            }),
+        )
+        .unwrap();
+        format_handoff_session(&mut metadata, SessionId(8), 102, Some(-1), None).unwrap();
+
+        let (req, pid, entries) = parse_handoff(&metadata, 4 + 2 * 8).unwrap();
+        assert_eq!((req, pid), (9, 4242));
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    SessionId(7),
+                    101,
+                    None,
+                    Some(WinSize {
+                        cols: 160,
+                        rows: 45,
+                    }),
+                ),
+                (SessionId(8), 102, Some(-1), None),
+            ]
+        );
+
+        let legacy = "9 4242\n7 101 live\n8 102 0\n";
+        let (req, pid, entries) = parse_handoff(legacy, 4 + 2 * 8).unwrap();
+        assert_eq!((req, pid), (9, 4242));
+        assert_eq!(
+            entries,
+            vec![
+                (SessionId(7), 101, None, None),
+                (SessionId(8), 102, Some(0), None),
+            ]
+        );
+
+        assert!(parse_handoff("9 4242\n7 101 live 160\n", 4 + 8).is_err());
+        assert!(parse_handoff(&metadata, 4 + 8).is_err());
     }
 }

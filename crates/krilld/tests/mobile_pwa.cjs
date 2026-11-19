@@ -40,15 +40,74 @@ for(const name of ['screens/details.js','screens/home.js','screens/settings.js']
  vm.runInContext(lines.find(l=>l.includes('let noticeTimer'))+lines.find(l=>l.includes('const pairingLink='))+'globalThis.T={toast,error,pairingLink};',context);const T=context.T;
  T.error(Error('RPC failed'));assert.equal(notice.hidden,false);assert.equal(notice.textContent,'RPC failed');T.error(Error('RPC failed'));timers[0].fn();assert.equal(notice.hidden,false);timers.at(-1).fn();assert.equal(notice.hidden,true);
  T.toast('Photo attached',3000);notice.dispatchEvent(new Event('click'));assert.equal(notice.hidden,true);
- assert.equal(T.pairingLink('#p=abc&key=def'),true);assert.equal(T.pairingLink('#pair=abc&key=def'),true);assert.equal(T.pairingLink('#t=x.trycloudflare.com&r=rid'),true);assert.equal(T.pairingLink('#/host/local/group/x/s/1'),false);assert.equal(T.pairingLink('#/pair-confirm'),false);assert.equal(T.pairingLink(''),false);}
+ assert.equal(T.pairingLink('#p=abc&key=def'),true);assert.equal(T.pairingLink('#pair=abc&key=def'),true);assert.equal(T.pairingLink('#r=rid'),true);assert.equal(T.pairingLink('#t=krill.example.com'),false);assert.equal(T.pairingLink('#/host/local/group/x/s/1'),false);assert.equal(T.pairingLink('#/pair-confirm'),false);assert.equal(T.pairingLink(''),false);}
 console.log('PASS mobile screens: account usage/reset/status, Needs You, connection log, toast auto-hide and same-tab pairing link detection');
 for(const name of ['index.html','app.js','app.css','i18n.js','manifest.json','icon.svg','icon-192.png','icon-512.png','icon-maskable-512.png','apple-touch-icon.png','crypto.js','storage.js','client.js','terminal.js','qr.js','sw.js','screens/chat.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
 const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','i18n.js','storage.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','app.js']){const at=html.indexOf('src="'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
+// Direct-origin offline shell service worker: v6 icon inventory, 5xx fallback and fetch timeout.
+async function serviceWorkerTests(){
+ const swSource=fs.readFileSync(path.join(assets,'sw.js'),'utf8');
+ function swFixture(){
+  const listeners=new Map(),stores=new Map(),signals=[];let skipped=0,claimed=0;
+  const openStore=name=>{let map=stores.get(name);if(!map){map=new Map();stores.set(name,map);}return {async addAll(urls){for(const u of urls)map.set('https://desktop.tail123.ts.net:18449'+u,{status:200,ok:true,body:'precached:'+u,clone(){return {...this};}});},async match(key){return map.get(key)||undefined;},async put(key,res){map.set(key,res);}};};
+  let responder=async url=>({status:200,ok:true,redirected:false,body:'live:'+url,clone(){return {...this};}});
+  const context=vm.createContext({
+   URL,
+   location:new URL('https://desktop.tail123.ts.net:18449/'),
+   AbortSignal:{timeout(ms){const s={timeoutMs:ms};signals.push(s);return s;}},
+   caches:{async open(name){return openStore(name);},async keys(){return [...stores.keys()];},async delete(name){return stores.delete(name);}},
+   fetch:(req,init)=>{signals.push({url:req.url,init});return responder(req.url,init);},
+   self:{addEventListener:(type,fn)=>listeners.set(type,fn),skipWaiting:async()=>{skipped++;},clients:{claim:async()=>{claimed++;}}}
+  });
+  context.globalThis=context;
+  vm.runInContext(swSource,context);
+  return {stores,signals,get skipped(){return skipped;},get claimed(){return claimed;},setResponder(fn){responder=fn;},
+   async install(){let p;listeners.get('install')({waitUntil:v=>{p=v;}});await p;},
+   async activate(){let p;listeners.get('activate')({waitUntil:v=>{p=v;}});await p;},
+   async get(pathname,method='GET',origin='https://desktop.tail123.ts.net:18449'){let p;listeners.get('fetch')({request:{url:origin+pathname,method},respondWith:v=>{p=v;}});return p?await p:null;}
+  };
+ }
+ const sw=swFixture();
+ sw.stores.set('krill-direct-shell-v5',new Map([['https://desktop.tail123.ts.net:18449/',{status:200,body:'old'}]]));
+ sw.stores.set('unrelated-cache',new Map([['k','v']]));
+ await sw.install();
+ assert(sw.stores.has('krill-direct-shell-v6'));
+ assert.equal(sw.skipped,1);
+ const cachedKeys=[...sw.stores.get('krill-direct-shell-v6').keys()];
+ for(const icon of ['/icon.svg','/apple-touch-icon.png','/icon-192.png','/icon-512.png','/icon-maskable-512.png','/manifest.json','/'])assert(cachedKeys.includes('https://desktop.tail123.ts.net:18449'+icon),icon);
+ await sw.activate();
+ assert(!sw.stores.has('krill-direct-shell-v5'),'activate deletes prior shell cache');
+ assert(sw.stores.has('krill-direct-shell-v6'));
+ assert(sw.stores.has('unrelated-cache'));
+ assert.equal(sw.claimed,1);
+ const liveShell=await sw.get('/');
+ assert.equal(liveShell.body,'live:https://desktop.tail123.ts.net:18449/');
+ const fetchCall=sw.signals.find(x=>x.url==='https://desktop.tail123.ts.net:18449/');
+ assert.equal(fetchCall.init.cache,'no-store');
+ assert.equal(fetchCall.init.signal.timeoutMs,3500);
+ // Upstream 502/503 during daemon restart falls back to cached shell/icons without overwriting cache.
+ for(const status of [502,503]){
+  sw.setResponder(async()=>({status,ok:false,redirected:false,body:'proxy-error-'+status,clone(){return {...this};}}));
+  assert.equal((await sw.get('/')).body,'live:https://desktop.tail123.ts.net:18449/');
+  assert.equal((await sw.get('/apple-touch-icon.png')).body,'precached:/apple-touch-icon.png');
+ }
+ // If a shell entry is not yet cached, a 502 still returns the upstream response cleanly.
+ sw.stores.get('krill-direct-shell-v6').delete('https://desktop.tail123.ts.net:18449/qr.js');
+ assert.equal((await sw.get('/qr.js')).status,503);
+ // Stalled fetch aborting via AbortSignal.timeout(3500) serves cached /app.js.
+ sw.setResponder(async(_url,init)=>{assert.equal(init.signal.timeoutMs,3500);const err=new Error('The operation was aborted due to timeout');err.name='TimeoutError';throw err;});
+ assert.equal((await sw.get('/app.js')).body,'precached:/app.js');
+ // Auth URLs remain network-only on 200/502 and never overwrite SHELL cache.
+ sw.setResponder(async()=>({status:200,ok:true,redirected:false,body:'auth-page'}));
+ assert.equal((await sw.get('/?pair=abc&key=def')).body,'auth-page');
+ assert.equal(sw.stores.get('krill-direct-shell-v6').get('https://desktop.tail123.ts.net:18449/').body,'live:https://desktop.tail123.ts.net:18449/');
+ console.log('PASS service worker v6: raster icons precached, 3500ms fetch timeout, 5xx and timeout fallback to cache, auth bypass');
+}
 // Fixed-origin bootstrap and transport, with real crypto and deterministic sockets.
 async function fixedOriginTests(){
- const hash='0123456789abcdef',rid='a'.repeat(32),saved={device_id:'saved',credential:'ab'.repeat(32),rid,url:'https://saved.trycloudflare.com',hash};
+ const hash='0123456789abcdef',rid='a'.repeat(32),saved={device_id:'saved',credential:'ab'.repeat(32),rid,hash};
  const source=fs.readFileSync(path.join(assets,'client.js'),'utf8');
- function fixture(href,credential=saved,found={url:'https://fresh.trycloudflare.com',hash},{serviceWorker=true}={}){
+ function fixture(href,credential=saved,found={relay:true,hash},{serviceWorker=true}={}){
   const location=new URL(href),values=new Map(credential?[['krill-mobile-v2',JSON.stringify(credential)]]:[]),requests=[],registrations=[],sockets=[],timers=new Map(),redirects=[];let id=0;
   location.replace=href=>redirects.push(href);
   class Socket extends EventTarget{
@@ -63,7 +122,7 @@ async function fixedOriginTests(){
  }
  const flush=async()=>{for(let n=0;n<25;n++)await Promise.resolve();};
  const fixed=`https://krill-mobile.pages.dev/m/${hash}/`;
- let f=fixture(fixed+`?session=7&pair=query&key=query&t=evil&r=evil#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}`);
+ let f=fixture(fixed+`?session=7&pair=query&key=query&r=evil#pair=ticket&key=secret&r=${rid}`);
  assert.equal(f.endpoint.credentials.device_id,'saved');assert.equal(f.endpoint.pair,null);assert(f.endpoint.initialRouteLink);assert.equal(f.location.href,fixed+'?session=7');assert.deepEqual(f.registrations,['/sw.js']);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);
  for(const compact of ['!', 'a'.repeat(42), 'a'.repeat(44), 'A'.repeat(42)+'B', 'A'.repeat(40000)]) {
   f=fixture(fixed+'#p='+compact+'&key=secret');assert.equal(f.endpoint.pair,null);assert(f.endpoint.pairingError);assert.equal(f.location.hash,'');assert.equal(f.endpoint.credentials.device_id,'saved');
@@ -71,56 +130,49 @@ async function fixedOriginTests(){
  }
  f=fixture(fixed+'#pair=ab&p='+'A'.repeat(43)+'&key=secret');assert.equal(f.endpoint.pair,null);assert.equal(f.location.hash,'');assert(f.endpoint.pairingError);
  f=fixture(fixed+'#p='+Buffer.alloc(32,7).toString('base64url')+'&key=secret&d=desktop.tail123.ts.net:18449',null);assert.equal(f.endpoint.pair.ticket,'07'.repeat(32));assert.equal(f.location.hash,'');assert.equal(f.endpoint.socketUrl(),'wss://desktop.tail123.ts.net:18449/ws');
- for(const fragment of ['#t=evil.trycloudflare.com&r=forged','#pair=only&t=evil.trycloudflare.com&r=forged','#key=only&t=evil.trycloudflare.com&r=forged']){
+ for(const fragment of ['#r=forged','#pair=only&r=forged','#key=only&r=forged']){
   f=fixture(fixed+fragment);assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);await f.endpoint.locate();assert.equal(f.requests[0].url,'/r/'+rid);
  }
- f=fixture(fixed+'?pair=query&key=query&t=evil.trycloudflare.com&r=forged');assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);assert.equal(f.location.search,'');
+ f=fixture(fixed+'?pair=query&key=query&r=forged');assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);assert.equal(f.location.search,'');
  // Browsers expose service workers on HTTP loopback, but not ordinary insecure LAN origins.
  f=fixture('http://127.0.0.1:1234/#pair=ticket&key=secret');assert.equal(f.endpoint.socketUrl(),'ws://127.0.0.1:1234/ws');assert.deepEqual(f.registrations,['/sw.js']);
  f=fixture('http://192.0.2.1:1234/#pair=ticket&key=secret',null,undefined,{serviceWorker:false});assert.equal(f.endpoint.socketUrl(),'ws://192.0.2.1:1234/ws');assert.deepEqual(f.registrations,[]);
  // Home Screen install link: pairs an empty store once; relaunches with the same start URL keep the saved device.
- f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.location.href,fixed);
- f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`);assert.equal(f.endpoint.pair,null);assert.deepEqual({...f.endpoint.credentials},saved);assert.equal(f.location.href,fixed);
- f=fixture(fixed+'#pair=ticket&key=secret&t=evil.test&r=bad');assert.throws(()=>f.endpoint.socketUrl(),/fresh QR/);
- for(const found of [{url:'https://evil.test',hash},{url:'https://ok.trycloudflare.com.evil.test',hash},{url:'https://ok.trycloudflare.com',hash:'../evil'},{url:'https://ok.trycloudflare.com',hash:'ABCDEF0123456789'},{url:'https://ok.trycloudflare.com',hash:1234567890123456}]){
+ f=fixture(fixed+`#pair=ticket&key=secret&r=${rid}&install=1`,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.location.href,fixed);
+ f=fixture(fixed+`#pair=ticket&key=secret&r=${rid}&install=1`);assert.equal(f.endpoint.pair,null);assert.deepEqual({...f.endpoint.credentials},saved);assert.equal(f.location.href,fixed);
+ f=fixture(fixed+'#pair=ticket&key=secret&r=bad');assert.throws(()=>f.endpoint.socketUrl(),/fresh QR/);
+ for(const found of [{url:'https://evil.test',hash},{url:'https://krill.example.com',hash},{relay:true,hash:'../evil'},{relay:true,hash:'ABCDEF0123456789'},{relay:true,hash:1234567890123456}]){
   f=fixture(fixed,saved,found);assert.equal(await f.endpoint.locate(),false);assert.deepEqual(f.stored(),saved);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);assert.deepEqual(f.redirects,[]);
  }
- // A pre-open failure locates and tries a changed endpoint immediately; unchanged endpoints back off.
+ // A pre-open failure locates the relay; an unchanged endpoint backs off.
  f=fixture(fixed);let t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});
- t.connect();await flush();f.sockets[0].emit('error');await flush();assert.equal(f.requests.length,1);assert.equal(f.requests[0].options.cache,'no-store');assert.equal(f.stored().url,'https://fresh.trycloudflare.com');assert.equal(f.timers.size,1);
- const retry=[...f.timers.values()][0];assert.equal(retry.ms,0);retry.fn();await flush();assert.equal(f.sockets[1].url,`wss://fresh.trycloudflare.com/ws?v=${hash}`);t.close();
- f=fixture(fixed,{...saved,rid:undefined});t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('error');await flush();assert.equal(f.requests.length,0);assert.equal([...f.timers.values()][0].ms,1000);t.close();
- f=fixture(fixed+'?session=7#/host/local',saved,{url:'https://fresh.trycloudflare.com',hash:'fedcba9876543210'});t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('error');await flush();assert.deepEqual(f.redirects,['/m/fedcba9876543210/?session=7#/host/local']);assert.equal(f.timers.size,0);t.close();
+ t.connect();await flush();f.sockets[0].emit('error');await flush();assert.equal(f.requests.length,1);assert.equal(f.requests[0].options.cache,'no-store');assert.equal(f.timers.size,1);assert.equal([...f.timers.values()][0].ms,1000);t.close();
+ f=fixture(fixed+'?session=7#/host/local',saved,{relay:true,hash:'fedcba9876543210'});t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('error');await flush();assert.deepEqual(f.redirects,['/m/fedcba9876543210/?session=7#/host/local']);assert.equal(f.timers.size,0);t.close();
  f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('open');f.sockets[0].emit('close',1008);await flush();assert.equal(f.requests.length,0);assert.equal(f.timers.size,0);assert.equal(t.blocked,true);t.close();
  // Returning to the app (visibilitychange/pageshow/online → resume) reconnects at once instead of waiting out the backoff.
  f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('error');await flush();assert.equal(f.sockets.length,1);assert.equal(t.blocked,false);t.resume();await flush();assert.equal(f.sockets.length,2);t.close();
  // Authentication saves endpoint metadata, and terminal sockets share the main URL.
- f=fixture(fixed+`#pair=ticket&key=${Buffer.alloc(32).toString('base64url')}&t=paired.trycloudflare.com&r=${rid}`,null);
+ f=fixture(fixed+`#pair=ticket&key=${Buffer.alloc(32).toString('base64url')}&r=${rid}`,null);
  let authenticated;t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,pair:f.endpoint.pair,onAuthenticated:auth=>{authenticated=auth;f.context.localStorage.setItem('krill-mobile-v2',JSON.stringify(auth));}});
  t.connect();await flush();const socket=f.sockets[0];socket.emit('open');socket.emit('message',JSON.stringify({version:2,challenge:'bc'.repeat(32)}));await flush();
  const server=new C.Channel(new Uint8Array(32),C.concat(C.unhex('bc'.repeat(32)),new Uint8Array(32).fill(1)),false);
  socket.emit('message',server.seal(new TextEncoder().encode(JSON.stringify({device_id:'new-device',credential:'cd'.repeat(32)}))));socket.emit('message',server.seal(frame(1,Buffer.concat([v(1),v(1),v(0)]))));await flush();
- socket.emit('message',server.seal(frame(0x65,Buffer.concat([v(6),string(JSON.stringify({ok:true,data:{sessions:[]}}))]))));await flush();assert(t.ready);assert.equal(authenticated.rid,rid);assert.equal(authenticated.url,'https://paired.trycloudflare.com');assert.equal(authenticated.hash,hash);assert.equal(f.stored().credential,'cd'.repeat(32));const terminal=t.terminalConnect();assert.equal(terminal.socket.url,socket.url);assert.equal(terminal.credentials.rid,rid);
- // Back from a long background (or a new network): resume(stale) reconnects at once instead of probing a likely dead socket.
- {const n=f.sockets.length;t.resume(true);await flush();assert.equal(f.sockets.length,n+1);assert.equal(f.sockets.at(-1).url,socket.url);assert(socket.closed);}t.close();
+ socket.emit('message',server.seal(frame(0x65,Buffer.concat([v(6),string(JSON.stringify({ok:true,data:{sessions:[]}}))]))));await flush();assert(t.ready);assert.equal(authenticated.rid,rid);assert.equal(authenticated.hash,hash);assert.equal(f.stored().credential,'cd'.repeat(32));const terminal=t.terminalConnect();assert.equal(terminal.socket.url,socket.url);assert.equal(terminal.credentials.rid,rid);
+ // Back from a long background the open socket is asked once (probe deadline) instead of dropped; a new network reconnects at once.
+ {t.resume(true);await flush();assert(!socket.closed,'the open control socket is kept');const n=f.sockets.length;t.resume('network');await flush();assert(f.sockets.length>n);assert.equal(f.sockets.at(-1).url,socket.url);assert(socket.closed);}t.close();
  // A hung connection handshake gives up after 20 s, so locate/fallback and retry run instead of waiting out the TCP timeout.
- f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();{const guard=[...f.timers.values()].find(x=>x.ms===20000);assert(guard);guard.fn();await flush();assert(f.sockets[0].closed);assert.equal(f.requests.length,1);assert([...f.timers.values()].some(x=>x.ms===0));}t.close();
- // In-app QR scan (endpoint.adopt): t/r or an https tunnel origin pairs in place; another app version or LAN origin opens the link; a LAN code in the fixed app says what to do.
- {const key=Buffer.alloc(32).toString('base64url'),other='b'.repeat(32);f=fixture(fixed);const next=f.endpoint.adopt(`https://elsewhere.example/m/${hash}/#pair=ab12&key=${key}&t=scan.trycloudflare.com&r=${other}`);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);next.use();assert.equal(next.ticket,'ab12');assert.equal(next.secret,key);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${other}?v=${hash}`);
-  f=fixture(fixed);f.endpoint.adopt(`https://quick.trycloudflare.com/#pair=ab12&key=${key}`).use();assert.equal(f.endpoint.socketUrl(),`wss://quick.trycloudflare.com/ws?v=${hash}`);
+ f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();{const guard=[...f.timers.values()].find(x=>x.ms===20000);assert(guard);guard.fn();await flush();assert(f.sockets[0].closed);assert.equal(f.requests.length,1);assert([...f.timers.values()].some(x=>x.ms===1000));}t.close();
+ // In-app QR scan (endpoint.adopt): r pairs in place; a Named Tunnel origin, another app version or LAN origin opens the link; a LAN code in the fixed app says what to do.
+ {const key=Buffer.alloc(32).toString('base64url'),other='b'.repeat(32);f=fixture(fixed);const next=f.endpoint.adopt(`https://elsewhere.example/m/${hash}/#pair=ab12&key=${key}&r=${other}`);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);next.use();assert.equal(next.ticket,'ab12');assert.equal(next.secret,key);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${other}?v=${hash}`);
+  f=fixture(fixed);assert.equal(f.endpoint.adopt(`https://krill.example.com/#pair=ab12&key=${key}`),null);
   f=fixture(fixed,null);f.endpoint.adopt(`${fixed}#pair=ab12&key=${key}&r=${other}`).use();assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${other}?v=${hash}`);
   assert.equal(f.endpoint.adopt(`https://krill-mobile.pages.dev/m/fedcba9876543210/#pair=ab12&key=${key}&r=${rid}`),null);assert.throws(()=>f.endpoint.adopt(`http://192.168.0.5:52931/#pair=ab12&key=${key}`),/older Tailscale address/);
   for(const bad of ['hello','https://example.com/','https://example.com/#pair=zz&key=k',`javascript:x#pair=ab&key=${key}`])assert.throws(()=>f.endpoint.adopt(bad),/Not a Krill pairing code/);
   f=fixture('http://127.0.0.1:1234/');assert.equal(f.endpoint.adopt(`http://127.0.0.1:1234/#pair=ab12&key=${key}`).secret,key);assert.equal(f.endpoint.adopt(`http://10.0.0.2:1234/#pair=ab12&key=${key}`),null);}
- // Relay wins over a saved tunnel; discovery retains that tunnel as the alternate.
+ // A relay pairing code dials the relay socket.
  f=fixture(fixed+`#pair=ticket&key=${Buffer.alloc(32).toString('base64url')}&r=${rid}`,null);
  assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);
- f=fixture(fixed,saved,{url:'https://saved.trycloudflare.com',hash});t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});
- t.connect();await flush();assert.equal(f.sockets[0].url,`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);
- f.sockets[0].emit('error');await flush();
- const relayRetry=[...f.timers.values()][0];relayRetry.fn();await flush();
- assert.equal(f.sockets[1].url,`wss://saved.trycloudflare.com/ws?v=${hash}`);t.close();
- console.log('PASS fixed-origin fragment cleanup, saved destination protection, rid/url/hash persistence, DO WS relay & fallback, shared socket URLs, strict rendezvous validation, hash redirect and pre-open retry');
+ console.log('PASS fixed-origin fragment cleanup, saved destination protection, rid/hash persistence, DO WS relay, shared socket URLs, strict rendezvous validation, hash redirect and pre-open retry');
 }
 // Cross-language fixed screen fixtures: wide Hangul, combining ZWJ, colors and scroll ops.
 const T=sandbox.MkTerminalCodec,model={};
@@ -130,10 +182,11 @@ const historyFixture=T.history(Buffer.from('100000002609e807030a0201017800000000
 const before=model.rows[3];T.update(Buffer.concat([v(301),v(70000),v(1),v(1),v(1),v(2)]),model);assert.equal(model.rows[2],before);
 for(let n=0;n<128;n++){const bytes=crypto.randomBytes(n);try{T.update(bytes,{cols:80,lines:24,rows:Array.from({length:24},()=>[])});}catch{}try{T.history(bytes);}catch{}}
 assert.equal(sandbox.KrillMobile.terminal.keys.length,24);
+if(process.argv.includes('--unit-only')){(async()=>{await serviceWorkerTests();await fixedOriginTests();console.log('PASS mobile_pwa unit-only suite');})().catch(error=>{console.error(error.stack);process.exitCode=1;});return;}
 const dir=fs.mkdtempSync('/tmp/m9pwa-'),repo=path.join(dir,'repo'),home=path.join(dir,'home'),profile=path.join(dir,'account');
 fs.mkdirSync(repo);fs.mkdirSync(home);fs.mkdirSync(profile);fs.mkdirSync(path.join(dir,'paste'),{mode:0o700});
 const env={...process.env,KRILL_TEST_OFFLINE:'1',KRILL_TELEMETRY_DISABLED:'1',KRILL_ERROR_REPORTING_DISABLED:'1',KRILL_STATE_DIR:dir,HOME:home,CLAUDE_CONFIG_DIR:path.join(home,'.claude'),CODEX_HOME:path.join(home,'.codex'),TMPDIR:path.join(dir,'paste')};
-const log=fs.openSync(path.join(dir,'holder.log'),'a');let holder,daemon=0,phone,other,webhookServer,files=[];
+const log=fs.openSync(path.join(dir,'holder.log'),'a');let holder,daemon=0,phone,other,files=[];
 const deadline=setTimeout(()=>{console.error('PWA E2E deadline exceeded');cleanup();process.exit(1);},150_000);
 function cli(args){return execFileSync(mk,args,{env,encoding:'utf8',timeout:20000,stdio:['ignore','pipe','pipe']}).trim();}
 function jsonCli(args){return JSON.parse(cli([...args,'--json']));}
@@ -143,7 +196,7 @@ function string(s){const bytes=Buffer.from(s);return Buffer.concat([v(bytes.leng
 function frame(k,body){const h=Buffer.alloc(5);h.writeUInt32LE(body.length+1);h[4]=k;return Buffer.concat([h,body]);}
 function reader(bytes){let at=0;return{u(){let n=0n,shift=0n;for(;;){const b=bytes[at++];n|=BigInt(b&127)<<shift;if(!(b&128))return n;shift+=7n;}},text(){const n=Number(this.u()),s=bytes.subarray(at,at+n).toString();at+=n;return s;}};}
 async function until(fn){const end=Date.now()+15000;while(Date.now()<end){try{const value=await fn();if(value)return value;}catch{}await new Promise(r=>setTimeout(r,30));}throw Error('condition timed out');}
-function cleanup(){clearTimeout(deadline);webhookServer?.close();phone?.socket.close();other?.socket.close();if(holder){try{const list=cli(['ls']).split('\n');for(const line of list){const id=line.split('\t')[0];if(/^\d+$/.test(id))cli(['kill',id]);}}catch{}holder.kill('SIGKILL');}if(daemon)try{process.kill(daemon,'SIGKILL');}catch{}for(const f of files)try{fs.unlinkSync(f);}catch{}fs.closeSync(log);fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
+function cleanup(){clearTimeout(deadline);phone?.socket.close();other?.socket.close();if(holder){try{const list=cli(['ls']).split('\n');for(const line of list){const id=line.split('\t')[0];if(/^\d+$/.test(id))cli(['kill',id]);}}catch{}holder.kill('SIGKILL');}if(daemon)try{process.kill(daemon,'SIGKILL');}catch{}for(const f of files)try{fs.unlinkSync(f);}catch{}fs.closeSync(log);fs.rmSync(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
 async function connect(url,credential){
  const u=new URL(url),socket=new WebSocket(`ws://${u.host}/ws`);socket.binaryType='arraybuffer';const messages=[],waiting=[];let failure;
  socket.addEventListener('message',e=>{const w=waiting.shift();if(w)w.resolve(e.data);else messages.push(e.data);});
@@ -161,6 +214,7 @@ async function connect(url,credential){
 }
 (async()=>{
  try {
+  await serviceWorkerTests();
   await fixedOriginTests();
   await require('./mobile_session.cjs').main();
   git(['init','-b','mobile-test']);git(['config','user.email','test@example.invalid']);git(['config','user.name','M9 test']);fs.writeFileSync(path.join(repo,'example.txt'),'before\n');git(['add','.']);git(['commit','-m','fixture']);fs.appendFileSync(path.join(repo,'example.txt'),'after\n');
@@ -282,19 +336,20 @@ async function connect(url,credential){
   const history=JSON.parse(fs.readFileSync(path.join(dir,'orchestration.json')));assert(!history.messages.find(m=>m.id===internalQuestion.id).acked);assert(!history.messages.find(m=>m.id===staleQuestion.id).acked);assert.equal(history.gates.find(g=>g.id===staleGate.id).status,'pending');
   const diff=await phone.rpc({action:'git',session,path:'example.txt'});assert(diff.patch.includes('+after'));const outside=await phone.rpc({action:'git',session,path:'../../secrets'});assert.equal(outside.diff_status,'outside_scope');assert.equal(outside.patch,'');
   const handoff=await phone.rpc({action:'handoff',session,agent:'codex'});assert(handoff.to_session);await until(()=>cli(['read',String(handoff.to_session)]).includes('KRILL HANDOFF'));
+  const DROP_CHUNK=384*1024,dropFile=crypto.randomBytes(DROP_CHUNK*2+12345),upload=crypto.randomBytes(16).toString('hex'),dropPut=(client,offset)=>client.rpc({action:'drop_put',upload,name:'../phone photo.bin',size:dropFile.length,offset,data:dropFile.subarray(offset,offset+DROP_CHUNK).toString('base64')});
+  assert.equal(data.capabilities.drop,true);assert.deepEqual(await dropPut(phone,0),{received:DROP_CHUNK});
   const saved={device_id:phone.authenticated.device_id,credential:phone.authenticated.credential};phone.socket.close();await new Promise(r=>setTimeout(r,80));
   const rejectedCode=await new Promise((resolve,reject)=>{const u=new URL(url),ws=new WebSocket(`ws://${u.host}/ws`);ws.binaryType='arraybuffer';ws.addEventListener('error',reject,{once:true});ws.addEventListener('message',e=>{const ch=JSON.parse(e.data),nonce=crypto.randomBytes(32),chan=new C.Channel(new Uint8Array(32),C.concat(C.unhex(ch.challenge),nonce));ws.send(JSON.stringify({token:null,device_id:saved.device_id,client_nonce:nonce.toString('hex')}));ws.send(chan.seal(new TextEncoder().encode('{"label":"Bad credential"}')));},{once:true});ws.addEventListener('close',e=>resolve(e.code),{once:true});});
   assert.equal(rejectedCode,1008);
   other=await connect(url,saved);const resumed=await other.rpc({action:'snapshot'});assert(resumed.sessions.some(s=>s.id===session));
-  // Daemon-owned notifications reach all providers with no desktop process running.
-  const posts=[];webhookServer=require('node:http').createServer((req,res)=>{let body='';req.on('data',b=>body+=b);req.on('end',()=>{posts.push({path:req.url,body});res.writeHead(204);res.end();});});await new Promise(r=>webhookServer.listen(0,'127.0.0.1',r));
-  const webhookBase=`http://127.0.0.1:${webhookServer.address().port}`;
-  fs.writeFileSync(path.join(dir,'settings.toml'),`notifications = false\n[[webhooks]]\nprovider = "ntfy"\nurl = "${webhookBase}/ntfy"\n[[webhooks]]\nprovider = "telegram"\nurl = "${webhookBase}/telegram"\nchat_id = "fixture"\n[[webhooks]]\nprovider = "discord"\nurl = "${webhookBase}/discord"\n`);
-  for(const [file,event] of [['working','UserPromptSubmit'],['waiting','PermissionRequest'],['done','Stop']])fs.writeFileSync(path.join(dir,file+'.json'),JSON.stringify({hook_event_name:event}));
-  const hookCommand=`while [ ! -f '${dir}/webhook-go' ]; do sleep 0.02; done; '${mk}' hook claude < '${dir}/working.json'; '${mk}' hook claude < '${dir}/waiting.json'; '${mk}' hook claude < '${dir}/done.json'; printf 'SECRET_TERMINAL_CONTENT\\n'; exec /bin/cat`;
-  const notifiedSession=Number(cli(['new','--cwd',repo,'--','/bin/sh','-c',hookCommand]));fs.writeFileSync(path.join(dir,'webhook-go'),'');await until(()=>posts.length===6);
-  for(const provider of ['ntfy','telegram','discord']){const pair=posts.filter(p=>p.path==='/'+provider);assert.equal(pair.length,2);for(const p of pair){assert(p.body.includes(base+'/?session='+notifiedSession));assert(!p.body.includes('SECRET'));assert(!p.body.includes('pair='));assert(!p.body.includes('key='));}assert(pair[0].body.includes('waiting for input'));assert(pair[1].body.includes('completed'));}
-  console.log('Daemon webhook E2E passed: ntfy, Telegram, Discord, waiting/done, credential-free deep links and no app process');
+  assert.deepEqual(await dropPut(other,0),{received:DROP_CHUNK},'a resent chunk after reconnect only reports what the PC holds');
+  let dropReply={received:DROP_CHUNK};while(!dropReply.saved)dropReply=await dropPut(other,dropReply.received);
+  const inboxFile=path.join(home,'Downloads','Krill Drop','phone photo.bin');assert.equal(dropReply.saved,inboxFile);assert.deepEqual(fs.readFileSync(inboxFile),dropFile);
+  const outBytes=crypto.randomBytes(DROP_CHUNK+777),outFile=path.join(dir,'agent report.md');fs.writeFileSync(outFile,outBytes);const queued=jsonCli(['drop',outFile]).items[0];
+  const dropList=await other.rpc({action:'drop_list'});assert.equal(dropList.inbox,path.dirname(inboxFile));assert.deepEqual(dropList.items.map(i=>[i.id,i.name,i.size]),[[queued.id,'agent report.md',outBytes.length]]);
+  const parts=[];for(let at=0;;){const r=await other.rpc({action:'drop_get',id:queued.id,offset:at});parts.push(Buffer.from(r.data,'base64'));at+=parts.at(-1).length;if(r.eof)break;}assert.deepEqual(Buffer.concat(parts),outBytes);
+  assert.deepEqual(await other.rpc({action:'drop_remove',id:queued.id}),{removed:true});assert.deepEqual((await other.rpc({action:'drop_list'})).items,[]);
+  console.log('PASS Krill Drop: chunked phone upload resumed after reconnect lands byte-identical in Downloads/Krill Drop; a krill drop item lists, downloads byte-identical and is removed');
   const {fragment}=await other.rpc({action:'install_handoff'});assert.match(fragment,/^pair=[0-9a-f]{64}&key=[\w-]{43}$/);await require('./mobile_install.cjs').main({base,fragment});
   console.log('PWA E2E passed: non-secure pure JS E2EE, gzip assets, approval, IME text, photo 0600, account switch, gate reply, diff, mock handoff and credential reconnect');
  } finally {cleanup();}

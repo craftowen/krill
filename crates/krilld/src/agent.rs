@@ -117,6 +117,9 @@ if [ "${ZDOTDIR:-$HOME}" != "$_krill_self_zdotdir" ] && [ -f "${ZDOTDIR:-$HOME}/
   . "${ZDOTDIR:-$HOME}/.zshenv"
 fi
 unset _krill_self_zdotdir
+if [ -n "${MK_PANE_ID-}" ]; then
+  export HERDR_ENV=1
+fi
 if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
   # OpenCode 격리 프로필만 XDG_DATA_HOME·XDG_STATE_HOME을 덮어쓴다. 처음 덮어쓰기 전 값(미설정 포함)을 기억했다가
   # 호스트 계정·항목 제거 때 되돌린다. 그 사이 사용자가 직접 바꾼 값은 보존한다(daemon-01).
@@ -141,6 +144,9 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
   __krill_sync_accounts() {
     if (( $+functions[__krill_flush_compdef] )); then
       __krill_flush_compdef
+    fi
+    if [ -n "${MK_PANE_ID-}" ]; then
+      export HERDR_ENV=1
     fi
     local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/krill}/active-accounts.env"
     if [ ! -f "$_krill_env" ] && [ -f "$HOME/Library/Application Support/dev.krill.app/active-accounts.env" ]; then
@@ -284,14 +290,15 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
         return login;
     }
     let home = accounts::default_home();
-    for (prog, provider) in [
-        ("claude", ProviderKind::Claude),
-        ("codex", ProviderKind::Codex),
-        ("opencode", ProviderKind::OpenCode),
-        ("agy", ProviderKind::Antigravity),
-        ("gemini", ProviderKind::Gemini),
+    let active_accounts = accounts::active_accounts(&home, Some(state));
+    for provider in [
+        ProviderKind::Claude,
+        ProviderKind::Codex,
+        ProviderKind::OpenCode,
+        ProviderKind::Antigravity,
+        ProviderKind::Gemini,
     ] {
-        let Some((_, active)) = accounts::active_account_info(&home, Some(state), prog) else {
+        let Some((_, active)) = active_accounts.iter().find(|(p, _)| *p == provider) else {
             continue;
         };
         let dir = &active.profile_dir;
@@ -923,8 +930,9 @@ pub(crate) fn pre_trust_workspace(profile: &Profile, cwd: &[u8], account: Option
 }
 
 /// 새 워크트리 생성 시 동의 플래그가 켜져 있으면 Claude·Codex·Cursor·Antigravity 모두에 신뢰를 등록한다(OWE-737).
-pub(crate) fn pre_trust_all_agents(cwd: &Path) {
-    let state_dir = krill_proto::daemon::state_dir();
+/// 동의는 워크트리를 만든 레지스트리의 상태 폴더에서 읽는다. 프로세스 환경의 `KRILL_STATE_DIR`는
+/// 같은 프로세스 안의 다른 레지스트리(테스트)에서는 운영 폴더일 수 있다.
+pub(crate) fn pre_trust_all_agents(state_dir: Option<&Path>, cwd: &Path) {
     let Some(home) = trust_home_for_runtime() else {
         return;
     };
@@ -935,7 +943,7 @@ pub(crate) fn pre_trust_all_agents(cwd: &Path) {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     pre_trust_all_agents_if_enabled(
-        state_dir.as_deref(),
+        state_dir,
         &home,
         claude_dir.as_deref(),
         codex_dir.as_deref(),
@@ -1025,7 +1033,7 @@ static TRUST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 fn read_trust_file_snapshot(target: &Path) -> io::Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(target) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            tracing::warn!(path = %target.display(), "refusing to read symlink trust config");
+            tracing::warn!("refusing to read symlink trust config");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "symlink trust config refused",
@@ -1059,7 +1067,7 @@ pub(crate) fn write_trust_file_cas(
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
     if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
-        tracing::warn!(path = %target.display(), "refusing to write symlink trust config");
+        tracing::warn!("refusing to write symlink trust config");
         return Ok(false);
     }
     #[cfg(unix)]
@@ -1090,7 +1098,7 @@ pub(crate) fn write_trust_file_cas(
     }
     if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
         std::fs::remove_file(&tmp).ok();
-        tracing::warn!(path = %target.display(), "trust config became symlink before rename; skipping");
+        tracing::warn!("trust config became symlink before rename; skipping");
         return Ok(false);
     }
     let unchanged = match (expected_original, std::fs::read(target)) {
@@ -1100,10 +1108,7 @@ pub(crate) fn write_trust_file_cas(
     };
     if !unchanged {
         std::fs::remove_file(&tmp).ok();
-        tracing::warn!(
-            path = %target.display(),
-            "trust config modified concurrently by another process; skipping write"
-        );
+        tracing::warn!("trust config modified concurrently by another process; skipping write");
         return Ok(false);
     }
     if let Err(e) = std::fs::rename(&tmp, target) {
@@ -1476,14 +1481,14 @@ pub(crate) fn pre_trust_claude_in_with_hook(
             if let Ok(s) = std::str::from_utf8(b) {
                 Some(s)
             } else {
-                tracing::warn!(path = %config_path.display(), "claude config is not valid UTF-8; skipping");
+                tracing::warn!("claude config is not valid UTF-8; skipping");
                 return Ok(false);
             }
         }
         None => None,
     };
     let Some((next, changed)) = patch_claude_trust_json(existing_str, &candidates) else {
-        tracing::warn!(path = %config_path.display(), "skipping claude trust preset due to malformed JSON or unexpected schema");
+        tracing::warn!("skipping claude trust preset due to malformed JSON or unexpected schema");
         return Ok(false);
     };
     if !changed {
@@ -1535,14 +1540,14 @@ pub(crate) fn pre_trust_codex_in_with_hook(
             if let Ok(s) = std::str::from_utf8(b) {
                 s
             } else {
-                tracing::warn!(path = %config_path.display(), "codex config.toml is not valid UTF-8; skipping");
+                tracing::warn!("codex config.toml is not valid UTF-8; skipping");
                 return Ok(false);
             }
         }
         None => "",
     };
     let Some((next, changed)) = upsert_codex_project_trust_checked(existing, project_path) else {
-        tracing::warn!(path = %config_path.display(), "skipping codex trust preset due to malformed TOML or unexpected schema");
+        tracing::warn!("skipping codex trust preset due to malformed TOML or unexpected schema");
         return Ok(false);
     };
     if !changed {
@@ -1708,14 +1713,16 @@ pub(crate) fn pre_trust_workspace_in(home: &Path, cwd: &Path) -> io::Result<()> 
             if let Ok(s) = std::str::from_utf8(b) {
                 Some(s)
             } else {
-                tracing::warn!(path = %settings_path.display(), "antigravity settings.json is not valid UTF-8; skipping");
+                tracing::warn!("antigravity settings.json is not valid UTF-8; skipping");
                 return Ok(());
             }
         }
         None => None,
     };
     let Some((next, changed)) = patch_antigravity_settings_json(existing_str, &candidates) else {
-        tracing::warn!(path = %settings_path.display(), "skipping antigravity trust preset due to malformed JSON or unexpected schema");
+        tracing::warn!(
+            "skipping antigravity trust preset due to malformed JSON or unexpected schema"
+        );
         return Ok(());
     };
     if !changed {
@@ -1876,26 +1883,6 @@ fn apply_account_env(
                 );
             } else if is(profile, "claude") {
                 sync_claude_profile_hooks_in(&host_home, Path::new(&account.dir)).ok();
-                crate::usage::accounts::agy_native::sync_provider_account_dir(
-                    &host_home,
-                    state,
-                    ProviderKind::Claude,
-                    Path::new(&account.dir),
-                );
-            } else if is(profile, "codex") {
-                crate::usage::accounts::agy_native::sync_provider_account_dir(
-                    &host_home,
-                    state,
-                    ProviderKind::Codex,
-                    Path::new(&account.dir),
-                );
-            } else if is(profile, "opencode") {
-                crate::usage::accounts::agy_native::sync_provider_account_dir(
-                    &host_home,
-                    state,
-                    ProviderKind::OpenCode,
-                    Path::new(&account.dir),
-                );
             }
         }
         if let Some(provider) = ProviderKind::from_env_var(&account.env_key) {
@@ -2135,7 +2122,12 @@ fn pane_env_with_socket(
     state: Option<&Path>,
     socket_dir: Option<&std::ffi::OsStr>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut env = vec![(b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes())];
+    let mut env = vec![
+        (b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes()),
+        // Codex TUI checks HERDR_ENV=1 to emit OSC 52 even when the host OS pasteboard succeeds,
+        // so remote krill-app clients receive Event::ClipboardStore -> Clipboard frame.
+        (b"HERDR_ENV".to_vec(), b"1".to_vec()),
+    ];
     if let Some(socket_dir) = socket_dir {
         env.push((b"KRILL_SOCKET_DIR".to_vec(), socket_dir.as_bytes().to_vec()));
     }
@@ -2186,6 +2178,12 @@ fn codex_hooks(
     else {
         return Ok(None);
     };
+    if command.starts_with(hooks::POWERSHELL_CODEX_PREFIX) && batch_launcher(profile, env) {
+        // Receipts from before the direct Windows command: npm's codex.cmd cannot carry its eight
+        // flags through cmd.exe (8191 characters). Launch without hooks until it is reinstalled.
+        tracing::warn!("codex hooks skipped: reinstall them with `krill hook install codex`");
+        return Ok(None);
+    }
     codex::ensure_trust(
         profile.program(),
         receipt
@@ -2228,6 +2226,25 @@ fn codex_hooks(
     let mut profile = profile.clone();
     profile.launch.splice(1..1, args);
     Ok(Some(profile))
+}
+
+/// Whether Windows starts this profile's program through cmd.exe (an npm `.cmd`/`.bat` shim).
+fn batch_launcher(profile: &Profile, env: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let path = env
+        .iter()
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case(b"PATH"))
+        .map(|(_, value)| std::ffi::OsStr::from_bytes(value).to_owned())
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    profile
+        .program()
+        .and_then(|program| krill_proto::agent::which(program, &path))
+        .and_then(|exe| exe.extension().map(std::ffi::OsStr::to_ascii_lowercase))
+        .is_some_and(|ext| ext == "cmd" || ext == "bat")
 }
 
 /// 로그인 셸 실행([`Shell::Login`])을 에이전트 실행으로 바꾼다. env는 건드리지 않는다.
@@ -2309,6 +2326,31 @@ mod executable_account_regressions {
                 Some(recorded.clone())
             );
         }
+    }
+
+    /// An old Windows PowerShell hook receipt would push npm's codex.cmd past cmd.exe's line
+    /// limit; launch it without hooks. A native codex.exe keeps them.
+    #[cfg(windows)]
+    #[test]
+    fn codex_hooks_skip_legacy_powershell_command_for_batch_shim() {
+        let dir = std::env::temp_dir().join(format!("krill-codex-shim-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let agents = krill_proto::agent::Agents::load(None).unwrap();
+        let codex = &agents.profiles["codex"];
+        let legacy = format!("{}AAAA", hooks::POWERSHELL_CODEX_PREFIX);
+        let r = serde_json::json!({"agent": "codex", "complete": true, "changes": [],
+            "codex": {"path": "C:/x/config.toml", "command": legacy, "added": {}}});
+        std::fs::write(hooks::receipt(&dir, Agent::Codex), r.to_string()).unwrap();
+        let env = [(b"PATH".to_vec(), bin.to_str().unwrap().as_bytes().to_vec())];
+        std::fs::write(bin.join("codex.exe"), b"").unwrap();
+        assert!(codex_hooks(codex, Some(&dir), &env).unwrap().is_some());
+        std::fs::remove_file(bin.join("codex.exe")).unwrap();
+        std::fs::write(bin.join("codex.cmd"), b"@echo off\r\n").unwrap();
+        assert!(codex_hooks(codex, Some(&dir), &env).unwrap().is_none());
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 

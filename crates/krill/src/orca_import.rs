@@ -142,6 +142,8 @@ use krill_proto::usage::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
+mod account_sources;
+
 pub const PROJECTS_FILE: &str = "projects.toml";
 const HOSTS_FILE: &str = "hosts.toml";
 const SETTINGS_FILE: &str = "settings.toml";
@@ -695,7 +697,7 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         report.accounts = import_accounts_domain(opts, &domains_map, &mut warnings);
     } else {
         report.accounts.skipped = true;
-        report.accounts.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.accounts.skipped_reason = Some("excluded by --only".to_owned());
     }
     if selected.contains(&ImportDomain::Ssh) {
         report.ssh = retry_on_conflict("ssh", &mut warnings, |w| {
@@ -703,7 +705,7 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         })?;
     } else {
         report.ssh.skipped = true;
-        report.ssh.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.ssh.skipped_reason = Some("excluded by --only".to_owned());
     }
     if selected.contains(&ImportDomain::Projects) {
         report.projects = retry_on_conflict("projects", &mut warnings, |w| {
@@ -711,7 +713,7 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         })?;
     } else {
         report.projects.skipped = true;
-        report.projects.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.projects.skipped_reason = Some("excluded by --only".to_owned());
     }
     if selected.contains(&ImportDomain::Settings) {
         report.settings = retry_on_conflict("settings", &mut warnings, |w| {
@@ -719,13 +721,13 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         })?;
     } else {
         report.settings.skipped = true;
-        report.settings.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.settings.skipped_reason = Some("excluded by --only".to_owned());
     }
     if selected.contains(&ImportDomain::Sessions) {
         report.sessions = import_sessions_domain(opts, &domains_map, &mut warnings);
     } else {
         report.sessions.skipped = true;
-        report.sessions.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+        report.sessions.skipped_reason = Some("excluded by --only".to_owned());
     }
 
     report.warnings = warnings;
@@ -754,7 +756,7 @@ pub fn format_report_human(report: &OrcaImportReport) -> String {
             writeln!(
                 out,
                 "  accounts: skipped ({})",
-                a.skipped_reason.as_deref().unwrap_or("데몬 필요")
+                a.skipped_reason.as_deref().unwrap_or("daemon required")
             )
             .ok();
         } else {
@@ -822,7 +824,7 @@ pub fn format_report_human(report: &OrcaImportReport) -> String {
             writeln!(
                 out,
                 "  sessions: skipped ({})",
-                se.skipped_reason.as_deref().unwrap_or("데몬 필요")
+                se.skipped_reason.as_deref().unwrap_or("daemon required")
             )
             .ok();
         } else {
@@ -1068,8 +1070,8 @@ fn import_accounts_domain(
     {
         summary.agy_detected = true;
         summary.agy_note = Some(
-            "Orca 암호화 vault 감지 — agy 개별 이관 불가(OWE-896·OWE-721). \
-             Krill은 호스트 agy 로그인을 공유해 사용한다"
+            "Orca encrypted vault found: agy accounts can't be imported one by one. \
+             Krill shares the host's agy login"
                 .to_owned(),
         );
     }
@@ -1281,6 +1283,8 @@ fn import_accounts_domain_inner(
         });
     }
 
+    planned.extend(account_sources::opencode(opts));
+
     let mut summary = AccountsImportSummary::default();
     // OWE-901: agy 계정은 Orca 암호화 저장소라 이관하지 않는다. 새로 로그인을 안내한다.
     if let Some(note) = detect_agy_import_note(opts, domains) {
@@ -1305,7 +1309,7 @@ fn import_accounts_domain_inner(
             // '데몬 필요' 사유로 accounts 도메인을 스킵한 뒤 다른 도메인만 진행한다.
             summary.skipped = true;
             summary.skipped_reason = Some(format!(
-                "데몬 필요: krilld에 연결할 수 없어 계정 이관을 건너뜀 ({e})"
+                "Daemon required: couldn't reach krilld, skipped importing accounts ({e})"
             ));
             for cand in planned {
                 summary.items.push(ImportedAccountSummary {
@@ -1320,7 +1324,7 @@ fn import_accounts_domain_inner(
                     connection: "unknown".to_owned(),
                 });
             }
-            warnings.push(format!("accounts skipped (데몬 필요): {e}"));
+            warnings.push(format!("accounts skipped (daemon required): {e}"));
             return summary;
         }
         Err(_) => {
@@ -1434,9 +1438,10 @@ fn import_accounts_domain_inner(
                     Ok(updated) => snap = updated,
                     Err(e) => {
                         summary.skipped = true;
-                        summary.skipped_reason =
-                            Some(format!("데몬 필요: krilld 계정 추가 실패 ({e})"));
-                        warnings.push(format!("accounts skipped (데몬 필요): {e}"));
+                        summary.skipped_reason = Some(format!(
+                            "Daemon required: adding the account to krilld failed ({e})"
+                        ));
+                        warnings.push(format!("accounts skipped (daemon required): {e}"));
                         return summary;
                     }
                 }
@@ -1596,7 +1601,7 @@ fn detect_agy_import_note(
     }
     (count > 0).then(|| {
         format!(
-            "agy 계정 {count}개 감지: 이관 불가(Orca 암호화 저장소) — Krill에서 새로 로그인하십시오"
+            "agy accounts found: {count}. They can't be imported (Orca encrypted store); sign in again in Krill"
         )
     })
 }
@@ -1645,21 +1650,24 @@ fn find_registered_account<'a>(
 }
 
 /// Orca 프로필 경로에서 계정 uuid를 뽑는다.
-/// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`.
+/// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`·`managed-data-accounts/opencode/<uuid>`.
 /// uuid 형태가 아니면 `None`(사용자 임의 경로와 오인 병합 방지).
 fn orca_uuid_from_profile_dir(dir: &str) -> Option<&str> {
     let mut parts = dir.split(['/', '\\']);
-    let leaf = parts.next_back()?;
-    let uuid = parts.next_back()?;
-    let parent = parts.next_back()?;
+    let last = parts.next_back()?;
+    let mid = parts.next_back()?;
+    let root = parts.next_back()?;
+    if root == "managed-data-accounts" && mid == "opencode" {
+        return is_uuid_shape(last).then_some(last);
+    }
     if !matches!(
-        parent,
+        root,
         "claude-profiles" | "claude-accounts" | "codex-accounts"
-    ) || !matches!(leaf, "home" | "auth")
+    ) || !matches!(last, "home" | "auth")
     {
         return None;
     }
-    is_uuid_shape(uuid).then_some(uuid)
+    is_uuid_shape(mid).then_some(mid)
 }
 
 /// uuid v4 텍스트 형태(8-4-4-4-12 hex)만 인정한다.
@@ -2006,7 +2014,7 @@ fn import_sessions_domain(
             Err(e) => {
                 summary.skipped = true;
                 summary.skipped_reason = Some(format!(
-                    "데몬 필요: krilld에 연결할 수 없어 세션 이관을 건너뜀 ({e})"
+                    "Daemon required: couldn't reach krilld, skipped importing sessions ({e})"
                 ));
             }
         }
@@ -3563,12 +3571,12 @@ pub fn terminal_font_skip_reason(family: &str) -> String {
     let family = family.trim();
     if family.eq_ignore_ascii_case("sf mono") {
         format!(
-            "터미널 글꼴 '{family}' 가져오기 건너뜀: macOS 숨김 시스템 글꼴이라 \
-             Krill에서 고정폭으로 해석되지 않아 기존 글꼴을 유지합니다"
+            "Skipped importing terminal font '{family}': it is a hidden macOS system font \
+             that Krill can't resolve as monospaced, keeping the current font"
         )
     } else {
         format!(
-            "터미널 글꼴 '{family}' 가져오기 건너뜀: 고정폭 확인이 안 돼 기존 글꼴을 유지합니다"
+            "Skipped importing terminal font '{family}': couldn't confirm it is monospaced, keeping the current font"
         )
     }
 }
@@ -3947,10 +3955,33 @@ fn map_orca_agent_id(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "claude" => Some("claude"),
         "codex" => Some("codex"),
-        "gemini" => Some("gemini"),
         "opencode" => Some("opencode"),
         "cursor" | "cursor-agent" => Some("cursor"),
         "agy" | "antigravity" => Some("agy"),
+        "grok" | "grok-cli" => Some("grok"),
+        "muse" | "muse-cli" => Some("muse"),
+        "copilot" | "github-copilot" => Some("copilot"),
+        "pi" => Some("pi"),
+        "omp" | "oh-my-pi" => Some("omp"),
+        "hermes" => Some("hermes"),
+        "kimi" | "kimi-cli" => Some("kimi"),
+        "qwen" | "qwen-code" => Some("qwen"),
+        "droid" => Some("droid"),
+        "kiro" | "kiro-cli" => Some("kiro"),
+        "aider" => Some("aider"),
+        "goose" => Some("goose"),
+        "amp" => Some("amp"),
+        "mistral-vibe" | "vibe" => Some("mistral-vibe"),
+        "crush" => Some("crush"),
+        "cline" => Some("cline"),
+        "kilo" | "kilocode" => Some("kilo"),
+        "continue" | "cn" => Some("continue"),
+        "devin" => Some("devin"),
+        "trae" | "trae-cli" => Some("trae"),
+        "zcode" => Some("zcode"),
+        "dsh" | "deepagents" => Some("dsh"),
+        "openclaude" | "open-claude" => Some("openclaude"),
+        "opencode2" | "open-code-2" => Some("opencode2"),
         _ => None,
     }
 }
@@ -3970,7 +4001,22 @@ fn import_agent_profiles(
         .unwrap_or_default();
     let default_args: BTreeMap<String, Vec<String>> = settings
         .get("agentDefaultArgs")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .and_then(|v| serde_json::from_value::<BTreeMap<String, Json>>(v.clone()).ok())
+        .map(|map| {
+            map.into_iter()
+                .filter_map(|(k, val)| {
+                    let parsed = match val {
+                        Json::Array(arr) => arr
+                            .into_iter()
+                            .filter_map(|item| item.as_str().map(str::to_owned))
+                            .collect(),
+                        Json::String(s) => s.split_whitespace().map(str::to_owned).collect(),
+                        _ => return None,
+                    };
+                    Some((k, parsed))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let default_env: BTreeMap<String, BTreeMap<String, String>> = settings
         .get("agentDefaultEnv")
@@ -3987,12 +4033,19 @@ fn import_agent_profiles(
             touched_ids.insert((k.clone(), canon));
         }
     }
+    if let Some(raw_agent) = settings.get("defaultTuiAgent").and_then(Json::as_str)
+        && let Some(canon) = map_orca_agent_id(raw_agent)
+        && !loaded.profiles.contains_key(canon)
+    {
+        touched_ids.insert((raw_agent.to_owned(), canon));
+    }
 
     let mut current_doc = existing_raw.clone();
     let mut updated_count = 0usize;
 
     for (orca_key, canon_id) in touched_ids {
-        let Some(base_profile) = loaded.profiles.get(canon_id).cloned() else {
+        let missing_in_user = !loaded.profiles.contains_key(canon_id);
+        let Some(base_profile) = loaded.resolve(canon_id).map(|(_, p)| p.clone()) else {
             continue;
         };
         let mut next: AgentProfile = base_profile.clone();
@@ -4032,7 +4085,7 @@ fn import_agent_profiles(
             }
         }
 
-        if next != base_profile {
+        if next != base_profile || missing_in_user {
             match agent::set_user_profile(current_doc.as_deref(), canon_id, &next) {
                 Ok(rendered) => {
                     current_doc = Some(rendered);
@@ -4918,6 +4971,12 @@ mod tests {
             ),
             Some("96f8c826-8b89-4470-a327-f4918efb8177")
         );
+        assert_eq!(
+            orca_uuid_from_profile_dir(
+                "/o/managed-data-accounts/opencode/96f8c826-8b89-4470-a327-f4918efb8177"
+            ),
+            Some("96f8c826-8b89-4470-a327-f4918efb8177")
+        );
         assert_eq!(orca_uuid_from_profile_dir("/tmp/other"), None);
         assert_eq!(
             orca_uuid_from_profile_dir("/o/claude-profiles/not-a-uuid/home"),
@@ -4927,6 +4986,38 @@ mod tests {
         assert_eq!(primary_email("표시명"), "표시명");
         assert!(emails_equal("A@EXAMPLE.COM", "a@example.com (Org A)"));
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn import_accounts_domain_includes_opencode_data_accounts_in_dry_run() {
+        let root =
+            std::env::temp_dir().join(format!("owe744-opencode-domain-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let base = root.join("orca/managed-data-accounts/opencode");
+        let id = "96f8c826-8b89-4470-a327-f4918efb8177";
+        fs::create_dir_all(base.join(id).join("data/opencode")).unwrap();
+        fs::write(base.join(id).join("data/opencode/auth.json"), "{}").unwrap();
+        fs::write(
+            base.join("accounts.json"),
+            format!(
+                r#"{{"accounts":[{{"id":"{id}","label":"OpenCode Work"}}],"activeAccountId":"{id}"}}"#
+            ),
+        )
+        .unwrap();
+        let opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: root.join("state"),
+            orca_dir: root.join("orca"),
+            dry_run: true,
+            domains: vec![ImportDomain::Accounts],
+        };
+        let mut warnings = Vec::new();
+        let summary = import_accounts_domain(&opts, &BTreeMap::new(), &mut warnings);
+        assert_eq!(summary.items.len(), 1);
+        assert_eq!(summary.items[0].provider, "opencode");
+        assert_eq!(summary.items[0].label, "OpenCode Work");
+        assert!(summary.items[0].active);
         fs::remove_dir_all(root).ok();
     }
 
@@ -5233,7 +5324,7 @@ mod tests {
                 .accounts
                 .skipped_reason
                 .as_deref()
-                .is_some_and(|r| r.starts_with("데몬 필요"))
+                .is_some_and(|r| r.starts_with("Daemon required"))
         );
         assert_eq!(no_daemon_acc.accounts.claude_added, 0);
         assert_eq!(no_daemon_acc.accounts.codex_added, 0);
@@ -5794,15 +5885,18 @@ mod tests {
             }),
         )]);
         let note = detect_agy_import_note(&opts, &domains).unwrap();
-        assert!(note.contains("3개"), "{note}");
-        assert!(note.contains("이관 불가(Orca 암호화 저장소)"), "{note}");
-        assert!(note.contains("새로 로그인"), "{note}");
+        assert!(note.contains("found: 3"), "{note}");
+        assert!(
+            note.contains("can't be imported (Orca encrypted store)"),
+            "{note}"
+        );
+        assert!(note.contains("sign in again"), "{note}");
         // 디스크 흔적만 있어도 안내한다.
         fs::create_dir_all(orca_dir.join("antigravity-accounts").join("a1")).unwrap();
         let disk_only: BTreeMap<String, Json> =
             BTreeMap::from([("settings".to_owned(), serde_json::json!({}))]);
         let note = detect_agy_import_note(&opts, &disk_only).unwrap();
-        assert!(note.contains("1개"), "{note}");
+        assert!(note.contains("found: 1"), "{note}");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -6087,5 +6181,66 @@ mod source_discovery_tests {
         assert!(discovered.join("orca-profile-index.json").is_file());
         // from_env preserves explicit --orca-dir and KRILL_ORCA_DIR before discovery.
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod multi_provider_tests {
+    use super::*;
+
+    #[test]
+    fn orca_import_preserves_grok_and_muse_presets() {
+        let root =
+            std::env::temp_dir().join(format!("krill-orca-multi-provider-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let orca_dir = root.join("orca");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&orca_dir).unwrap();
+        fs::create_dir_all(root.join("home")).unwrap();
+        let payload = serde_json::json!({
+            "settings": {
+                "defaultTuiAgent": "grok",
+                "agentCmdOverrides": {"muse": "/custom/muse"},
+                "agentDefaultArgs": {
+                    "grok": "-m grok-4",
+                    "muse": ["--fast"]
+                },
+                "agentDefaultEnv": {
+                    "grok": {"XAI_API_KEY": "secret"}
+                }
+            }
+        });
+        fs::write(orca_dir.join("orca-data.json"), payload.to_string()).unwrap();
+
+        let opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: state_dir.clone(),
+            orca_dir,
+            domains: vec![ImportDomain::Settings],
+            dry_run: false,
+        };
+        let report = run_import(&opts).unwrap();
+        assert_eq!(report.settings.default_agent.as_deref(), Some("grok"));
+        assert!(report.settings.agents_updated >= 2);
+
+        let settings_toml = fs::read_to_string(state_dir.join(SETTINGS_FILE)).unwrap();
+        assert!(
+            settings_toml.contains("default_agent = \"grok\""),
+            "{settings_toml}"
+        );
+
+        let agents_toml = fs::read_to_string(state_dir.join(agent::FILE_NAME)).unwrap();
+        let loaded = Agents::load(Some(&agents_toml)).unwrap();
+        assert_eq!(loaded.profiles["grok"].launch, ["grok", "-m", "grok-4"]);
+        assert_eq!(
+            loaded.profiles["grok"]
+                .env
+                .get("XAI_API_KEY")
+                .map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(loaded.profiles["muse"].launch, ["/custom/muse", "--fast"]);
+
+        fs::remove_dir_all(&root).ok();
     }
 }

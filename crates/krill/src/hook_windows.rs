@@ -123,7 +123,8 @@ fn read_stdin() -> (Input, Vec<u8>) {
 }
 
 fn collect_and_deliver(agent: &str, hint: Option<&str>, start: Instant) -> io::Result<()> {
-    let (mut input, mut payload) = read_stdin();
+    let (mut input, payload) = read_stdin();
+    let mut payload = hook::strip_utf8_bom(payload);
     if let Some(hint) = hint {
         if payload.iter().all(u8::is_ascii_whitespace) {
             payload = serde_json::json!({"hook_event_name": hint})

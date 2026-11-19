@@ -44,67 +44,6 @@ fn initial_config_read_cannot_enable_notifications_or_power_from_defaults(cx: &m
     fs::remove_dir_all(dir).ok();
 }
 
-#[gpui::test]
-fn daemon_owned_webhooks_are_not_duplicated_by_app_snapshots(cx: &mut TestAppContext) {
-    let _guard = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = temp_dir("webhook");
-    let (url, handle) = crate::webhook::tests::server(vec![]);
-    let settings = format!(
-        "notifications = false\nkeep_awake = \"off\"\n[[webhooks]]\nprovider = \"ntfy\"\nurl = \"{url}\"\n"
-    );
-    fs::write(dir.join("settings.toml"), &settings).unwrap();
-    init_settings(cx, &dir);
-    let sync = |state, since, cx: &mut App| {
-        let mut s = session(51, state, since, "/private/TERMINAL_SECRET");
-        s.status.agent = "AGENT_SECRET".into();
-        sync_snapshot(&snapshot(vec![s]), cx);
-    };
-    cx.update(|cx| {
-        // 초기 Done과 완료가 아닌 상태는 보내지 않는다.
-        sync(AgentState::Done, 1, cx);
-        sync(AgentState::Waiting, 2, cx);
-        sync(AgentState::Blocked, 3, cx);
-        sync(AgentState::Exited, 4, cx);
-        sync(AgentState::Unknown, 5, cx);
-        sync(AgentState::Working, 6, cx);
-        sync(AgentState::Done, 7, cx);
-        sync(AgentState::Done, 7, cx);
-        sync(AgentState::Done, 8, cx);
-        // 다음 작업이 입력 대기를 거쳐 완료돼도 보낸다.
-        sync(AgentState::Working, 9, cx);
-        sync(AgentState::Waiting, 10, cx);
-        sync(AgentState::Done, 11, cx);
-    });
-    cx.run_until_parked();
-    let (listener, requests) = handle.join().unwrap();
-    assert!(requests.is_empty());
-    assert!(cx.shown_system_notifications().is_empty());
-
-    // opt-in 제거는 즉시 반영하고 다시 켜도 과거 완료를 재전송하지 않는다.
-    fs::write(dir.join("settings.toml"), "keep_awake = \"off\"\n").unwrap();
-    cx.update(settings::reload);
-    cx.run_until_parked();
-    cx.update(|cx| {
-        assert!(settings::current(cx).webhooks.is_empty());
-        sync(AgentState::Working, 12, cx);
-        sync(AgentState::Done, 13, cx);
-    });
-    fs::write(dir.join("settings.toml"), settings).unwrap();
-    cx.update(settings::reload);
-    cx.run_until_parked();
-    cx.update(|cx| {
-        sync(AgentState::Done, 13, cx);
-    });
-    cx.run_until_parked();
-    assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
-    fs::remove_dir_all(dir).ok();
-}
-
 #[derive(Clone)]
 struct SharedSource(Arc<Mutex<Snapshot>>);
 

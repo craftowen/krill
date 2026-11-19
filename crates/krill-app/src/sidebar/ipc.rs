@@ -144,10 +144,26 @@ type Job = Box<dyn FnOnce() + Send>;
 /// 이보다 오래 걸린 호스트 폴링은 운영 로그에 남긴다.
 const SLOW_POLL: Duration = Duration::from_secs(1);
 
+/// Slow polls are logged, except that an unreachable host, which fails every poll while it is
+/// down, logs only its first slow failure until a poll succeeds again.
+fn slow_poll_logged(
+    failure_logged: &std::sync::atomic::AtomicBool,
+    ok: bool,
+    elapsed: Duration,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if ok {
+        failure_logged.store(false, Relaxed);
+        return elapsed >= SLOW_POLL;
+    }
+    elapsed >= SLOW_POLL && !failure_logged.swap(true, Relaxed)
+}
+
 struct CachedSnapshot {
     at: Instant,
     observed: IdentifiedSnapshot,
     histories: super::PromptHistories,
+    closed: krill_proto::control::ClosedSessionRanges,
     target: HostTarget,
 }
 
@@ -195,7 +211,7 @@ pub(super) struct Socket {
     worker: Mutex<Option<mpsc::Sender<Job>>>,
     /// gpui 테스트 스케줄러는 다른 스레드의 깨우기를 비결정으로 보고 실패시킨다. 단위 테스트 빌드는
     /// 기본으로 호출 스레드에서 바로 돌리고(종전 동작), 전용 스레드 경로는 [`Socket::threaded`]로 검증한다.
-    threaded: bool,
+    threaded: std::sync::atomic::AtomicBool,
 }
 
 struct Shared {
@@ -205,6 +221,8 @@ struct Shared {
     branches: Mutex<BTreeMap<PathBuf, String>>,
     external: Mutex<ExternalCache>,
     snapshot: Arc<SharedSnapshot>,
+    /// A slow failure was logged and no poll has succeeded since.
+    failure_logged: std::sync::atomic::AtomicBool,
 }
 
 impl Socket {
@@ -227,15 +245,16 @@ impl Socket {
                 watches: Mutex::new(WatchCache::default()),
                 branches: Mutex::new(BTreeMap::new()),
                 external: Mutex::new(ExternalCache::default()),
+                failure_logged: std::sync::atomic::AtomicBool::new(false),
             }),
             worker: Mutex::new(None),
-            threaded,
+            threaded: std::sync::atomic::AtomicBool::new(threaded),
         }
     }
 
     /// 작업을 전용 스레드에 넣는다. 스레드는 처음 쓸 때 띄우고, 소켓이 사라지면 남은 작업을 마친 뒤 끝난다.
     fn enqueue(&self, job: Job) -> bool {
-        if !self.threaded {
+        if !self.threaded.load(std::sync::atomic::Ordering::Relaxed) {
             job();
             return true;
         }
@@ -423,7 +442,7 @@ impl Shared {
             |stream| fetch_from(stream, &external, is_local),
         );
         match result {
-            Ok(((snapshot, branches, histories), identities)) => {
+            Ok(((snapshot, branches, histories, closed), identities)) => {
                 if let Ok(mut guard) = self.branches.lock() {
                     *guard = branches;
                 }
@@ -436,6 +455,7 @@ impl Shared {
                     at: Instant::now(),
                     observed: snapshot.clone(),
                     histories,
+                    closed,
                     target: self.target.clone(),
                 });
                 Ok(snapshot)
@@ -510,6 +530,12 @@ impl Source for Socket {
         self.shared.fetch_identified()
     }
 
+    fn forget_snapshot(&self) {
+        if let Ok(mut cached) = self.shared.snapshot.lock() {
+            *cached = None;
+        }
+    }
+
     fn prompt_histories(&self) -> super::PromptHistories {
         self.shared
             .snapshot
@@ -517,6 +543,20 @@ impl Source for Socket {
             .ok()
             .and_then(|cached| cached.as_ref().map(|cached| cached.histories.clone()))
             .unwrap_or_default()
+    }
+
+    fn closed_sessions(&self) -> krill_proto::control::ClosedSessionRanges {
+        self.shared
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|cached| cached.as_ref().map(|cached| cached.closed.clone()))
+            .unwrap_or_default()
+    }
+
+    fn disable_background_worker(&self) {
+        self.threaded
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn meta(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
@@ -535,7 +575,7 @@ impl Source for Socket {
             let polled = shared.poll();
             // 꺼진 원격 호스트 재시도(ssh) 같은 긴 폴링을 운영 로그에 남겨 UI 멈춤 시각과 대조할 수 있게 한다.
             let elapsed = started.elapsed();
-            if elapsed >= SLOW_POLL {
+            if slow_poll_logged(&shared.failure_logged, polled.is_ok(), elapsed) {
                 tracing::info!(
                     remote = !shared.target.allow_local_launch(),
                     ok = polled.is_ok(),
@@ -849,7 +889,12 @@ fn fetch_from(
     stream: &mut UnixStream,
     external: &BTreeMap<PathBuf, super::external::ExternalHit>,
     is_local: bool,
-) -> io::Result<(Snapshot, BTreeMap<PathBuf, String>, super::PromptHistories)> {
+) -> io::Result<(
+    Snapshot,
+    BTreeMap<PathBuf, String>,
+    super::PromptHistories,
+    krill_proto::control::ClosedSessionRanges,
+)> {
     use krill_proto::ipc;
     let mut call = |request: Request| -> io::Result<Reply> {
         stream.write_all(&request.encode()?)?;
@@ -897,6 +942,19 @@ fn fetch_from(
         .collect();
     let external_states = external;
     let mut states: BTreeMap<_, _> = states.into_iter().map(|s| (s.session, s.status)).collect();
+    // 데몬의 `Exited`+`Process`는 PTY 종료와 "에이전트만 끝나고 로그인 셸이 남음"을 함께 뜻한다.
+    // PTY가 살아 있으면 일반 터미널이다. 전경 프로세스·제목·셸 정보는 터미널의 것이라 남긴다.
+    for s in sessions.iter().filter(|s| s.status.is_none()) {
+        if let Some(status) = states.get_mut(&s.session)
+            && status.state == AgentState::Exited
+            && status.source == Some(krill_proto::control::Source::Process)
+        {
+            status.state = AgentState::Unknown;
+            status.confidence = krill_proto::control::Confidence::Low;
+            status.agent.clear();
+            status.subagents.clear();
+        }
+    }
     // AS-08: 외부 pid가 있는 후보가 있을 때만 프로세스 표를 한 번 읽는다.
     let want_parents = sessions.iter().any(|s| {
         s.status.is_none()
@@ -936,7 +994,7 @@ fn fetch_from(
                     .max_by_key(|p| p.as_os_str().len())
                     .cloned()
             });
-            Session {
+            let mut session = Session {
                 id: s.session,
                 status,
                 worktree,
@@ -945,22 +1003,51 @@ fn fetch_from(
                     .filter(|p| !p.as_os_str().is_empty())
                     .cloned(),
                 account: accounts.get(&s.session).cloned(),
+            };
+            if session.agent_ended() {
+                session.account = None;
             }
+            session
         })
         .collect();
     sessions.sort_by_key(|s| s.id);
+    let mut closed = data.closed_sessions;
+    for s in &sessions {
+        closed.remove(s.id);
+    }
     let histories = data
         .prompt_histories
         .into_iter()
         .filter(|(id, _)| sessions.iter().any(|s| s.id == *id))
         .collect();
-    Ok((Snapshot { sessions, trees }, branches, histories))
+    Ok((Snapshot { sessions, trees }, branches, histories, closed))
 }
 
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreachable_host_logs_one_slow_failure_per_outage() {
+        let logged = std::sync::atomic::AtomicBool::new(false);
+        let slow = SLOW_POLL * 3;
+        let polls = [
+            (false, slow),
+            (false, slow),
+            (false, Duration::ZERO),
+            (false, slow),
+            (true, Duration::ZERO),
+            (false, slow),
+            (true, slow),
+            (true, slow),
+        ];
+        let lines: Vec<_> = polls
+            .into_iter()
+            .map(|(ok, elapsed)| slow_poll_logged(&logged, ok, elapsed))
+            .collect();
+        assert_eq!(lines, [true, false, false, false, false, true, true, true]);
+    }
 
     #[test]
     fn snapshot_is_shared_across_sources_but_git_watch_state_is_independent() {
@@ -982,6 +1069,7 @@ mod tests {
                 machine_identity: Some(krill_proto::ipc::MachineIdentity([8; 16])),
             },
             histories: BTreeMap::new(),
+            closed: krill_proto::control::ClosedSessionRanges::default(),
             target: first.shared.target.clone(),
         });
         assert_eq!(first.fetch_identified().unwrap().daemon_identity, identity);
@@ -1051,15 +1139,78 @@ mod tests {
                     server.write_all(&reply.encode().unwrap()).unwrap();
                 }
             });
-            let (snapshot, _, histories) =
+            let (snapshot, _, histories, closed) =
                 fetch_from(&mut client, &BTreeMap::new(), false).unwrap();
             worker.join().unwrap();
             assert_eq!(snapshot.sessions.len(), 1);
+            assert!(closed.is_empty());
             assert_eq!(histories.len(), usize::from(include_prompts));
             if include_prompts {
                 assert_eq!(histories[&krill_proto::SessionId(7)].total_turns, 1);
             }
         }
+    }
+
+    #[test]
+    fn agent_exit_on_a_live_pty_is_a_plain_terminal() {
+        use krill_proto::SessionId;
+        use krill_proto::control::{AgentStatus, Info, SessionAccount, SessionStatus, Source};
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let ended = AgentStatus {
+                state: AgentState::Exited,
+                source: Some(Source::Process),
+                agent: "claude".into(),
+                title: Some("~/repo".into()),
+                ..AgentStatus::UNKNOWN
+            };
+            let replies = [
+                Reply::Sessions(vec![
+                    Info {
+                        session: SessionId(7),
+                        pid: 1,
+                        status: None,
+                    },
+                    Info {
+                        session: SessionId(8),
+                        pid: 2,
+                        status: Some(0),
+                    },
+                ]),
+                Reply::States(vec![
+                    SessionStatus {
+                        session: SessionId(7),
+                        status: ended.clone(),
+                    },
+                    SessionStatus {
+                        session: SessionId(8),
+                        status: ended,
+                    },
+                ]),
+                Reply::Sidebar(krill_proto::control::SidebarData::default()),
+                Reply::SessionAccounts(vec![SessionAccount {
+                    session: SessionId(7),
+                    account_id: "claude-work".into(),
+                    label: "work".into(),
+                }]),
+            ];
+            for reply in replies {
+                krill_proto::ipc::read_frame(&mut server).unwrap().unwrap();
+                server.write_all(&reply.encode().unwrap()).unwrap();
+            }
+        });
+        let (snapshot, ..) = fetch_from(&mut client, &BTreeMap::new(), false).unwrap();
+        worker.join().unwrap();
+        let shell = &snapshot.sessions[0];
+        assert!(!shell.is_exited(), "{shell:?}");
+        assert!(shell.agent_ended(), "{shell:?}");
+        assert_eq!(shell.status.state, AgentState::Unknown);
+        assert_eq!(shell.status.agent, "");
+        assert_eq!(shell.status.title.as_deref(), Some("~/repo"));
+        assert_eq!(shell.account, None);
+        let closed = &snapshot.sessions[1];
+        assert!(closed.is_exited(), "{closed:?}");
+        assert!(!closed.agent_ended(), "{closed:?}");
     }
 
     #[test]
@@ -1298,6 +1449,7 @@ mod tests {
                 machine_identity: Some(krill_proto::ipc::MachineIdentity([8; 16])),
             },
             histories: BTreeMap::new(),
+            closed: krill_proto::control::ClosedSessionRanges::default(),
             target: old.shared.target.clone(),
         });
         assert!(
@@ -1354,6 +1506,7 @@ mod tests {
                 machine_identity: Some(krill_proto::ipc::MachineIdentity([8; 16])),
             },
             histories: BTreeMap::new(),
+            closed: krill_proto::control::ClosedSessionRanges::default(),
             target: socket.shared.target.clone(),
         });
         let polled = socket.shared.poll().unwrap();

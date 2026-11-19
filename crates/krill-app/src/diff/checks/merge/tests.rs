@@ -627,3 +627,20 @@ fn remote_host_disables_pr_checks_and_drops_stale_local_inspection(cx: &mut gpui
     assert!(cx.debug_bounds("pr-merge-squash").is_some());
     assert!(before <= after_switch);
 }
+
+#[gpui::test]
+fn short_merge_confirmation_keeps_decision_buttons_inside_viewport(cx: &mut gpui::TestAppContext) {
+    let fake = Fake::new(false);
+    let (_, visual) = setup(cx, &fake);
+    click(visual, "pr-merge-squash");
+    visual.simulate_resize(gpui::size(gpui::px(540.), gpui::px(320.)));
+    visual.run_until_parked();
+    let card = visual.debug_bounds("pr-merge-confirmation").unwrap();
+    assert!(card.top() >= crate::ui::SPACE_4);
+    assert!(card.bottom() <= gpui::px(320.) - crate::ui::SPACE_4);
+    for selector in ["pr-merge-close", "pr-merge-cancel", "pr-merge-confirm"] {
+        let button = visual.debug_bounds(selector).unwrap();
+        assert!(button.top() >= card.top());
+        assert!(button.bottom() <= card.bottom());
+    }
+}

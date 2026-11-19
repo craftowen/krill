@@ -148,8 +148,8 @@ fn restart_with(
     .detach();
 }
 
-/// A launched child can fail before the durable quit finishes (including when
-/// the user cancels the unsaved-file prompt). Reap it and make retry available.
+/// A launched child can fail before the durable quit finishes. Reap it and make
+/// retry available.
 fn observe_relauncher(staged: StagedUpdate, wait: gpui::Task<Result<(), String>>, cx: &mut App) {
     cx.spawn(async move |cx| {
         let result = wait.await;

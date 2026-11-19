@@ -1,6 +1,6 @@
 //! MK-097 암호화·키체인·성능 회귀. 키체인 IO는 `HOME/CFFIXED_USER_HOME` 오버레이 자식에 격리한다.
 
-use super::crypto::{Key, SALT_LEN, Stream};
+use super::crypto::{Key, Keyring, SALT_LEN, Stream};
 use super::segment::{HEADER_LEN, Header};
 use super::tests::{SEGMENT_V1, noise};
 use super::*;
@@ -30,7 +30,7 @@ fn encrypted(root: &Path, key: Arc<Key>) -> Arc<Store> {
         Limits::default(),
         true,
         true,
-        Some(key),
+        Some(Keyring::ready(key)),
     )
 }
 
@@ -136,7 +136,13 @@ fn encrypted_reopen_with_lost_or_wrong_key_preserves_files() {
     let path = path(&store);
     let before = fs::read(&path).unwrap();
     for key in [None, Some(Arc::new(Key::from_slice(&[7; 32]).unwrap()))] {
-        let bad = Store::with_key(root.join("sessions"), Limits::default(), true, true, key);
+        let bad = Store::with_key(
+            root.join("sessions"),
+            Limits::default(),
+            true,
+            true,
+            key.map(Keyring::ready),
+        );
         assert!(bad.recorder(ID, SIZE).is_err());
         assert!(
             root.join(krill_proto::history::RECORDING_WARNING_FILE)
@@ -161,7 +167,9 @@ fn encrypted_torn_tail_recovers_and_restarts_with_new_salt() {
     let path = path(&store);
     let bytes = fs::read(&path).unwrap();
     fs::write(&path, &bytes[..bytes.len() - 3]).unwrap();
-    let seg = segment::read(&path, Some(&key())).unwrap().unwrap();
+    let seg = segment::read(&path, Some(&Keyring::ready(key())))
+        .unwrap()
+        .unwrap();
     assert_eq!(seg.records.len(), 2);
     assert!(!seg.sealed);
     let mut rec = store.recorder(ID, SIZE).unwrap();
@@ -247,16 +255,16 @@ fn key_file_is_private_reused_and_required_when_data_exists() {
     use std::os::unix::fs::PermissionsExt as _;
     let root = root("keyfile");
     assert!(
-        Key::load(&root, true).is_err(),
+        Key::load(&root, || Ok(true)).is_err(),
         "데이터가 있는데 키가 없으면 새로 만들지 않는다"
     );
-    let first = Key::load(&root, false).unwrap();
+    let first = Key::load(&root, || Ok(false)).unwrap();
     let mode = fs::metadata(root.join("segment.key"))
         .unwrap()
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600);
-    let second = Key::load(&root, true).unwrap();
+    let second = Key::load(&root, || panic!("키가 있으면 기존 기록을 검사하지 않는다")).unwrap();
     let store = encrypted(&root, first);
     let mut rec = store.recorder(ID, SIZE).unwrap();
     rec.append(b"secret from key file\r\n");
@@ -268,6 +276,9 @@ fn key_file_is_private_reused_and_required_when_data_exists() {
             .unwrap()
             .sealed
     );
+    // 암호화가 꺼진 기록기도 v2를 처음 읽을 때 기존 키 파일을 찾아 읽는다.
+    let off = Store::open(&root, Limits::default()).unwrap();
+    assert!(off.history(ID).unwrap().restore().is_ok());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -304,8 +315,13 @@ fn keychain_child() {
         .password("mk097-temporary-test-only")
         .create(&keychain_path)
         .unwrap();
-    let first = Key::load_from(&root, false, &keychain).unwrap();
-    let second = Key::load_from(&root, true, &keychain).unwrap();
+    let first = Key::load_from(&root, || Ok(false), &keychain).unwrap();
+    let second = Key::load_from(
+        &root,
+        || panic!("키가 있으면 기존 기록을 검사하지 않는다"),
+        &keychain,
+    )
+    .unwrap();
     let store = encrypted(&root, first);
     let mut rec = store.recorder(ID, SIZE).unwrap();
     rec.append(b"secret from keychain\r\n");
@@ -317,13 +333,18 @@ fn keychain_child() {
             .unwrap()
             .sealed
     );
+    // 암호화가 꺼진 기록기는 v2를 읽을 때 기본 키체인에서 키를 찾는다. 없으면 새로 만들지 않고 지우지도 않는다.
+    let off = Store::open(&root, Limits::default()).unwrap();
+    assert!(off.recorder(ID, SIZE).is_err());
+    assert!(off.history(ID).unwrap().restore().is_err());
+    assert_eq!(fs::read(path(&store)).unwrap(), bytes);
     // 키가 사라졌으면 새 키를 만들지 않고 오류로 끝난다.
     let lost_path = root.join("lost.keychain");
     let lost = CreateOptions::new()
         .password("mk097-temporary-test-only")
         .create(&lost_path)
         .unwrap();
-    assert!(Key::load_from(&root, true, &lost).is_err());
+    assert!(Key::load_from(&root, || Ok(true), &lost).is_err());
     assert!(
         lost.find_generic_password("com.krill.segment-key.v2", "nonexistent")
             .is_err()
@@ -371,8 +392,13 @@ fn encryption_measure() {
                     total_bytes: u64::MAX,
                     ..Limits::default()
                 };
-                let store =
-                    Store::with_key(dir.clone(), limits, true, mode == 1, Some(key.clone()));
+                let store = Store::with_key(
+                    dir.clone(),
+                    limits,
+                    true,
+                    mode == 1,
+                    Some(Keyring::ready(key.clone())),
+                );
                 let mut rec = store.recorder(ID, SIZE).unwrap();
                 let block = 16 << 10;
                 let start = Instant::now();
@@ -455,7 +481,7 @@ fn encrypted_reconstructs_after_process_sigkill() {
     rec.append(b"after restart\r\n");
     rec.seal();
     let paths = segments(&store.session_dir(ID)).unwrap();
-    let last = segment::read(paths.last().unwrap(), Some(&key()))
+    let last = segment::read(paths.last().unwrap(), Some(&Keyring::ready(key())))
         .unwrap()
         .unwrap();
     assert_eq!(last.records[0], Record::Gap(0));

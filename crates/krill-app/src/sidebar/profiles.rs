@@ -28,6 +28,10 @@ struct HostProfiles {
     replacements: BTreeMap<SessionId, SessionId>,
     /// Keep the row through a pending switch and until status sees its replacement.
     fallback: BTreeMap<SessionId, Fallback>,
+    /// Sessions listed while no retired original awaited its replacement's reveal.
+    seen: Option<BTreeSet<SessionId>>,
+    /// Rows that appeared while one did. The next account snapshot may name them replacements.
+    held: BTreeSet<SessionId>,
 }
 
 struct SpinnerGrace {
@@ -132,7 +136,19 @@ impl State {
             fallback.missing_polls = fallback.missing_polls.saturating_add(1);
             fallback.missing_polls <= 1
         });
-        before != state.fallback.len()
+        let listed = |id: &SessionId| snapshot.sessions.iter().any(|s| s.id == *id);
+        let awaiting = pending.iter().any(|id| !listed(id));
+        let ids = snapshot.sessions.iter().map(|s| s.id);
+        let held = match &state.seen {
+            Some(seen) if awaiting => ids.filter(|id| !seen.contains(id)).collect(),
+            _ => {
+                state.seen = Some(ids.collect());
+                BTreeSet::new()
+            }
+        };
+        let held_changed = held != state.held;
+        state.held = held;
+        before != state.fallback.len() || held_changed
     }
 
     pub(super) fn fallback(&self, host: &HostId, session: SessionId) -> Option<&Session> {
@@ -143,12 +159,13 @@ impl State {
             .map(|row| &row.session)
     }
 
-    pub(super) fn remove_fallback(&mut self, host: &HostId, session: SessionId) {
+    pub(super) fn remove_fallback(&mut self, host: &HostId, session: SessionId) -> bool {
         if let Some(state) = self.hosts.get_mut(host)
             && !state.is_pending(session)
         {
-            state.fallback.remove(&session);
+            return state.fallback.remove(&session).is_some();
         }
+        false
     }
 
     pub(super) fn snapshot<'a>(&self, host: &HostId, snapshot: &'a Snapshot) -> Cow<'a, Snapshot> {
@@ -162,12 +179,12 @@ impl State {
         let mut normalized = snapshot.clone();
         normalized
             .sessions
-            .retain(|s| state.destination(s.id) == s.id);
+            .retain(|s| state.destination(s.id) == s.id && !state.held.contains(&s.id));
         for (id, fallback) in &state.fallback {
             if state.is_pending(*id)
                 && let Some(row) = normalized.sessions.iter_mut().find(|s| s.id == *id)
             {
-                if row.is_exited() {
+                if row.is_exited() || row.agent_ended() {
                     *row = fallback.session.clone();
                 }
                 continue;
@@ -260,6 +277,7 @@ impl Sidebar {
                 .or_else(|| snapshot.sessions.iter().find(|s| s.id == handoff.from))
                 .cloned();
             state.replacements.insert(handoff.from, to);
+            state.held.remove(&to);
             state.fallback.remove(&handoff.from);
             if let Some(mut row) = before {
                 row.id = to;
@@ -378,7 +396,7 @@ impl Sidebar {
         if !self.session_account_pending(host, session)
             && let Some(error) = self.session_account_error(host, session)
         {
-            format!("{account} · {error}")
+            format!("{account} · {}", crate::i18n::sanitize_handoff_error(error))
         } else {
             account
         }

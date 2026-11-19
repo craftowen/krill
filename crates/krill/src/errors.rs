@@ -196,7 +196,8 @@ fn run_flush(
         });
     };
     if let Err(error) = collect(state) {
-        tracing::warn!(%error, "error reporting: native report collection skipped");
+        // 운영 로그 프라이버시 규칙(`krill-log`): 경로·Display 원문 대신 `ErrorKind`만 남긴다.
+        tracing::warn!(kind = ?error.kind(), "error reporting: native report collection skipped");
     }
     reporting::flush(state, &consent, &flight, transport)
 }

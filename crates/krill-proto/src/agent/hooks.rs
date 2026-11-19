@@ -86,8 +86,10 @@ pub fn shell_quote(text: &str) -> String {
 pub fn command(exe: &Path, agent: Agent) -> Option<String> {
     let exe = exe.to_str()?;
     #[cfg(windows)]
-    if agent == Agent::Codex {
-        return Some(windows_codex_command(exe));
+    match agent {
+        Agent::Codex => return Some(windows_codex_command(exe)),
+        Agent::Cursor => return Some(windows_cursor_command(exe)),
+        _ => {}
     }
     Some(format!(
         "if [ -n \"${{MK_PANE_ID:-}}\" ]; then exec {} hook {}; else printf '{{}}\\n'; fi",
@@ -96,11 +98,36 @@ pub fn command(exe: &Path, agent: Agent) -> Option<String> {
     ))
 }
 
+/// Codex runs Windows hooks as `cmd.exe /C "<command>"`, and npm's `codex.cmd` passes every
+/// session `-c` flag through one cmd.exe line (8191 characters). Run krill directly: its
+/// Windows hook answers and exits outside a Krill pane. cmd.exe expands `%NAME%` even inside
+/// quotes, so only such rare paths keep the encoded PowerShell wrapper.
 #[cfg(any(windows, test))]
 fn windows_codex_command(exe: &str) -> String {
+    if exe.contains('%') {
+        windows_powershell_codex_command(exe)
+    } else {
+        format!("\"{exe}\" hook codex")
+    }
+}
+
+/// Cursor runs Windows hooks through PowerShell and pipes the event JSON to stdin
+/// (<https://cursor.com/docs/hooks>). The call operator keeps the path a literal string.
+#[cfg(any(windows, test))]
+fn windows_cursor_command(exe: &str) -> String {
+    format!("& '{}' hook cursor", exe.replace('\'', "''"))
+}
+
+/// Prefix of the Windows Codex wrapper used before the direct command. Older receipts
+/// store it; npm's `codex.cmd` cannot start with it (cmd.exe line limit).
+pub const POWERSHELL_CODEX_PREFIX: &str =
+    "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ";
+
+#[cfg(any(windows, test))]
+fn windows_powershell_codex_command(exe: &str) -> String {
     use base64::Engine as _;
-    // Codex starts this through cmd.exe. Encoding protects the literal path;
-    // ProcessStartInfo forwards raw stdin without PowerShell's object pipeline.
+    // Encoding protects the literal path; ProcessStartInfo forwards raw stdin
+    // without PowerShell's object pipeline.
     let script = format!(
         "$ErrorActionPreference='Stop'; \
          if (-not $env:MK_PANE_ID) {{ [Console]::WriteLine('{{}}'); exit 0 }}; \
@@ -115,7 +142,7 @@ fn windows_codex_command(exe: &str) -> String {
     );
     let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}")
+    format!("{POWERSHELL_CODEX_PREFIX}{encoded}")
 }
 
 #[cfg(all(windows, test))]
@@ -259,16 +286,89 @@ pub fn encode_hook_json(value: &serde_json::Value) -> io::Result<String> {
         .map_err(io::Error::other)
 }
 
+/// A Windows executable path as one word for Claude Code's hook and statusLine shell:
+/// Git Bash, or PowerShell when Git Bash is missing (code.claude.com/docs/en/hooks,
+/// /statusline). A plain path is written unquoted with `/` separators, which both shells
+/// run as-is. A path with spaces or shell characters uses its 8.3 short name when the
+/// volume has one (`C:/Users/JOHNSM~1/...`). Otherwise POSIX quoting, which only Git Bash runs.
+#[must_use]
+pub fn windows_shell_word(exe: &str) -> String {
+    plain_word(exe)
+        .or_else(|| short_path(exe).as_deref().and_then(plain_word))
+        .unwrap_or_else(|| shell_quote(exe))
+}
+
+/// `exe`를 `/` 구분자로 바꿔 bash와 `PowerShell`이 따옴표 없이 읽을 수 있으면 그 단어.
+/// `~`는 단어 첫 글자만 bash가 홈으로 펼친다.
+pub(crate) fn plain_word(exe: &str) -> Option<String> {
+    let slashed = exe.replace('\\', "/");
+    (!slashed.is_empty()
+        && !slashed.starts_with('~')
+        && slashed
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '/' | ':' | '.' | '_' | '-' | '~')))
+    .then_some(slashed)
+}
+
+/// 8.3 짧은 경로. cmd의 `%~sI`가 `GetShortPathNameW`를 부른다(이 크레이트는 unsafe 금지).
+/// 같은 파일로 열리지 않거나(8.3이 꺼진 볼륨은 긴 이름 그대로) 실패하면 `None`.
+#[cfg(windows)]
+fn short_path(exe: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt as _;
+    // `%`는 따옴표 안에서도 환경 변수로 펼쳐진다.
+    if exe.contains(['"', '%', '\r', '\n']) {
+        return None;
+    }
+    let cmd = Path::new(&std::env::var_os("SystemRoot")?).join(r"System32\cmd.exe");
+    let output = std::process::Command::new(cmd)
+        .raw_arg(format!(
+            r#"/d /v:off /u /c for %I in ("{exe}") do @echo %~sI"#
+        ))
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let utf16: Vec<u16> = output
+        .stdout
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| u16::from_le_bytes(b))
+        .collect();
+    let short = String::from_utf16(&utf16).ok()?.trim().to_owned();
+    same_file(&short, exe).then_some(short)
+}
+
+#[cfg(not(windows))]
+fn short_path(_exe: &str) -> Option<String> {
+    None
+}
+
+/// 두 경로가 같은 파일로 열린다(짧은 이름·`/` 구분자도 긴 경로로 풀린다).
+pub(crate) fn same_file(a: &str, b: &str) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Claude command handler. Windows uses the documented exec form so executable
-/// paths with spaces, quotes or shell metacharacters never pass through a shell.
+/// paths with spaces, quotes or shell metacharacters never pass through a shell;
+/// Claude Code before `args` support (2.1.139) gets the shell form instead.
 /// Its CLI checks `MK_PANE_ID` before collecting or delivering an event.
-pub fn claude_hook(command: &str) -> serde_json::Value {
+pub fn claude_hook(command: &str, version: Option<&str>) -> serde_json::Value {
     #[cfg(windows)]
     {
-        json!({"type": "command", "command": command, "args": ["hook", "claude"]})
+        if super::claude::supports_exec_hooks(version) {
+            json!({"type": "command", "command": command, "args": ["hook", "claude"]})
+        } else {
+            json!({"type": "command", "command": format!("{} hook claude", windows_shell_word(command))})
+        }
     }
     #[cfg(not(windows))]
     {
+        let _ = version;
         json!({"type": "command", "command": command})
     }
 }
@@ -291,7 +391,7 @@ pub fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<St
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| merge_error(format!("hooks.{event} must be an array")))?;
-        let mut handler = claude_hook(command);
+        let mut handler = claude_hook(command, None);
         handler
             .as_object_mut()
             .ok_or_else(|| merge_error("Claude hook handler must be an object"))?
@@ -378,7 +478,19 @@ mod tests {
     #[test]
     fn windows_codex_command_encodes_literal_path_and_raw_stdin() {
         use base64::Engine as _;
-        let command = windows_codex_command(r"C:\한글 '$ & %USERNAME%\krill.exe");
+        let command = windows_powershell_codex_command(r"C:\한글 '$ & %USERNAME%\krill.exe");
+        assert_eq!(
+            windows_codex_command(r"C:\한글 '$ & %USERNAME%\krill.exe"),
+            command
+        );
+        assert_eq!(
+            windows_codex_command(r"C:\Users\홍 길동\krill.exe"),
+            r#""C:\Users\홍 길동\krill.exe" hook codex"#
+        );
+        assert_eq!(
+            windows_cursor_command(r"C:\Users\O'wen\krill.exe"),
+            r"& 'C:\Users\O''wen\krill.exe' hook cursor"
+        );
         let encoded = command.split_whitespace().last().unwrap();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
@@ -461,13 +573,41 @@ mod claude_platform_tests {
     #[test]
     fn windows_claude_exec_form_keeps_executable_metacharacters_literal() {
         let command = r"C:\한글 '$` & dir\krill.exe";
-        let handler = super::claude_hook(command);
+        let handler = super::claude_hook(command, None);
         assert_eq!(handler["command"], command);
         if cfg!(windows) {
             assert_eq!(handler["args"], serde_json::json!(["hook", "claude"]));
             assert!(handler.get("shell").is_none());
+            assert_eq!(
+                super::claude_hook(command, Some("2.1.139 (Claude Code)")),
+                handler
+            );
+            let old = super::claude_hook(r"C:\Users\홍길동\krill.exe", Some("2.1.138"));
+            assert_eq!(old["command"], "C:/Users/홍길동/krill.exe hook claude");
+            assert!(old.get("args").is_none());
         } else {
             assert!(handler.get("args").is_none());
         }
+    }
+
+    #[test]
+    fn windows_shell_word_is_unquoted_only_for_plain_paths() {
+        assert_eq!(
+            super::windows_shell_word(r"C:\Users\홍길동\AppData\Local\Programs\Krill\krill.exe"),
+            "C:/Users/홍길동/AppData/Local/Programs/Krill/krill.exe"
+        );
+        assert_eq!(
+            super::windows_shell_word(r"C:\Users\John Smith\krill.exe"),
+            r"'C:\Users\John Smith\krill.exe'"
+        );
+        assert_eq!(
+            super::windows_shell_word(r"C:\$x\krill.exe"),
+            r"'C:\$x\krill.exe'"
+        );
+        assert_eq!(
+            super::windows_shell_word(r"C:\Users\JOHNSM~1\krill.exe"),
+            "C:/Users/JOHNSM~1/krill.exe"
+        );
+        assert_eq!(super::plain_word("~/krill.exe"), None);
     }
 }

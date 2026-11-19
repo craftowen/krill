@@ -152,6 +152,7 @@ fn limit(link: &mut Link, dir: &Path) {
             req,
             id: SessionId(id),
             pid: sleeper.id(),
+            size: None,
         };
         assert_eq!(ask(link, &m, &[null.as_fd()]), FromHolder::Done { req });
     }

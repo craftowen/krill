@@ -28,7 +28,7 @@ IPC, shared-protocol, PTY/FFI, or session-survival changes also require integrat
 
 If **all** changed files are Markdown (`*.md`), or the only other changes are `debug`/`split-debuginfo` settings under Cargo `[profile.*]`, skip Cargo checks and run `git diff --check`. When committing such a change, include `check.sh 생략(<reason>)` in the commit message as required by AGENTS.md. Script, YAML, lint, or other code changes do not qualify for that exception; validate their affected behavior.
 
-The full `scripts/check.sh` is required for a **final release candidate**, rather than every small development change or documentation PR. It covers formatting, clippy, nextest, doctests, dependency policy, third-party notices, and the public surface. Release only the HEAD that passed; a candidate containing Windows changes must also pass `scripts/check-windows.sh --clippy`. CI and other release-specific gates still apply.
+The full `scripts/check.sh` is required for a **final release candidate**, rather than every small development change or documentation PR. It covers formatting, clippy, nextest, dependency policy, third-party notices, and the public surface. Release only the HEAD that passed; a candidate containing Windows changes must also pass `scripts/check-windows.sh --clippy`. CI and other release-specific gates still apply.
 
 ## Source-build environment
 

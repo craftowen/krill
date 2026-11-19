@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use krill_proto::SessionId;
 use krill_proto::holder::WinSize;
 
-use super::crypto::{SALT_LEN, Stream};
+use super::crypto::{SALT_LEN, Stream, key_unavailable};
 use super::segment::{self, Base, HEADER_LEN, Header, Record};
 use super::{LEVEL, OVERHEAD, RESUME, Store, WINDOW_LOG, lock, mkdir, privacy, segments};
 
@@ -429,10 +429,8 @@ impl Recorder {
             })
             .to_vec();
         let crypto = if header.encrypted {
-            let key = self.store.key.as_deref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::PermissionDenied, "segment key unavailable")
-            })?;
-            let (crypto, salt) = Stream::create(key, &prefix)?;
+            let keys = self.store.key.as_deref();
+            let (crypto, salt) = Stream::create(keys.ok_or_else(key_unavailable)?.get()?, &prefix)?;
             prefix.extend_from_slice(&salt);
             Some(crypto)
         } else {

@@ -30,7 +30,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -127,7 +127,7 @@ jobs:
             --output packaging/dist/latest.json
 
       - name: Upload Homebrew tap artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: homebrew-krill-${{ steps.meta.outputs.version }}
           path: packaging/dist/homebrew-krill/
@@ -179,7 +179,7 @@ jobs:
       - name: Preserve LF before checkout
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -237,9 +237,19 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked -p krill-app -p krill -p krilld -p krill-holder -p krill-link
 
+      - name: Verify Windows PE identities and Defender gate contracts
+        shell: powershell
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\packaging\windows\test_resources.ps1 -TargetDir target\release -Version $env:VERSION
+          & .\packaging\windows\test_defender-scan.ps1
+
       - name: Verify native Windows audit regressions
         shell: powershell
-        timeout-minutes: 25
+        # 19~24분 걸려 25분 제한에 걸린 적 있다(v0.3.5). 잡 전체 90분 안에 들어간다.
+        timeout-minutes: 45
         env:
           KRILL_STATE_DIR: ${{ runner.temp }}/krill-audit-native
           KRILL_LOG_DIR: ${{ runner.temp }}/krill-audit-native/logs
@@ -319,6 +329,18 @@ jobs:
 
       # TODO(OWE-838): Authenticode 서명(signtool)은 여기서 zip 전에 exe에 한다. 인증서·비밀은 사람이 정한다.
 
+      # Hosted images disable real-time protection and exclude C:/D:. Custom scans with
+      # -DisableRemediation ignore exclusions. Require a live Normal-mode engine; no bypass.
+      - name: Scan release ZIP with Microsoft Defender
+        shell: powershell
+        timeout-minutes: 15
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Start-Service WinDefend
+          & .\packaging\windows\defender-scan.ps1 -Zip "packaging\dist\Krill-$env:VERSION-windows-x64.zip"
+
       - name: Sign latest-windows.json
         if: ${{ !inputs.build_only && steps.key.outputs.public_key != '' }}
         shell: bash
@@ -353,7 +375,7 @@ jobs:
           git rev-parse HEAD | Set-Content -Encoding ascii packaging/dist/source-commit-windows.txt
 
       - name: Upload Windows release artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: krill-windows-${{ steps.meta.outputs.version }}-attempt-${{ github.run_attempt }}
           path: |
@@ -374,11 +396,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: krill-windows-${{ needs.build-windows.outputs.version }}-attempt-${{ github.run_attempt }}
           path: dist

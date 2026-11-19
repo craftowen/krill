@@ -31,7 +31,7 @@ function fixture(screen='orchestration',options={}){
  let timerId=0;const timers=new Map(),calls=[],errors=[],routes=[],headers=[],sheets=[],saved=[],buttons=[],abort=new AbortController();const state={snapshot:{host:{display_name:'Test desktop'},orchestration:{gates:[],questions:[],runs:[],tasks:[]},repositories:[]},connection:{phase:'ready'},groups:new Map(),sessions:new Map(),drafts:new Map(),preferences:{},logs:[],ui:{search:'',filter:'all'},...options.state};
  const el=(...args)=>new Element(...args),ctx={el,state,signal:abort.signal,route:options.route||{},t:(s,...values)=>{copyKeys.add(s);return options.t?.(s,...values)??s;},go:r=>routes.push(r),backTo:r=>routes.push(r),longPress:(node,action)=>{node._longPress=action;return ()=>{};},groupRoute:(g,id)=>`/host/local/group/${g?.key}/s/${id}`,rollup:s=>['Waiting','Blocked','Working','Done','Exited','Unknown'].find(v=>s.some(x=>(x.exited?'Exited':x.state)===v))||'Unknown',icon:()=>el('svg'),dot:v=>el('span',undefined,`status-dot ${String(v).toLowerCase()}`),button(label,action,cls=''){const b=el('button',ctx.t(label),cls);b.setAttribute('aria-label',ctx.t(label));b.action=action;buttons.push(b);return b;},header(title,fallback,onBack){headers.push({title,fallback,onBack});const h=el('header'),copy=el('div',undefined,'header-copy');copy.append(el('h1',ctx.t(title)));h.append(copy);return h;},linkRow(title,description,route){const b=ctx.button('',()=>ctx.go(route),'setting-link'),copy=el('span',undefined,'link-copy');copy.append(el('strong',ctx.t(title)));if(description)copy.append(el('small',ctx.t(description)));b.append(copy);return b;},sheet:(...v)=>sheets.push(v),act:fn=>Promise.resolve().then(fn).catch(e=>errors.push(e)),rpc:async req=>{calls.push(req);return options.rpc?.(req)??{};},createSession:(group,agent,req)=>{calls.push(req);routes.push(`/host/local/group/${group.key}/s/new`);},refresh:async()=>options.refresh?.(),error:e=>errors.push(e),savePreferences:patch=>{saved.push(patch);Object.assign(state.preferences,patch);},rerender(){ctx.rerenders++;},rerenders:0,scanQr(){ctx.scans++;},scans:0,pasteLink(){},install:{show(){ctx.installShown++;}},installShown:0,transport:{reconnect(){},resume(){}}};
  ctx.getConnections=()=>ctx.connections||[];ctx.selectHost=(id,after)=>{ctx.selected=id;after?.();};ctx.openRecent=(id,locator)=>{ctx.opened={id,locator};};ctx.reconnectHost=id=>{ctx.reconnected=id;};ctx.renameHost=id=>{ctx.renamed=id;};ctx.forgetHost=id=>{ctx.forgot=id;};
- const sandbox={document:doc,AbortController,Date,console,setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),setInterval:(fn,ms)=>{timers.set(++timerId,{fn,ms,interval:true});return timerId;},clearInterval:id=>timers.delete(id),KrillMobile:{terminal:{fontScales:[1,1.25],keys:[{id:'esc',label:'Esc'},{id:'tab',label:'Tab'}]},install:options.install||{offer:null}},navigator:{}};vm.createContext(sandbox);for(const file of ['details','home','workspaces','session','settings'])vm.runInContext(fs.readFileSync(path.join(options.assetRoot||path.join(__dirname,'../src/mobile/assets/screens'),`${file}.js`),'utf8'),sandbox);
+ const sandbox={document:doc,AbortController,Date,console,setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),setInterval:(fn,ms)=>{timers.set(++timerId,{fn,ms,interval:true});return timerId;},clearInterval:id=>timers.delete(id),KrillMobile:{terminal:{fontScales:[1,1.25],keys:[{id:'esc',label:'Esc'},{id:'tab',label:'Tab'}]},install:options.install||{offer:null}},navigator:{},...options.globals};vm.createContext(sandbox);for(const file of ['details','home','workspaces','session','settings'])vm.runInContext(fs.readFileSync(path.join(options.assetRoot||path.join(__dirname,'../src/mobile/assets/screens'),`${file}.js`),'utf8'),sandbox);
  const view=sandbox.KrillMobile.screens[screen](root,ctx),all=()=>root.descendants(),find=(selector)=>root.querySelector(selector),byText=(label)=>all().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')===label),flush=async()=>{for(let i=0;i<40;i++)await Promise.resolve();};
  return {root,ctx,state,doc,view,calls,errors,routes,headers,sheets,saved,buttons,all,find,byText,flush,timers,abort,M:sandbox.KrillMobile};
 }
@@ -66,19 +66,20 @@ async function confirmationInbox(){
 
 function groups(f){const a={id:1,state:'Waiting',agent:'codex',branch:'main',groupKey:'g-a',lines:['확인 필요']},b={id:2,state:'Working',branch:'dev',groupKey:'g-b',lines:[]};const ga={key:'g-a',label:'한글 워크스페이스',path:'/tmp/a',repoKey:'repo',sessions:[a]},gb={key:'g-b',label:'Other',path:'/tmp/b',repoKey:'repo',sessions:[b]};f.state.groups=new Map([[ga.key,ga],[gb.key,gb]]);f.state.sessions=new Map([[a.id,a],[b.id,b]]);f.state.snapshot.repositories=[{key:'repo',label:'프로젝트'}];f.state.preferences.workspaceTree={'repo:repo':true,...f.state.preferences.workspaceTree};return {a,b,ga,gb};}
 async function workspace(){const f=fixture('workspaces');const {a,ga}=groups(f);f.view.update();const row=f.all().find(n=>n.dataset.group==='g-a'),list=f.find('.workspace-list');row.focus();list.scrollTop=123;const initial=row.moves;a.lines=['갱신된 내용'];ga.label='긴 한글 '.repeat(70);f.view.update();assert.equal(f.all().find(n=>n.dataset.group==='g-a'),row);assert.equal(f.doc.activeElement,row);assert.equal(row.moves,initial);assert.equal(list.scrollTop,123);assert(row.getAttribute('aria-label').includes('Waiting'));assert(!row.textContent.includes('갱신된 내용'),'terminal output does not crowd the workspace list');assert(row.getAttribute('aria-label').includes(ga.label));await row.action();assert(f.routes.at(-1).endsWith('/s/1'));
- await f.byText('Search').action();const input=f.all().find(n=>n.tagName==='INPUT'&&n.type==='search');assert.equal(f.byText('Search').getAttribute('aria-expanded'),'true');input.value='Other';emit(input,'input');assert.equal(f.all().filter(n=>n.dataset.group).length,1);assert.equal(f.byText('Search').getAttribute('aria-pressed'),'true');await f.byText('Search').action();assert.equal(f.state.ui.search,'');assert.equal(input.value,'');assert.equal(f.byText('Search').getAttribute('aria-expanded'),'false');assert.equal(f.all().filter(n=>n.dataset.group).length,2);
- await f.byText('Search').action();input.value='missing';emit(input,'input');assert(f.root.textContent.includes('No matching workspaces'));await f.byText('Clear search').action();assert.equal(f.state.ui.search,'');assert.equal(f.doc.activeElement,input);input.value='Other';emit(input,'input');const escape=new Event('keydown',{cancelable:true});escape.key='Escape';input.dispatchEvent(escape);assert.equal(f.state.ui.search,'');assert.equal(f.doc.activeElement,f.byText('Search'));assert.equal(f.all().filter(n=>n.dataset.group).length,2);const ranked=['Unknown','Exited','Done','Working','Blocked','Waiting'].map((state,i)=>({key:'rank-'+state,label:state,path:'/tmp/'+state,sessions:[{id:10+i,state}]}));f.state.preferences.workspaceTree.folders=true;f.state.groups=new Map(ranked.map(g=>[g.key,g]));f.state.sessions=new Map(ranked.map(g=>[g.sessions[0].id,g.sessions[0]]));f.view.update();assert.deepEqual(f.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),['rank-Waiting','rank-Blocked','rank-Working','rank-Done','rank-Unknown']);f.abort.abort();
+ // Orca host page: the search pill stays in the bottom bar next to options and New workspace.
+ const input=f.all().find(n=>n.tagName==='INPUT'&&n.type==='search'),bar=f.find('.workspace-bottom-bar');assert(bar.contains(input));assert.deepEqual(bar.children.map(n=>n.getAttribute('aria-label')||n.className),['Workspace Options','workspace-search','New workspace']);assert(!f.byText('Search'),'phone search needs no toggle');input.value='Other';emit(input,'input');assert.equal(f.all().filter(n=>n.dataset.group).length,1);input.value='';emit(input,'input');assert.equal(f.state.ui.search,'');assert.equal(f.all().filter(n=>n.dataset.group).length,2);
+ input.value='missing';emit(input,'input');assert(f.root.textContent.includes('No matching workspaces'));await f.byText('Clear search').action();assert.equal(f.state.ui.search,'');assert.equal(f.doc.activeElement,input);input.value='Other';emit(input,'input');const escape=new Event('keydown',{cancelable:true});escape.key='Escape';input.dispatchEvent(escape);assert.equal(f.state.ui.search,'');assert.equal(f.doc.activeElement,input);assert(!input.parentElement.hidden);assert.equal(f.all().filter(n=>n.dataset.group).length,2);const ranked=['Unknown','Exited','Done','Working','Blocked','Waiting'].map((state,i)=>({key:'rank-'+state,label:state,path:'/tmp/'+state,sessions:[{id:10+i,state}]}));f.state.preferences.workspaceTree.folders=true;f.state.groups=new Map(ranked.map(g=>[g.key,g]));f.state.sessions=new Map(ranked.map(g=>[g.sessions[0].id,g.sessions[0]]));f.view.update();assert.deepEqual(f.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),['rank-Waiting','rank-Blocked','rank-Working','rank-Done','rank-Unknown']);f.abort.abort();
  console.log('PASS SC-A04/A06/A14 + SC-Q05 support: keyed workspace focus/scroll/latest callback, full context, search close/clear/Escape');}
 async function workspaceTree(){
  const f=fixture('workspaces');const {a,ga}=groups(f);a.title='✳ 리뷰 정리';a.lines=['마지막 출력'];const exited={id:3,state:'Done',exited:true};ga.sessions.push(exited);f.view.update();const folds=()=>JSON.parse(JSON.stringify(f.state.preferences.workspaceTree)),sessions=()=>f.all().filter(n=>n.dataset.session).map(n=>n.dataset.session),toggle=()=>f.all().find(n=>n.getAttribute('aria-label')===`Terminals: ${ga.label}`);
- assert.deepEqual(sessions(),['1','2'],'worktrees open by default and list only live sessions');assert.equal(toggle().getAttribute('aria-expanded'),'true');await toggle().action();assert.deepEqual(sessions(),['2'],'closing one worktree hides only its terminals');assert.equal(toggle().getAttribute('aria-expanded'),'false');assert.deepEqual(folds(),{'repo:repo':true,'w:g-a':false},'only the closed worktree is stored');await toggle().action();assert.deepEqual(folds(),{'repo:repo':true});
+ assert.deepEqual(sessions(),[],'phone worktrees start folded (Orca lists workspaces only)');assert.equal(toggle().getAttribute('aria-expanded'),'false');await toggle().action();assert.deepEqual(sessions(),['1'],'opening one worktree shows only its live terminals');assert.equal(toggle().getAttribute('aria-expanded'),'true');assert.deepEqual(folds(),{'repo:repo':true,'w:g-a':true},'only the opened worktree is stored');
  const row=f.all().find(n=>n.dataset.session==='1');assert(row.textContent.includes('마지막 출력'));assert.equal(row.getAttribute('aria-label'),'리뷰 정리 · Waiting for you · 마지막 출력');assert(row.descendants().some(n=>n.getAttribute('class')==='agent-icon codex'),'session row reuses the shared provider mark');a.lines=['새 출력','❯ '];f.view.update();assert.equal(f.all().find(n=>n.dataset.session==='1'),row,'session rows are keyed');assert(row.textContent.includes('새 출력'),'prompt-only trailing line is skipped');await row.action();assert(f.routes.at(-1).endsWith('/s/1'));
  f.state.ui.search='리뷰 정리';f.view.update();assert.deepEqual(f.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),['g-a'],'search matches session title');f.state.ui.search='codex';f.view.update();assert.deepEqual(f.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),['g-a'],'search matches session agent');f.state.ui.search='새 출력';f.view.update();assert.deepEqual(f.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),['g-a'],'search matches session activity line');f.state.ui.search='';f.view.update();
- const hostDot=f.find('.title-row').querySelector('.status-dot');assert.equal(hostDot.className,'status-dot connected');f.state.connection.phase='connecting';f.view.update();assert.equal(hostDot.className,'status-dot working');f.state.connection.phase='denied';f.view.update();assert.equal(hostDot.className,'status-dot blocked');f.state.connection.phase='ready';f.view.update();
- await toggle().action();assert.deepEqual(sessions(),['2']);await toggle().action();assert.deepEqual(sessions(),['1','2']);assert.deepEqual(folds(),{'repo:repo':true},'default terminal folds are not stored');
- const project=f.all().find(n=>n.classList.contains('repo-toggle'));assert.equal(project.getAttribute('aria-expanded'),'true');await project.action();await f.flush();assert.equal(project.getAttribute('aria-expanded'),'false');assert.equal(f.all().filter(n=>n.dataset.group).length,0);assert.deepEqual(folds(),{'repo:repo':false},'project folds stay on this phone');assert(!f.calls.some(c=>c.action==='set_workspace_view'),'nothing is sent to the PC');
+ const hostDot=f.find('.host-subtitle').querySelector('.status-dot');assert.equal(hostDot.className,'status-dot connected');f.state.connection.phase='connecting';f.view.update();assert.equal(hostDot.className,'status-dot working');f.state.connection.phase='denied';f.view.update();assert.equal(hostDot.className,'status-dot blocked');f.state.connection.phase='ready';f.view.update();
+ await toggle().action();assert.deepEqual(sessions(),[]);assert.deepEqual(folds(),{'repo:repo':true},'default terminal folds are not stored');await toggle().action();assert.deepEqual(sessions(),['1']);
+ const project=f.all().find(n=>n.classList.contains('repo-toggle'));assert.equal(project.getAttribute('aria-expanded'),'true');await project.action();await f.flush();assert.equal(project.getAttribute('aria-expanded'),'false');assert.equal(f.all().filter(n=>n.dataset.group).length,0);assert.deepEqual(folds(),{'repo:repo':false,'w:g-a':true},'project folds stay on this phone');assert(!f.calls.some(c=>c.action==='set_workspace_view'),'nothing is sent to the PC');
  f.state.ui.search='Other';f.view.update();assert.equal(f.all().filter(n=>n.dataset.group).length,1,'search opens collapsed projects');f.abort.abort();
- const g=fixture('workspaces',{state:{preferences:{workspaceTree:{'repo:repo':true,'w:g-a':false}}}});groups(g);g.view.update();assert.deepEqual(g.all().filter(n=>n.dataset.session).map(n=>n.dataset.session),['2'],'saved folds restore');g.abort.abort();
+ const g=fixture('workspaces',{state:{preferences:{workspaceTree:{'repo:repo':true,'w:g-a':true}}}});groups(g);g.view.update();assert.deepEqual(g.all().filter(n=>n.dataset.session).map(n=>n.dataset.session),['1'],'saved folds restore');g.abort.abort();
  // PC 사이드바의 접힘은 따라가지 않는다(기기별 저장). 폰에서 접은 프로젝트만 이 폰에 남는다.
  const d=fixture('workspaces');groups(d);d.state.snapshot.repositories.push({key:'closed',label:'Closed on PC',collapsed:true});d.state.groups.set('g-c',{key:'g-c',label:'C',path:'/tmp/c',repoKey:'closed',sessions:[]});d.view.update();const repoToggles=()=>d.all().filter(n=>n.classList.contains('repo-toggle')),shownGroups=()=>d.all().filter(n=>n.dataset.group).map(n=>n.dataset.group);
  assert.deepEqual(repoToggles().map(n=>n.getAttribute('aria-expanded')),['true','true'],'a fold on the PC does not close the project on the phone');assert.deepEqual(shownGroups(),['g-a','g-b','g-c']);
@@ -120,6 +121,45 @@ async function desktopVisibility(){
  // 다시 열어도 이 폰에 저장한 옵션이 남고, 저장한 적 없는 폰은 데스크톱 기본값(모두 보임·프로젝트별·최근순)으로 시작한다.
  const kept=fixture('workspaces',{state:{preferences:{workspaceTree:{},workspaceViews:JSON.parse(JSON.stringify(f.state.preferences.workspaceViews))}}}),keptBox={state:kept.state,M:{}};vm.createContext(keptBox);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',keptBox);keptBox.groupSnapshot(data);kept.view.update();assert.equal(kept.byText('Name').getAttribute('aria-pressed'),'true');assert.equal(kept.byText('Project').getAttribute('aria-pressed'),'true');kept.abort.abort();
  const fresh=fixture('workspaces'),freshBox={state:fresh.state,M:{}};vm.createContext(freshBox);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',freshBox);freshBox.groupSnapshot(data);fresh.view.update();assert.deepEqual(fresh.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),['a-main','a-idle','a-busy','b-main']);assert.equal(fresh.find('.chip-badge').hidden,true);assert.equal(fresh.byText('Recent').getAttribute('aria-pressed'),'true');fresh.abort.abort();
+ // Warm-cache snapshot sanitizer parity across Home and Workspaces + NaN-free rank comparator.
+ const storageCtx=vm.createContext({TextEncoder,TextDecoder,Uint8Array,DataView,URL,URLSearchParams,AbortController,MkCrypto:{enc:new TextEncoder(),hex:()=>'00',sha256:()=>new Uint8Array(32)}});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/storage.js'),'utf8'),storageCtx);
+ const warmInput={
+  host:{display_name:'Studio',platform:'macos'},
+  repositories:[{key:'a',label:'Shown',path:'/a',remote:'craftowen/krill',badge_color:'#3b82f6',icon:{kind:'emoji',value:'🚀'}},{key:'b',label:'Other',path:'/b'},{key:'c',label:'Removed',path:'/c',removed:true}],
+  workspaces:[
+   ...data.workspaces,
+   {key:'a-ext-hidden',repo_key:'a',label:'.claude/wt',status:'in-review',orders:[5,5,5,5],visibility:facts({asleep:false,external:true,external_shown:false})}
+  ],
+  sessions:[]
+ };
+ const cachedData=storageCtx.KrillMobile.storage.metadata(warmInput);
+ for(const groupBy of [0,1,3]){
+  const renderPair=snap=>{const w=fixture('workspaces',{state:{cached:snap===cachedData,preferences:{workspaceTree:{},workspaceViews:{'workspace-view':{group_by:groupBy,hide_sleeping:true}}}}}),box={state:w.state,M:{}};vm.createContext(box);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',box);box.groupSnapshot(snap);w.view.update();const out={sections:w.all().filter(n=>n.classList.contains('repo-toggle')&&!n.parentElement.hidden).map(n=>n.querySelector('.repo-label').textContent),groups:w.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),depths:w.all().filter(n=>n.classList.contains('tree-node')).map(n=>n.dataset.depth)};w.abort.abort();return out;};
+  const liveOut=renderPair(warmInput),warmOut=renderPair(cachedData);
+  assert.deepEqual(warmOut,liveOut,`warm-cache Workspaces parity for group_by=${groupBy}`);
+  assert(!warmOut.groups.includes('a-ext-hidden'));assert(!warmOut.groups.includes('c-main'));
+ }
+ const homeLive=fixture('home'),homeWarm=fixture('home');
+ homeLive.ctx.connections=[{id:'pc',name:'Studio',connection:{phase:'ready'},snapshot:warmInput,workspaceView:{hide_sleeping:true}}];
+ homeWarm.ctx.connections=[{id:'pc',name:'Studio',connection:{phase:'connecting'},cached:true,snapshot:cachedData,workspaceView:{hide_sleeping:true}}];
+ homeLive.view.update();homeWarm.view.update();
+ assert.equal(homeWarm.find('.session-summary').textContent,homeLive.find('.session-summary').textContent,'Home workspace count matches warm-cached snapshot');
+ homeLive.abort.abort();homeWarm.abort.abort();
+ // Missing/mixed orders never yield NaN in Array.prototype.sort across Project, Status, and None modes.
+ const origSort=Array.prototype.sort;let sawNaN=false;
+ Array.prototype.sort=function(cmp){return origSort.call(this,cmp?(a,b)=>{const r=cmp(a,b);if(Number.isNaN(r))sawNaN=true;return r;}:undefined);};
+ try{
+  for(const groupBy of [0,1,3]){
+   const m=fixture('workspaces',{state:{preferences:{workspaceTree:{},workspaceViews:{'workspace-view':{group_by:groupBy}}}}}),mBox={state:m.state,M:{}};
+   vm.createContext(mBox);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',mBox);
+   mBox.groupSnapshot({repositories:[{key:'a',label:'Repo'}],workspaces:[{key:'w-z',repo_key:'a',label:'Zeta',status:'todo'},{key:'w-a',repo_key:'a',label:'Alpha',status:'todo'},{key:'w-ranked',repo_key:'a',label:'Ranked',status:'todo',orders:[0,0,0,0]}],sessions:[]});
+   m.view.update();
+   assert.deepEqual(m.all().filter(n=>n.dataset.group).map(n=>n.dataset.group),['w-ranked','w-a','w-z'],`deterministic order for group_by=${groupBy}`);
+   m.abort.abort();
+  }
+ }finally{Array.prototype.sort=origSort;}
+ assert.equal(sawNaN,false,'rank comparator never returns NaN');
  console.log('PASS Orca workspace options: per-device project picker, group by none/status/project, sort, sleeping/automation/CLI filters redraw at once and save on this phone only');
 }
 async function desktopWorkspaceOrder(){
@@ -136,7 +176,7 @@ async function desktopWorkspaceOrder(){
 async function projectFilters(){
  const f=fixture('workspaces');const {ga,gb}=groups(f);gb.repoKey='other';f.state.snapshot.repositories.push({key:'other',label:'Second project'});f.state.preferences.workspaceTree.folders=true;const folder={key:'folder',label:'Notes',path:'/tmp/notes',sessions:[]};f.state.groups.set(folder.key,folder);f.state.preferences.workspaceViews={'workspace-view':{repos:['other']}};f.view.update();const shown=()=>f.all().filter(n=>n.dataset.group).map(n=>n.dataset.group);
  assert.deepEqual(shown(),[gb.key,'folder'],'folder sessions stay visible outside the project filter');
- await f.byText('Search').action();const search=f.all().find(n=>n.tagName==='INPUT'&&n.type==='search');search.value='프로젝트';emit(search,'input');assert.deepEqual(shown(),[ga.key],'search reaches projects outside the filter by name');search.value='';emit(search,'input');
+ const search=f.all().find(n=>n.tagName==='INPUT'&&n.type==='search');search.value='프로젝트';emit(search,'input');assert.deepEqual(shown(),[ga.key],'search reaches projects outside the filter by name');search.value='';emit(search,'input');
  f.state.preferences.workspaceViews={};f.state.snapshot.repositories=f.state.snapshot.repositories.filter(r=>r.key!=='other');f.view.update();assert.equal(shown().length,3,'a project gone from the snapshot falls back to the folder list');f.abort.abort();
  console.log('PASS project filter keeps folder sessions, search reaches filtered projects, removed repositories');
 }
@@ -182,15 +222,113 @@ async function createWorktreeSheet(){
  await f.sheets.at(-1)[1][0].action();await f.flush();
  assert.deepEqual(JSON.parse(JSON.stringify(f.calls.at(-1))),{action:'create_workspace',repository:'krill',name:'custom-wt',base:'feat/mobile-ui',agent:'codex',setup_hash:'a'.repeat(64)});
  f.abort.abort();
+ // Multi-desktop "Run on" omits offline/cached/unsupported desktops and guards mid-open disconnect; app.js newWorkspace & pendingHostAction lifecycle.
+ const md=fixture('workspaces');
+ md.state.snapshot.capabilities={worktree_create:true};
+ md.state.snapshot.repositories=[{key:'krill',label:'krill',path:'/krill'}];
+ const connA={id:'a',name:'Studio Mac',active:true,endpoint:'Relay · aaaa',connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'krill',label:'krill',path:'/krill'}]}},
+  connB={id:'b',name:'Linux Box',active:false,endpoint:'Relay · bbbb',connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'krill',label:'krill',path:'/krill'}]}},
+  connOff={id:'off',name:'Sleeping MacBook',active:false,endpoint:'Relay · cccc',connection:{phase:'disconnected'},snapshot:{capabilities:{worktree_create:true}}},
+  connCached={id:'cached',name:'Cached Mac',active:false,endpoint:'Relay · dddd',cached:true,connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:true}}},
+  connOld={id:'old',name:'Legacy Mac',active:false,endpoint:'Relay · eeee',connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:false},repositories:[{key:'krill'}]}};
+ md.ctx.connections=[connA,connB,connOff,connCached,connOld];
+ md.ctx.hosts=[connA,connB,connOff,connCached,connOld];
+ md.view.update();
+ await md.byText('New workspace').action();
+ const mdBody=md.ctx.el('div');md.sheets.at(-1)[3](mdBody);const mdForm=mdBody.querySelector('.worktree-composer'),mdTargetBtn=mdForm.querySelector('.worktree-target-button'),mdTargetList=mdForm.querySelector('.target-picker-list');
+ await mdTargetBtn.action();
+ assert.deepEqual(mdTargetList.children.map(n=>n.querySelector('.worktree-field-title').textContent),['Studio Mac','Linux Box'],'Run on lists only ready non-cached desktops supporting worktree_create');
+ connB.connection.phase='disconnected';
+ await mdTargetList.children[1].action();
+ assert.equal(md.ctx.selected,undefined,'disconnecting while Run on is open prevents host switch');
+ connB.connection.phase='ready';
+ await mdTargetBtn.action();
+ let reopenedRepo=null;md.ctx.newWorkspace=repoKey=>{reopenedRepo=repoKey;};
+ await mdTargetList.children[1].action();
+ assert.equal(md.ctx.selected,'b');assert.equal(reopenedRepo,'krill');
+ md.abort.abort();
+ // Exercise real app.js newWorkspace(), selectHost(id, after), go() and hashchange cancellation.
+ {
+  const appSource=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8'),lines=appSource.split('\n'),pick=m=>lines.find(l=>l.trim().startsWith(m));
+  const selectIdx=lines.findIndex(l=>l.trim().startsWith('function selectHost(')),hashLine=lines.find(l=>l.includes("globalThis.addEventListener('hashchange'")),hashHandler=hashLine.slice(hashLine.indexOf("globalThis.addEventListener('hashchange'"));
+  let activeId='off',composers=[],sheetsOpen=[],renders=0,reloads=0;
+  const profiles=[{id:'off',name:'Sleeping MacBook',endpoint:'Relay · off',get active(){return activeId==='off';}},{id:'studio',name:'Studio Mac',endpoint:'Relay · studio',get active(){return activeId==='studio';}},{id:'linux',name:'Linux Box',endpoint:'Relay · linux',get active(){return activeId==='linux';}}];
+  const entries=new Map([
+   ['off',{id:'off',transport:{ready:false,setActive(){}},connection:{phase:'disconnected',message:'Not connected'},snapshot:{capabilities:{worktree_create:true}},cached:false,endpoint:{credentials:{device_id:'d1'}} }],
+   ['studio',{id:'studio',transport:{ready:true,setActive(){}},connection:{phase:'ready',message:'Connected'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'r1'}]},cached:false,endpoint:{credentials:{device_id:'d2'}} }],
+   ['linux',{id:'linux',transport:{ready:false,setActive(){}},connection:{phase:'connecting',message:'Connecting…'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'r1'}]},cached:false,endpoint:{credentials:{device_id:'d3'}} }]
+  ]);
+  const win=new EventTarget(),historyEntries=['#/'];let histIdx=0;
+  const loc={pathname:'/',search:'',reload(){reloads++;}};
+  Object.defineProperty(loc,'hash',{get:()=>historyEntries[histIdx],set:v=>{if(v===historyEntries[histIdx])return;historyEntries.splice(histIdx+1,Infinity,v);histIdx++;queueMicrotask(()=>win.dispatchEvent(new Event('hashchange')));}});
+  const box={
+   location:loc,history:{replaceState:(_a,_b,url)=>{historyEntries[histIdx]=url.slice(url.indexOf('#'));},back:()=>{histIdx--;queueMicrotask(()=>win.dispatchEvent(new Event('hashchange')));}},
+   addEventListener:win.addEventListener.bind(win),URLSearchParams,
+   endpoint:{profiles:()=>profiles,selectHost:id=>{activeId=id;return {device_id:'d-'+id};}},
+   pool:{sync(){},get:id=>entries.get(id),owns:()=>true},
+   state:{connection:entries.get('off').connection,cached:false,logs:[],preferences:{},groups:new Map(),sessions:new Map()},
+   transport:entries.get('off').transport,landing:false,activeRouteScreen:'home',
+   banner:{replaceChildren(){},append(){},hidden:true,className:''},notice:{hidden:true,textContent:''},dialog:{open:false,close(){this.open=false;}},
+   hideNotice(){},update(){},render(){renders++;box.activeRouteScreen=box.parseRoute().screen;},clearHost(){},
+   activateEntry:entry=>{activeId=entry.id;box.transport=entry.transport;box.state.connection=entry.connection;box.state.cached=entry.cached;box.state.snapshot=entry.snapshot;},
+   workspaceComposer:repo=>composers.push([activeId,repo]),
+   sheet:(title,items)=>sheetsOpen.push({title,items}),closeSheet(){box.dialog.open=false;},scanner:null,
+   el:()=>({append(){}}),button:()=>({}),t:s=>s,M:{recentSession:{list:()=>[]}}
+  };
+  box.globalThis=box;
+  vm.createContext(box);
+  vm.runInContext([
+   pick('let routeStack='),pick('const hostRoute='),pick('const sessionPath='),pick('const go='),pick('function back('),pick('const pairingLink='),
+   pick('function parseRoute('),pick('function showConnection('),lines[selectIdx],lines[selectIdx+1],pick('function getConnections('),
+   pick('const canCreateWorkspace='),pick('function newWorkspace('),hashHandler
+  ].join('\n')+'\nglobalThis.parseRoute=parseRoute;globalThis.newWorkspace=newWorkspace;globalThis.selectHost=selectHost;globalThis.go=go;globalThis.back=back;globalThis.showConnection=showConnection;',box);
+  // 1) Home with 1 offline active desktop + 1 online ready desktop -> skips "Choose desktop" and selects Studio Mac directly!
+  box.newWorkspace('r1');
+  assert.equal(sheetsOpen.length,0,'single ready desktop skips offline desktop chooser');
+  assert.equal(activeId,'studio');
+  assert.deepEqual(composers,[['studio','r1']]);
+  // 2) Home with 2 ready desktops + 1 offline -> "Choose desktop" lists only the 2 ready desktops.
+  entries.get('linux').transport.ready=true;entries.get('linux').connection={phase:'ready',message:'Connected'};
+  box.go('/',true);box.newWorkspace('r1');
+  assert.equal(sheetsOpen.length,1);
+  assert.deepEqual(sheetsOpen[0].items.map(i=>i.label),['Studio Mac · Relay · studio','Linux Box · Relay · linux']);
+  // 3) pendingHostAction runs when staying on target host, but cancels on go() or Back (hashchange).
+  entries.get('linux').transport.ready=false;entries.get('linux').connection={phase:'connecting',message:'Connecting…'};
+  let fired=0;
+  box.go('/',true);box.selectHost('linux',()=>{fired++;});
+  entries.get('linux').transport.ready=true;entries.get('linux').connection={phase:'ready',message:'Connected'};
+  box.showConnection(entries.get('linux').connection);
+  assert.equal(fired,1,'valid selectHost callback runs once target becomes ready');
+  // Arm on connecting active host from Home, let initial #/host/linux hashchange settle, then navigate away via go('/settings').
+  entries.get('linux').transport.ready=false;entries.get('linux').connection={phase:'connecting',message:'Connecting…'};
+  box.go('/',true);box.selectHost('linux',()=>{fired++;});
+  await Promise.resolve();await Promise.resolve();
+  box.go('/settings');
+  await Promise.resolve();await Promise.resolve();
+  entries.get('linux').transport.ready=true;entries.get('linux').connection={phase:'ready',message:'Connected'};
+  box.showConnection(entries.get('linux').connection);
+  assert.equal(fired,1,'go() cancels stale pendingHostAction before delayed ready');
+  // Arm again from Home, let initial #/host/linux hashchange settle, then press Back to Home (#/).
+  entries.get('linux').transport.ready=false;entries.get('linux').connection={phase:'connecting',message:'Connecting…'};
+  box.go('/',true);box.selectHost('linux',()=>{fired++;});
+  await Promise.resolve();await Promise.resolve();
+  box.back();
+  await Promise.resolve();await Promise.resolve();
+  assert.equal(loc.hash,'#/');
+  entries.get('linux').transport.ready=true;entries.get('linux').connection={phase:'ready',message:'Connected'};
+  box.showConnection(entries.get('linux').connection);
+  assert.equal(fired,1,'Back hashchange cancels stale pendingHostAction');
+  assert.equal(reloads,0);
+ }
  console.log('PASS Orca Create worktree sheet: FAB, project/remote picker, Run on target, branch source suggestions, agent picker, auto-name and setup review');
 }
 async function home(){const f=fixture('home');assert.equal(f.find('.krill-logo').src,'icon.svg');assert(!f.root.textContent.includes('Welcome back'));assert(f.root.textContent.includes('Connect your desktop'));
  const first={id:'one',active:true,name:'First PC',endpoint:'Relay · aaaa',connection:{phase:'ready'},snapshot:{sessions:[{id:7,title:'First task',worktree_key:'same',state:'Working'}]}},second={id:'two',name:'Second PC',endpoint:'Relay · bbbb',connection:{phase:'ready'},snapshot:{sessions:[{id:7,title:'Second task',worktree_key:'same',state:'Waiting'}]}};f.ctx.connections=[first,second];f.view.update();assert.equal(f.find('.home-desktops').children.length,2);assert(f.root.textContent.includes('2/2'));assert(f.root.textContent.includes('Recent sessions'));assert.equal(f.calls.length,0,'Home does not poll every provider account');
- const sections=f.find('.home-list').children;assert.equal(sections[0].id,'home-quick-actions');assert.equal(sections[1],f.find('.recent-session'));assert.equal(sections.at(-1),f.find('.home-desktops'));assert.equal(f.find('.home-shortcuts').children[0],f.byText('New Workspace'));assert.equal(f.byText('New Workspace').disabled,true,'unsupported worktree creation stays disabled');first.snapshot.capabilities={worktree_create:true};f.view.update();assert.equal(f.byText('New Workspace').disabled,false);assert(f.root.textContent.includes('Quick actions'));
+ const sections=f.find('.home-list').children;assert.equal(f.find('.page-title').textContent,'Feed');assert.equal(sections[0],f.find('.recent-session'));assert.equal(sections.at(-1),f.find('.home-desktop-group'));assert(f.find('.home-desktop-group').contains(f.byText('Pair a desktop')),'Pair a desktop closes the Desktops group');assert.equal(f.find('.home-fab'),f.byText('New Workspace'));assert(!f.find('.home-list').contains(f.byText('New Workspace')),'New workspace floats over the feed');assert.equal(f.byText('New Workspace').disabled,true,'unsupported worktree creation stays disabled');first.snapshot.capabilities={worktree_create:true};f.view.update();assert.equal(f.byText('New Workspace').disabled,false);assert(!f.root.textContent.includes('Quick actions'));
  const cards=f.find('.home-desktops').children,firstButton=cards[0].querySelector('.host-main'),other=cards[1].querySelector('.host-main');await other.action();assert.equal(f.ctx.selected,'two');firstButton.focus();f.find('.home-list').scrollTop=201;const moves=firstButton.moves;first.name='Renamed PC';f.view.update();assert.equal(cards[0].querySelector('.host-main'),firstButton);assert.equal(f.doc.activeElement,firstButton);assert.equal(firstButton.moves,moves);assert.equal(f.find('.home-list').scrollTop,201);assert(firstButton.textContent.includes('Renamed PC'));
  const rows=f.find('.recent-session-list').children;assert.equal(rows[0].dataset.host,'two','Waiting session sorts ahead of Working');assert.equal(rows[1].dataset.host,'one');await rows[0].action();assert.equal(f.ctx.opened.id,'two');assert.equal(f.ctx.opened.locator.id,7);assert.equal(f.ctx.opened.locator.groupKey,'same');second.connection.phase='disconnected';f.view.update();assert(f.root.textContent.includes('1/2'));assert.equal(rows[0].disabled,true);assert.equal(rows[1].disabled,false);assert(other.textContent.includes('Not connected'));assert.equal(cards[1].querySelector('.status-dot').className,'status-dot unknown');second.connection.phase='connecting';f.view.update();assert.equal(cards[1].querySelector('.status-dot').className,'status-dot working');second.connection.phase='denied';f.view.update();assert.equal(cards[1].querySelector('.status-dot').className,'status-dot blocked');
  other._longPress();await f.sheets.at(-1)[1].find(a=>a.label==='Connection Log').action();assert.equal(f.routes.at(-1),'/diagnostics');
- cards[1].querySelectorAll('button')[1].action();await f.sheets.at(-1)[1].find(a=>a.label==='Reconnect').action();assert.equal(f.ctx.reconnected,'two');await f.sheets.at(-1)[1].find(a=>a.label==='Rename desktop').action();assert.equal(f.ctx.renamed,'two');await f.byText('Pair Desktop').action();assert.equal(f.ctx.scans,1);await f.byText('Accounts').action();assert.equal(f.routes.at(-1),'/accounts');second.snapshot.sessions[0].exited=true;f.view.update();assert.equal(f.find('.recent-session-list').children.length,1);f.abort.abort();
+ cards[1].querySelectorAll('button')[1].action();await f.sheets.at(-1)[1].find(a=>a.label==='Reconnect').action();assert.equal(f.ctx.reconnected,'two');await f.sheets.at(-1)[1].find(a=>a.label==='Rename desktop').action();assert.equal(f.ctx.renamed,'two');await f.byText('Pair a desktop').action();assert.equal(f.ctx.scans,1);assert(!f.byText('Accounts'),'accounts and settings live in the tab bar');second.snapshot.sessions[0].exited=true;f.view.update();assert.equal(f.find('.recent-session-list').children.length,1);f.abort.abort();
  console.log('PASS Home simultaneous PC states, scoped equal session IDs, direct PC entry, stable focus/scroll, no greeting/account clutter');}
 async function homeResumeAndLogins(){
  const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/home.js'),'utf8'),storage=new Map(),context=vm.createContext({localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)}});vm.runInContext(source,context);const R=context.KrillMobile.recentSession;
@@ -215,9 +353,52 @@ async function accounts(){const data={accounts:[{id:'work',provider:'Claude',lab
  let refreshes=0,handoffState={accounts:[{id:'agy-2',provider:'Antigravity',label:'Agy 2',email:'agy2@example.test',profile_dir:'/agy2',active:false,stale:false,usage:{five_hour:null,seven_day:null}}],statuses:[],connections:{supported:true,accounts:[{account_id:'agy-2',status:'connected'}]},details:{handoffs:[]}};
  const h=fixture('accounts',{refresh:()=>{refreshes++;},rpc:req=>{if(req.action==='switch_account'){handoffState={...handoffState,accounts:[{...handoffState.accounts[0],active:true}],details:{handoffs:[{from:7,to:null,account_id:'agy-2',error:null}]}};return handoffState;}return handoffState;}});await h.flush();
  await h.find('.account-row').action();await h.flush();assert.equal(refreshes,1);assert(h.find('.account-trailing').querySelector('.spinner'),'pending session handoff shows spinner');
- handoffState={...handoffState,details:{handoffs:[{from:7,to:null,account_id:'agy-2',error:'Session 7: could not resume with selected account'}]}};;
+ handoffState={...handoffState,details:{handoffs:[{from:7,to:null,account_id:'agy-2',error:'Session 7: could not resume with selected account (os error 2)'}]}};
  for(const [id,t] of [...h.timers])if(!t.interval){h.timers.delete(id);t.fn();}await h.flush();
- assert.equal(refreshes,2,'settling handoff refreshes mobile snapshot');assert(h.root.textContent.includes('Session 7: could not resume with selected account'));h.abort.abort();
+ assert.equal(refreshes,2,'settling handoff refreshes mobile snapshot');
+ const handoffErr=h.find('.account-error');
+ assert(handoffErr,'settling handoff renders .account-error');
+ assert.equal(handoffErr.textContent,"Couldn't switch a running session to this account. Kept the original session.");
+ assert(!h.root.textContent.includes('Session 7'));
+ assert(!h.root.textContent.includes('os error'));
+ assert(!handoffErr.textContent.includes('('));
+ h.abort.abort();
+ const locale=vm.createContext({navigator:{language:'ko'}});vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),locale);const I=locale.KrillMobile.i18n;
+ const diagAccounts={
+  accounts:[
+   {id:'claude-401',provider:'Claude',label:'Claude 401',email:'claude@example.test',profile_dir:'/c401',active:false,stale:false,usage:{five_hour:null,seven_day:null}},
+   {id:'agy-2',provider:'Antigravity',label:'Agy 2',email:'agy2@example.test',profile_dir:'/agy2',active:false,stale:false,usage:{five_hour:null,seven_day:null}},
+   {id:'opencode-default',provider:'OpenCode',label:'OpenCode default',host_default:true,email:null,profile_dir:null,active:true,stale:false,usage:{five_hour:null,seven_day:null}},
+  ],
+  statuses:[
+   {account_id:'claude-401',status:'needs_login',detail:'Usage API rejected the sign-in (HTTP 401)'},
+   {account_id:'opencode-default',status:'error',detail:'Usage API denied access (HTTP 403)'},
+  ],
+  connections:{supported:true,accounts:[
+   {account_id:'claude-401',status:'needs_login'},
+   {account_id:'agy-2',status:'connected'},
+   {account_id:'opencode-default',status:'connected'},
+  ]},
+  details:{handoffs:[{from:41205,to:null,account_id:'agy-2',error:'Session 41205: could not resume with selected account'}]},
+ };
+ for(const [lang,tr] of [['en',s=>s],['ko',I.t]]){
+  const d=fixture('accounts',{t:tr,rpc:()=>diagAccounts});await d.flush();
+  const rows=d.root.querySelectorAll('.account-row');assert.equal(rows.length,3);
+  const [cRow,aRow,oRow]=rows;
+  assert.equal(cRow.querySelector('.account-error')?.textContent,tr('Sign in to this account again to check usage.'),lang+' 401 error');
+  assert.equal(aRow.querySelector('.account-error')?.textContent,tr("Couldn't switch a running session to this account. Kept the original session."),lang+' handoff 41205');
+  assert.equal(oRow.querySelector('.account-error'),null,lang+' OpenCode host_default 403 must not show .account-error');
+  assert(oRow.querySelector('.account-meta')?.textContent.includes(tr("Usage details aren't available for this account.")),lang+' OpenCode host_default 403 shows muted note');
+  assert(!oRow.textContent.includes(tr('Usage error')),lang+' OpenCode host_default 403 suppresses Usage error badge');
+  for(const raw of ['HTTP 401','HTTP 403','Usage API','Session 41205','41205'])assert(!d.root.textContent.includes(raw),lang+' hides '+raw);
+  if(lang==='ko'){
+   assert.notEqual(cRow.querySelector('.account-error').textContent,'Sign in to this account again to check usage.');
+   assert.notEqual(aRow.querySelector('.account-error').textContent,"Couldn't switch a running session to this account. Kept the original session.");
+  }
+  d.abort.abort();
+ }
+ assert.equal(A.formatUsageDetail({detail:'Usage API rate limited (HTTP 429) — last successful value'},{provider:'Claude',host_default:false},I.t).error,`${I.t('Usage check is temporarily rate-limited. Try again shortly.')} (${I.t('showing last known usage')})`);
+ assert.equal(A.formatHandoffDetail('Replacement session 99 was retained for manual selection',I.t),I.t('Kept the new session for manual selection after the original ended. Held input was not sent.'));
  console.log('PASS SC-A04/A05/A12: Accounts stable focus/scroll, action name and associated complete login/error/reset context, inline Retry');}
 async function quickCommandSettings(){
  const f=fixture('settings',{route:{subpage:'terminal'},rpc:req=>({quick_commands:req.commands?.map(c=>({...c,name:c.name.toUpperCase()}))})});
@@ -263,11 +444,29 @@ async function sessionDetailsAudit(){
  const logs=fixture('diagnostics',{state:{logs:[{at:1000,phase:'ready',message:'Connected'}]},t:key=>key==='Connected'?'연결됨':key});assert(logs.find('.connection-log').textContent.includes('연결됨'));assert(!logs.find('.connection-log').textContent.includes('Connected'));logs.abort.abort();
  console.log('PASS Git scope/no-current/oversize messages and transient Retry, terminal key reset defaults, diagnostics translation');
 }
-async function settings(){const f=fixture('settings');assert.deepEqual(f.all().find(n=>n.getAttribute('role')==='group'&&n.getAttribute('aria-label')==='Appearance').children.map(n=>n.getAttribute('aria-pressed')),['false','false','true'],'Dark is the default appearance');await f.byText('Install Krill').action();assert.equal(f.ctx.installShown,1);for(const [label,name,key,value] of [['Language','한국어','language','ko'],['Appearance','Light','appearance','light'],['UI text size','150%','uiTextScale',1.5],['Default session view','Chat','defaultSessionView','chat']]){const group=f.all().find(n=>n.getAttribute('role')==='group'&&n.getAttribute('aria-label')===label),choice=group.children.find(n=>n.getAttribute('aria-label')===name);await choice.action();assert.equal(f.state.preferences[key],value);assert.deepEqual(group.children.map(n=>n.getAttribute('aria-pressed')),group.children.map(n=>String(n===choice)));}assert.equal(f.byText('Settings').getAttribute('aria-current'),'page');await f.byText('Terminal').action();assert.equal(f.routes.at(-1),'/settings/terminal');f.abort.abort();
- const invalid=fixture('settings',{state:{preferences:{defaultSessionView:'invalid'}}});assert.deepEqual(invalid.all().find(n=>n.getAttribute('aria-label')==='Default session view').children.map(n=>n.getAttribute('aria-pressed')),['false','true']);invalid.abort.abort();
- const g=fixture('settings',{route:{subpage:'terminal'}});g.headers[0].onBack();assert.equal(g.routes.at(-1),'/settings');for(const check of g.all().filter(n=>n.tagName==='INPUT'&&n.type==='checkbox')){const label=g.all().find(n=>n.tagName==='LABEL'&&n.htmlFor===check.id);assert(label);assert(label.textContent.length);assert(!label.querySelector('button'));check.checked=false;emit(check,'change');assert(!g.state.preferences.visibleKeyIds.includes(check.id.replace('accessory-key-','')));}await g.all().find(n=>n.getAttribute('aria-label')==='Buffered input').action();assert.equal(g.state.preferences.inputMode,'buffered');g.abort.abort();console.log('PASS SC-A11, CO-A14 and SC-Q01/Q02 support: checkbox label association excludes move buttons, installation reentry, persisted language/theme/UI scale and input mode segmented choices, settings page bar');}
+async function settings(){const f=fixture('settings'),link=label=>f.all().find(n=>n.tagName==='BUTTON'&&String(n.className).includes('setting-link')&&n.textContent===label);
+ // Orca settings root: one page menu; each control lives on its page and the app tab bar replaces the old section bar.
+ for(const [label,route] of [['Appearance','/settings/appearance'],['Terminal','/settings/terminal'],['Chat UI','/settings/chat'],['Connection Log','/diagnostics'],['About Krill','/settings/about']]){await link(label).action();assert.equal(f.routes.at(-1),route);}assert(!f.all().some(n=>n.getAttribute('role')==='group'),'no inline choices on the root menu');assert(!f.find('.settings-nav'));await f.byText('Install Krill').action();assert.equal(f.ctx.installShown,1);f.abort.abort();
+ const choose=async(v,label,name,key,value)=>{const group=v.all().find(n=>n.getAttribute('role')==='group'&&n.getAttribute('aria-label')===label),choice=group.children.find(n=>n.getAttribute('aria-label')===name);await choice.action();assert.equal(v.state.preferences[key],value);assert.deepEqual(group.children.map(n=>n.getAttribute('aria-pressed')),group.children.map(n=>String(n===choice)));};
+ const a=fixture('settings',{route:{subpage:'appearance'}});assert.deepEqual(a.all().find(n=>n.getAttribute('role')==='group'&&n.getAttribute('aria-label')==='Theme').children.map(n=>n.getAttribute('aria-pressed')),['false','false','true'],'Dark is the default theme');for(const v of [['Language','한국어','language','ko'],['Theme','Light','appearance','light'],['UI text size','150%','uiTextScale',1.5]])await choose(a,...v);assert(!a.all().some(n=>n.getAttribute('aria-label')==='Default session view'));a.headers[0].onBack();assert.equal(a.routes.at(-1),'/settings');a.abort.abort();
+ const c=fixture('settings',{route:{subpage:'chat'}});await choose(c,'Default session view','Chat','defaultSessionView','chat');c.abort.abort();
+ const invalid=fixture('settings',{route:{subpage:'chat'},state:{preferences:{defaultSessionView:'invalid'}}});assert.deepEqual(invalid.all().find(n=>n.getAttribute('aria-label')==='Default session view').children.map(n=>n.getAttribute('aria-pressed')),['false','true']);invalid.abort.abort();
+ const g=fixture('settings',{route:{subpage:'terminal'}});g.headers[0].onBack();assert.equal(g.routes.at(-1),'/settings');for(const check of g.all().filter(n=>n.tagName==='INPUT'&&n.type==='checkbox')){const label=g.all().find(n=>n.tagName==='LABEL'&&n.htmlFor===check.id);assert(label);assert(label.textContent.length);assert(!label.querySelector('button'));check.checked=false;emit(check,'change');assert(!g.state.preferences.visibleKeyIds.includes(check.id.replace('accessory-key-','')));}await g.all().find(n=>n.getAttribute('aria-label')==='Buffered input').action();assert.equal(g.state.preferences.inputMode,'buffered');g.abort.abort();
+ // Verify theme-color meta + manifest.json #0b0d13/#ffffff parity and system prefers-color-scheme change listener.
+ const manifest=JSON.parse(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/manifest.json'),'utf8'));
+ assert.equal(manifest.theme_color,'#0b0d13');assert.equal(manifest.background_color,'#0b0d13');
+ const appLines=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n'),media=Object.assign(new EventTarget(),{matches:false}),meta={content:'',setAttribute(_k,v){this.content=v;}},themeBox={state:{preferences:{}},M:{i18n:{configure(){}}},document:{documentElement:{dataset:{},style:{setProperty(){}}},querySelector:s=>s==='meta[name="theme-color"]'?meta:null},matchMedia:q=>q==='(prefers-color-scheme: light)'?media:null};
+ themeBox.globalThis=themeBox;vm.createContext(themeBox);
+ vm.runInContext([appLines.find(l=>l.trim().startsWith('function applyPreferences(')),appLines.find(l=>l.trim().startsWith('const colorSchemeMedia='))].join('\n')+'\nglobalThis.apply=applyPreferences;',themeBox);
+ themeBox.apply();assert.equal(meta.content,'#0b0d13','dark theme uses --surface-base #0b0d13');
+ themeBox.state.preferences.appearance='light';themeBox.apply();assert.equal(meta.content,'#ffffff','light theme uses --surface-base #ffffff');
+ themeBox.state.preferences.appearance='system';media.matches=false;themeBox.apply();assert.equal(meta.content,'#0b0d13');
+ media.matches=true;media.dispatchEvent(new Event('change'));assert.equal(meta.content,'#ffffff','OS switch to light updates theme-color in system mode');
+ media.matches=false;media.dispatchEvent(new Event('change'));assert.equal(meta.content,'#0b0d13','OS switch to dark updates theme-color in system mode');
+ themeBox.state.preferences.appearance='dark';media.matches=true;media.dispatchEvent(new Event('change'));assert.equal(meta.content,'#0b0d13','explicit dark ignores OS light change');
+ console.log('PASS SC-A11, CO-A14 and SC-Q01/Q02 support: checkbox label association excludes move buttons, installation reentry, persisted language/theme/UI scale and input mode segmented choices, settings page bar');}
 async function renderPerformance(){
- const f=fixture('workspaces');f.state.snapshot.repositories=[{key:'repo',label:'Large project'}];f.state.snapshot.workspaces=[];f.state.preferences.workspaceTree={'repo:repo':true};for(let i=0;i<1000;i++){const g={key:'g'+i,label:'Same',repoKey:'repo',path:'/repo/'+i+'/same',sessions:[]};f.state.groups.set(g.key,g);}f.view.update();assert.equal(f.all().filter(n=>n.dataset.group).length,1000);assert(f.find('.workspace-list').classList.contains('large-workspace-list'));assert(f.all().find(n=>n.dataset.group==='g500').textContent.includes('500/same'),'indexed suffix remains unambiguous');const focused=f.all().find(n=>n.dataset.group==='g500');let attributeWrites=0;const setAttribute=focused.setAttribute.bind(focused);focused.setAttribute=(...args)=>{attributeWrites++;setAttribute(...args);};f.view.update();assert.equal(attributeWrites,0,'unchanged row signature skips DOM attributes');focused.focus();const first=f.state.groups.get('g0');f.state.groups.delete(first.key);f.state.groups.set(first.key,first);f.view.update();assert.equal(f.doc.activeElement,focused);assert.equal(f.all().filter(n=>n.dataset.group).at(-1).dataset.group,'g0');await f.byText('Search').action();const composing=f.find('input');composing.value='Same';composing.selectionStart=1;composing.selectionEnd=3;composing.focus();emit(composing,'compositionstart');emit(composing,'input');f.view.update();assert.equal(f.doc.activeElement,composing);assert.equal(composing.value,'Same');assert.equal(composing.selectionStart,1);assert.equal(composing.selectionEnd,3);emit(composing,'compositionend');f.abort.abort();
+ const f=fixture('workspaces');f.state.snapshot.repositories=[{key:'repo',label:'Large project'}];f.state.snapshot.workspaces=[];f.state.preferences.workspaceTree={'repo:repo':true};for(let i=0;i<1000;i++){const g={key:'g'+i,label:'Same',repoKey:'repo',path:'/repo/'+i+'/same',sessions:[]};f.state.groups.set(g.key,g);}f.view.update();assert.equal(f.all().filter(n=>n.dataset.group).length,1000);assert(f.find('.workspace-list').classList.contains('large-workspace-list'));assert(f.all().find(n=>n.dataset.group==='g500').textContent.includes('500/same'),'indexed suffix remains unambiguous');const focused=f.all().find(n=>n.dataset.group==='g500');let attributeWrites=0;const setAttribute=focused.setAttribute.bind(focused);focused.setAttribute=(...args)=>{attributeWrites++;setAttribute(...args);};f.view.update();assert.equal(attributeWrites,0,'unchanged row signature skips DOM attributes');focused.focus();const first=f.state.groups.get('g0');f.state.groups.delete(first.key);f.state.groups.set(first.key,first);f.view.update();assert.equal(f.doc.activeElement,focused);assert.equal(f.all().filter(n=>n.dataset.group).at(-1).dataset.group,'g0');const composing=f.find('input');composing.value='Same';composing.selectionStart=1;composing.selectionEnd=3;composing.focus();emit(composing,'compositionstart');emit(composing,'input');f.view.update();assert.equal(f.doc.activeElement,composing);assert.equal(composing.value,'Same');assert.equal(composing.selectionStart,1);assert.equal(composing.selectionEnd,3);emit(composing,'compositionend');f.abort.abort();
  const fields=fixture('workspaces'),{a,ga}=groups(fields);fields.state.preferences.workspaceTree['w:g-a']=true;fields.view.update();const stable=fields.all().find(n=>n.dataset.group==='g-a'),terminal=fields.all().find(n=>n.dataset.session==='1');terminal.focus();a.title='New terminal';a.agent='claude';a.lines=['new last line'];a.state='Blocked';a.branch='feature';ga.label='Renamed';ga.depth=2;ga.primary=true;fields.view.update();assert.equal(fields.all().find(n=>n.dataset.group==='g-a'),stable);assert.equal(fields.all().find(n=>n.dataset.session==='1'),terminal);assert.equal(fields.doc.activeElement,terminal);assert.equal(stable.parentElement.parentElement.dataset.depth,'2');assert(stable.textContent.includes('Renamed'));assert(stable.textContent.includes('feature'));assert(terminal.textContent.includes('New terminal'));assert(terminal.textContent.includes('new last line'));assert(terminal.getAttribute('aria-label').includes('Blocked'));assert(terminal.descendants().some(n=>n.getAttribute('class')==='agent-icon claude'));a.exited=true;fields.view.update();assert(!fields.all().some(n=>n.dataset.session==='1'),'exited session removal invalidates signature');fields.abort.abort();
  const logs=fixture('diagnostics');logs.state.logs.push({at:1000,phase:'ready',message:'Connected'});logs.state.logRevision=1;logs.view.update();const log=logs.find('.connection-log').children[0];for(let i=0;i<100;i++)logs.view.update();assert.equal(logs.find('.connection-log').children[0],log,'unchanged logs do not rebuild DOM');logs.state.logs.push({at:2000,host:'Studio Mac',phase:'denied',message:'Access denied'});logs.state.logRevision++;logs.view.update();assert.equal(logs.find('.connection-log').children.length,2);assert.equal(logs.find('.connection-log').children[1].className,'log-error');assert(logs.find('.connection-log').children[1].textContent.includes('Studio Mac'));logs.abort.abort();
  const g=fixture('git',{route:{sessionId:7},rpc:req=>req.path?{patch:req.path==='large'?'+line\n'.repeat(800):'small current'}:{files:['large','small']}});await g.flush();let latest=0;g.ctx.rpcLatest=(key,request)=>{assert.equal(key,'git-patch:7');latest++;return g.ctx.rpc(request);};g.byText('large').action();await g.flush();const patch=g.find('.git-patch');assert.equal(patch.children.length,256,'large patch yields after one bounded DOM chunk');assert.equal(patch.getAttribute('aria-busy'),'true');await g.byText('small').action();await g.flush();for(const [id,t] of [...g.timers]){g.timers.delete(id);t.fn();}await g.flush();assert.equal(patch.textContent,'small current\n');assert.equal(patch.children.length,1);assert.equal(patch.getAttribute('aria-busy'),'false');assert.equal(latest,2);const complete=g.byText('large').action();await g.flush();assert.equal(patch.children.length,256);for(let n=0;n<4;n++){for(const [id,t] of [...g.timers]){g.timers.delete(id);t.fn();}await g.flush();}await complete;assert.equal(patch.children.length,801,'all diff lines eventually render in order');assert.equal(patch.textContent,'+line\n'.repeat(800)+'\n');g.byText('large').action();await g.flush();const stopped=patch.children.length;g.abort.abort();for(const [id,t] of [...g.timers]){g.timers.delete(id);t.fn();}await g.flush();assert.equal(patch.children.length,stopped,'aborted render creates no later chunks');
@@ -317,12 +516,88 @@ async function installHandoffFragments(){
  const run=async(code,fragment)=>{const replaced=[],sheets=[],sandbox={credentials:{device_id:'dev'},transport:{rpc:async req=>{assert.equal(req.action,'install_handoff');return {fragment};}},location:{pathname:'/m/0123456789abcdef/',search:''},history:{replaceState:(_s,_t,url)=>replaced.push(url)},install:{prompt:null,show(){}},sheet:title=>sheets.push(title),t:s=>s,el:()=>({append(){}})};vm.createContext(sandbox);vm.runInContext(code+'\nglobalThis.entry=typeof installIos==="function"?installIos:installAndroid;',sandbox);await sandbox.entry();return {replaced,sheets};};
  const pair='a'.repeat(64),key='B_-0123456789abcdefghijklmnopqrstuvwxyzABCD',r='c'.repeat(32),direct=`pair=${pair}&key=${key}`;
  for(const [platform,code] of [['ios',iosFn],['android',androidFn]]){
-  for(const valid of [direct,`${direct}&r=${r}`,`${direct}&t=quick-tunnel-1.trycloudflare.com&r=${r}`,`${direct}&t=krill.example.com&r=${'d'.repeat(32)}`,`${direct}&t=a.b.co&r=${r}`]){
+  for(const valid of [direct,`${direct}&r=${r}`,`${direct}&r=${'d'.repeat(32)}`]){
    const res=await run(code,valid);assert.deepEqual(res.replaced,[`/m/0123456789abcdef/#${valid}&install=1`],`${platform}: ${valid}`);assert.equal(res.sheets.length,1);
   }
-  for(const invalid of [null,123,'',`pair=${'A'.repeat(64)}&key=${key}`,`pair=${'a'.repeat(63)}&key=${key}`,`pair=${pair}&key=${key.slice(1)}`,`${direct}&r=`,`${direct}&r=${'C'.repeat(32)}`,`${direct}&r=${'c'.repeat(31)}`,`${direct}&r=${'c'.repeat(33)}`,`${direct}&t=https://krill.example.com&r=${r}`,`${direct}&t=krill.example.com/path&r=${r}`,`${direct}&t=localhost&r=${r}`,`${direct}&t=-bad.example.com&r=${r}`,`${direct}&t=bad-.example.com&r=${r}`,`${direct}&t=a..b.com&r=${r}`,`${direct}&t=${'a'.repeat(64)}.example.com&r=${r}`,`${direct}&t=user@krill.example.com&r=${r}`,`${direct}&r=${r}&t=krill.example.com`,`${direct}&r=${r}&r=${r}`,`${direct}&install=1`,`${direct}&extra=1`]){
+  for(const invalid of [null,123,'',`${direct}&t=krill.example.com&r=${r}`,`pair=${'A'.repeat(64)}&key=${key}`,`pair=${'a'.repeat(63)}&key=${key}`,`pair=${pair}&key=${key.slice(1)}`,`${direct}&r=`,`${direct}&r=${'C'.repeat(32)}`,`${direct}&r=${'c'.repeat(31)}`,`${direct}&r=${'c'.repeat(33)}`,`${direct}&t=https://krill.example.com&r=${r}`,`${direct}&t=krill.example.com/path&r=${r}`,`${direct}&t=localhost&r=${r}`,`${direct}&t=-bad.example.com&r=${r}`,`${direct}&t=bad-.example.com&r=${r}`,`${direct}&t=a..b.com&r=${r}`,`${direct}&t=${'a'.repeat(64)}.example.com&r=${r}`,`${direct}&t=user@krill.example.com&r=${r}`,`${direct}&r=${r}&t=krill.example.com`,`${direct}&r=${r}&r=${r}`,`${direct}&install=1`,`${direct}&extra=1`]){
    await assert.rejects(()=>run(code,invalid),/Could not prepare the Home Screen app/,`${platform} must reject ${invalid}`);
   }
+ }
+ // End-to-end install handoff lifecycle: live snapshot() updates continue while open and after close, hash restores to #/host/local, and forward + back() never calls location.reload().
+ {
+  const f=fixture('workspaces'),E=f.root.constructor,lines=source.split('\n'),pick=m=>lines.find(l=>l.trim().startsWith(m));
+  const dialog=new E('dialog'),sheetBody=new E('div'),rootNode=new E('main'),bannerNode=new E('div');
+  dialog.open=false;dialog.showModal=()=>{dialog.open=true;};dialog.close=()=>{dialog.open=false;dialog.dispatchEvent(new Event('close'));};dialog.removeAttribute=k=>{delete dialog.attrs[k];};
+  sheetBody.querySelector=()=>null;f.doc.body.classList.remove=v=>{f.doc.body.classList.toggle(v,false);};
+  dialog.append(sheetBody);f.doc.body.append(rootNode,dialog);
+  const win=new EventTarget(),entries=['#/host/local'];let idx=0,reloads=0,screenUpdates=0,renderedRoutes=[];
+  const loc={pathname:'/m/0123456789abcdef/',search:'',reload(){reloads++;}};
+  Object.defineProperty(loc,'hash',{get:()=>entries[idx],set:v=>{if(v===entries[idx])return;entries.splice(idx+1,Infinity,v);idx++;win.dispatchEvent(new Event('hashchange'));}});
+  const snapIdx=lines.findIndex(l=>l.trim().startsWith('function snapshot(')),hashLine=lines.find(l=>l.includes("globalThis.addEventListener('hashchange'")),hashHandler=hashLine.slice(hashLine.indexOf("globalThis.addEventListener('hashchange'"));
+  f.doc.addEventListener=()=>{};
+  const box={
+   document:f.doc,location:loc,history:{replaceState:(_a,_b,url)=>{entries[idx]=url.slice(url.indexOf('#'));},back:()=>{idx--;win.dispatchEvent(new Event('hashchange'));}},
+   addEventListener:win.addEventListener.bind(win),URLSearchParams,AbortController,Date,
+   credentials:{device_id:'dev'},endpoint:{profiles:()=>[{id:'local',active:true}],describeHost(){}},
+   transport:{ready:true,rpc:async req=>{assert.equal(req.action,'install_handoff');return {fragment:direct};}},
+   state:{snapshot:{workspaces:[{key:'w1',label:'Initial'}],sessions:[]},connection:{phase:'ready',message:'Connected'},groups:new Map(),sessions:new Map(),expected:new Map(),preferences:{}},
+   root:rootNode,banner:bannerNode,dialog,sheetBody,lastFocus:null,lastTrigger:null,routeKey:'#/host/local',activeRouteScreen:'workspaces',
+   screen:null,abort:null,hostGeneration:1,deepLink:null,parameters:new URLSearchParams(),
+   ios:true,android:false,installed:()=>false,landing:false,scanner:null,tabletMedia:null,tabletList:null,
+   el:(...v)=>new E(...v),icon:()=>new E('svg'),t:s=>s,error:e=>{throw e;},savePreferences(){},
+   button:(label,action,cls='')=>{const b=new E('button',label,cls);b.setAttribute('aria-label',label);b.action=()=>Promise.resolve().then(action);return b;},
+   sessionScope:()=>'scope',offerInstall:()=>false,M:{screens:{},recentSession:{resolve:()=>null}}
+  };
+  box.globalThis=box;
+  box.render=()=>{const r=box.parseRoute();const currentHash=typeof box.getInstallRestore()==='string'&&loc.hash.includes('&install=1')?box.getInstallRestore():loc.hash;box.routeKey=currentHash;box.activeRouteScreen=r.screen;renderedRoutes.push(r.screen);rootNode.replaceChildren(new E('section','','workspaces screen'));box.screen={update(){screenUpdates++;}};};
+  vm.createContext(box);
+  vm.runInContext([
+   pick('let routeStack='),pick('const hostRoute='),pick('const sessionPath='),pick('const go='),pick('function back('),
+   pick('function restoreFocus()'),pick('function closeSheet()'),pick("dialog.addEventListener('close'"),pick('function sheet('),
+   pick('const pairingLink='),iosFn,androidFn,pick('const install=M.install='),pick('function parseRoute('),
+   pick('let imeComposing='),pick('function update(){'),pick('function group(data)'),
+   'let pendingRecent=null;',lines[snapIdx],lines[snapIdx+1],lines[snapIdx+2],lines[snapIdx+3],hashHandler
+  ].join('\n')+'\nglobalThis.parseRoute=parseRoute;globalThis.getInstallRestore=()=>installRestoreHash;globalThis.runIos=installIos;globalThis.runAndroid=installAndroid;globalThis.closeSheet=closeSheet;globalThis.snapshot=snapshot;globalThis.go=go;globalThis.back=back;globalThis.install=install;',box);
+  box.render();
+  // 1) iOS install sheet open -> live snapshot() still updates -> closeSheet restores #/host/local -> forward + back() does not reload.
+  await box.runIos();
+  assert.equal(dialog.open,true);
+  assert.equal(loc.hash,`#${direct}&install=1`);
+  const beforeOpenUpdate=screenUpdates;
+  box.snapshot({workspaces:[{key:'w1',label:'Updated while sheet open'}],sessions:[{id:1,worktree_key:'w1',state:'Working'}]});
+  assert.equal(screenUpdates,beforeOpenUpdate+1,'live snapshot updates continue while iOS install sheet is open');
+  assert.equal(box.state.groups.get('w1').label,'Updated while sheet open');
+  box.closeSheet();
+  assert.equal(dialog.open,false);
+  assert.equal(loc.hash,'#/host/local','closing install sheet restores #/host/local');
+  box.snapshot({workspaces:[{key:'w1',label:'Updated after close'}],sessions:[{id:1,worktree_key:'w1',state:'Waiting'}]});
+  assert.equal(screenUpdates,beforeOpenUpdate+2,'live snapshot updates continue after closing install sheet');
+  assert.equal(box.state.groups.get('w1').label,'Updated after close');
+  box.go('/settings');
+  assert.equal(loc.hash,'#/settings');
+  box.back();
+  assert.equal(loc.hash,'#/host/local','Back returns to #/host/local');
+  assert.equal(reloads,0,'Back never triggers location.reload()');
+  // 2) Android install sheet with deferred beforeinstallprompt -> keeps &install=1 until install.show() settles, then restores #/host/local.
+  const choice=deferred();let prompted=0;
+  box.install.prompt={prompt:async()=>{prompted++;},userChoice:choice.promise};
+  await box.runAndroid();
+  assert.equal(dialog.open,true);
+  assert.equal(loc.hash,`#${direct}&install=1`);
+  const installBtn=sheetBody.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Install');
+  const pendingInstall=installBtn.action();
+  await f.flush();
+  assert.equal(dialog.open,false);
+  assert.equal(prompted,1);
+  assert.equal(loc.hash,`#${direct}&install=1`,'Android Install button keeps handoff hash while native prompt is open');
+  box.snapshot({workspaces:[{key:'w1',label:'Updated during Android prompt'}],sessions:[{id:1,worktree_key:'w1',state:'Done'}]});
+  assert.equal(screenUpdates,beforeOpenUpdate+3,'live snapshot updates continue while Android native prompt awaits userChoice');
+  choice.resolve({outcome:'dismissed'});
+  await pendingInstall;
+  assert.equal(loc.hash,'#/host/local','settling install.show() restores #/host/local');
+  box.go('/settings');box.back();
+  assert.equal(loc.hash,'#/host/local');assert.equal(reloads,0);
+  f.abort.abort();
  }
  console.log('PASS REMOTE-001: iOS/Android install_handoff accepts direct, relay and fixed/named tunnel fragments and rejects malformed fragments');
 }
@@ -342,7 +617,7 @@ async function layoutAnchors(){
  // Supply geometry explicitly: the shared fixture otherwise has clientHeight=0 semantics.
  const geometry=(f,port,predicate)=>{port.clientHeight=100;port.getBoundingClientRect=()=>({top:0,bottom:100});port.querySelectorAll=()=>f.all().filter(n=>port.contains(n)&&predicate(n));};
  const h=fixture('home');const host={id:'one',name:'PC',connection:{phase:'ready'},snapshot:{sessions:[],orchestration:{}}};h.ctx.connections=[host];h.view.update();const home=h.find('.home-list'),card=h.find('.host-card');home.scrollTop=88;geometry(h,home,n=>n.classList.contains('host-card'));card.getBoundingClientRect=()=>({top:200+(h.find('#confirmation-requests')?120:0)-home.scrollTop,bottom:300+(h.find('#confirmation-requests')?120:0)-home.scrollTop});h.find('.host-main').focus();const y=card.getBoundingClientRect().top;host.snapshot.orchestration.gates=[{id:'gate',status:'pending'}];h.view.update();assert.equal(card.getBoundingClientRect().top,y);assert.equal(home.scrollTop,208);host.snapshot.orchestration.gates=[];h.view.update();assert.equal(home.scrollTop,88);assert(!h.find('#confirmation-requests'));h.abort.abort();
- const w=fixture('workspaces');const {ga}=groups(w);w.view.update();const port=w.find('.workspace-list'),row=w.all().find(n=>n.dataset.group===ga.key),node=row.parentElement.parentElement;assert.equal(node.style.containIntrinsicBlockSize,'auto 102px');port.scrollTop=88;geometry(w,port,n=>n.dataset.group);const rowTop=()=>{const rows=port.querySelectorAll();return rows.indexOf(row)*100-port.scrollTop;};for(const r of port.querySelectorAll())r.getBoundingClientRect=()=>({top:port.querySelectorAll().indexOf(r)*100-port.scrollTop,bottom:port.querySelectorAll().indexOf(r)*100+100-port.scrollTop});row.focus();const before=rowTop();const first={key:'new',label:'New first',repoKey:'repo',pinned:true,sessions:[]};w.state.groups=new Map([[first.key,first],...w.state.groups]);w.view.update();assert.equal(rowTop(),before);w.abort.abort();
+ const w=fixture('workspaces');const {ga}=groups(w);w.view.update();const port=w.find('.workspace-list'),row=w.all().find(n=>n.dataset.group===ga.key),node=row.parentElement.parentElement;assert.equal(node.style.containIntrinsicBlockSize,'auto 78px','phone workspace terminals start folded (Orca lists workspaces only)');port.scrollTop=88;geometry(w,port,n=>n.dataset.group);const rowTop=()=>{const rows=port.querySelectorAll();return rows.indexOf(row)*100-port.scrollTop;};for(const r of port.querySelectorAll())r.getBoundingClientRect=()=>({top:port.querySelectorAll().indexOf(r)*100-port.scrollTop,bottom:port.querySelectorAll().indexOf(r)*100+100-port.scrollTop});row.focus();const before=rowTop();const first={key:'new',label:'New first',repoKey:'repo',pinned:true,sessions:[]};w.state.groups=new Map([[first.key,first],...w.state.groups]);w.view.update();assert.equal(rowTop(),before);w.abort.abort();
  const logs=fixture('diagnostics',{state:{logs:Array.from({length:100},(_,i)=>({at:1000+i*1000,phase:'ready',message:'Event '+i}))}}),logPort=logs.find('.connection-log'),survivor=logPort.children[5];geometry(logs,logPort,n=>n.tagName==='LI');logPort.scrollTop=250;for(const r of logPort.children)r.getBoundingClientRect=()=>({top:logPort.children.indexOf(r)*50-logPort.scrollTop,bottom:logPort.children.indexOf(r)*50+50-logPort.scrollTop});const logY=survivor.getBoundingClientRect().top;logs.state.logs=[...logs.state.logs.slice(1),{at:101000,phase:'ready',message:'Event 100'}];logs.state.logRevision=1;logs.view.update();assert.equal(logPort.children[4],survivor);assert.equal(survivor.getBoundingClientRect().top,logY);assert.equal(logPort.scrollTop,200);logs.abort.abort();
  const o=fixture('orchestration',{state:{snapshot:{orchestration:{questions:[{id:'q',to:'user',summary:'Question'}]}}}}),op=o.find('#orchestration'),question=o.find('.gate-card'),input=o.find('textarea');geometry(o,op,n=>n.classList.contains('gate-card'));op.scrollTop=177;question.getBoundingClientRect=()=>({top:op.children.indexOf(question)*300-op.scrollTop,bottom:op.children.indexOf(question)*300+300-op.scrollTop});input.focus();assert(o.find('.action-status').hidden);const qY=question.getBoundingClientRect().top;o.state.snapshot.orchestration.gates=[{id:'g',question:'New gate',status:'pending',options:['Proceed']}];o.view.update();assert.equal(question.getBoundingClientRect().top,qY);assert.equal(op.scrollTop,477);assert.equal(o.find('textarea'),input);o.abort.abort();
  const settings=fixture('settings',{route:{subpage:'terminal'}}),settingsPort=settings.find('.settings-list');settingsPort.scrollTop=900;const keyGroup=settings.all().find(n=>n.dataset.key==='esc').parentElement.parentElement;keyGroup.querySelector=selector=>keyGroup.descendants().find(n=>n.dataset.key==='esc'&&(!selector.includes('data-step')||n.dataset.step==='1')&&!n.disabled);const oldFocus=settings.root.constructor.prototype.focus;settings.root.constructor.prototype.focus=function(options){this.focusOptions=options;settings.doc.activeElement=this;};settings.all().find(n=>n.dataset.key==='esc'&&n.dataset.step==='1').action();assert.equal(settingsPort.scrollTop,900);assert.equal(settings.doc.activeElement.focusOptions.preventScroll,true);settings.root.constructor.prototype.focus=oldFocus;settings.abort.abort();
@@ -396,5 +671,23 @@ function pathLabelSnapshots(){
  console.log('PASS path label snapshots and actual Home module: drive, UNC, platform metadata, POSIX literal backslash, trailing/root/empty, provided workspace/session labels');
 }
 
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function dropScreen(){
+ const CHUNK=384*1024,size=CHUNK+10,id='a'.repeat(32),shared=[];let held=0,lost=true,removed=false;
+ const f=fixture('drop',{globals:{crypto:{getRandomValues:b=>b.fill(7)},btoa:s=>Buffer.from(s,'binary').toString('base64'),atob:s=>Buffer.from(s,'base64').toString('binary'),Blob:class{constructor(parts){this.parts=parts;}},File:class{constructor(parts,name){this.parts=parts;this.name=name;}},navigator:{canShare:()=>true,share:async({files})=>{shared.push(...files);}}},rpc:req=>{
+  if(req.action==='drop_list')return {items:removed?[]:[{id,name:'report.md',size:5,modified_unix_ms:0}],inbox:'/Users/me/Downloads/Krill Drop'};
+  if(req.action==='drop_get')return {data:Buffer.from('hello').toString('base64'),size:5,eof:true};
+  if(req.action==='drop_remove'){removed=true;return {removed:true};}
+  if(req.offset===held)held+=Buffer.from(req.data,'base64').length;
+  if(lost){lost=false;return Promise.reject(Error('Disconnected. The action was not resent.'));}
+  return held===req.size?{received:held,saved:'/Users/me/Downloads/Krill Drop/사진.jpg'}:{received:held};}});
+ await f.flush();assert(f.root.textContent.includes('/Users/me/Downloads/Krill Drop'));assert(f.root.textContent.includes('report.md'));
+ const picker=f.all().find(n=>n.tagName==='INPUT'&&n.type==='file');picker.files=[{name:'사진.jpg',size,slice:(a,b)=>({arrayBuffer:async()=>new Uint8Array(b-a).buffer})}];emit(picker,'change');
+ for(let i=0;i<5;i++){await f.flush();for(const [key,timer] of [...f.timers])if(timer.ms>=1000){f.timers.delete(key);timer.fn();}}
+ const puts=f.calls.filter(c=>c.action==='drop_put');assert.deepEqual(puts.map(c=>c.offset),[0,0,CHUNK],'a lost reply is resent at the same offset and the PC answers what it holds');assert.equal(puts[0].upload,'07'.repeat(16));assert.equal(held,size);assert(f.root.textContent.includes('Saved to /Users/me/Downloads/Krill Drop/사진.jpg'));
+ await f.byText('Download').action();await f.flush();assert.equal(shared.length,1);assert.equal(shared[0].name,'report.md');assert.equal(Buffer.from(await shared[0].parts[0].parts[0]).toString(),'hello');
+ await f.byText('Remove').action();await f.flush();assert(f.calls.some(c=>c.action==='drop_remove'&&c.id===id));assert(f.root.textContent.includes('Nothing waiting'));f.abort.abort();
+ const w=fixture('workspaces');assert(w.byText('Krill Drop').hidden,'older desktops without drop show no entry');w.state.snapshot.capabilities={drop:true};w.view.update();assert(!w.byText('Krill Drop').hidden);await w.byText('Krill Drop').action();assert.equal(w.routes.at(-1),'/drop');w.abort.abort();
+ console.log('PASS Krill Drop screen: inbox path, chunked upload resumed after a lost reply, download shared as a file, remove, empty state and the capability-gated PC entry');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

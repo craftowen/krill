@@ -4,6 +4,22 @@ use krill_proto::orchestration::{
     RunStatus, TaskStatus,
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
+
+#[derive(serde::Serialize)]
+struct MobileRunSummary<'a> {
+    id: &'a str,
+    title: &'a str,
+    status: RunStatus,
+}
+
+#[derive(serde::Serialize)]
+struct MobileTaskSummary<'a> {
+    id: &'a str,
+    run_id: &'a str,
+    title: &'a str,
+    status: TaskStatus,
+}
 
 fn run_active(store: &OrchestrationStore, id: &str) -> bool {
     store
@@ -49,6 +65,12 @@ pub(super) fn gate_pending(store: &OrchestrationStore, gate: &DecisionGate) -> b
 }
 
 pub(super) fn snapshot(store: &OrchestrationStore) -> Value {
+    let active_runs: HashSet<&str> = store
+        .runs
+        .iter()
+        .filter(|r| r.status == RunStatus::Active)
+        .map(|r| r.id.as_str())
+        .collect();
     let questions: Vec<_> = store
         .messages
         .iter()
@@ -63,11 +85,22 @@ pub(super) fn snapshot(store: &OrchestrationStore) -> Value {
         .runs
         .iter()
         .filter(|r| r.status == RunStatus::Active)
+        .map(|r| MobileRunSummary {
+            id: &r.id,
+            title: &r.title,
+            status: r.status,
+        })
         .collect();
     let tasks: Vec<_> = store
         .tasks
         .iter()
-        .filter(|t| run_active(store, &t.run_id))
+        .filter(|t| active_runs.contains(t.run_id.as_str()))
+        .map(|t| MobileTaskSummary {
+            id: &t.id,
+            run_id: &t.run_id,
+            title: &t.title,
+            status: t.status,
+        })
         .collect();
     json!({"runs":runs,"tasks":tasks,"gates":gates,"questions":questions})
 }
@@ -155,5 +188,111 @@ mod tests {
                 .iter()
                 .any(|m| m.to == "coordinator" && !m.acked)
         );
+    }
+
+    #[test]
+    fn mobile_requests_snapshot_projects_run_and_task_summaries() {
+        let mut store = OrchestrationStore::default();
+        let active_first = store.create_run("First active", Some(7)).unwrap();
+        let finished = store.create_run("Finished run", Some(8)).unwrap();
+        let active_second = store.create_run("Second active", None).unwrap();
+
+        let task_a = store
+            .create_task(
+                &active_first.id,
+                "Ship mobile",
+                "large task description omit me",
+                vec![],
+            )
+            .unwrap();
+        let task_b = store
+            .create_task(
+                &active_first.id,
+                "Follow-up check",
+                "pending task description omit me",
+                vec![],
+            )
+            .unwrap();
+        let old_task = store
+            .create_task(
+                &finished.id,
+                "Old task",
+                "finished run task omit me",
+                vec![],
+            )
+            .unwrap();
+        let task_c = store
+            .create_task(
+                &active_second.id,
+                "Verify mobile",
+                "second task description omit me",
+                vec![],
+            )
+            .unwrap();
+        store
+            .update_task(
+                &task_a.id,
+                TaskStatus::Completed,
+                Some("large result summary omit me".into()),
+            )
+            .unwrap();
+        store
+            .update_task(
+                &old_task.id,
+                TaskStatus::Completed,
+                Some("finished summary omit me".into()),
+            )
+            .unwrap();
+
+        let gate = store
+            .create_gate(
+                "coordinator",
+                "Approve deploy?",
+                vec!["Approve".into(), "Hold".into()],
+                Some(active_first.id.clone()),
+                Some(task_b.id.clone()),
+            )
+            .unwrap();
+        let question = store
+            .send_message(&SendParams {
+                from: "worker".into(),
+                to: "mobile".into(),
+                msg_type: MessageType::Question,
+                summary: "Use staging?".into(),
+                body: "Detailed question body".into(),
+                run_id: Some(active_first.id.clone()),
+                task_id: Some(task_b.id.clone()),
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            })
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let data = snapshot(&store);
+        assert_eq!(
+            data["runs"],
+            json!([
+                {"id": active_first.id, "title": "First active", "status": "active"},
+                {"id": active_second.id, "title": "Second active", "status": "active"},
+            ])
+        );
+        assert_eq!(
+            data["tasks"],
+            json!([
+                {"id": task_a.id, "run_id": active_first.id, "title": "Ship mobile", "status": "completed"},
+                {"id": task_b.id, "run_id": active_first.id, "title": "Follow-up check", "status": "ready"},
+                {"id": task_c.id, "run_id": active_second.id, "title": "Verify mobile", "status": "ready"},
+            ])
+        );
+        assert_eq!(data["gates"], json!([gate]));
+        assert_eq!(data["questions"], json!([question]));
+
+        let raw = serde_json::to_string(&data).unwrap();
+        assert!(!raw.contains("description"));
+        assert!(!raw.contains("result_summary"));
+        assert!(!raw.contains("omit me"));
     }
 }

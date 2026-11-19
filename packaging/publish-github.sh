@@ -279,9 +279,7 @@ elif ! mobile_deployed "$MOBILE_HASH"; then
   mobile_deployed "$MOBILE_HASH" ||
     soft_fail "mobile PWA ${MOBILE_HASH} is not deployed to ${MOBILE_ORIGIN}; run ${MOBILE_CLOUD}/deploy.sh --repo $PWD (or set KRILL_MOBILE_CLOUD_DIR)"
 fi
-if [[ -f "$MOBILE_CLOUD/verify-connection.mjs" ]] && ! node "$MOBILE_CLOUD/verify-connection.mjs" --repo "$PWD" --origin "$MOBILE_ORIGIN" --hash "$MOBILE_HASH" >/dev/null; then
-  soft_fail "mobile connection verification failed for ${MOBILE_HASH}; run node ${MOBILE_CLOUD}/verify-connection.mjs --repo $PWD"
-fi
+# 모바일 연결(페어링·E2EE·터미널) 검증은 --verified-release receipt의 mobile-real-browser 범위가 출고 바이너리로 한다.
 # 공개 표면: 소스 tarball(git archive HEAD)과 같은 내용에 내부 문서·비밀이 없어야 한다.
 FORBIDDEN=$(git ls-tree -r --name-only HEAD | grep -E '^(docs/(boost-|reports/)|\.night/)' || true)
 [[ -z "$FORBIDDEN" ]] || hard_fail "internal files are tracked and would ship in the source tarball:"$'\n'"$FORBIDDEN"

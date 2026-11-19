@@ -84,7 +84,6 @@ fn device_line_avoids_paired_duplication_and_handles_never_seen() {
     let now = 10_000_000_000;
     // 오프라인·접속 기록 없음: 상태는 OFFLINE 1회, 마지막 활동은 NEVER.
     let line = device_line(&device(now - 90_000, 0), false, now);
-    assert!(line.starts_with("○ "), "got {line}");
     assert!(line.contains(text::OFFLINE.get()), "got {line}");
     assert!(line.contains(text::NEVER.get()), "got {line}");
     assert_eq!(
@@ -98,9 +97,34 @@ fn device_line_avoids_paired_duplication_and_handles_never_seen() {
         true,
         now,
     );
-    assert!(line.starts_with("● "), "got {line}");
     assert!(line.contains(text::CONNECTED.get()), "got {line}");
     assert!(!line.contains(text::OFFLINE.get()), "got {line}");
+}
+
+/// 값이 같으면 다시 그리지 않는다. 화면에 있을 때만 카운트다운과 경과 표시가 시간을 따른다.
+#[test]
+fn poll_redraws_only_when_shown_values_change() {
+    let mut panel = Panel::new(Arc::new(|_| Err("unused".into())));
+    let start = 10_000_000_000 - 10_000_000_000 % 60_000;
+    assert!(panel.take_shown_change(start, true));
+    assert!(!panel.take_shown_change(start + 1_000, true));
+    assert!(panel.take_shown_change(start + 60_000, true), "ago text");
+
+    panel.offer = Some(("u".into(), start + 120_000, Qr::encode("u").unwrap()));
+    assert!(panel.take_shown_change(start + 60_100, true));
+    assert!(!panel.take_shown_change(start + 60_900, true));
+    assert!(panel.take_shown_change(start + 61_100, true), "countdown");
+
+    assert!(panel.take_shown_change(start + 61_100, false));
+    assert!(
+        !panel.take_shown_change(start + 200_000, false),
+        "off screen"
+    );
+    panel.devices.push(device(start, 0));
+    assert!(
+        panel.take_shown_change(start + 200_000, false),
+        "real change"
+    );
 }
 
 #[test]
@@ -435,26 +459,27 @@ fn mobile_qr_cards_fit_without_clipping_at_supported_widths(cx: &mut gpui::TestA
     }
     {
         let (_view, vcx) = offer_view(cx, false);
-        // 설정은 왼쪽 탐색 248px가 고정이라 360px 창에서는 본문 열이 48px뿐이다(기존부터, 측정만 한다).
+        // 좁은 설정 창은 상단 탐색으로 전환해 QR이 들어갈 본문 폭을 확보한다.
         for width in [360., 560., 580., 598., 800., 1100.] {
             for scale in [1., 1.25, 1.5, 2.] {
                 redraw(vcx, width, scale);
-                let card = vcx.debug_bounds("mobile-qr-card").expect("tab qr card");
+                let qr_box = vcx.debug_bounds("mobile-qr-card").expect("tab qr card");
                 let copy = vcx.debug_bounds("mobile-copy-link").expect("tab copy");
-                // QR 캔버스는 선택자가 없다. 카드(p_3 + 테두리 1)가 가운데 정렬하므로 실제 카드 경계와 렌더 크기로 위치를 구한다.
-                let side = f32::from(qr_side(px(220.), scale));
-                let center = f32::from(card.center().x);
-                let qr = (center - side / 2., center + side / 2.);
-                let content = (f32::from(card.left()) + 13., f32::from(card.right()) - 13.);
+                let panel = vcx
+                    .debug_bounds("admin-mobile-pair-section")
+                    .expect("pair panel");
+                // QR 상자는 캔버스 폭 그대로다. 패널의 안쪽 여백은 12이고, 배율에 따라 테두리 픽셀이 반올림된다.
+                let side = f32::from(qr_side(px(148.), scale));
+                let qr = span(qr_box);
+                let content = (
+                    f32::from(panel.left()) + 12.,
+                    f32::from(panel.right()) - 12.,
+                );
+                assert!((qr.1 - qr.0 - side).abs() < 0.01, "{qr:?} side={side}");
                 eprintln!(
-                    "tab w={width} @{scale}x card={:?} content={content:?} qr~{qr:?} side={side} fits_before_220={} copy={:?}",
-                    span(card),
-                    content.1 - content.0 >= 220.,
+                    "tab w={width} @{scale}x content={content:?} qr={qr:?} side={side} copy={:?}",
                     span(copy)
                 );
-                if width < 598. {
-                    continue;
-                }
                 let view = (0., width);
                 for (name, b) in [("qr", qr), ("copy", span(copy))] {
                     if !inside(b, content) || !inside(b, view) {
@@ -489,6 +514,96 @@ fn mobile_copy_buttons_copy_the_url_encoded_in_the_qr(cx: &mut gpui::TestAppCont
             assert_eq!(qr, &Qr::encode(&copied).unwrap(), "{selector}");
             assert_eq!(mobile.copied_url.as_deref(), Some(FIXTURE_TICKET));
         });
+    }
+}
+
+/// 긴 설명·주소·기기 상태가 QR이나 옆 열과 겹치지 않고, QR 상자가 정사각형을 유지한다.
+#[gpui::test]
+fn mobile_page_long_details_stay_in_their_columns(cx: &mut gpui::TestAppContext) {
+    let (view, vcx) = offer_view(cx, true);
+    view.update(vcx, |view, _| {
+        view.mobile.backup_address = Some("100.113.52.255:65535".into());
+        view.mobile.account.email = Some("very-long-account-address@example.test".into());
+        view.mobile.devices = (0..12)
+            .map(|index| PairedMobileDevice {
+                device_id: format!("device-{index}"),
+                label: "긴 이름의 휴대폰 · Mobile browser iPhone / iPad (Safari)".into(),
+                key_fingerprint: "fixture-fingerprint".into(),
+                ..device(1, 0)
+            })
+            .collect();
+    });
+    for language in [crate::i18n::Language::Ko, crate::i18n::Language::En] {
+        vcx.update(|_, cx| crate::i18n::set_language(language, cx));
+        for width in [360., 480., 720., 959., 1100.] {
+            for scale in [1., 1.25, 1.5, 2.] {
+                redraw(vcx, width, scale);
+                let card = vcx.debug_bounds("mobile-page-card").unwrap();
+                let description = vcx.debug_bounds("mobile-page-description").unwrap();
+                let address = vcx.debug_bounds("mobile-page-address").unwrap();
+                let qr = vcx.debug_bounds("mobile-page-qr").unwrap();
+                let phone = vcx.debug_bounds("mobile-page-phone").unwrap();
+                let item = vcx.debug_bounds("mobile-page-device-0").unwrap();
+                let status = vcx.debug_bounds("mobile-page-device-status-0").unwrap();
+                assert!(
+                    inside(span(description), span(card)),
+                    "description {width} @{scale}"
+                );
+                assert!(
+                    inside(span(address), span(description)),
+                    "address {width} @{scale}"
+                );
+                assert!(inside(span(qr), span(card)), "QR box {width} @{scale}");
+                assert!(
+                    (f32::from(qr.size.width - qr.size.height)).abs() < 0.01,
+                    "QR stretched {qr:?}"
+                );
+                assert!(
+                    description.right() <= qr.left() || qr.top() >= description.bottom(),
+                    "columns overlap {width} @{scale}"
+                );
+                assert!(inside(span(status), span(item)) && inside(span(item), span(phone)));
+                assert!(
+                    status.bottom() <= item.bottom(),
+                    "status clipped {width} @{scale}"
+                );
+                assert!(f32::from(status.size.height) > 20., "long status must wrap");
+            }
+        }
+    }
+    vcx.update(|_, cx| crate::i18n::set_language(crate::i18n::Language::Ko, cx));
+}
+
+#[gpui::test]
+fn mobile_qr_fits_small_windows_at_maximum_ui_zoom(cx: &mut gpui::TestAppContext) {
+    for page in [true, false] {
+        let (view, vcx) = offer_view(cx, page);
+        vcx.simulate_scale_factor_change(1.);
+        vcx.simulate_resize(gpui::size(px(360.), px(900.)));
+        vcx.update(|window, cx| {
+            window.set_rem_size(px(32.));
+            view.update(cx, |_, cx| cx.notify());
+        });
+        vcx.run_until_parked();
+        if page {
+            let qr = vcx.debug_bounds("mobile-page-qr").unwrap();
+            let card = vcx.debug_bounds("mobile-page-card").unwrap();
+            assert!(
+                inside(span(qr), span(card)) && inside(span(qr), (0., 360.)),
+                "page QR {qr:?} card {card:?}"
+            );
+        } else {
+            let card = vcx.debug_bounds("mobile-qr-card").unwrap();
+            let side = qr_side(px(220.), 1.);
+            let qr = (
+                f32::from(card.center().x - side / 2.),
+                f32::from(card.center().x + side / 2.),
+            );
+            assert!(
+                inside(qr, span(card)) && inside(qr, (0., 360.)),
+                "settings QR {qr:?} card {card:?}"
+            );
+        }
     }
 }
 

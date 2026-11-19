@@ -289,9 +289,9 @@ dependencies = [
 
 [[package]]
 name = "async-executor"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
+checksum = "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
 dependencies = [
  "async-task",
  "concurrent-queue",
@@ -3784,8 +3784,9 @@ dependencies = [
 
 [[package]]
 name = "krill"
-version = "0.2.48"
+version = "0.3.14"
 dependencies = [
+ "embed-resource",
  "krill-hosts",
  "krill-log",
  "krill-proto",
@@ -3800,14 +3801,16 @@ dependencies = [
  "sysinfo",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
+ "unicode-width",
+ "winapi-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "krill-app"
-version = "0.2.48"
+version = "0.3.14"
 dependencies = [
  "block2 0.6.2",
- "chrono",
  "embed-resource",
  "gpui-component",
  "gpui-kit-assets",
@@ -3819,6 +3822,7 @@ dependencies = [
  "krill-proto",
  "krill-term",
  "krilld",
+ "libc",
  "objc2 0.6.5",
  "objc2-foundation 0.3.2",
  "objc2-user-notifications",
@@ -3831,7 +3835,8 @@ dependencies = [
  "rustix-openpty",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
+ "sysinfo",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
@@ -3840,8 +3845,9 @@ dependencies = [
 
 [[package]]
 name = "krill-holder"
-version = "0.2.48"
+version = "0.3.14"
 dependencies = [
+ "embed-resource",
  "krill-log",
  "krill-proto",
  "libc",
@@ -3853,7 +3859,7 @@ dependencies = [
 
 [[package]]
 name = "krill-hosts"
-version = "0.2.48"
+version = "0.3.14"
 dependencies = [
  "krill-proto",
  "postcard",
@@ -3864,8 +3870,9 @@ dependencies = [
 
 [[package]]
 name = "krill-link"
-version = "0.2.48"
+version = "0.3.14"
 dependencies = [
+ "embed-resource",
  "iroh",
  "krill-holder",
  "krill-log",
@@ -3884,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "krill-log"
-version = "0.2.48"
+version = "0.3.14"
 dependencies = [
  "log",
  "rustix",
@@ -3893,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "krill-proto"
-version = "0.2.48"
+version = "0.3.14"
 dependencies = [
  "base64 0.22.1",
  "postcard",
@@ -3912,7 +3919,7 @@ dependencies = [
 
 [[package]]
 name = "krill-term"
-version = "0.2.48"
+version = "0.3.14"
 dependencies = [
  "krill-proto",
  "unicode-width",
@@ -3920,13 +3927,14 @@ dependencies = [
 
 [[package]]
 name = "krilld"
-version = "0.2.48"
+version = "0.3.14"
 dependencies = [
  "aes",
  "alacritty_terminal",
  "cbc",
  "core-foundation 0.10.1",
  "crc32fast",
+ "embed-resource",
  "krill-holder",
  "krill-log",
  "krill-proto",
@@ -3945,7 +3953,7 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "toml 1.1.8+spec-1.1.0",
@@ -6627,9 +6635,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",

@@ -1047,6 +1047,27 @@ fn worktreeinclude_doublestar_matches_root_and_nested_env_files() {
 }
 
 #[test]
+fn glob_path_matches_worst_case_doublestar_and_leading_bracket_class() {
+    let start = std::time::Instant::now();
+    let long_a = vec!["a"; 40].join("/");
+    assert!(!super::glob_path_matches(
+        "**/a/**/a/**/a/**/a/**/a/**/b",
+        &long_a
+    ));
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(50),
+        "worst-case glob took {:?}",
+        start.elapsed()
+    );
+    assert!(super::glob_path_matches("**/a/**/b", "x/a/y/z/a/b"));
+    assert!(super::glob_path_matches("[]a].txt", "].txt"));
+    assert!(super::glob_path_matches("[]a].txt", "a.txt"));
+    assert!(!super::glob_path_matches("[!]a].txt", "].txt"));
+    assert!(!super::glob_path_matches("[!]a].txt", "a.txt"));
+    assert!(super::glob_path_matches("[!]a].txt", "b.txt"));
+}
+
+#[test]
 fn non_git_folder_project_creates_workspace_at_folder_path() {
     let dir = std::env::temp_dir().join(format!("mkwt-folder-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();

@@ -39,7 +39,7 @@ try {
     Assert (Test-Path -LiteralPath $zip) 'Valid pinned backend did not produce a ZIP'
     $unpacked = Join-Path $root 'unpacked'
     Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
-    foreach ($name in @('conpty.dll', 'x64\OpenConsole.exe', 'Krill.json', 'krill-holder.exe')) {
+    foreach ($name in @('conpty.dll', 'x64\OpenConsole.exe', 'arm64\OpenConsole.exe', 'Krill.json', 'krill-holder.exe')) {
         Assert (Test-Path -LiteralPath (Join-Path $unpacked "Krill\$name")) "ZIP missing $name"
     }
     $info = Get-Content -LiteralPath (Join-Path $unpacked 'Krill\Krill.json') -Raw | ConvertFrom-Json

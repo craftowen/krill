@@ -2372,3 +2372,37 @@ fn asymmetric_rules_do_not_ping_pong_but_exhausted_account_still_escapes() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// 멈춘 Orca의 오래된 캐시 행이 호스트 계정의 현재 로그인 이름이 되지 않는다.
+#[test]
+fn stale_orca_row_does_not_name_host_account() {
+    use krill_proto::usage::ProviderKind;
+
+    let home = dir("orca-host-email-home");
+    let state = dir("orca-host-email-state");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let cache = home.join(".claude").join(ORCA_CACHE);
+    fs::write(
+        &cache,
+        r#"{"accounts":[{"host":true,"label":"old@example.dev"}]}"#,
+    )
+    .unwrap();
+    let host_email = || {
+        accounts::refresh_accounts(&home, Some(&state))
+            .accounts
+            .into_iter()
+            .find(|a| a.provider == ProviderKind::Claude && a.host_default)
+            .unwrap()
+            .email
+    };
+    assert_eq!(host_email().as_deref(), Some("old@example.dev"));
+    fs::File::options()
+        .write(true)
+        .open(&cache)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_hours(2))
+        .unwrap();
+    assert_eq!(host_email(), None);
+    fs::remove_dir_all(&home).ok();
+    fs::remove_dir_all(&state).ok();
+}

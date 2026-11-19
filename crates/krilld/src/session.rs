@@ -194,7 +194,7 @@ struct Out {
     /// 최근 원본. 맨 앞 바이트의 seq는 `end - ring.len()`.
     ring: VecDeque<u8>,
     end: u64,
-    /// 마지막으로 알린 화면 revision.
+    /// 마지막으로 알린 화면 revision. 리더는 디스크 기록 전에 먼저 올리므로(`reveal`) `end`보다 앞설 수 있다.
     revision: u64,
     closed: bool,
     /// publish·wake 세대. 잠금 밖에서 대기 조건을 평가하는 동안 지난 알림을 놓치지 않는다.
@@ -232,15 +232,30 @@ struct Shared {
     look: Arc<Appearance>,
     out: Mutex<Out>,
     changed: Condvar,
+    /// 화면 구독자 전용 알림(revision·종료·wake). 디스크 기록 전 revision 알림이 원본 구독자를 헛깨우지 않는다.
+    shown: Condvar,
     paused: AtomicBool,
     /// 링 밖 원본을 읽을 디스크 저장소(기록하지 않는 세션은 `None`).
     store: Option<Arc<Store>>,
 }
 
 impl Shared {
+    /// 엔진에 반영한 화면을 디스크 기록보다 먼저 화면 구독자에게 알린다. 원본 링·`end`는 [`Self::publish`]가 기록 뒤에 민다.
+    fn reveal(&self, revision: u64) {
+        let mut out = lock(&self.out);
+        if revision <= out.revision {
+            return;
+        }
+        out.revision = revision;
+        out.generation = out.generation.wrapping_add(1);
+        drop(out);
+        self.shown.notify_all();
+    }
+
     /// 엔진 변경을 알린다. `bytes`는 방금 디스크에 넘긴 원본.
     fn publish(&self, bytes: &[u8], revision: u64, closed: bool) {
         let mut out = lock(&self.out);
+        let shown = revision > out.revision || closed;
         let held = out.ring.len();
         let over = (held + bytes.len()).saturating_sub(RING);
         out.ring.drain(..over.min(held));
@@ -255,6 +270,9 @@ impl Shared {
         out.generation = out.generation.wrapping_add(1);
         drop(out);
         self.changed.notify_all();
+        if shown {
+            self.shown.notify_all();
+        }
     }
 
     /// 구독자가 0이 된 지 [`PARK_GRACE`]가 지났다. 그 사이 구독자가 오갔으면(`epoch`가 다르면) 아무것도 안 한다.
@@ -376,6 +394,7 @@ impl Session {
                 generation: 0,
             }),
             changed: Condvar::new(),
+            shown: Condvar::new(),
             paused: AtomicBool::new(false),
             store: rec
                 .as_ref()
@@ -501,20 +520,6 @@ pub enum Read {
     Idle(Pulse),
 }
 
-/// 묶음 종료 동안 새 attach·입력·출력을 막는다. holder fd는 계속 유지한다.
-#[must_use = "묶음 종료가 끝날 때까지 보관해야 한다"]
-pub(crate) struct HibernationGuard<'a> {
-    _input: MutexGuard<'a, input::State>,
-    clients: MutexGuard<'a, crate::attach::roles::Clients>,
-    _live: MutexGuard<'a, Live>,
-}
-
-impl HibernationGuard<'_> {
-    pub(crate) fn sleeping(&mut self) {
-        self.clients.sleeping = true;
-    }
-}
-
 impl Tap {
     /// 목록 표시용 터미널 제목([`krill_proto::control::display_title`]).
     pub(crate) fn title(&self) -> Option<String> {
@@ -531,32 +536,6 @@ impl Tap {
         let mut live = self.0.live();
         live.done_ns = ns;
         live.input_since_done = live.last_input_ns >= ns;
-    }
-
-    /// 연결·입력·출력과 직렬화한 최종 검사. 묶음 전체의 guard를 모은 뒤 종료를 시작한다.
-    pub(crate) fn hibernation_guard(
-        &self,
-        done_ns: u64,
-        idle: Duration,
-    ) -> Option<HibernationGuard<'_>> {
-        let input = self.0.input.try_lock().ok()?;
-        let clients = self.0.clients.lock().ok()?;
-        let live = self.0.live();
-        if clients.sleeping
-            || !clients.is_empty()
-            || live.viewers != 0
-            || live.done_ns != done_ns
-            || live.input_since_done
-            || live.last_output.elapsed() < idle
-            || clients.last_attached.is_some_and(|t| t.elapsed() < idle)
-        {
-            return None;
-        }
-        Some(HibernationGuard {
-            _input: input,
-            clients,
-            _live: live,
-        })
     }
 
     /// 화면 구독을 시작한다(MK-035). 강등된 세션이면 핫 스크롤백을 다시 쌓기 시작한다. 화면을 뜨기 전에 부른다.
@@ -731,7 +710,9 @@ impl Tap {
         #[cfg(unix)]
         pty::resize(&self.0.master, size)?;
         #[cfg(windows)]
-        windows::resize(&self.0, size)?;
+        if live.size != size {
+            windows::resize(&self.0, size)?;
+        }
         // OS가 바뀐 뒤에는 panic 복구도 같은 크기와 기록 이벤트를 사용해야 한다.
         live.size = size;
         live.resized = Some(size);
@@ -751,7 +732,7 @@ impl Tap {
     /// 핫 스크롤백을 비우고 콜드 세그먼트의 스크롤백 기준선(`seq`)을 기록한다(OWE-873b).
     /// 보이는 화면·세션·PTY는 건드리지 않는다.
     pub fn clear_scrollback(&self) -> u64 {
-        self.clear_scrollback_with(Engine::clear_history)
+        self.clear_scrollback_with(Engine::release_history)
     }
 
     fn clear_scrollback_with(&self, clear: impl FnOnce(&mut Engine)) -> u64 {
@@ -777,22 +758,29 @@ impl Tap {
 
     /// 입력은 보내지 않고 화면만 지운 뒤 구독자에게 새 revision을 알린다.
     pub fn clear_viewport(&self) -> bool {
+        self.clear_viewport_with(Engine::clear_viewport)
+    }
+
+    fn clear_viewport_with(&self, clear: impl FnOnce(&mut Engine)) -> bool {
         let _history = lock(&self.0.history_access);
-        let (seq, revision) = {
-            let mut live = lock(&self.0.live);
-            if panic::catch_unwind(AssertUnwindSafe(|| live.engine.clear_viewport())).is_err() {
-                return false;
-            }
-            live.revision = live.revision.wrapping_add(1);
+        let (seq, revision, cleared) = {
+            let mut live = self.0.live();
             live.history_epoch = live.history_epoch.wrapping_add(1);
-            (live.seq, live.revision)
+            let cleared = live.update_engine(clear).is_some();
+            if cleared {
+                live.revision = live.revision.wrapping_add(1);
+            }
+            *lock(&self.0.capture) = None;
+            (live.seq, live.revision, cleared)
         };
-        self.wait(|p| p.end >= seq || p.closed);
-        if let Some(store) = &self.0.store {
-            store.clear_scrollback(self.0.id, seq);
+        if cleared {
+            self.wait(|p| p.end >= seq || p.closed);
+            if let Some(store) = &self.0.store {
+                store.clear_scrollback(self.0.id, seq);
+            }
         }
         self.0.publish(&[], revision, false);
-        true
+        cleared
     }
 
     /// 디스크 저장소(콜드 페이지·링 밖 원본). 기록하지 않는 세션이면 `None`.
@@ -811,7 +799,17 @@ impl Tap {
     }
 
     /// `ready`가 참이 될 때까지 기다린다. 다른 스레드가 `ready`가 보는 값을 바꾸면 [`Tap::wake`]를 불러야 한다.
+    /// 기록 전에 먼저 알린 revision에는 깨지 않는다(원본 발행 때 본다). 화면은 [`Tap::wait_screen`].
     pub fn wait(&self, ready: impl Fn(&Pulse) -> bool) -> Pulse {
+        self.wait_on(&self.0.changed, ready)
+    }
+
+    /// 화면 구독자용 [`Tap::wait`]: revision·종료·[`Tap::wake`]에 깨고, 원본 `end`만 바뀐 발행에는 깨지 않는다.
+    pub(crate) fn wait_screen(&self, ready: impl Fn(&Pulse) -> bool) -> Pulse {
+        self.wait_on(&self.0.shown, ready)
+    }
+
+    fn wait_on(&self, changed: &Condvar, ready: impl Fn(&Pulse) -> bool) -> Pulse {
         let mut out = lock(&self.0.out);
         loop {
             let p = Pulse {
@@ -827,11 +825,38 @@ impl Tap {
             }
             out = lock(&self.0.out);
             if out.generation == generation {
+                out = changed.wait(out).unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+    }
+
+    /// [`Tap::wait`]에 상한 시간을 둔다. 기한이 지나면 그 시점의 [`Pulse`]를 돌려준다.
+    pub(crate) fn wait_timeout(&self, timeout: Duration, ready: impl Fn(&Pulse) -> bool) -> Pulse {
+        let deadline = Instant::now() + timeout;
+        let mut out = lock(&self.0.out);
+        loop {
+            let p = Pulse {
+                revision: out.revision,
+                end: out.end,
+                closed: out.closed,
+            };
+            let generation = out.generation;
+            drop(out);
+            if ready(&p) {
+                return p;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return p;
+            }
+            out = lock(&self.0.out);
+            if out.generation == generation {
                 out = self
                     .0
                     .changed
-                    .wait(out)
-                    .unwrap_or_else(PoisonError::into_inner);
+                    .wait_timeout(out, remaining)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
         }
     }
@@ -842,6 +867,12 @@ impl Tap {
         out.generation = out.generation.wrapping_add(1);
         drop(out);
         self.0.changed.notify_all();
+        self.0.shown.notify_all();
+    }
+
+    /// 엔진이 받은 원본 끝. 기록 중인 묶음만큼 [`Pulse::end`]보다 앞설 수 있다.
+    pub(crate) fn fed(&self) -> u64 {
+        self.0.live().seq
     }
 
     /// 원본 `pos`부터 최대 `max`바이트를 링에서 꺼낸다.
@@ -873,6 +904,10 @@ impl Tap {
     // 엔진·연결 장부는 잠그지 않으며 다른 입력 대기자는 HUP으로 취소할 수 있다. 세션 쓰기 큐가 생기면 그리로 옮긴다.
     pub fn write_input(&self, bytes: &[u8], peer: Option<BorrowedFd<'_>>) -> io::Result<()> {
         input::write_input(self, bytes, peer)
+    }
+
+    pub(crate) fn write_interrupt(&self, still_working: impl FnOnce() -> bool) -> io::Result<bool> {
+        input::write_interrupt(self, still_working)
     }
 
     pub(crate) fn guarded_command(
@@ -1081,10 +1116,13 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
             }
             e.feed(bytes, Feed::Live, look)
         });
+        shared.reveal(rev);
         // 엔진 호출은 `guarded`가 잡지만 기록·발행 panic은 여기서 잡는다. 이 묶음은
         // Gap으로 남기고 다음 묶음부터 계속 읽는다. 리더가 죽으면 PTY를 읽는 쪽이
         // 없어 세션 출력이 영구 정지한다(K-05).
         let recorded = publish_batch(shared, seq, bytes, rev, || {
+            #[cfg(test)]
+            publish_tests::before_record(shared.id);
             if !ok {
                 lock(&shared.gaps).push(Gap {
                     start: seq,
@@ -1122,7 +1160,7 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
     }
 }
 
-/// 기록(zstd·암호화·write)이 이보다 오래 걸리면 경고한다. 발행은 기록이 끝난 뒤라 그만큼 화면이 늦는다.
+/// 기록(zstd·암호화·write)이 이보다 오래 걸리면 경고한다. 화면은 먼저 알리지만 원본 발행·다음 PTY 읽기는 그만큼 늦는다.
 const SLOW_RECORD: Duration = Duration::from_millis(100);
 /// 느린 기록 경고의 마지막 시각. 세션이 많아도 프로세스 전체에서 초당 한 줄만 남긴다.
 static SLOW_RECORD_WARNED: Mutex<Option<Instant>> = Mutex::new(None);
@@ -1147,7 +1185,7 @@ fn publish_batch(shared: &Shared, seq: u64, bytes: &[u8], rev: u64, record: impl
         tracing::warn!(
             took_ms,
             bytes = bytes.len(),
-            "pty recording slow; screen publish waited"
+            "pty recording slow; raw publish waited"
         );
     }
     if !recorded {
@@ -1262,3 +1300,6 @@ mod tests;
 
 #[cfg(test)]
 mod pause_tests;
+
+#[cfg(test)]
+mod publish_tests;

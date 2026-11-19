@@ -116,6 +116,8 @@ fn cli_start_automatically_installs_and_updates_owned_skills_and_keeps_orca() {
             root.join("krill-orchestration/references/worker-contract.md")
                 .is_file()
         );
+        assert!(root.join("krig/SKILL.md").is_file(), "{}", root.display());
+        assert!(root.join("krig/scripts/route.mjs").is_file());
     }
     let installed = home.join(".gemini/antigravity-cli/skills/krill-orchestration/SKILL.md");
     fs::write(&installed, "old version\n<!-- krill-managed-skill -->\n").unwrap();

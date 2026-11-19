@@ -577,13 +577,6 @@ fn account_status_display_helpers_for_step_two_ui() {
     assert_eq!(AccountStatus::default(), AccountStatus::Unknown);
 
     let now = 1_792_123_200_u64;
-    assert_eq!(format_updated_ago_ko(None, now), "갱신 없음");
-    assert_eq!(format_updated_ago_ko(Some(now), now), "방금 전");
-    assert_eq!(format_updated_ago_ko(Some(now + 60), now), "방금 전");
-    assert_eq!(format_updated_ago_ko(Some(now - 45), now), "45초 전");
-    assert_eq!(format_updated_ago_ko(Some(now - 120), now), "2분 전");
-    assert_eq!(format_updated_ago_ko(Some(now - 7_200), now), "2시간 전");
-    assert_eq!(format_updated_ago_ko(Some(now - 172_800), now), "2일 전");
     assert!(!is_updated_stale(Some(now - 60), now));
     assert!(is_updated_stale(Some(now - 1_801), now));
     assert!(is_updated_stale(None, now));
@@ -783,8 +776,6 @@ fn auto_switch_policy_upsert_clamps_and_keys_by_provider_and_account() {
     first.provider = ProviderKind::Codex;
     policy.upsert_rule(first);
     assert_eq!(policy.rules.len(), 2);
-    assert!(policy.remove_rule(ProviderKind::Claude, "host"));
-    assert!(!policy.remove_rule(ProviderKind::Claude, "host"));
     assert!(policy.rule_for(ProviderKind::Codex, "host").is_some());
 }
 
@@ -1146,6 +1137,33 @@ fn reset_credit_request_reply_roundtrip_and_feature_gate() {
     // 새 비트를 모르는 피어에는 스냅샷만 남는다.
     let gated = reply.for_features(FEAT_USAGE);
     assert_eq!(gated, UsageReply::Accounts(AccountsSnapshot::default()));
+
+    let default_timeout = std::time::Duration::from_secs(5);
+    assert_eq!(
+        request.ipc_timeout(default_timeout),
+        RESET_CONSUME_IPC_TIMEOUT
+    );
+    assert_eq!(
+        UsageRequest::ListAccounts.ipc_timeout(default_timeout),
+        default_timeout
+    );
+    for err in [
+        ResetConsumeError::AuthRequired,
+        ResetConsumeError::RateLimited,
+        ResetConsumeError::TimedOut,
+        ResetConsumeError::Transport,
+        ResetConsumeError::UpstreamRejected,
+        ResetConsumeError::AccountNotFound,
+        ResetConsumeError::InvalidTarget,
+        ResetConsumeError::PermissionDenied,
+    ] {
+        let encoded = UsageReply::Failed(err.to_failure()).encode().unwrap();
+        let (kind, body) = ipc::read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+        let UsageReply::Failed(decoded) = UsageReply::decode(kind, &body).unwrap() else {
+            panic!("expected Failed reply");
+        };
+        assert_eq!(ResetConsumeError::from_failure(decoded), err);
+    }
 }
 
 #[test]
@@ -1441,4 +1459,97 @@ fn automatic_account_input_recovery_is_appended_and_feature_gated() {
     );
     assert!(!request.is_read());
     assert!(!request.contains_removed_provider());
+}
+
+#[test]
+fn retained_handoff_reasons_round_trip_and_classify_distinct_from_retryable_failures() {
+    let from = crate::SessionId(40_351);
+    let replacement = crate::SessionId(40_373);
+    for reason in [
+        RetainedReason::OriginalEnded,
+        RetainedReason::OriginalEndedDuringRecovery,
+        RetainedReason::OriginalExitUnconfirmed,
+    ] {
+        let handoff = SessionHandoff::retained(from, replacement, "codex-alpha", reason);
+        let message = handoff.error.as_deref().unwrap();
+        assert_eq!(
+            SessionHandoff::parse_retained_replacement(message),
+            Some(Some(replacement))
+        );
+        assert_eq!(
+            handoff.outcome(),
+            HandoffOutcome::RetainedReplacement {
+                replacement: Some(replacement),
+                message,
+            }
+        );
+    }
+
+    for unnumbered in [
+        "unconfirmed replacement retained",
+        "Original session ended; unconfirmed replacement 0 was retained. Select it explicitly to continue; held input was not sent",
+        "Original session ended; unconfirmed replacement 18446744073709551616 was retained. Select it explicitly to continue; held input was not sent",
+    ] {
+        assert_eq!(
+            SessionHandoff::parse_retained_replacement(unnumbered),
+            Some(None),
+            "{unnumbered}"
+        );
+        let handoff = SessionHandoff {
+            from,
+            to: None,
+            account_id: "codex-alpha".into(),
+            error: Some(unnumbered.into()),
+        };
+        assert_eq!(
+            handoff.outcome(),
+            HandoffOutcome::RetainedReplacement {
+                replacement: None,
+                message: unnumbered,
+            }
+        );
+    }
+
+    for retryable in [
+        "Replacement session is unavailable; original session preserved",
+        "Session 7: could not resume with selected account (denied); original session preserved",
+        "Original session has ended; automatic resume cancelled",
+    ] {
+        assert_eq!(
+            SessionHandoff::parse_retained_replacement(retryable),
+            None,
+            "{retryable}"
+        );
+        let handoff = SessionHandoff {
+            from,
+            to: None,
+            account_id: "codex-alpha".into(),
+            error: Some(retryable.into()),
+        };
+        assert_eq!(
+            handoff.outcome(),
+            HandoffOutcome::RetryableFailure { message: retryable }
+        );
+    }
+
+    assert_eq!(
+        SessionHandoff {
+            from,
+            to: None,
+            account_id: "codex-alpha".into(),
+            error: None,
+        }
+        .outcome(),
+        HandoffOutcome::Pending
+    );
+    assert_eq!(
+        SessionHandoff {
+            from,
+            to: Some(replacement),
+            account_id: "codex-alpha".into(),
+            error: None,
+        }
+        .outcome(),
+        HandoffOutcome::Completed { replacement }
+    );
 }

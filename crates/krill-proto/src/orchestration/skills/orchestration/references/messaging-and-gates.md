@@ -22,7 +22,9 @@ message; without one, matching workers across Runs can be selected. Prefer expli
 
 Inspect with `check --unread --wait` first and acknowledge the returned immutable
 batch with `check --to <name> --run <run-id> --ack <delivery-id> --json` after handling
-it. Mail arriving later stays unread. You can also acknowledge specific handled message IDs with
+it. Mail arriving later stays unread. Acknowledging a `worker_done` releases its
+idle created worker; run `worker-retain <dispatch-id>` first to keep it.
+You can also acknowledge specific handled message IDs with
 `check --to <name> --run <run-id> --ack-ids <id1,id2,...> --json` (`--ack-ids`
 cannot be combined with `--wait`). A bare `check --ack` acknowledges matching mail
 at read time and returns an array. If using bare `--ack`, preserve

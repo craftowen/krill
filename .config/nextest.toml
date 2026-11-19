@@ -1,3 +1,17 @@
+# 하네스(2026-11-03, F-01·B-04): 테스트 프로세스는 실행마다 새 임시 HOME에서 돈다. Krill 세션에서 물려받은
+# 운영 상태 폴더·에이전트 설정 경로(KRILL_STATE_DIR·CLAUDE_CONFIG_DIR·CODEX_HOME·XDG_CONFIG_HOME)도 그 안으로 옮긴다.
+# 테스트가 실제 ~/.codex·~/.claude*·~/.gemini·~/.cursor에 신뢰 항목 1,965개를 쌓은 사고 뒤 넣었다.
+# 빠지면 krill-proto의 tests/test_env_isolation.rs가 실패한다. setup-scripts는 nextest 0.9.148에서 실험 기능이다.
+experimental = ["setup-scripts"]
+
+[scripts.setup.isolate-env]
+command = { command-line = "scripts/nextest-isolate-env.sh", relative-to = "workspace-root" }
+
+[[profile.default.scripts]]
+platform = 'cfg(unix)'
+filter = 'all()'
+setup = 'isolate-env'
+
 # 하네스: 테스트 하나가 멈춰 check.sh 전체가 무한 대기하는 것을 막는다(2026-10-15 야간, krill::doctor 병렬 실행 중 600s+ 정지 관측).
 # 60초마다 SLOW 표시, 3회(180초) 넘으면 강제 종료·실패.
 [profile.default]
@@ -34,6 +48,7 @@ retries = 2
 
 # CI 전용(`cargo nextest run --profile ci`). default의 재시도·그룹·타임아웃을 그대로 물려받고,
 # 재시도로 녹색이 된 FLAKY가 묻히지 않게 junit(target/nextest/ci/junit.xml, flakyFailure 기록)으로 남긴다.
+# ci-macos가 그 junit을 읽어 FLAKY를 요약하고, .config/known-flaky.txt에 없는 FLAKY면 실패한다.
 # 한 테스트 실패로 나머지가 안 도는 것도 막는다(2026-10-18 macos-15-intel은 시간 초과 1건으로 2047개 중 786개만 실행).
 # 재시도 통과를 실패로 칠 때는 flaky-result = "fail"(nextest 0.9.148 확인).
 [profile.ci]

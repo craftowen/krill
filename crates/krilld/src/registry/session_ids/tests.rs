@@ -260,6 +260,7 @@ fn recording_disabled_create_and_resume_commit_before_spawn_and_kept_survives_ba
                 id,
                 pid: std::process::id(),
                 status: None,
+                size: None,
                 master: OwnedFd::from(master),
             }],
         )),
@@ -354,6 +355,11 @@ fn account_handoff_ids_remain_reserved_after_terminal_history_is_gone() {
             "account-handoffs.json",
             r#"[{"from":10,"to":427,"account_id":"selected","error":null}]"#,
             427,
+        ),
+        (
+            "account-handoffs.json",
+            r#"[{"from":10,"to":null,"account_id":"selected","error":"Original session ended; unconfirmed replacement 712 was retained. Select it explicitly to continue; held input was not sent"}]"#,
+            712,
         ),
         (
             "account-replacement.json",

@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use windows_sys::Win32::Foundation::{
-    ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
-    LocalFree, WAIT_OBJECT_0,
+    ERROR_BUFFER_OVERFLOW, ERROR_INVALID_PARAMETER, ERROR_NO_DATA, ERROR_SUCCESS, FILETIME, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
@@ -51,7 +51,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use zeroize::Zeroizing;
 
-use super::{AUDIT_TOKEN_LEN, CodeSign, User};
+use super::{AUDIT_TOKEN_LEN, CodeSign, ProcessCache, ProcessEntry as Process, User};
 
 mod child;
 mod file_users;
@@ -68,6 +68,24 @@ pub(crate) const SAME_USER: u32 = 0;
 const SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// 종료 감시 폴링 간격.
 const EXIT_POLL: Duration = Duration::from_millis(100);
+
+/// Children inherit the error mode, and a process that fails while loading cannot suppress its own
+/// dialog. The daemon turns dialogs off even under an older holder that stays alive across updates;
+/// session trampolines turn them back on so the user's programs keep Windows' default.
+pub fn set_hard_error_dialogs(show: bool) {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        GetErrorMode, SEM_FAILCRITICALERRORS, SetErrorMode,
+    };
+    // SAFETY: no pointers; only reads this process's error mode.
+    let mode = unsafe { GetErrorMode() };
+    let mode = if show {
+        mode & !SEM_FAILCRITICALERRORS
+    } else {
+        mode | SEM_FAILCRITICALERRORS
+    };
+    // SAFETY: no pointers; only changes this process's error mode.
+    unsafe { SetErrorMode(mode) };
+}
 
 /// Keep the waiting agent launcher alive on Ctrl+C/Break; the agent handles its own console events.
 /// Use a callback rather than the inheritable NULL-handler ignore flag, so children still receive Ctrl+C.
@@ -172,13 +190,23 @@ pub(crate) fn footprint(pid: u32) -> io::Result<u64> {
     private_bytes(process.as_raw_handle())
 }
 
-/// Toolhelp 스냅숏의 한 항목.
-#[derive(Debug, Clone)]
-struct Process {
-    pid: u32,
-    parent: u32,
-    /// 실행 파일 이름(경로 없이, 예: `node.exe`).
-    exe: String,
+/// 디렉터리·파일이 놓인 볼륨 일련번호(`dwVolumeSerialNumber`). 마운트 지점 경계 판정용.
+pub(crate) fn volume_id(path: &Path) -> Option<u64> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: file은 방금 연 유효한 핸들이고 info는 쓰기 가능한 구조체다.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
+        return None;
+    }
+    Some(u64::from(info.dwVolumeSerialNumber))
 }
 
 /// 지금 있는 모든 프로세스.
@@ -208,26 +236,30 @@ fn snapshot() -> io::Result<Vec<Process>> {
     Ok(out)
 }
 
-/// `pid` 항목. 캐시가 [`SNAPSHOT_TTL`]보다 오래됐거나 `pid`가 없으면 새로 찍는다. `pid`가 `None`이면 전체.
+fn pid_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    match open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(_) => true,
+        Err(e) => e.raw_os_error() != i32::try_from(ERROR_INVALID_PARAMETER).ok(),
+    }
+}
+
+/// `pid` 항목. 캐시가 [`SNAPSHOT_TTL`]보다 오래됐거나 살아 있는 새 `pid`가 없으면 새로 찍는다. `pid`가 `None`이면 전체.
 fn processes(pid: Option<u32>) -> io::Result<Vec<Process>> {
-    static CACHE: Mutex<Option<(Instant, Vec<Process>)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<ProcessCache>> = Mutex::new(None);
     let mut cache = CACHE
         .lock()
         .map_err(|_| io::Error::other("process cache poisoned"))?;
-    let fresh = cache.as_ref().is_some_and(|(at, list)| {
-        at.elapsed() < SNAPSHOT_TTL && pid.is_none_or(|p| list.iter().any(|e| e.pid == p))
-    });
-    if !fresh {
-        *cache = Some((Instant::now(), snapshot()?));
-    }
-    let list = cache
-        .as_ref()
-        .map(|(_, list)| list.as_slice())
-        .unwrap_or_default();
-    Ok(match pid {
-        Some(p) => list.iter().filter(|e| e.pid == p).cloned().collect(),
-        None => list.to_vec(),
-    })
+    ProcessCache::query(
+        &mut cache,
+        pid,
+        SNAPSHOT_TTL,
+        Instant::now(),
+        pid_exists,
+        snapshot,
+    )
 }
 
 fn process(pid: u32) -> io::Result<Process> {
@@ -414,6 +446,67 @@ pub fn user() -> io::Result<User> {
         home: var("USERPROFILE")?,
         shell: Vec::new(),
     })
+}
+
+/// 레지스트리 기준의 새 사용자 환경(시스템·사용자 변수, `REG_EXPAND_SZ` 확장, `Path`는 시스템;사용자).
+/// Windows Terminal의 새 탭처럼 이 프로세스가 물려받은 env와 무관하다. 키·값은 OS 인코딩 바이트다.
+pub(crate) fn user_environment() -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_IMPERSONATE};
+    use windows_sys::Win32::System::Environment::{
+        CreateEnvironmentBlock, DestroyEnvironmentBlock,
+    };
+    let mut raw = ptr::null_mut();
+    // SAFETY: 인자 없는 의사 핸들 조회다.
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: 현재 프로세스 의사 핸들과 쓰기 위치만 넘긴다.
+    if unsafe {
+        OpenProcessToken(
+            process,
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
+            &raw mut raw,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let token = owned(raw)?;
+    let mut block: *mut core::ffi::c_void = ptr::null_mut();
+    // SAFETY: token은 살아 있는 토큰이고 block은 쓰기 위치다. bInherit=FALSE라 이 프로세스 env를 섞지 않는다.
+    if unsafe { CreateEnvironmentBlock(&raw mut block, token.as_raw_handle(), 0) } == 0
+        || block.is_null()
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut env = Vec::new();
+    let mut at = block.cast::<u16>().cast_const();
+    loop {
+        let mut len = 0_usize;
+        // SAFETY: 블록은 NUL로 끝나는 UTF-16 문자열의 나열이고 빈 문자열(이중 NUL)로 끝난다.
+        // 그래서 NUL을 만나기 전의 위치는 모두 블록 안이다.
+        while unsafe { *at.wrapping_add(len) } != 0 {
+            len = len.saturating_add(1);
+        }
+        if len == 0 {
+            break;
+        }
+        // SAFETY: at..at+len은 위에서 NUL 전까지 읽은 같은 블록 안의 범위다.
+        let entry = unsafe { std::slice::from_raw_parts(at, len) };
+        // 첫 글자의 `=`는 이름의 일부다(`=C:` 같은 숨은 변수).
+        if let Some(eq) = entry.iter().skip(1).position(|&c| c == u16::from(b'=')) {
+            let (key, value) = entry.split_at(eq.saturating_add(1));
+            env.push((
+                std::ffi::OsString::from_wide(key).into_encoded_bytes(),
+                std::ffi::OsString::from_wide(value.get(1..).unwrap_or_default())
+                    .into_encoded_bytes(),
+            ));
+        }
+        // SAFETY: 다음 문자열은 이 문자열의 NUL 바로 뒤에서 시작한다.
+        at = unsafe { at.add(len.saturating_add(1)) };
+    }
+    // SAFETY: CreateEnvironmentBlock이 준 블록을 한 번만 해제한다. 위 슬라이스는 더 쓰지 않는다.
+    unsafe { DestroyEnvironmentBlock(block) };
+    Ok(env)
 }
 
 /// IPv4 주소·한글을 포함한 표시 이름·기본 게이트웨이 유무를 같은 네이티브 스냅샷에서 읽는다.
@@ -761,6 +854,15 @@ fn socket_pending(sock: BorrowedSocket<'_>) -> io::Result<u32> {
 
 pub(crate) fn release_malloc_cache() {}
 
+/// 이 로그온에 사용자 DPAPI 자격이 없으면 `true`. SSH 공개키 인증은 비밀번호 없는 NETWORK 로그온이라
+/// 사용자 마스터 키를 풀지 못해 `CryptProtectData`가 `ERROR_ACCESS_DENIED`로 실패한다(대화형 로그온은 된다).
+/// 다른 오류는 `false`로 두어 테스트가 그대로 실패하게 한다.
+#[cfg(test)]
+pub(crate) fn user_dpapi_unavailable() -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    protect(b"krill-dpapi-probe").is_err_and(|e| e.raw_os_error() == Some(ERROR_ACCESS_DENIED))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,6 +938,14 @@ mod tests {
     #[test]
     fn dpapi_round_trip_and_tamper() {
         let key = [7_u8; 32];
+        if user_dpapi_unavailable() {
+            // 봉인할 수 없는 로그온에서도 아무 blob이나 풀어 주면 안 된다.
+            assert!(unprotect(&key).is_err());
+            eprintln!(
+                "user DPAPI unavailable in this logon (SSH key auth?): round trip not exercised"
+            );
+            return;
+        }
         let sealed = protect(&key).unwrap();
         assert_ne!(sealed.as_slice(), key.as_slice());
         assert_eq!(unprotect(&sealed).unwrap().as_slice(), key.as_slice());

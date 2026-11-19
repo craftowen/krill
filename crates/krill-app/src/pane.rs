@@ -39,7 +39,7 @@ use krill_proto::agent::Permission;
 pub use krill_proto::control::Program;
 use krill_proto::control::{
     AgentLaunch, AgentSettings, Cold, Create, FEAT_AGENTS, FEAT_CLEAR_SCROLLBACK, FEAT_COLD,
-    FEAT_CONTROL, FEAT_RESUME, FEAT_SESSION_FORK, Reply, Request,
+    FEAT_CONTROL, FEAT_RESUME, FEAT_SESSION_FORK, Failure, Reply, Request,
 };
 use krill_proto::daemon::{self, Paths};
 use krill_proto::input::{self, InputAck, Journal, Notice, Now};
@@ -82,6 +82,32 @@ fn reconnect(target: &HostTarget, need: u64) -> io::Result<(UnixStream, u64)> {
         ));
     }
     Ok((c.stream, c.negotiated.features))
+}
+
+/// 앱이 요청한 krilld 교체(MK-062)와 세션을 만드는 요청(연결부터 답까지)을 직렬화한다. 교체가 끝나는 구 krilld에
+/// 닿은 Create·Resume는 답 없이 끊겨 결과를 알 수 없고, 칸은 같은 요청을 다시 보내지 않는다(Windows 실기:
+/// 앱 시작 직후 `resume_cold`가 `ConnectionReset` 10054, `outcome_unknown`).
+static DAEMON_UPGRADE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn creating() -> std::sync::RwLockReadGuard<'static, ()> {
+    DAEMON_UPGRADE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `target`의 krilld가 이 빌드보다 오래됐으면 교체한다([`HostTarget::upgrade`]). 진행 중인 세션 생성 요청이 끝난 뒤
+/// 시작하고, 새 krilld가 받을 때까지 새 생성 요청을 붙든다.
+///
+/// # Errors
+/// [`HostTarget::upgrade`]와 같다.
+pub fn upgrade_daemon(
+    target: &HostTarget,
+    hello: &ipc::ClientHello,
+) -> io::Result<Option<ipc::ServerHello>> {
+    let _gate = DAEMON_UPGRADE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    target.upgrade(hello)
 }
 
 /// 프레임 하나를 기다린다. 닫혔으면 `UnexpectedEof`.
@@ -262,7 +288,21 @@ pub fn ensure_session_in(
     want: Option<SessionId>,
     create: &Create,
 ) -> io::Result<Found> {
-    ensure_session_inner(&target.into(), want, create, true)
+    ensure_session_inner(&target.into(), want, create, true, false).map(|(found, _)| found)
+}
+
+/// 이미 열린 제어 소켓에서 미리 확인한 [`AgentLaunch`] 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreloadedLaunch(pub Option<AgentLaunch>);
+
+/// [`ensure_session_in`]과 같되 이미 열린 제어 소켓에서 [`AgentLaunch`]까지 함께 확인해,
+/// 직후 [`attach_with_launch`]가 별도 제어 소켓을 다시 열지 않게 한다.
+pub fn ensure_session_with_launch(
+    target: impl Into<HostTarget>,
+    want: Option<SessionId>,
+    create: &Create,
+) -> io::Result<(Found, Option<PreloadedLaunch>)> {
+    ensure_session_inner(&target.into(), want, create, true, true)
 }
 
 /// 이미 아는 세션만 찾는다: 라이브면 [`Found::Live`], 디스크 기록만 있으면 [`Found::Cold`], 없으면 `None`.
@@ -277,34 +317,118 @@ pub fn find_session_in(
     let target = target.into();
     let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
-    known_session(&target, &mut s, features, session, true)
+    known_session(&target, &mut s, features, session, true, None).map(|(found, _)| found)
 }
 
-/// 목록·계정 이어받기·콜드 기록에서 `id`를 찾는다(읽기만).
 fn known_session(
     target: &HostTarget,
     s: &mut UnixStream,
     features: u64,
     id: SessionId,
     allow_cold: bool,
-) -> io::Result<Option<Found>> {
-    if let Reply::Sessions(list) = call(s, &Request::List)?
-        && list.iter().any(|i| i.session == id)
-    {
-        return Ok(Some(Found::Live(id, false)));
+    wake_create: Option<&Create>,
+) -> io::Result<(Option<Found>, SessionId)> {
+    let list = match call(s, &Request::List)? {
+        Reply::Sessions(list) => list,
+        _ => Vec::new(),
+    };
+    if list.iter().any(|i| i.session == id) {
+        return Ok((Some(Found::Live(id, false)), id));
     }
-    if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0
-        && let Some(replacement) = account_handoff(target, id)?
-    {
-        return Ok(Some(Found::Live(replacement, false)));
+    let effective_id = if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0 {
+        account_handoff(target, id)?.unwrap_or(id)
+    } else {
+        id
+    };
+    if effective_id != id {
+        if list.iter().any(|i| i.session == effective_id) {
+            return Ok((Some(Found::Live(effective_id, false)), effective_id));
+        }
+        if let Some(create) = wake_create
+            && let Some(woken) =
+                hibernation::wake(&mut |req| call(s, req), features, effective_id, create)?
+        {
+            return Ok((Some(Found::Live(woken, true)), effective_id));
+        }
     }
     if allow_cold
         && features & FEAT_COLD != 0
-        && let Reply::Cold(cold) = call(s, &Request::Cold { session: id })?
+        && let Reply::Cold(cold) = call(
+            s,
+            &Request::Cold {
+                session: effective_id,
+            },
+        )?
     {
-        return Ok(Some(Found::Cold(id, cold)));
+        return Ok((Some(Found::Cold(effective_id, cold)), effective_id));
     }
-    Ok(None)
+    Ok((None, effective_id))
+}
+
+/// # Errors
+/// krilld 연결·프레임 읽기가 실패했거나 데몬이 세션 닫힘을 확정했다.
+pub fn resolve_observed_session_in(
+    target: impl Into<HostTarget>,
+    session: SessionId,
+    create: &Create,
+) -> io::Result<Found> {
+    let target = target.into();
+    let _upgrade = creating();
+    let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
+    s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    if let Some(woken) = hibernation::wake(&mut |req| call(&mut s, req), features, session, create)?
+    {
+        return Ok(Found::Live(woken, true));
+    }
+    let (found, effective_id) =
+        known_session(&target, &mut s, features, session, false, Some(create))?;
+    if let Some(found) = found {
+        return Ok(found);
+    }
+    let mut cold_no_session = false;
+    if features & FEAT_COLD != 0 {
+        match call(
+            &mut s,
+            &Request::Cold {
+                session: effective_id,
+            },
+        )? {
+            Reply::Cold(cold) => return Ok(Found::Cold(effective_id, cold)),
+            Reply::Failed(krill_proto::control::Failure::NoSession) => {
+                cold_no_session = true;
+            }
+            Reply::Failed(other) => return Err(failure_to_io_error(other)),
+            _ => return Err(io::ErrorKind::InvalidData.into()),
+        }
+    }
+    if features & krill_proto::control::FEAT_SIDEBAR != 0 {
+        match call(&mut s, &Request::Sidebar)? {
+            Reply::Sidebar(data) if data.closed_sessions.contains(effective_id) => Err(
+                failure_to_io_error(krill_proto::control::Failure::NoSession),
+            ),
+            Reply::Sidebar(_) => Ok(Found::Cold(
+                effective_id,
+                Cold {
+                    screen: Vec::new(),
+                    history: Vec::new(),
+                },
+            )),
+            Reply::Failed(failure) => Err(failure_to_io_error(failure)),
+            _ => Err(io::ErrorKind::InvalidData.into()),
+        }
+    } else if cold_no_session {
+        Err(failure_to_io_error(
+            krill_proto::control::Failure::NoSession,
+        ))
+    } else {
+        Ok(Found::Cold(
+            effective_id,
+            Cold {
+                screen: Vec::new(),
+                history: Vec::new(),
+            },
+        ))
+    }
 }
 
 /// [`ensure_session_in`]과 같으나 숨은 칸 복원 등에서 콜드 화면 재생(`Request::Cold`)을 거치지 않고
@@ -317,9 +441,27 @@ pub fn ensure_live_session_in(
     want: Option<SessionId>,
     create: &Create,
 ) -> io::Result<(SessionId, bool)> {
-    match ensure_session_inner(&target.into(), want, create, false)? {
+    match ensure_session_inner(&target.into(), want, create, false, false)?.0 {
         Found::Live(id, created) => Ok((id, created)),
         Found::Cold(id, _) => Ok((id, false)),
+    }
+}
+
+fn preload_agent_launch(
+    s: &mut UnixStream,
+    features: u64,
+    session: SessionId,
+    fresh_non_agent: bool,
+) -> Option<PreloadedLaunch> {
+    if fresh_non_agent {
+        return Some(PreloadedLaunch(None));
+    }
+    if features & (FEAT_CONTROL | FEAT_AGENTS) != FEAT_CONTROL | FEAT_AGENTS {
+        return None;
+    }
+    match call(s, &Request::AgentLaunch { session }).ok()? {
+        Reply::AgentLaunch(launch) => Some(PreloadedLaunch(launch)),
+        _ => None,
     }
 }
 
@@ -330,12 +472,14 @@ fn ensure_session_inner(
     want: Option<SessionId>,
     create: &Create,
     allow_cold: bool,
-) -> io::Result<Found> {
+    preload_launch: bool,
+) -> io::Result<(Found, Option<PreloadedLaunch>)> {
     let started = std::time::Instant::now();
-    let result = ensure_session_attempt(target, want, create, allow_cold);
+    let result = ensure_session_attempt(target, want, create, allow_cold, preload_launch);
     match &result {
-        Err(error) => tracing::warn!(
+        Err(error) if !(want.is_some() && is_session_gone(error)) => tracing::warn!(
             kind = ?error.kind(),
+            failure = diagnostics::failure_code(error),
             agent = matches!(create.program, Program::Agent { .. }),
             resume = want.is_some(),
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -346,7 +490,7 @@ fn ensure_session_inner(
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "session create slow"
         ),
-        Ok(_) => {}
+        Err(_) | Ok(_) => {}
     }
     result
 }
@@ -356,19 +500,34 @@ fn ensure_session_attempt(
     want: Option<SessionId>,
     create: &Create,
     allow_cold: bool,
-) -> io::Result<Found> {
+    preload_launch: bool,
+) -> io::Result<(Found, Option<PreloadedLaunch>)> {
     prepare_status_hook(target, &create.program);
+    let _upgrade = creating();
     let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+    let mut effective_want = want;
     if let Some(id) = want {
         if let Some(session) =
             hibernation::wake(&mut |req| call(&mut s, req), features, id, create)?
         {
-            return Ok(Found::Live(session, true));
+            let launch = preload_launch
+                .then(|| preload_agent_launch(&mut s, features, session, false))
+                .flatten();
+            return Ok((Found::Live(session, true), launch));
         }
-        if let Some(found) = known_session(target, &mut s, features, id, allow_cold)? {
-            return Ok(found);
+        let (found, effective_id) =
+            known_session(target, &mut s, features, id, allow_cold, Some(create))?;
+        if let Some(found) = found {
+            let launch = match (&found, preload_launch) {
+                (Found::Live(session, _), true) => {
+                    preload_agent_launch(&mut s, features, *session, false)
+                }
+                _ => None,
+            };
+            return Ok((found, launch));
         }
+        effective_want = Some(effective_id);
     }
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {
         return Err(io::Error::new(
@@ -385,16 +544,21 @@ fn ensure_session_attempt(
         ));
     }
     // 디스크 출력이 없거나 기록을 껐어도 옛 에이전트 ID는 Resume으로 이어야 한다.
-    let create = match want.filter(|_| features & FEAT_RESUME != 0) {
+    let req = match effective_want.filter(|_| features & FEAT_RESUME != 0) {
         Some(session) => Request::Resume {
             session,
             create: create.clone(),
         },
         None => Request::Create(create.clone()),
     };
-    match call(&mut s, &create)? {
+    let fresh_non_agent = matches!(&req, Request::Create(_))
+        && matches!(create.program, Program::Login | Program::Custom { .. });
+    match call(&mut s, &req)? {
         Reply::Created { session, .. } | Reply::Resumed { session, .. } => {
-            Ok(Found::Live(session, true))
+            let launch = preload_launch
+                .then(|| preload_agent_launch(&mut s, features, session, fresh_non_agent))
+                .flatten();
+            Ok((Found::Live(session, true), launch))
         }
         Reply::Failed(f) => Err(failure_to_io_error(f)),
         _ => Err(unexpected_reply()),
@@ -490,9 +654,27 @@ pub fn resume_session_in(
     session: Option<SessionId>,
     create: &Create,
 ) -> io::Result<SessionId> {
-    let target = target.into();
-    prepare_status_hook(&target, &create.program);
-    let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
+    resume_session_inner(&target.into(), session, create, false).map(|(id, _)| id)
+}
+
+/// [`resume_session_in`]과 같되 열린 제어 소켓에서 [`AgentLaunch`]도 함께 읽는다.
+pub fn resume_session_with_launch(
+    target: impl Into<HostTarget>,
+    session: Option<SessionId>,
+    create: &Create,
+) -> io::Result<(SessionId, Option<PreloadedLaunch>)> {
+    resume_session_inner(&target.into(), session, create, true)
+}
+
+fn resume_session_inner(
+    target: &HostTarget,
+    session: Option<SessionId>,
+    create: &Create,
+    preload_launch: bool,
+) -> io::Result<(SessionId, Option<PreloadedLaunch>)> {
+    prepare_status_hook(target, &create.program);
+    let _upgrade = creating();
+    let (mut s, features) = reconnect(target, FEAT_CONTROL)?;
     s.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
     if create.account.is_some() && features & krill_proto::usage::FEAT_ACCOUNT_POLICY == 0 {
         return Err(io::Error::new(
@@ -507,8 +689,15 @@ pub fn resume_session_in(
         },
         None => Request::Create(create.clone()),
     };
+    let fresh_non_agent = matches!(&req, Request::Create(_))
+        && matches!(create.program, Program::Login | Program::Custom { .. });
     match call(&mut s, &req)? {
-        Reply::Created { session, .. } | Reply::Resumed { session, .. } => Ok(session),
+        Reply::Created { session, .. } | Reply::Resumed { session, .. } => {
+            let launch = preload_launch
+                .then(|| preload_agent_launch(&mut s, features, session, fresh_non_agent))
+                .flatten();
+            Ok((session, launch))
+        }
         Reply::Failed(f) => Err(failure_to_io_error(f)),
         _ => Err(unexpected_reply()),
     }
@@ -573,6 +762,12 @@ fn agent_call(target: &HostTarget, request: &Request) -> io::Result<Option<Reply
     stream.write_all(&request.encode()?)?;
     let (kind, body) = read(&mut stream)?;
     match Reply::decode(kind, &body)? {
+        // A missing session is permanent: without NotFound the pane retries forever and never
+        // reaches the handoff/cold/Resume path that decides what happened to it.
+        Reply::Failed(Failure::NoSession) => Err(diagnostics::failure_error(
+            io::ErrorKind::NotFound,
+            Failure::NoSession,
+        )),
         Reply::Failed(failure) => Err(diagnostics::failure_error(io::ErrorKind::Other, failure)),
         reply => Ok(Some(reply)),
     }
@@ -700,11 +895,24 @@ pub fn attach(
     session: SessionId,
     known: Option<Known>,
 ) -> io::Result<Linked> {
+    attach_with_launch(target, session, known, None)
+}
+
+/// [`attach`]와 같되 이미 확인한 [`AgentLaunch`]가 있으면 추가 제어 소켓 연결을 생략한다.
+pub fn attach_with_launch(
+    target: impl Into<HostTarget>,
+    session: SessionId,
+    known: Option<Known>,
+    preloaded_launch: Option<PreloadedLaunch>,
+) -> io::Result<Linked> {
     let target = target.into();
-    let launch = match agent_call(&target, &Request::AgentLaunch { session })? {
-        Some(Reply::AgentLaunch(launch)) => launch,
-        None => None,
-        _ => return Err(io::ErrorKind::InvalidData.into()),
+    let launch = match preloaded_launch {
+        Some(PreloadedLaunch(launch)) => launch,
+        None => match agent_call(&target, &Request::AgentLaunch { session })? {
+            Some(Reply::AgentLaunch(launch)) => launch,
+            None => None,
+            _ => return Err(io::ErrorKind::InvalidData.into()),
+        },
     };
     let c = target.connect(&hello()).map_err(connect_error)?;
     if c.negotiated.features & FEAT_SCREEN == 0 {
@@ -885,20 +1093,24 @@ fn find_matches_with_pattern(
 }
 
 impl SearchState {
-    fn clear(&mut self) {
-        self.pending = None;
-        self.query.clear();
+    fn clear_matches(&mut self) {
         self.pattern = None;
         self.row_marks.clear();
         self.cursor = None;
         self.result = None;
         self.hist_req = None;
         self.hist_target = None;
-        self.top_request = None;
-        self.scrolled = false;
         self.highlight = None;
         self.track_screen_hit = false;
         self.highlights.clear();
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+        self.query.clear();
+        self.top_request = None;
+        self.scrolled = false;
+        self.clear_matches();
     }
 }
 
@@ -932,6 +1144,8 @@ pub struct Pane<W> {
     grid: Option<(u16, u16)>,
     /// 이 연결로 보낸 크기.
     sent: Option<(u16, u16)>,
+    /// 칸이 방금 보이게 됐다. 그사이 다른 클라이언트가 바꾼 크기를 한 번만 되찾는다([`Pane::show`]).
+    reclaim: bool,
     /// 이 연결이 `FEAT_ROLES`를 협상했다.
     roles: bool,
     account_input: AccountInput,
@@ -955,6 +1169,7 @@ impl<W> Default for Pane<W> {
             shown: Rc::default(),
             grid: None,
             sent: None,
+            reclaim: false,
             roles: false,
             account_input: AccountInput::Normal,
         }
@@ -1038,16 +1253,44 @@ impl<W: Write> Pane<W> {
         self.grid
     }
 
+    /// 칸이 방금 보이게 됐다(탭 전환, 덮던 화면이 닫힘). 그사이 다른 클라이언트가 세션 크기를 바꿨으면 다음
+    /// [`Pane::fit`]이 한 번 되찾는다. 계속 보이는 칸은 되찾지 않는다. 두 기기가 서로 다른 크기로 보면 다시 그릴
+    /// 때마다 뺏고 뺏겨 PTY 크기가 번갈아 바뀐다.
+    pub fn show(&mut self) {
+        self.reclaim = true;
+    }
+
+    /// 보이게 된 뒤 세션 크기가 칸과 달라 되찾아야 한다. 이미 같으면 되찾을 일을 끝낸다.
+    pub fn reclaims(&mut self, want: (u16, u16)) -> bool {
+        let s = &self.view.screen;
+        if s.cols == 0 || s.lines == 0 {
+            return false;
+        }
+        if (s.cols, s.lines) == want {
+            self.reclaim = false;
+        }
+        self.reclaim
+    }
+
     /// 칸 크기가 (열, 행)이다. 붙어 있고 보낸 크기와 다르면 `Resize`·`Focus`로 PTY를 맞춘다(MK-050: 이 연결이 크기
     /// 주인이 된다). 끊겨 있으면 다음 [`Pane::link`]에서 보낸다. 쓰기가 실패하면 연결을 끊고 그 알림.
     pub fn fit(&mut self, cols: u16, rows: u16) -> Option<Notice> {
-        self.grid = Some((cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_LINES)));
-        let (cols, rows) = self.grid.filter(|g| self.sent != Some(*g))?;
+        let want = (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_LINES));
+        self.grid = Some(want);
+        if self.sent == Some(want) && !self.reclaims(want) {
+            return None;
+        }
         if !self.roles || self.out.is_none() {
             return None;
         }
-        self.sent = self.grid;
-        let failed = self.send(&roles::Request::Resize { cols, rows }).is_err()
+        self.sent = Some(want);
+        self.reclaim = false;
+        let failed = self
+            .send(&roles::Request::Resize {
+                cols: want.0,
+                rows: want.1,
+            })
+            .is_err()
             || self.send(&roles::Request::Focus).is_err();
         failed.then(|| self.unlink()).flatten()
     }
@@ -1165,6 +1408,11 @@ impl<W: Write> Pane<W> {
         self.journal.pause();
     }
 
+    /// A replacement session is being prepared: the original's end is expected, not a failure.
+    pub fn awaiting_account_replacement(&self) -> bool {
+        self.account_input == AccountInput::Switching
+    }
+
     pub fn account_switching(&self) -> bool {
         matches!(
             self.account_input,
@@ -1176,6 +1424,12 @@ impl<W: Write> Pane<W> {
     pub fn keep_account_input(&self) -> bool {
         self.account_switching()
             || self.account_input == AccountInput::Delivering && self.journal.has_pending_input()
+    }
+
+    /// 계정 전환 때문에 붙들려 아직 보내지 못한 입력이 있다. [`Self::show_cold`]는 이 입력을 지우므로 먼저 확인한다.
+    #[must_use]
+    pub fn holds_account_input(&self) -> bool {
+        self.account_switching() && self.has_pending_input()
     }
 
     /// 아직 데몬이 확인하지 않은 보류·미확정 입력이 저널에 남아 있으면 `true`.
@@ -1191,7 +1445,8 @@ impl<W: Write> Pane<W> {
         self.journal.delivery(receipt)
     }
 
-    /// Only an acknowledged cancellation may deliver held input to the original account.
+    /// Held input reaches the original account only after an acknowledged cancellation or when
+    /// the switch is still queued behind a busy agent.
     /// Failed switches keep their journal paused for an explicit recovery decision.
     pub fn resume_account_input(&mut self, failed: bool, now: Now) -> Vec<Notice> {
         if failed {
@@ -1220,12 +1475,14 @@ impl<W: Write> Pane<W> {
         notices
     }
 
-    /// An explicit account handoff keeps only unsent input. In-flight bytes remain uncertain
-    /// and are never replayed to another PTY.
+    /// An explicit account handoff keeps only unsent input and the last picture, which the
+    /// replacement's first frame replaces. In-flight bytes remain uncertain and are never
+    /// replayed to another PTY.
     pub fn handoff_account(&mut self, session: SessionId) -> Option<Notice> {
         let notice = self.unlink();
         let journal = std::mem::take(&mut self.journal);
         let grid = self.grid;
+        let shown = Rc::clone(&self.shown);
         let account_input = if journal.has_pending_input() {
             AccountInput::Delivering
         } else {
@@ -1235,6 +1492,7 @@ impl<W: Write> Pane<W> {
             session: Some(session),
             journal,
             grid,
+            shown,
             account_input,
             ..Self::default()
         };
@@ -1342,10 +1600,12 @@ impl<W: Write> Pane<W> {
             }
         } else {
             let req = self.history.req;
+            let prior = std::mem::take(&mut self.history.prior);
             let mut window = rows.rows.clone();
             window.resize(usize::from(self.view.screen.lines), Vec::new());
             self.history = History::fixed(window);
             self.history.req = req;
+            self.history.prior = prior;
             self.history.offset = self.history.rows.len();
             self.search.scrolled = true;
         }
@@ -1751,7 +2011,11 @@ impl<W: Write> Pane<W> {
             .saturating_add(1);
         let lines = usize::from(self.view.screen.lines.max(1));
         let offset = rows.rows.len().min(depth.saturating_add(lines / 2));
+        let req = self.history.req;
+        let prior = std::mem::take(&mut self.history.prior);
         self.history = History::fixed(rows.rows.clone());
+        self.history.req = req;
+        self.history.prior = prior;
         self.history.offset = offset;
         self.search.scrolled = true;
         if depth >= 1 && depth <= offset {
@@ -1771,8 +2035,10 @@ impl<W: Write> Pane<W> {
         }
         self.search.scrolled = false;
         let req = self.history.req;
+        let prior = std::mem::take(&mut self.history.prior);
         self.history = History::default();
         self.history.req = req;
+        self.history.prior = prior;
         true
     }
 
@@ -1821,23 +2087,18 @@ impl<W: Write> Pane<W> {
             self.clear_search();
             return false;
         }
+        if self.search.query != query || self.search.options != options {
+            self.search.clear_matches();
+        }
         if !self.search.supported || self.is_cold() || self.out.is_none() {
             return false;
         }
-        let after = if self.search.query == query && self.search.options == options {
-            self.search.cursor
-        } else {
-            self.search.cursor = None;
-            self.search.result = None;
-            None
-        };
+        let after = self.search.cursor;
         self.search.options = options;
         query.clone_into(&mut self.search.query);
         self.search.req = self.search.req.wrapping_add(1);
         let req = self.search.req;
         self.search.pending = Some(req);
-        self.search.hist_req = None;
-        self.search.hist_target = None;
         let msg = krill_proto::search::SearchRequest {
             req,
             query: self.search.query.clone(),
@@ -2248,3 +2509,67 @@ fn after_overlap(page: &[Vec<Cell>], hot: &[Vec<Cell>]) -> usize {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+mod upgrade_gate_tests;
+
+#[cfg(test)]
+mod search_history_tests {
+    use super::*;
+
+    #[test]
+    fn search_and_top_fixed_views_preserve_history_req_and_prior_rows() {
+        let mut pane = Pane::<Vec<u8>>::default();
+        pane.view.screen.lines = 4;
+        let prior_row = vec![Cell {
+            ch: 'p',
+            ..Cell::default()
+        }];
+        pane.history.prior = vec![prior_row.clone()];
+        pane.history.req = 42;
+        pane.search.hist_req = Some(42);
+        pane.search.hist_target = Some(SearchTarget {
+            row: 0,
+            column: 0,
+            cols: 1,
+        });
+
+        let hit_row = vec![Cell {
+            ch: 'h',
+            ..Cell::default()
+        }];
+        assert!(pane.search_hist_rows(&HistoryRows {
+            req: 42,
+            total: 1,
+            skip: 0,
+            rows: vec![hit_row.clone()],
+            pages: 0,
+        }));
+        assert_eq!(pane.history.req, 42);
+        assert_eq!(pane.history.prior, vec![prior_row.clone()]);
+
+        assert!(pane.forget_search_view());
+        assert_eq!(pane.history.req, 42);
+        assert_eq!(pane.history.prior, vec![prior_row.clone()]);
+
+        pane.search.top_request = Some(TopRequest {
+            req: 43,
+            source: Source::Hot,
+            total: Some(1),
+        });
+        pane.history.req = 43;
+        assert!(pane.top_rows(&HistoryRows {
+            req: 43,
+            total: 1,
+            skip: 0,
+            rows: vec![hit_row],
+            pages: 0,
+        }));
+        assert_eq!(pane.history.req, 43);
+        assert_eq!(pane.history.prior, vec![prior_row.clone()]);
+
+        assert!(pane.forget_search_view());
+        assert_eq!(pane.history.req, 43);
+        assert_eq!(pane.history.prior, vec![prior_row]);
+    }
+}

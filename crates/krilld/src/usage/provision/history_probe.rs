@@ -1,7 +1,7 @@
 //! 프로필별 이행 전 읽기 전용 프로세스 조회. 호출은 백그라운드 작업에서만 한다.
 
 use std::io::{self, Read as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -10,10 +10,10 @@ const LIMIT: u64 = 16 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn quiescent(profile: &Path, env_key: &str) -> bool {
-    quiescent_at(profile, profile, env_key)
+    quiescent_at(&[profile.to_path_buf()], profile, env_key)
 }
 
-pub(super) fn quiescent_at(files: &Path, profile: &Path, env_key: &str) -> bool {
+pub(super) fn quiescent_at(files: &[PathBuf], profile: &Path, env_key: &str) -> bool {
     let mut ps = Command::new("/bin/ps");
     ps.args([
         "eww",
@@ -27,17 +27,30 @@ pub(super) fn quiescent_at(files: &Path, profile: &Path, env_key: &str) -> bool 
     };
     if !output.status.success()
         || !output.stderr.is_empty()
-        || !String::from_utf8(output.stdout).is_ok_and(|text| !has_writer(&text, profile, env_key))
+        || has_writer(&String::from_utf8_lossy(&output.stdout), profile, env_key)
     {
         return false;
+    }
+    paths_closed(files)
+}
+
+pub(super) fn paths_closed(paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return true;
     }
     #[cfg(target_os = "macos")]
     let lsof = "/usr/sbin/lsof";
     #[cfg(not(target_os = "macos"))]
     let lsof = "lsof";
-    // +D는 디렉터리 아래 열린 fd/cwd를 조회한다. 링크 대상은 따라가지 않는다.
     let mut command = Command::new(lsof);
-    command.args(["-t", "+D"]).arg(files);
+    command.arg("-t");
+    for path in paths {
+        // +D는 디렉터리 아래 열린 fd/cwd를 조회한다. 링크 대상은 따라가지 않는다.
+        if path.is_dir() {
+            command.arg("+D");
+        }
+        command.arg(path);
+    }
     capture(&mut command, TIMEOUT)
         .is_ok_and(|result| no_open_files(result.status.code(), &result.stdout, &result.stderr))
 }
@@ -77,7 +90,10 @@ pub(super) fn has_writer(text: &str, profile: &Path, env_key: &str) -> bool {
                 || line.contains("/claude/cli.js");
             // macOS는 보호 프로세스의 환경을 경고 없이 생략할 수 있다.
             // Claude 후보의 환경이 보이지 않으면 다른 계정이라고 단정하지 않는다.
-            claude && !line.contains(" HOME=") && !line.contains(" PATH=")
+            env_key == "CLAUDE_CONFIG_DIR"
+                && claude
+                && !line.contains(" HOME=")
+                && !line.contains(" PATH=")
         })
 }
 
@@ -155,5 +171,14 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bare_claude_process_only_blocks_claude_config_dir_probes() {
+        let profile = Path::new("/tmp/krill-profile-test");
+        let ps_table = "/opt/homebrew/bin/claude --resume abc\n";
+        assert!(has_writer(ps_table, profile, "CLAUDE_CONFIG_DIR"));
+        assert!(!has_writer(ps_table, profile, "CODEX_HOME"));
+        assert!(!has_writer(ps_table, profile, "ANTIGRAVITY_CLI_HOME"));
     }
 }

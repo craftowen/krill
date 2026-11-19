@@ -19,6 +19,7 @@ proptest::proptest! {
 }
 
 #[test]
+#[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: APFS clonefile")]
 fn clone_and_fallback_preserve_independent_files_and_never_overwrite() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -66,4 +67,58 @@ fn clone_and_fallback_preserve_independent_files_and_never_overwrite() {
     );
     assert!(!refused.exists());
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn discover_resolves_repo_linked_worktree_and_non_repo_without_spawning_git() {
+    let root = std::env::temp_dir().join(format!("mk-compat-discover-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let non_repo = root.join("plain/folder");
+    fs::create_dir_all(&non_repo).unwrap();
+    assert_eq!(discover(&non_repo), Some(Discovered::NotRepo));
+
+    let repo = root.join("main-repo");
+    let dot_git = repo.join(".git");
+    fs::create_dir_all(dot_git.join("worktrees/feat")).unwrap();
+    fs::write(dot_git.join("HEAD"), "ref: refs/heads/main\r\n").unwrap();
+    fs::write(dot_git.join("config"), "[core]\r\n\tbare = false\r\n").unwrap();
+    let nested = repo.join("crates/app");
+    fs::create_dir_all(&nested).unwrap();
+
+    let canon_repo = krill_proto::os::canonicalize(&repo).unwrap();
+    assert_eq!(
+        discover(&nested),
+        Some(Discovered::Repo {
+            root: canon_repo.clone(),
+            worktree: canon_repo.clone(),
+        })
+    );
+
+    let linked = root.join("worktrees/feat");
+    fs::create_dir_all(linked.join("src")).unwrap();
+    let wt_gitdir = canon_repo.join(".git/worktrees/feat");
+    fs::write(
+        linked.join(".git"),
+        format!("gitdir: {}\r\n", wt_gitdir.display()),
+    )
+    .unwrap();
+    fs::write(wt_gitdir.join("commondir"), "../..\r\n").unwrap();
+
+    let canon_linked = krill_proto::os::canonicalize(&linked).unwrap();
+    assert_eq!(
+        discover(&linked.join("src")),
+        Some(Discovered::Repo {
+            root: canon_repo,
+            worktree: canon_linked,
+        })
+    );
+
+    fs::write(
+        dot_git.join("config"),
+        "[core]\r\n\tworktree = ../elsewhere\r\n",
+    )
+    .unwrap();
+    assert_eq!(discover(&nested), None);
+
+    fs::remove_dir_all(root).unwrap();
 }

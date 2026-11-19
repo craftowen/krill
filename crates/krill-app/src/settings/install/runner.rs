@@ -45,9 +45,9 @@ pub(super) fn version_command(exe: &Path, args: &[&str]) -> Command {
 }
 
 fn powershell_script(command: &str) -> String {
-    // WinGet의 '적용할 업데이트 없음' HRESULT(0x8A15002B)만 정상 종료로 정규화한다.
+    // WinGet의 '적용할 업데이트 없음'(0x8A15002B)과 '이미 설치됨'(0x8A150061)만 정상 종료로 정규화한다.
     let no_update = if command.starts_with("winget ") {
-        "if ($LASTEXITCODE -eq -1978335189) { exit 0 }; "
+        "if ($LASTEXITCODE -eq -1978335189 -or $LASTEXITCODE -eq -1978335135) { exit 0 }; "
     } else {
         ""
     };
@@ -77,6 +77,7 @@ pub(super) fn run(command: &str, home: &Path, path: &OsStr) -> InstallJobResult 
         .env("HOME", home)
         .env("NONINTERACTIVE", "1")
         .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .env("HOMEBREW_NO_ASK", "1")
         .env("CI", "1")
         .current_dir(home);
     match capture(&mut cmd, TIMEOUT) {

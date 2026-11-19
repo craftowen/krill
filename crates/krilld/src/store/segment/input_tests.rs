@@ -16,9 +16,11 @@ fn oversized_chunk_length_is_rejected_before_reading_its_body() {
         prefix.extend(0_u32.to_le_bytes());
         let mut reader = Cursor::new(prefix);
         let declared_file_len = reader.get_ref().len() as u64 + u64::from(u32::MAX);
-        let error = read_from(&mut reader, declared_file_len, encrypted.then_some(&key))
-            .map(|_| ())
-            .expect_err("an oversized length must fail before allocating or reading the body");
+        let error = read_from(&mut reader, declared_file_len, || {
+            encrypted.then_some(&key).ok_or_else(key_unavailable)
+        })
+        .map(|_| ())
+        .expect_err("an oversized length must fail before allocating or reading the body");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(reader.position(), reader.get_ref().len() as u64);
     }
@@ -37,7 +39,7 @@ fn compressed_limit_counts_all_chunks_and_does_not_consume_excess_body() {
     let expected_read = bytes.len() as u64 - 1;
     let mut reader = Cursor::new(bytes);
     let file_len = reader.get_ref().len() as u64;
-    let error = read_from(&mut reader, file_len, None)
+    let error = read_from(&mut reader, file_len, no_key)
         .map(|_| ())
         .expect_err("a subsequent chunk must not bypass the aggregate stream limit");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -98,7 +100,7 @@ fn io_failure_is_not_recovered_as_a_truncated_tail() {
         SEGMENT_V1.len() - 1,
     ] {
         let reader = SEGMENT_V1.get(..cut).unwrap().chain(Failing);
-        let error = read_from(reader, SEGMENT_V1.len() as u64, None)
+        let error = read_from(reader, SEGMENT_V1.len() as u64, no_key)
             .map(|_| ())
             .expect_err("read failures must preserve the original rather than trim its tail");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -128,7 +130,7 @@ fn fragmented_and_interrupted_reads_preserve_the_fixed_fixture() {
         bytes: SEGMENT_V1,
         interrupted: false,
     };
-    let segment = read_from(reader, SEGMENT_V1.len() as u64, None)
+    let segment = read_from(reader, SEGMENT_V1.len() as u64, no_key)
         .unwrap()
         .unwrap();
     assert_eq!(segment.valid_len, SEGMENT_V1.len() as u64);
@@ -141,11 +143,15 @@ fn a_growing_input_is_only_read_to_the_snapshot_boundary() {
     let mut bytes = SEGMENT_V1.to_vec();
     bytes.extend(chunk(&vec![0; 1024]));
     let mut reader = Cursor::new(bytes);
-    let segment = read_from(&mut reader, SEGMENT_V1.len() as u64, None)
+    let segment = read_from(&mut reader, SEGMENT_V1.len() as u64, no_key)
         .unwrap()
         .unwrap();
     assert_eq!(reader.position(), SEGMENT_V1.len() as u64);
     assert_eq!(segment.valid_len, SEGMENT_V1.len() as u64);
     assert_eq!(segment.end_seq(), 12);
     assert!(segment.sealed);
+}
+
+fn no_key<'k>() -> io::Result<&'k Key> {
+    Err(key_unavailable())
 }

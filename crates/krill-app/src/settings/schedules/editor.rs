@@ -156,30 +156,50 @@ impl SettingsView {
                 &modal.precheck_timeout,
                 p,
             ));
-        let mut agents = div().flex().flex_wrap().gap_1();
-        for (agent, label) in [
+        let mut agent_choices: Vec<(String, String)> = [
             ("claude", "Claude"),
             ("codex", "Codex"),
             ("agy", "Antigravity"),
             ("opencode", "OpenCode"),
             ("cursor", "Cursor"),
-        ] {
+        ]
+        .into_iter()
+        .map(|(id, label)| (id.to_owned(), label.to_owned()))
+        .collect();
+        if let Some(parsed) = &self.agents_parsed {
+            let mut extra: Vec<(String, String)> = parsed
+                .profiles
+                .iter()
+                .filter(|(id, _)| !agent_choices.iter().any(|(known, _)| known == *id))
+                .map(|(id, prof)| (id.clone(), prof.name.clone()))
+                .collect();
+            extra.sort_by(|(a, _), (b, _)| {
+                krill_proto::agent::profile_rank(a)
+                    .cmp(&krill_proto::agent::profile_rank(b))
+                    .then_with(|| a.cmp(b))
+            });
+            agent_choices.extend(extra);
+        }
+        let mut agents = div().flex().flex_wrap().gap_1();
+        for (agent, label) in agent_choices {
             let id = format!("admin-schedule-agent-{agent}");
+            let sel = id.clone();
+            let agent_click = agent.clone();
             agents = agents.child(
                 layout::segment(
                     p,
-                    gpui::ElementId::Name(id.clone().into()),
+                    gpui::ElementId::Name(id.into()),
                     label,
-                    modal.agent.as_deref() == Some(agent),
+                    modal.agent.as_deref() == Some(agent.as_str()),
                 )
-                .debug_selector(move || id.clone())
+                .debug_selector(move || sel.clone())
                 .disabled(pending)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if let Some(modal) = &mut this.schedule_modal {
-                        modal.agent = Some(agent.to_owned());
+                        modal.agent = Some(agent_click.clone());
                         modal
                             .command
-                            .update(cx, |s, cx| s.set_value(agent, window, cx));
+                            .update(cx, |s, cx| s.set_value(agent_click.clone(), window, cx));
                         cx.notify();
                     }
                 })),
@@ -211,7 +231,8 @@ impl SettingsView {
                     }
                 }))
         });
-        let narrow = window.viewport_size().width < gpui::px(720.);
+        // Keep the two form columns readable when UI text and spacing are zoomed.
+        let narrow = window.viewport_size().width < window.rem_size() * 45.;
         let mut right = div()
             .min_w_0()
             .flex()

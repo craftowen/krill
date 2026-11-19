@@ -53,9 +53,11 @@
  }
  function create(options){
   const {endpoint}=options,current=/^\/m\/([0-9a-f]{16})\/$/.exec(location.pathname)?.[1];
-  let timer,applyTimer,work,controller,started=false,stopped=false,navigating=false,pending=null,holds=0,composing=false,lastInput=Date.now(),lastCheck=-Infinity;
+  let timer,applyTimer,initialTimer,work,controller,started=false,stopped=false,navigating=false,pending=null,holds=0,composing=false,lastInput=Date.now(),lastCheck=-Infinity;
   const identity=()=>endpoint.updateIdentity?.(),enabled=()=>!!(current&&identity()&&!stopped&&!navigating&&!options.blocked?.());
   const idle=()=>enabled()&&!!navigator.serviceWorker?.controller&&!document.hidden&&!composing&&!holds&&Date.now()-lastInput>=1500&&!options.busy?.();
+  const clearInitial=()=>{clearTimeout(initialTimer);initialTimer=null;};
+  const deferInitial=()=>{clearInitial();if(stopped||document.hidden||!enabled())return;initialTimer=setTimeout(()=>{initialTimer=null;if(stopped||document.hidden||!enabled())return;if(options.busy?.())deferInitial();else check();},1000);};
   const schedule=()=>{clearTimeout(timer);if(!stopped)timer=setTimeout(()=>{check();schedule();},30000);};
   const retry=()=>{clearTimeout(applyTimer);if(pending&&!stopped)applyTimer=setTimeout(apply,1000);};
   async function apply(){
@@ -70,7 +72,7 @@
     const encoded=JSON.stringify(record);sessionStorage.setItem(KEY,encoded);
     if(sessionStorage.getItem(KEY)!==encoded)throw Error('Update state not saved');
     if(!endpoint.commitUpdate(found)){sessionStorage.removeItem(KEY);retry();return;}
-    navigating=true;clearTimeout(timer);clearTimeout(applyTimer);
+    navigating=true;clearTimeout(timer);clearTimeout(applyTimer);clearInitial();
     location.replace(`/m/${candidate.hash}/`+location.search+location.hash);
    }catch{retry();}
   }
@@ -86,7 +88,7 @@
     pending=found;retry();
    }catch{}finally{clearTimeout(timeout);}
   }
-  function check(){if(!enabled()||document.hidden)return Promise.resolve();if(work)return work;lastCheck=Date.now();work=run().finally(()=>work=null);return work;}
+  function check(){clearInitial();if(!enabled()||document.hidden)return Promise.resolve();if(work)return work;lastCheck=Date.now();work=run().finally(()=>work=null);return work;}
   function invalidate(){controller?.abort();pending=null;clearTimeout(applyTimer);}
   function restore(){
    try{const raw=sessionStorage.getItem(KEY);if(!raw)return;const record=JSON.parse(raw);
@@ -94,10 +96,10 @@
     options.restore(record.state);
    }catch{}finally{try{sessionStorage.removeItem(KEY);}catch{}}
   }
-  const activity=()=>{lastInput=Date.now();},resume=()=>{if(!document.hidden){if(Date.now()-lastCheck>=1000)check();retry();}},startComposition=()=>{composing=true;activity();},endComposition=()=>{composing=false;activity();};
+  const activity=()=>{lastInput=Date.now();},resume=()=>{if(!document.hidden){if(!(initialTimer&&options.busy?.())&&Date.now()-lastCheck>=1000)check();retry();}},startComposition=()=>{composing=true;activity();},endComposition=()=>{composing=false;activity();};
   const events=[['input',activity],['pointerdown',activity],['keydown',activity],['compositionstart',startComposition],['compositionend',endComposition],['visibilitychange',resume]];
-  function start(){if(started||stopped)return;started=true;endpoint.setUpdateHandler?.(check);for(const [name,fn] of events)document.addEventListener(name,fn,true);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);navigator.serviceWorker?.addEventListener?.('controllerchange',resume);schedule();check();}
-  function stop(){stopped=true;invalidate();clearTimeout(timer);endpoint.setUpdateHandler?.(null);for(const [name,fn] of events)document.removeEventListener(name,fn,true);globalThis.removeEventListener('pageshow',resume);globalThis.removeEventListener('online',resume);navigator.serviceWorker?.removeEventListener?.('controllerchange',resume);}
+  function start(){if(started||stopped)return;started=true;endpoint.setUpdateHandler?.(check);for(const [name,fn] of events)document.addEventListener(name,fn,true);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);navigator.serviceWorker?.addEventListener?.('controllerchange',resume);schedule();if(!options.busy?.())check();else deferInitial();}
+  function stop(){stopped=true;invalidate();clearTimeout(timer);clearInitial();endpoint.setUpdateHandler?.(null);for(const [name,fn] of events)document.removeEventListener(name,fn,true);globalThis.removeEventListener('pageshow',resume);globalThis.removeEventListener('online',resume);navigator.serviceWorker?.removeEventListener?.('controllerchange',resume);}
   return {start,stop,check,invalidate,restore,get held(){return holds>0;},hold(){holds++;let released=false;return ()=>{if(!released){released=true;holds--;activity();}};}};
  }
  function pickFile(picker){const release=M.update?.hold?.()||(()=>{}),done=()=>{picker.removeEventListener('change',done);picker.removeEventListener('cancel',done);release();};picker.addEventListener('change',done);picker.addEventListener('cancel',done);try{picker.click();}catch(error){done();throw error;}}

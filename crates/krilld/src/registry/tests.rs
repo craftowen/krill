@@ -4,6 +4,111 @@ use std::fs;
 
 use krill_proto::agent::Permission;
 
+thread_local! {
+    /// Stands in for the rate-limit account refresh, which can block on `security` indefinitely.
+    pub(super) static AUTO_SWITCH_PROBE: std::cell::Cell<Option<fn(&Registry)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[test]
+fn hook_account_refresh_runs_without_blocking_other_daemon_work() {
+    fn other_work_proceeds(reg: &Registry) {
+        assert!(
+            reg.hook_commit.try_lock().is_ok(),
+            "account refresh held hook_commit, stalling Spawn, exits, and new connections"
+        );
+        let spool = reg.spool.as_ref().unwrap();
+        let next = HookEvent {
+            id: hook::EventId {
+                pid: 1,
+                unix_ns: 99,
+            },
+            agent: "claude".into(),
+            ppid: 0,
+            input: hook::Input::Complete,
+            payload: b"{}".to_vec(),
+        };
+        hook::append_spool(
+            spool,
+            &next.encode().unwrap(),
+            Instant::now() + Duration::from_millis(50),
+        )
+        .expect("account refresh held the spool lock, blocking `krill hook` appends");
+    }
+
+    let dir = std::env::temp_dir().join(format!("hook-refresh-unlocked-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(77);
+    let root_pid = std::process::id();
+    let (master, _user) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    {
+        let mut st = lock(&reg.state);
+        st.roots.insert(id, root_pid).unwrap();
+        st.sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: root_pid,
+                cwd: dir.clone(),
+                wrapped: false,
+            },
+        );
+    }
+    let event = |unix_ns| HookEvent {
+        id: hook::EventId {
+            pid: root_pid,
+            unix_ns,
+        },
+        agent: "claude".into(),
+        ppid: root_pid,
+        input: hook::Input::Complete,
+        payload: br#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#.to_vec(),
+    };
+
+    AUTO_SWITCH_PROBE.set(Some(other_work_proceeds));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let hello = krill_proto::daemon::client_hello(ipc::ClientRole::Cli, "test");
+    client.write_all(&hello.encode().unwrap()).unwrap();
+    client.write_all(&event(1).encode().unwrap()).unwrap();
+    let server_hello = ServerHello {
+        proto_min: ipc::PROTO_MIN,
+        proto_max: ipc::PROTO_MAX,
+        features: ipc::FEATURES,
+        build: "test".into(),
+        instance_id: 1,
+    };
+    reg.serve(server, &server_hello).unwrap();
+    assert!(
+        AUTO_SWITCH_PROBE.take().is_none(),
+        "socket hook skipped the refresh"
+    );
+
+    AUTO_SWITCH_PROBE.set(Some(other_work_proceeds));
+    hook::append_spool(
+        reg.spool.as_ref().unwrap(),
+        &event(2).encode().unwrap(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    reg.drain_spool();
+    assert!(
+        AUTO_SWITCH_PROBE.take().is_none(),
+        "spooled hook skipped the refresh"
+    );
+    drop(reg);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
     use krill_proto::os::ffi::OsStrExt as _;
@@ -107,12 +212,23 @@ fn sidebar_uses_launch_and_persisted_hook_cwd_without_shell_reports() {
     drop(reg);
 
     // With no cwd evidence, leave the session unclassified rather than selecting another project.
-    let reg = Registry::new(None, None);
+    // A fresh state dir, not `None`: that falls back to the real Krill state dir and evicts its prompts.
+    let empty = dir.join("no-evidence");
+    fs::create_dir_all(&empty).unwrap();
+    let reg = Registry::new(None, Some(&empty));
     let writer = insert(&reg, PathBuf::new());
     check(&reg, b"");
     drop(writer);
     drop(reg);
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// 상태 폴더 없이 만든 레지스트리(단독 테스트)가 `KRILL_STATE_DIR`·운영 기본 폴더로 넘어가 사용자 파일
+/// (Claude 주입 settings 삭제, 프롬프트 기록, 오케스트레이션 저장소)을 건드리지 않는다.
+#[test]
+fn registry_without_state_dir_has_no_state_folder() {
+    assert!(krill_proto::daemon::state_dir().is_some());
+    assert_eq!(Registry::new(None, None).state_dir(), None);
 }
 
 #[test]
@@ -357,6 +473,7 @@ fn closed_session_leaves_list_only_after_release_reaches_holder() {
         id,
         pid: 1,
         status: None,
+        size: None,
         master: OwnedFd::from(master),
     };
     let reg = Registry::new(Some((holder, vec![kept])), Some(&reservation_dir));
@@ -862,6 +979,40 @@ fn daemon_startup_collects_expired_orphan_launch_metadata() {
 }
 
 #[test]
+fn startup_history_gc_waits_for_first_monitor_tick() {
+    let dir = std::env::temp_dir().join(format!("startup-history-gc-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let store = Store::open(&dir, crate::store::Limits::default()).unwrap();
+    let mut rec = store.recorder(SessionId(42), FALLBACK_SIZE).unwrap();
+    rec.append(b"expired");
+    rec.seal();
+    drop(rec);
+    let session = store.session_dir(SessionId(42));
+    drop(store);
+    let old = SystemTime::now() - Duration::from_hours(8 * 24);
+    for segment in fs::read_dir(&session).unwrap() {
+        fs::File::options()
+            .write(true)
+            .open(segment.unwrap().path())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+    let reg = Registry::new(None, Some(&dir));
+    assert!(
+        session.exists(),
+        "startup must not scan history before accepting clients"
+    );
+    let last = *lock(&reg.last_gc);
+    reg.gc_due(last, SystemTime::now());
+    assert!(
+        !session.exists(),
+        "the first monitor tick collects expired history"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn monitor_tick_collects_history_on_interval_without_restart() {
     let dir = std::env::temp_dir().join(format!("mk587-gc-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
@@ -871,6 +1022,8 @@ fn monitor_tick_collects_history_on_interval_without_restart() {
     rec.append(b"expired");
     rec.seal();
     let last = *lock(&reg.last_gc);
+    reg.gc_due(last, SystemTime::now());
+    assert!(store.session_dir(SessionId(42)).exists());
     let later = SystemTime::now() + Duration::from_hours(8 * 24);
     reg.gc_due(last + GC_INTERVAL / 2, later);
     assert!(store.session_dir(SessionId(42)).exists());
@@ -993,12 +1146,14 @@ fn session_accounts_returns_launch_account_with_label() {
                     id: SessionId(7),
                     pid: 1,
                     status: None,
+                    size: None,
                     master: OwnedFd::from(master_a),
                 },
                 Kept {
                     id: SessionId(8),
                     pid: 2,
                     status: None,
+                    size: None,
                     master: OwnedFd::from(master_b),
                 },
             ],
@@ -1229,6 +1384,7 @@ fn fork_creates_new_session_and_keeps_original_session_alive() {
                 id: SessionId(7),
                 pid: 700,
                 status: None,
+                size: None,
                 master: OwnedFd::from(master_orig),
             }],
         )),
@@ -2245,6 +2401,36 @@ fn explicit_close_marks_session_closed_and_blocks_cold_or_resume_resurrection() 
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// K-26: 앱이 목록에서 못 찾아도 살아 있는 PTY의 대화를 새 에이전트로 다시 띄우지 않는다.
+#[test]
+fn resume_refuses_a_kept_session_that_failed_to_register() {
+    let reg = Registry::new(None, None);
+    let full = Peer {
+        pid: None,
+        scope: Scope::Session(SessionId(7)),
+    };
+    let id = SessionId(46);
+    lock(&reg.state).unregistered_kept.insert(id);
+    let create = Create {
+        account: None,
+        program: Program::Login,
+        cwd: Vec::new(),
+        cols: 80,
+        rows: 24,
+    };
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Resume {
+                session: id,
+                create,
+            },
+            &mut HashMap::new()
+        ),
+        Reply::Failed(Failure::BadRequest)
+    );
+}
+
 #[test]
 fn spawn_strips_workspace_suffix_and_falls_back_when_cwd_is_missing() {
     use crate::holder::link::Link;
@@ -2464,12 +2650,14 @@ fn close_succeeds_when_exited_races_with_failed_terminate_and_preserves_inflight
                     id: s1,
                     pid: 101,
                     status: None,
+                    size: None,
                     master: OwnedFd::from(m1),
                 },
                 Kept {
                     id: s2,
                     pid: 102,
                     status: None,
+                    size: None,
                     master: OwnedFd::from(m2),
                 },
             ],
@@ -2905,4 +3093,940 @@ fn wrapper_argv_is_recognized_only_for_agent_launches() {
     assert!(!is_wrapper_argv(&[
         "/bin/sh", "-c", "x", "y", "z", "mk-agent"
     ]));
+}
+
+#[cfg(unix)]
+struct FakeHolderGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    holder_worker: Option<std::thread::JoinHandle<()>>,
+    reader_worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Drop for FakeHolderGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(worker) = self.holder_worker.take() {
+            worker.join().ok();
+        }
+        if let Some(worker) = self.reader_worker.take() {
+            worker.join().ok();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn fake_holder_registry(
+    dir: Option<&Path>,
+) -> (
+    Arc<Registry>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    FakeHolderGuard,
+) {
+    use crate::holder::link::Link;
+    use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+    use krill_proto::os::net::UnixStream;
+    use std::os::fd::AsFd as _;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (krilld_end, holder_end) = UnixStream::pair().unwrap();
+    holder_end
+        .set_read_timeout(Some(Duration::from_millis(25)))
+        .unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    for m in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&m.encode().unwrap(), &[]).unwrap();
+    }
+    let (holder, link, kept, _) =
+        crate::holder::Holder::connect(OwnedFd::from(krilld_end)).unwrap();
+    let reg = Arc::new(Registry::new(Some((holder, kept)), dir));
+    let reg_for_reader = Arc::clone(&reg);
+    let reader_worker = std::thread::spawn(move || {
+        reg_for_reader.run_holder(link);
+    });
+    let spawn_calls = Arc::new(AtomicUsize::new(0));
+    let spawn_calls_bg = Arc::clone(&spawn_calls);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = Arc::clone(&stop);
+    let holder_worker = std::thread::spawn(move || {
+        let mut holder_link = holder_link;
+        let mut children: HashMap<SessionId, UnixStream> = HashMap::new();
+        while !stop_bg.load(Ordering::SeqCst) {
+            let pkt = match holder_link.recv() {
+                Ok(Some(pkt)) => pkt,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Ok(None) | Err(_) => break,
+            };
+            match ToHolder::decode(pkt.frame()).unwrap() {
+                ToHolder::Spawn { req, id, .. } => {
+                    spawn_calls_bg.fetch_add(1, Ordering::SeqCst);
+                    let (master, child) = UnixStream::pair().unwrap();
+                    children.insert(id, child);
+                    holder_link
+                        .send(
+                            &FromHolder::Spawned {
+                                req,
+                                id,
+                                pid: u32::MAX,
+                            }
+                            .encode()
+                            .unwrap(),
+                            &[master.as_fd()],
+                        )
+                        .unwrap();
+                }
+                ToHolder::Terminate { req, id } | ToHolder::Kill { req, id, .. } => {
+                    children.remove(&id);
+                    holder_link
+                        .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                        .unwrap();
+                    holder_link
+                        .send(&FromHolder::Exited { id, status: 0 }.encode().unwrap(), &[])
+                        .unwrap();
+                }
+                ToHolder::Release { req, id } => {
+                    children.remove(&id);
+                    holder_link
+                        .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    });
+    let guard = FakeHolderGuard {
+        stop,
+        holder_worker: Some(holder_worker),
+        reader_worker: Some(reader_worker),
+    };
+    (reg, spawn_calls, guard)
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_close_tombstone_survives_zero_segment_gc_and_store_clear() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = std::env::temp_dir().join(format!("close-tombstone-gc-clear-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (reg, _, guard_first) = fake_holder_registry(Some(&dir));
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let create = Create {
+        account: None,
+        program: Program::Login,
+        cwd: dir.as_os_str().as_bytes().to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+
+    let Reply::Created {
+        session: session_a, ..
+    } = reg.handle(&full, Request::Create(create.clone()), &mut HashMap::new())
+    else {
+        panic!("expected Created for session A");
+    };
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Close { session: session_a },
+            &mut HashMap::new()
+        ),
+        Reply::Closed
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !lock(&reg.state).sessions.is_empty() {
+        assert!(Instant::now() < deadline, "session A should be removed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reg.store
+        .as_ref()
+        .unwrap()
+        .gc(&[], SystemTime::now() + Duration::from_hours(720))
+        .unwrap();
+
+    let Reply::Created {
+        session: session_b, ..
+    } = reg.handle(&full, Request::Create(create.clone()), &mut HashMap::new())
+    else {
+        panic!("expected Created for session B");
+    };
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Close { session: session_b },
+            &mut HashMap::new()
+        ),
+        Reply::Closed
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !lock(&reg.state).sessions.is_empty() {
+        assert!(Instant::now() < deadline, "session B should be removed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reg.store.as_ref().unwrap().clear().unwrap();
+
+    drop(reg);
+    drop(guard_first);
+
+    let (reloaded, _, _guard_reloaded) = fake_holder_registry(Some(&dir));
+    assert!(
+        matches!(
+            reloaded.handle(
+                &full,
+                Request::Resume {
+                    session: SessionId(999),
+                    create: create.clone(),
+                },
+                &mut HashMap::new(),
+            ),
+            Reply::Resumed { .. }
+        ),
+        "unclosed session must resume on reloaded registry with live holder"
+    );
+    for closed_id in [session_a, session_b] {
+        assert_eq!(
+            reloaded.handle(
+                &full,
+                Request::Cold { session: closed_id },
+                &mut HashMap::new()
+            ),
+            Reply::Failed(Failure::NoSession),
+            "closed session {closed_id:?} must reject Cold after reload"
+        );
+        assert_eq!(
+            reloaded.handle(
+                &full,
+                Request::Resume {
+                    session: closed_id,
+                    create: create.clone(),
+                },
+                &mut HashMap::new(),
+            ),
+            Reply::Failed(Failure::NoSession),
+            "closed session {closed_id:?} must reject Resume after gc/clear and reload"
+        );
+    }
+
+    drop(reloaded);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[cfg(unix)]
+fn screen_row(screen: &krill_proto::screen::Screen, row: usize) -> String {
+    screen.rows[row]
+        .iter()
+        .filter(|c| !c.flags.contains(krill_proto::screen::Flags::SPACER))
+        .map(|c| c.ch)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn kept_session_restart_hidden_tab_preserves_size_without_overprint_or_clipped_rows() {
+    use krill_holder::link::Link;
+    use krill_proto::holder::{FromHolder, VERSION};
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let dir = std::env::temp_dir().join(format!("krill-kept-hidden-size-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let id = SessionId(77);
+    let size = WinSize {
+        cols: 160,
+        rows: 45,
+    };
+    let store = Store::open(&dir, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, size).unwrap();
+    rec.append_at(b"boot\r\n", Instant::now());
+    rec.seal();
+    drop(rec);
+    drop(store);
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let (master, mut writer) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    holder_link
+        .send(
+            &FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            }
+            .encode()
+            .unwrap(),
+            &[],
+        )
+        .unwrap();
+    holder_link
+        .send(
+            &FromHolder::Session {
+                id,
+                pid: 1,
+                status: None,
+                size: None,
+            }
+            .encode()
+            .unwrap(),
+            &[master.as_fd()],
+        )
+        .unwrap();
+    holder_link
+        .send(&FromHolder::Ready.encode().unwrap(), &[])
+        .unwrap();
+
+    let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    // Only after receipt: macOS can disconnect a socket whose last reference is in flight.
+    drop(master);
+    let reg = Registry::new(Some((holder, kept)), Some(&dir));
+    let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
+
+    let update = "\x1b[2J\x1b[Hh1\r\nh2\r\nh3\r\nh4\r\n• Added D:\\OneTabStorage\\Artifacts\\session-supervision-20261103\\storage-owner-r2252\\report.md\r\n\x1b[6;6H1\x1b[2C# 저장 공간 후속 확인 결과\x1b[40;1Hstatus-row-40";
+    writer.write_all(update.as_bytes()).unwrap();
+    let expected_end = 6 + update.len() as u64;
+    tap.wait_timeout(Duration::from_secs(5), |p| {
+        p.end >= expected_end || p.closed
+    });
+
+    let screen = tap.capture().0;
+    drop(writer);
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        (
+            screen.cols,
+            screen.lines,
+            screen_row(&screen, 4).as_str(),
+            screen_row(&screen, 5).as_str(),
+            screen.rows.get(39).map(|_| screen_row(&screen, 39)),
+        ),
+        (
+            160,
+            45,
+            "• Added D:\\OneTabStorage\\Artifacts\\session-supervision-20261103\\storage-owner-r2252\\report.md",
+            "     1  # 저장 공간 후속 확인 결과",
+            Some(String::from("status-row-40")),
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unregistered_kept_session_rejects_resume_and_cold_without_spawning() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::sync::atomic::Ordering;
+
+    let dir = std::env::temp_dir().join(format!("unregistered-kept-guard-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (reg, spawn_calls, _guard_holder) = fake_holder_registry(Some(&dir));
+    let kept_id = SessionId(77);
+    lock(&reg.state).unregistered_kept.insert(kept_id);
+
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let create = Create {
+        account: None,
+        program: Program::Login,
+        cwd: dir.as_os_str().as_bytes().to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Resume {
+                session: kept_id,
+                create,
+            },
+            &mut HashMap::new(),
+        ),
+        Reply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(
+        reg.handle(
+            &full,
+            Request::Cold { session: kept_id },
+            &mut HashMap::new()
+        ),
+        Reply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
+
+    drop(reg);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn kept_session_restart_active_tab_does_not_reflow_into_two_columns() {
+    use krill_holder::link::Link;
+    use krill_proto::holder::{FromHolder, VERSION};
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let dir = std::env::temp_dir().join(format!("krill-kept-active-reflow-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let id = SessionId(78);
+    let size = WinSize {
+        cols: 160,
+        rows: 45,
+    };
+    let store = Store::open(&dir, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, size).unwrap();
+    rec.append_at(b"boot\r\n", Instant::now());
+    rec.seal();
+    drop(rec);
+    drop(store);
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let (master, mut writer) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    holder_link
+        .send(
+            &FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            }
+            .encode()
+            .unwrap(),
+            &[],
+        )
+        .unwrap();
+    holder_link
+        .send(
+            &FromHolder::Session {
+                id,
+                pid: 1,
+                status: None,
+                size: None,
+            }
+            .encode()
+            .unwrap(),
+            &[master.as_fd()],
+        )
+        .unwrap();
+    holder_link
+        .send(&FromHolder::Ready.encode().unwrap(), &[])
+        .unwrap();
+
+    let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    // Only after receipt: macOS can disconnect a socket whose last reference is in flight.
+    drop(master);
+    let reg = Registry::new(Some((holder, kept)), Some(&dir));
+    let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
+
+    let update = format!(
+        "\x1b[2J\x1b[1;1H• 기존{}\x1b[2;1H  작업들에게{}\x1b[3;1H\x1b[48;5;238m> 크릴 연결됐어/\x1b[K\x1b[0m\r\n",
+        " ".repeat(154),
+        " ".repeat(148),
+    );
+    writer.write_all(update.as_bytes()).unwrap();
+    let expected_end = 6 + update.len() as u64;
+    tap.wait_timeout(Duration::from_secs(5), |p| {
+        p.end >= expected_end || p.closed
+    });
+    let restarted_screen = tap.capture().0;
+    let restarted_size = WinSize {
+        cols: restarted_screen.cols,
+        rows: restarted_screen.lines,
+    };
+    drop(writer);
+    tap.wait_timeout(Duration::from_secs(5), |p| p.closed);
+    drop(reg);
+
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let store = Store::open(&dir, Limits::default()).unwrap();
+    let session = Session::start(
+        id,
+        pty.controller,
+        restarted_size,
+        Arc::new(Appearance::load(PathBuf::new())),
+        Some(store.recorder(id, size).unwrap()),
+    )
+    .unwrap();
+    session
+        .tap()
+        .wait_timeout(Duration::from_secs(5), |p| p.revision >= 1 || p.closed);
+    session.tap().resize(size).unwrap();
+    let screen = session.tap().capture().0;
+    drop(pty.user);
+    session.wait().unwrap();
+    fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        (
+            screen.cols,
+            screen.lines,
+            screen_row(&screen, 0).as_str(),
+            screen_row(&screen, 1).as_str(),
+            screen_row(&screen, 2).as_str(),
+        ),
+        (160, 45, "• 기존", "  작업들에게", "> 크릴 연결됐어/")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn kept_quiet_session_wire_size_prevents_two_column_reflow() {
+    use krill_holder::link::Link;
+    use krill_proto::holder::{FromHolder, VERSION};
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let dir = std::env::temp_dir().join(format!("krill-kept-quiet-wire-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let id = SessionId(79);
+    let size = WinSize {
+        cols: 160,
+        rows: 45,
+    };
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let (master, mut writer) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    holder_link
+        .send(
+            &FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            }
+            .encode()
+            .unwrap(),
+            &[],
+        )
+        .unwrap();
+    holder_link
+        .send(
+            &FromHolder::Session {
+                id,
+                pid: 1,
+                status: None,
+                size: Some(size),
+            }
+            .encode()
+            .unwrap(),
+            &[master.as_fd()],
+        )
+        .unwrap();
+    holder_link
+        .send(&FromHolder::Ready.encode().unwrap(), &[])
+        .unwrap();
+
+    let (holder, _reader, kept, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    // Only after receipt: macOS can disconnect a socket whose last reference is in flight.
+    drop(master);
+    let reg = Registry::new(Some((holder, kept)), Some(&dir));
+    let tap = lock(&reg.state).sessions.get(&id).unwrap().session.tap();
+
+    let update = format!(
+        "\x1b[2J\x1b[1;1H• 기존{}\x1b[2;1H  작업들에게{}\x1b[3;1H\x1b[48;5;238m> 크릴 연결됐어/\x1b[K\x1b[0m\r\n",
+        " ".repeat(154),
+        " ".repeat(148),
+    );
+    writer.write_all(update.as_bytes()).unwrap();
+    let expected_end = update.len() as u64;
+    tap.wait_timeout(Duration::from_secs(5), |p| {
+        p.end >= expected_end || p.closed
+    });
+    let live_screen = tap.capture().0;
+    let restarted_size = WinSize {
+        cols: live_screen.cols,
+        rows: live_screen.lines,
+    };
+    drop(writer);
+    tap.wait_timeout(Duration::from_secs(5), |p| p.closed);
+    drop(reg);
+
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let store = Store::open(&dir, Limits::default()).unwrap();
+    let session = Session::start(
+        id,
+        pty.controller,
+        restarted_size,
+        Arc::new(Appearance::load(PathBuf::new())),
+        Some(store.recorder(id, size).unwrap()),
+    )
+    .unwrap();
+    session
+        .tap()
+        .wait_timeout(Duration::from_secs(5), |p| p.revision >= 1 || p.closed);
+    session.tap().resize(size).unwrap();
+    let replayed_screen = session.tap().capture().0;
+    drop(pty.user);
+    session.wait().unwrap();
+    fs::remove_dir_all(&dir).ok();
+
+    for screen in [live_screen, replayed_screen] {
+        assert_eq!(
+            (
+                screen.cols,
+                screen.lines,
+                screen_row(&screen, 0).as_str(),
+                screen_row(&screen, 1).as_str(),
+                screen_row(&screen, 2).as_str(),
+            ),
+            (160, 45, "• 기존", "  작업들에게", "> 크릴 연결됐어/")
+        );
+    }
+}
+
+#[test]
+fn kept_session_size_reconciles_only_when_holder_size_diverges() {
+    use krill_proto::screen::{MAX_COLS, MAX_LINES};
+
+    let size = WinSize {
+        cols: 160,
+        rows: 45,
+    };
+    assert_eq!(kept_session_size(None, Some(size), None), (size, false));
+    assert_eq!(kept_session_size(None, None, Some(size)), (size, true));
+    assert_eq!(
+        kept_session_size(
+            None,
+            Some(WinSize {
+                cols: 9999,
+                rows: 9999,
+            }),
+            None,
+        ),
+        (
+            WinSize {
+                cols: MAX_COLS,
+                rows: MAX_LINES,
+            },
+            true,
+        )
+    );
+}
+
+/// 셸 보고(OSC 7·9;9)도 프로세스 cwd도 없는 세션(Windows `krill new --cwd X -- powershell.exe`)은
+/// krilld를 바꿔도 띄운 디렉터리를 잃지 않는다.
+#[test]
+fn kept_session_without_shell_reports_keeps_launch_cwd_after_daemon_restart() {
+    use krill_proto::holder::{FromHolder, VERSION};
+    use krill_proto::os::net::UnixStream;
+
+    let dir = std::env::temp_dir().join(format!("krill-launch-cwd-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let work = dir.join("project");
+    fs::create_dir_all(&work).unwrap();
+    let work = krill_proto::os::canonicalize(&work).unwrap();
+    let id = SessionId(7);
+    {
+        let reg = Registry::new(None, Some(&dir));
+        let store = reg.store.as_ref().unwrap();
+        // 녹화기를 연 세션처럼 기록 디렉터리가 있어야 남긴다.
+        drop(store.recorder(id, WinSize { cols: 80, rows: 24 }).unwrap());
+        store.remember_cwd(id, &work);
+    }
+
+    let (krilld_end, mut holder_end) = UnixStream::pair().unwrap();
+    for m in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_end.write_all(&m.encode().unwrap()).unwrap();
+    }
+    let (holder, _link, _, _) = Holder::connect(OwnedFd::from(krilld_end)).unwrap();
+    let (master, _pty) = UnixStream::pair().unwrap();
+    let kept = Kept {
+        id,
+        // 없는 pid: 프로세스 cwd를 못 읽는 Windows와 같다.
+        pid: u32::MAX - 1,
+        status: None,
+        size: None,
+        master: OwnedFd::from(master),
+    };
+    let reg = Registry::new(Some((holder, vec![kept])), Some(&dir));
+    assert_eq!(reg.session_cwd(id), Some(work));
+    drop(reg);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn input_sent_after_the_agent_exits_is_not_a_prompt_turn() {
+    let dir = std::env::temp_dir().join(format!("krill-ended-turn-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(78);
+    let (master, _terminal) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    lock(&reg.state).sessions.insert(
+        id,
+        Entry {
+            session,
+            pid: 0,
+            cwd: dir.clone(),
+            wrapped: false,
+        },
+    );
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Session(id),
+    };
+    let send = |text: &str| {
+        let request = Request::SendInput {
+            session: id,
+            bytes: text.as_bytes().to_vec(),
+            submit: true,
+            wait_submit: false,
+        };
+        reg.handle(&peer, request, &mut HashMap::new());
+    };
+    let started = HookEvent {
+        id: hook::EventId {
+            pid: 1,
+            unix_ns: status::now_ns(),
+        },
+        agent: "claude".into(),
+        ppid: 1,
+        input: hook::Input::Complete,
+        payload: br#"{"hook_event_name":"SessionStart","source":"startup"}"#.to_vec(),
+    };
+    reg.with_status(id, |s| s.hook(&[(id, &started)]))
+        .unwrap()
+        .unwrap();
+
+    send("fix the bug");
+    reg.with_status(id, |s| s.exited(id));
+    send("codex");
+
+    let history = krill_proto::git::load_session_prompt_histories(&dir)
+        .remove(&id)
+        .expect("the running agent's prompt is recorded");
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+    assert_eq!(history.total_turns, 1);
+    assert_eq!(history.turns[0].text, "fix the bug");
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_exit_hides_its_prompts_from_the_next_agent() {
+    let dir = std::env::temp_dir().join(format!("krill-agent-exit-prompts-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(79);
+    let (master, _terminal) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    lock(&reg.state).sessions.insert(
+        id,
+        Entry {
+            session,
+            pid: 0,
+            cwd: dir.clone(),
+            wrapped: false,
+        },
+    );
+    krill_proto::git::record_session_prompt(&dir, id, "fix the bug", status::now_ns()).unwrap();
+
+    reg.agent_exited(id);
+
+    let histories = krill_proto::git::load_session_prompt_histories(&dir);
+    let state = reg.status.get(id).state;
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+    assert_eq!(state, control::AgentState::Exited);
+    assert!(!histories.contains_key(&id), "{histories:?}");
+}
+
+#[test]
+fn session_list_hides_an_unconfirmed_account_replacement() {
+    let reg = Registry::new(None, None);
+    let mut writers = Vec::new();
+    for id in [SessionId(51), SessionId(52)] {
+        let (master, writer) = UnixStream::pair().unwrap();
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )
+        .unwrap();
+        lock(&reg.state).sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: 0,
+                cwd: PathBuf::new(),
+                wrapped: false,
+            },
+        );
+        writers.push(writer);
+    }
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Session(SessionId(51)),
+    };
+    let listed = |reg: &Registry| match reg.list(&peer) {
+        Reply::Sessions(list) => list.into_iter().map(|i| i.session).collect::<Vec<_>>(),
+        _ => panic!("expected session list"),
+    };
+    lock(&reg.account_replacements).insert(SessionId(52));
+    assert_eq!(listed(&reg), [SessionId(51)]);
+    lock(&reg.account_replacements).remove(&SessionId(52));
+    assert_eq!(listed(&reg), [SessionId(51), SessionId(52)]);
+}
+
+#[test]
+fn check_messages_wait_timeout_keeps_legacy_and_unidentified_ack_wire_shape() {
+    use krill_proto::orchestration::{OrchAction, OrchResponse, OrchestrationStore};
+
+    let dir =
+        std::env::temp_dir().join(format!("krill-check-timeout-shape-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    OrchestrationStore::default().save(&dir).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+
+    // Legacy CheckMessages timing out must still reply with Messages(vec![]).
+    let legacy = reg.orchestration(
+        &peer,
+        OrchAction::CheckMessagesLegacy {
+            recipient: Some("nobody".into()),
+            types: vec![],
+            unread_only: true,
+            ack: false,
+            wait_ms: 5,
+        },
+    );
+    assert!(
+        matches!(
+            legacy,
+            Ok(Reply::Orchestration(OrchResponse::Messages(ref m))) if m.is_empty()
+        ),
+        "expected empty Messages for legacy timeout, got {legacy:?}"
+    );
+
+    // CheckMessages with ack=true and delivery_id=None timing out must also reply with Messages(vec![]).
+    let ack_without_id = reg.orchestration(
+        &peer,
+        OrchAction::CheckMessages {
+            recipient: Some("nobody".into()),
+            types: vec![],
+            unread_only: true,
+            ack: true,
+            wait_ms: 5,
+            run_id: None,
+            delivery_id: None,
+        },
+    );
+    assert!(
+        matches!(
+            ack_without_id,
+            Ok(Reply::Orchestration(OrchResponse::Messages(ref m))) if m.is_empty()
+        ),
+        "expected empty Messages for ack without delivery_id timeout, got {ack_without_id:?}"
+    );
+
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_holder_failure_cleans_up_staged_settings_and_launch_record() {
+    let dir = std::env::temp_dir().join(format!("krill-spawn-cleanup-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let (reg, _, guard) = fake_holder_registry(Some(&dir));
+    let sid = SessionId(19);
+    let settings =
+        crate::agent::claude::Settings::create(&dir, Path::new("/usr/bin/true"), sid, None)
+            .unwrap();
+    assert!(settings.path.is_file());
+    reg.agents
+        .remember_session(
+            sid,
+            &control::AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            Some("sid-19".into()),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+    assert!(dir.join("agent-launches/19.json").is_file());
+
+    // Stop the fake holder so spawn_holder fails on closed IPC channel.
+    drop(guard);
+    let holder = reg.holder.as_ref().unwrap();
+    let res = reg.spawn_holder(
+        holder,
+        sid,
+        vec![b"/usr/bin/true".to_vec()],
+        vec![],
+        dir.to_string_lossy().as_bytes().to_vec(),
+        80,
+        24,
+    );
+    assert_eq!(res, Err(Failure::NoHolder));
+    assert!(
+        !settings.path.exists(),
+        "claude-settings should be discarded on spawn_holder failure"
+    );
+    assert!(
+        !dir.join("agent-launches/19.json").exists(),
+        "agent-launches/19.json should be forgotten on spawn_holder failure"
+    );
+
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
 }

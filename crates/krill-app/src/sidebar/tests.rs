@@ -306,6 +306,87 @@ fn virtualized_500_rows_scroll_and_idle(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn ended_session_records_on_disk_cause_no_idle_renders(cx: &mut TestAppContext) {
+    struct Memory(Snapshot);
+    impl Source for Memory {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "krill-sidebar-ended-records-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let live = SessionId(1);
+    let ended = SessionId(99);
+    krill_proto::git::record_session_prompt(&dir, live, "live prompt", 1).unwrap();
+    krill_proto::git::record_session_prompt(&dir, ended, "ended prompt", 1).unwrap();
+    fs::write(
+        dir.join(krill_proto::git::SESSION_TITLES_FILE),
+        r#"{"1":"live auto title","99":"ended auto title"}"#,
+    )
+    .unwrap();
+    let tree = PathBuf::from("/repo/a");
+    let session = Session {
+        id: live,
+        status: AgentStatus::UNKNOWN,
+        worktree: Some(tree.clone()),
+        cwd: Some(tree.clone()),
+        account: None,
+    };
+    let snapshot = Snapshot {
+        sessions: vec![session.clone()],
+        trees: BTreeMap::from([(PathBuf::from("/repo"), vec![tree])]),
+    };
+    cx.update(gpui_component::init);
+    let path = dir.join("sidebar.bin");
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(path)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.connect_source(Arc::new(Memory(snapshot)), cx));
+    });
+    let idle = |cx: &mut gpui::VisualTestContext, seconds: u32| {
+        let mut shell_notifies = 0;
+        for _ in 0..seconds {
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            let prompts = krill_proto::git::load_session_prompt_histories(&dir);
+            if cx.update(|_, cx| view.update(cx, |s, cx| s.sync_prompt_histories(prompts, cx))) {
+                shell_notifies += 1;
+            }
+        }
+        shell_notifies
+    };
+    idle(cx, 4);
+    let before = cx.update(|_, cx| view.read(cx).renders);
+    let shell_notifies = idle(cx, 10);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).renders),
+        before,
+        "ended-session records on disk must cause zero idle renders"
+    );
+    assert_eq!(
+        shell_notifies, 0,
+        "Shell prompt sync must not notify while idle"
+    );
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let turns = &s
+            .session_prompt_history_on(&HostId::Local, live)
+            .unwrap()
+            .turns;
+        assert_eq!(turns[0].text, "live prompt");
+        assert_eq!(
+            s.session_label_on_with_title(&HostId::Local, &session, None)
+                .0,
+            "live auto title"
+        );
+    });
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
 fn rename_pins_persist_and_selection_emits(cx: &mut TestAppContext) {
     use std::cell::Cell;
     use std::rc::Rc;
@@ -988,6 +1069,32 @@ fn sidebar_stops_polling_and_hides_git_watch_when_hidden_or_inactive(cx: &mut Te
         source.fetches.load(Ordering::SeqCst),
         after_hide,
         "hidden sidebar must not poll"
+    );
+    // 탭 이름은 이 스냅샷에서 온다. 접힌 채로 모르는 세션이 탭에 붙으면 한 번만 읽고, 아는 세션만이면 읽지 않는다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_session_order(vec![(HostId::Local, SessionId(1))], cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(source.fetches.load(Ordering::SeqCst), after_hide);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_session_order(
+                vec![(HostId::Local, SessionId(1)), (HostId::Local, SessionId(9))],
+                cx,
+            );
+        });
+    });
+    for _ in 0..20 {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+    }
+    let after_hide = after_hide + 1;
+    assert_eq!(
+        source.fetches.load(Ordering::SeqCst),
+        after_hide,
+        "an unknown tab session is read once while hidden"
     );
 
     // 다시 펼치면 폴링이 재개된다.
@@ -2189,8 +2296,8 @@ fn virtualized_worktree_sessions_share_summary_panel_edges(cx: &mut TestAppConte
             };
             s.rows = vec![
                 Row::Worktree("/repo/a".into()),
-                Row::Session(first, true),
-                Row::Session(second, true),
+                Row::Session(Box::new(first), true),
+                Row::Session(Box::new(second), true),
             ];
             s.rows
                 .extend((0..100).map(|i| Row::Repository(format!("/extra/{i}").into())));
@@ -5480,14 +5587,29 @@ fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppCont
                 "Windows PowerShell",
                 "a shell without an identified agent retains its title"
             );
+            generic.status.title = Some(r"C:\Program Files\PowerShell\7\pwsh.exe".into());
+            assert_eq!(
+                s.session_label(&generic).0,
+                "pwsh",
+                "ConPTY's default title"
+            );
+            generic.status.title = Some("Windows PowerShell".into());
             generic.status.agent = "claude".into();
             assert_eq!(s.session_label(&generic).0, "fix-login-timeout");
             s.auto_titles.remove(&generic.id);
             assert_eq!(
                 s.session_label(&generic).0,
-                "Windows PowerShell",
-                "an agent without a known prompt must not invent a title"
+                "claude",
+                "an agent's launcher shell title yields to the agent name"
             );
+            generic.status.title = Some(r"C:\WINDOWS\system32\cmd.exe".into());
+            generic.status.agent = "codex".into();
+            assert_eq!(
+                s.session_label(&generic).0,
+                "codex",
+                "npm codex.cmd leaves cmd.exe as the console title"
+            );
+            generic.status.agent = "claude".into();
             s.set_auto_title(generic.id, "fix-login-timeout", cx);
 
             // The pane's cached generic OSC label must not hide a newer title
@@ -5514,7 +5636,7 @@ fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppCont
             assert_eq!(
                 s.session_label_on_with_title(&remote, &remote_session, Some("Windows PowerShell"))
                     .0,
-                "Windows PowerShell",
+                "claude",
                 "a remote ID never borrows the local prompt title"
             );
         });
@@ -5743,7 +5865,10 @@ fn card_session_lists_running_subagents_below_it(cx: &mut TestAppContext) {
                 sessions: vec![lead.clone()],
                 trees: BTreeMap::from([(PathBuf::from("/repo"), vec!["/repo/a".into()])]),
             };
-            s.rows = vec![Row::Worktree("/repo/a".into()), Row::Session(lead, true)];
+            s.rows = vec![
+                Row::Worktree("/repo/a".into()),
+                Row::Session(Box::new(lead), true),
+            ];
             s.expanded_cards.insert("/repo/a".into());
             s.sync_viewport();
             cx.notify();
@@ -7238,5 +7363,264 @@ fn machine_observations_follow_accepted_remote_snapshots(cx: &mut TestAppContext
         );
         assert_eq!(s.remote_hosts[0].snapshot.sessions[0].id, SessionId(2));
         assert_eq!(s.remote_hosts[0].status, HostStatus::Connected);
+    });
+}
+
+/// 접힌 채 시작한 창도 탭 이름에 쓸 첫 스냅샷을 한 번 읽고, 그 뒤로는 폴링하지 않는다.
+#[gpui::test]
+fn hidden_sidebar_reads_one_snapshot_for_tab_labels(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Once(AtomicUsize);
+    impl Source for Once {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Snapshot {
+                sessions: vec![session(1, AgentState::Working, Some("/repo/wt"))],
+                trees: BTreeMap::new(),
+            })
+        }
+    }
+    cx.update(gpui_component::init);
+    let source = Arc::new(Once(AtomicUsize::new(0)));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_visible(false, cx);
+            s.connect_source(source.clone(), cx);
+        });
+    });
+    for _ in 0..10 {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+    }
+    assert_eq!(source.0.load(Ordering::SeqCst), 1);
+    assert!(cx.update(|_, cx| view.read(cx).session(SessionId(1)).is_some()));
+}
+
+/// 같은 머신(`MachineIdentity`)으로 동시에 연결된 SSH + 초대(iroh) 경로와 로컬 루프백 경로는
+/// 사이드바·대시보드·Jump에서 한 번만 표시하고, 주 경로가 끊기면 보조 경로로 즉시 이어받는다.
+#[gpui::test]
+fn duplicate_verified_machine_routes_render_once_and_fail_over(cx: &mut TestAppContext) {
+    struct Identified {
+        identity: Option<krill_proto::ipc::MachineIdentity>,
+        snapshot: Arc<Snapshot>,
+    }
+    impl Source for Identified {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok((*self.snapshot).clone())
+        }
+        fn fetch_identified(&self) -> io::Result<IdentifiedSnapshot> {
+            Ok(IdentifiedSnapshot {
+                snapshot: self.snapshot.clone(),
+                daemon_identity: None,
+                machine_identity: self.identity,
+            })
+        }
+        fn poll_snapshot(&self) -> PollSnapshot {
+            let observed = IdentifiedSnapshot {
+                snapshot: self.snapshot.clone(),
+                daemon_identity: None,
+                machine_identity: self.identity,
+            };
+            Box::pin(async move {
+                Ok(PolledSnapshot {
+                    observed,
+                    meta: Meta::new(),
+                })
+            })
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let local_id = krill_proto::ipc::MachineIdentity([1; 16]);
+    let office_id = krill_proto::ipc::MachineIdentity([7; 16]);
+    let local_snap = Arc::new(Snapshot {
+        sessions: vec![session(
+            1,
+            AgentState::Working,
+            Some("/local/sd-tax-system"),
+        )],
+        trees: BTreeMap::from([(
+            PathBuf::from("/local/sd-tax-system"),
+            vec![PathBuf::from("/local/sd-tax-system")],
+        )]),
+    });
+    let office_snap = Arc::new(Snapshot {
+        sessions: vec![
+            session(10, AgentState::Done, Some("/remote/sd-tax-system")),
+            session(11, AgentState::Done, Some("/remote/sd-tax-system")),
+            session(12, AgentState::Done, Some("/remote/sd-tax-system")),
+        ],
+        trees: BTreeMap::from([(
+            PathBuf::from("/remote/sd-tax-system"),
+            vec![PathBuf::from("/remote/sd-tax-system")],
+        )]),
+    });
+
+    view.update(vcx, |s, cx| {
+        s.connect_source(
+            Arc::new(Identified {
+                identity: Some(local_id),
+                snapshot: local_snap.clone(),
+            }),
+            cx,
+        );
+        s.set_remote_host_source(
+            "ssh-tp-pc",
+            "이상덕세무사사무소",
+            HostStatus::Connected,
+            Arc::new(Identified {
+                identity: Some(office_id),
+                snapshot: office_snap.clone(),
+            }),
+            cx,
+        );
+        s.set_remote_host_source(
+            "iroh:krill-mac",
+            "이상덕세무사사무소",
+            HostStatus::Connected,
+            Arc::new(Identified {
+                identity: Some(office_id),
+                snapshot: office_snap.clone(),
+            }),
+            cx,
+        );
+        s.set_remote_host_source(
+            "ssh-loopback",
+            "내 Mac 루프백",
+            HostStatus::Connected,
+            Arc::new(Identified {
+                identity: Some(local_id),
+                snapshot: local_snap.clone(),
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |s, _| {
+        // 설정 > 머신 페이지용 관측 맵에는 모든 경로가 유지된다.
+        assert_eq!(s.machine_identities().len(), 4);
+        let remote_worktrees: Vec<_> = s
+            .rows
+            .iter()
+            .enumerate()
+            .filter(
+                |(_, r)| matches!(r, Row::Worktree(p) if p == Path::new("/remote/sd-tax-system")),
+            )
+            .map(|(i, _)| s.row_host(i).clone())
+            .collect();
+        assert_eq!(remote_worktrees, vec![HostId::Remote("ssh-tp-pc".into())]);
+        let local_worktrees = s
+            .rows
+            .iter()
+            .filter(|r| matches!(r, Row::Worktree(p) if p == Path::new("/local/sd-tax-system")))
+            .count();
+        assert_eq!(local_worktrees, 1);
+        assert_eq!(s.dashboard_sessions().len(), 4);
+        assert_eq!(s.jump_items().len(), 4);
+    });
+
+    // SSH 경로가 끊기면 같은 머신의 iroh 경로가 즉시 대표 경로가 되고 선택 워크트리도 유지된다.
+    view.update(vcx, |s, cx| {
+        s.select_worktree(Some(PathBuf::from("/remote/sd-tax-system")), cx);
+        s.set_remote_host_status("ssh-tp-pc", HostStatus::Disconnected, cx);
+    });
+    view.read_with(vcx, |s, _| {
+        let remote_worktrees: Vec<_> = s
+            .rows
+            .iter()
+            .enumerate()
+            .filter(
+                |(_, r)| matches!(r, Row::Worktree(p) if p == Path::new("/remote/sd-tax-system")),
+            )
+            .map(|(i, _)| s.row_host(i).clone())
+            .collect();
+        assert_eq!(
+            remote_worktrees,
+            vec![HostId::Remote("iroh:krill-mac".into())]
+        );
+        assert_eq!(
+            s.selected_workspace(),
+            Some((
+                HostId::Remote("iroh:krill-mac".into()),
+                PathBuf::from("/remote/sd-tax-system"),
+            ))
+        );
+        assert_eq!(s.dashboard_sessions().len(), 4);
+    });
+}
+
+#[gpui::test]
+fn adding_project_selects_it_in_active_project_filter_and_reveals_row(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let repo_a = PathBuf::from("/tmp/add-proj-a");
+    let repo_b = PathBuf::from("/tmp/add-proj-b");
+    let removed_repo = PathBuf::from("/tmp/add-proj-removed");
+    let repo_c = PathBuf::from("/tmp/add-proj-c");
+    let repo_d = PathBuf::from("/tmp/add-proj-d");
+
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: vec![
+                    session(1, AgentState::Working, Some("/tmp/add-proj-a")),
+                    session(2, AgentState::Working, Some("/tmp/add-proj-b")),
+                ],
+                trees: BTreeMap::from([
+                    (repo_a.clone(), vec![repo_a.clone()]),
+                    (repo_b.clone(), vec![repo_b.clone()]),
+                    (removed_repo.clone(), vec![removed_repo.clone()]),
+                ]),
+            };
+            s.removed_projects.insert(removed_repo.clone());
+            s.collapsed.insert(removed_repo.clone());
+            s.options.filters.hide_sleeping = true;
+            s.options.filters.always_show_default_branch = false;
+            s.toggle_repo_filter(repo_a.clone(), cx);
+
+            // 1. Adding repo_c while repo_a filter is active adds repo_c to the filter and selects it.
+            s.add_project_on(&HostId::Local, repo_c.clone(), cx);
+            assert!(s.options().filters.is_repo_selected(&repo_a));
+            assert!(s.options().filters.is_repo_selected(&repo_c));
+            assert!(!s.options().filters.is_repo_selected(&repo_b));
+            assert_eq!(s.selected_worktree(), Some(repo_c.as_path()));
+            assert!(s.rows.contains(&Row::Repository(repo_a.clone())));
+            assert!(s.rows.contains(&Row::Repository(repo_c.clone())));
+            assert!(s.rows.contains(&Row::Worktree(repo_c.clone())));
+            assert!(!s.rows.contains(&Row::Repository(repo_b.clone())));
+
+            // 2. Re-adding a previously removed & collapsed project restores, expands, and selects it.
+            s.add_project_on(&HostId::Local, removed_repo.clone(), cx);
+            assert!(!s.removed_projects.contains(&removed_repo));
+            assert!(!s.collapsed.contains(&removed_repo));
+            assert!(s.options().filters.is_repo_selected(&removed_repo));
+            assert_eq!(s.selected_worktree(), Some(removed_repo.as_path()));
+            assert!(s.rows.contains(&Row::Repository(removed_repo.clone())));
+            assert!(s.rows.contains(&Row::Worktree(removed_repo.clone())));
+
+            // 3. Clearing repo filters keeps "All projects" (empty filter) when adding repo_d.
+            s.clear_repo_filters(cx);
+            assert!(s.options().filters.repos.is_empty());
+            s.add_project_on(&HostId::Local, repo_d.clone(), cx);
+            assert!(s.options().filters.repos.is_empty());
+            for expected in [&repo_a, &repo_b, &repo_c, &removed_repo, &repo_d] {
+                assert!(
+                    s.rows.contains(&Row::Repository(expected.clone())),
+                    "expected {expected:?} to be visible under All projects"
+                );
+            }
+
+            // 4. Removing the sole selected filtered project clears its orphan filter entry.
+            s.toggle_repo_filter(repo_d.clone(), cx);
+            assert!(s.options().filters.is_repo_selected(&repo_d));
+            s.remove_project(repo_d.clone(), cx);
+            assert!(s.options().filters.repos.is_empty());
+            assert!(s.rows.contains(&Row::Repository(repo_a.clone())));
+            assert!(!s.rows.contains(&Row::Repository(repo_d.clone())));
+        });
     });
 }

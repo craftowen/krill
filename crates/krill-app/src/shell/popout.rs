@@ -58,9 +58,6 @@ fn daemon_status_dot(tip: String, color: gpui::Hsla) -> gpui::Stateful<gpui::Div
         .tooltip(move |window, cx| ui::tooltip_view("status-daemon", tip.clone(), window, cx))
 }
 
-/// 상태바 떼 미터 점 칸 수. 폭은 세션 수와 무관하게 이만큼 예약한다.
-const STATUS_SWARM_DOTS: usize = 8;
-
 /// 화면 객체가 그대로면 평문 변환도 생략한다. Weak로 이전 화면을 붙들지 않는다.
 #[derive(Default)]
 pub(super) struct PortCache {
@@ -80,8 +77,8 @@ impl PortCache {
         &self.entries
     }
 
-    pub(super) fn into_data(self) -> (String, Vec<krill_proto::orchestration::PortEntry>) {
-        (self.text, self.entries)
+    pub(super) fn data(&self) -> (String, Vec<krill_proto::orchestration::PortEntry>) {
+        (self.text.clone(), self.entries.clone())
     }
 
     pub(super) fn from_result(
@@ -133,22 +130,12 @@ pub(super) fn detect_ports(
     (text, entries)
 }
 
-/// OWE-856: 세션 수·알림 수(상태 역할·이름 노출). 세션 수 옆에 세션별 상태 떼 미터.
-fn usage_status(
-    p: &ui::Palette,
-    states: &[AgentState],
-    needs_you: usize,
-    cx: &App,
-) -> gpui::Stateful<gpui::Div> {
-    let sessions = states.len();
+/// OWE-856: 세션 수·알림 수(상태 역할·이름 노출). 알림 종은 확인할 세션이 있을 때만 보인다.
+fn usage_status(p: &ui::Palette, sessions: usize, needs_you: usize) -> gpui::Stateful<gpui::Div> {
     let usage_tip = counts(sessions, needs_you);
     let sessions_count = sessions.to_string();
     let needs_you_count = needs_you.to_string();
-    let needs_you_color = if needs_you > 0 {
-        p.agent_question
-    } else {
-        p.muted_foreground
-    };
+    let needs_you_color = p.agent_question;
     div()
         .id("status-usage")
         .debug_selector(|| "status-usage".into())
@@ -173,29 +160,27 @@ fn usage_status(
                         .data(ui::icons::TERMINAL_SVG)
                         .with_size(gpui_component::Size::XSmall),
                 )
-                .child(sessions_count)
-                .child(
-                    ui::status::swarm_meter(states, STATUS_SWARM_DOTS, cx)
-                        .debug_selector(|| "status-swarm".into()),
-                ),
+                .child(sessions_count),
         )
-        .child(
-            div()
-                .id("status-needs-you")
-                .debug_selector(|| "status-needs-you".into())
-                .flex()
-                .items_center()
-                .gap_1()
-                .font_family(ui::FONT_MONO)
-                .text_color(needs_you_color)
-                .child(
-                    gpui_component::Icon::default()
-                        .data(ui::icons::BELL_SVG)
-                        .with_size(gpui_component::Size::XSmall)
-                        .text_color(needs_you_color),
-                )
-                .child(needs_you_count),
-        )
+        .when(needs_you > 0, |d| {
+            d.child(
+                div()
+                    .id("status-needs-you")
+                    .debug_selector(|| "status-needs-you".into())
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .font_family(ui::FONT_MONO)
+                    .text_color(needs_you_color)
+                    .child(
+                        gpui_component::Icon::default()
+                            .data(ui::icons::BELL_SVG)
+                            .with_size(gpui_component::Size::XSmall)
+                            .text_color(needs_you_color),
+                    )
+                    .child(needs_you_count),
+            )
+        })
         .tooltip(move |window, cx| ui::tooltip_view("status-usage", usage_tip.clone(), window, cx))
 }
 
@@ -242,6 +227,7 @@ fn existing<T: 'static>(cx: &App) -> Option<WindowHandle<T>> {
     cx.windows().into_iter().find_map(|w| w.downcast::<T>())
 }
 
+#[cfg(all(test, unix))]
 pub(crate) fn existing_dashboard(cx: &App) -> Option<Entity<Dashboard>> {
     cx.windows()
         .into_iter()
@@ -854,24 +840,9 @@ fn has_provider_pill(
     }) && (remote || krill_app::accounts::installed::is_installed(cx, provider))
 }
 
-/// Codex banked reset 및 Claude 주간 세션·프로모션 리셋 크레딧 수. 미터가 아직 없으면 `None`.
-pub(in crate::shell) fn reset_credit_count(
-    snap: &AccountsSnapshot,
-    account: &AccountInfo,
-) -> Option<u64> {
-    snap.meters_for(&account.id)?
-        .meters
-        .iter()
-        .find(|m| m.key == krill_proto::usage::RESET_CREDITS_METER_KEY)?
-        .value
-        .as_deref()?
-        .parse::<u64>()
-        .ok()
-}
-
 /// 상태바 사용량 팝업의 "사용량 초기화" 행(Codex·Claude 2단계 확인).
 /// 1단계 행을 누르면 무장하고 메뉴가 닫히고, 다시 열면 안내·실행·취소 행이 보인다.
-/// 미터가 아직 조회되지 않았더라도(`None`) 소진 시점에 실시간 프로브·차감할 수 있게 활성화한다.
+/// 크레딧과 되돌릴 사용량을 확인한 뒤에만 활성화한다.
 fn append_reset_credit_rows(
     mut menu: PopupMenu,
     snap: &AccountsSnapshot,
@@ -887,9 +858,12 @@ fn append_reset_credit_rows(
     let Some(account) = active.filter(|a| !krill_app::accounts::orca_managed(a)) else {
         return menu;
     };
-    let credits = reset_credit_count(snap, account);
+    let meters = snap.meters_for(&account.id);
+    let credits = krill_app::accounts::display::reset_credits(meters);
+    let available =
+        krill_app::accounts::display::reset_available(meters, krill_app::accounts::display::now());
     let account_id = account.id.clone();
-    let armed = reset_armed.is_some_and(|(p, id)| *p == provider && *id == account_id);
+    let armed = available && reset_armed.is_some_and(|(p, id)| *p == provider && *id == account_id);
     if armed {
         let (title, _) = krill_app::settings::account_heading(account);
         let info = provider_text::PROVIDER_RESET_USAGE_INFO.format(&[("account", &title)]);
@@ -951,9 +925,14 @@ fn append_reset_credit_rows(
                     .ok();
             }),
         );
-    } else if credits == Some(0) {
+    } else if !available {
+        let label = if credits == Some(0) {
+            provider_text::PROVIDER_RESET_USAGE_NONE.get()
+        } else {
+            provider_text::PROVIDER_RESET_USAGE.get()
+        };
         menu = menu.item(
-            PopupMenuItem::element(|_, cx| {
+            PopupMenuItem::element(move |_, cx| {
                 let p = ui::palette(cx);
                 div()
                     .id("status-provider-reset-usage")
@@ -962,7 +941,7 @@ fn append_reset_credit_rows(
                     .py_0p5()
                     .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
-                    .child(provider_text::PROVIDER_RESET_USAGE_NONE.get())
+                    .child(label)
             })
             .disabled(true),
         );
@@ -1032,6 +1011,7 @@ pub(super) const ACCOUNTS_POLL: std::time::Duration = std::time::Duration::from_
 
 impl Shell {
     /// 현재 실행 중인 호스트·세션에 속하는 캐시 URL만 메뉴에 표시한다.
+    /// 화면이 바뀌어도 다음 감지 결과가 올 때까지 직전 결과를 유지한다(버튼 깜빡임 방지).
     pub(super) fn detected_ports(
         &self,
     ) -> Vec<(
@@ -1044,7 +1024,6 @@ impl Shell {
             let Some((&pane, _)) = self.live.iter().find(|(pane, live)| {
                 self.layout.host(**pane) == host
                     && live.pane.session().is_some_and(|session| session.0 == *sid)
-                    && cache.matches(&live.pane.shown())
             }) else {
                 continue;
             };
@@ -1214,28 +1193,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// OWE-851: 대시보드 카드·리소스 행 클릭 → 메인 창 해당 세션으로 포커스하고 메인 창을 앞으로.
-    #[expect(dead_code, reason = "dashboard window navigation helper")]
-    pub(super) fn focus_session_window(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        self.open_session(session, cx);
-        if let Some(win) = self.window {
-            let focus = self.focus.clone();
-            win.update(cx, |_, window, cx| {
-                window.activate_window();
-                window.focus(&focus, cx);
-            })
-            .ok();
-        }
-        let owner = cx.weak_entity();
-        let sidebar = self.sidebar.clone();
-        let previews = Dashboard::collect_previews(self);
-        let dashboard = cx.new(|cx| Dashboard::new(owner, sidebar, previews, cx));
-        self.dashboard = Some(dashboard);
-        self.sync_sidebar_visibility(cx);
-        self.sync_focused_session(cx);
-        cx.notify();
-    }
-
     pub(crate) fn upsert_account_rule(&mut self, rule: AutoSwitchRule, cx: &mut Context<Self>) {
         self.refresh_accounts(UsageRequest::UpsertAutoSwitchRule(rule), cx);
     }
@@ -1344,6 +1301,14 @@ impl Shell {
             Link::Connecting => (p.warning, text::DAEMON_CONNECTING.get().to_owned()),
             // 세션은 krill-holder가 쥐고 있어 끊김이 아니라 보존 중이다(STYLEGUIDE §3.3).
             Link::Down => (p.preserve, text::DAEMON_CONNECTING.get().to_owned()),
+            Link::Restricted => (
+                p.destructive,
+                format!(
+                    "{}: {}",
+                    text::DAEMON_FAILED.get(),
+                    krill_app::i18n::catalog::link::JOB_RESTRICTED.get()
+                ),
+            ),
             Link::Failed(err) => (
                 p.destructive,
                 if err.is_empty() {
@@ -1372,8 +1337,11 @@ impl Shell {
                     (h, label, s)
                 })
                 .collect();
+            let sidebar = self.sidebar.read(cx);
             for (h, s) in &self.remote_accounts {
-                if !list.iter().any(|(existing, _, _)| existing == h) {
+                if !list.iter().any(|(existing, _, _)| existing == h)
+                    && !sidebar.is_suppressed_remote_host(h)
+                {
                     let label = h.remote_id().unwrap_or_else(|| h.as_key()).to_owned();
                     list.push((h.clone(), label, s.clone()));
                 }
@@ -1559,6 +1527,7 @@ impl Shell {
             .filter(|h| !self.host_aliases.contains_key(&h.id))
             .cloned()
             .collect();
+        let ssh_shown = !ssh_hosts.is_empty();
         let ssh_count_label = ssh_hosts.len().to_string();
         let ssh_full_label = text::SSH_MENU_BTN.format(&[("count", &ssh_count_label)]);
         let ssh_tooltip = format!("{} — {ssh_full_label}", text::SSH_MENU_TITLE.get());
@@ -1607,7 +1576,7 @@ impl Shell {
                         );
                         open_weak
                             .update(cx, |shell, cx| {
-                                if let Some(settings) = &shell.settings {
+                                if let Some(settings) = shell.settings() {
                                     settings.update(cx, |view, cx| {
                                         view.show_machine_add(
                                             krill_app::machines::AddMethod::Ssh,
@@ -1624,6 +1593,8 @@ impl Shell {
         let state_dir = self.state_dir(cx);
         let orch_store = self.orch_snapshot.clone();
         let orch_compact_label = format!("{}·{}", orch_store.runs.len(), orch_store.tasks.len());
+        // 실행·작업이 없으면 숫자 없이 아이콘만 둔다(세션 넘기기 메뉴는 그대로 열린다).
+        let orch_counted = orch_has_content(&orch_store);
         let orch_full_label = text::ORCH_MENU_BTN.format(&[
             ("runs", &orch_store.runs.len().to_string()),
             ("tasks", &orch_store.tasks.len().to_string()),
@@ -1638,7 +1609,7 @@ impl Shell {
         let orch_menu = ui::button_with_tooltip_when(tooltips_on,
             Button::new("status-orchestration-menu")
                 .icon(gpui_component::Icon::default().data(ui::icons::WORKFLOW_SVG))
-                .label(orch_compact_label)
+                .when(orch_counted, |b| b.label(orch_compact_label))
                 .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
@@ -1874,6 +1845,7 @@ impl Shell {
             .on_open_change(track_menu_open(cx.weak_entity()));
         let detected_ports = self.detected_ports();
         let ports_weak = cx.weak_entity();
+        let ports_shown = !detected_ports.is_empty();
         let ports_count_label = detected_ports.len().to_string();
         let ports_full_label = text::PORTS_MENU_BTN.format(&[("count", &ports_count_label)]);
         let ports_tooltip = format!("{} — {ports_full_label}", text::PORTS_MENU_TITLE.get());
@@ -2046,11 +2018,13 @@ impl Shell {
                                 ))
                             }),
                     )
-                    .child(daemon_status_dot(daemon_tooltip, color))
-                    .child(usage_status(p, &states, needs_you, cx))
+                    .when(self.link != Link::Up, |d| {
+                        d.child(daemon_status_dot(daemon_tooltip, color))
+                    })
+                    .child(usage_status(p, states.len(), needs_you))
                     .child(orch_menu)
-                    .child(ports_menu)
-                    .child(ssh_menu)
+                    .when(ports_shown, |d| d.child(ports_menu))
+                    .when(ssh_shown, |d| d.child(ssh_menu))
                     .when(session.is_some(), |d| {
                         let float_tip =
                             format!("{} — {}", text::FLOAT_BUTTON.get(), text::FLOAT_LABEL.get());
@@ -2751,8 +2725,6 @@ impl Render for Dashboard {
         ui::modal_backdrop(viewport, ui::modal_focus_scope(card, &self.focus))
     }
 }
-
-pub(crate) mod bench;
 
 #[cfg(test)]
 #[cfg(unix)]

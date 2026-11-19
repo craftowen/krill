@@ -1,6 +1,6 @@
 use super::*;
-use std::os::unix::fs::PermissionsExt as _;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 struct TempDir(PathBuf);
 
@@ -154,202 +154,36 @@ fn open_maps_each_format_to_its_viewer() {
 }
 
 #[test]
-fn atomic_save_replaces_content_keeps_mode_and_leaves_no_temp() {
-    let dir = TempDir::new("save");
-    let p = dir.0.join("script.sh");
-    fs::write(&p, "old\n").unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o750)).unwrap();
-    let ino_before = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&p).unwrap());
-
-    let stamp_after = save_atomic(&p, "new 내용\n", stamp(&p).unwrap()).unwrap();
-
-    assert_eq!(fs::read_to_string(&p).unwrap(), "new 내용\n");
-    let meta = fs::metadata(&p).unwrap();
-    assert_eq!(meta.permissions().mode() & 0o777, 0o750);
-    // rename으로 교체했으니 inode가 바뀐다(제자리 덮어쓰기가 아님).
-    assert_ne!(std::os::unix::fs::MetadataExt::ino(&meta), ino_before);
-    assert_eq!(stamp(&p).unwrap(), Some(stamp_after));
-    let names: Vec<_> = fs::read_dir(&dir.0)
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    assert_eq!(names, vec![std::ffi::OsString::from("script.sh")]);
-}
-
-#[test]
-fn atomic_save_follows_symlink_and_creates_deleted_file() {
-    let dir = TempDir::new("link");
-    let real = dir.0.join("real.txt");
-    fs::write(&real, "a").unwrap();
-    let link = dir.0.join("link.txt");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    save_atomic(&link, "b", stamp(&link).unwrap()).unwrap();
-    assert!(
-        fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(fs::read_to_string(&real).unwrap(), "b");
-
-    let gone = dir.0.join("gone.txt");
-    save_atomic(&gone, "back", None).unwrap();
-    assert_eq!(fs::read_to_string(&gone).unwrap(), "back");
-}
-
-#[test]
-fn atomic_save_failure_keeps_old_file() {
-    let dir = TempDir::new("fail");
-    let p = dir.0.join("ro").join("x.txt");
-    fs::create_dir(p.parent().unwrap()).unwrap();
-    fs::write(&p, "keep").unwrap();
-    fs::set_permissions(p.parent().unwrap(), fs::Permissions::from_mode(0o500)).unwrap();
-    let result = save_atomic(&p, "lost?", stamp(&p).unwrap());
-    fs::set_permissions(p.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(result.is_err());
-    assert_eq!(fs::read_to_string(&p).unwrap(), "keep");
-}
-
-/// 열기 → 편집(dirty) → 되돌리기(깨끗) → 저장 → 자기 저장은 외부 변경이 아님.
-#[test]
-fn doc_edit_dirty_save_cycle() {
-    let dir = TempDir::new("doc");
-    let p = dir.0.join("a.txt");
-    fs::write(&p, "one").unwrap();
-    let (opened, st) = open(&p).unwrap();
-    let mut doc = Doc::new(p.clone(), text(opened), st);
-    assert!(!doc.is_dirty());
-
-    assert!(doc.edited("one!" == doc.saved()));
-    assert!(doc.is_dirty());
-    assert!(
-        !doc.edited("one!!" == doc.saved()),
-        "still dirty: no change"
-    );
-    assert!(
-        doc.edited("one" == doc.saved()),
-        "undo back to saved is clean"
-    );
-    assert!(!doc.is_dirty());
-
-    doc.edited(false);
-    doc.save("two".into()).unwrap();
-    assert!(!doc.is_dirty());
-    assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Nothing);
-}
-
-#[test]
-fn clean_doc_reloads_on_external_change() {
+fn doc_reloads_on_external_change() {
     let dir = TempDir::new("reload");
     let p = dir.0.join("a.txt");
     fs::write(&p, "one").unwrap();
-    let (opened, st) = open(&p).unwrap();
-    let mut doc = Doc::new(p.clone(), text(opened), st);
+    let (_, st) = open(&p).unwrap();
+    let mut doc = Doc::new(p.clone(), st);
+    assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Nothing);
     rewrite(&p, "outside change");
     assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Reload);
     let (opened, st) = open(&p).unwrap();
-    doc.reloaded(text(opened), st);
-    assert_eq!(doc.saved(), "outside change");
+    assert_eq!(text(opened), "outside change");
+    doc = Doc::new(p.clone(), st);
     assert_eq!(doc.disk(), Disk::Same);
     assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Nothing);
 }
 
 #[test]
-fn dirty_doc_is_marked_not_reloaded_then_keep_or_reload() {
-    let dir = TempDir::new("conflict");
-    let p = dir.0.join("a.txt");
-    fs::write(&p, "one").unwrap();
-    let (opened, st) = open(&p).unwrap();
-    let mut doc = Doc::new(p.clone(), text(opened), st);
-    doc.edited(false);
-    rewrite(&p, "outside change");
-    assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Marked);
-    assert_eq!(doc.disk(), Disk::Changed);
-    assert!(doc.is_dirty(), "draft kept");
-    // 같은 변경으로는 다시 표시하지 않는다.
-    assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Nothing);
-
-    doc.keep_mine(stamp(&p).unwrap());
-    assert_eq!(doc.disk(), Disk::Same);
-    assert!(doc.is_dirty());
-
-    rewrite(&p, "second outside change!");
-    assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Marked);
-    let (opened, st) = open(&p).unwrap();
-    doc.reloaded(text(opened), st);
-    assert!(!doc.is_dirty());
-    assert_eq!(doc.disk(), Disk::Same);
-}
-
-#[test]
-fn deleted_file_is_marked_and_save_recreates() {
+fn deleted_file_is_marked_and_reloads_when_recreated() {
     let dir = TempDir::new("delete");
     let p = dir.0.join("a.txt");
     fs::write(&p, "one").unwrap();
-    let (opened, st) = open(&p).unwrap();
-    let mut doc = Doc::new(p.clone(), text(opened), st);
+    let (_, st) = open(&p).unwrap();
+    let mut doc = Doc::new(p.clone(), st);
     fs::remove_file(&p).unwrap();
     assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Marked);
     assert_eq!(doc.disk(), Disk::Deleted);
     assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Nothing);
 
-    doc.save("one".into()).unwrap();
-    assert_eq!(doc.disk(), Disk::Same);
-
-    // 깨끗한 탭은 지워졌다 다시 생기면 다시 읽는다.
-    fs::remove_file(&p).unwrap();
-    doc.poll(None);
     rewrite(&p, "recreated");
     assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Reload);
-}
-
-/// 감사 2026-10-17: 읽은 뒤 바깥(에이전트 등)에서 바뀐 파일을 ⌘S가 조용히 덮어쓰지 않는다(lost update).
-#[test]
-fn save_refuses_to_overwrite_external_change() {
-    let dir = TempDir::new("lost");
-    let p = dir.0.join("a.txt");
-    fs::write(&p, "one").unwrap();
-    let (opened, st) = open(&p).unwrap();
-    let mut doc = Doc::new(p.clone(), text(opened), st);
-    doc.edited(false);
-    // 감시 주기(1초)가 돌기 전에 바깥에서 바뀌었다.
-    rewrite(&p, "agent edit");
-    assert!(matches!(doc.save("mine".into()), Err(SaveError::Conflict)));
-    assert_eq!(fs::read_to_string(&p).unwrap(), "agent edit");
-    assert!(doc.is_dirty(), "draft kept");
-
-    // 감시가 표시한 뒤에도 답하기 전에는 저장하지 않고, "내 편집 유지"를 고르면 저장한다.
-    assert_eq!(doc.poll(stamp(&p).unwrap()), Poll::Marked);
-    assert!(matches!(doc.save("mine".into()), Err(SaveError::Conflict)));
-    assert_eq!(fs::read_to_string(&p).unwrap(), "agent edit");
-    doc.keep_mine(stamp(&p).unwrap());
-    doc.save("mine".into()).unwrap();
-    assert_eq!(fs::read_to_string(&p).unwrap(), "mine");
-    assert!(!doc.is_dirty());
-
-    // 지운 파일을 누가 다시 만들었으면 덮어쓰지 않는다.
-    fs::remove_file(&p).unwrap();
-    doc.poll(None);
-    rewrite(&p, "recreated by someone");
-    assert!(matches!(doc.save("mine".into()), Err(SaveError::Conflict)));
-    assert_eq!(fs::read_to_string(&p).unwrap(), "recreated by someone");
-}
-
-/// 감사 2026-10-17: 쓰기 권한이 없는 파일을 rename으로 갈아끼우지 않는다(폴더 쓰기 권한만으로 덮어쓰기 방지).
-#[test]
-fn save_refuses_read_only_file() {
-    let dir = TempDir::new("ro-file");
-    let p = dir.0.join("locked.txt");
-    fs::write(&p, "keep").unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
-    let result = save_atomic(&p, "overwrite?", stamp(&p).unwrap());
-    assert!(
-        matches!(&result, Err(SaveError::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied),
-        "{result:?}"
-    );
-    assert_eq!(fs::read_to_string(&p).unwrap(), "keep");
-    let names: Vec<_> = fs::read_dir(&dir.0).unwrap().collect();
-    assert_eq!(names.len(), 1, "no temp file left");
 }
 
 /// 감사 2026-10-17: FIFO를 열면 `open(2)`이 쓰는 쪽을 기다리며 UI 스레드가 멈췄다. 일반 파일이 아니면 열지 않는다.

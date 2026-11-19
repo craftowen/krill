@@ -190,7 +190,9 @@ impl Saver {
                         task: Some(task),
                     });
                 }
-                Err(err) => tracing::error!(error = %err, "layout save worker failed to start"),
+                Err(err) => {
+                    tracing::error!(kind = ?err.kind(), "layout save worker failed to start");
+                }
             }
         }
         if let Some(worker) = worker.as_ref()
@@ -265,7 +267,7 @@ fn run(path: &Path, mailbox: &Mailbox) {
         let saved = layout.as_ref().is_none_or(|layout| {
             layout
                 .save(path)
-                .inspect_err(|err| tracing::error!(error = %err, "layout save failed"))
+                .inspect_err(|err| tracing::error!(kind = ?err.kind(), "layout save failed"))
                 .is_ok()
         });
         let Ok(mut pending) = mailbox.pending.lock() else {

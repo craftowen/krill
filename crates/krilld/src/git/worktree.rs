@@ -95,9 +95,12 @@ fn root_in(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
     if let Some(d) = get("KRILL_WORKTREES_DIR") {
         return Ok(PathBuf::from(d));
     }
-    get("HOME")
+    // Windows 기본 환경에는 HOME이 없다. 에이전트와 같은 홈(`krill_proto::os::home_dir`)을 쓴다.
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    get(key)
+        .filter(|h| !h.is_empty())
         .map(|h| krill_proto::user_dirs::worktrees_root(Path::new(&h)))
-        .ok_or_else(|| "HOME is not set".to_owned())
+        .ok_or_else(|| format!("{key} is not set"))
 }
 
 /// setup 세션을 띄울 기본 크기. 요청한 세션 크기를 알 수 없을 때만 쓴다.
@@ -114,7 +117,7 @@ pub fn serve(
     let trust = krill_proto::daemon::state_dir().map(|d| d.join(TRUST_FILE));
     let outcome = match (queue(), root(), trust) {
         (Ok(q), Ok(root), Some(trust)) => {
-            create_with_pool(q, req, &root, &trust, prepare::existing())
+            create_with_pool(q, req, &root, &trust, prepare::existing().as_deref())
         }
         (Err(e), _, _) | (_, Err(e), _) => Err(e),
         (_, _, None) => Err("HOME is not set".to_owned()),
@@ -227,7 +230,7 @@ pub fn create_isolated(repo: &Path, name: &str, state_dir: &Path) -> Result<Path
         base: None,
         setup: Setup::Skip,
     };
-    match create_with_pool(q, &req, &root, &trust, prepare::existing())? {
+    match create_with_pool(q, &req, &root, &trust, prepare::existing().as_deref())? {
         Outcome::Created { worktree, .. } => Ok(PathBuf::from(OsString::from_vec(worktree.path))),
         Outcome::Untrusted { .. } => Err("worktree setup untrusted".to_owned()),
     }
@@ -292,8 +295,9 @@ pub fn create_with_pool(
     let dir =
         compat::project_destination(&top, trust.parent())?.unwrap_or_else(|| root.join(repo_name));
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    // git이 기록하는 경로와 비교하려고 실제 경로로(`/tmp` → `/private/tmp`).
-    let dir = fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // git이 기록하는 경로와 비교하려고 실제 경로로(`/tmp` → `/private/tmp`). Windows 접두 `\\?\`는
+    // 뗀다: git은 그 경로를 `//?/C:/...`로 바꿔 `.git` 파일을 쓰지 못한다.
+    let dir = krill_proto::os::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (branch, path) = free_name(q, &top, &dir, &leaf)?;
 
     let promoted = match pool
@@ -339,7 +343,7 @@ pub fn create_with_pool(
     let (inc_copied, inc_warnings) = copy_includes(q, &top, &path, &include_entries);
     copied.extend(inc_copied);
     warnings.extend(inc_warnings);
-    crate::agent::pre_trust_all_agents(&path);
+    crate::agent::pre_trust_all_agents(trust.parent(), &path);
     Ok(Outcome::Created {
         worktree: Worktree {
             path: path.into_os_string().into_vec(),
@@ -362,7 +366,8 @@ fn create_folder_workspace(
     if let Some(b) = req.base.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return Err(format!("base ref {b:?} requires a git repository"));
     }
-    let top = fs::canonicalize(given).map_err(|e| format!("{}: {e}", given.display()))?;
+    let top =
+        krill_proto::os::canonicalize(given).map_err(|e| format!("{}: {e}", given.display()))?;
     let config = compat::read_config_with_state(&top, trust.parent())?;
 
     if let (Some(archive), Setup::Approve(h)) = (config.worktree.archive.as_deref(), &req.setup)
@@ -385,7 +390,7 @@ fn create_folder_workspace(
     };
 
     let branch = leaf(&req.name)?;
-    crate::agent::pre_trust_all_agents(&top);
+    crate::agent::pre_trust_all_agents(trust.parent(), &top);
     Ok(Outcome::Created {
         worktree: Worktree {
             path: top.into_os_string().into_vec(),
@@ -574,12 +579,32 @@ pub(crate) fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
     if let Some(d) = file.parent() {
         fs::create_dir_all(d)?;
     }
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(file)?
-        .write_all(format!("{}\n", hex(hash)).as_bytes())
+    let mut content = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&hex(hash));
+    content.push('\n');
+    let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
+    let write_result = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        drop(f);
+        fs::rename(&tmp, file)
+    })();
+    if write_result.is_err() {
+        fs::remove_file(&tmp).ok();
+    }
+    write_result
 }
 
 /// `state_dir/setup-trust`에 `(top, script)` SHA-256 해시가 승인돼 있거나
@@ -898,19 +923,30 @@ pub(crate) fn glob_path_matches(pattern: &str, path: &str) -> bool {
 }
 
 fn match_glob_segments(pat: &[&str], segs: &[&str]) -> bool {
-    let Some((&first, rest)) = pat.split_first() else {
-        return segs.is_empty();
-    };
-    if first == "**" {
-        return match_glob_segments(rest, segs)
-            || segs
-                .split_first()
-                .is_some_and(|(_, srest)| match_glob_segments(pat, srest));
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star_pi, mut star_si) = (None, 0usize);
+    while si < segs.len() {
+        if pat.get(pi) == Some(&"**") {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+        } else if let (Some(&p), Some(&s)) = (pat.get(pi), segs.get(si))
+            && match_glob_segment(p, s)
+        {
+            pi += 1;
+            si += 1;
+        } else if let Some(sp) = star_pi {
+            star_si += 1;
+            si = star_si;
+            pi = sp + 1;
+        } else {
+            return false;
+        }
     }
-    let Some((&seg, seg_rest)) = segs.split_first() else {
-        return false;
-    };
-    match_glob_segment(first, seg) && match_glob_segments(rest, seg_rest)
+    while pat.get(pi) == Some(&"**") {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 fn match_glob_segment(pat: &str, text: &str) -> bool {
@@ -919,39 +955,66 @@ fn match_glob_segment(pat: &str, text: &str) -> bool {
     match_glob_chars(&p, &t)
 }
 
+fn find_class_close(prest: &[char]) -> Option<usize> {
+    let mut start = usize::from(matches!(prest.first(), Some('!' | '^')));
+    if prest.get(start) == Some(&']') {
+        start += 1;
+    }
+    prest
+        .get(start..)?
+        .iter()
+        .position(|&c| c == ']')
+        .map(|pos| start + pos)
+}
+
 fn match_glob_chars(pat: &[char], text: &[char]) -> bool {
-    let Some((&pc, prest)) = pat.split_first() else {
-        return text.is_empty();
-    };
-    match pc {
-        '*' => {
-            match_glob_chars(prest, text)
-                || text
-                    .split_first()
-                    .is_some_and(|(_, trest)| match_glob_chars(pat, trest))
-        }
-        '?' => text
-            .split_first()
-            .is_some_and(|(_, trest)| match_glob_chars(prest, trest)),
-        '[' => {
-            let Some((&tc, trest)) = text.split_first() else {
-                return false;
-            };
-            let Some(close) = prest.iter().position(|&c| c == ']') else {
-                return pc == tc && match_glob_chars(prest, trest);
-            };
-            let class = prest.get(..close).unwrap_or_default();
-            let after = prest.get(close + 1..).unwrap_or_default();
-            if match_char_class(class, tc) {
-                match_glob_chars(after, trest)
-            } else {
-                false
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None, 0usize);
+    while ti < text.len() {
+        match (pat.get(pi), text.get(ti)) {
+            (Some('*'), _) => {
+                star_pi = Some(pi);
+                star_ti = ti;
+                pi += 1;
+            }
+            (Some('?'), Some(_)) => {
+                pi += 1;
+                ti += 1;
+            }
+            (Some('['), Some(&tc)) if pat.get(pi + 1..).and_then(find_class_close).is_some() => {
+                let prest = pat.get(pi + 1..).unwrap_or_default();
+                let close = find_class_close(prest).unwrap_or(0);
+                let class = prest.get(..close).unwrap_or_default();
+                if match_char_class(class, tc) {
+                    pi += 1 + close + 1;
+                    ti += 1;
+                } else if let Some(sp) = star_pi {
+                    star_ti += 1;
+                    ti = star_ti;
+                    pi = sp + 1;
+                } else {
+                    return false;
+                }
+            }
+            (Some(&pc), Some(&tc)) if pc == tc => {
+                pi += 1;
+                ti += 1;
+            }
+            _ => {
+                if let Some(sp) = star_pi {
+                    star_ti += 1;
+                    ti = star_ti;
+                    pi = sp + 1;
+                } else {
+                    return false;
+                }
             }
         }
-        c => text
-            .split_first()
-            .is_some_and(|(&tc, trest)| tc == c && match_glob_chars(prest, trest)),
     }
+    while pat.get(pi) == Some(&'*') {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 fn match_char_class(class: &[char], target: char) -> bool {
@@ -1023,7 +1086,68 @@ mod tests;
 
 /// Best-effort startup cleanup; preparation failures never prevent session recovery.
 pub fn recover_preparation() {
-    if let Err(error) = prepare::recover() {
-        tracing::warn!(%error, "cannot recover speculative worktree");
+    if prepare::recover().is_err() {
+        tracing::warn!("cannot recover speculative worktree");
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn worktree_root_uses_the_profile_when_home_is_unset() {
+    // 탐색기에서 띄운 Krill에는 HOME이 없다.
+    let profile = |k: &str| (k == "USERPROFILE").then(|| OsString::from(r"C:\Users\u"));
+    assert_eq!(
+        root_in(profile),
+        Ok(PathBuf::from(r"C:\Users\u").join("Krill/worktrees"))
+    );
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn remember_separates_entries_when_existing_trust_file_lacks_trailing_newline() {
+        let dir = std::env::temp_dir().join(format!("krill-setup-trust-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(TRUST_FILE);
+        let first = digest(Path::new("/tmp/repo-a"), "echo a");
+        let second = digest(Path::new("/tmp/repo-b"), "echo b");
+        fs::write(&file, hex(&first)).unwrap();
+
+        remember(&file, &second).unwrap();
+        assert!(trusted(&file, &first).unwrap());
+        assert!(trusted(&file, &second).unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn folder_workspace_canonicalizes_without_verbatim_prefix() {
+        let dir = std::env::temp_dir().join(format!("krill-folder-ws-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let workspace = dir.join("plain-folder");
+        fs::create_dir_all(&workspace).unwrap();
+        let trust = dir.join(TRUST_FILE);
+        let req = NewWorktree {
+            repo: workspace.as_os_str().as_bytes().to_vec(),
+            name: "session-1".to_owned(),
+            base: None,
+            setup: Setup::Skip,
+        };
+
+        let out = create_folder_workspace(&workspace, &req, &trust).unwrap();
+        let Outcome::Created { worktree, setup } = out else {
+            panic!("expected Created, got {out:?}");
+        };
+        assert!(setup.is_none());
+        let expected = krill_proto::os::canonicalize(&workspace).unwrap();
+        let got = PathBuf::from(OsString::from_vec(worktree.path));
+        assert_eq!(got, expected);
+        assert!(
+            !got.to_string_lossy().starts_with(r"\\?\"),
+            "unexpected verbatim prefix in {got:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 }

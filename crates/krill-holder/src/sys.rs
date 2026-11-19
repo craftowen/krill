@@ -48,7 +48,7 @@ pub fn set_controlling_tty(cmd: &mut Command) {
 pub static STOPPED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 #[cfg(target_os = "macos")]
 /// 종료 신호(TERM·HUP·INT) 처리기. 적기만 하고 종료는 이벤트 루프가 `EVFILT_SIGNAL`로 깨어 로그를 남긴 뒤 한다.
-/// `SIG_IGN`과 달리 exec 때 기본값으로 돌아가 krilld·세션에 물려지지 않는다. `SA_RESTART`: 링크 IO가 EINTR로 안 깨진다.
+/// `SIG_IGN`과 달리 exec 때 기본값으로 돌아가 krilld·세션에 물려지지 않는다. `SA_RESTART`: 링크 IO가 EINTR로 안 깨진다. 끝으로 신호 마스크를 비운다: std `Command`는 마스크를 물려주고, 앱은 이 신호들을 막은 dispatch 작업 스레드에서 holder를 띄운다.
 pub fn catch_stop_signals() {
     extern "C" fn note(signal: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
         // SAFETY: SA_SIGINFO 처리기에 커널이 넘긴 siginfo다(널이면 0). 원자 저장만 한다(async-signal-safe, panic 없음).
@@ -64,6 +64,8 @@ pub fn catch_stop_signals() {
         // SAFETY: `action`은 유효한 sigaction이고 이전 값은 받지 않는다. 실패하면 그 신호는 기본 동작(로그 없이 종료)으로 남는다.
         unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) };
     }
+    // SAFETY: 빈 집합을 읽기만 하고 이전 값은 받지 않는다. 처리기를 건 뒤라 막혀 있던 신호도 처리기로 간다.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &0, std::ptr::null_mut()) };
 }
 
 #[cfg(target_os = "macos")]

@@ -431,3 +431,60 @@ fn failed_upload_reports_deferred_with_retry_time() {
     assert_eq!(report.outcome, FlushOutcome::Backoff);
     assert_eq!(report.next_attempt_at_ms, Some(next));
 }
+
+#[test]
+fn native_collection_failure_logs_error_kind_without_display_paths() {
+    struct Capture(std::sync::Arc<std::sync::Mutex<String>>);
+    struct Line<'a>(&'a mut String);
+    impl tracing::field::Visit for Line<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            write!(self.0, " {}={value:?}", field.name()).ok();
+        }
+    }
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if let Ok(mut buf) = self.0.lock() {
+                event.record(&mut Line(&mut buf));
+                buf.push('\n');
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    let temp = Temp::new();
+    let state = temp.state();
+    let consent = consent(&state);
+    record(&state, &consent, 1);
+
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let report = tracing::subscriber::with_default(Capture(logs.clone()), || {
+        run_flush(
+            &state,
+            &Env::stub(&[]),
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "/Users/alice/secret/crash.ips",
+                ))
+            },
+            ack_all,
+        )
+    })
+    .unwrap();
+    assert_eq!(report.outcome, FlushOutcome::Sent);
+
+    let recorded = logs.lock().unwrap().clone();
+    assert!(recorded.contains("NotFound"), "{recorded}");
+    assert!(!recorded.contains("/Users/alice"), "{recorded}");
+    assert!(!recorded.contains("crash.ips"), "{recorded}");
+}

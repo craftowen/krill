@@ -140,8 +140,9 @@ impl<V: Clone + PartialEq> SearchableListItem for PickItem<V> {
     }
 
     fn matches(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
-        self.title.to_lowercase().contains(&query) || self.detail.to_lowercase().contains(&query)
+        let query = crate::jump::normalize_search_str(query);
+        crate::jump::normalize_search_str(&self.title).contains(&query)
+            || crate::jump::normalize_search_str(&self.detail).contains(&query)
     }
 }
 
@@ -195,6 +196,43 @@ pub struct Dialog {
     hooks_task: Option<Task<()>>,
     /// git이 아닌 폴더인지(레포 경로별 캐시). 폴더면 기준 ref 대신 안내를 보인다.
     folder: Option<(PathBuf, bool)>,
+    /// Fan-Out 칩에 노출할 에이전트 `(id, label)` 목록.
+    fan_out_agents: Vec<(String, String)>,
+}
+
+fn fan_out_label(id: &str, profile: &krill_proto::agent::Profile) -> String {
+    match id {
+        "claude" => "Claude".to_owned(),
+        "codex" => "Codex".to_owned(),
+        "agy" => "Antigravity".to_owned(),
+        "opencode" => "OpenCode".to_owned(),
+        "cursor" => "Cursor".to_owned(),
+        _ => profile.name.clone(),
+    }
+}
+
+fn build_fan_out_agents(agents: &krill_proto::agent::Agents) -> Vec<(String, String)> {
+    let mut keys: Vec<String> = agents.profiles.keys().cloned().collect();
+    keys.sort_by(|a, b| {
+        krill_proto::agent::profile_rank(a)
+            .cmp(&krill_proto::agent::profile_rank(b))
+            .then_with(|| a.cmp(b))
+    });
+    let mut list: Vec<(String, String)> = keys
+        .into_iter()
+        .filter_map(|id| {
+            agents
+                .profiles
+                .get(&id)
+                .map(|prof| (id.clone(), fan_out_label(&id, prof)))
+        })
+        .collect();
+    for &(extra_id, extra_label) in &[("pi", "Pi"), ("aider", "Aider")] {
+        if !list.iter().any(|(id, _)| id == extra_id) {
+            list.push((extra_id.to_owned(), extra_label.to_owned()));
+        }
+    }
+    list
 }
 
 struct Preparation {
@@ -263,16 +301,6 @@ impl Dialog {
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_with_options(repo, None, None, Vec::new(), source, window, cx)
-    }
-
-    pub fn new_with_parent(
-        repo: PathBuf,
-        parent: Option<PathBuf>,
-        source: Arc<dyn Source>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_with_options(repo, parent, None, Vec::new(), source, window, cx)
     }
 
     pub fn new_with_options(
@@ -382,7 +410,31 @@ impl Dialog {
             hooks: krill_proto::orchestration::RepoHookSummary::default(),
             hooks_task: None,
             folder: None,
+            fan_out_agents: FAN_OUT_AGENTS
+                .iter()
+                .map(|&(id, label)| (id.to_owned(), label.to_owned()))
+                .collect(),
         };
+        if let Some(dir) = crate::settings::state_dir(cx) {
+            cx.spawn(async move |this, cx| {
+                let list = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let path = dir.join(krill_proto::agent::FILE_NAME);
+                        let user = std::fs::read_to_string(path).ok();
+                        let agents =
+                            krill_proto::agent::Agents::load(user.as_deref()).unwrap_or_default();
+                        build_fan_out_agents(&agents)
+                    })
+                    .await;
+                this.update(cx, |d, cx| {
+                    d.fan_out_agents = list;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         if !candidates.is_empty() {
             dialog.set_branch_candidates(candidates, cx);
         }
@@ -410,6 +462,7 @@ impl Dialog {
         self.host_options = options;
         let host_changed = self.host != host;
         self.host = host;
+        let prev_repo = self.repo.clone();
         if let Some(opt) = self
             .host_options
             .iter()
@@ -423,7 +476,11 @@ impl Dialog {
                 self.repo = first.path.clone();
             }
         }
-        if host_changed {
+        let repo_changed = self.repo != prev_repo;
+        if repo_changed {
+            self.parent = None;
+        }
+        if host_changed || repo_changed {
             self.refresh_repo_hooks(cx);
             self.prepare(cx);
         }
@@ -627,11 +684,6 @@ impl Dialog {
         self.parent.as_deref()
     }
 
-    #[must_use]
-    pub fn selected_agents(&self) -> &[String] {
-        &self.selected_agents
-    }
-
     pub fn toggle_agent(&mut self, agent_id: &str, cx: &mut Context<Self>) {
         let trimmed = agent_id.trim();
         if trimmed.is_empty() {
@@ -755,6 +807,7 @@ impl Dialog {
                         Some(result)
                     })
                     .await;
+                let mut wait = Duration::from_millis(250);
                 match reply {
                     Some(Ok(Reply::WorktreePreparation(
                         WorktreePreparation::Preparing | WorktreePreparation::Busy,
@@ -765,15 +818,15 @@ impl Dialog {
                             cx.notify();
                         })
                         .ok();
+                        // A ready checkout only needs to notice its five-minute lease expiring.
+                        wait = Duration::from_secs(5);
                     }
                     _ => {
                         this.update(cx, Dialog::cancel_preparation).ok();
                         return;
                     }
                 }
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
+                cx.background_executor().timer(wait).await;
             }
         }));
     }
@@ -828,6 +881,9 @@ impl Dialog {
         for agent in &self.selected_agents {
             let mut req = base_req.clone();
             req.name = format!("{}-{agent}", base_req.name);
+            if req.name.len() > 255 {
+                return Err(text::NAME_TOO_LONG.get());
+            }
             out.push((req, Some(agent.clone()), prompt.clone()));
         }
         Ok(out)

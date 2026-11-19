@@ -8,7 +8,8 @@ static RUNNING: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 pub(super) fn spawn(profile: &Path, job: impl FnOnce() + Send + 'static) {
     let profile = profile.to_path_buf();
-    if !crate::session::lock(&RUNNING).insert(profile.clone()) {
+    let mut running = crate::session::lock(&RUNNING);
+    if !running.insert(profile.clone()) {
         return;
     }
     let key = profile.clone();
@@ -21,7 +22,8 @@ pub(super) fn spawn(profile: &Path, job: impl FnOnce() + Send + 'static) {
             crate::session::lock(&RUNNING).remove(&key);
         });
     if let Err(error) = result {
-        crate::session::lock(&RUNNING).remove(&profile);
+        running.remove(&profile);
+        drop(running);
         tracing::warn!(kind = ?error.kind(), "profile history worker failed to start");
     }
 }

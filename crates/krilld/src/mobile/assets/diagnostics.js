@@ -17,7 +17,7 @@
     "runtime",
     "resource",
   ]);
-  const routes = new Set(["relay", "tunnel", "tailscale", "direct", "unknown"]);
+  const routes = new Set(["relay", "tailscale", "direct", "unknown"]);
   const reasons = new Set([
     "websocket_error",
     "websocket_closed",
@@ -418,50 +418,181 @@
       /* Diagnostics must never interfere with the application. */
     }
   }
-  function attempt(retry = 0) {
-    const started = Date.now(),
-      attemptId = id();
-    let state = { phase: "socket_open", route: "unknown" },
-      breadcrumbs = [];
-    const metadata = (extra) => ({
-      ...state,
-      attempt_id: attemptId,
-      elapsed_ms: Math.min(300000, Math.max(0, Date.now() - started)),
-      retry_count: Math.min(10000, Math.max(0, retry)),
-      ...extra,
-    });
+  // An episode is the run of attempts until one succeeds. It files at most
+  // one report, held briefly so a quick recovery or a hidden page files none.
+  const weight = (code, input) =>
+    code === "mobile_auth_failed" || input.reason === "auth_required"
+      ? 2
+      : input.ws_code || input.http_status
+        ? 1
+        : 0;
+  function attempt(retry = 0, previous) {
+    let started = Date.now(),
+      lastAt = started,
+      attemptId = id(),
+      established = false,
+      state = { phase: "socket_open", route: "unknown" };
+    const episode = previous?.episode.open
+      ? previous.episode
+      : {
+          open: false,
+          held: null,
+          timer: null,
+          away: false,
+          inFlight: false,
+          flushedWeight: -1,
+          crumbs: [],
+        };
+    episode.inFlight = false;
+    const resetPostOk = () => {
+      if (established && !episode.open) {
+        started = Date.now();
+        lastAt = started;
+        attemptId = id();
+        retry = 0;
+        established = false;
+      }
+    };
+    const metadata = (extra) => {
+      const now = Date.now();
+      if (now - lastAt >= 60000) {
+        started += now - lastAt;
+        if (episode.away || document.visibilityState === "hidden")
+          episode.crumbs = [];
+      }
+      lastAt = now;
+      return {
+        ...state,
+        attempt_id: attemptId,
+        elapsed_ms: Math.min(300000, Math.max(0, now - started)),
+        retry_count: Math.min(10000, Math.max(0, retry)),
+        ...extra,
+      };
+    };
+    const remember = (input) => {
+      episode.away ||= document.visibilityState === "hidden";
+      episode.crumbs.push(crumb(input));
+      episode.crumbs = episode.crumbs.slice(-12);
+    };
+    const release = () => {
+      clearTimeout(episode.timer);
+      const hidden = document.visibilityState === "hidden";
+      if (hidden || episode.away || episode.inFlight) {
+        episode.away = hidden;
+        episode.inFlight = false;
+        episode.timer = setTimeout(release, 10000);
+        return;
+      }
+      const held = episode.held;
+      episode.held = null;
+      if (held) {
+        episode.flushedWeight = Math.max(
+          episode.flushedWeight ?? -1,
+          weight(held.code, held.input),
+        );
+        report(held.code, { ...held.input, breadcrumbs: episode.crumbs });
+      }
+    };
     return {
+      episode,
       mark(phase, extra = {}) {
-        state = { ...state, ...fields(extra), phase };
-        breadcrumbs.push(crumb(metadata(extra)));
-        breadcrumbs = breadcrumbs.slice(-12);
+        resetPostOk();
+        const clean = fields({ ...extra, phase });
+        state = {
+          phase: clean.phase || state.phase,
+          route: clean.route || state.route,
+        };
+        remember(metadata(clean));
+        if (
+          episode.open &&
+          ["challenge", "authentication", "ipc", "snapshot"].includes(
+            clean.phase,
+          )
+        ) {
+          episode.inFlight = true;
+          if (episode.held) {
+            clearTimeout(episode.timer);
+            episode.timer = setTimeout(release, 10000);
+          }
+        }
       },
       report(code, extra = {}) {
-        report(code, { ...metadata(extra), breadcrumbs });
+        resetPostOk();
+        episode.inFlight = false;
+        const input = metadata(extra);
+        remember(input);
+        if (episode.open) {
+          const w = weight(code, input);
+          if (episode.held) {
+            const heldWeight = weight(episode.held.code, episode.held.input);
+            if (
+              w > heldWeight ||
+              (w === heldWeight &&
+                code !== "mobile_discovery_failed" &&
+                input.attempt_id !== episode.held.input.attempt_id) ||
+              (code === "mobile_rpc_failed" &&
+                episode.held.code !== "mobile_auth_failed")
+            ) {
+              episode.held = { code, input };
+              if (code === "mobile_rpc_failed") release();
+            }
+          } else if (
+            w > (episode.flushedWeight ?? -1) ||
+            (code === "mobile_rpc_failed" && (episode.flushedWeight ?? -1) < 2)
+          ) {
+            episode.held = { code, input };
+            if (code === "mobile_rpc_failed") release();
+            else {
+              clearTimeout(episode.timer);
+              episode.timer = setTimeout(release, 10000);
+            }
+          }
+          return;
+        }
+        episode.open = true;
+        episode.flushedWeight = -1;
+        episode.held = { code, input };
+        if (code === "mobile_rpc_failed") release();
+        else episode.timer = setTimeout(release, 10000);
+      },
+      ok() {
+        clearTimeout(episode.timer);
+        established = true;
+        started = Date.now();
+        lastAt = started;
+        Object.assign(episode, {
+          open: false,
+          held: null,
+          away: false,
+          inFlight: false,
+          flushedWeight: -1,
+          crumbs: [],
+        });
       },
     };
   }
   function assetFile(value) {
+    if (typeof value !== "string" || !value.trim()) return;
     try {
       const u = new URL(value, location.href),
         base = /^\/m\/[0-9a-f]{16}\//.exec(location.pathname)?.[0] || "/";
       if (u.origin !== location.origin || !u.pathname.startsWith(base)) return;
-      return u.pathname.slice(base.length) || "index.html";
+      return u.pathname.slice(base.length) || undefined;
     } catch {}
   }
   function source(value) {
     const file = assetFile(value);
     if (files.has(file)) return file;
+    if (typeof value !== "string" || !value.trim()) return;
+    try {
+      const u = new URL(value, location.href);
+      if (
+        u.origin === location.origin &&
+        (/^\/m\/[0-9a-f]{16}\/?$/.test(u.pathname) || u.pathname === "/")
+      )
+        return "index.html";
+    } catch {}
   }
-  const resources = new Set([
-    "app.css",
-    "manifest.json",
-    "icon.svg",
-    "icon-192.png",
-    "icon-512.png",
-    "icon-maskable-512.png",
-    "apple-touch-icon.png",
-  ]);
   const exception = (error) => {
     const out = { error_name: names.has(error?.name) ? error.name : "Unknown" },
       frames = [];
@@ -500,7 +631,8 @@
         if (event.target && event.target !== globalThis) {
           const asset = assetFile(event.target.src || event.target.href),
             file = files.has(asset) ? asset : undefined;
-          if (file || resources.has(asset))
+          // Icons and the manifest are decorative: a failed logo breaks nothing.
+          if (file || asset === "app.css")
             report("mobile_asset_failed", {
               phase: "resource",
               reason: "resource_error",
@@ -508,13 +640,18 @@
             });
           return;
         }
+        const details = exception(event.error),
+          direct = source(event.filename),
+          top = details.stack_frames?.[0],
+          srcFile = direct || top?.source_file;
+        if (!srcFile && !details.stack_frames?.length) return;
         report("mobile_runtime_error", {
           phase: "runtime",
           reason: "runtime_error",
-          ...exception(event.error),
-          source_file: source(event.filename),
-          line: event.lineno,
-          column: event.colno,
+          ...details,
+          source_file: srcFile,
+          line: direct ? event.lineno : top?.line,
+          column: direct ? event.colno : top?.column,
         });
       } catch {}
     },
@@ -522,10 +659,19 @@
   );
   globalThis.addEventListener?.("unhandledrejection", (event) => {
     try {
+      const details = exception(event.reason);
+      if (
+        !details.stack_frames?.length &&
+        typeof event.reason?.stack === "string" &&
+        /(?:https?|chrome-extension|moz-extension|safari-(?:web-)?extension):\/\//i.test(
+          event.reason.stack,
+        )
+      )
+        return;
       report("mobile_unhandled_rejection", {
         phase: "runtime",
         reason: "unhandled_rejection",
-        ...exception(event.reason),
+        ...details,
       });
     } catch {}
   });

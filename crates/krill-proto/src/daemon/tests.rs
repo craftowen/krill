@@ -251,7 +251,145 @@ fn holder_that_dies_is_reported() {
     };
     let e = connect(&p, &hello()).unwrap_err();
     assert!(matches!(e, Error::HolderExited(s) if !s.success()), "{e}");
+    // 바로 다시 붙으면 holder를 또 띄우지 않고 직전 실패를 보고한다.
+    let again = connect(&p, &hello()).unwrap_err();
+    assert!(
+        matches!(&again, Error::Backoff { last, .. } if *last == e.to_string()),
+        "{again}"
+    );
+    assert_eq!(again.holder_exit_code(), e.holder_exit_code());
     std::fs::remove_dir_all(&d).ok();
+}
+
+/// A bootstrap that the Job refuses to let break away is not relaunched in this process.
+#[cfg(windows)]
+#[test]
+fn job_denied_holder_is_not_relaunched() {
+    static ESCAPES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let d = dir("job-denied");
+    std::fs::create_dir_all(&d).unwrap();
+    let holder = d.join("holder.cmd");
+    std::fs::write(&holder, "@echo x>>\"%~dp0starts.txt\"\r\n@exit /b 5\r\n").unwrap();
+    let system = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap()
+        .join("System32");
+    let p = Paths {
+        socket: d.join("run/krilld.sock"),
+        holder,
+        krilld: system.join("cmd.exe"),
+    };
+    let e = connect(&p, &hello()).unwrap_err();
+    assert!(e.is_job_restricted(), "{e}");
+    std::thread::sleep(launch_backoff(1) + Duration::from_millis(200));
+    let again = connect(&p, &hello()).unwrap_err();
+    assert!(
+        matches!(again, Error::Backoff { .. }) && again.is_job_restricted(),
+        "{again}"
+    );
+    let starts = std::fs::read_to_string(d.join("starts.txt")).unwrap();
+    assert_eq!(starts.lines().count(), 1, "{starts}");
+
+    // 앱이 Job 밖 기동기를 등록하면 같은 bootstrap 인수로 부르고, 실패하면 거부를 그대로 알리며 백오프 뒤 다시 시도한다.
+    set_job_escape(|holder, args, dir| {
+        ESCAPES.lock().unwrap().push(format!(
+            "{} {args:?} {}",
+            holder.display(),
+            dir.unwrap().display()
+        ));
+        Err(io::ErrorKind::NotFound.into())
+    });
+    std::thread::sleep(launch_backoff(2) + Duration::from_millis(200));
+    let e = connect(&p, &hello()).unwrap_err();
+    assert!(e.is_job_restricted(), "{e}");
+    let starts = std::fs::read_to_string(d.join("starts.txt")).unwrap();
+    assert_eq!(starts.lines().count(), 2, "{starts}");
+    assert_eq!(
+        *ESCAPES.lock().unwrap(),
+        [format!(
+            "{} {:?} {}",
+            p.holder.display(),
+            [
+                "--bootstrap",
+                &*p.krilld.to_string_lossy(),
+                &*p.socket.to_string_lossy()
+            ],
+            d.join("run").display()
+        )]
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
+
+/// A-05: 띄운 뒤 핸드셰이크가 다시 해도 안 되는 오류로 끝나면 띄운 holder를 남기지 않는다. 남기면 그 holder가
+/// krilld를 30초마다 영구 재기동한다. 그 holder는 고아 krilld에게서 세션을 넘겨받았을 수 있어 SIGKILL하지 않고
+/// 종료 신호로 세션을 새 krilld에 넘기고 끝나게 한다.
+#[cfg(unix)]
+#[test]
+fn launched_holder_is_stopped_gracefully_when_connect_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let d = dir("launch-fails");
+    std::fs::create_dir_all(d.join("run")).unwrap();
+    let pid_file = d.join("holder.pid");
+    let handed = d.join("handed-off");
+    let holder = d.join("holder.sh");
+    std::fs::write(
+        &holder,
+        format!(
+            "#!/bin/sh\ntrap \"touch '{}'; exit 0\" TERM\necho $$ > '{}'\nwhile :; do sleep 0.05; done\n",
+            handed.display(),
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let p = Paths {
+        socket: d.join("run/krilld.sock"),
+        holder: holder.clone(),
+        krilld: holder,
+    };
+    let socket = p.socket.clone();
+    let pid_wait = pid_file.clone();
+    // 띄운 holder가 뜬 뒤에야 소켓이 생기고, 붙으면 깨진 프레임을 보낸다(InvalidData: absent·transition 아님).
+    let server = thread::spawn(move || {
+        while !pid_wait.exists() {
+            thread::sleep(POLL);
+        }
+        let listener = crate::os::net::UnixListener::bind(&socket).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(&[0, 0, 0, 0]).unwrap();
+        thread::sleep(Duration::from_millis(200));
+    });
+    let e = connect(&p, &hello()).unwrap_err();
+    assert!(matches!(e, Error::Io(_)), "{e}");
+    server.join().unwrap();
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success();
+    Command::new("/bin/kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .ok();
+    assert!(!alive, "connect left the launched holder running");
+    assert!(
+        handed.exists(),
+        "connect killed the launched holder before it could hand its sessions off"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn launch_backoff_grows_to_a_minute() {
+    let secs: Vec<_> = [1, 2, 3, 7, 8, 100]
+        .map(|n| launch_backoff(n).as_secs())
+        .into();
+    assert_eq!(secs, [1, 2, 4, 60, 60, 60]);
 }
 
 #[test]
@@ -723,7 +861,11 @@ fn windows_paths_choose_flat_then_exact_version_holder() {
         std::fs::write(path, b"MZ").unwrap();
     }
     let paths = Paths::from_exe(&app, &root.join("state"), &[]).unwrap();
-    assert_eq!(paths.holder, executable_path(&current));
+    // `from_exe` canonicalizes, which expands 8.3 short names in `temp_dir()` (`RUNNER~1`).
+    assert_eq!(
+        paths.holder,
+        executable_path(&std::fs::canonicalize(&current).unwrap())
+    );
     assert!(!paths.holder.to_string_lossy().starts_with(r"\\?\"));
     std::fs::write(&holder, b"MZ").unwrap();
     assert_eq!(exe_near(&root, "krill-holder"), holder);
@@ -752,4 +894,17 @@ fn short_socket_override_keeps_long_state_and_isolates_installations() {
     assert_eq!(socket_path_in(&a, None).unwrap(), a.join("run/krilld.sock"));
     assert!(socket_path_in(&a, Some("relative".as_ref())).is_err());
     assert!(socket_path_in(&a, Some(format!(r"C:\{}", "long".repeat(30)).as_ref())).is_err());
+}
+
+#[test]
+fn session_exported_default_state_dir_is_not_isolation() {
+    let default = Path::new("/Users/u/Library/Application Support/dev.krill.app");
+    let exported = OsStr::new("/Users/u/Library/Application Support/dev.krill.app/");
+    assert!(!is_isolated(Some(exported), Some(default)));
+    assert!(!is_isolated(None, Some(default)));
+    assert!(is_isolated(
+        Some(OsStr::new("/tmp/mk-1/state")),
+        Some(default)
+    ));
+    assert!(is_isolated(Some(exported), None));
 }

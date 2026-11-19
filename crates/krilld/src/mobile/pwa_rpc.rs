@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 mod command_catalog;
 mod composer;
 mod composer_status;
+mod drops;
 pub(super) mod feed;
 mod mention_files;
 mod requests;
@@ -80,19 +81,20 @@ fn quick_commands_json(dir: Option<&Path>) -> Value {
 
 /// `create_terminal`이 받는 에이전트 프로필(`registry` create와 같은 출처) id·이름, 표준 순서. 설정을 못 읽으면 빈 목록.
 /// 미설치 CLI도 싣는다 — 띄우면 로그인 셸 preflight가 설치 안내를 보여 준다.
-fn agents_json(dir: Option<&Path>) -> Value {
-    let mut agents: Vec<_> = crate::agent::control::Control::new(dir)
-        .agents()
-        .map(|a| a.profiles.into_iter().collect())
-        .unwrap_or_default();
-    agents.sort_by(|(a, _), (b, _)| {
-        (krill_proto::agent::profile_rank(a), a).cmp(&(krill_proto::agent::profile_rank(b), b))
+fn format_agents_json(agents: Option<&krill_proto::agent::Agents>) -> Value {
+    let Some(agents) = agents else {
+        return json!([]);
+    };
+    let mut entries: Vec<_> = agents.profiles.iter().collect();
+    entries.sort_by(|(a, _), (b, _)| {
+        (krill_proto::agent::profile_rank(a), *a).cmp(&(krill_proto::agent::profile_rank(b), *b))
     });
-    agents
+    entries
         .into_iter()
         .map(|(id, p)| json!({"id":id,"name":p.name}))
         .collect()
 }
+
 pub(super) struct Backend {
     registry: Weak<Registry>,
     dir: Option<PathBuf>,
@@ -107,6 +109,10 @@ pub(super) struct Backend {
     snapshot_rev: AtomicU64,
     catalog_cache: Mutex<Option<CatalogSnapshot>>,
     settings_lock: Mutex<()>,
+    /// `~/Downloads/Krill Drop`, where finished phone uploads land.
+    drop_inbox: Option<PathBuf>,
+    // ponytail: global drop lock, per-upload locks if concurrent uploads matter
+    drop_lock: Mutex<()>,
 }
 type FileStamp = Option<crate::agent::control::cache::Stamp>;
 type SnapshotDependencies = (Vec<PathBuf>, Vec<FileStamp>);
@@ -186,6 +192,9 @@ enum Action {
         text: String,
         #[serde(default)]
         photo: Option<PreparedPhoto>,
+    },
+    Interrupt {
+        session: u64,
     },
     #[expect(
         dead_code,
@@ -274,6 +283,21 @@ enum Action {
         session: u64,
         effort: String,
     },
+    DropPut {
+        upload: String,
+        name: String,
+        size: u64,
+        offset: u64,
+        data: String,
+    },
+    DropList,
+    DropGet {
+        id: String,
+        offset: u64,
+    },
+    DropRemove {
+        id: String,
+    },
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -318,6 +342,105 @@ fn review_in_term() -> io::Error {
     )
 }
 
+const RPC_GENERIC_ERROR: &str = "Request failed. Check the desktop connection and try again.";
+
+fn contains_session_prefix(lower: &str) -> bool {
+    let mut rest = lower;
+    while let Some((_, after)) = rest.split_once("session ") {
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && after.as_bytes().get(digits) == Some(&b':') {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+fn contains_http_status(lower: &str) -> bool {
+    let mut rest = lower;
+    while let Some((_, after)) = rest.split_once("http ") {
+        if let Some(code) = after.as_bytes().get(..3)
+            && code.iter().all(u8::is_ascii_digit)
+        {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+fn sanitize_mobile_rpc_error(err: &io::Error) -> String {
+    let raw = err.to_string();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return RPC_GENERIC_ERROR.to_string();
+    }
+    if trimmed.eq_ignore_ascii_case("invalid mobile authentication or frame")
+        || trimmed.contains("Confirm in Term")
+    {
+        return trimmed.to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if err.kind() == io::ErrorKind::TimedOut {
+        return "Request timed out. Try again.".to_string();
+    }
+    if err.kind() == io::ErrorKind::PermissionDenied
+        && (lower == "permission denied" || lower.contains("os error"))
+    {
+        return "Permission denied on desktop.".to_string();
+    }
+    if matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    ) || lower.contains("os error")
+        || lower.contains("broken pipe")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection aborted")
+        || lower.contains("unexpected control reply")
+        || lower.contains("unexpected daemon reply")
+        || lower.contains("bad request")
+        || lower.contains("entity not found")
+        || lower.contains("no such file or directory")
+        || lower.contains("usage api")
+        || lower.contains("/users/")
+        || lower.contains("/home/")
+        || lower.contains("/var/")
+        || lower.contains("/tmp/")
+        || lower.contains("/volumes/")
+        || lower.contains(".sock")
+        || lower.contains(":\\")
+        || contains_session_prefix(&lower)
+        || contains_http_status(&lower)
+    {
+        return RPC_GENERIC_ERROR.to_string();
+    }
+    trimmed.to_string()
+}
+
+pub(crate) fn sanitize_tap_reason(error: &io::Error) -> &'static str {
+    if error.kind() == io::ErrorKind::NotFound {
+        return "Session is no longer active.";
+    }
+    match error.to_string().trim() {
+        "Wait for the running agent to become idle" => "Wait for the running agent to become idle",
+        "Wait for an idle Claude Code 2.1.311 or later chat with an empty native composer" => {
+            "Wait for an idle Claude Code 2.1.311 or later chat with an empty native composer"
+        }
+        "Wait for an idle Claude Code chat with an empty native composer" => {
+            "Wait for an idle Claude Code chat with an empty native composer"
+        }
+        "Wait for an idle Codex 0.164.0 or later chat with an empty native composer" => {
+            "Wait for an idle Codex 0.164.0 or later chat with an empty native composer"
+        }
+        _ => "Could not connect to the live agent session.",
+    }
+}
+
 impl Backend {
     pub(super) fn new(registry: Weak<Registry>, dir: Option<&Path>, hello: ServerHello) -> Self {
         Self {
@@ -332,6 +455,8 @@ impl Backend {
             snapshot_rev: AtomicU64::default(),
             catalog_cache: Mutex::default(),
             settings_lock: Mutex::default(),
+            drop_inbox: krill_proto::os::home_dir().map(|home| krill_proto::drop::inbox_dir(&home)),
+            drop_lock: Mutex::default(),
         }
     }
     pub(super) fn request(&self, request: &str) -> String {
@@ -344,7 +469,7 @@ impl Backend {
         })();
         let value = match result {
             Ok(data) => json!({"ok":true,"data":data}),
-            Err(e) => json!({"ok":false,"error":e.to_string()}),
+            Err(e) => json!({"ok":false,"error":sanitize_mobile_rpc_error(&e)}),
         };
         let out = serde_json::to_string(&value)
             .ok()
@@ -385,12 +510,12 @@ impl Backend {
                 let cwd = match (cwd_session, workspace) {
                     (Some(session), None) => self.cwd(session)?,
                     (None, Some(key)) => {
-                        let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
-                            return Err(invalid());
-                        };
-                        super::workspaces::Catalog::load(self.dir.as_deref(), &sidebar.repositories)
-                            .cwd(&key)
+                        let repositories = self
+                            .registry
+                            .upgrade()
                             .ok_or_else(invalid)?
+                            .mobile_repositories()?;
+                        self.catalog(&repositories).cwd(&key).ok_or_else(invalid)?
                     }
                     _ => return Err(invalid()),
                 };
@@ -401,7 +526,10 @@ impl Backend {
                     rows: 24,
                     account: None,
                 }))? {
-                    Reply::Created { session, .. } => Ok(json!({"session":session.0})),
+                    Reply::Created { session, .. } => {
+                        self.prewarm_composer(session.0);
+                        Ok(json!({"session":session.0}))
+                    }
                     Reply::Failed(error) => Err(io::Error::other(error.to_string())),
                     _ => Err(invalid()),
                 }
@@ -432,13 +560,15 @@ impl Backend {
                 {
                     return Err(invalid());
                 }
-                let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
-                    return Err(invalid());
-                };
-                let repo =
-                    super::workspaces::Catalog::load(self.dir.as_deref(), &sidebar.repositories)
-                        .repository(&repository)
-                        .ok_or_else(invalid)?;
+                let repositories = self
+                    .registry
+                    .upgrade()
+                    .ok_or_else(invalid)?
+                    .mobile_repositories()?;
+                let repo = self
+                    .catalog(&repositories)
+                    .repository(&repository)
+                    .ok_or_else(invalid)?;
                 let setup = if skip_setup {
                     control::Setup::Skip
                 } else if let Some(hash) = setup_hash {
@@ -470,28 +600,26 @@ impl Backend {
                         Ok(json!({"needs_setup":true,"script":script,"hash":hex(&hash)}))
                     }
                     Reply::WorktreeCreated(mut tree) => {
-                        let session = match self.control(&Request::Create(Create {
-                            program,
-                            cwd: tree.path.clone(),
-                            cols: 80,
-                            rows: 24,
-                            account: None,
-                        })) {
-                            Ok(Reply::Created { session, .. }) => {
-                                if let Some(dir) = self.dir.as_deref()
-                                    && !krill_proto::git::is_default_branch_or_worktree_name(name)
-                                {
-                                    krill_proto::git::record_session_auto_title(dir, session, name)
-                                        .ok();
-                                }
-                                Some(session.0)
+                        let session = if let Ok(Reply::Created { session, .. }) =
+                            self.control(&Request::Create(Create {
+                                program,
+                                cwd: tree.path.clone(),
+                                cols: 80,
+                                rows: 24,
+                                account: None,
+                            })) {
+                            if let Some(dir) = self.dir.as_deref()
+                                && !krill_proto::git::is_default_branch_or_worktree_name(name)
+                            {
+                                krill_proto::git::record_session_auto_title(dir, session, name)
+                                    .ok();
                             }
-                            other => {
-                                tree.warnings.push(format!(
-                                    "Workspace created; terminal unavailable: {other:?}"
-                                ));
-                                None
-                            }
+                            self.prewarm_composer(session.0);
+                            Some(session.0)
+                        } else {
+                            tree.warnings
+                                .push("Workspace created; terminal unavailable".to_string());
+                            None
                         };
                         let path = PathBuf::from(std::ffi::OsStr::from_bytes(&tree.path));
                         let path = fs::canonicalize(&path).unwrap_or(path);
@@ -543,6 +671,11 @@ impl Backend {
                 }
                 result?;
                 Ok(json!({"sent":true}))
+            }
+            Action::Interrupt { session } => {
+                let registry = self.registry.upgrade().ok_or_else(invalid)?;
+                let interrupted = registry.mobile_interrupt(SessionId(session))?;
+                Ok(json!({"interrupted": interrupted}))
             }
             Action::Approve { .. } => {
                 // Transcript IDs and visible text cannot atomically prove the current PTY question.
@@ -718,7 +851,45 @@ impl Backend {
                 effort,
             } => self.set_composer_model(session, &model, effort.as_deref()),
             Action::SetEffort { session, effort } => self.set_composer_effort(session, &effort),
+            Action::DropPut {
+                upload,
+                name,
+                size,
+                offset,
+                data,
+            } => {
+                let (state, inbox) = self.drop_dirs()?;
+                let _guard = crate::session::lock(&self.drop_lock);
+                drops::put(
+                    state,
+                    inbox,
+                    &drops::Chunk {
+                        upload: &upload,
+                        name: &name,
+                        size,
+                        offset,
+                        data: &data,
+                    },
+                )
+            }
+            Action::DropList => {
+                let (state, inbox) = self.drop_dirs()?;
+                let _guard = crate::session::lock(&self.drop_lock);
+                drops::list(state, inbox)
+            }
+            Action::DropGet { id, offset } => drops::get(self.drop_dirs()?.0, &id, offset),
+            Action::DropRemove { id } => {
+                let (state, _) = self.drop_dirs()?;
+                let _guard = crate::session::lock(&self.drop_lock);
+                drops::remove(state, &id)
+            }
         }
+    }
+    fn drop_dirs(&self) -> io::Result<(&Path, &Path)> {
+        Ok((
+            self.dir.as_deref().ok_or_else(invalid)?,
+            self.drop_inbox.as_deref().ok_or_else(invalid)?,
+        ))
     }
     fn session_bracketed_paste(&self, session: u64) -> bool {
         self.registry
@@ -752,7 +923,7 @@ impl Backend {
         socket.set_write_timeout(Some(Duration::from_secs(5)))?;
         let worker = thread::Builder::new()
             .name("mobile-rpc".into())
-            .stack_size(128 * 1024)
+            .stack_size(super::gateway::RPC_STACK)
             .spawn(move || {
                 crate::alloc::mobile_thread().ok();
                 let out = registry.serve_mobile(server, &hello).ok();
@@ -773,7 +944,10 @@ impl Backend {
         Ok(wire)
     }
     fn control(&self, request: &Request) -> io::Result<Reply> {
-        ask(&mut self.wire()?, request)
+        let mut wire = self.wire()?;
+        wire.socket.write_all(&request.encode()?)?;
+        let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
+        Reply::decode(kind, &body).map_err(Into::into)
     }
     fn accounts(&self, request: &UsageRequest) -> io::Result<krill_proto::usage::AccountsSnapshot> {
         let mut wire = self.wire()?;
@@ -838,18 +1012,10 @@ impl Backend {
         Ok(())
     }
     fn cwd(&self, session: u64) -> io::Result<PathBuf> {
-        let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
-            return Err(invalid());
-        };
-        let directory = sidebar
-            .sessions
-            .into_iter()
-            .find(|s| s.session.0 == session)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Session not found"))?;
-        if directory.cwd.is_empty() {
-            return Err(io::Error::other("session working directory unavailable"));
-        }
-        Ok(PathBuf::from(std::ffi::OsString::from_vec(directory.cwd)))
+        self.registry
+            .upgrade()
+            .ok_or_else(invalid)?
+            .mobile_session_cwd(SessionId(session))
     }
     fn save_quick_commands(&self, commands: Vec<QuickCommandEntry>) -> io::Result<Value> {
         if commands.len() > 128 {
@@ -1071,81 +1237,54 @@ impl Backend {
         &self,
         catalog_used: &mut Option<Arc<super::workspaces::Catalog>>,
     ) -> io::Result<Value> {
-        // 세션마다 요청이 2~3개라 요청마다 스레드·소켓·Hello를 새로 만들면 세션 수의 몇 배가 된다. 한 연결로 묶는다.
-        let mut wire = self.wire()?;
-        let mut control = |request: &Request| ask(&mut wire, request);
-        let Reply::Sessions(sessions) = control(&Request::List)? else {
-            return Err(invalid());
-        };
-        let states = match control(&Request::States)? {
-            Reply::States(s) => s,
-            _ => Vec::new(),
-        };
-        let sidebar = match control(&Request::Sidebar)? {
-            Reply::Sidebar(s) => s,
-            _ => control::SidebarData {
-                sessions: Vec::new(),
-                repositories: Vec::new(),
-                branches: Vec::new(),
-                prompt_histories: Vec::new(),
-            },
-        };
-        let catalog = self.catalog(&sidebar.repositories);
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let dashboard = registry.mobile_dashboard_inputs()?;
+        let catalog = self.catalog(&dashboard.repositories);
         *catalog_used = Some(Arc::clone(&catalog));
-        let truncated = sessions.len() > 64;
-        let rows: Vec<_> = sessions
+        let truncated = dashboard.sessions.len() > 64;
+        let rows: Vec<_> = dashboard
+            .sessions
             .into_iter()
             .take(64)
-            .map(|info| {
-                let cwd = sidebar
-                    .sessions
-                    .iter()
-                    .find(|s| s.session == info.session)
-                    .map_or(&[][..], |s| s.cwd.as_slice());
-                let group = session_group(info.session, cwd, &catalog.repositories);
-                (info, cwd, group)
+            .map(|row| {
+                let group = session_group(row.info.session, &row.cwd, &catalog.repositories);
+                (row.info, row.cwd, row.status, group)
             })
             .collect();
         let git = self.git_summaries_swr(
             rows.iter()
-                .filter_map(|(_, cwd, group)| git_cwd(cwd, group)),
+                .filter_map(|(_, cwd, _, group)| git_cwd(cwd, group)),
         );
         let mut cards = Vec::new();
         let mut workspace_titles = std::collections::BTreeMap::new();
-        let launch_metadata = crate::agent::control::Control::new(self.dir.as_deref());
-        let agent_profiles = launch_metadata.agents().unwrap_or_default();
+        let launch_metadata = registry.agent_control();
+        let loaded_agents = launch_metadata.agents().ok();
+        let agents_value = format_agents_json(loaded_agents.as_ref());
+        let agent_profiles = loaded_agents.unwrap_or_default();
         // 데스크톱 스마트 정렬과 같은 워크트리 순위(승인대기 0 → 작업 중 2 → 완료 3 → 유휴 4).
         let mut ranks: std::collections::BTreeMap<PathBuf, u8> = std::collections::BTreeMap::new();
         // 데스크톱 "잠든 작업 공간 숨기기"의 깨어 있음 판정: 작업 중·대기·완료이거나 에이전트가 살아 있는 세션.
         let mut awake = std::collections::BTreeSet::new();
-        for (info, _, group) in &rows {
+        for (_, _, status, group) in &rows {
             let Some(path) = group.path.as_deref() else {
                 continue;
             };
-            let status = states
-                .iter()
-                .find(|s| s.session == info.session)
-                .map(|s| &s.status);
-            if status.is_some_and(|s| {
-                matches!(
-                    s.state,
-                    control::AgentState::Working
-                        | control::AgentState::Waiting
-                        | control::AgentState::Blocked
-                        | control::AgentState::Done
-                ) || !s.agent.is_empty() && s.state != control::AgentState::Exited
-            }) {
+            if matches!(
+                status.state,
+                control::AgentState::Working
+                    | control::AgentState::Waiting
+                    | control::AgentState::Blocked
+                    | control::AgentState::Done
+            ) || !status.agent.is_empty() && status.state != control::AgentState::Exited
+            {
                 awake.insert(PathBuf::from(path));
             }
-            let rank = states
-                .iter()
-                .find(|s| s.session == info.session)
-                .map_or(4, |s| match s.status.state {
-                    control::AgentState::Waiting | control::AgentState::Blocked => 0,
-                    control::AgentState::Working => 2,
-                    control::AgentState::Done => 3,
-                    _ => 4,
-                });
+            let rank = match status.state {
+                control::AgentState::Waiting | control::AgentState::Blocked => 0,
+                control::AgentState::Working => 2,
+                control::AgentState::Done => 3,
+                _ => 4,
+            };
             ranks
                 .entry(PathBuf::from(path))
                 .and_modify(|r| *r = (*r).min(rank))
@@ -1156,7 +1295,7 @@ impl Backend {
             .as_deref()
             .map(krill_proto::git::load_session_auto_titles)
             .unwrap_or_default();
-        for (info, cwd_bytes, group) in rows {
+        for (info, cwd_bytes, state, group) in rows {
             let stored_launch = launch_metadata.stored(info.session).ok().flatten();
             if let Some(title) = auto_titles.get(&info.session)
                 && let Some(path) = &group.path
@@ -1165,17 +1304,11 @@ impl Backend {
                     .entry(PathBuf::from(path))
                     .or_insert_with(|| title.clone());
             }
-            let state = states
-                .iter()
-                .find(|s| s.session == info.session)
-                .map_or(control::AgentStatus::UNKNOWN, |s| s.status.clone());
             let agent = if state.agent.is_empty() {
-                match control(&Request::AgentLaunch {
-                    session: info.session,
-                }) {
-                    Ok(Reply::AgentLaunch(Some(launch))) => launch.profile,
-                    _ => String::new(),
-                }
+                stored_launch
+                    .as_ref()
+                    .map(|launch| launch.profile.clone())
+                    .unwrap_or_default()
             } else {
                 state.agent.clone()
             };
@@ -1188,16 +1321,12 @@ impl Backend {
                 })
                 .or_else(|| auto_titles.get(&info.session).map(String::as_str))
                 .or(state.title.as_deref());
-            let cwd = String::from_utf8_lossy(cwd_bytes);
-            let lines = self
-                .registry
-                .upgrade()
-                .and_then(|registry| registry.dashboard_tail(info.session))
-                .unwrap_or_default();
-            let git = git_cwd(cwd_bytes, &group)
+            let cwd = String::from_utf8_lossy(&cwd_bytes);
+            let lines = registry.dashboard_tail(info.session).unwrap_or_default();
+            let git = git_cwd(&cwd_bytes, &group)
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
-            cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+            cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"startup_stall":state.startup_stall,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
                 "profile_id":stored_launch.as_ref().map(|s|s.profile.as_str()),
                 "account_id":stored_launch.as_ref().and_then(|s|s.account.as_ref()).map(|a|a.id.as_str()),
                 "command_context":composer::command_context(stored_launch.as_ref(), &agent_profiles, &agent),
@@ -1209,9 +1338,9 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_interrupt":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
-            "host":self.host,"agents":agents_json(self.dir.as_deref())}),
+            "host":self.host,"agents":agents_value}),
         )
     }
     fn orchestration(&self) -> io::Result<Value> {
@@ -1222,8 +1351,7 @@ impl Backend {
             .orchestration_snapshot()?;
         Ok(requests::snapshot(&store))
     }
-    /// 만료된 값도 즉시 반환하고, cwd별로 하나의 백그라운드 조회만 예약한다.
-    /// 최초 미캐시(cold) cwd는 총 80ms 시한 안에서만 즉시 수확하고 넘치면 백그라운드로 넘긴다.
+    /// 미캐시(cold) cwd는 `Null`을, 만료된 cwd는 직전 값을 즉시(`0ms`) 반환하고 cwd별로 하나의 백그라운드 조회만 예약한다.
     fn git_summaries_swr(
         &self,
         cwds: impl IntoIterator<Item = PathBuf>,
@@ -1249,77 +1377,35 @@ impl Backend {
                 found.insert(cwd, value);
             }
         }
+        cold.extend(stale);
         {
             let mut inflight = crate::session::lock(&self.git_inflight);
             cold.retain(|cwd| inflight.insert(cwd.clone()));
-            stale.retain(|cwd| inflight.insert(cwd.clone()));
         }
-        let mut deferred = Vec::new();
         if !cold.is_empty() {
-            let queue = crate::git::queue().ok();
-            let pending: Vec<_> = cold
-                .into_iter()
-                .map(|cwd| {
-                    let rx = queue.map(|q| {
-                        crate::git::changes::query_with_branch(
-                            q,
-                            cwd.clone(),
-                            Arc::new(AtomicBool::new(false)),
-                        )
-                    });
-                    (cwd, rx)
-                })
-                .collect();
-            let deadline = Instant::now() + Duration::from_millis(80);
-            for (cwd, rx) in pending {
-                let Some(rx) = rx else {
-                    cache_git_summary(&self.git_cache, cwd.clone(), Value::Null);
-                    crate::session::lock(&self.git_inflight).remove(&cwd);
-                    continue;
-                };
-                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(res) => {
-                        let value = res.ok().map_or(Value::Null, |(changes, branch)| {
-                            let (added, deleted) = totals(&changes);
-                            json!({"branch":branch,"added":added,"deleted":deleted})
-                        });
-                        cache_git_summary(&self.git_cache, cwd.clone(), value.clone());
-                        crate::session::lock(&self.git_inflight).remove(&cwd);
-                        found.insert(cwd, value);
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        deferred.push((cwd, Some(rx)));
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        cache_git_summary(&self.git_cache, cwd.clone(), Value::Null);
-                        crate::session::lock(&self.git_inflight).remove(&cwd);
-                    }
-                }
-            }
-        }
-        if !deferred.is_empty() || !stale.is_empty() {
             let cache = Arc::clone(&self.git_cache);
             let inflight = Arc::clone(&self.git_inflight);
             let revision = Arc::clone(&self.git_revision);
-            let mut scheduled: Vec<PathBuf> = deferred.iter().map(|(cwd, _)| cwd.clone()).collect();
-            scheduled.extend(stale.iter().cloned());
+            let scheduled = cold.clone();
             let spawned = thread::Builder::new()
                 .name("mobile-git-swr".into())
                 .stack_size(128 * 1024)
                 .spawn(move || {
                     crate::alloc::mobile_thread().ok();
                     let queue = crate::git::queue().ok();
-                    let mut pending = deferred;
-                    pending.extend(stale.into_iter().map(|cwd| {
-                        let rx = queue.map(|q| {
-                            crate::git::changes::query_with_branch(
-                                q,
-                                cwd.clone(),
-                                Arc::new(AtomicBool::new(false)),
-                            )
-                        });
-                        (cwd, rx)
-                    }));
+                    let pending: Vec<_> = cold
+                        .into_iter()
+                        .map(|cwd| {
+                            let rx = queue.map(|q| {
+                                crate::git::changes::query_with_branch(
+                                    q,
+                                    cwd.clone(),
+                                    Arc::new(AtomicBool::new(false)),
+                                )
+                            });
+                            (cwd, rx)
+                        })
+                        .collect();
                     for (cwd, rx) in pending {
                         let value = rx
                             .and_then(|rx| rx.recv().ok())
@@ -1518,12 +1604,6 @@ fn host_metadata() -> Value {
         _ => None,
     };
     json!({"display_name":display_name,"platform":platform})
-}
-/// 제어 요청 하나를 보내고 응답을 받는다. 레지스트리 제어 연결은 요청을 여러 개 이어 받는다.
-fn ask(wire: &mut Wire, request: &Request) -> io::Result<Reply> {
-    wire.socket.write_all(&request.encode()?)?;
-    let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
-    Reply::decode(kind, &body).map_err(Into::into)
 }
 struct Wire {
     socket: UnixStream,
@@ -2545,6 +2625,14 @@ mod tests {
 
     #[test]
     fn snapshot_agents_follow_registry_profiles_in_standard_order() {
+        let agents_json = |dir: Option<&Path>| -> Value {
+            format_agents_json(
+                crate::agent::control::Control::new(dir)
+                    .agents()
+                    .ok()
+                    .as_ref(),
+            )
+        };
         let ids = |v: Value| -> Vec<String> {
             v.as_array()
                 .into_iter()
@@ -3018,6 +3106,390 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn snapshot_and_session_reads_populate_from_live_registry_in_process() {
+        use crate::holder::{Holder, link::Link};
+        use crate::os::{AsFd as _, OwnedFd};
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+
+        let dir = std::env::temp_dir().join(format!("mk-pwa-live-snap-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let state_dir = dir.join("state");
+        let repo_dir = dir.join("repo");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&repo_dir).unwrap();
+        let canonical_repo = fs::canonicalize(&repo_dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&canonical_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            state_dir.join("projects.toml"),
+            format!(
+                "[[projects]]\nid = \"repo\"\nname = \"Repo\"\npath = {:?}\n",
+                canonical_repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join(krill_proto::agent::FILE_NAME),
+            "[agent.my-bot]\nname = \"My Bot\"\nlaunch = [\"my-bot\"]\n",
+        )
+        .unwrap();
+
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .current_dir(&canonical_repo)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let registry = Arc::new(Registry::new(Some((holder, vec![])), Some(&state_dir)));
+        let reader_reg = Arc::clone(&registry);
+        let reader = std::thread::spawn(move || reader_reg.run_holder(link));
+        let holder_worker = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, cwd, .. } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!("expected Spawn");
+            };
+            let (master, pty) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned {
+                        req,
+                        id,
+                        pid: child_pid,
+                    }
+                    .encode()
+                    .unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            (cwd, pty)
+        });
+
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&state_dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let repo_key = hex(canonical_repo.as_os_str().as_bytes());
+        let create_reply: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "create_terminal",
+                    "workspace": repo_key,
+                    "agent": "my-bot",
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        let (spawned_cwd, _pty) = holder_worker.join().unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(create_reply["ok"], true, "{create_reply}");
+        assert_eq!(spawned_cwd, canonical_repo.as_os_str().as_bytes());
+        let session_id = create_reply["data"]["session"]
+            .as_u64()
+            .expect("session id");
+
+        let snap: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"snapshot"}"#)).unwrap();
+        assert_eq!(snap["ok"], true, "{snap}");
+        let sessions = snap["data"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["id"], session_id);
+        assert_eq!(sessions[0]["exited"], false);
+        assert_eq!(sessions[0]["agent"], "my-bot");
+        assert_eq!(sessions[0]["profile_id"], "my-bot");
+        assert_eq!(
+            sessions[0]["cwd"],
+            canonical_repo.to_string_lossy().as_ref()
+        );
+        assert_eq!(sessions[0]["repo_key"], repo_key);
+
+        let repositories = snap["data"]["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0]["key"], repo_key);
+
+        let workspaces = snap["data"]["workspaces"].as_array().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(
+            workspaces[0]["path"],
+            canonical_repo.to_string_lossy().as_ref()
+        );
+
+        let agents = snap["data"]["agents"].as_array().unwrap();
+        assert_eq!(
+            agents.first(),
+            Some(&json!({"id":"claude","name":"Claude Code"}))
+        );
+        assert_eq!(agents.last(), Some(&json!({"id":"my-bot","name":"My Bot"})));
+
+        assert_eq!(backend.cwd(session_id).unwrap(), canonical_repo);
+        assert_eq!(
+            backend.cwd(session_id + 999).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let context = backend.composer_context(session_id).unwrap();
+        assert_eq!(context.cwd, canonical_repo);
+        assert_eq!(context.agent, "my-bot");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::lock(&backend.git_inflight).is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(backend);
+        drop(registry);
+        child.kill().ok();
+        child.wait().ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mobile_interrupt_writes_ctrl_c_only_while_session_is_working() {
+        use crate::holder::{Holder, link::Link};
+        use crate::os::{AsFd as _, OwnedFd};
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+        use krill_proto::hook::{EventId, HookEvent, Input};
+        use std::io::Read as _;
+
+        struct Cleanup {
+            child: Option<std::process::Child>,
+            dir: std::path::PathBuf,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(child) = self.child.as_mut() {
+                    child.kill().ok();
+                    child.wait().ok();
+                }
+                fs::remove_dir_all(&self.dir).ok();
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("mk-pwa-interrupt-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let mut cleanup = Cleanup {
+            child: None,
+            dir: dir.clone(),
+        };
+        let state_dir = dir.join("state");
+        let repo_dir = dir.join("repo");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&repo_dir).unwrap();
+        let canonical_repo = fs::canonicalize(&repo_dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&canonical_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            state_dir.join("projects.toml"),
+            format!(
+                "[[projects]]\nid = \"repo\"\nname = \"Repo\"\npath = {:?}\n",
+                canonical_repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .current_dir(&canonical_repo)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        cleanup.child = Some(child);
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let registry = Arc::new(Registry::new(Some((holder, vec![])), Some(&state_dir)));
+        let reader_reg = Arc::clone(&registry);
+        let reader = std::thread::spawn(move || reader_reg.run_holder(link));
+        let holder_worker = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, .. } = ToHolder::decode(packet.frame()).unwrap() else {
+                panic!("expected Spawn");
+            };
+            let (master, pty) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned {
+                        req,
+                        id,
+                        pid: child_pid,
+                    }
+                    .encode()
+                    .unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            (holder_link, master, pty)
+        });
+
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&state_dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let repo_key = hex(canonical_repo.as_os_str().as_bytes());
+        let create_reply: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "create_terminal",
+                    "workspace": repo_key,
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        let (holder_link, master, mut pty) = holder_worker.join().unwrap();
+        drop(master);
+        pty.set_nonblocking(true).unwrap();
+
+        let session_id = create_reply["data"]["session"]
+            .as_u64()
+            .expect("session id");
+        let snap: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"snapshot"}"#)).unwrap();
+        assert_eq!(snap["data"]["capabilities"]["chat_interrupt"], true);
+
+        // Unknown / idle sessions must not receive Ctrl+C.
+        let mut buf = [0u8; 16];
+        let idle_reply: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "interrupt", "session": session_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            idle_reply,
+            json!({"ok": true, "data": {"interrupted": false}})
+        );
+        assert_eq!(
+            pty.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let missing_reply: Value = serde_json::from_str(
+            &backend
+                .request(&json!({"action": "interrupt", "session": session_id + 999}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            missing_reply,
+            json!({"ok": true, "data": {"interrupted": false}})
+        );
+
+        // Working session receives exactly b"\x03" and returns {"interrupted": true}.
+        registry
+            .record_test_hook(
+                SessionId(session_id),
+                &HookEvent {
+                    id: EventId {
+                        pid: child_pid,
+                        unix_ns: 1_000,
+                    },
+                    agent: "claude".into(),
+                    ppid: child_pid,
+                    input: Input::Complete,
+                    payload: br#"{"hook_event_name":"UserPromptSubmit"}"#.to_vec(),
+                },
+            )
+            .unwrap();
+        let working_reply: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "interrupt", "session": session_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            working_reply,
+            json!({"ok": true, "data": {"interrupted": true}})
+        );
+        let n = pty.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"\x03");
+
+        // Late interrupt arriving after Working finished (Done) writes 0 bytes and returns false.
+        registry
+            .record_test_hook(
+                SessionId(session_id),
+                &HookEvent {
+                    id: EventId {
+                        pid: child_pid,
+                        unix_ns: 2_000,
+                    },
+                    agent: "claude".into(),
+                    ppid: child_pid,
+                    input: Input::Complete,
+                    payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
+                },
+            )
+            .unwrap();
+        let late_reply: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "interrupt", "session": session_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            late_reply,
+            json!({"ok": true, "data": {"interrupted": false}})
+        );
+        assert_eq!(
+            pty.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::lock(&backend.git_inflight).is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(holder_link);
+        reader.join().unwrap();
+        drop(backend);
+        drop(registry);
+    }
+
+    #[test]
     fn photo_decoder_bounds_and_malformed_data() {
         for (encoded, plain) in [
             ("", ""),
@@ -3242,5 +3714,59 @@ mod revision_tests {
                 .is_none()
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sanitize_mobile_rpc_error_preserves_safe_messages_and_hides_internals() {
+        for safe in [
+            "This historical request cannot be verified against the current question. Confirm in Term.",
+            "invalid mobile authentication or frame",
+            "Not a Git repository",
+            "File exceeds 128 KiB diff limit",
+            "This file is no longer on the PC",
+            "Session not found",
+            "File is larger than 2 GiB",
+            "Invalid file name",
+            "This request is no longer pending.",
+        ] {
+            assert_eq!(sanitize_mobile_rpc_error(&io::Error::other(safe)), safe);
+        }
+
+        for leaked in [
+            io::Error::new(io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)"),
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "Connection refused (os error 61)",
+            ),
+            io::Error::other("unexpected control reply: Denied"),
+            io::Error::other("unexpected daemon reply"),
+            io::Error::other("bad request"),
+            io::Error::other("failed connecting /Users/owen/.krill/daemon.sock"),
+            io::Error::other("Session 41205: could not resume with selected account"),
+            io::Error::other("Usage API rejected the sign-in (HTTP 401)"),
+        ] {
+            assert_eq!(sanitize_mobile_rpc_error(&leaked), RPC_GENERIC_ERROR);
+        }
+    }
+
+    #[test]
+    fn sanitize_tap_reason_hides_raw_io_and_preserves_wait_guidance() {
+        assert_eq!(
+            sanitize_tap_reason(&io::Error::new(io::ErrorKind::NotFound, "no /Users/foo")),
+            "Session is no longer active."
+        );
+        assert_eq!(
+            sanitize_tap_reason(&io::Error::other(
+                "Wait for the running agent to become idle"
+            )),
+            "Wait for the running agent to become idle"
+        );
+        assert_eq!(
+            sanitize_tap_reason(&io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Broken pipe (os error 32)"
+            )),
+            "Could not connect to the live agent session."
+        );
     }
 }

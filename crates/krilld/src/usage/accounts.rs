@@ -12,10 +12,9 @@ pub(crate) mod switch_work;
 pub use profile_name::{Keychain, Vault, adopt_email_dirs};
 
 use std::collections::BTreeMap;
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use krill_proto::usage::{
@@ -34,6 +33,8 @@ use crate::session::lock;
 
 const ACCOUNTS_FILE: &str = "accounts.toml";
 const ACTIVE_ENV_FILE: &str = "active-accounts.env";
+/// 실행 중인 Orca가 갱신하는 캐시 행의 이메일을 현재 로그인으로 믿는 최대 나이(초).
+const ORCA_EMAIL_MAX_AGE: u64 = 3600;
 /// 상태 꼬리 재료: (Orca `error` 원문, `detail` 원문, 갱신 시각 epoch 초).
 type StatusMeta = (Option<String>, Option<String>, Option<u64>);
 /// `StopFailure` `rate_limit` 감지 계정 기록(OWE-703 2단계 지시·OWE-710).
@@ -57,6 +58,10 @@ pub fn clear_rate_limited(provider: ProviderKind, account_id: &str) -> bool {
     lock(&RATE_LIMITED)
         .remove(&(provider.as_str().to_owned(), account_id.to_owned()))
         .is_some()
+}
+
+pub(super) fn evict_login_profile(provider: ProviderKind, dir: &Path) {
+    login::evict_profile(provider, dir);
 }
 
 fn rate_limited_at(
@@ -138,8 +143,6 @@ fn manually_pinned(
 /// `accounts.toml` 읽기-수정-쓰기 전체를 직렬화하는 프로세스 전역 잠금(K-09). 파일 IO만 안에서 하고
 /// 자동전환 작업 알림은 마지막에 발행하며, 작업 큐 잠금 안에서는 이 잠금을 잡지 않는다.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
-/// 원자 쓰기 임시 파일명 중복 방지용 단조 증가 값(K-09). pid와 합쳐 같은 프로세스 스레드끼리도 겹치지 않는다.
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredAccount {
@@ -336,40 +339,7 @@ fn save_inner(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> io:
     Ok(())
 }
 
-pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no parent dir"));
-    };
-    std::fs::create_dir_all(parent)?;
-    // K-09: pid만으로는 같은 프로세스의 연결 스레드끼리 겹친다. 단조 증가 값을 더해 겹치지 않게 한다.
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(
-        ".{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("accounts"),
-        std::process::id(),
-        seq
-    ));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use krill_proto::os::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let write = (|| {
-        let mut f = opts.open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path)
-    })();
-    if write.is_err() {
-        std::fs::remove_file(&tmp).ok();
-    }
-    write
-}
+pub(crate) use krill_proto::os::write_atomic_0600;
 
 pub(crate) fn resolve_codex_dir(home: &Path, id: &str, raw_dir: &Path) -> PathBuf {
     let slug = id.strip_prefix("codex-").unwrap_or(id);
@@ -450,17 +420,20 @@ fn runnable(a: &AccountInfo) -> bool {
     a.host_default || Path::new(&a.profile_dir).is_dir()
 }
 
-/// Claude 프로필의 statusline 캐시 파일 값. 수정 시각이 `updated_at`이다.
-pub(crate) fn claude_statusline_usage(profile_dir: &Path) -> Option<ProfileUsage> {
-    [CLAUDE_CACHE, "usage_cache.json"].iter().find_map(|name| {
-        let path = profile_dir.join(name);
-        let usage = parse_claude(&std::fs::read_to_string(&path).ok()?);
-        (!usage.is_empty()).then(|| ProfileUsage {
-            usage,
-            updated_at: mtime_secs(&path),
-            ..ProfileUsage::default()
-        })
+/// Claude 사용량 파일 값. 수정 시각이 `updated_at`이다.
+fn claude_usage_file(profile_dir: &Path, name: &str) -> Option<ProfileUsage> {
+    let path = profile_dir.join(name);
+    let usage = parse_claude(&std::fs::read_to_string(&path).ok()?);
+    (!usage.is_empty()).then(|| ProfileUsage {
+        usage,
+        updated_at: mtime_secs(&path),
+        ..ProfileUsage::default()
     })
+}
+
+/// `krill statusline`이 세션의 `CLAUDE_CONFIG_DIR`에 기록한 값. 폴더가 곧 계정이다.
+pub(crate) fn claude_recorded_usage(profile_dir: &Path) -> Option<ProfileUsage> {
+    claude_usage_file(profile_dir, krill_proto::statusline::CACHE_FILE)
 }
 
 /// 프로필 디렉터리에서 해당 프로바이더 계정의 5h/7d 사용량·상태 근거를 읽는다.
@@ -475,15 +448,27 @@ pub fn read_profile_usage(
     host_default: bool,
 ) -> ProfileUsage {
     let direct = super::direct::cached(home, provider, profile_dir);
-    // Orca 패리티: 실행 중인 세션의 statusline 값이 직접 조회 값보다 새롭거나 조회가 실패했으면 그것을 쓴다.
-    let live = (provider == ProviderKind::Claude)
-        .then(|| claude_statusline_usage(profile_dir))
+    // 실행 중인 세션이 이 프로필에 기록한 값이 직접 조회보다 새롭거나 조회가 실패했으면 그것을 쓴다.
+    let recorded = (provider == ProviderKind::Claude)
+        .then(|| claude_recorded_usage(profile_dir))
         .flatten();
-    match (direct, live) {
+    // `statusline_cache.json`은 외부 스크립트가 계정과 무관한 경로에 쓸 수 있어(cc-alchemy는
+    // 항상 `~/.claude`) 다른 값이 전혀 없을 때만 쓴다.
+    let legacy = || {
+        (provider == ProviderKind::Claude)
+            .then(|| claude_usage_file(profile_dir, CLAUDE_CACHE))
+            .flatten()
+    };
+    match (direct, recorded) {
         (Some(d), Some(l)) if l.updated_at > d.updated_at || d.usage.is_empty() => return l,
+        (Some(d), None) if d.usage.is_empty() => return legacy().unwrap_or(d),
         (Some(d), _) => return d,
         (None, Some(l)) => return l,
-        (None, None) => {}
+        (None, None) => {
+            if let Some(l) = legacy() {
+                return l;
+            }
+        }
     }
     match provider {
         ProviderKind::Gemini => ProfileUsage::default(),
@@ -1039,7 +1024,11 @@ fn refresh_accounts_authenticated(
                     .iter_mut()
                     .find(|a| a.provider == ProviderKind::Claude && a.host_default)
                 {
-                    if let Some(email) = row_email {
+                    // Orca가 멈춘 뒤의 오래된 행은 지금 로그인을 말해 주지 못한다(이후 프로브가 채운다).
+                    let now = u64::try_from(now_epoch()).unwrap_or_default();
+                    if orca_stamp.is_some_and(|at| now.saturating_sub(at) < ORCA_EMAIL_MAX_AGE)
+                        && let Some(email) = row_email
+                    {
                         host_acc.email = Some(email);
                     }
                     if host_acc.usage.is_empty() && !row.usage.is_empty() {
@@ -1482,11 +1471,15 @@ fn refresh_accounts_authenticated(
     let statuses = all
         .iter()
         .map(|a| {
+            let profile_path = PathBuf::from(&a.profile_dir);
+            let codex_auth_rejected = a.provider == ProviderKind::Codex
+                && super::direct::has_auth_failure(home, a.provider, &profile_path);
             let (mut error, mut detail, updated_at) = meta.remove(&a.id).unwrap_or_default();
             // 새 로그인 성공은 오래된 사용량 캐시의 인증 오류보다 우선한다.
-            if auth
-                .get(&(a.provider, PathBuf::from(&a.profile_dir)))
-                .is_some_and(|s| s.logged_in)
+            if !codex_auth_rejected
+                && auth
+                    .get(&(a.provider, profile_path.clone()))
+                    .is_some_and(|s| s.logged_in)
                 && error
                     .as_deref()
                     .is_some_and(|e| classify_error(e) == AccountStatus::NeedsLogin)
@@ -1496,8 +1489,9 @@ fn refresh_accounts_authenticated(
             }
             let detected = rate_limited_at(&limited, a.provider, &a.id);
             let (status, detected_at) = if auth
-                .get(&(a.provider, PathBuf::from(&a.profile_dir)))
+                .get(&(a.provider, profile_path))
                 .is_some_and(|status| !status.logged_in)
+                || (codex_auth_rejected && detected.is_none())
             {
                 (AccountStatus::NeedsLogin, None)
             } else {
@@ -1522,9 +1516,19 @@ fn refresh_accounts_authenticated(
         direct_usage: true, // 구버전 클라이언트용 필드. 사용량은 항상 자동 수집한다.
         accounts: all
             .iter()
-            .map(|a| krill_proto::usage::AccountConnection {
-                account_id: a.id.clone(),
-                status: login::connection(a.provider, Path::new(&a.profile_dir)),
+            .map(|a| {
+                let path = Path::new(&a.profile_dir);
+                let status = if a.provider == ProviderKind::Codex
+                    && super::direct::has_auth_failure(home, a.provider, path)
+                {
+                    krill_proto::usage::ConnectionStatus::NeedsLogin
+                } else {
+                    login::connection(a.provider, path)
+                };
+                krill_proto::usage::AccountConnection {
+                    account_id: a.id.clone(),
+                    status,
+                }
             })
             .collect(),
     };
@@ -1551,7 +1555,7 @@ mod login_regression_tests {
         );
         assert_eq!(classify_error("token lookup failed"), AccountStatus::Error);
         // 사용량 API 429(값 없음)는 로그인 요청이 아니라 조회 오류다.
-        assert_eq!(classify_error("요청 제한"), AccountStatus::Error);
+        assert_eq!(classify_error("Rate limited"), AccountStatus::Error);
         assert_eq!(classify_error("not logged in"), AccountStatus::NeedsLogin);
     }
 
@@ -1646,6 +1650,85 @@ mod login_regression_tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_http_401_marks_needs_login_and_clears_immediately_when_auth_json_changes() {
+        let root =
+            std::env::temp_dir().join(format!("krill-codex-401-relogin-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        let added = add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            "Codex Profile #1",
+            None,
+            "",
+        )
+        .unwrap();
+        let account = added
+            .accounts
+            .iter()
+            .find(|a| a.id == "codex-codex-profile-1")
+            .unwrap();
+        let dir = PathBuf::from(&account.profile_dir);
+
+        std::fs::write(
+            dir.join("auth.json"),
+            br#"{"tokens":{"access_token":"expired-token","account_id":"acc-401"}}"#,
+        )
+        .unwrap();
+        crate::usage::direct::fail_for_tests(&home, ProviderKind::Codex, &dir);
+
+        let auth = BTreeMap::from([(
+            (ProviderKind::Codex, dir.clone()),
+            krill_proto::account_login::AuthStatus {
+                logged_in: true,
+                identity: None,
+            },
+        )]);
+
+        let snap =
+            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let first = snap.status_for("codex-codex-profile-1").unwrap();
+        assert_eq!(first.status, AccountStatus::NeedsLogin, "{first:?}");
+        assert!(
+            first
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("HTTP 401")),
+            "{first:?}"
+        );
+        assert_eq!(
+            snap.connection_for("codex-codex-profile-1"),
+            krill_proto::usage::ConnectionStatus::NeedsLogin
+        );
+
+        std::fs::write(
+            dir.join("auth.json"),
+            br#"{"tokens":{"access_token":"fresh-token","account_id":"acc-401"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(".krill-login-completed"), b"").unwrap();
+
+        let snap2 =
+            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let second = snap2.status_for("codex-codex-profile-1").unwrap();
+        assert_ne!(second.status, AccountStatus::NeedsLogin, "{second:?}");
+        assert!(second.detail.is_none(), "{second:?}");
+        assert_ne!(
+            snap2.connection_for("codex-codex-profile-1"),
+            krill_proto::usage::ConnectionStatus::NeedsLogin
+        );
+
+        crate::usage::direct::evict_profile(&home, ProviderKind::Codex, &dir);
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 /// 대표 사용량(`UsageRequest::Get` 응답용): 활성 Claude 계정 우선, 비었으면 활성 Codex 계정.
@@ -1719,12 +1802,10 @@ pub fn consume_reset_credit(
     state_dir: Option<&Path>,
     provider: ProviderKind,
     account_id: &str,
-) -> io::Result<(AccountsSnapshot, ResetConsumeOutcome, u64)> {
+) -> Result<(AccountsSnapshot, ResetConsumeOutcome, u64), krill_proto::usage::ResetConsumeError> {
+    use krill_proto::usage::ResetConsumeError;
     if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "reset credits are only available for codex and claude",
-        ));
+        return Err(ResetConsumeError::InvalidTarget);
     }
     let snap = refresh_accounts_with(home, state_dir, false);
     let Some(target) = snap
@@ -1732,16 +1813,10 @@ pub fn consume_reset_credit(
         .iter()
         .find(|a| a.provider == provider && a.id == account_id)
     else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("account not found: {account_id}"),
-        ));
+        return Err(ResetConsumeError::AccountNotFound);
     };
     if !runnable(target) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("account has no krill profile dir: {account_id}"),
-        ));
+        return Err(ResetConsumeError::InvalidTarget);
     }
     let dir = PathBuf::from(&target.profile_dir);
     let outcome_windows = if provider == ProviderKind::Codex {
@@ -1749,8 +1824,15 @@ pub fn consume_reset_credit(
     } else {
         consume_claude_reset(home, state_dir, &dir, target.host_default)
     };
-    let Some((outcome, windows)) = outcome_windows else {
-        return Err(io::Error::other("사용량 초기화 실패(크레딧부터 다시 확인)"));
+    let (outcome, windows) = match outcome_windows {
+        Ok(res) => res,
+        Err(err) => {
+            if err == ResetConsumeError::TimedOut {
+                super::direct::evict_profile(home, provider, &dir);
+                super::direct::refresh_on_request(home, state_dir);
+            }
+            return Err(err);
+        }
     };
     if matches!(
         outcome,
@@ -1762,22 +1844,13 @@ pub fn consume_reset_credit(
     Ok((refresh_accounts(home, state_dir), outcome, windows))
 }
 
-/// Claude 소진 한 걸음: 조직 조회 → 제공 프로그램 확인 → 소진. 제공 없음은 `NoCredit`으로,
-/// 단계 실패는 `Err`로 돌려준다(재시도 유도).
 fn consume_claude_reset(
     home: &Path,
     state_dir: Option<&Path>,
     dir: &Path,
     host: bool,
-) -> Option<(ResetConsumeOutcome, u64)> {
-    let token = super::direct::claude_token(dir, host, home, state_dir)?;
-    let org = super::direct::claude_org_uuid(&token, super::direct::get_text)?;
-    match super::direct::claude_offered_program(&token, super::direct::get_text)? {
-        Some(program) => {
-            super::direct::claude_claim_reset(&token, &org, program, super::direct::curl_status)
-        }
-        None => Some((ResetConsumeOutcome::NoCredit, 0)),
-    }
+) -> Result<(ResetConsumeOutcome, u64), krill_proto::usage::ResetConsumeError> {
+    super::direct::consume_claude_reset_credit(dir, host, home, state_dir)
 }
 
 /// 새 계정 프로필 등록(MK-107). `profile_dir`이 비어 있으면 기본 프로필 경로를 자동 생성한다.
@@ -1982,7 +2055,7 @@ pub fn delete_account(
     if krill_proto::usage::profiles::is_managed(home, &dir)
         && let Err(e) = krill_proto::usage::profiles::move_to_trash(home, &dir)
     {
-        tracing::warn!(error = %e, "account profile left as orphan");
+        tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "account profile left as orphan");
     }
     Ok(refresh_accounts(home, state_dir))
 }
@@ -2049,7 +2122,7 @@ pub fn purge_orphan_profiles(
             continue;
         }
         if let Err(e) = krill_proto::usage::profiles::move_to_trash(home, Path::new(&orphan.dir)) {
-            tracing::warn!(error = %e, "orphan profile not moved");
+            tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "orphan profile not moved");
         }
     }
     Ok(krill_proto::usage::profiles::orphans(home, &registered))
@@ -2129,8 +2202,7 @@ pub fn active_account_info(
 ) -> Option<(ProviderKind, AccountInfo)> {
     let name = Path::new(program).file_name()?.to_str()?;
     let provider = ProviderKind::parse(name)?;
-    let path = config_path(home, state_dir);
-    if !path.exists() {
+    if !has_configured_accounts(home, state_dir) {
         return None;
     }
     let snap = refresh_accounts(home, state_dir);
@@ -2139,6 +2211,24 @@ pub fn active_account_info(
         .into_iter()
         .find(|a| a.provider == provider && a.active && !a.host_default && runnable(a))?;
     Some((provider, active))
+}
+
+/// 로그인 셸 시작(`krilld::agent::login_in`) 시 모든 프로바이더의 비-기본 활성 계정을 한 번의 스냅샷으로 조회한다.
+pub fn active_accounts(home: &Path, state_dir: Option<&Path>) -> Vec<(ProviderKind, AccountInfo)> {
+    if !has_configured_accounts(home, state_dir) {
+        return Vec::new();
+    }
+    refresh_accounts(home, state_dir)
+        .accounts
+        .into_iter()
+        .filter(|a| a.active && !a.host_default && runnable(a))
+        .map(|a| (a.provider, a))
+        .collect()
+}
+
+fn has_configured_accounts(home: &Path, state_dir: Option<&Path>) -> bool {
+    config_path(home, state_dir).exists()
+        && load_file_result(home, state_dir).is_ok_and(|file| !file.accounts.is_empty())
 }
 
 #[cfg(test)]
@@ -2217,26 +2307,21 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn consume_reset_credit_rejects_without_network() {
-    use std::io::ErrorKind;
+    use krill_proto::usage::ResetConsumeError;
     let root = std::env::temp_dir().join(format!("reset-credit-{}", std::process::id()));
     std::fs::remove_dir_all(&root).ok();
     let home = root.join("home");
     let state = root.join("state");
     let profile = home.join("codex-a");
     std::fs::create_dir_all(&profile).unwrap();
-    // 프로바이더 제한·계정 확인은 네트워크 전에 일어난다.
     assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Antigravity, "x")
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidInput
+        consume_reset_credit(&home, Some(&state), ProviderKind::Antigravity, "x").unwrap_err(),
+        ResetConsumeError::InvalidTarget
     );
     for provider in [ProviderKind::Codex, ProviderKind::Claude] {
         assert_eq!(
-            consume_reset_credit(&home, Some(&state), provider, "missing")
-                .unwrap_err()
-                .kind(),
-            ErrorKind::NotFound
+            consume_reset_credit(&home, Some(&state), provider, "missing").unwrap_err(),
+            ResetConsumeError::AccountNotFound
         );
     }
     std::fs::create_dir_all(&state).unwrap();
@@ -2248,12 +2333,9 @@ fn consume_reset_credit_rejects_without_network() {
         ),
     )
     .unwrap();
-    // 자격증명이 없으면 소진 요청을 보내지 않고 실패한다(네트워크 금지).
     assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "codex-a")
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Other
+        consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "codex-a").unwrap_err(),
+        ResetConsumeError::AuthRequired
     );
     std::fs::write(
         state.join("accounts.toml"),
@@ -2264,10 +2346,8 @@ fn consume_reset_credit_rejects_without_network() {
     )
     .unwrap();
     assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Claude, "claude-a")
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Other
+        consume_reset_credit(&home, Some(&state), ProviderKind::Claude, "claude-a").unwrap_err(),
+        ResetConsumeError::AuthRequired
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -2525,5 +2605,65 @@ mod orca_identity_regressions {
         assert!(!orca_row_is_hidden(&file.hidden_accounts, 0, &refreshed[0]));
         assert!(orca_uuid_from_profile_dir("/custom/claude-profiles/not-a-uuid/home").is_none());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn active_accounts_fast_paths_empty_config_and_returns_configured_active_profiles() {
+        let root = std::env::temp_dir().join(format!("mk-active-accounts-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        assert!(!has_configured_accounts(&home, Some(&state)));
+        assert!(active_accounts(&home, Some(&state)).is_empty());
+
+        std::fs::write(state.join("accounts.toml"), "accounts = []\n").unwrap();
+        assert!(!has_configured_accounts(&home, Some(&state)));
+        assert!(active_accounts(&home, Some(&state)).is_empty());
+
+        let claude_dir = root.join("claude-work");
+        let codex_dir = root.join("codex-work");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let file = AccountsFile {
+            active: BTreeMap::from([
+                ("claude".to_owned(), "claude-work".to_owned()),
+                ("codex".to_owned(), "codex-work".to_owned()),
+            ]),
+            accounts: vec![
+                StoredAccount {
+                    id: "claude-work".into(),
+                    provider: "claude".into(),
+                    label: "Work".into(),
+                    email: None,
+                    profile_dir: claude_dir.display().to_string(),
+                },
+                StoredAccount {
+                    id: "codex-work".into(),
+                    provider: "codex".into(),
+                    label: "Work".into(),
+                    email: None,
+                    profile_dir: codex_dir.display().to_string(),
+                },
+            ],
+            ..AccountsFile::default()
+        };
+        save_inner(&home, Some(&state), &file).unwrap();
+        assert!(has_configured_accounts(&home, Some(&state)));
+        let found = active_accounts(&home, Some(&state));
+        assert_eq!(found.len(), 2);
+        assert!(
+            found
+                .iter()
+                .any(|(p, a)| *p == ProviderKind::Claude && a.id == "claude-work")
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(p, a)| *p == ProviderKind::Codex && a.id == "codex-work")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

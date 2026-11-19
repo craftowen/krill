@@ -6,7 +6,7 @@ use krill_proto::screen::{
     Cell, HistoryRequest, HistoryRows, Msg as _, Op, Revision, Seq, encode_update,
 };
 
-use crate::shell::tests::{layout_of, open, state_path};
+use crate::shell::tests::{layout_of, open, pick_overflow, state_path};
 use crate::shell::{Duration, UnixStream, ipc};
 
 #[gpui::test]
@@ -57,19 +57,13 @@ fn quick_command_click_path_and_context_clipboard(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    let bounds = cx.debug_bounds("quick-commands").unwrap();
-    cx.simulate_click(bounds.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    // 저장된 항목을 메뉴에서 선택한다. 실행용 Enter는 PTY에 덧붙이지 않는다.
-    cx.simulate_keystrokes("down enter");
-    cx.run_until_parked();
+    // 넘침 메뉴의 저장 명령 하위 메뉴에서 항목을 고른다. 실행용 Enter는 PTY에 덧붙이지 않는다.
+    pick_overflow(cx, "down down down down left enter");
     let (k, body) = ipc::read_frame(&mut theirs).unwrap().unwrap();
     assert_eq!(Input::decode(k, &body).unwrap().bytes, b"git status");
     cx.write_to_clipboard(ClipboardItem::new_string("이전".into()));
     cx.run_until_parked();
-    let bounds = cx.debug_bounds("copy-context").unwrap();
-    cx.simulate_click(bounds.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
+    pick_overflow(cx, "down down down down down enter");
     assert_eq!(
         cx.read_from_clipboard().unwrap().text().as_deref(),
         Some("이전")
@@ -106,7 +100,7 @@ fn quick_command_click_path_and_context_clipboard(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn commands_large_menu_filters_and_injects_original_command(cx: &mut TestAppContext) {
+fn commands_large_menu_opens_palette_and_injects_original_command(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("commands-large"));
     let (ours, mut theirs) = UnixStream::pair().unwrap();
     theirs
@@ -134,19 +128,12 @@ fn commands_large_menu_filters_and_injects_original_command(cx: &mut TestAppCont
         });
     });
     cx.run_until_parked();
-    let trigger = cx.debug_bounds("quick-commands").unwrap();
-    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("quick-command-search-list").is_some());
-    assert!(
-        cx.debug_bounds("quick-command-99").is_none(),
-        "offscreen commands must not render"
-    );
+    // 긴 목록은 메뉴에 펼치지 않고 검색되는 명령 팔레트를 연다.
+    pick_overflow(cx, "down down down down left enter");
+    assert!(cx.update(|_, cx| view.read(cx).jump.is_some()));
     cx.simulate_input("command 99");
     cx.run_until_parked();
-    let result = cx.debug_bounds("quick-command-99").unwrap();
-    assert!(cx.debug_bounds("quick-command-0").is_none());
-    cx.simulate_click(result.center(), gpui::Modifiers::default());
+    cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     let (kind, body) = ipc::read_frame(&mut theirs).unwrap().unwrap();
     assert_eq!(Input::decode(kind, &body).unwrap().bytes, b"echo 99");

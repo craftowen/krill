@@ -24,8 +24,11 @@ use super::{SettingsView, edit, layout, queue_terminal_command, state_dir};
 use crate::i18n::catalog::settings as text;
 use crate::ui::BadgeTone;
 
+mod latest;
 mod plan;
 mod runner;
+
+pub use latest::{UpdateAvailability, extract_semver};
 
 /// 설치 탭 카테고리.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +228,8 @@ pub struct ToolStatus {
     pub version: Option<String>,
     /// 백그라운드에서 감지한 기존 설치 출처에 맞는 명령.
     pub command: Option<String>,
+    /// 업스트림에서 확인한 최신 semver(조회 실패·미지원 시 `None`).
+    pub latest_version: Option<String>,
 }
 
 /// 인라인 설치 실행 결과.
@@ -240,7 +245,6 @@ pub struct AliasPreset {
     pub agent_id: &'static str,
     pub label: &'static str,
     pub default_alias: &'static str,
-    pub default_yolo_alias: &'static str,
     pub command: &'static str,
     pub yolo_command: &'static str,
 }
@@ -250,7 +254,6 @@ pub const ALIAS_PRESETS: &[AliasPreset] = &[
         agent_id: "claude",
         label: "Claude Code",
         default_alias: "cc",
-        default_yolo_alias: "ccy",
         command: "claude",
         yolo_command: "claude --dangerously-skip-permissions",
     },
@@ -258,7 +261,6 @@ pub const ALIAS_PRESETS: &[AliasPreset] = &[
         agent_id: "codex",
         label: "Codex CLI",
         default_alias: "cx",
-        default_yolo_alias: "cxy",
         command: "codex",
         yolo_command: "codex --dangerously-bypass-approvals-and-sandbox",
     },
@@ -266,7 +268,6 @@ pub const ALIAS_PRESETS: &[AliasPreset] = &[
         agent_id: "agy",
         label: "Antigravity CLI",
         default_alias: "ag",
-        default_yolo_alias: "agy-yolo",
         command: "agy",
         yolo_command: "agy --dangerously-skip-permissions",
     },
@@ -305,6 +306,10 @@ struct AliasFormRow {
 }
 
 /// `SettingsView`가 소유하는 설치 탭 상태.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "서로 독립인 화면 상태(점검 진행과 결과, 빠른 명령 연동)"
+)]
 #[derive(Default)]
 pub struct Panel {
     pub scanned: bool,
@@ -315,7 +320,14 @@ pub struct Panel {
     active: Option<&'static str>,
     pub results: BTreeMap<&'static str, InstallJobResult>,
     pub log_expanded: BTreeSet<&'static str>,
+    /// 펼친 도구 행.
+    pub expanded: BTreeSet<&'static str>,
+    /// 점검이 1초를 넘겨 진행 문구를 보일 때(§7.3).
+    pub scan_slow: bool,
+    scan_grace: Option<gpui::Task<()>>,
     alias_rows: BTreeMap<&'static str, AliasFormRow>,
+    /// 셸 설정에서 읽어 입력칸을 만들기 전까지 들고 있는 별칭.
+    alias_saved: Option<BTreeMap<String, (String, bool)>>,
     pub alias_sync_quick_commands: bool,
     pub alias_status: Option<(SharedString, bool)>,
     pub alias_configured_path: Option<PathBuf>,
@@ -334,16 +346,27 @@ impl std::fmt::Debug for Panel {
 /// 로그인 셸 + 자주 쓰는 사용자 바이너리 경로(`~/.local/bin`, `~/.bun/bin`, `~/.cargo/bin`, Homebrew 등)를 합친 탐색 PATH.
 #[must_use]
 pub fn effective_search_path(home: &Path) -> std::ffi::OsString {
-    let base = crate::onboarding::Env::current()
+    let env = if cfg!(test) {
+        crate::onboarding::Env::current()
+    } else {
+        crate::onboarding::Env::discover_current()
+    };
+    let base = env
+        .filter(|env| env.home == home)
         .and_then(|env| crate::onboarding::login_path(&env.shell))
         .or_else(|| std::env::var_os("PATH"))
         .unwrap_or_default();
     let mut paths: Vec<PathBuf> = std::env::split_paths(&base).collect();
-    let extra = [
+    let mut extra = vec![
         home.join(".local/bin"),
         home.join(".bun/bin"),
         home.join(".cargo/bin"),
         home.join(".npm-global/bin"),
+        home.join(".volta/bin"),
+        home.join(".asdf/shims"),
+        home.join(".local/share/mise/shims"),
+        home.join(".fnm/current/bin"),
+        home.join(".nvm/current/bin"),
         home.join("Library/pnpm"),
         home.join(".local/share/pnpm"),
         home.join("AppData/Roaming/npm"),
@@ -354,6 +377,11 @@ pub fn effective_search_path(home: &Path) -> std::ffi::OsString {
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
     ];
+    if let Ok(npmrc) = std::fs::read_to_string(home.join(".npmrc"))
+        && let Some(npm_bin) = npmrc_prefix_bin(home, &npmrc)
+    {
+        extra.push(npm_bin);
+    }
     for p in extra {
         if !paths.contains(&p) {
             paths.push(p);
@@ -364,30 +392,92 @@ pub fn effective_search_path(home: &Path) -> std::ffi::OsString {
     std::env::join_paths(paths).unwrap_or(base)
 }
 
+fn npmrc_prefix_bin(home: &Path, content: &str) -> Option<PathBuf> {
+    let raw = content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            return None;
+        }
+        let (key, val) = trimmed.split_once('=')?;
+        (key.trim() == "prefix").then_some(val.trim().trim_matches(|c| matches!(c, '\u{27}' | '"')))
+    })?;
+    if raw.is_empty() {
+        return None;
+    }
+    let prefix = if raw == "~" || raw == "$HOME" || raw == "${HOME}" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw
+        .strip_prefix("~/")
+        .or_else(|| raw.strip_prefix("$HOME/"))
+        .or_else(|| raw.strip_prefix("${HOME}/"))
+    {
+        home.join(rest)
+    } else {
+        PathBuf::from(raw)
+    };
+    Some(if cfg!(windows) {
+        prefix
+    } else {
+        prefix.join("bin")
+    })
+}
+
 /// 단일 도구의 설치 상태 및 버전을 확인한다(백그라운드 실행기용).
 #[must_use]
 pub fn probe_tool(spec: &ToolSpec, search_path: &OsStr) -> ToolStatus {
+    probe_tool_in(spec, search_path, None)
+}
+
+/// 지정된 `PATH`·`HOME` 문맥에서 단일 도구의 모든 실행 후보를 검사해 설치 상태 및 버전을 확인한다.
+#[must_use]
+pub fn probe_tool_in(spec: &ToolSpec, search_path: &OsStr, home: Option<&Path>) -> ToolStatus {
+    let mut candidates = Vec::new();
     for &bin in spec.probe_bins() {
-        if let Some(exe) = krill_proto::agent::which(bin, search_path) {
-            let version = probe_version(&exe, spec.version_args);
+        for exe in krill_proto::agent::which_all(bin, search_path) {
+            if let Some(version) = probe_version(&exe, spec.version_args, search_path, home) {
+                return ToolStatus {
+                    installed: true,
+                    binary_path: Some(exe),
+                    version: Some(version),
+                    command: Some(plan::command(spec, search_path)),
+                    latest_version: None,
+                };
+            }
+            candidates.push(exe);
+        }
+    }
+    for exe in &candidates {
+        if let Some(version) = krill_proto::agent::package_version(exe) {
             return ToolStatus {
                 installed: true,
-                binary_path: Some(exe),
-                version,
+                binary_path: Some(exe.clone()),
+                version: Some(version),
                 command: Some(plan::command(spec, search_path)),
+                latest_version: None,
             };
         }
     }
+    let first_exe = candidates.into_iter().next();
     ToolStatus {
-        installed: false,
-        binary_path: None,
+        installed: first_exe.is_some(),
+        binary_path: first_exe,
         version: None,
         command: Some(plan::command(spec, search_path)),
+        latest_version: None,
     }
 }
 
-fn probe_version(exe: &Path, args: &[&str]) -> Option<String> {
+fn probe_version(
+    exe: &Path,
+    args: &[&str],
+    search_path: &OsStr,
+    home: Option<&Path>,
+) -> Option<String> {
     let mut cmd = runner::version_command(exe, args);
+    cmd.env("PATH", search_path);
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+    }
     let out = super::child::output(&mut cmd, Duration::from_secs(4), 4096).ok()?;
     if !out.status.success() {
         return None;
@@ -417,7 +507,7 @@ pub fn probe_all_tools(home: &Path) -> BTreeMap<&'static str, ToolStatus> {
     let path = effective_search_path(home);
     CATALOG
         .iter()
-        .map(|spec| (spec.id, probe_tool(spec, &path)))
+        .map(|spec| (spec.id, probe_tool_in(spec, &path, Some(home))))
         .collect()
 }
 
@@ -478,6 +568,39 @@ pub fn render_alias_block(entries: &[AliasEntry], is_powershell: bool) -> String
     }
     lines.push(ALIAS_BLOCK_END.to_owned());
     lines.join("\n")
+}
+
+/// Rewrites the shell profile through its real path so a dotfile manager's symlink survives, and
+/// atomically so a crash or full disk never truncates it. `edit` gets `None` for a missing profile
+/// and returns `None` to leave the file untouched.
+pub(crate) fn rewrite_shell_rc(
+    rc_path: &Path,
+    edit: impl FnOnce(Option<&str>) -> Option<String>,
+) -> std::io::Result<()> {
+    let target =
+        std::fs::canonicalize(rc_path).unwrap_or_else(|_| match std::fs::read_link(rc_path) {
+            Ok(link) => rc_path
+                .parent()
+                .map_or_else(|| link.clone(), |dir| dir.join(&link)),
+            Err(_) => rc_path.to_path_buf(),
+        });
+    let existing = match std::fs::read_to_string(&target) {
+        Ok(existing) => Some(existing),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // 읽지 못한 프로필(UTF-8 아님·권한)을 빈 파일로 보면 사용자 설정 전체를 블록만으로 덮어쓴다.
+        Err(e) => return Err(e),
+    };
+    let Some(updated) = edit(existing.as_deref()) else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(&target).map_or(0o644, |m| m.permissions().mode() & 0o7777)
+    };
+    #[cfg(not(unix))]
+    let mode = 0o644;
+    krill_proto::os::write_atomic(&target, updated.as_bytes(), mode)
 }
 
 /// 기존 셸 프로필 내용에서 관리 블록을 교체하거나 끝에 추가한다.
@@ -596,15 +719,20 @@ impl SettingsView {
         if self.install.scanned || self.install.scanning {
             return;
         }
-        self.rescan_install_tools(cx);
+        self.scan_install_tools(false, cx);
     }
 
     /// 도구 설치 상태를 백그라운드에서 다시 스캔한다.
     pub fn rescan_install_tools(&mut self, cx: &mut Context<Self>) {
+        self.scan_install_tools(true, cx);
+    }
+
+    fn scan_install_tools(&mut self, force_refresh: bool, cx: &mut Context<Self>) {
         if self.install.scanning || !self.install.installing.is_empty() {
             return;
         }
         self.install.scanning = true;
+        self.install.scan_slow = false;
         let home = Self::install_home_dir(cx);
         let rc_path = shell_rc_path(&home);
         cx.notify();
@@ -618,13 +746,27 @@ impl SettingsView {
             cx.notify();
             return;
         }
+        self.install.scan_grace = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(layout::SLOW_FEEDBACK).await;
+            this.update(cx, |this, cx| {
+                this.install.scan_slow = true;
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.spawn(async move |this, cx| {
             let statuses = cx
                 .background_executor()
-                .spawn(async move { probe_all_tools(&home) })
+                .spawn(async move {
+                    let mut statuses = probe_all_tools(&home);
+                    latest::populate_latest_versions(&mut statuses, force_refresh);
+                    statuses
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.install.scanning = false;
+                this.install.scan_slow = false;
+                this.install.scan_grace = None;
                 this.install.scanned = true;
                 this.install.statuses = statuses;
                 this.install.alias_configured_path = Some(rc_path);
@@ -638,6 +780,14 @@ impl SettingsView {
     /// 단일 도구를 백그라운드에서 인라인 설치하고 완료 후 상태를 갱신한다.
     pub fn run_inline_install(&mut self, tool_id: &'static str, cx: &mut Context<Self>) {
         if self.install.installing.contains(tool_id) {
+            return;
+        }
+        if self
+            .install
+            .statuses
+            .get(tool_id)
+            .is_some_and(|s| s.update_availability() == UpdateAvailability::UpToDate)
+        {
             return;
         }
         let Some(spec) = CATALOG.iter().find(|s| s.id == tool_id) else {
@@ -670,6 +820,7 @@ impl SettingsView {
         }
         self.install.installing.insert(tool_id);
         self.install.results.remove(tool_id);
+        self.install.log_expanded.remove(tool_id);
         cx.notify();
 
         if cfg!(test) {
@@ -683,6 +834,7 @@ impl SettingsView {
                     )),
                     version: Some("1.0.0-test".to_owned()),
                     command: Some(spec.install_command().to_owned()),
+                    latest_version: None,
                 },
             );
             self.install.results.insert(
@@ -728,7 +880,8 @@ impl SettingsView {
                     } else {
                         runner::run(&command, &home, &path)
                     };
-                    let statuses = probe_all_tools(&home);
+                    let mut statuses = probe_all_tools(&home);
+                    latest::populate_latest_versions(&mut statuses, true);
                     let mut res = res;
                     if res.success
                         && !statuses
@@ -747,6 +900,7 @@ impl SettingsView {
                 this.install.installing.remove(tool_id);
                 if !res.success {
                     this.install.log_expanded.insert(tool_id);
+                    this.install.expanded.insert(tool_id);
                 }
                 this.install.results.insert(tool_id, res);
                 this.install.statuses = statuses;
@@ -781,18 +935,27 @@ impl SettingsView {
         if !self.install.alias_rows.is_empty() {
             return;
         }
-        let home = Self::install_home_dir(cx);
-        let rc_path = shell_rc_path(&home);
-        let existing_content = std::fs::read_to_string(&rc_path).unwrap_or_default();
-        let parsed = parse_existing_aliases(&existing_content);
-        self.install.alias_configured_path = Some(rc_path);
+        // 셸 설정은 그리는 경로 밖에서 읽는다. 끝나면 다음 그리기에서 입력칸을 만든다.
+        let Some(parsed) = self.install.alias_saved.take() else {
+            let rc_path = shell_rc_path(&Self::install_home_dir(cx));
+            self.install.alias_configured_path = Some(rc_path.clone());
+            self.file_job(
+                "shell-alias-read",
+                move || {
+                    parse_existing_aliases(&std::fs::read_to_string(rc_path).unwrap_or_default())
+                },
+                |this, parsed, _| this.install.alias_saved = Some(parsed),
+                cx,
+            );
+            return;
+        };
         self.install.alias_sync_quick_commands = true;
 
         for preset in ALIAS_PRESETS {
             let (default_val, use_yolo) = parsed
                 .get(preset.agent_id)
                 .cloned()
-                .unwrap_or_else(|| (preset.default_alias.to_owned(), true));
+                .unwrap_or_else(|| (preset.default_alias.to_owned(), false));
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(preset.default_alias)
@@ -801,10 +964,13 @@ impl SettingsView {
             let sub = cx.subscribe_in(
                 &input,
                 window,
-                |this, _, ev: &gpui_component::input::InputEvent, _, cx| {
-                    if matches!(ev, gpui_component::input::InputEvent::PressEnter { .. }) {
+                |this, _, ev: &gpui_component::input::InputEvent, _, cx| match ev {
+                    gpui_component::input::InputEvent::PressEnter { .. } => {
                         this.save_shell_aliases(cx);
                     }
+                    // 미리보기와 YOLO 경고가 입력을 따라간다.
+                    gpui_component::input::InputEvent::Change => cx.notify(),
+                    _ => {}
                 },
             );
             self.install.alias_rows.insert(
@@ -820,6 +986,10 @@ impl SettingsView {
 
     /// 에일리어스 설정을 셸 설정 파일(`~/.zshrc` 등)과 빠른 명령(`quick_commands`)에 저장한다.
     pub fn save_shell_aliases(&mut self, cx: &mut Context<Self>) {
+        // 아직 읽지 못한 별칭을 빈 목록으로 덮어쓰지 않는다.
+        if self.install.alias_rows.is_empty() {
+            return;
+        }
         let mut entries = Vec::new();
         for preset in ALIAS_PRESETS {
             let Some(row) = self.install.alias_rows.get(preset.agent_id) else {
@@ -846,83 +1016,72 @@ impl SettingsView {
             });
         }
 
-        let home = Self::install_home_dir(cx);
-        let rc_path = shell_rc_path(&home);
+        let rc_path = shell_rc_path(&Self::install_home_dir(cx));
         let is_ps = cfg!(windows);
-        // 읽지 못한 프로필(UTF-8 아님·권한)을 빈 파일로 보면 사용자 설정 전체를 블록만으로 덮어쓴다.
-        let existing = match std::fs::read_to_string(&rc_path) {
-            Ok(existing) => existing,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => {
-                self.install.alias_status = Some((e.to_string().into(), true));
-                cx.notify();
-                return;
-            }
-        };
-        let updated = upsert_alias_block(&existing, &entries, is_ps);
-
-        if let Some(parent) = rc_path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            self.install.alias_status = Some((e.to_string().into(), true));
-            cx.notify();
-            return;
-        }
-        if let Err(e) = std::fs::write(&rc_path, updated) {
-            self.install.alias_status = Some((e.to_string().into(), true));
-            cx.notify();
-            return;
-        }
-
-        if self.install.alias_sync_quick_commands {
-            let entries_clone = entries.clone();
-            edit(cx, move |s| {
-                for entry in &entries_clone {
-                    let cmd_text = entry.target_command().to_owned();
-                    if let Some(existing_qc) = s
-                        .quick_commands
-                        .iter_mut()
-                        .find(|q| q.name == entry.alias_name)
-                    {
-                        existing_qc.text = cmd_text;
-                    } else {
-                        s.quick_commands.push(crate::commands::QuickCommand {
-                            name: entry.alias_name.clone(),
-                            text: cmd_text,
-                        });
+        let written = entries.clone();
+        self.file_job(
+            "shell-alias",
+            move || {
+                rewrite_shell_rc(&rc_path, |existing| {
+                    Some(upsert_alias_block(existing.unwrap_or(""), &written, is_ps))
+                })
+                .map(|()| rc_path)
+            },
+            move |this, result, cx| {
+                let rc_path = match result {
+                    Ok(rc_path) => rc_path,
+                    Err(e) => {
+                        this.install.alias_status = Some((e.to_string().into(), true));
+                        return;
                     }
+                };
+                if this.install.alias_sync_quick_commands {
+                    edit(cx, move |s| {
+                        for entry in &entries {
+                            let cmd_text = entry.target_command().to_owned();
+                            if let Some(existing_qc) = s
+                                .quick_commands
+                                .iter_mut()
+                                .find(|q| q.name == entry.alias_name)
+                            {
+                                existing_qc.text = cmd_text;
+                            } else {
+                                s.quick_commands.push(crate::commands::QuickCommand {
+                                    name: entry.alias_name.clone(),
+                                    text: cmd_text,
+                                });
+                            }
+                        }
+                    });
                 }
-            });
-        }
-
-        self.install.alias_status = Some((
-            text::INSTALL_ALIAS_SAVED
-                .format(&[("path", &rc_path.display().to_string())])
-                .into(),
-            false,
-        ));
-        cx.notify();
+                this.install.alias_status = Some((
+                    text::INSTALL_ALIAS_SAVED
+                        .format(&[("path", &rc_path.display().to_string())])
+                        .into(),
+                    false,
+                ));
+            },
+            cx,
+        );
     }
 
     /// 셸 설정 파일에서 Krill이 등록한 에일리어스 블록을 제거한다.
     pub fn remove_shell_aliases(&mut self, cx: &mut Context<Self>) {
-        let home = Self::install_home_dir(cx);
-        let rc_path = shell_rc_path(&home);
-        let Ok(existing) = std::fs::read_to_string(&rc_path) else {
-            self.install.alias_status = Some((text::INSTALL_ALIAS_REMOVED.get().into(), false));
-            cx.notify();
-            return;
-        };
-        let cleaned = remove_alias_block(&existing);
-        if let Err(e) = std::fs::write(&rc_path, cleaned) {
-            self.install.alias_status = Some((e.to_string().into(), true));
-        } else {
-            self.install.alias_status = Some((text::INSTALL_ALIAS_REMOVED.get().into(), false));
-        }
-        cx.notify();
+        let rc_path = shell_rc_path(&Self::install_home_dir(cx));
+        self.file_job(
+            "shell-alias",
+            move || rewrite_shell_rc(&rc_path, |existing| existing.map(remove_alias_block)),
+            |this, result, _| {
+                this.install.alias_status = Some(match result {
+                    Ok(()) => (text::INSTALL_ALIAS_REMOVED.get().into(), false),
+                    Err(e) => (e.to_string().into(), true),
+                });
+            },
+            cx,
+        );
     }
 
-    /// 설치 탭 전체 렌더링.
+    /// 설치 탭 전체 렌더링: 요약, 도구 목록, 맨 아래 별칭.
     pub(super) fn render_install_tab(
         &mut self,
         window: &mut Window,
@@ -931,127 +1090,14 @@ impl SettingsView {
         self.ensure_install_scanned(cx);
         self.ensure_alias_form(window, cx);
 
-        let p = crate::ui::palette(cx);
-        let installed_count = CATALOG
-            .iter()
-            .filter(|s| {
-                self.install
-                    .statuses
-                    .get(s.id)
-                    .is_some_and(|st| st.installed)
-            })
-            .count();
-        let total_count = CATALOG.len();
-        let missing_frontier = CATALOG
-            .iter()
-            .filter(|s| s.category == ToolCategory::FrontierAi)
-            .filter(|s| {
-                !self
-                    .install
-                    .statuses
-                    .get(s.id)
-                    .is_some_and(|st| st.installed)
-            })
-            .count();
-        let any_installing = !self.install.installing.is_empty();
-
-        // 상단 요약 & 일괄 작업 카드
-        let summary_text = text::INSTALL_SUMMARY_COUNT.format(&[
-            ("installed", &installed_count.to_string()),
-            ("total", &total_count.to_string()),
-        ]);
-        let os_badge = if cfg!(windows) {
-            "Windows (PowerShell / winget)"
-        } else {
-            "macOS (zsh / bash / Homebrew)"
-        };
-
-        let summary_card = layout::card(p)
-            .id("admin-install-summary-card")
-            .debug_selector(|| "admin-install-summary-card".into())
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_size(crate::ui::TEXT_SM)
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(p.foreground)
-                                            .child(summary_text),
-                                    )
-                                    .child(crate::ui::badge(p, BadgeTone::Muted, os_badge)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(text::INSTALL_SUMMARY_DESC.get()),
-                            ),
-                    )
-                    .child(
-                        layout::controls()
-                            .child(
-                                layout::secondary(
-                                    "admin-install-rescan",
-                                    if self.install.scanning {
-                                        text::INSTALL_SCANNING.get()
-                                    } else {
-                                        text::INSTALL_RESCAN.get()
-                                    },
-                                )
-                                .icon(IconName::RefreshCw)
-                                .disabled(self.install.scanning || any_installing)
-                                .debug_selector(|| "admin-install-rescan".into())
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.rescan_install_tools(cx);
-                                    },
-                                )),
-                            )
-                            .when(missing_frontier > 0, |d| {
-                                d.child(
-                                    layout::primary(
-                                        "admin-install-all-frontier",
-                                        text::INSTALL_ALL_FRONTIER.get(),
-                                    )
-                                    .disabled(any_installing)
-                                    .debug_selector(|| "admin-install-all-frontier".into())
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.install_missing_frontier_clis(cx);
-                                        },
-                                    )),
-                                )
-                            }),
-                    ),
-            );
-
+        let small = layout::small_body(window);
+        let summary = self.render_install_summary(cx);
         let frontier_card = self.render_tool_category_card(
             "admin-install-cat-frontier",
             text::INSTALL_CAT_FRONTIER.get(),
             text::INSTALL_CAT_FRONTIER_DESC.get(),
             ToolCategory::FrontierAi,
+            small,
             cx,
         );
         let core_card = self.render_tool_category_card(
@@ -1059,6 +1105,7 @@ impl SettingsView {
             text::INSTALL_CAT_CORE.get(),
             text::INSTALL_CAT_CORE_DESC.get(),
             ToolCategory::CoreDev,
+            small,
             cx,
         );
         let runtime_card = self.render_tool_category_card(
@@ -1066,6 +1113,7 @@ impl SettingsView {
             text::INSTALL_CAT_RUNTIME.get(),
             text::INSTALL_CAT_RUNTIME_DESC.get(),
             ToolCategory::PackageAndRuntime,
+            small,
             cx,
         );
         let alias_card = self.render_alias_card(cx);
@@ -1073,12 +1121,123 @@ impl SettingsView {
         div()
             .flex()
             .flex_col()
-            .gap_4()
-            .child(summary_card)
+            .gap_3()
+            .child(summary)
             .child(frontier_card)
-            .child(alias_card)
             .child(core_card)
             .child(runtime_card)
+            .child(alias_card)
+    }
+
+    /// 카드 없는 한 줄 요약. 첫 점검이 끝나기 전에는 숫자 대신 빈 자리를 두고 일괄 설치를 숨긴다.
+    fn render_install_summary(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = crate::ui::palette(cx);
+        let scanned = self.install.scanned;
+        let installed_count = CATALOG.iter().filter(|s| self.tool_installed(s.id)).count();
+        let missing_frontier = CATALOG
+            .iter()
+            .filter(|s| s.category == ToolCategory::FrontierAi && !self.tool_installed(s.id))
+            .count();
+        let any_installing = !self.install.installing.is_empty();
+        let os_badge = if cfg!(windows) {
+            "Windows (PowerShell / winget)"
+        } else {
+            "macOS (zsh / bash / Homebrew)"
+        };
+        let count = if scanned {
+            div()
+                .text_size(crate::ui::TEXT_SM)
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(text::INSTALL_SUMMARY_COUNT.format(&[
+                    ("installed", &installed_count.to_string()),
+                    ("total", &CATALOG.len().to_string()),
+                ]))
+        } else {
+            layout::blank(p, px(120.))
+        };
+
+        div()
+            .id("admin-install-summary-card")
+            .debug_selector(|| "admin-install-summary-card".into())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_x_2p5()
+            .gap_y_1p5()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(count)
+                    .child(crate::ui::badge(p, BadgeTone::Muted, os_badge).max_w_full()),
+            )
+            .child(
+                layout::controls()
+                    .child(
+                        crate::ui::button_with_reserved_label(
+                            "admin-install-rescan",
+                            text::INSTALL_RESCAN.get(),
+                            text::INSTALL_SCANNING.get(),
+                            self.install.scan_slow,
+                        )
+                        .small()
+                        .outline()
+                        .icon(IconName::RefreshCw)
+                        .disabled(self.install.scanning || any_installing)
+                        .debug_selector(|| "admin-install-rescan".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.rescan_install_tools(cx);
+                        })),
+                    )
+                    .when(scanned && missing_frontier > 0, |d| {
+                        d.child(
+                            layout::primary(
+                                "admin-install-all-frontier",
+                                text::INSTALL_ALL_FRONTIER.get(),
+                            )
+                            .disabled(self.install.scanning || any_installing)
+                            .debug_selector(|| "admin-install-all-frontier".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.install_missing_frontier_clis(cx);
+                            })),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::INSTALL_SUMMARY_DESC.get()),
+            )
+    }
+
+    fn tool_installed(&self, tool_id: &str) -> bool {
+        self.install
+            .statuses
+            .get(tool_id)
+            .is_some_and(|status| status.installed)
+    }
+
+    /// 이 도구를 설치하기 전에 먼저 있어야 하는데 빠진 실행 파일.
+    fn missing_prerequisite(&self, spec: &ToolSpec, command: &str) -> Option<&'static str> {
+        if self.tool_installed(spec.id) {
+            return None;
+        }
+        plan::required_bin(command).filter(|bin| {
+            let provider = if matches!(*bin, "brew" | "winget") {
+                "pkgmgr"
+            } else {
+                "node"
+            };
+            !self.tool_installed(provider)
+        })
     }
 
     fn render_tool_category_card(
@@ -1087,99 +1246,156 @@ impl SettingsView {
         title: &'static str,
         desc: &'static str,
         category: ToolCategory,
+        small: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
-        let mut card = layout::card(p)
-            .id(card_id)
-            .debug_selector(move || card_id.into())
+        let tip_id = SharedString::from(format!("{card_id}-tip"));
+        let head = div()
+            .id(SharedString::from(format!("{card_id}-head")))
+            .w_full()
+            .min_w_0()
+            .px_2p5()
+            .py_1p5()
             .flex()
-            .flex_col()
-            .gap_0()
+            .flex_wrap()
+            .items_center()
+            .gap_x_2()
+            .text_color(p.muted_foreground)
             .child(
                 div()
-                    .w_full()
-                    .min_w_0()
-                    .pb_2p5()
-                    .border_b_1()
-                    .border_color(p.border)
-                    .child(layout::label(p, title, Some(desc))),
-            );
-
-        let specs: Vec<&ToolSpec> = CATALOG.iter().filter(|s| s.category == category).collect();
-        for (idx, spec) in specs.into_iter().enumerate() {
-            card = card.child(self.render_tool_row(idx, spec, cx));
-        }
-        card
+                    .text_size(crate::ui::TEXT_XS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .map(|head| {
+                if small {
+                    head.tooltip(move |window, cx| {
+                        crate::ui::tooltip_view(tip_id.clone(), desc, window, cx)
+                    })
+                } else {
+                    head.child(div().min_w_0().text_size(crate::ui::TEXT_XS).child(desc))
+                }
+            })
+            .into_any_element();
+        let rows = CATALOG
+            .iter()
+            .filter(|s| s.category == category)
+            .map(|spec| self.render_tool_row(spec, small, cx).into_any_element());
+        crate::ui::group(p, std::iter::once(head).chain(rows).collect::<Vec<_>>())
+            .id(card_id)
+            .debug_selector(move || card_id.into())
     }
 
+    /// 상태 자리. 첫 점검 전에는 빈칸이라 설치 안 됨으로 잘못 보이지 않는다.
+    fn render_tool_status(
+        &self,
+        p: &crate::ui::Palette,
+        spec: &'static ToolSpec,
+    ) -> gpui::Stateful<gpui::Div> {
+        let tool_id = spec.id;
+        let status = self.install.statuses.get(tool_id);
+        let badge_id = format!("admin-install-badge-{tool_id}");
+        let shell = div()
+            .id(gpui::ElementId::Name(badge_id.clone().into()))
+            .debug_selector(move || badge_id.clone())
+            .flex_1()
+            .flex_basis(px(0.))
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .text_size(crate::ui::TEXT_XS);
+        if !self.install.scanned {
+            return shell.child(layout::blank(p, px(52.)));
+        }
+        // 설치됨은 점만 초록이고 글자는 차분하게 둔다. 진행과 오류는 글자까지 그 색이다.
+        let (dot, color, label) = if self.install.installing.contains(tool_id) {
+            let label = if self.install.active == Some(tool_id) {
+                text::INSTALL_STATUS_INSTALLING.get()
+            } else {
+                text::INSTALL_STATUS_QUEUED.get()
+            };
+            (p.warning, p.warning, label.to_owned())
+        } else if status.is_some_and(|s| s.installed) {
+            let version = status
+                .and_then(|s| s.version.as_deref())
+                .filter(|v| !v.is_empty());
+            let availability = status.map(ToolStatus::update_availability);
+            let label = match (version, availability) {
+                (Some(ver), Some(UpdateAvailability::UpdateAvailable { latest })) => {
+                    text::INSTALL_STATUS_UPDATE_AVAILABLE
+                        .format(&[("current", ver), ("latest", &latest)])
+                }
+                _ => version
+                    .unwrap_or(text::INSTALL_STATUS_INSTALLED.get())
+                    .to_owned(),
+            };
+            (p.success, p.muted_foreground, label)
+        } else if self
+            .install
+            .results
+            .get(tool_id)
+            .is_some_and(|res| !res.success)
+        {
+            (
+                p.destructive,
+                p.destructive,
+                text::INSTALL_STATUS_FAILED.get().to_owned(),
+            )
+        } else {
+            (
+                p.muted_foreground,
+                p.muted_foreground,
+                text::CONNECTION_NOT_INSTALLED.get().to_owned(),
+            )
+        };
+        let tip_id = SharedString::from(format!("admin-install-badge-tip-{tool_id}"));
+        let tip = SharedString::from(label.clone());
+        shell
+            .tooltip(move |window, cx| {
+                crate::ui::tooltip_view(tip_id.clone(), tip.clone(), window, cx)
+            })
+            .text_color(color)
+            .child(div().flex_none().size(px(6.)).rounded_full().bg(dot))
+            .child(div().min_w_0().truncate().child(label))
+    }
+
+    /// 도구 한 줄. 설명, 명령, 터미널 설치, 로그는 펼친 행에만 그린다.
     fn render_tool_row(
         &self,
-        idx: usize,
         spec: &'static ToolSpec,
+        small: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
         let tool_id = spec.id;
-        let status = self.install.statuses.get(tool_id);
-        let is_installed = status.is_some_and(|s| s.installed);
+        let is_installed = self.tool_installed(tool_id);
         let is_installing = self.install.installing.contains(tool_id);
         let is_queued = is_installing && self.install.active != Some(tool_id);
-        let job_result = self.install.results.get(tool_id);
-        let log_open = self.install.log_expanded.contains(tool_id);
-
-        let (badge_tone, badge_text) = if is_installing {
-            (
-                BadgeTone::Warning,
-                if is_queued {
-                    text::INSTALL_STATUS_QUEUED.get()
-                } else {
-                    text::INSTALL_STATUS_INSTALLING.get()
-                }
-                .to_owned(),
-            )
-        } else if is_installed {
-            let ver = status
-                .and_then(|s| s.version.as_deref())
-                .filter(|v| !v.is_empty());
-            match ver {
-                Some(v) => (
-                    BadgeTone::Success,
-                    format!("{} · {v}", text::INSTALL_STATUS_INSTALLED.get()),
-                ),
-                None => (
-                    BadgeTone::Success,
-                    text::INSTALL_STATUS_INSTALLED.get().to_owned(),
-                ),
-            }
-        } else {
-            (
-                BadgeTone::Muted,
-                text::CONNECTION_NOT_INSTALLED.get().to_owned(),
-            )
-        };
+        let open = self.install.expanded.contains(tool_id);
 
         let icon_el = if let Some(agent_id) = spec.agent_icon {
-            crate::ui::icons::agent_brand_icon(agent_id, crate::ui::ICON_XL, p.foreground)
+            crate::ui::icons::agent_brand_icon(agent_id, crate::ui::ICON_MD, p.foreground)
                 .into_any_element()
         } else {
             Icon::new(IconName::SquareTerminal)
-                .small()
+                .xsmall()
                 .text_color(p.foreground)
                 .into_any_element()
         };
 
-        let requires_terminal = tool_id == "pkgmgr" && (cfg!(windows) || !is_installed);
-        let cmd_str = status
-            .and_then(|s| s.command.as_deref())
-            .unwrap_or_else(|| spec.install_command())
-            .to_owned();
+        let availability = self.install.statuses.get(tool_id).map_or(
+            UpdateAvailability::NotInstalled,
+            ToolStatus::update_availability,
+        );
+        let is_up_to_date = availability == UpdateAvailability::UpToDate;
+        let requires_terminal =
+            tool_id == "pkgmgr" && ((cfg!(windows) && !is_up_to_date) || !is_installed);
         let row_id = format!("admin-install-row-{tool_id}");
-        let badge_id = format!("admin-install-badge-{tool_id}");
+        let toggle_id = format!("admin-install-toggle-{tool_id}");
+        let name_id = format!("admin-install-name-{tool_id}");
         let btn_install_id = format!("admin-install-btn-{tool_id}");
-        let btn_term_id = format!("admin-install-term-{tool_id}");
-        let btn_copy_id = format!("admin-install-copy-{tool_id}");
-        let btn_log_id = format!("admin-install-log-toggle-{tool_id}");
 
         let primary_btn_label = if is_installing {
             if is_queued {
@@ -1187,6 +1403,8 @@ impl SettingsView {
             } else {
                 text::INSTALL_BTN_INSTALLING.get()
             }
+        } else if is_up_to_date {
+            text::INSTALL_BTN_UP_TO_DATE.get()
         } else if requires_terminal {
             text::INSTALL_IN_TERMINAL.get()
         } else if is_installed {
@@ -1195,26 +1413,140 @@ impl SettingsView {
             text::INSTALL_BTN_INSTALL.get()
         };
 
-        let install_btn = if is_installed {
-            layout::secondary(
-                gpui::ElementId::Name(btn_install_id.clone().into()),
-                primary_btn_label,
+        let action = div()
+            .flex_none()
+            .min_w(gpui::rems(5.75))
+            .flex()
+            .justify_end()
+            .when(self.install.scanned, |d| {
+                d.child(
+                    layout::secondary(
+                        gpui::ElementId::Name(btn_install_id.clone().into()),
+                        primary_btn_label,
+                    )
+                    .disabled(
+                        self.install.scanning
+                            || is_installing
+                            || is_up_to_date
+                            || (requires_terminal && !self.install.installing.is_empty()),
+                    )
+                    .debug_selector(move || btn_install_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.run_inline_install(tool_id, cx);
+                    })),
+                )
+            });
+
+        let hit = div()
+            .id(gpui::ElementId::Name(toggle_id.clone().into()))
+            .debug_selector(move || toggle_id.clone())
+            .role(gpui::Role::Button)
+            .aria_label(spec.display_name())
+            .aria_expanded(open)
+            .tab_index(0)
+            .focus_visible(|style| style.bg(p.accent))
+            .cursor_pointer()
+            .hover(|style| style.bg(p.accent))
+            .flex_grow(1.)
+            .flex_basis(gpui::rems(12.))
+            .min_w_0()
+            .h(px(32.))
+            .pl_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.install.expanded.remove(tool_id) {
+                    this.install.expanded.insert(tool_id);
+                }
+                cx.notify();
+            }))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .xsmall()
+                .text_color(p.muted_foreground),
             )
-        } else {
-            layout::primary(
-                gpui::ElementId::Name(btn_install_id.clone().into()),
-                primary_btn_label,
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(20.))
+                    .rounded(crate::ui::RADIUS_XS)
+                    .bg(p.muted)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon_el),
             )
-        }
-        .disabled(
-            self.install.scanning
-                || is_installing
-                || (requires_terminal && !self.install.installing.is_empty()),
-        )
-        .debug_selector(move || btn_install_id.clone())
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.run_inline_install(tool_id, cx);
-        }));
+            .child(
+                div()
+                    .id(gpui::ElementId::Name(name_id.clone().into()))
+                    .debug_selector(move || name_id.clone())
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::ui::TEXT_SM)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(spec.display_name()),
+            )
+            .child(self.render_tool_status(p, spec));
+
+        div()
+            .id(gpui::ElementId::Name(row_id.clone().into()))
+            .debug_selector(move || row_id.clone())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .pr_2p5()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_end()
+                    .gap_x_2()
+                    .child(hit)
+                    .child(action),
+            )
+            .when(open, |d| {
+                d.child(self.render_tool_detail(spec, requires_terminal, small, cx))
+            })
+    }
+
+    fn render_tool_detail(
+        &self,
+        spec: &'static ToolSpec,
+        requires_terminal: bool,
+        small: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = crate::ui::palette(cx);
+        let tool_id = spec.id;
+        let cmd_str = self
+            .install
+            .statuses
+            .get(tool_id)
+            .and_then(|s| s.command.as_deref())
+            .unwrap_or_else(|| spec.install_command())
+            .to_owned();
+        let job_result = self.install.results.get(tool_id);
+        let detail_id = format!("admin-install-detail-{tool_id}");
+        let btn_term_id = format!("admin-install-term-{tool_id}");
+        let btn_copy_id = format!("admin-install-copy-{tool_id}");
+        let btn_log_id = format!("admin-install-log-toggle-{tool_id}");
+        let prerequisite = self.missing_prerequisite(spec, &cmd_str);
+        let terminal_note = requires_terminal.then(|| {
+            if cfg!(windows) {
+                text::INSTALL_WINGET_MANUAL.get()
+            } else {
+                text::INSTALL_BREW_TERMINAL.get()
+            }
+        });
 
         let cmd_for_term = cmd_str.clone();
         let term_btn = layout::ghost(
@@ -1242,134 +1574,83 @@ impl SettingsView {
             text::INSTALL_COPY_CMD.get(),
         );
 
-        let mut row = div()
-            .id(gpui::ElementId::Name(row_id.clone().into()))
-            .debug_selector(move || row_id.clone())
+        let note = |message: &str, color: gpui::Hsla| {
+            div()
+                .min_w_0()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(color)
+                .child(message.to_owned())
+        };
+        let mut detail = div()
+            .id(gpui::ElementId::Name(detail_id.clone().into()))
+            .debug_selector(move || detail_id.clone())
             .w_full()
             .min_w_0()
-            .py_3()
+            .pr_3()
+            .pb_2p5()
+            .pl(if small { px(12.) } else { px(50.) })
             .flex()
             .flex_col()
-            .gap_2()
-            .when(idx > 0, |d| d.border_t_1().border_color(p.border))
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .min_w(px(180.))
-                            .flex()
-                            .items_center()
-                            .gap_2p5()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .size(px(28.))
-                                    .rounded(crate::ui::RADIUS_SM)
-                                    .bg(p.muted)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(icon_el),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .text_size(crate::ui::TEXT_SM)
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(p.foreground)
-                                                    .child(spec.display_name()),
-                                            )
-                                            .child(
-                                                crate::ui::badge(p, badge_tone, badge_text)
-                                                    .id(gpui::ElementId::Name(
-                                                        badge_id.clone().into(),
-                                                    ))
-                                                    .debug_selector(move || badge_id.clone()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .text_size(crate::ui::TEXT_XS)
-                                            .text_color(p.muted_foreground)
-                                            .child(spec.description()),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .font_family(crate::ui::FONT_MONO)
-                                                    .text_size(crate::ui::TEXT_2XS)
-                                                    .text_color(p.muted_foreground)
-                                                    .child(cmd_str),
-                                            )
-                                            .child(copy_btn),
-                                    ),
-                            ),
+            .gap_1p5()
+            .child(note(spec.description(), p.muted_foreground));
+        if let Some(bin) = prerequisite {
+            detail = detail.child(note(
+                &text::INSTALL_MISSING_PREREQUISITE.format(&[("tool", bin)]),
+                p.warning,
+            ));
+        }
+        detail = detail.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_start()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(crate::ui::FONT_MONO)
+                        .text_size(crate::ui::TEXT_2XS)
+                        .text_color(p.muted_foreground)
+                        .child(cmd_str),
+                )
+                .child(copy_btn),
+        );
+        if let Some(message) = terminal_note {
+            detail = detail.child(note(message, p.muted_foreground));
+        }
+        detail = detail.child(
+            div()
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .when(!requires_terminal, |d| d.child(term_btn))
+                .when_some(job_result, |d, res| {
+                    let label = if res.success {
+                        text::INSTALL_LOG_DONE.get()
+                    } else {
+                        text::INSTALL_LOG_FAILED.get()
+                    };
+                    d.child(
+                        layout::ghost(gpui::ElementId::Name(btn_log_id.clone().into()), label)
+                            .debug_selector(move || btn_log_id.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.install.log_expanded.remove(tool_id) {
+                                    this.install.log_expanded.insert(tool_id);
+                                }
+                                cx.notify();
+                            })),
                     )
-                    .child(
-                        layout::controls()
-                            .child(install_btn)
-                            .when(!requires_terminal, |d| d.child(term_btn))
-                            .when_some(job_result, |d, res| {
-                                let label = if res.success {
-                                    text::INSTALL_LOG_DONE.get()
-                                } else {
-                                    text::INSTALL_LOG_FAILED.get()
-                                };
-                                d.child(
-                                    layout::ghost(
-                                        gpui::ElementId::Name(btn_log_id.clone().into()),
-                                        label,
-                                    )
-                                    .debug_selector(move || btn_log_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            if !this.install.log_expanded.remove(tool_id) {
-                                                this.install.log_expanded.insert(tool_id);
-                                            }
-                                            cx.notify();
-                                        },
-                                    )),
-                                )
-                            }),
-                    ),
-            );
-
+                }),
+        );
         if let Some(res) = job_result
-            && (log_open || !res.success)
+            && self.install.log_expanded.contains(tool_id)
         {
             let log_box_id = format!("admin-install-log-{tool_id}");
-            row = row.child(
+            detail = detail.child(
                 div()
                     .id(gpui::ElementId::Name(log_box_id.clone().into()))
                     .debug_selector(move || log_box_id.clone())
@@ -1394,8 +1675,7 @@ impl SettingsView {
                     .child(res.output.clone()),
             );
         }
-
-        row
+        detail
     }
 
     fn render_alias_card(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -1405,32 +1685,37 @@ impl SettingsView {
             .alias_configured_path
             .as_ref()
             .map_or_else(|| "~/.zshrc".to_owned(), |path| path.display().to_string());
+        let loaded = !self.install.alias_rows.is_empty();
+        let yolo_count = self
+            .install
+            .alias_rows
+            .values()
+            .filter(|row| row.use_yolo && !row.alias_input.read(cx).value().trim().is_empty())
+            .count();
 
         let mut card = layout::card(p)
             .id("admin-install-alias-card")
             .debug_selector(|| "admin-install-alias-card".into())
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_2p5()
             .child(
                 div()
                     .w_full()
                     .min_w_0()
-                    .pb_2p5()
-                    .border_b_1()
-                    .border_color(p.border)
                     .flex()
                     .flex_wrap()
-                    .items_center()
+                    .items_start()
                     .justify_between()
                     .gap_3()
-                    .child(layout::label(
+                    .child(self.search_focus.label(
                         p,
                         text::INSTALL_ALIAS_TITLE.get(),
                         Some(text::INSTALL_ALIAS_DESC.get()),
                     ))
                     .child(
                         div()
+                            .min_w_0()
                             .font_family(crate::ui::FONT_MONO)
                             .text_size(crate::ui::TEXT_2XS)
                             .text_color(p.muted_foreground)
@@ -1441,132 +1726,27 @@ impl SettingsView {
                             .child(rc_display),
                     ),
             );
-
-        for preset in ALIAS_PRESETS {
-            let agent_id = preset.agent_id;
-            let Some(row_state) = self.install.alias_rows.get(agent_id) else {
-                continue;
-            };
-            let input_entity = row_state.alias_input.clone();
-            let use_yolo = row_state.use_yolo;
-            let preview_cmd = if use_yolo {
-                preset.yolo_command
-            } else {
-                preset.command
-            };
-            let alias_val = input_entity.read(cx).value().trim().to_owned();
-            let preview_line = if alias_val.is_empty() {
-                format!("# {}", text::INSTALL_ALIAS_DISABLED.get())
-            } else if cfg!(windows) {
-                format!("function {alias_val} {{ {preview_cmd} @args }}")
-            } else {
-                format!("alias {alias_val}='{preview_cmd}'")
-            };
-
-            let row_id = format!("admin-install-alias-row-{agent_id}");
-            let input_id = format!("admin-install-alias-input-{agent_id}");
-            let yolo_id = format!("admin-install-alias-yolo-{agent_id}");
-            let normal_id = format!("admin-install-alias-normal-{agent_id}");
-
-            let seg_yolo = layout::segment(
-                p,
-                gpui::ElementId::Name(yolo_id.clone().into()),
-                text::INSTALL_ALIAS_MODE_YOLO.get(),
-                use_yolo,
-            )
-            .debug_selector(move || yolo_id.clone())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(r) = this.install.alias_rows.get_mut(agent_id) {
-                    r.use_yolo = true;
-                    cx.notify();
-                }
-            }));
-
-            let seg_normal = layout::segment(
-                p,
-                gpui::ElementId::Name(normal_id.clone().into()),
-                text::INSTALL_ALIAS_MODE_NORMAL.get(),
-                !use_yolo,
-            )
-            .debug_selector(move || normal_id.clone())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(r) = this.install.alias_rows.get_mut(agent_id) {
-                    r.use_yolo = false;
-                    cx.notify();
-                }
-            }));
-
+        if yolo_count > 0 {
+            let (bg, border, fg) = BadgeTone::Warning.colors(p);
             card = card.child(
                 div()
-                    .id(gpui::ElementId::Name(row_id.clone().into()))
-                    .debug_selector(move || row_id.clone())
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
+                    .debug_selector(|| "admin-install-alias-yolo-warning".into())
+                    .px_2()
+                    .py_1p5()
+                    .rounded(crate::ui::RADIUS_SM)
+                    .bg(bg)
+                    .border_1()
+                    .border_color(border)
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(fg)
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_2p5()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .size(px(28.))
-                                    .rounded(crate::ui::RADIUS_SM)
-                                    .bg(p.muted)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(crate::ui::icons::agent_brand_icon(
-                                        agent_id,
-                                        crate::ui::ICON_XL,
-                                        p.foreground,
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .child(
-                                        div()
-                                            .text_size(crate::ui::TEXT_SM)
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(p.foreground)
-                                            .child(preset.label),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .font_family(crate::ui::FONT_MONO)
-                                            .text_size(crate::ui::TEXT_2XS)
-                                            .text_color(p.muted_foreground)
-                                            .child(preview_line),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        layout::controls()
-                            .child(
-                                div()
-                                    .id(gpui::ElementId::Name(input_id.clone().into()))
-                                    .debug_selector(move || input_id.clone())
-                                    .w(px(110.))
-                                    .flex_none()
-                                    .child(Input::new(&input_entity).small()),
-                            )
-                            .child(layout::segmented_control(p, [seg_yolo, seg_normal])),
+                        text::INSTALL_ALIAS_YOLO_WARNING.format(&[("n", &yolo_count.to_string())]),
                     ),
             );
+        }
+
+        for preset in ALIAS_PRESETS {
+            card = card.child(self.render_alias_row(preset, cx));
         }
 
         // 빠른 명령 연동 스위치 & 저장 버튼
@@ -1629,6 +1809,7 @@ impl SettingsView {
                                 "admin-install-alias-save",
                                 text::INSTALL_ALIAS_SAVE_BTN.get(),
                             )
+                            .disabled(!loaded)
                             .debug_selector(|| "admin-install-alias-save".into())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.save_shell_aliases(cx);
@@ -1652,11 +1833,196 @@ impl SettingsView {
 
         card
     }
+
+    /// 별칭 한 줄과 미리보기. 셸 설정을 읽기 전에는 입력 자리를 빈 모양으로 둔다.
+    fn render_alias_row(
+        &self,
+        preset: &'static AliasPreset,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = crate::ui::palette(cx);
+        let agent_id = preset.agent_id;
+        let row_id = format!("admin-install-alias-row-{agent_id}");
+        let head = div()
+            .flex_1()
+            .flex_basis(gpui::rems(6.25))
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(20.))
+                    .rounded(crate::ui::RADIUS_XS)
+                    .bg(p.muted)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(crate::ui::icons::agent_brand_icon(
+                        agent_id,
+                        crate::ui::ICON_MD,
+                        p.foreground,
+                    )),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(crate::ui::TEXT_SM)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(preset.label),
+            );
+        let line = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1p5()
+            .child(head);
+        let row = div()
+            .id(gpui::ElementId::Name(row_id.clone().into()))
+            .debug_selector(move || row_id.clone())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_0p5();
+        let Some(row_state) = self.install.alias_rows.get(agent_id) else {
+            return row.child(line.child(layout::blank(p, px(110.))));
+        };
+
+        let use_yolo = row_state.use_yolo;
+        let preview_cmd = if use_yolo {
+            preset.yolo_command
+        } else {
+            preset.command
+        };
+        let alias_val = row_state.alias_input.read(cx).value().trim().to_owned();
+        let preview_line = if alias_val.is_empty() {
+            format!("# {}", text::INSTALL_ALIAS_DISABLED.get())
+        } else if cfg!(windows) {
+            format!("function {alias_val} {{ {preview_cmd} @args }}")
+        } else {
+            format!("alias {alias_val}='{preview_cmd}'")
+        };
+        let input_id = format!("admin-install-alias-input-{agent_id}");
+        let yolo_id = format!("admin-install-alias-yolo-{agent_id}");
+        let normal_id = format!("admin-install-alias-normal-{agent_id}");
+        let seg_yolo = layout::segment(
+            p,
+            gpui::ElementId::Name(yolo_id.clone().into()),
+            text::INSTALL_ALIAS_MODE_YOLO.get(),
+            use_yolo,
+        )
+        .debug_selector(move || yolo_id.clone())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Some(r) = this.install.alias_rows.get_mut(agent_id) {
+                r.use_yolo = true;
+                cx.notify();
+            }
+        }));
+        let seg_normal = layout::segment(
+            p,
+            gpui::ElementId::Name(normal_id.clone().into()),
+            text::INSTALL_ALIAS_MODE_NORMAL.get(),
+            !use_yolo,
+        )
+        .debug_selector(move || normal_id.clone())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Some(r) = this.install.alias_rows.get_mut(agent_id) {
+                r.use_yolo = false;
+                cx.notify();
+            }
+        }));
+
+        row.child(
+            line.child(
+                div()
+                    .id(gpui::ElementId::Name(input_id.clone().into()))
+                    .debug_selector(move || input_id.clone())
+                    .w(px(110.))
+                    .flex_none()
+                    .child(Input::new(&row_state.alias_input).small()),
+            )
+            .child(layout::segmented_control(p, [seg_yolo, seg_normal])),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .font_family(crate::ui::FONT_MONO)
+                .text_size(crate::ui::TEXT_2XS)
+                .text_color(if use_yolo {
+                    p.warning
+                } else {
+                    p.muted_foreground
+                })
+                .child(preview_line),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_rc_rewrite_keeps_dotfile_symlink_and_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("krill-rc-link-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let dotfiles = root.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("zshrc");
+        std::fs::write(&real, "export A=1\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let rc = root.join(".zshrc");
+        std::os::unix::fs::symlink("dotfiles/zshrc", &rc).unwrap();
+        let entries = [AliasEntry {
+            agent_id: "claude",
+            alias_name: "cc".into(),
+            use_yolo: false,
+        }];
+
+        rewrite_shell_rc(&rc, |existing| {
+            Some(upsert_alias_block(existing.unwrap_or(""), &entries, false))
+        })
+        .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&rc)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let saved = std::fs::read_to_string(&real).unwrap();
+        assert!(saved.starts_with("export A=1\n"));
+        assert!(saved.contains(ALIAS_BLOCK_START));
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+
+        rewrite_shell_rc(&rc, |existing| existing.map(remove_alias_block)).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&rc)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "export A=1\n");
+        assert_eq!(
+            std::fs::read_dir(&dotfiles).unwrap().count(),
+            1,
+            "temp file left behind"
+        );
+
+        let missing = root.join(".bashrc");
+        rewrite_shell_rc(&missing, |existing| existing.map(remove_alias_block)).unwrap();
+        assert!(
+            !missing.exists(),
+            "removing from a missing profile created it"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn alias_block_upsert_and_remove_preserves_surrounding_rc_lines() {
@@ -1778,5 +2144,116 @@ mod tests {
             assert!(!spec.display_name().is_empty());
             assert!(!spec.probe_bins().is_empty());
         }
+    }
+
+    #[test]
+    fn npmrc_prefix_bin_resolves_home_and_ignores_comments() {
+        let home = Path::new("/tmp/krill-home");
+        assert_eq!(
+            npmrc_prefix_bin(home, "# prefix=/ignored\nprefix=\"~/.npm-packages\"\n"),
+            Some(if cfg!(windows) {
+                home.join(".npm-packages")
+            } else {
+                home.join(".npm-packages/bin")
+            })
+        );
+        assert_eq!(
+            npmrc_prefix_bin(home, "; prefix=/ignored\nprefix=${HOME}/npm-global\n"),
+            Some(if cfg!(windows) {
+                home.join("npm-global")
+            } else {
+                home.join("npm-global/bin")
+            })
+        );
+        assert_eq!(
+            npmrc_prefix_bin(home, "# no prefix\nregistry=https://registry.npmjs.org\n"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_tool_in_resolves_env_shebang_interpreter_and_skips_broken_shadow() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!("krill-probe-env-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let broken_dir = home.join("broken");
+        let interp_dir = home.join(".nvm/current/bin");
+        let npm_dir = home.join(".npm-global/bin");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::create_dir_all(&interp_dir).unwrap();
+        std::fs::create_dir_all(&npm_dir).unwrap();
+
+        let broken_codex = broken_dir.join("codex");
+        std::fs::write(&broken_codex, "#!/bin/sh\nexit 127\n").unwrap();
+        std::fs::set_permissions(&broken_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_node_name = format!("krill-fake-node-{}", std::process::id());
+        let fake_node = interp_dir.join(&fake_node_name);
+        std::fs::write(&fake_node, "#!/bin/sh\necho 'codex-cli 0.167.2'\n").unwrap();
+        std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let real_codex = npm_dir.join("codex");
+        std::fs::write(&real_codex, format!("#!/usr/bin/env {fake_node_name}\n")).unwrap();
+        std::fs::set_permissions(&real_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let search_path = std::env::join_paths([
+            broken_dir.as_path(),
+            npm_dir.as_path(),
+            interp_dir.as_path(),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap();
+        let codex_spec = CATALOG.iter().find(|s| s.id == "codex").unwrap();
+        let status = probe_tool_in(codex_spec, &search_path, Some(&home));
+        assert!(status.installed);
+        assert_eq!(status.binary_path.as_deref(), Some(real_codex.as_path()));
+        assert_eq!(status.version.as_deref(), Some("codex-cli 0.167.2"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_tool_in_falls_back_to_caskroom_package_version_when_version_command_fails() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root =
+            std::env::temp_dir().join(format!("krill-probe-cask-ver-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let wrapper_dir = home.join(".local/bin");
+        let brew_bin_dir = root.join("homebrew/bin");
+        let cask_bin = root.join("homebrew/Caskroom/codex/0.167.2/bin/codex");
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::create_dir_all(&brew_bin_dir).unwrap();
+        std::fs::create_dir_all(cask_bin.parent().unwrap()).unwrap();
+
+        let wrapper_codex = wrapper_dir.join("codex");
+        std::fs::write(&wrapper_codex, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&wrapper_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::fs::write(&cask_bin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&cask_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let brew_codex = brew_bin_dir.join("codex");
+        symlink(&cask_bin, &brew_codex).unwrap();
+
+        let search_path = std::env::join_paths([
+            wrapper_dir.as_path(),
+            brew_bin_dir.as_path(),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap();
+        let codex_spec = CATALOG.iter().find(|s| s.id == "codex").unwrap();
+        let status = probe_tool_in(codex_spec, &search_path, Some(&home));
+        assert!(status.installed);
+        assert_eq!(status.binary_path.as_deref(), Some(brew_codex.as_path()));
+        assert_eq!(status.version.as_deref(), Some("0.167.2"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

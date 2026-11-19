@@ -23,10 +23,16 @@ param(
     [switch]$NoOpen
 )
 $ErrorActionPreference = 'Stop'
-if ($env:OS -ne 'Windows_NT') { throw 'This installer requires Windows x64.' }
+if ($env:OS -ne 'Windows_NT') { throw 'This installer requires Windows x64 or Windows 11 on ARM64.' }
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }
-if ($arch -ne 'AMD64') { throw 'Windows release packages require an x64 PC.' }
+# ARM64 PCs run the x64 package through Windows 11's built-in x64 emulation (build 22000+).
+# Windows 10 on ARM only emulates 32-bit x86, so the x64 binaries cannot start there.
+if ($arch -eq 'ARM64') {
+    if ([Environment]::OSVersion.Version.Build -lt 22000) { throw 'Krill on ARM64 PCs requires Windows 11 (x64 emulation). Windows 10 on ARM is not supported.' }
+} elseif ($arch -ne 'AMD64') {
+    throw 'Windows release packages require an x64 PC or Windows 11 on ARM64.'
+}
 $required = @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64\OpenConsole.exe')
 $alreadyInstalled = Test-Path -LiteralPath $Dest
 if ($alreadyInstalled) {
@@ -44,6 +50,59 @@ if ($alreadyInstalled) {
 # -----------------------------------------------------------------------------
 function Convert-KrillUnicode([string]$Text) {
     return [regex]::Unescape($Text)
+}
+
+# IShellLinkW avoids WScript.Shell's ANSI path conversion on non-UTF-8 systems.
+function New-KrillShortcut([string]$Link, [string]$Target, [string]$WorkingDirectory) {
+    if (-not ('KrillInstaller.ShellLink' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+
+namespace KrillInstaller {
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    class ShellLinkObject { }
+
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
+    interface IShellLinkW {
+        void GetPath(IntPtr file, int count, IntPtr data, uint flags);
+        void GetIDList(out IntPtr idList);
+        void SetIDList(IntPtr idList);
+        void GetDescription(IntPtr name, int count);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string name);
+        void GetWorkingDirectory(IntPtr directory, int count);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string directory);
+        void GetArguments(IntPtr arguments, int count);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string arguments);
+        void GetHotkey(out short hotkey);
+        void SetHotkey(short hotkey);
+        void GetShowCmd(out int show);
+        void SetShowCmd(int show);
+        void GetIconLocation(IntPtr path, int count, out int icon);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string path, int icon);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+        void Resolve(IntPtr window, uint flags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string path);
+    }
+
+    public static class ShellLink {
+        public static void Create(string link, string target, string workingDirectory) {
+            object instance = new ShellLinkObject();
+            try {
+                IShellLinkW shellLink = (IShellLinkW)instance;
+                shellLink.SetPath(target);
+                shellLink.SetWorkingDirectory(workingDirectory);
+                ((IPersistFile)instance).Save(link, true);
+            } finally {
+                Marshal.FinalReleaseComObject(instance);
+            }
+        }
+    }
+}
+'@
+    }
+    [KrillInstaller.ShellLink]::Create($Link, $Target, $WorkingDirectory)
 }
 
 $krillUi = $false
@@ -152,12 +211,13 @@ function Fail-KrillStep([string]$Reason) {
 
 $download = -not $Zip
 if ($download -and -not $PSBoundParameters.ContainsKey('AddToPath')) { $AddToPath = $true }
-$modeText = if ($download) { "Windows $gDot x64 $gDot release: $Release" } else { "Windows $gDot x64 $gDot local package" }
+$archText = if ($arch -eq 'ARM64') { 'ARM64 (x64 emulation)' } else { 'x64' }
+$modeText = if ($download) { "Windows $gDot $archText $gDot release: $Release" } else { "Windows $gDot $archText $gDot local package" }
 Show-KrillIntro $modeText
 
 if (-not $alreadyInstalled) {
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("krill-install-" + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory $tmp | Out-Null
+    New-Item -ItemType Directory -Path $tmp | Out-Null
     try {
         if ($download) {
 
@@ -231,18 +291,23 @@ if (-not $alreadyInstalled) {
                 throw "Not a Krill package (missing $file)."
             }
         }
+        # conpty.dll starts <dll folder>\<native OS architecture>\OpenConsole.exe, so an ARM64 PC needs
+        # arm64\OpenConsole.exe even though Krill itself runs as x64; without it sessions fail.
+        if ($arch -eq 'ARM64' -and -not (Test-Path -LiteralPath (Join-Path $unpacked 'Krill\arm64\OpenConsole.exe') -PathType Leaf)) {
+            throw 'This Krill release has no ARM64 console host (arm64\OpenConsole.exe); ARM64 PCs need a newer release.'
+        }
         Complete-KrillStep '04' (Convert-KrillUnicode '\uAC80\uC99D') (Convert-KrillUnicode '\uBC88\uB4E4 \uD574\uC81C \u00B7 \uD544\uC218 \uAD6C\uC131 \uD30C\uC77C 5\uC885 \uD655\uC778')
 
 
         Start-KrillStep '05' ((Convert-KrillUnicode '\uC571 \uD30C\uC77C \uC124\uCE58 \uC911 (') + $Dest + ')') 4
-        New-Item -ItemType Directory -Force (Split-Path -Parent $Dest) | Out-Null
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Dest) | Out-Null
         Move-Item -LiteralPath (Join-Path $unpacked 'Krill') -Destination $Dest
         Complete-KrillStep '05' (Convert-KrillUnicode '\uC124\uCE58') ($Dest + (Convert-KrillUnicode ' \uC124\uCE58 \uC644\uB8CC'))
     } catch {
         Fail-KrillStep $_.Exception.Message
         throw
     } finally {
-        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -250,17 +315,23 @@ if (-not $alreadyInstalled) {
 Start-KrillStep '06' (Convert-KrillUnicode 'CLI PATH \u00B7 \uBC14\uB85C\uAC00\uAE30 \u00B7 \uC571 \uC5F4\uAE30 \uAD6C\uC131 \uC911') 5
 try {
     if (-not $NoShortcut) {
-        $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Krill.lnk'
-        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-        $s.TargetPath = Join-Path $Dest 'krill-app.exe'
-
-        $s.WorkingDirectory = $env:USERPROFILE
-        $s.Save()
+        try {
+            $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Krill.lnk'
+            New-KrillShortcut $lnk (Join-Path $Dest 'krill-app.exe') $env:USERPROFILE
+        } catch {
+            Write-Warning "Could not create the Start Menu shortcut: $($_.Exception.Message)"
+        }
     }
     if ($AddToPath) {
-        $path = [Environment]::GetEnvironmentVariable('Path', 'User')
+        # Read and write the raw registry value: [Environment]::SetEnvironmentVariable would store
+        # REG_SZ and expand entries such as %USERPROFILE%\...\WindowsApps for good.
+        $envKey = Get-Item 'HKCU:\Environment'
+        $path = [string]$envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
         if (($path -split ';') -notcontains $Dest) {
-            [Environment]::SetEnvironmentVariable('Path', ((@($path, $Dest) | Where-Object { $_ }) -join ';'), 'User')
+            New-ItemProperty -Path 'HKCU:\Environment' -Name Path -PropertyType ExpandString -Force `
+                -Value ((@($path.TrimEnd(';'), $Dest) | Where-Object { $_ }) -join ';') | Out-Null
+            # An empty set broadcasts WM_SETTINGCHANGE so new Explorer windows see the new PATH.
+            [Environment]::SetEnvironmentVariable('KRILL_PATH_REFRESH', $null, 'User')
         }
         if (($env:Path -split ';') -notcontains $Dest) { $env:Path += ";$Dest" }
     }
@@ -290,3 +361,20 @@ if ($krillUi) {
 if ($alreadyInstalled) { "already installed: $Dest (files preserved; use the app to check for updates)" }
 else { "installed: $Dest" }
 if ($download -and -not $NoOpen) { Start-Process -FilePath (Join-Path $Dest 'krill-app.exe') }
+elseif ($Dest -eq (Join-Path $env:LOCALAPPDATA 'Programs\Krill')) {
+    $cliExe = Join-Path $Dest 'krill.exe'
+    if (Test-Path -LiteralPath $cliExe -PathType Leaf) {
+        try {
+            $stream = [IO.File]::OpenRead($cliExe)
+            try {
+                $b0 = $stream.ReadByte()
+                $b1 = $stream.ReadByte()
+            } finally {
+                $stream.Dispose()
+            }
+            if ($b0 -eq 0x4D -and $b1 -eq 0x5A) {
+                & $cliExe ls *> $null
+            }
+        } catch {}
+    }
+}

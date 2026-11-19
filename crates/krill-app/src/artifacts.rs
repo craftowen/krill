@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use gpui::{
     ClipboardItem, Context, Entity, EventEmitter, FocusHandle, FontWeight, KeyDownEvent,
-    SharedString, Subscription, Task, Window, div, prelude::*, px, relative,
+    SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
@@ -166,14 +166,22 @@ pub type DeleteCall = Arc<dyn Fn(String) -> Result<(), String> + Send + Sync>;
 fn cli_call(state: Option<PathBuf>) -> Call {
     Arc::new(move |cursor| {
         let exe = krill_proto::daemon::sibling_exe("krill").map_err(|e| e.to_string())?;
-        list_command(&mut Command::new(exe), state.as_deref(), cursor)
+        list_command(
+            &mut crate::platform::background_command(exe),
+            state.as_deref(),
+            cursor,
+        )
     })
 }
 
 fn cli_delete_call(state: Option<PathBuf>) -> DeleteCall {
     Arc::new(move |slug| {
         let exe = krill_proto::daemon::sibling_exe("krill").map_err(|e| e.to_string())?;
-        delete_command(&mut Command::new(exe), state.as_deref(), &slug)
+        delete_command(
+            &mut crate::platform::background_command(exe),
+            state.as_deref(),
+            &slug,
+        )
     })
 }
 
@@ -227,6 +235,51 @@ fn delete_command(command: &mut Command, state: Option<&Path>, slug: &str) -> Re
 #[derive(Debug)]
 pub struct Close;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArmedDelete {
+    Row(String),
+    Detail(String),
+}
+
+#[derive(Clone, Debug)]
+struct PresentedRow {
+    slug: String,
+    title: String,
+    type_label: &'static str,
+    size_label: String,
+    updated_label: String,
+    expires_label: String,
+    search_haystack: String,
+}
+
+fn load_cached_page(dir: &Path) -> Option<Page> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CachedList {
+        #[serde(default)]
+        api_origin: String,
+        #[serde(default)]
+        artifacts: Vec<Item>,
+        #[serde(default)]
+        next_cursor: Option<String>,
+    }
+
+    let raw = std::fs::read(dir.join("artifact-list-cache.json")).ok()?;
+    let cached: CachedList = serde_json::from_slice(&raw).ok()?;
+    let expected_origin = std::env::var("KRILL_ARTIFACTS_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://share.krill.page".to_owned());
+    if !cached.api_origin.is_empty() && cached.api_origin.trim_end_matches('/') != expected_origin {
+        return None;
+    }
+    Some(Page {
+        artifacts: cached.artifacts,
+        next_cursor: cached.next_cursor,
+    })
+}
+
 /// Always available, including before the first artifact is published.
 #[expect(clippy::struct_excessive_bools, reason = "UI view state flags")]
 pub struct View {
@@ -237,8 +290,12 @@ pub struct View {
     input_sub: Option<Subscription>,
     query: String,
     items: Vec<Item>,
+    rows: Vec<PresentedRow>,
     next: Option<String>,
     selected_slug: Option<String>,
+    armed_delete: Option<ArmedDelete>,
+    detail: Option<detail::DetailState>,
+    detail_task: Option<Task<()>>,
     copied_slug: Option<String>,
     deleting_slug: Option<String>,
     retention_slug: Option<String>,
@@ -292,6 +349,7 @@ impl View {
         let sharing_enabled = state_dir
             .as_deref()
             .is_none_or(krill_proto::artifacts::sharing_enabled);
+        let cached_page = state_dir.as_deref().and_then(load_cached_page);
         let mut view = Self {
             focus: cx.focus_handle(),
             default_retention_days: state_dir
@@ -306,9 +364,16 @@ impl View {
             input: None,
             input_sub: None,
             query: String::new(),
-            items: Vec::new(),
-            next: None,
+            items: cached_page
+                .as_ref()
+                .map(|p| p.artifacts.clone())
+                .unwrap_or_default(),
+            rows: Vec::new(),
+            next: cached_page.and_then(|p| p.next_cursor),
             selected_slug: None,
+            armed_delete: None,
+            detail: None,
+            detail_task: None,
             copied_slug: None,
             deleting_slug: None,
             error: None,
@@ -322,6 +387,7 @@ impl View {
             focus_search: true,
             language: crate::i18n::language(),
         };
+        view.rebuild_rows();
         view.load(false, cx);
         view
     }
@@ -335,12 +401,168 @@ impl View {
         self.selected_slug.as_deref()
     }
 
+    pub(super) fn rebuild_rows(&mut self) {
+        self.rows = self
+            .items
+            .iter()
+            .map(|item| {
+                let title = item.title().to_owned();
+                let type_label = item.type_label();
+                let search_haystack = format!(
+                    "{} {} {} {}",
+                    title,
+                    item.artifact
+                        .original_file_name
+                        .as_deref()
+                        .unwrap_or_default(),
+                    item.artifact.slug,
+                    type_label,
+                )
+                .to_lowercase();
+                PresentedRow {
+                    slug: item.artifact.slug.clone(),
+                    title,
+                    type_label,
+                    size_label: format_byte_size(item.artifact.byte_size),
+                    updated_label: format_timestamp_short(item.artifact.updated_at.as_deref()),
+                    expires_label: retention::expiration_label(&item.artifact),
+                    search_haystack,
+                }
+            })
+            .collect();
+    }
+
+    pub fn on_hide(&mut self, cx: &mut Context<Self>) {
+        self.armed_delete = None;
+        self.copied_slug = None;
+        cx.notify();
+    }
+
+    pub fn reopen(&mut self, cx: &mut Context<Self>) {
+        self.armed_delete = None;
+        self.copied_slug = None;
+        self.focus_search = self.selected_slug.is_none();
+        if let Some(dir) = &self.state_dir {
+            self.sharing_enabled = krill_proto::artifacts::sharing_enabled(dir);
+            if let Ok(days) = krill_proto::artifacts::default_retention_days(dir) {
+                self.default_retention_days = days;
+            }
+        }
+        self.sync_from_disk_cache(cx);
+        if self.loading {
+            cx.notify();
+        } else {
+            self.load(false, cx);
+        }
+    }
+
+    pub fn sync_from_disk_cache(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = &self.state_dir else {
+            return;
+        };
+        let Some(cached) = load_cached_page(dir) else {
+            return;
+        };
+        if !cached.artifacts.is_empty() || self.items.is_empty() {
+            self.items = cached.artifacts;
+            self.next = cached.next_cursor;
+            self.rebuild_rows();
+            cx.notify();
+        }
+    }
+
     pub fn select_slug(&mut self, slug: Option<String>, cx: &mut Context<Self>) {
-        self.selected_slug = slug;
+        self.armed_delete = None;
+        let Some(slug) = slug else {
+            self.selected_slug = None;
+            self.detail = None;
+            self.detail_task = None;
+            cx.notify();
+            return;
+        };
+        let item = self.items.iter().find(|i| i.artifact.slug == slug);
+        let is_markdown = item.is_some_and(Item::is_markdown);
+        let openable = item.is_some_and(Item::openable);
+        let share_url = item.map(|i| i.share_url.clone()).unwrap_or_default();
+        let tab = if is_markdown {
+            detail::DetailTab::Preview
+        } else {
+            detail::DetailTab::Source
+        };
+        self.selected_slug = Some(slug.clone());
+        if let Some(dir) = self.state_dir.clone() {
+            self.detail = Some(detail::DetailState {
+                slug: slug.clone(),
+                tab,
+                content: detail::DetailContent {
+                    loading_remote: openable,
+                    ..Default::default()
+                },
+            });
+            self.detail_task = Some(cx.spawn(async move |this, cx| {
+                let target_slug = slug.clone();
+                let local = cx
+                    .background_executor()
+                    .spawn(async move { detail::local_source_for_slug(&dir, &target_slug) })
+                    .await;
+                let has_local_text = local
+                    .as_ref()
+                    .and_then(|(_, _, text, _)| text.as_ref())
+                    .is_some();
+                let need_remote = !has_local_text && openable;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if this.selected_slug.as_deref() != Some(slug.as_str()) {
+                            return false;
+                        }
+                        if let Some(state) = &mut this.detail {
+                            if let Some((path, exists, text, truncated)) = local {
+                                state.content.local_path = Some(path);
+                                state.content.local_exists = exists;
+                                state.content.text = text;
+                                state.content.truncated = truncated;
+                            }
+                            state.content.loading_remote = need_remote;
+                            cx.notify();
+                        }
+                        need_remote
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    return;
+                }
+                let remote = cx
+                    .background_executor()
+                    .spawn(async move { detail::fetch_remote_raw(&share_url) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.selected_slug.as_deref() != Some(slug.as_str()) {
+                        return;
+                    }
+                    if let Some(state) = &mut this.detail {
+                        if let Some((text, truncated)) = remote {
+                            state.content.text = Some(text);
+                            state.content.truncated = truncated;
+                        }
+                        state.content.loading_remote = false;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        } else {
+            self.detail = Some(detail::DetailState {
+                slug,
+                tab,
+                content: detail::DetailContent::default(),
+            });
+            self.detail_task = None;
+        }
         cx.notify();
     }
 
     pub fn clear_search(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         self.query.clear();
         if let Some(input) = &self.input
             && let Some(window) = window
@@ -353,19 +575,23 @@ impl View {
     }
 
     pub fn handle_escape(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.armed_delete.take().is_some() {
+            cx.notify();
+            return;
+        }
         if !self.query.is_empty() {
             self.clear_search(window, cx);
             return;
         }
         if self.selected_slug.is_some() {
-            self.selected_slug = None;
-            cx.notify();
+            self.select_slug(None, cx);
             return;
         }
         cx.emit(Close);
     }
 
     pub fn toggle_sharing(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         let Some(dir) = self.state_dir.clone() else {
             self.sharing_enabled = enabled;
             cx.notify();
@@ -388,7 +614,28 @@ impl View {
         cx.notify();
     }
 
+    fn activate_row_delete(&mut self, slug: String, cx: &mut Context<Self>) {
+        if self.armed_delete.as_ref() == Some(&ArmedDelete::Row(slug.clone())) {
+            self.armed_delete = None;
+            self.delete_artifact(slug, cx);
+        } else {
+            self.armed_delete = Some(ArmedDelete::Row(slug));
+            cx.notify();
+        }
+    }
+
+    fn activate_detail_delete(&mut self, slug: String, cx: &mut Context<Self>) {
+        if self.armed_delete.as_ref() == Some(&ArmedDelete::Detail(slug.clone())) {
+            self.armed_delete = None;
+            self.delete_artifact(slug, cx);
+        } else {
+            self.armed_delete = Some(ArmedDelete::Detail(slug));
+            cx.notify();
+        }
+    }
+
     pub fn delete_artifact(&mut self, slug: String, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         if self.deleting_slug.is_some() || self.retention_slug.is_some() {
             return;
         }
@@ -406,8 +653,11 @@ impl View {
                 match result {
                     Ok(()) => {
                         this.items.retain(|i| i.artifact.slug != slug);
+                        this.rebuild_rows();
                         if this.selected_slug.as_deref() == Some(slug.as_str()) {
                             this.selected_slug = None;
+                            this.detail = None;
+                            this.detail_task = None;
                         }
                     }
                     Err(err) => {
@@ -422,6 +672,7 @@ impl View {
     }
 
     fn load(&mut self, more: bool, cx: &mut Context<Self>) {
+        self.armed_delete = None;
         if self.loading || self.retention_slug.is_some() || (more && self.next.is_none()) {
             return;
         }
@@ -473,7 +724,10 @@ impl View {
                             && !this.items.iter().any(|i| &i.artifact.slug == sel)
                         {
                             this.selected_slug = None;
+                            this.detail = None;
+                            this.detail_task = None;
                         }
+                        this.rebuild_rows();
                         // A repeated cursor must not leave a misleading endless Load more button.
                         this.next = page
                             .next_cursor
@@ -486,27 +740,6 @@ impl View {
             .ok();
         }));
         cx.notify();
-    }
-
-    fn local_source_for_slug(&self, slug: &str) -> Option<(String, Option<String>)> {
-        #[derive(Deserialize)]
-        struct LocalShareEntry {
-            slug: String,
-        }
-        #[derive(Default, Deserialize)]
-        struct LocalSharesFile {
-            #[serde(default)]
-            files: std::collections::BTreeMap<String, LocalShareEntry>,
-        }
-        let dir = self.state_dir.as_deref()?;
-        let raw = std::fs::read(dir.join("artifact-shares.json")).ok()?;
-        let shares: LocalSharesFile = serde_json::from_slice(&raw).ok()?;
-        let (path, _) = shares.files.into_iter().find(|(_, s)| s.slug == slug)?;
-        let preview = std::fs::read_to_string(&path).ok().map(|content| {
-            let lines: Vec<&str> = content.lines().take(28).collect();
-            lines.join("\n")
-        });
-        Some((path, preview))
     }
 
     fn render_error_banner(&self, p: &ui::Palette, cx: &mut Context<Self>) -> Option<gpui::Div> {
@@ -737,308 +970,6 @@ impl View {
                     .child(text::COL_ACTIONS.get()),
             )
     }
-
-    fn render_detail_drawer(
-        &self,
-        item: &Item,
-        p: &ui::Palette,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let slug = item.artifact.slug.clone();
-        let slug_for_copy = slug.clone();
-        let slug_for_delete = slug.clone();
-        let share_url = item.share_url.clone();
-        let share_url_open = share_url.clone();
-        let share_url_preview_open = share_url.clone();
-        let is_openable = item.openable();
-        let is_copied = self.copied_slug.as_deref() == Some(slug.as_str());
-        let is_deleting = self.deleting_slug.as_deref() == Some(slug.as_str());
-        let updated = format_timestamp_short(item.artifact.updated_at.as_deref());
-        let size = format_byte_size(item.artifact.byte_size);
-        let expires = retention::expiration_label(&item.artifact);
-        let meta_line = format!(
-            "{} {updated} · {size} · {} {expires}",
-            text::COL_UPDATED.get(),
-            text::COL_EXPIRES.get()
-        );
-        let local_source = self.local_source_for_slug(&slug);
-
-        div()
-            .id("artifact-detail-drawer")
-            .debug_selector(|| "artifact-detail-drawer".into())
-            .w(px(440.))
-            .max_w(relative(0.5))
-            .h_full()
-            .flex_none()
-            .border_l_1()
-            .border_color(p.border)
-            .bg(p.background)
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .child(
-                // ArtifactDetailHeader
-                div()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap_2p5()
-                    .px_4()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(p.border)
-                    .child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .child(
-                                        div()
-                                            .text_size(ui::TEXT_MD)
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(p.foreground)
-                                            .truncate()
-                                            .child(item.title().to_owned()),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .text_size(ui::TEXT_XS)
-                                            .text_color(p.muted_foreground)
-                                            .child(ui::icons::svg_box(
-                                                ui::icons::GLOBE_SVG,
-                                                ui::icons::ICON_XS,
-                                                p.muted_foreground,
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .font_family(ui::FONT_MONO)
-                                                    .truncate()
-                                                    .child(item.share_url.clone()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(ui::TEXT_XS)
-                                            .text_color(p.muted_foreground)
-                                            .truncate()
-                                            .child(meta_line),
-                                    ),
-                            )
-                            .child(
-                                ui::ghost("artifact-detail-close", "")
-                                    .debug_selector(|| "artifact-detail-close".into())
-                                    .icon(IconName::Close)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.selected_slug = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                ui::primary(
-                                    "artifact-detail-copy",
-                                    if is_copied {
-                                        crate::i18n::link_ui::COPIED_LINK.get()
-                                    } else {
-                                        text::COPY_LINK.get()
-                                    },
-                                )
-                                .debug_selector(|| "artifact-detail-copy".into())
-                                .disabled(!is_openable)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            share_url.clone(),
-                                        ));
-                                        this.copied_slug = Some(slug_for_copy.clone());
-                                        cx.notify();
-                                    },
-                                )),
-                            )
-                            .child(
-                                ui::secondary("artifact-detail-open", text::OPEN_IN_BROWSER.get())
-                                    .debug_selector(|| "artifact-detail-open".into())
-                                    .disabled(!is_openable)
-                                    .on_click(move |_, _, cx| cx.open_url(&share_url_open)),
-                            )
-                            .child(
-                                Button::new("artifact-detail-delete")
-                                    .small()
-                                    .danger()
-                                    .label(text::DELETE.get())
-                                    .debug_selector(|| "artifact-detail-delete".into())
-                                    .disabled(is_deleting || self.retention_slug.is_some())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.delete_artifact(slug_for_delete.clone(), cx);
-                                    })),
-                            ),
-                    ),
-            )
-            .child(self.render_retention_control(Some(item), p, cx))
-            .child(
-                // ArtifactPreview surface
-                div()
-                    .id("artifact-detail-preview-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .bg(p.editor_surface)
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .rounded(ui::RADIUS_MD)
-                            .border_1()
-                            .border_color(p.border)
-                            .bg(p.background)
-                            .p_3()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_size(ui::TEXT_SM)
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(p.foreground)
-                                            .child(text::PREVIEW_TITLE.get()),
-                                    )
-                                    .child(ui::badge(p, ui::BadgeTone::Neutral, item.type_label())),
-                            )
-                            .child(
-                                div()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(text::PREVIEW_SUBTITLE.get()),
-                            )
-                            .child(
-                                div()
-                                    .pt_1()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .text_size(ui::TEXT_XS)
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .justify_between()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .text_color(p.muted_foreground)
-                                                    .child(text::SLUG_LABEL.get()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .font_family(ui::FONT_MONO)
-                                                    .text_color(p.foreground)
-                                                    .child(item.artifact.slug.clone()),
-                                            ),
-                                    )
-                                    .children(item.artifact.original_file_name.as_ref().map(
-                                        |orig| {
-                                            div()
-                                                .flex()
-                                                .justify_between()
-                                                .gap_2()
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_color(p.muted_foreground)
-                                                        .child(text::COL_NAME.get()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .font_family(ui::FONT_MONO)
-                                                        .text_color(p.foreground)
-                                                        .truncate()
-                                                        .child(orig.clone()),
-                                                )
-                                        },
-                                    )),
-                            )
-                            .child(
-                                div().pt_1().child(
-                                    ui::secondary(
-                                        "artifact-preview-open-browser",
-                                        text::OPEN_IN_BROWSER.get(),
-                                    )
-                                    .disabled(!is_openable)
-                                    .on_click(move |_, _, cx| cx.open_url(&share_url_preview_open)),
-                                ),
-                            ),
-                    )
-                    .children(local_source.map(|(source_path, preview_text)| {
-                        div()
-                            .rounded(ui::RADIUS_MD)
-                            .border_1()
-                            .border_color(p.border)
-                            .bg(p.background)
-                            .p_3()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(ui::TEXT_XS)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(p.muted_foreground)
-                                    .child(text::LOCAL_SOURCE.get()),
-                            )
-                            .child(
-                                div()
-                                    .font_family(ui::FONT_MONO)
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.foreground)
-                                    .truncate()
-                                    .child(source_path),
-                            )
-                            .children(preview_text.filter(|s| !s.trim().is_empty()).map(
-                                |snippet| {
-                                    div()
-                                        .rounded(ui::RADIUS_SM)
-                                        .border_1()
-                                        .border_color(p.border)
-                                        .bg(p.muted.opacity(0.25))
-                                        .p_2()
-                                        .font_family(ui::FONT_MONO)
-                                        .text_size(ui::TEXT_XS)
-                                        .text_color(p.foreground)
-                                        .child(snippet)
-                                },
-                            ))
-                    })),
-            )
-    }
 }
 
 impl Render for View {
@@ -1046,14 +977,22 @@ impl Render for View {
         let p = ui::palette(cx);
         if self.input.is_none() && cx.has_global::<gpui_component::Theme>() {
             let input = cx.new(|cx| InputState::new(window, cx).placeholder(text::SEARCH.get()));
-            self.input_sub = Some(cx.observe(&input, |this, input, cx| {
-                this.query = input.read(cx).value().to_lowercase();
-                cx.notify();
-            }));
+            self.input_sub = Some(cx.subscribe(
+                &input,
+                |this, input, event: &gpui_component::input::InputEvent, cx| {
+                    if matches!(event, gpui_component::input::InputEvent::Change) {
+                        this.query = input.read(cx).value().to_lowercase();
+                        cx.notify();
+                    }
+                },
+            ));
             self.input = Some(input);
         }
         let language_changed = self.language != crate::i18n::language();
         self.language = crate::i18n::language();
+        if language_changed {
+            self.rebuild_rows();
+        }
         if let Some(input) = &self.input {
             if language_changed || self.focus_search {
                 input.update(cx, |input, cx| {
@@ -1084,7 +1023,9 @@ impl Render for View {
             .gap_2()
             .child(
                 div()
+                    .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .children(self.input.as_ref().map(|input| {
@@ -1092,19 +1033,25 @@ impl Render for View {
                             .id("artifacts-search")
                             .debug_selector(|| "artifacts-search".into())
                             .w(px(224.))
+                            .max_w_full()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(div().flex_1().child(Input::new(input).small()))
+                            .child(div().flex_1().min_w_0().child(Input::new(input).small()))
                             .when(!self.query.is_empty(), |d| {
-                                d.child(
-                                    ui::ghost("artifacts-search-clear", "")
+                                d.child(ui::button_with_tooltip(
+                                    Button::new("artifacts-search-clear")
+                                        .small()
+                                        .ghost()
                                         .debug_selector(|| "artifacts-search-clear".into())
                                         .icon(IconName::Close)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.clear_search(Some(window), cx);
                                         })),
-                                )
+                                    "artifacts-search-clear",
+                                    crate::i18n::catalog::settings::SEARCH_CLEAR.get(),
+                                ))
                             })
                     }))
                     .child(
@@ -1114,22 +1061,7 @@ impl Render for View {
                             .on_click(cx.listener(|this, _, _, cx| this.load(false, cx))),
                     ),
             )
-            .when(self.state_dir.is_some(), |d| {
-                let enabled = self.sharing_enabled;
-                d.child(
-                    ui::ghost(
-                        "artifacts-sharing-toggle",
-                        if enabled {
-                            text::SHARING_ON.get()
-                        } else {
-                            text::SHARING_OFF.get()
-                        },
-                    )
-                    .debug_selector(|| "artifacts-sharing-toggle".into())
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_sharing(!enabled, cx))),
-                )
-            })
-            .child(self.render_retention_control(None, p, cx));
+            .child(self.render_inline_retention_control(None, p, cx));
 
         let main_body = if self.slow_load && self.items.is_empty() {
             Self::render_skeleton(p).into_any_element()
@@ -1158,27 +1090,24 @@ impl Render for View {
                 .flex_col();
 
             let mut visible = 0usize;
-            for (index, item) in self
-                .items
-                .iter()
-                .enumerate()
-                .filter(|(_, i)| i.matches(&self.query))
-            {
+            for (index, row) in self.rows.iter().enumerate().filter(|(_, row)| {
+                self.query
+                    .split_whitespace()
+                    .all(|term| row.search_haystack.contains(term))
+            }) {
+                let item = &self.items[index];
                 visible += 1;
                 let open = item.share_url.clone();
                 let copy = open.clone();
-                let slug = item.artifact.slug.clone();
+                let slug = row.slug.clone();
                 let slug_select = slug.clone();
                 let slug_copy = slug.clone();
                 let slug_delete = slug.clone();
                 let is_selected = self.selected_slug.as_deref() == Some(slug.as_str());
+                let is_copied = self.copied_slug.as_deref() == Some(slug.as_str());
                 let is_deleting = self.deleting_slug.as_deref() == Some(slug.as_str());
                 let id = format!("artifact-row-{index}");
                 let selector = id.clone();
-                let type_label = item.type_label();
-                let size_label = format_byte_size(item.artifact.byte_size);
-                let updated_label = format_timestamp_short(item.artifact.updated_at.as_deref());
-                let expires_label = retention::expiration_label(&item.artifact);
 
                 rows = rows.child(
                     div()
@@ -1219,7 +1148,7 @@ impl Render for View {
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(p.foreground)
                                         .truncate()
-                                        .child(item.title().to_owned()),
+                                        .child(row.title.clone()),
                                 )
                                 .child(
                                     div()
@@ -1236,7 +1165,7 @@ impl Render for View {
                                 .text_size(ui::TEXT_XS)
                                 .text_color(p.muted_foreground)
                                 .truncate()
-                                .child(type_label),
+                                .child(row.type_label),
                         )
                         .child(
                             div()
@@ -1245,7 +1174,7 @@ impl Render for View {
                                 .text_size(ui::TEXT_XS)
                                 .text_color(p.muted_foreground)
                                 .truncate()
-                                .child(size_label),
+                                .child(row.size_label.clone()),
                         )
                         .child(
                             div()
@@ -1254,7 +1183,7 @@ impl Render for View {
                                 .text_size(ui::TEXT_XS)
                                 .text_color(p.muted_foreground)
                                 .truncate()
-                                .child(updated_label),
+                                .child(row.updated_label.clone()),
                         )
                         .child(
                             div()
@@ -1263,7 +1192,7 @@ impl Render for View {
                                 .text_size(ui::TEXT_XS)
                                 .text_color(p.muted_foreground)
                                 .truncate()
-                                .child(expires_label),
+                                .child(row.expires_label.clone()),
                         )
                         .child(
                             div()
@@ -1274,17 +1203,27 @@ impl Render for View {
                                 .justify_end()
                                 .gap_1()
                                 .child(
-                                    ui::ghost(format!("artifact-copy-{index}"), text::COPY.get())
-                                        .debug_selector(move || format!("artifact-copy-{index}"))
-                                        .disabled(!item.openable())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                    ui::button_with_reserved_label(
+                                        format!("artifact-copy-{index}"),
+                                        text::COPY.get(),
+                                        crate::i18n::link_ui::COPIED_LINK.get(),
+                                        is_copied,
+                                    )
+                                    .small()
+                                    .ghost()
+                                    .debug_selector(move || format!("artifact-copy-{index}"))
+                                    .disabled(!item.openable())
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
                                             cx.stop_propagation();
+                                            this.armed_delete = None;
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 copy.clone(),
                                             ));
                                             this.copied_slug = Some(slug_copy.clone());
                                             cx.notify();
-                                        })),
+                                        },
+                                    )),
                                 )
                                 .child(
                                     ui::secondary(
@@ -1300,16 +1239,46 @@ impl Render for View {
                                         },
                                     ),
                                 )
-                                .child(
-                                    ui::ghost(format!("artifact-delete-{index}"), "")
+                                .child({
+                                    let row_delete_armed = self.armed_delete.as_ref()
+                                        == Some(&ArmedDelete::Row(slug_delete.clone()));
+                                    let out_slug = slug_delete.clone();
+                                    ui::button_with_tooltip(
+                                        (if row_delete_armed {
+                                            Button::new(format!("artifact-delete-{index}")).danger()
+                                        } else {
+                                            Button::new(format!("artifact-delete-{index}")).ghost()
+                                        })
+                                        .small()
                                         .debug_selector(move || format!("artifact-delete-{index}"))
                                         .icon(IconName::Delete)
                                         .disabled(is_deleting)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.delete_artifact(slug_delete.clone(), cx);
-                                        })),
-                                ),
+                                        .when(row_delete_armed, |btn| {
+                                            btn.on_mouse_down_out(cx.listener(
+                                                move |this, _, _, cx| {
+                                                    if this.armed_delete.as_ref()
+                                                        == Some(&ArmedDelete::Row(out_slug.clone()))
+                                                    {
+                                                        this.armed_delete = None;
+                                                        cx.notify();
+                                                    }
+                                                },
+                                            ))
+                                        })
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.activate_row_delete(slug_delete.clone(), cx);
+                                            }),
+                                        ),
+                                        format!("artifact-delete-{index}"),
+                                        if row_delete_armed {
+                                            crate::i18n::catalog::settings::CONFIRM_AGAIN.get()
+                                        } else {
+                                            text::DELETE.get()
+                                        },
+                                    )
+                                }),
                         ),
                 );
             }
@@ -1349,19 +1318,40 @@ impl Render for View {
                 })
                 .child(
                     div()
-                        .id("artifacts-table-scroll")
                         .flex_1()
-                        .min_h_0()
                         .min_w_0()
+                        .min_h_0()
                         .flex()
-                        .flex_col()
-                        .overflow_x_scroll()
                         .rounded(ui::RADIUS_MD)
                         .border_1()
                         .border_color(p.border)
                         .bg(p.muted.opacity(0.2))
-                        .child(Self::render_table_header(p))
-                        .child(rows),
+                        .child(
+                            div()
+                                .id("artifacts-table-scroll")
+                                .debug_selector(|| "artifacts-table-scroll".into())
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .overflow_x_scroll()
+                                .flex()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "artifacts-table".into())
+                                        .flex_1()
+                                        // Column widths + five gaps + horizontal padding.
+                                        .min_w(
+                                            px(160. + 84. + 72. + 116. + 116. + 184.)
+                                                + ui::SPACE_3 * 7.,
+                                        )
+                                        .h_full()
+                                        .min_h_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(Self::render_table_header(p))
+                                        .child(rows),
+                                ),
+                        ),
                 )
                 .when(self.next.is_some(), |d| {
                     d.child(
@@ -1376,83 +1366,110 @@ impl Render for View {
                 .into_any_element()
         };
 
-        div()
-            .id("artifacts-page")
-            .debug_selector(|| "artifacts-page".into())
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
-                    this.handle_escape(Some(window), cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .size_full()
-            .flex()
-            .bg(p.background)
-            .font_family(ui::FONT_UI)
-            .text_size(ui::TEXT_MD)
-            .text_color(p.foreground)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        // Top Header (Orca ArtifactsPage header + Krill Back button)
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_4()
-                            .px_5()
-                            .pt_5()
-                            .pb_3()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        ui::ghost("artifacts-back", text::BACK.get())
-                                            .debug_selector(|| "artifacts-back".into())
-                                            .icon(IconName::ArrowLeft)
-                                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Close))),
+        ui::modal_focus_scope(
+            div()
+                .id("artifacts-page")
+                .relative()
+                .debug_selector(|| "artifacts-page".into())
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+                        this.handle_escape(Some(window), cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(p.background)
+                .font_family(ui::FONT_UI)
+                .text_size(ui::TEXT_MD)
+                .text_color(p.foreground)
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .px_5()
+                        .pt_4()
+                        .pb_3()
+                        .border_b_1()
+                        .border_color(p.border)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(ui::TEXT_LG)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(p.foreground)
+                                        .child(text::TITLE.get()),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(p.muted_foreground)
+                                        .truncate()
+                                        .child(text::DESCRIPTION.get()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .when(self.state_dir.is_some(), |d| {
+                                    let enabled = self.sharing_enabled;
+                                    d.child(
+                                        ui::button_with_reserved_label(
+                                            "artifacts-sharing-toggle",
+                                            text::SHARING_ON.get(),
+                                            text::SHARING_OFF.get(),
+                                            !enabled,
+                                        )
+                                        .small()
+                                        .ghost()
+                                        .debug_selector(|| "artifacts-sharing-toggle".into())
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.toggle_sharing(!enabled, cx);
+                                            }),
+                                        ),
                                     )
-                                    .child(
-                                        div()
-                                            .text_size(ui::TEXT_LG)
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(p.foreground)
-                                            .child(text::TITLE.get()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .truncate()
-                                    .child(text::DESCRIPTION.get()),
-                            ),
-                    )
-                    .children(self.render_error_banner(p, cx))
-                    .child(main_body),
-            )
-            .children(
-                selected_item
-                    .as_ref()
-                    .map(|item| self.render_detail_drawer(item, p, cx)),
-            )
+                                })
+                                .child(ui::button_with_tooltip(
+                                    Button::new("artifacts-close")
+                                        .icon(IconName::Close)
+                                        .ghost()
+                                        .small()
+                                        .debug_selector(|| "artifacts-close".into())
+                                        .on_click(cx.listener(|_, _, _, cx| cx.emit(Close))),
+                                    "artifacts-close",
+                                    text::CLOSE.get(),
+                                )),
+                        ),
+                )
+                .children(self.render_error_banner(p, cx))
+                .when_some(selected_item.as_ref(), |d, item| {
+                    d.child(self.render_detail_view(item, p, cx))
+                })
+                .when(selected_item.is_none(), |d| d.child(main_body)),
+            &self.focus,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests;
 
+mod detail;
 mod retention;
 mod sharing;
 pub use sharing::{runner, share_path};

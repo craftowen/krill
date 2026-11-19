@@ -35,7 +35,7 @@ impl super::Shell {
             }
             Some(entity.update(cx, |this, cx| {
                 this.open_settings(krill_app::settings::AdminTab::Machines, None, cx);
-                if let Some(settings) = &this.settings {
+                if let Some(settings) = this.settings() {
                     settings.update(cx, |view, cx| {
                         view.show_machine_add(krill_app::machines::AddMethod::Invite, cx);
                     });

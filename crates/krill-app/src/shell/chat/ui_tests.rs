@@ -576,8 +576,18 @@ fn same_session_number_on_two_hosts_keeps_logs_drafts_and_target_apart(cx: &mut 
             shell.layout.set_session(remote, SESSION);
 
             let local_host = krill_app::hosts::HostId::Local;
-            shell.apply_chat_poll_for_host(SESSION, local_host, snapshot(vec![item("local")]));
-            shell.apply_chat_poll_for_host(SESSION, remote_host, snapshot(vec![item("remote")]));
+            shell.apply_chat_poll_for_host(
+                SESSION,
+                local_host,
+                snapshot(vec![item("local")]),
+                None,
+            );
+            shell.apply_chat_poll_for_host(
+                SESSION,
+                remote_host,
+                snapshot(vec![item("remote")]),
+                None,
+            );
             let local_log = &shell.chat.logs[&local_key(SESSION)];
             assert_eq!(local_log.items.len(), 1);
             assert_eq!(local_log.items[0].text, "local");
@@ -812,4 +822,1413 @@ fn composer_meta_observation_extracts_codex_and_claude_records() {
         claude_meta.context_percent, None,
         "the context window is unknown here; a 1M model must not read as full"
     );
+}
+
+#[gpui::test]
+fn chat_work_run_collapses_by_default_expands_steps_without_moving_composer_and_survives_remount(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = fixture(
+        cx,
+        "chat-work-run-disclosure",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "Running verification\nChecking warnings".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolCall,
+                tool_id: "call-bash".into(),
+                tool_name: "Bash".into(),
+                title: "Run cargo check".into(),
+                text: "cargo check -p krill-app --locked".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolResult,
+                tool_id: "call-bash".into(),
+                text: "Finished check".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "Inspecting crate root\nChecking exports".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolCall,
+                tool_id: "call-read".into(),
+                tool_name: "Read".into(),
+                file_path: "crates/krill-app/src/lib.rs".into(),
+                text: "crates/krill-app/src/lib.rs".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolResult,
+                tool_id: "call-read".into(),
+                text: "pub mod ui;\n".into(),
+                ..Default::default()
+            },
+        ],
+    );
+
+    let run_row = selector(&shell, cx, "chat-item", 0);
+    assert!(cx.debug_bounds(run_row).is_some());
+    assert!(
+        cx.debug_bounds(selector(&shell, cx, "chat-item", 1))
+            .is_none()
+    );
+    assert!(cx.debug_bounds("chat-work-run-toggle").is_some());
+    assert!(cx.debug_bounds("chat-disclosure").is_none());
+    assert!(cx.debug_bounds("chat-message-body").is_none());
+
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    let toggle = cx.debug_bounds("chat-work-run-toggle").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(cx.debug_bounds("desktop-chat-composer").unwrap(), composer);
+    assert!(cx.debug_bounds("chat-disclosure").is_some());
+    assert!(cx.debug_bounds("chat-message-body").is_none());
+
+    let step_toggle = cx.debug_bounds("chat-disclosure").unwrap();
+    cx.simulate_click(step_toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-message-body").is_some());
+    assert_eq!(cx.debug_bounds("desktop-chat-composer").unwrap(), composer);
+
+    let copy_btn = cx.debug_bounds("chat-copy-item").unwrap();
+    cx.simulate_click(copy_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("pub mod ui;\n")
+    );
+    assert!(
+        cx.debug_bounds("chat-message-body").is_some(),
+        "copy button inside step header must not collapse the step"
+    );
+
+    let term = cx.debug_bounds("chat-switch-terminal").unwrap();
+    cx.simulate_click(term.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
+
+    shell.update(cx, Shell::toggle_chat_view);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-disclosure").is_some());
+    assert!(cx.debug_bounds("chat-message-body").is_some());
+}
+
+#[gpui::test]
+fn chat_solo_reasoning_promotes_cleanly_and_requests_keep_raw_abs_idx_after_work_run(
+    cx: &mut TestAppContext,
+) {
+    struct Memory(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-solo-promote-and-requests",
+        vec![ChatItem {
+            kind: ChatItemKind::Reasoning,
+            text: "Planning safe rollout\nChecking preconditions".into(),
+            ..Default::default()
+        }],
+    );
+
+    assert!(cx.debug_bounds("chat-work-run-toggle").is_none());
+    assert!(cx.debug_bounds("chat-message-body").is_none());
+    let solo_disclosure = cx.debug_bounds("chat-disclosure").unwrap();
+    cx.simulate_click(solo_disclosure.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-message-body").is_some());
+
+    shell.update(cx, |shell, cx| {
+        shell.apply_chat_poll(
+            SESSION,
+            snapshot(vec![
+                ChatItem {
+                    kind: ChatItemKind::ToolCall,
+                    tool_id: "call-1".into(),
+                    tool_name: "Read".into(),
+                    file_path: "deploy.sh".into(),
+                    ..Default::default()
+                },
+                ChatItem {
+                    kind: ChatItemKind::ToolResult,
+                    tool_id: "call-1".into(),
+                    text: "#!/bin/sh\n".into(),
+                    ..Default::default()
+                },
+            ]),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("chat-work-run-toggle").is_some());
+    assert!(cx.debug_bounds("chat-message-body").is_none());
+    let run_toggle = cx.debug_bounds("chat-work-run-toggle").unwrap();
+    cx.simulate_click(run_toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-message-body").is_some(),
+        "step expanded while solo Reasoning must stay expanded when promoted into WorkRun"
+    );
+
+    let sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let captured = Arc::clone(&sent);
+    shell.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        shell.attach_test(pane, SESSION, ours, cx);
+        shell.live.get_mut(&pane).unwrap().sock = Some(theirs);
+        shell.live.get_mut(&pane).unwrap().target = Some(krill_app::hosts::HostTarget::local(
+            krill_proto::daemon::Paths {
+                socket: "/fake/socket".into(),
+                holder: "/fake/holder".into(),
+                krilld: "/fake/krilld".into(),
+            },
+        ));
+        shell.paths = None;
+        shell.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(Memory(krill_app::sidebar::Snapshot {
+                    sessions: vec![krill_app::sidebar::Session {
+                        id: SESSION,
+                        status: krill_proto::control::AgentStatus {
+                            state: krill_proto::control::AgentState::Waiting,
+                            agent: "claude".into(),
+                            ..krill_proto::control::AgentStatus::UNKNOWN
+                        },
+                        worktree: None,
+                        cwd: None,
+                        account: None,
+                    }],
+                    trees: BTreeMap::new(),
+                })),
+                cx,
+            );
+        });
+        shell.chat.send_input = Some(Box::new(move |bytes| {
+            captured.lock().unwrap().push(bytes);
+            true
+        }));
+        shell.apply_chat_poll(
+            SESSION,
+            snapshot(vec![
+                ChatItem {
+                    kind: ChatItemKind::Question,
+                    tool_id: "q-1".into(),
+                    title: "Target".into(),
+                    text: "Select environment".into(),
+                    options: vec![krill_proto::agent_history::ChatQuestionOption {
+                        label: "Staging".into(),
+                        description: String::new(),
+                    }],
+                    ..Default::default()
+                },
+                ChatItem {
+                    kind: ChatItemKind::Permission,
+                    tool_id: "perm-1".into(),
+                    text: "deploy production".into(),
+                    ..Default::default()
+                },
+            ]),
+        );
+        let ops = vec![
+            krill_proto::screen::Op::Reset {
+                cols: 100,
+                lines: 6,
+            },
+            krill_proto::screen::Op::Line {
+                line: 0,
+                cells: "Allow deploy production? (y/n)"
+                    .chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+        ];
+        for frame in krill_proto::screen::encode_update(
+            krill_proto::screen::Revision(1),
+            krill_proto::screen::Seq(0),
+            ops,
+        )
+        .unwrap()
+        {
+            let (kind, body) = krill_proto::ipc::read_frame(&mut frame.as_slice())
+                .unwrap()
+                .unwrap();
+            shell.on_frame(pane, kind, &body, cx);
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds(selector(&shell, cx, "chat-item", 3))
+            .is_some()
+    );
+    assert!(
+        cx.debug_bounds(selector(&shell, cx, "chat-item", 4))
+            .is_some()
+    );
+
+    let approve = cx
+        .debug_bounds("chat-permission-approve")
+        .expect("permission approve button must render outside WorkRun");
+    cx.simulate_click(approve.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(*sent.lock().unwrap(), vec![b"y\r".to_vec()]);
+}
+
+#[gpui::test]
+fn chat_narrow_320px_work_run_stays_inside_pane_collapsed_and_expanded(cx: &mut TestAppContext) {
+    let (shell, cx) = fixture(
+        cx,
+        "chat-work-run-narrow-320",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::ToolCall,
+                tool_id: "c1".into(),
+                tool_name: "Edit".into(),
+                title: "Update deeply nested layout component with long description".into(),
+                file_path: "/very/long/workspace/path/crates/krill-app/src/shell/chat/view.rs"
+                    .into(),
+                text: "diff --git a/view.rs b/view.rs".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolResult,
+                tool_id: "c1".into(),
+                is_error: true,
+                text: format!(
+                    "error summary\n```rust\nlet wide = \"{}\";\n```",
+                    "very_long_identifier_segment_".repeat(16)
+                ),
+                ..Default::default()
+            },
+        ],
+    );
+    cx.simulate_resize(size(px(320.), px(680.)));
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let run_card = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    let run_toggle = cx.debug_bounds("chat-work-run-toggle").unwrap();
+    assert!(run_card.left() >= overlay.left() && run_card.right() <= overlay.right());
+    assert!(run_toggle.left() >= overlay.left() && run_toggle.right() <= overlay.right());
+    assert!(
+        run_toggle.size.height < px(56.),
+        "collapsed 320px header must truncate on one line instead of vertical-wrapping: {run_toggle:?}"
+    );
+
+    cx.simulate_click(run_toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let step_disclosure = cx.debug_bounds("chat-disclosure").unwrap();
+    let open_file = cx.debug_bounds("chat-open-file").unwrap();
+    let copy_item = cx.debug_bounds("chat-copy-item").unwrap();
+    for (name, bounds) in [
+        ("step_disclosure", step_disclosure),
+        ("open_file", open_file),
+        ("copy_item", copy_item),
+    ] {
+        assert!(
+            bounds.left() >= overlay.left() && bounds.right() <= overlay.right(),
+            "{name} overflowed 320px pane: {bounds:?} outside {overlay:?}"
+        );
+    }
+
+    cx.simulate_click(step_disclosure.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let expanded_card = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    let code = cx.debug_bounds("chat-code-content").unwrap();
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    for (name, bounds) in [
+        ("expanded_card", expanded_card),
+        ("code", code),
+        ("composer", composer),
+    ] {
+        assert!(
+            bounds.left() >= overlay.left() && bounds.right() <= overlay.right(),
+            "{name} overflowed 320px pane when expanded: {bounds:?} outside {overlay:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn chat_composer_popovers_close_on_second_trigger_click_and_escape_and_expose_plus_a11y(
+    cx: &mut TestAppContext,
+) {
+    use gpui::EntityInputHandler as _;
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-composer-popover-toggle",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Ready.".into(),
+            ..Default::default()
+        }],
+    );
+    cx.simulate_resize(size(px(640.), px(680.)));
+    cx.run_until_parked();
+
+    let plus = cx.debug_bounds("chat-composer-plus").unwrap();
+    cx.simulate_mouse_move(plus.center(), None, gpui::Modifiers::default());
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tooltip:chat-composer-plus").is_some(),
+        "closed quick-commands button must show hover tooltip"
+    );
+
+    // Open quick menu via +, confirm tooltip hides while open, and confirm 2nd click closes it.
+    cx.simulate_click(plus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-quick-model").is_some());
+    cx.simulate_mouse_move(plus.center(), None, gpui::Modifiers::default());
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tooltip:chat-composer-plus").is_none(),
+        "open quick menu must suppress trigger tooltip"
+    );
+
+    let plus = cx.debug_bounds("chat-composer-plus").unwrap();
+    cx.simulate_click(plus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-quick-model").is_none(),
+        "clicking + while quick menu is open must close it without reopening"
+    );
+
+    // Reopen quick menu: IME Escape keeps it open, unmarked Escape closes it.
+    let plus = cx.debug_bounds("chat-composer-plus").unwrap();
+    cx.simulate_click(plus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-quick-model").is_some());
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let (input, _) = &shell.chat.inputs[&local_key(SESSION)];
+            input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-quick-model").is_some(),
+        "IME Escape cancellation must not dismiss quick menu"
+    );
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let (input, _) = &shell.chat.inputs[&local_key(SESSION)];
+            input.update(cx, |state, cx| state.unmark_text(window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-quick-model").is_none());
+
+    // Model picker: 1st click opens, 2nd click on trigger closes, Escape closes.
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_some());
+
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-model-picker").is_none(),
+        "clicking model button while picker is open must close it without reopening"
+    );
+
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_none());
+}
+
+#[gpui::test]
+fn chat_code_block_copy_feedback_conditional_header_and_line_wrap(cx: &mut TestAppContext) {
+    let code_body = format!("let value = \"{}\";", "segment_token_".repeat(12));
+    let (shell, cx) = fixture(
+        cx,
+        "chat-code-header-wrap",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: format!("Here:\n```rs\n{code_body}\n```"),
+            ..Default::default()
+        }],
+    );
+    cx.simulate_resize(size(px(320.), px(680.)));
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let header = cx.debug_bounds("chat-code-header").unwrap();
+    assert!(header.size.height <= px(34.));
+    assert!(header.left() >= overlay.left() && header.right() <= overlay.right());
+
+    let copy_before = cx.debug_bounds("chat-copy-code").unwrap();
+    let wrap_btn = cx.debug_bounds("chat-wrap-code").unwrap();
+    assert!(wrap_btn.left() >= overlay.left() && wrap_btn.right() <= overlay.right());
+
+    cx.simulate_click(copy_before.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| s.chat.copied_code.is_some()));
+    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), code_body);
+    let copy_during = cx.debug_bounds("chat-copy-code").unwrap();
+    assert_eq!(
+        copy_during.size.width, copy_before.size.width,
+        "reserved copy/copied width must prevent layout shift"
+    );
+
+    cx.executor().advance_clock(Duration::from_millis(1600));
+    cx.run_until_parked();
+    assert!(
+        shell.read_with(cx, |s, _| s.chat.copied_code.is_none()),
+        "1.5s timer must reset Copied feedback"
+    );
+
+    let wrap_btn = cx.debug_bounds("chat-wrap-code").unwrap();
+    cx.simulate_click(wrap_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| {
+        s.chat.logs[&local_key(SESSION)].is_code_wrapped(0, 0)
+    }));
+    let content = cx.debug_bounds("chat-code-content").unwrap();
+    assert!(content.left() >= overlay.left() && content.right() <= overlay.right());
+
+    // Language-less fence omits header bar and keeps corner actions inside bounds.
+    shell.update(cx, |shell, cx| {
+        let mut next = snapshot(vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: format!("```\n{code_body}\n```"),
+            ..Default::default()
+        }]);
+        next.reset = true;
+        shell.apply_chat_poll(SESSION, next);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-code-header").is_none(),
+        "unfenced/no-lang block must omit top header bar"
+    );
+    assert!(
+        shell.read_with(cx, |s, _| {
+            !s.chat.logs[&local_key(SESSION)].is_code_wrapped(0, 0)
+        }),
+        "wrap state must clear on transcript reset"
+    );
+    for target in ["chat-wrap-code", "chat-copy-code", "chat-code-content"] {
+        let b = cx.debug_bounds(target).unwrap();
+        assert!(b.left() >= overlay.left() && b.right() <= overlay.right());
+    }
+}
+
+#[gpui::test]
+fn chat_user_bubble_intrinsic_width_long_fold_and_assistant_footer(cx: &mut TestAppContext) {
+    let short_user = ChatItem {
+        kind: ChatItemKind::User,
+        text: "안녕".into(),
+        ..Default::default()
+    };
+    let (shell, cx) = fixture(cx, "chat-user-bubble", vec![short_user]);
+    cx.simulate_resize(size(px(800.), px(680.)));
+    cx.run_until_parked();
+
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    let bubble = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    assert!(
+        bubble.size.width < composer.size.width * 0.5,
+        "short user bubble must size to content rather than reading column: bubble={bubble:?}, composer={composer:?}"
+    );
+    assert!(
+        bubble.right() >= composer.right() - px(4.),
+        "short user bubble must right-align inside reading column: bubble={bubble:?}, composer={composer:?}"
+    );
+
+    // Long prompt folds to <= 176px height + toggle, and expands on click.
+    let long_prompt = (1..=14)
+        .map(|i| format!("Prompt detail line {i} explaining requirements clearly"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    shell.update(cx, |shell, cx| {
+        let mut next = snapshot(vec![ChatItem {
+            kind: ChatItemKind::User,
+            text: long_prompt,
+            ..Default::default()
+        }]);
+        next.reset = true;
+        shell.apply_chat_poll(SESSION, next);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let folded_bubble = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    let fold_btn = cx.debug_bounds("chat-user-fold").unwrap();
+    cx.simulate_click(fold_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let expanded_bubble = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    assert!(
+        expanded_bubble.size.height > folded_bubble.size.height,
+        "expanding folded user prompt must reveal full content: before={folded_bubble:?}, after={expanded_bubble:?}"
+    );
+
+    // Borderless assistant message renders footer copy + file + scroll-to-top without hover.
+    shell.update(cx, |shell, cx| {
+        let mut next = snapshot(vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "First paragraph.\n\nSecond paragraph.".into(),
+            file_path: "crates/krill-app/src/shell/chat/view.rs".into(),
+            ..Default::default()
+        }]);
+        next.reset = true;
+        shell.apply_chat_poll(SESSION, next);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let assistant_row = cx
+        .debug_bounds(selector(&shell, cx, "chat-item", 0))
+        .unwrap();
+    assert_eq!(assistant_row.left(), composer.left());
+    assert_eq!(assistant_row.size.width, composer.size.width);
+    assert!(cx.debug_bounds("chat-copy-item").is_some());
+    assert!(cx.debug_bounds("chat-open-file").is_some());
+    assert!(cx.debug_bounds("chat-scroll-top").is_some());
+}
+
+#[gpui::test]
+fn chat_borderless_work_run_guide_line_and_preamble_note(cx: &mut TestAppContext) {
+    let (_shell, cx) = fixture(
+        cx,
+        "chat-work-run-orca",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "Let me check Cargo.toml first.".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolCall,
+                tool_id: "r1".into(),
+                tool_name: "Read".into(),
+                file_path: "Cargo.toml".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolResult,
+                tool_id: "r1".into(),
+                text: "[workspace]".into(),
+                ..Default::default()
+            },
+        ],
+    );
+    cx.simulate_resize(size(px(320.), px(680.)));
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let toggle = cx.debug_bounds("chat-work-run-toggle").unwrap();
+    assert!(toggle.size.height < px(56.));
+    assert!(toggle.left() >= overlay.left() && toggle.right() <= overlay.right());
+    assert!(cx.debug_bounds("chat-work-note").is_none());
+
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    for target in [
+        "chat-work-note",
+        "chat-disclosure",
+        "chat-open-file",
+        "chat-copy-item",
+    ] {
+        let b = cx.debug_bounds(target).unwrap();
+        assert!(
+            b.left() >= overlay.left() && b.right() <= overlay.right(),
+            "{target} out of 320px bounds: {b:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn chat_top_right_term_pill_context_menu_turn_status_and_empty_state(cx: &mut TestAppContext) {
+    struct Memory(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (shell, cx) = open(cx, state_path("chat-chrome-overhaul"));
+    shell.update(cx, |shell, cx| {
+        shell.sidebar_collapsed = true;
+        shell.panel_collapsed = true;
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, SESSION);
+        shell.layout.set_chat_view(pane, true);
+        shell.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                bound: false,
+                ..Default::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.simulate_resize(size(px(320.), px(680.)));
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let switch_pill = cx.debug_bounds("chat-switch-terminal").unwrap();
+    assert!(switch_pill.left() >= overlay.left() && switch_pill.right() <= overlay.right());
+    assert!(
+        switch_pill.top() < overlay.center().y && switch_pill.right() > overlay.center().x,
+        "Term pill must float at top-right: {switch_pill:?} vs {overlay:?}"
+    );
+    assert!(cx.debug_bounds("chat-empty").is_some());
+    assert!(
+        cx.debug_bounds("chat-turn-status").is_none(),
+        "live turn status line must stay hidden when idle and no live status text exists"
+    );
+
+    // Working sidebar session shows live turn status line directly above composer.
+    shell.update(cx, |shell, cx| {
+        shell.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(Memory(krill_app::sidebar::Snapshot {
+                    sessions: vec![krill_app::sidebar::Session {
+                        id: SESSION,
+                        status: krill_proto::control::AgentStatus {
+                            state: krill_proto::control::AgentState::Working,
+                            agent: "claude".into(),
+                            ..krill_proto::control::AgentStatus::UNKNOWN
+                        },
+                        worktree: None,
+                        cwd: None,
+                        account: None,
+                    }],
+                    trees: BTreeMap::new(),
+                })),
+                cx,
+            );
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let status_line = cx.debug_bounds("chat-turn-status").unwrap();
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    assert!(status_line.bottom() <= composer.top() + px(1.));
+
+    // Right-click on chat overlay opens context menu with Continue with Terminal Agent.
+    let feed = cx.debug_bounds("desktop-chat-feed").unwrap();
+    cx.simulate_mouse_down(
+        feed.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        feed.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let menu_switch = cx.debug_bounds("chat-context-switch-terminal").unwrap();
+    cx.simulate_click(menu_switch.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("desktop-chat-overlay").is_none(),
+        "context menu item must switch pane back to Terminal"
+    );
+
+    // Top-right Term pill also switches back to Terminal.
+    shell.update(cx, Shell::toggle_chat_view);
+    cx.run_until_parked();
+    let switch_pill = cx.debug_bounds("chat-switch-terminal").unwrap();
+    cx.simulate_click(switch_pill.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
+}
+
+fn attach_live_test_pane(
+    shell: &mut Shell,
+    pane: super::super::PaneId,
+    session: SessionId,
+    cx: &mut Context<Shell>,
+) {
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    shell.attach_test(pane, session, ours, cx);
+    let live = shell.live.get_mut(&pane).unwrap();
+    live.sock = Some(theirs);
+    live.target = Some(krill_app::hosts::HostTarget::local(
+        krill_proto::daemon::Paths {
+            socket: "/fake/socket".into(),
+            holder: "/fake/holder".into(),
+            krilld: "/fake/krilld".into(),
+        },
+    ));
+}
+
+struct TestTempDir(std::path::PathBuf);
+
+impl TestTempDir {
+    fn new(prefix: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("krill-{prefix}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestTempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+#[gpui::test]
+fn chat_pending_card_renders_orca_intrinsic_bubble_confirms_fifo_and_rebases_across_chat_tail(
+    cx: &mut gpui::TestAppContext,
+) {
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let (shell, cx) = fixture(
+        cx,
+        "chat-pending-orca-fifo",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "How can I help?".into(),
+            ..Default::default()
+        }],
+    );
+    cx.simulate_resize(size(px(800.), px(680.)));
+    cx.run_until_parked();
+
+    let send_btn = cx.debug_bounds("desktop-chat-send").unwrap();
+    assert!((send_btn.size.width - px(32.)).abs() <= px(1.));
+    assert!((send_btn.size.height - px(32.)).abs() <= px(1.));
+
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            let recorded = sent.clone();
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            shell.ensure_chat_input(local_key(SESSION), window, cx)
+        })
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            input.update(cx, |state, cx| state.set_value("hello", window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(input.read_with(cx, |s, _| s.value().is_empty()));
+    let pending_bounds = cx
+        .debug_bounds("chat-pending-card")
+        .expect("optimistic prompt bubble must render on submit");
+    assert!(
+        pending_bounds.size.width < composer.size.width * 0.5,
+        "Orca pending bubble must wrap short prompts to intrinsic width, got {:?} vs composer {:?}",
+        pending_bounds.size.width,
+        composer.size.width
+    );
+    assert!(
+        pending_bounds.right() >= composer.right() - px(4.),
+        "pending bubble must align flush with the right edge of the composer"
+    );
+
+    // Queue a second optimistic prompt and confirm FIFO with a transcript poll + CHAT_BASE_ORIGIN rebase.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            input.update(cx, |state, cx| state.set_value("second", window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        shell.read_with(cx, |s, _| s.chat.pending_prompts[&local_key(SESSION)].len()),
+        2
+    );
+
+    shell.update(cx, |shell, _| {
+        shell.apply_chat_poll(
+            SESSION,
+            snapshot(vec![ChatItem {
+                kind: ChatItemKind::User,
+                text: "hello".into(),
+                ..Default::default()
+            }]),
+        );
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        let pending = &s.chat.pending_prompts[&local_key(SESSION)];
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].display_text, "second");
+        assert!(pending[0].origin_item < super::CHAT_BASE_ORIGIN);
+    });
+
+    // Confirm remaining "second", then verify CHAT_BASE_ORIGIN rebase across apply_chat_tail on bind.
+    shell.update(cx, |shell, _| {
+        shell.apply_chat_poll(
+            SESSION,
+            snapshot(vec![ChatItem {
+                kind: ChatItemKind::User,
+                text: "second".into(),
+                ..Default::default()
+            }]),
+        );
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert!(
+            s.chat
+                .pending_prompts
+                .get(&local_key(SESSION))
+                .is_none_or(Vec::is_empty)
+        );
+    });
+
+    shell.update(cx, |shell, _| {
+        shell.chat.logs.remove(&local_key(SESSION));
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            input.update(cx, |state, cx| state.set_value("rebased", window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(
+            s.chat.pending_prompts[&local_key(SESSION)][0].origin_item,
+            0
+        );
+    });
+
+    shell.update(cx, |shell, _| {
+        shell.apply_chat_tail(
+            SESSION,
+            local_key(SESSION).0,
+            super::ChatPage {
+                snapshot: krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "claude".into(),
+                    bound: true,
+                    reset: false,
+                    session_id: "chat-ui-tail".into(),
+                    transcript_path: "/fake/chat-ui-tail.jsonl".into(),
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "older".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                start: 20,
+                has_earlier: true,
+            },
+            None,
+            krill_proto::control::AgentState::Done,
+            std::time::Instant::now(),
+        );
+    });
+    shell.read_with(cx, |s, _| {
+        let pending = &s.chat.pending_prompts[&local_key(SESSION)];
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].origin_item, super::CHAT_BASE_ORIGIN);
+    });
+    shell.update(cx, |shell, cx| {
+        shell.apply_chat_poll(
+            SESSION,
+            krill_proto::agent_history::ChatPollSnapshot {
+                agent: "claude".into(),
+                bound: true,
+                reset: false,
+                session_id: "chat-ui-tail".into(),
+                transcript_path: "/fake/chat-ui-tail.jsonl".into(),
+                items: vec![ChatItem {
+                    kind: ChatItemKind::User,
+                    text: "rebased".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert!(
+            s.chat
+                .pending_prompts
+                .get(&local_key(SESSION))
+                .is_none_or(Vec::is_empty)
+        );
+    });
+    assert!(cx.debug_bounds("chat-pending-card").is_none());
+}
+
+#[gpui::test]
+fn chat_unconfirmed_prompt_restores_empty_composer_or_keeps_review_card_when_new_draft_exists(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (shell, cx) = fixture(
+        cx,
+        "chat-pending-restore-or-review",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Ready.".into(),
+            ..Default::default()
+        }],
+    );
+    let send_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            let ok = send_ok.clone();
+            let recorded = sent.clone();
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                if ok.load(std::sync::atomic::Ordering::SeqCst) {
+                    recorded.lock().unwrap().push(bytes);
+                    true
+                } else {
+                    false
+                }
+            }));
+            shell.ensure_chat_input(local_key(SESSION), window, cx)
+        })
+    });
+
+    // Case 1: failed send with empty composer restores prompt text back into composer.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("restore me", window, cx);
+            });
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(input.read_with(cx, |s, _| s.value()), "restore me");
+    assert!(cx.debug_bounds("chat-pending-card").is_none());
+
+    // Case 2: failed send while user has already typed a new draft enters ReviewRequired card.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let pending_id = 42;
+            shell.chat.pending_prompts.insert(
+                local_key(SESSION),
+                vec![super::PendingChatPrompt {
+                    id: pending_id,
+                    origin_item: 0,
+                    submitted_payload: "failed prompt".into(),
+                    display_text: "failed prompt".into(),
+                    attachments: Vec::new(),
+                    status: super::PendingStatus::Sending,
+                }],
+            );
+            input.update(cx, |state, cx| state.set_value("still typing", window, cx));
+            shell.transition_pending_to_review_required(
+                super::PendingReview {
+                    key: &local_key(SESSION),
+                    pending_id,
+                    immediate_send_failure: true,
+                },
+                Some(window),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(input.read_with(cx, |s, _| s.value()), "still typing");
+    assert!(cx.debug_bounds("chat-pending-card").is_some());
+    let copy_btn = cx.debug_bounds("chat-pending-copy").unwrap();
+    let retry_btn = cx.debug_bounds("chat-pending-retry").unwrap();
+
+    cx.simulate_click(copy_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("failed prompt")
+    );
+
+    send_ok.store(true, std::sync::atomic::Ordering::SeqCst);
+    cx.simulate_click(retry_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(input.read_with(cx, |s, _| s.value()), "still typing");
+    assert!(
+        !sent.lock().unwrap().is_empty(),
+        "clicking Retry must re-dispatch failed pending prompt"
+    );
+}
+
+#[gpui::test]
+fn chat_autocomplete_supports_file_and_slash_selection_ime_guard_working_priority_and_320px_bounds(
+    cx: &mut gpui::TestAppContext,
+) {
+    struct MetaMemory(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for MetaMemory {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let workspace = TestTempDir::new("chat-ac-ws");
+    std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+    std::fs::create_dir_all(workspace.path().join(".git")).unwrap();
+    std::fs::create_dir_all(workspace.path().join("target/debug")).unwrap();
+    std::fs::create_dir_all(workspace.path().join("node_modules/pkg")).unwrap();
+    std::fs::write(workspace.path().join("README.md"), "# krill\n").unwrap();
+    std::fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(workspace.path().join(".env"), "SECRET=1\n").unwrap();
+    std::fs::write(workspace.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(workspace.path().join("target/debug/krill"), "").unwrap();
+    std::fs::write(workspace.path().join("node_modules/pkg/index.js"), "").unwrap();
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-ac-and-composer",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Ready.".into(),
+            ..Default::default()
+        }],
+    );
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let ws_path = workspace.path().to_path_buf();
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            let recorded = sent.clone();
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            let log = shell.chat.logs.entry(local_key(SESSION)).or_default();
+            log.agent = "codex".into();
+            log.meta = ComposerMeta {
+                model: Some("gpt-5.4".into()),
+                current_model_id: Some("gpt-5.4".into()),
+                models: vec![ComposerModelItem {
+                    id: "gpt-5.4".into(),
+                    label: "GPT-5.4".into(),
+                    efforts: vec![
+                        "max".into(),
+                        "high".into(),
+                        "low".into(),
+                        "xhigh".into(),
+                        "medium".into(),
+                    ],
+                    default_effort: Some("medium".into()),
+                }],
+                effort: Some("medium".into()),
+                supported: true,
+                effort_supported: true,
+                ..Default::default()
+            };
+            shell.sidebar.update(cx, |sidebar, cx| {
+                sidebar.connect_source(
+                    std::sync::Arc::new(MetaMemory(krill_app::sidebar::Snapshot {
+                        sessions: vec![krill_app::sidebar::Session {
+                            id: SESSION,
+                            status: krill_proto::control::AgentStatus {
+                                state: krill_proto::control::AgentState::Done,
+                                agent: "codex".into(),
+                                ..krill_proto::control::AgentStatus::UNKNOWN
+                            },
+                            worktree: Some(ws_path.clone()),
+                            cwd: Some(ws_path),
+                            account: None,
+                        }],
+                        trees: std::collections::BTreeMap::new(),
+                    })),
+                    cx,
+                );
+            });
+            shell.ensure_chat_input(local_key(SESSION), window, cx)
+        })
+    });
+    cx.run_until_parked();
+
+    let send_btn = cx.debug_bounds("desktop-chat-send").unwrap();
+
+    // Effort picker must sort choices lowest-to-highest regardless of backend order.
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let opt_low = cx.debug_bounds("chat-effort-option-low").unwrap();
+    let opt_med = cx.debug_bounds("chat-effort-option-medium").unwrap();
+    let opt_high = cx.debug_bounds("chat-effort-option-high").unwrap();
+    let opt_xhigh = cx.debug_bounds("chat-effort-option-xhigh").unwrap();
+    let opt_max = cx.debug_bounds("chat-effort-option-max").unwrap();
+    assert!(opt_low.left() < opt_med.left());
+    assert!(opt_med.left() < opt_high.left());
+    assert!(opt_high.left() < opt_xhigh.left());
+    assert!(opt_xhigh.left() < opt_max.left());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Narrow 320px window: autocomplete `@` popover opens, excludes hidden/build dirs, and fits within bounds.
+    cx.simulate_resize(size(px(320.), px(680.)));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_value("", window, cx);
+                gpui::EntityInputHandler::replace_text_in_range(state, None, "@", window, cx);
+            });
+            shell.sync_chat_autocomplete(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let popover = cx
+        .debug_bounds("chat-autocomplete-popover")
+        .expect("@ query must open autocomplete popover");
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    assert!(popover.left() >= overlay.left());
+    assert!(popover.right() <= overlay.right());
+    assert!(popover.bottom() <= composer.top() + px(2.));
+    shell.read_with(cx, |s, _| {
+        let items = &s.chat.autocomplete[&local_key(SESSION)].items;
+        assert!(items.iter().any(|it| it.insert_text == "@README.md "));
+        assert!(items.iter().any(|it| it.insert_text == "@src/main.rs "));
+        assert!(!items.iter().any(|it| it.insert_text.contains(".git")
+            || it.insert_text.contains(".env")
+            || it.insert_text.contains("target/")
+            || it.insert_text.contains("node_modules/")));
+    });
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(input.read_with(cx, |s, _| s.value().starts_with('@')));
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "Enter accepting autocomplete must not send prompt"
+    );
+
+    // IME composition must keep autocomplete closed.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "@ㅎ", None, window, cx,
+                );
+            });
+            shell.sync_chat_autocomplete(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-autocomplete-popover").is_none());
+
+    // Slash command discovery opens on `/`.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                gpui::EntityInputHandler::replace_text_in_range(state, None, "/comp", window, cx);
+            });
+            shell.sync_chat_autocomplete(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-autocomplete-popover").is_some());
+    assert!(cx.debug_bounds("chat-autocomplete-option-0").is_some());
+
+    // Option A Stop: Working switches Send -> Stop at identical 32px circular dimensions even with draft.
+    shell.update(cx, |shell, cx| {
+        shell.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                std::sync::Arc::new(MetaMemory(krill_app::sidebar::Snapshot {
+                    sessions: vec![krill_app::sidebar::Session {
+                        id: SESSION,
+                        status: krill_proto::control::AgentStatus {
+                            state: krill_proto::control::AgentState::Working,
+                            agent: "codex".into(),
+                            since_unix_ns: 999,
+                            ..krill_proto::control::AgentStatus::UNKNOWN
+                        },
+                        worktree: None,
+                        cwd: None,
+                        account: None,
+                    }],
+                    trees: std::collections::BTreeMap::new(),
+                })),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    let stop_btn = cx
+        .debug_bounds("desktop-chat-stop")
+        .expect("Working session with draft text must show Stop under Option A");
+    assert!(cx.debug_bounds("desktop-chat-send").is_none());
+    assert_eq!(stop_btn.size, send_btn.size);
+    assert!((stop_btn.size.width - px(32.)).abs() <= px(1.));
+    cx.simulate_click(stop_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(*sent.lock().unwrap(), vec![b"\x03".to_vec()]);
+    assert_eq!(input.read_with(cx, |s, _| s.value()), "/comp");
+}
+
+#[gpui::test]
+fn chat_attachments_stage_from_drop_and_paste_remove_individually_and_submit_shell_escaped_payload(
+    cx: &mut gpui::TestAppContext,
+) {
+    let dir = TestTempDir::new("chat-attach");
+    let first = dir.path().join("hello world.txt");
+    let second = dir.path().join("spec'1.md");
+    std::fs::write(&first, "alpha").unwrap();
+    std::fs::write(&second, "beta").unwrap();
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-attachments-flow",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Ready.".into(),
+            ..Default::default()
+        }],
+    );
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            let recorded = sent.clone();
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            shell.ensure_chat_input(local_key(SESSION), window, cx)
+        })
+    });
+
+    // `+` popup exposes `chat-quick-attach`.
+    let plus = cx.debug_bounds("chat-composer-plus").unwrap();
+    cx.simulate_click(plus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-quick-attach").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Stage one file via overlay drop and another via clipboard image paste.
+    let drop_paths = gpui::ExternalPaths(vec![first.clone()].into());
+    // Minimal 1x1 PNG bytes for clipboard image paste staging test.
+    let png = gpui::Image::from_bytes(
+        gpui::ImageFormat::Png,
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ],
+    );
+    cx.write_to_clipboard(gpui::ClipboardItem::new_image(&png));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.attach_dropped_paths_to_chat(&local_key(SESSION), &drop_paths, window, cx);
+            shell.intercept_chat_clipboard_paste(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("chat-attachment-chips").is_some());
+    assert!(cx.debug_bounds("chat-attachment-chip-0").is_some());
+    assert!(cx.debug_bounds("chat-attachment-chip-1").is_some());
+
+    // Remove the dropped file (chip 0), then stage `spec'1.md` and remove image chip (chip 0).
+    let remove0 = cx.debug_bounds("chat-attachment-remove-0").unwrap();
+    cx.simulate_click(remove0.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-attachment-chip-0").is_some());
+    assert!(cx.debug_bounds("chat-attachment-chip-1").is_none());
+
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.attach_dropped_paths_to_chat(
+                &local_key(SESSION),
+                &gpui::ExternalPaths(vec![second.clone()].into()),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let remove_img = cx.debug_bounds("chat-attachment-remove-0").unwrap();
+    cx.simulate_click(remove_img.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-attachment-chip-0").is_some());
+    assert!(cx.debug_bounds("chat-attachment-chip-1").is_none());
+
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("please inspect", window, cx);
+            });
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let payload = String::from_utf8_lossy(sent.lock().unwrap().last().unwrap()).into_owned();
+    assert!(
+        payload.contains("'\\''"),
+        "shell-escaped attachment payload must quote single quotes safely, got {payload:?}"
+    );
+    assert!(payload.contains("please inspect"));
 }

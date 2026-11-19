@@ -337,13 +337,6 @@ impl Sidebar {
         crate::hosts::HostId::Local
     }
 
-    /// 같은 저장소 안에서 `path`의 부모가 될 수 있는 후보 워크트리 목록.
-    #[must_use]
-    pub fn eligible_parent_worktrees(&self, path: &Path) -> Vec<PathBuf> {
-        let host = self.resolve_worktree_host(path);
-        self.eligible_parent_worktrees_on(&host, path)
-    }
-
     #[must_use]
     pub fn eligible_parent_worktrees_on(
         &self,
@@ -638,7 +631,10 @@ impl Sidebar {
         }
         for remote in &self.remote_hosts {
             let r_host = crate::hosts::HostId::Remote(remote.id.clone());
-            if remote.status != crate::hosts::HostStatus::Connected && &r_host != initial_host {
+            if &r_host != initial_host
+                && (remote.status != crate::hosts::HostStatus::Connected
+                    || self.is_suppressed_remote_host(&r_host))
+            {
                 continue;
             }
             let Some(r_source) = remote.source.clone() else {

@@ -42,6 +42,13 @@ class TargetTests(unittest.TestCase):
             with self.subTest(target=target), self.assertRaisesRegex(ValueError, "must be below"):
                 self.validate(target)
 
+    def test_shared_target_across_worktrees_is_rejected(self):
+        # 10-20·10-27: worktrees sharing targets/shared reused each other's member artifacts.
+        for target in (self.targets / "shared", self.targets / "shared/debug"):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "targets/<worktree>"):
+                self.validate(target)
+        self.assertEqual(self.validate(self.targets / "shared-not/debug"), self.targets / "shared-not/debug")
+
     def test_symlink_out_of_external_targets_is_rejected(self):
         (self.targets / "escape").symlink_to(self.root, target_is_directory=True)
         with self.assertRaisesRegex(ValueError, "must be below"):

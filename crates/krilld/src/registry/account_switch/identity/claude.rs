@@ -9,14 +9,15 @@ use std::process::Command;
 
 use krill_proto::usage::ProviderKind;
 
-use super::{Identity, descendant_pids, process_pids, transcript};
+use super::{ExpectedId, Identity, descendant_pids, process_pids, transcript};
 
 pub(super) fn discover(
     homes: &[PathBuf],
     root: u32,
     foreground: Option<u32>,
+    expected_id: ExpectedId<'_>,
 ) -> io::Result<Option<Identity>> {
-    let mut found: Option<Identity> = None;
+    let mut found = CandidateState::default();
     let mut candidates = process_pids(root, foreground);
     for pid in descendant_pids(root, foreground) {
         if !candidates.contains(&pid) {
@@ -63,21 +64,65 @@ pub(super) fn discover(
             let Some(identity) = identity else {
                 continue;
             };
-            if let Some(previous) = &found {
-                if previous.id != identity.id
-                    || !same_file::is_same_file(&previous.path, &identity.path)?
-                {
-                    return Err(io::ErrorKind::InvalidData.into());
-                }
-            } else {
-                found = Some(identity);
-            }
+            select_candidate(&mut found, identity, expected_id)?;
         }
         if crate::sys::start_us(pid).ok() != Some(start) {
             return Err(io::ErrorKind::WouldBlock.into());
         }
     }
-    Ok(found)
+    found.finish()
+}
+
+#[derive(Default)]
+struct CandidateState {
+    preferred: Option<Identity>,
+    fallback: Option<Identity>,
+    fallback_ambiguous: bool,
+}
+
+impl CandidateState {
+    fn finish(self) -> io::Result<Option<Identity>> {
+        if self.preferred.is_some() {
+            return Ok(self.preferred);
+        }
+        if self.fallback_ambiguous {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(self.fallback)
+    }
+}
+
+fn select_candidate(
+    found: &mut CandidateState,
+    identity: Identity,
+    expected_id: ExpectedId<'_>,
+) -> io::Result<()> {
+    if Some(identity.id.as_str()) == expected_id.expected() {
+        if let Some(previous) = &found.preferred {
+            if previous.id != identity.id
+                || !same_file::is_same_file(&previous.path, &identity.path)?
+            {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+        } else {
+            found.preferred = Some(identity);
+        }
+        return Ok(());
+    }
+    if matches!(expected_id, ExpectedId::Exact(_)) {
+        return Ok(());
+    }
+    if let Some(previous) = &found.fallback {
+        if previous.id != identity.id || !same_file::is_same_file(&previous.path, &identity.path)? {
+            if matches!(expected_id, ExpectedId::Any) {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            found.fallback_ambiguous = true;
+        }
+    } else {
+        found.fallback = Some(identity);
+    }
+    Ok(())
 }
 
 fn from_record(bytes: &[u8], pid: u32, birth: &str, home: &Path) -> io::Result<Option<Identity>> {
@@ -141,6 +186,54 @@ mod tests {
         )
         .unwrap();
         assert!(from_record(record, 41, "Sat Oct 24 13:54:54 2026", &home).is_err());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn select_candidate_filters_by_expected_id_before_rejecting_siblings() {
+        let home = std::env::temp_dir().join(format!("kas-claude-select-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).unwrap();
+        let a_path = home.join("a.jsonl");
+        let b_path = home.join("b.jsonl");
+        std::fs::write(&a_path, r#"{"sessionId":"a"}"#).unwrap();
+        std::fs::write(&b_path, r#"{"sessionId":"b"}"#).unwrap();
+
+        let mk = |s: &str, p: &PathBuf| Identity {
+            id: s.into(),
+            path: p.clone(),
+            home: home.clone(),
+        };
+        let mut selected = CandidateState::default();
+        select_candidate(&mut selected, mk("a", &a_path), ExpectedId::Exact("b")).unwrap();
+        assert!(selected.preferred.is_none() && selected.fallback.is_none());
+        select_candidate(&mut selected, mk("b", &b_path), ExpectedId::Exact("b")).unwrap();
+        assert_eq!(
+            selected.finish().unwrap().as_ref().map(|i| i.id.as_str()),
+            Some("b")
+        );
+
+        let mut preferred = CandidateState::default();
+        select_candidate(
+            &mut preferred,
+            mk("a", &a_path),
+            ExpectedId::Prefer("missing"),
+        )
+        .unwrap();
+        assert_eq!(
+            preferred.finish().unwrap().as_ref().map(|i| i.id.as_str()),
+            Some("a")
+        );
+
+        let mut ambiguous = CandidateState::default();
+        select_candidate(&mut ambiguous, mk("a", &a_path), ExpectedId::Any).unwrap();
+        assert_eq!(
+            select_candidate(&mut ambiguous, mk("b", &b_path), ExpectedId::Any)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 }

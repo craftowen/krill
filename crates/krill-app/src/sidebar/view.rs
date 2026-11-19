@@ -602,7 +602,8 @@ impl Sidebar {
             .focused
             .and_then(|id| self.folder_on(&self.focused_host, id))
         {
-            return self.row_host(index) == &self.focused_host && focused == path;
+            return self.same_machine_host(self.row_host(index), &self.focused_host)
+                && focused == path;
         }
         self.selected_workspace()
             .is_some_and(|(host, folder)| self.row_host(index) == &host && folder == path)
@@ -1455,6 +1456,9 @@ impl Sidebar {
                                 .unwrap_or_else(|| text::SESSION_ACCOUNT_SWITCH.get())
                                 .to_owned();
                             let pending = account_pending;
+                            // 라벨 없는 계정 전환 버튼은 행에 올렸을 때만 보인다(진행·오류는 항상).
+                            let hover_only =
+                                account_label.is_none() && !pending && account_error.is_none();
                             let tip = self.session_account_tooltip(&account_host, id, &full);
                             let button = ui::button_with_tooltip(
                                 Button::new(("account-badge", index))
@@ -1483,19 +1487,19 @@ impl Sidebar {
                                 return button.disabled(true).into_any_element();
                             }
                             let sidebar = cx.weak_entity();
-                            button
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    menu = menu.label(text::SESSION_ACCOUNT_SWITCH.get());
-                                    for account in &account_choices {
-                                        let target = super::SwitchSessionAccount {
-                                            host: account_host.clone(),
-                                            session: id,
-                                            provider: account.provider,
-                                            account_id: account.id.clone(),
-                                        };
-                                        let sidebar = sidebar.clone();
-                                        let current = current_account.as_ref() == Some(&account.id);
-                                        menu = menu.item(
+                            let button = button.dropdown_menu(move |mut menu, _, _| {
+                                menu = menu.label(text::SESSION_ACCOUNT_SWITCH.get());
+                                for account in &account_choices {
+                                    let target = super::SwitchSessionAccount {
+                                        host: account_host.clone(),
+                                        session: id,
+                                        provider: account.provider,
+                                        account_id: account.id.clone(),
+                                    };
+                                    let sidebar = sidebar.clone();
+                                    let current = current_account.as_ref() == Some(&account.id);
+                                    menu =
+                                        menu.item(
                                             PopupMenuItem::new(super::profiles::account_label(
                                                 account,
                                                 &account_choices,
@@ -1514,10 +1518,19 @@ impl Sidebar {
                                                     .ok();
                                             }),
                                         );
-                                    }
-                                    menu
-                                })
-                                .into_any_element()
+                                }
+                                menu
+                            });
+                            if hover_only {
+                                div()
+                                    .flex_none()
+                                    .invisible()
+                                    .group_hover(ROW_GROUP, Styled::visible)
+                                    .child(button)
+                                    .into_any_element()
+                            } else {
+                                button.into_any_element()
+                            }
                         }),
                     )
                     .on_click(cx.listener(move |s, _, _, cx| {
@@ -2137,10 +2150,7 @@ impl Sidebar {
                     .aria_label(badge)
                     .debug_selector(move || format!("pr-badge-{index}"))
                     .flex_none()
-                    .px_1()
-                    .rounded(ui::RADIUS_XS)
-                    .bg(p.worktree_sidebar_accent)
-                    .text_size(ui::TEXT_2XS)
+                    .text_size(ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(badge)
             });
@@ -2154,11 +2164,8 @@ impl Sidebar {
                 .aria_label(iss.clone())
                 .debug_selector(move || format!("issue-badge-{index}"))
                 .flex_none()
-                .px_1()
-                .rounded(ui::RADIUS_XS)
-                .bg(p.worktree_sidebar_accent)
                 .font_family(ui::FONT_MONO)
-                .text_size(ui::TEXT_2XS)
+                .text_size(ui::TEXT_XS)
                 .text_color(p.muted_foreground)
                 .child(iss)
         });
@@ -2181,11 +2188,8 @@ impl Sidebar {
                 .aria_label(aria)
                 .debug_selector(move || format!("ports-badge-{index}"))
                 .flex_none()
-                .px_1()
-                .rounded(ui::RADIUS_XS)
-                .bg(p.worktree_sidebar_accent)
                 .font_family(ui::FONT_MONO)
-                .text_size(ui::TEXT_2XS)
+                .text_size(ui::TEXT_XS)
                 .text_color(p.success)
                 .child(text_str)
         });
@@ -2201,10 +2205,7 @@ impl Sidebar {
                     .aria_label(hb.clone())
                     .debug_selector(move || format!("host-badge-{index}"))
                     .flex_none()
-                    .px_1()
-                    .rounded(ui::RADIUS_XS)
-                    .bg(p.worktree_sidebar_accent)
-                    .text_size(ui::TEXT_2XS)
+                    .text_size(ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(hb)
             });
@@ -2457,10 +2458,7 @@ impl Sidebar {
                                             format!("worktree-default-badge-{index}")
                                         })
                                         .flex_none()
-                                        .px_1()
-                                        .rounded(ui::RADIUS_XS)
-                                        .bg(p.worktree_sidebar_accent)
-                                        .text_size(ui::TEXT_2XS)
+                                        .text_size(ui::TEXT_XS)
                                         .text_color(p.muted_foreground)
                                         .child(crate::i18n::catalog::general::DEFAULT.get()),
                                 )
@@ -2544,7 +2542,7 @@ impl Sidebar {
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap_1()
+                        .gap_2()
                         .children(checkpoint_pill)
                         .children(host_badge)
                         .children(issue_badge)
@@ -2674,15 +2672,6 @@ impl Sidebar {
                                         .h(px(22.))
                                         .px_1()
                                         .rounded(ui::RADIUS_XS)
-                                        .when(!card_expanded, |d| {
-                                            d.border_1().border_color(p.worktree_sidebar_border).bg(
-                                                if is_active_worktree {
-                                                    p.sidebar.opacity(0.75)
-                                                } else {
-                                                    p.sidebar_accent.opacity(0.65)
-                                                },
-                                            )
-                                        })
                                         .hover(|d| d.bg(p.sidebar_accent))
                                         .flex()
                                         .items_center()
@@ -2704,8 +2693,6 @@ impl Sidebar {
                                                 .gap_1()
                                                 .px_1p5()
                                                 .py_0p5()
-                                                .rounded(ui::RADIUS_XS)
-                                                .bg(p.worktree_sidebar_accent.opacity(0.65))
                                                 .child(status::status_glyph(
                                                     AgentState::Unknown,
                                                     unread,
@@ -2769,7 +2756,7 @@ impl Sidebar {
             .border_1()
             .when(is_active_worktree, |d| {
                 d.bg(p.worktree_sidebar)
-                    .border_color(p.sidebar_ring.opacity(0.65))
+                    .border_color(p.worktree_sidebar_border)
             })
             .when(!is_active_worktree, |d| {
                 let d = d
@@ -3308,17 +3295,6 @@ impl Render for Sidebar {
 
         self.ensure_external_polling(cx);
         self.ensure_setup_prompt_polling(cx);
-        if self.orca_import_subscription.is_none() {
-            self.orca_import_subscription = Some(
-                cx.observe_global::<crate::orca_import::OrcaImportState>(|this, cx| {
-                    if crate::orca_import::state(cx)
-                        .is_some_and(|st| !st.importing && st.last_result.is_some())
-                    {
-                        this.reload_external(cx);
-                    }
-                }),
-            );
-        }
         #[cfg(test)]
         {
             self.renders += 1;
@@ -3341,8 +3317,8 @@ impl Render for Sidebar {
             .filter(|repo| !self.removed_projects.contains(*repo))
             .map(|repo| (HostId::Local, repo.clone(), self.project_header_name(repo)))
             .collect();
-        for remote in &self.remote_hosts {
-            if remote.status == HostStatus::Connected && remote.source.is_some() {
+        for remote in self.connected_remote_hosts() {
+            if remote.source.is_some() {
                 let r_host = HostId::Remote(remote.id.clone());
                 for repo in remote.snapshot.trees.keys() {
                     projects.push((

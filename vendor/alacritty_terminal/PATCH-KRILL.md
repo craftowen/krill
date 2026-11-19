@@ -5,7 +5,7 @@
 루트 `[patch.crates-io]`로 연결한다. `Cargo.toml`에서 뺀 것: 비루트 `resolver` 줄(경고만 냄),
 `tests/` ref 스위트와 그에 딸린 `[[test]]`(46MB 녹화본, 빼고 vendor에 둠).
 
-바뀐 줄마다 `mk-006 patch` 또는 `OWE-474 patch` 표시가 있다.
+바뀐 줄마다 `mk-006 patch`, `OWE-474 patch` 또는 `Krill patch` 표시가 있다.
 원본 대비 전체 차이는 `diff -ru -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.lock`
 `~/.cargo/registry/src/*/alacritty_terminal-0.26.0 vendor/alacritty_terminal`로 재생성한다.
 
@@ -23,3 +23,9 @@
 |---|---|---|
 | `src/grid/row.rs` `Row::grow` (`mk-006 patch (bug fix)`) | 열을 늘릴 때 `occ`를 안 올려 다음 `reset`이 옛 배경색 셀을 남긴다(`self.occ = self.inner.len()` 추가) | `spikes/mk-006/tests/findings.rs::alacritty_row_grow_leaves_stale_background` |
 | `src/term/mod.rs` `push_keyboard_mode` (`OWE-474 patch (bug fix)`) | 키보드 스택이 가득 차면 키보드 스택 대신 **제목 스택**에서 `remove(0)` → 제목 스택이 비어 있으면 panic, 아니면 저장된 제목이 하나 사라진다(`push_title`에서 복사한 줄, `keyboard_mode_stack.remove(0)`으로 수정). 출력 바이트(`CSI > 1 u` × 4097)만으로 Term이 죽는다 | `crates/krilld/src/term/tests.rs::kitty_keyboard_stack_overflow_evicts_oldest` (상류 PR 본문 초안: `docs/spikes/OWE-474.md`) |
+
+## 버그 수정(동작 변경, 2026-11-05, 메인테이너 승인 필요)
+
+| 위치 | 버그 | 재현 |
+|---|---|---|
+| `src/term/mod.rs` `write_at_cursor` (`Krill patch (bug fix)`) | 넓은 글자가 줄 끝 한 칸에 안 들어가 `input`이 자리 채움(`LEADING_WIDE_CHAR_SPACER`)을 쓰고 줄을 넘긴 뒤, 다음 줄 0열의 옛 넓은 글자를 덮어쓰며 방금 쓴 자리 채움 표시를 지운다. 같은 줄을 다시 쓰는 PSReadLine(Windows ConPTY) 입력 줄을 넓히면 글자 사이에 빈칸이 남는다(`줄  바꿈확인`). 0열에 넓은 글자를 쓸 때는 표시를 남긴다 | `crates/krilld/src/term/tests.rs::rewritten_wide_char_wrap_reflows_without_a_gap` |

@@ -10,7 +10,12 @@ use krill_proto::usage::ProviderKind;
 
 mod brands;
 
-pub use brands::{ANTIGRAVITY_PNG, CLAUDE_SVG, CURSOR_PNG, OPENAI_SVG, OPENCODE_SVG, PI_SVG};
+pub use brands::{
+    AIDER_SVG, AMP_PNG, ANTIGRAVITY_PNG, CLAUDE_SVG, CLINE_PNG, CONTINUE_PNG, COPILOT_SVG,
+    CRUSH_PNG, CURSOR_PNG, DEVIN_PNG, DROID_PNG, DSH_PNG, GOOSE_PNG, GROK_PNG, HERMES_PNG,
+    KILO_PNG, KIMI_PNG, KIRO_PNG, MISTRAL_VIBE_PNG, MUSE_PNG, OMP_SVG, OPENAI_SVG, OPENCLAUDE_PNG,
+    OPENCODE_SVG, PI_SVG, QWEN_PNG, TRAE_PNG, ZCODE_PNG,
+};
 
 /// 커스텀 에이전트 메뉴용 중립 봇 마크. 특정 프로바이더 로고로 오인하지 않게 한다.
 pub const CUSTOM_AGENT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="7" width="16" height="14" rx="3"/><path d="M12 3v4M1 12v5M23 12v5M9 17h6"/><circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/></svg>"#;
@@ -37,9 +42,6 @@ pub const CROSSHAIR_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke
 
 /// Lucide `kanban` 아이콘 SVG(ISC License). 사이드바 하단 보드 뷰 토글.
 pub const KANBAN_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M6 5v11"/><path d="M12 5v6"/><path d="M18 5v14"/></svg>"#;
-
-/// Lucide `shield` 아이콘 SVG(ISC License). 사이드바 하단 보안 키보드 입력 토글.
-pub const SHIELD_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>"#;
 
 /// Lucide `arrow-left` 아이콘 SVG(ISC License). 타이틀바 뒤로 이동.
 pub const ARROW_LEFT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>"#;
@@ -92,6 +94,9 @@ pub const SERVER_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="c
 /// Lucide `panels-top-left` 아이콘 SVG(ISC License). 상태바 플로팅 터미널 팝아웃 버튼(OWE-788).
 pub const PANELS_TOP_LEFT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>"#;
 
+/// Lucide `square` 채움 기반 정지 아이콘 SVG(ISC License). 채팅 컴포저 작업 중 정지 버튼(OWE-1349).
+pub const STOP_SQUARE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>"#;
+
 /// Lucide `rotate-ccw-clock` 아이콘 SVG(ISC License). 상태바 세션 히스토리 토글 버튼(OWE-788).
 pub const HISTORY_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>"#;
 
@@ -113,8 +118,6 @@ pub const KRILL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox
 
 // ---- 프로바이더·에이전트 아이콘 크기 토큰 (OWE-875) ----
 
-/// 초소형 아이콘(10px): 사이드바 인라인 배지·트리 화살표 보조 표시.
-pub const ICON_2XS: f32 = 10.0;
 /// 소형 아이콘(12px): 사이드바 개별 세션 행, 에이전트 그룹 헤더, 필터 칩(AI Vault·Jump).
 pub const ICON_XS: f32 = 12.0;
 /// 기본 소형 아이콘(13px): 워크트리 카드 에이전트 요약, 탭 바 탭, 상태바 알약, 이어하기 모달 칩.
@@ -151,7 +154,29 @@ pub fn agent_icon_bytes(agent_id: &str) -> &'static [u8] {
         "agy" => ANTIGRAVITY_PNG,
         "pi" => PI_SVG,
         "cursor" | "cursor-agent" => CURSOR_PNG,
-        "opencode" => OPENCODE_SVG,
+        "opencode" | "opencode2" => OPENCODE_SVG,
+        "copilot" => COPILOT_SVG,
+        "aider" => AIDER_SVG,
+        "omp" => OMP_SVG,
+        "amp" => AMP_PNG,
+        "cline" => CLINE_PNG,
+        "continue" => CONTINUE_PNG,
+        "crush" => CRUSH_PNG,
+        "devin" => DEVIN_PNG,
+        "droid" => DROID_PNG,
+        "dsh" => DSH_PNG,
+        "goose" => GOOSE_PNG,
+        "grok" => GROK_PNG,
+        "hermes" => HERMES_PNG,
+        "kilo" => KILO_PNG,
+        "kimi" => KIMI_PNG,
+        "kiro" => KIRO_PNG,
+        "mistral-vibe" => MISTRAL_VIBE_PNG,
+        "muse" => MUSE_PNG,
+        "openclaude" => OPENCLAUDE_PNG,
+        "qwen" => QWEN_PNG,
+        "trae" => TRAE_PNG,
+        "zcode" => ZCODE_PNG,
         _ => CUSTOM_AGENT_SVG,
     }
 }
@@ -186,7 +211,10 @@ pub fn agent_brand_color(agent_id: &str, fg: Hsla) -> Hsla {
     match krill_proto::agent::canonical_id(agent_id) {
         "claude" => rgb(CLAUDE_COLOR).into(),
         "agy" => rgb(ANTIGRAVITY_BLUE).into(),
-        "codex" | "opencode" | "cursor" | "cursor-agent" | "pi" => fg,
+        "codex" | "opencode" | "opencode2" | "cursor" | "cursor-agent" | "pi" | "copilot"
+        | "aider" | "omp" | "grok" | "muse" | "hermes" | "kimi" | "qwen" | "droid" | "kiro"
+        | "goose" | "amp" | "mistral-vibe" | "crush" | "cline" | "kilo" | "continue" | "devin"
+        | "trae" | "zcode" | "dsh" | "openclaude" => fg,
         _ => rgb(CUSTOM_AGENT_COLOR).into(),
     }
 }
@@ -455,6 +483,7 @@ mod tests {
                 OPENCODE_SVG,
                 PI_SVG,
                 CUSTOM_AGENT_SVG,
+                STOP_SQUARE_SVG,
             ] {
                 cx.svg_renderer().parse_svg(bytes).expect("valid Orca SVG");
             }
@@ -628,6 +657,62 @@ mod tests {
         assert_eq!(project_lucide("Rocket"), gpui_kit_assets::IconName::Rocket);
         assert_eq!(project_lucide("Unknown"), gpui_kit_assets::IconName::Folder);
     }
+
+    #[test]
+    fn all_project_and_app_icons_load_from_assets() {
+        use gpui::AssetSource as _;
+        use gpui_kit_assets::IconName;
+
+        for name in [
+            "Code2",
+            "SquareTerminal",
+            "Bot",
+            "Package",
+            "Database",
+            "Globe",
+            "Server",
+            "Cpu",
+            "Layers",
+            "Braces",
+            "Rocket",
+            "Wrench",
+            "Briefcase",
+            "Building2",
+            "Palette",
+            "Gauge",
+            "Sparkles",
+            "Shapes",
+            "Box",
+            "Folder",
+        ] {
+            let icon = project_lucide(name);
+            let path = icon.path();
+            assert!(
+                AppAssets.load(&path).unwrap().is_some(),
+                "missing project icon asset for {name} ({path})"
+            );
+        }
+        for icon in [
+            IconName::Clock,
+            IconName::Lock,
+            IconName::Package,
+            IconName::Brain,
+            IconName::ListChecks,
+            IconName::MessageSquare,
+            IconName::MessageSquareMore,
+            IconName::Pencil,
+            IconName::Plug,
+            IconName::TextWrap,
+            IconName::Eye,
+            IconName::ArrowUp,
+        ] {
+            let path = icon.path();
+            assert!(
+                AppAssets.load(&path).unwrap().is_some(),
+                "missing app icon asset ({path})"
+            );
+        }
+    }
 }
 
 // GPUI Kit's default bundle contains component icons only; application icons are explicit.
@@ -636,6 +721,10 @@ gpui_kit_assets::icon_assets!(
     [
         Bell,
         Bot,
+        Box,
+        Braces,
+        Brain,
+        Briefcase,
         Check,
         ChevronDown,
         ChevronLeft,
@@ -644,42 +733,58 @@ gpui_kit_assets::icon_assets!(
         CircleAlert,
         CircleCheck,
         CircleX,
+        Clock,
         Close,
+        CodeXml,
         Copy,
         Cpu,
+        Database,
         Ellipsis,
         ExternalLink,
         File,
         FileText,
         Folder,
         FolderOpen,
+        Gauge,
         Globe,
         Info,
         Keyboard,
+        Layers,
         Link,
+        ListChecks,
         Loader,
         LoaderCircle,
+        Lock,
         MessageCircleQuestionMark,
+        MessageSquare,
+        MessageSquareMore,
         Minus,
         Monitor,
         Moon,
+        Package,
         PanelBottom,
         PanelLeft,
         PanelRight,
         PanelRightClose,
+        Pencil,
         Play,
+        Plug,
         Plus,
         RefreshCw,
         Rocket,
         Search,
         Server,
         Settings,
+        Shapes,
         Smartphone,
+        Sparkles,
         SquareTerminal,
         Star,
         StarFill,
+        TextWrap,
         TriangleAlert,
-        User
+        User,
+        Wrench
     ]
 );
 

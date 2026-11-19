@@ -102,6 +102,20 @@ class HookTests(unittest.TestCase):
                         "--format=%(refname)").stdout.splitlines()
         self.assertEqual(refs, ["refs/tags/v0.1.0"])
 
+    def test_commits_on_main_are_refused_but_other_branches_commit(self):
+        shutil.copy2(ROOT / "scripts/hooks/pre-commit", self.work / "scripts/hooks/pre-commit")
+        (self.work / "change").write_text("work\n")
+        self.git(self.work, "add", "change")
+        blocked = subprocess.run(["git", "commit", "-qm", "on main"], cwd=self.work,
+                                 env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("main 브랜치에는 커밋하지 않는다", blocked.stderr)
+        self.git(self.work, "checkout", "-q", "-b", "feature")
+        self.git(self.work, "commit", "-qm", "on a work branch")
+        self.git(self.work, "checkout", "-q", "--detach")
+        (self.work / "change").write_text("detached\n")
+        self.git(self.work, "commit", "-qam", "detached release candidate")
+
     def test_feature_branch_needs_no_protected_ref_reason(self):
         result = self.push("refs/heads/feature")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -163,6 +177,18 @@ class HookTests(unittest.TestCase):
                 self.assertEqual(allowed.returncode, 0, allowed.stderr)
                 self.assertIn("사용자 배포 지시", allowed.stderr)
 
+    def test_claude_wrapped_and_merge_or_workflow_commands_are_remote_writes(self):
+        for command in ("gh pr merge 12 --squash", "gh -R o/r pr merge 12", "gh workflow run release.yml -f tag=v1",
+                        "gh run rerun 41568471804", "command git push", "/usr/bin/git push origin main",
+                        "env X=1 git push", "env -u KRILL_STATE_DIR git push", "cd x && exec git push",
+                        "/opt/homebrew/bin/gh release create v1"):
+            with self.subTest(command=command):
+                self.assertEqual(self.guard(command).returncode, 2)
+        for command in ("gh pr view 12", "gh run list --limit 5", "gh run view 1 --log-failed",
+                        "gh workflow list", "env X=1 git status", "git commit -m 'gh pr merge later; git push'"):
+            with self.subTest(command=command):
+                self.assertEqual(self.guard(command).returncode, 0)
+
     def test_claude_empty_or_misplaced_record_is_rejected(self):
         for prefix in ("# KRILL_ALLOW_REMOTE:\n", "# KRILL_ALLOW_REMOTE: \t \n",
                        "true\n# KRILL_ALLOW_REMOTE: user requested deployment\n"):
@@ -177,6 +203,22 @@ class HookTests(unittest.TestCase):
         path = str(self.work / "AGENTS.md")
         self.assertEqual(self.guard(path=path, KRILL_ALLOW_REMOTE="1").returncode, 2)
         self.assertEqual(self.guard(path=path, KRILL_HARNESS_APPROVED="1").returncode, 0)
+
+    def test_every_codeowners_entry_is_guarded_and_release_gates_are_listed(self):
+        owners = [line.split()[0].lstrip("/") for line in (ROOT / ".github/CODEOWNERS").read_text().splitlines()
+                  if line.startswith("/")]
+        for name in (".gitleaks.toml", "packaging/release_check.py", "packaging/publish-github.sh",
+                     "packaging/ci_evidence.py", ".claude/hooks/"):
+            self.assertIn(name, owners)
+        for name in owners:
+            if name == "Cargo.toml":
+                continue
+            path = str(self.work / (name + "x" if name.endswith("/") else name))
+            with self.subTest(path=name):
+                self.assertEqual(self.guard(path=path).returncode, 2)
+        for name in ("Cargo.toml", ".claude/settings.local.json", "packaging/nightly.py", "crates/krilld/src/lib.rs"):
+            with self.subTest(path=name):
+                self.assertEqual(self.guard(path=str(self.work / name)).returncode, 0)
 
     def test_cargo_configuration_is_a_protected_harness_file(self):
         path = str(self.work / ".cargo/config.toml")

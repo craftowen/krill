@@ -23,6 +23,9 @@ def validate_target(target, targets=TARGETS):
         raise ValueError("external targets directory resolves outside its build volume")
     if target == allowed or allowed not in target.parents:
         raise ValueError("Cargo target must be below " + str(targets) + "/<name>: " + str(target))
+    if target.relative_to(allowed).parts[0] == "shared":
+        # Worktrees sharing one directory reuse each other's workspace-member artifacts (10-20, 10-27).
+        raise ValueError("targets/shared is shared across worktrees; use targets/<worktree>: " + str(target))
     return target
 
 

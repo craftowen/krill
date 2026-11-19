@@ -101,7 +101,7 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
 
             def pair(index):
                 if index:
-                    click('Pair Desktop')
+                    click('Pair a desktop')
                     click('Paste link instead')
                 else:
                     click('Paste pairing link')
@@ -170,9 +170,9 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             assert evaluate('JSON.parse(localStorage.getItem("krill-mobile-hosts-v1")).active') == hosts[1]['id']
             assert evaluate('KrillMobile.store.sessions.get('+str(hosts[1]['session'])+').cwd') == hosts[1]['cwd']
             home()
-            assert evaluate('document.querySelector(".krill-logo").complete && document.querySelector(".krill-logo").naturalWidth>0')
+            assert evaluate('document.querySelector(".tab-bar [aria-current=page]")?.getAttribute("aria-label")==="Feed"')
             browser('screenshot', str(shots / 'home.png'))
-            click('Accounts')
+            click('Usage')
             wait('!!document.querySelector(".account-row")')
             assert evaluate('document.querySelectorAll(".usage-bar").length>=2')
             assert evaluate('[...document.querySelectorAll(".usage-column")].every(n=>n.getBoundingClientRect().height<32)')

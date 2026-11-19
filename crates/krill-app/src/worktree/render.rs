@@ -162,29 +162,26 @@ impl Render for Dialog {
                             Some(text::OPTIONAL.get()),
                             p,
                         ))
-                        .child(
-                            div().flex().flex_wrap().gap_1().children(
-                                FAN_OUT_AGENTS.iter().enumerate().map(
-                                    |(idx, &(agent_id, label))| {
-                                        let selected =
-                                            selected_agents.iter().any(|a| a == agent_id);
-                                        let btn = Button::new(("worktree-agent", idx))
-                                            .debug_selector(move || {
-                                                format!("worktree-agent-{agent_id}")
-                                            })
-                                            .xsmall()
-                                            .icon(crate::ui::icons::agent_menu_icon(agent_id))
-                                            .label(label)
-                                            .selected(selected)
-                                            .toggled(selected);
-                                        let btn = btn.ghost();
-                                        btn.on_click(cx.listener(move |d, _, _, cx| {
-                                            d.toggle_agent(agent_id, cx);
-                                        }))
-                                    },
-                                ),
+                        .child(div().flex().flex_wrap().gap_1().children(
+                            self.fan_out_agents.iter().enumerate().map(
+                                |(idx, (agent_id, label))| {
+                                    let selected = selected_agents.iter().any(|a| a == agent_id);
+                                    let id_sel = agent_id.clone();
+                                    let id_click = agent_id.clone();
+                                    let btn = Button::new(("worktree-agent", idx))
+                                        .debug_selector(move || format!("worktree-agent-{id_sel}"))
+                                        .xsmall()
+                                        .icon(crate::ui::icons::agent_menu_icon(agent_id))
+                                        .label(label.clone())
+                                        .selected(selected)
+                                        .toggled(selected);
+                                    let btn = btn.ghost();
+                                    btn.on_click(cx.listener(move |d, _, _, cx| {
+                                        d.toggle_agent(&id_click, cx);
+                                    }))
+                                },
                             ),
-                        ),
+                        )),
                 )
                 .child(
                     Button::new("worktree-advanced")
@@ -218,6 +215,7 @@ impl Render for Dialog {
                         )
                     })
                     .when(self.preparation.is_some(), |body| {
+                        let ready = self.preparation_ready;
                         body.child(
                             div()
                                 .flex()
@@ -225,13 +223,32 @@ impl Render for Dialog {
                                 .gap_2()
                                 .text_size(crate::ui::TEXT_2XS)
                                 .text_color(muted)
-                                .child(if self.preparation_ready {
-                                    text::PREPARED.get()
-                                } else {
-                                    text::PREPARING.get()
-                                })
+                                .child(
+                                    div()
+                                        .grid()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .row_start(1)
+                                                .col_start(1)
+                                                .min_w_0()
+                                                .truncate()
+                                                .when(ready, gpui::Styled::invisible)
+                                                .child(text::PREPARING.get()),
+                                        )
+                                        .child(
+                                            div()
+                                                .row_start(1)
+                                                .col_start(1)
+                                                .min_w_0()
+                                                .truncate()
+                                                .when(!ready, gpui::Styled::invisible)
+                                                .child(text::PREPARED.get()),
+                                        ),
+                                )
                                 .child(
                                     Button::new("cancel-preparation")
+                                        .debug_selector(|| "cancel-preparation".into())
                                         .ghost()
                                         .xsmall()
                                         .label(text::CANCEL_PREPARATION.get())

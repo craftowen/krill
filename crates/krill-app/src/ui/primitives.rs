@@ -14,8 +14,8 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Selectable as _, Sizable as _};
 
 use super::theme::{
-    FONT_MONO, MODAL_BACKDROP, Palette, RADIUS_MD, RADIUS_SM, RADIUS_XS, SWITCH_HEIGHT,
-    SWITCH_THUMB, SWITCH_WIDTH, TEXT_2XS, TEXT_SM, TEXT_XS,
+    FONT_MONO, MODAL_BACKDROP, Palette, RADIUS_MD, RADIUS_SM, RADIUS_XS, SPACE_2, SPACE_4,
+    SWITCH_HEIGHT, SWITCH_THUMB, SWITCH_WIDTH, TEXT_2XS, TEXT_SM, TEXT_XS,
 };
 
 /// 테두리 있는 카드(섹션·그룹 내용 묶음, Orca `Card` / `Inset hairline` 대응).
@@ -36,6 +36,40 @@ pub fn card(p: &Palette) -> Div {
 /// 2열 설정·폼 행(Orca `SettingsRow` 대응): 왼쪽 [`label`], 오른쪽 [`controls`].
 pub fn row(p: &Palette) -> Div {
     card(p)
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_3()
+}
+
+/// 관련 행을 구분선으로 이은 한 장의 카드(얇은 묶음). 행마다 [`group_row`]를 넘기면 사이 구분선은 여기서 그린다.
+pub fn group(p: &Palette, rows: impl IntoIterator<Item = impl IntoElement>) -> Div {
+    let mut group = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .rounded(RADIUS_MD)
+        .bg(p.card)
+        .border_1()
+        .border_color(p.border)
+        .overflow_hidden();
+    for (i, row) in rows.into_iter().enumerate() {
+        if i > 0 {
+            group = group.child(div().flex_none().h_px().bg(p.border));
+        }
+        group = group.child(row);
+    }
+    group
+}
+
+/// [`group`] 안의 2열 행. [`row`]와 문법이 같고 바탕과 테두리만 없다.
+pub fn group_row() -> Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .p_3()
         .flex()
         .flex_wrap()
         .items_center()
@@ -98,7 +132,13 @@ pub fn label(p: &Palette, title: impl Into<SharedString>, desc: impl LabelDesc) 
                 .gap_1p5()
                 .text_size(TEXT_SM)
                 .font_weight(FontWeight::MEDIUM)
-                .child(title),
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_shrink_1()
+                        .overflow_hidden()
+                        .child(title),
+                ),
         )
         .children(desc.map(|desc| {
             div()
@@ -113,6 +153,7 @@ pub fn label(p: &Palette, title: impl Into<SharedString>, desc: impl LabelDesc) 
 pub fn field_label(name: &'static str, optional: Option<&'static str>, p: &Palette) -> Div {
     div()
         .flex()
+        .flex_wrap()
         .gap_1()
         .text_size(TEXT_XS)
         .font_weight(FontWeight::MEDIUM)
@@ -125,6 +166,7 @@ pub fn field_label(name: &'static str, optional: Option<&'static str>, p: &Palet
 pub fn controls() -> Div {
     div()
         .flex_none()
+        .min_w_0()
         .max_w_full()
         .flex()
         .flex_wrap()
@@ -249,6 +291,7 @@ pub fn switch(
 pub fn segmented_control(p: &Palette, items: impl IntoIterator<Item = impl IntoElement>) -> Div {
     div()
         .flex_none()
+        .min_w_0()
         .max_w_full()
         .flex()
         .flex_wrap()
@@ -333,8 +376,8 @@ pub fn button_with_reserved_label(
 /// 무장(`armed`) 상태가 되어도 버튼 폭이 변하지 않아 옆 버튼을 덮거나 밀어내지 않는다.
 pub fn danger_confirm(
     id: impl Into<ElementId>,
-    label: &'static str,
-    confirm: &'static str,
+    label: impl Into<SharedString>,
+    confirm: impl Into<SharedString>,
     armed: bool,
 ) -> Button {
     button_with_reserved_label(id, label, confirm, armed)
@@ -433,6 +476,19 @@ pub fn error_banner(p: &Palette, message: impl Into<SharedString>) -> Div {
 }
 
 /// 창 전체를 덮는 중앙 정렬 모달 오버레이(Orca `DialogOverlay` `fixed inset-0 bg-black/55` 대응).
+/// 메인 창 위 큰 모달(설정, 아티팩트, 자동화)의 크기. 작은 창에서는 가장자리 8px을 남기고 줄어든다.
+#[must_use]
+pub fn page_modal_size(viewport: gpui::Size<Pixels>) -> gpui::Size<Pixels> {
+    gpui::size(
+        (viewport.width - SPACE_4 * 4.)
+            .clamp(px(680.), px(1080.))
+            .min(viewport.width - SPACE_2 * 2.),
+        (viewport.height - SPACE_4 * 4.)
+            .clamp(px(480.), px(760.))
+            .min(viewport.height - SPACE_2 * 2.),
+    )
+}
+
 pub fn modal_backdrop(viewport: gpui::Size<Pixels>, content: impl IntoElement) -> Deferred {
     deferred(
         anchored().position(point(px(0.), px(0.))).child(
@@ -703,6 +759,100 @@ mod tests {
     use super::*;
     use crate::ui::{DARK, LIGHT};
     use gpui_component::button::ButtonVariants;
+
+    struct SettingsLayoutProbe {
+        width: f32,
+        title: &'static str,
+        desc: &'static str,
+    }
+
+    impl gpui::Render for SettingsLayoutProbe {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            div()
+                .w(px(self.width))
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div().w_full().flex().child(
+                        label(&DARK, self.title, Some(self.desc))
+                            .debug_selector(|| "layout-long-label".into()),
+                    ),
+                )
+                .child(
+                    row(&DARK)
+                        .debug_selector(|| "layout-row".into())
+                        .child(label(&DARK, "Context", Some(self.desc)))
+                        .child(
+                            controls()
+                                .debug_selector(|| "layout-controls".into())
+                                .child(
+                                    segmented_control(
+                                        &DARK,
+                                        ["50", "100", "250", "500", "1,000"].map(|value| {
+                                            segment(&DARK, value, value, false)
+                                                .debug_selector(move || value.into())
+                                        }),
+                                    )
+                                    .debug_selector(|| "layout-segments".into()),
+                                )
+                                .child(
+                                    secondary("layout-reset", "Reset")
+                                        .debug_selector(|| "layout-reset".into()),
+                                ),
+                        ),
+                )
+        }
+    }
+
+    /// Long unbroken titles stay inside their label column; control
+    /// groups and their segments stay inside a narrow card at both UI zoom limits.
+    #[gpui::test]
+    fn settings_labels_and_controls_stay_inside_narrow_rows(cx: &mut gpui::TestAppContext) {
+        use crate::i18n::{Language, catalog::settings};
+
+        cx.update(gpui_component::init);
+        for language in [Language::Ko, Language::En] {
+            for width in [280., 480., 720.] {
+                for rem in [16., 32.] {
+                    let title = "https://very-long-machine-name.example.invalid/0123456789012345678901234567890123456789";
+                    let (_, visual) = cx.add_window_view(|_, _| SettingsLayoutProbe {
+                        width,
+                        title,
+                        desc: settings::ACCOUNTS_HOST_DESC.in_language(language),
+                    });
+                    visual.update(|window, _| window.set_rem_size(px(rem)));
+                    visual.run_until_parked();
+                    let label = visual.debug_bounds("layout-long-label").expect("label");
+                    assert!(
+                        label.right() <= px(width) + px(0.5),
+                        "{label:?} wider than {width}"
+                    );
+                    let row = visual.debug_bounds("layout-row").expect("row");
+                    for selector in [
+                        "layout-controls",
+                        "layout-segments",
+                        "50",
+                        "100",
+                        "250",
+                        "500",
+                        "1,000",
+                        "layout-reset",
+                    ] {
+                        let control = visual.debug_bounds(selector).expect("control");
+                        assert!(
+                            control.left() >= row.left() && control.right() <= row.right(),
+                            "{language:?}, width={width}, rem={rem}, {selector}: {control:?} outside {row:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[gpui::test]
     fn switch_exposes_checked_state_and_unavailable_description(cx: &mut gpui::TestAppContext) {

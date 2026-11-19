@@ -255,10 +255,14 @@ pub fn meta(ks: &Keystroke, option_as_meta: bool) -> Option<Vec<u8>> {
     if is_shell_shortcut(ks) || !m.alt || m.control || m.platform || m.function {
         return None;
     }
-    let mut chars = ks.key.chars();
-    let c = chars
-        .next()
-        .filter(|c| c.is_ascii_graphic() && chars.next().is_none())?;
+    let c = if ks.key == "space" {
+        ' '
+    } else {
+        let mut chars = ks.key.chars();
+        chars
+            .next()
+            .filter(|c| c.is_ascii_graphic() && chars.next().is_none())?
+    };
     if !option_as_meta && (m.shift || !matches!(c, 'b' | 'f' | 'd')) {
         return None;
     }
@@ -439,6 +443,9 @@ mod tests {
         assert_eq!(meta(&ks("alt-a"), false), None);
         assert_eq!(meta(&ks("alt-shift-f"), true).unwrap(), b"\x1bF");
         assert_eq!(meta(&ks("alt-."), true).unwrap(), b"\x1b.");
+        assert_eq!(meta(&ks("alt-space"), true).unwrap(), b"\x1b ");
+        assert_eq!(meta(&ks("alt-shift-space"), true).unwrap(), b"\x1b ");
+        assert_eq!(meta(&ks("alt-space"), false), None);
         // Option 없는 글자·Ctrl/Cmd 조합·이름 있는 키는 대상이 아니다.
         assert_eq!(meta(&ks("b"), true), None);
         assert_eq!(meta(&ks("ctrl-alt-b"), true), None);

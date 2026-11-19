@@ -331,7 +331,7 @@ pub async fn create_invite_command(
 
     // 2. serve가 아직 떠 있지 않으면 저장된 포트(또는 새 포트)로 잠시 바인드해 주소를 얻고 포트를 고정한다.
     let identity = DeviceIdentity::load_or_create(state_dir)?;
-    let ep = build_iroh_endpoint(state_dir, &identity, &cfg, false, None).await?;
+    let ep = build_iroh_endpoint(state_dir, &identity, &cfg, true, None).await?;
     if include_relay {
         tokio::time::timeout(Duration::from_secs(5), ep.online())
             .await
@@ -540,5 +540,64 @@ mod tests {
         assert!(!limiter.check_and_record_attempt(t0 + Duration::from_secs(4)));
         // 윈도우(10초) 경과 후에는 다시 허용됨
         assert!(limiter.check_and_record_attempt(t0 + Duration::from_secs(15)));
+    }
+
+    #[tokio::test]
+    async fn create_invite_command_ignores_stale_ctl_socket_and_persists_port() {
+        let dir = std::env::temp_dir().join(format!("mklink-invport-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::create_dir_all(dir.join("link")).unwrap();
+
+        let cfg = LinkConfig {
+            relay: RelaySetting::Off,
+            ..LinkConfig::default()
+        };
+        cfg.save(&dir).unwrap();
+
+        // Write a bogus stale ticket + dead ctl socket file from a crashed serve process.
+        let dead_sk = SecretKey::generate();
+        let dead_addr =
+            EndpointAddr::new(dead_sk.public()).with_ip_addr("127.0.0.1:9".parse().unwrap());
+        std::fs::write(
+            dir.join("link/serve.ticket"),
+            encode_addr_ticket(&dead_addr).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("run/link-ctl.sock"), b"stale").unwrap();
+
+        let first = create_invite_command(&dir, Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let first_link = PairLink::parse(&first.link).unwrap();
+        assert_ne!(first_link.addr.id, dead_addr.id);
+
+        let saved_port: u16 = std::fs::read_to_string(dir.join("link/serve.port"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(saved_port > 0);
+        assert!(
+            first_link
+                .addr
+                .ip_addrs()
+                .any(|sock| sock.port() == saved_port),
+            "invite address should use the persisted serve.port ({saved_port})"
+        );
+
+        let second = create_invite_command(&dir, Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let second_link = PairLink::parse(&second.link).unwrap();
+        assert!(
+            second_link
+                .addr
+                .ip_addrs()
+                .any(|sock| sock.port() == saved_port),
+            "subsequent invite should reuse persisted serve.port ({saved_port})"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

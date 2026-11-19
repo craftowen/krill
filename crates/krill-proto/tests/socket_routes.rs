@@ -7,7 +7,6 @@ fn production_socket_defaults_use_the_shared_resolver() {
         (include_str!("../src/orchestration.rs"), 1),
         (include_str!("../../krill-app/src/automations.rs"), 1),
         (include_str!("../../krill-app/src/settings/schedules.rs"), 2),
-        (include_str!("../../krill-app/src/orca_import.rs"), 1),
         (include_str!("../../krill-link/src/serve.rs"), 1),
     ];
     for (source, count) in callers {
@@ -102,9 +101,10 @@ fn relocated_socket_child() {
             .write_all(&Reply::Failed(Failure::BadRequest).encode().unwrap())
             .unwrap();
     });
-    assert!(
-        OrchestrationStore::try_local_daemon_orch(&state, &action, Duration::from_secs(2)).is_err()
-    );
+    // 오케스트레이션을 모르는 데몬의 BadRequest는 v1 동작이면 디스크 경로로 넘긴다(`Ok(None)`).
+    // 이 테스트의 검증 대상은 옮긴 소켓에 요청이 실제로 닿았는지다(위 서버 스레드가 확인한다).
+    let reply = OrchestrationStore::try_local_daemon_orch(&state, &action, Duration::from_secs(2));
+    assert!(matches!(reply, Ok(None)), "{reply:?}");
     server.join().unwrap();
     std::fs::remove_file(endpoint).unwrap();
 }

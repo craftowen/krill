@@ -300,3 +300,49 @@ fn committed_wal_records_survive_migration_and_sqlite_integrity_check() {
     );
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+#[cfg(target_os = "macos")]
+fn idle_probe_checks_only_the_files_the_migration_moves() {
+    use super::super::history_probe::paths_closed;
+
+    let (home, host, profile) = fixture("probe");
+    let held = |path: PathBuf| {
+        let file = fs::File::create(path).unwrap();
+        Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(file)
+            .spawn()
+            .unwrap()
+    };
+    fs::create_dir(host.join("log")).unwrap();
+    fs::create_dir(host.join("conversations")).unwrap();
+    let local = profile.join(".gemini/antigravity-cli");
+    std::os::unix::fs::symlink(host.join("conversations"), local.join("conversations")).unwrap();
+    let closed = |store: &Path| paths_closed(&super::history::probe_paths(store));
+    assert!(
+        closed(&host),
+        "absent summary files are not an lsof failure"
+    );
+    assert!(
+        closed(&local),
+        "a linked store is checked through its target"
+    );
+
+    let mut log = held(host.join("log/cli.log"));
+    assert!(
+        closed(&host),
+        "an open log must not hold back the migration"
+    );
+    log.kill().unwrap();
+    log.wait().unwrap();
+
+    for open in ["conversations/id.db", "conversation_summaries.db"] {
+        let mut writer = held(host.join(open));
+        assert!(!closed(&host), "{open}");
+        writer.kill().unwrap();
+        writer.wait().unwrap();
+        assert!(closed(&host), "{open} closed");
+    }
+    fs::remove_dir_all(home).unwrap();
+}

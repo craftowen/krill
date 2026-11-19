@@ -358,3 +358,561 @@ fn composer_meta_reads_the_statusline_record_from_any_profile_scope() {
     assert_eq!(meta.effort.as_deref(), Some("high"));
     assert_eq!(meta.context_percent, Some(14));
 }
+
+#[cfg(unix)]
+#[gpui::test]
+fn closing_chat_pane_drops_its_chat_state(cx: &mut TestAppContext) {
+    use crate::shell::tests::{open, state_path};
+    let (shell, cx) = open(cx, state_path("chat-close-prune"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    shell.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, SessionId(445));
+        shell.layout.set_chat_view(pane, true);
+        shell.apply_chat_poll(
+            SessionId(445),
+            ChatPollSnapshot {
+                bound: true,
+                reset: true,
+                items: vec![ChatItem {
+                    kind: ChatItemKind::Assistant,
+                    text: "hello".into(),
+                    ..ChatItem::default()
+                }],
+                ..ChatPollSnapshot::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let key = local_key(SessionId(445));
+    shell.update(cx, |shell, _| {
+        assert!(shell.chat.logs.contains_key(&key));
+        assert!(shell.chat.inputs.contains_key(&key));
+    });
+    shell.update(cx, |shell, cx| shell.request_close_tab(1, cx));
+    cx.run_until_parked();
+    shell.update(cx, |shell, _| {
+        assert_eq!(shell.layout.tabs().len(), 1);
+        assert!(
+            !shell.chat.logs.contains_key(&key),
+            "closed pane keeps chat log"
+        );
+        assert!(
+            !shell.chat.inputs.contains_key(&key),
+            "closed pane keeps composer"
+        );
+    });
+}
+
+#[test]
+fn work_run_pairs_by_tool_id_falls_back_fifo_and_isolates_orphan_results() {
+    let single = work_run::RawSpan::single(5);
+    assert_eq!(single.start(), 5);
+    assert_eq!(single.end(), 6);
+    assert_eq!(single.range(), 5..6);
+
+    let items: Vec<Arc<ChatItem>> = vec![
+        ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_id: "call-read".into(),
+            tool_name: "Read".into(),
+            file_path: "crates/krill-app/src/lib.rs".into(),
+            text: "crates/krill-app/src/lib.rs".into(),
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_id: "call-bash".into(),
+            tool_name: "Bash".into(),
+            title: "Run check".into(),
+            text: "cargo check --locked".into(),
+            is_error: true,
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_name: "Grep".into(),
+            title: "Search symbols".into(),
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolResult,
+            text: "3 matches".into(),
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolResult,
+            tool_id: "call-bash".into(),
+            text: "exit code 1".into(),
+            is_error: true,
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolResult,
+            tool_id: "call-read".into(),
+            text: "pub mod ui;\n".into(),
+            ..ChatItem::default()
+        },
+        ChatItem {
+            kind: ChatItemKind::ToolResult,
+            tool_id: "unmatched-id".into(),
+            file_path: "crates/krill-app/src/orphan.rs".into(),
+            text: "orphan payload".into(),
+            ..ChatItem::default()
+        },
+    ]
+    .into_iter()
+    .map(Arc::new)
+    .collect();
+
+    let feed = work_run::DisplayFeed::project(100, &items);
+    assert_eq!(feed.len(), 1);
+    assert_eq!(feed.rows()[0].span().range(), 100..107);
+    let Some(work_run::DisplayRow::WorkRun(run)) = feed.get(0) else {
+        panic!("expected a single WorkRun row");
+    };
+    assert_eq!(run.counts.tool_calls, 3);
+    assert_eq!(run.counts.read, 1);
+    assert_eq!(run.counts.command, 1);
+    assert_eq!(run.counts.search, 1);
+    assert_eq!(run.counts.errors, 1);
+    assert_eq!(run.latest_detail, "crates/krill-app/src/orphan.rs");
+    assert_eq!(run.steps.len(), 4);
+
+    assert_eq!(run.steps[0].primary_abs_idx(), 100);
+    assert_eq!(run.steps[0].file_path(), "crates/krill-app/src/lib.rs");
+    assert_eq!(
+        run.steps[0].badge(),
+        (ui::BadgeTone::Neutral, ctext::STEP_READ.get())
+    );
+    let read_sections = run.steps[0].body_sections();
+    assert_eq!(read_sections.len(), 1);
+    assert_eq!(read_sections[0].abs_idx, 105);
+    assert_eq!(read_sections[0].label, Some(ctext::STEP_OUTPUT.get()));
+    assert_eq!(read_sections[0].text, "pub mod ui;\n");
+
+    assert_eq!(run.steps[1].primary_abs_idx(), 101);
+    assert!(run.steps[1].is_error());
+    assert_eq!(
+        run.steps[1].badge(),
+        (ui::BadgeTone::Destructive, ctext::TOOL_ERROR.get())
+    );
+    let bash_sections = run.steps[1].body_sections();
+    assert_eq!(bash_sections.len(), 2);
+    assert_eq!(bash_sections[0].label, Some(ctext::STEP_INPUT.get()));
+    assert_eq!(bash_sections[1].label, Some(ctext::TOOL_ERROR.get()));
+
+    assert_eq!(run.steps[2].primary_abs_idx(), 102);
+    assert_eq!(run.steps[2].headline(), "Search symbols");
+    assert_eq!(run.steps[2].copy_text(), "3 matches");
+
+    assert_eq!(run.steps[3].primary_abs_idx(), 106);
+    assert!(matches!(
+        run.steps[3],
+        work_run::WorkStep::Tool(work_run::ToolPair::OrphanResult {
+            result_abs_idx: 106,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn display_feed_keeps_solo_reasoning_groups_multi_reasoning_and_invalidates_cache() {
+    let mut log = SessionChatLog {
+        base_index: 50,
+        ..SessionChatLog::default()
+    };
+    log.append_and_trim(
+        vec![
+            ChatItem {
+                kind: ChatItemKind::User,
+                text: "question".into(),
+                ..ChatItem::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "single thought\ndetail".into(),
+                ..ChatItem::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "answer".into(),
+                ..ChatItem::default()
+            },
+        ],
+        MAX_CHAT_KEPT,
+    );
+    let first = log.display_feed();
+    let second = log.display_feed();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.len(), 3);
+    assert!(matches!(
+        first.get(1),
+        Some(work_run::DisplayRow::Item { abs_idx: 51, .. })
+    ));
+
+    log.append_and_trim(
+        vec![
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "first step\nmore".into(),
+                ..ChatItem::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Reasoning,
+                text: "second step".into(),
+                ..ChatItem::default()
+            },
+        ],
+        MAX_CHAT_KEPT,
+    );
+    let updated = log.display_feed();
+    assert!(!Arc::ptr_eq(&first, &updated));
+    assert_eq!(updated.len(), 4);
+    let Some(work_run::DisplayRow::WorkRun(run)) = updated.get(3) else {
+        panic!("two consecutive reasoning items must collapse into a WorkRun");
+    };
+    assert_eq!(run.span.range(), 53..55);
+    assert_eq!(
+        run.summary_label(),
+        ctext::RUN_REASONING.format(&[("n", "2")])
+    );
+    assert_eq!(run.latest_detail, "second step");
+
+    log.prepend_earlier(
+        vec![ChatItem {
+            kind: ChatItemKind::User,
+            text: "older".into(),
+            ..ChatItem::default()
+        }],
+        None,
+    );
+    let after_prepend = log.display_feed();
+    assert!(!Arc::ptr_eq(&updated, &after_prepend));
+    assert_eq!(
+        after_prepend.rows()[0].span(),
+        work_run::RawSpan::single(49)
+    );
+
+    log.reset_transcript();
+    assert!(log.display_feed().is_empty());
+}
+
+#[test]
+fn work_run_segmentation_folds_short_pre_tool_note_and_resets_at_turn_boundaries() {
+    let make = |kind: ChatItemKind, text: &str| {
+        Arc::new(ChatItem {
+            kind,
+            text: text.to_owned(),
+            ..Default::default()
+        })
+    };
+    let mut call = ChatItem {
+        kind: ChatItemKind::ToolCall,
+        tool_id: "c1".into(),
+        tool_name: "Read".into(),
+        file_path: "Cargo.toml".into(),
+        ..Default::default()
+    };
+    call.title = "Cargo.toml".into();
+
+    let items = vec![
+        make(ChatItemKind::Assistant, "Let me inspect."),
+        Arc::new(call.clone()),
+        make(ChatItemKind::ToolResult, "[package]\nname = \"krill\""),
+        make(ChatItemKind::Assistant, "Done."),
+    ];
+    let feed = work_run::DisplayFeed::project(10, &items);
+    assert_eq!(feed.len(), 2);
+    let Some(work_run::DisplayRow::WorkRun(run)) = feed.get(0) else {
+        panic!("pre-tool note + tool must merge into WorkRun");
+    };
+    assert_eq!(run.span.range(), 10..13);
+    assert!(matches!(
+        run.steps[0],
+        work_run::WorkStep::Note { abs_idx: 10, .. }
+    ));
+    assert!(matches!(run.steps[1], work_run::WorkStep::Tool(_)));
+    let Some(work_run::DisplayRow::Item { abs_idx: 13, item }) = feed.get(1) else {
+        panic!("final short answer must stay standalone Assistant item");
+    };
+    assert_eq!(item.text, "Done.");
+
+    // Multi-line prose, >160 chars, and prose preceding User turn boundary must not fold.
+    let long_prose = "x".repeat(work_run::MAX_PREAMBLE_CHARS + 1);
+    let boundary_items = vec![
+        make(ChatItemKind::Assistant, "before boundary"),
+        make(ChatItemKind::User, "follow up"),
+        make(ChatItemKind::Assistant, "line 1\nline 2"),
+        Arc::new(call.clone()),
+        make(ChatItemKind::Assistant, &long_prose),
+        Arc::new(call),
+    ];
+    let boundary_feed = work_run::DisplayFeed::project(0, &boundary_items);
+    assert_eq!(boundary_feed.len(), 6);
+    assert!(matches!(
+        boundary_feed.get(0),
+        Some(work_run::DisplayRow::Item { abs_idx: 0, .. })
+    ));
+    assert!(matches!(
+        boundary_feed.get(2),
+        Some(work_run::DisplayRow::Item { abs_idx: 2, .. })
+    ));
+    assert!(matches!(
+        boundary_feed.get(4),
+        Some(work_run::DisplayRow::Item { abs_idx: 4, .. })
+    ));
+}
+
+#[test]
+fn work_run_timing_tracks_live_working_run_without_fake_historical_timestamps() {
+    use krill_proto::control::AgentState;
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let call = Arc::new(ChatItem {
+        kind: ChatItemKind::ToolCall,
+        tool_id: "c1".into(),
+        tool_name: "Read".into(),
+        file_path: "src/lib.rs".into(),
+        ..Default::default()
+    });
+    let result = Arc::new(ChatItem {
+        kind: ChatItemKind::ToolResult,
+        tool_id: "c1".into(),
+        text: "pub fn ok() {}".into(),
+        ..Default::default()
+    });
+
+    // Historical run first seen while Waiting must have no fabricated elapsed timestamp.
+    let settled_feed = work_run::DisplayFeed::project(50, &[Arc::clone(&call), result]);
+    let mut timing = work_run::WorkRunTimingState::default();
+    timing.sync(&settled_feed, AgentState::Waiting, t0);
+    assert_eq!(timing.elapsed_secs(50, t0 + Duration::from_secs(30)), None);
+
+    // Live trailing WorkRun starts counting while Working, latches when Waiting, and survives drain.
+    let live_feed = work_run::DisplayFeed::project(60, &[call]);
+    timing.sync(&live_feed, AgentState::Working, t0);
+    assert_eq!(
+        timing.elapsed_secs(60, t0 + Duration::from_secs(65)),
+        Some(65)
+    );
+    timing.sync(
+        &live_feed,
+        AgentState::Waiting,
+        t0 + Duration::from_secs(65),
+    );
+    assert_eq!(
+        timing.elapsed_secs(60, t0 + Duration::from_secs(120)),
+        Some(65)
+    );
+    timing.migrate_head_drain(Some(60), 61);
+    assert_eq!(
+        timing.elapsed_secs(61, t0 + Duration::from_secs(120)),
+        Some(65)
+    );
+
+    assert_eq!(work_run::format_elapsed_secs(0), "0s");
+    assert_eq!(work_run::format_elapsed_secs(59), "59s");
+    assert_eq!(work_run::format_elapsed_secs(60), "1m");
+    assert_eq!(work_run::format_elapsed_secs(65), "1m 5s");
+    assert_eq!(work_run::format_elapsed_secs(3600), "1h");
+    assert_eq!(work_run::format_elapsed_secs(3660), "1h 1m");
+}
+
+#[test]
+fn work_run_summary_sentence_progress_and_tool_verbs() {
+    let items = vec![
+        Arc::new(ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_id: "c1".into(),
+            tool_name: "Read".into(),
+            file_path: "a.rs".into(),
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::ToolResult,
+            tool_id: "c1".into(),
+            text: "fn a() {}".into(),
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_id: "c2".into(),
+            tool_name: "Bash".into(),
+            title: "cargo test".into(),
+            is_error: true,
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::ToolResult,
+            tool_id: "c2".into(),
+            is_error: true,
+            text: "exit 1".into(),
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_id: "c3".into(),
+            tool_name: "Edit".into(),
+            file_path: "b.rs".into(),
+            ..Default::default()
+        }),
+    ];
+    let feed = work_run::DisplayFeed::project(0, &items);
+    let Some(work_run::DisplayRow::WorkRun(run)) = feed.get(0) else {
+        panic!("expected WorkRun");
+    };
+    assert_eq!(run.total_tools(), 3);
+    assert_eq!(run.completed_tools(), 2);
+    assert_eq!(run.progress_label(true).as_deref(), Some("2/3"));
+    assert_eq!(run.progress_label(false), None);
+    assert_eq!(
+        run.failed_count_label(),
+        Some(ctext::RUN_FAILED_N.format(&[("n", "1")]))
+    );
+    assert_eq!(run.active_detail(), "b.rs");
+    assert_eq!(run.steps[0].verb(false), ctext::VERB_READ_DONE.get());
+    assert_eq!(run.steps[1].verb(false), ctext::VERB_RUN_FAIL.get());
+    assert_eq!(run.steps[2].verb(true), ctext::VERB_EDIT_LIVE.get());
+    assert_eq!(run.steps[2].verb(false), ctext::VERB_EDIT_DONE.get());
+    assert!(
+        run.header_label(true).contains(
+            &ctext::RUN_EDIT_LIVE_ONE
+                .format(&[("n", "1")])
+                .to_ascii_lowercase()
+        )
+    );
+}
+
+#[test]
+fn user_prompt_fold_threshold_and_chat_log_wrap_state() {
+    assert!(!is_user_prompt_foldable(&"a".repeat(600)));
+    assert!(is_user_prompt_foldable(&"a".repeat(601)));
+    assert!(!is_user_prompt_foldable("1\n2\n3\n4\n5\n6\n7\n8"));
+    assert!(is_user_prompt_foldable("1\n2\n3\n4\n5\n6\n7\n8\n9"));
+
+    let mut log = SessionChatLog::default();
+    log.toggle_user_message(5);
+    log.toggle_code_wrap(6, 1);
+    assert!(log.is_user_message_expanded(5));
+    assert!(log.is_code_wrapped(6, 1));
+
+    let items: Vec<ChatItem> = (0..10)
+        .map(|i| ChatItem {
+            kind: ChatItemKind::User,
+            text: format!("msg {i}"),
+            ..Default::default()
+        })
+        .collect();
+    log.append_and_trim(items, 4);
+    // base_index becomes 6 after trimming 0..6
+    assert!(!log.is_user_message_expanded(5));
+    assert!(log.is_code_wrapped(6, 1));
+
+    log.reset_transcript();
+    assert!(!log.is_code_wrapped(6, 1));
+}
+
+#[test]
+fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
+    use krill_proto::control::AgentState;
+
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::InFlight,
+            draft_empty: true,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Sending,
+    );
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::InFlight,
+            draft_empty: false,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Sending,
+    );
+
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::ReviewRequired,
+            draft_empty: false,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Stop { latched: false },
+    );
+
+    // Option A: Working + ready shows Stop even when draft text or attachments exist.
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::Ready,
+            draft_empty: true,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Stop { latched: false },
+    );
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::Ready,
+            draft_empty: false,
+            interrupt_latched: false,
+        }),
+        ComposerPrimaryAction::Stop { latched: false },
+    );
+
+    // Latched Working keeps Stop disabled even when text is typed afterward.
+    assert_eq!(
+        composer_primary_action(ComposerPrimaryInput {
+            agent_state: AgentState::Working,
+            submission: ComposerSubmissionState::Ready,
+            draft_empty: false,
+            interrupt_latched: true,
+        }),
+        ComposerPrimaryAction::Stop { latched: true },
+    );
+
+    for state in [
+        AgentState::Waiting,
+        AgentState::Blocked,
+        AgentState::Done,
+        AgentState::Exited,
+        AgentState::Unknown,
+    ] {
+        assert_eq!(
+            composer_primary_action(ComposerPrimaryInput {
+                agent_state: state,
+                submission: ComposerSubmissionState::Ready,
+                draft_empty: true,
+                interrupt_latched: false,
+            }),
+            ComposerPrimaryAction::Send { enabled: false },
+        );
+        assert_eq!(
+            composer_primary_action(ComposerPrimaryInput {
+                agent_state: state,
+                submission: ComposerSubmissionState::Ready,
+                draft_empty: false,
+                interrupt_latched: false,
+            }),
+            ComposerPrimaryAction::Send { enabled: true },
+        );
+        assert_eq!(
+            composer_primary_action(ComposerPrimaryInput {
+                agent_state: state,
+                submission: ComposerSubmissionState::ReviewRequired,
+                draft_empty: false,
+                interrupt_latched: false,
+            }),
+            ComposerPrimaryAction::Send { enabled: false },
+        );
+    }
+}

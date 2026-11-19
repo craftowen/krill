@@ -19,7 +19,6 @@ mod locale;
 #[cfg(windows)]
 pub(crate) use locale::preferred_locale;
 
-pub mod computer;
 #[cfg_attr(
     windows,
     expect(
@@ -49,6 +48,25 @@ pub use macos::*;
 #[cfg(not(target_os = "macos"))]
 pub use windows::*;
 
+/// 시스템 시간대 기준 `epoch`(또는 Win32용 UTC 달력 시각)의 UTC 오프셋(초)을 돌려준다.
+pub(crate) fn local_utc_offset_secs(epoch: i64, utc: crate::local_time::CivilTime) -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = utc;
+        macos::local_utc_offset_secs(epoch)
+    }
+    #[cfg(windows)]
+    {
+        let _ = epoch;
+        windows::local_utc_offset_secs(utc)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = (epoch, utc);
+        Some(0)
+    }
+}
+
 /// Windows 단일 실행 표지 이름. 같은 상태 폴더(대소문자·구분자·끝 구분자 무시)끼리만 같다.
 pub fn instance_key(state_dir: Option<&std::path::Path>) -> String {
     use sha2::Digest as _;
@@ -66,6 +84,27 @@ pub fn instance_key(state_dir: Option<&std::path::Path>) -> String {
 /// remain available, so discovery and diagnostics keep their existing contracts.
 pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     krill_proto::os::background_command(program)
+}
+
+pub fn available_disk_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    let target = path
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .unwrap_or(path);
+    #[cfg(unix)]
+    {
+        let stat = rustix::fs::statvfs(target)?;
+        Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    }
+    #[cfg(windows)]
+    {
+        windows::available_disk_bytes(target)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = target;
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Refresh existing windows after a theme or attention-count change.
@@ -97,5 +136,15 @@ mod tests {
             super::instance_key(Some(Path::new(r"C:\Users\a\AppData\Local\Krill-test")))
         );
         assert_ne!(key, super::instance_key(None));
+    }
+
+    #[test]
+    fn available_disk_bytes_resolves_missing_child_under_temp_dir() {
+        let missing = std::env::temp_dir()
+            .join(format!("krill-disk-probe-{}", std::process::id()))
+            .join("missing")
+            .join("child");
+        let bytes = super::available_disk_bytes(&missing).unwrap();
+        assert!(bytes > 0, "expected positive free disk bytes, got {bytes}");
     }
 }

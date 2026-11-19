@@ -50,11 +50,12 @@ fn connect(sock: &Path) -> Option<(UnixStream, ServerHello)> {
     s.set_read_timeout(Some(WAIT)).unwrap();
     let (k, b) = ipc::read_frame(&mut s).ok()??;
     let hello = ServerHello::decode(k, &b).unwrap();
+    // 재시작 중인 옛 krilld는 인사를 보낸 뒤 닫을 수 있다(Broken pipe). 다시 접속한다.
     std::io::Write::write_all(
         &mut s,
         &client_hello(ClientRole::App, "it").encode().unwrap(),
     )
-    .unwrap();
+    .ok()?;
     Some((s, hello))
 }
 

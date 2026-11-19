@@ -54,6 +54,74 @@ fn keeps_ordinary_text() {
     assert_eq!(redact(text), text);
 }
 
+#[test]
+fn redacts_cross_platform_home_paths_idempotently_and_keeps_repo_home() {
+    let cases = [
+        (
+            r"C:\Users\alice\AppData\Local\Programs\Krill.6296-0-download.zip",
+            r"C:\Users\[USER]\AppData\Local\Programs\Krill.6296-0-download.zip",
+        ),
+        (
+            r"c:/users/alice/work/main.rs:12",
+            r"c:/users/[USER]/work/main.rs:12",
+        ),
+        (
+            r"C:\\Users\\alice\\AppData\\Local\\Temp",
+            r"C:\\Users\\[USER]\\AppData\\Local\\Temp",
+        ),
+        (
+            r"C:\Users\John Smith\AppData\Local\Temp\x",
+            r"C:\Users\[USER]\AppData\Local\Temp\x",
+        ),
+        (
+            r"C:\\Users\\John Smith\\Saved Games\\slot1",
+            r"C:\\Users\\[USER]\\Saved Games\\slot1",
+        ),
+        (
+            r"C:\Users\김민수\Documents\note.md",
+            r"C:\Users\[USER]\Documents\note.md",
+        ),
+        (
+            r"\\?\C:\Users\alice\Desktop\x",
+            r"\\?\C:\Users\[USER]\Desktop\x",
+        ),
+        (
+            r"\\?\C:\Users\John Smith\Desktop\x",
+            r"\\?\C:\Users\[USER]\Desktop\x",
+        ),
+        (
+            r"\\\\?\\C:\\Users\\alice\\Desktop\\x",
+            r"\\\\?\\C:\\Users\\[USER]\\Desktop\\x",
+        ),
+        ("/Users/alice/work", "/Users/[USER]/work"),
+        (
+            "/Users/John Smith/Library/Application Support/dev.krill.app",
+            "/Users/[USER]/Library/Application Support/dev.krill.app",
+        ),
+        (
+            "/Users/김민수/.krill/krilld.sock",
+            "/Users/[USER]/.krill/krilld.sock",
+        ),
+        ("/home/alice/.krill", "/home/[USER]/.krill"),
+        (
+            "sock=/home/alice/.krill/s (/home/bob) \"/home/John Smith/.config/krill\" file:///home/김민수/Downloads/a.tgz",
+            "sock=/home/[USER]/.krill/s (/home/[USER]) \"/home/[USER]/.config/krill\" file:///home/[USER]/Downloads/a.tgz",
+        ),
+        (
+            "/home/John Smith/.krill /home/Kim Minsu/.local",
+            "/home/[USER]/.krill /home/[USER]/.local",
+        ),
+    ];
+    for (input, expected) in cases {
+        let once = redact(input);
+        assert_eq!(once, expected, "input: {input}");
+        assert_eq!(redact(&once), once, "idempotency failed for: {input}");
+    }
+
+    let untouched = "at crates/krill-app/src/home/mod.rs:42:9 see https://krill.page/home/docs and https://krill.page/home/Downloads";
+    assert_eq!(redact(untouched), untouched);
+}
+
 fn temp_state(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("mk-diag-{}-{name}", std::process::id()));
     fs::remove_dir_all(&d).ok();

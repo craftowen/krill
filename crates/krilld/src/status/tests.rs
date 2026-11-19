@@ -396,9 +396,9 @@ fn failed_save_preserves_spool_for_retry() {
     let frame = e.encode().unwrap();
     append_spool(&spool, &frame, Instant::now() + Duration::from_secs(1)).unwrap();
     let st = Statuses::open(Some(path.clone()));
-    // 임시 파일 자리를 디렉터리로 막아 쓰기 실패를 결정적으로 만든다.
-    let blocked = with_suffix(&path, ".tmp");
-    fs::create_dir(&blocked).unwrap();
+    // 저장 대상 자리를 비지 않은 디렉터리로 막아 쓰기 실패를 결정적으로 만든다.
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("occupied"), b"").unwrap();
     let collect = |events: Vec<HookEvent>| {
         let found: Vec<_> = events.iter().map(|e| (S1, e)).collect();
         st.hook(&found).map(|_| ())
@@ -406,7 +406,7 @@ fn failed_save_preserves_spool_for_retry() {
     assert!(take_spool(&spool, collect).is_err());
     assert_eq!(fs::read(&spool).unwrap(), frame);
     assert_eq!(st.get(S1), AgentStatus::UNKNOWN);
-    fs::remove_dir(blocked).unwrap();
+    fs::remove_dir_all(&path).unwrap();
     take_spool(&spool, collect).unwrap();
     assert_eq!(fs::metadata(&spool).unwrap().len(), 0);
     let saved = Statuses::open(Some(path)).get(S1);
@@ -788,4 +788,29 @@ fn process_name_maps_versioned_claude_binary() {
         assert_eq!(name.unwrap(), want);
     }
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn is_turn_stop_distinguishes_final_turn_stop_from_startup_and_mid_turn_hooks() {
+    use super::is_turn_stop;
+    assert!(is_turn_stop(br#"{"hook_event_name":"Stop"}"#));
+    assert!(is_turn_stop(
+        br#"{"hook_event_name":"Stop","fullyIdle":true}"#
+    ));
+    assert!(!is_turn_stop(
+        br#"{"hook_event_name":"Stop","fullyIdle":false}"#
+    ));
+    assert!(is_turn_stop(br#"{"hookEventName":"AfterAgent"}"#));
+    assert!(is_turn_stop(br#"{"event":"stop"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"SessionStart"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"sessionStart"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"PostInvocation"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"StopFailure"}"#));
+    assert!(!is_turn_stop(br#"{"hook_event_name":"Interrupt"}"#));
+    assert!(!is_turn_stop(
+        br#"{"hook_event_name":"Stop","agent_id":"sub-1"}"#
+    ));
+    assert!(!is_turn_stop(
+        br#"{"hook_event_name":"Stop","isSubagent":true}"#
+    ));
 }

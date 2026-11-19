@@ -167,17 +167,27 @@ impl SshOptions {
     /// 안정성용 기본 옵션(`ServerAliveInterval=15`, `ServerAliveCountMax=3`, `ConnectTimeout`)과
     /// 포트(`-p`)·키 파일(`-i`)을 조립하는 공통 argv 빌더.
     pub fn common_args(&self, connect_timeout_secs: u16) -> Vec<String> {
-        // 처음 보는 호스트 키는 기록하고 믿는다(연결 테스트와 같은 수준). 바뀐 키는 ssh가 그대로 거부한다.
-        let mut args = vec![
-            "-o".to_owned(),
-            "StrictHostKeyChecking=accept-new".to_owned(),
+        // 모든 호출이 비대화형이다: 비밀번호·ASKPASS 창을 띄우지 않고 바로 실패한다.
+        let mut args = vec!["-o".to_owned(), "BatchMode=yes".to_owned()];
+        // 사용자가 StrictHostKeyChecking을 정하지 않았을 때만 처음 보는 호스트 키를 기록하고 믿는다.
+        // 바뀐 키는 ssh가 그대로 거부한다.
+        if !effective_config(&self.destination, self.port)
+            .as_deref()
+            .is_some_and(user_sets_host_key_checking)
+        {
+            args.extend([
+                "-o".to_owned(),
+                "StrictHostKeyChecking=accept-new".to_owned(),
+            ]);
+        }
+        args.extend([
             "-o".to_owned(),
             "ServerAliveInterval=15".to_owned(),
             "-o".to_owned(),
             "ServerAliveCountMax=3".to_owned(),
             "-o".to_owned(),
             format!("ConnectTimeout={connect_timeout_secs}"),
-        ];
+        ]);
         if let Some(port) = self.port {
             args.push("-p".to_owned());
             args.push(port.to_string());
@@ -215,24 +225,14 @@ impl SshOptions {
     /// 원격 `$HOME`·소켓 번들 조회([`remote_query`])용 ssh 인자 목록.
     pub fn remote_home_args(&self) -> Vec<String> {
         let mut args = self.common_args(5);
-        args.extend([
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            self.destination.clone(),
-            remote_query(),
-        ]);
+        args.extend([self.destination.clone(), remote_query()]);
         args
     }
 
     /// 관리형 원격 프로브(OS·아키·홈·버전·소켓 번들, OWE-897)용 ssh 인자 목록.
     pub fn probe_args(&self) -> Vec<String> {
         let mut args = self.common_args(5);
-        args.extend([
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            self.destination.clone(),
-            crate::managed::probe_command(),
-        ]);
+        args.extend([self.destination.clone(), crate::managed::probe_command()]);
         args
     }
 
@@ -241,8 +241,6 @@ impl SshOptions {
     pub fn test_args(&self) -> Vec<String> {
         let mut args = self.common_args(4);
         args.extend([
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
             self.destination.clone(),
             "uname -sr && ([ -x \"$HOME/.local/bin/krill\" ] || command -v krill >/dev/null 2>&1) && echo 'krill: ready' || echo 'krill: not installed'".to_owned(),
         ]);
@@ -475,16 +473,16 @@ fn explicit_remote_socket(opts: &SshOptions) -> io::Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// [`machine_key`] 결과를 다시 쓰는 시간. 앱은 호스트 동기화마다(1초 주기) 호스트별로 부르므로, 캐시가 없으면 그때마다
+/// `ssh -G` 결과를 다시 쓰는 시간. 앱은 호스트 동기화마다(1초 주기) 호스트별로 부르므로, 캐시가 없으면 그때마다
 /// `ssh` 프로세스를 띄운다. `~/.ssh/config` 수정 시각이 바뀌면 기한 전이라도 다시 묻는다. `Include`된 파일이나
 /// `/etc/ssh/ssh_config` 변경은 최대 이 시간만큼 늦게 반영된다.
 const MACHINE_KEY_TTL: Duration = Duration::from_secs(60);
 
-type MachineKeyCacheKey = (OsString, String, Option<u16>);
-type MachineKeyCacheEntry = (Instant, Option<std::time::SystemTime>, String);
+type SshConfigCacheKey = (OsString, String, Option<u16>);
+type SshConfigCacheEntry = (Instant, Option<std::time::SystemTime>, Option<String>);
 
-static MACHINE_KEYS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::BTreeMap<MachineKeyCacheKey, MachineKeyCacheEntry>>,
+static SSH_CONFIGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<SshConfigCacheKey, SshConfigCacheEntry>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
 fn ssh_config_mtime() -> Option<std::time::SystemTime> {
@@ -494,38 +492,33 @@ fn ssh_config_mtime() -> Option<std::time::SystemTime> {
         .ok()
 }
 
-/// 접속 대상이 실제로 가리키는 기기(`user@hostname:port`, `ssh -G` 기준). `~/.ssh/config` 별칭과 IP로 따로 등록한
-/// 같은 기기를 하나로 묶는 데 쓴다. 네트워크에 붙지 않는다. `ssh -G`가 실패하면 입력을 그대로 쓴다.
+/// 접속 대상에 실제로 적용되는 설정(`ssh -G` 출력). 네트워크에 붙지 않는다. 실패하면 `None`.
 /// 결과는 [`MACHINE_KEY_TTL`] 동안 캐시한다.
-pub fn machine_key(destination: &str, port: Option<u16>) -> String {
+fn effective_config(destination: &str, port: Option<u16>) -> Option<String> {
     let key = (ssh_program(), destination.to_owned(), port);
     let mtime = ssh_config_mtime();
-    if let Ok(cache) = MACHINE_KEYS.lock()
+    if let Ok(cache) = SSH_CONFIGS.lock()
         && let Some((at, seen, value)) = cache.get(&key)
         && at.elapsed() < MACHINE_KEY_TTL
         && *seen == mtime
     {
         return value.clone();
     }
-    let value = machine_key_with_program(destination, port, &ssh_program());
-    if let Ok(mut cache) = MACHINE_KEYS.lock() {
+    let value = effective_config_with_program(destination, port, &ssh_program());
+    if let Ok(mut cache) = SSH_CONFIGS.lock() {
         cache.retain(|_, (at, _, _)| at.elapsed() < MACHINE_KEY_TTL);
         cache.insert(key, (Instant::now(), mtime, value.clone()));
     }
     value
 }
 
-fn machine_key_with_program(
+fn effective_config_with_program(
     destination: &str,
     port: Option<u16>,
     program: &std::ffi::OsStr,
-) -> String {
-    let fallback = || match port {
-        Some(p) => format!("{}:{p}", destination.to_ascii_lowercase()),
-        None => destination.to_ascii_lowercase(),
-    };
+) -> Option<String> {
     if !valid_host(destination) {
-        return fallback();
+        return None;
     }
     let mut args = vec!["-G".to_owned()];
     if let Some(p) = port {
@@ -538,11 +531,49 @@ fn machine_key_with_program(
     let out =
         crate::managed::run_piped_ssh_with_timeout(program, &args, None, Duration::from_secs(5));
     match out {
-        Ok(o) if o.status.success() => {
-            machine_key_from_config(&String::from_utf8_lossy(&o.stdout)).unwrap_or_else(fallback)
-        }
-        _ => fallback(),
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        _ => None,
     }
+}
+
+/// 접속 대상이 실제로 가리키는 기기(`user@hostname:port`, `ssh -G` 기준). `~/.ssh/config` 별칭과 IP로 따로 등록한
+/// 같은 기기를 하나로 묶는 데 쓴다. `ssh -G`가 실패하면 입력을 그대로 쓴다.
+pub fn machine_key(destination: &str, port: Option<u16>) -> String {
+    machine_key_or_input(
+        effective_config(destination, port).as_deref(),
+        destination,
+        port,
+    )
+}
+
+#[cfg(all(test, unix))]
+fn machine_key_with_program(
+    destination: &str,
+    port: Option<u16>,
+    program: &std::ffi::OsStr,
+) -> String {
+    let config = effective_config_with_program(destination, port, program);
+    machine_key_or_input(config.as_deref(), destination, port)
+}
+
+fn machine_key_or_input(config: Option<&str>, destination: &str, port: Option<u16>) -> String {
+    config
+        .and_then(machine_key_from_config)
+        .unwrap_or_else(|| match port {
+            Some(p) => format!("{}:{p}", destination.to_ascii_lowercase()),
+            None => destination.to_ascii_lowercase(),
+        })
+}
+
+/// 사용자 ssh 설정이 `StrictHostKeyChecking`을 정했는지. `ssh -G`는 `yes`·`no`를 `true`·`false`로,
+/// 설정이 없으면 기본값 `ask`로 보여 준다.
+fn user_sets_host_key_checking(config: &str) -> bool {
+    config.lines().any(|l| {
+        l.split_once(' ').is_some_and(|(k, v)| {
+            k == "stricthostkeychecking"
+                && matches!(v.trim(), "true" | "false" | "yes" | "no" | "off")
+        })
+    })
 }
 
 /// `ssh -G` 출력에서 `user`·`hostname`·`port`를 뽑아 [`machine_key`] 형태로 만든다.
@@ -561,14 +592,20 @@ fn machine_key_from_config(config: &str) -> Option<String> {
     ))
 }
 
-/// 호스트 문자열 검사. ssh 마지막 인자로 그대로 가므로 플래그·경로·공백을 거부한다.
+/// 호스트 문자열 검사: `[user@]host`, 각 부분은 `[A-Za-z0-9._-]`이고 `-`로 시작하지 않는다.
+/// ssh 마지막 인자로 그대로 가고 사용자 `ProxyCommand`의 `%h`·`%r`로 셸에 들어갈 수 있으므로
+/// 셸 메타문자와 `%`를 거부하고, `-`로 시작하는 옵션 주입을 막는다.
 pub fn valid_host(host: &str) -> bool {
-    !host.is_empty()
-        && !host.starts_with('-')
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b':' | b'@' | b'\\'))
-        || valid_user_at_host(host)
+    let part = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    match host.split_once('@') {
+        Some((user, h)) => part(user) && part(h),
+        None => part(host),
+    }
 }
 
 /// 키 파일 경로 검사. 플래그 인젝션(`-`로 시작)과 제어문자를 거부한다.
@@ -583,23 +620,15 @@ pub fn valid_remote_socket(path: &str) -> bool {
     s.starts_with('/') && !s.contains(':') && !s.chars().any(char::is_control)
 }
 
-/// `user@host` 형태. `@`는 정확히 하나, user·host는 그래픽 문자.
-fn valid_user_at_host(host: &str) -> bool {
-    let mut parts = host.split('@');
-    let (Some(user), Some(h), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    for s in [user, h] {
-        if s.is_empty()
-            || s.starts_with('-')
-            || !s
-                .bytes()
-                .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b':' | b'\\'))
-        {
-            return false;
-        }
-    }
-    true
+/// 로컬 포워딩 소켓 경로 검사. Unix `-L` 구분자(`:`)와 제어문자를 거부한다.
+pub fn valid_local_socket(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| {
+        #[cfg(unix)]
+        let no_colon = !s.contains(':');
+        #[cfg(not(unix))]
+        let no_colon = true;
+        !s.is_empty() && no_colon && !s.chars().any(char::is_control)
+    })
 }
 
 /// 파일명에 쓸 호스트 별명. `@`는 살리고 나머지는 영숫자·`.-`_ 로 바꾼다.
@@ -638,6 +667,12 @@ pub fn local_socket_in(state: &Path, host: &str) -> io::Result<PathBuf> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("forward socket path too long for {}", path.display()),
+        ));
+    }
+    if !valid_local_socket(&path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid local forward socket path",
         ));
     }
     Ok(path)
@@ -680,6 +715,7 @@ pub fn extract_host(args: &[OsString]) -> Result<(Option<String>, Vec<OsString>)
 pub struct Tunnel {
     child: Child,
     socket: PathBuf,
+    control: Option<PathBuf>,
     /// Windows 원격 중계([`RemoteEndpoint::Bridge`])일 때만 있다.
     relay: Option<bridge::Relay>,
 }
@@ -732,6 +768,12 @@ impl Tunnel {
         ssh_bin: &std::ffi::OsStr,
     ) -> io::Result<Self> {
         opts.validate()?;
+        if !valid_local_socket(&local) || !remote.to_str().is_some_and(valid_remote_socket) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid forward socket path for ssh -L",
+            ));
+        }
         prepare_local(&local)?;
         let host = &opts.destination;
         // stdin 파이프의 쓰기 쪽은 `child`가 쥔다. 이 프로세스가 죽으면 닫혀 원격 `cat`과 ssh가 끝난다.
@@ -753,6 +795,7 @@ impl Tunnel {
                 return Ok(Self {
                     child,
                     socket: local,
+                    control: None,
                     relay: None,
                 });
             }
@@ -785,13 +828,17 @@ impl Tunnel {
         prepare_local(&local)?;
         let listener = UnixListener::bind(&local)?;
         let control = bridge::control_path(&local);
-        match bridge::Relay::start(opts, listener, control, ssh_bin) {
+        match bridge::Relay::start(opts, listener, control.as_deref(), ssh_bin) {
             Ok((child, relay)) => Ok(Self {
                 child,
                 socket: local,
+                control,
                 relay: Some(relay),
             }),
             Err(e) => {
+                if let Some(control) = &control {
+                    remove_control_socket(control);
+                }
                 std::fs::remove_file(&local).ok();
                 Err(e)
             }
@@ -838,34 +885,86 @@ impl Drop for Tunnel {
     fn drop(&mut self) {
         // 연결별 중계 ssh를 먼저 끝내고 ControlMaster(keepalive)를 끝낸다.
         self.relay.take();
+        drop(self.child.stdin.take());
         self.child.kill().ok();
         self.child.wait().ok();
         std::fs::remove_file(&self.socket).ok();
+        if let Some(control) = &self.control {
+            remove_control_socket(control);
+        }
     }
 }
 
-/// 소유 프로세스가 SIGKILL로 죽어 `Drop`이 못 지운 포워딩 소켓(`fwd-*`·`f-*`)을 지운다.
-/// 듣는 쪽이 없어 연결이 거부되는 것만 지우므로 살아 있는 다른 터널은 남는다.
+#[cfg(unix)]
+pub(crate) fn remove_control_socket(control: &Path) {
+    std::fs::remove_file(control).ok();
+    let (Some(dir), Some(stem)) = (
+        control.parent(),
+        control.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return;
+    };
+    let prefix = format!("{stem}.");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+            {
+                std::fs::remove_file(entry.path()).ok();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_control_socket_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("c-")?;
+    let (pid, tail) = rest.split_once('-')?;
+    let seq = tail.split('.').next().unwrap_or_default();
+    if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<u32>().ok().filter(|&p| p > 0)
+}
+
+/// 소유 프로세스가 SIGKILL로 죽어 `Drop`이 못 지운 포워딩 소켓(`fwd-*`·`f-*`)과
+/// `ControlMaster` 소켓(`c-<pid>-*`)을 지운다. 듣는 쪽이 없어 연결이 거부되는 것만 지우므로 살아 있는 다른 터널은 남는다.
 #[cfg(unix)]
 fn sweep_stale_forwards(dir: &Path, min_age: Duration) {
+    use std::os::unix::fs::FileTypeExt as _;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let self_pid = std::process::id();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !(name.starts_with("fwd-") || name.starts_with("f-")) || !name.ends_with(".sock") {
+        let is_forward =
+            (name.starts_with("fwd-") || name.starts_with("f-")) && name.ends_with(".sock");
+        let control_pid = is_control_socket_name(&name);
+        if !is_forward && control_pid.is_none() {
+            continue;
+        }
+        if control_pid == Some(self_pid) {
             continue;
         }
         let old = entry
             .metadata()
             .and_then(|m| m.modified())
             .is_ok_and(|t| t.elapsed().is_ok_and(|age| age >= min_age));
+        if !old {
+            continue;
+        }
         let path = entry.path();
-        if old
-            && UnixStream::connect(&path)
-                .is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused)
-        {
+        let is_dead = match entry.file_type() {
+            Ok(ft) if ft.is_socket() => UnixStream::connect(&path)
+                .is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused),
+            Ok(ft) if control_pid.is_some() && ft.is_file() => true,
+            _ => false,
+        };
+        if is_dead {
             std::fs::remove_file(&path).ok();
         }
     }

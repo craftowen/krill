@@ -1,89 +1,71 @@
 ---
 name: computer-use
-description: Drive a visible local macOS app through krill computer using immutable accessibility snapshots, guarded actions, and explicit delivery and verification results. Prefer shell, filesystem, git, HTTP, or an existing CLI when they can complete the task.
+tags: computer-use, desktop-automation, accessibility, ai-agent, gui-automation, cli, agent-desktop
+requirements:
+  - agent-desktop
+description: Operate desktop applications on macOS, Windows, and Linux through native accessibility trees using the bundled agent-desktop CLI. Prefer shell, filesystem, git, HTTP, or an existing CLI when they can complete the task.
 ---
 
-# Krill computer use
+# Computer use (`agent-desktop`)
 
-This guide describes `computer/2`. Read `krill computer capabilities --json` for the bundled guide hash, backend, supported actions, and service features. A different installed guide hash means the instructions may be stale; read `krill skills get computer-use` from the same binary.
+`agent-desktop` (`vercel-labs/agent-desktop`) is the CLI that lets an AI agent observe and operate desktop apps through the OS accessibility tree on macOS, Windows, and Linux. Krill automatically stages `agent-desktop` (and its required platform helper) into `~/.local/share/krill/bin/agent-desktop` and links `~/.local/bin/agent-desktop` on `PATH` (run `krill skills install agent-desktop` to repair or provision on demand). Every command prints one JSON envelope (`ok`, `data` or `error`). The observe, act, and verify loop runs in you.
 
-The native `krill-app` worker is the default engine for visible macOS app windows: it observes and runs element click (left, single, unmodified), secondary action, and set-value. Every other action, screenshots, `--restore-window`, `--window-index`, and CG window IDs run on JXA for that one call. Results report `path` (`native` or `jxa`) and, when JXA replaced the native engine, `fallbackReason`. `KRILL_COMPUTER_ENGINE=jxa` forces JXA. GUI execution is separate from terminal session survival.
+## Shell syntax
 
-## Observe, act, inspect
+Examples use a POSIX shell. In PowerShell, quote every ref (`'@s8f3k2p9:e1'`), because a bare `@token` is the splatting operator. Use `$env:NAME = 'value'` instead of `export`, and `| ConvertFrom-Json` instead of `$(...)` and `jq`. The Windows skill has the PowerShell forms.
 
-1. Check `krill computer capabilities --json` and `krill computer permissions --json`. To open the relevant Settings page, explicitly use `permissions --id accessibility` or `permissions --id screenshots`.
-2. Discover the exact process with `krill computer list-apps --json`. Use a PID when names are ambiguous.
-3. Observe the focused window with `krill computer get-app-state --app pid:123 --json`. To reach another window use its `ax:N` ID from an earlier result. `krill computer list-windows` reports CG window numbers; passing one to `--window-id` runs that observation on JXA, which takes seconds and reads a much smaller tree.
-4. Select a reference from that result and bind the action explicitly: `krill computer click --snapshot <snapshotId> --element 2 --json`.
-5. Read all result axes and the returned observation before choosing another action. A fresh observation supplies its own snapshot ID. Never reuse a reference number from a different snapshot.
+## First run
 
-JSON is compact by default and screenshots are **off by default**. Use `--screenshot` only when visual evidence is needed. `--no-screenshot` remains accepted. Use `--format full` to inspect the full bounded tree. Coverage describes observed nodes and truncation; an unobserved element is not proof that it disappeared.
+1. Run `agent-desktop status`. It reports the platform, permissions, and `supported_surfaces`.
+2. Run `agent-desktop skills get platform`. It loads the skill for the OS the binary runs on (macOS, Windows, or Linux).
+3. For flags and syntax, run `agent-desktop <command> --help`. This skill does not repeat flag lists.
 
-Completed screenshot files have separate bounded retention: at most 32 images and 64 MiB per capture directory. When another capture completes, older captures beyond 300 seconds and files exceeding those count/byte limits are removed; a single oversized capture is refused. A previously returned image path may therefore expire independently of snapshot history. Capture fresh evidence when the file is gone or the scene has changed; an old screenshot never refreshes a target reference.
+## The loop
 
-For additional elements already captured in the same immutable observation, use `krill computer get-app-state --snapshot <snapshotId> --offset 40 --limit 40 --json`. Follow `coverage.nextOffset`. Paging never refreshes the desktop or expands an unobserved subtree. Reference actions are refused when the fresh bounded census is incomplete: a partial tree cannot prove target uniqueness. Paging the saved prefix does not repair that missing coverage. Use a fresh observation or a different supported tool.
+Use `find` when you know the role or exact name. Otherwise map the app first and drill into one region.
 
-Snapshots expire for input after 120 seconds. They are private to the actual calling process context; `--session`, `--worktree`, and environment claims do not grant access to another caller. The parent-process cache namespace is a convenience boundary within one OS user, not authenticated session authorization. Separate invocations must share a long-lived parent process to reuse this namespace; independent shell wrappers may not share it. Use one persistent caller or the experimental MCP session below. Missing, stale, reordered, ambiguous, disabled, or replaced targets are refused. Observe again and reassess; do not substitute a new index for an old target automatically.
+```
+agent-desktop snapshot --skeleton --app "Notes" -i --compact   # shallow map, children_count on cut branches
+agent-desktop snapshot --root @s8f3k2p9:e3 -i --compact        # drill into one region
+agent-desktop click @s8f3k2p9:e12                              # act on a qualified ref
+agent-desktop snapshot --root @s8f3k2p9:e3 -i --compact        # verify: re-read the same region
+```
 
-## Actions
+- A small app needs no skeleton. Take a full `snapshot -i`.
+- Never skeleton a surface (`--surface menu`, `sheet`, `alert`). A surface is already focused.
+- An action that opens a menu, sheet, or alert lists it in `data.surfaces`. Target that overlay next.
+- After an async step, use `wait` (see `commands-system.md`). A fixed sleep is a race.
 
-All actions accept `--snapshot <snapshotId>`, `--json`, and optional `--screenshot`. The default numeric reference resolves only against the caller's last returned snapshot. An `--app` or window selector must agree with that original observation.
+## Refs
 
-- `krill computer click --element 2` or `krill computer click --x 100 --y 200`; optional `--button left|right|middle`, `--click-count 1..16`, and `--modifiers cmd,shift`.
-- `krill computer perform-secondary-action --element 2 --action AXShowMenu`; the requested action must be advertised by the actual AX element.
-- `krill computer set-value --element 1 --value-stdin` (or `--value <text>`). Verification compares the full value on the same resolved object, not its preview.
-- `krill computer type-text --element 1 --text-stdin` (or `--text <text>`). Requires an already focused editable receiver; newline/tab sequences are refused. Prefer set-value or paste-text for such text.
-- `krill computer paste-text --element 1 --text-stdin` (or `--text <text>`). Requires a focused editable receiver, an unambiguous selected-text range, and bounded preservation of all readable clipboard item types. Consumption is confirmed only when the full receiver value equals the expected edit.
-- `krill computer press-key --key return --modifiers cmd --repeat 1`; repeat is bounded to 32.
-- `krill computer hotkey --keys cmd+shift+p`.
-- `krill computer scroll --element 3 --direction down --pages 1`, or a point and `--delta-x` / `--delta-y`.
-- `krill computer drag --from-element 2 --to-element 3`, or explicit `--from-x`, `--from-y`, `--to-x`, `--to-y`.
+- Output refs are qualified: `@<snapshot_id>:e<N>`, for example `@s8f3k2p9:e1`. Pass them to later commands as they are.
+- Refs are valid for one snapshot. After any UI change, re-drill the affected region or take a new snapshot.
+- Only addressable elements get refs. Static text and inert containers do not.
+- `STALE_REF`: the ref no longer matches the live UI. Take a fresh snapshot and use the new ref.
+- `AMBIGUOUS_TARGET`: more than one live element matches. Narrow the target with `find --role --name --exact` or `--root`, then use the new ref.
+- `SNAPSHOT_NOT_FOUND`: the snapshot id expired. Snapshot again.
 
-An element action that falls back to JXA first observes the window with JXA, whose tree is bounded much tighter than the worker's, and the target must match exactly one element of it by role, title, and frame. Otherwise the action is refused before input and `fallbackReason` and the verification reason say why; there is no coordinate fallback. Key, hotkey, and coordinate actions only need the same window.
+## Delivery and retry
 
-The target app and window must already be foreground. Text input requires its observed receiver to remain focused. Unexpected foreground/window/receiver changes stop the action; do not force focus back after user intervention. `get-app-state --restore-window` explicitly allows guarded unhide/unminimization and foreground activation with a checked postcondition; it does not authorize targeting Krill itself. Coordinates use the observed desktop logical points, not screenshot pixels. A screenshot carries measured dimensions and capture bounds; changed geometry or occlusion requires a new observation.
+Action results carry `data.disposition` and errors carry `error.disposition`, each with `delivery` and `retry`. Observation commands such as `snapshot` have none on success; their errors, and every `INVALID_ARGS` refusal, carry `not_delivered` and `retry: safe`.
 
-## Read results honestly
+- Retry or substitute an action only when `disposition.retry` is `safe`. Only `not_delivered` is safe.
+- Any other delivery value means the action may have landed. A repeat can click, type, or submit twice, and `toggle` can undo itself.
+- On a result that is not safe, read the live state (`get`, `is`, or a fresh snapshot) and decide from that. `details.post_state` helps when present.
+- Branch on `error.code` and `error.disposition`. Message and suggestion text can change.
+- `details.retryable: false` means waiting cannot change the outcome. Try a different approach.
 
-`delivery` reports `not_dispatched`, `submitted`, `partial`, or `unknown`. Submitted means input was issued, not that the application completed the task. `observation` independently reports the post-action snapshot or its failure. `verification.status=verified` only means the specific reported predicate was observed (currently full set-value equality or confirmed paste receiver contents). Clicks, keys, scrolls, and drags are generally unverified even when successfully submitted. `cleanup` reports `not_needed`, `completed`, or `incomplete`; read clipboard `preserved` and `restored` separately.
+## Headless and headed
 
-Nonzero exit status can accompany a JSON result: retain that evidence. Post-action observation failure does not erase submitted input. An error or lost response after dispatch is unknown; **never replay it automatically**, switch backends, or fall back from an AX mutation to coordinates. Observe the target before deciding on any new action. A returned snapshot is an observation, not proof of business completion or causality.
+Ref actions are headless by default. They use semantic accessibility calls and do not take focus, move the cursor, synthesize keys, or use the clipboard. If no semantic path exists, the action fails closed. Use the global `--headed` flag only when the user explicitly permits physical input, such as double-click, hover, drag, or focus. Never switch to headed mode to recover from a headless failure. Raw coordinates (`--xy`) never imply focus. Which actions need `--headed` differs by OS: read the platform skill.
 
-Clipboard preservation is bounded to 4 MiB. Unsupported promised data or oversize contents cause refusal before writing. If another process changes the clipboard, its contents are retained and restoration is reported incomplete. If paste consumption cannot be confirmed, the temporary clipboard may remain for a delayed receiver; do not claim restoration or force previous contents over a user's copy. Previous clipboard text is never included in results. Use stdin flags for sensitive text; live payloads travel in private operation files rather than child argv.
+## References
 
-The input lease serializes cooperating Krill executors through the entire command, including restore and clipboard cleanup. It does not exclude the user or unrelated automation tools. Timeouts do not prove that an already submitted OS action was cancelled. Short batches, request deduplication, status, and cancel are not supported unless the running binary explicitly advertises them; do not invent a service protocol or LLM API.
+Load one only when you need it (`agent-desktop skills get desktop <reference>`):
 
-## Experimental persistent native MCP
-
-`krill computer serve --experimental [--worker /absolute/path/to/krill-app]` explicitly selects an isolated native worker for one stdio MCP session. The default CLI commands above start one worker per command; this session keeps one worker alive. This experimental path has not passed every native permission, hang isolation, update, footprint, and end-to-end gate. Do not infer permission inheritance from the worker being the app executable.
-
-The proxy supports **MCP 2025-11-25 only**, using `initialize`, then `notifications/initialized`. It reports that exact version, accepts `ping`, and returns `-32601` to `server/discover` so clients that support the documented legacy fallback can initialize. This is not a claim of support for the newer discovery/per-request metadata protocol. Messages are UTF-8 JSON-RPC lines on stdin/stdout; diagnostics go to stderr. The command neither registers an MCP server nor changes configuration, accounts, providers, or remote services.
-
-The worker is discovered beside the current `krill` executable, including a sibling `Krill.app/Contents/MacOS/krill-app`; use the absolute `--worker` override for a development or test binary. A missing, unsupported, or incompatible worker fails before desktop dispatch. The only worker transport is inherited private stdin/stdout pipes. No socket, daemon, or desktop work runs in the CLI proxy.
-
-After the handshake, discover `tools/list` and call:
-
-- `computer_session {}` returns the actual native hello: contract, epoch, context, capabilities, unsupported operations, and limits. These capabilities apply to this worker, separately from `krill computer capabilities`.
-- `computer_execute {"seq":1,"deadlineMs":5000,"op":{"kind":"apps"}}` submits one operation. `seq` is required, positive, caller-owned, and monotonically increasing within the advertised gap. `deadlineMs` includes queueing and execution and cannot exceed native limits. The returned tool schema lists the supported native op shapes. For example, observe with `{"kind":"observe","pid":123,"window":0,"limit":100}` and mutate only with an observed native target such as `{"kind":"click","target":{"snapshot":"E/C/1","element":"e2"}}`. Native window indices and element references are zero-based (`window:0` and `e0` are valid); copy them exactly from native observations.
-- `computer_status {"seq":1}` queries the original native request without issuing desktop input. `expired` or `unseen` never authorizes replay.
-- `computer_cancel {"seq":1}` attempts cancellation before dispatch. MCP `notifications/cancelled` also forwards cancellation of a pending execute request. `too_late` cannot undo already posted input; inspect all result axes.
-
-The proxy captures epoch/context from native hello; callers cannot replace them. A mutation target must contain a snapshot from that same native epoch/context. Snapshots from the CLI commands above and from another worker cannot be used. A restarted session always requires a fresh observation and a new assessment of the desktop.
-
-When the worker advertises `batch` and `limits.maxBatchSteps`, `computer_execute` also accepts `{"kind":"batch","steps":[...]}` with 1..4 mutation steps, bounded by the advertised maximum. Steps may be `action`, `set_value`, `click`, or `type_text`; reads and nested batches are refused. The batch has one seq and one deadline. Inspect each step and aggregate `issuedSteps`/`issuedUnits` (`issuedSteps` is null when dispatch is unknown): a known submitted prefix followed by a refused step reports Partial and `isError` without implying that prior input was undone. Aggregate verification is satisfied only if every step satisfied its explicit predicate; unverified input leaves it not requested. A known Partial result with completed cleanup keeps the session usable; Unknown, incomplete cleanup, or quiescing closes it.
-
-Retain the original `seq` and identical payload when checking or retrying a request within this live session. The proxy does not allocate sequences. Duplicate JSON-RPC request IDs with identical payloads and duplicate execute sequences do not issue multiple effects; a changed payload under a retained ID or seq is rejected. Always choose a new JSON-RPC ID for a new request. Completed request/payload/result entries roll out under count and byte limits, while pending entries are protected. The seq highwater survives eviction: an old seq returns `expired` without a native write and never becomes permission to replay. `computer_session.proxy` advertises these retention and pending/output bounds. A limit rejection before dispatch permits no claim of input delivery.
-
-Native result data appears once in `structuredContent`, with a short text summary. Read delivery, observation, verification, and cleanup independently. `isError` includes refused, partial, unknown, failed observation, and unsatisfied/unknown verification results; an error never erases submitted input. If the MCP envelope would exceed the frame cap, observation data may be omitted with `output_too_large` while delivery evidence remains.
-
-Native observations use one compact `treeText` by default, preserving native references, identity, and coverage. Set the execute argument `"format":"full"` to retain the native element array when its additional detail is needed; compact output does not also duplicate that array. Format is part of the retained execute payload, so retries of a seq must keep it identical. Format selects representation and does not refresh an earlier observation or grant new target identity.
-
-For optional display deltas, first observe with `"format":"full"`, then request a **new** observe seq with `"format":"delta","baseSnapshot":"E/C/1"` in the execute arguments. Every new seq still performs one fresh native observation. This is response compression, with no AX observer, cached observation shortcut, or reused input authority. Observer support remains deliberately unavailable. `baseSnapshot` is valid only with delta observe, must belong to this session's epoch/context, and is part of the retained seq payload together with format.
-
-The proxy retains at most 4 observation base entries and 4 MiB total serialized base/marker JSON per session, separately from request/result retention. Only complete reconstructable full/delta observations retain exact native data; compact, partial, and oversized observations retain tiny diagnostic markers without their elements or values. Oldest entries roll out first. A delta requires both observations to have complete coverage, matching app process/start witness and window scope, and a base delivered as full or as a reconstructable delta. Compact omits fields and cannot bootstrap an exact base. Missing/evicted, partial, compact-only, unknown/changed-scope, or oversized delta bases/results fall back to the same fresh observation in compact form with `data.deltaFallback.reason`; there is no second native execution. Output framing may still omit oversized observation data with `output_too_large` as described above. After a compact fallback, obtain a new full observation before resuming deltas.
-
-Delta data retains the **fresh** snapshot and all current metadata, and replaces `elements` with `upsert` (whole changed/new display nodes), `removed` (old display keys), and `order` (every current key in display order), plus `baseSnapshot` and `elementCount`. Reconstruct by copying the exact base's elements by key, deleting removed keys, replacing whole nodes from upsert, and ordering by order. Preserve all current metadata from the delta rather than copying base metadata. Display keys are positional references, not stable AX object identities: `removed` never claims that a semantic object is Gone. Always bind input to the fresh returned snapshot and its current references; the native worker still performs its own fresh guards. A repeated seq returns its original stored response even after base eviction; changing format or base under that seq is rejected.
-
-After submission, worker EOF, a deadline without a result, or transport failure leaves the **original seq unknown**. Native Unknown/quiescing or incomplete cleanup also closes the MCP session: the proxy terminates and reaps its worker with bounded waiting and reports uncertainty when output is still available. It never respawns, replays, switches to JXA, or converts termination into proof that posted effects were cancelled. If the client stops reading, output may be incomplete. Observe the desktop afresh through a separately chosen tool before deciding whether any new action is appropriate. Operations not advertised by both the worker and this proxy fail closed.
-
-If a delta would be larger than a complete fresh representation, the proxy may return `data.format: "full"` with `deltaFallback.reason: "delta_not_smaller_than_full"`. It preserves every fresh element and can serve as the next exact base. The choice compares encoded sizes including fallback metadata; it does not issue another native observation. If neither exact encoding fits the frame limit, the existing explicit compact fallback applies.
+| Reference | Open it when |
+|-----------|--------------|
+| `commands-observation` | You need `snapshot`, `find`, `get`, `is`, `screenshot`, `list-surfaces` semantics, partial trees, or the `--root` rules |
+| `commands-interaction` | You choose between click, type, set-value, select, toggle, scroll, press, and mouse commands, or you debug an action error |
+| `commands-system` | You launch or close apps, manage windows, use the clipboard, `wait`, `batch`, sessions, multi-agent cursors, tracing, or load skills |
+| `workflows` | You want worked patterns (forms, menus, dialogs, waiting for a new window, scroll-find, drag) and the anti-patterns list |

@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, KeyDownEvent, SharedString, Subscription, Window,
-    div, prelude::*,
+    Context, Entity, EventEmitter, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
+    Subscription, Window, div, prelude::*,
 };
 use gpui_component::Icon;
 use gpui_component::Sizable as _;
@@ -289,7 +289,23 @@ impl Dialog {
         }
     }
 
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        [&self.url, &self.dest, &self.remote_path]
+            .into_iter()
+            .any(|input| {
+                input.update(cx, |input, cx| {
+                    input.focus_handle(cx).is_focused(window)
+                        && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+                })
+            })
+    }
+
     fn on_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if (e.keystroke.key == "escape" && window.default_prevented())
+            || self.input_is_composing(window, cx)
+        {
+            return;
+        }
         match e.keystroke.key.as_str() {
             "escape" => {
                 cx.stop_propagation();
@@ -342,7 +358,7 @@ impl Dialog {
                 let key = id.as_key().to_owned();
                 let debug_key = key.clone();
                 let chip_label = label.clone();
-                div()
+                let chip = div()
                     .id(SharedString::from(format!("add-project-host-{key}")))
                     .debug_selector(move || format!("add-project-host-{debug_key}"))
                     .role(gpui::Role::Button)
@@ -363,10 +379,10 @@ impl Dialog {
                             .bg(p.background)
                             .text_color(p.muted_foreground)
                     })
-                    .child(label.clone())
-                    .on_click(cx.listener(move |d, _, window, cx| {
-                        d.set_host(next.clone(), window, cx);
-                    }))
+                    .child(label.clone());
+                on_activate(chip, cx, move |d, window, cx| {
+                    d.set_host(next.clone(), window, cx);
+                })
             })
             .collect::<Vec<_>>();
         Some(
@@ -382,6 +398,30 @@ impl Dialog {
 
 /// 아이콘 + 제목 + 설명 한 줄(Orca `AddRepoPrimaryStartAction`/`AddRepoSecondaryStartAction`).
 /// OWE-852: 스크린 리더가 버튼으로 읽도록 `Role::Button`을 단다.
+fn is_activation_key(e: &KeyDownEvent) -> bool {
+    matches!(e.keystroke.key.as_str(), "enter" | "space" | " ")
+        && !e.keystroke.modifiers.control
+        && !e.keystroke.modifiers.alt
+        && !e.keystroke.modifiers.platform
+        && !e.keystroke.modifiers.function
+}
+
+fn on_activate(
+    el: gpui::Stateful<gpui::Div>,
+    cx: &mut Context<Dialog>,
+    handler: impl Fn(&mut Dialog, &mut Window, &mut Context<Dialog>) + Clone + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let click = handler.clone();
+    el.on_click(cx.listener(move |d, _, window, cx| click(d, window, cx)))
+        .on_key_down(cx.listener(move |d, e: &KeyDownEvent, window, cx| {
+            if is_activation_key(e) {
+                cx.stop_propagation();
+                window.prevent_default();
+                handler(d, window, cx);
+            }
+        }))
+}
+
 fn action(
     p: &ui::Palette,
     id: &'static str,
@@ -458,15 +498,18 @@ impl Render for Dialog {
                 let selected = self.selected;
                 body.children(host_selector)
                     .child(selected_card(
-                        action(
-                            p,
-                            "add-project-browse",
-                            IconName::FolderOpen,
-                            text::BROWSE.get(),
-                            text::BROWSE_DESC.get(),
-                        )
-                        .child(ui::keycap(p, "↵"))
-                        .on_click(cx.listener(|d, _, window, cx| d.browse_activated(window, cx))),
+                        on_activate(
+                            action(
+                                p,
+                                "add-project-browse",
+                                IconName::FolderOpen,
+                                text::BROWSE.get(),
+                                text::BROWSE_DESC.get(),
+                            )
+                            .child(ui::keycap(p, "↵")),
+                            cx,
+                            Dialog::browse_activated,
+                        ),
                         p,
                         selected == 0,
                     ))
@@ -483,30 +526,32 @@ impl Render for Dialog {
                             .flex_col()
                             .gap_2()
                             .child(selected_card(
-                                action(
-                                    p,
-                                    "add-project-clone",
-                                    IconName::Globe,
-                                    text::CLONE.get(),
-                                    text::CLONE_DESC.get(),
-                                )
-                                .on_click(cx.listener(|d, _, window, cx| d.show_clone(window, cx))),
+                                on_activate(
+                                    action(
+                                        p,
+                                        "add-project-clone",
+                                        IconName::Globe,
+                                        text::CLONE.get(),
+                                        text::CLONE_DESC.get(),
+                                    ),
+                                    cx,
+                                    Dialog::show_clone,
+                                ),
                                 p,
                                 selected == 1,
                             ))
                             .child(selected_card(
-                                action(
-                                    p,
-                                    "add-project-create",
-                                    IconName::Plus,
-                                    text::CREATE.get(),
-                                    text::CREATE_DESC.get(),
-                                )
-                                .on_click(cx.listener(
-                                    |d, _, window, cx| {
-                                        d.create_activated(window, cx);
-                                    },
-                                )),
+                                on_activate(
+                                    action(
+                                        p,
+                                        "add-project-create",
+                                        IconName::Plus,
+                                        text::CREATE.get(),
+                                        text::CREATE_DESC.get(),
+                                    ),
+                                    cx,
+                                    Dialog::create_activated,
+                                ),
                                 p,
                                 selected == 2,
                             )),
@@ -611,6 +656,13 @@ impl Render for Dialog {
             .flex()
             .flex_col()
             .gap_4()
+            .capture_action(
+                cx.listener(|d, _: &gpui_component::input::Escape, window, cx| {
+                    if d.input_is_composing(window, cx) {
+                        window.prevent_default();
+                    }
+                }),
+            )
             .capture_key_down(cx.listener(|d, e: &KeyDownEvent, window, cx| {
                 d.on_key(e, window, cx);
             }))

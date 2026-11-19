@@ -20,11 +20,19 @@ pub(super) fn needs_merge(home: &Path, profile: &Path) -> bool {
 pub(super) fn provision(home: &Path, profile: &Path) -> io::Result<Report> {
     #[cfg(unix)]
     {
+        let cached = std::cell::Cell::new(None);
         history::provision(home, profile, &|| {
-            let local = profile.join(".gemini/antigravity-cli");
-            let host = home.join(".gemini/antigravity-cli");
-            super::history_probe::quiescent_at(&local, profile, "ANTIGRAVITY_CLI_HOME")
-                && super::history_probe::quiescent_at(&host, home, "ANTIGRAVITY_CLI_HOME")
+            if let Some(quiescent) = cached.get() {
+                return quiescent;
+            }
+            let idle = |store: &Path, root: &Path| {
+                let paths = history::probe_paths(store);
+                super::history_probe::quiescent_at(&paths, root, "ANTIGRAVITY_CLI_HOME")
+            };
+            let quiescent = idle(&profile.join(".gemini/antigravity-cli"), profile)
+                && idle(&home.join(".gemini/antigravity-cli"), home);
+            cached.set(Some(quiescent));
+            quiescent
         })
     }
     #[cfg(not(unix))]

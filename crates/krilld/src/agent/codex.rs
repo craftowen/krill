@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::usage::ProviderKind;
 
-type Stamp = Option<(SystemTime, u64)>;
+pub(super) type Stamp = Option<(SystemTime, u64)>;
 
 /// 홈별 마지막 확인. 성공은 (명령, 확인 직후 `config.toml` 도장)이 같을 동안 유지한다.
 /// 실패는 [`RETRY`] 동안만, 도장이 그대로일 때만 기억한다. 한 번의 실패가 굳지 않는다.
@@ -158,13 +158,13 @@ pub(super) fn ensure_trust_in(
     result
 }
 
-fn stamp(path: &Path) -> Stamp {
+pub(super) fn stamp(path: &Path) -> Stamp {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
 }
 
 /// 로그인 셸 `PATH`. 프로필이 절대 경로 codex면 그 폴더를 앞에 둬 실제로 뜰 바이너리에게 묻는다.
-fn search_path(program: Option<&Path>) -> OsString {
+pub(super) fn search_path(program: Option<&Path>) -> OsString {
     let login = OsStr::from_bytes(crate::shell::login_path());
     let first = program
         .filter(|p| p.is_absolute())

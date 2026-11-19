@@ -112,6 +112,68 @@ pub struct User {
     pub shell: Vec<u8>,
 }
 
+/// `Toolhelp` 스냅숏의 한 항목.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessEntry {
+    pub(crate) pid: u32,
+    pub(crate) parent: u32,
+    /// 실행 파일 이름(경로 없이, 예: `node.exe`).
+    pub(crate) exe: String,
+}
+
+/// `Toolhelp` 스냅숏 캐시. 이미 종료된 부모 PID(`explorer.exe`의 옛 `userinit.exe` 등) 조회가
+/// 신선한 스냅숏을 매 소켓 연결마다 무효화하지 않게 한다.
+#[cfg(any(windows, test))]
+pub(crate) struct ProcessCache {
+    at: std::time::Instant,
+    list: Vec<ProcessEntry>,
+    absent: std::collections::HashSet<u32>,
+}
+
+#[cfg(any(windows, test))]
+impl ProcessCache {
+    pub(crate) fn query(
+        slot: &mut Option<Self>,
+        pid: Option<u32>,
+        ttl: std::time::Duration,
+        now: std::time::Instant,
+        exists: impl FnOnce(u32) -> bool,
+        take_snapshot: impl FnOnce() -> io::Result<Vec<ProcessEntry>>,
+    ) -> io::Result<Vec<ProcessEntry>> {
+        let need_refresh = match slot.as_ref() {
+            None => true,
+            Some(c) if now.saturating_duration_since(c.at) >= ttl => true,
+            Some(c) => match pid {
+                None => false,
+                Some(p) if c.list.iter().any(|e| e.pid == p) => false,
+                Some(p) if c.absent.contains(&p) => return Ok(Vec::new()),
+                Some(p) if !exists(p) => return Ok(Vec::new()),
+                Some(_) => true,
+            },
+        };
+        if need_refresh {
+            let list = take_snapshot()?;
+            let mut absent = std::collections::HashSet::new();
+            if let Some(p) = pid
+                && !list.iter().any(|e| e.pid == p)
+            {
+                absent.insert(p);
+            }
+            *slot = Some(Self {
+                at: now,
+                list,
+                absent,
+            });
+        }
+        let list = slot.as_ref().map(|c| c.list.as_slice()).unwrap_or_default();
+        Ok(match pid {
+            Some(p) => list.iter().filter(|e| e.pid == p).cloned().collect(),
+            None => list.to_vec(),
+        })
+    }
+}
+
 /// 에이전트 셸 복귀 래퍼(`agent::PREFLIGHT`, `set +m`)는 에이전트를 루트와 같은 프로세스 그룹에 둔다.
 /// `root` 그룹에 속한 직계 자식이 하나뿐이면 그 PID. 작업 제어가 켜진 셸의 작업은 그룹이 달라 빠진다.
 #[cfg(unix)]
@@ -232,6 +294,28 @@ pub(crate) fn tcgetpgrp(fd: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
 #[cfg(unix)]
 static STOP_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+#[cfg(unix)]
+fn stop_signal_pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let (reader, writer) = std::io::pipe()?;
+    let flags = fcntl_getfl(&writer)?;
+    fcntl_setfl(&writer, flags | OFlags::NONBLOCK)?;
+    Ok((reader, writer))
+}
+
+#[cfg(unix)]
+fn wait_for_stop_byte(mut reader: impl std::io::Read) -> bool {
+    let mut buf = [0u8; 1];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(_) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 /// SIGTERM·SIGINT를 받으면 `done` 채널을 깨워 main이 `RunGuard`를 정상 정리하고 종료하게 한다.
 #[cfg(unix)]
 pub fn notify_on_stop_signal(done: std::sync::mpsc::Sender<()>) {
@@ -247,7 +331,7 @@ pub fn notify_on_stop_signal(done: std::sync::mpsc::Sender<()>) {
             }
         }
     }
-    let Ok((reader, writer)) = rustix::pipe::pipe() else {
+    let Ok((reader, writer)) = stop_signal_pipe() else {
         return;
     };
     let raw_writer = writer.into_raw_fd();
@@ -271,9 +355,9 @@ pub fn notify_on_stop_signal(done: std::sync::mpsc::Sender<()>) {
         .name("sig-stop".to_owned())
         .stack_size(64 * 1024)
         .spawn(move || {
-            let mut buf = [0u8; 1];
-            rustix::io::read(&reader, &mut buf).ok();
-            done.send(()).ok();
+            if wait_for_stop_byte(reader) {
+                done.send(()).ok();
+            }
         })
         .ok();
 }
@@ -290,5 +374,143 @@ mod tests {
         child.kill().ok();
         child.wait().ok();
         assert_eq!(args.unwrap(), ["sleep", "30"]);
+    }
+
+    #[test]
+    fn stop_signal_pipe_sets_cloexec_and_nonblocking_writer() {
+        use rustix::fs::{OFlags, fcntl_getfl};
+        use rustix::io::{FdFlags, fcntl_getfd};
+        let (reader, writer) = super::stop_signal_pipe().unwrap();
+        assert!(fcntl_getfd(&reader).unwrap().contains(FdFlags::CLOEXEC));
+        assert!(fcntl_getfd(&writer).unwrap().contains(FdFlags::CLOEXEC));
+        assert!(fcntl_getfl(&writer).unwrap().contains(OFlags::NONBLOCK));
+    }
+
+    #[test]
+    fn wait_for_stop_byte_retries_interrupted_and_ignores_eof() {
+        struct ScriptedRead<'a>(&'a [std::io::Result<u8>]);
+        impl std::io::Read for ScriptedRead<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let Some((first, rest)) = self.0.split_first() else {
+                    return Ok(0);
+                };
+                self.0 = rest;
+                match first {
+                    Ok(byte) => {
+                        if let Some(slot) = buf.first_mut() {
+                            *slot = *byte;
+                        }
+                        Ok(1)
+                    }
+                    Err(e) => Err(std::io::Error::from(e.kind())),
+                }
+            }
+        }
+
+        let interrupted_then_byte = [
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            Ok(1),
+        ];
+        assert!(super::wait_for_stop_byte(ScriptedRead(
+            &interrupted_then_byte
+        )));
+
+        let interrupted_then_eof = [Err(std::io::Error::from(std::io::ErrorKind::Interrupted))];
+        assert!(!super::wait_for_stop_byte(ScriptedRead(
+            &interrupted_then_eof
+        )));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{ProcessCache, ProcessEntry};
+
+    fn entry(pid: u32, parent: u32, exe: &str) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            parent,
+            exe: exe.to_owned(),
+        }
+    }
+
+    #[test]
+    fn dead_parent_pid_does_not_invalidate_fresh_process_snapshot() {
+        let t0 = Instant::now();
+        let ttl = Duration::from_millis(500);
+        let mut cache = None;
+        let mut snapshots = 0_usize;
+
+        let got = ProcessCache::query(
+            &mut cache,
+            Some(4500),
+            ttl,
+            t0,
+            |_| unreachable!("initial load snapshots unconditionally"),
+            || {
+                snapshots += 1;
+                Ok(vec![entry(4500, 3200, "explorer.exe")])
+            },
+        )
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(snapshots, 1);
+
+        // Exited parent PID 3200 (`exists == false`) must not trigger a new Toolhelp snapshot.
+        for ms in [1_u64, 10, 100] {
+            let dead = ProcessCache::query(
+                &mut cache,
+                Some(3200),
+                ttl,
+                t0 + Duration::from_millis(ms),
+                |pid| {
+                    assert_eq!(pid, 3200);
+                    false
+                },
+                || panic!("dead PID must not refresh fresh snapshot"),
+            )
+            .unwrap();
+            assert!(dead.is_empty());
+        }
+        assert_eq!(snapshots, 1);
+
+        // Newly spawned live PID 9000 (`exists == true`, including recycled 3200) refreshes once.
+        let spawned = ProcessCache::query(
+            &mut cache,
+            Some(3200),
+            ttl,
+            t0 + Duration::from_millis(120),
+            |_| true,
+            || {
+                snapshots += 1;
+                Ok(vec![
+                    entry(4500, 3200, "explorer.exe"),
+                    entry(3200, 4500, "krill.exe"),
+                ])
+            },
+        )
+        .unwrap();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(snapshots, 2);
+
+        // Zombie handle (`exists == true`, absent from snapshot) refreshes at most once per TTL.
+        for _ in 0..3 {
+            let zombie = ProcessCache::query(
+                &mut cache,
+                Some(7777),
+                ttl,
+                t0 + Duration::from_millis(150),
+                |_| true,
+                || {
+                    snapshots += 1;
+                    Ok(vec![entry(4500, 3200, "explorer.exe")])
+                },
+            )
+            .unwrap();
+            assert!(zombie.is_empty());
+        }
+        assert_eq!(snapshots, 3);
     }
 }

@@ -437,6 +437,71 @@ impl Drop for IsolatedKrilld {
 }
 
 #[tokio::test]
+async fn revoke_takes_effect_without_the_control_socket() {
+    let base = short_temp_dir("rvk");
+    let server_dir = base.join("s");
+    let client_dir = base.join("c");
+    fs::create_dir_all(&server_dir).unwrap();
+    fs::create_dir_all(&client_dir).unwrap();
+    write_offline_config(&server_dir, Some("server"));
+    write_offline_config(&client_dir, None);
+
+    let mock_sock = server_dir.join("run/krilld.sock");
+    fs::create_dir_all(mock_sock.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(&mock_sock).unwrap();
+    let echo_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let server = start_server(ServeOptions::new(server_dir.clone()))
+        .await
+        .unwrap();
+    let invite = create_invite_command(&server_dir, Some(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    let host = pair_with_server(&client_dir, &invite.link, "client")
+        .await
+        .unwrap();
+    let tunnel = start_tunnel(ConnectOptions::new(client_dir.clone(), host.id.clone()))
+        .await
+        .unwrap();
+    let mut stream = UnixStream::connect(tunnel.socket_path()).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut reply = [0u8; 4];
+    tokio::time::timeout(WAIT, stream.read_exact(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The control socket can be missing (path too long for sun_path, or removed); revoke must still apply.
+    fs::remove_file(server_dir.join("run/link-ctl.sock")).unwrap();
+    let devices = load_devices(&server_dir).unwrap();
+    revoke_device_command(&server_dir, &devices[0].id)
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("revoked device must be disconnected without a serve restart");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+
+    tunnel.shutdown().await;
+    server.shutdown().await;
+    echo_task.abort();
+    fs::remove_dir_all(&base).ok();
+}
+
+#[tokio::test]
 async fn tunnel_end_to_end_mk_ls_new_read_and_server_restart_auto_reconnect() {
     let base = short_temp_dir("e2e");
     let server_dir = base.join("s");

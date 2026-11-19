@@ -39,7 +39,8 @@ A native Rust workspace for parallel AI coding agents, persistent terminal sessi
 
 - **macOS Apple Silicon (arm64):** primary desktop platform. The app is not notarized; a local/ad-hoc signature is not Apple Developer ID approval. The installer removes the downloaded app's quarantine attribute.
 - **Windows x64:** native desktop preview; Authenticode signing remains pending. Windows Server VM results do not establish desktop GUI, interactive-logon, sleep, or reboot validation.
-- Intel Macs, Linux, Windows ARM64, and 32-bit Windows are outside this public preview's supported desktop scope. Check the assets attached to this release for actual download availability; source or packaging code is not a download promise.
+- **Windows 11 on ARM64:** the installer accepts ARM64 PCs and runs the x64 package through Windows 11 x64 emulation; there is no native ARM64 build.
+- Intel Macs, Linux, Windows 10 on ARM, and 32-bit Windows are outside this public preview's supported desktop scope. Check the assets attached to this release for actual download availability; source or packaging code is not a download promise.
 - **Session continuity:** app quit/restart can reconnect to running sessions while the holder and daemon remain alive. A daemon crash can lose bytes read but not yet recorded and mark a Gap. Rebooting or losing both session services ends the old processes; saved history or agent conversation resume is a separate form of recovery.
 
 [Installation and requirements]({url}/blob/{tag}/README.md) · [Failure guarantees]({url}/blob/{tag}/docs/ARCHITECTURE.md#41-장애별-보장-범위-규범) · [Security reporting]({url}/blob/{tag}/SECURITY.md)

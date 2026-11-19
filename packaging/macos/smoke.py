@@ -4,6 +4,7 @@ import contextlib
 import json
 from pathlib import Path
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -21,9 +22,42 @@ def wait_for(label, condition, timeout=30):
     raise RuntimeError(f"signed bundle smoke timed out: {label}")
 
 
+def kill_home_processes(root):
+    """Kill every process still running with HOME set to the temporary root.
+
+    The daemon probes real agent CLIs, and opencode detaches a managed service that
+    leaves the process tree and keeps writing into HOME after cleanup starts.
+    """
+    marker, quiet = f"HOME={root}", 0
+    while quiet < 2:
+        listing = subprocess.run(["/bin/ps", "axeww", "-o", "pid=,command="],
+                                 capture_output=True, text=True, timeout=10).stdout
+        pids = [int(line.split(None, 1)[0]) for line in listing.splitlines() if marker in line.split()]
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        quiet = 0 if pids else quiet + 1
+        time.sleep(0.5)
+
+
+def remove_home(root):
+    """Delete the temporary HOME, retrying while late agent processes still write into it."""
+    for _ in range(20):
+        kill_home_processes(root)
+        try:
+            shutil.rmtree(root)
+            return
+        except OSError:
+            if not root.exists():
+                return
+            time.sleep(0.5)
+    shutil.rmtree(root)
+
+
 def smoke(bundle):
     bundle = Path(bundle).resolve()
-    with tempfile.TemporaryDirectory(prefix="krill-signed-", dir="/tmp") as temporary:
+    temporary = tempfile.mkdtemp(prefix="krill-signed-", dir="/tmp")
+    try:
         root = Path(temporary)
         env = dict(
             os.environ,
@@ -118,6 +152,8 @@ def smoke(bundle):
             for pid in daemons | session_pids:
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGKILL)
+    finally:
+        remove_home(Path(temporary))
 
 
 if __name__ == "__main__":

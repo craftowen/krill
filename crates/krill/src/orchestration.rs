@@ -16,10 +16,10 @@ use krill_proto::control::{FEAT_CLI, FEAT_CONTROL, Failure, Reply, Request};
 use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::orchestration::{
-    DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchSessionOrigin, DispatchStatus,
-    FEAT_ORCH_SNAPSHOT_PAGE, FRAME_LIMIT_ERROR, GateStatus, MessageType, OrchAction, OrchResponse,
-    OrchestrationStore, Run, SendParams, TaskStatus, WorkerOperation, WorkerStartSpec,
-    worker_preamble,
+    DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchReleaseState, DispatchSessionOrigin,
+    DispatchStatus, FEAT_ORCH_SNAPSHOT_PAGE, FRAME_LIMIT_ERROR, GateStatus, MessageType,
+    OrchAction, OrchMessage, OrchResponse, OrchestrationStore, Run, SendParams, TaskStatus,
+    WorkerOperation, WorkerStartSpec, worker_preamble,
 };
 use krill_proto::screen::Msg;
 
@@ -54,7 +54,7 @@ usage: krill [--host <user@host>] orchestration <subcommand> [options]
   worker-retain <worker-or-dispatch> [--json]
   worker-release <worker-or-dispatch> [--json]
   worker-abandon <worker-or-dispatch> [--json]
-  reset (--run <run-id> | --yes) [--json]   (--yes는 모든 run 초기화)";
+  reset (--run <run-id> | --yes) [--json]   (--yes resets every run)";
 
 enum TargetRef<'a> {
     Borrowed(&'a Target),
@@ -87,6 +87,25 @@ impl<'a> OrchCtx<'a> {
 
     fn is_remote(&self) -> bool {
         self.target.is_some_and(Target::is_remote)
+    }
+
+    /// The caller's pane, which only names a session in the local daemon. A remote store must not
+    /// record it as a coordinator: the remote daemon would type mail pointers into its own session
+    /// with the same number.
+    fn caller_session(&self) -> Option<u32> {
+        if self.is_remote() {
+            None
+        } else {
+            caller_session_id()
+        }
+    }
+
+    fn resolve_env_depth(&self, krill_depth: Option<&str>, mk_depth: Option<&str>) -> Option<u32> {
+        resolve_env_depth_for(self.is_remote(), krill_depth, mk_depth)
+    }
+
+    fn resolve_caller_pane(&self, mk_pane: Option<&str>) -> Option<u64> {
+        resolve_caller_pane_for(self.is_remote(), mk_pane)
     }
 
     fn can_query_daemon(&self) -> bool {
@@ -406,6 +425,7 @@ fn cmd_run_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         }
     }
     let title = title.ok_or_else(|| bad_arg("missing --title"))?;
+    let coordinator = coordinator.or_else(|| ctx.caller_session().map(u64::from));
     let created = match ctx.try_ipc(
         &OrchAction::CreateRun {
             title: title.clone(),
@@ -447,7 +467,7 @@ fn cmd_run_show_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         }
     }
     let store = ctx.load_store()?;
-    let run_id = store.resolve_run_for_session(given.as_deref(), caller_session_id())?;
+    let run_id = store.resolve_run_for_session(given.as_deref(), ctx.caller_session())?;
     let Some(run) = store.runs.iter().find(|r| r.id == run_id) else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -499,10 +519,11 @@ fn cmd_run_use_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     }
     let run_id = target_run
         .ok_or_else(|| bad_arg("usage: krill orchestration run-use <run-id|--clear> [--json]"))?;
+    let session_id = ctx.caller_session();
     let cur_id = match ctx.try_ipc(
         &OrchAction::SetCurrentRun {
             run_id: run_id.clone(),
-            session_id: caller_session_id(),
+            session_id,
         },
         Duration::from_secs(2),
     )? {
@@ -510,7 +531,7 @@ fn cmd_run_use_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         Some(OrchResponse::Error(error)) => return Err(bad_arg(error)),
         Some(_) => return Err(io::Error::other("unexpected run selection reply")),
         None => OrchestrationStore::mutate(ctx.state_dir, |s| {
-            s.set_session_run(caller_session_id(), run_id.as_deref())
+            s.set_session_run(session_id, run_id.as_deref())
         })?,
     };
     let active: Option<Run> =
@@ -535,7 +556,7 @@ fn cmd_run_current_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     }
     let store = ctx.load_store()?;
     let current: Option<Run> = store
-        .resolve_run_for_session(None, caller_session_id())
+        .resolve_run_for_session(None, ctx.caller_session())
         .ok()
         .and_then(|id| store.runs.into_iter().find(|r| r.id == id));
     let Some(r) = current else {
@@ -634,7 +655,7 @@ fn cmd_task_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         Some(id) => id,
         None => ctx
             .load_store()?
-            .resolve_run_for_session(None, caller_session_id())?,
+            .resolve_run_for_session(None, ctx.caller_session())?,
     };
     let task = match ctx.try_ipc(
         &OrchAction::CreateTask {
@@ -1107,10 +1128,10 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             spec.effort.as_deref(),
         )?;
     }
-    let env_depth = std::env::var("KRILL_ORCH_DEPTH")
-        .or_else(|_| std::env::var("MK_WORKER_DEPTH"))
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let env_depth = ctx.resolve_env_depth(
+        std::env::var("KRILL_ORCH_DEPTH").ok().as_deref(),
+        std::env::var("MK_WORKER_DEPTH").ok().as_deref(),
+    );
     let max_depth = explicit_max_depth
         .or(spec.max_depth)
         .or_else(|| {
@@ -1139,9 +1160,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         }
         None => return Err(bad_arg("missing --worker")),
     };
-    let current_pane = std::env::var("MK_PANE_ID")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
+    let current_pane = ctx.resolve_caller_pane(std::env::var("MK_PANE_ID").ok().as_deref());
     let depth = explicit_depth
         .or(spec.depth)
         .or(env_depth)
@@ -1150,7 +1169,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let run_id = match spec.run_id {
         Some(id) => id,
         None => store
-            .resolve_run_for_session(None, caller_session_id())
+            .resolve_run_for_session(None, ctx.caller_session())
             .map_err(|_| bad_arg("missing --run"))?,
     };
     store.validate_worker_start_with_depth(
@@ -1551,7 +1570,7 @@ fn cmd_send_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let to = to.unwrap_or_else(|| "coordinator".to_owned());
     let summary = summary.ok_or_else(|| bad_arg("missing --summary"))?;
     if run_id.is_none()
-        && let Some(sid) = caller_session_id()
+        && let Some(sid) = ctx.caller_session()
     {
         run_id = ctx.load_store()?.session_runs.get(&sid).cloned();
     }
@@ -1744,11 +1763,23 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             }
         }
     };
+    // Only mail this call acknowledged: a bare `--ack` with nothing new returns acked history.
+    let acked: &[OrchMessage] = if ack_ids_flag || (ack && delivery.is_some()) {
+        &messages
+    } else {
+        &[]
+    };
+    let auto_released = auto_release_acked_workers(ctx, acked);
     if json {
         if ack_ids_flag || (ack && delivery_id.is_none()) {
+            // An array has no room for a new field; the release notices on stderr cover it.
             print_json(&messages)?;
         } else {
-            print_json(&serde_json::json!({ "delivery": delivery, "messages": messages }))?;
+            let mut out = serde_json::json!({ "delivery": delivery, "messages": messages });
+            if !auto_released.is_empty() {
+                out["auto_released"] = serde_json::json!(auto_released);
+            }
+            print_json(&out)?;
         }
     } else {
         if let Some(delivery) = delivery {
@@ -2001,7 +2032,7 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let body = body.ok_or_else(|| bad_arg("missing --body"))?;
     let from = match from {
         Some(explicit) => explicit,
-        None => match caller_session_id() {
+        None => match ctx.caller_session() {
             Some(sid) => inferred_reply_sender(&ctx.load_store()?, u64::from(sid))?,
             None => "coordinator".to_owned(),
         },
@@ -2238,6 +2269,71 @@ fn dispatch_owns_session(all_dispatches: &[Dispatch], disp: &Dispatch) -> bool {
                 .find(|d| d.session_id == Some(sid))
         });
     owner.is_some_and(|o| o.id == disp.id)
+}
+
+/// Dispatches `check` releases after acknowledging `acked`: a created worker whose `worker_done`
+/// is among them, whose dispatch settled without a retain or release decision, and whose session
+/// is idle, exited, or gone. A worker still mid-turn waits for the final `worker-list` sweep.
+fn auto_release_targets<'a>(
+    dispatches: &'a [Dispatch],
+    acked: &[OrchMessage],
+    observed: &[crate::session::ObservedSession],
+) -> Vec<&'a Dispatch> {
+    use krill_proto::control::AgentState;
+    dispatches
+        .iter()
+        .filter(|d| {
+            acked.iter().any(|m| {
+                m.msg_type == MessageType::WorkerDone && m.dispatch_id.as_deref() == Some(&d.id)
+            }) && !matches!(
+                d.status,
+                DispatchStatus::Active | DispatchStatus::Retained | DispatchStatus::Released
+            ) && d.release_state == DispatchReleaseState::Active
+                && d.session_origin == DispatchSessionOrigin::Created
+                && dispatch_owns_session(dispatches, d)
+                && d.session_id.is_some_and(|sid| {
+                    observed.iter().find(|s| s.id == sid).is_none_or(|s| {
+                        s.exit_code.is_some()
+                            || matches!(s.agent_state, Some(AgentState::Done | AgentState::Exited))
+                    })
+                })
+        })
+        .collect()
+}
+
+/// Best effort: a failed release leaves the mail acknowledged and the worker for `worker-list`.
+fn auto_release_acked_workers(ctx: &OrchCtx<'_>, acked: &[OrchMessage]) -> Vec<String> {
+    if !acked.iter().any(|m| m.msg_type == MessageType::WorkerDone) {
+        return Vec::new();
+    }
+    let store = match ctx.load_store() {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("orchestration: warning: skipped worker auto-release: {e}");
+            return Vec::new();
+        }
+    };
+    // Unknown session state (no daemon) is not idle.
+    let Some(observed) = observe_daemon_sessions(ctx) else {
+        return Vec::new();
+    };
+    let mut released = Vec::new();
+    for d in auto_release_targets(&store.dispatches, acked, &observed) {
+        match stop_dispatch(ctx, &store.dispatches, d, true) {
+            Ok(_) => {
+                eprintln!(
+                    "orchestration: released {} ({}) after acknowledging its worker_done",
+                    d.id, d.worker_name
+                );
+                released.push(d.id.clone());
+            }
+            Err(e) => eprintln!(
+                "orchestration: warning: could not auto-release {} ({}): {e}",
+                d.id, d.worker_name
+            ),
+        }
+    }
+    released
 }
 
 fn build_worker_report(
@@ -2675,6 +2771,28 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
                 format!("worker not found: {target_name}"),
             )
         })?;
+    let disp = stop_dispatch(ctx, &store.dispatches, selected, release)?;
+    if json {
+        print_json(&disp)?;
+    } else {
+        println!(
+            "{}\t{}\t{}",
+            disp.id,
+            disp.worker_name,
+            disp.status.as_str()
+        );
+    }
+    Ok(())
+}
+
+/// Stops or releases one dispatch: archives its owned session's output, closes that session, and
+/// records the outcome. `worker-stop`, `worker-release`, and `check`'s auto-release share it.
+fn stop_dispatch(
+    ctx: &OrchCtx<'_>,
+    dispatches: &[Dispatch],
+    selected: &Dispatch,
+    release: bool,
+) -> io::Result<Dispatch> {
     if release {
         selected.validate_release()?;
     }
@@ -2688,7 +2806,7 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
             "cannot close a borrowed session; use {action}; neither stops the existing process"
         )));
     }
-    let owns_session = dispatch_owns_session(&store.dispatches, selected);
+    let owns_session = dispatch_owns_session(dispatches, selected);
     let target = ctx.effective_target()?;
     let captured = match selected.session_id {
         Some(sid) if owns_session && !selected.is_released() => {
@@ -2721,7 +2839,7 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
             Ok(())
         })?;
     }
-    let disp = complete_worker_stop_ctx(ctx, &selected.id, release, captured, || {
+    complete_worker_stop_ctx(ctx, &selected.id, release, captured, || {
         if owns_session
             && !selected.is_released()
             && let Some(sid) = selected.session_id
@@ -2732,18 +2850,7 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
             crate::session::close_session_on_target(&target, sid).map_err(io::Error::other)?;
         }
         Ok(())
-    })?;
-    if json {
-        print_json(&disp)?;
-    } else {
-        println!(
-            "{}\t{}\t{}",
-            disp.id,
-            disp.worker_name,
-            disp.status.as_str()
-        );
-    }
-    Ok(())
+    })
 }
 
 fn cmd_worker_retain_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
@@ -4643,6 +4750,96 @@ mod delivery_and_launch_cli_tests {
         assert_eq!(fenced.status, DispatchStatus::Abandoned);
         std::fs::remove_dir_all(dir)
     }
+
+    #[test]
+    fn acked_worker_done_targets_only_settled_created_workers_that_stopped_working()
+    -> io::Result<()> {
+        use crate::session::ObservedSession;
+        use krill_proto::control::AgentState;
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("auto release", None)?;
+        let mut done = Vec::new();
+        let mut ids = std::collections::BTreeMap::new();
+        for (worker, sid) in [
+            ("idle", 1),
+            ("gone", 2),
+            ("exited", 3),
+            ("working", 4),
+            ("retained", 5),
+            ("borrowed", 6),
+            ("unknown", 7),
+        ] {
+            let d = store.start_worker(&run.id, None, worker, "codex", Some(sid), "/tmp", "p")?;
+            done.extend(store.send_message(&SendParams {
+                from: worker.into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                summary: "finished".into(),
+                body: String::new(),
+                run_id: Some(run.id.clone()),
+                task_id: None,
+                dispatch_id: Some(d.id.clone()),
+                outcome: None,
+                reply_to: None,
+            })?);
+            ids.insert(worker, d.id);
+        }
+        store.retain_worker(&ids["retained"])?;
+        for d in &mut store.dispatches {
+            if d.worker_name == "borrowed" {
+                d.session_origin = DispatchSessionOrigin::Borrowed;
+            }
+        }
+        let live = |id, agent_state| ObservedSession {
+            id,
+            exit_code: None,
+            agent_state,
+        };
+        let observed = [
+            live(1, Some(AgentState::Done)),
+            ObservedSession {
+                id: 3,
+                exit_code: Some(0),
+                agent_state: None,
+            },
+            live(4, Some(AgentState::Working)),
+            live(5, Some(AgentState::Done)),
+            live(6, Some(AgentState::Done)),
+            live(7, None),
+        ];
+        let targets = |acked: &[OrchMessage]| -> Vec<String> {
+            auto_release_targets(&store.dispatches, acked, &observed)
+                .into_iter()
+                .map(|d| d.worker_name.clone())
+                .collect()
+        };
+        assert_eq!(targets(&done), ["idle", "gone", "exited"]);
+        assert!(targets(&[]).is_empty());
+        let mut not_done = done.clone();
+        for m in &mut not_done {
+            m.msg_type = MessageType::Status;
+        }
+        assert!(targets(&not_done).is_empty());
+        Ok(())
+    }
+}
+
+fn resolve_env_depth_for(
+    remote: bool,
+    krill_depth: Option<&str>,
+    mk_depth: Option<&str>,
+) -> Option<u32> {
+    if remote {
+        return None;
+    }
+    krill_depth.or(mk_depth).and_then(|v| v.parse().ok())
+}
+
+fn resolve_caller_pane_for(remote: bool, mk_pane: Option<&str>) -> Option<u64> {
+    if remote {
+        return None;
+    }
+    mk_pane.and_then(|v| v.parse::<u64>().ok())
 }
 
 #[cfg(test)]
@@ -4670,5 +4867,14 @@ mod snapshot_fallback_tests {
         assert!(!snapshot_unavailable(&io::Error::other(
             "orchestration snapshot kept changing while paging; retry"
         )));
+    }
+
+    #[test]
+    fn remote_orchestration_ignores_local_worker_depth_and_pane_env() {
+        assert_eq!(resolve_env_depth_for(true, Some("2"), Some("1")), None);
+        assert_eq!(resolve_env_depth_for(false, Some("2"), Some("1")), Some(2));
+        assert_eq!(resolve_env_depth_for(false, None, Some("3")), Some(3));
+        assert_eq!(resolve_caller_pane_for(true, Some("42")), None);
+        assert_eq!(resolve_caller_pane_for(false, Some("42")), Some(42));
     }
 }

@@ -28,7 +28,7 @@ IPC·공유 프로토콜·PTY/FFI·세션 생존 계약을 바꾸면 해당 경�
 
 변경이 **전부 Markdown(`*.md`)**이거나 그 외 변경이 Cargo `[profile.*]`의 `debug`·`split-debuginfo`뿐이면 Cargo 검사 없이 `git diff --check`만 확인합니다. 해당 변경을 커밋할 때 메시지에 `check.sh 생략(<사유>)`를 적습니다. 스크립트·YAML·lint·코드 변경은 이 예외가 아니며 영향받는 동작을 검증합니다.
 
-전체 `scripts/check.sh`는 작은 개발 변경·문서 PR마다 요구하지 않으며 **최종 릴리스 후보**에서 필수입니다. 포맷·clippy·nextest·doctest·의존성 정책·서드파티 고지·공개 표면을 검사하고 통과한 HEAD만 릴리스합니다. Windows 변경이 있는 후보는 `scripts/check-windows.sh --clippy`도 통과해야 하며 CI와 별도 릴리스 게이트도 유지합니다.
+전체 `scripts/check.sh`는 작은 개발 변경·문서 PR마다 요구하지 않으며 **최종 릴리스 후보**에서 필수입니다. 포맷·clippy·nextest·의존성 정책·서드파티 고지·공개 표면을 검사하고 통과한 HEAD만 릴리스합니다. Windows 변경이 있는 후보는 `scripts/check-windows.sh --clippy`도 통과해야 하며 CI와 별도 릴리스 게이트도 유지합니다.
 
 ## 소스 빌드 환경
 

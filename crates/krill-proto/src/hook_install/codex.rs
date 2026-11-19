@@ -27,6 +27,20 @@ pub struct Record {
     pub replaced: BTreeMap<String, Value>,
 }
 
+impl Record {
+    /// Take over an older Krill receipt for the same config. Hashes it added are Krill's own,
+    /// so replacing them restores what that receipt had replaced (or removes the key).
+    pub(super) fn supersede(&mut self, old: &Self) {
+        for (key, value) in std::mem::take(&mut self.replaced) {
+            if old.added.get(&key) != Some(&value) {
+                self.replaced.insert(key, value);
+            } else if let Some(original) = old.replaced.get(&key) {
+                self.replaced.insert(key, original.clone());
+            }
+        }
+    }
+}
+
 pub struct Plan {
     rpc: Rpc,
     pub record: Record,
@@ -44,7 +58,7 @@ impl Plan {
     ) -> io::Result<Self> {
         let path = home.join("config.toml");
         let original = store::read(&path)?;
-        let mut rpc = Rpc::start(home, command, search)?;
+        let mut rpc = Rpc::start(home, Some(command), search)?;
         let version = rpc.version(&path)?;
         // Match the bytes to the versioned snapshot before computing the patch.
         if store::read(&path)? != original {
@@ -131,7 +145,9 @@ impl Plan {
             .parent()
             .ok_or_else(|| error("missing Codex home"))?;
         let original = store::read(&record.path)?;
-        let mut rpc = Rpc::start(home, &record.command, search)?;
+        // Rollback only reads the config version and writes trust, so it passes no session
+        // hooks. An old Windows PowerShell command would overflow npm codex.cmd's cmd.exe line.
+        let mut rpc = Rpc::start(home, None, search)?;
         let version = rpc.version(&record.path)?;
         if store::read(&record.path)? != original {
             return Err(error("Codex configuration changed during discovery"));
@@ -234,7 +250,7 @@ impl Drop for Rpc {
 }
 
 impl Rpc {
-    fn start(home: &Path, command: &str, search: Option<&OsStr>) -> io::Result<Self> {
+    fn start(home: &Path, command: Option<&str>, search: Option<&OsStr>) -> io::Result<Self> {
         #[cfg(windows)]
         let inherited = std::env::var_os("PATH");
         #[cfg(windows)]
@@ -259,7 +275,7 @@ impl Rpc {
         }
         let mut child = codex
             .arg("app-server")
-            .args(hooks::codex_args(command))
+            .args(command.map(hooks::codex_args).unwrap_or_default())
             .env("CODEX_HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -430,9 +446,37 @@ mod windows_tests {
             ),
         )
         .unwrap();
-        let rpc = Rpc::start(&home, "fixture command", Some(bin.as_os_str())).unwrap();
+        let rpc = Rpc::start(&home, Some("fixture command"), Some(bin.as_os_str())).unwrap();
         drop(rpc);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// npm's `codex.cmd` runs through cmd.exe, whose command line stops at 8191 characters.
+    /// Every session hook flag for a typical per-user install must still fit.
+    #[test]
+    fn rpc_starts_npm_batch_shim_with_installed_session_hooks() {
+        let root = std::env::temp_dir().join(format!("krill hook len {}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let bin = root.join("npm bin");
+        let home = root.join("profile");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            bin.join("codex.cmd"),
+            concat!(
+                "@echo off\r\n",
+                "if not \"%~1\"==\"app-server\" exit /b 12\r\n",
+                "set /p krill_request=\r\n",
+                "echo {\"id\":0,\"result\":{}}\r\n",
+                "set /p krill_notice=\r\n",
+            ),
+        )
+        .unwrap();
+        let exe = Path::new(r"C:\Users\홍길동\AppData\Local\Programs\Krill\krill.exe");
+        let command = hooks::command(exe, hooks::Agent::Codex).unwrap();
+        let rpc = Rpc::start(&home, Some(&command), Some(bin.as_os_str()));
+        std::fs::remove_dir_all(root).ok();
+        assert!(rpc.is_ok(), "{:?}", rpc.err());
     }
 
     #[test]
@@ -486,7 +530,7 @@ mod windows_tests {
             ),
         )
         .unwrap();
-        let mut rpc = Rpc::start(&home, "fixture command", Some(bin.as_os_str())).unwrap();
+        let mut rpc = Rpc::start(&home, Some("fixture command"), Some(bin.as_os_str())).unwrap();
         assert_eq!(rpc.version(&canonical).unwrap(), "native-version");
         std::fs::create_dir(root.join("another")).unwrap();
         assert!(rpc.version(&root.join("another/config.toml")).is_err());

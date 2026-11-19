@@ -357,3 +357,52 @@ fn mobile_frontend_regressions() {
         );
     }
 }
+
+/// The E2E deadline ends node with `process.exit` while headless Chrome is still waiting on a page.
+/// Chrome must not outlive it.
+#[test]
+fn headless_chrome_does_not_outlive_the_e2e_deadline() {
+    let tmp = std::env::temp_dir().join(format!("kpwa-orphan-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let script = r"
+        const server=require('node:http').createServer(()=>{});
+        server.listen(0,'127.0.0.1',()=>{
+          setTimeout(()=>process.exit(3),5000);
+          require(process.argv[1]).main({base:`http://127.0.0.1:${server.address().port}`,fragment:''});
+        });";
+    let status = std::process::Command::new("node")
+        .args(["-e", script])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/mobile_install.cjs"
+        ))
+        .env("TMPDIR", &tmp)
+        .status()
+        .unwrap();
+    let pattern = tmp.join("krill-chrome-");
+    let alive = || {
+        std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(&pattern)
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let orphaned = alive();
+    std::process::Command::new("pkill")
+        .args(["-KILL", "-f"])
+        .arg(&pattern)
+        .status()
+        .ok();
+    std::fs::remove_dir_all(&tmp).ok();
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "the page wait must outlast the deadline"
+    );
+    assert!(!orphaned, "headless Chrome outlived the E2E process");
+}

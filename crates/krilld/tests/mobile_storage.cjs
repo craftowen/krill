@@ -56,3 +56,41 @@ test('remove, removeHost and clear synchronously purge seeds while preserving un
 test('seed quota failures leave IndexedDB and immediate metadata usable',async()=>{
  const f=fixture(),bound=f.cache.bind(host,auth);f.context.localStorage.setItem=()=>{throw Error('quota');};assert.equal(await settle(f,bound.write(snapshot('network'))),true);assert.equal(bound.peek().sessions[0].title,'network');f.context.localStorage.getItem=()=>{throw Error('denied');};f.context.localStorage.removeItem=()=>{throw Error('denied');};const other=f.cache.bind('relay:other',auth);assert.equal(other.peek(),null);await settle(f,bound.remove());await settle(f,f.cache.clear());f.cache.close();
 });
+test('warm-cache sanitizer preserves bounded catalog facts while stripping secrets and malformed nested fields',async()=>{
+ const f=fixture(),bound=f.cache.bind(host,auth),input={
+  host:{display_name:'Studio',platform:'macos',credential:'SECRET_HOST'},
+  sessions:[{id:7,title:'work',cwd:'/shown',state:'Working',lines:['SECRET_LINE'],question:{text:'SECRET_Q'},credential:'SECRET_CRED'}],
+  repositories:[
+   {key:'shown',label:'Shown',path:'/shown',removed:false,remote:'craftowen/krill',badge_color:'#3b82f6',icon:{kind:'emoji',value:'🚀',secret:'SECRET_ICON'},secret:'SECRET_REPO'},
+   {key:'removed',label:'Removed',path:'/removed',removed:true,icon:{kind:'url',value:'https://evil.test/x.svg'}},
+   {key:'long-icon',label:'Long',path:'/long',icon:{kind:'emoji',value:'x'.repeat(32)}},
+   {key:'blank-icon',label:'Blank',path:'/blank',icon:{kind:'emoji',value:'   '}}
+  ],
+  workspaces:[
+   {key:'main',repo_key:'shown',label:'main',path:'/shown',pinned:true,branch:'main',depth:0,primary:true,status:'todo',badge_color:'#22c55e',icon:{kind:'emoji',value:'🐋',token:'SECRET_TOKEN'},visibility:{asleep:false,default_branch:true,automation:false,external:false,external_shown:false,hidden:true,secret:'SECRET_VIS'},orders:[2,1,0,3],transcript:'SECRET_WS'},
+   {key:'child',repo_key:'shown',label:'child',path:'/shown/child',parent:'main',depth:1,status:'in-progress',visibility:{asleep:true,default_branch:false,automation:true,external:true,external_shown:false},orders:[0,0,1,0]},
+   {key:'bad-neg',repo_key:'shown',label:'bad-neg',path:'/shown/b1',orders:[-1,0,0,0]},
+   {key:'bad-len',repo_key:'shown',label:'bad-len',path:'/shown/b2',orders:[0,1,2,3,4]},
+   {key:'bad-nan',repo_key:'shown',label:'bad-nan',path:'/shown/b3',orders:[NaN,Infinity]}
+  ],
+  orchestration:{questions:[{text:'SECRET_ORCH'}]},capabilities:{worktree_create:true},transcript:'SECRET_TRANSCRIPT'
+ };
+ assert.equal(await settle(f,bound.write(input)),true);
+ const persisted=JSON.stringify([...f.db.rows.values()])+f.store.get('krill-mobile-seed-v1:'+host);
+ for(const forbidden of ['SECRET','evil.test','hidden','lines','question','orchestration','transcript'])assert(!persisted.includes(forbidden),forbidden);
+ const check=data=>{
+  assert.deepEqual(plain(data.repositories[0]),{key:'shown',label:'Shown',path:'/shown',removed:false,remote:'craftowen/krill',badge_color:'#3b82f6',icon:{kind:'emoji',value:'🚀'}});
+  assert.deepEqual(plain(data.repositories[1]),{key:'removed',label:'Removed',path:'/removed',removed:true});
+  assert.equal(data.repositories[2].icon,undefined);
+  assert.equal(data.repositories[3].icon,undefined);
+  assert.deepEqual(plain(data.workspaces[0]),{key:'main',repo_key:'shown',label:'main',path:'/shown',pinned:true,branch:'main',depth:0,primary:true,status:'todo',badge_color:'#22c55e',icon:{kind:'emoji',value:'🐋'},visibility:{asleep:false,default_branch:true,automation:false,external:false,external_shown:false},orders:[2,1,0,3]});
+  assert.deepEqual(plain(data.workspaces[1]),{key:'child',repo_key:'shown',label:'child',path:'/shown/child',parent:'main',depth:1,status:'in-progress',visibility:{asleep:true,default_branch:false,automation:true,external:true,external_shown:false},orders:[0,0,1,0]});
+  for(const i of [2,3,4])assert.equal(data.workspaces[i].orders,undefined);
+ };
+ const peeked=bound.peek();check(peeked);
+ peeked.workspaces[0].orders[0]=99;peeked.workspaces[0].visibility.asleep=true;peeked.repositories[0].icon.value='💥';
+ check(bound.peek());
+ f.cache.close();
+ const cold=fixture(database(),f.store);cold.db.stall=true;check(cold.cache.bind(host,auth).peek());cold.cache.close();
+ const warm=fixture(f.db);check(await settle(warm,warm.cache.bind(host,auth).hydrate()));warm.cache.close();
+});

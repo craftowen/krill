@@ -24,7 +24,7 @@ pub(super) struct State {
     pub store: WorktreeStore,
     pub orchestration: OrchestrationStore,
     pub imported: Snapshot,
-    imported_meta: Meta,
+    pub imported_meta: Meta,
     pub folder_updated_at: BTreeMap<PathBuf, u64>,
     /// 워크트리 폴더 생성 시각(ms). `SortBy::Created` 정렬 키.
     pub worktree_created_at: BTreeMap<PathBuf, u64>,
@@ -439,9 +439,11 @@ impl Sidebar {
     fn accept_disk_snapshot(
         &mut self,
         generation: u64,
-        data: DiskSnapshot,
+        mut data: DiskSnapshot,
         cx: &mut Context<Self>,
     ) {
+        retain_live(self.listed_sessions(), &mut data.auto_titles);
+        retain_live(self.listed_sessions(), &mut data.prompt_histories);
         // A scan started before an edit/delete/import must never resurrect its state.
         if self.disk.generation == generation
             && self.disk.writes_pending == 0

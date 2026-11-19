@@ -1,7 +1,7 @@
 //! `krill import orca` CLI 통합 테스트 (MK-172 / OWE-726).
 //!
 //! - `--dry-run --json` 출력 스키마(OWE-727 GUI 위저드 연동 계약) 검증
-//! - 데몬 미기동 시 `accounts` 도메인 `'데몬 필요'` 건너뛰기 + 로컬 `accounts.toml` 미접촉 + 나머지 도메인 정상 이관 검증
+//! - 데몬 미기동 시 `accounts` 도메인 `'Daemon required'` 건너뛰기 + 로컬 `accounts.toml` 미접촉 + 나머지 도메인 정상 이관 검증
 //! - 데몬(`run/krilld.sock`) 연결 시 `ListAccounts` -> `AddAccount` -> `SwitchAccount` IPC 호출 및 재실행 멱등성 검증
 
 #![cfg_attr(unix, expect(clippy::unwrap_used, reason = "integration test helpers"))]
@@ -394,7 +394,7 @@ fn cli_import_orca_dry_run_daemon_skip_and_daemon_ipc_apply() {
         assert_eq!(item["connection"], "unknown");
     }
 
-    // 2. Without running krilld: `accounts` domain is skipped with `'데몬 필요'`, local `accounts.toml`
+    // 2. Without running krilld: `accounts` domain is skipped with `'Daemon required'`, local `accounts.toml`
     // is never touched, no daemon is spawned, and other selected domains (`ssh`) succeed.
     let sentinel_accounts = "# existing\nprovisioning = true\n";
     fs::write(state_dir.join("accounts.toml"), sentinel_accounts).unwrap();
@@ -423,7 +423,7 @@ fn cli_import_orca_dry_run_daemon_skip_and_daemon_ipc_apply() {
     assert!(
         no_daemon_report["accounts"]["skipped_reason"]
             .as_str()
-            .is_some_and(|s| s.starts_with("데몬 필요"))
+            .is_some_and(|s| s.starts_with("Daemon required"))
     );
     assert_eq!(no_daemon_report["accounts"]["claude_added"], 0);
     assert_eq!(no_daemon_report["accounts"]["codex_added"], 0);

@@ -407,24 +407,15 @@ fn client_dialog_clipboard_prefill_nearby_and_all_pair_outcomes(cx: &mut TestApp
 }
 
 #[gpui::test]
-fn pairing_view_renders_server_and_client_together(cx: &mut TestAppContext) {
+fn pairing_view_renders_the_client_dialog(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let backend: Arc<dyn LinkBackend> = Arc::new(MockLinkBackend::with_demo_data());
-    let (view, vcx) = cx.add_window_view(|window, cx| PairingView::new(backend, window, cx));
+    let (_view, vcx) = cx.add_window_view(|window, cx| PairingView::new(backend, window, cx));
     vcx.simulate_resize(size(px(1100.), px(1800.)));
     vcx.run_until_parked();
-    vcx.update(|window, cx| {
-        let server = view.read(cx).server.clone();
-        server.update(cx, ServerPanel::create_invite);
-        window.draw(cx).clear(cx);
-    });
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.draw(cx).clear(cx));
 
     assert!(vcx.debug_bounds("link-pairing-view").is_some());
-    assert!(vcx.debug_bounds("link-server-panel").is_some());
     assert!(vcx.debug_bounds("link-client-dialog").is_some());
-    assert!(vcx.debug_bounds("link-invite-qr").is_some());
     // 페이지 본문은 예전 모달 폭에 갇히지 않고 사용할 수 있는 폭을 채운다.
     let page = vcx.debug_bounds("link-pairing-view").expect("pairing page");
     assert!(
@@ -435,7 +426,7 @@ fn pairing_view_renders_server_and_client_together(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn paste_pairs_once_and_server_uses_one_switch(cx: &mut TestAppContext) {
+fn paste_pairs_once(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let mock = Arc::new(MockLinkBackend::new());
     let backend: Arc<dyn LinkBackend> = mock;
@@ -464,9 +455,6 @@ fn paste_pairs_once_and_server_uses_one_switch(cx: &mut TestAppContext) {
         ));
         window.draw(cx).clear(cx);
     });
-    assert!(vcx.debug_bounds("link-server-toggle").is_some());
-    assert!(vcx.debug_bounds("link-server-on").is_none());
-    assert!(vcx.debug_bounds("link-server-off").is_none());
     assert_eq!(DEFAULT_INVITE_TTL_SECS, 600);
 }
 
@@ -626,7 +614,7 @@ fn client_host_name_overrides_remote_name(cx: &mut TestAppContext) {
     });
 }
 
-/// 연결 설정은 모달 장식 없이 페이지 본문으로 렌더한다.
+/// 초대 입력은 모달 장식 없이 본문으로 렌더한다. 서버 패널은 원격 탭이 나눠 그린다.
 #[gpui::test]
 fn pairing_page_renders_panels_without_modal(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -636,7 +624,6 @@ fn pairing_page_renders_panels_without_modal(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("link-pairing-modal").is_none());
     assert!(vcx.debug_bounds("link-pairing-view").is_some());
-    assert!(vcx.debug_bounds("link-server-panel").is_some());
     assert!(vcx.debug_bounds("link-client-input-link").is_some());
 }
 
@@ -786,15 +773,6 @@ fn remote_disconnect_failure_keeps_the_row_and_allows_retry(cx: &mut TestAppCont
     let backend = Arc::new(RealLinkBackend::new(dir.clone(), "unused-link".into()));
     let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend, cx));
     vcx.simulate_resize(size(px(1000.), px(1600.)));
-    vcx.update(|_, cx| {
-        panel.update(cx, |p, cx| {
-            p.page = PairingPage::Details {
-                local: false,
-                routes: vec!["studio".into()],
-            };
-            cx.notify();
-        });
-    });
     vcx.run_until_parked();
     click(vcx, "link-remote-disconnect-studio");
     assert!(panel.read_with(vcx, |p, _| p.confirm_disconnect.is_some()));
@@ -812,7 +790,6 @@ fn remote_disconnect_failure_keeps_the_row_and_allows_retry(cx: &mut TestAppCont
     assert!(vcx.debug_bounds("link-remote-host-studio").is_some());
     assert!(panel.read_with(vcx, |p, _| p.error.is_some()));
     assert!(vcx.debug_bounds("link-server-error").is_some());
-    assert!(vcx.debug_bounds("link-server-toggle").is_none());
     krill_link::save_hosts(&dir, &[host]).unwrap();
     click(vcx, "link-remote-disconnect-studio");
     click(vcx, "link-remote-disconnect-studio");
@@ -851,6 +828,46 @@ fn hidden_server_panel_clock_pauses_without_canceling_active_invite(cx: &mut Tes
         assert!(panel.read(cx).now_secs > 1);
         assert!(panel.read(cx).invite.is_some());
     });
+}
+
+/// 1초 갱신은 접속 관리를 펼치고 초대가 살아 있을 때만 다시 그린다.
+#[gpui::test]
+fn server_clock_redraws_only_for_a_visible_live_invite(cx: &mut TestAppContext) {
+    let backend = Arc::new(MockLinkBackend::new());
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend, cx));
+    vcx.run_until_parked();
+    // 스위치는 하나다.
+    assert!(vcx.debug_bounds("link-server-toggle").is_some());
+    assert!(vcx.debug_bounds("link-server-on").is_none());
+    assert!(vcx.debug_bounds("link-server-off").is_none());
+    let redraws = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = redraws.clone();
+    let _observe =
+        vcx.update(|_, cx| cx.observe(&panel, move |_, _| counter.set(counter.get() + 1)));
+    let count_after_ticks = |vcx: &mut gpui::VisualTestContext| {
+        redraws.set(0);
+        for _ in 0..3 {
+            vcx.executor()
+                .advance_clock(std::time::Duration::from_secs(1));
+            vcx.run_until_parked();
+        }
+        redraws.get()
+    };
+
+    // 초대 없음: 분이 바뀌는 순간 말고는 다시 그리지 않는다.
+    assert!(count_after_ticks(vcx) <= 1);
+    vcx.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            panel.invite = Some(Invite {
+                link: "krill://pair?code=fixture".into(),
+                expires_at: current_epoch_secs() + 60,
+            });
+        });
+    });
+    assert!(count_after_ticks(vcx) >= 3, "countdown must keep ticking");
+    // 접으면 카운트다운이 안 보이므로 초가 흘러도 다시 그리지 않는다.
+    vcx.update(|_, cx| panel.update(cx, |panel, _| panel.set_hub_open(false)));
+    assert_eq!(count_after_ticks(vcx), 0);
 }
 
 #[gpui::test]
@@ -925,4 +942,135 @@ fn remote_rename_all_closures_restore_initiating_focus(cx: &mut TestAppContext) 
         });
         vcx.run_until_parked();
     }
+}
+
+#[derive(Debug)]
+struct RecoveringBackend {
+    inner: MockLinkBackend,
+    fail_queries: std::sync::atomic::AtomicBool,
+}
+
+impl RecoveringBackend {
+    fn new(fail_queries: bool) -> Self {
+        Self {
+            inner: MockLinkBackend::new(),
+            fail_queries: std::sync::atomic::AtomicBool::new(fail_queries),
+        }
+    }
+
+    fn set_fail(&self, fail: bool) {
+        self.fail_queries
+            .store(fail, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl LinkBackend for RecoveringBackend {
+    fn enable_server(&self) -> Result<ServerStatus, String> {
+        self.inner.enable_server()
+    }
+    fn disable_server(&self) -> Result<ServerStatus, String> {
+        self.inner.disable_server()
+    }
+    fn server_status(&self) -> Result<ServerStatus, String> {
+        if self.fail_queries.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("transient daemon error".to_owned());
+        }
+        self.inner.server_status()
+    }
+    fn create_invite(&self) -> Result<Invite, String> {
+        self.inner.create_invite()
+    }
+    fn pair(&self, link: &str, device_name: &str, host_name: &str) -> PairOutcome {
+        self.inner.pair(link, device_name, host_name)
+    }
+    fn devices(&self) -> Result<Vec<PairedDevice>, String> {
+        if self.fail_queries.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("transient daemon error".to_owned());
+        }
+        self.inner.devices()
+    }
+    fn remote_hosts(&self) -> Result<Vec<PairedHost>, String> {
+        if self.fail_queries.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("transient daemon error".to_owned());
+        }
+        self.inner.remote_hosts()
+    }
+    fn revoke(&self, id: &str) -> Result<Vec<PairedDevice>, String> {
+        self.inner.revoke(id)
+    }
+    fn nearby(&self) -> Result<Vec<NearbyMac>, String> {
+        self.inner.nearby()
+    }
+}
+
+#[gpui::test]
+fn server_panel_clears_stale_error_on_refresh_and_cancel_clears_deadline(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let backend = Arc::new(RecoveringBackend::new(true));
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend.clone(), cx));
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.debug_bounds("link-server-error").is_some(),
+        "initial query failure should show error banner"
+    );
+
+    // Recover backend and refresh: stale error must disappear.
+    backend.set_fail(false);
+    vcx.update(|_, cx| panel.update(cx, ServerPanel::refresh));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("link-server-error").is_none(),
+        "successful refresh must clear stale error banner"
+    );
+
+    // Background poll recovery must also clear a previously surfaced error.
+    vcx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            p.error = Some(SharedString::from("stale poll error"));
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("link-server-error").is_some());
+    for _ in 0..3 {
+        vcx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        vcx.run_until_parked();
+    }
+    assert!(
+        vcx.debug_bounds("link-server-error").is_none(),
+        "healthy background poll must clear stale error banner"
+    );
+
+    // Cancelling revoke/disconnect confirmation must clear confirmation_deadline too.
+    vcx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            p.request_revoke(
+                PairedDevice {
+                    id: "d1".into(),
+                    name: "Mac".into(),
+                    added_at: 1,
+                    last_seen_at: None,
+                },
+                cx,
+            );
+            assert!(p.confirmation_deadline.is_some());
+            p.cancel_revoke(cx);
+            assert!(p.confirmation_deadline.is_none());
+
+            p.request_disconnect(
+                PairedHost {
+                    id: "h1".into(),
+                    name: "Host".into(),
+                    status: krill_hosts::HostStatus::Disconnected,
+                    version: None,
+                },
+                cx,
+            );
+            assert!(p.confirmation_deadline.is_some());
+            p.cancel_disconnect(cx);
+            assert!(p.confirmation_deadline.is_none());
+        });
+    });
 }

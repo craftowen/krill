@@ -114,7 +114,7 @@ impl RemotePlatform {
             RemoteOs::Windows => "Windows".to_owned(),
             RemoteOs::Other(raw) => {
                 if raw.is_empty() {
-                    "알 수 없는 OS".to_owned()
+                    "Unknown OS".to_owned()
                 } else {
                     raw.clone()
                 }
@@ -661,6 +661,7 @@ pub(crate) fn run_piped_ssh_with_timeout(
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let (mut out_eof, mut err_eof) = (false, false);
         let mut status = None;
+        let mut stdin_err: Option<io::Error> = None;
         loop {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
@@ -673,14 +674,20 @@ pub(crate) fn run_piped_ssh_with_timeout(
                     input.take();
                 } else {
                     match pipe.write(remaining) {
-                        Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                        Ok(0) => {
+                            stdin_err = Some(io::ErrorKind::WriteZero.into());
+                            input.take();
+                        }
                         Ok(n) => remaining = remaining.get(n..).unwrap_or_default(),
                         Err(error)
                             if matches!(
                                 error.kind(),
                                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                             ) => {}
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            stdin_err = Some(error);
+                            input.take();
+                        }
                     }
                 }
             }
@@ -719,6 +726,11 @@ pub(crate) fn run_piped_ssh_with_timeout(
                 && err_eof
                 && input.is_none()
             {
+                if status.success()
+                    && let Some(err) = stdin_err
+                {
+                    return Err(err);
+                }
                 return Ok(std::process::Output {
                     status,
                     stdout: out,
@@ -860,11 +872,7 @@ fn install_remote_with_program(
     }
 
     let mut base = opts.common_args(10);
-    base.extend([
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        opts.destination.clone(),
-    ]);
+    base.push(opts.destination.clone());
     let run = |remote_cmd: &str, stdin: Option<&[u8]>, step: &'static str| {
         let mut args = base.clone();
         args.push(remote_cmd.to_owned());

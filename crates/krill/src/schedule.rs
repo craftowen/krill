@@ -42,11 +42,37 @@ fn execute(raw: &[OsString]) -> io::Result<()> {
     execute_in(&dir, &args, true)
 }
 
+fn is_schedule_subcommand(arg: &str) -> bool {
+    matches!(
+        arg,
+        "ls" | "list"
+            | "runs"
+            | "show"
+            | "add"
+            | "create"
+            | "edit"
+            | "rm"
+            | "remove"
+            | "enable"
+            | "disable"
+            | "run"
+    )
+}
+
 fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io::Result<()> {
     // `--` 뒤 `<executable> [args...]`의 `--help`는 검색어가 아니라 해당 명령의 도움말 요청이 아니라
-    // 스케줄 실행 대상의 인자이므로 도움말로 삼키지 않는다. 첫 토큰(서브커맨드 자리)만 본다.
+    // 스케줄 실행 대상의 인자이므로 도움말로 삼키지 않는다. `"help"`는 첫 인자일 때만, `-h`/`--help`는
+    // 첫 인자이거나 유효한 서브커맨드의 두 번째 인자일 때만 도움말로 본다(예: `show help`는 ID `help`).
     let head = args.split(|a| *a == "--").next().unwrap_or(&[]);
-    if head.len() <= 2 && head.iter().any(|a| matches!(*a, "-h" | "--help" | "help")) {
+    let wants_help = match head {
+        [first] => matches!(*first, "-h" | "--help" | "help"),
+        [first, second] => {
+            matches!(*first, "-h" | "--help" | "help")
+                || (is_schedule_subcommand(first) && matches!(*second, "-h" | "--help"))
+        }
+        _ => false,
+    };
+    if wants_help {
         println!("{USAGE}");
         return Ok(());
     }
@@ -700,6 +726,44 @@ mod tests {
 
         execute_in(&dir, &["rm", "nightly", "--json"], false).unwrap();
         assert!(Schedules::load(&dir).unwrap().schedule.is_empty());
+
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn schedule_named_help_works_across_subcommands_and_unknown_subcommand_help_errors() {
+        let dir = std::env::temp_dir().join(format!("krill-sched-id-help-{}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).unwrap();
+
+        execute_in(
+            &dir,
+            &[
+                "add",
+                "help",
+                "--cron",
+                "0 9 * * *",
+                "--workdir",
+                dir.to_str().unwrap(),
+                "--prompt",
+                "check",
+                "--agent",
+                "claude",
+            ],
+            false,
+        )
+        .unwrap();
+        execute_in(&dir, &["show", "help"], false).unwrap();
+        execute_in(&dir, &["disable", "help"], false).unwrap();
+        assert!(!Schedules::load(&dir).unwrap().schedule[0].enabled);
+        execute_in(&dir, &["enable", "help"], false).unwrap();
+        assert!(Schedules::load(&dir).unwrap().schedule[0].enabled);
+        execute_in(&dir, &["remove", "help"], false).unwrap();
+        assert!(Schedules::load(&dir).unwrap().schedule.is_empty());
+
+        assert!(execute_in(&dir, &["bogus", "help"], false).is_err());
+        assert!(execute_in(&dir, &["bogus", "--help"], false).is_err());
+        assert!(execute_in(&dir, &["show", "--help"], false).is_ok());
 
         drop(fs::remove_dir_all(&dir));
     }

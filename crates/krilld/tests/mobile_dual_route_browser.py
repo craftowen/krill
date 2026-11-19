@@ -33,7 +33,7 @@ const server=http.createServer((req,res)=>{
  const file=u.pathname.replace(/^\/m\/[0-9a-f]{16}\//,'').replace(/^\//,'')||'index.html',resolved=path.resolve(root,file);
  if(!resolved.startsWith(root+path.sep)){res.writeHead(403);res.end();return;}
  try{const data=fs.readFileSync(resolved);res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':file.endsWith('.html')?'text/html':file.endsWith('.png')?'image/png':file.endsWith('.svg')?'image/svg+xml':'application/json');
- if(file==='index.html')res.setHeader('Content-Security-Policy',"default-src 'self'; connect-src 'self' wss://*.trycloudflare.com wss://*.ts.net:* https://errors.krill.page; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'");
+ if(file==='index.html')res.setHeader('Content-Security-Policy',"default-src 'self'; connect-src 'self' wss://*.ts.net:* https://errors.krill.page; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'");
  res.end(data);}catch{res.writeHead(404);res.end();}
 });
 server.on('upgrade',(req,socket,head)=>{
@@ -245,7 +245,7 @@ def main():
                     until(lambda: 'Waiting for pairing' in (scratch / 'qr.log').read_text() or qr.poll() is not None, 60)
                     photo = shots / 'tailscale-real-qr.png'
                     qr_photo((scratch / 'qr.log').read_text(), photo)
-                    click('Pair Desktop')
+                    click('Pair a desktop')
                     wait('!!document.querySelector("dialog.scanner")')
                     browser('upload', 'dialog.scanner input[type=file]', str(photo))
                     wait('dualProbe.notices.some(text=>text.includes("Desktop backup added"))')
@@ -253,7 +253,7 @@ def main():
                     qr_log.close()
                 else:
                     link = relay_link()
-                    click('Pair Desktop')
+                    click('Pair a desktop')
                     click('Paste link instead')
                     browser('fill', 'input[type=url]', link)
                     click('Continue')

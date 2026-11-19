@@ -70,7 +70,7 @@ pub fn run(raw: &[OsString]) -> ExitCode {
 }
 
 /// `--check` 결과: 실행 중인 krilld가 이 빌드보다 오래됐는지만 보고한다(교체하지 않는다).
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "linux", test))]
 fn daemon_check_report(current: &str, running: &str, json: bool) -> String {
     let available = krill_proto::control::is_newer(current, running) == Some(true);
     if json {
@@ -135,7 +135,23 @@ fn upgrade_daemon(check: bool, json: bool) -> ExitCode {
 #[cfg(not(target_os = "linux"))]
 fn delegate_to_app(raw: &[OsString], app_bundle: Option<&Path>) -> ExitCode {
     let exe = resolve_krill_app_exe(app_bundle);
-    let status = match Command::new(&exe).arg("--update-cli").args(raw).status() {
+    let mut command = Command::new(&exe);
+    command.arg("--update-cli").args(raw);
+    #[cfg(windows)]
+    let status = match command.output() {
+        Ok(output) => {
+            use std::io::Write as _;
+            std::io::stdout().write_all(&output.stdout).ok();
+            std::io::stderr().write_all(&output.stderr).ok();
+            output.status
+        }
+        Err(e) => {
+            eprintln!("krill update: failed to launch {}: {e}", exe.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(not(windows))]
+    let status = match command.status() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("krill update: failed to launch {}: {e}", exe.display());
@@ -161,22 +177,32 @@ fn resolve_krill_app_exe(app_bundle: Option<&Path>) -> PathBuf {
         if candidate.is_file() {
             return candidate;
         }
+        let near = krill_proto::daemon::exe_near(bundle, "krill-app");
+        if near.is_file() {
+            return near;
+        }
+        if bundle.is_file() {
+            return bundle.to_path_buf();
+        }
     }
     if let Ok(sibling) = krill_proto::daemon::sibling_exe("krill-app")
         && sibling.is_file()
     {
         return sibling;
     }
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local).join(r"Programs\Krill\krill-app.exe");
+    }
     PathBuf::from("/Applications/Krill.app/Contents/MacOS/krill-app")
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 mod tests {
     use super::*;
     #[cfg(not(target_os = "linux"))]
     use std::fs;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -199,6 +225,21 @@ mod tests {
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn resolve_krill_app_exe_supports_flat_dir_and_direct_file() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-update-flat-test-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let flat_exe = dir.join(format!("krill-app{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&flat_exe, b"stub").unwrap();
+
+        assert_eq!(resolve_krill_app_exe(Some(&dir)), flat_exe);
+        assert_eq!(resolve_krill_app_exe(Some(&flat_exe)), flat_exe);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn delegates_to_bundle_krill_app_with_update_cli_arg() {
         let dir =

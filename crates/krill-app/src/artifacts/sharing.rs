@@ -59,5 +59,5 @@ pub fn share_path(run: &CliRunner, path: &Path) -> Result<ShareOutcome, CliFailu
 /// 스테이징된 `krill` CLI 실행기. 바이너리를 못 찾으면 `None`.
 #[must_use]
 pub fn runner(cx: &App) -> Option<CliRunner> {
-    crate::orca_import::resolve_krill_bin(cx).map(|bin| CliRunner::process(bin, state_dir(cx)))
+    crate::settings::space::krill_bin().map(|bin| CliRunner::process(bin, state_dir(cx)))
 }

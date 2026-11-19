@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """야간 배포의 실패 차단·커밋 고정·자산 출처 검증. 실제 빌드·원격 쓰기는 하지 않는다."""
 
+import fcntl
 import hashlib
 import io
 import os
@@ -21,6 +22,9 @@ os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 
 import nightly
 from nightly_assets import download_artifact, import_assets
+
+# 테스트가 실제 디스코드로 알리지 않게 한다. 알림을 확인하는 테스트만 가짜 명령으로 바꾼다.
+nightly.NOTIFIER = Path("/nonexistent/discord-notify")
 
 SHA = "a" * 40
 BASE = "b" * 40
@@ -138,6 +142,68 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("agent", args)
             self.assertEqual(json.loads((root / "dispatch.json").read_text())["terminal"], "test-terminal")
 
+    def test_dispatch_retries_after_transient_orca_runtime_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = {"orca_cli": "orca", "workspace": "id:repo::/w"}
+            ok = json.dumps({"ok": True, "result": {"terminal": {"handle": "term-2"}}})
+            side_effects = [
+                "{}",
+                nightly.NightlyError("command failed (1): orca terminal create"),
+                "{}",
+                ok,
+            ]
+            with patch.object(nightly, "command", side_effect=side_effects) as mocked, \
+                    patch.object(nightly.time, "sleep") as slept:
+                nightly.dispatch(config, root / "config.json")
+            self.assertEqual(mocked.call_count, 4)
+            slept.assert_called_once_with(nightly.DISPATCH_RETRY_DELAY)
+            saved = json.loads((root / "dispatch.json").read_text())
+            self.assertEqual(saved["terminal"], "term-2")
+            self.assertEqual(saved["attempt"], 2)
+
+    def test_dispatch_recovers_without_duplicate_when_run_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = {"orca_cli": "orca", "workspace": "id:repo::/w"}
+            with (root / "run.lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                side_effects = [
+                    "{}",
+                    nightly.NightlyError("command failed (1): orca terminal create"),
+                ]
+                with patch.object(nightly, "command", side_effect=side_effects) as mocked, \
+                        patch.object(nightly.time, "sleep") as slept:
+                    nightly.dispatch(config, root / "config.json")
+            self.assertEqual(mocked.call_count, 2)
+            slept.assert_not_called()
+            saved = json.loads((root / "dispatch.json").read_text())
+            self.assertEqual(saved["terminal"], "recovered-via-run-lock")
+            self.assertEqual(saved["attempt"], 1)
+
+    def test_dispatch_fails_after_exhausting_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = {"orca_cli": "orca", "workspace": "id:repo::/w"}
+            side_effects = [
+                "{}",
+                nightly.NightlyError("command failed (1): orca terminal create"),
+            ] * nightly.DISPATCH_ATTEMPTS
+            with patch.object(nightly, "command", side_effect=side_effects) as mocked, \
+                    patch.object(nightly.time, "sleep") as slept:
+                with self.assertRaises(nightly.NightlyError):
+                    nightly.dispatch(config, root / "config.json")
+            self.assertEqual(mocked.call_count, nightly.DISPATCH_ATTEMPTS * 2)
+            self.assertEqual(slept.call_count, nightly.DISPATCH_ATTEMPTS - 1)
+            self.assertFalse((root / "dispatch.json").exists())
+
+    def test_release_commands_do_not_inherit_the_session_state_or_agent_config(self):
+        session = {key: "/Users/u/real" for key in ("KRILL_STATE_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+                                                     "KRILL_CLI", "KRILL_WORKTREE_PATH")}
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, session):
+            release = nightly.Release({"run_root": root, "target_dir": "/t", "key_file": "/k"}, Path(root))
+        self.assertEqual(set(session) & set(release.env), set())
+
     def test_patch_version_is_newer_than_both_workspace_and_latest_release(self):
         self.assertEqual(nightly.bump_version("0.1.2", "0.1.4"), "0.1.5")
         self.assertEqual(nightly.bump_version("0.2.0", "0.1.4"), "0.2.1")
@@ -151,12 +217,16 @@ class PublicationTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         self.config = {"source": str(root / "source"), "run_root": str(root),
-                       "target_dir": "/Volumes/krill-build/targets/nightly", "key_file": "/unused", "repo": "o/r"}
+                       "target_dir": "/Volumes/krill-build/targets/nightly", "key_file": "/unused", "repo": "o/r",
+                       "branch": "dev"}
         self.release = nightly.Release(self.config, root / "state")
         self.release.work.mkdir()
         self.calls = []
         self.failure = None
         self.main = BASE
+        self.dev = BASE
+        self.ancestry = {(BASE, SHA)}
+        self.release.ancestor = lambda older, newer: older == newer or (older, newer) in self.ancestry
         self.current = SHA
         self.dirty = ""
         self.release.prepare = lambda: (SHA, "release/nightly-test", "0.1.2", BASE)
@@ -179,6 +249,8 @@ class PublicationTests(unittest.TestCase):
             raise nightly.NightlyError("injected failure")
         if args == ("git", "rev-parse", "origin/main"):
             return self.main
+        if args == ("git", "rev-parse", "origin/dev"):
+            return self.dev
         if args == ("git", "rev-parse", "HEAD"):
             return self.current
         if args == ("git", "status", "--porcelain"):
@@ -217,12 +289,32 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.downloader.call_count, 1)
         self.assertTrue(all(call.args[3].endswith("-attempt-2") for call in self.downloader.call_args_list))
 
+    def test_promotion_fast_forwards_dev_to_the_release_commit(self):
+        self.release.publish()
+        self.assertIn(("git", "push", "origin", f"{SHA}:refs/heads/dev"), self.calls)
+        self.assertLess(self.calls.index(("git", "push", "origin", f"{SHA}:refs/heads/dev")),
+                        self.calls.index(("wait-ci", "main")))
+        self.assertEqual(self.release.state["dev_sync"], "fast-forwarded")
+
+    def test_moved_dev_gets_a_merge_and_a_failed_sync_does_not_block_publication(self):
+        self.dev = "d" * 40
+        self.release.publish()
+        self.assertIn(("git", "merge", "--no-edit", SHA), self.calls)
+        self.assertIn(("git", "push", "origin", "HEAD:refs/heads/dev"), self.calls)
+        self.assertEqual(self.release.state["dev_sync"], "merged")
+        self.calls.clear()
+        self.failure = "--no-edit"
+        self.release.publish()
+        self.assertTrue(self.published())
+        self.assertNotIn(("git", "push", "origin", "HEAD:refs/heads/dev"), self.calls)
+        self.assertTrue(self.release.state["dev_sync"].startswith("failed:"))
+
     def test_resumed_failed_ci_is_restarted_once_without_failed_job_filter(self):
         original = self.release.git
         self.release.git = lambda *args: (SHA + "\trefs/heads/release/nightly-test" if args[:1] == ("ls-remote",) else original(*args))
         failed = nightly.FailedRun({"id": 12, "conclusion": "failure"})
         with patch.object(nightly, "Evidence") as evidence:
-            evidence.return_value.proof.side_effect = [failed, nightly.Pending("running"), {"run_id": 123, "attempt": 2}]
+            evidence.return_value.proof.side_effect = [failed, nightly.Pending("running"), nightly.Pending("running"), {"run_id": 123, "attempt": 2}]
             self.release.publish()
         reruns = [call for call in self.calls if call[:3] == ("gh", "run", "rerun")]
         self.assertEqual(len(reruns), 1)
@@ -279,7 +371,7 @@ class PublicationTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
-    def test_prepare_integrates_committed_dev_and_main_without_touching_dirty_source(self):
+    def test_prepare_cuts_from_committed_dev_containing_main_without_touching_dirty_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, origin = root / "source", root / "origin.git"
@@ -331,9 +423,19 @@ class SnapshotTests(unittest.TestCase):
                 return real_command(args, **kwargs)
 
             with patch.object(nightly, "command", side_effect=local_command):
+                with self.assertRaisesRegex(nightly.NightlyError, "missing from origin/dev"):
+                    release.prepare()
+            git(source, "stash", "--include-untracked")
+            git(source, "merge", "--no-edit", "main")
+            frozen = git(source, "rev-parse", "HEAD")
+            git(source, "push", "origin", "dev")
+            git(source, "stash", "pop")
+            release = nightly.Release(config, root / "state")
+            with patch.object(nightly, "command", side_effect=local_command):
                 sha, _branch, version, _main = release.prepare()
             self.assertEqual(version, "0.1.2")
             self.assertEqual(release.state["source_head"], frozen)
+            self.assertEqual(git(release.work, "rev-parse", "HEAD^"), frozen)
             self.assertEqual(git(source, "rev-parse", "HEAD"), frozen)
             self.assertEqual(git(source, "status", "--porcelain"), status)
             self.assertEqual((release.work / "dev-change").read_text(), "committed dev\n")
@@ -365,6 +467,193 @@ class SnapshotTests(unittest.TestCase):
                 self.assertIsNone(waiting.prepare())
             self.assertEqual(waiting.state["status"], "skipped")
             self.assertIn("existing v0.1.2 release owner", waiting.state["reason"])
+
+
+    def test_promoted_candidate_resumes_after_dev_moved_with_it_or_past_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, origin = root / "source", root / "origin.git"
+
+            def git(cwd, *args):
+                return subprocess.check_output(["git", *args], cwd=cwd, stderr=subprocess.DEVNULL).decode().strip()
+
+            git(root, "init", "--bare", "--initial-branch=main", str(origin))
+            git(root, "init", "--initial-branch=main", str(source))
+            git(source, "config", "user.name", "nightly test")
+            git(source, "config", "user.email", "nightly@example.invalid")
+            (source / "Cargo.toml").write_text('[workspace.package]\nversion = "0.1.1"\n')
+            (source / "Cargo.lock").write_text("lock\n")
+            (source / "THIRD_PARTY_NOTICES.md").write_text("notices\n")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "published")
+            git(source, "tag", "v0.1.1")
+            git(source, "remote", "add", "origin", str(origin))
+            git(source, "push", "origin", "main", "--tags")
+            git(source, "checkout", "-b", "dev")
+            (source / "dev-change").write_text("committed dev\n")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "dev work")
+            git(source, "push", "origin", "dev")
+            config = {"source": str(source), "branch": "dev", "repo": "o/r", "run_root": str(root / "nightly"),
+                      "target_dir": str(nightly.TARGETS / "nightly"), "key_file": "/unused",
+                      "user.name": "nightly test", "user.email": "nightly@example.invalid"}
+            real_command = nightly.command
+
+            def local_command(args, **kwargs):
+                args = list(map(str, args))
+                if args[:4] == ["git", "remote", "add", "origin"]:
+                    args[-1] = str(origin)
+                if args[:3] == ["gh", "release", "view"]:
+                    return json.dumps({"tagName": "v0.1.1"})
+                if args[0] in ("cargo", "python3"):
+                    return ""
+                return real_command(args, **kwargs)
+
+            def prepare():
+                release = nightly.Release(config, root / "state")
+                return release, release.prepare()
+
+            with patch.object(nightly, "command", side_effect=local_command):
+                release, (sha, _branch, version, base) = prepare()
+                self.assertEqual(version, "0.1.2")
+                # 게시 전 멈춤: 후보가 main과 dev에 이미 올라갔다.
+                git(release.work, "push", "origin", f"{sha}:refs/heads/main", f"{sha}:refs/heads/dev")
+                release, again = prepare()
+                self.assertEqual(again, (sha, nightly.CANDIDATE_BRANCH, "0.1.2", base))
+                self.assertTrue(release.state["resumed"])
+                # 그 뒤 dev에 새 PR이 들어와도 main에 올라간 후보를 먼저 끝낸다.
+                git(source, "fetch", "origin", "dev")
+                git(source, "checkout", "-B", "dev", "origin/dev")
+                (source / "later").write_text("later\n")
+                git(source, "add", ".")
+                git(source, "commit", "-m", "later work")
+                git(source, "push", "origin", "dev")
+                release, again = prepare()
+                self.assertEqual(again[0], sha)
+                self.assertTrue(release.state["resumed"])
+
+    def test_dev_that_merged_the_release_back_creates_no_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, origin = root / "source", root / "origin.git"
+
+            def git(cwd, *args):
+                return subprocess.check_output(["git", *args], cwd=cwd, stderr=subprocess.DEVNULL).decode().strip()
+
+            def commit(message, **files):
+                for name, text in files.items():
+                    (source / name).write_text(text)
+                git(source, "add", ".")
+                git(source, "commit", "-m", message)
+
+            git(root, "init", "--bare", "--initial-branch=main", str(origin))
+            git(root, "init", "--initial-branch=main", str(source))
+            git(source, "config", "user.name", "nightly test")
+            git(source, "config", "user.email", "nightly@example.invalid")
+            git(source, "remote", "add", "origin", str(origin))
+            commit("base", **{"Cargo.toml": '[workspace.package]\nversion = "0.1.1"\n', "Cargo.lock": "lock\n",
+                              "THIRD_PARTY_NOTICES.md": "notices\n"})
+            git(source, "checkout", "-b", "dev")
+            commit("fix on dev", fix="fixed\n")
+            git(source, "checkout", "main")
+            git(source, "merge", "--ff-only", "dev")
+            commit("Release v0.1.2", **{"Cargo.toml": '[workspace.package]\nversion = "0.1.2"\n'})
+            git(source, "tag", "v0.1.2")
+            git(source, "checkout", "dev")
+            git(source, "merge", "--no-ff", "--no-edit", "main")
+            git(source, "push", "origin", "main", "dev", "--tags")
+            config = {"source": str(source), "branch": "dev", "repo": "o/r", "run_root": str(root / "nightly"),
+                      "target_dir": str(nightly.TARGETS / "nightly"), "key_file": "/unused",
+                      "user.name": "nightly test", "user.email": "nightly@example.invalid"}
+            assets = [{"name": n} for n in ("Krill-0.1.2.dmg", "Krill-0.1.2-windows-x64.zip",
+                                            "latest.json", "latest-windows.json")]
+            real_command = nightly.command
+
+            def local_command(args, **kwargs):
+                args = list(map(str, args))
+                if args[:4] == ["git", "remote", "add", "origin"]:
+                    args[-1] = str(origin)
+                if args[:3] == ["gh", "release", "view"]:
+                    return json.dumps({"tagName": "v0.1.2", "assets": assets})
+                if args[0] in ("cargo", "python3"):
+                    raise AssertionError(f"no candidate may be built: {args}")
+                return real_command(args, **kwargs)
+
+            merged = subprocess.run(["git", "merge-base", "--is-ancestor", "dev", "v0.1.2"], cwd=source)
+            self.assertEqual(merged.returncode, 1, "dev must not be an ancestor of the release")
+            release = nightly.Release(config, root / "state")
+            with patch.object(nightly, "command", side_effect=local_command):
+                self.assertIsNone(release.prepare())
+            self.assertEqual(release.state["status"], "skipped")
+            self.assertIn("no committed changes", release.state["reason"])
+            self.assertFalse((root / "state/pending.json").exists())
+
+
+class KoreanNotesTests(unittest.TestCase):
+    def test_titles_keep_user_facing_changes_like_the_app(self):
+        log = "\n".join([
+            "Release v0.2.52", "Merge branch 'dev'", "test(log): widen a timeout",
+            "fix(updater): reopen the app when the relauncher fails (#90)",
+            "feat(app)!: open settings as a modal", "chore: bump", "plain subject",
+            "fix(updater): reopen the app when the relauncher fails"])
+        self.assertEqual(nightly.release_titles(log), [
+            "Reopen the app when the relauncher fails", "Open settings as a modal", "Plain subject"])
+
+    def test_translator_output_must_be_a_short_korean_array(self):
+        self.assertEqual(nightly.korean_items('```json\n["앱을 다시 띄웁니다."]\n```'), ["앱을 다시 띄웁니다."])
+        for bad in ("no array", "[]", '["English only"]', '["가"' + ', "가"' * 12 + "]", '[1]'):
+            with self.assertRaises(ValueError, msg=bad):
+                nightly.korean_items(bad)
+
+    def test_release_commit_gets_korean_notes_and_translation_failure_never_blocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "nightly/repository"
+            work.mkdir(parents=True)
+
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=work, stderr=subprocess.DEVNULL).decode().strip()
+
+            git("init", "--initial-branch=main")
+            git("config", "user.name", "t")
+            git("config", "user.email", "t@example.invalid")
+            notes = work / nightly.KOREAN_NOTES
+            notes.parent.mkdir(parents=True)
+            notes.write_text('{\n  "0.1.1": [\n    "이전 항목입니다."\n  ]\n}\n', encoding="utf-8")
+            git("add", ".")
+            git("commit", "-m", "Release v0.1.1")
+            published = git("rev-parse", "HEAD")
+            git("commit", "--allow-empty", "-m", "fix(app): keep tabs (#7)")
+            config = {"repo": "o/r", "run_root": str(root / "nightly"), "target_dir": str(nightly.TARGETS / "n"),
+                      "key_file": "/unused", "translator": "/fake/claude"}
+            release = nightly.Release(config, root / "state")
+            real = nightly.command
+            prompts = []
+
+            def fake(args, **kwargs):
+                if str(args[0]) != "/fake/claude":
+                    return real(args, **kwargs)
+                prompts.append(str(args[-1]))
+                self.assertNotEqual(Path(kwargs["cwd"]), work)
+                return '["탭을 유지합니다."]'
+
+            with patch.object(nightly, "command", side_effect=fake):
+                release.write_korean_notes("0.1.2", published)
+            data = json.loads(notes.read_text(encoding="utf-8"))
+            self.assertEqual(list(data), ["0.1.2", "0.1.1"])
+            self.assertEqual(data["0.1.2"], ["탭을 유지합니다."])
+            self.assertIn("- Keep tabs", prompts[0])
+            self.assertIn("docs/releases/ko.json", git("diff", "--cached", "--name-only"))
+
+            # 이미 있는 버전은 번역기를 다시 부르지 않는다.
+            with patch.object(nightly, "command", side_effect=AssertionError("translator called")):
+                release.write_korean_notes("0.1.2", published)
+
+            before = notes.read_text(encoding="utf-8")
+            with patch.object(nightly, "command", side_effect=lambda a, **k: real(a, **k) if str(a[0]) == "git" else "not json"):
+                release.write_korean_notes("0.1.3", published)
+            self.assertEqual(notes.read_text(encoding="utf-8"), before)
+            self.assertTrue(release.state["korean_notes"].startswith("skipped:"))
 
 
 class ArtifactTests(unittest.TestCase):
@@ -475,6 +764,42 @@ class RecoveryTests(unittest.TestCase):
             finally:
                 signal.signal(signal.SIGTERM, previous_handler)
                 timer.join()
+
+
+class NotifyTests(unittest.TestCase):
+    def test_failed_and_skipped_runs_are_reported_and_a_broken_notifier_keeps_the_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sent = root / "sent.txt"
+            notifier = root / "notify"
+            notifier.write_text(f"#!/bin/sh\n[ \"$1\" = 알림-크론 ] || exit 3\ncat >> {sent}\necho >> {sent}\n")
+            notifier.chmod(0o755)
+
+            class Failing:
+                def __init__(self, _config, _state_dir):
+                    self.state = {"status": "running"}
+                def update(self, **values):
+                    self.state.update(values)
+                def publish(self):
+                    raise nightly.NightlyError("run 1: failure")
+
+            class Skipping(Failing):
+                def publish(self):
+                    self.update(status="skipped", reason="no committed changes since the last published release")
+
+            with patch.object(nightly, "NOTIFIER", notifier), patch.object(nightly, "LOGS", root / "logs"):
+                with patch.object(nightly, "Release", Failing), self.assertRaises(nightly.NightlyError):
+                    nightly.run_release({}, root / "state")
+                with patch.object(nightly, "Release", Skipping):
+                    nightly.run_release({}, root / "state")
+                notifier.write_text("#!/bin/sh\nexit 1\n")
+                with patch.object(nightly, "Release", Skipping):
+                    nightly.run_release({}, root / "state")
+            text = sent.read_text()
+            self.assertIn("Krill nightly 실패: run 1: failure", text)
+            self.assertIn("로그: " + str(root / "logs"), text)
+            self.assertIn("Krill nightly 건너뜀: no committed changes", text)
+            self.assertEqual(text.count("Krill nightly"), 2)
 
 
 if __name__ == "__main__":

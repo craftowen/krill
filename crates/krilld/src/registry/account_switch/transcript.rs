@@ -3,7 +3,7 @@
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -46,6 +46,42 @@ pub(super) fn session_id(provider: ProviderKind, stored: &StoredLaunch) -> io::R
         io::ErrorKind::WouldBlock,
         "conversation identity is not bound",
     ))
+}
+
+/// Claude fires `SessionStart` with a planned `session_id` and `transcript_path` before the first
+/// prompt creates the `.jsonl` file on disk. Auto-switches and opted-out panes check whether a
+/// non-empty transcript file actually exists before queueing a handoff.
+pub(super) fn has_claude_transcript(
+    home: &Path,
+    source: Option<&LaunchAccount>,
+    stored: &StoredLaunch,
+) -> bool {
+    if let Some(path) = stored.transcript_path.as_deref().map(Path::new) {
+        if let Ok(found_id) = file_session_id(path, ProviderKind::Claude) {
+            return stored
+                .session_id
+                .as_deref()
+                .is_none_or(|expected| expected == found_id);
+        }
+        if path.exists() {
+            return false;
+        }
+    }
+    let Some(id) = stored
+        .session_id
+        .as_deref()
+        .filter(|id| valid_session_id(id))
+    else {
+        return false;
+    };
+    let from = match source.filter(|s| !s.dir.is_empty()) {
+        Some(account) => PathBuf::from(&account.dir),
+        None => accounts::host_default_dir(home, ProviderKind::Claude),
+    };
+    find_transcript(&from.join("projects"), ProviderKind::Claude, id)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// The conversation as the selected profile will see it, re-checked before the original retires.
@@ -229,31 +265,46 @@ pub(super) fn prepare_bound(
 
 /// Read only provider identity metadata, never infer an ID from an arbitrary rollout filename.
 pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result<String> {
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    let mut head = Vec::new();
     let file = File::open(path)?;
-    let len = file.metadata()?.len();
-    file.take(128 * 1024).read_to_end(&mut head)?;
-    // A newly opened rollout may be visible before its metadata write completes.
-    // Only an empty file or an incomplete last line is retryable; complete invalid
-    // metadata stays fatal. A read cut at the size cap is not a pending write.
-    let last_line = head
-        .rsplit(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    let pending_header = head.is_empty()
-        || (len <= head.len() as u64
-            && !last_line.is_empty()
-            && serde_json::from_slice::<serde_json::Value>(last_line).is_err_and(|e| e.is_eof()));
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut total_read = 0_usize;
+    let mut saw_any_bytes = false;
+    let mut last_incomplete = false;
     let mut identity: Option<String> = None;
     // A forked Codex rollout replays the parent's `session_meta` after its own.
     let mut parent: Option<String> = None;
-    for record in String::from_utf8_lossy(&head)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-    {
+    while total_read < MAX_BYTES {
+        let cap = MAX_BYTES
+            .saturating_sub(total_read)
+            .min(MAX_LINE_BYTES)
+            .saturating_add(1);
+        line.clear();
+        let n = reader
+            .by_ref()
+            .take(u64::try_from(cap).unwrap_or(u64::MAX))
+            .read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        saw_any_bytes = true;
+        total_read = total_read.saturating_add(n);
+        let ended_with_newline = line.last() == Some(&b'\n');
+        let truncated_at_cap = n == cap && !ended_with_newline;
+        last_incomplete = !ended_with_newline
+            && !truncated_at_cap
+            && serde_json::from_slice::<serde_json::Value>(&line).is_err_and(|e| e.is_eof());
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            if truncated_at_cap {
+                break;
+            }
+            continue;
+        };
         let id = match provider {
             ProviderKind::Codex
                 if record.get("type").and_then(serde_json::Value::as_str)
@@ -297,10 +348,13 @@ pub(super) fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result
             }
             identity = Some(id.to_owned());
         }
+        if truncated_at_cap {
+            break;
+        }
     }
     identity.ok_or_else(|| {
         io::Error::new(
-            if pending_header {
+            if !saw_any_bytes || last_incomplete {
                 io::ErrorKind::WouldBlock
             } else {
                 io::ErrorKind::InvalidData
@@ -437,7 +491,7 @@ fn opencode_with_exe(
     cwd: &[u8],
 ) -> io::Result<()> {
     let command = |dir: Option<&Path>| {
-        let mut command = Command::new(exe);
+        let mut command = krill_proto::os::background_command(exe);
         command
             .env("PATH", path)
             .env_remove("OPENCODE_CONFIG_DIR")
@@ -958,6 +1012,91 @@ mod bound_path_tests {
                 "{body}"
             );
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_transcript_check_and_stale_handoff_temp_sweep_work() {
+        let root =
+            std::env::temp_dir().join(format!("kas-claude-has-transcript-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let profile = root.join("claude-profile");
+        let projects = profile.join("projects/work");
+        fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("11111111-2222-4333-8444-555555555555.jsonl");
+        let source = LaunchAccount {
+            id: "claude-a".into(),
+            env_key: "CLAUDE_CONFIG_DIR".into(),
+            dir: profile.to_string_lossy().into_owned(),
+        };
+        let mut stored = StoredLaunch {
+            profile: "claude".into(),
+            permission: krill_proto::agent::Permission::Yolo,
+            session_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+            cwd: Vec::new(),
+            account: Some(source.clone()),
+            hibernation_blocked: false,
+        };
+        assert!(!has_claude_transcript(&root, Some(&source), &stored));
+        fs::write(&transcript, b"").unwrap();
+        assert!(!has_claude_transcript(&root, Some(&source), &stored));
+        fs::write(
+            &transcript,
+            r#"{"sessionId":"99999999-2222-4333-8444-555555555555"}"#,
+        )
+        .unwrap();
+        assert!(!has_claude_transcript(&root, Some(&source), &stored));
+        fs::write(
+            &transcript,
+            r#"{"sessionId":"11111111-2222-4333-8444-555555555555"}"#,
+        )
+        .unwrap();
+        assert!(has_claude_transcript(&root, Some(&source), &stored));
+        stored.transcript_path = None;
+        assert!(has_claude_transcript(&root, Some(&source), &stored));
+
+        let stale_tmp = root.join(".account-handoffs.json.tmp.999999.0");
+        let live_tmp = root.join(format!(
+            ".account-handoffs.json.tmp.{}.0",
+            std::process::id()
+        ));
+        fs::write(&stale_tmp, b"{}").unwrap();
+        fs::write(&live_tmp, b"{}").unwrap();
+        assert_eq!(super::super::load(Some(&root)).len(), 0);
+        assert!(!stale_tmp.exists());
+        assert!(live_tmp.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_session_id_scans_past_128k_lines_and_preserves_would_block_on_incomplete_line() {
+        let root = std::env::temp_dir().join(format!("kas-file-sid-128k-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let claude_path = root.join("claude.jsonl");
+        let filler = "{\"type\":\"summary\",\"summary\":\"x\"}\n";
+        let repeat_count = (140 * 1024) / filler.len() + 1;
+        let mut content = filler.repeat(repeat_count);
+        content.push_str(r#"{"sessionId":"after-128k"}"#);
+        content.push('\n');
+        fs::write(&claude_path, content).unwrap();
+        assert_eq!(
+            file_session_id(&claude_path, ProviderKind::Claude).unwrap(),
+            "after-128k"
+        );
+
+        let partial = root.join("partial.jsonl");
+        let pad = "{\"type\":\"summary\"}\n".repeat(7_500);
+        assert!(pad.len() > 130 * 1024);
+        fs::write(&partial, format!("{pad}{{\"type\":\"turn_context\"")).unwrap();
+        assert_eq!(
+            file_session_id(&partial, ProviderKind::Claude)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

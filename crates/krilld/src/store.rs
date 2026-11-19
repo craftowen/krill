@@ -65,6 +65,8 @@ const REPLAY_STEP: usize = 256;
 const CLEARED_FILE: &str = "cleared";
 /// 명시적 `Request::Close`로 닫힌 세션을 표시하는 파일 이름. 재부팅 소실 세션과 구분해 부활을 막는다.
 const CLOSED_FILE: &str = "closed";
+/// 세션을 띄운 디렉터리. 셸 보고(OSC 7·9;9)가 없는 세션도 krilld 교체 뒤 cwd를 안다(Windows는 남의 cwd를 못 읽는다).
+const CWD_FILE: &str = "cwd";
 
 /// 저장소 상한. 기본값이 ARCHITECTURE §4의 값이다(MB = 10⁶B).
 #[derive(Debug, Clone)]
@@ -135,7 +137,7 @@ pub struct Store {
     sessions: PathBuf,
     recording: bool,
     encryption: bool,
-    key: Option<Arc<crypto::Key>>,
+    key: Option<Arc<crypto::Keyring>>,
     generation: AtomicU64,
     /// 생성·rename만 직렬화한다. 압축·열린 파일 쓰기·재귀 삭제는 이 잠금 밖이다.
     gate: Mutex<()>,
@@ -145,8 +147,8 @@ pub struct Store {
     written: AtomicU64,
     /// 일시중지 ACK는 진행 중인 쓰기가 끝난 뒤에만 돌려준다.
     pause: RwLock<Pause>,
-    /// 세션별 스크롤백 지우기 기준선 `(generation, cleared_seq)`(OWE-873b).
-    cleared: Mutex<HashMap<SessionId, (u64, u64)>>,
+    /// 세션별 스크롤백 지우기 기준선 `(generation, cleared_seq, unpersisted)`(OWE-873b).
+    cleared: Mutex<HashMap<SessionId, (u64, u64, bool)>>,
     /// 명시적 `Close`로 닫힌 세션 집합.
     closed: Mutex<HashSet<SessionId>>,
 }
@@ -180,11 +182,14 @@ impl Store {
         if recording {
             privacy::prepare(&sessions)?;
         }
-        let existing = recording && segment::has_encrypted(&sessions)?;
-        let key = if recording && (config.encryption || existing) {
-            Some(crypto::Key::load(root, existing)?)
-        } else {
+        // 키가 있으면 전수 검사(`.krs`마다 open)를 건너뛴다. 키가 없을 때만 이전 암호문 유무로 새 키 생성 여부를 정한다.
+        let key = if !recording {
             None
+        } else if config.encryption {
+            let key = crypto::Key::load(root, || segment::has_encrypted(&sessions))?;
+            Some(crypto::Keyring::ready(key))
+        } else {
+            Some(crypto::Keyring::existing(root))
         };
         let store = Self::with_key(sessions, limits, recording, config.encryption, key);
         store.set_paused(privacy::initial_pause(root)?);
@@ -196,7 +201,7 @@ impl Store {
         limits: Limits,
         recording: bool,
         encryption: bool,
-        key: Option<Arc<crypto::Key>>,
+        key: Option<Arc<crypto::Keyring>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             sessions,
@@ -249,6 +254,24 @@ impl Store {
         closed
     }
 
+    /// 세션을 띄운 디렉터리를 세션 기록 옆에 남긴다. 최선형이라 실패해도 세션은 그대로다.
+    pub(crate) fn remember_cwd(&self, id: SessionId, cwd: &Path) {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let _gate = lock(&self.gate);
+        let dir = self.session_dir(id);
+        if self.recording && !cwd.as_os_str().is_empty() && dir.is_dir() {
+            write_private(&dir.join(CWD_FILE), cwd.as_os_str().as_bytes());
+        }
+    }
+
+    /// [`Self::remember_cwd`]가 남긴 디렉터리.
+    pub(crate) fn launch_cwd(&self, id: SessionId) -> Option<PathBuf> {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let bytes = fs::read(self.session_dir(id).join(CWD_FILE)).ok()?;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+        path.is_absolute().then_some(path)
+    }
+
     pub(crate) fn recording(&self) -> bool {
         self.recording
     }
@@ -283,6 +306,32 @@ impl Store {
         result
     }
 
+    pub(crate) fn last_size(&self, id: SessionId) -> Option<WinSize> {
+        if !self.recording {
+            return None;
+        }
+        segment::warm_decoder();
+        let mut paths = segments(&self.session_dir(id)).ok()?;
+        while let Some(path) = paths.pop() {
+            let seg = match segment::read(&path, self.key.as_deref()) {
+                Ok(Some(seg)) if !seg.records.is_empty() => seg,
+                Ok(_) => continue,
+                Err(_) => return None,
+            };
+            let size = seg
+                .records
+                .iter()
+                .rev()
+                .find_map(|r| match r {
+                    Record::Resize(sz) => Some(*sz),
+                    _ => None,
+                })
+                .unwrap_or(seg.header.size);
+            return (size.cols > 0 && size.rows > 0).then_some(size);
+        }
+        None
+    }
+
     /// 세션 `id`의 콜드 스크롤백 기준선(`seq`)을 기록한다(OWE-873b).
     /// 세그먼트 파일은 지우지 않고 기준선 이전 원본에서 밀려난 행만 히스토리 응답에서 제외한다.
     pub fn clear_scrollback(&self, id: SessionId, seq: u64) {
@@ -293,21 +342,21 @@ impl Store {
         let pause = self.record_guard();
         let _gate = lock(&self.gate);
         let generation = self.generation.load(Ordering::Acquire);
+        let dir = self.session_dir(id);
+        let can_persist = self.recording && !pause.paused && dir.is_dir();
         let target = {
             let mut cleared = lock(&self.cleared);
-            let entry = cleared.entry(id).or_insert((generation, 0));
+            let entry = cleared.entry(id).or_insert((generation, 0, false));
             if entry.0 == generation {
                 entry.1 = entry.1.max(seq);
+                entry.2 = !can_persist;
             } else {
-                *entry = (generation, seq);
+                *entry = (generation, seq, !can_persist);
             }
             entry.1
         };
-        if self.recording && !pause.paused {
-            let dir = self.session_dir(id);
-            if dir.is_dir() {
-                write_cleared(&dir, target);
-            }
+        if can_persist {
+            write_cleared(&dir, target);
         }
     }
 
@@ -317,7 +366,8 @@ impl Store {
         if !self.recording {
             return false;
         }
-        let Ok(mut paths) = segments(&self.session_dir(id)) else {
+        let dir = self.session_dir(id);
+        let Ok(mut paths) = segments(&dir) else {
             return false;
         };
         while let Some(path) = paths.pop() {
@@ -328,14 +378,27 @@ impl Store {
                 return true;
             }
         }
+        if dir.join(archive::PRIOR).is_file() {
+            self.clear_scrollback(id, 0);
+            return true;
+        }
         false
+    }
+
+    pub(super) fn is_unpersisted_clear(&self, id: SessionId) -> bool {
+        let generation = self.generation.load(Ordering::Acquire);
+        lock(&self.cleared)
+            .get(&id)
+            .is_some_and(|&(recorded_gen, _, unpersisted)| {
+                recorded_gen == generation && unpersisted
+            })
     }
 
     fn cleared_seq(&self, id: SessionId) -> u64 {
         let generation = self.generation.load(Ordering::Acquire);
         {
             let cleared = lock(&self.cleared);
-            if let Some(&(recorded_gen, seq)) = cleared.get(&id)
+            if let Some(&(recorded_gen, seq, _)) = cleared.get(&id)
                 && recorded_gen == generation
             {
                 return seq;
@@ -347,11 +410,11 @@ impl Store {
         let seq = read_cleared(&self.session_dir(id)).unwrap_or(0);
         if seq > 0 {
             let mut cleared = lock(&self.cleared);
-            let entry = cleared.entry(id).or_insert((generation, 0));
+            let entry = cleared.entry(id).or_insert((generation, 0, false));
             if entry.0 == generation {
                 entry.1 = entry.1.max(seq);
             } else {
-                *entry = (generation, seq);
+                *entry = (generation, seq, false);
             }
             return entry.1;
         }
@@ -537,6 +600,9 @@ impl Store {
             let age = newest.map_or(Duration::MAX, |t| now.duration_since(t).unwrap_or_default());
             // 세그먼트가 하나도 없는 죽은 세션 디렉터리도 걷는다. 살아 있는 세션의 빈 디렉터리는 둔다.
             if !is_live && (newest.is_none() || age > self.limits.keep_closed) {
+                if dir.join(CLOSED_FILE).is_file() {
+                    lock(&self.closed).insert(id);
+                }
                 if let Err(e) = self.discard(&dir, generation) {
                     tracing::warn!(kind = ?e.kind(), "history gc could not discard a session");
                 }
@@ -646,14 +712,21 @@ fn read_cleared(dir: &Path) -> Option<u64> {
 }
 
 fn write_closed(dir: &Path) {
+    write_private(&dir.join(CLOSED_FILE), b"");
+}
+
+fn write_private(path: &Path, bytes: &[u8]) {
     use krill_proto::os::fs::OpenOptionsExt as _;
-    fs::OpenOptions::new()
+    use std::io::Write as _;
+    if let Ok(mut file) = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(dir.join(CLOSED_FILE))
-        .ok();
+        .open(path)
+    {
+        file.write_all(bytes).ok();
+    }
 }
 
 /// [`Store::raw`]가 넘기는 원본 구간 조각.
@@ -687,7 +760,7 @@ pub struct History {
     segs: Vec<PathBuf>,
     first_page: usize,
     cleared_seq: u64,
-    key: Option<Arc<crypto::Key>>,
+    key: Option<Arc<crypto::Keyring>>,
 }
 
 /// A search consumes harvested batches immediately; no full page of cells is retained.

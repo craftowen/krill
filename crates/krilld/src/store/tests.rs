@@ -1392,3 +1392,31 @@ fn forward_history_reflow_recovers_after_a_manifest_segment_becomes_corrupt() {
     assert!(actual.iter().any(|(_, result)| result.is_err()));
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn paused_clear_scrollback_breaks_archive_history_chain_and_cold_clear_recognizes_prior_only() {
+    let root = tmp("s1-3-archive-clear");
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let old = SessionId(1);
+    let resumed = SessionId(2);
+
+    let mut rec = store.recorder(old, SIZE).unwrap();
+    rec.append(b"prior output\r\n");
+    rec.seal();
+    drop(rec);
+
+    store.inherit_history(resumed, old).unwrap();
+    assert!(store.archive(resumed).unwrap().len() > 0);
+    store.set_paused(true);
+    store.clear_scrollback(resumed, 0);
+    assert_eq!(store.history_chain(resumed), [resumed]);
+    assert_eq!(store.archive(resumed).unwrap().len(), 0);
+    store.set_paused(false);
+
+    let resumed2 = SessionId(3);
+    store.inherit_history(resumed2, old).unwrap();
+    assert!(store.clear_cold_scrollback(resumed2));
+    assert_eq!(store.history_chain(resumed2), [resumed2]);
+    assert_eq!(store.archive(resumed2).unwrap().len(), 0);
+    fs::remove_dir_all(root).ok();
+}

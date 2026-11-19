@@ -407,8 +407,7 @@ impl Lease {
         let child = self.child.lock().ok().and_then(|mut guard| guard.take());
         if let Some(mut child) = child {
             let pid = child.id();
-            child.kill().ok();
-            child.wait().ok();
+            terminate_tunnel_child(&mut child);
             self.slot.forget_child(pid);
         }
     }
@@ -470,8 +469,7 @@ impl Lease {
             && let Some(mut process) = child.take()
         {
             let pid = process.id();
-            process.kill().ok();
-            process.wait().ok();
+            terminate_tunnel_child(&mut process);
             self.slot.forget_child(pid);
         }
         if let Some(process) = child.as_mut() {
@@ -570,8 +568,7 @@ impl Lease {
                 });
                 if let Some(mut child) = child {
                     let pid = child.id();
-                    child.kill().ok();
-                    child.wait().ok();
+                    terminate_tunnel_child(&mut child);
                     lease.slot.forget_child(pid);
                 }
             })
@@ -616,6 +613,31 @@ impl Drop for Lease {
     }
 }
 
+fn terminate_tunnel_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        crate::platform::background_command("/bin/kill")
+            .args(["-TERM", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+    child.kill().ok();
+    child.wait().ok();
+}
+
 fn reap_child(slot: &Slot, pending: &Mutex<Option<Child>>) {
     if let Some(mut child) = pending
         .lock()
@@ -623,8 +645,7 @@ fn reap_child(slot: &Slot, pending: &Mutex<Option<Child>>) {
         .take()
     {
         let pid = child.id();
-        child.kill().ok();
-        child.wait().ok();
+        terminate_tunnel_child(&mut child);
         slot.forget_child(pid);
     }
 }
@@ -806,5 +827,44 @@ mod tests {
             .is_some_and(|child| child.try_wait().unwrap().is_none());
         lease.stop_blocking();
         assert!(alive, "an old stop request killed the reconnected child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_blocking_delivers_sigterm_before_falling_back_to_sigkill() {
+        let dir = std::env::temp_dir().join(format!("krill-link-term-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let ready = dir.join("ready");
+        let cleaned = dir.join("cleaned");
+        let child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap 'printf term > \"$2\"; exit 0' TERM; printf ok > \"$1\"; while :; do sleep 0.02; done",
+                "sh",
+            ])
+            .arg(&ready)
+            .arg(&cleaned)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let wait_ready = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < wait_ready {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "child shell must arm SIGTERM trap");
+
+        let lease = lease();
+        let pid = child.id();
+        lease.slot.owned.lock().unwrap().insert(pid);
+        *lease.slot.children.pending.lock().unwrap() = 1;
+        *lease.child.lock().unwrap() = Some(child);
+
+        lease.stop_blocking();
+        assert_eq!(std::fs::read_to_string(&cleaned).unwrap(), "term");
+        assert_eq!(*lease.slot.children.pending.lock().unwrap(), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

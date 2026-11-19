@@ -164,8 +164,7 @@ test('mobile reuses transactional conflicts, shared native quotas, and 30-day qu
 test('mobile preflight admits only canonical PWA, loopback and Tailscale origins, never credentials', async t => {
   const env = environment(t);
   for (const origin of [ORIGIN, 'http://localhost:3000', 'https://localhost', 'http://127.0.0.1:9123',
-    'http://127.9.8.7:8080', 'http://[::1]:9123', 'https://100.64.0.0:9123', 'http://100.127.255.255:9123',
-    'https://a.trycloudflare.com', 'https://example-random-123.trycloudflare.com']) {
+    'http://127.9.8.7:8080', 'http://[::1]:9123', 'https://100.64.0.0:9123', 'http://100.127.255.255:9123']) {
     const response = await worker.fetch(new Request('https://errors.test/v1/mobile-events', {method: 'OPTIONS', headers: {
       origin, 'access-control-request-method': 'POST', 'access-control-request-headers': 'Content-Type',
     }}), env);
@@ -178,10 +177,7 @@ test('mobile preflight admits only canonical PWA, loopback and Tailscale origins
     'http://localhost.evil.test', 'http://100.63.255.255:9123', 'http://100.128.0.0:9123',
     'http://192.168.1.2:9123', 'https://user:secret@localhost:3000', 'http://127.1:3000', 'http://0x7f000001:3000',
     'ftp://localhost', 'https://krill-mobile.pages.dev:444', 'http://[::ffff:7f00:1]:9123',
-    'http://example.trycloudflare.com', 'https://example.trycloudflare.com:444',
-    'https://example.trycloudflare.com:443', 'https://sub.example.trycloudflare.com',
-    'https://example.trycloudflare.com.evil.test', 'https://-bad.trycloudflare.com',
-    'https://bad-.trycloudflare.com', 'https://bad_name.trycloudflare.com', 'https://secret@example.trycloudflare.com']) {
+    'https://a.trycloudflare.com', 'https://example-random-123.trycloudflare.com']) {
     const response = await send(env, [event()], {headers: {origin}});
     assert.equal(response.status, 403, origin); assert.equal(response.headers.get('access-control-allow-origin'), null);
     assert.equal((await response.text()).includes(origin), false);
@@ -286,4 +282,30 @@ test('sanitized stack frames enforce closed public-file positions, bounded count
     assert.equal(response.status, 400, JSON.stringify(stack_frames)); cors(response);
   }
   assert.equal(rows(env).length, 2);
+});
+
+test('mobile stats sample_detail picks modal reason and breaks ties away from unknown', async t => {
+  const env = environment(t), now = Math.floor(Date.now() / 1000);
+  await ingest(env.DB, validateMobile({schema_version: 1, events: [
+    event(1, {error_code: 'mobile_connect_failed', diagnostics: {reason: 'websocket_closed'}}),
+    event(2, {error_code: 'mobile_connect_failed', diagnostics: {reason: 'websocket_closed'}}),
+    event(3, {error_code: 'mobile_connect_failed', diagnostics: {reason: 'websocket_closed'}}),
+    event(4, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'auth_required'}}),
+    event(5, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'auth_required'}}),
+    event(6, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'auth_required'}}),
+    event(7, {error_code: 'mobile_rpc_failed', diagnostics: {reason: 'auth_rejected'}}),
+    event(8, {error_code: 'mobile_rpc_failed', diagnostics: {reason: 'auth_rejected'}}),
+  ]}), now - 10);
+  await ingest(env.DB, validateMobile({schema_version: 1, events: [
+    event(9, {error_code: 'mobile_connect_failed', diagnostics: {reason: 'websocket_error'}}),
+    event(10, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'timeout'}}),
+    event(11, {error_code: 'mobile_auth_failed', diagnostics: {reason: 'unknown'}}),
+    event(12, {error_code: 'mobile_rpc_failed', diagnostics: {reason: 'unknown'}}),
+    event(13, {error_code: 'mobile_rpc_failed', diagnostics: {reason: 'unknown'}}),
+  ]}), now);
+  const stats = await (await admin(env, '/api/stats')).json();
+  const byCode = Object.fromEntries(stats.details.map(g => [g.error_code, g.sample_detail]));
+  assert.equal(byCode.mobile_connect_failed, 'websocket_closed');
+  assert.equal(byCode.mobile_auth_failed, 'auth_required');
+  assert.equal(byCode.mobile_rpc_failed, 'auth_rejected');
 });

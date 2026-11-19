@@ -18,6 +18,16 @@ type Stamp = Vec<Option<SystemTime>>;
 type Cached = (Instant, Stamp, Option<AuthStatus>);
 static STATES: Mutex<BTreeMap<CacheKey, ConnectionStatus>> = Mutex::new(BTreeMap::new());
 
+fn connection_from_auth(status: Option<&AuthStatus>) -> ConnectionStatus {
+    status.map_or(ConnectionStatus::CheckFailed, |s| {
+        if s.logged_in {
+            ConnectionStatus::Connected
+        } else {
+            ConnectionStatus::NeedsLogin
+        }
+    })
+}
+
 pub(super) fn connection(provider: ProviderKind, dir: &Path) -> ConnectionStatus {
     lock(&STATES)
         .get(&(provider, dir.to_path_buf()))
@@ -91,22 +101,15 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
                         home.to_path_buf(),
                         state.map(Path::to_path_buf),
                     );
+                } else if !lock(&PROBING).contains(&key) {
+                    lock(&STATES).insert(key.clone(), connection_from_auth(status.as_ref()));
                 }
                 status
             }
             _ if provider == ProviderKind::Antigravity => {
-                let status = super::super::direct::antigravity_auth(&dir, false);
+                let status = super::super::direct::antigravity_auth_file(&dir, host);
                 if !host || status.as_ref().is_some_and(|s| s.logged_in) {
-                    lock(&STATES).insert(
-                        key.clone(),
-                        status.as_ref().map_or(ConnectionStatus::CheckFailed, |s| {
-                            if s.logged_in {
-                                ConnectionStatus::Connected
-                            } else {
-                                ConnectionStatus::NeedsLogin
-                            }
-                        }),
-                    );
+                    lock(&STATES).insert(key.clone(), connection_from_auth(status.as_ref()));
                     lock(&CACHE).insert(key.clone(), (Instant::now(), stamp, status.clone()));
                     if !host {
                         super::super::provision::provision_if_enabled(
@@ -154,6 +157,10 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
 /// 같은 프로필은 한 번에 하나만 조회한다.
 static PROBING: Mutex<BTreeSet<CacheKey>> = Mutex::new(BTreeSet::new());
 
+pub(super) fn evict_profile(provider: ProviderKind, dir: &Path) {
+    lock(&CACHE).remove(&(provider, dir.to_path_buf()));
+}
+
 fn spawn_probe(
     exe: PathBuf,
     key: &CacheKey,
@@ -191,20 +198,12 @@ fn spawn_probe(
             })
             .ok()
             .flatten();
-            lock(&STATES).insert(
-                job.clone(),
-                status.as_ref().map_or(ConnectionStatus::CheckFailed, |s| {
-                    if s.logged_in {
-                        ConnectionStatus::Connected
-                    } else {
-                        ConnectionStatus::NeedsLogin
-                    }
-                }),
-            );
+            let conn = connection_from_auth(status.as_ref());
             let mut cache = lock(&CACHE);
             cache.retain(|_, (at, _, _)| at.elapsed() < Duration::from_secs(300));
             cache.insert(job.clone(), (Instant::now(), stamp, status));
             drop(cache);
+            lock(&STATES).insert(job.clone(), conn);
             // 기록 이행은 별도 작업으로 보낸다. 사용 중이던 프로필도 종료 후 다음 조회에서 재시도한다.
             if !host
                 && matches!(
@@ -223,7 +222,7 @@ fn spawn_probe(
         });
     if let Err(error) = spawned {
         lock(&STATES).insert(key.clone(), ConnectionStatus::CheckFailed);
-        tracing::warn!(%error, "account auth probe thread failed to start");
+        tracing::warn!(kind = ?error.kind(), errno = error.raw_os_error(), "account auth probe thread failed to start");
         lock(&PROBING).remove(key);
     }
 }
@@ -320,7 +319,8 @@ mod tests {
             )
             .unwrap();
         };
-        // Host credentials must never fill an unauthenticated isolated profile.
+        // Host credentials must never fill an unauthenticated isolated profile,
+        // while the host account itself resolves its email from the host token file synchronously.
         let host = host_default_dir(&home, ProviderKind::Antigravity);
         std::fs::create_dir_all(&host).unwrap();
         std::fs::write(
@@ -329,6 +329,13 @@ mod tests {
         )
         .unwrap();
         assert!(emails().values().all(Option::is_none));
+        assert_eq!(
+            statuses(&home, Some(&state))
+                .get(&(ProviderKind::Antigravity, host.clone()))
+                .and_then(|s| s.identity.as_ref())
+                .map(|i| i.email.as_str()),
+            Some("host@example.test")
+        );
         write_token(&one, "one@example.test");
         write_token(&two, "two@example.test");
         assert_eq!(

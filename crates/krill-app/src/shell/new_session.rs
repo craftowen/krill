@@ -266,18 +266,18 @@ impl Shell {
                 .get()
                 .to_owned(),
         )];
-        for host in self.sidebar.read(cx).remote_hosts() {
-            if host.status == krill_app::hosts::HostStatus::Connected {
-                out.push((
-                    krill_app::hosts::HostId::Remote(host.id.clone()),
-                    host.label.clone(),
-                ));
-            }
+        let sidebar = self.sidebar.read(cx);
+        for host in sidebar.connected_remote_hosts() {
+            out.push((
+                krill_app::hosts::HostId::Remote(host.id.clone()),
+                host.label.clone(),
+            ));
         }
         for (spec, status) in &self.host_statuses {
             let id = krill_app::hosts::HostId::Remote(spec.id.clone());
             if *status == krill_app::hosts::HostStatus::Connected
                 && !out.iter().any(|(h, _)| h == &id)
+                && !sidebar.is_suppressed_remote_host(&id)
             {
                 out.push((id, spec.display_name().to_owned()));
             }
@@ -332,6 +332,7 @@ impl Shell {
         .dropdown_menu(move |mut menu, window, cx| {
             menu = menu
                 .action_context(focus.clone())
+                .scrollable(true)
                 .min_w(gpui::px(220.))
                 .item(
                     PopupMenuItem::new(text::NEW_TERMINAL.get())
@@ -470,10 +471,13 @@ impl Shell {
                     icons::FILES_SVG,
                     krill_app::i18n::catalog::artifacts::TITLE.get(),
                 )
-                .when(self.artifacts.is_some(), |d| {
-                    d.bg(p.sidebar_accent)
-                        .text_color(p.sidebar_accent_foreground)
-                })
+                .when(
+                    matches!(self.modal, Some(super::Modal::Artifacts(_))),
+                    |d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    },
+                )
                 .on_click(cx.listener(|this, _, window, cx| this.open_artifacts(Some(window), cx))),
             )
             .when(show_automations, |d| {
@@ -486,14 +490,14 @@ impl Shell {
                     )
                     .debug_selector(|| "nav-automations".into())
                     .when(
-                        self.automations.is_some() || self.automations_page_open(cx),
+                        matches!(self.modal, Some(super::Modal::Automations(_))),
                         |d| {
                             d.bg(p.sidebar_accent)
                                 .text_color(p.sidebar_accent_foreground)
                         },
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_automations_page(Some(window), cx);
+                        this.open_automations(Some(window), cx);
                     }))
                     .context_menu(|menu, _, _| {
                         menu.item(

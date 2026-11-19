@@ -43,11 +43,11 @@ fn expiry_rotation_one_time_and_rate_limit() {
             .is_err()
     );
     for _ in 0..5 {
-        d.attempt(20).unwrap();
+        d.attempt(20, None).unwrap();
     }
     d.mint(21, true).unwrap();
-    assert!(d.attempt(21).is_err());
-    assert!(d.attempt(60_020).is_ok());
+    assert!(d.attempt(21, None).is_err());
+    assert!(d.attempt(60_020, None).is_ok());
     let t = d.mint(60_020, true).unwrap();
     d.pair(&t.token, "phone", 60_021).unwrap();
     assert!(d.ticket(60_022).is_none());

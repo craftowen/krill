@@ -38,6 +38,7 @@ scp "${scp_opts[@]}" "$src" "$host:C:/krill-release/src.tar.gz" >>"$log" 2>&1
   Set-Location C:\krill-release\src
   \$env:CARGO_TARGET_DIR = 'C:\krill-release\target'
   & .\packaging\windows\build.ps1 -Version '$version' -PublicKey '$pubkey' -UpdateUrl '$update_url'
+  & .\packaging\windows\defender-scan.ps1 -Zip 'packaging\dist\\$zip'
   & .\packaging\windows\smoke.ps1 -Zip 'packaging\dist\\$zip'" >>"$log" 2>&1 || { echo "FAILED windows-x64 (see $log)" >&2; exit 1; }
 scp "${scp_opts[@]}" "$host:C:/krill-release/src/packaging/dist/$zip" "$host:C:/krill-release/src/packaging/dist/$zip.sha256" "$out/" >>"$log" 2>&1
 grep -a 'smoke ok:' "$log" | tr -d '\r' || true

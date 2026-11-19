@@ -1,9 +1,9 @@
 //! 계정 카드와 상태바가 함께 쓰는 사용량·상태 표시(OWE-703).
 
-use crate::i18n::catalog::settings as text;
+use crate::i18n::catalog::{daemon_notice, settings as text};
 use krill_proto::usage::{
-    AccountInfo, AccountStatus, AccountStatusInfo, AccountsSnapshot, ConnectionStatus, Snapshot,
-    Window,
+    AccountInfo, AccountStatus, AccountStatusInfo, AccountsSnapshot, ConnectionStatus,
+    ProviderKind, Snapshot, Window,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +123,27 @@ pub fn meter_value(meter: &krill_proto::usage::UsageMeter, now: u64) -> Option<S
     })
 }
 
+/// 남은 리셋 크레딧 수. 미터가 아직 없으면 `None`.
+pub fn reset_credits(meters: Option<&krill_proto::usage::AccountMeters>) -> Option<u64> {
+    meters?
+        .meters
+        .iter()
+        .find(|m| m.key == krill_proto::usage::RESET_CREDITS_METER_KEY)?
+        .value
+        .as_deref()?
+        .parse()
+        .ok()
+}
+
+/// 사용량 초기화를 지금 누를 수 있는가: 크레딧이 남아 있고 되돌릴 사용량이 있어야 한다.
+pub fn reset_available(meters: Option<&krill_proto::usage::AccountMeters>, now: u64) -> bool {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    reset_credits(meters).is_some_and(|credits| credits > 0)
+        && meters
+            .and_then(|m| m.effective_max(now))
+            .is_some_and(|used| used > 0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountDisplay {
     pub status: AccountStatus,
@@ -134,18 +155,31 @@ pub struct AccountDisplay {
 
 pub fn account(info: &AccountInfo, status: Option<&AccountStatusInfo>, now: u64) -> AccountDisplay {
     // N-1 데몬은 꼬리가 없으므로 기존 stale·사용량에서 보수적으로 표시한다.
-    let kind = status.map_or_else(
-        || {
-            if info.stale {
-                AccountStatus::Stale
-            } else if info.usage.is_empty() {
-                AccountStatus::Unknown
-            } else {
-                AccountStatus::Ok
-            }
-        },
-        |s| s.status,
-    );
+    let opencode_host_default_403 = info.provider == ProviderKind::OpenCode
+        && info.host_default
+        && status.is_some_and(|s| {
+            s.status == AccountStatus::Error
+                && s.detail.as_deref().is_some_and(|raw| {
+                    let lower = raw.to_ascii_lowercase();
+                    lower.contains("denied access") || lower.contains("403")
+                })
+        });
+    let kind = if opencode_host_default_403 {
+        AccountStatus::Unknown
+    } else {
+        status.map_or_else(
+            || {
+                if info.stale {
+                    AccountStatus::Stale
+                } else if info.usage.is_empty() {
+                    AccountStatus::Unknown
+                } else {
+                    AccountStatus::Ok
+                }
+            },
+            |s| s.status,
+        )
+    };
     let label = match kind {
         AccountStatus::Unknown => text::ACCOUNT_STATUS_UNKNOWN,
         AccountStatus::Stale => text::ACCOUNT_STATUS_STALE,
@@ -163,11 +197,15 @@ pub fn account(info: &AccountInfo, status: Option<&AccountStatusInfo>, now: u64)
         faded: info.stale
             || kind == AccountStatus::Stale
             || krill_proto::usage::is_updated_stale(updated, now),
-        detail: status
-            .and_then(|s| s.detail.as_deref())
-            .map(str::trim)
-            .filter(|detail| !detail.is_empty())
-            .map(str::to_owned),
+        detail: if opencode_host_default_403 {
+            Some(daemon_notice::USAGE_UNSUPPORTED.get().to_owned())
+        } else {
+            status
+                .and_then(|s| s.detail.as_deref())
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty())
+                .map(crate::i18n::cached_notice)
+        },
     }
 }
 
@@ -303,6 +341,47 @@ pub fn render_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reset_requires_a_known_credit_and_usage_to_reset() {
+        use krill_proto::usage::{AccountMeters, UsageMeter};
+        let meters = |credits: Option<&str>, percent: Option<u8>, resets_at: Option<&str>| {
+            let mut meters = Vec::new();
+            if let Some(percent) = percent {
+                meters.push(UsageMeter {
+                    key: "seven_day".into(),
+                    label: "7d".into(),
+                    window: Some(Window {
+                        percent,
+                        resets_at: resets_at.map(str::to_owned),
+                    }),
+                    value: None,
+                });
+            }
+            if let Some(credits) = credits {
+                meters.push(UsageMeter {
+                    key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
+                    label: "Reset credits".into(),
+                    window: None,
+                    value: Some(credits.into()),
+                });
+            }
+            AccountMeters {
+                meters,
+                ..AccountMeters::default()
+            }
+        };
+        let can = |m: &AccountMeters| reset_available(Some(m), 1000);
+        assert!(!reset_available(None, 1000), "미터 조회 전");
+        assert!(!can(&meters(None, Some(50), None)), "크레딧 모름");
+        assert!(!can(&meters(Some("0"), Some(50), None)), "크레딧 없음");
+        assert!(!can(&meters(Some("1"), None, None)), "사용량 모름");
+        assert!(
+            !can(&meters(Some("1"), Some(0), None)),
+            "되돌릴 사용량 없음"
+        );
+        assert!(!can(&meters(Some("1"), Some(50), Some("999"))), "창 리셋됨");
+        assert!(can(&meters(Some("1"), Some(50), Some("2000"))));
+    }
 
     #[test]
     fn reset_credit_expiry_shows_date_timezone_unknown_and_expired() {
@@ -481,11 +560,26 @@ mod tests {
         status.detail = Some("  usage API returned HTTP 403  ".into());
         assert_eq!(
             account(&info, Some(&status), 5000).detail.as_deref(),
-            Some("usage API returned HTTP 403")
+            Some(daemon_notice::USAGE_HTTP_403.get())
+        );
+        status.detail = Some("  Custom notice  ".into());
+        assert_eq!(
+            account(&info, Some(&status), 5000).detail.as_deref(),
+            Some("Custom notice")
         );
         status.detail = Some(" \n ".into());
         assert!(account(&info, Some(&status), 5000).detail.is_none());
         assert!(account(&info, None, 5000).detail.is_none());
+        info.provider = ProviderKind::OpenCode;
+        info.host_default = true;
+        status.status = AccountStatus::Error;
+        status.detail = Some("Usage API denied access (HTTP 403)".into());
+        let opencode_display = account(&info, Some(&status), 5000);
+        assert_eq!(opencode_display.status, AccountStatus::Unknown);
+        assert_eq!(
+            opencode_display.detail.as_deref(),
+            Some(daemon_notice::USAGE_UNSUPPORTED.get())
+        );
         assert_eq!(
             updated_text(None, 5000),
             text::ACCOUNT_UPDATED_UNKNOWN.get()

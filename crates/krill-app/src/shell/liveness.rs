@@ -172,6 +172,20 @@ impl Shell {
         });
         krill_app::link::stalled_banner(stalled)
     }
+
+    /// A visible pane whose launch is stuck in login shell startup (daemon `startup_stall`).
+    pub(super) fn startup_stall_banner(&self, cx: &App) -> Option<String> {
+        let sidebar = self.sidebar.read(cx);
+        self.layout.visible().into_iter().find_map(|pane| {
+            let session = self.layout.session(pane)?;
+            let command = sidebar
+                .session_on(self.layout.host(pane), session)?
+                .status
+                .startup_stall
+                .as_deref()?;
+            Some(text::AGENT_STARTUP_STALLED.format(&[("command", command)]))
+        })
+    }
 }
 
 #[cfg(all(test, unix))]

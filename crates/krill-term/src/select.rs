@@ -59,8 +59,27 @@ impl Selection {
         Some(cell.ch)
     }
 
+    fn row_wraps(screen: &Screen, line: u16) -> bool {
+        screen.cols > 0
+            && screen.rows.get(usize::from(line)).is_some_and(|row| {
+                row.len() == usize::from(screen.cols)
+                    && row
+                        .last()
+                        .is_some_and(|c| c.flags.contains(Flags::WRAPLINE))
+            })
+    }
+
+    fn is_leading_wide_spacer(row: &[Cell], col: u16) -> bool {
+        row.get(usize::from(col))
+            .is_some_and(|c| c.flags.contains(Flags::SPACER))
+            && (col == 0
+                || !row
+                    .get(usize::from(col) - 1)
+                    .is_some_and(|p| p.flags.contains(Flags::WIDE)))
+    }
+
     /// `at` 칸이 속한 단어 구간(OWE-866, 더블클릭). 구분자·공백을 누르면 그 한 칸만.
-    /// 항상 `anchor <= head` 순서로 돌려준다.
+    /// 자동 줄바꿈([`Flags::WRAPLINE`])된 인접 행의 단어도 이어서 선택하며 항상 `anchor <= head` 순서다.
     pub fn word_at(screen: &Screen, at: Point) -> Self {
         if screen.cols == 0 {
             return Self::new(at);
@@ -80,73 +99,124 @@ impl Selection {
         }
         let at = Point {
             line: at.line,
-            ..at
+            column: col,
         };
-        let at = Point { column: col, ..at };
         let is_word = Self::cell_char(screen, at.line, at.column).is_some_and(Self::is_word_char);
         if !is_word {
             return Self::new(at);
         }
+        let mut start_line = at.line;
         let mut first = at.column;
-        while first > 0
-            && Self::cell_char(screen, at.line, first - 1).is_some_and(Self::is_word_char)
-        {
-            first -= 1;
-        }
-        let mut last = at.column;
-        while last + 1 < cols
-            && Self::cell_char(screen, at.line, last + 1).is_some_and(Self::is_word_char)
-        {
-            last += 1;
-        }
-        // 2칸 글자 경계에 걸치면 그 글자 전체를 포함한다(복사 `text()`도 같은 규칙).
-        if let Some(row) = screen.rows.get(usize::from(at.line)) {
-            if row
-                .get(usize::from(last))
-                .is_some_and(|c| c.flags.contains(Flags::WIDE))
-                && last + 1 < cols
-                && row
-                    .get(usize::from(last) + 1)
-                    .is_some_and(|c| c.flags.contains(Flags::SPACER))
-            {
-                last += 1;
-            }
-            if row
-                .get(usize::from(first))
-                .is_some_and(|c| c.flags.contains(Flags::SPACER))
-                && first > 0
-                && row
-                    .get(usize::from(first) - 1)
-                    .is_some_and(|c| c.flags.contains(Flags::WIDE))
+        loop {
+            while first > 0
+                && Self::cell_char(screen, start_line, first - 1).is_some_and(Self::is_word_char)
             {
                 first -= 1;
             }
+            if first == 0 && start_line > 0 && Self::row_wraps(screen, start_line - 1) {
+                let prev_line = start_line - 1;
+                let prev_col = if cols >= 2
+                    && screen
+                        .rows
+                        .get(usize::from(prev_line))
+                        .is_some_and(|r| Self::is_leading_wide_spacer(r, cols - 1))
+                {
+                    cols - 2
+                } else {
+                    cols - 1
+                };
+                if Self::cell_char(screen, prev_line, prev_col).is_some_and(Self::is_word_char) {
+                    start_line = prev_line;
+                    first = prev_col;
+                    continue;
+                }
+            }
+            break;
+        }
+        let max_lines = usize::from(screen.lines).min(screen.rows.len());
+        let mut end_line = at.line;
+        let mut last = at.column;
+        loop {
+            while last + 1 < cols
+                && Self::cell_char(screen, end_line, last + 1).is_some_and(Self::is_word_char)
+            {
+                last += 1;
+            }
+            let wraps_from_here = last + 1 == cols
+                || (last + 2 == cols
+                    && screen
+                        .rows
+                        .get(usize::from(end_line))
+                        .is_some_and(|r| Self::is_leading_wide_spacer(r, cols - 1)));
+            if wraps_from_here
+                && usize::from(end_line) + 1 < max_lines
+                && Self::row_wraps(screen, end_line)
+                && Self::cell_char(screen, end_line + 1, 0).is_some_and(Self::is_word_char)
+            {
+                end_line += 1;
+                last = 0;
+            } else {
+                break;
+            }
+        }
+        // 2칸 글자 경계에 걸치면 그 글자 전체를 포함한다(복사 `text()`도 같은 규칙).
+        if let Some(row) = screen.rows.get(usize::from(end_line))
+            && row
+                .get(usize::from(last))
+                .is_some_and(|c| c.flags.contains(Flags::WIDE))
+            && last + 1 < cols
+            && row
+                .get(usize::from(last) + 1)
+                .is_some_and(|c| c.flags.contains(Flags::SPACER))
+        {
+            last += 1;
+        }
+        if let Some(row) = screen.rows.get(usize::from(start_line))
+            && row
+                .get(usize::from(first))
+                .is_some_and(|c| c.flags.contains(Flags::SPACER))
+            && first > 0
+            && row
+                .get(usize::from(first) - 1)
+                .is_some_and(|c| c.flags.contains(Flags::WIDE))
+        {
+            first -= 1;
         }
         Self {
             anchor: Point {
-                line: at.line,
+                line: start_line,
                 column: first,
             },
             head: Point {
-                line: at.line,
+                line: end_line,
                 column: last,
             },
             block: false,
         }
     }
 
-    /// `at` 행 전체(OWE-866, 트리플클릭). 항상 `anchor <= head` 순서로 돌려준다.
+    /// `at` 논리 행 전체(OWE-866, 트리플클릭). 자동 줄바꿈([`Flags::WRAPLINE`])으로 이어진 행을 모두 포함한다.
+    /// 항상 `anchor <= head` 순서로 돌려준다.
     pub fn line_at(screen: &Screen, at: Point) -> Self {
         if screen.cols == 0 {
             return Self::new(at);
         }
+        let max_lines = usize::from(screen.lines).min(screen.rows.len());
+        let mut start_line = at.line;
+        while start_line > 0 && Self::row_wraps(screen, start_line - 1) {
+            start_line -= 1;
+        }
+        let mut end_line = at.line;
+        while usize::from(end_line) + 1 < max_lines && Self::row_wraps(screen, end_line) {
+            end_line += 1;
+        }
         Self {
             anchor: Point {
-                line: at.line,
+                line: start_line,
                 column: 0,
             },
             head: Point {
-                line: at.line,
+                line: end_line,
                 column: screen.cols - 1,
             },
             block: false,
@@ -961,6 +1031,60 @@ mod tests {
             }
         );
         assert_eq!(line.text(&s), "ab");
+    }
+
+    #[test]
+    fn word_at_and_line_at_follow_soft_wrapped_rows() {
+        let mut s = screen(
+            &[
+                "$ open /Us",
+                "ers/macmin",
+                "i/file.rs ",
+                "echo start",
+                " --verbose",
+                "done",
+            ],
+            10,
+        );
+        s.rows[0][9].flags = Flags::WRAPLINE;
+        s.rows[1][9].flags = Flags::WRAPLINE;
+        s.rows[3][9].flags = Flags::WRAPLINE;
+
+        for pt in [
+            Point { line: 0, column: 8 },
+            Point { line: 1, column: 4 },
+            Point { line: 2, column: 3 },
+        ] {
+            let word = Selection::word_at(&s, pt);
+            assert_eq!(word, sel((0, 7), (2, 8)), "pt {pt:?}");
+            assert_eq!(word.text(&s), "/Users/macmini/file.rs");
+        }
+
+        for row in [0, 1, 2] {
+            let line = Selection::line_at(
+                &s,
+                Point {
+                    line: row,
+                    column: 2,
+                },
+            );
+            assert_eq!(line, sel((0, 0), (2, 9)), "row {row}");
+            assert_eq!(line.text(&s), "$ open /Users/macmini/file.rs");
+        }
+        for row in [3, 4] {
+            let line = Selection::line_at(
+                &s,
+                Point {
+                    line: row,
+                    column: 1,
+                },
+            );
+            assert_eq!(line, sel((3, 0), (4, 9)), "row {row}");
+            assert_eq!(line.text(&s), "echo start --verbose");
+        }
+        let trailing = Selection::line_at(&s, Point { line: 5, column: 0 });
+        assert_eq!(trailing, sel((5, 0), (5, 9)));
+        assert_eq!(trailing.text(&s), "done");
     }
 
     /// OWE-866: 2칸 글자 위 더블클릭은 그 글자를 포함한다.

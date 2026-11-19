@@ -205,10 +205,20 @@ pub enum OwnCommand {
     Foreign,
 }
 
+/// Executable word. Without Git Bash, Claude Code runs the Windows status line in PowerShell,
+/// so Windows uses a form both shells read ([`crate::agent::hooks::windows_shell_word`]).
+fn exe_word(exe: &str) -> String {
+    if cfg!(windows) {
+        crate::agent::hooks::windows_shell_word(exe)
+    } else {
+        shell_quote(exe)
+    }
+}
+
 /// 설치 명령(체인 없음).
 #[must_use]
 pub fn install_command(exe: &str) -> String {
-    format!("{} {SUBCOMMAND}", shell_quote(exe))
+    format!("{} {SUBCOMMAND}", exe_word(exe))
 }
 
 /// 설치 명령(사용자 원본을 체인으로 보존).
@@ -216,23 +226,37 @@ pub fn install_command(exe: &str) -> String {
 pub fn chain_command(exe: &str, user_command: &str) -> String {
     format!(
         "{} {SUBCOMMAND} --chain {}",
-        shell_quote(exe),
+        exe_word(exe),
         shell_quote(user_command)
     )
 }
 
 /// Krill 설치 명령을 구조로 판별한다. 엄격한 형식 일치만 우리 것으로 본다.
+/// Windows에서 예전에 설치한 POSIX 인용 모양(`'C:\…\krill.exe' statusline`)과 8.3 짧은 경로 모양도 우리 것이다.
 #[must_use]
 pub fn classify_command(cmd: &str, exe: &str) -> OwnCommand {
-    let quoted = shell_quote(exe);
-    if cmd.trim() == format!("{quoted} {SUBCOMMAND}") {
-        return OwnCommand::Bare;
+    let cmd = cmd.trim();
+    let mut words = vec![shell_quote(exe)];
+    if cfg!(windows) {
+        words.extend(crate::agent::hooks::plain_word(exe));
+        // 8.3 짧은 경로로 설치한 단어는 같은 파일인지로 확인한다(짧은 경로를 다시 구하지 않는다).
+        if let Some((first, _)) = cmd.split_once(' ')
+            && !words.iter().any(|w| w == first)
+            && crate::agent::hooks::same_file(first, exe)
+        {
+            words.push(first.to_owned());
+        }
     }
-    let chained_prefix = format!("{quoted} {SUBCOMMAND} --chain ");
-    if let Some(rest) = cmd.trim().strip_prefix(chained_prefix.as_str())
-        && let Some(original) = decode_shell_arg(rest)
-    {
-        return OwnCommand::Chained(original);
+    for word in words {
+        if cmd == format!("{word} {SUBCOMMAND}") {
+            return OwnCommand::Bare;
+        }
+        let chained_prefix = format!("{word} {SUBCOMMAND} --chain ");
+        if let Some(rest) = cmd.strip_prefix(chained_prefix.as_str())
+            && let Some(original) = decode_shell_arg(rest)
+        {
+            return OwnCommand::Chained(original);
+        }
     }
     OwnCommand::Foreign
 }
@@ -258,10 +282,10 @@ pub fn read_slot(text: Option<&str>) -> io::Result<Option<serde_json::Value>> {
     let Some(text) = text else {
         return Ok(None);
     };
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| invalid(format!("settings.json 파싱 실패: {e}")))?;
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| invalid(format!("Failed to parse settings.json: {e}")))?;
     if !value.is_object() {
-        return Err(invalid("settings.json은 객체여야 합니다"));
+        return Err(invalid("settings.json must be an object"));
     }
     Ok(value.get("statusLine").cloned())
 }
@@ -380,7 +404,7 @@ pub fn apply_uninstall(
         );
     if !owned {
         return Err(invalid(
-            "statusLine이 Krill 설치 이후 바뀌었습니다; 덮어쓰지 않습니다",
+            "statusLine changed after Krill installed it; not overwriting",
         ));
     }
     let before_slot = match before {

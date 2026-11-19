@@ -156,7 +156,9 @@ impl Panel {
             .occlude()
             .track_focus(&confirmation.focus)
             .w(crate::ui::DIALOG_WIDTH)
-            .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
+            .max_w((window.viewport_size().width - crate::ui::SPACE_4 * 2.).max(gpui::px(0.)))
+            .max_h((window.viewport_size().height - crate::ui::SPACE_4 * 2.).max(gpui::px(0.)))
+            .overflow_hidden()
             .p_6()
             .rounded(crate::ui::RADIUS_LG)
             .bg(p.popover)
@@ -188,7 +190,9 @@ impl Panel {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.cancel_merge(cx)))
             .child(
                 div()
+                    .flex_none()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .child(
@@ -206,36 +210,48 @@ impl Panel {
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_merge(cx))),
                     ),
             )
-            .child(detail(
-                "pr-merge-repository",
-                text::MERGE_REPOSITORY.format(&[("repo", &pr.url)]),
-            ))
-            .child(detail(
-                "pr-merge-worktree",
-                text::MERGE_WORKTREE.format(&[("path", &confirmation.repo.display().to_string())]),
-            ))
-            .child(detail(
-                "pr-merge-branch",
-                text::MERGE_BRANCH.format(&[("branch", &confirmation.branch)]),
-            ))
-            .child(detail(
-                "pr-merge-number",
-                format!("PR #{} · {}", pr.number.unwrap_or_default(), pr.title),
-            ))
-            .child(detail(
-                "pr-merge-refs",
-                text::MERGE_REFS.format(&[
-                    ("base", &metadata.base_ref_name),
-                    ("head", &metadata.head_ref_name),
-                ]),
-            ))
-            .child(detail(
-                "pr-merge-method",
-                text::MERGE_METHOD.format(&[("method", method.get())]),
-            ))
             .child(
                 div()
+                    .id("pr-merge-details")
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(detail(
+                        "pr-merge-repository",
+                        text::MERGE_REPOSITORY.format(&[("repo", &pr.url)]),
+                    ))
+                    .child(detail(
+                        "pr-merge-worktree",
+                        text::MERGE_WORKTREE
+                            .format(&[("path", &confirmation.repo.display().to_string())]),
+                    ))
+                    .child(detail(
+                        "pr-merge-branch",
+                        text::MERGE_BRANCH.format(&[("branch", &confirmation.branch)]),
+                    ))
+                    .child(detail(
+                        "pr-merge-number",
+                        format!("PR #{} · {}", pr.number.unwrap_or_default(), pr.title),
+                    ))
+                    .child(detail(
+                        "pr-merge-refs",
+                        text::MERGE_REFS.format(&[
+                            ("base", &metadata.base_ref_name),
+                            ("head", &metadata.head_ref_name),
+                        ]),
+                    ))
+                    .child(detail(
+                        "pr-merge-method",
+                        text::MERGE_METHOD.format(&[("method", method.get())]),
+                    )),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_wrap()
                     .justify_end()
                     .gap_2()
                     .child(

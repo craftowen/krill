@@ -26,9 +26,9 @@ use crate::pair::{
     generate_invite_for_addr, read_pair_frame, write_pair_frame,
 };
 use crate::store::{
-    AllowedDevice, acquire_instance_lock, compact_endpoint_addr, load_allowed_node_set,
-    now_unix_ms, now_unix_secs, remove_device, sanitize_id_slug, upsert_device,
-    verify_and_consume_invite, write_atomic_0600, write_status_0600,
+    AllowedDevice, DEVICES_REL_PATH, acquire_instance_lock, compact_endpoint_addr,
+    load_allowed_node_set, now_unix_ms, now_unix_secs, remove_device, sanitize_id_slug,
+    upsert_device, verify_and_consume_invite, write_atomic_0600, write_status_0600,
 };
 use crate::{ALPN_LINK, ALPN_PAIR, Error};
 
@@ -230,8 +230,7 @@ fn save_bound_serve_port(state_dir: &Path, addr: &EndpointAddr) {
 
 /// 실행 중인 `krill-link serve`의 현재 `EndpointAddr`를 읽는다(없거나 프로세스가 죽었으면 `None`).
 pub fn read_live_server_addr(state_dir: &Path) -> Option<EndpointAddr> {
-    let ctl = state_dir.join(SERVE_CTL_SOCK_REL_PATH);
-    if !ctl.exists() {
+    if !is_serve_running(state_dir) {
         return None;
     }
     let ticket = fs::read_to_string(state_dir.join(SERVE_TICKET_REL_PATH)).ok()?;
@@ -338,6 +337,9 @@ enum ControlResponse {
         node_id: String,
         allowed_count: usize,
         active_peers: usize,
+        /// 서버 실행 파일의 `krill_proto::BUILD`. 이 필드가 없던 구 서버는 빈 값이다.
+        #[serde(default)]
+        build: String,
     },
     Err {
         message: String,
@@ -353,6 +355,8 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
     let krilld_sock = opts.effective_krilld_socket().map_err(Error::Io)?;
     let cfg = LinkConfig::load(&state_dir)?;
     let identity = DeviceIdentity::load_or_create(&state_dir)?;
+    let devices_path = state_dir.join(DEVICES_REL_PATH);
+    let mut devices_stamp = fs::metadata(&devices_path).and_then(|m| m.modified()).ok();
     let initial_allowed = load_allowed_node_set(&state_dir)?;
     let allowed = Arc::new(RwLock::new(initial_allowed));
     let rate_limiter = opts
@@ -445,6 +449,13 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
             tokio::select! {
                 _ = &mut shutdown_rx => break,
                 _=tick.tick()=> {
+                    // Revocation must not depend on the control socket, which can be absent or unreachable.
+                    let stamp = fs::metadata(&devices_path).and_then(|m| m.modified()).ok();
+                    if stamp != devices_stamp
+                        && reload_allowlist(&state_loop, &allowed_loop, &peers_loop, &streams_loop).await.is_ok()
+                    {
+                        devices_stamp = stamp;
+                    }
                     streams_loop.sweep();
                     let statuses = streams_loop.statuses();
                     if saved_status.as_ref() != Some(&statuses)
@@ -464,6 +475,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
                     let krilld_conn = Arc::clone(&krilld_arc);
                     let state_conn = state_loop.clone();
                     let rate_conn = Arc::clone(&rate_limiter);
+                    let server_id = endpoint.id();
                     tasks.spawn(async move {
                         let _permit=permit;
                         let Ok(accepting) = incoming.accept() else { return };
@@ -481,6 +493,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
                         } else if alpn == ALPN_PAIR {
                             handle_pair_connection(
                                 conn,
+                                server_id,
                                 state_conn,
                                 allowed_conn,
                                 rate_conn,
@@ -618,6 +631,28 @@ async fn accept_ctl_optional(listener: Option<&Listener>) -> Option<Stream> {
     }
 }
 
+/// `devices.toml`을 다시 읽고, 빠진 기기의 스트림과 연결을 끊는다.
+async fn reload_allowlist(
+    state_dir: &Path,
+    allowed: &Arc<RwLock<BTreeSet<EndpointId>>>,
+    active_peers: &ActivePeersMap,
+    streams: &crate::resume::registry::Registry,
+) -> Result<(), Error> {
+    let fresh = load_allowed_node_set(state_dir)?;
+    let removed_ids: Vec<EndpointId> = allowed
+        .read()
+        .map(|old| old.difference(&fresh).copied().collect())
+        .unwrap_or_default();
+    if let Ok(mut set) = allowed.write() {
+        *set = fresh;
+    }
+    for id in removed_ids {
+        streams.revoke(id);
+        disconnect_peer(active_peers, id).await;
+    }
+    Ok(())
+}
+
 async fn handle_ctl_stream(
     mut stream: Stream,
     state_dir: &Path,
@@ -653,45 +688,24 @@ async fn handle_ctl_stream(
                     message: format!("revoked {peer_id}"),
                 }
             } else {
-                if let Ok(fresh) = load_allowed_node_set(state_dir) {
-                    let removed_ids: Vec<EndpointId> = allowed
-                        .read()
-                        .map(|old| old.difference(&fresh).copied().collect())
-                        .unwrap_or_default();
-                    if let Ok(mut set) = allowed.write() {
-                        *set = fresh;
-                    }
-                    for id in removed_ids {
-                        streams.revoke(id);
-                        disconnect_peer(active_peers, id).await;
-                    }
-                }
+                reload_allowlist(state_dir, allowed, active_peers, streams)
+                    .await
+                    .ok();
                 ControlResponse::Ok {
                     message: "reloaded allowlist".to_owned(),
                 }
             }
         }
-        ControlRequest::Reload => match load_allowed_node_set(state_dir) {
-            Ok(fresh) => {
-                let removed_ids: Vec<EndpointId> = allowed
-                    .read()
-                    .map(|old| old.difference(&fresh).copied().collect())
-                    .unwrap_or_default();
-                if let Ok(mut set) = allowed.write() {
-                    *set = fresh;
-                }
-                for id in removed_ids {
-                    streams.revoke(id);
-                    disconnect_peer(active_peers, id).await;
-                }
-                ControlResponse::Ok {
+        ControlRequest::Reload => {
+            match reload_allowlist(state_dir, allowed, active_peers, streams).await {
+                Ok(()) => ControlResponse::Ok {
                     message: "reloaded".to_owned(),
-                }
+                },
+                Err(e) => ControlResponse::Err {
+                    message: e.to_string(),
+                },
             }
-            Err(e) => ControlResponse::Err {
-                message: e.to_string(),
-            },
-        },
+        }
         ControlRequest::Status => {
             let allowed_count = allowed.read().map_or(0, |s| s.len());
             let active_count = active_peers.lock().await.len();
@@ -699,6 +713,7 @@ async fn handle_ctl_stream(
                 node_id: node_id.to_owned(),
                 allowed_count,
                 active_peers: active_count,
+                build: krill_proto::BUILD.to_owned(),
             }
         }
         ControlRequest::Shutdown => {
@@ -764,6 +779,7 @@ async fn handle_link_connection(
 
 async fn handle_pair_connection(
     conn: Connection,
+    server_id: EndpointId,
     state_dir: PathBuf,
     allowed: Arc<RwLock<BTreeSet<EndpointId>>>,
     rate_limiter: Arc<PairRateLimiter>,
@@ -789,7 +805,7 @@ async fn handle_pair_connection(
 
     let cfg = LinkConfig::load(&state_dir).unwrap_or_default();
     let server_name = cfg.effective_server_name();
-    let host_id = sanitize_id_slug(&server_name, "host", &conn.alpn().len().to_string());
+    let host_id = sanitize_id_slug(&server_name, "host", &server_id.to_string());
 
     let verify_res = verify_and_consume_invite(&state_dir, &req.token, now_unix_ms());
     let resp = match verify_res {
@@ -868,6 +884,27 @@ pub fn is_serve_running(state_dir: &Path) -> bool {
     krill_proto::os::net::UnixStream::connect(ctl_path).is_ok()
 }
 
+/// 실행 중인 수신 서버의 빌드 식별자. 꺼져 있거나 응답이 없으면 `None`, 빌드를 알리지 않는 구 서버는 빈 문자열.
+pub async fn serve_build_command(state_dir: &Path) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = Stream::connect(state_dir.join(SERVE_CTL_SOCK_REL_PATH))
+            .await
+            .ok()?;
+        let request = serde_json::to_vec(&ControlRequest::Status).ok()?;
+        stream.write_all(&request).await.ok()?;
+        stream.shutdown().await.ok()?;
+        let mut reply = Vec::new();
+        stream.take(4097).read_to_end(&mut reply).await.ok()?;
+        match serde_json::from_slice::<ControlResponse>(&reply).ok()? {
+            ControlResponse::Status { build, .. } => Some(build),
+            _ => None,
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// 로컬 제어 소켓으로 수신 서버를 정상 종료한다. 이미 꺼져 있으면 성공한다.
 pub async fn shutdown_server_command(state_dir: &Path) -> Result<(), Error> {
     if !is_serve_running(state_dir) {
@@ -900,4 +937,45 @@ pub async fn shutdown_server_command(state_dir: &Path) -> Result<(), Error> {
     })
     .await
     .map_err(|_| Error::Timeout("incoming server shutdown"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    #[test]
+    fn read_live_server_addr_ignores_stale_ctl_socket_and_reads_live_listener() {
+        let dir = std::env::temp_dir().join(format!("mklink-live-addr-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::create_dir_all(dir.join("link")).unwrap();
+
+        let sk = SecretKey::generate();
+        let addr = EndpointAddr::new(sk.public()).with_ip_addr("127.0.0.1:41235".parse().unwrap());
+        let ticket = crate::pair::encode_addr_ticket(&addr).unwrap();
+        std::fs::write(dir.join(SERVE_TICKET_REL_PATH), ticket).unwrap();
+
+        // Stale non-listening ctl socket path left behind after an unclean exit must not look live.
+        let ctl = dir.join(SERVE_CTL_SOCK_REL_PATH);
+        std::fs::write(&ctl, b"stale").unwrap();
+        assert_eq!(read_live_server_addr(&dir), None);
+        std::fs::remove_file(&ctl).ok();
+
+        let _listener = krill_proto::os::net::UnixListener::bind(&ctl).unwrap();
+        assert_eq!(read_live_server_addr(&dir), Some(addr));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_ascii_server_names_with_distinct_endpoint_ids_do_not_collide() {
+        let id_a = SecretKey::generate().public();
+        let id_b = SecretKey::generate().public();
+        let slug_a = sanitize_id_slug("집 맥미니", "host", &id_a.to_string());
+        let slug_b = sanitize_id_slug("회사 맥", "host", &id_b.to_string());
+        assert!(slug_a.starts_with("host-"));
+        assert!(slug_b.starts_with("host-"));
+        assert_ne!(slug_a, slug_b);
+    }
 }

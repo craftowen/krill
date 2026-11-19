@@ -33,6 +33,10 @@ try {
     await delay(100);
   }
   assert.ok(ready, 'local Worker health within 20 seconds');
+  const feedback = await fetch(`${base}/v1/feedback`, {method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({message: 'http feedback', release: '0.3.8', os: 'macos', arch: 'aarch64'})});
+  assert.equal(feedback.status, 200, 'feedback must be stored in local D1');
+  assert.deepEqual(await feedback.json(), {ok: true});
   const e = {event_id: '00000000000000000000000000000001', process: 'krill-app',
     kind: 'operation_error', error_code: 'session_start_failed', release: '0.2.16', build_id: 'http-test',
     os: 'macos', arch: 'aarch64', source_loc: null, hang_bucket_ms: null, native: null};
@@ -75,7 +79,7 @@ try {
   const tunnel = 'https://sample-random-123.trycloudflare.com';
   response = await fetch(`${base}/v1/mobile-events`, {method: 'OPTIONS', headers: {origin: tunnel,
     'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type'}});
-  assert.equal(response.status, 204); assert.equal(response.headers.get('access-control-allow-origin'), tunnel);
+  assert.equal(response.status, 403); assert.equal(response.headers.get('access-control-allow-origin'), null);
   const mobilePost = (events, options = {}) => fetch(`${base}/v1/mobile-events`, {method: 'POST',
     headers: {'content-type': 'application/json', origin}, body: JSON.stringify({schema_version: 1, events}), ...options});
   response = await mobilePost([mobile]); assert.equal(response.status, 200); checkCors(response);

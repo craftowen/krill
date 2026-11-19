@@ -1,6 +1,7 @@
 //! MK-082의 외부 transcript → MK-052 재개 경계.
 //! 잠정 결정 의존: OWE-417의 `agent::resume_in`. 거부 시 이 모듈의 재개 분기만 제거한다.
-use super::{Failure, Launch, Path, Peer, Registry, Reply, control, os};
+use super::{Failure, Launch, Path, Peer, Registry, Reply, control, lock, os};
+use krill_proto::SessionId;
 use krill_proto::agent_history::{Action, Response, VaultAgent, VaultTarget};
 
 impl Registry {
@@ -40,6 +41,18 @@ impl Registry {
                 target
             }
         };
+        let live: Vec<SessionId> = {
+            let st = lock(&self.state);
+            st.sessions
+                .keys()
+                .filter(|session| !st.exited.contains_key(session))
+                .copied()
+                .collect()
+        };
+        let stored = |session| self.agents.stored(session).ok().flatten();
+        if let Some(session) = conversation_owner(live, stored, &target) {
+            return Ok(Reply::AgentHistory(Response::Resumed { session }));
+        }
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
         let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
         let id = target.agent.profile();
@@ -112,6 +125,57 @@ impl Registry {
             })?;
         let (session, _) = self.spawn_holder(holder, session, argv, env, cwd_bytes, 80, 24)?;
         Ok(Reply::AgentHistory(Response::Resumed { session }))
+    }
+}
+
+/// A conversation has one live writer. Two agents resuming it append to the same transcript.
+fn conversation_owner(
+    live: impl IntoIterator<Item = SessionId>,
+    stored: impl Fn(SessionId) -> Option<crate::agent::control::StoredLaunch>,
+    target: &VaultTarget,
+) -> Option<SessionId> {
+    live.into_iter().find(|session| {
+        stored(*session).is_some_and(|launch| {
+            launch.profile == target.agent.profile()
+                && launch.session_id.as_deref() == Some(target.id.as_str())
+        })
+    })
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    fn launch(profile: &str, session_id: &str) -> crate::agent::control::StoredLaunch {
+        crate::agent::control::StoredLaunch {
+            profile: profile.to_owned(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: Some(session_id.to_owned()),
+            transcript_path: None,
+            cwd: Vec::new(),
+            hibernation_blocked: false,
+            account: None,
+        }
+    }
+
+    #[test]
+    fn opening_a_live_conversation_finds_its_session() {
+        let target = VaultTarget {
+            agent: VaultAgent::Claude,
+            id: "conversation".into(),
+            cwd: "/tmp".into(),
+            modified: 1,
+        };
+        let stored = |session: SessionId| match session.0 {
+            1 => Some(launch("claude", "other")),
+            2 => Some(launch("codex", "conversation")),
+            3 => Some(launch("claude", "conversation")),
+            _ => None,
+        };
+        let owner =
+            |live: &[u64]| conversation_owner(live.iter().copied().map(SessionId), stored, &target);
+        assert_eq!(owner(&[1, 2, 3, 4]), Some(SessionId(3)));
+        assert_eq!(owner(&[1, 2, 4]), None, "a closed session does not own it");
     }
 }
 

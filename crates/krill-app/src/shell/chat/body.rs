@@ -70,9 +70,73 @@ pub(super) fn parse_chat_segments(text: &str) -> Vec<ChatBodySegment> {
     segments
 }
 
+/// Normalizes a fenced code block language tag into a concise display label.
+/// Returns `None` when the fence carries no meaningful language identifier.
+pub(super) fn normalize_code_language(tag: &str) -> Option<String> {
+    let token = tag
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| matches!(c, '{' | '}' | '`' | '"' | '\''))
+        .trim();
+    if token.is_empty() {
+        return None;
+    }
+    let normalized = match token.to_ascii_lowercase().as_str() {
+        "ts" | "typescript" => "TypeScript",
+        "tsx" => "TSX",
+        "js" | "javascript" | "mjs" | "cjs" => "JavaScript",
+        "jsx" => "JSX",
+        "py" | "python" | "python3" => "Python",
+        "rs" | "rust" => "Rust",
+        "sh" | "shell" => "Shell",
+        "bash" => "Bash",
+        "zsh" => "Zsh",
+        "fish" => "Fish",
+        "json" | "jsonc" | "json5" => "JSON",
+        "yaml" | "yml" => "YAML",
+        "toml" => "TOML",
+        "md" | "markdown" | "mdx" => "Markdown",
+        "sql" => "SQL",
+        "css" => "CSS",
+        "scss" => "SCSS",
+        "html" | "htm" => "HTML",
+        "xml" | "svg" => "XML",
+        "go" | "golang" => "Go",
+        "c" => "C",
+        "cpp" | "c++" | "cxx" | "cc" => "C++",
+        "java" => "Java",
+        "kt" | "kotlin" => "Kotlin",
+        "swift" => "Swift",
+        "rb" | "ruby" => "Ruby",
+        "diff" | "patch" => "Diff",
+        "dockerfile" | "docker" => "Dockerfile",
+        "text" | "txt" | "plaintext" | "plain" => "Text",
+        _ => return Some(token.to_owned()),
+    };
+    Some(normalized.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_code_language_formats_known_tags_and_drops_empty() {
+        assert_eq!(normalize_code_language("").as_deref(), None);
+        assert_eq!(normalize_code_language("   \t ").as_deref(), None);
+        assert_eq!(normalize_code_language("{}").as_deref(), None);
+        assert_eq!(normalize_code_language("rs").as_deref(), Some("Rust"));
+        assert_eq!(normalize_code_language("rust").as_deref(), Some("Rust"));
+        assert_eq!(
+            normalize_code_language("ts title=\"app.ts\"").as_deref(),
+            Some("TypeScript")
+        );
+        assert_eq!(normalize_code_language("tsx").as_deref(), Some("TSX"));
+        assert_eq!(normalize_code_language("sh").as_deref(), Some("Shell"));
+        assert_eq!(normalize_code_language("bash").as_deref(), Some("Bash"));
+        assert_eq!(normalize_code_language("zig").as_deref(), Some("zig"));
+    }
 
     #[test]
     fn fences_preserve_blank_code_lines_and_nested_backticks() {

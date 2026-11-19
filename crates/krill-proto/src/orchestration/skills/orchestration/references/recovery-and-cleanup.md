@@ -10,9 +10,10 @@ A non-zero start, command-tool timeout or missing JSON is not proof nothing ran.
 Keep every returned Dispatch, request and session ID. Inspect on the original host:
 
 `worker_done` records the result and settles ownership; it does not close the
-terminal. The coordinator owns cleanup. Once the report/output has been read and
-no follow-up needs the terminal, release the settled worker as part of the same
-workflow. No separate cleanup approval is needed for sessions created by that
+terminal. The coordinator owns cleanup. Acknowledging the `worker_done` releases
+a created worker whose agent is idle, exited, or gone; retain it first to keep
+it. Otherwise, once the report/output has been read and no follow-up needs the
+terminal, release the settled worker as part of the same workflow. No separate cleanup approval is needed for sessions created by that
 dispatch. Keep active, borrowed, reassigned, and uncertain sessions intact.
 
 - `worker-retain <dispatch-id>` keeps the terminal. **For an active dispatch it

@@ -249,9 +249,11 @@ pub fn sanitize_id_slug(raw: &str, fallback_prefix: &str, node_id: &str) -> Stri
 /// 호스트 ID가 파일 이름 및 UDS 소켓 경로 구성에 안전한지 검사한다.
 pub fn validate_host_id(host_id: &str) -> Result<(), Error> {
     let trimmed = host_id.trim();
-    if trimmed.is_empty()
+    if trimmed != host_id
+        || trimmed.is_empty()
         || trimmed.len() > HOST_ID_MAX_LEN
         || trimmed.starts_with('.')
+        || trimmed.ends_with('.')
         || trimmed.starts_with('-')
         || !trimmed
             .bytes()
@@ -970,5 +972,16 @@ mod tests {
         assert!(matches!(reuse_err, Ok(InviteVerifyError::AlreadyUsed)));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_host_id_rejects_untrimmed_and_trailing_dot() {
+        for bad in [" office", "office ", "office\n", "office.", ".", ".."] {
+            assert!(
+                validate_host_id(bad).is_err(),
+                "expected InvalidHostId for {bad:?}"
+            );
+        }
+        assert!(validate_host_id("office-mac.1").is_ok());
     }
 }

@@ -105,7 +105,8 @@ fn record_skips_without_rate_limits_and_missing_dir() {
 fn chain_passthrough_returns_user_output_verbatim() {
     // 사용자 명령(`cat`)이 stdin을 그대로 돌려준다.
     let input = payload(10, 20);
-    let output = run_chain_within(OsStr::new("cat"), &input, CHAIN_WAIT);
+    // The budget only has to cover Git Bash startup on a loaded Windows runner.
+    let output = run_chain_within(OsStr::new("cat"), &input, Duration::from_secs(60));
     assert_eq!(output, input);
     // 없는 명령은 빈 출력이다(표시만 비고 0으로 끝난다 — 호출자가 보장).
     assert!(run_chain_within(OsStr::new("/no/such/command-owe701"), &input, CHAIN_WAIT).is_empty());
@@ -310,18 +311,13 @@ fn chain_that_never_exits_is_killed_at_the_deadline() {
 
 #[test]
 fn chain_output_is_kept_when_a_background_child_holds_stdout_open() {
+    // The child outlives the deadline, so waiting for EOF would use the whole budget. The
+    // budget itself is wide because Git Bash can take seconds to start on a Windows runner.
+    let wait = Duration::from_secs(30);
     let started = std::time::Instant::now();
-    let out = run_chain_within(
-        OsStr::new("echo hi; sleep 3 2>/dev/null &"),
-        b"{}",
-        Duration::from_secs(1),
-    );
+    let out = run_chain_within(OsStr::new("echo hi; sleep 40 2>/dev/null &"), b"{}", wait);
     assert_eq!(String::from_utf8_lossy(&out), "hi\n");
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        started.elapsed()
-    );
+    assert!(started.elapsed() < wait, "{:?}", started.elapsed());
 }
 
 #[cfg(unix)]
@@ -354,4 +350,48 @@ fn chain_timeout_also_kills_the_shells_children() {
     }
     std::fs::remove_dir_all(&dir).ok();
     assert!(!alive, "the chain's child outlived the timeout");
+}
+
+#[test]
+fn uninstall_preserves_settings_file_when_user_manually_removed_slot() {
+    let (root, paths) = install_paths("uninstall-manual-remove");
+    let exe = "/test/krill";
+    let probe = || Some("2.1.301".to_owned());
+    let mut out = Vec::new();
+    install_with(&paths, exe, &probe, true, false, &mut out).unwrap();
+    // User manually clears `statusLine` while keeping other keys.
+    std::fs::write(&paths.settings, r#"{"theme": "light"}"#).unwrap();
+    let mut out = Vec::new();
+    uninstall_with(&paths, exe, true, false, &mut out).unwrap();
+    assert!(
+        paths.settings.exists(),
+        "user settings must not be deleted when statusLine was already removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&paths.settings).unwrap(),
+        r#"{"theme": "light"}"#
+    );
+    assert!(!paths.receipt.exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn uninstall_targets_recorded_receipt_change_path() {
+    let (root, mut paths) = install_paths("uninstall-recorded-path");
+    let exe = "/test/krill";
+    let probe = || Some("2.1.301".to_owned());
+    let mut out = Vec::new();
+    install_with(&paths, exe, &probe, true, false, &mut out).unwrap();
+    let installed_settings = paths.settings.clone();
+    assert!(installed_settings.exists());
+    // Point `paths.settings` somewhere else (simulating an env override change after install).
+    paths.settings = root.join("other/settings.json");
+    let mut out = Vec::new();
+    uninstall_with(&paths, exe, true, false, &mut out).unwrap();
+    assert!(
+        !installed_settings.exists(),
+        "uninstall must revert change.path recorded in receipt"
+    );
+    assert!(!paths.receipt.exists());
+    std::fs::remove_dir_all(&root).ok();
 }

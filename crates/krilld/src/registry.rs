@@ -49,6 +49,7 @@ use crate::store::{Limits, Store};
 mod account_switch;
 pub mod admission;
 mod agent_history;
+mod closed_sessions;
 mod hibernation;
 mod hook_identity;
 mod orch_cache;
@@ -119,7 +120,7 @@ struct Entry {
 }
 
 /// argv가 에이전트 셸 복귀 래퍼(`<shell> -l -i -c PREFLIGHT mk-agent ...`)인가.
-fn is_wrapper_argv<S: AsRef<[u8]>>(argv: &[S]) -> bool {
+pub(crate) fn is_wrapper_argv<S: AsRef<[u8]>>(argv: &[S]) -> bool {
     #[cfg(unix)]
     return argv
         .get(5)
@@ -148,6 +149,27 @@ struct State {
     roots: Roots,
 }
 
+type IdleMailScope = (u64, String, Option<String>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MailEpochState {
+    InFlight(u64),
+    Delivered(u64),
+}
+
+#[derive(Debug)]
+pub(crate) struct MobileSessionRow {
+    pub info: Info,
+    pub cwd: Vec<u8>,
+    pub status: control::AgentStatus,
+}
+
+#[derive(Debug)]
+pub(crate) struct MobileDashboardInputs {
+    pub sessions: Vec<MobileSessionRow>,
+    pub repositories: Vec<control::RepositoryTrees>,
+}
+
 /// krilld 전체에 하나.
 pub struct Registry {
     holder: Option<Arc<Holder>>,
@@ -163,6 +185,7 @@ pub struct Registry {
     /// `krill hook`의 spool 파일.
     spool: Option<PathBuf>,
     state: Mutex<State>,
+    closed_ledger: closed_sessions::ClosedLedger,
     ids: Mutex<session_ids::SessionIds>,
     sidebar: Arc<Mutex<sidebar::Cache>>,
     hibernation: Mutex<hibernation::Clock>,
@@ -173,7 +196,7 @@ pub struct Registry {
     /// 진행 중인 `Resume`의 `old` id. 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다(K-25).
     resuming: Mutex<HashSet<SessionId>>,
     account_work: Arc<crate::usage::accounts::switch_work::SwitchWork>,
-    account_handoffs: Mutex<BTreeMap<SessionId, krill_proto::usage::SessionHandoff>>,
+    account_handoffs: Mutex<account_switch::ledger::HandoffLedger>,
     account_recovered: std::sync::atomic::AtomicBool,
     account_processing: std::sync::atomic::AtomicBool,
     account_replacements: Mutex<std::collections::BTreeSet<SessionId>>,
@@ -183,11 +206,13 @@ pub struct Registry {
     /// 디스크 사용량을 잴 상태 디렉터리(MK-071).
     dir: Option<PathBuf>,
     last_gc: Mutex<Instant>,
+    /// 기동 GC는 첫 감시 바퀴(별도 스레드)에서 돈다. 연결 수락 전 경로에서 세그먼트 수만 개를 stat하지 않는다.
+    startup_gc: std::sync::atomic::AtomicBool,
     app_opened: OnceLock<()>,
     mobile: OnceLock<Arc<crate::mobile::gateway::Gateway>>,
-    webhooks: Mutex<crate::webhook::Dispatcher>,
     orch_signal: (Mutex<u64>, std::sync::Condvar),
     orch_cache: Mutex<orch_cache::Cache>,
+    orch_mail_notified_done: Mutex<BTreeMap<IdleMailScope, MailEpochState>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -198,15 +223,28 @@ impl std::fmt::Debug for Registry {
     }
 }
 
+fn kept_session_size(
+    live_pty: Option<WinSize>,
+    reported: Option<WinSize>,
+    stored: Option<WinSize>,
+) -> (WinSize, bool) {
+    let actual = live_pty.or(reported);
+    let size = crate::term::clamp_size(actual.or(stored).unwrap_or(FALLBACK_SIZE));
+    (size, actual != Some(size))
+}
+
 impl Registry {
     /// `dir`(상태 디렉터리)이 있으면 세그먼트 저장소·테마·감사 로그·에이전트 프로필을 그 아래에 둔다. `holder`가
     /// 다시 넘긴 세션은 바로 다시 띄운다. 기록을 열지 못해도 세션은 띄운다(그 세션만 디스크 기록이 없다).
     pub fn new(holder: Option<(Holder, Vec<Kept>)>, dir: Option<&Path>) -> Self {
         let started = Instant::now();
+        // Only the daemon that owns a state folder upgrades account registrations. `cfg!(test)` does
+        // not cover other crates' tests that link krilld.
         if !cfg!(test)
+            && let Some(dir) = dir
             && let Err(error) = crate::usage::accounts::codex_home::migrate(
                 &crate::usage::accounts::default_home(),
-                dir,
+                Some(dir),
             )
         {
             tracing::warn!(kind = ?error.kind(), "Codex account home migration failed");
@@ -221,7 +259,6 @@ impl Registry {
                 .into_iter()
                 .flat_map(|(_, kept)| kept.iter().map(|k| k.id)),
         );
-        let ids_ready = ids.ready();
         let at = |name: &str| dir.map_or_else(PathBuf::new, |d| d.join(name));
         // 기록 저장소를 열지 못해도 세션은 띄운다. 조용히 넘기지 않고 경고를 남겨 `krill doctor`가 보인다.
         let store = dir.and_then(|d| match Store::open(d, Limits::default()) {
@@ -230,7 +267,7 @@ impl Registry {
                 Some(store)
             }
             Err(e) => {
-                tracing::warn!("segment store unavailable in {}: {e}", d.display());
+                tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "segment store unavailable");
                 note_record_warning(d, &format!("store open failed: {e}"));
                 None
             }
@@ -238,9 +275,11 @@ impl Registry {
         let (holder, kept) = holder.map_or((None, Vec::new()), |(h, k)| (Some(Arc::new(h)), k));
         let kept_count = kept.len();
         let kept_ids: Vec<_> = kept.iter().map(|session| session.id).collect();
+        let closed_ledger = closed_sessions::ClosedLedger::open(dir, &kept_ids);
         let reg = Self {
             app_opened: OnceLock::new(),
             last_gc: Mutex::new(Instant::now()),
+            startup_gc: std::sync::atomic::AtomicBool::new(true),
             sidebar: Arc::default(),
             hibernation: Mutex::default(),
             schedule_minute: Mutex::default(),
@@ -259,9 +298,9 @@ impl Registry {
             exit: OnceLock::new(),
             dir: dir.map(Path::to_path_buf),
             mobile: OnceLock::new(),
-            webhooks: Mutex::new(crate::webhook::Dispatcher::new(dir)),
             orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
             orch_cache: Mutex::default(),
+            orch_mail_notified_done: Mutex::default(),
             watch: crate::watch::Watch::new(if holder.is_some() {
                 HolderStatus::Linked
             } else {
@@ -276,6 +315,7 @@ impl Registry {
             status: Statuses::open(dir.map(|d| d.join(status::FILE_NAME))),
             spool: dir.map(|d| d.join(hook::SPOOL_FILE)),
             ids: Mutex::new(ids),
+            closed_ledger,
             state: Mutex::new(State::default()),
         };
         let mut st = lock(&reg.state);
@@ -286,14 +326,7 @@ impl Registry {
                 // 종료 요청 전후에 krilld가 죽었으면 살아 있는 프로세스를 우선 보존한다.
                 reg.clear_sleeping(k.id);
             }
-            // 보관 세션의 PTY 크기를 그대로 쓰면 세션 안 `stty`로 키운 거대 winsize가
-            // 재기동 때 Term에 들어가 수백 MB를 할당한다(K-01). 엔진·PTY 모두 자른다.
-            #[cfg(unix)]
-            let size = crate::term::clamp_size(
-                crate::session::pty::size(&k.master).unwrap_or(FALLBACK_SIZE),
-            );
-            #[cfg(windows)]
-            let size = FALLBACK_SIZE;
+            let size = reg.resolve_kept_size(&k);
             let Ok(session) = reg.start(k.id, k.master, size) else {
                 // master는 holder가 계속 쥔다. 다음 krilld 기동 때 다시 온다.
                 // 조용히 넘기면 그 krilld 수명 동안 세션이 목록에서 사라진다(K-26).
@@ -311,15 +344,16 @@ impl Registry {
                 Entry {
                     session,
                     pid: k.pid,
-                    cwd: PathBuf::new(),
+                    cwd: reg
+                        .store
+                        .as_ref()
+                        .and_then(|s| s.launch_cwd(k.id))
+                        .unwrap_or_default(),
                     wrapped: crate::sys::process_args(k.pid).is_ok_and(|a| is_wrapper_argv(&a)),
                 },
             );
         }
         let live: Vec<_> = st.sessions.keys().copied().collect();
-        if ids_ready && let Some(store) = &reg.store {
-            store.gc(&live, SystemTime::now()).ok();
-        }
         if let Some(d) = dir {
             crate::agent::claude::sweep(d, &live);
         }
@@ -345,15 +379,22 @@ impl Registry {
 
     /// 감시 루프의 가상 시계 입력. 레지스트리 잠금은 live 목록을 복사하는 동안에만 쥔다.
     pub(crate) fn gc_due(&self, now: Instant, wall: SystemTime) {
-        {
+        let due = {
             let mut last = lock(&self.last_gc);
-            if now.saturating_duration_since(*last) < GC_INTERVAL {
-                return;
+            let due = now.saturating_duration_since(*last) >= GC_INTERVAL;
+            if due {
+                *last = now;
             }
-            *last = now;
+            due
+        };
+        let startup = self
+            .startup_gc
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !due && !startup {
+            return;
         }
         let ids_ready = lock(&self.ids).ready();
-        if ids_ready {
+        if due && ids_ready {
             let retired: Vec<_> = {
                 let state = lock(&self.state);
                 state
@@ -373,7 +414,7 @@ impl Registry {
         if ids_ready && let Some(store) = &self.store {
             let live: Vec<_> = lock(&self.state).sessions.keys().copied().collect();
             if let Err(e) = store.gc(&live, wall) {
-                tracing::warn!(error = %e, "history gc failed");
+                tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "history gc failed");
             }
         }
     }
@@ -399,16 +440,25 @@ impl Registry {
             };
             for (id, cwd, tap, e) in found {
                 if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
-                    self.auto_switch_from_hook(id, e);
-                    hooked.push((id, e.payload.clone(), e.id));
+                    hooked.push((id, e.clone()));
                 }
             }
             Ok(())
         })
         .ok();
         drop(commit);
-        for (id, payload, event_id) in &hooked {
-            self.maybe_rename_from_hook(*id, payload, *event_id);
+        for (id, e) in &hooked {
+            self.auto_switch_from_hook(*id, e);
+            self.maybe_rename_from_hook(*id, &e.payload, e.id);
+            if status::is_turn_stop(&e.payload)
+                && let Some(dir) = self.state_dir()
+                && let Err(error) = self.notify_idle_orchestration_mail_for(&dir, Some(*id))
+            {
+                tracing::warn!(
+                    kind = ?error.kind(),
+                    "orchestration idle mail notification failed"
+                );
+            }
         }
     }
 
@@ -420,6 +470,15 @@ impl Registry {
     }
 
     /// 감시 스냅샷 뒤 세션이 지워졌으면 그 상태를 다시 만들지 않는다.
+    /// 셸이 남은 세션에서 에이전트만 끝났다. 그때까지의 프롬프트를 다음 에이전트에 보여 주지 않는다.
+    pub(crate) fn agent_exited(&self, id: SessionId) {
+        if self.with_status(id, |s| s.exited(id)).is_some()
+            && let Some(dir) = self.state_dir()
+        {
+            krill_proto::git::forget_session_prompts(&dir, id, status::now_ns()).ok();
+        }
+    }
+
     pub(crate) fn with_status<T>(
         &self,
         id: SessionId,
@@ -431,19 +490,6 @@ impl Registry {
             st.sessions.contains_key(&id) && !st.exited.contains_key(&id)
         };
         allowed.then(|| f(&self.status))
-    }
-
-    /// 프로세스·제목·화면 보조 감시. PTY 읽기와 별도 스레드에서 호출한다.
-    pub(crate) fn observe_webhook(&self, id: SessionId) {
-        let state = self.status.get(id).state;
-        let link = self
-            .mobile_gateway()
-            .and_then(|gateway| gateway.deep_link(id));
-        lock(&self.webhooks).observe(id, state, link);
-    }
-
-    pub(crate) fn retain_webhooks(&self, ids: &[SessionId]) {
-        lock(&self.webhooks).retain(ids);
     }
 
     pub fn monitor_status(&self) {
@@ -503,6 +549,40 @@ impl Registry {
     /// 모바일 제어는 하나의 게이트웨이 인스턴스로 직렬화한다.
     pub fn mobile_gateway(&self) -> Option<&Arc<crate::mobile::gateway::Gateway>> {
         self.mobile.get()
+    }
+
+    fn resolve_kept_size(&self, k: &Kept) -> WinSize {
+        #[cfg(unix)]
+        let live_pty = crate::session::pty::size(&k.master).ok();
+        #[cfg(windows)]
+        let live_pty = None;
+        let stored = if live_pty.is_none() && k.size.is_none() {
+            self.store.as_deref().and_then(|s| s.last_size(k.id))
+        } else {
+            None
+        };
+        let (size, needs_holder_resize) = kept_session_size(live_pty, k.size, stored);
+        #[cfg(unix)]
+        let _ = needs_holder_resize;
+        #[cfg(windows)]
+        if k.status.is_none()
+            && needs_holder_resize
+            && let Some(h) = &self.holder
+            && h.version() >= 4
+        {
+            h.notify(|req| ToHolder::Resize {
+                req,
+                id: k.id,
+                size,
+            })
+            .ok();
+        }
+        size
+    }
+
+    pub(crate) fn session_size(&self, id: SessionId) -> Option<WinSize> {
+        let tap = lock(&self.state).sessions.get(&id).map(|e| e.session.tap());
+        tap?.size().ok()
     }
 
     pub fn start_mobile(self: &Arc<Self>, hello: ServerHello) -> io::Result<()> {
@@ -686,6 +766,9 @@ impl Registry {
         if k == screen::kind::ATTACH && n.features & FEAT_SCREEN != 0 {
             let a = Attach::decode(k, &body)?;
             let tap = self.tap(&peer, a.session);
+            if tap.is_some() && role != Role::Observer {
+                self.acknowledge_retained_handoff(a.session);
+            }
             let frame_min = if mobile {
                 attach::MOBILE_FRAME_MIN
             } else {
@@ -704,7 +787,17 @@ impl Registry {
             let ack = s.write_all(&hook::ack());
             drop(s);
             if let Some(id) = session {
+                self.auto_switch_from_hook(id, &e);
                 self.maybe_rename_from_hook(id, &e.payload, e.id);
+                if status::is_turn_stop(&e.payload)
+                    && let Some(dir) = self.state_dir()
+                    && let Err(error) = self.notify_idle_orchestration_mail_for(&dir, Some(id))
+                {
+                    tracing::warn!(
+                        kind = ?error.kind(),
+                        "orchestration idle mail notification failed"
+                    );
+                }
             }
             return ack;
         }
@@ -1123,10 +1216,14 @@ impl Registry {
                     .map(|id| (id, self.session_cwd(id)))
                     .collect();
                 sidebar::snapshot(&self.sidebar, &entries).map(|mut data| {
+                    let state = self.state_dir();
                     if peer.scope.full() {
-                        sidebar::include_projects(&mut data);
+                        if let Some(dir) = &state {
+                            sidebar::include_projects(&mut data, dir);
+                        }
+                        data.closed_sessions = self.closed_sidebar_ranges();
                     }
-                    if let Some(dir) = self.state_dir() {
+                    if let Some(dir) = state {
                         data.prompt_histories =
                             krill_proto::git::load_session_prompt_histories(&dir)
                                 .into_iter()
@@ -1350,6 +1447,9 @@ impl Registry {
         if !peer.authorize("cold", id, &self.audit) {
             return Err(Failure::Denied);
         }
+        if lock(&self.state).unregistered_kept.contains(&id) {
+            return Err(Failure::BadRequest);
+        }
         if self.is_closed(id) {
             return Err(Failure::NoSession);
         }
@@ -1376,7 +1476,12 @@ impl Registry {
             .and_then(|s| match s.recorder(id, size) {
                 Ok(rec) => Some(rec),
                 Err(e) => {
-                    tracing::warn!("session {} recorder unavailable: {e}", id.0);
+                    tracing::warn!(
+                        session = id.0,
+                        kind = ?e.kind(),
+                        errno = e.raw_os_error(),
+                        "session recorder unavailable"
+                    );
                     if let Some(dir) = self.dir.as_deref() {
                         note_record_warning(dir, &format!("session {} recorder failed: {e}", id.0));
                     }
@@ -1576,21 +1681,27 @@ impl Registry {
         if !peer.authorize("resume", old, &self.audit) {
             return Err(Failure::Denied);
         }
-        if self.is_closed(old) {
-            return Err(Failure::NoSession);
-        }
         {
             let st = lock(&self.state);
             if st.resumed.contains(&old) {
                 return Err(Failure::NoSession);
             }
-            if st.sessions.contains_key(&old) && !st.exited.contains_key(&old) {
+            // K-26: 이 PTY는 holder에 살아 있다. 목록에 없다고 되살리면 같은 대화의 에이전트가 둘이 된다.
+            if st.unregistered_kept.contains(&old)
+                || st.sessions.contains_key(&old) && !st.exited.contains_key(&old)
+            {
                 return Err(Failure::BadRequest);
             }
+        }
+        if self.is_closed(old) {
+            return Err(Failure::NoSession);
         }
         // 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다. 두 창이 동시에 눌러도
         // `claude --resume`이 두 번 뜨지 않는다(K-25).
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
+        if lock(&self.state).unregistered_kept.contains(&old) {
+            return Err(Failure::BadRequest);
+        }
         // A competing resume may have completed between the first check and claim.
         if self.is_closed(old) || lock(&self.state).resumed.contains(&old) {
             return Err(Failure::NoSession);
@@ -1689,7 +1800,11 @@ impl Registry {
         };
         if let Some(store) = &self.store {
             // holder Spawn 전에 연결을 남겨 데몬이 응답 전에 죽어도 이력을 잇는다.
-            store.inherit_history(session, old).map_err(|e| os(&e))?;
+            store.inherit_history(session, old).map_err(|e| {
+                self.discard_settings(session);
+                self.agents.forget(session);
+                os(&e)
+            })?;
         }
         let (session, pid) =
             match self.spawn_holder(holder, session, argv, env, c.cwd, c.cols, c.rows) {
@@ -1758,37 +1873,43 @@ impl Registry {
         let size = crate::term::clamp_size(WinSize { cols, rows });
         let mut initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
         env.extend(crate::git::worktree::environment(&initial_cwd));
+        crate::shell::dedupe_env(&mut env);
         // 자식은 Spawned 응답보다 먼저 hook을 보낼 수 있다. 루트·세션을 모두 등록하기 전에는
         // socket hook 적용과 spool 소거를 막아 최초 이벤트가 미귀속 상태로 ACK/폐기되지 않게 한다.
         // holder 응답 리더는 on_exited 워커와 분리돼 있어 이 잠금을 기다리지 않는다.
         let commit = lock(&self.hook_commit);
-        let mut reply = holder
-            .request(|req| ToHolder::Spawn {
-                req,
-                id,
-                argv: argv.clone(),
-                env: env.clone(),
-                cwd: cwd.clone(),
-                size,
-            })
-            .map_err(|_| Failure::NoHolder)?;
+        let Ok(mut reply) = holder.request(|req| ToHolder::Spawn {
+            req,
+            id,
+            argv: argv.clone(),
+            env: env.clone(),
+            cwd: cwd.clone(),
+            size,
+        }) else {
+            self.discard_settings(id);
+            self.agents.forget(id);
+            return Err(Failure::NoHolder);
+        };
         if matches!(
             reply,
             (FromHolder::Failed { errno, .. }, _)
-                if Failure::from_holder_errno(errno) == Failure::Os(libc::ENOENT)
-        ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &env)
+                if missing_path_errno(errno)
+        ) && fallback_spawn_on_enoent(&mut argv, &mut cwd, &mut env)
         {
             initial_cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&cwd));
-            reply = holder
-                .request(|req| ToHolder::Spawn {
-                    req,
-                    id,
-                    argv,
-                    env,
-                    cwd,
-                    size,
-                })
-                .map_err(|_| Failure::NoHolder)?;
+            let Ok(next_reply) = holder.request(|req| ToHolder::Spawn {
+                req,
+                id,
+                argv,
+                env,
+                cwd,
+                size,
+            }) else {
+                self.discard_settings(id);
+                self.agents.forget(id);
+                return Err(Failure::NoHolder);
+            };
+            reply = next_reply;
         }
         match reply {
             (FromHolder::Spawned { pid, .. }, Some(master)) => {
@@ -1799,6 +1920,9 @@ impl Registry {
                     self.agents.forget(id);
                     os(&e)
                 })?;
+                if let Some(store) = &self.store {
+                    store.remember_cwd(id, &initial_cwd);
+                }
                 let mut st = lock(&self.state);
                 st.roots.insert(id, pid).ok();
                 st.sessions.insert(
@@ -1814,6 +1938,7 @@ impl Registry {
             }
             (FromHolder::Failed { errno, .. }, _) => {
                 // spawn 실패: 세션이 없으니 주입 settings만 지우고 만들다 만 계보 기록도 걷는다.
+                tracing::warn!(id = id.0, errno, wrapped, "holder session spawn failed");
                 lock(&self.state).roots.remove(id);
                 self.discard_settings(id);
                 self.agents.forget(id);
@@ -1831,7 +1956,10 @@ impl Registry {
                 Err(Failure::from_holder_errno(errno))
             }
             _ => {
+                holder.notify(|req| ToHolder::Release { req, id }).ok();
                 lock(&self.state).roots.remove(id);
+                self.discard_settings(id);
+                self.agents.forget(id);
                 Err(Failure::Os(libc::EIO))
             }
         }
@@ -1875,11 +2003,14 @@ impl Registry {
     }
 
     fn list(&self, peer: &Peer) -> Reply {
+        // An unconfirmed account replacement is published as its original's successor, never as a
+        // separate session; account snapshots reveal it at the same moment.
+        let replacements = lock(&self.account_replacements).clone();
         let st = lock(&self.state);
         Reply::Sessions(
             st.sessions
                 .iter()
-                .filter(|_| peer.scope.full())
+                .filter(|(session, _)| peer.scope.full() && !replacements.contains(session))
                 .map(|(&session, e)| Info {
                     session,
                     pid: e.pid,
@@ -1945,120 +2076,131 @@ impl Registry {
                     // Reader completion also occurs during daemon handoff. Only the
                     // published EOF flag (or holder exit) proves the terminal ended.
                     let exited = st.exited.contains_key(&session) || tap.pulse().closed;
-                    (session, e.pid, exited, tap)
+                    (session, e.pid, exited, tap, e.wrapped)
                 })
                 .collect()
         };
         Reply::States(
             sessions
                 .into_iter()
-                .map(|(session, root, exited, tap)| {
-                    let mut status = self.status.get(session);
-                    // EOF/holder 종료는 저장된 hook보다 우선한다. 종료 콜백이 늦거나
-                    // 더 최신 시각의 hook이 도착해도 끝난 세션을 Done으로 되살리지 않는다.
-                    if exited {
-                        status.state = control::AgentState::Exited;
-                        status.source = Some(control::Source::Process);
-                        status.confidence = control::Confidence::High;
-                        status.subagents.clear();
-                    }
-                    // Pi has no hook identity. Its executable may be reported as `node`,
-                    // and its terminal title can be renamed. Keep the explicit launch identity.
-                    if status.agent.is_empty()
-                        && let Ok(Some(launch)) = self.agents.launch(session)
-                        && launch.profile == "pi"
-                    {
-                        status.agent = launch.profile;
-                    }
-                    status.foreground = status::session_foreground(root, tap.foreground(), exited);
-                    status.title = tap.title();
-                    status.root_shell = (!exited)
-                        .then(|| crate::sys::process_name(root).ok())
-                        .flatten()
-                        .and_then(|program| {
-                            krill_proto::control::RootShell::new(
-                                if cfg!(windows) {
-                                    krill_proto::control::ShellOs::Windows
-                                } else {
-                                    krill_proto::control::ShellOs::Unix
-                                },
-                                program,
-                            )
-                        })
-                        .map(Box::new);
-                    let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
-                        || status.agent.eq_ignore_ascii_case("antigravity")
-                        || status.foreground.as_deref().is_some_and(|fg| {
-                            fg.eq_ignore_ascii_case("agy") || fg.eq_ignore_ascii_case("antigravity")
-                        });
-                    let stored = if is_agy_fg || status.agent.is_empty() {
-                        self.agents.stored(session).ok().flatten()
-                    } else {
-                        None
-                    };
-                    // Hook 실행 전(기동 직후·계정 전환·재개·Pi 등)에도 저장된 런치 프로필이 있으면 에이전트 정체성을 유지한다.
-                    if status.agent.is_empty()
-                        && let Some(s) = &stored
-                        && !s.profile.is_empty()
-                    {
-                        krill_proto::agent::canonical_id(&s.profile).clone_into(&mut status.agent);
-                    }
-                    let is_agy_stored = stored.as_ref().is_some_and(|s| {
-                        s.profile.eq_ignore_ascii_case("agy")
-                            || s.profile.eq_ignore_ascii_case("antigravity")
-                    });
-                    if is_agy_fg || is_agy_stored {
-                        if status.agent.is_empty() {
-                            "agy".clone_into(&mut status.agent);
-                        }
-                        let (title, discovered) =
-                            crate::agent_history::vault::resolve_live_agy_title(
-                                session,
-                                root,
-                                tap.foreground(),
-                                exited,
-                                stored.as_ref(),
-                            );
-                        if let Some((ref conv_id, ref tp)) = discovered {
-                            if tp.is_some() {
-                                self.agents.bind_discovered_session(
-                                    session,
-                                    conv_id,
-                                    tp.as_deref(),
-                                );
-                            } else if let Ok(Some(found)) = account_switch::identity::discover(
-                                krill_proto::usage::ProviderKind::Antigravity,
-                                root,
-                                tap.foreground(),
-                            ) {
-                                self.agents.bind_discovered_session(
-                                    session,
-                                    &found.id,
-                                    Some(&found.path),
-                                );
-                            } else {
-                                self.agents.bind_discovered_session(session, conv_id, None);
-                            }
-                        }
-                        if !exited
-                            && status.state == control::AgentState::Unknown
-                            && (title.is_some()
-                                || discovered.is_some()
-                                || stored.as_ref().is_some_and(|s| s.session_id.is_some()))
-                        {
-                            status.state = control::AgentState::Done;
-                        }
-                        let title = title
-                            .as_deref()
-                            .and_then(krill_proto::control::display_title);
-                        if title.is_some() || status.title.is_none() {
-                            status.title = title;
-                        }
-                    }
-                    SessionStatus { session, status }
+                .map(|(session, root, exited, tap, wrapped)| SessionStatus {
+                    session,
+                    status: self.resolve_session_status(session, root, exited, &tap, wrapped),
                 })
                 .collect(),
         )
+    }
+
+    fn resolve_session_status(
+        &self,
+        session: SessionId,
+        root: u32,
+        exited: bool,
+        tap: &crate::session::Tap,
+        wrapped: bool,
+    ) -> control::AgentStatus {
+        let mut status = self.status.get(session);
+        // EOF/holder 종료는 저장된 hook보다 우선한다. 종료 콜백이 늦거나
+        // 더 최신 시각의 hook이 도착해도 끝난 세션을 Done으로 되살리지 않는다.
+        if exited {
+            status.state = control::AgentState::Exited;
+            status.source = Some(control::Source::Process);
+            status.confidence = control::Confidence::High;
+            status.subagents.clear();
+        }
+        // Pi has no hook identity. Its executable may be reported as `node`,
+        // and its terminal title can be renamed. Keep the explicit launch identity.
+        if status.agent.is_empty()
+            && let Ok(Some(launch)) = self.agents.launch(session)
+            && launch.profile == "pi"
+        {
+            status.agent = launch.profile;
+        }
+        status.foreground = status::session_foreground(root, tap.foreground(), exited);
+        status.title = tap.title();
+        // Only a launch with no agent evidence yet can still be in shell startup.
+        status.startup_stall = (wrapped
+            && !exited
+            && status.state == control::AgentState::Unknown
+            && status.source.is_none())
+        .then(|| status::startup::startup_stall(root))
+        .flatten();
+        status.root_shell = (!exited)
+            .then(|| crate::sys::process_name(root).ok())
+            .flatten()
+            .and_then(|program| {
+                krill_proto::control::RootShell::new(
+                    if cfg!(windows) {
+                        krill_proto::control::ShellOs::Windows
+                    } else {
+                        krill_proto::control::ShellOs::Unix
+                    },
+                    program,
+                )
+            })
+            .map(Box::new);
+        let is_agy_fg = status.agent.eq_ignore_ascii_case("agy")
+            || status.agent.eq_ignore_ascii_case("antigravity")
+            || status.foreground.as_deref().is_some_and(|fg| {
+                fg.eq_ignore_ascii_case("agy") || fg.eq_ignore_ascii_case("antigravity")
+            });
+        let stored = if is_agy_fg || status.agent.is_empty() {
+            self.agents.stored(session).ok().flatten()
+        } else {
+            None
+        };
+        // Hook 실행 전(기동 직후·계정 전환·재개·Pi 등)에도 저장된 런치 프로필이 있으면 에이전트 정체성을 유지한다.
+        if status.agent.is_empty()
+            && let Some(s) = &stored
+            && !s.profile.is_empty()
+        {
+            krill_proto::agent::canonical_id(&s.profile).clone_into(&mut status.agent);
+        }
+        let is_agy_stored = stored.as_ref().is_some_and(|s| {
+            s.profile.eq_ignore_ascii_case("agy") || s.profile.eq_ignore_ascii_case("antigravity")
+        });
+        if is_agy_fg || is_agy_stored {
+            if status.agent.is_empty() {
+                "agy".clone_into(&mut status.agent);
+            }
+            let (title, discovered) = crate::agent_history::vault::resolve_live_agy_title(
+                session,
+                root,
+                tap.foreground(),
+                exited,
+                stored.as_ref(),
+            );
+            if let Some((ref conv_id, ref tp)) = discovered {
+                if tp.is_some() {
+                    self.agents
+                        .bind_discovered_session(session, conv_id, tp.as_deref());
+                } else if let Ok(Some(found)) = account_switch::identity::discover(
+                    krill_proto::usage::ProviderKind::Antigravity,
+                    root,
+                    tap.foreground(),
+                ) {
+                    self.agents
+                        .bind_discovered_session(session, &found.id, Some(&found.path));
+                } else {
+                    self.agents.bind_discovered_session(session, conv_id, None);
+                }
+            }
+            if !exited
+                && status.state == control::AgentState::Unknown
+                && (title.is_some()
+                    || discovered.is_some()
+                    || stored.as_ref().is_some_and(|s| s.session_id.is_some()))
+            {
+                status.state = control::AgentState::Done;
+            }
+            let title = title
+                .as_deref()
+                .and_then(krill_proto::control::display_title);
+            if title.is_some() || status.title.is_none() {
+                status.title = title;
+            }
+        }
+        status
     }
 
     /// 소켓으로 온 hook 이벤트. 세션 후손이 보냈으면 그 세션만, 외부에서 왔으면 `ppid` 계보의 세션.
@@ -2079,7 +2221,6 @@ impl Registry {
         };
         if let Some((id, cwd, tap)) = target {
             if self.apply_agent_hook(id, e, Some(&cwd), Some(&tap))? {
-                self.auto_switch_from_hook(id, e);
                 Ok(Some(id))
             } else {
                 Ok(None)
@@ -2165,6 +2306,17 @@ impl Registry {
         };
         if !is_subagent_or_foreign
             && let Ok(Some(stored)) = self.agents.stored(id)
+            && stored.permission == krill_proto::agent::Permission::Manual
+            && self.live_agent_has_yolo_args(id, &stored.profile)
+        {
+            let yolo = crate::agent::control::StoredLaunch {
+                permission: krill_proto::agent::Permission::Yolo,
+                ..stored
+            };
+            self.agents.bind_switch_identity(id, &yolo).ok();
+        }
+        if !is_subagent_or_foreign
+            && let Ok(Some(stored)) = self.agents.stored(id)
             && (stored.session_id.is_none() || stored.transcript_path.is_none())
         {
             let root_pid = lock(&self.state)
@@ -2200,12 +2352,13 @@ impl Registry {
             }
         }
         self.status.subagent_hook(id, e, !is_subagent_or_foreign);
-        self.observe_webhook(id);
         let allow_status_hook = !is_subagent_or_foreign
             || crate::agent::control::Control::is_explicit_subagent_hook(&e.payload);
         if allow_status_hook && self.status.hook(&[(id, e)])? > 0 {
-            self.observe_webhook(id);
             let status = self.status.get(id);
+            if status.state != control::AgentState::Done {
+                lock(&self.orch_mail_notified_done).retain(|(sid, _, _), _| *sid != id.0);
+            }
             if status.state == control::AgentState::Working {
                 self.agents.clear_rate_limited(id);
             }
@@ -2240,8 +2393,13 @@ impl Registry {
     }
 
     // Account evaluation wakes the session worker. Release `state` first: the worker's
-    // final handoff holds its queue lock while retiring the old session.
+    // final handoff holds its queue lock while retiring the old session. This also runs account
+    // CLIs and the keychain without a deadline, so callers must not hold `hook_commit` or the spool lock.
     fn auto_switch_from_hook(&self, id: SessionId, e: &HookEvent) {
+        #[cfg(all(test, unix))]
+        if let Some(probe) = tests::AUTO_SWITCH_PROBE.take() {
+            return probe(self);
+        }
         if let Some(switched) = status::auto_switch_on_rate_limit(
             &crate::usage::accounts::default_home(),
             self.state_dir().as_deref(),
@@ -2276,6 +2434,7 @@ impl Registry {
                 // 끝나면 on_exited가 지운다. 잠금 안에서 표시해 그사이 온 Exited를 놓치지 않는다.
                 let first = st.closing.insert(id);
                 drop(st);
+                self.cancel_queued_account_switch(id);
                 let end = |req| {
                     if holder.version() >= TERMINATE_SINCE {
                         ToHolder::Terminate { req, id }
@@ -2331,6 +2490,7 @@ impl Registry {
 
     fn mark_closed(&self, id: SessionId) {
         lock(&self.state).closed.insert(id);
+        self.closed_ledger.record_closed(id);
         if let Some(store) = &self.store {
             store.mark_closed(id);
         }
@@ -2338,7 +2498,47 @@ impl Registry {
 
     fn is_closed(&self, id: SessionId) -> bool {
         lock(&self.state).closed.contains(&id)
+            || self.closed_ledger.contains(id)
             || self.store.as_ref().is_some_and(|s| s.is_closed(id))
+    }
+
+    fn closed_sidebar_ranges(&self) -> krill_proto::control::ClosedSessionRanges {
+        let mut ranges = self.closed_ledger.snapshot();
+        {
+            let st = lock(&self.state);
+            for &id in &st.closed {
+                ranges.insert(id);
+            }
+            for &id in st.sessions.keys() {
+                ranges.remove(id);
+            }
+            for &id in &st.unregistered_kept {
+                ranges.remove(id);
+            }
+        }
+        {
+            let handoffs = lock(&self.account_handoffs);
+            let max_hops = handoffs.len().saturating_add(1);
+            for (&from, h) in handoffs.iter() {
+                if h.to.is_none() && h.error.is_none() {
+                    ranges.remove(from);
+                } else if let Some(mut target) = h.to {
+                    for _ in 0..max_hops {
+                        let Some(next) = handoffs.get(&target).and_then(|nh| nh.to) else {
+                            break;
+                        };
+                        if next == target {
+                            break;
+                        }
+                        target = next;
+                    }
+                    if !ranges.contains(target) {
+                        ranges.remove(from);
+                    }
+                }
+            }
+        }
+        ranges
     }
 
     /// holder `Exited` 송신 큐의 워커. 응답 리더와 분리해 `Release`가 exec 잠금을 기다려도 응답을 계속 읽는다.
@@ -2368,8 +2568,9 @@ impl Registry {
         self.remove(id);
     }
 
+    /// 자기 상태 폴더만 쓴다. 폴더 없는 레지스트리(단독 테스트)가 운영 폴더로 넘어가지 않게 기본값으로 폴백하지 않는다.
     fn state_dir(&self) -> Option<PathBuf> {
-        self.dir.clone().or_else(krill_proto::daemon::state_dir)
+        self.dir.clone()
     }
 
     /// 상태 디렉터리가 있으면 세션 `id`의 Claude 주입 settings를 지운다.
@@ -2397,8 +2598,9 @@ impl Registry {
         }
         drop(st);
         self.status.remove(id);
+        lock(&self.orch_mail_notified_done).retain(|(sid, _, _), _| *sid != id.0);
         self.clear_sleeping(id);
-        self.forget_failed_account_handoff(id);
+        self.forget_failed_account_handoff(id, ids_durable);
     }
 
     #[cfg(all(test, unix))]
@@ -2603,7 +2805,7 @@ impl Registry {
                     outcome,
                     windows_reset,
                 },
-                Err(e) => UsageReply::Failed(os(&e)),
+                Err(e) => UsageReply::Failed(e.to_failure()),
             },
             UsageRequest::SetAutoSwitch(policy) => {
                 match accounts::set_auto_switch(&home, state_ref, &policy) {
@@ -2690,6 +2892,87 @@ impl Registry {
         self.session_screen_and_bracketed_paste(id).1
     }
 
+    pub(crate) fn agent_control(&self) -> &crate::agent::control::Control {
+        &self.agents
+    }
+
+    pub(crate) fn mobile_repositories(&self) -> io::Result<Vec<control::RepositoryTrees>> {
+        let ids: Vec<_> = lock(&self.state).sessions.keys().copied().collect();
+        let entries: Vec<_> = ids
+            .into_iter()
+            .map(|id| (id, self.session_cwd(id)))
+            .collect();
+        sidebar::mobile_repositories(&self.sidebar, &entries, self.state_dir().as_deref())
+            .map(|(_, repos)| repos)
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    pub(crate) fn mobile_dashboard_inputs(&self) -> io::Result<MobileDashboardInputs> {
+        let raw: Vec<_> = {
+            let st = lock(&self.state);
+            st.sessions
+                .iter()
+                .map(|(&session, e)| {
+                    (
+                        session,
+                        e.pid,
+                        st.exited.get(&session).copied(),
+                        e.session.tap(),
+                        e.wrapped,
+                    )
+                })
+                .collect()
+        };
+        let entries: Vec<_> = raw
+            .iter()
+            .map(|(id, ..)| (*id, self.session_cwd(*id)))
+            .collect();
+        let (dirs, repositories) =
+            sidebar::mobile_repositories(&self.sidebar, &entries, self.state_dir().as_deref())
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut sessions = Vec::with_capacity(raw.len());
+        for ((session, root, exit_code, tap, wrapped), dir) in raw.into_iter().zip(dirs) {
+            let exited = exit_code.is_some() || tap.pulse().closed;
+            let status = self.resolve_session_status(session, root, exited, &tap, wrapped);
+            sessions.push(MobileSessionRow {
+                info: Info {
+                    session,
+                    pid: root,
+                    status: exit_code,
+                },
+                cwd: dir.cwd,
+                status,
+            });
+        }
+        Ok(MobileDashboardInputs {
+            sessions,
+            repositories,
+        })
+    }
+
+    pub(crate) fn mobile_session_cwd(&self, id: SessionId) -> io::Result<PathBuf> {
+        if !lock(&self.state).sessions.contains_key(&id) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Session not found"));
+        }
+        let path = self
+            .session_cwd(id)
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| io::Error::other("session working directory unavailable"))?;
+        lock(&self.sidebar).record_directory(id, path.clone());
+        Ok(path)
+    }
+
+    pub(crate) fn mobile_session_status(&self, id: SessionId) -> Option<control::AgentStatus> {
+        let (tap, exited, root, wrapped) = {
+            let st = lock(&self.state);
+            let e = st.sessions.get(&id)?;
+            let tap = e.session.tap();
+            let exited = st.exited.contains_key(&id) || tap.pulse().closed;
+            (tap, exited, e.pid, e.wrapped)
+        };
+        Some(self.resolve_session_status(id, root, exited, &tap, wrapped))
+    }
+
     /// An existing live tap only; mobile model control must never spawn/resume a replacement.
     pub(crate) fn mobile_composer_tap(&self, id: SessionId) -> io::Result<Tap> {
         let state = lock(&self.state);
@@ -2713,6 +2996,49 @@ impl Registry {
 
     pub(crate) fn agent_working(&self, id: SessionId) -> bool {
         self.status.get(id).state == control::AgentState::Working
+    }
+
+    /// 모바일 정지 요청: 살아 있는 세션이 현재 `AgentState::Working`이고 열린 붙여넣기가 없을 때만
+    /// 단일 `Ctrl+C`(`\x03`)를 기록한다(OWE-1349). 이미 턴이 끝났으면 PTY에 아무것도 쓰지 않는다.
+    pub(crate) fn mobile_interrupt(&self, id: SessionId) -> io::Result<bool> {
+        let (tap, root, wrapped) = {
+            let st = lock(&self.state);
+            let Some(entry) = st.sessions.get(&id) else {
+                return Ok(false);
+            };
+            if st.exited.contains_key(&id)
+                || entry.session.is_closed()
+                || self.agents.account_binding_retiring(id)
+            {
+                return Ok(false);
+            }
+            let tap = entry.session.tap();
+            if tap.pulse().closed {
+                return Ok(false);
+            }
+            (tap, entry.pid, entry.wrapped)
+        };
+        if self
+            .resolve_session_status(id, root, false, &tap, wrapped)
+            .state
+            != control::AgentState::Working
+        {
+            return Ok(false);
+        }
+        tap.write_interrupt(|| {
+            !tap.pulse().closed
+                && !self.agents.account_binding_retiring(id)
+                && self.status.get(id).state == control::AgentState::Working
+        })
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn record_test_hook(
+        &self,
+        id: SessionId,
+        event: &krill_proto::hook::HookEvent,
+    ) -> io::Result<usize> {
+        self.status.hook(&[(id, event)])
     }
 
     /// Read-only and not gated on the agent being idle, unlike [`Self::mobile_composer_tap`].
@@ -2798,8 +3124,17 @@ impl Registry {
                 .as_ref()
                 .is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none())
         {
-            if let Ok(Some(found)) = account_switch::identity::discover(provider, root_pid, fg_pid)
-            {
+            let expected_id = stored
+                .as_ref()
+                .and_then(|s| s.session_id.as_deref())
+                .filter(|sid| crate::agent::control::valid_session_id(sid));
+            let discovered = match expected_id {
+                Some(sid) => {
+                    account_switch::identity::discover_resumed(provider, root_pid, fg_pid, sid)
+                }
+                None => account_switch::identity::discover(provider, root_pid, fg_pid),
+            };
+            if let Ok(Some(found)) = discovered {
                 // A process-owned file also covers external account homes that are
                 // absent from the daemon's configured transcript search roots.
                 // Never replace a launch/hook-bound conversation with another ID.
@@ -2894,7 +3229,7 @@ impl Registry {
     }
 
     pub(crate) fn deliver_input_to_tap(tap: &Tap, bytes: &[u8], submit: bool) -> io::Result<()> {
-        let (_, _, _, modes) = tap.capture_with_modes();
+        let (_, _, _, modes) = tap.capture_shared_with_modes();
         let bracketed = modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE);
         let payload = if submit {
             bytes
@@ -2913,6 +3248,18 @@ impl Registry {
             && !payload.is_empty()
             && !is_control_seq
             && (submit || payload.contains(&b'\n') || payload.contains(&b'\r'));
+        let single_line;
+        let payload = if submit
+            && !use_bracketed
+            && !is_control_seq
+            && (payload.contains(&b'\n') || payload.contains(&b'\r'))
+        {
+            single_line = Self::flatten_unbracketed_submit_lines(payload);
+            single_line.as_slice()
+        } else {
+            payload
+        };
+        let before_end = tap.pulse().end;
         if use_bracketed {
             let mut framed = Vec::with_capacity(payload.len() + 12);
             framed.extend_from_slice(b"\x1b[200~");
@@ -2924,19 +3271,94 @@ impl Registry {
             framed.extend_from_slice(rest);
             framed.extend_from_slice(b"\x1b[201~");
             tap.write_input(&framed, None)?;
-            if submit {
-                std::thread::sleep(krill_proto::input::PASTE_SUBMIT_DELAY);
-                tap.write_input(b"\r", None)?;
+        } else if !payload.is_empty() {
+            tap.write_input(payload, None)?;
+        }
+        if submit {
+            // ConPTY without VT passthrough never exposes DECSET 2004, and busy TUIs can echo a
+            // paste tens or hundreds of ms after write_input returns. Always separate text and CR
+            // until after echo settles so the TUI does not fold Enter into the paste burst.
+            if !payload.is_empty() && !is_control_seq {
+                Self::wait_for_paste_submit_settle(tap, before_end);
             }
-        } else {
-            if !payload.is_empty() {
-                tap.write_input(payload, None)?;
-            }
-            if submit {
-                tap.write_input(b"\r", None)?;
-            }
+            tap.write_input(b"\r", None)?;
         }
         Ok(())
+    }
+
+    fn flatten_unbracketed_submit_lines(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(payload.len() + 16);
+        let mut pending_sep = false;
+        for &b in payload {
+            match b {
+                b'\r' | b'\n' => {
+                    if !out.is_empty() {
+                        pending_sep = true;
+                    }
+                }
+                _ => {
+                    if pending_sep {
+                        if !out.ends_with(b" ") {
+                            out.push(b' ');
+                        }
+                        out.extend_from_slice(b"| ");
+                        pending_sep = false;
+                    }
+                    out.push(b);
+                }
+            }
+        }
+        out
+    }
+
+    fn wait_for_paste_submit_settle(tap: &Tap, before_end: u64) {
+        const ECHO_WAIT_MAX: Duration = Duration::from_millis(500);
+        const ECHO_DRAIN_MAX: Duration = Duration::from_millis(800);
+
+        let write_at = Instant::now();
+        let first = tap.wait_timeout(ECHO_WAIT_MAX, |p| p.closed || p.end > before_end);
+        if first.closed {
+            return;
+        }
+        if first.end == before_end {
+            let remaining =
+                krill_proto::input::PASTE_SUBMIT_DELAY.saturating_sub(write_at.elapsed());
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining);
+            }
+            return;
+        }
+        let mut last_end = first.end;
+        let mut last_echo_at = Instant::now();
+        let drain_deadline = last_echo_at + ECHO_DRAIN_MAX;
+        loop {
+            let quiet_remaining =
+                krill_proto::input::PASTE_SUBMIT_DELAY.saturating_sub(last_echo_at.elapsed());
+            if quiet_remaining.is_zero() {
+                break;
+            }
+            let budget = drain_deadline
+                .saturating_duration_since(Instant::now())
+                .min(quiet_remaining);
+            if budget.is_zero() {
+                break;
+            }
+            let next = tap.wait_timeout(budget, |p| p.closed || p.end > last_end);
+            if next.closed {
+                return;
+            }
+            if next.end > last_end {
+                last_end = next.end;
+                last_echo_at = Instant::now();
+            } else {
+                break;
+            }
+        }
+        let remaining =
+            krill_proto::input::PASTE_SUBMIT_DELAY.saturating_sub(last_echo_at.elapsed());
+        if !remaining.is_zero() {
+            std::thread::sleep(remaining);
+        }
     }
 
     fn send_input(
@@ -2963,10 +3385,13 @@ impl Registry {
             }
         }
         let before_end = tap.pulse().end;
-        let was_working = self.status.get(session).state == control::AgentState::Working;
+        let status = self.status.get(session);
+        let was_working = status.state == control::AgentState::Working;
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
+        self.acknowledge_retained_handoff(session);
         if submit
-            && !self.status.get(session).agent.is_empty()
+            && !status.agent.is_empty()
+            && status.state != control::AgentState::Exited
             && let Ok(text) = std::str::from_utf8(bytes)
             && let Some(dir) = self.state_dir()
         {
@@ -3086,7 +3511,7 @@ impl Registry {
                 bytes.hash(&mut revision);
             }
         }
-        revision.finish()
+        revision.finish() ^ sidebar::revision(&self.sidebar).wrapping_mul(0xBF58_476D_1CE4_E5B9)
     }
 
     fn notify_orch(&self) {
@@ -3254,6 +3679,22 @@ impl Registry {
             if let Ok(sid) = u32::try_from(session.0) {
                 store.session_runs.insert(sid, dispatch.run_id);
             }
+            let dispatch_msg_ids: Vec<String> = store
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.dispatch_id.as_deref() == Some(dispatch_id)
+                        && m.msg_type == krill_proto::orchestration::MessageType::Dispatch
+                })
+                .map(|m| m.id.clone())
+                .collect();
+            if !dispatch_msg_ids.is_empty() {
+                store
+                    .idle_mail_notified
+                    .entry(session.0)
+                    .or_default()
+                    .extend(dispatch_msg_ids);
+            }
             Ok(result)
         })
     }
@@ -3261,81 +3702,178 @@ impl Registry {
     /// Submit only a mailbox pointer to an idle live PTY, once per unacknowledged mail.
     /// Message content stays in the durable mailbox, not in terminal input.
     fn notify_idle_orchestration_mail(&self, dir: &Path) -> io::Result<()> {
+        self.notify_idle_orchestration_mail_for(dir, None)
+    }
+
+    fn notify_idle_orchestration_mail_for(
+        &self,
+        dir: &Path,
+        only_session: Option<SessionId>,
+    ) -> io::Result<()> {
         use krill_proto::orchestration::{
-            DispatchReleaseState, DispatchStatus, OrchestrationStore,
+            DispatchReleaseState, DispatchStatus, ORCH_FILE, OrchestrationStore,
         };
-        OrchestrationStore::mutate(dir, |store| {
-            let mut targets: BTreeMap<(u64, String, Option<String>), Vec<String>> = BTreeMap::new();
-            for message in store.messages.iter().filter(|m| !m.acked) {
-                let session = if message.to == "coordinator" {
-                    store
-                        .runs
-                        .iter()
-                        .find(|r| Some(&r.id) == message.run_id.as_ref())
-                        .and_then(|r| r.coordinator_session_id)
-                } else {
-                    store
-                        .dispatches
-                        .iter()
-                        .rev()
-                        .find(|d| {
-                            d.worker_name == message.to
-                                && message.run_id.as_ref().is_none_or(|id| &d.run_id == id)
-                                && d.release_state != DispatchReleaseState::Released
-                                && !matches!(
-                                    d.status,
-                                    DispatchStatus::Abandoned
-                                        | DispatchStatus::Failed
-                                        | DispatchStatus::Released
-                                )
-                        })
-                        .and_then(|d| d.session_id)
-                };
-                let Some(sid) = session else {
-                    continue;
-                };
-                if store
-                    .idle_mail_notified
-                    .get(&sid)
-                    .is_some_and(|ids| ids.contains(&message.id))
-                {
-                    continue;
-                }
-                targets
-                    .entry((sid, message.to.clone(), message.run_id.clone()))
-                    .or_default()
-                    .push(message.id.clone());
+        if !dir.join(ORCH_FILE).exists() {
+            return Ok(());
+        }
+        if let Some(session) = only_session
+            && self.status.get(session).state != control::AgentState::Done
+        {
+            return Ok(());
+        }
+        let store = OrchestrationStore::load(dir)?;
+        let mut targets: BTreeMap<IdleMailScope, Vec<String>> = BTreeMap::new();
+        for message in store.messages.iter().filter(|m| !m.acked) {
+            let session = if message.to == "coordinator" {
+                store
+                    .runs
+                    .iter()
+                    .find(|r| Some(&r.id) == message.run_id.as_ref())
+                    .and_then(|r| r.coordinator_session_id)
+            } else {
+                store
+                    .dispatches
+                    .iter()
+                    .rev()
+                    .find(|d| {
+                        d.worker_name == message.to
+                            && message.run_id.as_ref().is_none_or(|id| &d.run_id == id)
+                            && d.release_state != DispatchReleaseState::Released
+                            && !matches!(
+                                d.status,
+                                DispatchStatus::Abandoned
+                                    | DispatchStatus::Failed
+                                    | DispatchStatus::Released
+                            )
+                    })
+                    .and_then(|d| d.session_id)
+            };
+            let Some(sid) = session else {
+                continue;
+            };
+            if only_session.is_some_and(|only| only.0 != sid) {
+                continue;
             }
-            for ((sid, recipient, run_id), ids) in targets {
-                let session = SessionId(sid);
-                // Waiting includes approval/questions; never type mail into those prompts.
-                if self.status.get(session).state != control::AgentState::Done {
+            if store
+                .idle_mail_notified
+                .get(&sid)
+                .is_some_and(|ids| ids.contains(&message.id))
+            {
+                continue;
+            }
+            targets
+                .entry((sid, message.to.clone(), message.run_id.clone()))
+                .or_default()
+                .push(message.id.clone());
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut delivered: Vec<(u64, Vec<String>)> = Vec::new();
+        for (scope, ids) in targets {
+            let (sid, ref recipient, ref run_id) = scope;
+            let session = SessionId(sid);
+            // Waiting includes approval/questions; never type mail into those prompts.
+            let initial = self.status.get(session);
+            if initial.state != control::AgentState::Done {
+                continue;
+            }
+            let epoch = initial.since_unix_ns;
+            let tap = lock(&self.state)
+                .sessions
+                .get(&session)
+                .map(|entry| entry.session.tap());
+            let Some(tap) = tap.filter(|tap| !tap.pulse().closed) else {
+                continue;
+            };
+            {
+                let mut epochs = lock(&self.orch_mail_notified_done);
+                if matches!(
+                    epochs.get(&scope),
+                    Some(MailEpochState::InFlight(e) | MailEpochState::Delivered(e)) if *e == epoch
+                ) {
                     continue;
                 }
-                let tap = lock(&self.state)
-                    .sessions
-                    .get(&session)
-                    .map(|entry| entry.session.tap());
-                let Some(tap) = tap.filter(|tap| !tap.pulse().closed) else {
-                    continue;
-                };
-                // Avoid interpreting names as shell fragments, even for a login shell.
-                let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-                let run_flag = run_id
-                    .as_deref()
-                    .map(|id| format!(" --run {}", quote(id)))
-                    .unwrap_or_default();
-                let pointer = format!(
-                    "[Krill orchestration] Unread mail. Read with: krill orchestration check --to {}{} --unread --json",
-                    quote(&recipient),
-                    run_flag
-                );
-                if Self::deliver_input_to_tap(&tap, pointer.as_bytes(), true).is_ok() {
-                    store.idle_mail_notified.entry(sid).or_default().extend(ids);
+                epochs.insert(scope.clone(), MailEpochState::InFlight(epoch));
+            }
+            if !self.wait_for_idle_mail_prompt(session, epoch, &tap) {
+                let mut epochs = lock(&self.orch_mail_notified_done);
+                if epochs.get(&scope) == Some(&MailEpochState::InFlight(epoch)) {
+                    epochs.remove(&scope);
+                }
+                continue;
+            }
+            // Avoid interpreting names as shell fragments, even for a login shell.
+            let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+            let run_flag = run_id
+                .as_deref()
+                .map(|id| format!(" --run {}", quote(id)))
+                .unwrap_or_default();
+            let pointer = format!(
+                "[Krill orchestration] Unread mail. Read with: krill orchestration check --to {}{} --unread --json",
+                quote(recipient),
+                run_flag
+            );
+            let sent = Self::deliver_input_to_tap(&tap, pointer.as_bytes(), true).is_ok();
+            {
+                let mut epochs = lock(&self.orch_mail_notified_done);
+                if epochs.get(&scope) == Some(&MailEpochState::InFlight(epoch)) {
+                    if sent {
+                        epochs.insert(scope, MailEpochState::Delivered(epoch));
+                    } else {
+                        epochs.remove(&scope);
+                    }
                 }
             }
-            Ok(())
-        })
+            if sent {
+                delivered.push((sid, ids));
+            }
+        }
+        if !delivered.is_empty() {
+            OrchestrationStore::mutate(dir, |store| {
+                let unread: std::collections::BTreeSet<&str> = store
+                    .messages
+                    .iter()
+                    .filter(|m| !m.acked)
+                    .map(|m| m.id.as_str())
+                    .collect();
+                for (sid, ids) in delivered {
+                    let notified = store.idle_mail_notified.entry(sid).or_default();
+                    for id in ids {
+                        if unread.contains(id.as_str()) {
+                            notified.insert(id);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_idle_mail_prompt(&self, session: SessionId, epoch: u64, tap: &Tap) -> bool {
+        const MIN_DONE_AGE_NS: u64 = 250_000_000;
+        const MIN_QUIET_MS: u64 = 200;
+        const MAX_SETTLE: Duration = Duration::from_millis(450);
+        const POLL: Duration = Duration::from_millis(20);
+
+        let started = Instant::now();
+        loop {
+            if tap.pulse().closed {
+                return false;
+            }
+            let current = self.status.get(session);
+            if current.state != control::AgentState::Done || current.since_unix_ns != epoch {
+                return false;
+            }
+            let done_age_ns = status::now_ns().saturating_sub(epoch);
+            if (done_age_ns >= MIN_DONE_AGE_NS && tap.quiet_ms() >= MIN_QUIET_MS)
+                || started.elapsed() >= MAX_SETTLE
+            {
+                return true;
+            }
+            std::thread::sleep(POLL);
+        }
     }
 
     fn orchestration(
@@ -3546,21 +4084,24 @@ impl Registry {
                         }
                     });
                     match checked {
-                        Ok((delivery, messages))
-                            if !messages.is_empty() || Instant::now() >= deadline =>
-                        {
-                            break Ok(if !v2 || (ack && delivery_id.is_none()) {
-                                OrchResponse::Messages(messages)
-                            } else {
-                                OrchResponse::Delivery { delivery, messages }
-                            });
-                        }
-                        Ok(_) => {
-                            let rem = deadline.saturating_duration_since(Instant::now());
+                        Ok((delivery, messages)) => {
+                            let now = Instant::now();
+                            if !messages.is_empty() || now >= deadline {
+                                break Ok(if !v2 || (ack && delivery_id.is_none()) {
+                                    OrchResponse::Messages(messages)
+                                } else {
+                                    OrchResponse::Delivery { delivery, messages }
+                                });
+                            }
+                            let rem = deadline.saturating_duration_since(now);
                             if rem.is_zero() {
-                                break Ok(OrchResponse::Delivery {
-                                    delivery: None,
-                                    messages: Vec::new(),
+                                break Ok(if !v2 || (ack && delivery_id.is_none()) {
+                                    OrchResponse::Messages(Vec::new())
+                                } else {
+                                    OrchResponse::Delivery {
+                                        delivery: None,
+                                        messages: Vec::new(),
+                                    }
                                 });
                             }
                             let (lock_gen, cvar) = &self.orch_signal;
@@ -3662,6 +4203,12 @@ impl Registry {
             } => OrchestrationStore::mutate(&dir, |s| s.reply_message(&question_id, &from, &body))
                 .map(|m| {
                     self.notify_orch();
+                    if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            "orchestration idle mail notification failed"
+                        );
+                    }
                     OrchResponse::Message(m)
                 }),
             OrchAction::CreateGate {
@@ -3779,14 +4326,24 @@ fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
 /// - 로그인 셸(`-l`) 실행 파일이 삭제된 경우(`/opt/homebrew/bin/fish` 등) 시스템 기본 셸로 폴백한다.
 ///
 /// 사용자 지정 실행 파일(`Program::Custom`) 자체가 없는 경우는 건드리지 않고 ENOENT를 그대로 돌려준다.
+/// holder `Spawn` 실패가 "경로 없음"인가. Windows holder는 Win32 코드를 그대로 보낸다: 지워진 cwd는
+/// `ERROR_DIRECTORY`(267), 중간 폴더까지 없으면 `ERROR_PATH_NOT_FOUND`(3), 파일은 `ERROR_FILE_NOT_FOUND`(2=ENOENT).
+fn missing_path_errno(errno: i32) -> bool {
+    Failure::from_holder_errno(errno) == Failure::Os(libc::ENOENT)
+        || cfg!(windows) && matches!(errno, 3 | 15 | 21 | 53 | 67 | 123 | 206 | 267)
+}
+
+#[cfg_attr(
+    unix,
+    expect(
+        clippy::ptr_arg,
+        reason = "Windows fallback replaces argv and pushes to env"
+    )
+)]
 fn fallback_spawn_on_enoent(
-    #[cfg_attr(
-        not(unix),
-        expect(unused_variables, reason = "로그인 셸(-l) 경로 폴백은 Unix 전용")
-    )]
-    argv: &mut [Vec<u8>],
+    argv: &mut Vec<Vec<u8>>,
     cwd: &mut Vec<u8>,
-    env: &[(Vec<u8>, Vec<u8>)],
+    env: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) -> bool {
     use krill_proto::os::ffi::OsStrExt as _;
     let mut changed = false;
@@ -3800,8 +4357,15 @@ fn fallback_spawn_on_enoent(
                 .map(|a| a.as_os_str().as_bytes().to_vec())
                 .or_else(|| {
                     env.iter()
-                        .find(|(k, _)| k.as_slice() == b"HOME")
+                        .find(|(k, _)| {
+                            k.as_slice() == b"HOME" || k.eq_ignore_ascii_case(b"USERPROFILE")
+                        })
                         .map(|(_, v)| Path::new(std::ffi::OsStr::from_bytes(v)))
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.as_os_str().as_bytes().to_vec())
+                })
+                .or_else(|| {
+                    krill_proto::os::home_dir()
                         .filter(|p| p.is_dir())
                         .map(|p| p.as_os_str().as_bytes().to_vec())
                 })
@@ -3825,6 +4389,26 @@ fn fallback_spawn_on_enoent(
                     break;
                 }
             }
+        }
+    }
+    #[cfg(windows)]
+    if !is_wrapper_argv(argv)
+        && argv.first().is_some_and(|prog| {
+            env.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case(b"SHELL") && v == prog)
+                && !Path::new(std::ffi::OsStr::from_bytes(prog)).is_file()
+        })
+    {
+        let fallback = Shell::Login.launch();
+        if fallback.argv != *argv {
+            *argv = fallback.argv;
+            for (k, v) in fallback.env {
+                if k.eq_ignore_ascii_case(b"PROMPT") || k.eq_ignore_ascii_case(b"SHELL") {
+                    env.push((k, v));
+                }
+            }
+            crate::shell::dedupe_env(env);
+            changed = true;
         }
     }
     changed
@@ -4260,7 +4844,8 @@ mod orchestration_delivery_tests {
         assert!(
             OrchestrationStore::load(&dir)?
                 .idle_mail_notified
-                .is_empty()
+                .get(&id.0)
+                .is_some_and(|ids| ids.len() == 1)
         );
         status("Stop", 2)?;
         // A subsequent send retries previously unnotified mail for newly idle recipients.
@@ -4280,5 +4865,490 @@ mod orchestration_delivery_tests {
         drop(reg);
         drop(terminal);
         std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn deliver_input_to_tap_paces_unbracketed_and_delayed_echo_submit() -> io::Result<()> {
+        use std::io::Write as _;
+
+        let look = Arc::new(Appearance::load(PathBuf::new()));
+
+        // 1. Unbracketed mode (ConPTY without VT passthrough / rejoined PTY): payload and CR must
+        //    not coalesce into one paste burst.
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            SessionId(412),
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&look),
+            None,
+        )?;
+        let tap = session.tap();
+        let tui = std::thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>, Duration)> {
+            let mut buf = [0_u8; 512];
+            let n1 = terminal.read(&mut buf)?;
+            let first = buf[..n1].to_vec();
+            terminal.write_all(b"> [Krill orchestration] Unread mail.")?;
+            let echoed_at = Instant::now();
+            let n2 = terminal.read(&mut buf)?;
+            let gap = echoed_at.elapsed();
+            let second = buf[..n2].to_vec();
+            Ok((first, second, gap))
+        });
+        let text = b"[Krill orchestration]\nUnread mail.\r\n\nCheck now.";
+        Registry::deliver_input_to_tap(&tap, text, true)?;
+        let (first, second, gap) = tui.join().unwrap()?;
+        assert_eq!(first, b"[Krill orchestration] | Unread mail. | Check now.");
+        assert_eq!(second, b"\r");
+        assert!(
+            gap >= Duration::from_millis(220),
+            "expected PASTE_SUBMIT_DELAY after unbracketed echo, got {gap:?}"
+        );
+        drop(session);
+
+        // 1b. Unbracketed mode where OpenConsole emits an immediate cursor-hide byte and the TUI
+        //     echoes the pasted text 120ms later (> 60ms): CR must wait PASTE_SUBMIT_DELAY after
+        //     the late echo chunk instead of firing right after a blind sleep.
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            SessionId(415),
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&look),
+            None,
+        )?;
+        let tap = session.tap();
+        let tui = std::thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>, Duration)> {
+            let mut buf = [0_u8; 512];
+            let n1 = terminal.read(&mut buf)?;
+            let first = buf[..n1].to_vec();
+            terminal.write_all(b"\x1b[?25l")?;
+            std::thread::sleep(Duration::from_millis(120));
+            terminal.write_all(b"> [Krill orchestration] | Unread mail. | Check now.\x1b[?25h")?;
+            let late_echo_at = Instant::now();
+            let n2 = terminal.read(&mut buf)?;
+            let gap = late_echo_at.elapsed();
+            let second = buf[..n2].to_vec();
+            Ok((first, second, gap))
+        });
+        Registry::deliver_input_to_tap(&tap, text, true)?;
+        let (first, second, gap) = tui.join().unwrap()?;
+        assert_eq!(first, b"[Krill orchestration] | Unread mail. | Check now.");
+        assert_eq!(second, b"\r");
+        assert!(
+            gap >= Duration::from_millis(220),
+            "expected PASTE_SUBMIT_DELAY after late ConPTY echo, got {gap:?}"
+        );
+        drop(session);
+
+        // 2. Bracketed mode with delayed multi-chunk echo: CR must wait PASTE_SUBMIT_DELAY after
+        //    the final echoed chunk, not merely from write_input enqueue time.
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            SessionId(413),
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            look,
+            None,
+        )?;
+        let tap = session.tap();
+        terminal.write_all(b"\x1b[?2004h")?;
+        tap.wait_timeout(Duration::from_secs(1), |p| p.end >= 8);
+        assert!(
+            tap.capture_shared_with_modes()
+                .3
+                .contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
+        );
+        let tui = std::thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>, Duration)> {
+            let mut buf = [0_u8; 512];
+            let n1 = terminal.read(&mut buf)?;
+            let first = buf[..n1].to_vec();
+            std::thread::sleep(Duration::from_millis(200));
+            terminal.write_all(b"> [Krill orchestration] ")?;
+            std::thread::sleep(Duration::from_millis(30));
+            terminal.write_all(b"Unread mail.")?;
+            let last_echo_at = Instant::now();
+            let n2 = terminal.read(&mut buf)?;
+            let gap = last_echo_at.elapsed();
+            let second = buf[..n2].to_vec();
+            Ok((first, second, gap))
+        });
+        Registry::deliver_input_to_tap(&tap, text, true)?;
+        let (first, second, gap) = tui.join().unwrap()?;
+        assert!(first.starts_with(b"\x1b[200~") && first.ends_with(b"\x1b[201~"));
+        assert_eq!(second, b"\r");
+        assert!(
+            gap >= Duration::from_millis(220),
+            "expected PASTE_SUBMIT_DELAY after delayed echo, got {gap:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_mail_pointer_skips_mid_turn_post_invocation_and_dedupes_same_done_epoch()
+    -> io::Result<()> {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!("krill-idle-mail-agy-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let id = SessionId(414);
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_millis(120)))?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )?;
+        let root_pid = std::process::id();
+        {
+            let mut st = lock(&reg.state);
+            st.roots.insert(id, root_pid).unwrap();
+            st.sessions.insert(
+                id,
+                Entry {
+                    session,
+                    pid: root_pid,
+                    cwd: PathBuf::from("/tmp"),
+                    wrapped: false,
+                },
+            );
+        }
+        let run = OrchestrationStore::mutate(&dir, |s| s.create_run("agy mail", Some(id.0)))?;
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let emit_hook = move |reg: &Registry, name: &str, pid: u32| -> io::Result<()> {
+            let (mut client, server) = UnixStream::pair()?;
+            let hello = krill_proto::daemon::client_hello(ipc::ClientRole::Cli, "test");
+            client.write_all(&hello.encode()?)?;
+            let ev = HookEvent {
+                id: hook::EventId {
+                    pid,
+                    unix_ns: status::now_ns(),
+                },
+                agent: "agy".into(),
+                ppid: root_pid,
+                input: hook::Input::Complete,
+                payload: serde_json::to_vec(&serde_json::json!({"hook_event_name": name}))?,
+            };
+            client.write_all(&ev.encode()?)?;
+            let server_hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            };
+            let res = reg.serve(server, &server_hello);
+            drop(client);
+            res
+        };
+        let send = |summary: &str| -> io::Result<()> {
+            reg.orchestration(
+                &peer,
+                OrchAction::SendMessage(SendParams {
+                    from: "worker-1".into(),
+                    to: "coordinator".into(),
+                    msg_type: MessageType::Status,
+                    summary: summary.into(),
+                    body: "details".into(),
+                    run_id: Some(run.id.clone()),
+                    task_id: None,
+                    dispatch_id: None,
+                    outcome: None,
+                    reply_to: None,
+                }),
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            Ok(())
+        };
+
+        // 1. Mid-turn PostInvocation followed quickly by PreInvocation must defer, not inject.
+        emit_hook(&reg, "PostInvocation", 101)?;
+        let resume_reg = Arc::clone(&reg);
+        let resume = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            emit_hook(&resume_reg, "PreInvocation", 102)
+        });
+        send("mid-turn report")?;
+        resume.join().unwrap()?;
+        let mut buf = [0_u8; 4096];
+        assert!(terminal.read(&mut buf).is_err());
+        assert!(
+            OrchestrationStore::load(&dir)?
+                .idle_mail_notified
+                .is_empty()
+        );
+
+        // 2. Final Stop hook delivers the deferred pointer once, and additional sends in the same
+        //    Done epoch (before PreInvocation) do not type duplicate pointers onto the composer.
+        emit_hook(&reg, "Stop", 103)?;
+        send("second report in same idle epoch")?;
+        let mut captured = Vec::new();
+        while let Ok(n) = terminal.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            captured.extend_from_slice(&buf[..n]);
+        }
+        let text = String::from_utf8_lossy(&captured);
+        assert_eq!(
+            text.matches("[Krill orchestration] Unread mail.").count(),
+            1,
+            "expected exactly one pointer in same Done epoch, got: {text:?}"
+        );
+        assert!(text.ends_with('\r'));
+
+        // 3. After a new turn runs and finishes without acking the second message, the new Done
+        //    epoch notifies again cleanly.
+        emit_hook(&reg, "PreInvocation", 104)?;
+        std::thread::sleep(Duration::from_millis(5));
+        emit_hook(&reg, "Stop", 105)?;
+        captured.clear();
+        while let Ok(n) = terminal.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            captured.extend_from_slice(&buf[..n]);
+        }
+        let second_text = String::from_utf8_lossy(&captured);
+        assert_eq!(
+            second_text
+                .matches("[Krill orchestration] Unread mail.")
+                .count(),
+            1,
+            "expected unacked second message to notify on next Stop, got: {second_text:?}"
+        );
+        assert!(second_text.ends_with('\r'));
+
+        drop(reg);
+        drop(terminal);
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn unbound_agy_ignores_startup_conversation_files_until_presence_lock() -> io::Result<()> {
+        use std::fmt::Write as _;
+        use std::io::Read as _;
+        use std::process::{Child, Command, Stdio};
+
+        struct ChildGuard(Option<Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    child.kill().ok();
+                    child.wait().ok();
+                }
+            }
+        }
+
+        fn spawn_holding(paths: &[&Path]) -> io::Result<ChildGuard> {
+            let mut script = String::from("exec");
+            for (idx, _) in paths.iter().enumerate() {
+                write!(script, " {}<\"${}\"", idx + 3, idx + 1).map_err(io::Error::other)?;
+            }
+            script.push_str("; printf ready; exec sleep 30");
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg(script).arg("krill-test-holder");
+            for path in paths {
+                cmd.arg(path);
+            }
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let mut child = cmd.spawn()?;
+            let mut ready = [0_u8; 5];
+            if let Some(mut stdout) = child.stdout.take() {
+                stdout.read_exact(&mut ready)?;
+            }
+            assert_eq!(&ready, b"ready");
+            Ok(ChildGuard(Some(child)))
+        }
+
+        let dir = std::env::temp_dir().join(format!("krill-agy-unbound-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let agy_home = dir.join(".gemini/antigravity-cli");
+        let old_conv = "0373fc46-0d68-498c-9c95-c8dd17bd4352";
+        let new_conv = "1f11082a-215d-4b11-941a-28f6acdc1b75";
+
+        let old_db = agy_home
+            .join("conversations")
+            .join(format!("{old_conv}.db"));
+        let old_pbtxt = agy_home
+            .join("annotations")
+            .join(format!("{old_conv}.pbtxt"));
+        let old_log = agy_home
+            .join("brain")
+            .join(old_conv)
+            .join(".system_generated/logs/transcript.jsonl");
+        std::fs::create_dir_all(old_db.parent().unwrap())?;
+        std::fs::create_dir_all(old_pbtxt.parent().unwrap())?;
+        std::fs::create_dir_all(old_log.parent().unwrap())?;
+        std::fs::write(&old_db, b"sqlite")?;
+        std::fs::write(&old_pbtxt, b"title: \"Old Session Title\"\n")?;
+        std::fs::write(
+            &old_log,
+            "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nOld session prompt\\n</USER_REQUEST>\"}\n",
+        )?;
+
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let id = SessionId(416);
+        let (master, _terminal) = UnixStream::pair()?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )?;
+        let child1 = spawn_holding(&[&old_db, &old_pbtxt, &old_log])?;
+        let pid1 = child1.0.as_ref().unwrap().id();
+        {
+            let mut st = lock(&reg.state);
+            st.roots.insert(id, pid1).unwrap();
+            st.sessions.insert(
+                id,
+                Entry {
+                    session,
+                    pid: pid1,
+                    cwd: dir.clone(),
+                    wrapped: false,
+                },
+            );
+        }
+        reg.agents.remember_session(
+            id,
+            &control::AgentLaunch {
+                profile: "agy".into(),
+                permission: krill_proto::agent::Permission::Yolo,
+            },
+            None,
+            dir.as_os_str().as_encoded_bytes().to_vec(),
+            Some(crate::agent::control::LaunchAccount {
+                id: String::new(),
+                env_key: "ANTIGRAVITY_CLI_HOME".into(),
+                dir: agy_home.display().to_string(),
+            }),
+        )?;
+
+        // Phase 1: startup reconciliation opens old conversation files without a presence lock.
+        // Neither status polling nor chat polling may bind this new session to `old_conv`.
+        let status = reg.mobile_session_status(id).expect("session status");
+        let checked_at = Instant::now();
+        assert_eq!(status.state, control::AgentState::Unknown);
+        assert_eq!(status.title, None);
+
+        let poll = reg.chat_poll(id, 0);
+        assert!(!poll.bound);
+        assert!(poll.session_id.is_empty());
+        assert!(poll.items.is_empty());
+
+        let stored = reg.agents.stored(id)?.expect("stored launch");
+        assert_eq!(stored.session_id, None);
+        assert_eq!(stored.transcript_path, None);
+
+        // Phase 2: once the process holds `presence/<new_conv>.lock`, both status and chat bind it.
+        let new_lock = agy_home.join("presence").join(format!("{new_conv}.lock"));
+        let new_pbtxt = agy_home
+            .join("annotations")
+            .join(format!("{new_conv}.pbtxt"));
+        let new_log = agy_home
+            .join("brain")
+            .join(new_conv)
+            .join(".system_generated/logs/transcript.jsonl");
+        std::fs::create_dir_all(new_lock.parent().unwrap())?;
+        std::fs::create_dir_all(new_log.parent().unwrap())?;
+        std::fs::write(&new_lock, b"")?;
+        std::fs::write(&new_pbtxt, b"title: \"New Session Title\"\n")?;
+        std::fs::write(
+            &new_log,
+            "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nNew user prompt\\n</USER_REQUEST>\"}\n",
+        )?;
+
+        drop(child1);
+        let child2 = spawn_holding(&[&new_lock, &old_db, &old_pbtxt])?;
+        let pid2 = child2.0.as_ref().unwrap().id();
+        {
+            let mut st = lock(&reg.state);
+            st.roots.insert(id, pid2).unwrap();
+            st.sessions.get_mut(&id).unwrap().pid = pid2;
+        }
+
+        // Wait past resolve_live_agy_title's 1s negative cooldown from Phase 1.
+        if let Some(remaining) = Duration::from_millis(1100).checked_sub(checked_at.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+
+        let bound_poll = reg.chat_poll(id, 0);
+        assert!(bound_poll.bound);
+        assert_eq!(bound_poll.session_id, new_conv);
+        assert!(!bound_poll.items.is_empty());
+
+        let bound_status = reg.mobile_session_status(id).expect("bound status");
+        assert_eq!(bound_status.state, control::AgentState::Done);
+        assert_eq!(bound_status.title.as_deref(), Some("New user prompt"));
+
+        let stored = reg.agents.stored(id)?.expect("stored launch");
+        assert_eq!(stored.session_id.as_deref(), Some(new_conv));
+        let expected_log = std::fs::canonicalize(&new_log)?;
+        let stored_log =
+            std::fs::canonicalize(stored.transcript_path.as_deref().expect("transcript path"))?;
+        assert_eq!(stored_log, expected_log);
+
+        drop(child2);
+        drop(reg);
+        std::fs::remove_dir_all(dir)
+    }
+}
+
+#[cfg(test)]
+mod spawn_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_spawn_on_enoent_uses_userprofile_and_recovers_missing_shell() {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let home = std::env::temp_dir().join(format!("krilld-userprofile-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).unwrap();
+        let mut argv = vec![b"/nonexistent/custom-shell".to_vec(), b"-l".to_vec()];
+        let mut cwd = b"nonexistent-relative-root/deleted-child".to_vec();
+        let mut env = vec![
+            (
+                b"UserProfile".to_vec(),
+                home.as_os_str().as_bytes().to_vec(),
+            ),
+            (b"SHELL".to_vec(), b"/nonexistent/custom-shell".to_vec()),
+        ];
+        assert!(fallback_spawn_on_enoent(&mut argv, &mut cwd, &mut env));
+        assert_eq!(cwd, home.as_os_str().as_bytes());
+        assert_ne!(argv[0], b"/nonexistent/custom-shell");
+        std::fs::remove_dir_all(home).ok();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_spawn_tests {
+    /// 지워진 cwd로 `CreateProcessW`가 내는 실제 코드가 폴백 대상이어야 한다(holder는 이 코드를 그대로 보낸다).
+    #[test]
+    fn deleted_cwd_spawn_errors_fall_back() {
+        let root = std::env::temp_dir().join(format!("krilld-gone-cwd-{}", std::process::id()));
+        for cwd in [root.clone(), root.join("a").join("b")] {
+            let error = std::process::Command::new("cmd.exe")
+                .args(["/c", "exit"])
+                .current_dir(&cwd)
+                .spawn()
+                .unwrap_err();
+            let code = error.raw_os_error().unwrap();
+            assert!(super::missing_path_errno(code), "{cwd:?}: {error} ({code})");
+        }
+        assert!(!super::missing_path_errno(5));
     }
 }

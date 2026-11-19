@@ -50,7 +50,6 @@ use krill_proto::input::{Input, InputAck, InputId, InputResult, Now};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::os::net::UnixStream;
 use krill_proto::screen::{self, Attach, Attached, GapMsg, Msg as _, Seq, Stream, kind};
-use sha2::{Digest as _, Sha256};
 
 const PHASE: &str = "OWE836_PHASE";
 const WAIT: Duration = Duration::from_secs(60);
@@ -98,7 +97,7 @@ fn shell() -> Program {
 }
 
 fn sha(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    krill_app::updater::ed25519::sha256_hex(bytes)
 }
 
 fn ms(d: Duration) -> f64 {
