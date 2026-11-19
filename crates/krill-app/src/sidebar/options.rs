@@ -1431,6 +1431,7 @@ impl Sidebar {
 
     pub fn clear_repo_filters(&mut self, cx: &mut Context<Self>) {
         if !self.disk.initialized {
+            self.disk.startup.added_repos.clear();
             self.disk.startup.touch("repos.clear");
         }
         if !self.options.filters.repos.is_empty() || !self.disk.initialized {
@@ -1459,6 +1460,7 @@ impl Sidebar {
 
     pub fn clear_host_filters(&mut self, cx: &mut Context<Self>) {
         if !self.disk.initialized {
+            self.disk.startup.added_hosts.clear();
             self.disk.startup.touch("hosts.clear");
         }
         if !self.options.filters.hosts.is_empty() || !self.disk.initialized {
