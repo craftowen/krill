@@ -1,9 +1,16 @@
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
+use gpui_kit_assets::IconName;
 use krill_app::i18n::catalog::chat as ctext;
+#[cfg(test)]
 use krill_app::ui;
 use krill_proto::agent_history::{ChatItem, ChatItemKind};
+use krill_proto::control::AgentState;
+
+pub(super) const MAX_PREAMBLE_CHARS: usize = 160;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RawSpan {
@@ -44,11 +51,12 @@ impl DisplayFeed {
     }
 
     pub(super) fn project(base_index: usize, items: &[Arc<ChatItem>]) -> Self {
+        let foldable = compute_foldable_notes(items);
         let mut rows = Vec::new();
         let mut rel_idx = 0;
         while rel_idx < items.len() {
             let item = &items[rel_idx];
-            if !is_work_kind(item.kind) {
+            if !is_work_or_foldable(item.kind, foldable[rel_idx]) {
                 let abs_idx = base_index + rel_idx;
                 rows.push(DisplayRow::Item {
                     abs_idx,
@@ -58,7 +66,9 @@ impl DisplayFeed {
                 continue;
             }
             let mut rel_end = rel_idx + 1;
-            while rel_end < items.len() && is_work_kind(items[rel_end].kind) {
+            while rel_end < items.len()
+                && is_work_or_foldable(items[rel_end].kind, foldable[rel_end])
+            {
                 rel_end += 1;
             }
             let slice = &items[rel_idx..rel_end];
@@ -135,6 +145,7 @@ pub(super) struct WorkRun {
     pub span: RawSpan,
     pub steps: Vec<WorkStep>,
     pub counts: WorkCounts,
+    pub category_counts: Vec<(ToolCategory, usize)>,
     pub latest_detail: String,
 }
 
@@ -142,6 +153,7 @@ impl WorkRun {
     fn from_slice(span: RawSpan, slice: &[Arc<ChatItem>]) -> Self {
         let mut steps: Vec<WorkStep> = Vec::with_capacity(slice.len());
         let mut counts = WorkCounts::default();
+        let mut category_counts: Vec<(ToolCategory, usize)> = Vec::new();
         let mut tool_detail = None;
         let mut thought_detail = None;
 
@@ -150,12 +162,25 @@ impl WorkRun {
             match item.kind {
                 ChatItemKind::ToolCall => {
                     counts.tool_calls += 1;
-                    match ToolStepKind::from_name_and_title(&item.tool_name, &item.title) {
-                        ToolStepKind::Read => counts.read += 1,
-                        ToolStepKind::Edit => counts.edit += 1,
-                        ToolStepKind::Search => counts.search += 1,
-                        ToolStepKind::Command => counts.command += 1,
-                        ToolStepKind::Other => counts.other += 1,
+                    let category = ToolCategory::from_name_and_title(&item.tool_name, &item.title);
+                    match category {
+                        ToolCategory::Read => counts.read += 1,
+                        ToolCategory::Edit => counts.edit += 1,
+                        ToolCategory::Search | ToolCategory::ListFiles => counts.search += 1,
+                        ToolCategory::Command => counts.command += 1,
+                        ToolCategory::WebFetch
+                        | ToolCategory::WebSearch
+                        | ToolCategory::Agent
+                        | ToolCategory::Todo
+                        | ToolCategory::Mcp
+                        | ToolCategory::Other => counts.other += 1,
+                    }
+                    if let Some((_, count)) =
+                        category_counts.iter_mut().find(|(cat, _)| *cat == category)
+                    {
+                        *count += 1;
+                    } else {
+                        category_counts.push((category, 1));
                     }
                     if item.is_error {
                         counts.errors += 1;
@@ -235,6 +260,12 @@ impl WorkRun {
                         item: Arc::clone(item),
                     });
                 }
+                ChatItemKind::Assistant => {
+                    steps.push(WorkStep::Note {
+                        abs_idx,
+                        item: Arc::clone(item),
+                    });
+                }
                 _ => {}
             }
         }
@@ -243,34 +274,80 @@ impl WorkRun {
             span,
             steps,
             counts,
+            category_counts,
             latest_detail: tool_detail.or(thought_detail).unwrap_or("").to_owned(),
         }
     }
 
+    #[cfg(test)]
     pub(super) fn summary_label(&self) -> String {
+        self.header_label(false)
+    }
+
+    pub(super) fn header_label(&self, is_live: bool) -> String {
         if self.counts.tool_calls == 0 {
             if self.counts.reasoning > 0 {
-                return ctext::RUN_REASONING.format(&[("n", &self.counts.reasoning.to_string())]);
+                return if is_live {
+                    ctext::RUN_REASONING_LIVE.get().to_owned()
+                } else {
+                    ctext::RUN_REASONING.format(&[("n", &self.counts.reasoning.to_string())])
+                };
             }
             return ctext::RUN_ACTIVITY.get().to_owned();
         }
-        let mut parts = Vec::with_capacity(5);
-        for (count, message) in [
-            (self.counts.read, ctext::RUN_READ),
-            (self.counts.edit, ctext::RUN_EDIT),
-            (self.counts.search, ctext::RUN_SEARCH),
-            (self.counts.command, ctext::RUN_COMMAND),
-            (self.counts.other, ctext::RUN_OTHER),
-        ] {
-            if count > 0 {
-                parts.push(message.format(&[("n", &count.to_string())]));
+        if self.category_counts.is_empty() {
+            return ctext::RUN_ACTIVITY.get().to_owned();
+        }
+        let mut parts = Vec::with_capacity(self.category_counts.len());
+        let last_ix = self.category_counts.len() - 1;
+        for (ix, &(category, count)) in self.category_counts.iter().enumerate() {
+            let clause = category.summary_clause(count, is_live && ix == last_ix);
+            parts.push(if ix == 0 {
+                clause
+            } else {
+                lowercase_ascii_initial(clause)
+            });
+        }
+        parts.join(", ")
+    }
+
+    pub(super) fn header_icon(&self) -> IconName {
+        self.category_counts
+            .first()
+            .map_or(IconName::Brain, |(cat, _)| cat.icon())
+    }
+
+    pub(super) fn failed_count_label(&self) -> Option<String> {
+        (self.counts.errors > 0)
+            .then(|| ctext::RUN_FAILED_N.format(&[("n", &self.counts.errors.to_string())]))
+    }
+
+    pub(super) fn total_tools(&self) -> usize {
+        self.counts.tool_calls
+    }
+
+    pub(super) fn completed_tools(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| matches!(step, WorkStep::Tool(ToolPair::CallAndResult { .. })))
+            .count()
+    }
+
+    pub(super) fn progress_label(&self, is_live: bool) -> Option<String> {
+        let total = self.total_tools();
+        (is_live && total > 0).then(|| format!("{}/{}", self.completed_tools(), total))
+    }
+
+    pub(super) fn active_detail(&self) -> &str {
+        for step in self.steps.iter().rev() {
+            if let WorkStep::Tool(ToolPair::CallOnly { call, .. }) = step {
+                let detail = call_detail(call);
+                if !detail.is_empty() {
+                    return detail;
+                }
             }
         }
-        if parts.is_empty() {
-            ctext::RUN_ACTIVITY.get().to_owned()
-        } else {
-            parts.join(" · ")
-        }
+        self.latest_detail.as_str()
     }
 }
 
@@ -296,6 +373,7 @@ pub(super) enum ToolPair {
 pub(super) enum WorkStep {
     Tool(ToolPair),
     Reasoning { abs_idx: usize, item: Arc<ChatItem> },
+    Note { abs_idx: usize, item: Arc<ChatItem> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,7 +391,7 @@ impl WorkStep {
                 | ToolPair::CallAndResult { call_abs_idx, .. },
             ) => *call_abs_idx,
             Self::Tool(ToolPair::OrphanResult { result_abs_idx, .. }) => *result_abs_idx,
-            Self::Reasoning { abs_idx, .. } => *abs_idx,
+            Self::Reasoning { abs_idx, .. } | Self::Note { abs_idx, .. } => *abs_idx,
         }
     }
 
@@ -324,10 +402,44 @@ impl WorkStep {
                 call.is_error || result.is_error
             }
             Self::Tool(ToolPair::OrphanResult { result, .. }) => result.is_error,
-            Self::Reasoning { .. } => false,
+            Self::Reasoning { .. } | Self::Note { .. } => false,
         }
     }
 
+    pub(super) fn is_pending_call(&self) -> bool {
+        matches!(self, Self::Tool(ToolPair::CallOnly { .. }))
+    }
+
+    pub(super) fn icon(&self) -> IconName {
+        match self {
+            Self::Tool(ToolPair::CallOnly { call, .. } | ToolPair::CallAndResult { call, .. }) => {
+                ToolCategory::from_name_and_title(&call.tool_name, &call.title).icon()
+            }
+            Self::Tool(ToolPair::OrphanResult { result, .. }) => {
+                ToolCategory::from_name_and_title(&result.tool_name, &result.title).icon()
+            }
+            Self::Reasoning { .. } => IconName::Brain,
+            Self::Note { .. } => IconName::MessageSquareMore,
+        }
+    }
+
+    pub(super) fn verb(&self, run_is_live: bool) -> &'static str {
+        let failed = self.is_error();
+        let active = run_is_live && self.is_pending_call();
+        match self {
+            Self::Tool(ToolPair::CallOnly { call, .. } | ToolPair::CallAndResult { call, .. }) => {
+                ToolCategory::from_name_and_title(&call.tool_name, &call.title).verb(active, failed)
+            }
+            Self::Tool(ToolPair::OrphanResult { result, .. }) => {
+                ToolCategory::from_name_and_title(&result.tool_name, &result.title)
+                    .verb(active, failed)
+            }
+            Self::Reasoning { .. } => ctext::REASONING.get(),
+            Self::Note { .. } => ctext::STEP_NOTE.get(),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn badge(&self) -> (ui::BadgeTone, &'static str) {
         if self.is_error() {
             return (ui::BadgeTone::Destructive, ctext::TOOL_ERROR.get());
@@ -341,7 +453,9 @@ impl WorkStep {
                 let kind = ToolStepKind::from_name_and_title(&result.tool_name, &result.title);
                 (kind.tone(), kind.label())
             }
-            Self::Reasoning { .. } => (ui::BadgeTone::Muted, ctext::REASONING.get()),
+            Self::Reasoning { .. } | Self::Note { .. } => {
+                (ui::BadgeTone::Muted, ctext::REASONING.get())
+            }
         }
     }
 
@@ -394,6 +508,7 @@ impl WorkStep {
                     line.to_owned()
                 }
             }
+            Self::Note { item, .. } => item.text.trim().to_owned(),
         }
     }
 
@@ -409,7 +524,7 @@ impl WorkStep {
                 }
             }
             Self::Tool(ToolPair::OrphanResult { result, .. }) => result.file_path.trim(),
-            Self::Reasoning { .. } => "",
+            Self::Reasoning { .. } | Self::Note { .. } => "",
         }
     }
 
@@ -485,6 +600,7 @@ impl WorkStep {
                     }]
                 }
             }
+            Self::Note { .. } => Vec::new(),
         }
     }
 
@@ -500,22 +616,49 @@ impl WorkStep {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolStepKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum ToolCategory {
     Read,
     Edit,
+    ListFiles,
     Search,
     Command,
+    WebFetch,
+    WebSearch,
+    Agent,
+    Todo,
+    Mcp,
     Other,
 }
 
-impl ToolStepKind {
-    fn from_name_and_title(name: &str, title: &str) -> Self {
-        let n = name.to_ascii_lowercase();
-        let t = title.to_ascii_lowercase();
-        if n.contains("read")
+impl ToolCategory {
+    pub(super) fn from_name_and_title(name: &str, title: &str) -> Self {
+        let n = name.trim().to_ascii_lowercase();
+        let t = title.trim().to_ascii_lowercase();
+        if n.starts_with("mcp__") || n.starts_with("mcp:") {
+            Self::Mcp
+        } else if n.contains("websearch")
+            || n.contains("web_search")
+            || n == "google_search"
+            || (n.contains("search") && t.contains("web"))
+        {
+            Self::WebSearch
+        } else if n.contains("webfetch") || n.contains("web_fetch") || n == "fetch" {
+            Self::WebFetch
+        } else if n == "agent"
+            || n == "task"
+            || n.contains("subagent")
+            || n.contains("dispatch_agent")
+        {
+            Self::Agent
+        } else if n.contains("todo") || n == "task_write" || t.contains("todo") {
+            Self::Todo
+        } else if n == "ls" || n.contains("list_dir") || n.contains("list_files") {
+            Self::ListFiles
+        } else if n.contains("read")
             || n.contains("view")
             || n == "cat"
+            || n == "open_file"
             || t.contains("read")
             || t.contains("view")
         {
@@ -523,6 +666,7 @@ impl ToolStepKind {
         } else if n.contains("edit")
             || n.contains("write")
             || n.contains("patch")
+            || n.contains("replace")
             || t.contains("edit")
             || t.contains("write")
         {
@@ -531,7 +675,7 @@ impl ToolStepKind {
             || n.contains("glob")
             || n.contains("search")
             || n.contains("find")
-            || n == "ls"
+            || n == "rg"
             || t.contains("search")
             || t.contains("grep")
         {
@@ -546,6 +690,157 @@ impl ToolStepKind {
             Self::Command
         } else {
             Self::Other
+        }
+    }
+
+    pub(super) fn icon(self) -> IconName {
+        match self {
+            Self::Read => IconName::Eye,
+            Self::Edit => IconName::Pencil,
+            Self::ListFiles => IconName::Folder,
+            Self::Search => IconName::Search,
+            Self::Command => IconName::SquareTerminal,
+            Self::WebFetch | Self::WebSearch => IconName::Globe,
+            Self::Agent => IconName::Bot,
+            Self::Todo => IconName::ListChecks,
+            Self::Mcp => IconName::Plug,
+            Self::Other => IconName::Wrench,
+        }
+    }
+
+    fn summary_clause(self, count: usize, is_live: bool) -> String {
+        let count_str = count.to_string();
+        match (self, is_live, count == 1) {
+            (Self::Read, true, true) => ctext::RUN_READ_LIVE_ONE.format(&[("n", &count_str)]),
+            (Self::Read, true, false) => ctext::RUN_READ_LIVE_MANY.format(&[("n", &count_str)]),
+            (Self::Read, false, true) => ctext::RUN_READ_ONE.format(&[("n", &count_str)]),
+            (Self::Read, false, false) => ctext::RUN_READ_MANY.format(&[("n", &count_str)]),
+            (Self::Edit, true, true) => ctext::RUN_EDIT_LIVE_ONE.format(&[("n", &count_str)]),
+            (Self::Edit, true, false) => ctext::RUN_EDIT_LIVE_MANY.format(&[("n", &count_str)]),
+            (Self::Edit, false, true) => ctext::RUN_EDIT_ONE.format(&[("n", &count_str)]),
+            (Self::Edit, false, false) => ctext::RUN_EDIT_MANY.format(&[("n", &count_str)]),
+            (Self::ListFiles, true, true) => ctext::RUN_LIST_LIVE_ONE.format(&[("n", &count_str)]),
+            (Self::ListFiles, true, false) => {
+                ctext::RUN_LIST_LIVE_MANY.format(&[("n", &count_str)])
+            }
+            (Self::ListFiles, false, true) => ctext::RUN_LIST_ONE.format(&[("n", &count_str)]),
+            (Self::ListFiles, false, false) => ctext::RUN_LIST_MANY.format(&[("n", &count_str)]),
+            (Self::Search, true, true) => ctext::RUN_SEARCH_LIVE.get().to_owned(),
+            (Self::Search, true, false) => ctext::RUN_SEARCH_LIVE_MANY.format(&[("n", &count_str)]),
+            (Self::Search, false, true) => ctext::RUN_SEARCH_ONE.format(&[("n", &count_str)]),
+            (Self::Search, false, false) => ctext::RUN_SEARCH_MANY.format(&[("n", &count_str)]),
+            (Self::Command, true, true) => ctext::RUN_COMMAND_LIVE_ONE.format(&[("n", &count_str)]),
+            (Self::Command, true, false) => {
+                ctext::RUN_COMMAND_LIVE_MANY.format(&[("n", &count_str)])
+            }
+            (Self::Command, false, true) => ctext::RUN_COMMAND_ONE.format(&[("n", &count_str)]),
+            (Self::Command, false, false) => ctext::RUN_COMMAND_MANY.format(&[("n", &count_str)]),
+            (Self::WebFetch, true, true) => ctext::RUN_FETCH_LIVE_ONE.format(&[("n", &count_str)]),
+            (Self::WebFetch, true, false) => {
+                ctext::RUN_FETCH_LIVE_MANY.format(&[("n", &count_str)])
+            }
+            (Self::WebFetch, false, true) => ctext::RUN_FETCH_ONE.format(&[("n", &count_str)]),
+            (Self::WebFetch, false, false) => ctext::RUN_FETCH_MANY.format(&[("n", &count_str)]),
+            (Self::WebSearch, true, _) => ctext::RUN_WEB_LIVE.get().to_owned(),
+            (Self::WebSearch, false, true) => ctext::RUN_WEB_ONE.format(&[("n", &count_str)]),
+            (Self::WebSearch, false, false) => ctext::RUN_WEB_MANY.format(&[("n", &count_str)]),
+            (Self::Agent, true, true) => ctext::RUN_AGENT_LIVE_ONE.format(&[("n", &count_str)]),
+            (Self::Agent, true, false) => ctext::RUN_AGENT_LIVE_MANY.format(&[("n", &count_str)]),
+            (Self::Agent, false, true) => ctext::RUN_AGENT_ONE.format(&[("n", &count_str)]),
+            (Self::Agent, false, false) => ctext::RUN_AGENT_MANY.format(&[("n", &count_str)]),
+            (Self::Todo, true, true) => ctext::RUN_TODO_LIVE_ONE.format(&[("n", &count_str)]),
+            (Self::Todo, true, false) => ctext::RUN_TODO_LIVE_MANY.format(&[("n", &count_str)]),
+            (Self::Todo, false, true) => ctext::RUN_TODO_ONE.format(&[("n", &count_str)]),
+            (Self::Todo, false, false) => ctext::RUN_TODO_MANY.format(&[("n", &count_str)]),
+            (Self::Mcp, true, true) => ctext::RUN_MCP_LIVE_ONE.format(&[("n", &count_str)]),
+            (Self::Mcp, true, false) => ctext::RUN_MCP_LIVE_MANY.format(&[("n", &count_str)]),
+            (Self::Mcp, false, true) => ctext::RUN_MCP_ONE.format(&[("n", &count_str)]),
+            (Self::Mcp, false, false) => ctext::RUN_MCP_MANY.format(&[("n", &count_str)]),
+            (Self::Other, true, true) => ctext::RUN_TOOL_LIVE_ONE.format(&[("n", &count_str)]),
+            (Self::Other, true, false) => ctext::RUN_TOOL_LIVE_MANY.format(&[("n", &count_str)]),
+            (Self::Other, false, true) => ctext::RUN_TOOL_ONE.format(&[("n", &count_str)]),
+            (Self::Other, false, false) => ctext::RUN_TOOL_MANY.format(&[("n", &count_str)]),
+        }
+    }
+
+    fn verb(self, is_live: bool, is_error: bool) -> &'static str {
+        match (self, is_error, is_live) {
+            (Self::Read, true, _) => ctext::VERB_READ_FAIL.get(),
+            (Self::Read, false, true) => ctext::VERB_READ_LIVE.get(),
+            (Self::Read, false, false) => ctext::VERB_READ_DONE.get(),
+            (Self::Edit, true, _) => ctext::VERB_EDIT_FAIL.get(),
+            (Self::Edit, false, true) => ctext::VERB_EDIT_LIVE.get(),
+            (Self::Edit, false, false) => ctext::VERB_EDIT_DONE.get(),
+            (Self::ListFiles, true, _) => ctext::VERB_LIST_FAIL.get(),
+            (Self::ListFiles, false, true) => ctext::VERB_LIST_LIVE.get(),
+            (Self::ListFiles, false, false) => ctext::VERB_LIST_DONE.get(),
+            (Self::Search, true, _) => ctext::VERB_SEARCH_FAIL.get(),
+            (Self::Search, false, true) => ctext::VERB_SEARCH_LIVE.get(),
+            (Self::Search, false, false) => ctext::VERB_SEARCH_DONE.get(),
+            (Self::Command, true, _) => ctext::VERB_RUN_FAIL.get(),
+            (Self::Command, false, true) => ctext::VERB_RUN_LIVE.get(),
+            (Self::Command, false, false) => ctext::VERB_RUN_DONE.get(),
+            (Self::WebFetch, true, _) => ctext::VERB_FETCH_FAIL.get(),
+            (Self::WebFetch, false, true) => ctext::VERB_FETCH_LIVE.get(),
+            (Self::WebFetch, false, false) => ctext::VERB_FETCH_DONE.get(),
+            (Self::WebSearch, true, _) => ctext::VERB_WEB_FAIL.get(),
+            (Self::WebSearch, false, true) => ctext::VERB_WEB_LIVE.get(),
+            (Self::WebSearch, false, false) => ctext::VERB_WEB_DONE.get(),
+            (Self::Agent, true, _) => ctext::VERB_AGENT_FAIL.get(),
+            (Self::Agent, false, true) => ctext::VERB_AGENT_LIVE.get(),
+            (Self::Agent, false, false) => ctext::VERB_AGENT_DONE.get(),
+            (Self::Todo, true, _) => ctext::VERB_TODO_FAIL.get(),
+            (Self::Todo, false, true) => ctext::VERB_TODO_LIVE.get(),
+            (Self::Todo, false, false) => ctext::VERB_TODO_DONE.get(),
+            (Self::Mcp, true, _) => ctext::VERB_MCP_FAIL.get(),
+            (Self::Mcp, false, true) => ctext::VERB_MCP_LIVE.get(),
+            (Self::Mcp, false, false) => ctext::VERB_MCP_DONE.get(),
+            (Self::Other, true, _) => ctext::VERB_OTHER_FAIL.get(),
+            (Self::Other, false, true) => ctext::VERB_OTHER_LIVE.get(),
+            (Self::Other, false, false) => ctext::VERB_OTHER_DONE.get(),
+        }
+    }
+}
+
+fn lowercase_ascii_initial(text: String) -> String {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return text;
+    };
+    if first.is_ascii_uppercase() {
+        let mut out = String::with_capacity(text.len());
+        out.push(first.to_ascii_lowercase());
+        out.push_str(chars.as_str());
+        out
+    } else {
+        text
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ToolStepKind {
+    Read,
+    Edit,
+    Search,
+    Command,
+    Other,
+}
+
+#[cfg(test)]
+impl ToolStepKind {
+    fn from_name_and_title(name: &str, title: &str) -> Self {
+        match ToolCategory::from_name_and_title(name, title) {
+            ToolCategory::Read => Self::Read,
+            ToolCategory::Edit => Self::Edit,
+            ToolCategory::Search | ToolCategory::ListFiles => Self::Search,
+            ToolCategory::Command => Self::Command,
+            ToolCategory::WebFetch
+            | ToolCategory::WebSearch
+            | ToolCategory::Agent
+            | ToolCategory::Todo
+            | ToolCategory::Mcp
+            | ToolCategory::Other => Self::Other,
         }
     }
 
@@ -565,6 +860,166 @@ impl ToolStepKind {
             Self::Read | Self::Search | Self::Command | Self::Other => ui::BadgeTone::Neutral,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkRunTiming {
+    started_at: Instant,
+    completed_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct WorkRunTimingState {
+    runs: HashMap<usize, WorkRunTiming>,
+}
+
+impl WorkRunTimingState {
+    pub(super) fn clear(&mut self) {
+        self.runs.clear();
+    }
+
+    pub(super) fn sync(&mut self, feed: &DisplayFeed, agent_state: AgentState, now: Instant) {
+        let rows = feed.rows();
+        let last_ix = rows.len().saturating_sub(1);
+        let mut live_keys = Vec::new();
+        for (ix, row) in rows.iter().enumerate() {
+            let DisplayRow::WorkRun(run) = row else {
+                continue;
+            };
+            let key = run.span.start();
+            live_keys.push(key);
+            let is_live = ix == last_ix && agent_state == AgentState::Working;
+            if let Some(entry) = self.runs.get_mut(&key) {
+                if is_live {
+                    entry.completed_at = None;
+                } else if entry.completed_at.is_none() {
+                    entry.completed_at = Some(now);
+                }
+            } else if is_live {
+                self.runs.insert(
+                    key,
+                    WorkRunTiming {
+                        started_at: now,
+                        completed_at: None,
+                    },
+                );
+            }
+        }
+        self.runs.retain(|key, _| live_keys.contains(key));
+    }
+
+    pub(super) fn migrate_head_drain(&mut self, old_run_abs_start: Option<usize>, new_base: usize) {
+        if let Some(old) = old_run_abs_start
+            && old < new_base
+            && let Some(timing) = self.runs.remove(&old)
+        {
+            self.runs.entry(new_base).or_insert(timing);
+        }
+        self.runs.retain(|&key, _| key >= new_base);
+    }
+
+    pub(super) fn elapsed_secs(&self, run_start: usize, now: Instant) -> Option<u64> {
+        let timing = self.runs.get(&run_start)?;
+        let end = timing.completed_at.unwrap_or(now);
+        Some(end.saturating_duration_since(timing.started_at).as_secs())
+    }
+}
+
+pub(super) fn format_elapsed_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        if rem == 0 {
+            format!("{mins}m")
+        } else {
+            format!("{mins}m {rem}s")
+        }
+    } else {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        if mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {mins}m")
+        }
+    }
+}
+
+fn is_turn_boundary(kind: ChatItemKind) -> bool {
+    matches!(
+        kind,
+        ChatItemKind::User | ChatItemKind::Question | ChatItemKind::Permission
+    )
+}
+
+pub(super) fn is_foldable_preamble(item: &ChatItem) -> bool {
+    if item.kind != ChatItemKind::Assistant {
+        return false;
+    }
+    let trimmed = item.text.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().count() <= MAX_PREAMBLE_CHARS
+        && !trimmed.contains('\n')
+        && !trimmed.contains("```")
+        && item.file_path.trim().is_empty()
+}
+
+pub(super) fn compute_foldable_notes(items: &[Arc<ChatItem>]) -> Vec<bool> {
+    let mut foldable = vec![false; items.len()];
+    let mut seen_tool_ahead = false;
+    for (idx, item) in items.iter().enumerate().rev() {
+        if is_turn_boundary(item.kind) {
+            seen_tool_ahead = false;
+            continue;
+        }
+        if matches!(item.kind, ChatItemKind::ToolCall | ChatItemKind::ToolResult) {
+            seen_tool_ahead = true;
+            continue;
+        }
+        if item.kind == ChatItemKind::Assistant {
+            if seen_tool_ahead && is_foldable_preamble(item) {
+                foldable[idx] = true;
+            } else {
+                seen_tool_ahead = false;
+            }
+        }
+    }
+    foldable
+}
+
+fn is_work_or_foldable(kind: ChatItemKind, folded: bool) -> bool {
+    is_work_kind(kind) || folded
+}
+
+pub(super) fn straddling_run_rel_start(items: &[Arc<ChatItem>], excess: usize) -> Option<usize> {
+    if excess == 0 || excess >= items.len() {
+        return None;
+    }
+    let foldable = compute_foldable_notes(items);
+    let mut rel_idx = 0;
+    while rel_idx < items.len() {
+        if !is_work_or_foldable(items[rel_idx].kind, foldable[rel_idx]) {
+            rel_idx += 1;
+            continue;
+        }
+        let mut rel_end = rel_idx + 1;
+        while rel_end < items.len() && is_work_or_foldable(items[rel_end].kind, foldable[rel_end]) {
+            rel_end += 1;
+        }
+        let has_tool = items[rel_idx..rel_end].iter().any(|entry| {
+            matches!(
+                entry.kind,
+                ChatItemKind::ToolCall | ChatItemKind::ToolResult
+            )
+        });
+        if (has_tool || rel_end - rel_idx > 1) && rel_idx < excess && excess < rel_end {
+            return Some(rel_idx);
+        }
+        rel_idx = rel_end;
+    }
+    None
 }
 
 pub(super) fn is_work_kind(kind: ChatItemKind) -> bool {

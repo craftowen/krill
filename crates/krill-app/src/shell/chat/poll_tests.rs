@@ -250,11 +250,13 @@ fn prepended_rows_keep_the_rows_on_screen_in_place(cx: &mut gpui::TestAppContext
         feed: initial,
         revision: 0,
         epoch: 1,
+        pending_len: 0,
+        pending_rev: 0,
         state: state.clone(),
     };
     let prepended = Arc::new(work_run::DisplayFeed::project(990, &make_items(110)));
     cx.update(|_| {
-        list.sync(&prepended, 1, 1);
+        list.sync(&prepended, 0, 0, 1, 1);
     });
     assert_eq!(state.logical_scroll_top().item_ix, 50);
     assert_eq!(state.item_count(), 110);
@@ -324,7 +326,7 @@ fn work_run_list_sync_preserves_anchor_across_boundary_prepend_head_drain_and_ta
             Arc::new(item(ChatItemKind::ToolResult, "contents a")),
             Arc::new(item(ChatItemKind::Assistant, "answer 1")),
             Arc::new(item(ChatItemKind::User, "anchor user message")),
-            Arc::new(item(ChatItemKind::Assistant, "answer 2")),
+            Arc::new(item(ChatItemKind::Assistant, "answer 2\ndetail")),
             Arc::new(item(ChatItemKind::ToolCall, "read b.rs")),
         ],
         ..Default::default()
@@ -346,6 +348,8 @@ fn work_run_list_sync_preserves_anchor_across_boundary_prepend_head_drain_and_ta
         feed,
         revision: log.revision,
         epoch: log.epoch,
+        pending_len: 0,
+        pending_rev: 0,
         state: state.clone(),
     };
     assert!(list.near_top(log.base_index, 4));
@@ -363,7 +367,7 @@ fn work_run_list_sync_preserves_anchor_across_boundary_prepend_head_drain_and_ta
     let tail_grown = log.display_feed();
     assert_eq!(tail_grown.len(), 5);
     cx.update(|_| {
-        list.sync(&tail_grown, log.revision, log.epoch);
+        list.sync(&tail_grown, 0, 0, log.revision, log.epoch);
     });
     assert_eq!(state.item_count(), 5);
     assert_eq!(state.logical_scroll_top().item_ix, 2);
@@ -380,7 +384,7 @@ fn work_run_list_sync_preserves_anchor_across_boundary_prepend_head_drain_and_ta
     assert_eq!(merged.rows()[1].span().range(), 999..1_002);
     assert!(log.is_run_expanded(merged.rows()[1].span()));
     cx.update(|_| {
-        list.sync(&merged, log.revision, log.epoch);
+        list.sync(&merged, 0, 0, log.revision, log.epoch);
     });
     assert_eq!(state.item_count(), 6);
     assert_eq!(state.logical_scroll_top().item_ix, 3);
@@ -395,7 +399,7 @@ fn work_run_list_sync_preserves_anchor_across_boundary_prepend_head_drain_and_ta
         "partially drained front WorkRun must keep its expanded state"
     );
     cx.update(|_| {
-        list.sync(&drained, log.revision, log.epoch);
+        list.sync(&drained, 0, 0, log.revision, log.epoch);
     });
     assert_eq!(state.logical_scroll_top().item_ix, 2);
     let Some(work_run::DisplayRow::Item {

@@ -291,6 +291,25 @@ fn popup_heading(palette: &ui::Palette, text: &'static str) -> gpui::Div {
         .child(text)
 }
 
+pub(super) fn effort_rank(raw: &str) -> usize {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" | "x-high" | "extra-high" => 5,
+        "max" => 6,
+        "ultra" => 7,
+        _ => usize::MAX,
+    }
+}
+
+pub(super) fn sort_effort_choices(mut efforts: Vec<String>) -> Vec<String> {
+    efforts.sort_by_key(|effort| effort_rank(effort));
+    efforts
+}
+
 fn resolved_composer_choices(
     agent: &str,
     meta: Option<&ComposerMeta>,
@@ -311,7 +330,7 @@ fn resolved_composer_choices(
                 .or_else(|| (!m.efforts.is_empty()).then(|| m.efforts.clone()))
         })
         .unwrap_or(fallback_efforts);
-    (models, efforts)
+    (models, sort_effort_choices(efforts))
 }
 
 impl Shell {
@@ -394,6 +413,7 @@ impl Shell {
 
         let quick_menu = quick_menu_open.then(|| {
             let close_key = key.clone();
+            let attach_key = key.clone();
             composer_popup(palette)
                 .id(SharedString::from(format!(
                     "chat-quick-menu-{}",
@@ -403,6 +423,27 @@ impl Shell {
                     this.chat.quick_menu.remove(&close_key);
                     cx.notify();
                 }))
+                .child(
+                    popup_row(
+                        palette,
+                        SharedString::from(format!("chat-quick-attach-{}", pane.get())),
+                        true,
+                    )
+                    .debug_selector(|| "chat-quick-attach".into())
+                    .gap_2()
+                    .child(
+                        gpui_component::Icon::new(IconName::File)
+                            .size(px(ui::ICON_SM))
+                            .text_color(palette.muted_foreground),
+                    )
+                    .child(ctext::ATTACH_FILE.get())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.chat.quick_menu.remove(&attach_key);
+                        this.prompt_for_chat_attachments(&attach_key, cx);
+                        cx.notify();
+                    })),
+                )
+                .child(div().h_px().w_full().my_0p5().bg(palette.border))
                 .children(
                     ["/model", "/compact", "/clear", "/review"]
                         .into_iter()
@@ -433,6 +474,14 @@ impl Shell {
                                                 .update(cx, |state, cx| state.focus(window, cx));
                                         }
                                         return;
+                                    }
+                                    if let Some(ac) = this.chat.autocomplete.get_mut(&key) {
+                                        ac.dismissed = Some((
+                                            super::catalog::AutocompleteKind::Slash,
+                                            0,
+                                            cmd_str.trim_start_matches('/').to_owned(),
+                                        ));
+                                        ac.close();
                                     }
                                     input_state.update(cx, |state, cx| {
                                         let val = state.value();
@@ -514,11 +563,15 @@ impl Shell {
                             .disabled(is_pending || !supported)
                             .ghost()
                             .xsmall()
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
+                            .on_click(cx.listener({
+                                let focus_input = input_state.clone();
+                                move |this, _, window, cx| {
                                     this.select_chat_effort(&key, &option_effort, cx);
-                                },
-                            ))
+                                    if !focus_input.read(cx).focus_handle(cx).is_focused(window) {
+                                        focus_input.update(cx, |state, cx| state.focus(window, cx));
+                                    }
+                                }
+                            }))
                         }),
                     ))
                     .children(notice.map(|notice| {
@@ -536,23 +589,333 @@ impl Shell {
                     }))
             });
 
-        let can_send = !input_state.read(cx).value().trim().is_empty()
-            && !self.chat.prompt_tasks.contains_key(&key)
-            && !self.chat.prompt_review.contains(&key);
+        let attachments = self
+            .chat
+            .draft_attachments
+            .get(&key)
+            .map_or(&[][..], Vec::as_slice);
+        let has_attachments = !attachments.is_empty();
+        let autocomplete_open = self
+            .chat
+            .autocomplete
+            .get(&key)
+            .is_some_and(super::catalog::AutocompleteState::is_open);
+
+        let autocomplete_popover = autocomplete_open.then(|| {
+            let ac = &self.chat.autocomplete[&key];
+            let items = ac.items.clone();
+            let selected = ac.selected.min(items.len().saturating_sub(1));
+            let kind = ac
+                .trigger
+                .as_ref()
+                .map_or(super::catalog::AutocompleteKind::File, |t| t.kind);
+            let heading = match kind {
+                super::catalog::AutocompleteKind::File => ctext::AUTOCOMPLETE_FILES.get(),
+                super::catalog::AutocompleteKind::Slash => ctext::AUTOCOMPLETE_COMMANDS.get(),
+            };
+            let close_key = key.clone();
+            let mut list_box = div()
+                .id(SharedString::from(format!(
+                    "chat-autocomplete-list-{}",
+                    pane.get()
+                )))
+                .max_h(px(216.))
+                .overflow_y_scroll()
+                .track_scroll(&ac.scroll)
+                .flex()
+                .flex_col()
+                .gap_0p5();
+            for (idx, item) in items.iter().enumerate() {
+                let is_selected = idx == selected;
+                let accept_key = key.clone();
+                let icon_name = match item.source {
+                    super::catalog::AutocompleteSource::File => gpui_kit_assets::IconName::File,
+                    super::catalog::AutocompleteSource::Skill => {
+                        gpui_kit_assets::IconName::Sparkles
+                    }
+                    super::catalog::AutocompleteSource::Builtin
+                    | super::catalog::AutocompleteSource::Command => {
+                        gpui_kit_assets::IconName::Terminal
+                    }
+                };
+                let badge = match item.source {
+                    super::catalog::AutocompleteSource::Skill => {
+                        Some(ctext::AUTOCOMPLETE_SKILL_BADGE.get())
+                    }
+                    super::catalog::AutocompleteSource::Command => {
+                        Some(ctext::AUTOCOMPLETE_CMD_BADGE.get())
+                    }
+                    super::catalog::AutocompleteSource::Builtin
+                    | super::catalog::AutocompleteSource::File => None,
+                };
+                let mut row = popup_row(
+                    palette,
+                    SharedString::from(format!("chat-autocomplete-option-{idx}-{}", pane.get())),
+                    true,
+                )
+                .debug_selector(move || format!("chat-autocomplete-option-{idx}"))
+                .gap_2()
+                .justify_between();
+                if is_selected {
+                    row = row.bg(palette.muted);
+                }
+                row = row
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .flex_1()
+                            .child(Icon::new(icon_name).size(px(ui::ICON_SM)).text_color(
+                                if is_selected {
+                                    palette.foreground
+                                } else {
+                                    palette.muted_foreground
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(palette.foreground)
+                                    .child(item.label.clone()),
+                            )
+                            .when(!item.detail.is_empty(), |parent| {
+                                parent.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(palette.muted_foreground)
+                                        .child(item.detail.clone()),
+                                )
+                            }),
+                    )
+                    .children(badge.map(|badge_text| {
+                        div()
+                            .flex_none()
+                            .rounded(ui::RADIUS_SM)
+                            .bg(palette.muted)
+                            .px_1p5()
+                            .py_0p5()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(palette.muted_foreground)
+                            .child(badge_text)
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.accept_chat_autocomplete(&accept_key, Some(idx), window, cx);
+                    }));
+                list_box = list_box.child(row);
+            }
+            div()
+                .id(SharedString::from(format!(
+                    "chat-autocomplete-popover-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-autocomplete-popover".into())
+                .occlude()
+                .absolute()
+                .left_0()
+                .bottom_full()
+                .mb_1p5()
+                .w_full()
+                .rounded(ui::RADIUS_MD)
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.popover)
+                .shadow_lg()
+                .p_1p5()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                    if let Some(ac) = this.chat.autocomplete.get_mut(&close_key) {
+                        ac.dismiss_current();
+                    }
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .text_size(ui::TEXT_XS)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(palette.muted_foreground)
+                        .child(heading),
+                )
+                .child(list_box)
+        });
+
+        let attachment_chips = (!attachments.is_empty()).then(|| {
+            div()
+                .id(SharedString::from(format!(
+                    "chat-attachment-chips-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-attachment-chips".into())
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1p5()
+                .px_1p5()
+                .pt_0p5()
+                .children(attachments.iter().enumerate().map(|(idx, attachment)| {
+                    let remove_key = key.clone();
+                    let label = if attachment.is_image {
+                        format!(
+                            "{} ({}, {})",
+                            attachment.display_name,
+                            ctext::ATTACH_IMAGE_BADGE.get(),
+                            super::catalog::format_byte_len(attachment.byte_len)
+                        )
+                    } else {
+                        format!(
+                            "{} ({})",
+                            attachment.display_name,
+                            super::catalog::format_byte_len(attachment.byte_len)
+                        )
+                    };
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-attachment-chip-{idx}-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(move || format!("chat-attachment-chip-{idx}"))
+                        .max_w(px(260.))
+                        .rounded(ui::RADIUS_SM)
+                        .border_1()
+                        .border_color(palette.border)
+                        .bg(palette.muted)
+                        .px_2()
+                        .py_1()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(palette.foreground)
+                        .child(
+                            Icon::new(if attachment.is_image {
+                                gpui_kit_assets::IconName::Image
+                            } else {
+                                gpui_kit_assets::IconName::File
+                            })
+                            .size(px(ui::ICON_SM))
+                            .text_color(palette.muted_foreground),
+                        )
+                        .child(div().min_w_0().truncate().child(label))
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "chat-attachment-remove-{idx}-{}",
+                                pane.get()
+                            )))
+                            .debug_selector(move || format!("chat-attachment-remove-{idx}"))
+                            .icon(IconName::Close)
+                            .tooltip(ctext::ATTACH_REMOVE.get())
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.remove_chat_attachment(&remove_key, idx, cx);
+                                },
+                            )),
+                        )
+                }))
+        });
+
+        let submission = if self.chat.prompt_tasks.contains_key(&key)
+            || self.paste_queue.has_pending_for(pane)
+        {
+            super::ComposerSubmissionState::InFlight
+        } else if self.chat.prompt_review.contains(&key) {
+            super::ComposerSubmissionState::ReviewRequired
+        } else {
+            super::ComposerSubmissionState::Ready
+        };
+        let agent_state = self.session_agent_state(&key.0, key.1, cx);
+        let interrupt_latched = self.is_chat_interrupt_latched(&key, cx);
+        let draft_empty = input_state.read(cx).value().trim().is_empty() && !has_attachments;
+        let primary_action = super::composer_primary_action(super::ComposerPrimaryInput {
+            agent_state,
+            submission,
+            draft_empty,
+            interrupt_latched,
+        });
 
         let inner_card = div()
             .id("desktop-chat-composer")
             .debug_selector(|| "desktop-chat-composer".into())
             .capture_action(cx.listener({
-                let escape_input = input_state.clone();
-                move |_, _: &gpui_component::input::Escape, window, cx| {
-                    let composing = escape_input.update(cx, |state, cx| {
-                        state.focus_handle(cx).is_focused(window)
-                            && gpui::EntityInputHandler::marked_text_range(state, window, cx)
-                                .is_some()
-                    });
-                    if composing {
+                let up_key = key.clone();
+                move |this, _: &gpui_component::input::MoveUp, _, cx| {
+                    if let Some(ac) = this.chat.autocomplete.get_mut(&up_key)
+                        && ac.is_open()
+                    {
+                        ac.step_selection(-1);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }
+            }))
+            .capture_action(cx.listener({
+                let down_key = key.clone();
+                move |this, _: &gpui_component::input::MoveDown, _, cx| {
+                    if let Some(ac) = this.chat.autocomplete.get_mut(&down_key)
+                        && ac.is_open()
+                    {
+                        ac.step_selection(1);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }
+            }))
+            .capture_action(cx.listener({
+                let tab_key = key.clone();
+                move |this, _: &gpui_component::input::IndentInline, window, cx| {
+                    if this.accept_chat_autocomplete(&tab_key, None, window, cx) {
                         window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                }
+            }))
+            .capture_action(cx.listener({
+                let enter_key = key.clone();
+                let enter_input = input_state.clone();
+                move |this, action: &gpui_component::input::Enter, window, cx| {
+                    if !action.secondary && !action.shift {
+                        if super::Shell::chat_input_is_composing(&enter_input, window, cx) {
+                            return;
+                        }
+                        if this.accept_chat_autocomplete(&enter_key, None, window, cx) {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        }
+                    }
+                }
+            }))
+            .capture_action(cx.listener({
+                let paste_key = key.clone();
+                let paste_input = input_state.clone();
+                move |this, _: &gpui_component::input::Paste, window, cx| {
+                    if paste_input.read(cx).focus_handle(cx).is_focused(window) {
+                        this.intercept_chat_clipboard_paste(&paste_key, window, cx);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                }
+            }))
+            .capture_action(cx.listener({
+                let escape_key = key.clone();
+                let escape_input = input_state.clone();
+                move |this, _: &gpui_component::input::Escape, window, cx| {
+                    if super::Shell::chat_input_is_composing(&escape_input, window, cx) {
+                        window.prevent_default();
+                        return;
+                    }
+                    if this.dismiss_open_composer_popover(&escape_key) {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
                     }
                 }
             }))
@@ -566,23 +929,13 @@ impl Shell {
                     {
                         return;
                     }
-                    if !this.chat.quick_menu.contains(&escape_key)
-                        && !this.chat.model_picker.contains(&escape_key)
-                    {
+                    if super::Shell::chat_input_is_composing(&escape_input, window, cx) {
                         return;
                     }
-                    let composing = escape_input.update(cx, |state, cx| {
-                        state.focus_handle(cx).is_focused(window)
-                            && gpui::EntityInputHandler::marked_text_range(state, window, cx)
-                                .is_some()
-                    });
-                    if composing {
-                        return;
+                    if this.dismiss_open_composer_popover(&escape_key) {
+                        cx.stop_propagation();
+                        cx.notify();
                     }
-                    this.chat.quick_menu.remove(&escape_key);
-                    this.chat.model_picker.remove(&escape_key);
-                    cx.stop_propagation();
-                    cx.notify();
                 }
             }))
             .on_action(cx.listener(
@@ -598,18 +951,18 @@ impl Shell {
             .w_full()
             .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
             .min_w_0()
-            .rounded(ui::RADIUS_LG)
+            .rounded(ui::RADIUS_XL)
             .border_1()
             .border_color(border)
             .bg(palette.card)
-            .px_2()
-            .pt_1p5()
-            .pb_1p5()
+            .p_1p5()
             .flex()
             .flex_col()
             .gap_1()
             .children(quick_menu)
             .children(model_picker)
+            .children(autocomplete_popover)
+            .children(attachment_chips)
             .child(
                 Textarea::new(input_state)
                     .small()
@@ -665,6 +1018,9 @@ impl Shell {
                                             return;
                                         }
                                         this.chat.model_picker.remove(&key);
+                                        if let Some(ac) = this.chat.autocomplete.get_mut(&key) {
+                                            ac.dismiss_current();
+                                        }
                                         if this.chat.quick_menu.contains(&key) {
                                             this.chat.quick_menu.remove(&key);
                                         } else {
@@ -745,24 +1101,69 @@ impl Shell {
                             .items_center()
                             .gap_2()
                             .children(context_ring)
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "desktop-chat-send-{}",
-                                    pane.get()
-                                )))
-                                .debug_selector(|| "desktop-chat-send".into())
-                                .icon(IconName::ArrowUp)
-                                .tooltip(ctext::SEND.get())
-                                .small()
-                                .primary()
-                                .rounded(px(999.))
-                                .disabled(!can_send)
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.submit_chat_prompt(&key, window, cx);
-                                    },
-                                )),
-                            ),
+                            .child({
+                                match primary_action {
+                                    super::ComposerPrimaryAction::Stop { latched } => Button::new(
+                                        SharedString::from(format!(
+                                            "desktop-chat-stop-{}",
+                                            pane.get()
+                                        )),
+                                    )
+                                    .debug_selector(|| "desktop-chat-stop".into())
+                                    .icon(
+                                        gpui_component::Icon::default()
+                                            .data(ui::icons::STOP_SQUARE_SVG),
+                                    )
+                                    .tooltip(if latched {
+                                        ctext::STOPPING.get()
+                                    } else {
+                                        ctext::STOP.get()
+                                    })
+                                    .secondary()
+                                    .rounded(px(999.))
+                                    .disabled(latched)
+                                    .on_click(cx.listener(
+                                        move |this, event: &gpui::ClickEvent, _, cx| {
+                                            if event.click_count() > 1 {
+                                                return;
+                                            }
+                                            this.interrupt_chat_turn(&key, cx);
+                                        },
+                                    )),
+                                    super::ComposerPrimaryAction::Sending => {
+                                        Button::new(SharedString::from(format!(
+                                            "desktop-chat-send-{}",
+                                            pane.get()
+                                        )))
+                                        .debug_selector(|| "desktop-chat-send".into())
+                                        .icon(IconName::ArrowUp)
+                                        .tooltip(ctext::SEND.get())
+                                        .primary()
+                                        .rounded(px(999.))
+                                        .disabled(true)
+                                    }
+                                    super::ComposerPrimaryAction::Send { enabled } => {
+                                        Button::new(SharedString::from(format!(
+                                            "desktop-chat-send-{}",
+                                            pane.get()
+                                        )))
+                                        .debug_selector(|| "desktop-chat-send".into())
+                                        .icon(IconName::ArrowUp)
+                                        .tooltip(ctext::SEND.get())
+                                        .primary()
+                                        .rounded(px(999.))
+                                        .disabled(!enabled)
+                                        .on_click(cx.listener(
+                                            move |this, event: &gpui::ClickEvent, window, cx| {
+                                                if event.click_count() > 1 {
+                                                    return;
+                                                }
+                                                this.submit_chat_prompt(&key, window, cx);
+                                            },
+                                        ))
+                                    }
+                                }
+                            }),
                     ),
             );
 
@@ -771,7 +1172,8 @@ impl Shell {
             .min_w_0()
             .flex_none()
             .px_3()
-            .py_2()
+            .pt_2()
+            .pb_3()
             .bg(palette.background)
             .flex()
             .justify_center()
@@ -871,5 +1273,38 @@ mod name_tests {
         assert!(!model_is_selected(Some("claude-opus-5-5"), "sonnet"));
         assert_eq!(effort_bars("high"), Some(3));
         assert_eq!(effort_bars("unknown"), None);
+    }
+
+    #[test]
+    fn effort_choices_sort_lowest_to_highest_including_live_meta() {
+        let sorted = sort_effort_choices(vec![
+            "max".into(),
+            "high".into(),
+            "low".into(),
+            "xhigh".into(),
+            "medium".into(),
+            "custom".into(),
+        ]);
+        assert_eq!(
+            sorted,
+            vec!["low", "medium", "high", "xhigh", "max", "custom"]
+        );
+
+        let meta = ComposerMeta {
+            model: Some("gpt-5.4".into()),
+            current_model_id: Some("gpt-5.4".into()),
+            models: vec![ComposerModelItem {
+                id: "gpt-5.4".into(),
+                label: "GPT-5.4".into(),
+                efforts: vec!["xhigh".into(), "high".into(), "medium".into(), "low".into()],
+                default_effort: Some("medium".into()),
+            }],
+            effort: Some("medium".into()),
+            efforts: vec![],
+            supported: true,
+            ..Default::default()
+        };
+        let (_, resolved_efforts) = resolved_composer_choices("codex", Some(&meta));
+        assert_eq!(resolved_efforts, vec!["low", "medium", "high", "xhigh"]);
     }
 }

@@ -906,6 +906,10 @@ impl Tap {
         input::write_input(self, bytes, peer)
     }
 
+    pub(crate) fn write_interrupt(&self, still_working: impl FnOnce() -> bool) -> io::Result<bool> {
+        input::write_interrupt(self, still_working)
+    }
+
     pub(crate) fn guarded_command(
         &self,
         revision: u64,

@@ -244,7 +244,7 @@ PWA는 `/`, `/manifest.json`, `/app.js`, `/app.css`, `/icon.svg`를 gzip 사전 
 
 ## 5. UI와 터미널 렌더링 (T3)
 
-- **프레임워크**: gpui(`gpui-pre`·**모든 `gpui-pre-*`**·`gpui-component`를 `=`로 묶어 고정, `cargo vendor`, Apache-2.0). gpui-pre는 Zed 공식 배포가 아니라 1인 게시 스냅샷이다(공식 `gpui`는 0.2.2 이후 1년 갱신 없음) — 공급망 위험으로 관리. 근거는 메모리가 아니라 **macOS IME 구현 경로(NSTextInputClient)가 있다는 점**이며, 실제 한글 동작은 MK-002에서 확정한다(T3 기준 일부 메서드는 미확인). Xcode 없는 빌드는 `font-kit` + `runtime_shaders`. **첫 스파이크(MK-002) 실패 시 objc2 AppKit + 커스텀 Metal로 전환.**
+- **프레임워크**: gpui(`gpui-pre`·**모든 `gpui-pre-*`**·`gpui-component`를 `=`로 묶어 고정, `cargo vendor`, Apache-2.0). gpui-pre는 Zed 공식 배포가 아니라 1인 게시 스냅샷이므로(공식 `gpui`는 0.2.2 이후 장기 미갱신) 공급망 위험으로 관리하고, 묶음 호환성과 `vendor/` 패치 안정성이 확인되기 전에는 현행 고정을 유지한다. 근거는 메모리가 아니라 **macOS IME 구현 경로(NSTextInputClient)가 있다는 점**이며(실제 한글 동작은 MK-002로 확정), Xcode 없는 빌드는 `font-kit` + `runtime_shaders`. **게시 중단 대비책**: `gpui-pre`·`gpui-component` 게시가 멈추거나 핀 불일치가 고착되면 검증된 `zed-industries/zed` 커밋의 `crates/gpui*`(Apache-2.0, GPL-3.0 터미널 제외)를 직접 `cargo vendor`로 편입하고 `gpui-component` 호환을 로컬에서 유지한다. **교체안(macOS·Windows 공통)**: 기존 macOS 전용 `objc2 AppKit + 커스텀 Metal` 전환안은 M11 Windows 포팅 범위를 덮지 못해 폐기하며, 교체가 필요하면 프레임워크 중립 모델(`krill-term`) 위에 **`winit` + `wgpu` 직접 렌더러**(주 후보) 또는 **Iced**로 이관한다.
 - **렌더**: 같은 스타일 연속 셀을 run으로 묶어 gpui 텍스트 시스템으로 그림, 셀 폭 강제, 배경 병합, vsync당 1회. **Zed 터미널 코드는 GPL-3.0이라 클린룸 구현**(구조만 참고).
 - **IME**: preedit는 UI 상태로만 두고 커서 셀 위 오버레이, PTY에는 확정 텍스트만, 포커스 이탈·탭 전환 시 확정.
 - **vendor 패치**: 글리프 아틀라스 nearest 샘플링(한글 획 번짐, Zed #57777), `maximumDrawableCount` 3→2(장당 25.6MB).

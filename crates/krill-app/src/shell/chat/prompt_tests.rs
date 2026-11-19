@@ -28,7 +28,7 @@ fn chat_single_line_bracketed_paste_submits_separately_and_keeps_draft_until_ent
             input.update(cx, |state, cx| state.set_value("한 줄 prompt", window, cx));
             shell.submit_chat_prompt(&local_key(SESSION), window, cx);
             shell.submit_chat_prompt(&local_key(SESSION), window, cx);
-            assert_eq!(input.read(cx).value(), "한 줄 prompt");
+            assert!(input.read(cx).value().is_empty());
             input
         })
     });
@@ -341,11 +341,9 @@ fn chat_paste_waits_for_pty_ack_and_provider_turn_before_clearing(cx: &mut TestA
     cx.executor().advance_clock(Duration::from_millis(2));
     cx.run_until_parked();
     assert_eq!(sent.lock().unwrap().len(), 2);
-    assert_eq!(
-        input.read_with(cx, |state, _| state.value()),
-        "ack gated prompt"
-    );
+    assert!(input.read_with(cx, |state, _| state.value().is_empty()));
     view.update(cx, |shell, _| {
+        assert_eq!(shell.chat.pending_prompts[&local_key(SESSION)].len(), 1);
         shell.apply_chat_poll(
             SESSION,
             krill_proto::agent_history::ChatPollSnapshot {
@@ -365,6 +363,15 @@ fn chat_paste_waits_for_pty_ack_and_provider_turn_before_clearing(cx: &mut TestA
     cx.executor().advance_clock(Duration::from_millis(20));
     cx.run_until_parked();
     assert!(input.read_with(cx, |state, _| state.value()).is_empty());
+    view.read_with(cx, |shell, _| {
+        assert!(
+            shell
+                .chat
+                .pending_prompts
+                .get(&local_key(SESSION))
+                .is_none_or(Vec::is_empty)
+        );
+    });
 }
 
 #[gpui::test]
@@ -548,4 +555,96 @@ fn chat_uncertain_paste_never_submits_or_replays_and_preserves_draft(cx: &mut Te
         );
         cx.notify();
     });
+}
+
+#[gpui::test]
+fn tui_opening_slash_command_defers_terminal_switch_until_delivery_applied(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::input::Delivery;
+
+    let (view, cx, _, _) = fixture(cx, "chat-tui-slash-bracketed", &permission(), "ready");
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            shell.chat.prompt_delivery = Some(Delivery::Pending);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value("/config", window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+
+    // Bracketed delivery is still Pending after 2ms -> stay in Chat View!
+    cx.executor().advance_clock(Duration::from_millis(2));
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |shell, app_cx| shell.is_pane_chat_view(pane, app_cx)),
+        "must not flip to Terminal View while slash prompt delivery is Pending"
+    );
+
+    // Next receipt tick observes Delivery::Applied -> switches to Terminal View once delay + poll settle.
+    view.update(cx, |shell, _| {
+        shell.chat.prompt_delivery = Some(Delivery::Applied);
+    });
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    assert!(
+        !view.read_with(cx, |shell, app_cx| shell.is_pane_chat_view(pane, app_cx)),
+        "must switch to Terminal View once TUI-opening slash command is Applied"
+    );
+
+    // Uncertain delivery must NOT switch to Terminal View.
+    let (view2, cx2, _, _) = fixture(cx, "chat-tui-slash-uncertain", &permission(), "ready");
+    let pane2 = view2.read_with(cx2, |shell, _| shell.layout.focused().unwrap());
+    cx2.update(|window, cx| {
+        view2.update(cx, |shell, cx| {
+            shell.chat.prompt_delivery = Some(Delivery::Uncertain);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value("/resume", window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx2.executor().advance_clock(Duration::from_millis(2));
+    cx2.run_until_parked();
+    assert!(
+        view2.read_with(cx2, |shell, app_cx| shell.is_pane_chat_view(pane2, app_cx)),
+        "Uncertain slash delivery must keep Chat View open"
+    );
+
+    // Unbracketed Pending -> Applied transitions to Terminal View once Applied.
+    let (view3, cx3, _, _) = fixture(cx, "chat-tui-slash-unbracketed", &permission(), "ready");
+    let pane3 = view3.read_with(cx3, |shell, _| shell.layout.focused().unwrap());
+    cx3.update(|window, cx| {
+        view3.update(cx, |shell, cx| {
+            shell.chat.prompt_delivery = Some(Delivery::Pending);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value("/config", window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx3.executor().advance_clock(Duration::from_millis(2));
+    cx3.run_until_parked();
+    assert!(
+        view3.read_with(cx3, |shell, app_cx| shell.is_pane_chat_view(pane3, app_cx)),
+        "unbracketed Pending delivery must stay in Chat View"
+    );
+    view3.update(cx3, |shell, _| {
+        shell.chat.prompt_delivery = Some(Delivery::Applied);
+    });
+    cx3.executor().advance_clock(Duration::from_millis(30));
+    cx3.run_until_parked();
+    assert!(
+        !view3.read_with(cx3, |shell, app_cx| shell.is_pane_chat_view(pane3, app_cx)),
+        "unbracketed slash command switches to Terminal View after Applied settles"
+    );
 }
