@@ -240,23 +240,23 @@ fn render_markdown(title: &str, arch: Archetype) -> String {
     if arch == Archetype::Brief {
         format!(
             "# {title}\n\n\
-             **핵심 결론:** 독자가 첫 문장에서 결정 사항과 수치 변화를 파악할 수 있도록 한 문장 결론을 적는다.\n\n\
-             ## 주요 지표 변화\n\n\
-             | 지표 | 현재값 | 기준 대비 변화 | 비고 |\n\
+             **Key takeaway:** State the decision and measured delta in one direct opening sentence.\n\n\
+             ## Key Metrics\n\n\
+             | Metric | Current | Delta vs Baseline | Notes |\n\
              |---|---:|---:|---|\n\
-             | 응답 지연 (p99) | 28 ms | -41.7% (▼ 20 ms) | 실측 기준 명시 |\n\n\
-             ## 다음 실행 항목\n\n\
-             - [ ] 담당자와 완료 기준이 드러나는 동사형 할 일을 적는다.\n"
+             | Tail latency (p99) | 28 ms | -41.7% (▼ 20 ms) | Measured under identical load |\n\n\
+             ## Next Actions\n\n\
+             - [ ] Write concrete verb-led actions with an explicit owner and target date.\n"
         )
     } else {
         format!(
             "# {title}\n\n\
-             **요약:** 이 문서가 답하는 질문과 검증된 결론을 2~3문장으로 먼저 제시한다.\n\n\
-             ## 1. 결론형 소제목을 적어 독자가 제목만 읽어도 논지를 따라가게 한다\n\n\
-             사실과 측정 수치를 중심으로 서술하고, 정량 근거 없는 추상 수식절은 생략한다.\n\n\
-             | 비교 항목 | 대안 A | 대안 B | 판정 근거 |\n\
+             **Summary:** State the question this document answers and the verified conclusion in 2 to 3 sentences.\n\n\
+             ## 1. Use assertion headings so readers can scan the argument from headings alone\n\n\
+             Lead with measured facts and concrete trade-offs; omit filler qualifiers without quantitative backing.\n\n\
+             | Criterion | Option A | Option B | Basis |\n\
              |---|---:|---:|---|\n\
-             | 상주 메모리 | 42 MB | 96 MB | 동일 워크로드 실측 |\n"
+             | Resident memory | 42 MB | 96 MB | Measured on identical workload |\n"
         )
     }
 }
@@ -276,7 +276,7 @@ fn render_html(title: &str, arch: Archetype, theme: ArtifactTheme) -> String {
     };
     format!(
         "<!doctype html>\n\
-         <html lang=\"ko\"{theme_attr}>\n\
+         <html lang=\"en\"{theme_attr}>\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -289,13 +289,13 @@ fn render_html(title: &str, arch: Archetype, theme: ArtifactTheme) -> String {
          <div class=\"ka-topbar\">\n\
            <div class=\"ka-topbar-inner\">\n\
              <span class=\"ka-meta-label\">{safe_title}</span>\n\
-             <div class=\"ka-mode-switch\" role=\"radiogroup\" aria-label=\"테마 선택\">\n\
+             <div class=\"ka-mode-switch\" role=\"radiogroup\" aria-label=\"Color theme\">\n\
                <input type=\"radio\" name=\"ka-mode\" id=\"ka-mode-auto\" checked>\n\
-               <label for=\"ka-mode-auto\">시스템</label>\n\
+               <label for=\"ka-mode-auto\">System</label>\n\
                <input type=\"radio\" name=\"ka-mode\" id=\"ka-mode-light\">\n\
-               <label for=\"ka-mode-light\">라이트</label>\n\
+               <label for=\"ka-mode-light\">Light</label>\n\
                <input type=\"radio\" name=\"ka-mode\" id=\"ka-mode-dark\">\n\
-               <label for=\"ka-mode-dark\">다크</label>\n\
+               <label for=\"ka-mode-dark\">Dark</label>\n\
              </div>\n\
            </div>\n\
          </div>\n\
@@ -311,22 +311,22 @@ fn render_report_body(safe_title: &str) -> String {
     format!(
         "  <header style=\"max-width:var(--ka-body-w);margin-bottom:28px\">\n\
              <h1>{safe_title}</h1>\n\
-             <p style=\"color:var(--ka-muted);margin:0\">작성 기준과 측정 환경을 한 줄로 명시한다.</p>\n\
+             <p style=\"color:var(--ka-muted);margin:0\">Scope, baseline, and measurement environment.</p>\n\
            </header>\n\
            <div class=\"ka-bluf\">\n\
-             <span class=\"ka-bluf-label\">핵심 결론 (BLUF)</span>\n\
-             <p style=\"margin:0\">독자가 첫 문단에서 핵심 판단과 정량 근거를 바로 확인하도록 결론을 먼저 적는다.</p>\n\
+             <span class=\"ka-bluf-label\">Bottom Line (BLUF)</span>\n\
+             <p style=\"margin:0\">Lead with the primary conclusion and quantitative evidence so readers get the answer in the first paragraph.</p>\n\
            </div>\n\
            <section class=\"ka-sec\">\n\
              <div class=\"ka-editorial\">\n\
-               <h2>1. 결론이 드러나는 문장형 제목을 적는다</h2>\n\
-               <p>본문은 68ch 폭 안에서 사실과 수치 중심으로 서술한다. 보충 출처나 예외 조건은 우측 여백 주석으로 분리해 읽기 흐름을 지킨다.</p>\n\
-               <aside class=\"ka-sidenote\">여백 주석: 측정 조건, 원전 출처, 용어 정의를 본문 문단 옆에 배치한다.</aside>\n\
+               <h2>1. Replace this with a claim-driven heading stating the finding</h2>\n\
+               <p>Keep body prose within a 68ch measure focused on verified facts and numbers. Move secondary citations and caveats into the right-hand sidenote column.</p>\n\
+               <aside class=\"ka-sidenote\">Sidenote: place benchmark setup, primary sources, or definitions alongside the paragraph they support.</aside>\n\
                <div class=\"ka-wide ka-table-wrap\">\n\
                  <table>\n\
-                   <thead><tr><th>항목</th><th class=\"num\">변경 전</th><th class=\"num\">변경 후</th><th class=\"num\">변화량</th></tr></thead>\n\
+                   <thead><tr><th>Metric</th><th class=\"num\">Before</th><th class=\"num\">After</th><th class=\"num\">Delta</th></tr></thead>\n\
                    <tbody>\n\
-                     <tr><td>예시 지표</td><td class=\"num\">120.0 ms</td><td class=\"num\">48.0 ms</td><td class=\"num ka-pos\">-60.0% ▼</td></tr>\n\
+                     <tr><td>Sample latency (p99)</td><td class=\"num\">120.0 ms</td><td class=\"num\">48.0 ms</td><td class=\"num ka-pos\">-60.0% ▼</td></tr>\n\
                    </tbody>\n\
                  </table>\n\
                </div>\n\
@@ -341,27 +341,27 @@ fn render_brief_body(safe_title: &str) -> String {
              <h1>{safe_title}</h1>\n\
            </header>\n\
            <div class=\"ka-bluf\">\n\
-             <span class=\"ka-bluf-label\">한 줄 요약</span>\n\
-             <p style=\"margin:0\">의사결정자가 30초 안에 파악해야 할 핵심 결론과 요청 사항을 적는다.</p>\n\
+             <span class=\"ka-bluf-label\">Executive Summary</span>\n\
+             <p style=\"margin:0\">State the key decision, trade-off, and requested action so a reader can decide within 30 seconds.</p>\n\
            </div>\n\
            <div class=\"ka-kpi-strip\">\n\
              <div class=\"ka-kpi\">\n\
-               <div class=\"ka-kpi-label\">핵심 지표 A</div>\n\
+               <div class=\"ka-kpi-label\">Resident Memory</div>\n\
                <div class=\"ka-kpi-val\">42.0 MB</div>\n\
-               <div class=\"ka-kpi-ctx\"><span class=\"ka-pos\">▼ -30.0%</span> vs 목표 상한 60 MB</div>\n\
+               <div class=\"ka-kpi-ctx\"><span class=\"ka-pos\">▼ -30.0%</span> vs 60 MB budget</div>\n\
              </div>\n\
              <div class=\"ka-kpi\">\n\
-               <div class=\"ka-kpi-label\">핵심 지표 B</div>\n\
+               <div class=\"ka-kpi-label\">Availability</div>\n\
                <div class=\"ka-kpi-val\">99.4%</div>\n\
-               <div class=\"ka-kpi-ctx\"><span class=\"ka-pos\">▲ +1.2%p</span> vs 지난 주</div>\n\
+               <div class=\"ka-kpi-ctx\"><span class=\"ka-pos\">▲ +1.2 pp</span> vs prior week</div>\n\
              </div>\n\
            </div>\n\
            <section class=\"ka-sec\">\n\
-             <h2>결정 및 후속 실행 항목</h2>\n\
+             <h2>Decisions and Next Steps</h2>\n\
              <div class=\"ka-table-wrap\">\n\
                <table>\n\
-                 <thead><tr><th>할 일</th><th>담당</th><th class=\"num\">기한</th></tr></thead>\n\
-                 <tbody><tr><td>구체적인 동사로 시작하는 실행 항목을 적는다</td><td>담당자</td><td class=\"num\">2026-11-20</td></tr></tbody>\n\
+                 <thead><tr><th>Action</th><th>Owner</th><th class=\"num\">Target Date</th></tr></thead>\n\
+                 <tbody><tr><td>Start each item with a concrete verb and measurable completion check</td><td>Owner</td><td class=\"num\">2026-11-20</td></tr></tbody>\n\
                </table>\n\
              </div>\n\
            </section>"
@@ -372,11 +372,11 @@ fn render_explorer_body(safe_title: &str) -> String {
     format!(
         "  <header style=\"margin-bottom:24px\">\n\
              <h1>{safe_title}</h1>\n\
-             <p style=\"color:var(--ka-muted);max-width:var(--ka-body-w)\">정적 데이터 스냅샷을 내장해 네트워크 요청이나 스토리지 접근 없이 즉시 필터링·재계산한다.</p>\n\
+             <p style=\"color:var(--ka-muted);max-width:var(--ka-body-w)\">Embeds a static JSON snapshot for instant client-side filtering without network calls or browser storage.</p>\n\
            </header>\n\
            <div class=\"ka-panel\">\n\
              <div style=\"display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px\">\n\
-               <label for=\"ka-limit\" style=\"font-size:0.875rem\">상한 기준선: <output id=\"ka-limit-out\" style=\"font-family:var(--ka-font-mono);font-weight:700\">60</output> ms\n\
+               <label for=\"ka-limit\" style=\"font-size:0.875rem\">Threshold: <output id=\"ka-limit-out\" style=\"font-family:var(--ka-font-mono);font-weight:700\">60</output> ms\n\
                  <input id=\"ka-limit\" type=\"range\" min=\"10\" max=\"120\" value=\"60\" style=\"vertical-align:middle;margin-left:8px\">\n\
                </label>\n\
                <span id=\"ka-summary\" style=\"font-size:0.8125rem;color:var(--ka-muted)\"></span>\n\
@@ -384,7 +384,7 @@ fn render_explorer_body(safe_title: &str) -> String {
              <div id=\"ka-chart\" style=\"display:flex;flex-direction:column;gap:8px\"></div>\n\
            </div>\n\
            <script id=\"artifact-data\" type=\"application/json\">\n\
-             [{{\"name\":\"단계 A\",\"ms\":24}},{{\"name\":\"단계 B\",\"ms\":52}},{{\"name\":\"단계 C\",\"ms\":84}}]\n\
+             [{{\"name\":\"Stage A\",\"ms\":24}},{{\"name\":\"Stage B\",\"ms\":52}},{{\"name\":\"Stage C\",\"ms\":84}}]\n\
            </script>\n\
            <script>\n\
            (function () {{\n\
@@ -418,7 +418,7 @@ fn render_explorer_body(safe_title: &str) -> String {
                  line.appendChild(label); line.appendChild(track); line.appendChild(val);\n\
                  chart.appendChild(line);\n\
                }});\n\
-               summary.textContent = '기준 초과: ' + over + '건 / 전체 ' + rows.length + '건';\n\
+               summary.textContent = 'Over budget: ' + over + ' of ' + rows.length;\n\
              }}\n\
              input.addEventListener('input', render);\n\
              render();\n\
@@ -431,21 +431,21 @@ fn render_variants_body(safe_title: &str) -> String {
     format!(
         "  <header style=\"margin-bottom:20px\">\n\
              <h1>{safe_title}</h1>\n\
-             <p style=\"color:var(--ka-muted);max-width:var(--ka-body-w)\">동일한 데이터 모델을 공유하는 서로 다른 정보 구조 시안을 눌러 비교하고 하나를 확정한다.</p>\n\
+             <p style=\"color:var(--ka-muted);max-width:var(--ka-body-w)\">Compare distinct layouts backed by the same shared data model before committing to an implementation.</p>\n\
            </header>\n\
-           <div role=\"tablist\" aria-label=\"시안 선택\" style=\"display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px\">\n\
-             <button type=\"button\" class=\"ka-btn\" role=\"tab\" aria-selected=\"true\" data-variant=\"a\">시안 A: 고밀도 표</button>\n\
-             <button type=\"button\" class=\"ka-btn\" role=\"tab\" aria-selected=\"false\" data-variant=\"b\">시안 B: 상태 보드</button>\n\
+           <div role=\"tablist\" aria-label=\"Design variants\" style=\"display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px\">\n\
+             <button type=\"button\" class=\"ka-btn\" role=\"tab\" aria-selected=\"true\" data-variant=\"a\">Option A: Dense Table</button>\n\
+             <button type=\"button\" class=\"ka-btn\" role=\"tab\" aria-selected=\"false\" data-variant=\"b\">Option B: Status Cards</button>\n\
            </div>\n\
            <div class=\"ka-panel\" id=\"ka-stage\"></div>\n\
            <section class=\"ka-sec\">\n\
-             <h2>시안 비교표</h2>\n\
+             <h2>Trade-off Matrix</h2>\n\
              <div class=\"ka-table-wrap\">\n\
                <table>\n\
-                 <thead><tr><th>시안</th><th>잘 맞는 상황</th><th>약점</th><th>구현 비용</th></tr></thead>\n\
+                 <thead><tr><th>Option</th><th>Best For</th><th>Trade-off</th><th>Effort</th></tr></thead>\n\
                  <tbody>\n\
-                   <tr><td>시안 A</td><td>수십 건을 한 화면에서 대조할 때</td><td>모바일 폭에서 열 압축 필요</td><td>작음</td></tr>\n\
-                   <tr><td>시안 B</td><td>진행 단계별 병목을 바로 볼 때</td><td>정밀 수치 비교에는 불리</td><td>중간</td></tr>\n\
+                   <tr><td>Option A</td><td>Scanning dozens of rows side by side</td><td>Requires horizontal scroll on narrow screens</td><td>Low</td></tr>\n\
+                   <tr><td>Option B</td><td>Spotting status bottlenecks quickly</td><td>Lower numeric comparison density</td><td>Medium</td></tr>\n\
                  </tbody>\n\
                </table>\n\
              </div>\n\
@@ -453,15 +453,15 @@ fn render_variants_body(safe_title: &str) -> String {
            <script>\n\
            (function () {{\n\
              var items = [\n\
-               {{ title: '항목 1', status: '진행 중', owner: '팀 A' }},\n\
-               {{ title: '항목 2', status: '검토 대기', owner: '팀 B' }}\n\
+               {{ title: 'Item 1', status: 'In Review', owner: 'Team A' }},\n\
+               {{ title: 'Item 2', status: 'Queued', owner: 'Team B' }}\n\
              ];\n\
              var stage = document.getElementById('ka-stage');\n\
              var tabs = Array.prototype.slice.call(document.querySelectorAll('[role=\"tab\"]'));\n\
              function show(key) {{\n\
                tabs.forEach(function (t) {{ t.setAttribute('aria-selected', String(t.getAttribute('data-variant') === key)); }});\n\
                if (key === 'a') {{\n\
-                 stage.innerHTML = '<table><thead><tr><th>제목</th><th>상태</th><th>담당</th></tr></thead><tbody>' +\n\
+                 stage.innerHTML = '<table><thead><tr><th>Title</th><th>Status</th><th>Owner</th></tr></thead><tbody>' +\n\
                    items.map(function (i) {{ return '<tr><td>' + i.title + '</td><td>' + i.status + '</td><td>' + i.owner + '</td></tr>'; }}).join('') +\n\
                    '</tbody></table>';\n\
                }} else {{\n\
@@ -482,7 +482,7 @@ fn render_variants_body(safe_title: &str) -> String {
 fn render_deck_html(safe_title: &str, theme_attr: &str) -> String {
     format!(
         "<!doctype html>\n\
-         <html lang=\"ko\"{theme_attr}>\n\
+         <html lang=\"en\"{theme_attr}>\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -509,17 +509,17 @@ fn render_deck_html(safe_title: &str, theme_attr: &str) -> String {
          <div class=\"ka-deck\">\n\
            <section class=\"ka-slide active\">\n\
              <h1>{safe_title}</h1>\n\
-             <p style=\"font-size:1.3rem;color:var(--ka-muted)\">발표의 핵심 결론 한 문장을 표지 부제로 둔다.</p>\n\
+             <p style=\"font-size:1.3rem;color:var(--ka-muted)\">State the core takeaway of the presentation in one subtitle sentence.</p>\n\
            </section>\n\
            <section class=\"ka-slide\">\n\
-             <h1>슬라이드마다 주제가 아니라 검증된 결론 문장을 제목으로 쓴다</h1>\n\
+             <h1>Title each slide with a verified assertion rather than a generic topic label</h1>\n\
              <ul>\n\
-               <li>한 슬라이드에는 하나의 메시지와 최대 4~5개 근거만 둔다.</li>\n\
-               <li>모든 수치에는 비교 기준과 변화 방향(▲/▼)을 함께 표기한다.</li>\n\
+               <li>Keep one message and at most 4 to 5 supporting points per slide.</li>\n\
+               <li>Pair every number with its baseline and direction of change (▲ / ▼).</li>\n\
              </ul>\n\
            </section>\n\
            <footer class=\"ka-deck-bar no-print\">\n\
-             <span>방향키(←/→) 또는 Space로 이동</span>\n\
+             <span>Use Left / Right arrows or Space to navigate</span>\n\
              <span id=\"ka-slide-num\">1 / 2</span>\n\
            </footer>\n\
          </div>\n\
