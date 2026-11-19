@@ -28,6 +28,8 @@ PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
 VOLUME = Path("/Volumes/krill-build")
 TARGETS = VOLUME / "targets"
 PUBLISH_LOCK = Path("/tmp/krill-publish.lock")
+DISPATCH_ATTEMPTS = 3
+DISPATCH_RETRY_DELAY = 15
 AUTHORIZATION = "사용자 지시: 매일 한국시간 자정 dev 전체 검증 후 main·태그·릴리스 자동 배포"
 
 
@@ -570,20 +572,54 @@ def run_release(config, state_dir):
                 notify(outcome(release.state))
 
 
+def run_lock_held(state_dir):
+    lock_path = state_dir / "run.lock"
+    if not lock_path.exists():
+        return False
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    return False
+
+
+def record_dispatch(config_path, action, terminal, attempt):
+    write_json(config_path.parent / "dispatch.json", {
+        "dispatched_at": datetime.now().astimezone().isoformat(),
+        "action": action,
+        "terminal": terminal,
+        "attempt": attempt,
+    })
+
+
 def dispatch(config, config_path, preflight_only=False):
     # macOS TCC 권한은 launchd 자식에게 상속되지 않는다. 권한이 있는 Orca 호스트에서 셸을 연다.
     # AI 에이전트를 시작하지 않고 결정적인 실행기만 호출한다.
     cli = config["orca_cli"]
-    command([cli, "open", "--json"], cwd=SUPPORT)
     action = "preflight" if preflight_only else "run"
     shell = "exec " + shlex.join(["/usr/bin/python3", str(SUPPORT / "nightly.py"), action, "--config", str(config_path)])
-    result = json.loads(command([cli, "terminal", "create", "--worktree", config["workspace"],
-                                 "--title", "Krill nightly " + action, "--command", shell, "--json"], cwd=SUPPORT))
-    if not result.get("ok"):
-        raise NightlyError("Orca did not accept the nightly shell launch")
-    write_json(config_path.parent / "dispatch.json", {
-        "dispatched_at": datetime.now().astimezone().isoformat(), "action": action,
-        "terminal": result["result"]["terminal"]["handle"]})
+    last_error = None
+    for attempt in range(1, DISPATCH_ATTEMPTS + 1):
+        try:
+            command([cli, "open", "--json"], cwd=SUPPORT)
+            result = json.loads(command([cli, "terminal", "create", "--worktree", config["workspace"],
+                                         "--title", "Krill nightly " + action, "--command", shell, "--json"], cwd=SUPPORT))
+            if not result.get("ok"):
+                raise NightlyError("Orca did not accept the nightly shell launch")
+            record_dispatch(config_path, action, result["result"]["terminal"]["handle"], attempt)
+            return
+        except (NightlyError, json.JSONDecodeError, KeyError, TypeError) as error:
+            last_error = error
+            print(f"Nightly dispatch attempt {attempt}/{DISPATCH_ATTEMPTS} failed: {error}", flush=True)
+            if attempt < DISPATCH_ATTEMPTS and not (action == "run" and run_lock_held(config_path.parent)):
+                time.sleep(DISPATCH_RETRY_DELAY)
+            if action == "run" and run_lock_held(config_path.parent):
+                print("Nightly run already holds run.lock; skipping duplicate launch.", flush=True)
+                record_dispatch(config_path, action, "recovered-via-run-lock", attempt)
+                return
+    raise last_error
 
 
 def install(source, after_release=None):
@@ -614,11 +650,16 @@ def install_locked(source, after_release=None):
     config["orca_cli"] = cli
     config["workspace"] = "id:" + workspace["result"]["worktree"]["id"]
     previous = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
-    if previous.get("repo") == config["repo"] and previous.get("workspace"):
+    same_repo = previous.get("repo") == config["repo"]
+    if same_repo and previous.get("workspace"):
         config["workspace"] = previous["workspace"]
+    if same_repo and not (source / "cloud/mobile").is_dir() and previous.get("mobile_cloud"):
+        config["mobile_cloud"] = previous["mobile_cloud"]
     if after_release:
         version_tuple(after_release)
         config["after_release"] = after_release
+    elif same_repo and previous.get("after_release"):
+        config["after_release"] = previous["after_release"]
     for field in ("user.name", "user.email"):
         config[field] = command(["git", "config", "--get", field], cwd=source)
     preflight(config)

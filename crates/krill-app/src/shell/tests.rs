@@ -12977,3 +12977,116 @@ fn new_single_pane_tab_inherits_measured_full_tab_grid_without_affecting_splits(
         assert_eq!(s.initial_pane_grid(pane2), Some((132, 43)));
     });
 }
+
+#[gpui::test]
+fn choose_folder_and_clone_completion_select_added_project_when_filter_active(
+    cx: &mut TestAppContext,
+) {
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let base = std::env::temp_dir().join(format!("krill-shell-add-proj-{}", std::process::id()));
+    std::fs::remove_dir_all(&base).ok();
+    let repo_existing = base.join("existing");
+    let repo_added = base.join("added");
+    let parent = base.join("parent");
+    let repo_cloned = parent.join("cloned");
+    std::fs::create_dir_all(repo_existing.join(".git")).unwrap();
+    std::fs::create_dir_all(repo_added.join(".git")).unwrap();
+    std::fs::create_dir_all(&parent).unwrap();
+    let canon_existing = std::fs::canonicalize(&repo_existing).unwrap();
+    let canon_added = std::fs::canonicalize(&repo_added).unwrap();
+
+    let state = state_path("add-project-filter");
+    let (view, cx) = open(cx, state.clone());
+    view.update(cx, |s, cx| {
+        let initial_snapshot = sidebar::Snapshot {
+            sessions: Vec::new(),
+            trees: BTreeMap::from([(canon_existing.clone(), vec![canon_existing.clone()])]),
+        };
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(Arc::new(Memory(initial_snapshot)), cx);
+            sb.toggle_repo_filter(canon_existing.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 1. Opening a folder via choose_folder automatically selects it in the active project filter.
+    view.update(cx, |_, cx| Shell::choose_folder(cx));
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|_| Some(vec![repo_added.clone()]));
+    cx.run_until_parked();
+
+    view.read_with(cx, |s, cx| {
+        let sb = s.sidebar.read(cx);
+        assert!(sb.options().filters.is_repo_selected(&canon_existing));
+        assert!(sb.options().filters.is_repo_selected(&canon_added));
+        assert_eq!(sb.selected_worktree(), Some(canon_added.as_path()));
+        assert!(
+            sb.visible_workspaces()
+                .iter()
+                .any(|(_, host, path)| host.is_local() && path == &canon_added),
+            "added project must be visible in sidebar rows: {:?}",
+            sb.visible_workspaces()
+        );
+    });
+
+    // 2. Completing a git init / clone project tab also adds it to the active project filter.
+    std::fs::create_dir_all(repo_cloned.join(".git")).unwrap();
+    let canon_cloned = std::fs::canonicalize(&repo_cloned).unwrap();
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sb, cx| {
+            sb.reveal_host_filter(&krill_app::hosts::HostId::Local, cx);
+        });
+        s.new_local_project_tab(
+            &parent,
+            folder::init_program(
+                folder::TargetOs::local(),
+                repo_cloned.as_os_str().as_bytes(),
+            ),
+            cx,
+        );
+        let pane = s.layout.focused().unwrap();
+        s.layout.set_session(pane, krill_proto::SessionId(77));
+        let completed_snapshot = sidebar::Snapshot {
+            sessions: vec![sidebar::Session {
+                id: krill_proto::SessionId(77),
+                status: krill_proto::control::AgentStatus::UNKNOWN,
+                worktree: None,
+                cwd: Some(canon_cloned.clone()),
+                account: None,
+            }],
+            trees: BTreeMap::from([
+                (canon_existing.clone(), vec![canon_existing.clone()]),
+                (canon_added.clone(), vec![canon_added.clone()]),
+                (canon_cloned.clone(), vec![canon_cloned.clone()]),
+            ]),
+        };
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(Arc::new(Memory(completed_snapshot)), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |s, cx| {
+        let sb = s.sidebar.read(cx);
+        assert!(sb.options().filters.is_repo_selected(&canon_cloned));
+        assert_eq!(sb.selected_worktree(), Some(canon_cloned.as_path()));
+        assert!(
+            sb.visible_workspaces()
+                .iter()
+                .any(|(_, host, path)| host.is_local() && path == &canon_cloned),
+            "cloned/created project must be visible in sidebar rows: {:?}",
+            sb.visible_workspaces()
+        );
+    });
+
+    std::fs::remove_dir_all(&base).ok();
+    if let Some(dir) = state.parent() {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}

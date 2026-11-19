@@ -985,6 +985,8 @@ pub struct Sidebar {
     selected_worktree: Option<PathBuf>,
     /// 목록에서 제거한 저장소·폴더 프로젝트(OWE-845). `projects.toml` 정리와 별개로 행을 숨긴다.
     removed_projects: BTreeSet<PathBuf>,
+    /// 프로젝트 추가 직후 데몬 스냅샷과 주 저장소·워크트리 루트를 맞춰 줄 대기 목록.
+    pending_added_projects: BTreeSet<(HostId, PathBuf)>,
     /// 프로젝트(저장소·폴더) 헤더 아이콘·배지 색상·표시 이름 메타.
     project_visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
     /// 원격 호스트 저장소에서 탐지한 아이콘·메타 캐시.
@@ -1384,6 +1386,7 @@ impl Sidebar {
             manually_folded_cards: BTreeSet::new(),
             selected_worktree: ui.selected_worktree,
             removed_projects: ui.removed_projects,
+            pending_added_projects: BTreeSet::new(),
             project_visuals: BTreeMap::new(),
             remote_visuals: BTreeMap::new(),
             remote_probed_repos: BTreeMap::new(),
@@ -1472,6 +1475,11 @@ impl Sidebar {
             let Some(trees) = self.snapshot.trees.get(&repo) else {
                 continue;
             };
+            if self.pending_reveal_worktree.as_deref().is_some_and(|p| {
+                path_identity::same(p, &repo) || trees.iter().any(|t| path_identity::same(t, p))
+            }) {
+                continue;
+            }
             let has_session = trees.iter().any(|t| occupied.contains(t.as_path()));
             if has_session {
                 continue;
@@ -3256,8 +3264,70 @@ impl Sidebar {
         self.merged_projects = merged;
     }
 
+    fn reconcile_pending_added_projects(&mut self) -> bool {
+        if self.pending_added_projects.is_empty() {
+            return false;
+        }
+        let mut filter_changed = false;
+        let pending: Vec<_> = self.pending_added_projects.iter().cloned().collect();
+        for (host, added_path) in pending {
+            let added_ref = added_path.as_path();
+            let resolved = self
+                .repo_for_worktree_on(&host, &added_path)
+                .map(|repo| (repo, added_path.clone()))
+                .or_else(|| {
+                    self.snapshot_for(&host)
+                        .trees
+                        .iter()
+                        .flat_map(|(repo, trees)| {
+                            trees
+                                .iter()
+                                .filter(move |wt| {
+                                    !wt.as_os_str().is_empty() && path_within(added_ref, wt)
+                                })
+                                .map(move |wt| (repo.clone(), wt.clone()))
+                        })
+                        .max_by_key(|(_, wt)| wt.as_os_str().len())
+                });
+            let Some((actual_repo, actual_wt)) = resolved else {
+                continue;
+            };
+            self.pending_added_projects
+                .remove(&(host, added_path.clone()));
+            self.removed_projects.retain(|p| {
+                !path_identity::same(p, &actual_repo) && !path_identity::same(p, &actual_wt)
+            });
+            self.collapsed.retain(|p| {
+                !path_identity::same(p, &actual_repo) && !path_identity::same(p, &actual_wt)
+            });
+            self.sleeping_worktrees
+                .retain(|p| !path_identity::same(p, &actual_wt));
+            self.recently_created_worktrees.insert(actual_wt.clone());
+            if !self.options.filters.repos.is_empty() {
+                if !path_identity::same(&actual_repo, &added_path)
+                    && !self.snapshot.trees.contains_key(&added_path)
+                    && !self
+                        .remote_hosts
+                        .iter()
+                        .any(|r| r.snapshot.trees.contains_key(&added_path))
+                    && self.options.filters.repos.remove(&added_path)
+                {
+                    filter_changed = true;
+                }
+                if !self.options.filters.is_repo_selected(&actual_repo) {
+                    self.options.filters.repos.insert(actual_repo);
+                    filter_changed = true;
+                }
+            }
+        }
+        filter_changed
+    }
+
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.reconcile_path_identity();
+        if self.reconcile_pending_added_projects() {
+            self.write_state(cx);
+        }
         let cursor_item = self
             .cursor
             .and_then(|i| {
@@ -4577,6 +4647,202 @@ impl Sidebar {
         );
     }
 
+    /// 호스트 필터·접힘 상태에서 새로 추가할 호스트가 가려지지 않도록 풀어 준다.
+    pub fn reveal_host_filter(&mut self, host: &HostId, cx: &mut Context<Self>) {
+        let mut changed = self.collapsed_hosts.remove(host);
+        if !self.disk.initialized {
+            changed |= self
+                .disk
+                .startup
+                .added_hosts
+                .insert(host.as_key().to_owned());
+        }
+        if !self.options.filters.hosts.is_empty() && !self.host_filter_matches(host) {
+            changed |= self.options.filters.hosts.insert(host.as_key().to_owned());
+        }
+        if changed {
+            self.persist(cx);
+        }
+    }
+
+    fn apply_added_project_state(&mut self, host: &HostId, repo: &Path, wt: &Path) -> bool {
+        self.removed_projects
+            .retain(|p| !path_identity::same(p, repo) && !path_identity::same(p, wt));
+        self.collapsed
+            .retain(|p| !path_identity::same(p, repo) && !path_identity::same(p, wt));
+        self.collapsed_hosts.remove(host);
+        if let Some(group) = self.group_for_path(host, wt) {
+            self.collapsed_groups.remove(&group);
+        }
+        self.sleeping_worktrees
+            .retain(|p| !path_identity::same(p, wt));
+        self.recently_created_worktrees.insert(wt.to_path_buf());
+        if external::is_claude_worktree(wt) {
+            self.shown_external.insert(repo.to_path_buf());
+        }
+        if !self.disk.initialized {
+            self.disk.startup.added_repos.insert(repo.to_path_buf());
+            self.disk
+                .startup
+                .added_hosts
+                .insert(host.as_key().to_owned());
+        }
+        let inserted_repo = if !self.options.filters.repos.is_empty()
+            && !self.options.filters.is_repo_selected(repo)
+        {
+            self.options.filters.repos.insert(repo.to_path_buf());
+            true
+        } else {
+            false
+        };
+        if !self.options.filters.hosts.is_empty() && !self.host_filter_matches(host) {
+            self.options.filters.hosts.insert(host.as_key().to_owned());
+        }
+        self.pending_reveal_worktree = Some(wt.to_path_buf());
+        self.selected_worktree = Some(wt.to_path_buf());
+        inserted_repo
+    }
+
+    fn focus_added_project_row(
+        &mut self,
+        host: &HostId,
+        repo: &Path,
+        wt: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        let idx = self
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, row)| {
+                (self.same_machine_host(self.row_host(i), host)
+                    && matches!(row, Row::Worktree(p) | Row::Folder(p) if path_identity::same(p, wt)))
+                .then_some(i)
+            })
+            .or_else(|| {
+                self.rows.iter().enumerate().find_map(|(i, row)| {
+                    (self.same_machine_host(self.row_host(i), host)
+                        && matches!(row, Row::Repository(p) if path_identity::same(p, repo)))
+                    .then_some(i)
+                })
+            });
+        if let Some(idx) = idx {
+            self.cursor = Some(idx);
+            self.sync_viewport();
+            self.scroll_row_into_view(idx, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+    }
+
+    /// 사용자가 새로 추가한 프로젝트를 활성 필터(프로젝트·호스트·유휴 숨김)·접힘·제거 목록에서
+    /// 즉시 풀어 선택 상태로 드러내고, 로컬이면 백그라운드에서 경로·브랜치를 해석해 등록한다.
+    pub fn add_project_on(&mut self, host: &HostId, path: PathBuf, cx: &mut Context<Self>) {
+        let wt = if host.is_local() {
+            let cleaned = path
+                .to_str()
+                .map(krill_proto::orchestration::clean_workspace_path_str)
+                .map(PathBuf::from);
+            krill_proto::path::normalize(cleaned.as_deref().unwrap_or(&path))
+        } else {
+            path
+        };
+        if wt.as_os_str().is_empty() {
+            return;
+        }
+        let optimistic_repo = self
+            .repo_for_worktree_on(host, &wt)
+            .unwrap_or_else(|| wt.clone());
+        let inserted_repo = self.apply_added_project_state(host, &optimistic_repo, &wt);
+        if host.is_local() {
+            if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
+                self.pending_added_projects
+                    .insert((host.clone(), wt.clone()));
+                self.persist(cx);
+                self.focus_added_project_row(host, &optimistic_repo, &wt, cx);
+                let raw = wt;
+                let raw_worker = raw.clone();
+                let opt_repo = optimistic_repo;
+                let resolved = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let resolved_worker = std::sync::Arc::clone(&resolved);
+                self.enqueue_disk_write_with_completion(
+                    move || {
+                        let info = external::register_project_resolved(&dir, &raw_worker)?;
+                        if let Ok(mut guard) = resolved_worker.lock() {
+                            *guard = info;
+                        }
+                        Ok(())
+                    },
+                    move |s, result, cx| match result {
+                        Ok(()) => {
+                            let info = resolved.lock().ok().and_then(|mut g| g.take());
+                            if let Some((real_repo, real_wt, branch)) = info {
+                                let imported =
+                                    s.disk.imported.trees.entry(real_repo.clone()).or_default();
+                                if !imported.contains(&real_wt) {
+                                    imported.push(real_wt.clone());
+                                }
+                                let trees = s.snapshot.trees.entry(real_repo.clone()).or_default();
+                                if !trees.contains(&real_wt) {
+                                    trees.push(real_wt.clone());
+                                }
+                                if let Some(branch) = branch {
+                                    let imported_entry =
+                                        s.disk.imported_meta.entry(real_wt.clone()).or_default();
+                                    if imported_entry.branch.is_none() {
+                                        imported_entry.branch = Some(branch.clone());
+                                    }
+                                    let meta_entry = s.meta.entry(real_wt.clone()).or_default();
+                                    if meta_entry.branch.is_none() {
+                                        meta_entry.branch = Some(branch);
+                                    }
+                                }
+                                if inserted_repo
+                                    && real_repo != opt_repo
+                                    && !s.options.filters.repos.is_empty()
+                                {
+                                    s.options.filters.repos.remove(&opt_repo);
+                                }
+                                if !s.disk.initialized && real_repo != opt_repo {
+                                    s.disk.startup.added_repos.remove(&opt_repo);
+                                }
+                                s.pending_added_projects.remove(&(HostId::Local, raw));
+                                s.pending_added_projects
+                                    .insert((HostId::Local, real_wt.clone()));
+                                s.apply_added_project_state(&HostId::Local, &real_repo, &real_wt);
+                                s.persist(cx);
+                                s.focus_added_project_row(&HostId::Local, &real_repo, &real_wt, cx);
+                            } else if inserted_repo && !s.snapshot.trees.contains_key(&opt_repo) {
+                                s.options.filters.repos.remove(&opt_repo);
+                                s.write_state(cx);
+                            }
+                        }
+                        Err(error) => {
+                            s.pending_added_projects.remove(&(HostId::Local, raw));
+                            s.error = Some(error.to_string());
+                        }
+                    },
+                    cx,
+                );
+            } else {
+                let trees = self
+                    .snapshot
+                    .trees
+                    .entry(optimistic_repo.clone())
+                    .or_default();
+                if !trees.contains(&wt) {
+                    trees.push(wt.clone());
+                }
+                self.persist(cx);
+                self.focus_added_project_row(host, &optimistic_repo, &wt, cx);
+            }
+        } else {
+            self.pending_added_projects
+                .insert((host.clone(), wt.clone()));
+            self.persist(cx);
+            self.focus_added_project_row(host, &optimistic_repo, &wt, cx);
+        }
+    }
+
     /// 저장소·폴더 프로젝트를 목록에서 제거한다(OWE-845).
     /// `projects.toml`에 기록된 이관 프로젝트는 파일에서도 지우고,
     /// 그 외에는 제거 집합에 넣어 행을 숨긴다(재시작 후에도 유지).
@@ -4591,10 +4857,20 @@ impl Sidebar {
                 cx,
             );
         }
+        self.disk.imported.trees.remove(&path);
         self.collapsed.remove(&path);
         self.expanded_cards.remove(&path);
         self.shown_external.remove(&path);
-        self.removed_projects.insert(path);
+        self.removed_projects.insert(path.clone());
+        let key = basename(&path);
+        let still_present = !key.is_empty()
+            && self
+                .filterable_project_repos()
+                .iter()
+                .any(|r| basename(r).eq_ignore_ascii_case(&key));
+        if !still_present && self.options.filters.is_repo_selected(&path) {
+            self.options.filters.toggle_repo(path);
+        }
         self.persist(cx);
     }
 

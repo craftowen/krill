@@ -12,6 +12,8 @@ pub(super) struct Edits {
     pub parents: BTreeSet<PathBuf>,
     pub collapsed_lineage: BTreeSet<PathBuf>,
     pub sleeping: BTreeSet<PathBuf>,
+    pub added_repos: BTreeSet<PathBuf>,
+    pub added_hosts: BTreeSet<String>,
 }
 
 pub(super) fn capture(s: &Sidebar) -> PersistedSidebarState {
@@ -57,6 +59,8 @@ impl Edits {
     }
 
     pub fn reset_filters(&mut self) {
+        self.added_repos.clear();
+        self.added_hosts.clear();
         self.fields.extend([
             "filters.hide_sleeping",
             "filters.always_show_default_branch",
@@ -207,6 +211,18 @@ impl Edits {
 
         if self.fields.contains("hosts.clear") {
             saved.1.filters.hosts.clone_from(&now.1.filters.hosts);
+        }
+        if !saved.1.filters.repos.is_empty() {
+            for repo in self.added_repos {
+                if !saved.1.filters.is_repo_selected(&repo) {
+                    saved.1.filters.repos.insert(repo);
+                }
+            }
+        }
+        if !saved.1.filters.hosts.is_empty() {
+            for host in self.added_hosts {
+                saved.1.filters.hosts.insert(host);
+            }
         }
 
         macro_rules! sets {

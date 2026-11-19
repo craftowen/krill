@@ -17,6 +17,11 @@ pub(super) fn available_disk_bytes(path: &std::path::Path) -> io::Result<u64> {
     win::available_disk_bytes(path)
 }
 
+#[cfg(windows)]
+pub(super) fn local_utc_offset_secs(utc: crate::local_time::CivilTime) -> Option<i32> {
+    win::local_utc_offset_secs(utc)
+}
+
 /// 실행 중인 Explorer에게 프로그램을 대신 띄우게 한다(`IShellDispatch2::ShellExecute`). 새 프로세스는 Explorer의 자식이라
 /// 이 앱이 갇힌 Job(작업 스케줄러 등 breakaway 금지)을 물려받지 않는다.
 #[cfg(windows)]
@@ -740,6 +745,68 @@ mod win {
         } else {
             Err(io::Error::last_os_error())
         }
+    }
+
+    pub(super) fn local_utc_offset_secs(utc: crate::local_time::CivilTime) -> Option<i32> {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::Time::SystemTimeToTzSpecificLocalTimeEx;
+
+        // `SystemTimeToTzSpecificLocalTimeEx`는 1601..=30827년만 받는다. 1601년 이전과 서반구
+        // 자정 경계 언더플로를 피하기 위해 같은 윤년 성질을 갖는 1602/1604년을 대표 연도로 쓴다.
+        let ref_year = match utc.year {
+            1602..=9999 => u16::try_from(utc.year).ok()?,
+            1..=1601 => {
+                if utc.year % 4 == 0 && (utc.year % 100 != 0 || utc.year % 400 == 0) {
+                    1604
+                } else {
+                    1602
+                }
+            }
+            _ => return None,
+        };
+        let ref_utc = crate::local_time::CivilTime {
+            year: i32::from(ref_year),
+            ..utc
+        };
+        let universal = SYSTEMTIME {
+            wYear: ref_year,
+            wMonth: u16::from(ref_utc.month),
+            wDayOfWeek: 0,
+            wDay: u16::from(ref_utc.day),
+            wHour: u16::from(ref_utc.hour),
+            wMinute: u16::from(ref_utc.minute),
+            wSecond: u16::from(ref_utc.second),
+            wMilliseconds: 0,
+        };
+        let mut local = SYSTEMTIME {
+            wYear: 0,
+            wMonth: 0,
+            wDayOfWeek: 0,
+            wDay: 0,
+            wHour: 0,
+            wMinute: 0,
+            wSecond: 0,
+            wMilliseconds: 0,
+        };
+        // SAFETY: `universal`과 `local`은 이 동기 호출 동안 유효한 스택 `SYSTEMTIME`이며
+        // null 시간대 포인터는 현재 시스템 로컬 시간대를 조회한다.
+        let ok = unsafe {
+            SystemTimeToTzSpecificLocalTimeEx(ptr::null(), &raw const universal, &raw mut local)
+        };
+        if ok == 0 {
+            return None;
+        }
+        let local_civil = crate::local_time::CivilTime {
+            year: i32::from(local.wYear),
+            month: u8::try_from(local.wMonth).ok()?,
+            day: u8::try_from(local.wDay).ok()?,
+            hour: u8::try_from(local.wHour).ok()?,
+            minute: u8::try_from(local.wMinute).ok()?,
+            second: u8::try_from(local.wSecond).ok()?,
+        };
+        let utc_epoch = crate::local_time::epoch_from_civil(ref_utc)?;
+        let local_epoch = crate::local_time::epoch_from_civil(local_civil)?;
+        i32::try_from(local_epoch.checked_sub(utc_epoch)?).ok()
     }
 }
 

@@ -7552,3 +7552,75 @@ fn duplicate_verified_machine_routes_render_once_and_fail_over(cx: &mut TestAppC
         assert_eq!(s.dashboard_sessions().len(), 4);
     });
 }
+
+#[gpui::test]
+fn adding_project_selects_it_in_active_project_filter_and_reveals_row(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let repo_a = PathBuf::from("/tmp/add-proj-a");
+    let repo_b = PathBuf::from("/tmp/add-proj-b");
+    let removed_repo = PathBuf::from("/tmp/add-proj-removed");
+    let repo_c = PathBuf::from("/tmp/add-proj-c");
+    let repo_d = PathBuf::from("/tmp/add-proj-d");
+
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: vec![
+                    session(1, AgentState::Working, Some("/tmp/add-proj-a")),
+                    session(2, AgentState::Working, Some("/tmp/add-proj-b")),
+                ],
+                trees: BTreeMap::from([
+                    (repo_a.clone(), vec![repo_a.clone()]),
+                    (repo_b.clone(), vec![repo_b.clone()]),
+                    (removed_repo.clone(), vec![removed_repo.clone()]),
+                ]),
+            };
+            s.removed_projects.insert(removed_repo.clone());
+            s.collapsed.insert(removed_repo.clone());
+            s.options.filters.hide_sleeping = true;
+            s.options.filters.always_show_default_branch = false;
+            s.toggle_repo_filter(repo_a.clone(), cx);
+
+            // 1. Adding repo_c while repo_a filter is active adds repo_c to the filter and selects it.
+            s.add_project_on(&HostId::Local, repo_c.clone(), cx);
+            assert!(s.options().filters.is_repo_selected(&repo_a));
+            assert!(s.options().filters.is_repo_selected(&repo_c));
+            assert!(!s.options().filters.is_repo_selected(&repo_b));
+            assert_eq!(s.selected_worktree(), Some(repo_c.as_path()));
+            assert!(s.rows.contains(&Row::Repository(repo_a.clone())));
+            assert!(s.rows.contains(&Row::Repository(repo_c.clone())));
+            assert!(s.rows.contains(&Row::Worktree(repo_c.clone())));
+            assert!(!s.rows.contains(&Row::Repository(repo_b.clone())));
+
+            // 2. Re-adding a previously removed & collapsed project restores, expands, and selects it.
+            s.add_project_on(&HostId::Local, removed_repo.clone(), cx);
+            assert!(!s.removed_projects.contains(&removed_repo));
+            assert!(!s.collapsed.contains(&removed_repo));
+            assert!(s.options().filters.is_repo_selected(&removed_repo));
+            assert_eq!(s.selected_worktree(), Some(removed_repo.as_path()));
+            assert!(s.rows.contains(&Row::Repository(removed_repo.clone())));
+            assert!(s.rows.contains(&Row::Worktree(removed_repo.clone())));
+
+            // 3. Clearing repo filters keeps "All projects" (empty filter) when adding repo_d.
+            s.clear_repo_filters(cx);
+            assert!(s.options().filters.repos.is_empty());
+            s.add_project_on(&HostId::Local, repo_d.clone(), cx);
+            assert!(s.options().filters.repos.is_empty());
+            for expected in [&repo_a, &repo_b, &repo_c, &removed_repo, &repo_d] {
+                assert!(
+                    s.rows.contains(&Row::Repository(expected.clone())),
+                    "expected {expected:?} to be visible under All projects"
+                );
+            }
+
+            // 4. Removing the sole selected filtered project clears its orphan filter entry.
+            s.toggle_repo_filter(repo_d.clone(), cx);
+            assert!(s.options().filters.is_repo_selected(&repo_d));
+            s.remove_project(repo_d.clone(), cx);
+            assert!(s.options().filters.repos.is_empty());
+            assert!(s.rows.contains(&Row::Repository(repo_a.clone())));
+            assert!(!s.rows.contains(&Row::Repository(repo_d.clone())));
+        });
+    });
+}
