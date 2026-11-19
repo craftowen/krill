@@ -37,20 +37,29 @@ const MAX_SKIP_BYTES: u64 = 64 * 1024 * 1024;
 // Tokens are opaque: only byte/raw-row cursors have numeric ordering.
 const OPENCODE_END: u64 = 1 << 52;
 
+const SCAN_DEADLINE: Duration = if cfg!(test) {
+    Duration::from_secs(10)
+} else {
+    Duration::from_millis(100)
+};
+
 /// Global per-resolution work budget shared by recursive directory walks.
 struct ScanBudget {
     remaining: usize,
     deadline: Instant,
+    exhausted: bool,
 }
 impl ScanBudget {
     fn new() -> Self {
         Self {
             remaining: 2048,
-            deadline: Instant::now() + Duration::from_millis(100),
+            deadline: Instant::now() + SCAN_DEADLINE,
+            exhausted: false,
         }
     }
     fn take(&mut self) -> bool {
         if self.remaining == 0 || Instant::now() >= self.deadline {
+            self.exhausted = true;
             return false;
         }
         self.remaining -= 1;
@@ -1124,7 +1133,7 @@ fn resolve_transcript_uncached(
                 best = Some(cand);
             }
         }
-        if budget.remaining == 0 || Instant::now() >= budget.deadline {
+        if budget.exhausted {
             return None;
         }
         if let Some((_, path, found_sid)) = best {
@@ -1313,9 +1322,25 @@ fn newest_claude_in_dir(
         .ok()?
         .take(65_536)
         .flatten()
-        .map(|entry| entry.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-        .filter_map(|p| Some((file_mtime(&p)?, p)))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            if Path::new(&name).extension().is_none_or(|e| e != "jsonl") {
+                return None;
+            }
+            let path = entry.path();
+            let meta = if entry.file_type().is_ok_and(|ft| ft.is_symlink()) {
+                fs::metadata(&path).ok()?
+            } else {
+                entry.metadata().ok()?
+            };
+            let mtime = meta
+                .modified()
+                .ok()?
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some((mtime, path))
+        })
         .collect();
     files.sort_unstable_by_key(|f| std::cmp::Reverse(f.0));
     files.into_iter().take(64).find_map(|(mtime, p)| {
@@ -3474,7 +3499,7 @@ mod cross_platform_tests {
             .set_times(fs::FileTimes::new().set_modified(new_time))
             .unwrap();
         let roots4 = VaultRoots {
-            claude: vec![root4],
+            claude: vec![root4.clone()],
             ..VaultRoots::default()
         };
         let snap4 = poll_session_in(&roots4, Some(&stored_claude), br"D:\work\FallbackProj", 0);
@@ -3483,6 +3508,69 @@ mod cross_platform_tests {
             "fallback projects scan must sort by mtime instead of missing transcripts after 256 older files"
         );
         assert_eq!(snap4.items[0].text, "newest past 256");
+
+        let empty_ids = BTreeSet::new();
+        let empty_paths = BTreeSet::new();
+        let filter = CwdFallbackFilter {
+            min_birth_secs: None,
+            claimed_ids: &empty_ids,
+            claimed_paths: &empty_paths,
+        };
+        let mut expired_budget = ScanBudget {
+            remaining: 2048,
+            deadline: Instant::now(),
+            exhausted: false,
+        };
+        assert_eq!(
+            resolve_transcript_uncached(
+                &roots4,
+                VaultAgent::Claude,
+                &stored_claude,
+                r"D:\work\FallbackProj",
+                &filter,
+                &mut expired_budget,
+            ),
+            None
+        );
+        assert!(expired_budget.exhausted);
+
+        let mut exact_budget = ScanBudget {
+            remaining: 1,
+            deadline: Instant::now() + Duration::from_secs(10),
+            exhausted: false,
+        };
+        assert_eq!(
+            resolve_transcript_uncached(
+                &roots4,
+                VaultAgent::Claude,
+                &stored_claude,
+                r"D:\work\FallbackProj",
+                &filter,
+                &mut exact_budget,
+            ),
+            Some((newest_p.clone(), "sid-fallback-newest".into()))
+        );
+        assert_eq!(exact_budget.remaining, 0);
+        assert!(!exact_budget.exhausted);
+
+        fs::create_dir_all(root4.join("projects/aaa-decoy")).unwrap();
+        let mut truncated_budget = ScanBudget {
+            remaining: 1,
+            deadline: Instant::now() + Duration::from_secs(10),
+            exhausted: false,
+        };
+        assert_eq!(
+            resolve_transcript_uncached(
+                &roots4,
+                VaultAgent::Claude,
+                &stored_claude,
+                r"D:\work\FallbackProj",
+                &filter,
+                &mut truncated_budget,
+            ),
+            None
+        );
+        assert!(truncated_budget.exhausted);
 
         fs::remove_dir_all(dir).unwrap();
     }
