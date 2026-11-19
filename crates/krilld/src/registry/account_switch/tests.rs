@@ -3310,3 +3310,772 @@ fn retained_replacement_disposition_unlinks_journal_only_when_persisted_without_
     drop(reg);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn chat_poll_discovers_claude_from_process_record_when_transcript_closed() {
+    let root = std::env::temp_dir().join(format!("kas-chat-poll-claude-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let profile = root.join("claude-profile");
+    let projects = profile.join("projects/work");
+    let sessions_dir = profile.join("sessions");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&projects).unwrap();
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        "Claude Profile",
+        None,
+        profile.to_str().unwrap(),
+    )
+    .unwrap();
+    let account_id = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Claude Profile")
+        .unwrap()
+        .id
+        .clone();
+
+    let sid = "3b71560c-6c71-4dce-86d0-5ce025eac068";
+    let transcript = projects.join(format!("{sid}.jsonl"));
+    fs::write(
+        &transcript,
+        format!("{{\"sessionId\":\"{sid}\",\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":\"Process record reply\"}}}}\n"),
+    )
+    .unwrap();
+
+    // Spawn a real process named `claude` that does NOT hold `transcript` open (matching Windows
+    // and closed-JSONL behavior between Claude writes).
+    let bin = root.join("claude");
+    fs::copy("/bin/sleep", &bin).unwrap();
+    let mut child = std::process::Command::new(&bin).arg("30").spawn().unwrap();
+    let pid = child.id();
+    let ps_out = std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .unwrap();
+    let birth = String::from_utf8_lossy(&ps_out.stdout).trim().to_owned();
+    fs::write(
+        sessions_dir.join(format!("{pid}.json")),
+        serde_json::json!({
+            "pid": pid,
+            "procStart": birth,
+            "sessionId": sid,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (master, _process) = UnixStream::pair().unwrap();
+    let (holder, _reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Arc::new(Registry::new(
+        Some((
+            holder,
+            vec![Kept {
+                id: SessionId(88),
+                pid,
+                status: None,
+                size: None,
+                master: OwnedFd::from(master),
+            }],
+        )),
+        Some(&state),
+    ));
+    reg.agents
+        .remember_session(
+            SessionId(88),
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            None,
+            root.as_os_str().as_encoded_bytes().to_vec(),
+            Some(LaunchAccount {
+                id: account_id,
+                env_key: "CLAUDE_CONFIG_DIR".into(),
+                dir: profile.display().to_string(),
+            }),
+        )
+        .unwrap();
+
+    let poll = reg.chat_poll(SessionId(88), 0);
+    child.kill().ok();
+    child.wait().ok();
+    drop(holder_link);
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+
+    assert!(
+        poll.bound,
+        "chat_poll must recover Claude session identity via process record when transcript is closed: {poll:?}"
+    );
+    assert_eq!(poll.session_id, sid);
+    assert_eq!(
+        poll.items
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Process record reply"]
+    );
+}
+
+#[test]
+fn multi_session_straggler_rate_limit_requeues_host_default_and_shared_claude_sessions() {
+    use krill_proto::hook::{EventId, HookEvent, Input};
+    use krill_proto::usage::{AccountStatus, AutoSwitchPolicy, AutoSwitchRule};
+
+    let root = std::env::temp_dir().join(format!("kas-straggler-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let host_claude = home.join(".claude");
+    let host_projects = host_claude.join("projects/repo");
+    let healthy = root.join("claude-healthy");
+    let old_isolated = root.join("claude-old");
+    let disabled_isolated = root.join("claude-disabled");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&host_projects).unwrap();
+    fs::create_dir_all(&healthy).unwrap();
+    fs::create_dir_all(&old_isolated).unwrap();
+    fs::create_dir_all(&disabled_isolated).unwrap();
+    // Share `projects` between host default and the healthy target profile to verify that
+    // `keep_active_when_shared` never misattributes or poisons the healthy target account.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(host_claude.join("projects"), healthy.join("projects")).unwrap();
+
+    // Prevent background login CLI probes against any host binary.
+    let mut profiles: Option<String> = None;
+    for name in ["claude", "codex", "agy", "opencode"] {
+        let profile = krill_proto::agent::Profile {
+            name: name.into(),
+            launch: vec![root.join("uninstalled").join(name).display().to_string()],
+            yolo_args: Vec::new(),
+            install: String::new(),
+            install_windows: String::new(),
+            env: std::collections::BTreeMap::new(),
+        };
+        profiles = Some(
+            krill_proto::agent::set_user_profile(profiles.as_deref(), name, &profile).unwrap(),
+        );
+    }
+    fs::write(state.join(krill_proto::agent::FILE_NAME), profiles.unwrap()).unwrap();
+
+    fs::write(
+        host_claude.join(crate::usage::CLAUDE_CACHE),
+        r#"{"five_hour":{"utilization":50}}"#,
+    )
+    .unwrap();
+    fs::write(
+        healthy.join(crate::usage::CLAUDE_CACHE),
+        r#"{"five_hour":{"utilization":10}}"#,
+    )
+    .unwrap();
+
+    accounts::set_auto_switch(
+        &home,
+        Some(&state),
+        &AutoSwitchPolicy {
+            enabled: true,
+            switch_on_rate_limit: true,
+            ..AutoSwitchPolicy::default()
+        },
+    )
+    .unwrap();
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        "Healthy",
+        None,
+        healthy.to_str().unwrap(),
+    )
+    .unwrap();
+    let healthy_id = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Healthy")
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        accounts::load_file(&home, Some(&state))
+            .active
+            .get("claude")
+            .map(String::as_str),
+        None
+    );
+
+    let (reg, _processes) = kept_sessions_fixture(
+        &state,
+        &[
+            SessionId(101),
+            SessionId(102),
+            SessionId(103),
+            SessionId(104),
+            SessionId(105),
+        ],
+    );
+    let sid_101 = "11111111-1111-4111-8111-111111111101";
+    let sid_102 = "11111111-1111-4111-8111-111111111102";
+    let tp_101 = host_projects.join(format!("{sid_101}.jsonl"));
+    let tp_102 = host_projects.join(format!("{sid_102}.jsonl"));
+    fs::write(&tp_101, format!("{{\"sessionId\":\"{sid_101}\"}}\n")).unwrap();
+    fs::write(&tp_102, format!("{{\"sessionId\":\"{sid_102}\"}}\n")).unwrap();
+
+    for (session, sid, tp) in [
+        (SessionId(101), sid_101, &tp_101),
+        (SessionId(102), sid_102, &tp_102),
+    ] {
+        let start_payload = serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": sid,
+            "transcript_path": tp,
+        }))
+        .unwrap();
+        assert!(!reg.agents.record_hook_session_with_context(
+            session,
+            &start_payload,
+            Some("claude"),
+            None,
+        ));
+    }
+    reg.agents
+        .remember_session(
+            SessionId(103),
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            Some("sid-103".into()),
+            Vec::new(),
+            Some(LaunchAccount {
+                id: "claude-old".into(),
+                env_key: "CLAUDE_CONFIG_DIR".into(),
+                dir: old_isolated.display().to_string(),
+            }),
+        )
+        .unwrap();
+    lock(&reg.account_switch_opt_out).insert(SessionId(103));
+    lock(&reg.account_handoffs).insert(
+        SessionId(103),
+        SessionHandoff {
+            from: SessionId(103),
+            to: None,
+            account_id: healthy_id.clone(),
+            error: Some("stale failure before rate limit".into()),
+        },
+    );
+    reg.save_account_handoffs().unwrap();
+    lock(&reg.account_work.pending).insert(
+        SwitchScope::Session(SessionId(103), ProviderKind::Claude),
+        accounts::switch_work::SwitchTarget {
+            account_id: healthy_id.clone(),
+            prepared: true,
+            not_before: Some(Instant::now() + Duration::from_secs(30)),
+        },
+    );
+
+    reg.agents
+        .remember_session(
+            SessionId(104),
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            Some("sid-104".into()),
+            Vec::new(),
+            Some(LaunchAccount {
+                id: "claude-disabled".into(),
+                env_key: "CLAUDE_CONFIG_DIR".into(),
+                dir: disabled_isolated.display().to_string(),
+            }),
+        )
+        .unwrap();
+    accounts::upsert_auto_switch_rule(
+        &home,
+        Some(&state),
+        AutoSwitchRule {
+            provider: ProviderKind::Claude,
+            from_account_id: "claude-disabled".into(),
+            enabled: false,
+            threshold_percent: 90,
+            metric: krill_proto::usage::AutoSwitchMetric::Max,
+            target_account_id: None,
+        },
+    )
+    .unwrap();
+
+    reg.agents
+        .remember_session(
+            SessionId(105),
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            Some("sid-105".into()),
+            Vec::new(),
+            Some(LaunchAccount {
+                id: "claude-old".into(),
+                env_key: "CLAUDE_CONFIG_DIR".into(),
+                dir: old_isolated.display().to_string(),
+            }),
+        )
+        .unwrap();
+
+    let rate_limit_event = |unix_ns| HookEvent {
+        id: EventId { pid: 100, unix_ns },
+        ppid: 100,
+        agent: "claude".into(),
+        input: Input::Complete,
+        payload: br#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#.to_vec(),
+    };
+
+    // 1. Session 101 (host default, `account: None`) triggers the initial switch `claude-host` -> `healthy_id`.
+    let e1 = rate_limit_event(1);
+    assert!(
+        reg.apply_agent_hook_in(&home, SessionId(101), &e1, None, None)
+            .unwrap()
+    );
+    reg.auto_switch_from_hook_in(&home, SessionId(101), &e1);
+    assert_eq!(
+        accounts::load_file(&home, Some(&state))
+            .active
+            .get("claude")
+            .map(String::as_str),
+        Some(healthy_id.as_str())
+    );
+    assert!(
+        lock(&reg.account_work.pending).contains_key(&SwitchScope::Provider(ProviderKind::Claude))
+    );
+    // Simulate worker having already consumed the provider-wide notification.
+    lock(&reg.account_work.pending).clear();
+
+    // 2. Straggler Session 102 (`account: None`, shared `projects/`) hits rate limit afterward:
+    // must record `claude-host` (never poisoning `healthy_id`) and queue Session 102 -> `healthy_id`.
+    let e2 = rate_limit_event(2);
+    assert!(
+        reg.apply_agent_hook_in(&home, SessionId(102), &e2, None, None)
+            .unwrap()
+    );
+    reg.auto_switch_from_hook_in(&home, SessionId(102), &e2);
+    assert!(reg.agents.is_rate_limited(SessionId(102)));
+    let after_102 = accounts::refresh_accounts_with(&home, Some(&state), false);
+    assert_eq!(
+        after_102.status_for("claude-host").map(|s| s.status),
+        Some(AccountStatus::RateLimited)
+    );
+    assert_ne!(
+        after_102.status_for(&healthy_id).map(|s| s.status),
+        Some(AccountStatus::RateLimited),
+        "shared history must never poison the healthy selected account"
+    );
+    let saved_102 = load(Some(&state));
+    let handoff_102 = saved_102.get(&SessionId(102)).expect("queued session 102");
+    assert_eq!(handoff_102.account_id, healthy_id);
+    assert_eq!(handoff_102.to, None);
+    assert_eq!(handoff_102.error, None);
+    {
+        let pending = lock(&reg.account_work.pending);
+        let target = pending
+            .get(&SwitchScope::Session(SessionId(102), ProviderKind::Claude))
+            .expect("Session 102 queued in pending");
+        assert_eq!(target.account_id, healthy_id);
+        assert!(target.not_before.is_none());
+    }
+
+    // 3. Straggler Session 103 had opt-out, a stale failed handoff error, and a delayed `not_before`:
+    // hitting StopFailure clears opt-out & error and queues immediately (`not_before: None`).
+    let e3 = rate_limit_event(3);
+    assert!(
+        reg.apply_agent_hook_in(&home, SessionId(103), &e3, None, None)
+            .unwrap()
+    );
+    reg.auto_switch_from_hook_in(&home, SessionId(103), &e3);
+    assert!(!lock(&reg.account_switch_opt_out).contains(&SessionId(103)));
+    let saved_103 = load(Some(&state));
+    let handoff_103 = saved_103.get(&SessionId(103)).expect("queued session 103");
+    assert_eq!(handoff_103.account_id, healthy_id);
+    assert_eq!(handoff_103.error, None);
+    assert!(
+        lock(&reg.account_work.pending)
+            .get(&SwitchScope::Session(SessionId(103), ProviderKind::Claude))
+            .is_some_and(|t| t.not_before.is_none())
+    );
+
+    // 3b. A repeated StopFailure on Session 103 while its switch to `healthy_id` is already
+    // pending without error must be a no-op (must not re-insert into `account_work.pending`).
+    lock(&reg.account_work.pending)
+        .remove(&SwitchScope::Session(SessionId(103), ProviderKind::Claude));
+    let e3b = rate_limit_event(31);
+    reg.auto_switch_from_hook_in(&home, SessionId(103), &e3b);
+    assert!(
+        !lock(&reg.account_work.pending)
+            .contains_key(&SwitchScope::Session(SessionId(103), ProviderKind::Claude)),
+        "active/unfailed pending handoff must not be re-queued on duplicate StopFailure"
+    );
+
+    // 3c. If a straggler re-queue fails (e.g. non-live session), opt-out and prior error stay intact.
+    let failed_before = SessionHandoff {
+        from: SessionId(999),
+        to: None,
+        account_id: "claude-old".into(),
+        error: Some("preserve me".into()),
+    };
+    lock(&reg.account_switch_opt_out).insert(SessionId(999));
+    lock(&reg.account_handoffs).insert(SessionId(999), failed_before);
+    let e_missing = rate_limit_event(32);
+    reg.auto_switch_from_hook_in(&home, SessionId(999), &e_missing);
+    assert!(lock(&reg.account_switch_opt_out).contains(&SessionId(999)));
+    assert_eq!(
+        lock(&reg.account_handoffs)
+            .get(&SessionId(999))
+            .and_then(|h| h.error.as_deref()),
+        Some("preserve me")
+    );
+    lock(&reg.account_switch_opt_out).remove(&SessionId(999));
+    lock(&reg.account_handoffs).remove(&SessionId(999));
+
+    // 4. Disabled per-account rule blocks straggler auto-queueing for Session 104.
+    let e4 = rate_limit_event(4);
+    assert!(
+        reg.apply_agent_hook_in(&home, SessionId(104), &e4, None, None)
+            .unwrap()
+    );
+    reg.auto_switch_from_hook_in(&home, SessionId(104), &e4);
+    assert!(!load(Some(&state)).contains_key(&SessionId(104)));
+    assert!(
+        !lock(&reg.account_work.pending)
+            .contains_key(&SwitchScope::Session(SessionId(104), ProviderKind::Claude))
+    );
+
+    // 5. If `healthy_id` is itself rate-limited, Session 105 must not queue a switch into it.
+    accounts::record_rate_limited(ProviderKind::Claude, &healthy_id);
+    let e5 = rate_limit_event(5);
+    assert!(
+        reg.apply_agent_hook_in(&home, SessionId(105), &e5, None, None)
+            .unwrap()
+    );
+    reg.auto_switch_from_hook_in(&home, SessionId(105), &e5);
+    assert!(!load(Some(&state)).contains_key(&SessionId(105)));
+
+    // 6. `switch_on_rate_limit = false` also prevents straggler queueing even when selected is healthy.
+    accounts::clear_rate_limited(ProviderKind::Claude, &healthy_id);
+    accounts::set_auto_switch(
+        &home,
+        Some(&state),
+        &AutoSwitchPolicy {
+            enabled: true,
+            switch_on_rate_limit: false,
+            ..AutoSwitchPolicy::default()
+        },
+    )
+    .unwrap();
+    let e6 = rate_limit_event(6);
+    reg.auto_switch_from_hook_in(&home, SessionId(105), &e6);
+    assert!(!load(Some(&state)).contains_key(&SessionId(105)));
+
+    accounts::clear_rate_limited(ProviderKind::Claude, "claude-host");
+    accounts::clear_rate_limited(ProviderKind::Claude, "claude-old");
+    accounts::clear_rate_limited(ProviderKind::Claude, "claude-disabled");
+    accounts::clear_rate_limited(ProviderKind::Claude, &healthy_id);
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn deferred_session_not_before_is_not_dispatched_early_by_provider_scope() {
+    let root = std::env::temp_dir().join(format!("kas-not-before-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let to = root.join("to");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&to).unwrap();
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Selected",
+        None,
+        to.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id
+        .clone();
+
+    let (reg, _processes) = kept_sessions_fixture(&state, &[SessionId(201)]);
+    reg.agents
+        .remember_session(
+            SessionId(201),
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+            Some("sid-201".into()),
+            Vec::new(),
+            Some(LaunchAccount {
+                id: "codex-old".into(),
+                env_key: "CODEX_HOME".into(),
+                dir: root.display().to_string(),
+            }),
+        )
+        .unwrap();
+    lock(&reg.account_handoffs).insert(
+        SessionId(201),
+        SessionHandoff {
+            from: SessionId(201),
+            to: None,
+            account_id: target.clone(),
+            error: None,
+        },
+    );
+    reg.save_account_handoffs().unwrap();
+    {
+        let mut pending = lock(&reg.account_work.pending);
+        pending.insert(
+            SwitchScope::Session(SessionId(201), ProviderKind::Codex),
+            accounts::switch_work::SwitchTarget {
+                account_id: target.clone(),
+                prepared: true,
+                not_before: Some(Instant::now() + Duration::from_secs(60)),
+            },
+        );
+        pending.insert(
+            SwitchScope::Provider(ProviderKind::Codex),
+            accounts::switch_work::SwitchTarget {
+                account_id: target,
+                prepared: true,
+                not_before: None,
+            },
+        );
+    }
+
+    reg.process_account_work_in(&home);
+    let saved = load(Some(&state));
+    let handoff = saved.get(&SessionId(201)).unwrap();
+    assert_eq!(handoff.to, None);
+    assert_eq!(handoff.error, None);
+    assert!(
+        lock(&reg.account_work.pending)
+            .contains_key(&SwitchScope::Session(SessionId(201), ProviderKind::Codex))
+    );
+    assert!(
+        !lock(&reg.account_work.pending).contains_key(&SwitchScope::Provider(ProviderKind::Codex))
+    );
+
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn superseded_handoff_failure_does_not_overwrite_newer_pending_selection() {
+    let root = std::env::temp_dir().join(format!("kas-superseded-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let newer_dir = root.join("newer");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&newer_dir).unwrap();
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Newer",
+        None,
+        newer_dir.to_str().unwrap(),
+    )
+    .unwrap();
+    let newer_id = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Newer")
+        .unwrap()
+        .id
+        .clone();
+
+    let (reg, _processes) = kept_sessions_fixture(&state, &[SessionId(202)]);
+    reg.agents
+        .remember_session(
+            SessionId(202),
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+            Some("sid-202".into()),
+            Vec::new(),
+            Some(LaunchAccount {
+                id: "codex-host".into(),
+                env_key: "CODEX_HOME".into(),
+                dir: String::new(),
+            }),
+        )
+        .unwrap();
+    lock(&reg.account_handoffs).insert(
+        SessionId(202),
+        SessionHandoff {
+            from: SessionId(202),
+            to: None,
+            account_id: "missing-old-account".into(),
+            error: None,
+        },
+    );
+    reg.save_account_handoffs().unwrap();
+    lock(&reg.account_work.pending).insert(
+        SwitchScope::Session(SessionId(202), ProviderKind::Codex),
+        accounts::switch_work::SwitchTarget {
+            account_id: newer_id.clone(),
+            prepared: true,
+            not_before: None,
+        },
+    );
+
+    // An older attempt for `missing-old-account` failing with BadRequest must not stamp a
+    // stale error onto `account_handoffs` once `account_work.pending` holds a newer selection.
+    reg.process_account_handoff(
+        SessionId(202),
+        ProviderKind::Codex,
+        "missing-old-account",
+        &home,
+    );
+    let saved = load(Some(&state));
+    let handoff = saved.get(&SessionId(202)).unwrap();
+    assert_eq!(handoff.to, None);
+    assert_eq!(handoff.error, None);
+    assert_eq!(
+        lock(&reg.account_work.pending)
+            .get(&SwitchScope::Session(SessionId(202), ProviderKind::Codex))
+            .map(|t| t.account_id.as_str()),
+        Some(newer_id.as_str())
+    );
+
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn running_account_resolves_isolated_claude_session_id_without_transcript_path() {
+    let root = std::env::temp_dir().join(format!("kas-iso-sid-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let host_projects = home.join(".claude/projects/repo");
+    let isolated_dir = root.join("claude-isolated");
+    let isolated_projects = isolated_dir.join("projects/repo");
+    let shared_dir = root.join("claude-shared");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&host_projects).unwrap();
+    fs::create_dir_all(&isolated_dir).unwrap();
+    fs::create_dir_all(&shared_dir).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(home.join(".claude/projects"), shared_dir.join("projects")).unwrap();
+
+    // Register accounts while `isolated_dir` is still empty so `add_account` finishes synchronously
+    // without spawning a background history merge, then restore an isolated non-shared `projects` dir.
+    let _ = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        "Isolated",
+        None,
+        isolated_dir.to_str().unwrap(),
+    )
+    .unwrap();
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        "Shared",
+        None,
+        shared_dir.to_str().unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(isolated_dir.join("projects"))
+        .or_else(|_| fs::remove_dir_all(isolated_dir.join("projects")))
+        .ok();
+    fs::create_dir_all(&isolated_projects).unwrap();
+
+    let sid_iso = "claude-iso-1";
+    let sid_shared = "claude-shared-1";
+    fs::write(
+        isolated_projects.join(format!("{sid_iso}.jsonl")),
+        format!("{{\"sessionId\":\"{sid_iso}\"}}\n"),
+    )
+    .unwrap();
+    fs::write(
+        host_projects.join(format!("{sid_shared}.jsonl")),
+        format!("{{\"sessionId\":\"{sid_shared}\"}}\n"),
+    )
+    .unwrap();
+    let iso_id = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Isolated")
+        .unwrap()
+        .id
+        .clone();
+
+    let (reg, _processes) = kept_sessions_fixture(&state, &[SessionId(203), SessionId(204)]);
+    reg.agents
+        .remember_session(
+            SessionId(203),
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            Some(sid_iso.into()),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+    reg.agents
+        .remember_session(
+            SessionId(204),
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            Some(sid_shared.into()),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+
+    let stored_iso = reg.agents.stored(SessionId(203)).unwrap().unwrap();
+    let stored_shared = reg.agents.stored(SessionId(204)).unwrap().unwrap();
+    assert_eq!(
+        reg.resolve_session_account_id(&home, ProviderKind::Claude, Some(&stored_iso)),
+        iso_id
+    );
+    assert_eq!(
+        reg.resolve_session_account_id(&home, ProviderKind::Claude, Some(&stored_shared)),
+        "claude-host"
+    );
+
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}

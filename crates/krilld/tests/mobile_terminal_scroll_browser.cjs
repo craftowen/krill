@@ -17,11 +17,11 @@ class Cdp {
 
 const fixture=`
 globalThis.sentInputs=()=>socket.sent.filter(a=>a instanceof Uint8Array&&a[4]===0x13).map(a=>{const r=MkTerminalCodec.reader(a.slice(5));r.n();return r.text();}).join('');
-globalThis.mountCase=async(fit=true,tall=false)=>{
+globalThis.mountCase=async(fit=true,tall=false,flags=120)=>{
  globalThis.handle?.unmount();globalThis.handle=mountFixture(document.querySelector('main'),7,{preferences:{inputMode:'direct',fitToPhone:false}});await Promise.resolve();globalThis.socket=sockets.at(-1);socket.handshake();socket.autoAck=true;
  const T=MkTerminalCodec,C=MkCrypto,send=socket.send.bind(socket);let position=100,revision=2;
  socket.send=data=>{send(data);if(!(data instanceof Uint8Array))return;if(data[4]===0x17)queueMicrotask(()=>socket.frame(0x2c,T.v(0)));if(data[4]===0x13){const r=T.reader(data.slice(5));r.n();const text=r.text();position-=(text.match(/\\x1b\\[<64;/g)||[]).length;position+=(text.match(/\\x1b\\[<65;/g)||[]).length;const chars=[...('History row '+position)],cell=ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0));socket.frame(0x21,T.v(++revision),T.v(revision),T.v(1),T.v(1),T.v(2),T.v(0),T.v(chars.length),...chars.map(cell));}};
- socket.screen('History row 100');const port=document.querySelector('.terminal-scroll'),rows=Math.max(10,Math.floor(port.clientHeight/18))*(tall?2:1);socket.frame(0x21,T.v(revision),T.v(revision),T.v(1),T.v(1),T.v(0),T.v(80),T.v(rows));socket.frame(0x2b,Uint8Array.of(0),T.v(120));if(fit)await handle.fitToPhone(true);
+ socket.screen('History row 100');const port=document.querySelector('.terminal-scroll'),rows=Math.max(10,Math.floor(port.clientHeight/18))*(tall?2:1);socket.frame(0x21,T.v(revision),T.v(revision),T.v(1),T.v(1),T.v(0),T.v(80),T.v(rows));socket.frame(0x2b,Uint8Array.of(0),T.v(flags));if(fit)await handle.fitToPhone(true);
  globalThis.touchEvents=[];for(const type of ['touchstart','touchmove','touchend'])port.addEventListener(type,e=>touchEvents.push({type,trusted:e.isTrusted,prevented:e.defaultPrevented}));
  await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));port.scrollTop=port.scrollHeight;
 };
@@ -50,7 +50,10 @@ globalThis.handle=null;mountCase();
    await browser('screenshot',path.join(evidence,`${width}x${height}-${fit?'fit':'original'}.png`));results.push({width,height,fit,before,up,down});
   }
   await browser('set','viewport','390','844');await evaluate('mountCase(true,true)');const before=await evaluate('measure()');await swipe(100,220);const after=await evaluate('measure()');assert(after.top<before.top,'overflowing canvas still scrolls locally');assert.equal(after.up,0,'local canvas scrolling does not also scroll the TUI');
-  fs.writeFileSync(path.join(evidence,'measurements.json'),JSON.stringify({results,overflow:{before,after}},null,2)+'\n');
+  await evaluate('mountCase(true,true,20)');const normalBefore=await evaluate('measure()');await swipe(100,220);const normalAfter=await evaluate('measure()');assert(normalAfter.top<normalBefore.top,'normal screen with SGR mouse scrolls natively instead of freezing');assert.equal(normalAfter.up,0,'normal screen native scroll does not emit SGR wheel');
+  await evaluate('mountCase(true,false,120)');await evaluate('handle.focus();const c=document.querySelector(".live-capture");c.value="x";c.dispatchEvent(new Event("input",{bubbles:true}));socket.frame(0x27,MkTerminalCodec.v(1),MkTerminalCodec.v(2));true');await swipe(100,220);const blocked=await evaluate('measure()');assert(blocked.touchEvents.some(e=>e.type==='touchmove')&&blocked.touchEvents.filter(e=>e.type==='touchmove').every(e=>!e.prevented),'contextBlocked terminal never locks touchmove with preventDefault');
+  await evaluate('socket.close();true');await swipe(100,220);const closed=await evaluate('measure()');assert(closed.touchEvents.some(e=>e.type==='touchmove')&&closed.touchEvents.filter(e=>e.type==='touchmove').every(e=>!e.prevented),'disconnected terminal never locks touchmove with preventDefault');
+  fs.writeFileSync(path.join(evidence,'measurements.json'),JSON.stringify({results,overflow:{before,after},normalScreen:{before:normalBefore,after:normalAfter},blocked,closed},null,2)+'\n');
   console.log('PASS trusted Chromium touch: short canvas, both directions, Fit/original, portrait/landscape, visible output and overflowing canvas');
  }catch(error){try{fs.writeFileSync(path.join(evidence,'failure.json'),JSON.stringify(await evaluate('measure()'),null,2));await browser('screenshot',path.join(evidence,'failure.png'));}catch{}throw error;
  }finally{cdp?.close();await browser('close').catch(()=>{});if(server)await new Promise(resolve=>server.close(resolve));fs.rmSync(scratch,{recursive:true,force:true});}

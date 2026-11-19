@@ -7,7 +7,6 @@ use krill_proto::usage::ProviderKind;
 
 use super::transcript;
 
-#[cfg(unix)]
 mod claude;
 
 #[derive(Clone, Copy)]
@@ -26,28 +25,13 @@ impl<'a> ExpectedId<'a> {
     }
 }
 
-#[cfg_attr(
-    not(unix),
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "Unix process discovery may fail; other platforms keep the same interface"
-    )
-)]
 pub(super) fn discover_claude_with(
     homes: &[PathBuf],
     root: u32,
     foreground: Option<u32>,
     expected_id: ExpectedId<'_>,
 ) -> io::Result<Option<Identity>> {
-    #[cfg(unix)]
-    {
-        claude::discover(homes, root, foreground, expected_id)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (homes, root, foreground, expected_id);
-        Ok(None)
-    }
+    claude::discover(homes, root, foreground, expected_id)
 }
 
 fn process_pids(root: u32, foreground: Option<u32>) -> Vec<u32> {

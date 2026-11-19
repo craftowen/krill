@@ -2163,10 +2163,11 @@ impl Registry {
             if status.agent.is_empty() {
                 "agy".clone_into(&mut status.agent);
             }
+            let agy_fg = account_switch::effective_foreground_pid(root, tap.foreground(), exited);
             let (title, discovered) = crate::agent_history::vault::resolve_live_agy_title(
                 session,
                 root,
-                tap.foreground(),
+                agy_fg,
                 exited,
                 stored.as_ref(),
             );
@@ -2177,7 +2178,7 @@ impl Registry {
                 } else if let Ok(Some(found)) = account_switch::identity::discover(
                     krill_proto::usage::ProviderKind::Antigravity,
                     root,
-                    tap.foreground(),
+                    agy_fg,
                 ) {
                     self.agents
                         .bind_discovered_session(session, &found.id, Some(&found.path));
@@ -2283,6 +2284,17 @@ impl Registry {
         cwd: Option<&Path>,
         tap: Option<&Tap>,
     ) -> io::Result<bool> {
+        self.apply_agent_hook_in(&crate::usage::accounts::default_home(), id, e, cwd, tap)
+    }
+
+    fn apply_agent_hook_in(
+        &self,
+        home: &Path,
+        id: SessionId,
+        e: &HookEvent,
+        cwd: Option<&Path>,
+        tap: Option<&Tap>,
+    ) -> io::Result<bool> {
         use krill_proto::os::ffi::OsStrExt as _;
         let cwd_hint = cwd.map(|cwd| cwd.as_os_str().as_bytes());
         let root = lock(&self.state).sessions.get(&id).map(|entry| entry.pid);
@@ -2323,15 +2335,20 @@ impl Registry {
                 .sessions
                 .get(&id)
                 .map_or(0, |entry| entry.pid);
-            let fg_pid = (e.ppid > 1)
-                .then_some(e.ppid)
-                .or_else(|| tap.and_then(Tap::foreground));
+            let fg_pid = (e.ppid > 1).then_some(e.ppid).or_else(|| {
+                account_switch::effective_foreground_pid(
+                    root_pid,
+                    tap.and_then(Tap::foreground),
+                    false,
+                )
+            });
             let provider = krill_proto::usage::ProviderKind::parse(&stored.profile)
                 .or_else(|| krill_proto::usage::ProviderKind::parse(&e.agent));
             if let Some(provider) = provider
                 && root_pid > 1
             {
-                let discovered = account_switch::identity::discover(provider, root_pid, fg_pid)
+                let discovered = self
+                    .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
                     .ok()
                     .flatten()
                     .map(|found| (found.id, found.path))
@@ -2376,16 +2393,25 @@ impl Registry {
             if !is_subagent_or_foreign {
                 self.agents.mark_rate_limited(id);
             }
-            if let Ok(Some(stored)) = self.agents.stored(id)
-                && let Some(launch) = stored.account
-                && let Some(provider) =
-                    krill_proto::usage::ProviderKind::from_env_var(&launch.env_key)
+            let stored = self.agents.stored(id).ok().flatten();
+            let event_provider = krill_proto::usage::ProviderKind::parse(&e.agent);
+            let provider = stored
+                .as_ref()
+                .and_then(|s| {
+                    s.account
+                        .as_ref()
+                        .and_then(|launch| {
+                            krill_proto::usage::ProviderKind::from_env_var(&launch.env_key)
+                        })
+                        .or_else(|| self.provider_for_profile(&s.profile))
+                        .or_else(|| krill_proto::usage::ProviderKind::parse(&s.profile))
+                })
+                .or(event_provider);
+            if let Some(provider) = provider
+                && (!is_subagent_or_foreign
+                    || event_provider.is_none_or(|event_p| event_p == provider))
             {
-                let account_id = if launch.id.is_empty() {
-                    crate::usage::accounts::host_default_id(provider)
-                } else {
-                    launch.id
-                };
+                let account_id = self.resolve_session_account_id(home, provider, stored.as_ref());
                 crate::usage::accounts::record_rate_limited(provider, &account_id);
             }
         }
@@ -2400,23 +2426,144 @@ impl Registry {
         if let Some(probe) = tests::AUTO_SWITCH_PROBE.take() {
             return probe(self);
         }
-        if let Some(switched) = status::auto_switch_on_rate_limit(
-            &crate::usage::accounts::default_home(),
-            self.state_dir().as_deref(),
-            &e.agent,
-            &e.payload,
-        ) && !switched.is_empty()
+        self.auto_switch_from_hook_in(&crate::usage::accounts::default_home(), id, e);
+    }
+
+    fn auto_switch_from_hook_in(&self, home: &Path, id: SessionId, e: &HookEvent) {
+        let state_dir = self.state_dir();
+        if let Some(switched) =
+            status::auto_switch_on_rate_limit(home, state_dir.as_deref(), &e.agent, &e.payload)
         {
-            for s in &switched {
-                tracing::info!(
-                    session = id.0,
-                    provider = s.provider.as_str(),
-                    from = %s.from_id,
-                    to = %s.to_id,
-                    percent = s.reason_percent,
-                    "stop failure rate limit auto-switched account"
+            if switched.is_empty() {
+                self.requeue_straggler_rate_limited_session(
+                    home,
+                    state_dir.as_deref(),
+                    id,
+                    &e.agent,
                 );
+            } else {
+                for s in &switched {
+                    tracing::info!(
+                        session = id.0,
+                        provider = s.provider.as_str(),
+                        from = %s.from_id,
+                        to = %s.to_id,
+                        percent = s.reason_percent,
+                        "stop failure rate limit auto-switched account"
+                    );
+                }
             }
+        }
+    }
+
+    fn requeue_straggler_rate_limited_session(
+        &self,
+        home: &Path,
+        state_dir: Option<&Path>,
+        id: SessionId,
+        event_agent: &str,
+    ) {
+        use krill_proto::usage::{AccountStatus, AutoSwitchMetric, ConnectionStatus, ProviderKind};
+
+        let Some(provider) = ProviderKind::parse(event_agent) else {
+            return;
+        };
+        let stored = self
+            .live_agent_for_switch_in(id, home)
+            .or_else(|| self.agents.stored(id).ok().flatten());
+        if let Some(stored_provider) = stored.as_ref().and_then(|s| {
+            self.provider_for_profile(&s.profile)
+                .or_else(|| ProviderKind::parse(&s.profile))
+        }) && stored_provider != provider
+        {
+            return;
+        }
+        if lock(&self.account_handoffs)
+            .get(&id)
+            .is_some_and(|h| h.to.is_some())
+        {
+            return;
+        }
+        let session_account_id = self.resolve_session_account_id(home, provider, stored.as_ref());
+        let snapshot = crate::usage::accounts::refresh_accounts_with(home, state_dir, false);
+        let policy = &snapshot.auto_switch;
+        let rule_enabled = policy
+            .rule_for(provider, &session_account_id)
+            .map_or(policy.enabled, |rule| rule.enabled);
+        if !policy.switch_on_rate_limit || !rule_enabled {
+            return;
+        }
+        let Some(selected) = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.provider == provider && a.active)
+        else {
+            return;
+        };
+        if selected.id == session_account_id
+            || (!selected.host_default && !Path::new(&selected.profile_dir).is_dir())
+        {
+            return;
+        }
+        if snapshot.status_for(&selected.id).is_some_and(|s| {
+            matches!(
+                s.status,
+                AccountStatus::RateLimited | AccountStatus::NeedsLogin | AccountStatus::Error
+            )
+        }) {
+            return;
+        }
+        if snapshot.connections.supported
+            && matches!(
+                snapshot.connection_for(&selected.id),
+                ConnectionStatus::NeedsLogin | ConnectionStatus::CheckFailed
+            )
+        {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
+            .unwrap_or(0);
+        if AutoSwitchMetric::Max
+            .effective_percent(&selected.usage, now)
+            .is_some_and(|pct| pct >= 100)
+        {
+            return;
+        }
+        let handoff = lock(&self.account_handoffs).get(&id).cloned();
+        let already_pending_or_active = handoff
+            .as_ref()
+            .is_some_and(|h| h.to.is_some() || (h.error.is_none() && h.account_id == selected.id))
+            || (handoff.as_ref().is_none_or(|h| h.error.is_none())
+                && lock(&self.account_work.pending)
+                    .get(&crate::usage::accounts::switch_work::SwitchScope::Session(
+                        id, provider,
+                    ))
+                    .is_some_and(|t| t.account_id == selected.id && t.not_before.is_none()));
+        if already_pending_or_active {
+            return;
+        }
+        if let Err(error) =
+            self.queue_session_account_switch_in(id, provider, &selected.id, &snapshot, home)
+        {
+            tracing::debug!(
+                session = id.0,
+                provider = provider.as_str(),
+                to = %selected.id,
+                ?error,
+                "straggler rate-limit re-queue skipped"
+            );
+        } else {
+            lock(&self.account_switch_opt_out).remove(&id);
+            tracing::info!(
+                session = id.0,
+                provider = provider.as_str(),
+                from = %session_account_id,
+                to = %selected.id,
+                "straggler rate-limited session queued to selected account"
+            );
         }
     }
 
@@ -3068,7 +3215,7 @@ impl Registry {
         offset: u64,
     ) -> krill_proto::agent_history::ChatPollSnapshot {
         use krill_proto::os::ffi::OsStrExt as _;
-        let (root_pid, fg_pid, exited) = {
+        let (root_pid, raw_fg, exited) = {
             let st = lock(&self.state);
             if let Some(e) = st.sessions.get(&id) {
                 let ex = st.exited.contains_key(&id) || e.session.is_closed();
@@ -3077,14 +3224,7 @@ impl Registry {
                 (0, None, true)
             }
         };
-        // Windows has no PTY foreground group. Without this, an agent typed into a shell
-        // never gets a transcript unless its hook arrives (Codex has none outside Krill launches).
-        #[cfg(windows)]
-        let fg_pid = fg_pid.or_else(|| {
-            (!exited)
-                .then(|| crate::sys::session_agent_process(root_pid))
-                .flatten()
-        });
+        let fg_pid = account_switch::effective_foreground_pid(root_pid, raw_fg, exited);
         let cwd = self
             .session_cwd(id)
             .map(|p| p.as_os_str().as_bytes().to_vec())
@@ -3124,16 +3264,14 @@ impl Registry {
                 .as_ref()
                 .is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none())
         {
-            let expected_id = stored
-                .as_ref()
-                .and_then(|s| s.session_id.as_deref())
-                .filter(|sid| crate::agent::control::valid_session_id(sid));
-            let discovered = match expected_id {
-                Some(sid) => {
-                    account_switch::identity::discover_resumed(provider, root_pid, fg_pid, sid)
-                }
-                None => account_switch::identity::discover(provider, root_pid, fg_pid),
-            };
+            let discovered = self.discover_live_identity_with_mode(
+                provider,
+                &crate::usage::accounts::default_home(),
+                stored.as_ref(),
+                root_pid,
+                fg_pid,
+                true,
+            );
             if let Ok(Some(found)) = discovered {
                 // A process-owned file also covers external account homes that are
                 // absent from the daemon's configured transcript search roots.

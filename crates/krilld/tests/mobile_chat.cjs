@@ -4839,6 +4839,7 @@ async function main() {
     "PASS scrolled-up submit jumps to bottom with optimistic user bubble, reconciles without duplicate, and protects dictation input",
   );
   await agyStartupAndModelApplyUx();
+  await unboundEmptyAndVisibilityTransitions();
 }
 
 async function agyStartupAndModelApplyUx() {
@@ -5196,6 +5197,163 @@ async function agyStartupAndModelApplyUx() {
   }
   console.log(
     "PASS working stop button single interrupt, double-tap guard, duplicate tap latch, draft retention, and next-turn reset",
+  );
+}
+async function unboundEmptyAndVisibilityTransitions() {
+  // 1) Unbound / empty Windows Claude Code sessions must always show .chat-view and an active .chat-composer
+  // and must never raise a spurious "Transcript changed" error when an empty transcript stays unbound.
+  let pollSeq = 0;
+  const unbound = fixture({
+    visible: true,
+    capabilities: { chat_tail: true, chat_composer: true, composer_models: true },
+    handler: async (req) => {
+      if (req.action === "chat_composer") return { supported: false };
+      if (req.action === "chat_poll") {
+        pollSeq++;
+        if (pollSeq === 1)
+          return {
+            generation: "g0",
+            agent: "claude",
+            bound: true,
+            items: [],
+            next_offset: 0,
+            page_start: 0,
+            has_more: false,
+          };
+        return {
+          generation: "",
+          agent: "claude",
+          bound: false,
+          items: [],
+          next_offset: 0,
+          page_start: 0,
+          has_more: false,
+        };
+      }
+      return { sent: true };
+    },
+  });
+  await flush();
+  assert.equal(pollSeq, 1);
+  assert(unbound.find("chat-view"));
+  assert(unbound.find("chat-feed"));
+  assert(unbound.find("chat-composer"));
+  assert(!unbound.find("chat-composer").hidden);
+  assert.equal(unbound.find("chat-input").disabled, false);
+  assert.equal(unbound.find("primary composer-send").disabled, false);
+  // Second poll transitions from empty-bound to unbound: must NOT trigger "Back to latest" or poll error.
+  for (const fn of [...unbound.timers.values()]) fn();
+  await flush();
+  const statusEl = unbound.root.descendants().find((n) => n.attrs?.role === "status");
+  assert.equal(
+    statusEl.hidden,
+    true,
+    "empty unbound transcript must not display Transcript changed poll error",
+  );
+  assert.equal(
+    unbound.button("Back to latest").hidden,
+    true,
+    "empty unbound transcript must not show Back to latest recovery button",
+  );
+  assert(unbound.find("chat-empty"));
+  unbound.dispose();
+
+  // 2) Hidden -> visible transition while a hidden poll is still in flight must queue a visible follow-up poll
+  // and re-measure .chat-input height once visible.
+  const firstPoll = deferred();
+  let mode = "hidden";
+  const switched = fixture({
+    visible: false,
+    capabilities: { chat_tail: true, chat_composer: true },
+    handler: async (req) => {
+      if (req.action !== "chat_poll") return { supported: true, agent: "claude" };
+      if (mode === "hidden") return firstPoll.promise;
+      return {
+        generation: "g-win",
+        agent: "claude",
+        bound: true,
+        items: [{ id: "m1", kind: "assistant", text: "Visible after switch" }],
+        next_offset: 64,
+        page_start: 0,
+        has_more: false,
+      };
+    },
+  });
+  let isShown = false;
+  const input = switched.find("chat-input");
+  Object.defineProperty(input, "clientWidth", {
+    get: () => (isShown ? 320 : 0),
+  });
+  Object.defineProperty(input, "scrollHeight", {
+    get: () => (isShown ? 88 : 28),
+  });
+  switched.input("line1\nline2\nline3");
+  await flush();
+  assert.equal(input.style.height, "28px");
+
+  // User taps Chat while hidden poll is still inFlight.
+  isShown = true;
+  mode = "visible";
+  switched.setVisible(true);
+  assert.equal(
+    input.style.height,
+    "88px",
+    "visibilityChanged must resize .chat-input when becoming visible",
+  );
+  firstPoll.resolve({
+    generation: "",
+    agent: "claude",
+    bound: false,
+    items: [],
+    next_offset: 0,
+    page_start: 0,
+    has_more: false,
+  });
+  await flush();
+  assert(
+    switched.find("chat-feed").textContent.includes("Visible after switch"),
+    "in-flight hidden poll must not drop visible refresh poll on setVisible(true)",
+  );
+  switched.dispose();
+
+  // 3) Live question disables model button even when syncAgent runs after composer status load.
+  const qChat = fixture({
+    visible: true,
+    capabilities: { chat_tail: true, chat_composer: true, composer_models: true },
+    getQuestion: () => ({
+      token: "q-tok",
+      prompt: "Pick?",
+      options: [{ label: "Yes" }],
+    }),
+    handler: async (req) =>
+      req.action === "chat_composer"
+        ? { supported: true, agent: "claude", model: "opus", model_label: "Opus" }
+        : {
+            generation: "gq",
+            agent: "claude",
+            bound: true,
+            items: [],
+            next_offset: 0,
+            page_start: 0,
+            has_more: false,
+          },
+  });
+  qChat.setQuestion({
+    token: "q-tok",
+    identity: "q1",
+    prompt: "Pick?",
+    enabled: true,
+    options: [{ label: "Yes" }],
+  });
+  await flush();
+  assert.equal(
+    qChat.find("composer-pill").disabled,
+    true,
+    "modelBtn must remain disabled while liveQuestion is active",
+  );
+  qChat.dispose();
+  console.log(
+    "PASS unbound empty composer stays usable without error, hidden->visible poll queue & input resize, and modelBtn disabled on liveQuestion",
   );
 }
 main().catch((error) => {
