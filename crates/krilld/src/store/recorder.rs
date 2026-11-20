@@ -353,6 +353,8 @@ impl Recorder {
         else {
             return;
         };
+        #[cfg(test)]
+        write_hook::before_seal(self.id);
         if let Ok(mut tail) = enc.finish() {
             if let Some(crypto) = &mut crypto
                 && crypto.seal(&mut tail).is_err()
@@ -618,6 +620,7 @@ struct AsyncState {
     enqueued_gen: u64,
     completed_gen: u64,
     in_flight: bool,
+    idle_sealing: bool,
     worker_open: bool,
     lifecycle: WorkerLifecycle,
 }
@@ -631,7 +634,9 @@ impl AsyncHandle {
     fn flush(&self) {
         let mut state = lock(&self.mu);
         let target = state.enqueued_gen;
-        while state.completed_gen < target && state.lifecycle != WorkerLifecycle::Dead {
+        while (state.completed_gen < target || state.idle_sealing)
+            && state.lifecycle != WorkerLifecycle::Dead
+        {
             state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
         }
     }
@@ -639,7 +644,9 @@ impl AsyncHandle {
     fn flush_cancelled(&self, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
         let mut state = lock(&self.mu);
         let target = state.enqueued_gen;
-        while state.completed_gen < target && state.lifecycle != WorkerLifecycle::Dead {
+        while (state.completed_gen < target || state.idle_sealing)
+            && state.lifecycle != WorkerLifecycle::Dead
+        {
             if cancelled() {
                 return Err(io::ErrorKind::Interrupted.into());
             }
@@ -813,6 +820,7 @@ impl AsyncRecorder {
                 enqueued_gen: 0,
                 completed_gen: 0,
                 in_flight: false,
+                idle_sealing: false,
                 worker_open: projected_open,
                 lifecycle: WorkerLifecycle::Running,
             }),
@@ -1078,6 +1086,7 @@ impl Drop for WorkerExitGuard<'_> {
         self.store.unregister_async(self.reg_id);
         let mut state = lock(&self.handle.mu);
         state.in_flight = false;
+        state.idle_sealing = false;
         state.worker_open = false;
         state.lifecycle = WorkerLifecycle::Dead;
         self.handle.cv.notify_all();
@@ -1127,6 +1136,7 @@ fn recorder_worker(
                     let now = Instant::now();
                     if at <= now {
                         state.in_flight = true;
+                        state.idle_sealing = true;
                         break NextWork::IdleSeal;
                     }
                     let (guard, _) = handle
@@ -1257,6 +1267,7 @@ fn recorder_worker(
 
         let mut state = lock(&handle.mu);
         state.in_flight = false;
+        state.idle_sealing = false;
         if let Some(ticket) = completed_ticket {
             state.completed_gen = state.completed_gen.max(ticket);
         }
@@ -1293,28 +1304,52 @@ pub(crate) mod write_hook {
 
     type Hook = (SessionId, Arc<dyn Fn() + Send + Sync>);
     static BEFORE_WRITE: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
+    static BEFORE_SEAL: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 
-    pub(crate) struct Guard(SessionId);
+    pub(crate) struct Guard {
+        table: &'static Mutex<Vec<Hook>>,
+        id: SessionId,
+    }
 
     pub(crate) fn install(id: SessionId, hook: impl Fn() + Send + Sync + 'static) -> Guard {
-        lock(&BEFORE_WRITE).push((id, Arc::new(hook)));
-        Guard(id)
+        install_in(&BEFORE_WRITE, id, hook)
+    }
+
+    pub(crate) fn install_seal(id: SessionId, hook: impl Fn() + Send + Sync + 'static) -> Guard {
+        install_in(&BEFORE_SEAL, id, hook)
+    }
+
+    fn install_in(
+        table: &'static Mutex<Vec<Hook>>,
+        id: SessionId,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> Guard {
+        lock(table).push((id, Arc::new(hook)));
+        Guard { table, id }
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            lock(&BEFORE_WRITE).retain(|(target, _)| *target != self.0);
+            lock(self.table).retain(|(target, _)| *target != self.id);
         }
     }
 
-    pub(super) fn before_write(id: SessionId) {
-        let hook = lock(&BEFORE_WRITE)
+    fn fire(table: &'static Mutex<Vec<Hook>>, id: SessionId) {
+        let hook = lock(table)
             .iter()
             .find(|(target, _)| *target == id)
             .map(|(_, hook)| Arc::clone(hook));
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    pub(super) fn before_write(id: SessionId) {
+        fire(&BEFORE_WRITE, id);
+    }
+
+    pub(super) fn before_seal(id: SessionId) {
+        fire(&BEFORE_SEAL, id);
     }
 }
 
@@ -1509,6 +1544,115 @@ mod async_tests {
             })
             .unwrap();
         assert_eq!(actual, expected);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn flush_waits_for_in_flight_idle_seal_without_new_ticket() {
+        let root = tmp("idle-seal-flush");
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let id = SessionId(9504);
+        let size = WinSize { cols: 80, rows: 24 };
+        let mut rec = store.recorder(id, size).unwrap();
+        rec.append_at(
+            b"before-idle",
+            Instant::now()
+                .checked_sub(IDLE_SEAL + Duration::from_secs(1))
+                .unwrap(),
+        );
+        assert!(rec.idle_deadline().is_some_and(|at| at <= Instant::now()));
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook = write_hook::install_seal(id, move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).ok();
+                lock(&release_rx).recv().ok();
+            }
+        });
+
+        let async_rec = AsyncRecorder::start(rec, |_| {}).ok().unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let flush_store = Arc::clone(&store);
+        let (flush_tx, flush_rx) = mpsc::channel();
+        let flusher = thread::spawn(move || {
+            let hist = flush_store.history(id).unwrap();
+            flush_tx.send(hist).unwrap();
+        });
+        assert!(flush_rx.recv_timeout(Duration::from_millis(80)).is_err());
+
+        release_tx.send(()).unwrap();
+        drop(hook);
+        let hist = flush_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        flusher.join().unwrap();
+        assert_eq!(hist.len(), 1);
+        let segs = segments(&store.session_dir(id)).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert!(
+            segment::read(segs.first().unwrap(), store.key.as_deref())
+                .unwrap()
+                .unwrap()
+                .sealed
+        );
+        async_rec.finish(None);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn flush_cancelled_waits_for_idle_seal_and_honors_cancellation() {
+        let root = tmp("idle-seal-cancel");
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let id = SessionId(9505);
+        let size = WinSize { cols: 80, rows: 24 };
+        let mut rec = store.recorder(id, size).unwrap();
+        rec.append_at(
+            b"before-cancel",
+            Instant::now()
+                .checked_sub(IDLE_SEAL + Duration::from_secs(1))
+                .unwrap(),
+        );
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook = write_hook::install_seal(id, move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).ok();
+                lock(&release_rx).recv().ok();
+            }
+        });
+
+        let async_rec = AsyncRecorder::start(rec, |_| {}).ok().unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_flag = Arc::clone(&cancelled);
+        let cancel_store = Arc::clone(&store);
+        let canceller = thread::spawn(move || {
+            cancel_store.flush_session_cancelled(id, &|| cancel_flag.load(Ordering::Acquire))
+        });
+        thread::sleep(Duration::from_millis(30));
+        assert!(!canceller.is_finished());
+        cancelled.store(true, Ordering::Release);
+        let err = canceller.join().unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+
+        release_tx.send(()).unwrap();
+        drop(hook);
+        store.flush_session_cancelled(id, &|| false).unwrap();
+        let segs = segments(&store.session_dir(id)).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert!(
+            segment::read(segs.first().unwrap(), store.key.as_deref())
+                .unwrap()
+                .unwrap()
+                .sealed
+        );
+        async_rec.finish(None);
         fs::remove_dir_all(&root).ok();
     }
 }
