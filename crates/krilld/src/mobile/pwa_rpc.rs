@@ -459,6 +459,59 @@ enum Action {
     DropRemove {
         id: String,
     },
+    #[serde(rename = "bots.list")]
+    BotsList {},
+    #[serde(rename = "bots.items")]
+    BotsItems {
+        #[serde(default)]
+        bot_id: Option<String>,
+        #[serde(default)]
+        include_closed: bool,
+    },
+    #[serde(rename = "bots.item.update")]
+    BotsItemUpdate {
+        item_id: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        done_means: Option<String>,
+        #[serde(default)]
+        status: Option<krill_proto::bots::BotItemStatus>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        decisions: Vec<krill_proto::bots::BotItemDecision>,
+        #[serde(default)]
+        close_note: Option<String>,
+        #[serde(default)]
+        snoozed_until_ms: krill_proto::bots::FieldPatch<u64>,
+    },
+    #[serde(rename = "bots.access.list")]
+    BotsAccessList {
+        #[serde(default)]
+        bot_id: Option<String>,
+    },
+    #[serde(rename = "bots.access.decide")]
+    BotsAccessDecide {
+        token: String,
+        approve: bool,
+    },
+    #[serde(rename = "bots.reply")]
+    BotsReply {
+        bot_id: String,
+        #[serde(default)]
+        link_id: Option<String>,
+        text: String,
+        #[serde(default)]
+        reaction: Option<String>,
+    },
+    #[serde(rename = "bots.connectors.status")]
+    BotsConnectorsStatus {
+        #[serde(default)]
+        bot_id: Option<String>,
+    },
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1044,6 +1097,165 @@ impl Backend {
                 let _guard = crate::session::lock(&self.drop_lock);
                 drops::remove(state, &id)
             }
+            Action::BotsList {} => {
+                if self.bots_inactive()? {
+                    return Ok(json!({"bots": []}));
+                }
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::ListBots)? {
+                    krill_proto::bots::BotRpcResponse::Bots(bots) => {
+                        Ok(json!({"bots": to_value(bots)?}))
+                    }
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsItems {
+                bot_id,
+                include_closed,
+            } => {
+                let bot_id = parse_opt_bot_id(bot_id.as_deref())?;
+                if self.bots_inactive()? {
+                    return Ok(json!({"items": []}));
+                }
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::ListItems {
+                    bot_id,
+                    include_closed,
+                })? {
+                    krill_proto::bots::BotRpcResponse::Items(items) => {
+                        Ok(json!({"items": to_value(items)?}))
+                    }
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsItemUpdate {
+                item_id,
+                title,
+                description,
+                done_means,
+                status,
+                comment,
+                decisions,
+                close_note,
+                snoozed_until_ms,
+            } => {
+                let trimmed_id = item_id.trim();
+                if trimmed_id.is_empty()
+                    || trimmed_id.len() > 128
+                    || trimmed_id.chars().any(char::is_control)
+                    || comment.as_ref().is_some_and(|c| c.len() > 16 * 1024)
+                {
+                    return Err(invalid());
+                }
+                let params = krill_proto::bots::UpdateBotItemParams {
+                    item_id: trimmed_id.to_owned(),
+                    title,
+                    description,
+                    done_means,
+                    status,
+                    comment,
+                    decisions,
+                    close_note,
+                    snoozed_until_ms,
+                };
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::UpdateItem(Box::new(
+                    params,
+                )))? {
+                    krill_proto::bots::BotRpcResponse::Item(item) => {
+                        Ok(json!({"item": to_value(*item)?}))
+                    }
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsAccessList { bot_id } => {
+                let bot_id = parse_opt_bot_id(bot_id.as_deref())?;
+                if self.bots_inactive()? {
+                    return Ok(json!({"requests": []}));
+                }
+                match self
+                    .bot_rpc(krill_proto::bots::BotRpcRequest::ListAccessRequests { bot_id })?
+                {
+                    krill_proto::bots::BotRpcResponse::AccessRequests(requests) => {
+                        Ok(json!({"requests": to_value(requests)?}))
+                    }
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsAccessDecide { token, approve } => {
+                let trimmed = token.trim();
+                if trimmed.is_empty()
+                    || trimmed.len() > 128
+                    || trimmed.chars().any(char::is_control)
+                {
+                    return Err(invalid());
+                }
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::DecideAccessRequest {
+                    token: trimmed.to_owned(),
+                    approve,
+                })? {
+                    krill_proto::bots::BotRpcResponse::AccessRequestDecided(request) => {
+                        Ok(json!({"request": to_value(request)?}))
+                    }
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsReply {
+                bot_id,
+                link_id,
+                text,
+                reaction,
+            } => {
+                let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
+                if text.len() > 32 * 1024
+                    || (text.trim().is_empty()
+                        && reaction.as_deref().map(str::trim).is_none_or(str::is_empty))
+                {
+                    return Err(invalid());
+                }
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::PostBotReply {
+                    bot_id,
+                    link_id,
+                    text,
+                    files: Vec::new(),
+                    reaction,
+                })? {
+                    krill_proto::bots::BotRpcResponse::ReplyPosted { external_ref } => {
+                        Ok(json!({"posted": true, "external_ref": external_ref}))
+                    }
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsConnectorsStatus { bot_id } => {
+                let bot_id = parse_opt_bot_id(bot_id.as_deref())?;
+                if self.bots_inactive()? {
+                    return Ok(json!({"statuses": []}));
+                }
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::ConnectorStatus { bot_id })? {
+                    krill_proto::bots::BotRpcResponse::ConnectorStatuses(statuses) => {
+                        Ok(json!({"statuses": to_value(statuses)?}))
+                    }
+                    _ => Err(invalid()),
+                }
+            }
+        }
+    }
+    fn bots_inactive(&self) -> io::Result<bool> {
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        if registry.bots_if_initialized().is_some() {
+            return Ok(false);
+        }
+        Ok(self
+            .dir
+            .as_deref()
+            .is_some_and(|dir| !crate::bots::store::BotStore::index_exists_at(dir)))
+    }
+    fn bot_rpc(
+        &self,
+        req: krill_proto::bots::BotRpcRequest,
+    ) -> io::Result<krill_proto::bots::BotRpcResponse> {
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let mgr = registry.bots().map_err(io::Error::other)?;
+        match mgr.handle_rpc(&registry, req) {
+            krill_proto::bots::BotRpcResponse::Error(msg) => Err(io::Error::other(msg)),
+            resp => Ok(resp),
         }
     }
     fn drop_dirs(&self) -> io::Result<(&Path, &Path)> {
@@ -1498,7 +1710,7 @@ impl Backend {
         }
         let mut data = json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_interrupt":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_interrupt":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_value});
         bound_snapshot_payload(&mut data);
@@ -1672,6 +1884,15 @@ impl Backend {
         )
     }
 }
+fn parse_opt_bot_id(raw: Option<&str>) -> io::Result<Option<krill_proto::bots::BotId>> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(id) => krill_proto::bots::BotId::new(id)
+            .map(Some)
+            .map_err(|_| invalid()),
+    }
+}
+
 /// 표시용 lossy UTF-8과 분리해 OS 경로 바이트를 그대로 식별한다.
 #[derive(Debug)]
 struct SessionGroup {
@@ -4176,5 +4397,239 @@ mod revision_tests {
         reader.join().ok();
         drop(backend);
         drop(registry);
+    }
+
+    #[test]
+    fn mobile_pwa_bot_workflow_rpcs_are_lazy_safe_and_preserve_fail_closed_approvals() {
+        use krill_proto::bots::{
+            BotConnectorConfig, BotItemStatus, BotRpcRequest, BotRpcResponse, CreateBotItemParams,
+            CreateBotParams, ExternalSource,
+        };
+
+        let dir = std::env::temp_dir().join(format!("mk-pwa-bots-rpc-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let registry = Arc::new(Registry::new(None, Some(&dir)));
+        registry.bind_self_arc();
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+
+        // Strictly lazy when no bots exist: read-only workflow actions do NOT initialize BotsManager.
+        let empty_bots: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"bots.list"}"#)).unwrap();
+        assert_eq!(empty_bots, json!({"ok": true, "data": {"bots": []}}));
+        let empty_items: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"bots.items"}"#)).unwrap();
+        assert_eq!(empty_items, json!({"ok": true, "data": {"items": []}}));
+        let empty_statuses: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"bots.connectors.status"}"#))
+                .unwrap();
+        assert_eq!(
+            empty_statuses,
+            json!({"ok": true, "data": {"statuses": []}})
+        );
+        assert!(registry.bots_if_initialized().is_none());
+
+        // Seed a bot, an item, a pending access request, and an enabled connector.
+        let mgr = registry.bots().unwrap();
+        let created = match mgr.handle_rpc(
+            &registry,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "Mobile Triage Bot".to_owned(),
+                agent_id: "claude".to_owned(),
+                description: "Triages PRs from phone".to_owned(),
+                emoji: Some("M".to_owned()),
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        ) {
+            BotRpcResponse::Bot(b) => *b,
+            other => panic!("unexpected create bot reply: {other:?}"),
+        };
+
+        let mut connectors = BotConnectorConfig::default();
+        connectors.telegram.enabled = true;
+        assert!(matches!(
+            mgr.handle_rpc(
+                &registry,
+                BotRpcRequest::SetConnectorConfig {
+                    bot_id: created.id.clone(),
+                    connectors: Box::new(connectors),
+                }
+            ),
+            BotRpcResponse::Bot(_)
+        ));
+
+        let item = match mgr.handle_rpc(
+            &registry,
+            BotRpcRequest::CreateItem(Box::new(CreateBotItemParams {
+                bot_id: created.id.clone(),
+                title: "Verify release checksum".to_owned(),
+                description: None,
+                done_means: None,
+                status: Some(BotItemStatus::NeedsYou),
+                links: Vec::new(),
+            })),
+        ) {
+            BotRpcResponse::Item(i) => *i,
+            other => panic!("unexpected create item reply: {other:?}"),
+        };
+
+        let decision = mgr
+            .store()
+            .check_or_request_access(
+                &created.id,
+                ExternalSource::Telegram,
+                "777",
+                "Bob",
+                "chat-777",
+                1_500,
+            )
+            .unwrap();
+        let access_token = match decision {
+            crate::bots::connectors::AccessDecision::Pending(req) => req.token,
+            other => panic!("expected pending access request, got {other:?}"),
+        };
+
+        // 1. bots.list
+        let list_resp: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"bots.list"}"#)).unwrap();
+        assert_eq!(list_resp["ok"], true, "{list_resp}");
+        assert_eq!(list_resp["data"]["bots"].as_array().unwrap().len(), 1);
+        assert_eq!(list_resp["data"]["bots"][0]["name"], "Mobile Triage Bot");
+
+        // 2. bots.items
+        let items_resp: Value = serde_json::from_str(
+            &backend.request(
+                &json!({"action":"bots.items","bot_id":created.id.as_str(),"include_closed":false})
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(items_resp["ok"], true, "{items_resp}");
+        assert_eq!(items_resp["data"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(items_resp["data"]["items"][0]["uid"], item.uid);
+
+        // 3. bots.item.update
+        let upd_resp: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.item.update",
+                    "item_id": item.uid,
+                    "status": "done",
+                    "comment": "Verified on mobile",
+                    "close_note": "SHA-256 matches"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(upd_resp["ok"], true, "{upd_resp}");
+        assert_eq!(upd_resp["data"]["item"]["status"], "done");
+
+        // Open items list is now empty; include_closed=true returns it.
+        let open_items: Value = serde_json::from_str(
+            &backend.request(
+                &json!({"action":"bots.items","bot_id":created.id.as_str(),"include_closed":false})
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(open_items["data"]["items"].as_array().unwrap().len(), 0);
+        let all_items: Value = serde_json::from_str(
+            &backend.request(
+                &json!({"action":"bots.items","bot_id":created.id.as_str(),"include_closed":true})
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(all_items["data"]["items"].as_array().unwrap().len(), 1);
+
+        // 4. bots.access.list + bots.access.decide
+        let access_list: Value = serde_json::from_str(&backend.request(
+            &json!({"action":"bots.access.list","bot_id":created.id.as_str()}).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(access_list["ok"], true, "{access_list}");
+        assert_eq!(access_list["data"]["requests"].as_array().unwrap().len(), 1);
+
+        let decided: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.access.decide",
+                    "token": access_token,
+                    "approve": true
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(decided["ok"], true, "{decided}");
+        assert_eq!(decided["data"]["request"]["status"], "approved");
+
+        // 5. bots.reply
+        let reply_resp: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.reply",
+                    "bot_id": created.id.as_str(),
+                    "text": "Ack from phone"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(reply_resp["ok"], true, "{reply_resp}");
+        assert_eq!(reply_resp["data"]["posted"], true);
+
+        // 6. bots.connectors.status (missing token reported cleanly as error/not_set_up)
+        let status_resp: Value = serde_json::from_str(&backend.request(
+            &json!({"action":"bots.connectors.status","bot_id":created.id.as_str()}).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(status_resp["ok"], true, "{status_resp}");
+        let statuses = status_resp["data"]["statuses"].as_array().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["source"], "telegram");
+        assert_eq!(statuses[0]["error_category"], "not_set_up");
+
+        // 7. Fail-closed invariants for legacy approve / answer_question remain strictly preserved.
+        for legacy in [
+            r#"{"action":"approve","session":1,"value":"y"}"#,
+            r#"{"action":"answer_question","session":1,"selected":[0]}"#,
+        ] {
+            let res: Value = serde_json::from_str(&backend.request(legacy)).unwrap();
+            assert_eq!(res["ok"], false);
+            assert!(
+                res["error"].as_str().unwrap().contains("Confirm in Term"),
+                "{res}"
+            );
+        }
+
+        // Unknown fields rejected cleanly.
+        let bad: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"bots.list","extra":123}"#))
+                .unwrap();
+        assert_eq!(bad["ok"], false);
+
+        mgr.shutdown();
+        drop(backend);
+        drop(registry);
+        fs::remove_dir_all(&dir).ok();
     }
 }

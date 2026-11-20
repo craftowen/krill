@@ -11,6 +11,7 @@ mod agent_history;
 pub mod alloc;
 mod appearance;
 pub mod attach;
+pub mod bots;
 mod child;
 mod cli;
 pub mod git;

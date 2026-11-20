@@ -7125,6 +7125,57 @@ fn automations_open_from_sidebar_and_back_preserves_the_workspace(cx: &mut TestA
     assert_eq!(layout_of(&view, cx), before);
 }
 
+#[gpui::test]
+fn bots_open_from_sidebar_shows_attention_badge_and_preserves_workspace(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("bots-default"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let before = layout_of(&view, cx);
+
+    // Attention badge appears when bots have needs_you items or pending access requests.
+    assert!(cx.debug_bounds("nav-bots-badge").is_none());
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bots_attention_count = 3;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("nav-bots-badge").is_some());
+
+    // Clicking nav-bots opens the Bots modal over the workspace without touching layout.
+    let nav = cx.debug_bounds("nav-bots").unwrap();
+    cx.simulate_click(nav.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bots-modal").is_some());
+    assert!(cx.debug_bounds("bots-page").is_some());
+    assert!(cx.debug_bounds("terminal-surface").is_some());
+    assert!(cx.debug_bounds("session-tab-0").is_some());
+    cx.update(|_, cx| {
+        let shell = view.read(cx);
+        assert_eq!(shell.layout, before);
+        assert_eq!(shell.nav_history.entries.last(), Some(&NavEntry::Bots));
+    });
+
+    // Escape closes the modal cleanly and returns to workspace.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bots-modal").is_none());
+    assert_eq!(layout_of(&view, cx), before);
+
+    // Keyboard shortcut (cmd-shift-b) opens Bots modal and backdrop click closes it.
+    cx.simulate_keystrokes("cmd-shift-b");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bots-modal").is_some());
+    let modal = cx.debug_bounds("bots-modal").unwrap();
+    cx.simulate_click(
+        point(modal.left() / 2., modal.center().y),
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bots-modal").is_none());
+    assert_eq!(layout_of(&view, cx), before);
+}
+
 /// 여러 `Shell` 창이 열려 있을 때 한 창에서 인앱 설정을 닫으면 해당 창의 설정만 닫히고,
 /// 나중에 등록된 다른 `Shell` 창이 닫기 명령을 가로채거나 함께 닫히지 않는다.
 #[gpui::test]

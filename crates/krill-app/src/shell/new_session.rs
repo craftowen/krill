@@ -467,6 +467,29 @@ impl Shell {
             .child(
                 Self::nav_row(
                     p,
+                    "nav-bots",
+                    icons::CUSTOM_AGENT_SVG,
+                    sb_text::NAV_BOTS.get(),
+                )
+                .when(matches!(self.modal, Some(super::Modal::Bots(_))), |d| {
+                    d.bg(p.sidebar_accent)
+                        .text_color(p.sidebar_accent_foreground)
+                })
+                .when(self.bots_attention_count > 0, |d| {
+                    d.child(
+                        krill_app::ui::badge(
+                            p,
+                            krill_app::ui::BadgeTone::Warning,
+                            self.bots_attention_count.to_string(),
+                        )
+                        .debug_selector(|| "nav-bots-badge".into()),
+                    )
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.open_bots(Some(window), cx))),
+            )
+            .child(
+                Self::nav_row(
+                    p,
                     "nav-artifacts",
                     icons::FILES_SVG,
                     krill_app::i18n::catalog::artifacts::TITLE.get(),

@@ -210,6 +210,8 @@ pub struct Registry {
     startup_gc: std::sync::atomic::AtomicBool,
     app_opened: OnceLock<()>,
     mobile: OnceLock<Arc<crate::mobile::gateway::Gateway>>,
+    self_ref: OnceLock<std::sync::Weak<Self>>,
+    bots: OnceLock<Arc<crate::bots::BotsManager>>,
     orch_signal: (Mutex<u64>, std::sync::Condvar),
     orch_cache: Mutex<orch_cache::Cache>,
     orch_mail_notified_done: Mutex<BTreeMap<IdleMailScope, MailEpochState>>,
@@ -298,6 +300,8 @@ impl Registry {
             exit: OnceLock::new(),
             dir: dir.map(Path::to_path_buf),
             mobile: OnceLock::new(),
+            self_ref: OnceLock::new(),
+            bots: OnceLock::new(),
             orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
             orch_cache: Mutex::default(),
             orch_mail_notified_done: Mutex::default(),
@@ -450,6 +454,9 @@ impl Registry {
         for (id, e) in &hooked {
             self.auto_switch_from_hook(*id, e);
             self.maybe_rename_from_hook(*id, &e.payload, e.id);
+            if let Some(bots) = self.bots_if_initialized() {
+                bots.on_hook_event(self, *id, e);
+            }
             if status::is_turn_stop(&e.payload)
                 && let Some(dir) = self.state_dir()
                 && let Err(error) = self.notify_idle_orchestration_mail_for(&dir, Some(*id))
@@ -514,8 +521,15 @@ impl Registry {
     }
 
     /// 업그레이드 답을 보낸 뒤 `done`으로 main에 종료를 알린다(MK-062). 한 번만 설정된다.
-    pub fn exit_with(&self, done: Sender<()>) {
+    pub fn exit_with(self: &Arc<Self>, done: Sender<()>) {
+        self.bind_self_arc();
         self.exit.set(done).ok();
+    }
+
+    /// Binds a weak self-reference so lazy background subsystems (e.g., Bots connectors) can
+    /// upgrade back to this [`Registry`].
+    pub fn bind_self_arc(self: &Arc<Self>) {
+        self.self_ref.set(Arc::downgrade(self)).ok();
     }
 
     /// 재결합 소켓 준비가 끝난 뒤 감시 클라이언트에 holder 상실을 알린다.
@@ -586,6 +600,7 @@ impl Registry {
     }
 
     pub fn start_mobile(self: &Arc<Self>, hello: ServerHello) -> io::Result<()> {
+        self.bind_self_arc();
         if self.mobile.get().is_some() {
             return Ok(());
         }
@@ -789,6 +804,9 @@ impl Registry {
             if let Some(id) = session {
                 self.auto_switch_from_hook(id, &e);
                 self.maybe_rename_from_hook(id, &e.payload, e.id);
+                if let Some(bots) = self.bots_if_initialized() {
+                    bots.on_hook_event(self, id, &e);
+                }
                 if status::is_turn_stop(&e.payload)
                     && let Some(dir) = self.state_dir()
                     && let Err(error) = self.notify_idle_orchestration_mail_for(&dir, Some(id))
@@ -845,6 +863,17 @@ impl Registry {
                 krill_proto::usage::UsageReply::Failed(Failure::BadRequest)
             }
             .for_features(n.features);
+            return s.write_all(&reply.encode()?);
+        }
+        if k == krill_proto::bots::BOT_REQ && n.features & ipc::FEAT_BOTS != 0 {
+            use krill_proto::bots::{BotRpcRequest, BotRpcResponse};
+            let req = BotRpcRequest::decode(k, &body)?;
+            let reply = if !peer.scope.full() || (role == Role::Observer && !req.is_read_only()) {
+                peer.deny("bots", &self.audit);
+                BotRpcResponse::Error("permission denied".to_owned())
+            } else {
+                self.on_bot_rpc(req)
+            };
             return s.write_all(&reply.encode()?);
         }
         if k != control::kind::REQUEST || n.features & FEAT_CONTROL == 0 {
@@ -996,6 +1025,9 @@ impl Registry {
                     Reply::Failed(Failure::BadRequest)
                 }
                 Ok(Request::RemoteFs(_)) if n.features & control::FEAT_REMOTE_FS == 0 => {
+                    Reply::Failed(Failure::BadRequest)
+                }
+                Ok(Request::Bot(_)) if n.features & ipc::FEAT_BOTS == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
                 Ok(Request::RemoteFs(krill_proto::remote_fs::RemoteFsRequest::PortForward {
@@ -1327,6 +1359,14 @@ impl Registry {
                     Ok(Reply::RemoteFs(crate::remote_fs::serve(req)))
                 } else {
                     peer.deny("remote-fs", &self.audit);
+                    Err(Failure::Denied)
+                }
+            }
+            Request::Bot(req) => {
+                if peer.scope.full() {
+                    Ok(Reply::Bot(self.on_bot_rpc(req)))
+                } else {
+                    peer.deny("bots", &self.audit);
                     Err(Failure::Denied)
                 }
             }
@@ -2796,7 +2836,7 @@ impl Registry {
     }
 
     /// 자기 상태 폴더만 쓴다. 폴더 없는 레지스트리(단독 테스트)가 운영 폴더로 넘어가지 않게 기본값으로 폴백하지 않는다.
-    fn state_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn state_dir(&self) -> Option<PathBuf> {
         self.dir.clone()
     }
 
@@ -2828,6 +2868,9 @@ impl Registry {
         lock(&self.orch_mail_notified_done).retain(|(sid, _, _), _| *sid != id.0);
         self.clear_sleeping(id);
         self.forget_failed_account_handoff(id, ids_durable);
+        if let Some(bots) = self.bots_if_initialized() {
+            bots.on_session_removed(id);
+        }
     }
 
     #[cfg(all(test, unix))]
@@ -3761,12 +3804,154 @@ impl Registry {
             ^ crate::agent_history::vault::agy_swr_revision().wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 
-    fn notify_orch(&self) {
+    pub(crate) fn notify_orch(&self) {
         let (lock_gen, cvar) = &self.orch_signal;
         let mut g = lock(lock_gen);
         *g = g.wrapping_add(1);
         drop(g);
         cvar.notify_all();
+    }
+
+    /// Returns the [`crate::bots::BotsManager`] only if already lazily initialized (zero side effects).
+    pub fn bots_if_initialized(&self) -> Option<&Arc<crate::bots::BotsManager>> {
+        self.bots.get()
+    }
+
+    /// Lazily initializes the [`crate::bots::BotsManager`] when a bot RPC or periodic bot tick needs it.
+    pub(crate) fn bots(&self) -> Result<&Arc<crate::bots::BotsManager>, String> {
+        if let Some(existing) = self.bots.get() {
+            return Ok(existing);
+        }
+        let dir = self
+            .state_dir()
+            .ok_or_else(|| "daemon state directory unavailable for bots".to_owned())?;
+        let weak_reg = self.self_ref.get().cloned().unwrap_or_default();
+        let created = crate::bots::BotsManager::new(dir, weak_reg);
+        Ok(self.bots.get_or_init(|| created))
+    }
+
+    /// Dispatches a [`krill_proto::bots::BotRpcRequest`] through the lazy [`crate::bots::BotsManager`].
+    fn on_bot_rpc(
+        &self,
+        req: krill_proto::bots::BotRpcRequest,
+    ) -> krill_proto::bots::BotRpcResponse {
+        match self.bots() {
+            Ok(mgr) => mgr.handle_rpc(self, req),
+            Err(msg) => krill_proto::bots::BotRpcResponse::Error(msg),
+        }
+    }
+
+    /// Runs periodic bot tasks (memory tidy, look around, bot cron schedules, lazy poller reconcile)
+    /// ONLY if bots already exist on disk or the bots subsystem is already active.
+    pub(crate) fn tick_bots_periodic(&self, dir: &Path, now: SystemTime) {
+        if self.bots.get().is_none() && !crate::bots::store::BotStore::index_exists_at(dir) {
+            return;
+        }
+        if let Ok(mgr) = self.bots() {
+            mgr.tick_periodic(self, now);
+        }
+    }
+
+    /// Returns a [`Tap`] for a live session (internal daemon helper for Bots runtime).
+    pub(crate) fn session_tap(&self, id: SessionId) -> Option<Tap> {
+        lock(&self.state).sessions.get(&id).map(|e| e.session.tap())
+    }
+
+    /// Returns `true` if `id` is a live, non-exited session.
+    pub(crate) fn is_session_live(&self, id: SessionId) -> bool {
+        let st = lock(&self.state);
+        !st.exited.contains_key(&id)
+            && st
+                .sessions
+                .get(&id)
+                .is_some_and(|entry| !entry.session.is_closed())
+    }
+
+    /// Delivers input bytes to a live bot session PTY.
+    pub(crate) fn deliver_bot_input(
+        &self,
+        id: SessionId,
+        bytes: &[u8],
+        submit: bool,
+    ) -> io::Result<()> {
+        let tap = self
+            .session_tap(id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bot session not live"))?;
+        Self::deliver_input_to_tap(&tap, bytes, submit)
+    }
+
+    /// Captures the trailing non-empty plain-text lines from a session's PTY screen (reply fallback).
+    pub(crate) fn capture_session_plain_tail(&self, id: SessionId) -> Option<String> {
+        let tap = self.session_tap(id)?;
+        let (_, bytes) = tap.capture_cli(control::CaptureFormat::Plain).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        let start = lines.len().saturating_sub(40);
+        let joined = lines.get(start..).unwrap_or_default().join("\n");
+        (!joined.trim().is_empty()).then_some(joined)
+    }
+
+    /// Launches a bot agent session via normal `holder::Spawn` (untouched!) with bot env vars.
+    pub(crate) fn spawn_bot_agent_session(
+        &self,
+        agent_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        permission: krill_proto::agent::Permission,
+        cwd: &Path,
+        extra_env: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(SessionId, u32), String> {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let holder = self
+            .holder
+            .as_ref()
+            .ok_or_else(|| "daemon holder unavailable (cannot spawn bot session)".to_owned())?;
+        let agents = self
+            .agents
+            .agents()
+            .map_err(|_| "failed to load agent profiles".to_owned())?;
+        let (canonical, base_profile) = agents
+            .resolve(agent_id)
+            .ok_or_else(|| format!("unknown bot agent profile: {agent_id}"))?;
+        let mut profile = base_profile.clone();
+        let overrides = krill_proto::agent::LaunchOverrides {
+            model: model.map(ToOwned::to_owned),
+            effort: effort.map(ToOwned::to_owned),
+        };
+        if !overrides.is_empty() {
+            krill_proto::agent::apply_launch_overrides(canonical, &mut profile, &overrides)?;
+        }
+        let session = self
+            .reserve_session_id(None)
+            .map_err(|err| format!("failed to reserve session id: {err}"))?;
+        let state = self.state_dir();
+        let mut cwd_bytes = cwd.as_os_str().as_bytes().to_vec();
+        sanitize_spawn_cwd(&mut cwd_bytes);
+
+        let (mut launch, session_id, account) =
+            crate::agent::launch_selected_in(&profile, permission, session, state.as_deref(), None)
+                .map_err(|err| format!("failed to prepare agent launch: {err}"))?;
+        launch.env.extend(extra_env);
+        crate::agent::pre_trust_workspace(&profile, &cwd_bytes, account.as_ref());
+        let metadata = control::AgentLaunch {
+            profile: canonical.to_owned(),
+            permission,
+        };
+        self.agents
+            .remember_session(session, &metadata, session_id, cwd_bytes.clone(), account)
+            .map_err(|err| {
+                self.discard_settings(session);
+                format!("failed to persist session metadata: {err}")
+            })?;
+        self.spawn_holder(holder, session, launch.argv, launch.env, cwd_bytes, 120, 40)
+            .map_err(|fail| format!("failed to spawn bot session: {fail:?}"))
     }
 
     fn check_messages_wait(
@@ -4864,7 +5049,9 @@ fn read_only(req: &Request) -> bool {
                     }
             )
             | Request::RemoteFs(_)
+            | Request::Bot(_)
     ) && !matches!(req, Request::RemoteFs(r) if !r.is_read_only())
+        && !matches!(req, Request::Bot(r) if !r.is_read_only())
 }
 
 #[cfg(test)]

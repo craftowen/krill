@@ -370,6 +370,7 @@ fn feature_registry_matches_architecture_and_frozen_values() {
             35,
         ),
         ("FEAT_WORKTREE_REFS", crate::control::FEAT_WORKTREE_REFS, 37),
+        ("FEAT_BOTS", crate::ipc::FEAT_BOTS, 40),
     ];
     // 새 상수를 표·fixture 양쪽에서 빠뜨리는 것도 잡는다.
     let declared: std::collections::BTreeSet<_> =
@@ -470,6 +471,8 @@ fn client_channel_kinds() -> Vec<(&'static str, u8)> {
         ("clipboard::CLIPBOARD", crate::clipboard::CLIPBOARD),
         ("daemon::PING", crate::daemon::PING),
         ("daemon::PONG", crate::daemon::PONG),
+        ("bots::BOT_REQ", crate::bots::BOT_REQ),
+        ("bots::BOT_REPLY", crate::bots::BOT_REPLY),
     ]
 }
 
