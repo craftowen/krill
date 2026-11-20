@@ -118,7 +118,7 @@ if [ "${ZDOTDIR:-$HOME}" != "$_krill_self_zdotdir" ] && [ -f "${ZDOTDIR:-$HOME}/
 fi
 unset _krill_self_zdotdir
 if [ -n "${MK_PANE_ID-}" ]; then
-  export HERDR_ENV=1
+  export HERDR_ENV=1 PI_CLIPBOARD_OSC52=1
 fi
 if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
   # OpenCode 격리 프로필만 XDG_DATA_HOME·XDG_STATE_HOME을 덮어쓴다. 처음 덮어쓰기 전 값(미설정 포함)을 기억했다가
@@ -146,7 +146,7 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
       __krill_flush_compdef
     fi
     if [ -n "${MK_PANE_ID-}" ]; then
-      export HERDR_ENV=1
+      export HERDR_ENV=1 PI_CLIPBOARD_OSC52=1
     fi
     local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/krill}/active-accounts.env"
     if [ ! -f "$_krill_env" ] && [ -f "$HOME/Library/Application Support/dev.krill.app/active-accounts.env" ]; then
@@ -2124,9 +2124,10 @@ fn pane_env_with_socket(
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut env = vec![
         (b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes()),
-        // Codex TUI checks HERDR_ENV=1 to emit OSC 52 even when the host OS pasteboard succeeds,
-        // so remote krill-app clients receive Event::ClipboardStore -> Clipboard frame.
+        // Codex(HERDR_ENV=1)와 Pi(PI_CLIPBOARD_OSC52=1)가 호스트 클립보드 성공 뒤에도 OSC 52를 내보내
+        // 원격 krill-app 클라이언트가 Event::ClipboardStore -> Clipboard 프레임을 받게 한다.
         (b"HERDR_ENV".to_vec(), b"1".to_vec()),
+        (b"PI_CLIPBOARD_OSC52".to_vec(), b"1".to_vec()),
     ];
     if let Some(socket_dir) = socket_dir {
         env.push((b"KRILL_SOCKET_DIR".to_vec(), socket_dir.as_bytes().to_vec()));
