@@ -46,7 +46,7 @@ static RATE_LIMITED: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMa
 static SWITCH_BLOCKED: Mutex<BTreeMap<ProviderKind, String>> = Mutex::new(BTreeMap::new());
 
 /// 한도 도달을 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 전환 평가가 일어난다.
-/// 수동 전환 경로(`switch_account`)·`switch_on_rate_limit=false`·비활성 정책은 그대로 존중된다.
+/// `switch_on_rate_limit=false`·비활성 정책은 그대로 존중되고, 수동 전환(`switch_account`)은 기록을 지운다.
 pub fn record_rate_limited(provider: ProviderKind, account_id: &str) {
     let now = now_epoch();
     let now = u64::try_from(now).unwrap_or(u64::MAX);
@@ -1788,6 +1788,9 @@ pub fn switch_account(
         save_inner(home, state_dir, &file)?;
         set_manual_pin(home, state_dir, provider, account_id, pinned_usage, &file);
     }
+    // 사용자가 한도 계정을 직접 고르면(예: 모델별 한도라 다른 모델로 쓰려 할 때) 이전 한도 기록이
+    // 고정을 풀고 바로 다른 계정으로 되돌리지 않게 지운다. 다시 한도에 걸리면 훅이 새로 기록한다.
+    clear_rate_limited(provider, account_id);
 
     Ok(refresh_accounts_with(home, state_dir, false))
 }
