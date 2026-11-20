@@ -1687,3 +1687,100 @@ test("document URL runtime errors map source_file to index.html", async () => {
   assert.equal(h.events()[0].diagnostics.line, 76);
   assert.equal(h.events()[0].diagnostics.column, 5094);
 });
+test("relay socket open before daemon challenge keeps phase as socket_open on 1011, 1006, and timeout", async () => {
+  for (const wsCode of [1011, 1006]) {
+    const h = harness();
+    relayHost(h);
+    h.diagnostics.setEnabled(true);
+    const endpoint = h.context.KrillMobile.transport.bootstrap(),
+      t = h.transport({ endpoint }),
+      { pending, socket } = await h.start(t, 1);
+    socket.emit("close", { code: wsCode });
+    await pending;
+    await settle(h);
+    assert.equal(h.events().length, 1);
+    assert.equal(h.events()[0].error_code, "mobile_connect_failed");
+    assert.equal(h.events()[0].diagnostics.phase, "socket_open");
+    assert.equal(h.events()[0].diagnostics.route, "relay");
+    assert.equal(h.events()[0].diagnostics.ws_code, wsCode);
+    t.close();
+  }
+
+  const hTimeout = harness();
+  relayHost(hTimeout);
+  hTimeout.setDiscovery(async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      hash: "0123456789abcdef",
+      url: "",
+      relay: true,
+    }),
+  }));
+  hTimeout.diagnostics.setEnabled(true);
+  const endpoint = hTimeout.context.KrillMobile.transport.bootstrap(),
+    t = hTimeout.transport({ endpoint }),
+    { pending } = await hTimeout.start(t, 1);
+  await hTimeout.tick(20000);
+  await pending;
+  await settle(hTimeout);
+  const e = hTimeout.events().find((ev) => ev.diagnostics.reason === "timeout");
+  assert(e);
+  assert.equal(e.error_code, "mobile_connect_failed");
+  assert.equal(e.diagnostics.phase, "socket_open");
+  assert.equal(e.diagnostics.route, "relay");
+  t.close();
+});
+test("multi-leg relay socket open does not misclassify stalled legs as challenge", async () => {
+  const h = harness(),
+    rid = "c".repeat(32);
+  h.store.set(
+    "krill-mobile-v2",
+    JSON.stringify({
+      device_id: "a".repeat(64),
+      credential: "b".repeat(64),
+      rid,
+      hash: "0123456789abcdef",
+      routes: {
+        relay: { origin: "https://krill-mobile.pages.dev", rid },
+        tailscale: { origin: "https://desktop.tail123.ts.net:18449" },
+      },
+    }),
+  );
+  h.diagnostics.setEnabled(true);
+  const endpoint = h.context.KrillMobile.transport.bootstrap(),
+    t = h.transport({ endpoint }),
+    pending = t.connect();
+  await flush();
+  const relaySocket = h.sockets.find((s) => s.url.includes("/r/"));
+  assert(relaySocket);
+  relaySocket.emit("open");
+  await flush();
+  await h.tick(250);
+  const tsSocket = h.sockets.find((s) => !s.url.includes("/r/"));
+  assert(tsSocket);
+  relaySocket.emit("close", { code: 1011 });
+  tsSocket.emit("close", { code: 1006 });
+  await pending;
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].error_code, "mobile_connect_failed");
+  assert.equal(h.events()[0].diagnostics.phase, "socket_open");
+  t.close();
+});
+test("stage-2 protocol error does not report mobile_auth_failed or block authentication", async () => {
+  const h = harness();
+  relayHost(h);
+  h.diagnostics.setEnabled(true);
+  const endpoint = h.context.KrillMobile.transport.bootstrap(),
+    t = h.transport({ endpoint }),
+    { pending, socket } = await h.start(t, 2);
+  socket.emit("message", { data: "unexpected-text" });
+  await pending;
+  await settle(h);
+  assert.equal(t.blocked, false);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].error_code, "mobile_connect_failed");
+  assert.equal(h.events()[0].diagnostics.reason, "protocol_error");
+  t.close();
+});

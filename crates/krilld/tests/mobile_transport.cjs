@@ -2544,3 +2544,74 @@ test("success clears only the winning route, so a route that failed mid-handshak
   assert(!h.sockets.slice(before).some(relay), "and with the 2 s head start");
   h.transport.close();
 });
+test("connectDeadline counts visible time only across hidden suspension and wake skew", async () => {
+  const doc = page(),
+    h = harness(null, undefined, false, doc),
+    { pending, socket } = await h.start(4);
+  h.transport.setActive(false);
+  await h.tick(5000);
+  doc.hide();
+  await h.tick(30000);
+  assert.equal(
+    h.events.some((e) => e.message.includes("timed out")),
+    false,
+    "background suspension must not expire snapshot stage",
+  );
+  doc.show();
+  await h.tick(19999);
+  assert.equal(
+    h.events.some((e) => e.message.includes("timed out")),
+    false,
+    "snapshot receives full 20s visible window after return",
+  );
+  h.response(socket, { sessions: [] });
+  await pending;
+  assert.equal(h.transport.ready, true);
+  h.transport.close();
+
+  const hFreeze = harness();
+  hFreeze.transport.setActive(false);
+  const sFreeze = await hFreeze.start(4);
+  await hFreeze.tick(21500);
+  assert.equal(
+    hFreeze.events.some((e) => e.message.includes("timed out")),
+    false,
+    "single late wake timer earns one fresh visible stage window",
+  );
+  hFreeze.response(sFreeze.socket, { sessions: [] });
+  await sFreeze.pending;
+  assert.equal(hFreeze.transport.ready, true);
+  hFreeze.transport.close();
+
+  const hExpire = harness();
+  hExpire.transport.setActive(false);
+  const sExpire = await hExpire.start(4);
+  await hExpire.tick(21500);
+  assert.equal(
+    hExpire.events.some((e) => e.message.includes("timed out")),
+    false,
+  );
+  await hExpire.tick(20000);
+  await sExpire.pending;
+  assert.equal(hExpire.transport.ready, false);
+  assert.match(
+    hExpire.events.find((e) => e.message.includes("timed out"))?.message || "",
+    /timed out/,
+  );
+  hExpire.transport.close();
+});
+test("unexpected text or protocol error during stage-2 authentication does not set authBlocked", async () => {
+  const h = harness(),
+    { pending, socket } = await h.start(2);
+  socket.emit("message", { data: "HTTP/1.1 502 Bad Gateway" });
+  await pending;
+  assert.equal(h.transport.blocked, false);
+  await h.tick(1000);
+  const retry = h.sockets.at(-1);
+  assert.notEqual(retry, socket);
+  await h.advance(retry, 4);
+  h.response(retry, { sessions: [] });
+  await flush();
+  assert.equal(h.transport.ready, true);
+  h.transport.close();
+});

@@ -1311,30 +1311,58 @@
         ]).finally(() => clearTimeout(timeout));
       }
       function connectDeadline(current, run, stageMs = 20000, capMs = 60000) {
-        const startedAt = Date.now();
         let timeout, rejectDeadline;
+        let stageStarted = Date.now(),
+          stageWait = stageMs,
+          late = false,
+          capStarted = stageStarted;
         const expired = new Promise((_, reject) => {
             rejectDeadline = reject;
           }),
-          arm = (ms) => {
+          expire = () => {
+            const error = Error(
+              "Connection timed out. Pending actions were not resent.",
+            );
+            error.diagnosticReason = "timeout";
+            ((error.transport = !0),
+              rejectDeadline(error),
+              current === generation && disconnect(error));
+          },
+          arm = (wait) => {
             clearTimeout(timeout);
+            const due = Date.now() + wait;
             timeout = setTimeout(() => {
-              const error = Error(
-                "Connection timed out. Pending actions were not resent.",
-              );
-              error.diagnosticReason = "timeout";
-              ((error.transport = !0),
-                rejectDeadline(error),
-                current === generation && disconnect(error));
-            }, ms);
+              const now = Date.now();
+              if (globalThis.document?.hidden) {
+                capStarted += Math.max(0, now - stageStarted);
+                stageStarted = now;
+                return arm(stageWait);
+              }
+              if (now - due > 1000 && !late) {
+                late = true;
+                capStarted += now - due;
+                return arm(stageWait);
+              }
+              if (visibleAt > stageStarted) {
+                capStarted += visibleAt - stageStarted;
+                stageStarted = visibleAt;
+              }
+              const left = Math.max(stageStarted, visibleAt) + stageWait - now;
+              if (left > 0) return arm(left);
+              expire();
+            }, wait);
           };
-        arm(stageMs);
+        arm(stageWait);
         return Promise.race([
-          run(() =>
-            arm(
-              Math.min(stageMs, Math.max(5000, startedAt + capMs - Date.now())),
-            ),
-          ),
+          run(() => {
+            const now = Date.now();
+            if (visibleAt > stageStarted) capStarted += visibleAt - stageStarted;
+            const visibleElapsed = Math.max(0, now - capStarted);
+            stageStarted = now;
+            late = false;
+            stageWait = Math.min(stageMs, Math.max(5000, capMs - visibleElapsed));
+            arm(stageWait);
+          }),
           expired,
         ]).finally(() => clearTimeout(timeout));
       }
@@ -1791,10 +1819,28 @@
                   heard = Date.now();
                   received++;
                   let data = e.data;
+                  if (typeof data === "string") {
+                    if (channel || stage >= 2) {
+                      disconnect(
+                        Object.assign(Error("Unexpected daemon response"), {
+                          diagnosticReason: "protocol_error",
+                        }),
+                      );
+                      return;
+                    }
+                  } else if (stage >= 2 && !channel) {
+                    disconnect(
+                      Object.assign(Error("Unexpected pre-auth frame"), {
+                        diagnosticReason: "protocol_error",
+                      }),
+                    );
+                    return;
+                  }
                   if (channel && typeof data !== "string") {
                     try {
                       data = channel.open(data);
                     } catch (error) {
+                      error.diagnosticReason ||= "protocol_error";
                       disconnect(error);
                       return;
                     }
@@ -1912,7 +1958,7 @@
                   active.addEventListener(
                     "open",
                     () => {
-                      stage = 1;
+                      if (timing.route !== "relay") stage = 1;
                       resolve();
                     },
                     { once: true },
@@ -1929,11 +1975,17 @@
                   );
                 });
                 ensureCurrent();
-                advanceStage();
                 mark("socketOpenMs");
-                trace?.mark("challenge");
+                if (timing.route !== "relay") {
+                  advanceStage();
+                  trace?.mark("challenge");
+                }
                 const challengeBytes = await next();
                 ensureCurrent();
+                if (stage < 1) {
+                  stage = 1;
+                  trace?.mark("challenge");
+                }
                 challenge = JSON.parse(challengeBytes);
                 stage = 2;
                 advanceStage();
@@ -2011,9 +2063,19 @@
                       timing.route = chosen.route;
                       socket = chosen.socket;
                       if (chosen.protocolError && priority(chosen) === 0) {
+                        stage = 1;
+                        trace?.mark("challenge", { route: chosen.route });
                         reject(chosen.protocolError);
                         return;
                       }
+                      stage =
+                        chosen.route !== "relay" &&
+                        chosen.socketOpenMs !== undefined
+                          ? 1
+                          : 0;
+                      trace?.mark(stage === 1 ? "challenge" : "socket_open", {
+                        route: chosen.route,
+                      });
                       if (!chosen.closeEvent && chosen.socket)
                         chosen.socket.addEventListener(
                           "close",
@@ -2125,7 +2187,7 @@
                           0,
                           clock() - timing.started,
                         );
-                        if (stage < 1) {
+                        if (leg.route !== "relay" && stage < 1) {
                           stage = 1;
                           advanceStage();
                           timing.socketOpenMs = leg.socketOpenMs;
@@ -2164,6 +2226,7 @@
                           leg.socketOpenMs ??
                           Math.max(0, clock() - timing.started);
                         heard = Date.now();
+                        if (stage < 1) trace?.mark("challenge", { route: leg.route });
                         stage = 2;
                         ws.addEventListener("message", onMessage);
                         ws.addEventListener("close", end);
@@ -2303,7 +2366,8 @@
               reason === "timeout" || reason === "network_offline";
           if (!e.diagnosticReported && !failed?.diagnosticReported)
             trace?.report(
-              !transientConnect && (stage === 2 || authBlocked)
+              authBlocked ||
+                reason === "auth_rejected"
                 ? "mobile_auth_failed"
                 : "mobile_connect_failed",
               {
@@ -2348,15 +2412,10 @@
               quick = true;
             }
           }
-          // A transport close while authenticating is not a rejection: the daemon signals those with
-          // 1008/4009, and its own failure budget answers repeated bad proofs with 1013 (65s above).
-          // Timeouts and interruptions do not consume that budget, so normal backoff is safe here.
-          (!transientConnect &&
-            stage === 2 &&
-            !routeAlternative &&
-            !(e?.transport || failed?.transport) &&
-            (authBlocked = !0),
-            options.onError?.(e),
+          // A transport or protocol failure while authenticating is not an explicit rejection: the daemon
+          // signals rejections with 1008/4009, and its failure budget answers bad proofs with 1013.
+          // Timeouts, interruptions, and stale/malformed frames never trip permanent auth lockout.
+          (options.onError?.(e),
             disconnect(e),
             status("disconnected", failed?.message || e.message));
         } finally {

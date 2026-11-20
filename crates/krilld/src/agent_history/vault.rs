@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -461,12 +461,30 @@ fn root_contains_target(dir: &Path, target: &VaultTarget) -> bool {
 }
 
 pub(crate) fn search_in(roots: &VaultRoots, query: &SearchQuery) -> SearchSnapshot {
+    search_in_with_budget(roots, query, SCAN_TIME)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn search_in_with_time_budget(
+    roots: &VaultRoots,
+    query: &SearchQuery,
+    scan_time: Duration,
+) -> SearchSnapshot {
+    search_in_with_budget(roots, query, scan_time)
+}
+
+fn search_in_with_budget(
+    roots: &VaultRoots,
+    query: &SearchQuery,
+    scan_time: Duration,
+) -> SearchSnapshot {
     let parsed_query = ParsedQuery::parse(query);
     let mut indexer = Indexer {
         docs: BTreeMap::new(),
         nodes: 0,
         bytes: 0,
         start: Instant::now(),
+        scan_time,
         truncated: false,
         skipped: false,
     };
@@ -907,14 +925,16 @@ struct Indexer {
     nodes: usize,
     bytes: usize,
     start: Instant,
+    scan_time: Duration,
     truncated: bool,
     skipped: bool,
 }
 
 impl Indexer {
     fn exhausted(&mut self) -> bool {
-        let done =
-            self.nodes >= MAX_NODES || self.bytes >= MAX_BYTES || self.start.elapsed() >= SCAN_TIME;
+        let done = self.nodes >= MAX_NODES
+            || self.bytes >= MAX_BYTES
+            || self.start.elapsed() >= self.scan_time;
         self.truncated |= done;
         done
     }
@@ -2823,6 +2843,103 @@ struct AgyLiveTitleEntry {
 }
 
 static AGY_LIVE_TITLE_CACHE: OnceLock<Mutex<BTreeMap<u64, AgyLiveTitleEntry>>> = OnceLock::new();
+static AGY_LIVE_TITLE_INFLIGHT: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
+static AGY_SWR_REVISION: AtomicU64 = AtomicU64::new(0);
+
+const MAX_AGY_SWR_INFLIGHT: usize = 64;
+
+pub(crate) fn agy_swr_revision() -> u64 {
+    AGY_SWR_REVISION.load(Ordering::Acquire)
+}
+
+pub(crate) fn bump_agy_swr_revision() {
+    AGY_SWR_REVISION.fetch_add(1, Ordering::Release);
+}
+
+pub(crate) fn try_claim_agy_swr(
+    sessions: &[krill_proto::SessionId],
+) -> Vec<krill_proto::SessionId> {
+    let mutex = AGY_LIVE_TITLE_INFLIGHT.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let mut inflight = lock(mutex);
+    let mut claimed = Vec::new();
+    for &id in sessions {
+        if inflight.len() >= MAX_AGY_SWR_INFLIGHT {
+            break;
+        }
+        if inflight.insert(id.0) {
+            claimed.push(id);
+        }
+    }
+    claimed
+}
+
+pub(crate) fn release_agy_swr(sessions: &[krill_proto::SessionId]) {
+    let Some(mutex) = AGY_LIVE_TITLE_INFLIGHT.get() else {
+        return;
+    };
+    let mut inflight = lock(mutex);
+    for id in sessions {
+        inflight.remove(&id.0);
+    }
+}
+
+fn needs_agy_store_binding(stored: Option<&crate::agent::control::StoredLaunch>) -> bool {
+    stored.is_some_and(|s| {
+        s.session_id.is_none()
+            || s.transcript_path.is_none()
+            || s.transcript_path
+                .as_deref()
+                .is_some_and(crate::agent::control::is_agy_conversation_db_path)
+    })
+}
+
+fn agy_discovered_from_entry(
+    entry: &AgyLiveTitleEntry,
+    stored: Option<&crate::agent::control::StoredLaunch>,
+) -> Option<(String, Option<PathBuf>)> {
+    if !needs_agy_store_binding(stored) {
+        return None;
+    }
+    entry.conv_id.as_ref().and_then(|cid| {
+        (stored.is_some_and(|s| s.session_id.is_none()) || entry.discovered_tp.is_some())
+            .then(|| (cid.clone(), entry.discovered_tp.clone()))
+    })
+}
+
+pub(crate) struct CachedAgyTitle {
+    pub title: Option<String>,
+    pub discovered: Option<(String, Option<PathBuf>)>,
+    pub stale: bool,
+}
+
+/// 캐시된 `agy` 제목·바인딩 정보만 즉시 반환하고 백그라운드 갱신 필요 여부(`stale`)를 알린다.
+/// 동기 OS PID/vnode 탐색을 수행하지 않아 모바일 대시보드 스냅샷이 절대 블로킹되지 않는다.
+pub(crate) fn cached_live_agy_title(
+    session: krill_proto::SessionId,
+    stored: Option<&crate::agent::control::StoredLaunch>,
+) -> CachedAgyTitle {
+    let cache_mutex = AGY_LIVE_TITLE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let cache = lock(cache_mutex);
+    let Some(entry) = cache.get(&session.0) else {
+        return CachedAgyTitle {
+            title: None,
+            discovered: None,
+            stale: true,
+        };
+    };
+    let ttl = if entry.title.is_some() || entry.conv_id.is_some() {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(1)
+    };
+    let stale = entry.checked_at.elapsed() >= ttl;
+    let discovered = agy_discovered_from_entry(entry, stored);
+    CachedAgyTitle {
+        title: entry.title.clone(),
+        discovered,
+        stale,
+    }
+}
 
 /// 실행 중인 Antigravity(`agy`) 세션의 대화 제목·요약을 조회한다.
 /// OSC 0/2 터미널 타이틀을 내보내지 않는 `agy`를 위해 `annotations/<id>.pbtxt`와 트랜스크립트 첫 프롬프트를 읽는다.
@@ -2834,8 +2951,7 @@ pub(crate) fn resolve_live_agy_title(
     stored: Option<&crate::agent::control::StoredLaunch>,
 ) -> (Option<String>, Option<(String, Option<PathBuf>)>) {
     let cache_mutex = AGY_LIVE_TITLE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let needs_store_binding =
-        stored.is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none());
+    let needs_store_binding = needs_agy_store_binding(stored);
     let cached_snapshot = {
         let cache = lock(cache_mutex);
         if let Some(entry) = cache.get(&session.0) {
@@ -2846,11 +2962,7 @@ pub(crate) fn resolve_live_agy_title(
             };
             if entry.checked_at.elapsed() < ttl {
                 let discovered = if needs_store_binding {
-                    entry.conv_id.as_ref().and_then(|cid| {
-                        (stored.is_some_and(|s| s.session_id.is_none())
-                            || entry.discovered_tp.is_some())
-                        .then(|| (cid.clone(), entry.discovered_tp.clone()))
-                    })
+                    agy_discovered_from_entry(entry, stored)
                 } else {
                     None
                 };
@@ -2939,6 +3051,9 @@ pub(crate) fn resolve_live_agy_title(
 
     let Some((agy_root, conv_id)) = resolved_pair else {
         let mut cache = lock(cache_mutex);
+        let changed = cache.get(&session.0).is_some_and(|prev| {
+            prev.title.is_some() || prev.conv_id.is_some() || prev.discovered_tp.is_some()
+        });
         if cache.len() >= 128 && !cache.contains_key(&session.0) {
             cache.pop_first();
         }
@@ -2953,6 +3068,10 @@ pub(crate) fn resolve_live_agy_title(
                 checked_at: Instant::now(),
             },
         );
+        drop(cache);
+        if changed {
+            bump_agy_swr_revision();
+        }
         return (None, None);
     };
 
@@ -2965,9 +3084,16 @@ pub(crate) fn resolve_live_agy_title(
         && (*prev_mtime == u128::MAX || (mtime_ns > 0 && *prev_mtime == mtime_ns))
     {
         let mut cache = lock(cache_mutex);
+        let next_tp = discovered_for_store.as_ref().and_then(|(_, tp)| tp.clone());
+        let mut tp_changed = false;
         if let Some(entry) = cache.get_mut(&session.0) {
-            entry.discovered_tp = discovered_for_store.as_ref().and_then(|(_, tp)| tp.clone());
+            tp_changed = entry.discovered_tp != next_tp;
+            entry.discovered_tp = next_tp;
             entry.checked_at = Instant::now();
+        }
+        drop(cache);
+        if tp_changed {
+            bump_agy_swr_revision();
         }
         return (Some(prev_title.clone()), discovered_for_store);
     }
@@ -2988,7 +3114,13 @@ pub(crate) fn resolve_live_agy_title(
         }
     });
     let recorded_mtime = if title.is_some() { recorded_mtime } else { 0 };
+    let next_tp = discovered_for_store.as_ref().and_then(|(_, tp)| tp.clone());
     let mut cache = lock(cache_mutex);
+    let changed = cache.get(&session.0).is_none_or(|prev| {
+        prev.conv_id.as_deref() != Some(conv_id.as_str())
+            || prev.title != title
+            || prev.discovered_tp != next_tp
+    });
     if cache.len() >= 128 && !cache.contains_key(&session.0) {
         cache.pop_first();
     }
@@ -2997,12 +3129,16 @@ pub(crate) fn resolve_live_agy_title(
         AgyLiveTitleEntry {
             agy_root: Some(agy_root),
             conv_id: Some(conv_id),
-            discovered_tp: discovered_for_store.as_ref().and_then(|(_, tp)| tp.clone()),
+            discovered_tp: next_tp,
             title: title.clone(),
             pbtxt_mtime_ns: recorded_mtime,
             checked_at: Instant::now(),
         },
     );
+    drop(cache);
+    if changed {
+        bump_agy_swr_revision();
+    }
     (title, discovered_for_store)
 }
 
@@ -3499,10 +3635,18 @@ mod cache_budget_tests {
                 VAULT_CACHE_BYTES.store(0, Ordering::Relaxed);
             };
             // 첫 검색은 지연 초기화되는 전역까지 할당하므로 비우고 다시 잰다.
-            drop(search_in(&roots, &SearchQuery::default()));
+            drop(search_in_with_time_budget(
+                &roots,
+                &SearchQuery::default(),
+                Duration::from_secs(60),
+            ));
             clear();
             let before = heap();
-            let snapshot = search_in(&roots, &SearchQuery::default());
+            let snapshot = search_in_with_time_budget(
+                &roots,
+                &SearchQuery::default(),
+                Duration::from_secs(60),
+            );
             assert!(
                 !snapshot.truncated,
                 "{content}: scan budget must not cut the corpus"
