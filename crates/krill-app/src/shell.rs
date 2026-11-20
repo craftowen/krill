@@ -209,6 +209,8 @@ struct Live {
     selecting: bool,
     /// 끄는 중인 선택 단위(OWE-866).
     selecting_kind: SelectKind,
+    /// 프로그램 마우스 보고로 누른 버튼 비트마스크(bit b = button b).
+    mouse_down: u8,
     task: Task<()>,
     creation: Arc<std::sync::Mutex<close::Creation>>,
     /// 만든 때. 붙기 전 [`CONNECTING_GRACE`] 동안은 문구 없이 빈 터미널로 보인다.
@@ -238,6 +240,7 @@ impl Live {
             selection_text: None,
             selecting: false,
             selecting_kind: SelectKind::Char,
+            mouse_down: 0,
             task,
             creation: Arc::default(),
             born: Instant::now(),
@@ -245,6 +248,7 @@ impl Live {
     }
 
     fn cut(&mut self) {
+        self.mouse_down = 0;
         if let Some(s) = self.sock.take() {
             s.shutdown(Shutdown::Both).ok();
         }
@@ -5780,19 +5784,55 @@ impl Shell {
         modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
+        let bit = match event {
+            keys::tui::Mouse::Press(b)
+            | keys::tui::Mouse::Release(b)
+            | keys::tui::Mouse::Move(Some(b))
+                if b < 3 =>
+            {
+                1u8 << b
+            }
+            _ => 0,
+        };
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let active_drag = bit != 0 && (l.mouse_down & bit) != 0;
+        if matches!(event, keys::tui::Mouse::Release(_)) {
+            l.mouse_down &= !bit;
+        } else if matches!(event, keys::tui::Mouse::Move(None)) {
+            l.mouse_down = 0;
+        }
         // 파일 드롭(gpui가 왼쪽 버튼 이동·놓기로 바꿔 보낸다)은 프로그램에 마우스 보고로 보내지 않는다.
         if cx.has_active_drag() {
             return;
         }
-        let Some(l) = self.live.get_mut(&pane) else {
+        let is_drag_or_release = active_drag && !matches!(event, keys::tui::Mouse::Press(_));
+        let Some((column, line)) = (if is_drag_or_release {
+            krill_app::terminal::cell_at_clamped(&l.painted, l.pane.screen(), position)
+        } else {
+            cell_at(&l.painted, l.pane.screen(), position)
+        }) else {
             return;
         };
-        let Some((column, line)) = cell_at(&l.painted, l.pane.screen(), position) else {
+        let effective_modifiers = if is_drag_or_release {
+            Modifiers {
+                shift: false,
+                alt: false,
+                platform: false,
+                ..modifiers
+            }
+        } else {
+            modifiers
+        };
+        let Some(bytes) =
+            keys::tui::mouse(l.pane.modes(), event, column, line, effective_modifiers)
+        else {
             return;
         };
-        let Some(bytes) = keys::tui::mouse(l.pane.modes(), event, column, line, modifiers) else {
-            return;
-        };
+        if matches!(event, keys::tui::Mouse::Press(_)) {
+            l.mouse_down |= bit;
+        }
         let n = l.pane.report(&bytes);
         self.show(n.as_ref(), cx);
         cx.stop_propagation();
@@ -7416,10 +7456,22 @@ impl Shell {
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(move |this, _: &gpui::MouseUpEvent, _, cx| {
-                    // 패인 밖의 release도 시작한 선택을 확정한다. 다른 패인에는 입력을 보내지 않는다.
-                    if this.select_end(id, cx) && krill_app::settings::copy_on_select(cx) {
-                        this.copy(cx);
+                cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                    // 패인 밖의 release도 시작한 선택·TUI 마우스 끌기를 확정한다. 다른 패인에는 입력을 보내지 않는다.
+                    if this.select_end(id, cx) {
+                        if krill_app::settings::copy_on_select(cx) {
+                            this.copy(cx);
+                        }
+                        return;
+                    }
+                    if this.live.get(&id).is_some_and(|l| l.mouse_down & 1 != 0) {
+                        this.mouse_input(
+                            id,
+                            keys::tui::Mouse::Release(0),
+                            e.position,
+                            e.modifiers,
+                            cx,
+                        );
                     }
                 }),
             )
@@ -7438,7 +7490,12 @@ impl Shell {
             .on_mouse_up(
                 MouseButton::Right,
                 cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
-                    if this.selects(id, e.modifiers) {
+                    if this.selects(id, e.modifiers)
+                        && this
+                            .live
+                            .get(&id)
+                            .is_none_or(|l| l.mouse_down & (1 << 2) == 0)
+                    {
                         return;
                     }
                     this.mouse_input(

@@ -199,6 +199,37 @@ pub fn cell_at(
     Some((x as u16, y as u16))
 }
 
+/// 진행 중인 TUI 마우스 끌기·놓기 좌표를 그리드 경계로 고정한다.
+pub fn cell_at_clamped(
+    painted: &Painted,
+    screen: &Screen,
+    position: gpui::Point<Pixels>,
+) -> Option<(u16, u16)> {
+    let (bounds, cell) = painted.get();
+    if screen.cols == 0
+        || screen.lines == 0
+        || bounds.size.width <= px(0.)
+        || bounds.size.height <= px(0.)
+        || cell.width <= px(0.)
+        || cell.height <= px(0.)
+    {
+        return None;
+    }
+    let x = (f32::from(position.x - bounds.origin.x) / f32::from(cell.width)).floor();
+    let y = (f32::from(position.y - bounds.origin.y) / f32::from(cell.height)).floor();
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let max_x = f32::from(screen.cols - 1);
+    let max_y = f32::from(screen.lines - 1);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "0..=cols-1 / 0..=lines-1 범위로 고정한 유한한 좌표다"
+    )]
+    Some((x.clamp(0., max_x) as u16, y.clamp(0., max_y) as u16))
+}
+
 /// Cmd+클릭 대상. OSC 8이 임의 앱 실행용 scheme을 열지 않도록 일반 링크만 허용한다.
 pub fn link_target<'a>(
     screen: &'a Screen,

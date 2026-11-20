@@ -158,3 +158,63 @@ fn remote_sgr_mouse_keeps_program_input_and_shift_selection(cx: &mut TestAppCont
         Some("hello")
     );
 }
+
+#[gpui::test]
+fn remote_sgr_drag_outside_grid_clamps_release_and_applies_osc52_clipboard(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::clipboard::{CLIPBOARD, Clipboard};
+    use krill_proto::input::Input;
+
+    let (view, cx, pane, mut peer) = remote_terminal(
+        cx,
+        "remote-selection-sgr-outside",
+        Modes::MOUSE_DRAG | Modes::SGR_MOUSE,
+    );
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    let start = point(
+        bounds.origin.x + cell.width * 0.5,
+        bounds.origin.y + cell.height * 0.5,
+    );
+    let outside = point(
+        bounds.origin.x + bounds.size.width + px(20.),
+        bounds.origin.y + cell.height * 0.5,
+    );
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(outside, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::default());
+    let mut input = Vec::new();
+    while input.len() < 3 {
+        let (kind, body) = ipc::read_frame(&mut peer).unwrap().unwrap();
+        if let Ok(message) = Input::decode(kind, &body) {
+            input.push(message.bytes);
+        }
+    }
+    assert_eq!(
+        input,
+        [
+            b"\x1b[<0;1;1M",
+            b"\x1b[<32;20;1M".as_slice(),
+            b"\x1b[<0;20;1m"
+        ]
+    );
+    assert!(cx.update(|_, cx| view.read(cx).live[&pane].mouse_down == 0));
+
+    let frame = Clipboard {
+        text: "hello world".to_owned(),
+    }
+    .encode()
+    .unwrap();
+    let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+    assert_eq!(kind, CLIPBOARD);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            assert!(s.on_frame(pane, kind, &body, cx));
+        });
+    });
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("hello world")
+    );
+}
