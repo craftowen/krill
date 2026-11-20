@@ -150,6 +150,8 @@ pub(super) struct Files {
     goto: Option<(PathBuf, u32, u32)>,
     /// 아티팩트 공유(`krill artifacts share`)가 진행 중인 칸.
     sharing: std::collections::HashSet<PaneId>,
+    scratch_panes: Vec<PaneId>,
+    scratch_candidates: Vec<(u64, PaneId, usize)>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -231,6 +233,8 @@ impl Default for Files {
             hover: None,
             goto: None,
             sharing: std::collections::HashSet::new(),
+            scratch_panes: Vec::new(),
+            scratch_candidates: Vec::new(),
         }
     }
 }
@@ -518,7 +522,47 @@ impl FileHost {
     }
 }
 
+fn visit_tree_leaves_while(
+    tree: &krill_app::layout::PaneTree,
+    f: &mut impl FnMut(PaneId) -> bool,
+) -> bool {
+    match tree {
+        krill_app::layout::PaneTree::Leaf(id) => f(*id),
+        krill_app::layout::PaneTree::Split { first, second, .. } => {
+            visit_tree_leaves_while(first, f) && visit_tree_leaves_while(second, f)
+        }
+    }
+}
+
+fn visit_tree_leaves(tree: &krill_app::layout::PaneTree, f: &mut impl FnMut(PaneId)) {
+    visit_tree_leaves_while(tree, &mut |pane| {
+        f(pane);
+        true
+    });
+}
+
+fn visible_panes_match(layout: &krill_app::layout::Layout, cached: &[PaneId]) -> bool {
+    let Some(tab) = layout.tabs().get(layout.active()) else {
+        return cached.is_empty();
+    };
+    let mut index = 0usize;
+    let matches = visit_tree_leaves_while(&tab.root, &mut |pane| {
+        if cached.get(index) == Some(&pane) {
+            index += 1;
+            true
+        } else {
+            false
+        }
+    });
+    matches && index == cached.len()
+}
+
 impl Shell {
+    fn pane_host_is_available(&self, pane: PaneId) -> bool {
+        let host = self.layout.host(pane);
+        !host.is_remote() || self.host_targets.contains_key(host)
+    }
+
     pub(super) fn file_host_for_pane(&self, pane: PaneId) -> FileHost {
         let host = self.layout.host(pane);
         if !host.is_remote() {
@@ -2118,40 +2162,65 @@ impl Shell {
 
     /// 그리기 전에: 보이는 파일 칸을 읽고, 감시를 켜고, 바뀐 포커스를 옮기고, 창 닫기 확인을 건다.
     pub(super) fn sync_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for path in std::mem::take(&mut self.files.released) {
-            fview::release_image(&path, window, cx);
+        if !self.files.released.is_empty() {
+            for path in std::mem::take(&mut self.files.released) {
+                fview::release_image(&path, window, cx);
+            }
         }
-        self.apply_goto(window, cx);
-        self.files
-            .loading
-            .retain(|pane, (_, path)| self.layout.file(*pane) == Some(path.as_path()));
+        if self.files.goto.is_some() {
+            self.apply_goto(window, cx);
+        }
+        if !self.files.loading.is_empty() {
+            self.files
+                .loading
+                .retain(|pane, (_, path)| self.layout.file(*pane) == Some(path.as_path()));
+        }
         // 전송이 없어 읽지 못한 칸은 전송이 생기면, 다른 호스트에서 읽은 칸은 칸의 호스트가 바뀌면 버리고
         // 다시 읽는다(디스크 IO 없이 맵 조회만). 읽어 온 본문은 읽어 온 호스트에만 속한다(APP-F01 후속).
-        let stale: Vec<PaneId> = self
-            .files
-            .tabs
-            .iter()
-            .filter(|(pane, tab)| {
-                (self.layout.file(**pane).is_some() && *self.layout.host(**pane) != tab.host)
-                    || (matches!(tab.body, Body::Offline)
-                        && !matches!(self.file_host_for_pane(**pane), FileHost::Unavailable(_)))
-            })
-            .map(|(pane, _)| *pane)
-            .collect();
-        for pane in stale {
-            if let Some(tab) = self.files.tabs.remove(&pane) {
-                self.files.forget(&tab);
+        if !self.files.tabs.is_empty() {
+            let mut stale = std::mem::take(&mut self.files.scratch_panes);
+            stale.clear();
+            for (&pane, tab) in &self.files.tabs {
+                let host_changed =
+                    self.layout.file(pane).is_some() && *self.layout.host(pane) != tab.host;
+                let came_online =
+                    matches!(tab.body, Body::Offline) && self.pane_host_is_available(pane);
+                if host_changed || came_online {
+                    stale.push(pane);
+                }
             }
-            self.files.cache_count = usize::MAX;
+            if !stale.is_empty() {
+                for &pane in &stale {
+                    if let Some(tab) = self.files.tabs.remove(&pane) {
+                        self.files.forget(&tab);
+                    }
+                }
+                self.files.cache_count = usize::MAX;
+            }
+            stale.clear();
+            self.files.scratch_panes = stale;
         }
-        for pane in self.layout.visible() {
-            if let Some(path) = self.layout.file(pane).map(Path::to_owned)
-                && !self.files.tabs.contains_key(&pane)
-                && !self.files.loading.contains_key(&pane)
-            {
-                self.start_file_load(pane, path, window, cx);
+        let mut to_load = std::mem::take(&mut self.files.scratch_panes);
+        to_load.clear();
+        if let Some(tab) = self.layout.tabs().get(self.layout.active()) {
+            visit_tree_leaves(&tab.root, &mut |pane| {
+                if self.layout.file(pane).is_some()
+                    && !self.files.tabs.contains_key(&pane)
+                    && !self.files.loading.contains_key(&pane)
+                {
+                    to_load.push(pane);
+                }
+            });
+        }
+        if !to_load.is_empty() {
+            for &pane in &to_load {
+                if let Some(path) = self.layout.file(pane).map(Path::to_owned) {
+                    self.start_file_load(pane, path, window, cx);
+                }
             }
         }
+        to_load.clear();
+        self.files.scratch_panes = to_load;
         self.trim_clean_file_cache(window, cx);
         if !self.files.watching
             && (self.layout.files().next().is_some() || self.file_requests_dir(cx).is_some())
@@ -2160,31 +2229,31 @@ impl Shell {
             self.files.watch = Some(Self::watch_files(window, cx));
         }
         // 팔레트·모달이 떠 있거나 터미널 칸에서 검색 바 입력창에 포커스가 있으면 그쪽 포커스를 뺏지 않는다.
-        let search_focused = self.search.as_ref().is_some_and(|(bar, _)| {
-            self.layout
-                .focused()
-                .is_none_or(|p| self.layout.file(p).is_none())
-                && bar.read(cx).is_focused(window, cx)
-        });
-        if !self.has_workspace_focus_blocker(cx)
-            && !search_focused
-            && std::mem::take(&mut self.files.refocus)
-        {
-            let focused = self.layout.focused();
-            let editor = focused
-                .and_then(|p| self.files.tabs.get(&p))
-                .and_then(FileTab::focus_editor)
-                .cloned();
-            if let Some(state) = editor {
-                state.update(cx, |s, cx| s.focus(window, cx));
-            } else if let Some(chat_key) = focused
-                .filter(|p| self.is_pane_chat_view(*p, cx))
-                .and_then(|p| self.chat_key(p))
-            {
-                let input = self.ensure_chat_input(chat_key, window, cx);
-                input.update(cx, |s, cx| s.focus(window, cx));
-            } else {
-                window.focus(&self.focus, cx);
+        if self.files.refocus {
+            let search_focused = self.search.as_ref().is_some_and(|(bar, _)| {
+                self.layout
+                    .focused()
+                    .is_none_or(|p| self.layout.file(p).is_none())
+                    && bar.read(cx).is_focused(window, cx)
+            });
+            if !self.has_workspace_focus_blocker(cx) && !search_focused {
+                self.files.refocus = false;
+                let focused = self.layout.focused();
+                let editor = focused
+                    .and_then(|p| self.files.tabs.get(&p))
+                    .and_then(FileTab::focus_editor)
+                    .cloned();
+                if let Some(state) = editor {
+                    state.update(cx, |s, cx| s.focus(window, cx));
+                } else if let Some(chat_key) = focused
+                    .filter(|p| self.is_pane_chat_view(*p, cx))
+                    .and_then(|p| self.chat_key(p))
+                {
+                    let input = self.ensure_chat_input(chat_key, window, cx);
+                    input.update(cx, |s, cx| s.focus(window, cx));
+                } else {
+                    window.focus(&self.focus, cx);
+                }
             }
         }
         if !self.files.close_guard {
@@ -2199,27 +2268,33 @@ impl Shell {
     }
 
     fn trim_clean_file_cache(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let visible_panes = self.layout.visible();
-        if self.files.cache_visible == visible_panes
-            && self.files.cache_count == self.files.tabs.len()
+        if self.files.cache_count == self.files.tabs.len()
+            && visible_panes_match(&self.layout, &self.files.cache_visible)
         {
             return;
         }
-        self.files.cache_visible.clone_from(&visible_panes);
+        self.files.cache_visible.clear();
+        if let Some(tab) = self.layout.tabs().get(self.layout.active()) {
+            visit_tree_leaves(&tab.root, &mut |pane| self.files.cache_visible.push(pane));
+        }
         self.files.cache_count = self.files.tabs.len();
-        let visible: std::collections::HashSet<_> = visible_panes.into_iter().collect();
         self.files.cache_clock = self.files.cache_clock.wrapping_add(1);
         let clock = self.files.cache_clock;
-        for pane in &visible {
-            self.files.last_visible.insert(*pane, clock);
+        for &pane in &self.files.cache_visible {
+            self.files.last_visible.insert(pane, clock);
         }
-        self.files
-            .last_visible
-            .retain(|pane, _| self.layout.file(*pane).is_some());
-        self.files
-            .evicted_scroll
-            .retain(|pane, (path, _)| self.layout.file(*pane) == Some(path.as_path()));
-        let mut candidates = Vec::new();
+        if !self.files.last_visible.is_empty() {
+            self.files
+                .last_visible
+                .retain(|pane, _| self.layout.file(*pane).is_some());
+        }
+        if !self.files.evicted_scroll.is_empty() {
+            self.files
+                .evicted_scroll
+                .retain(|pane, (path, _)| self.layout.file(*pane) == Some(path.as_path()));
+        }
+        let mut candidates = std::mem::take(&mut self.files.scratch_candidates);
+        candidates.clear();
         let mut retained = 0usize;
         for (&pane, tab) in &self.files.tabs {
             let bytes = if tab.shows_image() {
@@ -2241,7 +2316,7 @@ impl Shell {
                 Body::Text { state, .. } => state.read(cx).is_copyable(),
                 _ => false,
             };
-            if visible.contains(&pane)
+            if self.files.cache_visible.contains(&pane)
                 || self.layout.focused() == Some(pane)
                 || selected
                 || tab.error.is_some()
@@ -2259,7 +2334,7 @@ impl Shell {
         }
         candidates.sort_by_key(|(age, pane, _)| (*age, *pane));
         let mut count = self.files.tabs.len();
-        for (_, pane, bytes) in candidates {
+        for &(_, pane, bytes) in &candidates {
             if retained <= CLEAN_CACHE_BYTES && count <= CLEAN_CACHE_TABS {
                 break;
             }
@@ -2274,9 +2349,13 @@ impl Shell {
                 count -= 1;
             }
         }
+        candidates.clear();
+        self.files.scratch_candidates = candidates;
         self.files.cache_count = self.files.tabs.len();
-        for path in std::mem::take(&mut self.files.released) {
-            fview::release_image(&path, window, cx);
+        if !self.files.released.is_empty() {
+            for path in std::mem::take(&mut self.files.released) {
+                fview::release_image(&path, window, cx);
+            }
         }
     }
 
@@ -3045,3 +3124,134 @@ fn restart_quit_is_current(staged: Option<&krill_app::updater::StagedUpdate>, cx
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+mod sync_perf_tests {
+    use super::*;
+
+    #[test]
+    fn visible_panes_match_agrees_with_layout_visible() {
+        let mut layout = krill_app::layout::Layout::default();
+        let p0 = layout.focused().unwrap();
+        assert_eq!(layout.visible(), vec![p0]);
+        assert!(visible_panes_match(&layout, &[p0]));
+        assert!(!visible_panes_match(&layout, &[]));
+        assert!(!visible_panes_match(&layout, &[p0, p0]));
+
+        layout.split(krill_app::layout::Axis::Horizontal);
+        layout.split(krill_app::layout::Axis::Vertical);
+        let expected = layout.visible();
+        assert_eq!(expected.len(), 3);
+        assert!(visible_panes_match(&layout, &expected));
+        assert!(!visible_panes_match(&layout, &expected[..2]));
+        let reversed = [expected[2], expected[1], expected[0]];
+        assert!(!visible_panes_match(&layout, &reversed));
+
+        layout.deactivate();
+        assert!(layout.visible().is_empty());
+        assert!(visible_panes_match(&layout, &[]));
+        assert!(!visible_panes_match(&layout, &expected));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn sync_files_steady_state_is_idempotent_and_preserves_cache_clock(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::shell::tests::{open, state_path};
+
+        let dir = std::env::temp_dir().join(format!("mk-files-sync-idle-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("steady.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let (view, visual) = open(cx, state_path("files-sync-steady"));
+        view.update(visual, |s, cx| s.open_file(file.clone(), cx));
+        visual.run_until_parked();
+
+        // Settle once after open_file completes.
+        visual.update(|window, cx| {
+            view.update(cx, |s, cx| {
+                s.sync_files(window, cx);
+            });
+        });
+
+        let (clock_before, count_before, visible_before) = view.read_with(visual, |s, _| {
+            (
+                s.files.cache_clock,
+                s.files.cache_count,
+                s.files.cache_visible.clone(),
+            )
+        });
+        assert!(!visible_before.is_empty());
+
+        // Repeated steady-state sync_files passes must not advance cache_clock or disturb state.
+        for _ in 0..8 {
+            visual.update(|window, cx| {
+                view.update(cx, |s, cx| {
+                    s.sync_files(window, cx);
+                    assert!(s.files.close_guard);
+                    assert!(s.files.watching);
+                    assert!(!s.files.refocus);
+                });
+            });
+        }
+
+        view.read_with(visual, |s, _| {
+            assert_eq!(s.files.cache_clock, clock_before);
+            assert_eq!(s.files.cache_count, count_before);
+            assert_eq!(s.files.cache_visible, visible_before);
+            assert!(s.files.scratch_panes.is_empty());
+        });
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn sync_files_preserves_refocus_while_blocked_and_applies_goto(cx: &mut gpui::TestAppContext) {
+        use crate::shell::tests::{layout_of, open, state_path};
+
+        let dir = std::env::temp_dir().join(format!("mk-files-sync-goto-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("goto.rs");
+        std::fs::write(&file, "line1\nline2\nline3\n").unwrap();
+
+        let (view, visual) = open(cx, state_path("files-sync-goto"));
+        // Hold refocus while settings modal blocks workspace focus.
+        view.update(visual, |s, cx| {
+            s.open_settings(krill_app::settings::AdminTab::Appearance, None, cx);
+            s.files.refocus = true;
+        });
+        visual.update(|window, cx| view.update(cx, |s, cx| s.sync_files(window, cx)));
+        view.read_with(visual, |s, _| {
+            assert!(
+                s.files.refocus,
+                "refocus must wait while a modal blocks workspace focus"
+            );
+        });
+        view.update(visual, |s, cx| s.close_settings(None, cx));
+        visual.update(|window, cx| view.update(cx, |s, cx| s.sync_files(window, cx)));
+        view.read_with(visual, |s, _| {
+            assert!(
+                !s.files.refocus,
+                "refocus clears once workspace blocker is gone"
+            );
+        });
+
+        // Open file at line 3, col 2 via goto and ensure sync_files/load applies it cleanly.
+        view.update(visual, |s, cx| s.open_file_at(file.clone(), 3, 2, cx));
+        visual.run_until_parked();
+        let pane = layout_of(&view, visual).active_tab().focused;
+        view.read_with(visual, |shell, cx| {
+            assert!(shell.files.goto.is_none());
+            let ed = shell.files.tabs[&pane].editor().unwrap().read(cx);
+            let pos = ed.cursor_position();
+            assert_eq!((pos.line, pos.character), (2, 1));
+        });
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
