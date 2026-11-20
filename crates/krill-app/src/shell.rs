@@ -369,7 +369,8 @@ actions!(
         CopyClean,
         Paste,
         ForkSession,
-        ContinueInNewSession
+        ContinueInNewSession,
+        OpenBots
     ]
 );
 
@@ -393,6 +394,7 @@ pub(super) enum NavEntry {
     Mobile,
     Artifacts,
     Automations,
+    Bots,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -535,6 +537,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(&keys::tab_index_key(8), ActivateTab8, ctx),
         KeyBinding::new(&keys::tab_index_key(9), ActivateTab9, ctx),
         krill_app::keys::bind("cmd-b", ToggleSidebar, ctx),
+        krill_app::keys::bind("cmd-shift-b", OpenBots, ctx),
         krill_app::keys::bind("cmd-shift-0", FocusSidebar, ctx),
         krill_app::keys::bind("cmd-shift-e", ToggleExplorer, ctx),
         krill_app::keys::bind("cmd-shift-f", ToggleSearch, ctx),
@@ -793,6 +796,10 @@ pub struct Shell {
     /// 렌더마다 모든 칸의 화면 텍스트에 정규식을 돌리지 않고 텍스트가 바뀔 때만 다시 감지한다.
     ports_cache: std::cell::RefCell<HashMap<(krill_app::hosts::HostId, u64), popout::PortCache>>,
     artifacts_cache: Option<gpui::Entity<krill_app::artifacts::View>>,
+    bots_cache: Option<gpui::Entity<krill_app::bots::View>>,
+    pub(super) bots_attention_count: usize,
+    #[cfg(not(test))]
+    bots_badge_task: Option<Task<()>>,
     modal: Option<Modal>,
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
     pub(super) role: WindowRole,
@@ -840,6 +847,7 @@ enum Modal {
     Settings(gpui::Entity<krill_app::settings::SettingsView>),
     Artifacts(gpui::Entity<krill_app::artifacts::View>),
     Automations(gpui::Entity<krill_app::automations::View>),
+    Bots(gpui::Entity<krill_app::bots::View>),
 }
 
 impl Modal {
@@ -848,6 +856,7 @@ impl Modal {
             Self::Settings(v) => v.read(cx).focus_handle(),
             Self::Artifacts(v) => v.read(cx).focus_handle(),
             Self::Automations(v) => v.read(cx).focus_handle(),
+            Self::Bots(v) => v.read(cx).focus_handle(),
         }
     }
 }
@@ -1436,6 +1445,10 @@ impl Shell {
             workspace_closing: std::collections::HashSet::new(),
             ports_cache: std::cell::RefCell::default(),
             artifacts_cache: None,
+            bots_cache: None,
+            bots_attention_count: 0,
+            #[cfg(not(test))]
+            bots_badge_task: None,
             modal: None,
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,
@@ -1847,7 +1860,8 @@ impl Shell {
             NavEntry::Settings(_)
             | NavEntry::Mobile
             | NavEntry::Artifacts
-            | NavEntry::Automations => true,
+            | NavEntry::Automations
+            | NavEntry::Bots => true,
             NavEntry::Workspace {
                 pane,
                 session,
@@ -1960,6 +1974,7 @@ impl Shell {
         match entry {
             NavEntry::Artifacts => self.open_artifacts(window, cx),
             NavEntry::Automations => self.open_automations(window, cx),
+            NavEntry::Bots => self.open_bots(window, cx),
             NavEntry::Mobile => self.open_mobile_page(window, cx),
             NavEntry::Settings(tab) => {
                 self.open_settings(tab, window, cx);
@@ -3330,6 +3345,8 @@ impl Shell {
                 cx,
             );
             self.refresh_ssh_hosts(cx);
+            #[cfg(not(test))]
+            self.refresh_bots_badge(cx);
             return;
         }
         let home = krill_app::accounts::default_home();
@@ -8571,6 +8588,9 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_toggle_secure_input))
             .on_action(cx.listener(Self::on_float_terminal))
             .on_action(cx.listener(Self::on_dashboard))
+            .on_action(cx.listener(|this, _: &OpenBots, window, cx| {
+                this.open_bots(Some(window), cx);
+            }))
             .capture_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 krill_app::star_nag::record_key_down(&e.keystroke.key, cx);
                 if this.dashboard.is_some()
@@ -8715,6 +8735,12 @@ impl Render for Shell {
                         "automations-modal-backdrop",
                         "automations-modal",
                         catalog::sidebar::NAV_AUTOMATIONS.get(),
+                        v.into(),
+                    ),
+                    Modal::Bots(v) => (
+                        "bots-modal-backdrop",
+                        "bots-modal",
+                        catalog::sidebar::NAV_BOTS.get(),
                         v.into(),
                     ),
                 };

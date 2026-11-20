@@ -8,6 +8,7 @@ pub mod alert;
 pub mod appearance;
 pub mod artifacts;
 pub mod automations;
+pub mod bots;
 pub mod commands;
 pub mod continue_session;
 pub mod crash;
