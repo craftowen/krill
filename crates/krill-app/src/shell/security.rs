@@ -71,6 +71,8 @@ struct QueuedInput {
     attachment: bool,
     files: bool,
     drop_policy: Option<DropPolicy>,
+    /// 붙여넣을 로컬 파일 경로. 준비 중 칸의 셸·에이전트가 바뀌면 이 경로를 지금 정책으로 다시 맞춘다.
+    paths: Vec<std::path::PathBuf>,
 }
 impl QueuedInput {
     fn targets(&self, shell: &Shell) -> bool {
@@ -97,10 +99,11 @@ enum QueuedKind {
 }
 
 impl Shell {
-    fn mark_file_paste(&mut self, id: u64) {
+    fn mark_file_paste(&mut self, id: u64, paths: &[std::path::PathBuf]) {
         for entry in &mut self.paste_queue.entries {
             if matches!(entry.kind, QueuedKind::Paste(request, _) if request == id) {
                 entry.files = true;
+                entry.paths = paths.to_vec();
             }
         }
     }
@@ -342,6 +345,7 @@ impl Shell {
             attachment: false,
             files: false,
             drop_policy: Some(drop_policy),
+            paths: Vec::new(),
         });
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
@@ -482,8 +486,14 @@ impl Shell {
             let item = read.await.ok().flatten();
             #[cfg(not(test))]
             let item = augment_clipboard_item_from_pasteboard(item);
-            if item.as_ref().is_some_and(clipboard_has_files) {
-                this.update(cx, |this, _| this.mark_file_paste(id)).ok();
+            if let Some(item) = item.as_ref().filter(|item| clipboard_has_files(item)) {
+                let paths = if remote_pane {
+                    Vec::new()
+                } else {
+                    clipboard_external_paths(item).unwrap_or_default()
+                };
+                this.update(cx, |this, _| this.mark_file_paste(id, &paths))
+                    .ok();
             }
             let attachment = item
                 .as_ref()
@@ -543,7 +553,7 @@ impl Shell {
                 policy,
             );
             if let Some(id) = self.begin_clipboard_paste(window, cx) {
-                self.mark_file_paste(id);
+                self.mark_file_paste(id, paths.paths());
                 self.complete_attachment_paste(id, text, attachment, window, cx);
             }
             return;
@@ -558,7 +568,7 @@ impl Shell {
         let item = gpui::ClipboardItem {
             entries: vec![gpui::ClipboardEntry::ExternalPaths(paths.clone())],
         };
-        self.mark_file_paste(id);
+        self.mark_file_paste(id, &[]);
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let attachment = clipboard_is_attachment(&item, policy);
@@ -612,7 +622,12 @@ impl Shell {
             .map_or_else(DropPolicy::default, |pane| self.drop_policy_for(pane, cx));
         let item = item.clone();
         if clipboard_has_files(&item) {
-            self.mark_file_paste(id);
+            let paths = if remote_pane {
+                Vec::new()
+            } else {
+                clipboard_external_paths(&item).unwrap_or_default()
+            };
+            self.mark_file_paste(id, &paths);
         }
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
@@ -667,6 +682,7 @@ impl Shell {
             attachment: false,
             files: false,
             drop_policy: None,
+            paths: Vec::new(),
         });
         true
     }
@@ -859,22 +875,37 @@ impl Shell {
             }
             let bytes = match entry.kind {
                 QueuedKind::Bytes(bytes) => bytes,
-                QueuedKind::Paste(id, PreparedPaste::Ready(Some(bytes))) => {
+                QueuedKind::Paste(id, PreparedPaste::Ready(Some(mut bytes))) => {
                     if self.page_open()
                         || self.dashboard.is_some()
                         || self.layout.focused() != Some(entry.pane)
                     {
                         continue;
                     }
-                    if entry
-                        .drop_policy
-                        .is_some_and(|policy| policy != self.drop_policy_for(entry.pane, cx))
-                    {
-                        if entry.files {
-                            self.notice = Some(sec_text::FILE_PASTE_FAILED.get().to_owned());
-                            cx.notify();
-                        }
-                        continue;
+                    let current = self.drop_policy_for(entry.pane, cx);
+                    if entry.drop_policy.is_some_and(|policy| policy != current) {
+                        // 에이전트가 명령을 돌리면 포그라운드가 잠깐 셸로 바뀐다. 로컬 파일은 지금 정책으로 다시 맞춘다.
+                        use krill_proto::os::ffi::OsStrExt as _;
+                        let again = (!entry.paths.is_empty())
+                            .then(|| {
+                                krill_term::paste::dropped_with_policy(
+                                    entry.paths.iter().map(|p| p.as_os_str().as_bytes()),
+                                    current,
+                                )
+                            })
+                            .flatten();
+                        let Some(again) = again else {
+                            if entry.files {
+                                self.notice = Some(sec_text::FILE_PASTE_FAILED.get().to_owned());
+                                cx.notify();
+                            }
+                            continue;
+                        };
+                        bytes = again;
+                        entry.attachment = current.image_attachments
+                            && entry.paths.iter().all(|p| {
+                                krill_term::paste::is_image_path(p.as_os_str().as_bytes())
+                            });
                     }
                     let mut modes = modes;
                     if entry.attachment {
@@ -960,6 +991,7 @@ impl Shell {
                     attachment: false,
                     files: false,
                     drop_policy: Some(drop_policy),
+                    paths: Vec::new(),
                 });
                 self.refresh_pending_paste_banner(cx);
                 cx.notify();
@@ -1394,6 +1426,29 @@ pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<
     clipboard_paste_payload_with_policy(item, DropPolicy::default())
 }
 
+/// 클립보드에서 붙여넣을 로컬 파일 경로. 이미지가 함께 있으면 디스크에 남은 경로만 쓴다(#28245).
+fn clipboard_external_paths(item: &gpui::ClipboardItem) -> Option<Vec<std::path::PathBuf>> {
+    let has_valid_image = item.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            gpui::ClipboardEntry::Image(img)
+                if !img.bytes.is_empty() && img.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES
+        )
+    });
+    item.entries().iter().find_map(|entry| {
+        let gpui::ClipboardEntry::ExternalPaths(paths) = entry else {
+            return None;
+        };
+        let kept: Vec<_> = paths
+            .paths()
+            .iter()
+            .filter(|p| !has_valid_image || p.exists())
+            .cloned()
+            .collect();
+        (!kept.is_empty()).then_some(kept)
+    })
+}
+
 fn clipboard_paste_payload_with_policy(
     item: &gpui::ClipboardItem,
     policy: DropPolicy,
@@ -1410,30 +1465,16 @@ fn clipboard_paste_payload_with_policy(
                 if !img.bytes.is_empty() && img.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES
         )
     });
-    let mut skipped_dead_external_paths = false;
-
-    for entry in item.entries() {
-        if let gpui::ClipboardEntry::ExternalPaths(paths) = entry
-            && !paths.paths().is_empty()
-        {
-            if has_valid_image {
-                let existing: Vec<&std::path::PathBuf> =
-                    paths.paths().iter().filter(|p| p.exists()).collect();
-                if !existing.is_empty() {
-                    return krill_term::paste::dropped_with_policy(
-                        existing.into_iter().map(|p| p.as_os_str().as_bytes()),
-                        policy,
-                    );
-                }
-                skipped_dead_external_paths = true;
-            } else {
-                return krill_term::paste::dropped_with_policy(
-                    paths.paths().iter().map(|p| p.as_os_str().as_bytes()),
-                    policy,
-                );
-            }
-        }
+    if let Some(paths) = clipboard_external_paths(item) {
+        return krill_term::paste::dropped_with_policy(
+            paths.iter().map(|p| p.as_os_str().as_bytes()),
+            policy,
+        );
     }
+    // 쓸 경로가 없는데 경로 항목이 있으면 이미지와 함께 온 죽은 임시 경로다.
+    let skipped_dead_external_paths = item.entries().iter().any(|entry| {
+        matches!(entry, gpui::ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty())
+    });
 
     if !skipped_dead_external_paths {
         let has_usable_string = item.entries().iter().any(|entry| match entry {

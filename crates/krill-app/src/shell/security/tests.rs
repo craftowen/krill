@@ -1586,6 +1586,51 @@ fn input_policy_late_preparation_cannot_reuse_a_changed_shell_or_attachment_poli
 }
 
 #[gpui::test]
+fn input_policy_late_file_paste_is_requoted_for_the_current_shell(cx: &mut TestAppContext) {
+    use krill_proto::control::{Create, Program};
+    let (view, cx) = open(cx, state_path("drop-policy-requote"));
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            shell.attach_test(pane, krill_proto::SessionId(715), ours, cx);
+            let request = shell.begin_clipboard_paste(window, cx).unwrap();
+            shell.mark_file_paste(request, &["/tmp/it's a.dwg".into()]);
+            // 준비하는 사이 포그라운드가 PowerShell로 바뀌었다.
+            shell.layout.set_launch(
+                pane,
+                Create {
+                    program: Program::Custom {
+                        program: b"pwsh.exe".to_vec(),
+                        args: vec![],
+                    },
+                    cwd: vec![],
+                    cols: 80,
+                    rows: 24,
+                    account: None,
+                },
+            );
+            shell.complete_attachment_paste(
+                request,
+                Some(b"'/tmp/it'\\''s a.dwg' ".to_vec()),
+                false,
+                window,
+                cx,
+            );
+            assert!(shell.paste_queue.entries.is_empty());
+            assert!(shell.notice.is_none(), "no failure toast");
+        });
+    });
+    cx.run_until_parked();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let (kind, body) = krill_proto::ipc::read_frame(&mut peer).unwrap().unwrap();
+    assert_eq!(
+        Input::decode(kind, &body).unwrap().bytes,
+        b"'/tmp/it''s a.dwg' "
+    );
+}
+
+#[gpui::test]
 fn input_policy_uses_observed_remote_shell_and_os_without_local_platform_guesses(
     cx: &mut TestAppContext,
 ) {
