@@ -908,3 +908,221 @@ fn session_exported_default_state_dir_is_not_isolation() {
     ));
     assert!(is_isolated(Some(exported), None));
 }
+
+#[test]
+fn timeout_invariants_hold_on_every_os() {
+    assert_eq!(
+        default_hello_timeout_for(ClientRole::App, false),
+        HELLO_TIMEOUT
+    );
+    assert_eq!(
+        default_hello_timeout_for(ClientRole::Cli, false),
+        HELLO_TIMEOUT
+    );
+    assert_eq!(
+        default_hello_timeout_for(ClientRole::Hook, false),
+        HELLO_TIMEOUT
+    );
+    assert_eq!(
+        default_hello_timeout_for(ClientRole::Hook, true),
+        HELLO_TIMEOUT
+    );
+    assert_eq!(
+        default_hello_timeout_for(ClientRole::App, true),
+        SIGNED_HELLO_TIMEOUT
+    );
+    assert_eq!(
+        default_hello_timeout_for(ClientRole::Cli, true),
+        SIGNED_HELLO_TIMEOUT
+    );
+    assert!(UNDER_LOCK_HELLO_TIMEOUT <= HELLO_TIMEOUT);
+    assert!(UNDER_LOCK_BUDGET + Duration::from_secs(1) < LOCK_TIMEOUT);
+}
+
+#[test]
+fn non_watch_connect_releases_launch_lock_before_second_handshake() {
+    let d = dir("rel-lock");
+    std::fs::create_dir_all(d.join("run")).unwrap();
+    let socket = d.join("run/krilld.sock");
+    let holder = d.join("krill-holder");
+    std::fs::write(&holder, b"not an executable").unwrap();
+    let listener = crate::os::net::UnixListener::bind(&socket).unwrap();
+    let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+    let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let server_hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: "test".into(),
+            instance_id: 7,
+        };
+        // 1) Pre-lock probe hits a transient close -> forces connect_or_launch to acquire `_launch`.
+        let (drop_stream, _) = listener.accept().unwrap();
+        drop(drop_stream);
+
+        // 2) Under-lock watch probe succeeds -> connect_or_launch must drop `_launch` right after.
+        let (mut watch_stream, _) = listener.accept().unwrap();
+        watch_stream
+            .write_all(&server_hello.encode().unwrap())
+            .unwrap();
+        let (kind, body) = ipc::read_frame(&mut watch_stream).unwrap().unwrap();
+        let watch_client = ClientHello::decode(kind, &body).unwrap();
+        assert!(is_watch(watch_client.features));
+        watch_stream
+            .write_all(&HolderStatus::Linked.encode().unwrap())
+            .unwrap();
+
+        // 3) Second (non-watch) handshake stalls until the concurrent locker finishes probing `_launch`.
+        let (mut main_stream, _) = listener.accept().unwrap();
+        second_entered_tx.send(()).unwrap();
+        release_second_rx.recv().unwrap();
+        main_stream
+            .write_all(&server_hello.encode().unwrap())
+            .unwrap();
+        let (kind, body) = ipc::read_frame(&mut main_stream).unwrap().unwrap();
+        let main_client = ClientHello::decode(kind, &body).unwrap();
+        assert!(!is_watch(main_client.features));
+    });
+
+    let paths = Paths {
+        socket: socket.clone(),
+        holder: holder.clone(),
+        krilld: holder,
+    };
+    let conn_thread = thread::spawn(move || connect(&paths, &client_hello(ClientRole::App, "app")));
+
+    second_entered_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("second handshake should begin");
+    // While the second handshake is blocked in-flight, another launcher must acquire `_launch` immediately.
+    let contender_lock = launch_lock(&socket, Duration::from_millis(250))
+        .expect("`_launch` must be released before the second non-watch handshake");
+    drop(contender_lock);
+    release_second_tx.send(()).unwrap();
+
+    let connected = conn_thread.join().unwrap().unwrap();
+    assert!(!connected.launched);
+    assert_eq!(connected.server.instance_id, 7);
+    server.join().unwrap();
+    std::fs::remove_dir_all(d).ok();
+}
+
+#[test]
+fn await_successor_within_bounds_stalled_probe_to_deadline() {
+    let d = dir("succ-bound");
+    std::fs::create_dir_all(d.join("run")).unwrap();
+    let socket = d.join("run/krilld.sock");
+    let listener = crate::os::net::UnixListener::bind(&socket).unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        // Hold accepted sockets open without sending ServerHello until the client finishes.
+        let mut held = Vec::new();
+        while done_rx.try_recv().is_err() {
+            if let Ok((s, _)) = listener.accept() {
+                held.push(s);
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let lock_deadline = started + Duration::from_millis(200);
+    let err = await_successor_within(
+        &socket,
+        &hello(),
+        io::ErrorKind::UnexpectedEof.into(),
+        Duration::from_millis(150),
+        Duration::from_secs(5),
+        lock_deadline,
+    )
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(err, Error::Io(_)), "{err}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "await_successor_within overshot budget ({elapsed:?})"
+    );
+    done_tx.send(()).ok();
+    // Unblock listener.accept() before joining.
+    UnixStream::connect(&socket).ok();
+    server.join().unwrap();
+    std::fs::remove_dir_all(d).ok();
+}
+
+#[test]
+fn deadline_read_reads_already_buffered_pong_after_deadline_passed() {
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    server.write_all(&pong(42).unwrap()).unwrap();
+
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let mut reader = DeadlineRead {
+        stream: &mut client,
+        deadline: expired,
+        read: 0,
+    };
+    let (kind, body) = ipc::read_frame(&mut reader).unwrap().unwrap();
+    assert_eq!(kind, PONG);
+    assert_eq!(pong_nonce(kind, &body).unwrap(), 42);
+    assert!(reader.read > 0);
+
+    // With nothing further buffered and deadline still expired, it must fail with TimedOut.
+    let mut empty_reader = DeadlineRead {
+        stream: &mut client,
+        deadline: expired,
+        read: 0,
+    };
+    let err = ipc::read_frame(&mut empty_reader).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+}
+
+#[test]
+fn paused_watch_reader_recovers_when_pong_is_already_buffered() {
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let (pong_sent_tx, pong_sent_rx) = std::sync::mpsc::channel();
+    let answer = thread::spawn(move || {
+        // First ping: reply immediately before the reader wakes from its simulated App Nap pause.
+        let (kind, body) = ipc::read_frame(&mut server).unwrap().unwrap();
+        let nonce = ping_nonce(kind, &body).unwrap();
+        server.write_all(&pong(nonce).unwrap()).unwrap();
+        pong_sent_tx.send(()).unwrap();
+
+        // Second ping after recovery must also succeed normally, then close cleanly.
+        let (kind, body) = ipc::read_frame(&mut server).unwrap().unwrap();
+        let nonce = ping_nonce(kind, &body).unwrap();
+        server.write_all(&pong(nonce).unwrap()).unwrap();
+        drop(server);
+    });
+
+    let probe = Duration::from_millis(80);
+    let mut reads = 0u32;
+    let res = watch_for_with(&mut client, Duration::from_millis(20), probe, || {
+        reads = reads.saturating_add(1);
+        if reads == 1 {
+            pong_sent_rx.recv().unwrap();
+            thread::sleep(probe.saturating_mul(2));
+        }
+    });
+    assert!(
+        res.is_ok(),
+        "buffered PONG after wake must not fail: {res:?}"
+    );
+    answer.join().unwrap();
+}
+
+#[test]
+fn paused_watch_reader_still_times_out_when_daemon_is_hung() {
+    let (mut client, _hung_server) = UnixStream::pair().unwrap();
+    let probe = Duration::from_millis(60);
+    let mut reads = 0u32;
+    let err = watch_for_with(&mut client, Duration::from_millis(20), probe, || {
+        reads = reads.saturating_add(1);
+        if reads == 1 {
+            thread::sleep(probe.saturating_mul(2));
+        }
+    })
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+}

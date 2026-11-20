@@ -445,6 +445,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
         let mut tasks = tokio::task::JoinSet::new();
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         let mut saved_status = None;
+        let status_path = state_loop.join("run/link-streams.status.json");
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => break,
@@ -458,12 +459,12 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
                     }
                     streams_loop.sweep();
                     let statuses = streams_loop.statuses();
-                    if saved_status.as_ref() != Some(&statuses)
-                        && let Ok(bytes) = serde_json::to_vec(&statuses)
-                        && write_status_0600(&state_loop.join("run/link-streams.status.json"), &bytes).is_ok()
-                    {
-                        saved_status = Some(statuses);
-                    }
+                    maybe_write_stream_status(
+                        &status_path,
+                        &mut saved_status,
+                        statuses,
+                        Instant::now(),
+                    );
                 }
                 _=tasks.join_next(),if !tasks.is_empty()=>{},
                 incoming_opt = endpoint.accept() => {
@@ -530,7 +531,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         streams_loop.shutdown().await;
-        fs::remove_file(state_loop.join("run/link-streams.status.json")).ok();
+        fs::remove_file(&status_path).ok();
         // 모든 활성 QUIC 연결 종료
         let all_entries: Vec<ActiveConnectionEntry> = {
             let mut map = peers_loop.lock().await;
@@ -939,10 +940,178 @@ pub async fn shutdown_server_command(state_dir: &Path) -> Result<(), Error> {
     .map_err(|_| Error::Timeout("incoming server shutdown"))?
 }
 
+/// Rate limit for disk rewrites caused solely by in-flight byte counter changes (`buffered_bytes` / `retransmitted_bytes`).
+const STREAM_STATUS_COUNTER_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+struct SavedStreamStatus {
+    statuses: Vec<crate::resume::StreamStatus>,
+    written_at: Instant,
+}
+
+fn same_structural_stream_status(
+    a: &crate::resume::StreamStatus,
+    b: &crate::resume::StreamStatus,
+) -> bool {
+    let mut comparable = b.clone();
+    comparable.retransmitted_bytes = a.retransmitted_bytes;
+    comparable.buffered_bytes = a.buffered_bytes;
+    a == &comparable
+}
+
+fn stream_status_changed_or_due(
+    saved: Option<&SavedStreamStatus>,
+    next: &[crate::resume::StreamStatus],
+    now: Instant,
+) -> bool {
+    let Some(saved) = saved else {
+        return true;
+    };
+    if saved.statuses == next {
+        return false;
+    }
+    if saved.statuses.len() != next.len()
+        || saved
+            .statuses
+            .iter()
+            .zip(next)
+            .any(|(a, b)| !same_structural_stream_status(a, b))
+    {
+        return true;
+    }
+    now.saturating_duration_since(saved.written_at) >= STREAM_STATUS_COUNTER_INTERVAL
+}
+
+fn maybe_write_stream_status(
+    path: &Path,
+    saved: &mut Option<SavedStreamStatus>,
+    statuses: Vec<crate::resume::StreamStatus>,
+    now: Instant,
+) -> bool {
+    if !stream_status_changed_or_due(saved.as_ref(), &statuses, now) {
+        return false;
+    }
+    let Ok(bytes) = serde_json::to_vec(&statuses) else {
+        return false;
+    };
+    if write_status_0600(path, &bytes).is_ok() {
+        *saved = Some(SavedStreamStatus {
+            statuses,
+            written_at: now,
+        });
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resume::{StreamId, StreamPhase, StreamStatus};
     use iroh::SecretKey;
+
+    fn sample_stream(
+        id: StreamId,
+        state: StreamPhase,
+        buffered_bytes: u64,
+        retransmitted_bytes: u64,
+    ) -> StreamStatus {
+        StreamStatus {
+            id,
+            state,
+            last_disconnect_at_ms: None,
+            disconnect_count: 0,
+            retransmitted_bytes,
+            buffered_bytes,
+            last_resume_ms: None,
+            close_reason: None,
+        }
+    }
+
+    #[test]
+    fn stream_status_rate_limits_counter_churn_and_persists_state_changes() {
+        let dir =
+            std::env::temp_dir().join(format!("kl-stream-status-rate-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let path = dir.join("run/link-streams.status.json");
+        let mut saved = None;
+        let t0 = Instant::now();
+
+        // Initial tick writes empty snapshot.
+        assert!(maybe_write_stream_status(&path, &mut saved, Vec::new(), t0));
+        // Repeated empty ticks do not rewrite.
+        assert!(!maybe_write_stream_status(
+            &path,
+            &mut saved,
+            Vec::new(),
+            t0 + Duration::from_secs(10),
+        ));
+
+        // Adding a stream is a structural change -> persisted immediately.
+        let id = StreamId([7; 16]);
+        let t1 = t0 + Duration::from_millis(100);
+        assert!(maybe_write_stream_status(
+            &path,
+            &mut saved,
+            vec![sample_stream(id, StreamPhase::Normal, 128, 0)],
+            t1,
+        ));
+        let bytes_before = fs::read(&path).unwrap();
+
+        // 49 consecutive 100ms ticks with changing in-flight byte counters must NOT rewrite disk.
+        for step in 1..=49_u64 {
+            let at = t1 + Duration::from_millis(step * 100);
+            let next = vec![sample_stream(
+                id,
+                StreamPhase::Normal,
+                128 + step * 64,
+                step * 32,
+            )];
+            assert!(
+                !maybe_write_stream_status(&path, &mut saved, next, at),
+                "tick {step} with counter-only change must be rate-limited"
+            );
+        }
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+
+        // Once the rate-limit interval elapses, changed counters flush to disk.
+        let t2 = t1 + STREAM_STATUS_COUNTER_INTERVAL;
+        assert!(maybe_write_stream_status(
+            &path,
+            &mut saved,
+            vec![sample_stream(id, StreamPhase::Normal, 4096, 1024)],
+            t2,
+        ));
+        let flushed: Vec<StreamStatus> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(flushed[0].buffered_bytes, 4096);
+        assert_eq!(flushed[0].retransmitted_bytes, 1024);
+
+        // A state transition 100ms later (well inside the 5s window) persists immediately.
+        let t3 = t2 + Duration::from_millis(100);
+        let mut suspended = sample_stream(id, StreamPhase::Suspended, 4096, 1024);
+        suspended.disconnect_count = 1;
+        suspended.last_disconnect_at_ms = Some(1_700_000_000_000);
+        assert!(maybe_write_stream_status(
+            &path,
+            &mut saved,
+            vec![suspended.clone()],
+            t3,
+        ));
+        let on_disk: Vec<StreamStatus> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk, vec![suspended]);
+
+        // Removing the stream (structural change) 100ms later persists immediately.
+        assert!(maybe_write_stream_status(
+            &path,
+            &mut saved,
+            Vec::new(),
+            t3 + Duration::from_millis(100),
+        ));
+        let cleared: Vec<StreamStatus> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(cleared.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn read_live_server_addr_ignores_stale_ctl_socket_and_reads_live_listener() {

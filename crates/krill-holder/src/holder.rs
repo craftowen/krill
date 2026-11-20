@@ -422,26 +422,24 @@ impl Holder {
     }
 
     fn on_krilld_exit(&mut self, failed_handover: bool) {
-        let stable = self
-            .krilld
-            .take()
-            .is_some_and(|k| !failed_handover && k.started.elapsed() >= STABLE);
+        let k = self.krilld.take();
+        let stable = k.is_some_and(|k| !failed_handover && k.started.elapsed() >= STABLE);
         let handover = std::mem::take(&mut self.upgrading);
-        self.streak = match (handover, stable) {
-            (true, _) => 0,
-            (false, true) => 1,
-            (false, false) => self.streak.saturating_add(1),
-        };
-        if !handover {
+        if handover {
+            self.streak = 0;
+            tracing::info!(streak = 0u32, give_up = false, "daemon restart scheduled");
+            self.restart_at = Some(Instant::now());
+        } else {
             if stable {
-                // 새 경로가 안정됐다: 롤백 대상을 버린다.
-                self.prev_krilld = None;
+                self.streak = 1;
+                self.prev_krilld = None; // 새 경로가 안정됐다: 롤백 대상을 버린다.
                 self.unstable = 0;
             } else {
+                self.streak = self.streak.saturating_add(1);
                 self.note_unstable();
             }
+            self.schedule();
         }
-        self.schedule();
     }
 
     fn schedule(&mut self) {
