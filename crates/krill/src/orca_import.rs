@@ -123,9 +123,14 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use krill_proto::agent::{self, Agents, Profile as AgentProfile};
+use krill_proto::agent::{self, Agents, Permission, Profile as AgentProfile};
 use krill_proto::agent_history::{
     Action, FEAT_AGENT_HISTORY, FEAT_AI_VAULT, Response, VaultAgent, VaultTarget,
+};
+use krill_proto::bots::{
+    BotConfig, BotId, BotMember, BotSlug, ExternalBotCandidate, ExternalBotSourceApp,
+    ExternalSource, bot_slug_from_name, init_bot_home, soul_description, strip_png_metadata,
+    validate_bot_id, validate_bot_slug,
 };
 use krill_proto::config_document;
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
@@ -223,15 +228,17 @@ pub enum ImportDomain {
     Projects,
     Settings,
     Sessions,
+    Bots,
 }
 
 impl ImportDomain {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Accounts,
         Self::Ssh,
         Self::Projects,
         Self::Settings,
         Self::Sessions,
+        Self::Bots,
     ];
 
     #[must_use]
@@ -242,6 +249,7 @@ impl ImportDomain {
             Self::Projects => "projects",
             Self::Settings => "settings",
             Self::Sessions => "sessions",
+            Self::Bots => "bots",
         }
     }
 
@@ -252,8 +260,9 @@ impl ImportDomain {
             "projects" | "project" | "repos" | "worktrees" => Ok(Self::Projects),
             "settings" | "setting" | "config" => Ok(Self::Settings),
             "sessions" | "session" | "tabs" => Ok(Self::Sessions),
+            "bots" | "bot" => Ok(Self::Bots),
             other => Err(invalid(format!(
-                "unknown import domain '{other}' (expected accounts,ssh,projects,settings,sessions)"
+                "unknown import domain '{other}' (expected accounts,ssh,projects,settings,sessions,bots)"
             ))),
         }
     }
@@ -269,7 +278,7 @@ impl ImportDomain {
         }
         if set.is_empty() {
             return Err(invalid(
-                "--only requires at least one domain (accounts,ssh,projects,settings,sessions)",
+                "--only requires at least one domain (accounts,ssh,projects,settings,sessions,bots)",
             ));
         }
         Ok(set.into_iter().collect())
@@ -362,8 +371,47 @@ pub struct OrcaImportReport {
     pub settings: SettingsImportSummary,
     #[serde(default)]
     pub sessions: SessionsImportSummary,
+    #[serde(default)]
+    pub bots: BotsImportSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// 봇(`bots`) 도메인 계획·결과·외부 앱 후보 목록.
+/// `~/.orca/bots/*` 및 `<orca_dir>/bots/*`를 `<state_dir>/bots/`로 멱등 이관한다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotsImportSummary {
+    #[serde(default)]
+    pub skipped: bool,
+    #[serde(default)]
+    pub skipped_reason: Option<String>,
+    #[serde(default)]
+    pub bots_added: usize,
+    #[serde(default)]
+    pub bots_skipped: usize,
+    #[serde(default)]
+    pub items: Vec<ImportedBotSummary>,
+    /// OpenClaw·Hermes·OpenBot에서 발견된 봇 후보(비밀 설정·키는 열지 않음).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_candidates: Vec<ExternalBotCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedBotSummary {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub agent_id: String,
+    pub source_path: String,
+    #[serde(default)]
+    pub has_soul: bool,
+    #[serde(default)]
+    pub has_memory: bool,
+    #[serde(default)]
+    pub memory_topic_count: usize,
+    /// 이미 Krill에 존재해 건너뛰었으면 `true`.
+    #[serde(default)]
+    pub already_exists: bool,
 }
 
 /// Orca 열린 탭의 에이전트 세션(`sessions`) 도메인 계획·결과.
@@ -729,6 +777,14 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         report.sessions.skipped = true;
         report.sessions.skipped_reason = Some("excluded by --only".to_owned());
     }
+    if selected.contains(&ImportDomain::Bots) {
+        report.bots = retry_on_conflict("bots", &mut warnings, |w| {
+            import_bots_domain(opts, &domains_map, w)
+        })?;
+    } else {
+        report.bots.skipped = true;
+        report.bots.skipped_reason = Some("excluded by --only".to_owned());
+    }
 
     report.warnings = warnings;
     Ok(report)
@@ -844,6 +900,39 @@ pub fn format_report_human(report: &OrcaImportReport) -> String {
                     item.cwd,
                     item.title.as_deref().unwrap_or(&item.id),
                     if item.resumed { " *" } else { "" }
+                )
+                .ok();
+            }
+        }
+    }
+    if report.domains.iter().any(|d| d == "bots") {
+        let b = &report.bots;
+        if b.skipped {
+            writeln!(
+                out,
+                "  bots: skipped ({})",
+                b.skipped_reason.as_deref().unwrap_or("skipped")
+            )
+            .ok();
+        } else {
+            writeln!(
+                out,
+                "  bots: +{} added, {} existing skipped, {} external candidate(s)",
+                b.bots_added,
+                b.bots_skipped,
+                b.external_candidates.len()
+            )
+            .ok();
+            for item in &b.items {
+                let state = if item.already_exists {
+                    " (existing)"
+                } else {
+                    ""
+                };
+                writeln!(
+                    out,
+                    "    - [{}] {} ({}){state}",
+                    item.agent_id, item.name, item.slug
                 )
                 .ok();
             }
@@ -4485,6 +4574,887 @@ pub fn rrule_to_utc_cron(rrule: Option<&str>, dtstart: Option<&str>) -> String {
 }
 
 // ============================================================================
+// Domain 6: Bots (`bots`) & External Bot Discovery (Orca / OpenClaw / Hermes / OpenBot)
+// Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
+// ============================================================================
+
+const BOTS_DIR: &str = "bots";
+const BOTS_INDEX_FILE: &str = "bots.json";
+const MAX_BOTS_PER_APP: usize = 24;
+const MAX_BOT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_BOT_COPY_FILES: usize = 128;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OrcaBotMember {
+    id: String,
+    name: String,
+    source: Option<String>,
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OrcaBotNotifications {
+    needs_permission: Option<bool>,
+    task_complete: Option<bool>,
+    could_not_finish: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OrcaBotLaunch {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OrcaBotRecord {
+    id: String,
+    name: String,
+    #[serde(alias = "agentId", alias = "agent_id")]
+    agent: Option<String>,
+    folder: Option<String>,
+    description: Option<String>,
+    emoji: Option<String>,
+    avatar: Option<String>,
+    avatar_color: Option<String>,
+    paused: Option<bool>,
+    permission_mode: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    launch: Option<OrcaBotLaunch>,
+    template_id: Option<String>,
+    notifications: Option<OrcaBotNotifications>,
+    members: Vec<OrcaBotMember>,
+    skills: Vec<String>,
+    created_at: Option<u64>,
+    updated_at: Option<u64>,
+}
+
+fn import_bots_domain(
+    opts: &ImportOptions,
+    domains: &BTreeMap<String, Json>,
+    warnings: &mut Vec<String>,
+) -> io::Result<BotsImportSummary> {
+    let bots_root = opts.state_dir.join(BOTS_DIR);
+    let index_path = bots_root.join(BOTS_INDEX_FILE);
+    let original = read_original(&index_path)?;
+    let mut existing_bots: Vec<BotConfig> = match &original {
+        Some(raw) => serde_json::from_str::<Vec<BotConfig>>(raw).map_err(invalid_data)?,
+        None => Vec::new(),
+    };
+
+    let mut summary = BotsImportSummary::default();
+    let db_records = load_orca_db_bot_records(domains);
+    let source_dirs = collect_orca_bot_dirs(&opts.home, &opts.orca_dir);
+
+    let mut seen_source_paths: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut added_any = false;
+    let now_ms = now_secs().saturating_mul(1000);
+
+    for bot_dir in source_dirs {
+        let norm_dir = normalize_import_path(&bot_dir);
+        if !seen_source_paths.insert(norm_dir) {
+            continue;
+        }
+        let Some(folder_name) = bot_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let mut disk_rec = read_orca_bot_json(&bot_dir, warnings);
+        if disk_rec.is_none()
+            && !bot_dir.join("SOUL.md").is_file()
+            && !bot_dir.join("MEMORY.md").is_file()
+        {
+            continue;
+        }
+
+        // Enrich on-disk `bot.json` with profile-state DB metadata when available.
+        let db_match = db_records.iter().find(|r| {
+            disk_rec
+                .as_ref()
+                .is_some_and(|d| !d.id.trim().is_empty() && d.id == r.id)
+                || r.folder.as_deref() == Some(folder_name)
+        });
+        if disk_rec.is_none() {
+            disk_rec = db_match.cloned();
+        }
+
+        let soul = read_bounded_utf8(&bot_dir.join("SOUL.md"));
+        let memory = read_bounded_utf8(&bot_dir.join("MEMORY.md"));
+        let memory_topics = list_memory_topic_files(&bot_dir.join("memory"));
+
+        let config = match build_krill_bot_config(
+            folder_name,
+            disk_rec.as_ref(),
+            db_match,
+            soul.as_deref(),
+            now_ms,
+        ) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                warnings.push(format!("skipping Orca bot '{folder_name}': {err}"));
+                continue;
+            }
+        };
+
+        let target_home = bots_root.join(config.slug.as_str());
+        let already_exists = existing_bots
+            .iter()
+            .any(|b| b.id == config.id || b.slug == config.slug)
+            || target_home.join("bot.json").is_file();
+
+        let item = ImportedBotSummary {
+            id: config.id.as_str().to_owned(),
+            slug: config.slug.as_str().to_owned(),
+            name: config.name.clone(),
+            agent_id: config.agent_id.clone(),
+            source_path: bot_dir.display().to_string(),
+            has_soul: soul.is_some(),
+            has_memory: memory.is_some(),
+            memory_topic_count: memory_topics.len(),
+            already_exists,
+        };
+
+        if already_exists {
+            summary.bots_skipped = summary.bots_skipped.saturating_add(1);
+            summary.items.push(item);
+            continue;
+        }
+
+        if !opts.dry_run {
+            ensure_dir_0700(&bots_root)?;
+            let created_home = init_bot_home(&bots_root, &config, soul.as_deref())?;
+            if let Some(ref mem_text) = memory {
+                let mem_path = created_home.join("MEMORY.md");
+                krill_proto::os::write_atomic_0600(&mem_path, mem_text.as_bytes())?;
+            }
+            for (topic_name, topic_path) in &memory_topics {
+                if let Some(content) = read_bounded_utf8(topic_path) {
+                    let dst = created_home.join("memory").join(topic_name);
+                    if !dst.exists() {
+                        krill_proto::os::write_atomic_0600(&dst, content.as_bytes())?;
+                    }
+                }
+            }
+            let src_skills = bot_dir.join("skills");
+            if src_skills.is_dir() {
+                copy_safe_text_tree(&src_skills, &created_home.join("skills"), warnings);
+            }
+            let src_avatar = bot_dir.join("avatar.png");
+            if fs::symlink_metadata(&src_avatar).is_ok_and(|m| m.is_file())
+                && let Ok(raw_png) = fs::read(&src_avatar)
+            {
+                match strip_png_metadata(&raw_png) {
+                    Ok(clean_png) => {
+                        krill_proto::os::write_atomic_0600(
+                            &created_home.join("avatar.png"),
+                            &clean_png,
+                        )?;
+                    }
+                    Err(err) => {
+                        warnings.push(format!(
+                            "skipped invalid avatar.png for bot '{}': {err}",
+                            config.slug
+                        ));
+                    }
+                }
+            }
+        }
+
+        existing_bots.push(config);
+        added_any = true;
+        summary.bots_added = summary.bots_added.saturating_add(1);
+        summary.items.push(item);
+    }
+
+    if !opts.dry_run && added_any {
+        let mut rendered = serde_json::to_string_pretty(&existing_bots).map_err(invalid_data)?;
+        rendered.push('\n');
+        write_atomic_0600(&index_path, rendered.as_bytes(), original.as_deref())?;
+    }
+
+    // Also discover non-Orca external bot candidates (OpenClaw, Hermes, OpenBot) read-only.
+    let mut external = discover_external_bots(&opts.home, None);
+    external.retain(|c| c.app != ExternalBotSourceApp::Orca);
+    summary.external_candidates = external;
+
+    Ok(summary)
+}
+
+fn load_orca_db_bot_records(domains: &BTreeMap<String, Json>) -> Vec<OrcaBotRecord> {
+    let Some(arr) = domains.get("bots").and_then(Json::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| serde_json::from_value::<OrcaBotRecord>(v.clone()).ok())
+        .collect()
+}
+
+fn collect_orca_bot_dirs(home: &Path, orca_dir: &Path) -> Vec<PathBuf> {
+    let roots = [home.join(".orca").join(BOTS_DIR), orca_dir.join(BOTS_DIR)];
+    let mut out = Vec::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                if name.starts_with('.') {
+                    return None;
+                }
+                let path = e.path();
+                let meta = fs::symlink_metadata(&path).ok()?;
+                (!meta.file_type().is_symlink() && meta.is_dir()).then_some(path)
+            })
+            .collect();
+        children.sort();
+        out.extend(children.into_iter().take(MAX_BOTS_PER_APP));
+    }
+    out
+}
+
+fn read_orca_bot_json(bot_dir: &Path, warnings: &mut Vec<String>) -> Option<OrcaBotRecord> {
+    let path = bot_dir.join("bot.json");
+    let raw = read_bounded_utf8(&path)?;
+    match serde_json::from_str::<OrcaBotRecord>(&raw) {
+        Ok(rec) => Some(rec),
+        Err(err) => {
+            warnings.push(format!("ignoring malformed {}: {err}", path.display()));
+            None
+        }
+    }
+}
+
+fn read_bounded_utf8(path: &Path) -> Option<String> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_BOT_FILE_BYTES {
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+fn list_memory_topic_files(memory_dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(memory_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            if name.starts_with('.') {
+                return None;
+            }
+            let path = e.path();
+            let meta = fs::symlink_metadata(&path).ok()?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return None;
+            }
+            Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                .then_some((name, path))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn copy_safe_text_tree(src_root: &Path, dst_root: &Path, warnings: &mut Vec<String>) {
+    let mut copied = 0usize;
+    copy_safe_text_tree_inner(src_root, dst_root, 0, &mut copied, warnings);
+}
+
+fn copy_safe_text_tree_inner(
+    src_dir: &Path,
+    dst_dir: &Path,
+    depth: usize,
+    copied: &mut usize,
+    warnings: &mut Vec<String>,
+) {
+    if depth > 6 || *copied >= MAX_BOT_COPY_FILES {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(src_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if *copied >= MAX_BOT_COPY_FILES {
+            break;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let src_path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&src_path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let dst_path = dst_dir.join(&name);
+        if meta.is_dir() {
+            copy_safe_text_tree_inner(
+                &src_path,
+                &dst_path,
+                depth.saturating_add(1),
+                copied,
+                warnings,
+            );
+        } else if meta.is_file() && meta.len() <= MAX_BOT_FILE_BYTES {
+            if dst_path.exists() {
+                continue;
+            }
+            if let Ok(bytes) = fs::read(&src_path) {
+                if ensure_dir_0700(dst_dir).is_ok()
+                    && krill_proto::os::write_atomic_0600(&dst_path, &bytes).is_ok()
+                {
+                    *copied = copied.saturating_add(1);
+                } else {
+                    warnings.push(format!("failed to copy skill file {}", src_path.display()));
+                }
+            }
+        }
+    }
+}
+
+fn build_krill_bot_config(
+    folder_name: &str,
+    disk: Option<&OrcaBotRecord>,
+    db: Option<&OrcaBotRecord>,
+    soul: Option<&str>,
+    now_ms: u64,
+) -> Result<BotConfig, String> {
+    let raw_name = disk
+        .map(|r| r.name.trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| db.map(|r| r.name.trim()).filter(|s| !s.is_empty()))
+        .map_or_else(|| bot_name_from_id(folder_name), str::to_owned);
+
+    let slug = validate_bot_slug(folder_name)
+        .ok()
+        .and_then(|s| BotSlug::new(s).ok())
+        .unwrap_or_else(|| bot_slug_from_name(&raw_name));
+
+    let raw_id = disk
+        .map(|r| r.id.trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| db.map(|r| r.id.trim()).filter(|s| !s.is_empty()));
+    let id = raw_id
+        .and_then(|id| validate_bot_id(id).ok())
+        .and_then(|id| BotId::new(id).ok())
+        .or_else(|| BotId::new(format!("orca-{}", slug.as_str())).ok())
+        .ok_or_else(|| "unable to derive valid bot id".to_owned())?;
+
+    let raw_agent = disk
+        .and_then(|r| r.agent.as_deref())
+        .or_else(|| db.and_then(|r| r.agent.as_deref()))
+        .unwrap_or("claude");
+    let agent_id = map_orca_agent_id(raw_agent).unwrap_or("claude");
+
+    let created_at = db
+        .and_then(|r| r.created_at)
+        .or_else(|| disk.and_then(|r| r.created_at))
+        .unwrap_or(now_ms);
+    let updated_at = db
+        .and_then(|r| r.updated_at)
+        .or_else(|| disk.and_then(|r| r.updated_at))
+        .unwrap_or(now_ms);
+
+    let mut cfg = BotConfig::new(id, &raw_name, agent_id, created_at).map_err(|e| e.to_string())?;
+    cfg.slug = slug.clone();
+    slug.as_str().clone_into(&mut cfg.folder);
+    cfg.updated_at_ms = updated_at;
+
+    let description = disk
+        .and_then(|r| r.description.as_deref())
+        .or_else(|| db.and_then(|r| r.description.as_deref()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| soul.and_then(soul_description))
+        .unwrap_or_default();
+    cfg.description = description;
+
+    cfg.emoji = disk
+        .and_then(|r| r.emoji.clone())
+        .or_else(|| db.and_then(|r| r.emoji.clone()));
+    cfg.avatar = disk
+        .and_then(|r| r.avatar.clone())
+        .or_else(|| db.and_then(|r| r.avatar.clone()));
+    cfg.avatar_color = disk
+        .and_then(|r| r.avatar_color.clone())
+        .or_else(|| db.and_then(|r| r.avatar_color.clone()));
+    cfg.model = disk
+        .and_then(|r| {
+            r.model
+                .clone()
+                .or_else(|| r.launch.as_ref().and_then(|l| l.model.clone()))
+        })
+        .or_else(|| {
+            db.and_then(|r| {
+                r.model
+                    .clone()
+                    .or_else(|| r.launch.as_ref().and_then(|l| l.model.clone()))
+            })
+        });
+    cfg.effort = disk
+        .and_then(|r| {
+            r.effort
+                .clone()
+                .or_else(|| r.launch.as_ref().and_then(|l| l.effort.clone()))
+        })
+        .or_else(|| {
+            db.and_then(|r| {
+                r.effort
+                    .clone()
+                    .or_else(|| r.launch.as_ref().and_then(|l| l.effort.clone()))
+            })
+        });
+    cfg.template_id = disk
+        .and_then(|r| r.template_id.clone())
+        .or_else(|| db.and_then(|r| r.template_id.clone()));
+    cfg.paused = db
+        .and_then(|r| r.paused)
+        .or_else(|| disk.and_then(|r| r.paused))
+        .unwrap_or(false);
+    cfg.first_run_completed = soul.and_then(soul_description).is_some();
+
+    if let Some(perm) = db
+        .and_then(|r| r.permission_mode.as_deref())
+        .or_else(|| disk.and_then(|r| r.permission_mode.as_deref()))
+        && matches!(
+            perm.trim().to_ascii_lowercase().as_str(),
+            "yolo" | "bypass" | "bypasspermissions" | "bypass-permissions"
+        )
+    {
+        cfg.permission_mode = Permission::Yolo;
+    }
+
+    if let Some(n) = db
+        .and_then(|r| r.notifications.as_ref())
+        .or_else(|| disk.and_then(|r| r.notifications.as_ref()))
+    {
+        if let Some(v) = n.needs_permission {
+            cfg.notifications.needs_permission = v;
+        }
+        if let Some(v) = n.task_complete {
+            cfg.notifications.task_complete = v;
+        }
+        if let Some(v) = n.could_not_finish {
+            cfg.notifications.could_not_finish = v;
+        }
+    }
+
+    let raw_members = disk
+        .filter(|r| !r.members.is_empty())
+        .or(db)
+        .map_or(&[][..], |r| r.members.as_slice());
+    for m in raw_members {
+        let mid = m.id.trim();
+        if mid.is_empty() {
+            continue;
+        }
+        let source = match m
+            .source
+            .as_deref()
+            .unwrap_or("slack")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "slack" => ExternalSource::Slack,
+            "telegram" => ExternalSource::Telegram,
+            "discord" => ExternalSource::Discord,
+            "google" => ExternalSource::Google,
+            "github" => ExternalSource::GitHub,
+            "linear" => ExternalSource::Linear,
+            "composio" => ExternalSource::Composio,
+            _ => continue,
+        };
+        cfg.members.push(BotMember {
+            id: mid.to_owned(),
+            name: m.name.trim().to_owned(),
+            source,
+            workspace_id: m
+                .workspace_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        });
+    }
+
+    let raw_skills = disk
+        .filter(|r| !r.skills.is_empty())
+        .or(db)
+        .map_or(&[][..], |r| r.skills.as_slice());
+    cfg.skills = raw_skills
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    cfg.validate().map_err(|e| e.to_string())?;
+    Ok(cfg)
+}
+
+/// Discovers bots installed by Orca, `OpenClaw` (`.openclaw`/`.clawdbot`/`.moltbot`),
+/// Hermes (`~/.hermes`), and `OpenBot` on this machine.
+/// Reads folder names, `IDENTITY.md` name lines, and `SOUL.md` previews only;
+/// never opens config files with API keys, tokens, or databases.
+#[must_use]
+pub fn discover_external_bots(
+    home: &Path,
+    filter: Option<ExternalBotSourceApp>,
+) -> Vec<ExternalBotCandidate> {
+    let app_data = default_openbot_data_dir(home);
+    let env_openclaw = std::env::var_os("OPENCLAW_STATE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let env_hermes = std::env::var_os("HERMES_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    discover_external_bots_in(
+        home,
+        Some(&app_data),
+        env_openclaw.as_deref(),
+        env_hermes.as_deref(),
+        filter,
+    )
+}
+
+/// Deterministic, environment-independent external bot discovery helper (also used in tests).
+#[must_use]
+pub fn discover_external_bots_in(
+    home: &Path,
+    openbot_app_data: Option<&Path>,
+    openclaw_state_dir: Option<&Path>,
+    hermes_home: Option<&Path>,
+    filter: Option<ExternalBotSourceApp>,
+) -> Vec<ExternalBotCandidate> {
+    let mut out = Vec::new();
+    let want = |app: ExternalBotSourceApp| filter.is_none_or(|f| f == app);
+    if want(ExternalBotSourceApp::Orca) {
+        out.extend(discover_orca_bots_in(home));
+    }
+    if want(ExternalBotSourceApp::OpenClaw) {
+        out.extend(discover_openclaw_bots_in(home, openclaw_state_dir));
+    }
+    if want(ExternalBotSourceApp::Hermes) {
+        out.extend(discover_hermes_bots_in(home, hermes_home));
+    }
+    if want(ExternalBotSourceApp::OpenBot) {
+        out.extend(discover_openbot_bots_in(home, openbot_app_data));
+    }
+    out
+}
+
+fn discover_orca_bots_in(home: &Path) -> Vec<ExternalBotCandidate> {
+    let root = home.join(".orca").join(BOTS_DIR);
+    let mut out = Vec::new();
+    for folder_name in non_hidden_child_dirs(&root)
+        .into_iter()
+        .take(MAX_BOTS_PER_APP)
+    {
+        let dir = root.join(&folder_name);
+        let manifest = read_bounded_utf8(&dir.join("bot.json"))
+            .and_then(|raw| serde_json::from_str::<OrcaBotRecord>(&raw).ok());
+        let soul = read_bounded_utf8(&dir.join("SOUL.md"));
+        if manifest.is_none() && soul.is_none() && !dir.join("MEMORY.md").is_file() {
+            continue;
+        }
+        let name = manifest
+            .as_ref()
+            .map(|m| m.name.trim())
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| bot_name_from_id(&folder_name), str::to_owned);
+        let agent = manifest
+            .as_ref()
+            .and_then(|m| m.agent.as_deref())
+            .and_then(map_orca_agent_id)
+            .unwrap_or("claude")
+            .to_owned();
+        let soul_preview = soul.as_deref().and_then(soul_description);
+        out.push(ExternalBotCandidate {
+            app: ExternalBotSourceApp::Orca,
+            agent,
+            name,
+            path: tilde_display(&dir, home),
+            soul_preview,
+        });
+    }
+    out
+}
+
+fn discover_openclaw_bots_in(
+    home: &Path,
+    openclaw_state_dir: Option<&Path>,
+) -> Vec<ExternalBotCandidate> {
+    let mut roots: Vec<PathBuf> = Vec::with_capacity(4);
+    if let Some(override_dir) = openclaw_state_dir {
+        roots.push(override_dir.to_path_buf());
+    }
+    for name in [".openclaw", ".clawdbot", ".moltbot"] {
+        roots.push(home.join(name));
+    }
+    let Some(root) = roots.into_iter().find(|p| p.is_dir()) else {
+        return Vec::new();
+    };
+    let ids = non_hidden_child_dirs(&root.join("agents"));
+    let agents: Vec<String> = if !ids.is_empty() {
+        ids
+    } else if root.join("workspace").is_dir() {
+        vec!["main".to_owned()]
+    } else {
+        Vec::new()
+    };
+
+    let mut out = Vec::new();
+    for agent in agents.into_iter().take(MAX_BOTS_PER_APP) {
+        let mut places = Vec::with_capacity(3);
+        if agent == "main" {
+            places.push(root.join("workspace"));
+        }
+        places.push(root.join(format!("workspace-{agent}")));
+        places.push(root.join("workspace").join(&agent));
+
+        let workspace = places.into_iter().find(|p| p.is_dir());
+        let folder = workspace
+            .clone()
+            .unwrap_or_else(|| root.join("agents").join(&agent));
+        let name = workspace
+            .as_deref()
+            .and_then(read_openclaw_identity_name)
+            .unwrap_or_else(|| bot_name_from_id(&agent));
+        let soul_preview = read_bounded_utf8(&folder.join("SOUL.md"))
+            .as_deref()
+            .and_then(soul_description);
+        out.push(ExternalBotCandidate {
+            app: ExternalBotSourceApp::OpenClaw,
+            agent,
+            name,
+            path: tilde_display(&folder, home),
+            soul_preview,
+        });
+    }
+    out
+}
+
+/// Parses `OpenClaw`'s `IDENTITY.md` name line (`- **Name:** Molty`).
+fn read_openclaw_identity_name(workspace: &Path) -> Option<String> {
+    let text = read_bounded_utf8(&workspace.join("IDENTITY.md"))?;
+    for line in text.lines() {
+        let stripped = line.trim_start_matches([' ', '\t', '*', '-']);
+        let cleaned_key = stripped.trim_start_matches('*');
+        let Some((key, val)) = cleaned_key.split_once(':') else {
+            continue;
+        };
+        let key_norm = key.trim().trim_end_matches('*').trim();
+        if !key_norm.eq_ignore_ascii_case("name") {
+            continue;
+        }
+        let name = val.trim().trim_matches('*').trim();
+        if !name.is_empty() && name.len() <= 120 && !name.starts_with('(') {
+            return Some(name.to_owned());
+        }
+    }
+    None
+}
+
+fn discover_hermes_bots_in(home: &Path, hermes_home: Option<&Path>) -> Vec<ExternalBotCandidate> {
+    let root = match hermes_home {
+        Some(p) => strip_hermes_profile_suffix(p),
+        None => home.join(".hermes"),
+    };
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if is_hermes_profile_dir(&root) {
+        let soul_preview = read_bounded_utf8(&root.join("SOUL.md"))
+            .as_deref()
+            .and_then(soul_description);
+        out.push(ExternalBotCandidate {
+            app: ExternalBotSourceApp::Hermes,
+            agent: "default".to_owned(),
+            name: "Hermes".to_owned(),
+            path: tilde_display(&root, home),
+            soul_preview,
+        });
+    }
+    for profile in non_hidden_child_dirs(&root.join("profiles")) {
+        if out.len() >= MAX_BOTS_PER_APP {
+            break;
+        }
+        let folder = root.join("profiles").join(&profile);
+        if is_hermes_profile_dir(&folder) {
+            let soul_preview = read_bounded_utf8(&folder.join("SOUL.md"))
+                .as_deref()
+                .and_then(soul_description);
+            out.push(ExternalBotCandidate {
+                app: ExternalBotSourceApp::Hermes,
+                agent: profile.clone(),
+                name: bot_name_from_id(&profile),
+                path: tilde_display(&folder, home),
+                soul_preview,
+            });
+        }
+    }
+    out
+}
+
+fn strip_hermes_profile_suffix(path: &Path) -> PathBuf {
+    if let Some(parent) = path.parent()
+        && parent.file_name().and_then(|n| n.to_str()) == Some("profiles")
+        && let Some(grandparent) = parent.parent()
+    {
+        return grandparent.to_path_buf();
+    }
+    path.to_path_buf()
+}
+
+fn is_hermes_profile_dir(dir: &Path) -> bool {
+    dir.join("SOUL.md").is_file() || dir.join("config.yaml").is_file()
+}
+
+fn default_openbot_data_dir(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("OpenBot")
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+            .join("OpenBot")
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("OpenBot")
+    }
+}
+
+fn discover_openbot_bots_in(
+    home: &Path,
+    openbot_app_data: Option<&Path>,
+) -> Vec<ExternalBotCandidate> {
+    let agents_root = home.join("OpenBot").join("Agents");
+    let has_data = openbot_app_data.is_some_and(Path::is_dir);
+    if !has_data && !agents_root.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for agent in non_hidden_child_dirs(&agents_root)
+        .into_iter()
+        .take(MAX_BOTS_PER_APP)
+    {
+        let stripped = agent
+            .strip_prefix("agent-")
+            .or_else(|| agent.strip_prefix("bot-"))
+            .unwrap_or(&agent);
+        let name = if looks_like_uuid_prefix(stripped) {
+            "OpenBot agent".to_owned()
+        } else {
+            bot_name_from_id(stripped)
+        };
+        let folder = agents_root.join(&agent);
+        let soul_preview = read_bounded_utf8(&folder.join("SOUL.md"))
+            .as_deref()
+            .and_then(soul_description);
+        out.push(ExternalBotCandidate {
+            app: ExternalBotSourceApp::OpenBot,
+            agent,
+            name,
+            path: tilde_display(&folder, home),
+            soul_preview,
+        });
+    }
+    out
+}
+
+fn non_hidden_child_dirs(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            if name.starts_with('.') {
+                return None;
+            }
+            let meta = fs::symlink_metadata(e.path()).ok()?;
+            (!meta.file_type().is_symlink() && meta.is_dir()).then_some(name)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+fn bot_name_from_id(id: &str) -> String {
+    let words: String = id
+        .chars()
+        .map(|c| if c == '-' || c == '_' { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = words.chars();
+    let Some(first) = chars.next() else {
+        return id.to_owned();
+    };
+    let mut out = String::new();
+    for upper in first.to_uppercase() {
+        out.push(upper);
+    }
+    out.push_str(chars.as_str());
+    out
+}
+
+fn looks_like_uuid_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 14
+        && bytes
+            .get(0..8)
+            .is_some_and(|p| p.iter().all(u8::is_ascii_hexdigit))
+        && bytes.get(8) == Some(&b'-')
+        && bytes
+            .get(9..13)
+            .is_some_and(|p| p.iter().all(u8::is_ascii_hexdigit))
+        && bytes.get(13) == Some(&b'-')
+}
+
+fn tilde_display(path: &Path, home: &Path) -> String {
+    if path == home {
+        return "~".to_owned();
+    }
+    if let Ok(rel) = path.strip_prefix(home) {
+        let joined = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        return format!("~/{joined}");
+    }
+    path.display().to_string()
+}
+
+// ============================================================================
 // Common Helpers
 // ============================================================================
 
@@ -6240,6 +7210,342 @@ mod multi_provider_tests {
             Some("secret")
         );
         assert_eq!(loaded.profiles["muse"].launch, ["/custom/muse", "--fast"]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod bots_import_tests {
+    use super::*;
+
+    fn test_png_with_metadata() -> Vec<u8> {
+        fn chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+            let mut body = Vec::with_capacity(data.len().saturating_add(4));
+            body.extend_from_slice(&kind);
+            body.extend_from_slice(data);
+            let crc = krill_proto::bots::crc32(&body);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc.to_be_bytes());
+            out
+        }
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&chunk(*b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]));
+        png.extend_from_slice(&chunk(*b"tEXt", b"Author\0OrcaSecretMeta"));
+        png.extend_from_slice(&chunk(
+            *b"IDAT",
+            &[0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01],
+        ));
+        png.extend_from_slice(&chunk(*b"IEND", &[]));
+        png
+    }
+
+    #[test]
+    fn import_domain_parses_bots_and_includes_in_all() {
+        assert_eq!(ImportDomain::parse("bots").unwrap(), ImportDomain::Bots);
+        assert_eq!(ImportDomain::parse("bot").unwrap(), ImportDomain::Bots);
+        assert!(ImportDomain::ALL.contains(&ImportDomain::Bots));
+        assert_eq!(
+            ImportDomain::parse_list("settings,bots").unwrap(),
+            vec![ImportDomain::Settings, ImportDomain::Bots]
+        );
+    }
+
+    #[test]
+    fn orca_bots_domain_dry_run_apply_and_idempotency() {
+        let root =
+            std::env::temp_dir().join(format!("krill-orca-bots-import-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let orca_dir = root.join("orca");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&orca_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        // Seed ~/.orca/bots/pr-reviewer/
+        let bot_dir = home.join(".orca/bots/pr-reviewer");
+        fs::create_dir_all(bot_dir.join("memory")).unwrap();
+        fs::create_dir_all(bot_dir.join("skills/pr-review-checklist")).unwrap();
+        fs::write(
+            bot_dir.join("bot.json"),
+            serde_json::json!({
+                "id": "orca-bot-1",
+                "name": "PR Reviewer",
+                "agent": "codex",
+                "avatar": "B1",
+                "members": [
+                    { "id": "U100", "name": "Alice", "source": "slack", "workspaceId": "T1" }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            bot_dir.join("SOUL.md"),
+            "# PR Reviewer\n\nReviews pull requests carefully.\n",
+        )
+        .unwrap();
+        fs::write(
+            bot_dir.join("MEMORY.md"),
+            "# Memory\n\n- 2026-11-19 Watch retry timeouts.\n",
+        )
+        .unwrap();
+        fs::write(
+            bot_dir.join("memory/repos.md"),
+            "# Repos\n\n- craftowen/krill\n",
+        )
+        .unwrap();
+        fs::write(
+            bot_dir.join("skills/pr-review-checklist/SKILL.md"),
+            "---\nname: pr-review-checklist\n---\n",
+        )
+        .unwrap();
+        fs::write(bot_dir.join("avatar.png"), test_png_with_metadata()).unwrap();
+
+        // Also seed profile metadata in orca-data.json
+        fs::write(
+            orca_dir.join("orca-data.json"),
+            serde_json::json!({
+                "bots": [{
+                    "id": "orca-bot-1",
+                    "name": "PR Reviewer",
+                    "folder": "pr-reviewer",
+                    "agent": "codex",
+                    "templateId": "pr-review",
+                    "paused": true,
+                    "launch": { "model": "gpt-5", "effort": "high" }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // 1. Dry-run: detects bot, writes zero files under state_dir/bots
+        let dry_opts = ImportOptions {
+            home: home.clone(),
+            state_dir: state_dir.clone(),
+            orca_dir: orca_dir.clone(),
+            domains: vec![ImportDomain::Bots],
+            dry_run: true,
+        };
+        let dry_report = run_import(&dry_opts).unwrap();
+        assert!(!dry_report.bots.skipped);
+        assert_eq!(dry_report.bots.bots_added, 1);
+        assert_eq!(dry_report.bots.bots_skipped, 0);
+        assert_eq!(dry_report.bots.items.len(), 1);
+        assert_eq!(dry_report.bots.items[0].slug, "pr-reviewer");
+        assert_eq!(dry_report.bots.items[0].agent_id, "codex");
+        assert!(dry_report.bots.items[0].has_soul);
+        assert!(dry_report.bots.items[0].has_memory);
+        assert_eq!(dry_report.bots.items[0].memory_topic_count, 1);
+        assert!(!dry_report.bots.items[0].already_exists);
+        assert!(!state_dir.join("bots").exists());
+
+        // 2. Apply: writes bots.json + home files, strips PNG metadata
+        let apply_opts = ImportOptions {
+            dry_run: false,
+            ..dry_opts.clone()
+        };
+        let applied = run_import(&apply_opts).unwrap();
+        assert_eq!(applied.bots.bots_added, 1);
+        assert_eq!(applied.bots.bots_skipped, 0);
+
+        let krill_bots_root = state_dir.join("bots");
+        let index: Vec<BotConfig> =
+            serde_json::from_str(&fs::read_to_string(krill_bots_root.join("bots.json")).unwrap())
+                .unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].id.as_str(), "orca-bot-1");
+        assert_eq!(index[0].slug.as_str(), "pr-reviewer");
+        assert_eq!(index[0].agent_id, "codex");
+        assert_eq!(index[0].model.as_deref(), Some("gpt-5"));
+        assert_eq!(index[0].effort.as_deref(), Some("high"));
+        assert_eq!(index[0].template_id.as_deref(), Some("pr-review"));
+        assert!(index[0].paused);
+        assert_eq!(index[0].members.len(), 1);
+        assert_eq!(index[0].description, "Reviews pull requests carefully.");
+
+        let krill_home = krill_bots_root.join("pr-reviewer");
+        assert_eq!(
+            fs::read_to_string(krill_home.join("SOUL.md")).unwrap(),
+            "# PR Reviewer\n\nReviews pull requests carefully.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(krill_home.join("MEMORY.md")).unwrap(),
+            "# Memory\n\n- 2026-11-19 Watch retry timeouts.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(krill_home.join("memory/repos.md")).unwrap(),
+            "# Repos\n\n- craftowen/krill\n"
+        );
+        assert!(
+            krill_home
+                .join("skills/pr-review-checklist/SKILL.md")
+                .is_file()
+        );
+        assert!(krill_home.join("AGENTS.md").is_file());
+        assert_eq!(
+            fs::read_to_string(krill_home.join("CLAUDE.md")).unwrap(),
+            "@AGENTS.md\n"
+        );
+        let copied_avatar = fs::read(krill_home.join("avatar.png")).unwrap();
+        assert!(!copied_avatar.windows(4).any(|w| w == b"tEXt"));
+
+        // 3. User modifies SOUL.md and MEMORY.md, then re-runs import -> must skip safely!
+        fs::write(krill_home.join("SOUL.md"), "# User Edited Soul\n").unwrap();
+        fs::write(
+            krill_home.join("MEMORY.md"),
+            "# Memory\n\n- Keep my edits\n",
+        )
+        .unwrap();
+
+        // Also add a second Orca bot to verify incremental migration
+        let bot2 = home.join(".orca/bots/release-notes");
+        fs::create_dir_all(&bot2).unwrap();
+        fs::write(
+            bot2.join("SOUL.md"),
+            "# Release notes\n\nDrafts changelogs.\n",
+        )
+        .unwrap();
+
+        let rerun = run_import(&apply_opts).unwrap();
+        assert_eq!(rerun.bots.bots_added, 1);
+        assert_eq!(rerun.bots.bots_skipped, 1);
+        assert_eq!(
+            fs::read_to_string(krill_home.join("SOUL.md")).unwrap(),
+            "# User Edited Soul\n"
+        );
+        assert_eq!(
+            fs::read_to_string(krill_home.join("MEMORY.md")).unwrap(),
+            "# Memory\n\n- Keep my edits\n"
+        );
+        assert!(krill_bots_root.join("release-notes/SOUL.md").is_file());
+
+        let human = format_report_human(&rerun);
+        assert!(human.contains("bots: +1 added, 1 existing skipped"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn discovers_openclaw_hermes_and_openbot_fixtures_without_reading_secrets() {
+        let root = std::env::temp_dir().join(format!(
+            "krill-external-bots-discovery-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+
+        // 1. OpenClaw (.openclaw with IDENTITY.md + planted secret in openclaw.json)
+        fs::create_dir_all(home.join(".openclaw/agents/main/agent")).unwrap();
+        fs::create_dir_all(home.join(".openclaw/agents/scout")).unwrap();
+        fs::create_dir_all(home.join(".openclaw/workspace")).unwrap();
+        fs::create_dir_all(home.join(".openclaw/workspace-scout")).unwrap();
+        fs::write(
+            home.join(".openclaw/openclaw.json"),
+            r#"{"channels":{"slack":{"botToken":"xoxb-PLANTED-NEVER-READ"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join(".openclaw/workspace/IDENTITY.md"),
+            "# Identity\n\n- **Name:** Molty\n- **Vibe:** calm\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".openclaw/workspace/SOUL.md"),
+            "# Molty\n\nCalm engineering helper.\n",
+        )
+        .unwrap();
+
+        // 2. Hermes (~/.hermes root + profiles/research-desk, ignoring empty & .deleted)
+        fs::create_dir_all(home.join(".hermes/profiles/research-desk")).unwrap();
+        fs::create_dir_all(home.join(".hermes/profiles/empty")).unwrap();
+        fs::create_dir_all(home.join(".hermes/profiles/.deleted/old")).unwrap();
+        fs::write(
+            home.join(".hermes/SOUL.md"),
+            "# Hermes\n\nYou are Hermes.\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".hermes/profiles/research-desk/config.yaml"),
+            "model: x\n",
+        )
+        .unwrap();
+        fs::write(home.join(".hermes/profiles/.deleted/old/SOUL.md"), "old").unwrap();
+
+        // 3. OpenBot (data dir + Agents/agent-research + Agents/bot-<uuid>)
+        let openbot_data = root.join("app-data/OpenBot");
+        fs::create_dir_all(&openbot_data).unwrap();
+        fs::create_dir_all(home.join("OpenBot/Agents/agent-research")).unwrap();
+        fs::create_dir_all(home.join("OpenBot/Agents/bot-8c41d0f2-6b5a-4e93-8d17-2a0b3c4d5e6f"))
+            .unwrap();
+
+        let found = discover_external_bots_in(&home, Some(&openbot_data), None, None, None);
+        let serialized = serde_json::to_string(&found).unwrap();
+        assert!(!serialized.contains("xoxb-PLANTED-NEVER-READ"));
+
+        let openclaw: Vec<_> = found
+            .iter()
+            .filter(|c| c.app == ExternalBotSourceApp::OpenClaw)
+            .collect();
+        assert_eq!(openclaw.len(), 2);
+        assert_eq!(openclaw[0].agent, "main");
+        assert_eq!(openclaw[0].name, "Molty");
+        assert_eq!(openclaw[0].path, "~/.openclaw/workspace");
+        assert_eq!(
+            openclaw[0].soul_preview.as_deref(),
+            Some("Calm engineering helper.")
+        );
+        assert_eq!(openclaw[1].agent, "scout");
+        assert_eq!(openclaw[1].name, "Scout");
+        assert_eq!(openclaw[1].path, "~/.openclaw/workspace-scout");
+
+        let hermes: Vec<_> = found
+            .iter()
+            .filter(|c| c.app == ExternalBotSourceApp::Hermes)
+            .collect();
+        assert_eq!(hermes.len(), 2);
+        assert_eq!(hermes[0].agent, "default");
+        assert_eq!(hermes[0].name, "Hermes");
+        assert_eq!(hermes[1].agent, "research-desk");
+        assert_eq!(hermes[1].name, "Research desk");
+
+        let openbot: Vec<_> = found
+            .iter()
+            .filter(|c| c.app == ExternalBotSourceApp::OpenBot)
+            .collect();
+        assert_eq!(openbot.len(), 2);
+        assert_eq!(openbot[0].name, "Research");
+        assert_eq!(openbot[1].name, "OpenBot agent");
+
+        // Legacy OpenClaw folder fallback (`.clawdbot/workspace` without `agents/`)
+        let legacy_home = root.join("legacy-home");
+        fs::create_dir_all(legacy_home.join(".clawdbot/workspace")).unwrap();
+        let legacy = discover_external_bots_in(
+            &legacy_home,
+            None,
+            None,
+            None,
+            Some(ExternalBotSourceApp::OpenClaw),
+        );
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].agent, "main");
+        assert_eq!(legacy[0].path, "~/.clawdbot/workspace");
+
+        // Legacy `.moltbot` fallback
+        let molt_home = root.join("molt-home");
+        fs::create_dir_all(molt_home.join(".moltbot/workspace")).unwrap();
+        let molt = discover_external_bots_in(
+            &molt_home,
+            None,
+            None,
+            None,
+            Some(ExternalBotSourceApp::OpenClaw),
+        );
+        assert_eq!(molt.len(), 1);
+        assert_eq!(molt[0].path, "~/.moltbot/workspace");
 
         fs::remove_dir_all(&root).ok();
     }

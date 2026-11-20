@@ -18,6 +18,7 @@ macro_rules! println {
 
 mod account;
 mod artifacts;
+mod bot;
 mod changes;
 mod doctor;
 mod drop;
@@ -50,7 +51,7 @@ use std::process::ExitCode;
 use krill_proto::agent::{self, Agents, Permission};
 use krill_proto::daemon;
 
-const USAGE: &str = "usage: krill mobile pair/devices/revoke/serve | krill drop <file>...|ls|rm <id> [--json] | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts init|lint|share|update|retention|unshare|status|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable|flush [--json] | krill errors status|enable|disable|flush [--json] | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>] | krill --version";
+const USAGE: &str = "usage: krill mobile pair/devices/revoke/serve | krill drop <file>...|ls|rm <id> [--json] | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions,bots] | krill bot ls/new/show/update/rm/start/templates/skills/apps/soul/memory/items/suggest/reply/send/groups/connectors/access/secret/tools/export/import/import-external | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts init|lint|share|update|retention|unshare|status|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable|flush [--json] | krill errors status|enable|disable|flush [--json] | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>] | krill --version";
 
 fn main() -> ExitCode {
     run(std::env::args_os().skip(1).collect())
@@ -99,6 +100,7 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
         // 실제 진단이 사라진다(2026-11-05). 사람이 드물게 실행해 되짚을 가치가 있는 명령만 이름과 함께 남긴다.
         if let Some(command) = [
             "account",
+            "bot",
             "doctor",
             "hook",
             "import",
@@ -164,6 +166,16 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
         let mut forwarded = vec![raw[0].clone(), raw[1].clone()];
         forwarded.extend_from_slice(&raw[3..]);
         return orchestration::run(&forwarded);
+    }
+    if raw.first().is_some_and(|s| s == "--host")
+        && raw.get(2).is_some_and(|s| s == "bot" || s == "bots")
+    {
+        let mut forwarded = vec![raw[0].clone(), raw[1].clone()];
+        forwarded.extend_from_slice(&raw[3..]);
+        return bot::run(&forwarded);
+    }
+    if raw.first().is_some_and(|s| s == "bot" || s == "bots") {
+        return bot::run(&raw[1..]);
     }
     if raw.first().is_some_and(|s| s == "mobile") {
         return mobile::run(&raw[1..]);
@@ -485,6 +497,7 @@ mod tests {
             vec!["worktree", "--help"],
             vec!["set", "--help"],
             vec!["import", "--help"],
+            vec!["bot", "--help"],
             vec!["skills", "--help"],
             vec!["handoff", "--help"],
             vec!["reference", "--help"],
