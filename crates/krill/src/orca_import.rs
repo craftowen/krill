@@ -5335,16 +5335,14 @@ fn default_openbot_data_dir(home: &Path) -> PathBuf {
     {
         std::env::var_os("APPDATA")
             .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+            .map_or_else(|| home.join("AppData").join("Roaming"), PathBuf::from)
             .join("OpenBot")
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         std::env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"))
+            .map_or_else(|| home.join(".config"), PathBuf::from)
             .join("OpenBot")
     }
 }
