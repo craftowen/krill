@@ -1035,6 +1035,14 @@ fn connect_or_launch(paths: &Paths, hello: &ClientHello) -> Result<Connection, E
         }
         .or_else(|_: Option<()>| {
             launch_gate(&paths.socket)?;
+            // 죽은 bootstrap 포트(옛 로그인 세션)에서 띄운 holder는 세션 전체를 같은 상태로 만든다.
+            // 현재 로그인 세션의 클라이언트가 띄울 때까지 기다린다.
+            if crate::os::bootstrap_dead() {
+                return Err(Error::Backoff {
+                    last: "this process belongs to a previous macOS login session and cannot start krill-holder; quit and reopen Krill".to_owned(),
+                    code: None,
+                });
+            }
             ensure_autostart(paths);
             #[cfg(target_os = "macos")]
             let bootstrapped = autostart::try_bootstrap(paths);

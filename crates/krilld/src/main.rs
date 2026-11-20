@@ -257,6 +257,7 @@ fn main() -> ExitCode {
         h.hold_listener(fd).ok();
     }
     krilld::monitor::start(Arc::clone(&registry), done.clone()).ok();
+    krilld::login_guard::start(&registry);
     if linked {
         let r = Arc::clone(&registry);
         thread::Builder::new()
