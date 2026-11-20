@@ -1336,8 +1336,27 @@ fn rate_limited_is_excluded_and_triggers_switch() {
     );
     assert_eq!(status_of("claude-ratebak"), Some(AccountStatus::Ok));
 
-    // `switch_on_rate_limit=false`면 한도만으로는 전환하지 않지만 후보 제외·상태는 유지된다.
+    // 사용자가 한도 계정을 직접 고르면 다음 주기 새로고침이 다른 계정으로 되돌리지 않는다
+    // (모델별 한도라 다른 모델로 쓰려는 경우, 액터진 2026-11-20 제보).
     accounts::switch_account(&home, Some(&state), ProviderKind::Claude, "claude-ratelim").unwrap();
+    let snap = accounts::refresh_accounts(&home, Some(&state));
+    assert!(snap.switched.is_empty(), "{snap:?}");
+    assert!(
+        snap.accounts
+            .iter()
+            .any(|a| a.id == "claude-ratelim" && a.active),
+        "{snap:?}"
+    );
+    assert_ne!(
+        snap.statuses
+            .iter()
+            .find(|s| s.account_id == "claude-ratelim")
+            .map(|s| s.status),
+        Some(AccountStatus::RateLimited)
+    );
+
+    // `switch_on_rate_limit=false`면 한도만으로는 전환하지 않지만 후보 제외·상태는 유지된다.
+    accounts::record_rate_limited(ProviderKind::Claude, "claude-ratelim");
     accounts::set_auto_switch(
         &home,
         Some(&state),
