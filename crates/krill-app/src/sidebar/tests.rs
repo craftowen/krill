@@ -7624,3 +7624,131 @@ fn adding_project_selects_it_in_active_project_filter_and_reveals_row(cx: &mut T
         });
     });
 }
+
+#[gpui::test]
+fn sync_remote_hosts_reuses_source_without_throwaway_allocations_and_hidden_skips_source(
+    cx: &mut TestAppContext,
+) {
+    use krill_hosts::RemoteHostSpec;
+    cx.update(gpui_component::init);
+    let manager = HostManager::new();
+    let mut spec = RemoteHostSpec {
+        id: "studio".into(),
+        label: "Studio".into(),
+        address: "owen@studio.local".into(),
+        port: None,
+        identity_file: None,
+        remote_socket: Some("/tmp/krilld.sock".into()),
+    };
+    manager.sync_specs(&[spec.clone()]);
+
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    view.update(vcx, |s, cx| s.sync_remote_hosts(&manager, cx));
+    vcx.run_until_parked();
+
+    let first_src = view.read_with(vcx, |s, _| s.remote_hosts[0].source.clone().unwrap());
+
+    // Unchanged status/label-only syncs must reuse the exact same Source pointer.
+    spec.label = "Studio Renamed".into();
+    manager.sync_specs(&[spec]);
+    view.update(vcx, |s, cx| s.sync_remote_hosts(&manager, cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert!(Arc::ptr_eq(
+            &first_src,
+            s.remote_hosts[0].source.as_ref().unwrap()
+        ));
+    });
+
+    // While hidden, syncing remote hosts must not allocate a fresh ipc::Socket.
+    view.update(vcx, |s, cx| {
+        s.set_visible(false, cx);
+        s.sync_remote_hosts(&manager, cx);
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert!(
+            s.remote_hosts[0].source.is_none(),
+            "hidden sidebar must not eagerly create remote IPC sources"
+        );
+    });
+
+    view.update(vcx, |s, cx| s.set_visible(true, cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert!(s.remote_hosts[0].source.is_some());
+    });
+}
+
+#[gpui::test]
+fn remote_poll_pacing_backs_off_failures_and_sluggish_polls_and_reconnect_resets(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingSource(Arc<AtomicUsize>);
+    impl Source for FailingSource {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    // Unit-level schedule check: exponential failure backoff (2s..=60s) and sluggish ok cooldown (5s..=30s).
+    let t0 = std::time::Instant::now();
+    let mut pacing = RemotePollPacing::default();
+    let expected_delays = [2, 4, 8, 16, 32, 60, 60];
+    for secs in expected_delays {
+        pacing.record(false, Duration::from_secs(5), t0);
+        assert_eq!(pacing.remaining(t0), Some(Duration::from_secs(secs)));
+    }
+    pacing.record(true, Duration::from_secs(2), t0);
+    assert_eq!(pacing.remaining(t0), Some(Duration::from_secs(5)));
+    pacing.record(true, Duration::from_secs(10), t0);
+    assert_eq!(pacing.remaining(t0), Some(Duration::from_secs(20)));
+    pacing.record(true, Duration::from_secs(20), t0);
+    assert_eq!(pacing.remaining(t0), Some(Duration::from_secs(30)));
+    pacing.record(true, Duration::from_millis(20), t0);
+    assert_eq!(pacing.remaining(t0), None);
+
+    // Integration check inside Sidebar::spawn_remote_polling with GPUI simulated clock.
+    cx.update(gpui_component::init);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    view.update(vcx, |s, cx| {
+        s.set_remote_host_source(
+            "studio",
+            "Studio",
+            HostStatus::Connecting,
+            Arc::new(FailingSource(Arc::clone(&polls))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(polls.load(Ordering::SeqCst), 1, "initial poll fires once");
+
+    // 1.5s < 2s first failure backoff: even across poll_interval (500ms), no second poll fires yet.
+    vcx.executor().advance_clock(Duration::from_millis(1500));
+    vcx.run_until_parked();
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+
+    // Passing 2s triggers the second attempt, which backs off for 4s.
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+
+    vcx.executor().advance_clock(Duration::from_secs(3));
+    vcx.run_until_parked();
+    assert_eq!(polls.load(Ordering::SeqCst), 2, "must honor 4s backoff");
+
+    vcx.executor().advance_clock(Duration::from_secs(1));
+    vcx.run_until_parked();
+    assert_eq!(polls.load(Ordering::SeqCst), 3);
+
+    // Manual reconnect clears the 8s backoff and polls immediately.
+    view.update(vcx, |s, cx| {
+        s.reconnect_host(HostId::Remote("studio".into()), cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(polls.load(Ordering::SeqCst), 4);
+}

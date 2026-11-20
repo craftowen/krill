@@ -18,13 +18,16 @@
 //!   확정 셀과 같은 폭(`layout_line` + 셀 폭 강제)으로 그린다. 밑줄도 확정 셀과 같은 `underline_dy` 장식
 //!   사각형이라 확정 전후 픽셀 위치가 같다. 그리드 커서 대신 마지막 글자 끝에 같은 모양 커서를 그린다.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Weak};
 
 use gpui::{
-    App, Bounds, Context, Element, ElementId, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Render, SharedString, Size, Style, TextRun,
-    Window, fill, font, point, px, rems, size, underline_y_offset,
+    App, Bounds, Context, Element, ElementId, Font, FontId, FontStyle, FontWeight, GlobalElementId,
+    Hsla, InspectorElementId, IntoElement, LayoutId, LineLayout, Pixels, Render, ShapedGlyph,
+    ShapedRun, SharedString, Size, Style, TextRun, Window, WindowTextSystem, fill, font, point, px,
+    rems, size, underline_y_offset,
 };
 use krill_proto::screen::{CursorShape, CursorStyle};
 use krill_proto::theme::{Rgb, Theme};
@@ -507,18 +510,46 @@ impl Element for TerminalElement {
             }
         });
 
-        // 밑줄·취소선 세로 위치(칸 위에서부터). 기본 글꼴 한 글자 레이아웃의 ascent·descent로(프레임 캐시에 걸린다).
+        // 밑줄·취소선 세로 위치(칸 위에서부터). 기본 글꼴 한 글자 레이아웃의 ascent·descent로(스타일별 캐시).
         let font_size = font_size(window, cx);
-        let probe = window.text_system().layout_line(
-            "m",
-            font_size,
-            &[text_run(&family, 1, false, false)],
-            None,
-        );
-        let underline_dy = underline_y_offset(cell.height, probe.ascent, probe.descent);
+        let text_system = window.text_system();
+        let base_font_id = text_system.resolve_font(&term_font(&family, false, false));
+        let (style_id, probe_ascent, probe_descent) = if let Some(resolved) =
+            SHAPE_CACHE.with(|cache| {
+                cache.borrow_mut().resolve_style(
+                    text_system,
+                    base_font_id,
+                    &family,
+                    font_size,
+                    cell.width,
+                )
+            }) {
+            resolved
+        } else {
+            let probe = text_system.layout_line(
+                "m",
+                font_size,
+                &[text_run(&family, 1, false, false)],
+                None,
+            );
+            let style_id = SHAPE_CACHE.with(|cache| {
+                cache.borrow_mut().register_style(
+                    text_system,
+                    base_font_id,
+                    family.clone(),
+                    font_size,
+                    cell.width,
+                    probe.ascent,
+                    probe.descent,
+                )
+            });
+            (style_id, probe.ascent, probe.descent)
+        };
+        let underline_dy = underline_y_offset(cell.height, probe_ascent, probe_descent);
         let strike_dy =
-            (cell.height - probe.ascent - probe.descent) / 2. + probe.ascent * (1. - STRIKE_RISE);
+            (cell.height - probe_ascent - probe_descent) / 2. + probe_ascent * (1. - STRIKE_RISE);
 
+        let mut runs_scratch = SHAPE_CACHE.with(|cache| cache.borrow_mut().take_runs());
         window.paint_layer(bounds, |window| {
             for (line, plan) in (0u16..).zip(plans.iter()) {
                 for (spans, dy) in [(&plan.underlines, underline_dy), (&plan.strikes, strike_dy)] {
@@ -534,17 +565,40 @@ impl Element for TerminalElement {
                     window.paint_quad(fill(Bounds::new(origin, extent), hsla(theme.foreground)));
                 }
                 for seg in &plan.segments {
-                    let runs: Vec<TextRun> = seg
-                        .runs
-                        .iter()
-                        .map(|r| text_run(&family, r.len, r.bold, r.italic))
-                        .collect();
-                    // MK-058: ZWJ 묶음·넘침(VS16) 묶음은 2칸 간격으로 칠한다(엔진 열은 그대로).
-                    let force = cell.width * if seg.wide || seg.overflow { 2. } else { 1. };
-                    let layout =
-                        window
-                            .text_system()
-                            .layout_line(&seg.text, font_size, &runs, Some(force));
+                    let two_cell = seg.wide || seg.overflow;
+                    let cached = SHAPE_CACHE.with(|cache| {
+                        cache
+                            .borrow_mut()
+                            .get_layout(style_id, two_cell, &seg.text, &seg.runs)
+                    });
+                    let layout = if let Some(layout) = cached {
+                        layout
+                    } else {
+                        runs_scratch.clear();
+                        runs_scratch.extend(
+                            seg.runs
+                                .iter()
+                                .map(|r| text_run(&family, r.len, r.bold, r.italic)),
+                        );
+                        // MK-058: ZWJ 묶음·넘침(VS16) 묶음은 2칸 간격으로 칠한다(엔진 열은 그대로).
+                        let force = cell.width * if two_cell { 2. } else { 1. };
+                        let layout = window.text_system().layout_line(
+                            &seg.text,
+                            font_size,
+                            &runs_scratch,
+                            Some(force),
+                        );
+                        SHAPE_CACHE.with(|cache| {
+                            cache.borrow_mut().insert_layout(
+                                style_id,
+                                two_cell,
+                                &seg.text,
+                                &seg.runs,
+                                Arc::clone(&layout),
+                            );
+                        });
+                        layout
+                    };
                     // 줄 높이 안에서 세로 가운데(gpui ShapedLine::paint와 같은 계산).
                     let baseline = line_y(line)
                         + (cell.height - layout.ascent - layout.descent) / 2.
@@ -572,6 +626,7 @@ impl Element for TerminalElement {
                 }
             }
         });
+        SHAPE_CACHE.with(|cache| cache.borrow_mut().put_runs(runs_scratch));
 
         // OWE-615 원인 1·3: 확정 에코 대기 글자와 조합 중 글자를 확정 셀과 같은 폭으로 그린다.
         // `pending`은 밑줄 없이(확정된 글자), `preedit`는 밑줄 장식으로. 커서는 마지막 글자 끝에.
@@ -726,5 +781,656 @@ mod row_cache;
 mod url_link;
 pub use row_cache::RowPlanCache;
 
+const SHAPE_CACHE_MAX_ENTRIES: usize = 4096;
+const SHAPE_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SHAPE_CACHE_MAX_STYLES: usize = 32;
+
+thread_local! {
+    static SHAPE_CACHE: RefCell<ShapeCache> = RefCell::new(ShapeCache::default());
+}
+
+fn px_bits(p: Pixels) -> u32 {
+    let v = f32::from(p);
+    if v == 0.0 { 0 } else { v.to_bits() }
+}
+
+fn hash_segment(style_id: u64, two_cell: bool, text: &str, runs: &[krill_term::grid::Run]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    feed(&style_id.to_le_bytes());
+    feed(&[u8::from(two_cell)]);
+    feed(&text.len().to_le_bytes());
+    feed(text.as_bytes());
+    feed(&runs.len().to_le_bytes());
+    for r in runs {
+        feed(&r.len.to_le_bytes());
+        feed(&[u8::from(r.bold), u8::from(r.italic)]);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h
+}
+
+fn entry_bytes(text_len: usize, runs_len: usize, layout: &LineLayout) -> usize {
+    let glyphs: usize = layout.runs.iter().map(|r| r.glyphs.len()).sum();
+    std::mem::size_of::<ShapeSlot>()
+        + text_len
+        + runs_len * std::mem::size_of::<krill_term::grid::Run>()
+        + std::mem::size_of::<LineLayout>()
+        + layout.runs.len() * std::mem::size_of::<ShapedRun>()
+        + glyphs * std::mem::size_of::<ShapedGlyph>()
+        + 64
+}
+
+struct StyleEntry {
+    id: u64,
+    text_system: Weak<WindowTextSystem>,
+    base_font_id: FontId,
+    family: SharedString,
+    font_size_bits: u32,
+    cell_width_bits: u32,
+    probe_ascent: Pixels,
+    probe_descent: Pixels,
+}
+
+struct ShapeSlot {
+    hash: u64,
+    style_id: u64,
+    two_cell: bool,
+    text: Box<str>,
+    runs: Box<[krill_term::grid::Run]>,
+    layout: Arc<LineLayout>,
+    bytes: usize,
+    bucket_next: Option<usize>,
+    lru_prev: Option<usize>,
+    lru_next: Option<usize>,
+}
+
+struct ShapeCache {
+    next_style_id: u64,
+    styles: Vec<StyleEntry>,
+    slots: Vec<Option<ShapeSlot>>,
+    free_slots: Vec<usize>,
+    buckets: HashMap<u64, usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    len: usize,
+    total_bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    scratch_runs: Vec<TextRun>,
+    #[cfg(test)]
+    hits: u64,
+    #[cfg(test)]
+    misses: u64,
+}
+
+impl Default for ShapeCache {
+    fn default() -> Self {
+        Self::with_limits(SHAPE_CACHE_MAX_ENTRIES, SHAPE_CACHE_MAX_BYTES)
+    }
+}
+
+impl ShapeCache {
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            next_style_id: 1,
+            styles: Vec::new(),
+            slots: Vec::new(),
+            free_slots: Vec::new(),
+            buckets: HashMap::new(),
+            head: None,
+            tail: None,
+            len: 0,
+            total_bytes: 0,
+            max_entries,
+            max_bytes,
+            scratch_runs: Vec::new(),
+            #[cfg(test)]
+            hits: 0,
+            #[cfg(test)]
+            misses: 0,
+        }
+    }
+
+    fn take_runs(&mut self) -> Vec<TextRun> {
+        std::mem::take(&mut self.scratch_runs)
+    }
+
+    fn put_runs(&mut self, mut runs: Vec<TextRun>) {
+        runs.clear();
+        if self.scratch_runs.capacity() < runs.capacity() && runs.capacity() <= 256 {
+            self.scratch_runs = runs;
+        }
+    }
+
+    fn prune_dead_styles(&mut self) {
+        let mut i = 0;
+        while i < self.styles.len() {
+            let dead = self
+                .styles
+                .get(i)
+                .is_some_and(|style| style.text_system.upgrade().is_none());
+            if dead {
+                let removed = self.styles.remove(i);
+                self.purge_style(removed.id);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn resolve_style(
+        &mut self,
+        text_system: &Arc<WindowTextSystem>,
+        base_font_id: FontId,
+        family: &SharedString,
+        font_size: Pixels,
+        cell_width: Pixels,
+    ) -> Option<(u64, Pixels, Pixels)> {
+        self.prune_dead_styles();
+        let font_size_bits = px_bits(font_size);
+        let cell_width_bits = px_bits(cell_width);
+        let idx = self.styles.iter().position(|entry| {
+            entry.base_font_id == base_font_id
+                && entry.font_size_bits == font_size_bits
+                && entry.cell_width_bits == cell_width_bits
+                && entry.family == *family
+                && entry
+                    .text_system
+                    .upgrade()
+                    .is_some_and(|arc| Arc::ptr_eq(&arc, text_system))
+        })?;
+        if idx > 0
+            && let Some(prefix) = self.styles.get_mut(..=idx)
+        {
+            prefix.rotate_right(1);
+        }
+        self.styles
+            .first()
+            .map(|s| (s.id, s.probe_ascent, s.probe_descent))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Style key fields and probe metrics are recorded together on miss"
+    )]
+    fn register_style(
+        &mut self,
+        text_system: &Arc<WindowTextSystem>,
+        base_font_id: FontId,
+        family: SharedString,
+        font_size: Pixels,
+        cell_width: Pixels,
+        probe_ascent: Pixels,
+        probe_descent: Pixels,
+    ) -> u64 {
+        if let Some((id, _, _)) =
+            self.resolve_style(text_system, base_font_id, &family, font_size, cell_width)
+        {
+            return id;
+        }
+        if self.styles.len() >= SHAPE_CACHE_MAX_STYLES
+            && let Some(evicted) = self.styles.pop()
+        {
+            self.purge_style(evicted.id);
+        }
+        let id = self.next_style_id;
+        self.next_style_id = self.next_style_id.wrapping_add(1);
+        self.styles.insert(
+            0,
+            StyleEntry {
+                id,
+                text_system: Arc::downgrade(text_system),
+                base_font_id,
+                family,
+                font_size_bits: px_bits(font_size),
+                cell_width_bits: px_bits(cell_width),
+                probe_ascent,
+                probe_descent,
+            },
+        );
+        id
+    }
+
+    fn get_layout(
+        &mut self,
+        style_id: u64,
+        two_cell: bool,
+        text: &str,
+        runs: &[krill_term::grid::Run],
+    ) -> Option<Arc<LineLayout>> {
+        let hash = hash_segment(style_id, two_cell, text, runs);
+        let mut cur = self.buckets.get(&hash).copied();
+        while let Some(idx) = cur {
+            let Some(slot) = self.slots.get(idx).and_then(Option::as_ref) else {
+                break;
+            };
+            if slot.style_id == style_id
+                && slot.two_cell == two_cell
+                && slot.text.as_ref() == text
+                && slot.runs.as_ref() == runs
+            {
+                let layout = Arc::clone(&slot.layout);
+                self.touch_lru(idx);
+                #[cfg(test)]
+                {
+                    self.hits = self.hits.saturating_add(1);
+                }
+                return Some(layout);
+            }
+            cur = slot.bucket_next;
+        }
+        #[cfg(test)]
+        {
+            self.misses = self.misses.saturating_add(1);
+        }
+        None
+    }
+
+    fn insert_layout(
+        &mut self,
+        style_id: u64,
+        two_cell: bool,
+        text: &str,
+        runs: &[krill_term::grid::Run],
+        layout: Arc<LineLayout>,
+    ) {
+        let bytes = entry_bytes(text.len(), runs.len(), &layout);
+        if self.max_entries == 0 || bytes > self.max_bytes {
+            return;
+        }
+        let hash = hash_segment(style_id, two_cell, text, runs);
+        let mut cur = self.buckets.get(&hash).copied();
+        while let Some(idx) = cur {
+            let Some(slot) = self.slots.get(idx).and_then(Option::as_ref) else {
+                break;
+            };
+            if slot.style_id == style_id
+                && slot.two_cell == two_cell
+                && slot.text.as_ref() == text
+                && slot.runs.as_ref() == runs
+            {
+                self.touch_lru(idx);
+                return;
+            }
+            cur = slot.bucket_next;
+        }
+        while self.len >= self.max_entries
+            || self.total_bytes.saturating_add(bytes) > self.max_bytes
+        {
+            if !self.evict_lru() {
+                break;
+            }
+        }
+        let bucket_head = self.buckets.get(&hash).copied();
+        let slot = ShapeSlot {
+            hash,
+            style_id,
+            two_cell,
+            text: text.into(),
+            runs: runs.into(),
+            layout,
+            bytes,
+            bucket_next: bucket_head,
+            lru_prev: None,
+            lru_next: None,
+        };
+        let idx = if let Some(free) = self.free_slots.pop() {
+            if let Some(cell) = self.slots.get_mut(free) {
+                *cell = Some(slot);
+            }
+            free
+        } else {
+            let idx = self.slots.len();
+            self.slots.push(Some(slot));
+            idx
+        };
+        self.buckets.insert(hash, idx);
+        self.push_front_lru(idx);
+        self.len = self.len.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+    }
+
+    fn purge_style(&mut self, style_id: u64) {
+        let mut cur = self.head;
+        while let Some(idx) = cur {
+            let Some(slot) = self.slots.get(idx).and_then(Option::as_ref) else {
+                break;
+            };
+            let next = slot.lru_next;
+            if slot.style_id == style_id {
+                self.remove_slot(idx);
+            }
+            cur = next;
+        }
+    }
+
+    fn evict_lru(&mut self) -> bool {
+        let Some(tail_idx) = self.tail else {
+            return false;
+        };
+        self.remove_slot(tail_idx)
+    }
+
+    fn remove_slot(&mut self, idx: usize) -> bool {
+        self.unlink_lru(idx);
+        let Some(slot) = self.slots.get_mut(idx).and_then(Option::take) else {
+            return false;
+        };
+        self.unlink_bucket(idx, slot.hash, slot.bucket_next);
+        self.len = self.len.saturating_sub(1);
+        self.total_bytes = self.total_bytes.saturating_sub(slot.bytes);
+        self.free_slots.push(idx);
+        true
+    }
+
+    fn unlink_bucket(&mut self, idx: usize, hash: u64, bucket_next: Option<usize>) {
+        let Some(head_idx) = self.buckets.get(&hash).copied() else {
+            return;
+        };
+        if head_idx == idx {
+            if let Some(next) = bucket_next {
+                self.buckets.insert(hash, next);
+            } else {
+                self.buckets.remove(&hash);
+            }
+            return;
+        }
+        let mut prev_idx = head_idx;
+        while let Some(next) = self
+            .slots
+            .get(prev_idx)
+            .and_then(Option::as_ref)
+            .and_then(|s| s.bucket_next)
+        {
+            if next == idx {
+                if let Some(ps) = self.slots.get_mut(prev_idx).and_then(Option::as_mut) {
+                    ps.bucket_next = bucket_next;
+                }
+                break;
+            }
+            prev_idx = next;
+        }
+    }
+
+    fn unlink_lru(&mut self, idx: usize) {
+        let Some((prev, next)) = self
+            .slots
+            .get(idx)
+            .and_then(Option::as_ref)
+            .map(|s| (s.lru_prev, s.lru_next))
+        else {
+            return;
+        };
+        match prev {
+            Some(p) => {
+                if let Some(ps) = self.slots.get_mut(p).and_then(Option::as_mut) {
+                    ps.lru_next = next;
+                }
+            }
+            None => self.head = next,
+        }
+        match next {
+            Some(n) => {
+                if let Some(ns) = self.slots.get_mut(n).and_then(Option::as_mut) {
+                    ns.lru_prev = prev;
+                }
+            }
+            None => self.tail = prev,
+        }
+        if let Some(s) = self.slots.get_mut(idx).and_then(Option::as_mut) {
+            s.lru_prev = None;
+            s.lru_next = None;
+        }
+    }
+
+    fn push_front_lru(&mut self, idx: usize) {
+        let old_head = self.head;
+        if let Some(h) = old_head
+            && let Some(hs) = self.slots.get_mut(h).and_then(Option::as_mut)
+        {
+            hs.lru_prev = Some(idx);
+        }
+        if let Some(s) = self.slots.get_mut(idx).and_then(Option::as_mut) {
+            s.lru_prev = None;
+            s.lru_next = old_head;
+        }
+        self.head = Some(idx);
+        if self.tail.is_none() {
+            self.tail = Some(idx);
+        }
+    }
+
+    fn touch_lru(&mut self, idx: usize) {
+        if self.head == Some(idx) {
+            return;
+        }
+        self.unlink_lru(idx);
+        self.push_front_lru(idx);
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod shape_cache_tests {
+    use super::*;
+    use gpui::{TestAppContext, point};
+    use krill_proto::theme::DEFAULT;
+    use krill_term::grid::{Cell, Flags, Run};
+
+    fn fake_layout(glyphs: usize) -> Arc<LineLayout> {
+        let len_px = f32::from(u16::try_from(glyphs).unwrap_or(u16::MAX));
+        let shaped = (0..glyphs)
+            .map(|i| ShapedGlyph {
+                id: gpui::GlyphId(u32::try_from(i).unwrap_or(0)),
+                position: point(px(8. * f32::from(u16::try_from(i).unwrap_or(0))), px(0.)),
+                index: i,
+                is_emoji: false,
+            })
+            .collect();
+        Arc::new(LineLayout {
+            font_size: px(14.),
+            width: px(8. * len_px),
+            ascent: px(11.),
+            descent: px(3.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: shaped,
+            }],
+            len: glyphs,
+        })
+    }
+
+    #[test]
+    fn shape_cache_hits_on_repeat_and_misses_on_style_or_content_change() {
+        let mut cache = ShapeCache::with_limits(16, 1024 * 1024);
+        let runs = [Run {
+            len: 5,
+            bold: false,
+            italic: false,
+        }];
+        let layout_a = fake_layout(5);
+        cache.insert_layout(1, false, "hello", &runs, Arc::clone(&layout_a));
+
+        let hit = cache.get_layout(1, false, "hello", &runs).unwrap();
+        assert!(Arc::ptr_eq(&hit, &layout_a));
+        assert_eq!((cache.hits, cache.misses), (1, 0));
+
+        assert!(cache.get_layout(2, false, "hello", &runs).is_none());
+        assert!(cache.get_layout(1, true, "hello", &runs).is_none());
+        assert!(cache.get_layout(1, false, "world", &runs).is_none());
+        let bold_runs = [Run {
+            len: 5,
+            bold: true,
+            italic: false,
+        }];
+        assert!(cache.get_layout(1, false, "hello", &bold_runs).is_none());
+        assert_eq!((cache.hits, cache.misses), (1, 4));
+    }
+
+    #[test]
+    fn shape_cache_evicts_lru_within_entry_and_byte_bounds() {
+        let layout = fake_layout(4);
+        let one_bytes = entry_bytes(4, 1, &layout);
+        let mut cache = ShapeCache::with_limits(2, one_bytes * 2);
+        let runs = [Run {
+            len: 4,
+            bold: false,
+            italic: false,
+        }];
+        cache.insert_layout(1, false, "aaaa", &runs, Arc::clone(&layout));
+        cache.insert_layout(1, false, "bbbb", &runs, Arc::clone(&layout));
+        assert_eq!(cache.len, 2);
+        assert!(cache.total_bytes <= one_bytes * 2);
+
+        // Touch "aaaa" so "bbbb" becomes LRU tail and gets evicted on "cccc".
+        assert!(cache.get_layout(1, false, "aaaa", &runs).is_some());
+        cache.insert_layout(1, false, "cccc", &runs, Arc::clone(&layout));
+        assert_eq!(cache.len, 2);
+        assert!(cache.total_bytes <= one_bytes * 2);
+        assert!(cache.get_layout(1, false, "aaaa", &runs).is_some());
+        assert!(cache.get_layout(1, false, "cccc", &runs).is_some());
+        assert!(cache.get_layout(1, false, "bbbb", &runs).is_none());
+
+        // Byte bound smaller than 2 entries forces eviction down to 1 entry.
+        let mut tight = ShapeCache::with_limits(64, one_bytes + 8);
+        tight.insert_layout(1, false, "aaaa", &runs, Arc::clone(&layout));
+        tight.insert_layout(1, false, "bbbb", &runs, Arc::clone(&layout));
+        assert_eq!(tight.len, 1);
+        assert!(tight.total_bytes <= one_bytes + 8);
+        assert!(tight.get_layout(1, false, "aaaa", &runs).is_none());
+        assert!(tight.get_layout(1, false, "bbbb", &runs).is_some());
+
+        // Oversized entry never exceeds max_bytes or evicts existing cached entries.
+        let huge = fake_layout(500);
+        tight.insert_layout(1, false, "huge", &runs, huge);
+        assert_eq!(tight.len, 1);
+        assert!(tight.total_bytes <= one_bytes + 8);
+        assert!(tight.get_layout(1, false, "bbbb", &runs).is_some());
+    }
+
+    #[test]
+    fn shape_cache_purge_style_reclaims_all_slots_and_bytes() {
+        let mut cache = ShapeCache::with_limits(16, 1024 * 1024);
+        let runs = [Run {
+            len: 3,
+            bold: false,
+            italic: false,
+        }];
+        let layout = fake_layout(3);
+        cache.insert_layout(10, false, "one", &runs, Arc::clone(&layout));
+        cache.insert_layout(10, false, "two", &runs, Arc::clone(&layout));
+        cache.insert_layout(20, false, "keep", &runs, Arc::clone(&layout));
+        let bytes_20 = entry_bytes(4, 1, &layout);
+        cache.purge_style(10);
+        assert_eq!(cache.len, 1);
+        assert_eq!(cache.total_bytes, bytes_20);
+        assert!(cache.get_layout(10, false, "one", &runs).is_none());
+        assert!(cache.get_layout(10, false, "two", &runs).is_none());
+        assert!(cache.get_layout(20, false, "keep", &runs).is_some());
+    }
+
+    #[gpui::test]
+    fn terminal_element_paint_caches_and_invalidates_across_frames_theme_zoom_and_content(
+        cx: &mut TestAppContext,
+    ) {
+        let mut screen = Screen::blank(12, 2);
+        screen.rows[0] = "hello world!"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        screen.rows[1] = "second row!!"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                flags: Flags::BOLD,
+                ..Cell::default()
+            })
+            .collect();
+        let screen = Rc::new(screen);
+        let (_, cx) = cx.add_window_view(|_, _| Terminal::new(Screen::blank(1, 1), DEFAULT));
+
+        SHAPE_CACHE.with(|cache| {
+            *cache.borrow_mut() = ShapeCache::default();
+        });
+
+        // Frame 1: cold miss populates the cache for both rows.
+        cx.draw(point(px(0.), px(0.)), size(px(400.), px(200.)), |_, _| {
+            TerminalElement::new(screen.clone(), DEFAULT)
+        });
+        let (hits1, misses1, len1) = SHAPE_CACHE.with(|c| {
+            let c = c.borrow();
+            (c.hits, c.misses, c.len)
+        });
+        assert_eq!(hits1, 0);
+        assert_eq!(misses1, 2);
+        assert_eq!(len1, 2);
+
+        // Frame 2: identical screen + theme hits both segments without shaping.
+        cx.draw(point(px(0.), px(0.)), size(px(400.), px(200.)), |_, _| {
+            TerminalElement::new(screen.clone(), DEFAULT)
+        });
+        let (hits2, misses2) = SHAPE_CACHE.with(|c| {
+            let c = c.borrow();
+            (c.hits, c.misses)
+        });
+        assert_eq!(hits2, 2);
+        assert_eq!(misses2, 2);
+
+        // Frame 3: theme color change keeps color-independent shaping hits.
+        let mut alt_theme = DEFAULT;
+        alt_theme.foreground = Rgb {
+            r: 10,
+            g: 200,
+            b: 30,
+        };
+        cx.draw(point(px(0.), px(0.)), size(px(400.), px(200.)), |_, _| {
+            TerminalElement::new(screen.clone(), alt_theme)
+        });
+        let (hits3, misses3) = SHAPE_CACHE.with(|c| {
+            let c = c.borrow();
+            (c.hits, c.misses)
+        });
+        assert_eq!(hits3, 4);
+        assert_eq!(misses3, 2);
+
+        // Frame 4: single row content edit misses only the modified row.
+        let mut edited = (*screen).clone();
+        edited.rows[0][0].ch = 'H';
+        let edited = Rc::new(edited);
+        cx.draw(point(px(0.), px(0.)), size(px(400.), px(200.)), |_, _| {
+            TerminalElement::new(edited.clone(), alt_theme)
+        });
+        let (hits4, misses4) = SHAPE_CACHE.with(|c| {
+            let c = c.borrow();
+            (c.hits, c.misses)
+        });
+        assert_eq!(hits4, 5);
+        assert_eq!(misses4, 3);
+
+        // Frame 5: font size / zoom change invalidates style and re-shapes cleanly.
+        cx.update(|window, _| window.set_rem_size(px(24.)));
+        cx.draw(point(px(0.), px(0.)), size(px(400.), px(200.)), |_, _| {
+            TerminalElement::new(edited.clone(), alt_theme)
+        });
+        let (hits5, misses5, styles5) = SHAPE_CACHE.with(|c| {
+            let c = c.borrow();
+            (c.hits, c.misses, c.styles.len())
+        });
+        assert_eq!(hits5, 5);
+        assert_eq!(misses5, 5);
+        assert_eq!(styles5, 2);
+    }
+}

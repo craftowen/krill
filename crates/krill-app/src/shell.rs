@@ -767,6 +767,8 @@ pub struct Shell {
     host_targets: HashMap<krill_app::hosts::HostId, krill_app::hosts::HostTarget>,
     host_generation: u64,
     #[cfg(test)]
+    pub(super) host_sync_count: usize,
+    #[cfg(test)]
     next_host_io: Option<tokio::sync::oneshot::Receiver<()>>,
     host_source: Option<HostSource>,
     host_refresh_running: bool,
@@ -844,6 +846,59 @@ impl Modal {
             Self::Automations(v) => v.read(cx).focus_handle(),
         }
     }
+}
+
+fn same_external_hosts(a: &[krill_hosts::ExternalHost], b: &[krill_hosts::ExternalHost]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(l, r)| l.spec == r.spec && l.socket == r.socket && l.info == r.info)
+}
+
+fn daemon_upgrade_rebind_needed(server: &krill_proto::ipc::ServerHello) -> bool {
+    use krill_proto::control::{FEAT_UPGRADE, FEAT_WINDOWS_UPGRADE, is_newer};
+    server.features & FEAT_UPGRADE != 0
+        && (!cfg!(windows) || server.features & FEAT_WINDOWS_UPGRADE != 0)
+        && is_newer(krill_proto::BUILD, &server.build) == Some(true)
+}
+
+fn rebind_after_daemon_upgrade_with<F>(
+    target: &krill_app::hosts::HostTarget,
+    hello: &krill_proto::ipc::ClientHello,
+    conn: daemon::Connection,
+    upgrade: F,
+) -> daemon::Connection
+where
+    F: FnOnce(
+        &krill_app::hosts::HostTarget,
+        &krill_proto::ipc::ClientHello,
+    ) -> std::io::Result<Option<krill_proto::ipc::ServerHello>>,
+{
+    match upgrade(target, hello) {
+        Ok(Some(new_server)) => {
+            if new_server.instance_id != conn.server.instance_id {
+                drop(conn);
+                return target.reconnect_until(hello);
+            }
+        }
+        Ok(None) => {
+            if daemon_upgrade_rebind_needed(&conn.server) {
+                // Another client may have replaced the daemon between `conn` and `upgrade`.
+                drop(conn);
+                return target.reconnect_until(hello);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(kind = ?error.kind(), "daemon upgrade failed");
+            if daemon_upgrade_rebind_needed(&conn.server)
+                && let Ok(fresh) = target.connect(hello)
+            {
+                drop(conn);
+                return fresh;
+            }
+        }
+    }
+    conn
 }
 
 impl Shell {
@@ -1361,6 +1416,8 @@ impl Shell {
             host_statuses: Vec::new(),
             host_targets: HashMap::new(),
             host_generation: 0,
+            #[cfg(test)]
+            host_sync_count: 0,
             #[cfg(test)]
             next_host_io: None,
             host_source: None,
@@ -2533,16 +2590,14 @@ impl Shell {
                     conn
                 }
             };
-            // MK-062: 앱이 새 빌드면 구 krilld를 교체한다. 구 krilld가 끝나며 감시 연결이 EOF가 되고 아래 루프가 다시 붙는다.
-            // 칸의 세션 생성·복원 요청과는 직렬화한다(교체 순간 끊긴 요청은 결과를 알 수 없다).
-            // 칸 복원 요청이 인계 중인 구 krilld에 가서 EOF로 끝나지 않게 교체가 끝난 뒤 링크를 올린다.
+            // MK-062: 앱이 새 빌드면 구 krilld를 교체한다. 교체가 일어났거나 동시 교체가 감지되면
+            // 구 데몬의 감시 스트림으로 `wait_responsive`에 들어가기 전에 새 데몬으로 다시 붙는다.
             let (t, h) = (target.clone(), hello.clone());
-            bg.spawn(async move {
-                if let Err(error) = pane::upgrade_daemon(&t, &h) {
-                    tracing::warn!(kind = ?error.kind(), "daemon upgrade failed");
-                }
-            })
-            .await;
+            conn = bg
+                .spawn(async move {
+                    rebind_after_daemon_upgrade_with(&t, &h, conn, pane::upgrade_daemon)
+                })
+                .await;
             loop {
                 let t = target.clone();
                 let appearance = bg
@@ -2590,6 +2645,37 @@ impl Shell {
         }));
     }
 
+    fn apply_link_host_poll(
+        &mut self,
+        registrations: Option<Vec<krill_hosts::ExternalHost>>,
+        statuses: &[(krill_hosts::RemoteHostSpec, krill_app::hosts::HostStatus)],
+        info: &[(String, Option<krill_hosts::HostConnectionInfo>)],
+        last_info: &mut Option<Vec<(String, Option<krill_hosts::HostConnectionInfo>)>>,
+        cx: &mut Context<Self>,
+    ) {
+        let external_changed = registrations
+            .as_ref()
+            .is_some_and(|hosts| !same_external_hosts(hosts, &self.external_hosts));
+        let stale_target = self
+            .host_targets
+            .values()
+            .any(|target| !target.is_current());
+        let status_or_info_changed = !self.host_refresh_running
+            && (statuses != self.host_statuses.as_slice()
+                || last_info
+                    .as_ref()
+                    .is_some_and(|prev| prev.as_slice() != info));
+        if !self.host_refresh_running {
+            *last_info = Some(info.to_vec());
+        }
+        if external_changed || stale_target || status_or_info_changed {
+            if let Some(hosts) = registrations {
+                self.external_hosts = hosts;
+            }
+            self.sync_hosts(cx);
+        }
+    }
+
     fn start_link_hosts(&mut self, cx: &mut Context<Self>) {
         if self.link_poll.is_some() {
             return;
@@ -2597,6 +2683,7 @@ impl Shell {
         let Some(state) = self.state_dir(cx) else {
             return;
         };
+        let manager = self.host_manager.clone();
         self.link_poll = Some(cx.spawn(async move |this, cx| {
             let bg = cx.background_executor().clone();
             let source_state = state.clone();
@@ -2618,20 +2705,31 @@ impl Shell {
             if !installed {
                 return;
             }
+            let mut last_info: Option<Vec<(String, Option<krill_hosts::HostConnectionInfo>)>> =
+                None;
             loop {
                 let service = service.clone();
-                let registrations = bg.spawn(async move { service.registrations() }).await;
+                let manager = manager.clone();
+                let (registrations, statuses, info) = bg
+                    .spawn(async move {
+                        let registrations = service.registrations();
+                        let statuses = manager.statuses();
+                        let info: Vec<_> = statuses
+                            .iter()
+                            .map(|(spec, _)| (spec.id.clone(), manager.connection_info(&spec.id)))
+                            .collect();
+                        (registrations, statuses, info)
+                    })
+                    .await;
                 if this
                     .update(cx, |shell, cx| {
-                        if let Ok(hosts) = registrations
-                            && (!hosts.is_empty()
-                                || !shell.external_hosts.is_empty()
-                                || !shell.ssh_hosts.is_empty()
-                                || !shell.host_statuses.is_empty())
-                        {
-                            shell.external_hosts = hosts;
-                            shell.sync_hosts(cx);
-                        }
+                        shell.apply_link_host_poll(
+                            registrations.ok(),
+                            &statuses,
+                            &info,
+                            &mut last_info,
+                            cx,
+                        );
                     })
                     .is_err()
                 {
@@ -2690,6 +2788,10 @@ impl Shell {
         }
         self.host_refresh_running = true;
         self.host_refresh_again = false;
+        #[cfg(test)]
+        {
+            self.host_sync_count += 1;
+        }
         let generation = self.host_generation;
         let reconnects = std::mem::take(&mut self.host_pending_reconnects);
         let link_hosts = self.link_hosts.clone();

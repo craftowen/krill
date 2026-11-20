@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -137,6 +138,7 @@ struct RemoteSlot {
     last_error: Option<String>,
     tunnel_starts: usize,
     generation: u64,
+    transport_epoch: Arc<AtomicU64>,
     registration: Arc<()>,
     /// 사용자가 사이드바에서 '연결 해제'를 눌러 수동으로 끊은 상태.
     /// `reconnect_now`로만 풀린다. 켜져 있으면 자동 재연결·폴링 재접속을 하지 않는다.
@@ -158,16 +160,10 @@ impl RemoteSlot {
             last_error: None,
             tunnel_starts: 0,
             generation: 0,
+            transport_epoch: Arc::new(AtomicU64::new(0)),
             registration: Arc::new(()),
             suspended: false,
         }
-    }
-
-    fn current_socket(&self) -> PathBuf {
-        self.tunnel.as_ref().map_or_else(
-            || self.placeholder_socket.clone(),
-            |t| t.socket().to_path_buf(),
-        )
     }
 }
 
@@ -377,6 +373,7 @@ impl HostManager {
         }
         // 살아 있는 터널도 내린다: 원격 데몬 재탐색·깨우기는 터널을 새로 만들 때만 돈다(remote_query).
         s.generation = s.generation.wrapping_add(1);
+        s.transport_epoch.fetch_add(1, Ordering::Release);
         s.tunnel = None;
         s.next_retry_at = None;
         s.failures = 0;
@@ -401,6 +398,7 @@ impl HostManager {
             return;
         };
         s.generation = s.generation.wrapping_add(1);
+        s.transport_epoch.fetch_add(1, Ordering::Release);
         s.tunnel = None;
         s.next_retry_at = None;
         s.suspended = true;
@@ -427,9 +425,15 @@ impl HostManager {
                     ));
                 }
                 let slot = self.slot(id)?;
-                let (initial_socket, registration) = {
+                let (initial_socket, registration, transport_epoch) = {
                     let slot = slot.lock().ok()?;
-                    (slot.current_socket(), slot.registration.clone())
+                    // Keep placeholder_socket stable across tunnel start/drop/restart so UI
+                    // sources are not replaced solely because the ephemeral forwarding socket changed.
+                    (
+                        slot.placeholder_socket.clone(),
+                        slot.registration.clone(),
+                        Arc::clone(&slot.transport_epoch),
+                    )
                 };
                 let manager = self.clone();
                 let host_id = id.clone();
@@ -471,7 +475,8 @@ impl HostManager {
                             !slot.suspended && Arc::ptr_eq(&slot.registration, &registration)
                         })
                     }
-                });
+                })
+                .with_transport_epoch(move || transport_epoch.load(Ordering::Acquire));
                 Some(HostTarget::remote_with_connector(
                     id.clone(),
                     initial_socket,
@@ -612,7 +617,6 @@ impl HostManager {
                     offline.remove(&key);
                 }
                 let sock = tunnel.socket().to_path_buf();
-                s.placeholder_socket.clone_from(&sock);
                 s.tunnel = Some(tunnel);
                 s.tunnel_starts = s.tunnel_starts.saturating_add(1);
                 Ok((sock, Arc::clone(&s.registration), s.generation))
@@ -650,6 +654,7 @@ impl HostManager {
             return;
         };
         s.generation = s.generation.wrapping_add(1);
+        s.transport_epoch.fetch_add(1, Ordering::Release);
         s.tunnel = None;
         s.failures = s.failures.saturating_add(1);
         let delay = Self::backoff_delay(s.failures);
@@ -696,6 +701,7 @@ impl HostManager {
             s.status = HostStatus::Disconnected;
             return;
         }
+        s.transport_epoch.fetch_add(1, Ordering::Release);
         if let Some(t) = &mut s.tunnel
             && !t.is_alive()
         {

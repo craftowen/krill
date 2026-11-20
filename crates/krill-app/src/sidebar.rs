@@ -306,6 +306,46 @@ enum Row {
     Loose,
 }
 
+const REMOTE_POLL_FAIL_BASE: Duration = Duration::from_secs(2);
+const REMOTE_POLL_FAIL_MAX: Duration = Duration::from_secs(60);
+const REMOTE_POLL_SLOW_THRESHOLD: Duration = Duration::from_secs(1);
+const REMOTE_POLL_SLOW_COOLDOWN_MIN: Duration = Duration::from_secs(5);
+const REMOTE_POLL_SLOW_COOLDOWN_MAX: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, Default)]
+struct RemotePollPacing {
+    consecutive_failures: u32,
+    next_poll_at: Option<std::time::Instant>,
+}
+
+impl RemotePollPacing {
+    fn remaining(&self, now: std::time::Instant) -> Option<Duration> {
+        let due = self.next_poll_at?;
+        due.checked_duration_since(now).filter(|d| !d.is_zero())
+    }
+
+    fn record(&mut self, ok: bool, elapsed: Duration, now: std::time::Instant) {
+        if ok {
+            self.consecutive_failures = 0;
+            if elapsed >= REMOTE_POLL_SLOW_THRESHOLD {
+                let cooldown = elapsed
+                    .saturating_mul(2)
+                    .clamp(REMOTE_POLL_SLOW_COOLDOWN_MIN, REMOTE_POLL_SLOW_COOLDOWN_MAX);
+                self.next_poll_at = Some(now + cooldown);
+            } else {
+                self.next_poll_at = None;
+            }
+            return;
+        }
+        let shift = self.consecutive_failures.min(5);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay = REMOTE_POLL_FAIL_BASE
+            .saturating_mul(1u32 << shift)
+            .min(REMOTE_POLL_FAIL_MAX);
+        self.next_poll_at = Some(now + delay);
+    }
+}
+
 /// 사이드바에 표시되는 원격 호스트 섹션 상태.
 #[derive(Clone)]
 pub struct RemoteHost {
@@ -1014,6 +1054,9 @@ pub struct Sidebar {
     card_list: viewport::CardList,
     status_summary: (usize, Arc<Vec<AgentState>>),
     local_rows_cache: std::cell::RefCell<options::LocalRowsCache>,
+    worktree_sessions_index: Vec<(HostId, PathBuf, usize)>,
+    worktree_sessions_counts: Option<(usize, usize)>,
+    remote_poll_pacing: BTreeMap<String, RemotePollPacing>,
     hovered_worktree: Option<(HostId, PathBuf)>,
     editing: Option<(PathBuf, Entity<InputState>)>,
     edit_subscription: Option<Subscription>,
@@ -1405,6 +1448,9 @@ impl Sidebar {
             card_list: viewport::CardList::default(),
             status_summary: (0, Arc::new(Vec::new())),
             local_rows_cache: std::cell::RefCell::default(),
+            worktree_sessions_index: Vec::new(),
+            worktree_sessions_counts: None,
+            remote_poll_pacing: BTreeMap::new(),
             editing: None,
             edit_subscription: None,
             creating: None,
@@ -1845,10 +1891,11 @@ impl Sidebar {
 
     /// 끊긴 원격 호스트의 '다시 연결' 버튼을 눌렀을 때 상태를 `Connecting`으로 바꾸고 재연결을 요청한다.
     pub fn reconnect_host(&mut self, host: HostId, cx: &mut Context<Self>) {
-        if let HostId::Remote(id) = &host
-            && let Some(r) = self.remote_hosts.iter_mut().find(|r| r.id == *id)
-        {
-            r.status = HostStatus::Connecting;
+        if let HostId::Remote(id) = &host {
+            self.remote_poll_pacing.remove(id);
+            if let Some(r) = self.remote_hosts.iter_mut().find(|r| r.id == *id) {
+                r.status = HostStatus::Connecting;
+            }
         }
         self.rebuild(cx);
         cx.emit(ReconnectHost(host));
@@ -1874,7 +1921,7 @@ impl Sidebar {
         let generation = self.disk.remote_generation;
         let manager = manager.clone();
         cx.spawn(async move |this, cx| {
-            let (statuses, info, mut sources) = cx
+            let (statuses, info, mut targets) = cx
                 .background_executor()
                 .spawn(async move {
                     #[cfg(all(test, unix))]
@@ -1890,15 +1937,15 @@ impl Sidebar {
                                 .map(|info| (spec.id.clone(), info))
                         })
                         .collect();
-                    let sources: BTreeMap<_, _> = statuses
+                    let targets: BTreeMap<_, _> = statuses
                         .iter()
                         .filter_map(|(spec, _)| {
                             manager
                                 .target_for(&HostId::Remote(spec.id.clone()), None)
-                                .map(|target| (spec.id.clone(), status_source(target)))
+                                .map(|target| (spec.id.clone(), target))
                         })
                         .collect();
-                    (statuses, info, sources)
+                    (statuses, info, targets)
                 })
                 .await;
             this.update(cx, |s, cx| {
@@ -1936,13 +1983,15 @@ impl Sidebar {
                                 }
                             });
                         let label = spec.display_name().to_owned();
+                        let reconnected = entry.status == HostStatus::Disconnected
+                            && matches!(status, HostStatus::Connecting | HostStatus::Connected);
                         changed |= entry.label != label || entry.status != status;
                         entry.label = label;
                         entry.status = status;
-                        let next = sources.remove(&spec.id);
+                        let next_target = targets.remove(&spec.id);
                         let replaced = entry.source.as_ref().is_some_and(|old| {
                             old.target()
-                                .zip(next.as_ref().and_then(|s| s.target()))
+                                .zip(next_target.as_ref())
                                 .is_some_and(|(old, next)| old != next)
                         });
                         if replaced {
@@ -1952,13 +2001,17 @@ impl Sidebar {
                                 .is_some();
                             changed |= s.remote_closed_sessions.remove(&spec.id).is_some();
                         }
+                        if replaced || reconnected {
+                            s.remote_poll_pacing.remove(&spec.id);
+                        }
                         if (entry.source.is_none() || replaced) && s.visible {
-                            if cx.background_executor().is_test()
-                                && let Some(ref src) = next
-                            {
-                                src.disable_background_worker();
-                            }
-                            entry.source = next;
+                            entry.source = next_target.map(|target| {
+                                let src = status_source(target);
+                                if cx.background_executor().is_test() {
+                                    src.disable_background_worker();
+                                }
+                                src
+                            });
                             new_source |= entry.source.is_some();
                         }
                         entry
@@ -1971,6 +2024,8 @@ impl Sidebar {
                             .any(|entry| *host == HostId::Remote(entry.id.clone()))
                 });
                 s.remote_closed_sessions
+                    .retain(|id, _| s.remote_hosts.iter().any(|entry| entry.id == *id));
+                s.remote_poll_pacing
                     .retain(|id, _| s.remote_hosts.iter().any(|entry| entry.id == *id));
                 if changed {
                     s.rebuild(cx);
@@ -1998,6 +2053,7 @@ impl Sidebar {
         if cx.background_executor().is_test() {
             source.disable_background_worker();
         }
+        self.remote_poll_pacing.remove(&id);
         self.machine_identities.remove(&HostId::Remote(id.clone()));
         self.remote_closed_sessions.remove(&id);
         let label = label.into();
@@ -2149,30 +2205,78 @@ impl Sidebar {
             let bg = cx.background_executor().clone();
             let mut forced = force_once;
             loop {
-                let Ok(Some(sources)) = this.read_with(cx, |s, _| {
+                let now = bg.now();
+                let Ok(Some((sources, due_wait))) = this.read_with(cx, |s, _| {
                     if (!s.is_visible() && !forced) || s.remote_hosts.is_empty() {
                         return None;
                     }
-                    let list: Vec<(String, Arc<dyn Source>)> = s
-                        .remote_hosts
-                        .iter()
-                        .filter_map(|r| Some((r.id.clone(), r.source.clone()?)))
-                        .collect();
-                    (!list.is_empty()).then_some(list)
+                    let interval = s.poll_interval();
+                    let mut due = Vec::new();
+                    let mut min_wait: Option<Duration> = None;
+                    for r in &s.remote_hosts {
+                        let Some(source) = r.source.clone() else {
+                            continue;
+                        };
+                        if let Some(wait) = s
+                            .remote_poll_pacing
+                            .get(&r.id)
+                            .and_then(|pacing| pacing.remaining(now))
+                        {
+                            min_wait = Some(min_wait.map_or(wait, |m| m.min(wait)));
+                        } else {
+                            due.push((r.id.clone(), source));
+                        }
+                    }
+                    if due.is_empty() && min_wait.is_none() {
+                        return None;
+                    }
+                    let wait =
+                        min_wait.map_or(interval, |w| w.clamp(interval, REMOTE_POLL_FAIL_MAX));
+                    Some((due, wait))
                 }) else {
                     return;
                 };
+                if sources.is_empty() {
+                    if !forced {
+                        bg.timer(due_wait).await;
+                        continue;
+                    }
+                    let visible = this
+                        .read_with(cx, |s, _| s.is_visible() && !s.remote_hosts.is_empty())
+                        .unwrap_or(false);
+                    forced = false;
+                    if !visible {
+                        return;
+                    }
+                    bg.timer(due_wait).await;
+                    continue;
+                }
                 let mut tasks = Vec::with_capacity(sources.len());
                 for (id, source) in sources {
                     let bg = bg.clone();
                     let this = this.clone();
                     tasks.push(cx.spawn(async move |cx| {
-                        let (id, source, res, histories, mut closed) = bg
-                            .spawn(async move {
+                        let real_started = std::time::Instant::now();
+                        let sim_started = bg.now();
+                        let clock = bg.clone();
+                        let (id, source, res, histories, mut closed, poll_elapsed, completed_at) =
+                            bg.spawn(async move {
                                 let res = source.poll_snapshot().await;
                                 let histories = source.prompt_histories();
                                 let closed = source.closed_sessions();
-                                (id, source, res, histories, closed)
+                                let poll_elapsed = real_started
+                                    .elapsed()
+                                    .max(clock.now().saturating_duration_since(sim_started));
+                                let completed_at = clock.now();
+                                (
+                                    id,
+                                    source,
+                                    res,
+                                    histories,
+                                    closed,
+                                    poll_elapsed,
+                                    completed_at,
+                                )
                             })
                             .await;
                         this.update(cx, |s, cx| {
@@ -2192,6 +2296,7 @@ impl Sidebar {
                             if source.target().is_some_and(|target| !target.is_current()) {
                                 return;
                             }
+                            let ok = res.is_ok();
                             let mut changed = false;
                             let mut probe_repos = Vec::new();
                             if let Ok(PolledSnapshot { observed, mut meta }) = res {
@@ -2250,6 +2355,11 @@ impl Sidebar {
                                     changed = true;
                                 }
                             }
+                            s.remote_poll_pacing.entry(id).or_default().record(
+                                ok,
+                                poll_elapsed,
+                                completed_at,
+                            );
                             if !probe_repos.is_empty()
                                 && let Some(target) = source.target().cloned()
                             {
@@ -2286,9 +2396,26 @@ impl Sidebar {
                     t.await;
                 }
                 let next_delay = this.update(cx, |s, _| {
-                    ((s.is_visible() || forced) && !s.remote_hosts.is_empty())
-                        .then(|| s.is_visible().then(|| s.poll_interval()))
-                        .flatten()
+                    if (!s.is_visible() && !forced) || s.remote_hosts.is_empty() {
+                        return None;
+                    }
+                    if !s.is_visible() {
+                        return None;
+                    }
+                    let interval = s.poll_interval();
+                    let now = bg.now();
+                    let min_wait = s
+                        .remote_hosts
+                        .iter()
+                        .filter(|r| r.source.is_some())
+                        .map(|r| {
+                            s.remote_poll_pacing
+                                .get(&r.id)
+                                .and_then(|p| p.remaining(now))
+                                .unwrap_or(interval)
+                        })
+                        .min()?;
+                    Some(min_wait.clamp(interval, REMOTE_POLL_FAIL_MAX))
                 });
                 forced = false;
                 let Ok(Some(delay)) = next_delay else {
@@ -3434,14 +3561,89 @@ impl Sidebar {
             .filter(|_| !self.rows.is_empty());
         self.cursor_anchor = cursor_item.filter(|_| self.cursor.is_none());
         self.index_lineage();
-        self.sync_viewport();
-        self.card_list.invalidate_heights();
+        self.index_worktree_sessions();
+        if !self.sync_viewport() {
+            self.card_list.invalidate_heights();
+        }
         cx.notify();
+    }
+
+    fn index_worktree_sessions(&mut self) {
+        self.worktree_sessions_index.clear();
+        for (idx, s) in self.snapshot.sessions.iter().enumerate() {
+            if let Some(wt) = &s.worktree {
+                self.worktree_sessions_index
+                    .push((HostId::Local, wt.clone(), idx));
+            }
+        }
+        for remote in &self.remote_hosts {
+            let host = HostId::Remote(remote.id.clone());
+            for (idx, s) in remote.snapshot.sessions.iter().enumerate() {
+                if let Some(wt) = &s.worktree {
+                    self.worktree_sessions_index
+                        .push((host.clone(), wt.clone(), idx));
+                }
+            }
+        }
+        self.worktree_sessions_index
+            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        self.worktree_sessions_counts = Some(self.session_counts());
+    }
+
+    fn session_counts(&self) -> (usize, usize) {
+        (
+            self.snapshot.sessions.len(),
+            self.remote_hosts
+                .iter()
+                .map(|r| r.snapshot.sessions.len())
+                .sum(),
+        )
+    }
+
+    pub(super) fn for_each_worktree_session<'a>(
+        &'a self,
+        host: &HostId,
+        path: &Path,
+        mut f: impl FnMut(usize, &'a Session),
+    ) {
+        self.for_each_worktree_session_all(host, path, |idx, s| {
+            if !s.is_exited() {
+                f(idx, s);
+            }
+        });
+    }
+
+    pub(super) fn for_each_worktree_session_all<'a>(
+        &'a self,
+        host: &HostId,
+        path: &Path,
+        mut f: impl FnMut(usize, &'a Session),
+    ) {
+        let sessions = &self.snapshot_for(host).sessions;
+        if self.worktree_sessions_counts == Some(self.session_counts()) {
+            let start = self.worktree_sessions_index.partition_point(|(h, p, _)| {
+                h.cmp(host).then_with(|| p.as_path().cmp(path)).is_lt()
+            });
+            for (h, p, idx) in &self.worktree_sessions_index[start..] {
+                if h != host || p.as_path() != path {
+                    break;
+                }
+                if let Some(s) = sessions.get(*idx) {
+                    f(*idx, s);
+                }
+            }
+            return;
+        }
+        for (idx, s) in sessions.iter().enumerate() {
+            if s.worktree.as_deref() == Some(path) {
+                f(idx, s);
+            }
+        }
     }
 
     /// Build lightweight row membership once per model/navigation change. Card headers and
     /// expanded sessions are separate list items, so even one huge card is virtualized.
-    fn sync_viewport(&mut self) {
+    fn sync_viewport(&mut self) -> bool {
         let cursor_session = self.cursor.and_then(|i| match self.rows.get(i)? {
             Row::Session(session, true) => Some((self.row_host(i), session.worktree.as_ref()?)),
             _ => None,
@@ -3472,7 +3674,7 @@ impl Sidebar {
             }
         }
         self.card_parents = parents;
-        self.card_list.update(visible);
+        self.card_list.update(visible)
     }
 
     fn scroll_row_into_view(&self, index: usize, strategy: ScrollStrategy) {
@@ -5009,10 +5211,19 @@ impl Sidebar {
         if self.auto_titles.is_empty() {
             return None;
         }
+        let mut found = None;
+        self.for_each_worktree_session_all(&HostId::Local, path, |_, s| {
+            if found.is_none() {
+                found = self.auto_titles.get(&s.id).map(String::as_str);
+            }
+        });
+        if found.is_some() {
+            return found;
+        }
         self.snapshot
             .sessions
             .iter()
-            .filter(|s| s.worktree.as_deref() == Some(path) || s.cwd.as_deref() == Some(path))
+            .filter(|s| s.cwd.as_deref() == Some(path))
             .find_map(|s| self.auto_titles.get(&s.id).map(String::as_str))
     }
 

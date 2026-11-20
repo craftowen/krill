@@ -40,7 +40,7 @@ pub use autostart::{ensure_autostart, is_autostart_registered};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions, TryLockError};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -118,6 +118,15 @@ pub fn wait_responsive(stream: &mut UnixStream, features: u64) -> io::Result<()>
 }
 
 fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io::Result<()> {
+    watch_for_with(stream, interval, probe, || {})
+}
+
+fn watch_for_with(
+    stream: &mut UnixStream,
+    interval: Duration,
+    probe: Duration,
+    mut before_read: impl FnMut(),
+) -> io::Result<()> {
     stream.set_write_timeout(Some(probe))?;
     let mut nonce = 0u64;
     stream.write_all(&ping(nonce)?)?;
@@ -127,6 +136,7 @@ fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io
         .checked_add(probe)
         .ok_or(io::ErrorKind::TimedOut)?;
     loop {
+        before_read();
         let mut reader = DeadlineRead {
             stream,
             deadline,
@@ -180,20 +190,67 @@ fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io
 
 /// [`ipc::read_frame`]의 길이·`body` 읽기 전체에 같은 마감. 조각 수신·`EINTR`로 마감을 밀지 않는다.
 /// 소켓 타임아웃이 잠자기를 포함해 먼저 끝나도 깨어 있는 시계의 남은 시간만큼 다시 기다린다.
+/// App Nap 등으로 마감을 넘겨 깨어난 경우에도 커널 버퍼에 이미 도착한 응답·EOF는 비차단 읽기로 확인한다.
 struct DeadlineRead<'a> {
     stream: &'a mut UnixStream,
     deadline: Instant,
     read: usize,
 }
 
+impl DeadlineRead<'_> {
+    fn try_read_nonblocking(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_nonblocking(true)?;
+        let res = loop {
+            match self.stream.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                other => break other,
+            }
+        };
+        let restore = self.stream.set_nonblocking(false);
+        match res {
+            Ok(0) => {
+                if buf.is_empty() {
+                    restore?;
+                }
+                Ok(0)
+            }
+            Ok(n) => {
+                restore?;
+                self.read = self.read.saturating_add(n);
+                Ok(n)
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                restore?;
+                Err(io::ErrorKind::TimedOut.into())
+            }
+            Err(e) => {
+                restore.ok();
+                Err(e)
+            }
+        }
+    }
+}
+
 impl io::Read for DeadlineRead<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let remaining = self.deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::ErrorKind::TimedOut.into());
+            if remaining < Duration::from_micros(1) {
+                return self.try_read_nonblocking(buf);
             }
-            self.stream.set_read_timeout(Some(remaining))?;
+            match self.stream.set_read_timeout(Some(remaining)) {
+                Ok(()) => {}
+                #[cfg(target_os = "macos")]
+                Err(e) if e.raw_os_error() == Some(22) => {
+                    return self.try_read_nonblocking(buf);
+                }
+                Err(e) => return Err(e),
+            }
             match self.stream.read(buf) {
                 Err(e)
                     if matches!(
@@ -253,14 +310,18 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
 /// 붙은 뒤 `ServerHello`를 기다리는 최대 시간. krilld가 멈춰 있어도 앱·CLI가 붙잡히지 않게 한다.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-/// 앱·CLI의 첫 Hello에는 macOS 피어 코드서명 검증 IO가 포함된다.
+/// macOS 락 밖 앱·CLI 연결의 첫 Hello에는 피어 코드서명 검증 IO가 포함된다.
 const SIGNED_HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+/// 기동 락을 쥔 동안 단일 감시 탐침이 기다리는 최대 시간.
+const UNDER_LOCK_HELLO_TIMEOUT: Duration = HELLO_TIMEOUT;
+/// 기동 락 보유 전체 상한(Unix `STOP_TIMEOUT` 여유 포함 시에도 [`LOCK_TIMEOUT`]보다 짧다).
+const UNDER_LOCK_BUDGET: Duration = Duration::from_secs(15);
 /// 업그레이드 답을 기다리는 최대 시간. holder exec 핸드오프와 리더 정지(최대 2초)를 넉넉히 덮는다.
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 재연결 간격: 50ms에서 두 배씩, 상한 500ms. krilld가 다시 뜬 뒤 붙기까지 최대 0.5초(설계값).
 const RETRY_FIRST: Duration = Duration::from_millis(50);
 const RETRY_CAP: Duration = Duration::from_millis(500);
-/// `<소켓>.launch` 락을 기다리는 최대 시간. 락을 쥔 쪽은 핸드셰이크 둘과 [`LAUNCH_TIMEOUT`] 안에 놓으므로
+/// `<소켓>.launch` 락을 기다리는 최대 시간. 락을 쥔 쪽은 [`UNDER_LOCK_BUDGET`]과 종료 대기 안에 놓으므로
 /// 그보다 길게 잡는다. 넘으면 락을 쥔 채 멈춘 프로세스가 있는 것이다.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -945,127 +1006,151 @@ fn connect_or_launch(paths: &Paths, hello: &ClientHello) -> Result<Connection, E
             return Err(Error::Missing(exe.clone()));
         }
     }
-    let _launch = launch_lock(&paths.socket, LOCK_TIMEOUT)?;
-    // 락을 기다리는 동안 다른 클라이언트가 띄웠을 수 있다.
-    match ready_handshake(&paths.socket, hello) {
-        Ok(Some(c)) => {
+    let watch_ready = {
+        let _launch = launch_lock(&paths.socket, LOCK_TIMEOUT)?;
+        let lock_deadline = Instant::now()
+            .checked_add(UNDER_LOCK_BUDGET)
+            .ok_or(Error::Timeout)?;
+        let probe_timeout = under_lock_probe_timeout(lock_deadline)?;
+        // 락을 기다리는 동안 다른 클라이언트가 띄웠을 수 있다. 락 아래에서는 단일 감시 탐침만 수행해
+        // 비감시 두 번째 핸드셰이크 전에 락을 즉시 놓는다.
+        match probe_watch(&paths.socket, hello, probe_timeout) {
+            Ok(Some(c)) => Ok(c),
+            Ok(None) => Err(None),
+            Err(e) if is_absent(&e) => Err(None),
+            Err(e) if is_transition(&e) => {
+                match await_successor_within(
+                    &paths.socket,
+                    hello,
+                    e,
+                    LAUNCH_TIMEOUT,
+                    UNDER_LOCK_HELLO_TIMEOUT,
+                    lock_deadline,
+                )? {
+                    Some(c) => Ok(c),
+                    None => Err(None),
+                }
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+        .or_else(|_: Option<()>| {
+            launch_gate(&paths.socket)?;
             ensure_autostart(paths);
-            return Ok(c);
-        }
-        Ok(None) => {}
-        Err(e) if is_absent(&e) => {}
-        Err(e) if is_transition(&e) => {
-            if let Some(c) = await_successor(&paths.socket, hello, e)? {
-                ensure_autostart(paths);
-                return Ok(c);
-            }
-        }
-        Err(e) => return Err(Error::Io(e)),
-    }
-    launch_gate(&paths.socket)?;
-    ensure_autostart(paths);
-    #[cfg(target_os = "macos")]
-    let bootstrapped = autostart::try_bootstrap(paths);
-    #[cfg(not(target_os = "macos"))]
-    let bootstrapped = false;
-    let mut holder = if bootstrapped {
-        None
-    } else {
-        let mut command = Command::new(&paths.holder);
-        #[cfg(unix)]
-        command.arg(DETACH_ARG);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            // Short-lived bootstrap only. The holder FFI boundary creates the real
-            // holder with bInheritHandles=false and explicit Job breakaway.
-            command
-                .arg("--bootstrap")
-                .creation_flags(0x0000_0008 | 0x0000_0200);
-            // holder와 그 krilld는 이 cwd를 물려받아 세션 내내 쥔다. Windows는 프로세스의 현재 폴더를
-            // 지우거나 이름을 바꾸지 못하게 하므로, 띄운 곳(워크트리·설치 폴더) 대신 소켓 폴더를 쥔다.
-            // `launch_lock`이 이 폴더를 이미 만들었다.
-            if let Some(dir) = paths.socket.parent().filter(|d| !d.as_os_str().is_empty()) {
-                command.current_dir(dir);
-            }
-        }
-        Some(
-            command
-                .arg(&paths.krilld)
-                .arg(&paths.socket)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(Error::Spawn)?,
-        )
-    };
-    #[cfg_attr(
-        not(windows),
-        expect(unused_mut, reason = "Job 밖 기동은 Windows만 기한을 늘린다")
-    )]
-    let mut deadline = Instant::now()
-        .checked_add(LAUNCH_TIMEOUT)
-        .ok_or(Error::Timeout)?;
-    #[cfg(windows)]
-    let mut escaped = false;
-    let ready = loop {
-        match ready_handshake(&paths.socket, hello) {
-            Ok(Some(c)) => break Ok(c),
-            Ok(None) => {}
-            Err(e) if is_absent(&e) || is_transition(&e) => {}
-            Err(e) => break Err(Error::Io(e)),
-        }
-        if let Some(holder) = holder.as_mut() {
-            match holder.try_wait() {
+            #[cfg(target_os = "macos")]
+            let bootstrapped = autostart::try_bootstrap(paths);
+            #[cfg(not(target_os = "macos"))]
+            let bootstrapped = false;
+            let mut holder = if bootstrapped {
+                None
+            } else {
+                let mut command = Command::new(&paths.holder);
                 #[cfg(unix)]
-                Ok(Some(status)) => break Err(Error::HolderExited(status)),
+                command.arg(DETACH_ARG);
                 #[cfg(windows)]
-                Ok(Some(status)) if !status.success() && !escaped => {
-                    escaped = status.code() == Some(HOLDER_JOB_DENIED) && escape_job(paths);
-                    if !escaped {
-                        break Err(Error::HolderExited(status));
-                    }
-                    match Instant::now().checked_add(LAUNCH_TIMEOUT) {
-                        Some(d) => deadline = d,
-                        None => break Err(Error::Timeout),
+                {
+                    use std::os::windows::process::CommandExt as _;
+                    // Short-lived bootstrap only. The holder FFI boundary creates the real
+                    // holder with bInheritHandles=false and explicit Job breakaway.
+                    command
+                        .arg("--bootstrap")
+                        .creation_flags(0x0000_0008 | 0x0000_0200);
+                    // holder와 그 krilld는 이 cwd를 물려받아 세션 내내 쥔다. Windows는 프로세스의 현재 폴더를
+                    // 지우거나 이름을 바꾸지 못하게 하므로, 띄운 곳(워크트리·설치 폴더) 대신 소켓 폴더를 쥔다.
+                    // `launch_lock`이 이 폴더를 이미 만들었다.
+                    if let Some(dir) = paths.socket.parent().filter(|d| !d.as_os_str().is_empty()) {
+                        command.current_dir(dir);
                     }
                 }
-                Err(e) => break Err(Error::Io(e)),
-                _ => {}
-            }
-        }
-        if Instant::now() >= deadline {
-            // Job 밖 기동도 제때 붙지 않았으면 처음 거부를 그대로 돌려준다(백오프 뒤 다시 시도).
+                Some(
+                    command
+                        .arg(&paths.krilld)
+                        .arg(&paths.socket)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .map_err(Error::Spawn)?,
+                )
+            };
+            #[cfg_attr(
+                not(windows),
+                expect(unused_mut, reason = "Job 밖 기동은 Windows만 기한을 늘린다")
+            )]
+            let mut deadline = Instant::now()
+                .checked_add(LAUNCH_TIMEOUT)
+                .ok_or(Error::Timeout)?
+                .min(lock_deadline);
             #[cfg(windows)]
-            if let Some(holder) = holder.as_mut()
-                && let Ok(Some(status)) = holder.try_wait()
-                && !status.success()
-            {
-                break Err(Error::HolderExited(status));
+            let mut escaped = false;
+            let ready = loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let probe_timeout = remaining.min(UNDER_LOCK_HELLO_TIMEOUT);
+                if probe_timeout >= Duration::from_micros(1) {
+                    match probe_watch(&paths.socket, hello, probe_timeout) {
+                        Ok(Some(c)) => break Ok(c),
+                        Ok(None) => {}
+                        Err(e) if is_absent(&e) || is_transition(&e) => {}
+                        Err(e)
+                            if e.kind() == io::ErrorKind::TimedOut
+                                && probe_timeout < UNDER_LOCK_HELLO_TIMEOUT
+                                && Instant::now() >= deadline => {}
+                        Err(e) => break Err(Error::Io(e)),
+                    }
+                }
+                if let Some(holder) = holder.as_mut() {
+                    match holder.try_wait() {
+                        #[cfg(unix)]
+                        Ok(Some(status)) => break Err(Error::HolderExited(status)),
+                        #[cfg(windows)]
+                        Ok(Some(status)) if !status.success() && !escaped => {
+                            escaped = status.code() == Some(HOLDER_JOB_DENIED) && escape_job(paths);
+                            if !escaped {
+                                break Err(Error::HolderExited(status));
+                            }
+                            match Instant::now().checked_add(LAUNCH_TIMEOUT) {
+                                Some(d) => deadline = d.min(lock_deadline),
+                                None => break Err(Error::Timeout),
+                            }
+                        }
+                        Err(e) => break Err(Error::Io(e)),
+                        _ => {}
+                    }
+                }
+                if Instant::now() >= deadline {
+                    // Job 밖 기동도 제때 붙지 않았으면 처음 거부를 그대로 돌려준다(백오프 뒤 다시 시도).
+                    #[cfg(windows)]
+                    if let Some(holder) = holder.as_mut()
+                        && let Ok(Some(status)) = holder.try_wait()
+                        && !status.success()
+                    {
+                        break Err(Error::HolderExited(status));
+                    }
+                    break Err(Error::Timeout);
+                }
+                thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+            };
+            // 실패한 기동의 holder를 남기면 krilld를 백오프로 영구 재기동한다(A-05). Windows에서 띄운 것은 곧바로 끝나는
+            // bootstrap이라 실제 holder에 닿지 않는다. 그 holder는 세션이 없으면 스스로 포기한다.
+            #[cfg(unix)]
+            if ready.is_err() {
+                if let Some(holder) = holder.as_mut() {
+                    stop_launched(holder);
+                }
+                #[cfg(target_os = "macos")]
+                if bootstrapped {
+                    autostart::bootout();
+                }
             }
-            break Err(Error::Timeout);
-        }
-        thread::sleep(POLL);
-    };
-    // 실패한 기동의 holder를 남기면 krilld를 백오프로 영구 재기동한다(A-05). Windows에서 띄운 것은 곧바로 끝나는
-    // bootstrap이라 실제 holder에 닿지 않는다. 그 holder는 세션이 없으면 스스로 포기한다.
-    #[cfg(unix)]
-    if ready.is_err() {
-        if let Some(holder) = holder.as_mut() {
-            stop_launched(holder);
-        }
-        #[cfg(target_os = "macos")]
-        if bootstrapped {
-            autostart::bootout();
-        }
-    }
-    // ponytail: 붙으면 holder는 띄운 프로세스의 자식으로 남는다(앱이 먼저 끝나면 launchd가 거둔다).
-    // 앱보다 먼저 죽으면 앱이 끝날 때까지 좀비 하나가 남는다. 거슬리면 앱에서 waitpid 스레드.
-    ready.map(|c| Connection {
-        launched: true,
-        ..c
-    })
+            // ponytail: 붙으면 holder는 띄운 프로세스의 자식으로 남는다(앱이 먼저 끝나면 launchd가 거둔다).
+            // 앱보다 먼저 죽으면 앱이 끝날 때까지 좀비 하나가 남는다. 거슬리면 앱에서 waitpid 스레드.
+            ready.map(|c| Connection {
+                launched: true,
+                ..c
+            })
+        })
+    }?;
+    ensure_autostart(paths);
+    finish_handshake(&paths.socket, hello, watch_ready).map_err(Error::Io)
 }
 
 /// 띄운 holder를 SIGTERM으로 끝낸다. 그 holder는 고아 krilld에게서 세션을 넘겨받아 master 마지막 사본을 쥐고 있을 수
@@ -1108,57 +1193,103 @@ fn is_transition(e: &io::Error) -> bool {
     )
 }
 
-/// 기동 락 아래에서도 전환 중이면 holder를 띄우지 않고 다음 krilld를 [`LAUNCH_TIMEOUT`]까지 기다린다.
-/// 다시 보내는 것은 핸드셰이크뿐이라 요청이 두 번 가지 않는다. 붙으면 연결, 소켓이 사라졌거나 고아면 `None`
-/// (호출자가 holder를 띄운다). 기한까지 계속 닫히면 마지막 오류.
-fn await_successor(
+/// 기동 락 아래에서도 전환 중이면 holder를 띄우지 않고 다음 krilld를 `launch_timeout`과 `lock_deadline`
+/// 안쪽까지 기다린다. 다시 보내는 것은 핸드셰이크뿐이라 요청이 두 번 가지 않는다. 붙으면 감시 연결,
+/// 소켓이 사라졌거나 고아면 `None`(호출자가 holder를 띄운다). 기한까지 계속 닫히면 마지막 오류.
+fn await_successor_within(
     socket: &Path,
     hello: &ClientHello,
     mut last: io::Error,
+    launch_timeout: Duration,
+    hello_timeout: Duration,
+    lock_deadline: Instant,
 ) -> Result<Option<Connection>, Error> {
     let deadline = Instant::now()
-        .checked_add(LAUNCH_TIMEOUT)
-        .ok_or(Error::Timeout)?;
+        .checked_add(launch_timeout)
+        .ok_or(Error::Timeout)?
+        .min(lock_deadline);
     let mut attempt = 0u32;
-    while Instant::now() < deadline {
-        thread::sleep(retry_delay(attempt));
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Io(last));
+        }
+        thread::sleep(retry_delay(attempt).min(remaining));
         attempt = attempt.saturating_add(1);
-        match ready_handshake(socket, hello) {
+        let probe_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(hello_timeout);
+        if probe_timeout < Duration::from_micros(1) {
+            return Err(Error::Io(last));
+        }
+        match probe_watch(socket, hello, probe_timeout) {
             Ok(c) => return Ok(c),
             Err(e) if is_absent(&e) => return Ok(None),
             Err(e) if is_transition(&e) => last = e,
             Err(e) => return Err(Error::Io(e)),
         }
     }
-    Err(Error::Io(last))
+}
+
+fn under_lock_probe_timeout(lock_deadline: Instant) -> Result<Duration, Error> {
+    let remaining = lock_deadline.saturating_duration_since(Instant::now());
+    let timeout = remaining.min(UNDER_LOCK_HELLO_TIMEOUT);
+    if timeout < Duration::from_micros(1) {
+        return Err(Error::Timeout);
+    }
+    Ok(timeout)
 }
 
 /// 초기 상태는 전용 감시 연결에서 읽는다. 일반 제어·화면 연결에는 새 프레임을 섞지 않는다.
 /// `None`이면 고아 krilld라 소켓이 살아 있어도 holder를 띄워야 한다.
-fn ready_handshake(socket: &Path, hello: &ClientHello) -> io::Result<Option<Connection>> {
+fn probe_watch(
+    socket: &Path,
+    hello: &ClientHello,
+    timeout: Duration,
+) -> io::Result<Option<Connection>> {
     let mut watch = watch_hello(hello.role, &hello.name);
     if hello.features & FEAT_HEARTBEAT != 0 {
         watch.features |= FEAT_HEARTBEAT;
     }
-    // 기한을 지정하지 않은 기본 연결은 macOS 피어 코드서명 검증 IO를 기다린다.
-    // 호출자가 기한을 명시한 handshake/dial 경로와 hook(수십 ms 예산)은 그대로 둔다.
-    let first_hello = default_hello_timeout(hello.role);
-    let c = handshake(socket, &watch, first_hello)?;
+    let c = handshake(socket, &watch, timeout)?;
     if c.holder_status == Some(HolderStatus::Orphan) {
         return Ok(None);
     }
+    Ok(Some(c))
+}
+
+fn finish_handshake(
+    socket: &Path,
+    hello: &ClientHello,
+    watch: Connection,
+) -> io::Result<Connection> {
     if is_watch(hello.features) {
-        Ok(Some(c))
+        Ok(watch)
     } else {
-        drop(c);
-        handshake(socket, hello, first_hello).map(Some)
+        let launched = watch.launched;
+        drop(watch);
+        handshake(socket, hello, default_hello_timeout(hello.role))
+            .map(|c| Connection { launched, ..c })
     }
 }
 
-/// 기본 앱·CLI 연결이 첫 `ServerHello`를 기다리는 상한. 서명 검증이 느린 머신에서도
-/// 붙도록 [`HELLO_TIMEOUT`]보다 넉넉히 잡는다. hook·명시 기한 경로는 쓰지 않는다.
+fn ready_handshake(socket: &Path, hello: &ClientHello) -> io::Result<Option<Connection>> {
+    let first_hello = default_hello_timeout(hello.role);
+    let Some(c) = probe_watch(socket, hello, first_hello)? else {
+        return Ok(None);
+    };
+    finish_handshake(socket, hello, c).map(Some)
+}
+
+/// 기본 앱·CLI 연결이 락 밖에서 `ServerHello`를 기다리는 상한. macOS에서는 피어 코드서명 검증 IO가
+/// 느린 머신에서도 붙도록 [`SIGNED_HELLO_TIMEOUT`]을 쓰고, 다른 OS와 hook·명시 기한 경로는
+/// [`HELLO_TIMEOUT`]을 쓴다.
 fn default_hello_timeout(role: ClientRole) -> Duration {
-    if matches!(role, ClientRole::App | ClientRole::Cli) {
+    default_hello_timeout_for(role, cfg!(target_os = "macos"))
+}
+
+fn default_hello_timeout_for(role: ClientRole, macos: bool) -> Duration {
+    if macos && matches!(role, ClientRole::App | ClientRole::Cli) {
         HELLO_TIMEOUT.max(SIGNED_HELLO_TIMEOUT)
     } else {
         HELLO_TIMEOUT
@@ -1212,9 +1343,9 @@ fn launch_lock(socket: &Path, timeout: Duration) -> Result<std::fs::File, Error>
 
 /// 이미 떠 있는 krilld에 붙어서 `ServerHello`를 받고 `hello`로 답한 뒤 협상한다(데몬을 띄우지 않는다). 순서는
 /// [`crate::ipc`] 핸드셰이크와 같다. `timeout`은 Hello 읽기·쓰기 각각의 상한이고, 돌려준 스트림에는 타임아웃이
-/// 없다. 명시한 기한은 그대로 존중한다. 서명 검증 여유가 필요한 기본 앱·CLI 연결은 [`connect`]가
-/// [`SIGNED_HELLO_TIMEOUT`]으로 이 함수를 부른다. 소켓 파일이 없으면 `NotFound`,
-/// krilld가 죽었으면 `ConnectionRefused`.
+/// 없다. 명시한 기한은 그대로 존중한다. macOS 기본 앱·CLI 연결은 [`connect`]가 락 밖 경로에서
+/// [`SIGNED_HELLO_TIMEOUT`]으로, 락 안·다른 OS에서는 [`HELLO_TIMEOUT`]으로 이 함수를 부른다. 소켓 파일이
+/// 없으면 `NotFound`, krilld가 죽었으면 `ConnectionRefused`.
 pub fn handshake(socket: &Path, hello: &ClientHello, timeout: Duration) -> io::Result<Connection> {
     handshake_stream(UnixStream::connect(socket)?, hello, timeout)
 }

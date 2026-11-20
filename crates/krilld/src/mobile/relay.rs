@@ -569,6 +569,7 @@ fn run_once(
             if out_rx.is_closed() {
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }
+            prune_closed_sessions(&mut sessions);
             drain_outbox(&mut transport, &out_rx)?;
             let mut decoded = 0usize;
             while decoded < 64 {
@@ -664,6 +665,36 @@ fn wait_io(_tcp: &TcpStream, wake_rx: &mut UnixStream, _timeout: Duration) {
     thread::sleep(Duration::from_millis(10));
 }
 
+fn prune_closed_sessions(sessions: &mut HashMap<u32, MuxSession>) {
+    sessions.retain(|_, s| {
+        if s.tx.is_closed() {
+            s.stream.shutdown(Shutdown::Both).ok();
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn forward_mux_frame(
+    sessions: &mut HashMap<u32, MuxSession>,
+    outbox: &Outbox,
+    conn_id: u32,
+    opcode: u8,
+    payload: &[u8],
+) {
+    if let Some(s) = sessions.get(&conn_id)
+        && let Err(err) = s.tx.send(0, (opcode, payload.to_vec()), payload.len())
+        && let Some(s) = sessions.remove(&conn_id)
+    {
+        s.tx.close();
+        s.stream.shutdown(Shutdown::Both).ok();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            outbox.send_close(conn_id, RETRY_CLOSE);
+        }
+    }
+}
+
 fn handle_mux_frame(
     body: &[u8],
     sessions: &mut HashMap<u32, MuxSession>,
@@ -675,14 +706,7 @@ fn handle_mux_frame(
     let Ok((kind, conn_id, payload)) = decode_mux(body) else {
         return;
     };
-    sessions.retain(|_, s| {
-        if s.tx.is_closed() {
-            s.stream.shutdown(Shutdown::Both).ok();
-            false
-        } else {
-            true
-        }
-    });
+    prune_closed_sessions(sessions);
     match kind {
         // 챌린지는 데몬이 만든다(serve_mux_client). DO가 정하면 같은 챌린지로 녹화한 세션을 재생할 수 있다.
         // DO는 빈 OPEN만 보낸다. 내용이 있거나(서버 지정 챌린지) 이미 열린 conn_id면 거부한다.
@@ -754,30 +778,37 @@ fn handle_mux_frame(
                 .name("mobile-relay-ws".into())
                 .stack_size(STACK)
                 .spawn(move || {
-                    let _close = rx.close_guard();
                     crate::alloc::mobile_thread().ok();
-                    let opened = Instant::now();
-                    let code = match serve_mux_client(
-                        conn_id, challenge, &rx, &close_tx, local, server, &out, &sh, id, &reg, &h,
-                    ) {
-                        Err(err) => {
-                            // 폰이 인증 중 1011을 받은 원인(예산 만료인지)을 가릴 수 있게 남긴다. 비밀값은 없다.
-                            if err.kind() == io::ErrorKind::TimedOut {
-                                tracing::info!(
-                                    elapsed_ms = opened.elapsed().as_millis(),
-                                    "mobile relay connection timed out (1011)"
-                                );
+                    let code = {
+                        let _close = rx.close_guard();
+                        let opened = Instant::now();
+                        match serve_mux_client(
+                            conn_id, challenge, &rx, &close_tx, local, server, &out, &sh, id, &reg,
+                            &h,
+                        ) {
+                            Err(err) => {
+                                // 폰이 인증 중 1011을 받은 원인(예산 만료인지)을 가릴 수 있게 남긴다. 비밀값은 없다.
+                                if err.kind() == io::ErrorKind::TimedOut {
+                                    tracing::info!(
+                                        elapsed_ms = opened.elapsed().as_millis(),
+                                        "mobile relay connection timed out (1011)"
+                                    );
+                                }
+                                super::gateway::auth_close_code(&err).unwrap_or(1011)
                             }
-                            super::gateway::auth_close_code(&err).unwrap_or(1011)
+                            _ => 1000,
                         }
-                        _ => 1000,
                     };
-                    out.send_close(conn_id, code);
-                    let mut s = lock(&sh.state);
-                    if let Some(c) = s.connections.remove(&id) {
-                        c.socket.shutdown();
+                    // 연결 슬롯을 먼저 비워 즉시 재접속하는 클라이언트가 MAX_PENDING/MAX_CONNECTIONS에 걸리지 않게 한다.
+                    {
+                        let mut s = lock(&sh.state);
+                        if let Some(c) = s.connections.remove(&id) {
+                            c.socket.shutdown();
+                        }
                     }
+                    out.send_close(conn_id, code);
                     sh.wake();
+                    crate::alloc::purge();
                 })
                 .is_err()
             {
@@ -786,30 +817,8 @@ fn handle_mux_frame(
                 outbox.send_close(conn_id, 1011);
             }
         }
-        MUX_TEXT => {
-            if let Some(s) = sessions.get(&conn_id)
-                && s.tx
-                    .send(0, (ws::TEXT, payload.to_vec()), payload.len())
-                    .is_err()
-                && let Some(s) = sessions.remove(&conn_id)
-            {
-                s.tx.close();
-                s.stream.shutdown(Shutdown::Both).ok();
-                outbox.send_close(conn_id, RETRY_CLOSE);
-            }
-        }
-        MUX_BINARY => {
-            if let Some(s) = sessions.get(&conn_id)
-                && s.tx
-                    .send(0, (ws::BINARY, payload.to_vec()), payload.len())
-                    .is_err()
-                && let Some(s) = sessions.remove(&conn_id)
-            {
-                s.tx.close();
-                s.stream.shutdown(Shutdown::Both).ok();
-                outbox.send_close(conn_id, RETRY_CLOSE);
-            }
-        }
+        MUX_TEXT => forward_mux_frame(sessions, outbox, conn_id, ws::TEXT, payload),
+        MUX_BINARY => forward_mux_frame(sessions, outbox, conn_id, ws::BINARY, payload),
         MUX_CLOSE => {
             if let Some(s) = sessions.remove(&conn_id) {
                 s.tx.close();
@@ -1244,5 +1253,50 @@ mod tests {
             parse_origin("http://127.0.0.1:8123").unwrap(),
             (false, "127.0.0.1:8123".into(), "127.0.0.1".into(), 8123)
         );
+    }
+
+    #[test]
+    fn forward_mux_frame_skips_spurious_1011_on_closed_session_and_closes_overflow() {
+        let (wake_tx, _wake_rx) = UnixStream::pair().unwrap();
+        let out_rx = Arc::new(Mailbox::new(OUTBOX_BYTES, PEER_QUEUE_BYTES, 128));
+        let outbox = Outbox {
+            tx: Arc::clone(&out_rx),
+            wake: Arc::new(Mutex::new(wake_tx)),
+        };
+
+        // Already-closed worker mailbox (BrokenPipe) must not enqueue a second 1011 close.
+        let (stream_a, _peer_a) = UnixStream::pair().unwrap();
+        let closed_tx = Arc::new(Mailbox::new(1024, 1024, 8));
+        closed_tx.close();
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            10,
+            MuxSession {
+                tx: closed_tx,
+                stream: stream_a,
+            },
+        );
+        forward_mux_frame(&mut sessions, &outbox, 10, ws::BINARY, b"late");
+        assert!(!sessions.contains_key(&10));
+        assert!(out_rx.is_empty());
+
+        // Full mailbox (WouldBlock) closes the stalled session with RETRY_CLOSE (1011).
+        let (stream_b, _peer_b) = UnixStream::pair().unwrap();
+        let full_tx = Arc::new(Mailbox::new(4, 4, 4));
+        full_tx.send(0, (ws::BINARY, vec![1, 2, 3, 4]), 4).unwrap();
+        sessions.insert(
+            11,
+            MuxSession {
+                tx: full_tx,
+                stream: stream_b,
+            },
+        );
+        forward_mux_frame(&mut sessions, &outbox, 11, ws::TEXT, b"overflow");
+        assert!(!sessions.contains_key(&11));
+        let close_mux = out_rx.try_recv().unwrap();
+        let (kind, conn_id, payload) = decode_mux(&close_mux).unwrap();
+        assert_eq!(kind, MUX_CLOSE);
+        assert_eq!(conn_id, 11);
+        assert_eq!(payload, RETRY_CLOSE.to_be_bytes());
     }
 }

@@ -617,29 +617,23 @@ pub(super) fn is_worktree_visible(
 }
 
 /// 스마트 정렬 우선순위: 0(승인/주의) < 1(완료 미확인) < 2(작업 중) < 3(완료) < 4(유휴).
-fn smart_rank(
-    path: &Path,
-    sessions_by_wt: &BTreeMap<&Path, Vec<&Session>>,
-    ctx: &WorktreeContext<'_>,
-) -> u8 {
+fn smart_rank(path: &Path, sessions_by_wt: &WorktreeSessions<'_>, ctx: &WorktreeContext<'_>) -> u8 {
     let mut has_waiting_or_blocked = false;
     let mut has_unread_done = ctx.unread_worktrees.is_some_and(|u| u.contains(path));
     let mut has_working = false;
     let mut has_done = false;
-    if let Some(list) = sessions_by_wt.get(path) {
-        for s in list {
-            let is_unread = ctx.unread.is_some_and(|u| u.contains(&s.id));
-            match s.status.state {
-                AgentState::Waiting | AgentState::Blocked => has_waiting_or_blocked = true,
-                AgentState::Working => has_working = true,
-                AgentState::Done => {
-                    has_done = true;
-                    if is_unread {
-                        has_unread_done = true;
-                    }
+    for (_, s) in sessions_by_wt.get(path) {
+        let is_unread = ctx.unread.is_some_and(|u| u.contains(&s.id));
+        match s.status.state {
+            AgentState::Waiting | AgentState::Blocked => has_waiting_or_blocked = true,
+            AgentState::Working => has_working = true,
+            AgentState::Done => {
+                has_done = true;
+                if is_unread {
+                    has_unread_done = true;
                 }
-                AgentState::Exited | AgentState::Unknown => {}
             }
+            AgentState::Exited | AgentState::Unknown => {}
         }
     }
     if has_waiting_or_blocked {
@@ -655,17 +649,56 @@ fn smart_rank(
     }
 }
 
-fn worktree_sort_name(path: &Path, prefs: &Preferences, meta: Option<&Meta>) -> String {
-    prefs
+fn worktree_sort_name<'a>(
+    path: &'a Path,
+    prefs: &'a Preferences,
+    meta: Option<&'a Meta>,
+) -> std::borrow::Cow<'a, str> {
+    if let Some(name) = prefs
         .get(path)
         .filter(|v| !v.name.is_empty())
-        .map(|v| v.name.clone())
-        .or_else(|| {
-            meta.and_then(|m| m.get(path))
-                .and_then(|t| t.branch.as_deref())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| basename(path))
+        .map(|v| v.name.as_str())
+    {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    if let Some(branch) = meta
+        .and_then(|m| m.get(path))
+        .and_then(|t| t.branch.as_deref())
+    {
+        return std::borrow::Cow::Borrowed(branch);
+    }
+    if !super::windows_style(path)
+        && let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+    {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    std::borrow::Cow::Owned(basename(path))
+}
+
+pub(super) struct WorktreeSessions<'a>(Vec<(&'a Path, &'a Session)>);
+
+impl<'a> WorktreeSessions<'a> {
+    fn from_snapshot(snapshot: &'a Snapshot) -> Self {
+        let mut entries: Vec<(&'a Path, &'a Session)> = snapshot
+            .sessions
+            .iter()
+            .filter(|s| !s.is_exited())
+            .filter_map(|s| Some((s.worktree.as_deref()?, s)))
+            .collect();
+        // `slice::sort_by_key` is stable and preserves the caller's session order per worktree.
+        entries.sort_by_key(|(a, _)| *a);
+        Self(entries)
+    }
+
+    fn get(&self, path: &Path) -> &[(&'a Path, &'a Session)] {
+        let start = self.0.partition_point(|(p, _)| *p < path);
+        let rest = &self.0[start..];
+        let end = rest.partition_point(|(p, _)| *p == path);
+        &rest[..end]
+    }
 }
 
 /// 카드에 [기본] 배지가 붙는 워크트리(저장소 본 체크아웃)인지. 배지와 정렬이 이 함수 하나로 판정한다.
@@ -677,52 +710,83 @@ pub(super) fn is_primary_worktree(snapshot: &Snapshot, path: &Path) -> bool {
 pub(super) fn sort_worktrees(
     trees: &mut [&PathBuf],
     _snapshot: &Snapshot,
-    sessions_by_wt: &BTreeMap<&Path, Vec<&Session>>,
+    sessions_by_wt: &WorktreeSessions<'_>,
     prefs: &Preferences,
     sort_by: SortBy,
     ctx: &WorktreeContext<'_>,
 ) {
-    trees.sort_by_cached_key(|a| {
-        let name = worktree_sort_name(a, prefs, ctx.meta);
-        let updated = ctx.updated_at.and_then(|u| u.get(*a)).copied().unwrap_or(0);
-        let created_grace = ctx
-            .created_at
-            .and_then(|c| c.get(*a))
-            .map_or(0, |created| created.saturating_add(300));
-        let recent = Reverse(updated.max(created_grace));
-        let rank = match sort_by {
-            SortBy::Smart => smart_rank(a, sessions_by_wt, ctx),
-            SortBy::Recent | SortBy::Name | SortBy::Created => 0,
-        };
-        let recent_key = match sort_by {
-            SortBy::Smart | SortBy::Recent => recent,
-            SortBy::Created => {
-                Reverse(ctx.created_at.and_then(|c| c.get(*a)).copied().unwrap_or(0))
-            }
-            SortBy::Name => Reverse(0),
-        };
-        let manual = if sort_by == SortBy::Created {
-            ctx.worktree_order
-                .and_then(|order| order.iter().position(|p| p == *a))
-                .unwrap_or(usize::MAX)
-        } else {
-            usize::MAX
-        };
-        (manual, rank, recent_key, name, *a)
+    if sort_by == SortBy::Name {
+        trees.sort_by_cached_key(|a| (worktree_sort_name(a, prefs, ctx.meta), *a));
+        return;
+    }
+    let manual_order: BTreeMap<&Path, usize> = if sort_by == SortBy::Created {
+        ctx.worktree_order
+            .map(|order| {
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (p.as_path(), i))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    let mut keyed: Vec<(usize, u8, Reverse<u64>, &PathBuf)> = trees
+        .iter()
+        .copied()
+        .map(|a| {
+            let manual = if sort_by == SortBy::Created {
+                manual_order.get(a.as_path()).copied().unwrap_or(usize::MAX)
+            } else {
+                usize::MAX
+            };
+            let rank = match sort_by {
+                SortBy::Smart => smart_rank(a, sessions_by_wt, ctx),
+                SortBy::Recent | SortBy::Name | SortBy::Created => 0,
+            };
+            let recent_key = match sort_by {
+                SortBy::Smart | SortBy::Recent => {
+                    let updated = ctx.updated_at.and_then(|u| u.get(a)).copied().unwrap_or(0);
+                    let created_grace = ctx
+                        .created_at
+                        .and_then(|c| c.get(a))
+                        .map_or(0, |created| created.saturating_add(300));
+                    Reverse(updated.max(created_grace))
+                }
+                SortBy::Created => {
+                    Reverse(ctx.created_at.and_then(|c| c.get(a)).copied().unwrap_or(0))
+                }
+                SortBy::Name => Reverse(0),
+            };
+            (manual, rank, recent_key, a)
+        })
+        .collect();
+    keyed.sort_by(|lhs, rhs| {
+        lhs.0
+            .cmp(&rhs.0)
+            .then_with(|| lhs.1.cmp(&rhs.1))
+            .then_with(|| lhs.2.cmp(&rhs.2))
+            .then_with(|| {
+                worktree_sort_name(lhs.3, prefs, ctx.meta)
+                    .cmp(&worktree_sort_name(rhs.3, prefs, ctx.meta))
+            })
+            .then_with(|| lhs.3.cmp(rhs.3))
     });
+    for (dst, (_, _, _, src)) in trees.iter_mut().zip(keyed) {
+        *dst = src;
+    }
 }
 
 fn push_worktree_and_sessions(
     out: &mut Vec<Row>,
     tree: &PathBuf,
-    sessions_by_wt: &BTreeMap<&Path, Vec<&Session>>,
+    sessions_by_wt: &WorktreeSessions<'_>,
     collapsed: &BTreeSet<PathBuf>,
 ) {
     out.push(Row::Worktree(tree.clone()));
-    if !collapsed.contains(tree)
-        && let Some(list) = sessions_by_wt.get(tree.as_path())
-    {
-        for &s in list {
+    if !collapsed.contains(tree) {
+        for &(_, s) in sessions_by_wt.get(tree.as_path()) {
             out.push(Row::Session(Box::new(s.clone()), true));
         }
     }
@@ -758,38 +822,36 @@ pub(super) fn rows_with_options<'a>(
     ctx: &WorktreeContext<'_>,
 ) -> Vec<Row> {
     let mut out = Vec::new();
-    let mut sessions_by_wt: BTreeMap<&Path, Vec<&'a Session>> = BTreeMap::new();
-    for s in snapshot.sessions.iter().filter(|s| !s.is_exited()) {
-        if let Some(wt) = s.worktree.as_deref() {
-            sessions_by_wt.entry(wt).or_default().push(s);
-        }
-    }
-    let mut awake: BTreeSet<_> = snapshot
-        .sessions
-        .iter()
-        .filter(|s| {
-            ctx.focused == Some(s.id)
-                || ctx.unread.is_some_and(|unread| unread.contains(&s.id))
-                || matches!(
-                    s.status.state,
-                    AgentState::Working
-                        | AgentState::Waiting
-                        | AgentState::Blocked
-                        | AgentState::Done
-                )
-                || (!s.status.agent.is_empty() && s.status.state != AgentState::Exited)
-        })
-        .filter_map(|s| s.worktree.clone())
-        .collect();
-    if let Some(recent) = ctx.recently_created {
-        for path in recent {
-            if !ctx.sleeping_worktrees.is_some_and(|s| s.contains(path)) {
-                awake.insert(path.clone());
+    let sessions_by_wt = WorktreeSessions::from_snapshot(snapshot);
+    let awake = options.filters.hide_sleeping.then(|| {
+        let mut set: BTreeSet<_> = snapshot
+            .sessions
+            .iter()
+            .filter(|s| {
+                ctx.focused == Some(s.id)
+                    || ctx.unread.is_some_and(|unread| unread.contains(&s.id))
+                    || matches!(
+                        s.status.state,
+                        AgentState::Working
+                            | AgentState::Waiting
+                            | AgentState::Blocked
+                            | AgentState::Done
+                    )
+                    || (!s.status.agent.is_empty() && s.status.state != AgentState::Exited)
+            })
+            .filter_map(|s| s.worktree.clone())
+            .collect();
+        if let Some(recent) = ctx.recently_created {
+            for path in recent {
+                if !ctx.sleeping_worktrees.is_some_and(|s| s.contains(path)) {
+                    set.insert(path.clone());
+                }
             }
         }
-    }
+        set
+    });
     let ctx = &WorktreeContext {
-        awake_worktrees: Some(&awake),
+        awake_worktrees: awake.as_ref(),
         ..*ctx
     };
     let mut pinned: Vec<_> = snapshot
@@ -1231,7 +1293,6 @@ impl Sidebar {
     pub(super) fn local_rows(&self) -> Vec<Row> {
         let mut derived = self.local_rows_cache.borrow_mut();
         derived.refresh(self);
-        let parents = self.merged_parents();
         let pending: Vec<_> = self
             .pending_worktrees
             .iter()
@@ -1251,7 +1312,7 @@ impl Sidebar {
             awake_worktrees: None,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
-            parents: Some(&parents),
+            parents: Some(&self.parents),
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             recently_created: Some(&self.recently_created_worktrees),
@@ -1579,12 +1640,7 @@ impl Sidebar {
             }
         }
         if !self.titles.is_empty() {
-            for s in self
-                .snapshot_for(host)
-                .sessions
-                .iter()
-                .filter(|s| s.worktree.as_deref() == Some(path))
-            {
+            self.for_each_worktree_session_all(host, path, |_, s| {
                 if let Some(title) = self.titles.get(&s.id) {
                     for entry in
                         krill_proto::orchestration::extract_local_urls(s.id.0, title, false)
@@ -1592,7 +1648,7 @@ impl Sidebar {
                         set.insert(entry.port);
                     }
                 }
-            }
+            });
         }
         set.into_iter().collect()
     }

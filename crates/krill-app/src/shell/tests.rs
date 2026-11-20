@@ -13090,3 +13090,292 @@ fn choose_folder_and_clone_completion_select_added_project_when_filter_active(
         std::fs::remove_dir_all(dir).ok();
     }
 }
+
+#[gpui::test]
+fn link_host_poll_skips_unchanged_ssh_and_syncs_on_status_transition(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("link-host-churn"));
+    let spec = krill_hosts::RemoteHostSpec {
+        id: "studio".into(),
+        label: "Studio".into(),
+        address: "owen@studio.local".into(),
+        port: None,
+        identity_file: None,
+        remote_socket: Some("/tmp/krilld.sock".into()),
+    };
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.ssh_hosts = vec![krill_app::ssh_hosts::SshHost {
+                id: spec.id.clone(),
+                label: spec.label.clone(),
+                destination: spec.address.clone(),
+                port: None,
+                identity_file: None,
+                remote_socket: spec.remote_socket.clone(),
+                imported: false,
+                copy_id_first: false,
+            }];
+            s.sync_hosts(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let mut last_info: Option<Vec<(String, Option<krill_hosts::HostConnectionInfo>)>> = None;
+    let sync_after_init = view.read_with(cx, |s, _| s.host_sync_count);
+
+    // Repeating unchanged link registrations + unchanged SSH statuses must not trigger sync_hosts.
+    for _ in 0..5 {
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                let statuses = s.host_manager.statuses();
+                let info: Vec<_> = statuses
+                    .iter()
+                    .map(|(sp, _)| (sp.id.clone(), s.host_manager.connection_info(&sp.id)))
+                    .collect();
+                s.apply_link_host_poll(Some(Vec::new()), &statuses, &info, &mut last_info, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |s, _| s.host_sync_count),
+            sync_after_init,
+            "unchanged host state must not trigger 1s sync_hosts churn"
+        );
+    }
+
+    // When SSH host status changes in HostManager (e.g. Disconnected -> Connected), sync_hosts runs.
+    let updated_statuses = vec![(spec.clone(), krill_app::hosts::HostStatus::Connected)];
+    let updated_info = vec![(
+        spec.id.clone(),
+        Some(krill_hosts::HostConnectionInfo {
+            status: krill_app::hosts::HostStatus::Connected,
+            detail: None,
+            error: None,
+        }),
+    )];
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.apply_link_host_poll(
+                Some(Vec::new()),
+                &updated_statuses,
+                &updated_info,
+                &mut last_info,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s.host_sync_count),
+        sync_after_init + 1,
+        "SSH status transition must still trigger sync_hosts promptly"
+    );
+}
+
+#[test]
+fn rebind_after_daemon_upgrade_reconnects_before_wait_responsive() {
+    use krill_proto::daemon::{HolderStatus, Paths, pong, wait_responsive};
+    use krill_proto::ipc::{self, ClientRole, ServerHello};
+    use std::io::Write as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct MockDaemon {
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockDaemon {
+        fn spawn(socket_path: &std::path::Path, hello: ServerHello) -> Self {
+            std::fs::remove_file(socket_path).ok();
+            let listener = UnixListener::bind(socket_path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                let mut clients = Vec::new();
+                while !stop_flag.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let hello = hello.clone();
+                            let client_stop = Arc::clone(&stop_flag);
+                            clients.push(std::thread::spawn(move || {
+                                stream.set_nonblocking(false).ok();
+                                stream
+                                    .set_read_timeout(Some(Duration::from_millis(50)))
+                                    .ok();
+                                if stream.write_all(&hello.encode().unwrap()).is_err() {
+                                    return;
+                                }
+                                // ClientHello (+ watch HolderStatus::Linked) + optional Ping(s) until stopped or client closes.
+                                while !client_stop.load(Ordering::Acquire) {
+                                    match ipc::read_frame(&mut stream) {
+                                        Ok(Some((kind, body))) => {
+                                            if let Ok(client) =
+                                                ipc::ClientHello::decode(kind, &body)
+                                            {
+                                                if client.features
+                                                    & krill_proto::daemon::FEAT_HOLDER_WATCH
+                                                    != 0
+                                                    && hello.features
+                                                        & krill_proto::daemon::FEAT_HOLDER_WATCH
+                                                        != 0
+                                                {
+                                                    stream
+                                                        .write_all(
+                                                            &HolderStatus::Linked.encode().unwrap(),
+                                                        )
+                                                        .ok();
+                                                }
+                                            } else if let Ok(nonce) =
+                                                daemon::ping_nonce(kind, &body)
+                                            {
+                                                stream.write_all(&pong(nonce).unwrap()).ok();
+                                                stream
+                                                    .write_all(
+                                                        &HolderStatus::Orphan.encode().unwrap(),
+                                                    )
+                                                    .ok();
+                                            }
+                                        }
+                                        Err(e)
+                                            if matches!(
+                                                e.kind(),
+                                                std::io::ErrorKind::WouldBlock
+                                                    | std::io::ErrorKind::TimedOut
+                                            ) => {}
+                                        Ok(None) | Err(_) => break,
+                                    }
+                                }
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                drop(listener);
+                for client in clients {
+                    client.join().ok();
+                }
+            });
+            Self {
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for MockDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                worker.join().ok();
+            }
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("krill-rebind-upgrade-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let socket_path = root.join("krilld.sock");
+    let paths = Paths {
+        socket: socket_path.clone(),
+        holder: root.join("krill-holder"),
+        krilld: root.join("krilld"),
+    };
+    let target = krill_app::hosts::HostTarget::local(paths);
+    let hello = daemon::heartbeat_hello(ClientRole::App, "krill-app-test");
+
+    // 1. Old daemon accepts initial connection and then stops during upgrade.
+    let mut old_daemon = Some(MockDaemon::spawn(
+        &socket_path,
+        ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: "0.1.0".into(),
+            instance_id: 1,
+        },
+    ));
+    let conn = target.connect(&hello).unwrap();
+    assert_eq!(conn.server.instance_id, 1);
+
+    // 2. Upgrade swaps the daemon socket to instance_id 2 before returning.
+    let mut new_daemon = None;
+    let rebound = rebind_after_daemon_upgrade_with(&target, &hello, conn, |_, _| {
+        old_daemon.take();
+        let new_hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: krill_proto::BUILD.into(),
+            instance_id: 2,
+        };
+        new_daemon = Some(MockDaemon::spawn(&socket_path, new_hello.clone()));
+        Ok(Some(new_hello))
+    });
+
+    assert_eq!(
+        rebound.server.instance_id, 2,
+        "must rebind to new daemon before entering heartbeat loop"
+    );
+    let features = rebound.negotiated.features;
+    let mut stream = rebound.stream;
+    wait_responsive(&mut stream, features)
+        .expect("heartbeat on rebound post-upgrade daemon stream must succeed cleanly");
+    drop(stream);
+    drop(new_daemon);
+
+    // 3. Concurrent upgrade: `conn` saw old build ("0.1.0"), then `upgrade` saw NotNewer (`Ok(None)`).
+    let mut racing_old = Some(MockDaemon::spawn(
+        &socket_path,
+        ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: "0.1.0".into(),
+            instance_id: 10,
+        },
+    ));
+    let racing_conn = target.connect(&hello).unwrap();
+    let mut racing_new = None;
+    let rebound_concurrent =
+        rebind_after_daemon_upgrade_with(&target, &hello, racing_conn, |_, _| {
+            racing_old.take();
+            let new_hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: krill_proto::BUILD.into(),
+                instance_id: 11,
+            };
+            racing_new = Some(MockDaemon::spawn(&socket_path, new_hello));
+            Ok(None)
+        });
+    assert_eq!(rebound_concurrent.server.instance_id, 11);
+    drop(rebound_concurrent);
+    drop(racing_new);
+
+    // 4. Up-to-date daemon with Ok(None) keeps the existing connection without reconnecting.
+    let current_daemon = MockDaemon::spawn(
+        &socket_path,
+        ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: ipc::FEATURES,
+            build: krill_proto::BUILD.into(),
+            instance_id: 4,
+        },
+    );
+    let current_conn = target.connect(&hello).unwrap();
+    let kept = rebind_after_daemon_upgrade_with(&target, &hello, current_conn, |_, _| Ok(None));
+    assert_eq!(kept.server.instance_id, 4);
+    drop(kept);
+    drop(current_daemon);
+    std::fs::remove_dir_all(&root).ok();
+}

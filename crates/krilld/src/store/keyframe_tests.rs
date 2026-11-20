@@ -190,6 +190,7 @@ fn recording_failure_does_not_close_or_stop_the_live_pty_reader() {
     let tap = session.tap();
     rustix::io::write(&pty.user, b"before").unwrap();
     tap.wait(|p| p.end >= 6 || p.closed);
+    assert!(!store.history(id).unwrap().is_empty());
     let dir = store.session_dir(id);
     fs::remove_dir_all(&dir).unwrap();
     fs::write(&dir, b"prevent mkdir").unwrap();

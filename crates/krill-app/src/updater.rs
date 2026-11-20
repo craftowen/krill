@@ -93,14 +93,16 @@ enum TempKind {
     UnpackTmp,
     Candidate,
     StagePublishTmp,
+    WriteProbe,
 }
 
 impl TempKind {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::DownloadZip,
         Self::UnpackTmp,
         Self::Candidate,
         Self::StagePublishTmp,
+        Self::WriteProbe,
     ];
 
     const fn suffix(self) -> &'static str {
@@ -109,6 +111,7 @@ impl TempKind {
             Self::UnpackTmp => "unpack.tmp",
             Self::Candidate => "candidate",
             Self::StagePublishTmp => "stage-publish.tmp",
+            Self::WriteProbe => "write.probe",
         }
     }
 
@@ -468,6 +471,7 @@ pub enum Error {
     Unpack(String),
     NoBackup(PathBuf),
     NoJournal,
+    InstallDirNotWritable(PathBuf),
     Io(io::Error),
 }
 
@@ -494,6 +498,7 @@ impl Clone for Error {
             Self::Unpack(v) => Self::Unpack(v.clone()),
             Self::NoBackup(v) => Self::NoBackup(v.clone()),
             Self::NoJournal => Self::NoJournal,
+            Self::InstallDirNotWritable(v) => Self::InstallDirNotWritable(v.clone()),
             Self::Io(v) => Self::Io(v.raw_os_error().map_or_else(
                 || io::Error::new(v.kind(), v.to_string()),
                 io::Error::from_raw_os_error,
@@ -532,7 +537,7 @@ fn mentions_disk_full(text: &str) -> bool {
 }
 
 fn should_report_update_failure(error: &Error) -> bool {
-    !matches!(error, Error::Http(_))
+    !matches!(error, Error::Http(_) | Error::InstallDirNotWritable(_))
         && !matches!(error, Error::Io(io_err) if io_err.kind() == io::ErrorKind::TimedOut)
         && !error.is_disk_full()
 }
@@ -570,6 +575,9 @@ impl fmt::Display for Error {
                 f,
                 "update journal not found; backup completeness unknown, rollback refused"
             ),
+            Self::InstallDirNotWritable(p) => {
+                write!(f, "install directory is not writable: {}", p.display())
+            }
             Self::Io(e) => write!(f, "updater I/O error: {e}"),
         }
     }
@@ -597,6 +605,10 @@ impl Error {
             Self::Unpack(m) => utext::UPDATE_ERR_UNPACK.format(&[("detail", m)]),
             Self::NoBackup(_) => utext::UPDATE_ERR_BACKUP.get().to_owned(),
             Self::NoJournal => utext::UPDATE_ERR_JOURNAL.get().to_owned(),
+            Self::InstallDirNotWritable(p) => utext::UPDATE_ERR_IO.format(&[(
+                "detail",
+                &format!("install directory is not writable: {}", p.display()),
+            )]),
             Self::Io(e) => utext::UPDATE_ERR_IO.format(&[("detail", &e.to_string())]),
         }
     }
@@ -1229,11 +1241,209 @@ pub fn stage_verified_archive(
     result
 }
 
+const STAGING_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(400),
+];
+
+fn is_transient_staging_io_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(5 | 32 | 33)) {
+        return true;
+    }
+    false
+}
+
+fn is_non_writable_dir_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(5 | 19)) {
+        return true;
+    }
+    false
+}
+
+fn retry_staging_with<T>(
+    delays: &[Duration],
+    mut op: impl FnMut() -> io::Result<T>,
+    mut on_transient: impl FnMut(),
+) -> io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < delays.len() && is_transient_staging_io_error(&error) => {
+                on_transient();
+                let delay = delays[attempt];
+                attempt += 1;
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn clear_readonly_meta(path: &Path, meta: &fs::Metadata) {
+    let mut perm = meta.permissions();
+    if !perm.readonly() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        perm.set_mode(perm.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    #[expect(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows clears FILE_ATTRIBUTE_READONLY without Unix world-write mode bits"
+    )]
+    perm.set_readonly(false);
+    fs::set_permissions(path, perm).ok();
+}
+
+fn clear_readonly_file(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || meta.is_dir() {
+        return;
+    }
+    clear_readonly_meta(path, &meta);
+}
+
+fn clear_readonly_recursive(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    clear_readonly_meta(path, &meta);
+    if meta.is_dir()
+        && let Ok(entries) = fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            clear_readonly_recursive(&entry.path());
+        }
+    }
+}
+
+fn staging_rename_with(from: &Path, to: &Path, delays: &[Duration]) -> io::Result<()> {
+    retry_staging_with(
+        delays,
+        || fs::rename(from, to),
+        || {
+            clear_readonly_file(to);
+            clear_readonly_file(from);
+        },
+    )
+}
+
+fn staging_rename(from: &Path, to: &Path) -> io::Result<()> {
+    staging_rename_with(from, to, &STAGING_RETRY_DELAYS)
+}
+
+fn staging_remove_file_with(path: &Path, delays: &[Duration]) -> io::Result<()> {
+    retry_staging_with(
+        delays,
+        || fs::remove_file(path),
+        || clear_readonly_file(path),
+    )
+}
+
+fn staging_remove_file(path: &Path) -> io::Result<()> {
+    staging_remove_file_with(path, &STAGING_RETRY_DELAYS)
+}
+
+fn staging_remove_dir_all_with(path: &Path, delays: &[Duration]) -> io::Result<()> {
+    retry_staging_with(
+        delays,
+        || fs::remove_dir_all(path),
+        || clear_readonly_recursive(path),
+    )
+}
+
+fn staging_remove_dir_all(path: &Path) -> io::Result<()> {
+    staging_remove_dir_all_with(path, &STAGING_RETRY_DELAYS)
+}
+
+fn staging_remove_dir_all_if_exists(path: &Path) -> io::Result<()> {
+    match staging_remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_existing_stage_entry(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => staging_remove_dir_all_if_exists(path),
+        Ok(_) => match staging_remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_staging_parent_writable(app_bundle: &Path) -> Result<(), Error> {
+    let parent = app_bundle
+        .parent()
+        .ok_or_else(|| Error::BundleStructure("bundle has no parent".into()))?;
+    let probe_dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if !probe_dir.exists()
+        && let Err(error) = fs::create_dir_all(probe_dir)
+    {
+        if is_non_writable_dir_error(&error) {
+            return Err(Error::InstallDirNotWritable(probe_dir.to_path_buf()));
+        }
+        return Err(Error::Io(error));
+    }
+    let probe = unique_update_path(app_bundle, TempKind::WriteProbe);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            staging_remove_file(&probe).ok();
+            Ok(())
+        }
+        Err(error) if is_non_writable_dir_error(&error) => {
+            Err(Error::InstallDirNotWritable(probe_dir.to_path_buf()))
+        }
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 fn remove_update_temp(path: &Path, directory: bool) {
     let result = if directory {
-        fs::remove_dir_all(path)
+        staging_remove_dir_all(path)
     } else {
-        fs::remove_file(path)
+        staging_remove_file(path)
     };
     if let Err(error) = result
         && error.kind() != io::ErrorKind::NotFound
@@ -1315,7 +1525,8 @@ fn stage_verified_file_with_probe(
     let parent = app_bundle
         .parent()
         .ok_or_else(|| Error::BundleStructure("bundle has no parent".into()))?;
-    fs::create_dir_all(parent)?;
+    ensure_staging_parent_writable(app_bundle)?;
+    let _ = parent;
     let _lock = staging_lock(app_bundle)?;
     recover_stage_publish_locked(app_bundle)?;
     let unpack = unique_update_path(app_bundle, TempKind::UnpackTmp);
@@ -1329,23 +1540,24 @@ fn stage_verified_file_with_probe(
             return Err(error);
         }
         verifier.verify(&candidate)?;
-        fs::remove_dir_all(&incoming).ok();
-        fs::rename(&candidate, &incoming)?;
+        remove_existing_stage_entry(&incoming)?;
+        staging_rename(&candidate, &incoming)?;
         if let Err(error) = write_stage_marker(app_bundle) {
             remove_update_temp(&incoming, true);
             return Err(error.into());
         }
         if staging.exists() {
-            fs::rename(&staging, &backup)?;
+            remove_existing_stage_entry(&backup)?;
+            staging_rename(&staging, &backup)?;
         }
-        if let Err(error) = fs::rename(&incoming, &staging) {
+        if let Err(error) = staging_rename(&incoming, &staging) {
             recover_stage_publish_locked(app_bundle).ok();
             return Err(error.into());
         }
         sync_stage_parent(app_bundle)?;
-        fs::remove_file(append_ext(app_bundle, "stage-publish"))?;
+        staging_remove_file(&append_ext(app_bundle, "stage-publish"))?;
         sync_stage_parent(app_bundle)?;
-        fs::remove_dir_all(&backup).ok();
+        staging_remove_dir_all_if_exists(&backup).ok();
         let marker = serde_json::to_vec(&(manifest.version.as_str(), manifest.sha256.as_str()))
             .map_err(|error| Error::Json(error.to_string()))?;
         write_private_file(&append_ext(app_bundle, "staging.verified"), &marker)?;
@@ -1357,13 +1569,20 @@ fn stage_verified_file_with_probe(
 }
 
 fn staging_lock(app_bundle: &Path) -> io::Result<fs::File> {
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(append_ext(app_bundle, "update.lock"))?;
+    let lock_path = append_ext(app_bundle, "update.lock");
+    let lock = retry_staging_with(
+        &STAGING_RETRY_DELAYS,
+        || {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(&lock_path)
+        },
+        || clear_readonly_file(&lock_path),
+    )?;
     let deadline = Instant::now() + Duration::from_secs(120);
     while lock.try_lock().is_err() {
         if Instant::now() >= deadline {
@@ -1404,7 +1623,7 @@ fn write_stage_marker(app_bundle: &Path) -> io::Result<()> {
         file.write_all(b"krill-stage-publish-v1\n")?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, &path)
+        staging_rename(&temporary, &path)
     })();
     if let Err(error) = publish {
         remove_update_temp(&temporary, false);
@@ -1419,8 +1638,8 @@ fn recover_stage_publish_locked(app_bundle: &Path) -> io::Result<()> {
     let backup = append_ext(app_bundle, "staging.previous");
     if !marker.exists() {
         if staging.exists() {
-            fs::remove_dir_all(&backup).ok();
-            fs::remove_dir_all(&incoming).ok();
+            staging_remove_dir_all_if_exists(&backup).ok();
+            staging_remove_dir_all_if_exists(&incoming).ok();
         }
         return Ok(());
     }
@@ -1434,9 +1653,9 @@ fn recover_stage_publish_locked(app_bundle: &Path) -> io::Result<()> {
     }
     if !staging.exists() {
         if backup.exists() {
-            fs::rename(&backup, &staging)?;
+            staging_rename(&backup, &staging)?;
         } else if incoming.exists() {
-            fs::rename(&incoming, &staging)?;
+            staging_rename(&incoming, &staging)?;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1445,10 +1664,10 @@ fn recover_stage_publish_locked(app_bundle: &Path) -> io::Result<()> {
         }
     }
     sync_stage_parent(app_bundle)?;
-    fs::remove_file(marker)?;
+    staging_remove_file(&marker)?;
     sync_stage_parent(app_bundle)?;
-    fs::remove_dir_all(incoming).ok();
-    fs::remove_dir_all(backup).ok();
+    staging_remove_dir_all_if_exists(&incoming).ok();
+    staging_remove_dir_all_if_exists(&backup).ok();
     Ok(())
 }
 
@@ -1509,9 +1728,9 @@ fn cleanup_update_orphans(bundle: &Path) -> io::Result<()> {
             continue;
         }
         let result = if metadata.is_dir() {
-            fs::remove_dir_all(entry.path())
+            staging_remove_dir_all(&entry.path())
         } else {
-            fs::remove_file(entry.path())
+            staging_remove_file(&entry.path())
         };
         if let Err(error) = result {
             tracing::warn!(kind = ?error.kind(), "updater temporary file cleanup failed");
@@ -1775,6 +1994,7 @@ fn download_and_stage_with_probe(
     if decision != Decision::Available {
         return Ok(None);
     }
+    ensure_staging_parent_writable(app_bundle)?;
     // The marker records an already authenticated archive; it is not a security boundary
     // against a user who can modify the installation and the marker together.
     {
@@ -2042,6 +2262,7 @@ fn check_and_stage_with_probe(
     error_env: &krill_proto::error_reporting::Env,
 ) -> Result<CheckStatus, Error> {
     if append_ext(app_bundle, "stage-publish").exists() {
+        ensure_staging_parent_writable(app_bundle)?;
         let _lock = staging_lock(app_bundle)?;
         recover_stage_publish_locked(app_bundle)?;
     }
@@ -2093,6 +2314,9 @@ fn check_and_stage_with_probe(
             disk_probe,
         )
         .inspect_err(|error| {
+            if matches!(error, Error::InstallDirNotWritable(_)) {
+                tracing::warn!("update staging skipped: install directory is not writable");
+            }
             if should_report_update_failure(error) {
                 let detail = error.to_string();
                 crate::errors::record_app_error_with_env(
@@ -2564,7 +2788,7 @@ fn unpack_with_ditto(zip_path: &Path, unpack_tmp: &Path, staging: &Path) -> Resu
     }
     reject_escaping_symlinks(unpack_tmp, unpack_tmp)?;
     let extracted = find_extracted_bundle(unpack_tmp)?;
-    fs::rename(extracted, staging)?;
+    staging_rename(&extracted, staging)?;
     Ok(())
 }
 
@@ -2618,13 +2842,19 @@ pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?
-        .write_all(bytes)
+    let mut file = retry_staging_with(
+        &STAGING_RETRY_DELAYS,
+        || {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+        },
+        || clear_readonly_file(path),
+    )?;
+    file.write_all(bytes)
 }
 
 #[cfg(test)]
@@ -2790,4 +3020,345 @@ fn windows_unpack_zip_in_unicode_directory() {
     .unwrap();
     assert!(root.join("staging").join(BUNDLE_INFO).is_file());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(test)]
+mod staging_resilience_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn retry_staging_succeeds_after_transient_permission_denied_and_stops_on_non_transient() {
+        let attempts = AtomicUsize::new(0);
+        let cleanups = AtomicUsize::new(0);
+        let delays = [Duration::ZERO, Duration::ZERO, Duration::ZERO];
+
+        let ok = retry_staging_with(
+            &delays,
+            || {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "transient AV lock",
+                    ))
+                } else {
+                    Ok(42)
+                }
+            },
+            || {
+                cleanups.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        assert_eq!(ok, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 2);
+
+        // Exhausted retries return the final PermissionDenied error.
+        let attempts_exhausted = AtomicUsize::new(0);
+        let cleanups_exhausted = AtomicUsize::new(0);
+        let err = retry_staging_with(
+            &delays,
+            || -> io::Result<()> {
+                attempts_exhausted.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "persistent lock",
+                ))
+            },
+            || {
+                cleanups_exhausted.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts_exhausted.load(Ordering::SeqCst), delays.len() + 1);
+        assert_eq!(cleanups_exhausted.load(Ordering::SeqCst), delays.len());
+
+        // Non-transient errors fail immediately without retrying.
+        let non_transient_attempts = AtomicUsize::new(0);
+        let non_transient_cleanups = AtomicUsize::new(0);
+        let err = retry_staging_with(
+            &delays,
+            || -> io::Result<()> {
+                non_transient_attempts.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt"))
+            },
+            || {
+                non_transient_cleanups.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(non_transient_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(non_transient_cleanups.load(Ordering::SeqCst), 0);
+
+        assert!(is_transient_staging_io_error(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_transient_staging_io_error(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        #[cfg(windows)]
+        {
+            assert!(is_transient_staging_io_error(
+                &io::Error::from_raw_os_error(5)
+            ));
+            assert!(is_transient_staging_io_error(
+                &io::Error::from_raw_os_error(32)
+            ));
+            assert!(is_transient_staging_io_error(
+                &io::Error::from_raw_os_error(33)
+            ));
+        }
+    }
+
+    #[test]
+    fn staging_cleanup_and_rename_clear_readonly_attributes() {
+        let root = std::env::temp_dir().join(format!("krill-ro-cleanup-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let nested = root.join("bundle/sub");
+        fs::create_dir_all(&nested).unwrap();
+
+        let ro_file = nested.join("locked.exe");
+        fs::write(&ro_file, b"binary").unwrap();
+        let mut file_perm = fs::metadata(&ro_file).unwrap().permissions();
+        file_perm.set_readonly(true);
+        fs::set_permissions(&ro_file, file_perm).unwrap();
+
+        let mut dir_perm = fs::metadata(&nested).unwrap().permissions();
+        dir_perm.set_readonly(true);
+        fs::set_permissions(&nested, dir_perm).unwrap();
+
+        let delays = [Duration::ZERO, Duration::ZERO];
+        staging_remove_dir_all_with(&root.join("bundle"), &delays).unwrap();
+        assert!(!root.join("bundle").exists());
+
+        // Single readonly file removal & rename-over-readonly target.
+        let single = root.join("single.tmp");
+        fs::write(&single, b"old").unwrap();
+        let mut perm = fs::metadata(&single).unwrap().permissions();
+        perm.set_readonly(true);
+        fs::set_permissions(&single, perm).unwrap();
+        staging_remove_file_with(&single, &delays).unwrap();
+        assert!(!single.exists());
+
+        let from = root.join("from.tmp");
+        let to = root.join("to.tmp");
+        fs::write(&from, b"new-bytes").unwrap();
+        fs::write(&to, b"old-bytes").unwrap();
+        let mut to_perm = fs::metadata(&to).unwrap().permissions();
+        to_perm.set_readonly(true);
+        fs::set_permissions(&to, to_perm).unwrap();
+        staging_rename_with(&from, &to, &delays).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to).unwrap(), b"new-bytes");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_dir_not_writable_classification_and_telemetry_suppression() {
+        let err = Error::InstallDirNotWritable(PathBuf::from(r"C:\Program Files\Krill"));
+        let cloned = err.clone();
+        assert!(matches!(cloned, Error::InstallDirNotWritable(_)));
+        assert!(
+            cloned
+                .to_string()
+                .contains("install directory is not writable")
+        );
+        assert!(!cloned.user_message().is_empty());
+        assert!(!should_report_update_failure(&err));
+
+        // Actionable permission denied inside a writable parent (after retries) still reports.
+        let actionable_perm = Error::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unexpected handle lock after retries",
+        ));
+        assert!(should_report_update_failure(&actionable_perm));
+        assert!(should_report_update_failure(&Error::BadSignature));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_writable_install_parent_skips_download_and_suppresses_update_failed_telemetry() {
+        use krill_proto::error_reporting::{self, Ack, Env, Reply, Request, UploadLock};
+        use ring::signature::{Ed25519KeyPair, KeyPair as _};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        struct DirModeGuard(PathBuf);
+        impl Drop for DirModeGuard {
+            fn drop(&mut self) {
+                fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755)).ok();
+                if let Some(root) = self.0.parent() {
+                    fs::remove_dir_all(root).ok();
+                }
+            }
+        }
+
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("krill-readonly-parent-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let install_parent = root.join("protected");
+        let bundle = install_parent.join("Krill.app");
+        let state = root.join("state");
+        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        error_reporting::enable(&state).unwrap();
+
+        // Ensure writable parent passes write probe cleanly and leaves zero probe files behind.
+        ensure_staging_parent_writable(&bundle).unwrap();
+        let leftover_probes: Vec<_> = fs::read_dir(&install_parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with("write.probe"))
+            .collect();
+        assert!(leftover_probes.is_empty());
+
+        let write_plist = |ver: &str| {
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleShortVersionString</key><string>{ver}</string>
+</dict></plist>"#
+            );
+            fs::write(bundle.join("Contents/Info.plist"), plist).unwrap();
+            fs::write(bundle.join("Contents/MacOS/krill-app"), b"bin").unwrap();
+        };
+        write_plist("0.1.0");
+
+        let mut seed = [7u8; 32];
+        seed[0] = 99;
+        let kp = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let pk: PublicKey = kp.public_key().as_ref().try_into().unwrap();
+        fs::write(
+            state.join(CONFIG_FILE),
+            format!("public_key = \"{}\"\n", ed25519::encode_hex(&pk)),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let mut manifest = Manifest {
+            version: "0.2.0".to_owned(),
+            url: format!("{base_url}/Krill-0.2.0.zip"),
+            sha256: "aa".repeat(32),
+            ed25519_sig: String::new(),
+            min_daemon_protocol: 1,
+            channel: Channel::Stable,
+            rollout_pct: 100,
+        };
+        let sig = kp.sign(&manifest.signing_payload());
+        manifest.ed25519_sig = ed25519::encode_hex(sig.as_ref());
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+
+        let archive_hits = Arc::new(AtomicUsize::new(0));
+        let archive_hits_srv = Arc::clone(&archive_hits);
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body: &[u8] = match path {
+                    "/latest.json" => &manifest_json,
+                    "/Krill-0.2.0.zip" => {
+                        archive_hits_srv.fetch_add(1, Ordering::SeqCst);
+                        b"should-not-fetch"
+                    }
+                    "/stop" => break,
+                    _ => b"not found",
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).ok();
+                stream.write_all(body).ok();
+            }
+        });
+
+        fs::set_permissions(&install_parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let _guard = DirModeGuard(install_parent.clone());
+
+        let err = check_and_stage_with_probe(
+            Some(&format!("{base_url}/latest.json")),
+            &bundle,
+            &state,
+            true,
+            |_| Ok(16 * 1024 * 1024 * 1024),
+            &Env::stub(&[]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InstallDirNotWritable(ref p) if p == &install_parent),
+            "expected InstallDirNotWritable, got {err:?}"
+        );
+        assert_eq!(
+            archive_hits.load(Ordering::SeqCst),
+            0,
+            "non-writable install parent must abort before fetching archive"
+        );
+
+        let consent = error_reporting::consent_with(&state, &Env::stub(&[]))
+            .unwrap()
+            .unwrap();
+        let lock = UploadLock::try_acquire(&state).unwrap().unwrap();
+        let mut events = Vec::new();
+        error_reporting::flush(&state, &consent, &lock, |body| {
+            let req: Request = serde_json::from_slice(body).unwrap();
+            let ack = Ack {
+                schema_version: error_reporting::SCHEMA_VERSION,
+                accepted_ids: req.events.iter().map(|e| e.event_id.clone()).collect(),
+                duplicate_ids: Vec::new(),
+            };
+            events.extend(req.events);
+            Reply::Http {
+                status: 200,
+                retry_after_secs: None,
+                body: serde_json::to_vec(&ack).unwrap(),
+            }
+        })
+        .unwrap();
+        assert!(
+            events.is_empty(),
+            "InstallDirNotWritable must not spam UpdateFailed telemetry: {events:?}"
+        );
+
+        // Already up-to-date checks still succeed cleanly even in a non-writable parent.
+        fs::set_permissions(&install_parent, fs::Permissions::from_mode(0o755)).unwrap();
+        write_plist("0.2.0");
+        fs::set_permissions(&install_parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let up_to_date = check_and_stage_with_probe(
+            Some(&format!("{base_url}/latest.json")),
+            &bundle,
+            &state,
+            true,
+            |_| Ok(16 * 1024 * 1024 * 1024),
+            &Env::stub(&[]),
+        )
+        .unwrap();
+        assert_eq!(
+            up_to_date,
+            CheckStatus::UpToDate {
+                version: "0.2.0".to_owned()
+            }
+        );
+
+        fetch_bytes(&format!("{base_url}/stop"), 64).ok();
+        server.join().ok();
+    }
 }

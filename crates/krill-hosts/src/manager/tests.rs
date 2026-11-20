@@ -334,3 +334,79 @@ fn ssh_target_registration_cannot_follow_a_replaced_or_removed_host_spec() {
         "same host ID must not revive a removed registration"
     );
 }
+
+#[test]
+fn ssh_target_stays_equal_across_tunnel_start_drop_and_restart() {
+    let dir = std::env::temp_dir().join(format!("krill-target-eq-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ssh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $ARGV[0], Listen => 5) or exit 3; while ($c = $s->accept) { close $c }' "${fwd%%:*}"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+    let mut host_spec = spec(Some("/tmp/remote.sock"));
+    let host = HostId::Remote(host_spec.id.clone());
+    manager.sync_specs(&[host_spec.clone()]);
+
+    let before_tunnel = manager.target_for(&host, None).unwrap();
+    let initial_epoch = before_tunnel.transport_epoch();
+    let first_sock = manager.ensure_tunnel_socket("studio").unwrap();
+    let during_first_tunnel = manager.target_for(&host, None).unwrap();
+    assert_eq!(
+        before_tunnel, during_first_tunnel,
+        "starting a tunnel must not change HostTarget identity"
+    );
+    assert_ne!(
+        before_tunnel.socket(),
+        first_sock.as_path(),
+        "ephemeral tunnel socket stays independent of HostTarget::socket"
+    );
+
+    manager.disconnect_now("studio");
+    let after_drop = manager.target_for(&host, None).unwrap();
+    let after_drop_epoch = after_drop.transport_epoch();
+    assert_eq!(
+        before_tunnel, after_drop,
+        "tunnel disconnect must not toggle HostTarget identity"
+    );
+    assert!(
+        after_drop_epoch > initial_epoch,
+        "disconnecting a tunnel must advance transport_epoch for snapshot cache invalidation"
+    );
+
+    manager.reconnect_now("studio");
+    let second_sock = manager.ensure_tunnel_socket("studio").unwrap();
+    assert_ne!(first_sock, second_sock);
+    let during_second_tunnel = manager.target_for(&host, None).unwrap();
+    assert_eq!(
+        before_tunnel, during_second_tunnel,
+        "tunnel restart must keep the same HostTarget identity"
+    );
+    assert!(
+        during_second_tunnel.transport_epoch() > after_drop_epoch,
+        "reconnecting a tunnel must advance transport_epoch"
+    );
+
+    host_spec.port = Some(2224);
+    manager.sync_specs(&[host_spec]);
+    let replaced = manager.target_for(&host, None).unwrap();
+    assert_ne!(
+        before_tunnel, replaced,
+        "changing SSH transport config must still replace HostTarget"
+    );
+
+    drop(manager);
+    fs::remove_dir_all(&dir).ok();
+}

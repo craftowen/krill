@@ -1915,6 +1915,22 @@ impl Registry {
             (FromHolder::Spawned { pid, .. }, Some(master)) => {
                 let session = self.start(id, master, size).map_err(|e| {
                     // krilld가 master를 버렸으니 holder 것까지 놓으면 세션은 SIGHUP으로 끝난다.
+                    tracing::warn!(
+                        id = id.0,
+                        kind = ?e.kind(),
+                        errno = e.raw_os_error(),
+                        wrapped,
+                        "session start failed"
+                    );
+                    record_session_start_failed(
+                        self.dir.as_deref(),
+                        "daemon_start",
+                        &format!("{:?}", e.kind()),
+                        e.raw_os_error(),
+                        wrapped,
+                        file!(),
+                        line!(),
+                    );
                     holder.notify(|req| ToHolder::Release { req, id }).ok();
                     self.discard_settings(id);
                     self.agents.forget(id);
@@ -1938,28 +1954,45 @@ impl Registry {
             }
             (FromHolder::Failed { errno, .. }, _) => {
                 // spawn 실패: 세션이 없으니 주입 settings만 지우고 만들다 만 계보 기록도 걷는다.
-                tracing::warn!(id = id.0, errno, wrapped, "holder session spawn failed");
+                let kind = session_start_failure_kind(errno);
+                tracing::warn!(
+                    id = id.0,
+                    errno,
+                    kind,
+                    wrapped,
+                    "holder session spawn failed"
+                );
                 lock(&self.state).roots.remove(id);
                 self.discard_settings(id);
                 self.agents.forget(id);
                 drop(commit);
-                if let Some(state) = self.dir.as_deref() {
-                    use krill_proto::error_reporting::{self, Code, Event, Process};
-                    if let Ok(event) = Event::new(
-                        Process::Daemon,
-                        Code::SessionStartFailed,
-                        error_reporting::source_location(file!(), line!()),
-                    ) {
-                        error_reporting::record_at(state, event).ok();
-                    }
-                }
+                record_session_start_failed(
+                    self.dir.as_deref(),
+                    "holder_spawn",
+                    kind,
+                    Some(errno),
+                    wrapped,
+                    file!(),
+                    line!(),
+                );
                 Err(Failure::from_holder_errno(errno))
             }
             _ => {
+                tracing::warn!(id = id.0, wrapped, "unexpected holder spawn reply");
                 holder.notify(|req| ToHolder::Release { req, id }).ok();
                 lock(&self.state).roots.remove(id);
                 self.discard_settings(id);
                 self.agents.forget(id);
+                drop(commit);
+                record_session_start_failed(
+                    self.dir.as_deref(),
+                    "holder_reply",
+                    "UnexpectedReply",
+                    Some(libc::EIO),
+                    wrapped,
+                    file!(),
+                    line!(),
+                );
                 Err(Failure::Os(libc::EIO))
             }
         }
@@ -2099,6 +2132,18 @@ impl Registry {
         tap: &crate::session::Tap,
         wrapped: bool,
     ) -> control::AgentStatus {
+        self.resolve_session_status_inner(session, root, exited, tap, wrapped, AgyLookup::Sync)
+    }
+
+    fn resolve_session_status_inner(
+        &self,
+        session: SessionId,
+        root: u32,
+        exited: bool,
+        tap: &crate::session::Tap,
+        wrapped: bool,
+        agy_lookup: AgyLookup<'_>,
+    ) -> control::AgentStatus {
         let mut status = self.status.get(session);
         // EOF/holder 종료는 저장된 hook보다 우선한다. 종료 콜백이 늦거나
         // 더 최신 시각의 hook이 도착해도 끝난 세션을 Done으로 되살리지 않는다.
@@ -2163,29 +2208,64 @@ impl Registry {
             if status.agent.is_empty() {
                 "agy".clone_into(&mut status.agent);
             }
-            let agy_fg = account_switch::effective_foreground_pid(root, tap.foreground(), exited);
-            let (title, discovered) = crate::agent_history::vault::resolve_live_agy_title(
-                session,
-                root,
-                agy_fg,
-                exited,
-                stored.as_ref(),
-            );
-            if let Some((ref conv_id, ref tp)) = discovered {
-                if tp.is_some() {
-                    self.agents
-                        .bind_discovered_session(session, conv_id, tp.as_deref());
-                } else if let Ok(Some(found)) = account_switch::identity::discover(
-                    krill_proto::usage::ProviderKind::Antigravity,
-                    root,
-                    agy_fg,
-                ) {
-                    self.agents
-                        .bind_discovered_session(session, &found.id, Some(&found.path));
-                } else {
-                    self.agents.bind_discovered_session(session, conv_id, None);
+            let (title, discovered) = match agy_lookup {
+                AgyLookup::Nonblocking(agy_jobs) => {
+                    let cached = crate::agent_history::vault::cached_live_agy_title(
+                        session,
+                        stored.as_ref(),
+                    );
+                    let needs_binding = cached.discovered.is_some()
+                        && stored.as_ref().is_some_and(|s| {
+                            s.session_id.is_none()
+                                || s.transcript_path.is_none()
+                                || s.transcript_path
+                                    .as_deref()
+                                    .is_some_and(crate::agent::control::is_agy_conversation_db_path)
+                        });
+                    if (cached.stale || needs_binding)
+                        && let Some(jobs) = agy_jobs
+                    {
+                        jobs.push(AgyRefreshJob {
+                            session,
+                            root,
+                            tap_fg: tap.foreground(),
+                            exited,
+                            stored: stored.clone(),
+                        });
+                    }
+                    (cached.title, cached.discovered)
                 }
-            }
+                AgyLookup::Sync => {
+                    let agy_fg =
+                        account_switch::effective_foreground_pid(root, tap.foreground(), exited);
+                    let (title, discovered) = crate::agent_history::vault::resolve_live_agy_title(
+                        session,
+                        root,
+                        agy_fg,
+                        exited,
+                        stored.as_ref(),
+                    );
+                    if let Some((ref conv_id, ref tp)) = discovered {
+                        if tp.is_some() {
+                            self.agents
+                                .bind_discovered_session(session, conv_id, tp.as_deref());
+                        } else if let Ok(Some(found)) = account_switch::identity::discover(
+                            krill_proto::usage::ProviderKind::Antigravity,
+                            root,
+                            agy_fg,
+                        ) {
+                            self.agents.bind_discovered_session(
+                                session,
+                                &found.id,
+                                Some(&found.path),
+                            );
+                        } else {
+                            self.agents.bind_discovered_session(session, conv_id, None);
+                        }
+                    }
+                    (title, discovered)
+                }
+            };
             if !exited
                 && status.state == control::AgentState::Unknown
                 && (title.is_some()
@@ -3054,7 +3134,21 @@ impl Registry {
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
+    #[cfg(all(test, unix))]
     pub(crate) fn mobile_dashboard_inputs(&self) -> io::Result<MobileDashboardInputs> {
+        self.mobile_dashboard_inputs_inner(None)
+    }
+
+    pub(crate) fn mobile_dashboard_inputs_swr(
+        self: &Arc<Self>,
+    ) -> io::Result<MobileDashboardInputs> {
+        self.mobile_dashboard_inputs_inner(Some(Arc::downgrade(self)))
+    }
+
+    fn mobile_dashboard_inputs_inner(
+        &self,
+        refresh_reg: Option<std::sync::Weak<Self>>,
+    ) -> io::Result<MobileDashboardInputs> {
         let raw: Vec<_> = {
             let st = lock(&self.state);
             st.sessions
@@ -3078,9 +3172,17 @@ impl Registry {
             sidebar::mobile_repositories(&self.sidebar, &entries, self.state_dir().as_deref())
                 .map_err(|e| io::Error::other(e.to_string()))?;
         let mut sessions = Vec::with_capacity(raw.len());
+        let mut agy_jobs = Vec::new();
         for ((session, root, exit_code, tap, wrapped), dir) in raw.into_iter().zip(dirs) {
             let exited = exit_code.is_some() || tap.pulse().closed;
-            let status = self.resolve_session_status(session, root, exited, &tap, wrapped);
+            let status = self.resolve_session_status_inner(
+                session,
+                root,
+                exited,
+                &tap,
+                wrapped,
+                AgyLookup::Nonblocking(refresh_reg.is_some().then_some(&mut agy_jobs)),
+            );
             sessions.push(MobileSessionRow {
                 info: Info {
                     session,
@@ -3090,6 +3192,11 @@ impl Registry {
                 cwd: dir.cwd,
                 status,
             });
+        }
+        if !agy_jobs.is_empty()
+            && let Some(weak_reg) = refresh_reg
+        {
+            spawn_agy_swr_refresh(weak_reg, agy_jobs);
         }
         Ok(MobileDashboardInputs {
             sessions,
@@ -3649,7 +3756,9 @@ impl Registry {
                 bytes.hash(&mut revision);
             }
         }
-        revision.finish() ^ sidebar::revision(&self.sidebar).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        revision.finish()
+            ^ sidebar::revision(&self.sidebar).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+            ^ crate::agent_history::vault::agy_swr_revision().wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 
     fn notify_orch(&self) {
@@ -4432,6 +4541,165 @@ fn os(e: &io::Error) -> Failure {
 
 /// [`krill_proto::ipc::MAX_FRAME`]을 넘는 `reply`(본문 `bytes`) 대신 보내는 작은 응답. 어떤 Reply 종류든
 /// 스트림을 닫지 않고, 기존 와이어 variant만 써서 N-1 클라이언트도 읽는다.
+enum AgyLookup<'a> {
+    Sync,
+    Nonblocking(Option<&'a mut Vec<AgyRefreshJob>>),
+}
+
+struct AgyRefreshJob {
+    session: SessionId,
+    root: u32,
+    tap_fg: Option<u32>,
+    exited: bool,
+    stored: Option<crate::agent::control::StoredLaunch>,
+}
+
+fn spawn_agy_swr_refresh(weak_reg: std::sync::Weak<Registry>, jobs: Vec<AgyRefreshJob>) {
+    let ids: Vec<SessionId> = jobs.iter().map(|job| job.session).collect();
+    let claimed = crate::agent_history::vault::try_claim_agy_swr(&ids);
+    if claimed.is_empty() {
+        return;
+    }
+    let claimed_set: HashSet<SessionId> = claimed.iter().copied().collect();
+    let work: Vec<AgyRefreshJob> = jobs
+        .into_iter()
+        .filter(|job| claimed_set.contains(&job.session))
+        .collect();
+    let claimed_guard_ids = claimed.clone();
+    if std::thread::Builder::new()
+        .name("mobile-agy-swr".into())
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            struct ReleaseGuard(Vec<SessionId>);
+            impl Drop for ReleaseGuard {
+                fn drop(&mut self) {
+                    crate::agent_history::vault::release_agy_swr(&self.0);
+                    crate::alloc::purge();
+                }
+            }
+            crate::alloc::mobile_thread().ok();
+            let _guard = ReleaseGuard(claimed_guard_ids);
+            for job in work {
+                let Some(reg) = weak_reg.upgrade() else {
+                    break;
+                };
+                let agy_fg =
+                    account_switch::effective_foreground_pid(job.root, job.tap_fg, job.exited);
+                let (_title, discovered) = crate::agent_history::vault::resolve_live_agy_title(
+                    job.session,
+                    job.root,
+                    agy_fg,
+                    job.exited,
+                    job.stored.as_ref(),
+                );
+                if let Some((ref conv_id, ref tp)) = discovered {
+                    if tp.is_some() {
+                        reg.agents
+                            .bind_discovered_session(job.session, conv_id, tp.as_deref());
+                    } else if let Ok(Some(found)) = account_switch::identity::discover(
+                        krill_proto::usage::ProviderKind::Antigravity,
+                        job.root,
+                        agy_fg,
+                    ) {
+                        reg.agents.bind_discovered_session(
+                            job.session,
+                            &found.id,
+                            Some(&found.path),
+                        );
+                    } else {
+                        reg.agents
+                            .bind_discovered_session(job.session, conv_id, None);
+                    }
+                    crate::agent_history::vault::bump_agy_swr_revision();
+                }
+            }
+        })
+        .is_err()
+    {
+        crate::agent_history::vault::release_agy_swr(&claimed);
+    }
+}
+
+fn unwrap_win32_code(errno: i32) -> i32 {
+    if (errno.cast_unsigned() & 0xFFFF_0000) == 0x8007_0000 {
+        errno & 0xFFFF
+    } else {
+        errno
+    }
+}
+
+fn session_start_failure_kind(errno: i32) -> &'static str {
+    if Failure::from_holder_errno(errno) == Failure::SessionLimit {
+        return "SessionLimit";
+    }
+    let code = if cfg!(windows) {
+        unwrap_win32_code(errno)
+    } else {
+        errno
+    };
+    match std::io::Error::from_raw_os_error(code).kind() {
+        io::ErrorKind::NotFound => "NotFound",
+        io::ErrorKind::PermissionDenied => "PermissionDenied",
+        io::ErrorKind::InvalidInput => "InvalidInput",
+        io::ErrorKind::AlreadyExists => "AlreadyExists",
+        io::ErrorKind::TimedOut => "TimedOut",
+        io::ErrorKind::ResourceBusy => "ResourceBusy",
+        io::ErrorKind::OutOfMemory => "OutOfMemory",
+        _ => "Other",
+    }
+}
+
+fn format_session_start_detail(
+    phase: &str,
+    kind: &str,
+    raw_code: Option<i32>,
+    wrapped: bool,
+) -> String {
+    let mut detail = match raw_code {
+        Some(code) if !(0..=0xFFFF).contains(&code) => {
+            format!("phase={phase} kind={kind} errno={code} hex=0x{code:08x} wrapped={wrapped}")
+        }
+        Some(code) => format!("phase={phase} kind={kind} errno={code} wrapped={wrapped}"),
+        None => format!("phase={phase} kind={kind} wrapped={wrapped}"),
+    };
+    detail.retain(|c| !c.is_ascii_control());
+    if detail.len() > 256 {
+        let mut end = 256;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    detail
+}
+
+fn record_session_start_failed(
+    dir: Option<&Path>,
+    phase: &str,
+    kind: &str,
+    raw_code: Option<i32>,
+    wrapped: bool,
+    file: &str,
+    line: u32,
+) {
+    use krill_proto::error_reporting::{self, Code, Event, Process};
+
+    let Some(state) = dir else {
+        return;
+    };
+    if let Ok(mut event) = Event::new(
+        Process::Daemon,
+        Code::SessionStartFailed,
+        error_reporting::source_location(file, line),
+    ) {
+        let detail = format_session_start_detail(phase, kind, raw_code, wrapped);
+        if !detail.is_empty() {
+            event.detail = Some(detail);
+        }
+        error_reporting::record_at(state, event).ok();
+    }
+}
+
 fn oversized_reply(reply: &Reply, bytes: u64) -> Reply {
     if matches!(reply, Reply::Orchestration(_)) {
         Reply::Orchestration(krill_proto::orchestration::OrchResponse::Error(
@@ -4467,8 +4735,9 @@ fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
 /// holder `Spawn` 실패가 "경로 없음"인가. Windows holder는 Win32 코드를 그대로 보낸다: 지워진 cwd는
 /// `ERROR_DIRECTORY`(267), 중간 폴더까지 없으면 `ERROR_PATH_NOT_FOUND`(3), 파일은 `ERROR_FILE_NOT_FOUND`(2=ENOENT).
 fn missing_path_errno(errno: i32) -> bool {
+    let win32 = unwrap_win32_code(errno);
     Failure::from_holder_errno(errno) == Failure::Os(libc::ENOENT)
-        || cfg!(windows) && matches!(errno, 3 | 15 | 21 | 53 | 67 | 123 | 206 | 267)
+        || cfg!(windows) && matches!(win32, 2 | 3 | 15 | 21 | 53 | 67 | 123 | 206 | 267)
 }
 
 #[cfg_attr(
@@ -4518,11 +4787,17 @@ fn fallback_spawn_on_enoent(
     {
         let prog_path = Path::new(std::ffi::OsStr::from_bytes(prog));
         if prog_path.is_absolute() && !prog_path.is_file() {
+            let old_prog = prog.clone();
             for candidate in [&b"/bin/zsh"[..], &b"/bin/sh"[..]] {
                 if Path::new(std::ffi::OsStr::from_bytes(candidate)).is_file()
                     && prog.as_slice() != candidate
                 {
                     *prog = candidate.to_vec();
+                    for (k, v) in env.iter_mut() {
+                        if k.as_slice() == b"SHELL" && v.as_slice() == old_prog.as_slice() {
+                            *v = candidate.to_vec();
+                        }
+                    }
                     changed = true;
                     break;
                 }
@@ -4533,7 +4808,7 @@ fn fallback_spawn_on_enoent(
     if !is_wrapper_argv(argv)
         && argv.first().is_some_and(|prog| {
             env.iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case(b"SHELL") && v == prog)
+                .any(|(k, v)| k.eq_ignore_ascii_case(b"SHELL") && v.eq_ignore_ascii_case(prog))
                 && !Path::new(std::ffi::OsStr::from_bytes(prog)).is_file()
         })
     {
@@ -5488,5 +5763,121 @@ mod windows_spawn_tests {
             assert!(super::missing_path_errno(code), "{cwd:?}: {error} ({code})");
         }
         assert!(!super::missing_path_errno(5));
+    }
+}
+
+#[cfg(test)]
+mod spawn_observability_tests {
+    use super::*;
+
+    #[test]
+    fn session_start_failed_detail_is_valid_non_pii_and_records_hresult() {
+        use krill_proto::error_reporting::{Code, Event, Process};
+
+        for (phase, errno, wrapped, expected_kind, expected_hex) in [
+            ("holder_spawn", libc::ENOENT, false, "NotFound", None),
+            (
+                "holder_spawn",
+                0x8007_0002_u32.cast_signed(),
+                true,
+                if cfg!(windows) { "NotFound" } else { "Other" },
+                Some("hex=0x80070002"),
+            ),
+            (
+                "holder_spawn",
+                krill_proto::holder::SESSION_LIMIT_ERRNO,
+                false,
+                "SessionLimit",
+                None,
+            ),
+        ] {
+            let kind = session_start_failure_kind(errno);
+            if errno == krill_proto::holder::SESSION_LIMIT_ERRNO || errno == libc::ENOENT {
+                assert_eq!(kind, expected_kind);
+            }
+            let detail = format_session_start_detail(phase, kind, Some(errno), wrapped);
+            if let Some(hex) = expected_hex {
+                assert!(detail.contains(hex), "{detail}");
+            }
+            let mut event = Event::new(
+                Process::Daemon,
+                Code::SessionStartFailed,
+                krill_proto::error_reporting::source_location(file!(), line!()),
+            )
+            .unwrap();
+            event.detail = Some(detail);
+            event.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_path_errno_recognizes_win32_hresult_wrapper() {
+        assert!(missing_path_errno(libc::ENOENT));
+        if cfg!(windows) {
+            assert!(missing_path_errno(0x8007_0002_u32.cast_signed())); // ERROR_FILE_NOT_FOUND
+            assert!(missing_path_errno(0x8007_0003_u32.cast_signed())); // ERROR_PATH_NOT_FOUND
+            assert!(missing_path_errno(0x8007_010b_u32.cast_signed())); // ERROR_DIRECTORY
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_fallback_updates_shell_env_when_replacing_missing_login_shell() {
+        let mut argv = vec![b"/nonexistent/custom-shell".to_vec(), b"-l".to_vec()];
+        let mut cwd = Vec::new();
+        let mut env = vec![(b"SHELL".to_vec(), b"/nonexistent/custom-shell".to_vec())];
+        assert!(fallback_spawn_on_enoent(&mut argv, &mut cwd, &mut env));
+        assert_ne!(argv[0], b"/nonexistent/custom-shell");
+        let shell_env = env
+            .iter()
+            .find(|(k, _)| k.as_slice() == b"SHELL")
+            .map(|(_, v)| v.as_slice());
+        assert_eq!(shell_env, Some(argv[0].as_slice()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mobile_dashboard_inputs_uses_cached_agy_state_without_blocking() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("krill-agy-nonblock-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir)?;
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let id = SessionId(912);
+        let (master, _terminal) = UnixStream::pair()?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )?;
+        {
+            let mut st = lock(&reg.state);
+            st.roots.insert(id, std::process::id()).ok();
+            st.sessions.insert(
+                id,
+                Entry {
+                    session,
+                    pid: std::process::id(),
+                    cwd: dir.clone(),
+                    wrapped: false,
+                },
+            );
+        }
+        reg.agents.remember_session(
+            id,
+            &control::AgentLaunch {
+                profile: "agy".into(),
+                permission: krill_proto::agent::Permission::Yolo,
+            },
+            None,
+            dir.as_os_str().as_encoded_bytes().to_vec(),
+            None,
+        )?;
+        let inputs = reg.mobile_dashboard_inputs()?;
+        assert_eq!(inputs.sessions.len(), 1);
+        assert_eq!(inputs.sessions[0].status.agent, "agy");
+        drop(reg);
+        std::fs::remove_dir_all(dir)
     }
 }

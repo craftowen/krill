@@ -37,6 +37,167 @@ pub(super) mod feed;
 mod mention_files;
 mod requests;
 
+const SNAPSHOT_MAX_DATA_BYTES: usize = ipc::MAX_FRAME.saturating_sub(256);
+
+fn json_byte_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+fn truncate_string_value(value: &mut Value, max_chars: usize) {
+    if let Value::String(text) = value
+        && text.chars().count() > max_chars
+    {
+        let keep = text
+            .char_indices()
+            .nth(max_chars)
+            .map_or(text.len(), |(idx, _)| idx);
+        text.truncate(keep);
+    }
+}
+
+fn trim_snapshot_card_lines(data: &mut Value, max_lines: usize, max_chars: usize) {
+    let Some(cards) = data.get_mut("sessions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for card in cards {
+        let Some(lines) = card.get_mut("lines").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        if max_lines == 0 {
+            lines.clear();
+            continue;
+        }
+        if lines.len() > max_lines {
+            let drain = lines.len() - max_lines;
+            lines.drain(..drain);
+        }
+        for line in lines {
+            truncate_string_value(line, max_chars);
+        }
+    }
+}
+
+fn trim_snapshot_card_fields(data: &mut Value, drop_command_context: bool) {
+    let Some(cards) = data.get_mut("sessions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for card in cards {
+        for key in [
+            "title",
+            "foreground",
+            "startup_stall",
+            "cwd",
+            "branch",
+            "group_label",
+            "group_path",
+        ] {
+            if let Some(value) = card.get_mut(key) {
+                truncate_string_value(value, 200);
+            }
+        }
+        if drop_command_context && let Some(obj) = card.as_object_mut() {
+            obj.insert("command_context".into(), Value::Null);
+        }
+    }
+}
+
+fn trim_snapshot_secondary_sections(data: &mut Value) {
+    if let Some(orch) = data.get_mut("orchestration").and_then(Value::as_object_mut) {
+        for (key, limit) in [
+            ("runs", 16),
+            ("tasks", 32),
+            ("gates", 16),
+            ("questions", 16),
+        ] {
+            if let Some(items) = orch.get_mut(key).and_then(Value::as_array_mut) {
+                if items.len() > limit {
+                    items.truncate(limit);
+                }
+                for item in items {
+                    if let Some(fields) = item.as_object_mut() {
+                        for text_key in ["title", "summary", "body"] {
+                            if let Some(val) = fields.get_mut(text_key) {
+                                truncate_string_value(val, 240);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if json_byte_len(data) <= SNAPSHOT_MAX_DATA_BYTES {
+        return;
+    }
+    if let Some(qc) = data.get_mut("quick_commands").and_then(Value::as_array_mut) {
+        qc.clear();
+    }
+}
+
+pub(super) fn bound_snapshot_payload(data: &mut Value) {
+    if json_byte_len(data) <= SNAPSHOT_MAX_DATA_BYTES {
+        return;
+    }
+    trim_snapshot_card_lines(data, 1, 160);
+    if json_byte_len(data) <= SNAPSHOT_MAX_DATA_BYTES {
+        return;
+    }
+    trim_snapshot_card_lines(data, 0, 0);
+    if json_byte_len(data) <= SNAPSHOT_MAX_DATA_BYTES {
+        return;
+    }
+    trim_snapshot_card_fields(data, false);
+    if json_byte_len(data) <= SNAPSHOT_MAX_DATA_BYTES {
+        return;
+    }
+    trim_snapshot_card_fields(data, true);
+    if json_byte_len(data) <= SNAPSHOT_MAX_DATA_BYTES {
+        return;
+    }
+    trim_snapshot_secondary_sections(data);
+    if json_byte_len(data) <= SNAPSHOT_MAX_DATA_BYTES {
+        return;
+    }
+    if let Some(cards) = data.get_mut("sessions").and_then(Value::as_array_mut)
+        && !cards.is_empty()
+    {
+        while !cards.is_empty()
+            && json_byte_len(&Value::Array(cards.clone())) > SNAPSHOT_MAX_DATA_BYTES / 2
+        {
+            cards.pop();
+        }
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("truncated".into(), Value::Bool(true));
+        }
+    }
+    while json_byte_len(data) > SNAPSHOT_MAX_DATA_BYTES {
+        let Some(cards) = data.get_mut("sessions").and_then(Value::as_array_mut) else {
+            break;
+        };
+        if cards.pop().is_none() {
+            break;
+        }
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("truncated".into(), Value::Bool(true));
+        }
+    }
+    if json_byte_len(data) > SNAPSHOT_MAX_DATA_BYTES
+        && let Some(obj) = data.as_object_mut()
+    {
+        obj.insert(
+            "orchestration".into(),
+            json!({"runs":[],"tasks":[],"gates":[],"questions":[]}),
+        );
+        for key in ["workspaces", "repositories", "agents"] {
+            if json_byte_len(&Value::Object(obj.clone())) <= SNAPSHOT_MAX_DATA_BYTES {
+                break;
+            }
+            if let Some(arr) = obj.get_mut(key).and_then(Value::as_array_mut) {
+                arr.clear();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct QuickCommandEntry {
     name: String,
@@ -1238,7 +1399,7 @@ impl Backend {
         catalog_used: &mut Option<Arc<super::workspaces::Catalog>>,
     ) -> io::Result<Value> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
-        let dashboard = registry.mobile_dashboard_inputs()?;
+        let dashboard = registry.mobile_dashboard_inputs_swr()?;
         let catalog = self.catalog(&dashboard.repositories);
         *catalog_used = Some(Arc::clone(&catalog));
         let truncated = dashboard.sessions.len() > 64;
@@ -1335,13 +1496,13 @@ impl Backend {
                 "state_source":state.source,"state_confidence":state.confidence,
                 "state_since_unix_ns":state.since_unix_ns.to_string()}));
         }
-        Ok(
-            json!({"sessions":cards,"orchestration":self.orchestration()?,
+        let mut data = json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
             "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_interrupt":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
-            "host":self.host,"agents":agents_value}),
-        )
+            "host":self.host,"agents":agents_value});
+        bound_snapshot_payload(&mut data);
+        Ok(data)
     }
     fn orchestration(&self) -> io::Result<Value> {
         let store = self
@@ -3768,5 +3929,252 @@ mod revision_tests {
             )),
             "Could not connect to the live agent session."
         );
+    }
+
+    #[test]
+    fn snapshot_bounds_oversized_payload_below_ipc_and_e2ee_limits() {
+        use super::super::e2ee::{Channel, Endpoint, MAX_PLAINTEXT};
+
+        let huge_line = "x".repeat(8192);
+        let huge_title = "t".repeat(4096);
+        let mut sessions: Vec<Value> = (1..=64)
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "state": "working",
+                    "agent": "claude",
+                    "title": huge_title,
+                    "foreground": "claude",
+                    "startup_stall": null,
+                    "cwd": "/tmp/repo",
+                    "lines": [huge_line, huge_line, huge_line],
+                    "exited": false,
+                    "branch": "main",
+                    "added": 1,
+                    "deleted": 0,
+                    "profile_id": "claude",
+                    "account_id": null,
+                    "command_context": {"commands": vec![huge_line.clone(); 4]},
+                    "repo_key": "repo",
+                    "worktree_key": "wt",
+                    "group_label": "repo",
+                    "group_path": "/tmp/repo",
+                    "state_source": "hook",
+                    "state_confidence": "high",
+                    "state_since_unix_ns": "0",
+                })
+            })
+            .collect();
+        let mut data = json!({
+            "sessions": sessions,
+            "orchestration": {"runs":[],"tasks":[],"gates":[],"questions":[]},
+            "repositories": [],
+            "workspaces": [],
+            "truncated": false,
+            "capabilities": {"change_feed": true},
+            "quick_commands": [],
+            "host": "test",
+            "agents": [],
+        });
+        assert!(json_byte_len(&data) > ipc::MAX_FRAME);
+
+        bound_snapshot_payload(&mut data);
+        let wrapped = json!({"ok": true, "data": data});
+        let raw = serde_json::to_vec(&wrapped).unwrap();
+        assert!(
+            raw.len() < ipc::MAX_FRAME.saturating_sub(32),
+            "bounded snapshot rpc len {} exceeded IPC budget",
+            raw.len()
+        );
+        let ipc_frame = ipc::encode_frame(6, &raw).unwrap();
+        assert!(ipc_frame.len() <= MAX_PLAINTEXT);
+        let mut daemon = Channel::new(&[1u8; 32], &[2u8; 64], Endpoint::Daemon).unwrap();
+        let mut client = Channel::new(&[1u8; 32], &[2u8; 64], Endpoint::Client).unwrap();
+        let sealed = daemon.seal(&ipc_frame).unwrap();
+        assert_eq!(client.open(&sealed).unwrap(), ipc_frame);
+
+        // Even when cards remain >1MB without lines/context, cards are trimmed and `truncated` flips true.
+        sessions = (1..=64)
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "blob": "b".repeat(32 * 1024),
+                    "lines": [],
+                })
+            })
+            .collect();
+        let mut hard = json!({
+            "sessions": sessions,
+            "orchestration": {"runs":[],"tasks":[],"gates":[],"questions":[]},
+            "repositories": [],
+            "workspaces": [],
+            "truncated": false,
+            "quick_commands": [],
+            "agents": [],
+        });
+        bound_snapshot_payload(&mut hard);
+        assert_eq!(hard["truncated"], true);
+        let wrapped_hard = serde_json::to_vec(&json!({"ok": true, "data": hard})).unwrap();
+        assert!(wrapped_hard.len() < ipc::MAX_FRAME.saturating_sub(32));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_swr_returns_without_blocking_on_cold_agy_session() {
+        use crate::holder::{Holder, link::Link};
+        use crate::os::OwnedFd;
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+        use std::os::fd::AsFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        struct Cleanup {
+            dir: PathBuf,
+            child: Option<std::process::Child>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(mut c) = self.child.take() {
+                    c.kill().ok();
+                    c.wait().ok();
+                }
+                fs::remove_dir_all(&self.dir).ok();
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("pwa-agy-swr-{}", hex(&random().unwrap())));
+        let state_dir = dir.join("state");
+        let repo = dir.join("repo");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let repo = fs::canonicalize(&repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            state_dir.join("projects.toml"),
+            format!(
+                "[[projects]]\nid = \"repo\"\nname = \"Repo\"\npath = {:?}\n",
+                repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut cleanup = Cleanup { dir, child: None };
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .current_dir(&repo)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        cleanup.child = Some(child);
+
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let registry = Arc::new(Registry::new(Some((holder, vec![])), Some(&state_dir)));
+        let reader_reg = Arc::clone(&registry);
+        let reader = thread::spawn(move || reader_reg.run_holder(link));
+        let holder_worker = thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, .. } = ToHolder::decode(packet.frame()).unwrap() else {
+                panic!("expected Spawn");
+            };
+            let (master, pty) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned {
+                        req,
+                        id,
+                        pid: child_pid,
+                    }
+                    .encode()
+                    .unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            (holder_link, master, pty)
+        });
+
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&state_dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let repo_key = hex(repo.as_os_str().as_bytes());
+        let create_reply: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "create_terminal",
+                    "workspace": repo_key,
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            create_reply["ok"], true,
+            "create_terminal failed: {create_reply}"
+        );
+        let (holder_link, master, _pty) = holder_worker.join().unwrap();
+        drop(master);
+        let session_id = create_reply["data"]["session"].as_u64().unwrap();
+
+        registry
+            .agent_control()
+            .remember_session(
+                SessionId(session_id),
+                &control::AgentLaunch {
+                    profile: "agy".into(),
+                    permission: krill_proto::agent::Permission::Yolo,
+                },
+                None,
+                repo.as_os_str().as_bytes().to_vec(),
+                None,
+            )
+            .unwrap();
+
+        let rev_before = registry.dashboard_revision();
+        let started = Instant::now();
+        let snap: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"snapshot"}"#)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "snapshot SWR blocked for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(snap["ok"], true);
+        assert_eq!(snap["data"]["sessions"][0]["agent"], "agy");
+
+        // When background SWR discovery changes title/binding, dashboard_revision must advance.
+        crate::agent_history::vault::bump_agy_swr_revision();
+        assert_ne!(registry.dashboard_revision(), rev_before);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::lock(&backend.git_inflight).is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(holder_link);
+        reader.join().ok();
+        drop(backend);
+        drop(registry);
     }
 }
