@@ -27,7 +27,10 @@ pub(crate) mod replay_gate;
 mod segment;
 pub(crate) mod stable;
 
+pub(crate) use recorder::AsyncRecorder;
 pub use recorder::Recorder;
+#[cfg(all(test, unix))]
+pub(crate) use recorder::write_hook::install as install_recorder_write_hook;
 
 use krill_proto::os::fs::DirBuilderExt;
 use std::collections::{HashMap, HashSet};
@@ -35,8 +38,8 @@ use std::fs;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use krill_proto::SessionId;
@@ -151,12 +154,32 @@ pub struct Store {
     cleared: Mutex<HashMap<SessionId, (u64, u64, bool)>>,
     /// 명시적 `Close`로 닫힌 세션 집합.
     closed: Mutex<HashSet<SessionId>>,
+    /// Active [`Store::clear`] calls suppressing stale async writes.
+    clearing: AtomicUsize,
+    /// Pending `set_paused(true)` callers; workers yield before taking `pause.read()`.
+    pause_waiters: Mutex<usize>,
+    pause_wait_cv: Condvar,
+    /// Active per-session async recorder queues for cold-read/clear/pause barriers.
+    async_recorders: Mutex<Vec<(u64, SessionId, Weak<recorder::AsyncHandle>)>>,
+    next_async_id: AtomicU64,
 }
 
 #[derive(Debug, Default)]
 struct Pause {
     paused: bool,
     epoch: u64,
+}
+
+struct PauseWaitGuard<'a>(&'a Store);
+
+impl Drop for PauseWaitGuard<'_> {
+    fn drop(&mut self) {
+        let mut waiters = lock(&self.0.pause_waiters);
+        *waiters = waiters.saturating_sub(1);
+        if *waiters == 0 {
+            self.0.pause_wait_cv.notify_all();
+        }
+    }
 }
 
 impl Store {
@@ -220,6 +243,11 @@ impl Store {
             pause: RwLock::default(),
             cleared: Mutex::default(),
             closed: Mutex::default(),
+            clearing: AtomicUsize::new(0),
+            pause_waiters: Mutex::new(0),
+            pause_wait_cv: Condvar::new(),
+            async_recorders: Mutex::default(),
+            next_async_id: AtomicU64::new(1),
         })
     }
 
@@ -278,10 +306,41 @@ impl Store {
 
     /// 일시중지 동안 PTY·화면은 유지하고 새 디스크 기록만 막는다.
     pub fn set_paused(&self, paused: bool) {
-        let mut state = self.pause.write().unwrap_or_else(PoisonError::into_inner);
-        if state.paused != paused {
-            state.epoch = state.epoch.saturating_add(1);
-            state.paused = paused;
+        if paused {
+            let wait_guard = self.begin_pause_wait();
+            {
+                let mut state = self.pause.write().unwrap_or_else(PoisonError::into_inner);
+                if !state.paused {
+                    state.epoch = state.epoch.saturating_add(1);
+                    state.paused = true;
+                }
+            }
+            // Drop wait_guard after pause.write() releases so queued workers observe
+            // `paused = true` instead of slipping another read lock ahead of the writer.
+            drop(wait_guard);
+            self.flush_all_async();
+        } else {
+            let mut state = self.pause.write().unwrap_or_else(PoisonError::into_inner);
+            if state.paused {
+                state.epoch = state.epoch.saturating_add(1);
+                state.paused = false;
+            }
+        }
+    }
+
+    fn begin_pause_wait(&self) -> PauseWaitGuard<'_> {
+        let mut waiters = lock(&self.pause_waiters);
+        *waiters = waiters.saturating_add(1);
+        PauseWaitGuard(self)
+    }
+
+    pub(super) fn wait_for_pending_pause(&self) {
+        let mut waiters = lock(&self.pause_waiters);
+        while *waiters > 0 {
+            waiters = self
+                .pause_wait_cv
+                .wait(waiters)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -335,6 +394,9 @@ impl Store {
     /// 세션 `id`의 콜드 스크롤백 기준선(`seq`)을 기록한다(OWE-873b).
     /// 세그먼트 파일은 지우지 않고 기준선 이전 원본에서 밀려난 행만 히스토리 응답에서 제외한다.
     pub fn clear_scrollback(&self, id: SessionId, seq: u64) {
+        if self.recording {
+            self.flush_session(id);
+        }
         let _publication = self
             .history_publication
             .write()
@@ -366,6 +428,7 @@ impl Store {
         if !self.recording {
             return false;
         }
+        self.flush_session(id);
         let dir = self.session_dir(id);
         let Ok(mut paths) = segments(&dir) else {
             return false;
@@ -424,6 +487,7 @@ impl Store {
     /// 세션의 콜드 이력(디스크에 남은 세그먼트 목록).
     pub fn history(&self, id: SessionId) -> io::Result<History> {
         let segs = if self.recording {
+            self.flush_session(id);
             segments(&self.session_dir(id))?
         } else {
             Vec::new()
@@ -541,10 +605,11 @@ impl Store {
     /// 오래된 세그먼트부터 지운다(열린 세션의 마지막 세그먼트는 남긴다). krilld 기동 때와 주기적으로 부른다.
     /// 항목 하나의 IO 오류가 전체 주기를 중단시키지 않는다. 실패한 항목은 경고만 남기고 건너뛴다(K-20).
     pub fn gc(&self, live: &[SessionId], now: SystemTime) -> io::Result<()> {
-        let generation = self.generation.load(Ordering::Acquire);
         if !self.recording || !self.sessions.exists() {
             return Ok(());
         }
+        self.flush_all_async();
+        let generation = self.generation.load(Ordering::Acquire);
         // 재개 이력은 새 라이브 세션의 일부다. closed 보존 기간만으로 조상을 지우지 않는다.
         // 전역 디스크 상한은 기존대로 적용한다.
         let live: std::collections::HashSet<_> =

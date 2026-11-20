@@ -78,7 +78,7 @@ fn directory_in(
     home: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(dir) = get("KRILL_LOG_DIR") {
-        return Some(PathBuf::from(dir));
+        return (!dir.is_empty()).then(|| PathBuf::from(dir));
     }
     if test_process {
         return Some(std::env::temp_dir().join("krill-test-logs"));
@@ -115,25 +115,27 @@ fn directory_in(
 /// 사용자가 고른 `KRILL_STATE_DIR`은 해당하지 않는다(이 경우 로그는 숨기지 않고 `<상태 폴더>/logs`에 남는다).
 /// - `NEXTEST`: nextest가 늘 1로 둔다.
 /// - `CARGO_BIN_EXE_<이름>`: `cargo test`가 통합 테스트 프로세스에 런타임으로도 둔다(`cargo run`에는 없다).
+/// - `KRILL_TEST_<이름>`: 비어 있거나 `"0"`이 아닌 테스트/하네스 전용 플래그.
 /// - 실행 파일이 `target/<프로필>/deps/<이름>-<해시>`: libtest 바이너리 자신(직접 실행 포함).
 ///
-/// 앞의 둘은 환경이라 holder → krilld 재기동·exec 핸드오프까지 그대로 이어진다. 테스트 바이너리를 직접 실행하는
+/// 앞의 표식은 환경이라 holder → krilld 재기동·exec 핸드오프까지 그대로 이어진다. 테스트 바이너리를 직접 실행하는
 /// 게이트(`packaging/release_check.py`)의 자식은 테스트가 `KRILL_LOG_DIR`을 넘긴다.
 /// `krill_proto::error_reporting`에 같은 판정이 있다(krill-proto는 이 크레이트에 의존하지 않는다).
 #[must_use]
 pub fn is_test_process() -> bool {
-    is_test_process_in(
-        std::env::vars_os().map(|(key, _)| key),
-        std::env::current_exe().ok().as_deref(),
-    )
+    is_test_process_in(std::env::vars_os(), std::env::current_exe().ok().as_deref())
 }
 
-fn is_test_process_in(keys: impl IntoIterator<Item = OsString>, exe: Option<&Path>) -> bool {
-    keys.into_iter().any(|key| {
+fn is_test_process_in(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+    exe: Option<&Path>,
+) -> bool {
+    vars.into_iter().any(|(key, value)| {
         key == "NEXTEST"
-            || key
-                .to_str()
-                .is_some_and(|key| key.starts_with("CARGO_BIN_EXE_"))
+            || key.to_str().is_some_and(|key| {
+                key.starts_with("CARGO_BIN_EXE_")
+                    || (key.starts_with("KRILL_TEST_") && !value.is_empty() && value != "0")
+            })
     }) || exe
         .and_then(Path::parent)
         .and_then(Path::file_name)
@@ -168,6 +170,14 @@ mod tests {
                 Some(PathBuf::from("/KRILL_LOG_DIR"))
             );
         }
+        assert_eq!(
+            directory_in(
+                |k| (k == "KRILL_LOG_DIR").then(OsString::new),
+                false,
+                || Some(PathBuf::from("/h"))
+            ),
+            None
+        );
         assert_eq!(directory_in(|_| None, false, || None), None);
     }
 
@@ -188,11 +198,24 @@ mod tests {
     /// 일반 `cargo run`(`CARGO_MANIFEST_DIR`만 있음)과 임시 폴더의 사용자 상태 폴더는 테스트가 아니다.
     #[test]
     fn only_test_harness_markers_mark_a_test_process() {
-        let keys = |names: &[&str]| names.iter().map(OsString::from).collect::<Vec<_>>();
+        let keys = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (OsString::from(name), OsString::from("1")))
+                .collect::<Vec<_>>()
+        };
         let dev = Path::new("/w/target/debug/krill-holder");
         assert!(is_test_process_in(keys(&["NEXTEST"]), Some(dev)));
         assert!(is_test_process_in(
             keys(&["CARGO_MANIFEST_DIR", "CARGO_BIN_EXE_krill-holder"]),
+            Some(dev)
+        ));
+        assert!(is_test_process_in(keys(&["KRILL_TEST_OFFLINE"]), Some(dev)));
+        assert!(!is_test_process_in(
+            vec![
+                (OsString::from("KRILL_TEST_OFFLINE"), OsString::from("0")),
+                (OsString::from("KRILL_TEST_BALLAST_MB"), OsString::new()),
+            ],
             Some(dev)
         ));
         let libtest = Path::new("/w/target/release/deps/survive-0123abcd");
@@ -223,6 +246,12 @@ mod tests {
         assert_eq!(
             directory_in(state(PathBuf::from("/tmp/x")), false, || Some(home.clone())),
             Some(PathBuf::from("/tmp/x/logs"))
+        );
+        assert_eq!(
+            directory_in(state(PathBuf::from("/var/folders/ab/state")), false, || {
+                None
+            }),
+            Some(PathBuf::from("/var/folders/ab/state/logs"))
         );
         // 테스트 프로세스는 지금처럼 임시 폴더로 간다.
         assert_eq!(

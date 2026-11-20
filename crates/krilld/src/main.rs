@@ -75,15 +75,6 @@ fn main() -> ExitCode {
     #[cfg(windows)]
     krilld::set_hard_error_dialogs(false);
     let path = PathBuf::from(argument);
-    krill_log::init(krill_log::Component::Daemon).ok();
-    tracing::info!("daemon starting");
-    // 세션 panic은 `catch_unwind`가 잡지만(P4) 원인은 크래시 로그로 남긴다(MK-067).
-    krill_proto::diag::install_panic_hook("krilld");
-    // 실패해도 데몬은 뜬다: 해제 페이지가 늦게 돌아올 뿐 세션에는 영향이 없다.
-    krilld::alloc::return_freed_pages().ok();
-    krilld::alloc::mobile_thread().ok();
-    // MK-066: 메모리 게이트가 의도적 회귀를 잡는지 확인하는 주입(`scripts/memory-gate.sh --inject`). 평소에는 빈 Vec.
-    let _ballast = std::hint::black_box(ballast());
     #[cfg(unix)]
     let stdin = io::stdin();
     #[cfg(unix)]
@@ -91,6 +82,17 @@ fn main() -> ExitCode {
         .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) == FileType::Socket);
     #[cfg(windows)]
     let linked = std::env::var_os("KRILL_HOLDER_LINK").is_some();
+    if should_init_log(linked, &path) {
+        krill_log::init(krill_log::Component::Daemon).ok();
+        tracing::info!("daemon starting");
+    }
+    // 세션 panic은 `catch_unwind`가 잡지만(P4) 원인은 크래시 로그로 남긴다(MK-067).
+    krill_proto::diag::install_panic_hook("krilld");
+    // 실패해도 데몬은 뜬다: 해제 페이지가 늦게 돌아올 뿐 세션에는 영향이 없다.
+    krilld::alloc::return_freed_pages().ok();
+    krilld::alloc::mobile_thread().ok();
+    // MK-066: 메모리 게이트가 의도적 회귀를 잡는지 확인하는 주입(`scripts/memory-gate.sh --inject`). 평소에는 빈 Vec.
+    let _ballast = std::hint::black_box(ballast());
     let (holder, held) = if linked {
         #[cfg(unix)]
         let connection = stdin.as_fd().try_clone_to_owned().and_then(Holder::connect);
@@ -127,23 +129,21 @@ fn main() -> ExitCode {
             }
         }
         Err(error) => {
-            let reason = (error.kind() == io::ErrorKind::PermissionDenied
-                && error
-                    .to_string()
-                    .contains("socket directory must be a 0700 directory"))
-            .then_some("socket directory must be a 0700 directory");
+            let (reason, capture_error) = classify_listener_error(&error, &path);
             tracing::error!(
                 kind = ?error.kind(),
                 errno = error.raw_os_error(),
                 reason,
                 "listener failed"
             );
-            krill_proto::error_reporting::capture(
-                krill_proto::error_reporting::Process::Daemon,
-                krill_proto::error_reporting::Code::DaemonListenerFailed,
-                file!(),
-                line!(),
-            );
+            if capture_error && should_report_listener_failure(linked, &path) {
+                krill_proto::error_reporting::capture(
+                    krill_proto::error_reporting::Process::Daemon,
+                    krill_proto::error_reporting::Code::DaemonListenerFailed,
+                    file!(),
+                    line!(),
+                );
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -408,6 +408,59 @@ fn owns_mobile(socket: &Path) -> bool {
         .is_some_and(|dir| daemon::socket_path(&dir).is_ok_and(|path| path == socket))
 }
 
+fn should_init_log(linked: bool, socket: &Path) -> bool {
+    should_init_log_with(
+        linked,
+        owns_mobile(socket),
+        daemon::state_dir_isolated(),
+        std::env::var_os("KRILL_LOG_DIR").as_deref(),
+    )
+}
+
+fn should_init_log_with(
+    linked: bool,
+    owns_mobile: bool,
+    isolated_state: bool,
+    log_dir_override: Option<&std::ffi::OsStr>,
+) -> bool {
+    match log_dir_override {
+        Some(dir) if dir.is_empty() => false,
+        Some(_) => true,
+        None => linked || owns_mobile || isolated_state,
+    }
+}
+
+fn classify_listener_error(error: &io::Error, path: &Path) -> (Option<&'static str>, bool) {
+    match error.kind() {
+        io::ErrorKind::InvalidInput => {
+            let message = error.to_string();
+            let reason = if message.contains("socket path must be shorter than 100 bytes") {
+                "socket path must be shorter than 100 bytes"
+            } else if path
+                .parent()
+                .is_none_or(|parent| parent.as_os_str().is_empty())
+            {
+                "socket path must include a parent directory"
+            } else {
+                "invalid socket path"
+            };
+            (Some(reason), false)
+        }
+        io::ErrorKind::PermissionDenied
+            if error
+                .to_string()
+                .contains("socket directory must be a 0700 directory") =>
+        {
+            (Some("socket directory must be a 0700 directory"), true)
+        }
+        _ => (None, true),
+    }
+}
+
+fn should_report_listener_failure(linked: bool, socket: &Path) -> bool {
+    linked || owns_mobile(socket)
+}
+
 /// 환경 변수 `KRILL_TEST_BALLAST_MB`(메비바이트 단위)만큼을 0이 아닌 값으로 채워 쥔다(dirty 페이지라 footprint에 잡힌다). 없거나 잘못된 값이면 빈 Vec.
 fn ballast() -> Vec<u8> {
     std::env::var("KRILL_TEST_BALLAST_MB")
@@ -416,4 +469,85 @@ fn ballast() -> Vec<u8> {
         .and_then(|mb| mb.checked_mul(1 << 20))
         .map(|n| vec![1; n])
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listener_error_classification_gives_non_pii_reasons_and_gates_capture() {
+        let too_long = io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path must be shorter than 100 bytes",
+        );
+        assert_eq!(
+            classify_listener_error(&too_long, Path::new("/tmp/very/long/socket.sock")),
+            (Some("socket path must be shorter than 100 bytes"), false)
+        );
+
+        let missing_parent = io::Error::from(io::ErrorKind::InvalidInput);
+        assert_eq!(
+            classify_listener_error(&missing_parent, Path::new("krilld.sock")),
+            (Some("socket path must include a parent directory"), false)
+        );
+        assert_eq!(
+            classify_listener_error(&missing_parent, Path::new("/")),
+            (Some("socket path must include a parent directory"), false)
+        );
+
+        let generic_invalid = io::Error::new(io::ErrorKind::InvalidInput, "bad input");
+        assert_eq!(
+            classify_listener_error(&generic_invalid, Path::new("/tmp/run/krilld.sock")),
+            (Some("invalid socket path"), false)
+        );
+
+        let bad_mode = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket directory must be a 0700 directory owned by this user",
+        );
+        assert_eq!(
+            classify_listener_error(&bad_mode, Path::new("/tmp/run/krilld.sock")),
+            (Some("socket directory must be a 0700 directory"), true)
+        );
+
+        let other = io::Error::from(io::ErrorKind::NotFound);
+        assert_eq!(
+            classify_listener_error(&other, Path::new("/tmp/run/krilld.sock")),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn standalone_non_isolated_daemon_skips_log_init_and_failure_reporting() {
+        use std::ffi::OsStr;
+
+        assert!(!should_init_log_with(false, false, false, None));
+        assert!(should_init_log_with(true, false, false, None));
+        assert!(should_init_log_with(false, true, false, None));
+        assert!(should_init_log_with(false, false, true, None));
+        assert!(should_init_log_with(
+            false,
+            false,
+            false,
+            Some(OsStr::new("/tmp/logs"))
+        ));
+        assert!(!should_init_log_with(
+            true,
+            true,
+            true,
+            Some(OsStr::new(""))
+        ));
+
+        let isolated =
+            std::env::temp_dir().join(format!("krilld-main-test-{}", std::process::id()));
+        assert!(!should_report_listener_failure(
+            false,
+            &isolated.join("custom.sock")
+        ));
+        assert!(should_report_listener_failure(
+            true,
+            &isolated.join("custom.sock")
+        ));
+    }
 }

@@ -2,10 +2,13 @@
 //! 압축·열린 파일 쓰기는 gate 밖에서 하고, 일시중지 ACK는 쓰기 read 잠금이 풀린 뒤 반환한다.
 
 use krill_proto::os::fs::OpenOptionsExt;
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, atomic::Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
@@ -14,9 +17,14 @@ use krill_proto::holder::WinSize;
 use super::crypto::{SALT_LEN, Stream, key_unavailable};
 use super::segment::{self, Base, HEADER_LEN, Header, Record};
 use super::{LEVEL, OVERHEAD, RESUME, Store, WINDOW_LOG, lock, mkdir, privacy, segments};
+use crate::session::Gap;
 
 /// Keep the compression window during bursts, then release it for quiet sessions.
 const IDLE_SEAL: Duration = Duration::from_secs(5);
+/// Per-session bounded async recording queue (10 sessions <= 6.25 MiB worst-case, 0 when idle).
+pub(crate) const MAX_ASYNC_QUEUE_BYTES: usize = 640 * 1024;
+pub(crate) const MAX_ASYNC_QUEUE_ITEMS: usize = 128;
+const MAX_ASYNC_COALESCE_BYTES: usize = 64 * 1024;
 
 struct Open {
     file: File,
@@ -29,7 +37,7 @@ struct Open {
     len: u64,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Snapshots {
     Allowed,
     Suppressed,
@@ -362,8 +370,50 @@ impl Recorder {
         self.trim(&path).ok();
     }
 
+    /// Advances `seq` across `Store::clear` without touching disk.
+    fn discard_for_clear(&mut self, generation: u64, len: u64, resized: Option<WinSize>) {
+        self.open = None;
+        self.keyframe.clear();
+        self.lost = 0;
+        self.crashed = false;
+        self.started = false;
+        self.dropping = false;
+        self.generation = generation;
+        if let Some(size) = resized {
+            self.size = size;
+        }
+        self.seq = self.seq.saturating_add(len);
+    }
+
+    fn record_overflow_gap(&mut self, len: u64, resized: Option<WinSize>) {
+        let store = Arc::clone(&self.store);
+        let pause = store.record_guard();
+        self.refresh(store.generation.load(Ordering::Acquire));
+        self.observe_pause(pause.epoch);
+        if let Some(size) = resized {
+            self.size = size;
+            if store.recording && !pause.paused && self.open.is_some() {
+                let mut spent = 0;
+                let res = self.write(&[Record::Resize(size)], 0, &mut spent);
+                self.store.charge(spent);
+                if res.is_err() {
+                    self.abandon();
+                }
+            }
+        }
+        if !store.recording {
+            self.seq = self.seq.saturating_add(len);
+            return;
+        }
+        self.keyframe.clear();
+        self.lost = self.lost.saturating_add(len);
+        self.seq = self.seq.saturating_add(len);
+    }
+
     /// 레코드들을 청크 하나로 쓴다. 세그먼트가 없으면 새로 연다. 실패하면 호출자가 [`Self::abandon`].
     fn write(&mut self, recs: &[Record], raw: u64, spent: &mut u64) -> io::Result<()> {
+        #[cfg(test)]
+        write_hook::before_write(self.id);
         if self.open.is_none() {
             let keyframe = matches!(recs.first(), Some(Record::Keyframe(_)));
             match self.create(spent, keyframe) {
@@ -525,5 +575,940 @@ impl Recorder {
             total -= len;
         }
         Ok(())
+    }
+}
+
+struct BatchItem {
+    seq: u64,
+    bytes: Vec<u8>,
+    resized: Option<WinSize>,
+    snapshot: Vec<u8>,
+    generation: u64,
+}
+
+enum AsyncOp {
+    Batch {
+        ticket: u64,
+        batch: BatchItem,
+    },
+    DropSpan {
+        ticket: u64,
+        len: u64,
+        resized: Option<WinSize>,
+        generation: u64,
+        clear: bool,
+    },
+    Seal {
+        ticket: u64,
+        resized: Option<WinSize>,
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerLifecycle {
+    Running,
+    Stopping,
+    Dead,
+}
+
+struct AsyncState {
+    queue: VecDeque<AsyncOp>,
+    queued_bytes: usize,
+    enqueued_gen: u64,
+    completed_gen: u64,
+    in_flight: bool,
+    worker_open: bool,
+    lifecycle: WorkerLifecycle,
+}
+
+pub(super) struct AsyncHandle {
+    mu: Mutex<AsyncState>,
+    cv: Condvar,
+}
+
+impl AsyncHandle {
+    fn flush(&self) {
+        let mut state = lock(&self.mu);
+        let target = state.enqueued_gen;
+        while state.completed_gen < target && state.lifecycle != WorkerLifecycle::Dead {
+            state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn flush_cancelled(&self, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+        let mut state = lock(&self.mu);
+        let target = state.enqueued_gen;
+        while state.completed_gen < target && state.lifecycle != WorkerLifecycle::Dead {
+            if cancelled() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(state, Duration::from_millis(10))
+                .unwrap_or_else(PoisonError::into_inner);
+            state = guard;
+        }
+        Ok(())
+    }
+
+    fn quiesce_for_clear(&self, generation: u64) {
+        let mut state = lock(&self.mu);
+        let mut dropped_len = 0u64;
+        let mut dropped_resized = None;
+        let mut max_ticket = state.enqueued_gen;
+        let mut had_ops = false;
+        while let Some(op) = state.queue.pop_front() {
+            had_ops = true;
+            match op {
+                AsyncOp::Batch { ticket, batch } => {
+                    max_ticket = max_ticket.max(ticket);
+                    dropped_len = dropped_len.saturating_add(batch.bytes.len() as u64);
+                    if batch.resized.is_some() {
+                        dropped_resized = batch.resized;
+                    }
+                }
+                AsyncOp::DropSpan {
+                    ticket,
+                    len,
+                    resized,
+                    ..
+                } => {
+                    max_ticket = max_ticket.max(ticket);
+                    dropped_len = dropped_len.saturating_add(len);
+                    if resized.is_some() {
+                        dropped_resized = resized;
+                    }
+                }
+                AsyncOp::Seal {
+                    ticket, resized, ..
+                } => {
+                    max_ticket = max_ticket.max(ticket);
+                    if resized.is_some() {
+                        dropped_resized = resized;
+                    }
+                }
+            }
+        }
+        state.queued_bytes = 0;
+        if had_ops {
+            state.queue.push_back(AsyncOp::DropSpan {
+                ticket: max_ticket,
+                len: dropped_len,
+                resized: dropped_resized,
+                generation,
+                clear: true,
+            });
+            self.cv.notify_all();
+        }
+        let target = state.enqueued_gen;
+        while (state.completed_gen < target || state.in_flight)
+            && state.lifecycle != WorkerLifecycle::Dead
+        {
+            state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+pub(crate) struct ClearGuard<'a>(&'a Store);
+
+impl Drop for ClearGuard<'_> {
+    fn drop(&mut self) {
+        self.0.clearing.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl Store {
+    pub(super) fn begin_clear(&self) -> ClearGuard<'_> {
+        self.clearing.fetch_add(1, Ordering::AcqRel);
+        ClearGuard(self)
+    }
+
+    pub(super) fn is_clearing(&self) -> bool {
+        self.clearing.load(Ordering::Acquire) > 0
+    }
+
+    fn register_async(&self, id: SessionId, handle: &Arc<AsyncHandle>) -> u64 {
+        let reg_id = self.next_async_id.fetch_add(1, Ordering::Relaxed);
+        let mut map = lock(&self.async_recorders);
+        map.retain(|(_, _, weak)| weak.strong_count() > 0);
+        map.push((reg_id, id, Arc::downgrade(handle)));
+        reg_id
+    }
+
+    fn unregister_async(&self, reg_id: u64) {
+        let mut map = lock(&self.async_recorders);
+        map.retain(|(existing, _, weak)| *existing != reg_id && weak.strong_count() > 0);
+    }
+
+    fn active_async(&self, filter: Option<SessionId>) -> Vec<Arc<AsyncHandle>> {
+        let map = lock(&self.async_recorders);
+        map.iter()
+            .filter(|(_, id, _)| filter.is_none_or(|target| *id == target))
+            .filter_map(|(_, _, weak)| weak.upgrade())
+            .collect()
+    }
+
+    pub(super) fn flush_session(&self, id: SessionId) {
+        for handle in self.active_async(Some(id)) {
+            handle.flush();
+        }
+    }
+
+    pub(super) fn flush_session_cancelled(
+        &self,
+        id: SessionId,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        for handle in self.active_async(Some(id)) {
+            handle.flush_cancelled(cancelled)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn flush_all_async(&self) {
+        for handle in self.active_async(None) {
+            handle.flush();
+        }
+    }
+
+    pub(super) fn discard_async_recorders_for_clear(&self) {
+        let generation = self.generation.load(Ordering::Acquire);
+        for handle in self.active_async(None) {
+            handle.quiesce_for_clear(generation);
+        }
+    }
+}
+
+/// Asynchronous bounded per-session recorder wrapper used by [`crate::session`].
+/// Disk compression, encryption, and file I/O run off the PTY reader thread.
+pub(crate) struct AsyncRecorder {
+    store: Arc<Store>,
+    handle: Arc<AsyncHandle>,
+    reg_id: u64,
+    worker: Option<JoinHandle<()>>,
+    projected_open: bool,
+    projected_open_raw: u64,
+    projected_pause_epoch: u64,
+    projected_snapshots: Snapshots,
+    projected_generation: u64,
+}
+
+impl AsyncRecorder {
+    pub(crate) fn start(
+        recorder: Recorder,
+        on_panic_gap: impl Fn(Gap) + Send + 'static,
+    ) -> Result<Self, Box<Recorder>> {
+        let store = Arc::clone(&recorder.store);
+        let id = recorder.id;
+        let projected_open = recorder.open.is_some();
+        let projected_pause_epoch = recorder.pause_epoch;
+        let projected_snapshots = recorder.snapshots;
+        let projected_generation = recorder.generation;
+
+        let handle = Arc::new(AsyncHandle {
+            mu: Mutex::new(AsyncState {
+                queue: VecDeque::new(),
+                queued_bytes: 0,
+                enqueued_gen: 0,
+                completed_gen: 0,
+                in_flight: false,
+                worker_open: projected_open,
+                lifecycle: WorkerLifecycle::Running,
+            }),
+            cv: Condvar::new(),
+        });
+        let reg_id = store.register_async(id, &handle);
+        let worker_store = Arc::clone(&store);
+        let worker_handle = Arc::clone(&handle);
+        let slot = Arc::new(Mutex::new(Some(recorder)));
+        let worker_slot = Arc::clone(&slot);
+
+        if let Ok(worker) = thread::Builder::new()
+            .name(format!("rec-{}", id.0))
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                crate::alloc::mobile_thread().ok();
+                let recorder = lock(&worker_slot).take();
+                let Some(recorder) = recorder else { return };
+                recorder_worker(
+                    recorder,
+                    &worker_store,
+                    &worker_handle,
+                    reg_id,
+                    &on_panic_gap,
+                );
+            })
+        {
+            Ok(Self {
+                store,
+                handle,
+                reg_id,
+                worker: Some(worker),
+                projected_open,
+                projected_open_raw: 0,
+                projected_pause_epoch,
+                projected_snapshots,
+                projected_generation,
+            })
+        } else {
+            store.unregister_async(reg_id);
+            let mut state = lock(&handle.mu);
+            state.lifecycle = WorkerLifecycle::Dead;
+            handle.cv.notify_all();
+            drop(state);
+            let recorder = lock(&slot).take();
+            match recorder {
+                Some(r) => Err(Box::new(r)),
+                None => unreachable!("recorder slot only consumed by spawned thread"),
+            }
+        }
+    }
+
+    pub(crate) fn needs_keyframe(&mut self) -> bool {
+        let pause = self.store.record_guard();
+        if !self.store.recording || pause.paused {
+            return false;
+        }
+        if self.projected_pause_epoch != pause.epoch {
+            self.projected_pause_epoch = pause.epoch;
+            self.projected_snapshots = Snapshots::Suppressed;
+            self.projected_open = false;
+            self.projected_open_raw = 0;
+        }
+        drop(pause);
+        if self.projected_snapshots != Snapshots::Allowed {
+            return false;
+        }
+        let generation = self.store.generation.load(Ordering::Acquire);
+        if self.projected_generation != generation {
+            self.projected_generation = generation;
+            self.projected_open = false;
+            self.projected_open_raw = 0;
+        }
+        let state = lock(&self.handle.mu);
+        if state.queue.is_empty()
+            && !state.in_flight
+            && state.completed_gen >= state.enqueued_gen
+            && !state.worker_open
+        {
+            self.projected_open = false;
+            self.projected_open_raw = 0;
+        }
+        !self.projected_open
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        seq: u64,
+        bytes: &[u8],
+        resized: Option<WinSize>,
+        snapshot: Option<Vec<u8>>,
+    ) {
+        if bytes.is_empty() && resized.is_none() {
+            return;
+        }
+        let generation = self.store.generation.load(Ordering::Acquire);
+        if self.projected_generation != generation {
+            self.projected_generation = generation;
+            self.projected_open = false;
+            self.projected_open_raw = 0;
+        }
+        let mut state_guard = lock(&self.handle.mu);
+        let state = &mut *state_guard;
+        if state.lifecycle == WorkerLifecycle::Dead {
+            return;
+        }
+        let snapshot_bytes = snapshot.unwrap_or_default();
+        let batch_mem = bytes.len().saturating_add(snapshot_bytes.len());
+        let coalesce_cap = MAX_ASYNC_COALESCE_BYTES
+            .min(usize::try_from(self.store.limits.seal_bytes.max(1)).unwrap_or(usize::MAX));
+        let accepted = if resized.is_none()
+            && snapshot_bytes.is_empty()
+            && !bytes.is_empty()
+            && state.queued_bytes.saturating_add(bytes.len()) <= MAX_ASYNC_QUEUE_BYTES
+            && let Some(AsyncOp::Batch { ticket, batch }) = state.queue.back_mut()
+            && batch.generation == generation
+            && batch.seq.saturating_add(batch.bytes.len() as u64) == seq
+            && batch.bytes.len().saturating_add(bytes.len()) <= coalesce_cap
+        {
+            state.enqueued_gen = state.enqueued_gen.saturating_add(1);
+            *ticket = state.enqueued_gen;
+            batch.bytes.extend_from_slice(bytes);
+            state.queued_bytes = state.queued_bytes.saturating_add(bytes.len());
+            true
+        } else if state.queue.is_empty()
+            || (state.queue.len() < MAX_ASYNC_QUEUE_ITEMS
+                && state.queued_bytes.saturating_add(batch_mem) <= MAX_ASYNC_QUEUE_BYTES)
+        {
+            state.enqueued_gen = state.enqueued_gen.saturating_add(1);
+            let ticket = state.enqueued_gen;
+            state.queued_bytes = state.queued_bytes.saturating_add(batch_mem);
+            state.queue.push_back(AsyncOp::Batch {
+                ticket,
+                batch: BatchItem {
+                    seq,
+                    bytes: bytes.to_vec(),
+                    resized,
+                    snapshot: snapshot_bytes,
+                    generation,
+                },
+            });
+            true
+        } else {
+            // Queue bounded: do not stall PTY reader/publish; fold overflow into a Gap span.
+            let drop_len = bytes.len() as u64;
+            let next_ticket = state.enqueued_gen.saturating_add(1);
+            state.enqueued_gen = next_ticket;
+            if let Some(AsyncOp::DropSpan {
+                ticket,
+                len,
+                resized: tail_resized,
+                generation: tail_gen,
+                clear: false,
+            }) = state.queue.back_mut()
+                && *tail_gen == generation
+            {
+                *ticket = next_ticket;
+                *len = len.saturating_add(drop_len);
+                if resized.is_some() {
+                    *tail_resized = resized;
+                }
+            } else {
+                state.queue.push_back(AsyncOp::DropSpan {
+                    ticket: next_ticket,
+                    len: drop_len,
+                    resized,
+                    generation,
+                    clear: false,
+                });
+            }
+            self.projected_open = false;
+            self.projected_open_raw = 0;
+            false
+        };
+        if accepted && !bytes.is_empty() {
+            self.projected_open_raw = self.projected_open_raw.saturating_add(bytes.len() as u64);
+            if self.projected_open_raw >= self.store.limits.seal_bytes {
+                self.projected_open = false;
+                self.projected_open_raw = 0;
+            } else {
+                self.projected_open = true;
+            }
+        }
+        self.handle.cv.notify_all();
+    }
+
+    pub(crate) fn seal(&mut self, resized: Option<WinSize>) {
+        let generation = self.store.generation.load(Ordering::Acquire);
+        let mut state = lock(&self.handle.mu);
+        if state.lifecycle != WorkerLifecycle::Dead {
+            state.enqueued_gen = state.enqueued_gen.saturating_add(1);
+            let ticket = state.enqueued_gen;
+            state.queue.push_back(AsyncOp::Seal {
+                ticket,
+                resized,
+                generation,
+            });
+            self.handle.cv.notify_all();
+            while (state.completed_gen < ticket || state.in_flight)
+                && state.lifecycle != WorkerLifecycle::Dead
+            {
+                state = self
+                    .handle
+                    .cv
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        self.projected_open = false;
+        self.projected_open_raw = 0;
+    }
+
+    pub(crate) fn finish(mut self, resized: Option<WinSize>) {
+        self.shutdown(resized);
+    }
+
+    fn shutdown(&mut self, resized: Option<WinSize>) {
+        let generation = self.store.generation.load(Ordering::Acquire);
+        {
+            let mut state = lock(&self.handle.mu);
+            if state.lifecycle != WorkerLifecycle::Dead {
+                state.enqueued_gen = state.enqueued_gen.saturating_add(1);
+                let ticket = state.enqueued_gen;
+                state.queue.push_back(AsyncOp::Seal {
+                    ticket,
+                    resized,
+                    generation,
+                });
+                state.lifecycle = WorkerLifecycle::Stopping;
+                self.handle.cv.notify_all();
+            }
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().ok();
+        }
+        self.store.unregister_async(self.reg_id);
+        self.projected_open = false;
+        self.projected_open_raw = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_bytes(&self) -> usize {
+        lock(&self.handle.mu).queued_bytes
+    }
+}
+
+impl Drop for AsyncRecorder {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            self.shutdown(None);
+        }
+    }
+}
+
+struct WorkerExitGuard<'a> {
+    store: &'a Store,
+    handle: &'a AsyncHandle,
+    reg_id: u64,
+}
+
+impl Drop for WorkerExitGuard<'_> {
+    fn drop(&mut self) {
+        self.store.unregister_async(self.reg_id);
+        let mut state = lock(&self.handle.mu);
+        state.in_flight = false;
+        state.worker_open = false;
+        state.lifecycle = WorkerLifecycle::Dead;
+        self.handle.cv.notify_all();
+    }
+}
+
+fn recorder_worker(
+    recorder: Recorder,
+    store: &Store,
+    handle: &AsyncHandle,
+    reg_id: u64,
+    on_panic_gap: &dyn Fn(Gap),
+) {
+    let mut rec = Some(recorder);
+    let mut last_size = rec
+        .as_ref()
+        .map_or(WinSize { cols: 80, rows: 24 }, |r| r.size);
+    let _exit_guard = WorkerExitGuard {
+        store,
+        handle,
+        reg_id,
+    };
+
+    loop {
+        enum NextWork {
+            Op(AsyncOp),
+            IdleSeal,
+            Exit,
+        }
+
+        let work = {
+            let mut state = lock(&handle.mu);
+            loop {
+                if let Some(op) = state.queue.pop_front() {
+                    if let AsyncOp::Batch { batch, .. } = &op {
+                        state.queued_bytes = state
+                            .queued_bytes
+                            .saturating_sub(batch.bytes.len().saturating_add(batch.snapshot.len()));
+                    }
+                    state.in_flight = true;
+                    break NextWork::Op(op);
+                }
+                if state.lifecycle == WorkerLifecycle::Stopping {
+                    break NextWork::Exit;
+                }
+                if let Some(at) = rec.as_ref().and_then(Recorder::idle_deadline) {
+                    let now = Instant::now();
+                    if at <= now {
+                        state.in_flight = true;
+                        break NextWork::IdleSeal;
+                    }
+                    let (guard, _) = handle
+                        .cv
+                        .wait_timeout(state, at.saturating_duration_since(now))
+                        .unwrap_or_else(PoisonError::into_inner);
+                    state = guard;
+                } else {
+                    state = handle
+                        .cv
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+        };
+
+        let mut completed_ticket = None;
+        if !matches!(work, NextWork::Exit) {
+            store.wait_for_pending_pause();
+        }
+        match work {
+            NextWork::Exit => break,
+            NextWork::IdleSeal => {
+                if !store.is_clearing()
+                    && let Some(r) = &mut rec
+                    && panic::catch_unwind(AssertUnwindSafe(|| r.seal())).is_err()
+                {
+                    tracing::warn!("pty seal panicked; continuing");
+                    let seq = r.seq();
+                    rec = recover_worker_recorder(rec.take(), seq, last_size);
+                }
+            }
+            NextWork::Op(AsyncOp::Batch { ticket, batch }) => {
+                completed_ticket = Some(ticket);
+                let batch_seq = batch.seq;
+                let batch_len = batch.bytes.len() as u64;
+                if let Some(sz) = batch.resized {
+                    last_size = sz;
+                }
+                let current_gen = store.generation.load(Ordering::Acquire);
+                if store.is_clearing() || batch.generation != current_gen {
+                    if let Some(r) = &mut rec {
+                        r.discard_for_clear(current_gen, batch_len, batch.resized);
+                    }
+                } else if let Some(r) = &mut rec {
+                    let expected_end = r.seq().max(batch_seq.saturating_add(batch_len));
+                    let BatchItem {
+                        bytes,
+                        resized,
+                        snapshot,
+                        ..
+                    } = batch;
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        if let Some(sz) = resized {
+                            r.resize(sz);
+                        }
+                        if !snapshot.is_empty() {
+                            r.keyframe(snapshot);
+                        }
+                        r.append(&bytes);
+                    }));
+                    if result.is_err() {
+                        tracing::warn!("pty batch recording panicked; kept as gap");
+                        on_panic_gap(Gap {
+                            start: batch_seq,
+                            len: batch_len,
+                        });
+                        rec = recover_worker_recorder(rec.take(), expected_end, last_size);
+                    }
+                }
+            }
+            NextWork::Op(AsyncOp::DropSpan {
+                ticket,
+                len,
+                resized,
+                generation,
+                clear,
+            }) => {
+                completed_ticket = Some(ticket);
+                if let Some(sz) = resized {
+                    last_size = sz;
+                }
+                let current_gen = store.generation.load(Ordering::Acquire);
+                if let Some(r) = &mut rec {
+                    if clear || store.is_clearing() || generation != current_gen {
+                        r.discard_for_clear(current_gen, len, resized);
+                    } else {
+                        let expected_end = r.seq().saturating_add(len);
+                        if panic::catch_unwind(AssertUnwindSafe(|| {
+                            r.record_overflow_gap(len, resized);
+                        }))
+                        .is_err()
+                        {
+                            tracing::warn!("pty overflow gap recording panicked; recovering");
+                            rec = recover_worker_recorder(rec.take(), expected_end, last_size);
+                        }
+                    }
+                }
+            }
+            NextWork::Op(AsyncOp::Seal {
+                ticket,
+                resized,
+                generation,
+            }) => {
+                completed_ticket = Some(ticket);
+                if let Some(sz) = resized {
+                    last_size = sz;
+                }
+                let current_gen = store.generation.load(Ordering::Acquire);
+                if let Some(r) = &mut rec {
+                    if store.is_clearing() || generation != current_gen {
+                        r.discard_for_clear(current_gen, 0, resized);
+                    } else if panic::catch_unwind(AssertUnwindSafe(|| {
+                        if let Some(sz) = resized {
+                            r.resize(sz);
+                        }
+                        r.seal();
+                    }))
+                    .is_err()
+                    {
+                        tracing::warn!("pty seal panicked; continuing shutdown");
+                        let expected_end = r.seq();
+                        rec = recover_worker_recorder(rec.take(), expected_end, last_size);
+                    }
+                }
+            }
+        }
+
+        let mut state = lock(&handle.mu);
+        state.in_flight = false;
+        if let Some(ticket) = completed_ticket {
+            state.completed_gen = state.completed_gen.max(ticket);
+        }
+        state.worker_open = rec.as_ref().is_some_and(|r| r.open.is_some());
+        handle.cv.notify_all();
+    }
+}
+
+fn recover_worker_recorder(
+    recorder: Option<Recorder>,
+    end: u64,
+    size: WinSize,
+) -> Option<Recorder> {
+    let recorder = recorder?;
+    match panic::catch_unwind(AssertUnwindSafe(|| recorder.recover_after_panic(end, size))) {
+        Ok(Ok(recovered)) => Some(recovered),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                kind = ?error.kind(),
+                "pty recorder recovery failed; continuing without recording"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!("pty recorder recovery panicked; continuing without recording");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod write_hook {
+    use super::*;
+
+    type Hook = (SessionId, Arc<dyn Fn() + Send + Sync>);
+    static BEFORE_WRITE: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
+
+    pub(crate) struct Guard(SessionId);
+
+    pub(crate) fn install(id: SessionId, hook: impl Fn() + Send + Sync + 'static) -> Guard {
+        lock(&BEFORE_WRITE).push((id, Arc::new(hook)));
+        Guard(id)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            lock(&BEFORE_WRITE).retain(|(target, _)| *target != self.0);
+        }
+    }
+
+    pub(super) fn before_write(id: SessionId) {
+        let hook = lock(&BEFORE_WRITE)
+            .iter()
+            .find(|(target, _)| *target == id)
+            .map(|(_, hook)| Arc::clone(hook));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+    use crate::store::{Limits, Piece, Store};
+    use std::sync::mpsc;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("krill-rec-async-{tag}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn clear_discards_queued_async_writes_and_preserves_seq_alignment() {
+        let root = tmp("clear");
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let id = SessionId(9501);
+        let size = WinSize { cols: 80, rows: 24 };
+        let rec = store.recorder(id, size).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook = write_hook::install(id, move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).ok();
+                lock(&release_rx).recv().ok();
+            }
+        });
+
+        let mut async_rec = AsyncRecorder::start(rec, |_| {}).ok().unwrap();
+        async_rec.record(0, b"secret-1", None, None);
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        async_rec.record(8, b"secret-2", None, None);
+        assert!(async_rec.queued_bytes() >= 8);
+
+        let clear_store = Arc::clone(&store);
+        let (clear_tx, clear_rx) = mpsc::channel();
+        let clearer = thread::spawn(move || {
+            clear_store.clear().unwrap();
+            clear_tx.send(()).unwrap();
+        });
+        assert!(clear_rx.recv_timeout(Duration::from_millis(80)).is_err());
+        release_tx.send(()).unwrap();
+        drop(hook);
+        clear_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        clearer.join().unwrap();
+
+        assert_eq!(async_rec.queued_bytes(), 0);
+        assert_eq!(store.history(id).unwrap().len(), 0);
+
+        async_rec.record(16, b"public-3", None, None);
+        async_rec.finish(None);
+
+        let mut pieces = Vec::new();
+        store
+            .raw(id, 0, 24, |piece| {
+                pieces.push(piece);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                Piece::Gap { seq: 0, len: 16 },
+                Piece::Data {
+                    seq: 16,
+                    bytes: b"public-3".to_vec(),
+                },
+            ]
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn set_paused_true_quiesces_in_flight_writes_without_deadlock() {
+        let root = tmp("pause");
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let id = SessionId(9502);
+        let size = WinSize { cols: 80, rows: 24 };
+        let rec = store.recorder(id, size).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook = write_hook::install(id, move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).ok();
+                lock(&release_rx).recv().ok();
+            }
+        });
+
+        let mut async_rec = AsyncRecorder::start(rec, |_| {}).ok().unwrap();
+        async_rec.record(0, b"before-pause", None, None);
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        async_rec.record(12, b"secret-paused", None, None);
+
+        let pause_store = Arc::clone(&store);
+        let (pause_tx, pause_rx) = mpsc::channel();
+        let pauser = thread::spawn(move || {
+            pause_store.set_paused(true);
+            pause_tx.send(()).unwrap();
+        });
+        assert!(pause_rx.recv_timeout(Duration::from_millis(80)).is_err());
+        release_tx.send(()).unwrap();
+        drop(hook);
+        pause_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        pauser.join().unwrap();
+
+        let written_at_pause = store.written();
+        store.set_paused(false);
+        async_rec.record(25, b"after-resume", None, None);
+        async_rec.finish(None);
+        assert!(store.written() > written_at_pause);
+
+        let mut pieces = Vec::new();
+        store
+            .raw(id, 0, 37, |piece| {
+                pieces.push(piece);
+                Ok(())
+            })
+            .unwrap();
+        assert!(pieces.iter().all(|piece| match piece {
+            Piece::Data { bytes, .. } => !bytes.windows(6).any(|w| w == b"secret"),
+            Piece::Gap { .. } => true,
+        }));
+        assert!(
+            pieces
+                .iter()
+                .any(|p| matches!(p, Piece::Gap { seq: 12, len: 13 }))
+        );
+        assert!(
+            pieces.iter().any(|p| {
+                matches!(p, Piece::Data { seq: 25, bytes } if bytes == b"after-resume")
+            })
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tiny_burst_under_byte_budget_coalesces_without_dropping_gap() {
+        let root = tmp("tiny-coalesce");
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let id = SessionId(9503);
+        let size = WinSize { cols: 80, rows: 24 };
+        let rec = store.recorder(id, size).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook = write_hook::install(id, move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).ok();
+                lock(&release_rx).recv().ok();
+            }
+        });
+
+        let mut async_rec = AsyncRecorder::start(rec, |_| {}).ok().unwrap();
+        async_rec.record(0, b"seed", None, None);
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let mut seq = 4u64;
+        let mut expected = b"seed".to_vec();
+        for i in 0..500u32 {
+            let line = format!("line-{i:04}\n").into_bytes();
+            async_rec.record(seq, &line, None, None);
+            seq += line.len() as u64;
+            expected.extend_from_slice(&line);
+        }
+        assert!(async_rec.queued_bytes() <= MAX_ASYNC_QUEUE_BYTES);
+        assert!(
+            lock(&async_rec.handle.mu).queue.len() < MAX_ASYNC_QUEUE_ITEMS,
+            "tiny writes should coalesce instead of exhausting item slots"
+        );
+
+        release_tx.send(()).unwrap();
+        drop(hook);
+        async_rec.finish(None);
+
+        let mut actual = Vec::new();
+        store
+            .raw(id, 0, seq, |piece| {
+                match piece {
+                    Piece::Data { bytes, .. } => actual.extend_from_slice(&bytes),
+                    Piece::Gap { seq, len } => panic!("unexpected gap at {seq} len={len}"),
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        fs::remove_dir_all(&root).ok();
     }
 }

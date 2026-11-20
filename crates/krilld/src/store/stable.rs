@@ -103,6 +103,9 @@ impl Store {
     ) -> io::Result<Manifest> {
         let mut paths = Vec::new();
         let mut bytes = 0usize;
+        if self.recording {
+            self.flush_session_cancelled(id, cancelled)?;
+        }
         let cleared_seq = self.cleared_seq(id);
         // No frozen history can precede the clear boundary. An empty new
         // view must not try to replay an entirely cleared segment basis.

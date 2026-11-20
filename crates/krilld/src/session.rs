@@ -51,7 +51,7 @@ use crate::holder::Master;
 use crate::os::BorrowedFd;
 #[cfg(unix)]
 use crate::os::{AsFd, OwnedFd};
-use crate::store::{Piece, Recorder, Store};
+use crate::store::{AsyncRecorder, Piece, Recorder, Store};
 use crate::term::{Engine, Feed};
 
 /// macOS PTY master의 read 한 번 최대 크기(perf-first 실측).
@@ -1024,7 +1024,71 @@ type Source<'a> = BorrowedFd<'a>;
 #[cfg(windows)]
 type Source<'a> = &'a mut windows::Reader;
 
-fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> io::Result<()> {
+enum SessionRecorder {
+    Async(AsyncRecorder),
+    Sync(Box<Recorder>),
+}
+
+impl SessionRecorder {
+    fn start(rec: Recorder, shared: &Arc<Shared>) -> Self {
+        if !rec.store().recording() {
+            return Self::Sync(Box::new(rec));
+        }
+        let weak = Arc::downgrade(shared);
+        match AsyncRecorder::start(rec, move |gap| {
+            if let Some(shared) = weak.upgrade() {
+                lock(&shared.gaps).push(gap);
+            }
+        }) {
+            Ok(async_rec) => Self::Async(async_rec),
+            Err(rec) => Self::Sync(rec),
+        }
+    }
+
+    fn idle_deadline(&self) -> Option<Instant> {
+        match self {
+            // The async worker owns IDLE_SEAL without waking the PTY reader thread.
+            Self::Async(_) => None,
+            Self::Sync(rec) => rec.idle_deadline(),
+        }
+    }
+
+    fn needs_keyframe(&mut self) -> bool {
+        match self {
+            Self::Async(rec) => rec.needs_keyframe(),
+            Self::Sync(rec) => rec.needs_keyframe(),
+        }
+    }
+
+    fn seal(&mut self, shared: &Shared, resized: Option<WinSize>) {
+        match self {
+            Self::Async(rec) => rec.seal(resized),
+            Self::Sync(rec) => {
+                if let Some(size) = resized {
+                    seal_sync_with_resize(shared, rec, size);
+                } else {
+                    seal(shared, rec);
+                }
+            }
+        }
+    }
+
+    fn finish(self, shared: &Shared, resized: Option<WinSize>) {
+        match self {
+            Self::Async(rec) => rec.finish(resized),
+            Self::Sync(mut rec) => {
+                if let Some(size) = resized {
+                    seal_sync_with_resize(shared, &mut rec, size);
+                } else {
+                    seal(shared, &mut rec);
+                }
+            }
+        }
+    }
+}
+
+fn read_loop(shared: &Arc<Shared>, source: Source<'_>, rec: Option<Recorder>) -> io::Result<()> {
+    let mut rec = rec.map(|r| SessionRecorder::start(r, shared));
     let look = &*shared.look;
     let mut buf = vec![0u8; BATCH];
     let mut seq = shared.live().seq;
@@ -1034,7 +1098,12 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
         // through EOF after cancellation before sealing, or handover loses bytes.
         #[cfg(unix)]
         if HALTED.load(Ordering::SeqCst) {
-            handoff::wait(shared, &mut rec);
+            if let Some(r) = &mut rec {
+                let resized = shared.live().resized.take();
+                r.seal(shared, resized);
+            }
+            let mut unused = None;
+            handoff::wait(shared, &mut unused);
             continue;
         }
         let (sync_at, trim_at) = {
@@ -1052,7 +1121,7 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
             shared.live().update_engine(Engine::trim);
             continue;
         }
-        let record_deadline = rec.as_ref().and_then(Recorder::idle_deadline);
+        let record_deadline = rec.as_ref().and_then(SessionRecorder::idle_deadline);
         let deadline = sync_at
             .into_iter()
             .chain(trim_at)
@@ -1066,7 +1135,7 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
         let Some(n) = (match ready {
             Ok(Some(0)) => {
                 if record_deadline.is_some_and(|at| at <= Instant::now())
-                    && let Some(recorder) = rec.as_mut()
+                    && let Some(SessionRecorder::Sync(recorder)) = rec.as_mut()
                 {
                     seal(shared, recorder);
                 }
@@ -1084,7 +1153,12 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
             if source.cancelled() {
                 // The queue is drained. Even if preparation already rolled back,
                 // this canceled worker is not terminal EOF and must be replaced.
-                handoff::wait(shared, &mut rec);
+                if let Some(r) = &mut rec {
+                    let resized = shared.live().resized.take();
+                    r.seal(shared, resized);
+                }
+                let mut unused = None;
+                handoff::wait(shared, &mut unused);
                 match windows::Reader::start(&shared.master) {
                     Ok(reader) => *source = reader,
                     Err(error) => {
@@ -1095,14 +1169,15 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
                 }
                 continue;
             }
-            if let Some(r) = &mut rec {
-                seal(shared, r);
+            if let Some(r) = rec.take() {
+                let resized = shared.live().resized.take();
+                r.finish(shared, resized);
             }
             return Ok(());
         };
         errors = 0;
         let Some(bytes) = buf.get(..n) else { continue };
-        let capture = rec.as_ref().is_some_and(Recorder::needs_keyframe);
+        let capture = rec.as_mut().is_some_and(SessionRecorder::needs_keyframe);
         let mut snapshot = None;
         let (ok, rev, resized) = guarded(shared, n, |e| {
             // resize와 같은 잠금 안에서 이번 원본을 feed하기 전 상태를 캡처한다.
@@ -1120,6 +1195,7 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
         // 엔진 호출은 `guarded`가 잡지만 기록·발행 panic은 여기서 잡는다. 이 묶음은
         // Gap으로 남기고 다음 묶음부터 계속 읽는다. 리더가 죽으면 PTY를 읽는 쪽이
         // 없어 세션 출력이 영구 정지한다(K-05).
+        let is_sync = matches!(rec, Some(SessionRecorder::Sync(_)));
         let recorded = publish_batch(shared, seq, bytes, rev, || {
             #[cfg(test)]
             publish_tests::before_record(shared.id);
@@ -1129,32 +1205,43 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
                     len: n as u64,
                 });
             }
-            if let Some(r) = &mut rec {
-                if let Some(size) = resized {
-                    r.resize(size);
+            match rec.as_mut() {
+                Some(SessionRecorder::Async(r)) => {
+                    r.record(seq, bytes, resized, snapshot);
                 }
-                if let Some(snapshot) = snapshot {
-                    r.keyframe(snapshot);
+                Some(SessionRecorder::Sync(r)) => {
+                    if let Some(size) = resized {
+                        r.resize(size);
+                    }
+                    if let Some(snapshot) = snapshot {
+                        r.keyframe(snapshot);
+                    }
+                    r.append(bytes);
                 }
-                r.append(bytes);
+                None => {}
             }
         });
-        if !recorded {
-            rec = rec.take().and_then(|recorder| {
-                // unwind 뒤의 인코더를 다시 쓰지 않는다. 디스크의 온전한 꼬리부터
-                // 새 기록기를 열고 빠진 seq를 Gap으로 넘긴다. 복구 실패도 PTY를 멈추지 않는다.
-                panic::catch_unwind(AssertUnwindSafe(|| {
-                    let size = shared.live().size;
-                    recorder.recover_after_panic(seq.saturating_add(n as u64), size)
-                }))
-                .ok()
-                .and_then(|result| {
-                    if let Err(error) = &result {
-                        tracing::warn!(kind = ?error.kind(), "recorder panic recovery failed");
-                    }
-                    result.ok()
-                })
-            });
+        if !recorded && is_sync {
+            rec = match rec.take() {
+                Some(SessionRecorder::Sync(recorder)) => {
+                    // unwind 뒤의 인코더를 다시 쓰지 않는다. 디스크의 온전한 꼬리부터
+                    // 새 기록기를 열고 빠진 seq를 Gap으로 넘긴다. 복구 실패도 PTY를 멈추지 않는다.
+                    panic::catch_unwind(AssertUnwindSafe(|| {
+                        let size = shared.live().size;
+                        recorder.recover_after_panic(seq.saturating_add(n as u64), size)
+                    }))
+                    .ok()
+                    .and_then(|result| {
+                        if let Err(error) = &result {
+                            tracing::warn!(kind = ?error.kind(), "recorder panic recovery failed");
+                        }
+                        result.ok()
+                    })
+                    .map(Box::new)
+                    .map(SessionRecorder::Sync)
+                }
+                other => other,
+            };
         }
         seq += n as u64;
     }
@@ -1212,6 +1299,21 @@ fn backoff(consecutive: u32) -> Duration {
 fn seal(shared: &Shared, rec: &mut Recorder) {
     if panic::catch_unwind(AssertUnwindSafe(|| {
         if let Some(size) = shared.live().resized.take() {
+            rec.resize(size);
+        }
+        rec.seal();
+    }))
+    .is_err()
+    {
+        tracing::warn!("pty seal panicked; continuing shutdown");
+    }
+}
+
+fn seal_sync_with_resize(shared: &Shared, rec: &mut Recorder, size: WinSize) {
+    if panic::catch_unwind(AssertUnwindSafe(|| {
+        if let Some(latest) = shared.live().resized.take() {
+            rec.resize(latest);
+        } else {
             rec.resize(size);
         }
         rec.seal();
@@ -1303,3 +1405,274 @@ mod pause_tests;
 
 #[cfg(test)]
 mod publish_tests;
+
+#[cfg(all(test, unix))]
+mod async_recording_tests {
+    use super::*;
+    use crate::store::{Limits, Store, install_recorder_write_hook};
+    use krill_proto::screen::{Attach, Stream, kind};
+    use std::io::Write as _;
+    use std::sync::mpsc;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("krill-async-rec-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    #[expect(clippy::unwrap_used, reason = "test helper")]
+    fn pty_session(id: u64, store: &Arc<Store>) -> (Session, std::fs::File) {
+        let pty = rustix_openpty::openpty(None, None).unwrap();
+        let mut mode = rustix::termios::tcgetattr(&pty.user).unwrap();
+        mode.make_raw();
+        rustix::termios::tcsetattr(&pty.user, rustix::termios::OptionalActions::Now, &mode)
+            .unwrap();
+        let size = WinSize { cols: 80, rows: 24 };
+        let session = Session::start(
+            SessionId(id),
+            pty.controller,
+            size,
+            Arc::new(Appearance::load(std::path::PathBuf::new())),
+            Some(store.recorder(SessionId(id), size).unwrap()),
+        )
+        .unwrap();
+        (session, std::fs::File::from(pty.user))
+    }
+
+    #[expect(clippy::unwrap_used, reason = "test helper")]
+    fn attach_raw(tap: &Tap, from: Seq) -> krill_proto::os::net::UnixStream {
+        let (client, server) = krill_proto::os::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let tap = tap.clone();
+        let session = tap.0.id;
+        thread::spawn(move || {
+            crate::attach::run_as(
+                server,
+                Attach {
+                    session,
+                    stream: Stream::Raw { from },
+                },
+                1,
+                0,
+                Some(tap),
+                krill_proto::roles::Role::Observer,
+                crate::attach::FRAME_MIN,
+            )
+        });
+        assert_eq!(
+            krill_proto::ipc::read_frame(&mut client.try_clone().unwrap())
+                .unwrap()
+                .unwrap()
+                .0,
+            kind::ATTACHED
+        );
+        client
+    }
+
+    #[test]
+    fn slow_disk_recording_does_not_stall_raw_publish_and_cold_read_flushes() {
+        let root = tmp("raw-fast");
+        let store = Store::open(
+            &root,
+            Limits {
+                seal_bytes: 32,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let id = SessionId(9401);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook = install_recorder_write_hook(id, move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).ok();
+                lock(&release_rx).recv().ok();
+            }
+        });
+
+        let (session, mut output) = pty_session(id.0, &store);
+        let tap = session.tap();
+        let mut raw = attach_raw(&tap, Seq(0));
+
+        let payload = b"hello-async-raw-publish\r\n";
+        let started = Instant::now();
+        output.write_all(payload).unwrap();
+
+        // Worker is blocked on write_hook, yet raw stream + pulse advance without blocking.
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut got = Vec::new();
+        while got.len() < payload.len() {
+            let (k, body) = krill_proto::ipc::read_frame(&mut raw).unwrap().unwrap();
+            if k == kind::OUTPUT {
+                let (_, bytes) = krill_proto::screen::decode_output(k, &body).unwrap();
+                got.extend_from_slice(bytes);
+            }
+        }
+        assert_eq!(got, payload);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(tap.pulse().end >= payload.len() as u64);
+
+        // Concurrent cold-read waits for queued disk writes cleanly once released.
+        let store_reader = Arc::clone(&store);
+        let (cold_tx, cold_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let hist = store_reader.history(id).unwrap();
+            let mut disk_bytes = Vec::new();
+            store_reader
+                .raw(id, 0, payload.len() as u64, |piece| {
+                    if let Piece::Data { bytes, .. } = piece {
+                        disk_bytes.extend_from_slice(&bytes);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            cold_tx.send((hist.len(), disk_bytes)).unwrap();
+        });
+        assert!(cold_rx.recv_timeout(Duration::from_millis(80)).is_err());
+        release_tx.send(()).unwrap();
+        drop(hook);
+        let (pages, disk_bytes) = cold_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(pages >= 1);
+        assert_eq!(disk_bytes, payload);
+        reader.join().unwrap();
+
+        drop(raw);
+        drop(output);
+        session.wait().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bounded_queue_folds_excess_into_gap_when_disk_stalls() {
+        let root = tmp("bounded-overflow");
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let id = SessionId(9402);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook = install_recorder_write_hook(id, move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).ok();
+                lock(&release_rx).recv().ok();
+            }
+        });
+
+        let (session, mut output) = pty_session(id.0, &store);
+        let tap = session.tap();
+
+        // Trigger the worker block on the first batch, then push well past MAX_ASYNC_QUEUE_BYTES (640 KiB).
+        output.write_all(b"seed-stall").unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let chunk = vec![b'A'; 16 * 1024];
+        for _ in 0..64 {
+            output.write_all(&chunk).unwrap();
+        }
+        let expected_end = 10 + 64 * chunk.len() as u64;
+        let pulse = tap.wait_timeout(Duration::from_secs(5), |p| p.end >= expected_end);
+        assert_eq!(pulse.end, expected_end, "PTY raw publish must not stall");
+
+        release_tx.send(()).unwrap();
+        drop(hook);
+        // Drain the queued burst/drop span before testing normal tail recording after the stall.
+        store.history(id).unwrap();
+        output.write_all(b"tail-after-drain").unwrap();
+        drop(output);
+        session.wait().unwrap();
+
+        let total = expected_end + b"tail-after-drain".len() as u64;
+        let mut covered = 0u64;
+        let mut saw_gap = false;
+        let mut tail = Vec::new();
+        store
+            .raw(id, 0, total, |piece| {
+                match piece {
+                    Piece::Data { seq, bytes } => {
+                        assert_eq!(seq, covered);
+                        covered += bytes.len() as u64;
+                        tail.extend_from_slice(&bytes);
+                    }
+                    Piece::Gap { seq, len } => {
+                        assert_eq!(seq, covered);
+                        covered += len;
+                        if len > 0 {
+                            saw_gap = true;
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(covered, total);
+        assert!(saw_gap, "bounded overflow must emit a contiguous Gap");
+        assert!(tail.ends_with(b"tail-after-drain"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn worker_panic_recovers_keeps_pty_alive_and_marks_gap() {
+        let root = tmp("worker-panic");
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let id = SessionId(9403);
+        let arm_panic = Arc::new(AtomicBool::new(false));
+        let hook_arm = Arc::clone(&arm_panic);
+        let _hook = install_recorder_write_hook(id, move || {
+            assert!(
+                !hook_arm.swap(false, Ordering::SeqCst),
+                "injected recorder disk panic"
+            );
+        });
+
+        let (session, mut output) = pty_session(id.0, &store);
+        let tap = session.tap();
+
+        output.write_all(b"before-panic").unwrap();
+        tap.wait(|p| p.end >= 12);
+        // Flush batch 1 to disk so batch 2 is isolated as the panicking write.
+        let _ = store.history(id).unwrap();
+
+        arm_panic.store(true, Ordering::SeqCst);
+        output.write_all(b"panic-batch!").unwrap();
+        tap.wait(|p| p.end >= 24);
+        let _ = store.history(id).unwrap();
+
+        output.write_all(b"after-panic!").unwrap();
+        tap.wait(|p| p.end >= 36);
+        assert!(!session.is_closed());
+        assert!(session.screen_text().contains("after-panic!"));
+
+        let mut pieces = Vec::new();
+        store
+            .raw(id, 0, 36, |piece| {
+                pieces.push(piece);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            pieces
+                .iter()
+                .any(|p| matches!(p, Piece::Data { bytes, .. } if bytes == b"before-panic"))
+        );
+        assert!(
+            pieces
+                .iter()
+                .any(|p| matches!(p, Piece::Gap { seq: 12, len } if *len > 0)),
+            "pieces={pieces:?}"
+        );
+        assert!(
+            pieces
+                .iter()
+                .any(|p| matches!(p, Piece::Data { seq: 24, bytes } if bytes == b"after-panic!")),
+            "pieces={pieces:?}"
+        );
+
+        drop(output);
+        session.wait().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
