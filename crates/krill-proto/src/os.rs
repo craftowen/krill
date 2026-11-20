@@ -18,6 +18,45 @@ pub fn home_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// macOS: `launchctl managername`이 실행됐는데 거절되면 이 프로세스의 Mach bootstrap 포트가 죽은 것이다.
+/// loginwindow가 다시 떠 `gui/<uid>`가 새로 생긴 뒤에도 옛 도메인에 남은 프로세스가 그렇다. 이런 프로세스와 그 자식은
+/// `trustd` 같은 시스템 서비스에 닿지 못해 Go 바이너리가 `x509: OSStatus -26276`으로 TLS 검증에 실패하고
+/// (2026-11-20, curl은 정상), 창도 못 연다. 실행 자체를 못 했거나 3초 안에 끝나지 않으면 판단하지 않는다(`false`).
+#[cfg(target_os = "macos")]
+pub fn bootstrap_dead() -> bool {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let Ok(mut child) = std::process::Command::new("/bin/launchctl")
+        .arg("managername")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return !status.success(),
+            Ok(None) if started.elapsed() < Duration::from_secs(3) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                return false;
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn bootstrap_dead() -> bool {
+    false
+}
+
 /// Background CLI work must not allocate a Windows console, including npm `.cmd` launchers.
 pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut command = std::process::Command::new(program);

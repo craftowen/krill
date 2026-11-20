@@ -17,6 +17,7 @@ mod cli;
 pub mod git;
 pub mod holder;
 pub mod ipc;
+pub mod login_guard;
 pub mod mobile;
 pub mod monitor;
 mod os;

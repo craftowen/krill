@@ -47,6 +47,19 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     krill_proto::diag::install_panic_hook("krill-app");
+    // 옛 로그인 세션에 남은 앱은 창도 못 열고 holder도 못 띄운다(SIGTERM·종료 요청도 못 받는다). 끝나야 다시 열린다.
+    #[cfg(target_os = "macos")]
+    std::thread::Builder::new()
+        .name("login-guard".to_owned())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                if krill_proto::os::bootstrap_dead() && krill_proto::os::bootstrap_dead() {
+                    std::process::exit(0);
+                }
+            }
+        })
+        .ok();
     if std::env::args().any(|a| a == "--crash-test") {
         crash_test();
     }
