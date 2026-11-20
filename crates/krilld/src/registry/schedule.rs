@@ -311,6 +311,9 @@ impl Registry {
         let _guard = exclusive(dir)?;
         let cron_due = last.is_none_or(|previous| previous < minute);
         *last = Some(minute);
+        if cron_due {
+            self.tick_bots_periodic(dir, now);
+        }
         let schedules = Schedules::load(dir)?;
         if schedules.schedule.is_empty() && !dir.join(RUNS).exists() {
             if dir.join(RUN_NOW).exists() {

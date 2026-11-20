@@ -1,0 +1,1139 @@
+// Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
+//! 100% local BYO Google Desktop OAuth 2.0 (PKCE S256 + loopback callback) and lazy 60s
+//! Google Workspace poller (`Gmail`, `Calendar`, `Drive`).
+//!
+//! Zero cloud backend required: the user brings their own Google Desktop OAuth JSON saved in
+//! [`SecretVault`]. Access & refresh tokens stay encrypted in [`SecretVault`] and auto-refresh.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use krill_proto::bots::{
+    BotConfig, BotConnectorStatus, BotErrorCategory, BotErrorDetail, BotId, BotItemActor,
+    BotItemLink, BotItemStatus, ConnectorHealthState, CreateBotItemParams, ExternalSource,
+    GoogleServicesConfig,
+};
+use ring::rand::{SecureRandom as _, SystemRandom};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use zeroize::Zeroizing;
+
+use crate::bots::http_client::{
+    self, HttpRequest, base64url_encode, parse_query_params, percent_encode,
+};
+use crate::bots::items::BotItemsStore;
+use crate::bots::secrets::SecretVault;
+use crate::bots::store::BotStore;
+use crate::bots::tool_relay::constant_time_eq;
+use crate::session::lock;
+
+const STACK_SIZE: usize = 128 * 1024;
+const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+const TOKEN_REFRESH_MARGIN_MS: u64 = 60_000;
+const DEFAULT_POLL_SECS: u64 = 60;
+
+/// Overridable Google OAuth & Workspace API endpoints (defaults to official Google endpoints).
+#[expect(
+    clippy::struct_field_names,
+    reason = "explicit _url suffix distinguishes each Google OAuth/API endpoint"
+)]
+#[derive(Debug, Clone)]
+pub struct GoogleEndpoints {
+    pub auth_base_url: String,
+    pub token_url: String,
+    pub gmail_base_url: String,
+    pub calendar_base_url: String,
+    pub drive_base_url: String,
+}
+
+impl Default for GoogleEndpoints {
+    fn default() -> Self {
+        Self {
+            auth_base_url: "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
+            token_url: "https://oauth2.googleapis.com/token".to_owned(),
+            gmail_base_url: "https://gmail.googleapis.com".to_owned(),
+            calendar_base_url: "https://www.googleapis.com".to_owned(),
+            drive_base_url: "https://www.googleapis.com".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OAuthClientCredentials {
+    client_id: String,
+    client_secret: Option<Zeroizing<String>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct GoogleTokenBundle {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at_ms: u64,
+    #[serde(default)]
+    token_type: Option<String>,
+}
+
+impl fmt::Debug for GoogleTokenBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoogleTokenBundle")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("has_refresh_token", &self.refresh_token.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    token_type: Option<String>,
+}
+
+/// Callback result emitted after the local loopback OAuth redirect finishes.
+pub type OAuthCompleteCallback = Arc<dyn Fn(BotConnectorStatus) + Send + Sync>;
+
+/// Starts a local loopback BYO Google Desktop OAuth 2.0 PKCE S256 flow.
+///
+/// Binds `127.0.0.1:0`, spawns a short-lived 128 KiB callback listener thread, and returns
+/// `(auth_url, state)` for the user's browser.
+pub fn start_google_oauth(
+    bot: &BotConfig,
+    secrets: Arc<SecretVault>,
+    endpoints: GoogleEndpoints,
+    on_complete: Option<OAuthCompleteCallback>,
+) -> Result<(String, String), String> {
+    let creds = load_oauth_client(bot, &secrets)?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|err| format!("failed to bind OAuth loopback listener: {err}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|err| format!("failed to inspect OAuth listener addr: {err}"))?
+        .port();
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("failed to configure OAuth listener: {err}"))?;
+
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    let verifier = generate_pkce_verifier().map_err(|err| err.to_string())?;
+    let challenge = pkce_s256_challenge(&verifier);
+    let state = generate_random_hex(16).map_err(|err| err.to_string())?;
+
+    let scopes = build_scopes(bot.connectors.google.services);
+    let auth_url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256&access_type=offline&prompt=consent",
+        endpoints.auth_base_url,
+        percent_encode(&creds.client_id),
+        percent_encode(&redirect_uri),
+        percent_encode(&scopes.join(" ")),
+        percent_encode(&state),
+        percent_encode(&challenge),
+    );
+
+    let bot_id = bot.id.clone();
+    let token_ref = bot
+        .connectors
+        .google
+        .token_secret_ref
+        .clone()
+        .unwrap_or_else(|| SecretVault::scoped_ref(&bot.id, "google_oauth_tokens"));
+    let expected_state = state.clone();
+
+    thread::Builder::new()
+        .name(format!("bot-goauth-{}", bot.slug.as_str()))
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_oauth_callback_listener(
+                    &listener,
+                    &bot_id,
+                    &creds,
+                    &redirect_uri,
+                    &verifier,
+                    &expected_state,
+                    &token_ref,
+                    &endpoints.token_url,
+                    &secrets,
+                )
+            }));
+            let status = match res {
+                Ok(Ok(())) => BotConnectorStatus {
+                    bot_id: bot_id.clone(),
+                    source: ExternalSource::Google,
+                    enabled: true,
+                    connected: true,
+                    state: ConnectorHealthState::Connected,
+                    account_label: Some("Google Workspace (OAuth)".to_owned()),
+                    last_sync_ms: Some(now_ms()),
+                    last_error: None,
+                    error_category: None,
+                },
+                Ok(Err(msg)) => BotConnectorStatus {
+                    bot_id: bot_id.clone(),
+                    source: ExternalSource::Google,
+                    enabled: true,
+                    connected: false,
+                    state: ConnectorHealthState::Error,
+                    account_label: None,
+                    last_sync_ms: None,
+                    last_error: Some(msg),
+                    error_category: Some(BotErrorCategory::SignedOut),
+                },
+                Err(_) => BotConnectorStatus {
+                    bot_id: bot_id.clone(),
+                    source: ExternalSource::Google,
+                    enabled: true,
+                    connected: false,
+                    state: ConnectorHealthState::Error,
+                    account_label: None,
+                    last_sync_ms: None,
+                    last_error: Some("Google OAuth listener panicked".to_owned()),
+                    error_category: Some(BotErrorCategory::AgentError),
+                },
+            };
+            if let Some(cb) = on_complete {
+                cb(status);
+            }
+        })
+        .map_err(|err| format!("failed to spawn Google OAuth listener thread: {err}"))?;
+
+    Ok((auth_url, state))
+}
+
+#[expect(clippy::too_many_arguments, reason = "OAuth callback state bundle")]
+fn run_oauth_callback_listener(
+    listener: &TcpListener,
+    _bot_id: &BotId,
+    creds: &OAuthClientCredentials,
+    redirect_uri: &str,
+    verifier: &Zeroizing<String>,
+    expected_state: &str,
+    token_ref: &str,
+    token_url: &str,
+    secrets: &SecretVault,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + OAUTH_CALLBACK_TIMEOUT;
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((s, _)) => break s,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("Google OAuth callback timed out".to_owned());
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => return Err(format!("OAuth callback accept error: {}", err.kind())),
+        }
+    };
+
+    stream.set_nonblocking(false).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+
+    let mut req_buf = [0u8; 8192];
+    let n = stream
+        .read(&mut req_buf)
+        .map_err(|err| format!("failed reading OAuth callback: {}", err.kind()))?;
+    let head = String::from_utf8_lossy(req_buf.get(..n).unwrap_or_default());
+    let first_line = head.lines().next().unwrap_or_default();
+    let target = first_line.split_whitespace().nth(1).unwrap_or_default();
+    let query = target.split_once('?').map_or("", |(_, q)| q);
+    let params = parse_query_params(query);
+
+    if let Some((_, err_val)) = params.iter().find(|(k, _)| k == "error") {
+        write_html_page(
+            &mut stream,
+            400,
+            "Google sign-in declined. You can close this tab.",
+        )
+        .ok();
+        return Err(format!("Google OAuth denied: {err_val}"));
+    }
+
+    let state = params
+        .iter()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or_default();
+    if !constant_time_eq(state.as_bytes(), expected_state.as_bytes()) {
+        write_html_page(
+            &mut stream,
+            400,
+            "Invalid OAuth state parameter. Please restart from Krill.",
+        )
+        .ok();
+        return Err("Google OAuth state mismatch".to_owned());
+    }
+
+    let code = params
+        .iter()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            write_html_page(&mut stream, 400, "Missing authorization code.").ok();
+            "Google OAuth callback missing code".to_owned()
+        })?;
+
+    let bundle = exchange_code_for_tokens(token_url, creds, code, redirect_uri, verifier)?;
+    let encoded = serde_json::to_string(&bundle)
+        .map_err(|_| "failed to serialize Google OAuth token bundle".to_owned())?;
+    secrets
+        .set_ref(token_ref, Zeroizing::new(encoded))
+        .map_err(|err| format!("failed to store Google OAuth tokens: {}", err.kind()))?;
+
+    write_html_page(
+        &mut stream,
+        200,
+        "Krill connected to Google Workspace. You can close this tab.",
+    )
+    .ok();
+    Ok(())
+}
+
+fn exchange_code_for_tokens(
+    token_url: &str,
+    creds: &OAuthClientCredentials,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &Zeroizing<String>,
+) -> Result<GoogleTokenBundle, String> {
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", &creds.client_id),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", verifier.as_str()),
+    ];
+    if let Some(ref secret) = creds.client_secret {
+        pairs.push(("client_secret", secret.as_str()));
+    }
+    let resp = http_client::send(&HttpRequest::post_form(token_url, &pairs))
+        .map_err(|err| format!("Google token exchange transport error: {}", err.kind()))?;
+    if !resp.is_success() {
+        return Err(format!(
+            "Google token exchange rejected with HTTP {}",
+            resp.status
+        ));
+    }
+    let parsed: OAuthTokenResponse = resp
+        .json()
+        .map_err(|_| "invalid Google token exchange JSON response".to_owned())?;
+    let ttl_ms = parsed.expires_in.unwrap_or(3600).saturating_mul(1_000);
+    Ok(GoogleTokenBundle {
+        access_token: parsed.access_token,
+        refresh_token: parsed.refresh_token,
+        expires_at_ms: now_ms().saturating_add(ttl_ms),
+        token_type: parsed.token_type,
+    })
+}
+
+/// Loads the bot's Google access token, transparently refreshing it via `refresh_token` when expired.
+pub fn ensure_valid_access_token(
+    bot: &BotConfig,
+    secrets: &SecretVault,
+    endpoints: &GoogleEndpoints,
+    current_ms: u64,
+) -> Result<Zeroizing<String>, BotErrorDetail> {
+    let token_ref = bot
+        .connectors
+        .google
+        .token_secret_ref
+        .as_deref()
+        .unwrap_or("google_oauth_tokens");
+    let raw = secrets
+        .resolve_secret(
+            &bot.id,
+            bot.connectors.google.token_secret_ref.as_deref(),
+            "google_oauth_tokens",
+        )
+        .map_err(|err| BotErrorDetail {
+            category: BotErrorCategory::NotSetUp,
+            agent_name: None,
+            message: format!("failed reading Google token vault: {}", err.kind()),
+            resets_at_ms: None,
+        })?
+        .ok_or_else(|| BotErrorDetail {
+            category: BotErrorCategory::SignedOut,
+            agent_name: None,
+            message: "Google OAuth not completed yet; run StartGoogleOAuth".to_owned(),
+            resets_at_ms: None,
+        })?;
+
+    let mut bundle: GoogleTokenBundle = serde_json::from_str(&raw).map_err(|_| BotErrorDetail {
+        category: BotErrorCategory::SignedOut,
+        agent_name: None,
+        message: "corrupt Google OAuth token bundle".to_owned(),
+        resets_at_ms: None,
+    })?;
+
+    if bundle.expires_at_ms > current_ms.saturating_add(TOKEN_REFRESH_MARGIN_MS) {
+        return Ok(Zeroizing::new(bundle.access_token));
+    }
+
+    let refresh_token = bundle
+        .refresh_token
+        .clone()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| BotErrorDetail {
+            category: BotErrorCategory::SignedOut,
+            agent_name: None,
+            message: "Google access token expired and no refresh token is stored".to_owned(),
+            resets_at_ms: None,
+        })?;
+
+    let creds = load_oauth_client(bot, secrets).map_err(|msg| BotErrorDetail {
+        category: BotErrorCategory::NotSetUp,
+        agent_name: None,
+        message: msg,
+        resets_at_ms: None,
+    })?;
+
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &refresh_token),
+        ("client_id", &creds.client_id),
+    ];
+    if let Some(ref secret) = creds.client_secret {
+        pairs.push(("client_secret", secret.as_str()));
+    }
+
+    let resp = http_client::send(&HttpRequest::post_form(&endpoints.token_url, &pairs)).map_err(
+        |err| BotErrorDetail {
+            category: BotErrorCategory::AgentError,
+            agent_name: None,
+            message: format!("Google token refresh failed: {}", err.kind()),
+            resets_at_ms: None,
+        },
+    )?;
+    if !resp.is_success() {
+        return Err(BotErrorDetail {
+            category: BotErrorCategory::SignedOut,
+            agent_name: None,
+            message: format!("Google token refresh returned HTTP {}", resp.status),
+            resets_at_ms: None,
+        });
+    }
+
+    let refreshed: OAuthTokenResponse = resp.json().map_err(|_| BotErrorDetail {
+        category: BotErrorCategory::AgentError,
+        agent_name: None,
+        message: "invalid Google refresh JSON response".to_owned(),
+        resets_at_ms: None,
+    })?;
+    let ttl_ms = refreshed.expires_in.unwrap_or(3600).saturating_mul(1_000);
+    bundle.access_token = refreshed.access_token;
+    if refreshed.refresh_token.is_some() {
+        bundle.refresh_token = refreshed.refresh_token;
+    }
+    bundle.expires_at_ms = current_ms.saturating_add(ttl_ms);
+
+    let save_ref = if bot.connectors.google.token_secret_ref.is_some() {
+        token_ref.to_owned()
+    } else {
+        SecretVault::scoped_ref(&bot.id, "google_oauth_tokens")
+    };
+    if let Ok(encoded) = serde_json::to_string(&bundle) {
+        secrets.set_ref(&save_ref, Zeroizing::new(encoded)).ok();
+    }
+
+    Ok(Zeroizing::new(bundle.access_token))
+}
+
+/// Polls enabled Google Workspace services (`Gmail`, `Calendar`, `Drive`) for `bot` and creates
+/// deduplicated [`BotItem`]s for newly discovered events. Returns the number of newly created items.
+pub fn poll_bot_google(
+    bot: &BotConfig,
+    secrets: &SecretVault,
+    items: &BotItemsStore,
+    endpoints: &GoogleEndpoints,
+    current_ms: u64,
+) -> Result<usize, BotErrorDetail> {
+    let token = ensure_valid_access_token(bot, secrets, endpoints, current_ms)?;
+    let auth_header = format!("Bearer {}", *token);
+    let actor = BotItemActor::System {
+        reason: "google-poller".to_owned(),
+    };
+    let mut created = 0usize;
+
+    if bot.connectors.google.services.gmail {
+        let url = format!(
+            "{}/gmail/v1/users/me/messages?q=is:unread&maxResults=5",
+            endpoints.gmail_base_url.trim_end_matches('/')
+        );
+        let resp =
+            http_client::send(&HttpRequest::get(&url).with_header("Authorization", &auth_header))
+                .map_err(|err| google_transport_err("Gmail", &err))?;
+        if resp.is_success()
+            && let Ok(val) = resp.json::<serde_json::Value>()
+            && let Some(messages) = val.get("messages").and_then(serde_json::Value::as_array)
+        {
+            for msg in messages {
+                let Some(id) = msg.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let link =
+                    BotItemLink::Url(format!("https://mail.google.com/mail/u/0/#inbox/{id}"));
+                if items
+                    .find_item_by_link(&bot.id, &link)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
+                let subject = msg
+                    .get("snippet")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map_or_else(
+                        || format!("Unread Gmail message ({id})"),
+                        |s| format!("Gmail: {}", truncate_chars(s.trim(), 120)),
+                    );
+                if items
+                    .create_item(
+                        &CreateBotItemParams {
+                            bot_id: bot.id.clone(),
+                            title: subject,
+                            description: Some(format!("Detected unread Gmail message {id}.")),
+                            done_means: None,
+                            status: Some(BotItemStatus::Planned),
+                            links: vec![link],
+                        },
+                        &actor,
+                        current_ms,
+                    )
+                    .is_ok()
+                {
+                    created = created.saturating_add(1);
+                }
+            }
+        } else if resp.status == 401 || resp.status == 403 {
+            return Err(BotErrorDetail {
+                category: BotErrorCategory::SignedOut,
+                agent_name: None,
+                message: format!("Gmail rejected credentials (HTTP {})", resp.status),
+                resets_at_ms: None,
+            });
+        }
+    }
+
+    if bot.connectors.google.services.calendar {
+        let url = format!(
+            "{}/calendar/v3/calendars/primary/events?maxResults=5&singleEvents=true&orderBy=startTime",
+            endpoints.calendar_base_url.trim_end_matches('/')
+        );
+        let resp =
+            http_client::send(&HttpRequest::get(&url).with_header("Authorization", &auth_header))
+                .map_err(|err| google_transport_err("Calendar", &err))?;
+        if resp.is_success()
+            && let Ok(val) = resp.json::<serde_json::Value>()
+            && let Some(events) = val.get("items").and_then(serde_json::Value::as_array)
+        {
+            for ev in events {
+                let Some(id) = ev.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let link_url = ev
+                    .get("htmlLink")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(
+                        || format!("https://calendar.google.com/calendar/event?eid={id}"),
+                        ToOwned::to_owned,
+                    );
+                let link = BotItemLink::Url(link_url);
+                if items
+                    .find_item_by_link(&bot.id, &link)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
+                let summary = ev
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("Upcoming calendar event");
+                if items
+                    .create_item(
+                        &CreateBotItemParams {
+                            bot_id: bot.id.clone(),
+                            title: format!("Calendar: {}", truncate_chars(summary.trim(), 120)),
+                            description: ev
+                                .get("description")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToOwned::to_owned),
+                            done_means: None,
+                            status: Some(BotItemStatus::Planned),
+                            links: vec![link],
+                        },
+                        &actor,
+                        current_ms,
+                    )
+                    .is_ok()
+                {
+                    created = created.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    if bot.connectors.google.services.drive
+        || bot.connectors.google.services.docs
+        || bot.connectors.google.services.sheets
+    {
+        let url = format!(
+            "{}/drive/v3/files?pageSize=5&orderBy=modifiedTime%20desc&fields=files(id,name,webViewLink,modifiedTime)",
+            endpoints.drive_base_url.trim_end_matches('/')
+        );
+        let resp =
+            http_client::send(&HttpRequest::get(&url).with_header("Authorization", &auth_header))
+                .map_err(|err| google_transport_err("Drive", &err))?;
+        if resp.is_success()
+            && let Ok(val) = resp.json::<serde_json::Value>()
+            && let Some(files) = val.get("files").and_then(serde_json::Value::as_array)
+        {
+            for file in files {
+                let Some(id) = file.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let link_url = file
+                    .get("webViewLink")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(
+                        || format!("https://drive.google.com/file/d/{id}/view"),
+                        ToOwned::to_owned,
+                    );
+                let link = BotItemLink::Url(link_url);
+                if items
+                    .find_item_by_link(&bot.id, &link)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
+                let name = file
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Drive file");
+                if items
+                    .create_item(
+                        &CreateBotItemParams {
+                            bot_id: bot.id.clone(),
+                            title: format!("Drive: {}", truncate_chars(name.trim(), 120)),
+                            description: None,
+                            done_means: None,
+                            status: Some(BotItemStatus::Planned),
+                            links: vec![link],
+                        },
+                        &actor,
+                        current_ms,
+                    )
+                    .is_ok()
+                {
+                    created = created.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    Ok(created)
+}
+
+/// Strictly-lazy 60s local Google Workspace trigger checker thread.
+pub struct GoogleTriggerChecker {
+    store: Arc<BotStore>,
+    secrets: Arc<SecretVault>,
+    items: Arc<BotItemsStore>,
+    endpoints: GoogleEndpoints,
+    statuses: Arc<Mutex<BTreeMap<BotId, BotConnectorStatus>>>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    running: AtomicBool,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl fmt::Debug for GoogleTriggerChecker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoogleTriggerChecker")
+            .field("running", &self.running.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for GoogleTriggerChecker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl GoogleTriggerChecker {
+    /// Creates a lazy checker with ZERO background threads until `reconcile` sees an enabled bot.
+    #[must_use]
+    pub fn new(
+        store: Arc<BotStore>,
+        secrets: Arc<SecretVault>,
+        items: Arc<BotItemsStore>,
+        endpoints: GoogleEndpoints,
+    ) -> Self {
+        Self {
+            store,
+            secrets,
+            items,
+            endpoints,
+            statuses: Arc::new(Mutex::new(BTreeMap::new())),
+            stop: Arc::new((Mutex::new(false), Condvar::new())),
+            running: AtomicBool::new(false),
+            thread: Mutex::new(None),
+        }
+    }
+
+    /// Starts the 60s poller thread if ≥1 bot has `google.enabled`, or stops it when none do.
+    pub fn reconcile(&self) {
+        let has_enabled = self
+            .store
+            .list_bots()
+            .unwrap_or_default()
+            .iter()
+            .any(|b| !b.paused && b.connectors.google.enabled);
+        if has_enabled {
+            self.ensure_started();
+        } else {
+            self.stop();
+        }
+    }
+
+    /// Runs an immediate sync for `bot` and records its updated [`BotConnectorStatus`].
+    pub fn sync_bot_now(&self, bot: &BotConfig, current_ms: u64) -> BotConnectorStatus {
+        let status =
+            match poll_bot_google(bot, &self.secrets, &self.items, &self.endpoints, current_ms) {
+                Ok(_) => BotConnectorStatus {
+                    bot_id: bot.id.clone(),
+                    source: ExternalSource::Google,
+                    enabled: bot.connectors.google.enabled,
+                    connected: true,
+                    state: ConnectorHealthState::Connected,
+                    account_label: Some("Google Workspace".to_owned()),
+                    last_sync_ms: Some(current_ms),
+                    last_error: None,
+                    error_category: None,
+                },
+                Err(detail) => BotConnectorStatus {
+                    bot_id: bot.id.clone(),
+                    source: ExternalSource::Google,
+                    enabled: bot.connectors.google.enabled,
+                    connected: false,
+                    state: ConnectorHealthState::Error,
+                    account_label: None,
+                    last_sync_ms: None,
+                    last_error: Some(detail.message),
+                    error_category: Some(detail.category),
+                },
+            };
+        self.record_status(status.clone());
+        status
+    }
+
+    /// Updates a stored status (e.g., on OAuth callback completion).
+    pub fn record_status(&self, status: BotConnectorStatus) {
+        lock(&self.statuses).insert(status.bot_id.clone(), status);
+    }
+
+    /// Returns tracked Google connector statuses, optionally filtered by `bot_id`.
+    #[must_use]
+    pub fn statuses(&self, bot_id: Option<&BotId>) -> Vec<BotConnectorStatus> {
+        lock(&self.statuses)
+            .values()
+            .filter(|s| bot_id.is_none_or(|id| &s.bot_id == id))
+            .cloned()
+            .collect()
+    }
+
+    /// Returns a cloned copy of the configured endpoints.
+    #[must_use]
+    pub fn endpoints(&self) -> GoogleEndpoints {
+        self.endpoints.clone()
+    }
+
+    /// Returns whether the background poller thread is running.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    fn ensure_started(&self) {
+        let mut handle_guard = lock(&self.thread);
+        if handle_guard.is_some() {
+            return;
+        }
+        *lock(&self.stop.0) = false;
+        let store = Arc::clone(&self.store);
+        let secrets = Arc::clone(&self.secrets);
+        let items = Arc::clone(&self.items);
+        let endpoints = self.endpoints.clone();
+        let statuses = Arc::clone(&self.statuses);
+        let stop = Arc::clone(&self.stop);
+
+        if let Ok(handle) = thread::Builder::new()
+            .name("bot-google-poll".to_owned())
+            .stack_size(STACK_SIZE)
+            .spawn(move || {
+                let mut last_polled: BTreeMap<BotId, u64> = BTreeMap::new();
+                loop {
+                    let wait_res = {
+                        let guard = lock(&stop.0);
+                        if *guard {
+                            break;
+                        }
+                        let (guard, _) = stop
+                            .1
+                            .wait_timeout_while(
+                                guard,
+                                Duration::from_secs(DEFAULT_POLL_SECS),
+                                |s| !*s,
+                            )
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *guard
+                    };
+                    if wait_res {
+                        break;
+                    }
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let ts = now_ms();
+                        let bots = store.list_bots().unwrap_or_default();
+                        for bot in bots {
+                            if bot.paused || !bot.connectors.google.enabled {
+                                continue;
+                            }
+                            let interval_ms = bot
+                                .connectors
+                                .google
+                                .poll_interval_secs
+                                .max(15)
+                                .saturating_mul(1_000);
+                            if last_polled
+                                .get(&bot.id)
+                                .is_some_and(|&prev| ts.saturating_sub(prev) < interval_ms)
+                            {
+                                continue;
+                            }
+                            last_polled.insert(bot.id.clone(), ts);
+                            let st = match poll_bot_google(&bot, &secrets, &items, &endpoints, ts) {
+                                Ok(_) => BotConnectorStatus {
+                                    bot_id: bot.id.clone(),
+                                    source: ExternalSource::Google,
+                                    enabled: true,
+                                    connected: true,
+                                    state: ConnectorHealthState::Connected,
+                                    account_label: Some("Google Workspace".to_owned()),
+                                    last_sync_ms: Some(ts),
+                                    last_error: None,
+                                    error_category: None,
+                                },
+                                Err(detail) => BotConnectorStatus {
+                                    bot_id: bot.id.clone(),
+                                    source: ExternalSource::Google,
+                                    enabled: true,
+                                    connected: false,
+                                    state: ConnectorHealthState::Error,
+                                    account_label: None,
+                                    last_sync_ms: None,
+                                    last_error: Some(detail.message),
+                                    error_category: Some(detail.category),
+                                },
+                            };
+                            lock(&statuses).insert(bot.id.clone(), st);
+                        }
+                    }))
+                    .ok();
+                }
+            })
+        {
+            self.running.store(true, Ordering::Release);
+            *handle_guard = Some(handle);
+        }
+    }
+
+    /// Stops the background poller thread cleanly.
+    pub fn stop(&self) {
+        let handle = lock(&self.thread).take();
+        if let Some(h) = handle {
+            *lock(&self.stop.0) = true;
+            self.stop.1.notify_all();
+            h.join().ok();
+            self.running.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn load_oauth_client(
+    bot: &BotConfig,
+    secrets: &SecretVault,
+) -> Result<OAuthClientCredentials, String> {
+    let raw = secrets
+        .resolve_secret(
+            &bot.id,
+            bot.connectors.google.oauth_client_secret_ref.as_deref(),
+            "google_oauth_client",
+        )
+        .map_err(|err| format!("failed to read Google OAuth JSON: {}", err.kind()))?
+        .ok_or_else(|| {
+            "missing Google Desktop OAuth JSON in secret vault (set secret before starting OAuth)"
+                .to_owned()
+        })?;
+    let val: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|_| "invalid Google Desktop OAuth JSON format".to_owned())?;
+    let obj = val
+        .get("installed")
+        .or_else(|| val.get("web"))
+        .unwrap_or(&val);
+    let client_id = obj
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Google OAuth JSON missing client_id".to_owned())?
+        .to_owned();
+    let client_secret = obj
+        .get("client_secret")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Zeroizing::new(s.to_owned()));
+    Ok(OAuthClientCredentials {
+        client_id,
+        client_secret,
+    })
+}
+
+fn build_scopes(services: GoogleServicesConfig) -> Vec<&'static str> {
+    let mut scopes = Vec::new();
+    if services.gmail {
+        scopes.push("https://www.googleapis.com/auth/gmail.readonly");
+    }
+    if services.calendar {
+        scopes.push("https://www.googleapis.com/auth/calendar.readonly");
+    }
+    if services.drive || services.docs || services.sheets {
+        scopes.push("https://www.googleapis.com/auth/drive.readonly");
+    }
+    if services.contacts {
+        scopes.push("https://www.googleapis.com/auth/contacts.readonly");
+    }
+    if scopes.is_empty() {
+        scopes.push("https://www.googleapis.com/auth/gmail.readonly");
+        scopes.push("https://www.googleapis.com/auth/calendar.readonly");
+    }
+    scopes
+}
+
+fn generate_pkce_verifier() -> io::Result<Zeroizing<String>> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    SystemRandom::new()
+        .fill(bytes.as_mut())
+        .map_err(|_| io::Error::other("PKCE RNG failure"))?;
+    Ok(Zeroizing::new(base64url_encode(bytes.as_ref())))
+}
+
+fn pkce_s256_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64url_encode(&digest)
+}
+
+fn generate_random_hex(len: usize) -> io::Result<String> {
+    let mut buf = vec![0u8; len];
+    SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| io::Error::other("RNG failure"))?;
+    Ok(crate::mobile::devices::hex(&buf))
+}
+
+fn write_html_page(stream: &mut std::net::TcpStream, status: u16, msg: &str) -> io::Result<()> {
+    let body = format!(
+        "<!doctype html><html><body style=\"font-family:sans-serif;padding:24px\"><h3>{msg}</h3></body></html>"
+    );
+    let reason = if status == 200 { "OK" } else { "Bad Request" };
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(resp.as_bytes())?;
+    stream.flush()
+}
+
+fn google_transport_err(service: &str, err: &io::Error) -> BotErrorDetail {
+    BotErrorDetail {
+        category: BotErrorCategory::AgentError,
+        agent_name: None,
+        message: format!("Google {service} poll failed: {}", err.kind()),
+        resets_at_ms: None,
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        out.push_str("...");
+    }
+    out
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "krilld-bot-google-{label}-{}-{n}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn google_oauth_pkce_callback_token_refresh_and_poller_work_on_loopback() {
+        let dir = temp_dir("oauth");
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x77; 32]));
+        let items = BotItemsStore::new(dir.join("bot-items.db"));
+
+        // Mock Google token + Gmail/Calendar/Drive API server.
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mock_addr = mock.local_addr().unwrap();
+        let mock_thread = thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut sock, _) = mock.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(buf.get(..n).unwrap_or_default());
+                let target = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if target.starts_with("/token") {
+                    r#"{"access_token":"ya29.fresh","refresh_token":"1//ref","expires_in":3600,"token_type":"Bearer"}"#
+                } else if target.starts_with("/gmail/") {
+                    r#"{"messages":[{"id":"m1","snippet":"Deploy signoff needed"}]}"#
+                } else if target.starts_with("/calendar/") {
+                    r#"{"items":[{"id":"ev1","summary":"Release sync","htmlLink":"https://calendar.google.com/ev1"}]}"#
+                } else {
+                    r#"{"files":[{"id":"f1","name":"Runbook.md","webViewLink":"https://drive.google.com/f1"}]}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let bot_id = BotId::new("bot-google").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "Google Bot", "claude", 1_000).unwrap();
+        bot.connectors.google.enabled = true;
+        bot.connectors.google.services = GoogleServicesConfig {
+            gmail: true,
+            calendar: true,
+            drive: true,
+            docs: false,
+            sheets: false,
+            contacts: false,
+        };
+
+        secrets
+            .set_secret(
+                &bot_id,
+                "google_oauth_client",
+                Zeroizing::new(
+                    r#"{"installed":{"client_id":"cid-123","client_secret":"csec-456"}}"#
+                        .to_owned(),
+                ),
+            )
+            .unwrap();
+
+        let endpoints = GoogleEndpoints {
+            auth_base_url: "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
+            token_url: format!("http://{mock_addr}/token"),
+            gmail_base_url: format!("http://{mock_addr}"),
+            calendar_base_url: format!("http://{mock_addr}"),
+            drive_base_url: format!("http://{mock_addr}"),
+        };
+
+        let done_flag = Arc::new(AtomicBool::new(false));
+        let done_cb = Arc::clone(&done_flag);
+        let (auth_url, state) = start_google_oauth(
+            &bot,
+            Arc::clone(&secrets),
+            endpoints.clone(),
+            Some(Arc::new(move |st| {
+                if st.connected {
+                    done_cb.store(true, Ordering::Release);
+                }
+            })),
+        )
+        .unwrap();
+        assert!(auth_url.contains("code_challenge_method=S256"));
+
+        // Extract loopback redirect_uri from auth_url and simulate browser callback.
+        let query = auth_url.split_once('?').unwrap().1;
+        let params = parse_query_params(query);
+        let redirect_uri = params
+            .iter()
+            .find(|(k, _)| k == "redirect_uri")
+            .unwrap()
+            .1
+            .clone();
+        let cb_resp = http_client::send(&HttpRequest::get(format!(
+            "{redirect_uri}?code=auth-code-99&state={state}"
+        )))
+        .unwrap();
+        assert_eq!(cb_resp.status, 200);
+
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done_flag.load(Ordering::Acquire) && std::time::Instant::now() < wait_deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(done_flag.load(Ordering::Acquire));
+
+        // Poll Gmail + Calendar + Drive using stored OAuth token.
+        let created = poll_bot_google(&bot, &secrets, &items, &endpoints, now_ms()).unwrap();
+        assert_eq!(created, 3);
+        assert_eq!(
+            items
+                .list_items(Some(&bot_id), None, true, true, now_ms())
+                .unwrap()
+                .len(),
+            3
+        );
+
+        mock_thread.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+}
