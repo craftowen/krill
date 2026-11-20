@@ -257,6 +257,8 @@ pub enum Request {
         #[serde(deserialize_with = "sidebar_path")]
         repo: Vec<u8>,
     },
+    /// `FEAT_BOTS` 필요. Krill Bots 관리·기억·항목·커넥터·패키지 RPC.
+    Bot(crate::bots::BotRpcRequest),
 }
 
 /// A dialog owns one token; cancellation also applies if it arrives before preparation.
@@ -1181,6 +1183,8 @@ pub enum Reply {
     RemoteFs(crate::remote_fs::RemoteFsReply),
     /// `FEAT_WORKTREE_REFS` 필요. 실패는 기존 `WorktreeFailed`로 답한다.
     WorktreeRefs(#[serde(deserialize_with = "worktree_refs")] Vec<String>),
+    /// `FEAT_BOTS` 필요. [`Request::Bot`]의 응답.
+    Bot(crate::bots::BotRpcResponse),
 }
 
 fn worktree_refs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {

@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 pub const PROTO_MAX: u16 = 1;
 /// 이 빌드가 받는 최저 프로토콜 버전. `PROTO_MAX`를 올릴 때 `PROTO_MAX - 1`보다 크면 안 된다(N-1 호환).
 pub const PROTO_MIN: u16 = 1;
+/// Krill Bots 제어·커넥터·패키지 RPC(`control::Request::Bot`·`Reply::Bot`, 전용 kind `bots::BOT_REQ`·`BOT_REPLY`).
+pub const FEAT_BOTS: u64 = 1 << 40;
 /// Git 원격 동기화 동작(`Edit::Push`·`Pull`·`Sync`·`CommitAndPush`, MK-184·OWE-738 지휘자 배정).
 /// [`crate::control::FEAT_CONTROL`]·[`crate::control::FEAT_GIT_EDIT`]와 함께 협상한다.
 pub const FEAT_GIT_SYNC: u64 = 1 << 41;
@@ -101,9 +103,10 @@ pub const FEATURES: u64 = crate::screen::FEAT_HISTORY_VIEW
     | crate::control::FEAT_REMOTE_FS
     | crate::mobile::FEAT_MOBILE
     | crate::orchestration::FEAT_ORCH_RETAIN
-    | crate::orchestration::FEAT_ORCH_SNAPSHOT_PAGE;
+    | crate::orchestration::FEAT_ORCH_SNAPSHOT_PAGE
+    | FEAT_BOTS;
 // 기능 비트는 서로 겹치면 안 된다(2026-10-15 번호 충돌 사고 방지). 비트가 모두 다르면 합의 1 비트 수가 항목 수와 같다.
-const _: () = assert!(FEATURES.count_ones() == 62);
+const _: () = assert!(FEATURES.count_ones() == 63);
 /// 프레임 최대 길이(`len` 값 기준).
 pub const MAX_FRAME: usize = 1 << 20;
 /// [`ClientHello::name`] 최대 바이트.

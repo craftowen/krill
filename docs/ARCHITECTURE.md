@@ -166,6 +166,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_WORKTREE_REFS | `1 << 37` | `krill_proto::control` (호스트별 Git 브랜치·태그 조회) |
 | FEAT_REMOTE_FS | `1 << 27` | `krill_proto::control` (원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩 `Request::RemoteFs`/`Reply::RemoteFs` 한 쌍; enum 끝에 추가) |
 | FEAT_ORCH_SNAPSHOT_PAGE | `1 << 35` | `krill_proto::orchestration` (1MiB 프레임을 넘는 유효 저장소의 무손실 페이지 스냅샷 `OrchAction::SnapshotPage`(opcode 25)/`OrchResponse::SnapshotPage`(wire 14), foundation-02 지휘자 배정 2026-10-27; enum 끝에 추가, 미협상 피어에는 요청 금지) |
+| FEAT_BOTS | `1 << 40` | `krill_proto::ipc` (Krill Bots 제어·기억·항목·커넥터·패키지 RPC `Request::Bot`/`Reply::Bot` 및 전용 kind `bots::BOT_REQ`·`bots::BOT_REPLY`) |
 
 OWE-722(MK-159)의 `SetProvisioning`·`GetProvisioning`/`UsageReply::Provisioning`은 미출시 `FEAT_USAGE_MANAGE`(`1 << 59`)에 포함한다(새 비트 없음, 미협상 피어에 요청 금지).
 
@@ -211,6 +212,8 @@ OWE-722(MK-159)의 `SetProvisioning`·`GetProvisioning`/`UsageReply::Provisionin
 | `clipboard::CLIPBOARD` | `0x62` | 데몬→클라 (FEAT_CLIPBOARD, OSC 52 쓰기) |
 | `daemon::PING` | `0x43` | 클라→데몬 (감시 연결만, FEAT_HEARTBEAT, OWE-586) |
 | `daemon::PONG` | `0x63` | 데몬→클라 (감시 연결만, FEAT_HEARTBEAT, OWE-586) |
+| `bots::BOT_REQ` | `0x48` | 클라→데몬 (FEAT_BOTS 필요) |
+| `bots::BOT_REPLY` | `0x68` | 데몬→클라 (FEAT_BOTS 필요) |
 
 `term_modes::Modes.flags`는 bit 0 APP_CURSOR, 1 MOUSE_CLICK, 2 MOUSE_DRAG, 3 MOUSE_MOTION, 4 SGR_MOUSE, 5 BRACKETED_PASTE, 6 ALT_SCREEN, 7 ALTERNATE_SCROLL(DEC 1007)을 사용한다. 알 수 없는 비트는 무시한다. 대체 화면에서 마우스 보고가 꺼져 있고 DEC 1007이 켜져 있으면 클라이언트는 휠을 커서 모드에 맞는 위/아래 키로 보낸다.
 

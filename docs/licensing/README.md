@@ -25,7 +25,7 @@ crate 배포본에 단독 라이선스 파일이 없으면 잠긴 Cargo 메타�
 이는 라이선스 조건의 보완이며 upstream 저작권 고지의 복구가 아니므로 배포 전 출처 확인은 여전히 필요하다.
 이 목록의 완성 여부와 최종 배포물의 라이선스 충족 여부는 별도 검토가 필요하다.
 
-PWA의 Orca·jsQR 고지는 [Mobile UI notices](mobile-ui-NOTICES.md)에 보존한다.
+PWA의 Orca·jsQR 고지는 [Mobile UI notices](mobile-ui-NOTICES.md)에, Krill Bots의 Orca MIT 고지는 [Bots notices](bots-NOTICES.md)에 보존한다.
 
 배포 전 체크리스트:
 

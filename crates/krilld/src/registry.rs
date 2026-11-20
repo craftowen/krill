@@ -998,6 +998,9 @@ impl Registry {
                 Ok(Request::RemoteFs(_)) if n.features & control::FEAT_REMOTE_FS == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
+                Ok(Request::Bot(_)) if n.features & ipc::FEAT_BOTS == 0 => {
+                    Reply::Failed(Failure::BadRequest)
+                }
                 Ok(Request::RemoteFs(krill_proto::remote_fs::RemoteFsRequest::PortForward {
                     port,
                 })) => {
@@ -1327,6 +1330,16 @@ impl Registry {
                     Ok(Reply::RemoteFs(crate::remote_fs::serve(req)))
                 } else {
                     peer.deny("remote-fs", &self.audit);
+                    Err(Failure::Denied)
+                }
+            }
+            Request::Bot(_req) => {
+                if peer.scope.full() {
+                    Ok(Reply::Bot(krill_proto::bots::BotRpcResponse::Error(
+                        "bots subsystem not initialized".to_owned(),
+                    )))
+                } else {
+                    peer.deny("bots", &self.audit);
                     Err(Failure::Denied)
                 }
             }
@@ -4864,7 +4877,9 @@ fn read_only(req: &Request) -> bool {
                     }
             )
             | Request::RemoteFs(_)
+            | Request::Bot(_)
     ) && !matches!(req, Request::RemoteFs(r) if !r.is_read_only())
+        && !matches!(req, Request::Bot(r) if !r.is_read_only())
 }
 
 #[cfg(test)]
