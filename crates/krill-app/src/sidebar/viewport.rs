@@ -2,9 +2,39 @@
 use gpui::{FocusHandle, ListAlignment, ListOffset, ListState, ScrollStrategy, SharedString, px};
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::rc::Rc;
 
-use super::{HostId, Row};
+use super::{GroupKey, HostId, Row};
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum AnchorKey<'a> {
+    HostHeader(&'a HostId, &'a HostId),
+    GroupHeader(&'a HostId, &'a GroupKey),
+    Repository(&'a HostId, &'a Path),
+    PendingWorktree(&'a HostId, u64),
+    Worktree(&'a HostId, &'a Path),
+    Folder(&'a HostId, &'a Path),
+    HiddenWorktrees(&'a HostId, &'a Path),
+    Session(&'a HostId, krill_proto::SessionId, bool),
+    NeedsYou(&'a HostId),
+    Loose(&'a HostId),
+}
+
+fn anchor_key<'a>(host: &'a HostId, row: &'a Row) -> AnchorKey<'a> {
+    match row {
+        Row::HostHeader { host: inner, .. } => AnchorKey::HostHeader(host, inner),
+        Row::GroupHeader { key, .. } => AnchorKey::GroupHeader(host, key),
+        Row::Repository(path) => AnchorKey::Repository(host, path),
+        Row::PendingWorktree { id, .. } => AnchorKey::PendingWorktree(host, *id),
+        Row::Worktree(path) => AnchorKey::Worktree(host, path),
+        Row::Folder(path) => AnchorKey::Folder(host, path),
+        Row::HiddenWorktrees(path, ..) => AnchorKey::HiddenWorktrees(host, path),
+        Row::Session(session, nested) => AnchorKey::Session(host, session.id, *nested),
+        Row::NeedsYou => AnchorKey::NeedsYou(host),
+        Row::Loose => AnchorKey::Loose(host),
+    }
+}
 
 pub(super) struct CardList {
     pub state: ListState,
@@ -57,24 +87,23 @@ impl CardList {
         }
     }
 
-    pub fn update(&mut self, rows: Vec<(HostId, Row, usize)>) {
+    pub fn update(&mut self, rows: Vec<(HostId, Row, usize)>) -> bool {
         if rows == self.rows {
-            return;
+            return false;
         }
         let indices: BTreeMap<_, _> = rows
             .iter()
             .enumerate()
-            .map(|(i, (host, row, _))| (row_id(host, row), i))
+            .map(|(i, (host, row, _))| (anchor_key(host, row), i))
             .collect();
         let pending = self
             .pending_reveal
             .get()
             .and_then(|row| self.rows.iter().find(|(_, _, i)| *i == row));
-        self.pending_reveal.set(pending.and_then(|(host, row, _)| {
-            rows.iter()
-                .find(|(h, r, _)| h == host && same_item(row, r))
-                .map(|(_, _, i)| *i)
-        }));
+        self.pending_reveal
+            .set(pending.and_then(|(host, row, _)| {
+                indices.get(&anchor_key(host, row)).map(|&i| rows[i].2)
+            }));
         let old_offset = self.state.logical_scroll_top();
         if let Some(index) = self.editor.take() {
             self.state.splice_focusable(index..index + 1, [None]);
@@ -90,7 +119,7 @@ impl CardList {
             .chain(self.rows.iter().enumerate().take(old_offset.item_ix).rev())
             .find_map(|(old_index, (host, row, _))| {
                 indices
-                    .get(&row_id(host, row))
+                    .get(&anchor_key(host, row))
                     .copied()
                     .map(|index| (old_index, index))
             });
@@ -122,12 +151,21 @@ impl CardList {
                 prefix..self.rows.len() - suffix,
                 rows.len() - prefix - suffix,
             );
+            // Metadata, wrapping and expansion can change heights without changing row identity.
+            // Keep GPUI's measured size hints on preserved spans while avoiding double-invalidating spliced items.
+            if prefix > 0 {
+                self.state.remeasure_items(0..prefix);
+            }
+            let tail_start = rows.len().saturating_sub(suffix);
+            if tail_start < rows.len() {
+                self.state.remeasure_items(tail_start..rows.len());
+            }
+        } else {
+            self.state.remeasure_items(0..rows.len());
         }
-        // Metadata, wrapping and expansion can change heights without changing row identity.
-        // Keep GPUI's measured size hints rather than discarding every off-screen measurement.
-        self.state.remeasure_items(0..rows.len());
         self.rows = rows;
         self.state.scroll_to(offset);
+        true
     }
 
     pub fn row_index(&self, index: usize) -> Option<usize> {

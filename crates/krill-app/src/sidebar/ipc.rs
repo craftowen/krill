@@ -38,6 +38,24 @@ pub(super) struct WatchCache {
 }
 
 impl WatchCache {
+    fn matches_trees(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> bool {
+        let mut count = 0usize;
+        for tree in trees.values().flatten().take(MAX_WATCHES) {
+            if !self.entries.contains_key(tree) {
+                return false;
+            }
+            count += 1;
+        }
+        count == self.entries.len()
+    }
+
+    fn cached_dirty(&self) -> BTreeMap<PathBuf, usize> {
+        self.entries
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), v.dirty?)))
+            .collect()
+    }
+
     pub(super) fn poll(
         &mut self,
         trees: &BTreeMap<PathBuf, Vec<PathBuf>>,
@@ -121,7 +139,10 @@ fn watch_exchange(stream: &mut UnixStream, req: GitWatchRequest) -> io::Result<G
         krill_proto::ipc::read_frame(stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
     match Reply::decode(kind, &bytes).map_err(io::Error::other)? {
         Reply::GitWatch(reply) => Ok(reply),
-        Reply::Failed(f) => Err(io::Error::other(f.to_string())),
+        Reply::Failed(f) => Ok(GitWatchReply::Failed {
+            generation: 0,
+            error: f.to_string(),
+        }),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
 }
@@ -143,24 +164,149 @@ type Job = Box<dyn FnOnce() + Send>;
 
 /// 이보다 오래 걸린 호스트 폴링은 운영 로그에 남긴다.
 const SLOW_POLL: Duration = Duration::from_secs(1);
+/// `ok=true` 느린 폴링의 호스트별 로그 재출력 최소 간격.
+const SLOW_OK_LOG_COOLDOWN: Duration = Duration::from_secs(60);
+/// `ok=false` 장애 상태가 계속될 때 호스트별 요약 로그 재출력 최소 간격.
+const SLOW_FAILURE_RELOG_COOLDOWN: Duration = Duration::from_secs(300);
+/// 일시적인 단발 `ok=true` 한 번으로 장애 로그 억제를 풀지 않고 연속 성공 횟수를 요구한다.
+const FAILURE_RECOVERY_POLLS: u8 = 2;
+/// 원격 호스트의 `GitWatch` 폴링 최소 간격(로컬 Unix 소켓은 제한 없음).
+const REMOTE_GIT_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Slow polls are logged, except that an unreachable host, which fails every poll while it is
-/// down, logs only its first slow failure until a poll succeeds again.
-fn slow_poll_logged(
-    failure_logged: &std::sync::atomic::AtomicBool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlowPollDecision {
+    log: bool,
+    suppressed_repeats: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SlowPollTracker {
+    in_failure_outage: bool,
+    recovery_streak: u8,
+    last_failure_log_at: Option<Instant>,
+    suppressed_failure_repeats: u64,
+    last_slow_ok_log_at: Option<Instant>,
+    suppressed_ok_repeats: u64,
+}
+
+impl SlowPollTracker {
+    fn record(&mut self, ok: bool, elapsed: Duration, now: Instant) -> SlowPollDecision {
+        if ok {
+            if self.in_failure_outage {
+                self.recovery_streak = self.recovery_streak.saturating_add(1);
+                if self.recovery_streak >= FAILURE_RECOVERY_POLLS {
+                    self.in_failure_outage = false;
+                    self.recovery_streak = 0;
+                    self.last_failure_log_at = None;
+                    self.suppressed_failure_repeats = 0;
+                }
+            }
+            if elapsed < SLOW_POLL {
+                return SlowPollDecision {
+                    log: false,
+                    suppressed_repeats: 0,
+                };
+            }
+            let due = self
+                .last_slow_ok_log_at
+                .is_none_or(|prev| now.saturating_duration_since(prev) >= SLOW_OK_LOG_COOLDOWN);
+            if due {
+                self.last_slow_ok_log_at = Some(now);
+                return SlowPollDecision {
+                    log: true,
+                    suppressed_repeats: std::mem::take(&mut self.suppressed_ok_repeats),
+                };
+            }
+            self.suppressed_ok_repeats = self.suppressed_ok_repeats.saturating_add(1);
+            return SlowPollDecision {
+                log: false,
+                suppressed_repeats: 0,
+            };
+        }
+
+        self.recovery_streak = 0;
+        if elapsed < SLOW_POLL {
+            return SlowPollDecision {
+                log: false,
+                suppressed_repeats: 0,
+            };
+        }
+        if !self.in_failure_outage {
+            self.in_failure_outage = true;
+            self.last_failure_log_at = Some(now);
+            self.suppressed_failure_repeats = 0;
+            return SlowPollDecision {
+                log: true,
+                suppressed_repeats: 0,
+            };
+        }
+        let due = self
+            .last_failure_log_at
+            .is_some_and(|prev| now.saturating_duration_since(prev) >= SLOW_FAILURE_RELOG_COOLDOWN);
+        if due {
+            self.last_failure_log_at = Some(now);
+            return SlowPollDecision {
+                log: true,
+                suppressed_repeats: std::mem::take(&mut self.suppressed_failure_repeats),
+            };
+        }
+        self.suppressed_failure_repeats = self.suppressed_failure_repeats.saturating_add(1);
+        SlowPollDecision {
+            log: false,
+            suppressed_repeats: 0,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SlowPollKey {
+    host: HostId,
+    allow_local_launch: bool,
+}
+
+fn slow_poll_decision(
+    target: &HostTarget,
     ok: bool,
     elapsed: Duration,
-) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    if ok {
-        failure_logged.store(false, Relaxed);
-        return elapsed >= SLOW_POLL;
+    now: Instant,
+) -> SlowPollDecision {
+    static TRACKERS: OnceLock<Mutex<BTreeMap<SlowPollKey, SlowPollTracker>>> = OnceLock::new();
+    let key = SlowPollKey {
+        host: target.host().clone(),
+        allow_local_launch: target.allow_local_launch(),
+    };
+    let Ok(mut map) = TRACKERS.get_or_init(Mutex::default).lock() else {
+        return SlowPollTracker::default().record(ok, elapsed, now);
+    };
+    map.entry(key).or_default().record(ok, elapsed, now)
+}
+
+fn host_kind(target: &HostTarget) -> &'static str {
+    if target.allow_local_launch() {
+        "local"
+    } else if matches!(target.host(), HostId::Remote(id) if id.starts_with("iroh:")) {
+        "iroh"
+    } else {
+        "ssh"
     }
-    elapsed >= SLOW_POLL && !failure_logged.swap(true, Relaxed)
+}
+
+fn host_hash(host: &HostId) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let bytes = match host {
+        HostId::Local => b"local".as_slice(),
+        HostId::Remote(id) => id.as_bytes(),
+    };
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:08x}", ((hash >> 32) ^ hash) & 0xffff_ffff)
 }
 
 struct CachedSnapshot {
     at: Instant,
+    epoch: u64,
     observed: IdentifiedSnapshot,
     histories: super::PromptHistories,
     closed: krill_proto::control::ClosedSessionRanges,
@@ -221,8 +367,8 @@ struct Shared {
     branches: Mutex<BTreeMap<PathBuf, String>>,
     external: Mutex<ExternalCache>,
     snapshot: Arc<SharedSnapshot>,
-    /// A slow failure was logged and no poll has succeeded since.
-    failure_logged: std::sync::atomic::AtomicBool,
+    /// 마지막 원격 `GitWatch` 폴링 시각(슬러기시 원격 호스트의 연속 타임아웃 방지).
+    last_remote_watch: Mutex<Option<Instant>>,
 }
 
 impl Socket {
@@ -245,7 +391,7 @@ impl Socket {
                 watches: Mutex::new(WatchCache::default()),
                 branches: Mutex::new(BTreeMap::new()),
                 external: Mutex::new(ExternalCache::default()),
-                failure_logged: std::sync::atomic::AtomicBool::new(false),
+                last_remote_watch: Mutex::new(None),
             }),
             worker: Mutex::new(None),
             threaded: std::sync::atomic::AtomicBool::new(threaded),
@@ -344,10 +490,16 @@ impl Shared {
         res.map(|value| (value, identity))
     }
 
-    /// 워크트리별 미커밋 파일 수(`Request::GitWatch` 재사용). 실패한 워크트리는 빠진다(UI는 수를 숨긴다).
-    fn dirty(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> BTreeMap<PathBuf, usize> {
+    /// 워크트리별 미커밋 파일 수(`Request::GitWatch` 재사용).
+    /// 미지원 데몬(`Unsupported`)·단위 저장소 거부(`Failed`)는 캐시/생략으로 내리고,
+    /// 실제 전송 끊김·타임아웃은 오류로 올려 `poll()`이 장애로 기록하게 한다.
+    fn try_dirty(
+        &self,
+        trees: &BTreeMap<PathBuf, Vec<PathBuf>>,
+        skip_remote_poll: bool,
+    ) -> io::Result<BTreeMap<PathBuf, usize>> {
         let Ok(mut cache) = self.watches.lock() else {
-            return BTreeMap::new();
+            return Ok(BTreeMap::new());
         };
         if trees.values().flatten().next().is_none() {
             if !cache.entries.is_empty() {
@@ -368,10 +520,26 @@ impl Shared {
                 )
                 .ok();
             }
-            return BTreeMap::new();
+            if let Ok(mut guard) = self.last_remote_watch.lock() {
+                *guard = None;
+            }
+            return Ok(BTreeMap::new());
+        }
+        let is_local = self.target.allow_local_launch();
+        if !is_local {
+            let cooldown_hit = self
+                .last_remote_watch
+                .lock()
+                .ok()
+                .and_then(|guard| *guard)
+                .is_some_and(|at| at.elapsed() < REMOTE_GIT_WATCH_INTERVAL)
+                && cache.matches_trees(trees);
+            if skip_remote_poll || cooldown_hit {
+                return Ok(cache.cached_dirty());
+            }
         }
         let mut err = None;
-        self.with_conn(
+        let res = self.with_conn(
             FEAT_CONTROL | FEAT_GIT_WATCH,
             Duration::from_secs(5),
             |stream| {
@@ -391,17 +559,32 @@ impl Shared {
                     Ok(out)
                 }
             },
-        )
-        .unwrap_or_else(|_| {
-            for state in cache.entries.values_mut() {
-                state.generation = 0;
+        );
+        match res {
+            Ok(out) => {
+                if !is_local && let Ok(mut guard) = self.last_remote_watch.lock() {
+                    *guard = Some(Instant::now());
+                }
+                Ok(out)
             }
-            cache
-                .entries
-                .iter()
-                .filter_map(|(k, v)| Some((k.clone(), v.dirty?)))
-                .collect()
-        })
+            Err(error) => {
+                for state in cache.entries.values_mut() {
+                    state.generation = 0;
+                }
+                if error.kind() == io::ErrorKind::Unsupported {
+                    Ok(cache.cached_dirty())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn cached_dirty(&self) -> BTreeMap<PathBuf, usize> {
+        self.watches
+            .lock()
+            .map(|cache| cache.cached_dirty())
+            .unwrap_or_default()
     }
 
     fn fetch(&self) -> io::Result<Snapshot> {
@@ -422,6 +605,7 @@ impl Shared {
             .map_err(|_| io::Error::other("sidebar snapshot mutex poisoned"))?;
         if let Some(snapshot) = cached.as_ref()
             && snapshot.target == self.target
+            && snapshot.epoch == self.target.transport_epoch()
             && snapshot.at.elapsed() < Duration::from_millis(450)
         {
             return Ok(snapshot.observed.clone());
@@ -453,6 +637,7 @@ impl Shared {
                 };
                 *cached = Some(CachedSnapshot {
                     at: Instant::now(),
+                    epoch: self.target.transport_epoch(),
                     observed: snapshot.clone(),
                     histories,
                     closed,
@@ -467,9 +652,12 @@ impl Shared {
         }
     }
 
-    fn meta(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
+    fn meta_from_dirty(
+        &self,
+        trees: &BTreeMap<PathBuf, Vec<PathBuf>>,
+        dirty: &BTreeMap<PathBuf, usize>,
+    ) -> Meta {
         let is_local = self.target.allow_local_launch();
-        let dirty = self.dirty(trees);
         let known = self.branches.lock().map(|g| g.clone()).unwrap_or_default();
         trees
             .values()
@@ -487,11 +675,29 @@ impl Shared {
             .collect()
     }
 
+    fn meta(&self, trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
+        let dirty = self
+            .try_dirty(trees, false)
+            .unwrap_or_else(|_| self.cached_dirty());
+        self.meta_from_dirty(trees, &dirty)
+    }
+
+    fn try_meta(
+        &self,
+        trees: &BTreeMap<PathBuf, Vec<PathBuf>>,
+        fetch_elapsed: Duration,
+    ) -> io::Result<Meta> {
+        let skip_remote_poll = !self.target.allow_local_launch() && fetch_elapsed >= SLOW_POLL;
+        let dirty = self.try_dirty(trees, skip_remote_poll)?;
+        Ok(self.meta_from_dirty(trees, &dirty))
+    }
+
     fn poll(&self) -> io::Result<PolledSnapshot> {
-        self.fetch_identified().map(|observed| {
-            let meta = self.meta(&observed.snapshot.trees);
-            PolledSnapshot { observed, meta }
-        })
+        let fetch_started = Instant::now();
+        let observed = self.fetch_identified()?;
+        let fetch_elapsed = fetch_started.elapsed();
+        let meta = self.try_meta(&observed.snapshot.trees, fetch_elapsed)?;
+        Ok(PolledSnapshot { observed, meta })
     }
 
     fn hide(&self) {
@@ -509,6 +715,9 @@ impl Shared {
             cache.clear(|req| watch_exchange(&mut conn.stream, req));
         }
         cache.entries.clear();
+        if let Ok(mut guard) = self.last_remote_watch.lock() {
+            *guard = None;
+        }
         *connection = None;
     }
 }
@@ -575,11 +784,16 @@ impl Source for Socket {
             let polled = shared.poll();
             // 꺼진 원격 호스트 재시도(ssh) 같은 긴 폴링을 운영 로그에 남겨 UI 멈춤 시각과 대조할 수 있게 한다.
             let elapsed = started.elapsed();
-            if slow_poll_logged(&shared.failure_logged, polled.is_ok(), elapsed) {
+            let decision =
+                slow_poll_decision(&shared.target, polled.is_ok(), elapsed, Instant::now());
+            if decision.log {
                 tracing::info!(
                     remote = !shared.target.allow_local_launch(),
+                    host_kind = host_kind(&shared.target),
+                    host_hash = %host_hash(shared.target.host()),
                     ok = polled.is_ok(),
                     elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    suppressed_repeats = decision.suppressed_repeats,
                     "sidebar host poll slow"
                 );
             }
@@ -1030,23 +1244,181 @@ mod tests {
 
     #[test]
     fn unreachable_host_logs_one_slow_failure_per_outage() {
-        let logged = std::sync::atomic::AtomicBool::new(false);
+        let mut tracker = SlowPollTracker::default();
         let slow = SLOW_POLL * 3;
+        let t0 = Instant::now();
         let polls = [
-            (false, slow),
-            (false, slow),
-            (false, Duration::ZERO),
-            (false, slow),
-            (true, Duration::ZERO),
-            (false, slow),
-            (true, slow),
-            (true, slow),
+            (0, false, slow),
+            (2, false, slow),
+            (4, false, Duration::ZERO),
+            (6, false, slow),
+            // A single quick response does not end an outage.
+            (8, true, Duration::ZERO),
+            (10, false, slow),
+            // Two consecutive successes clear the outage so a new outage logs again.
+            (12, true, Duration::ZERO),
+            (14, true, Duration::ZERO),
+            (16, false, slow),
+            // Slow ok=true polls are rate-limited by SLOW_OK_LOG_COOLDOWN.
+            (18, true, slow),
+            (20, true, slow),
+            (20 + SLOW_OK_LOG_COOLDOWN.as_secs() + 1, true, slow),
         ];
         let lines: Vec<_> = polls
             .into_iter()
-            .map(|(ok, elapsed)| slow_poll_logged(&logged, ok, elapsed))
+            .map(|(secs, ok, elapsed)| {
+                let d = tracker.record(ok, elapsed, t0 + Duration::from_secs(secs));
+                (d.log, d.suppressed_repeats)
+            })
             .collect();
-        assert_eq!(lines, [true, false, false, false, false, true, true, true]);
+        assert_eq!(
+            lines,
+            [
+                (true, 0),
+                (false, 0),
+                (false, 0),
+                (false, 0),
+                (false, 0),
+                (false, 0),
+                (false, 0),
+                (false, 0),
+                (true, 0),
+                (true, 0),
+                (false, 0),
+                (true, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn slow_failure_relogs_after_cooldown_and_persists_across_socket_recreation() {
+        let mut tracker = SlowPollTracker::default();
+        let slow = SLOW_POLL * 2;
+        let t0 = Instant::now();
+        assert!(tracker.record(false, slow, t0).log);
+        assert!(
+            !tracker
+                .record(false, slow, t0 + Duration::from_secs(10))
+                .log
+        );
+        assert!(
+            !tracker
+                .record(false, slow, t0 + Duration::from_secs(20))
+                .log
+        );
+        let relog = tracker.record(false, slow, t0 + SLOW_FAILURE_RELOG_COOLDOWN);
+        assert!(relog.log);
+        assert_eq!(relog.suppressed_repeats, 2);
+
+        // Recreating Socket (e.g. sidebar hide/unhide) preserves host slow-poll suppression.
+        let target_a =
+            HostTarget::remote("slow-poll-persist-test", "/tmp/unused-slow-a.sock".into());
+        let target_b =
+            HostTarget::remote("slow-poll-persist-test", "/tmp/unused-slow-b.sock".into());
+        assert!(slow_poll_decision(&target_a, false, slow, t0).log);
+        drop(target_a);
+        assert!(
+            !slow_poll_decision(&target_b, false, slow, t0 + Duration::from_secs(2)).log,
+            "recreating HostTarget/Socket for the same host must keep outage cooldown"
+        );
+    }
+
+    #[test]
+    fn host_discriminator_never_leaks_destination_or_raw_id() {
+        let ssh = HostTarget::remote("ssh-owen@secret.example.com", "/tmp/unused-ssh.sock".into());
+        let iroh = HostTarget::remote("iroh:studio-node", "/tmp/unused-iroh.sock".into());
+        assert_eq!(host_kind(&ssh), "ssh");
+        assert_eq!(host_kind(&iroh), "iroh");
+        let hash = host_hash(ssh.host());
+        assert_eq!(hash.len(), 8);
+        assert!(!hash.contains("owen"));
+        assert!(!hash.contains("secret"));
+    }
+
+    #[test]
+    fn remote_dirty_propagates_transport_eof_and_throttles_watch_polls() {
+        use krill_proto::ipc::{self as wire, DaemonIdentity, ServerHello};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = PathBuf::from(format!("/tmp/krill-dirty-err-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let watch_count = Arc::new(AtomicUsize::new(0));
+        let watch_seen = Arc::clone(&watch_count);
+
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = ServerHello {
+                proto_min: wire::PROTO_MIN,
+                proto_max: wire::PROTO_MAX,
+                features: wire::FEATURES,
+                build: "fixture".into(),
+                instance_id: 1,
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(&hello.encode_with_identity(DaemonIdentity([9; 16])).unwrap())
+                .unwrap();
+            wire::read_frame(&mut stream).unwrap().unwrap();
+            // 1. First poll: GitWatch succeeds once.
+            let (kind, body) = wire::read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::GitWatch(_)
+            ));
+            watch_seen.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(
+                    &Reply::GitWatch(GitWatchReply::Unchanged { pending: false })
+                        .encode()
+                        .unwrap(),
+                )
+                .unwrap();
+            // Drop socket so a forced unthrottled second GitWatch fails with UnexpectedEof.
+            drop(stream);
+        });
+
+        let socket = Socket::new(HostTarget::remote("dirty-err-test", path));
+        let trees = BTreeMap::from([("/repo".into(), vec!["/repo".into()])]);
+        *socket.shared.snapshot.lock().unwrap() = Some(CachedSnapshot {
+            at: Instant::now(),
+            epoch: socket.shared.target.transport_epoch(),
+            observed: IdentifiedSnapshot {
+                snapshot: Arc::new(Snapshot {
+                    trees: trees.clone(),
+                    ..Snapshot::default()
+                }),
+                daemon_identity: Some(DaemonIdentity([9; 16])),
+                machine_identity: None,
+            },
+            histories: BTreeMap::new(),
+            closed: krill_proto::control::ClosedSessionRanges::default(),
+            target: socket.shared.target.clone(),
+        });
+
+        // First poll executes GitWatch and seeds remote watch cooldown.
+        assert!(socket.shared.poll().is_ok());
+        assert_eq!(watch_count.load(Ordering::SeqCst), 1);
+
+        // Second poll within REMOTE_GIT_WATCH_INTERVAL reuses cache without hitting socket.
+        assert!(socket.shared.poll().is_ok());
+        assert_eq!(watch_count.load(Ordering::SeqCst), 1);
+
+        // Once cooldown expires, transport EOF during GitWatch propagates Err from poll().
+        *socket.shared.last_remote_watch.lock().unwrap() =
+            Instant::now().checked_sub(REMOTE_GIT_WATCH_INTERVAL + Duration::from_secs(1));
+        assert!(
+            socket.shared.poll().is_err(),
+            "transport disconnect in dirty() must fail poll() instead of masking Disconnected"
+        );
+        worker.join().unwrap();
+        drop(socket);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1063,6 +1435,7 @@ mod tests {
         let identity = Some(krill_proto::ipc::DaemonIdentity([7; 16]));
         *first.shared.snapshot.lock().unwrap() = Some(CachedSnapshot {
             at: Instant::now(),
+            epoch: first.shared.target.transport_epoch(),
             observed: IdentifiedSnapshot {
                 snapshot: snapshot.clone(),
                 daemon_identity: identity,
@@ -1443,6 +1816,7 @@ mod tests {
         assert!(Arc::ptr_eq(&old.shared.snapshot, &new.shared.snapshot));
         *old.shared.snapshot.lock().unwrap() = Some(CachedSnapshot {
             at: Instant::now(),
+            epoch: old.shared.target.transport_epoch(),
             observed: IdentifiedSnapshot {
                 snapshot: Arc::new(Snapshot::default()),
                 daemon_identity: Some(krill_proto::ipc::DaemonIdentity([1; 16])),
@@ -1497,6 +1871,7 @@ mod tests {
         let socket = Socket::new(HostTarget::remote("metadata", path));
         *socket.shared.snapshot.lock().unwrap() = Some(CachedSnapshot {
             at: Instant::now(),
+            epoch: socket.shared.target.transport_epoch(),
             observed: IdentifiedSnapshot {
                 snapshot: Arc::new(Snapshot {
                     trees: BTreeMap::from([("/repo".into(), vec!["/repo".into()])]),

@@ -1975,46 +1975,51 @@ impl Sidebar {
             folder_name.replace('-', " ")
         };
         let branch_subtitle = raw_branch.map_or_else(|| folder_name, str::to_owned);
-        let tree_sessions: Vec<_> = self
-            .snapshot_for(&row_host)
-            .sessions
-            .iter()
-            .filter(|s| !s.is_exited() && s.worktree.as_deref() == Some(path))
-            .collect();
-        let unread =
-            row_host.is_local() && tree_sessions.iter().any(|s| self.unread.contains(&s.id));
-        let summary_pairs: Vec<_> = tree_sessions
-            .iter()
-            .filter(|s| {
-                !s.status.agent.is_empty()
-                    || !matches!(s.status.state, AgentState::Exited | AgentState::Unknown)
-            })
-            .map(|s| {
-                (
+        let mut unread = false;
+        let mut summary_pairs = Vec::new();
+        let mut tree_session_count = 0usize;
+        let mut single_tree_session_idx = None;
+        self.for_each_worktree_session(&row_host, path, |idx, s| {
+            tree_session_count += 1;
+            if tree_session_count == 1 {
+                single_tree_session_idx = Some(idx);
+            } else {
+                single_tree_session_idx = None;
+            }
+            if row_host.is_local() && self.unread.contains(&s.id) {
+                unread = true;
+            }
+            if !s.status.agent.is_empty()
+                || !matches!(s.status.state, AgentState::Exited | AgentState::Unknown)
+            {
+                summary_pairs.push((
                     s.status.state,
                     status::infer_agent_from_status(
                         &s.status,
                         s.status.title.as_deref().unwrap_or_default(),
                     ),
-                )
-            })
-            .collect();
+                ));
+            }
+        });
+        let single_tree_session =
+            single_tree_session_idx.and_then(|idx| self.snapshot_for(&row_host).sessions.get(idx));
         let summary = status::summarize(&summary_pairs);
-        let tree_session_count = tree_sessions.len();
-        let states = summary
-            .groups
-            .iter()
-            .map(|g| state_text(g.state).to_owned())
-            .chain(unread.then(|| text::UNREAD.get().to_owned()))
-            .collect::<Vec<_>>();
+        let states: Vec<_> = if summary.groups.is_empty() && !unread {
+            Vec::new()
+        } else {
+            summary
+                .groups
+                .iter()
+                .map(|g| state_text(g.state).to_owned())
+                .chain(unread.then(|| text::UNREAD.get().to_owned()))
+                .collect()
+        };
         let comment = row_host.is_local().then(|| self.comment(path)).flatten();
-        let checkpoint_badge = row_host
+        let card_checkpoint_parts = row_host
             .is_local()
-            .then(|| {
-                super::external::checkpoint_parts_from_store(&self.disk.store, path)
-                    .and_then(|p| p.label(false))
-            })
+            .then(|| super::external::checkpoint_parts_from_store(&self.disk.store, path))
             .flatten();
+        let checkpoint_badge = card_checkpoint_parts.as_ref().and_then(|p| p.label(false));
         let mut label = super::external::worktree_a11y_label(text::TITLE.get(), &name, comment);
         for part in [branch.clone(), checkpoint_badge]
             .into_iter()
@@ -2169,11 +2174,6 @@ impl Sidebar {
                 .text_color(p.muted_foreground)
                 .child(iss)
         });
-        let card_checkpoint_parts = row_host
-            .is_local()
-            .then(|| super::external::checkpoint_parts_from_store(&self.disk.store, path))
-            .flatten();
-
         let ports_list = if props.ports {
             self.ports_for(&row_host, path)
         } else {
@@ -2553,7 +2553,7 @@ impl Sidebar {
             // 3행: 코멘트 또는 에이전트 상태 요약(1개 세션이면 인라인 요약 줄, 다중 세션이면 알약 바)
             .when(has_line3, |d| {
                 let single_session = if tree_session_count == 1 && !card_expanded {
-                    tree_sessions.first().copied()
+                    single_tree_session
                 } else {
                     None
                 };

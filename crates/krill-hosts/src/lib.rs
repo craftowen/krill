@@ -92,6 +92,7 @@ pub struct RemoteConnector {
     on_outcome: Arc<OutcomeFn>,
     map_error: Option<Arc<dyn Fn(io::Error) -> io::Error + Send + Sync>>,
     lifetime: Option<ConnectorLifetime>,
+    transport_epoch: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl fmt::Debug for RemoteConnector {
@@ -110,6 +111,7 @@ impl RemoteConnector {
             on_outcome: Arc::new(on_outcome),
             map_error: None,
             lifetime: None,
+            transport_epoch: None,
         }
     }
 
@@ -133,6 +135,13 @@ impl RemoteConnector {
             key,
             current: Arc::new(current),
         });
+        self
+    }
+
+    /// 원격 터널 소켓 세대(단절·재접속 시 단조 증가)를 돌려준다. `HostTarget` 동등성에는 포함하지 않는다.
+    #[must_use]
+    pub fn with_transport_epoch(mut self, epoch: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.transport_epoch = Some(Arc::new(epoch));
         self
     }
 }
@@ -261,6 +270,14 @@ impl HostTarget {
             .as_ref()
             .and_then(|connector| connector.lifetime.as_ref())
             .is_none_or(|lifetime| (lifetime.current)())
+    }
+
+    /// 연결 관리자가 추적하는 전송 소켓 세대. 터널이 끊기거나 재시작되면 증가한다.
+    pub fn transport_epoch(&self) -> u64 {
+        self.connector
+            .as_ref()
+            .and_then(|connector| connector.transport_epoch.as_ref())
+            .map_or(0, |epoch| epoch())
     }
 
     /// A forwarding socket may change while the registered remote endpoint stays the same.
