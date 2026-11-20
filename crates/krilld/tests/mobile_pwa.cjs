@@ -108,17 +108,18 @@ async function fixedOriginTests(){
  const hash='0123456789abcdef',rid='a'.repeat(32),saved={device_id:'saved',credential:'ab'.repeat(32),rid,hash};
  const source=fs.readFileSync(path.join(assets,'client.js'),'utf8');
  function fixture(href,credential=saved,found={relay:true,hash},{serviceWorker=true}={}){
-  const location=new URL(href),values=new Map(credential?[['krill-mobile-v2',JSON.stringify(credential)]]:[]),requests=[],registrations=[],sockets=[],timers=new Map(),redirects=[];let id=0;
+  const location=new URL(href),values=new Map(credential?[['krill-mobile-v2',JSON.stringify(credential)]]:[]),requests=[],registrations=[],sockets=[],timers=new Map(),redirects=[];let id=0,now=Date.now();
   location.replace=href=>redirects.push(href);
+  class FakeDate extends Date{static now(){return now;}}
   class Socket extends EventTarget{
    constructor(url){super();this.url=url;this.sent=[];sockets.push(this);}
    send(bytes){this.sent.push(bytes);}
    emit(type,data){const e=new Event(type);if(type==='message')e.data=data;if(type==='close')e.code=data;this.dispatchEvent(e);}
    close(){if(this.closed)return;this.closed=true;this.emit('close',1006);}
   }
-  const context={AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,BigInt,URL,URLSearchParams,location,history:{replaceState(a,b,url){location.href=new URL(url,location).href;}},navigator:serviceWorker?{serviceWorker:{register:url=>{registrations.push(url);return Promise.resolve();}}}:{},localStorage:{getItem:key=>values.get(key),setItem:(key,value)=>values.set(key,value)},fetch:async(url,options)=>{requests.push({url,options});return {ok:true,json:async()=>found};},setTimeout:(fn,ms)=>{timers.set(++id,{fn,ms});return id;},clearTimeout:id=>timers.delete(id),crypto:{getRandomValues:bytes=>bytes.fill(1)},WebSocket:Socket,MkCrypto:C};
+  const context={AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,BigInt,URL,URLSearchParams,Date:FakeDate,location,history:{replaceState(a,b,url){location.href=new URL(url,location).href;}},navigator:serviceWorker?{serviceWorker:{register:url=>{registrations.push(url);return Promise.resolve();}}}:{},localStorage:{getItem:key=>values.get(key),setItem:(key,value)=>values.set(key,value)},fetch:async(url,options)=>{requests.push({url,options});return {ok:true,json:async()=>found};},setTimeout:(fn,ms)=>{timers.set(++id,{fn,ms});return id;},clearTimeout:id=>timers.delete(id),crypto:{getRandomValues:bytes=>bytes.fill(1)},WebSocket:Socket,MkCrypto:C};
   vm.createContext(context);vm.runInContext(source,context);const endpoint=context.KrillMobile.transport.bootstrap();
-  return {context,endpoint,location,values,requests,registrations,sockets,timers,redirects,stored:()=>JSON.parse(values.get('krill-mobile-v2'))};
+  return {context,endpoint,location,values,requests,registrations,sockets,timers,redirects,advance:ms=>{now+=ms;},stored:()=>JSON.parse(values.get('krill-mobile-v2'))};
  }
  const flush=async()=>{for(let n=0;n<25;n++)await Promise.resolve();};
  const fixed=`https://krill-mobile.pages.dev/m/${hash}/`;
@@ -161,7 +162,7 @@ async function fixedOriginTests(){
  // Back from a long background the open socket is asked once (probe deadline) instead of dropped; a new network reconnects at once.
  {t.resume(true);await flush();assert(!socket.closed,'the open control socket is kept');const n=f.sockets.length;t.resume('network');await flush();assert(f.sockets.length>n);assert.equal(f.sockets.at(-1).url,socket.url);assert(socket.closed);}t.close();
  // A hung connection handshake gives up after 20 s, so locate/fallback and retry run instead of waiting out the TCP timeout.
- f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();{const guard=[...f.timers.values()].find(x=>x.ms===20000);assert(guard);guard.fn();await flush();assert(f.sockets[0].closed);assert.equal(f.requests.length,1);assert([...f.timers.values()].some(x=>x.ms===1000));}t.close();
+ f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();{const guard=[...f.timers.values()].find(x=>x.ms===20000);assert(guard);f.advance(guard.ms);guard.fn();await flush();assert(f.sockets[0].closed);assert.equal(f.requests.length,1);assert([...f.timers.values()].some(x=>x.ms===1000));}t.close();
  // In-app QR scan (endpoint.adopt): r pairs in place; a Named Tunnel origin, another app version or LAN origin opens the link; a LAN code in the fixed app says what to do.
  {const key=Buffer.alloc(32).toString('base64url'),other='b'.repeat(32);f=fixture(fixed);const next=f.endpoint.adopt(`https://elsewhere.example/m/${hash}/#pair=ab12&key=${key}&r=${other}`);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);next.use();assert.equal(next.ticket,'ab12');assert.equal(next.secret,key);assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${other}?v=${hash}`);
   f=fixture(fixed);assert.equal(f.endpoint.adopt(`https://krill.example.com/#pair=ab12&key=${key}`),null);

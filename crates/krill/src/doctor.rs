@@ -493,13 +493,28 @@ fn login_path() -> Option<OsString> {
     login_path_with(&shell, SHELL_TIMEOUT)
 }
 
+/// POSIX 셸에서는 `+m`으로 job control을 꺼 `.process_group(0)` 하에서 `/dev/tty` 접근 시 `SIGTTIN`/`SIGTTOU` 정지를 막는다.
+#[cfg(unix)]
+fn login_shell_args<'a>(shell: &std::ffi::OsStr, script: &'a str) -> Vec<&'a str> {
+    const POSIX_SHELLS: &[&str] = &["zsh", "bash", "sh", "dash", "ksh", "ash", "mksh"];
+    let is_posix = Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| POSIX_SHELLS.iter().any(|s| name.eq_ignore_ascii_case(s)));
+    if is_posix {
+        vec!["-l", "-i", "+m", "-c", script]
+    } else {
+        vec!["-l", "-i", "-c", script]
+    }
+}
+
 #[cfg(unix)]
 fn login_path_with(shell: &std::ffi::OsStr, timeout: Duration) -> Option<OsString> {
     use std::os::unix::process::CommandExt as _;
 
     let script = format!("printf '\\n{PATH_MARK}%s\\n' \"$PATH\"");
     let mut child = Command::new(shell)
-        .args(["-l", "-i", "-c", &script])
+        .args(login_shell_args(shell, &script))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -7,6 +7,54 @@ use krill_proto::doctor::Status;
 
 #[test]
 #[cfg(unix)]
+fn login_shell_args_disables_monitor_only_for_posix_shells() {
+    use std::ffi::OsStr;
+
+    for shell in [
+        "/bin/zsh",
+        "/opt/homebrew/bin/ZSH",
+        "/bin/bash",
+        "/bin/sh",
+        "/usr/bin/dash",
+        "/bin/ksh",
+        "/bin/ash",
+        "/bin/mksh",
+    ] {
+        assert_eq!(
+            super::login_shell_args(OsStr::new(shell), "echo ok"),
+            vec!["-l", "-i", "+m", "-c", "echo ok"],
+            "{shell}"
+        );
+    }
+
+    for shell in ["/opt/homebrew/bin/fish", "/tmp/probe.sh", "fish", ""] {
+        assert_eq!(
+            super::login_shell_args(OsStr::new(shell), "echo ok"),
+            vec!["-l", "-i", "-c", "echo ok"],
+            "{shell}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn login_path_with_zsh_succeeds_without_tty_stop() {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    let zsh = Path::new("/bin/zsh");
+    if !zsh.is_file() {
+        return;
+    }
+    let path = super::login_path_with(OsStr::new("/bin/zsh"), std::time::Duration::from_secs(2));
+    assert!(
+        path.is_some_and(|value| !value.is_empty()),
+        "login_path_with(/bin/zsh) timed out or returned empty PATH"
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn timed_out_login_probe_reaps_shell_and_stops_descendants() {
     use std::os::unix::fs::PermissionsExt as _;
     let root = std::env::temp_dir().join(format!("doctor-timeout-{}", std::process::id()));
