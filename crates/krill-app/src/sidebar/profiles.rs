@@ -464,11 +464,7 @@ impl Sidebar {
         }
     }
 
-    pub(super) fn session_account_choices(
-        &self,
-        host: &HostId,
-        session: &Session,
-    ) -> Vec<AccountInfo> {
+    pub fn session_account_choices(&self, host: &HostId, session: &Session) -> Vec<AccountInfo> {
         let Some(state) = self.profiles.hosts.get(host) else {
             return Vec::new();
         };
@@ -552,11 +548,7 @@ impl Sidebar {
         }
     }
 
-    pub(super) fn switch_session_account(
-        &mut self,
-        target: SwitchSessionAccount,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn switch_session_account(&mut self, target: SwitchSessionAccount, cx: &mut Context<Self>) {
         let snapshot = self
             .profiles
             .snapshot(&target.host, self.snapshot_for(&target.host));

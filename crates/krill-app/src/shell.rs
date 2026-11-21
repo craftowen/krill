@@ -36,6 +36,7 @@ pub(crate) mod popout;
 mod release;
 pub(crate) mod security;
 mod session_accounts;
+mod stale_account_banner;
 mod tabs;
 mod terminal_menu;
 mod workspaces;
@@ -762,6 +763,9 @@ pub struct Shell {
         BTreeMap<(krill_app::hosts::HostId, krill_proto::SessionId), account_input::Hold>,
     account_hold_serial: u64,
     account_epochs: BTreeMap<krill_app::hosts::HostId, u64>,
+    /// Banner dismissals keep the target account they declined; a newer target shows again.
+    dismissed_stale_account_banners:
+        BTreeMap<(krill_app::hosts::HostId, krill_proto::SessionId), String>,
     account_mutations: BTreeMap<krill_app::hosts::HostId, usize>,
     account_deferred: Vec<(
         Option<krill_app::hosts::HostTarget>,
@@ -1435,6 +1439,7 @@ impl Shell {
             account_holds: BTreeMap::new(),
             account_hold_serial: 0,
             account_epochs: BTreeMap::new(),
+            dismissed_stale_account_banners: BTreeMap::new(),
             account_mutations: BTreeMap::new(),
             account_deferred: Vec::new(),
             accounts_poll: None,
@@ -4013,6 +4018,7 @@ impl Shell {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.sync_session_accounts(&host, Arc::new(snap.clone()), cx);
         });
+        self.prune_stale_account_dismissals(&host, cx);
         if host.is_local() {
             krill_app::alert::sync_account_switches(&snap.advanced, cx);
         }
@@ -7434,6 +7440,8 @@ impl Shell {
             None => (None, None),
         };
         let has_sticky_bar = sticky_bar.is_some();
+        let stale_account_banner =
+            self.render_stale_account_banner(id, in_card && !has_sticky_bar, cx);
         let pane = div()
             .id(ElementId::Name(format!("pane-{}", id.get()).into()))
             .size_full()
@@ -7444,6 +7452,7 @@ impl Shell {
             .flex()
             .flex_col()
             .children(sticky_bar)
+            .children(stale_account_banner)
             .child(
                 div()
                     .flex_1()
