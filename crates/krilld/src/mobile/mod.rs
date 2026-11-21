@@ -4,8 +4,12 @@ pub mod e2ee;
 pub mod gateway;
 pub mod net;
 pub mod pwa;
-mod pwa_rpc;
+pub(crate) mod pwa_rpc;
 pub mod relay;
+
+pub(crate) fn prewarm_agy_launch(home: &std::path::Path, config: Option<std::path::PathBuf>) {
+    pwa_rpc::composer::prewarm_agy_launch(home, config);
+}
 mod relay_auth;
 pub mod tailscale_serve;
 mod workspaces;

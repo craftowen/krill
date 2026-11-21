@@ -1,5 +1,5 @@
 use super::*;
-use krill_proto::screen::{Cell, Cursor};
+use krill_proto::screen::{Cell, Color, Cursor, Flags};
 use std::collections::BTreeMap as Env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -8,6 +8,9 @@ const MODELS: &str = "Fetching available models...
 gemini-4-argon-medium\tGemini 4 Argon (Medium)
 gemini-4-argon-high\tGemini 4 Argon (High)
 gemini-4-argon-low\tGemini 4 Argon (Low)
+gemini-pro-orchestrator-neon\tOrchestrator (Neon)
+gemini-pro-orchestrator\tOrchestrator (Carbon)
+gemini-pro-orchestrator-argon\tOrchestrator (Argon)
 gemini-3.8-flash-high\tGemini 3.8 Flash (High)
 gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)
 gemini-3.8-flash-low\tGemini 3.8 Flash (Low)
@@ -57,7 +60,11 @@ fn rows_group_by_model_with_ordered_efforts() {
     let summary: Vec<_> = families
         .iter()
         .map(|family| {
-            let efforts: Vec<_> = family.levels.iter().map(|l| l.effort.as_str()).collect();
+            let efforts: Vec<_> = family
+                .levels
+                .iter()
+                .filter_map(|l| l.effort.as_deref())
+                .collect();
             (family.id.as_str(), family.label.as_str(), efforts)
         })
         .collect();
@@ -68,6 +75,17 @@ fn rows_group_by_model_with_ordered_efforts() {
                 "gemini-4-argon",
                 "Gemini 4 Argon",
                 vec!["low", "medium", "high"]
+            ),
+            (
+                "gemini-pro-orchestrator-neon",
+                "Orchestrator (Neon)",
+                vec![]
+            ),
+            ("gemini-pro-orchestrator", "Orchestrator (Carbon)", vec![]),
+            (
+                "gemini-pro-orchestrator-argon",
+                "Orchestrator (Argon)",
+                vec![]
             ),
             (
                 "gemini-3.8-flash",
@@ -82,30 +100,50 @@ fn rows_group_by_model_with_ordered_efforts() {
             ("gpt-oss-120b", "GPT-OSS 120B", vec!["medium"]),
         ]
     );
-    assert_eq!(families[1].level("low").unwrap().id, "gemini-3.8-flash-low");
+    assert_eq!(
+        families[4].level(Some("low")).unwrap().id,
+        "gemini-3.8-flash-low"
+    );
+    assert_eq!(
+        families[1].level(None).unwrap().id,
+        "gemini-pro-orchestrator-neon"
+    );
+    assert!(families[1].level(Some("high")).is_none());
     assert_eq!(
         families[0].item(),
         json!({"id":"gemini-4-argon","label":"Gemini 4 Argon","efforts":["low","medium","high"]})
     );
+    assert_eq!(
+        families[1].item(),
+        json!({"id":"gemini-pro-orchestrator-neon","label":"Orchestrator (Neon)","efforts":[]})
+    );
 }
 
 #[test]
-fn rows_that_do_not_encode_their_effort_are_left_out() {
+fn invalid_rows_and_mismatched_efforts_are_rejected_while_standalone_models_parse() {
     for row in [
-        "plain-model\tPlain Model",
         "gemini-x-low\tGemini X (High)",
-        "gemini-x-turbo\tGemini X (Turbo)",
         "bad id-low\tBad (Low)",
         "../x-low\tEscape (Low)",
         "x-low\tRm <rf> (Low)",
+        "nested\tBad ((Inner))",
+        "bad-url\tBad (http://x)",
     ] {
         assert!(parse(row).is_empty(), "{row}");
     }
+    let parsed =
+        parse("plain-model\tPlain Model\ngemini-pro-orchestrator-neon\tOrchestrator (Neon)");
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].id, "plain-model");
+    assert_eq!(parsed[1].label, "Orchestrator (Neon)");
+    assert!(parsed[1].levels[0].effort.is_none());
 }
 
 #[test]
-fn both_footer_layouts_give_label_and_effort() {
-    let pair = |label: &str, effort: &str| Some((label.to_owned(), effort.to_owned()));
+fn both_footer_layouts_and_standalone_orchestrator_models_parse() {
+    let pair = |label: &str, effort: &str| Some((label.to_owned(), Some(effort.to_owned())));
+    let bare = |label: &str| Some((label.to_owned(), None));
+    let families = parse(MODELS);
     assert_eq!(
         footer(&idle(STATUS)),
         pair("Gemini 4 Argon", "medium"),
@@ -129,13 +167,40 @@ fn both_footer_layouts_give_label_and_effort() {
         footer(&idle("GPT-OSS 120B · medium")),
         pair("GPT-OSS 120B", "medium")
     );
+    assert_eq!(
+        footer(&idle(
+            "Orchestrator (Neon) (1.0M) │ main* │ 245.7k/1.0M │ 5h 2% (4h 49m)"
+        )),
+        bare("Orchestrator (Neon)"),
+        "standalone orchestrator in default status line"
+    );
+    assert_eq!(
+        footer_with(
+            &idle("Orchestrator (Neon) (1M) │ 993.6k/1.0M"),
+            Some(&families)
+        ),
+        bare("Orchestrator (Neon)"),
+        "1M context window suffix stripped"
+    );
+    assert_eq!(
+        footer_with(
+            &idle(&format!("{}Orchestrator (Neon)", " ".repeat(60))),
+            Some(&families)
+        ),
+        bare("Orchestrator (Neon)"),
+        "right-aligned standalone model with known catalog"
+    );
     for other in [
         "  ↑/↓ Navigate · enter Select",
         "assistant text (not an effort)",
         "> Gemini 3.8 Flash (Low)  gemini-3.8-flash-low",
         "",
     ] {
-        assert_eq!(footer(&screen(&[other], (0, 0))), None, "{other}");
+        assert_eq!(
+            footer_with(&screen(&[other], (0, 0)), Some(&families)),
+            None,
+            "{other}"
+        );
     }
 }
 
@@ -156,7 +221,7 @@ fn footer_stays_readable_above_an_open_completion_row() {
     );
     assert_eq!(
         footer(&open),
-        Some(("Gemini 4 Argon".to_owned(), "medium".to_owned()))
+        Some(("Gemini 4 Argon".to_owned(), Some("medium".to_owned())))
     );
 }
 
@@ -177,13 +242,98 @@ fn footer_stays_readable_while_the_agent_generates() {
     );
     assert_eq!(
         footer(&working),
-        Some(("Gemini 3.8 Flash".to_owned(), "high".to_owned()))
+        Some(("Gemini 3.8 Flash".to_owned(), Some("high".to_owned())))
     );
 }
 
 #[test]
-fn only_an_empty_composer_between_borders_is_idle() {
+fn only_an_empty_composer_or_mode_placeholder_between_borders_is_idle() {
     assert!(composer(&idle(STATUS), None));
+
+    let prompt_fg = Color::Rgb(krill_proto::theme::Rgb {
+        r: 122,
+        g: 162,
+        b: 247,
+    });
+    let hint_fg = Color::Rgb(krill_proto::theme::Rgb {
+        r: 154,
+        g: 165,
+        b: 206,
+    });
+    let mut hinted = idle(STATUS);
+    hinted.rows[2] = "> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
+        .chars()
+        .enumerate()
+        .map(|(idx, ch)| Cell {
+            ch,
+            fg: if idx == 0 {
+                prompt_fg
+            } else if idx >= 2 {
+                hint_fg
+            } else {
+                Color::Default
+            },
+            ..Cell::default()
+        })
+        .collect();
+    assert!(
+        composer(&hinted, None),
+        "agy 1.5.13 themed mode placeholder at column 2 is idle"
+    );
+
+    let mut truncated_40col = idle(STATUS);
+    truncated_40col.rows[2] = "> Auto mode: edits & safe commands a..."
+        .chars()
+        .enumerate()
+        .map(|(idx, ch)| Cell {
+            ch,
+            fg: if idx == 0 {
+                prompt_fg
+            } else if idx >= 2 {
+                hint_fg
+            } else {
+                Color::Default
+            },
+            ..Cell::default()
+        })
+        .collect();
+    assert!(composer(&truncated_40col, None));
+
+    let mut dim_placeholder = idle(STATUS);
+    dim_placeholder.rows[2] = "> Type your message..."
+        .chars()
+        .enumerate()
+        .map(|(idx, ch)| Cell {
+            ch,
+            flags: if idx >= 2 {
+                Flags::DIM
+            } else {
+                Flags::default()
+            },
+            ..Cell::default()
+        })
+        .collect();
+    assert!(composer(&dim_placeholder, None));
+
+    let mut slash_accent = idle(STATUS);
+    slash_accent.rows[2] = "> /help"
+        .chars()
+        .enumerate()
+        .map(|(idx, ch)| Cell {
+            ch,
+            fg: if idx == 0 || idx >= 2 {
+                prompt_fg
+            } else {
+                Color::Default
+            },
+            ..Cell::default()
+        })
+        .collect();
+    assert!(
+        !composer(&slash_accent, None),
+        "slash command is not placeholder"
+    );
+
     let mut hidden = idle(STATUS);
     hidden.cursor.visible = false;
     assert!(!composer(&hidden, None), "hidden cursor");
@@ -203,7 +353,7 @@ fn only_an_empty_composer_between_borders_is_idle() {
 #[test]
 fn enter_needs_the_echo_and_the_exact_completion_row() {
     let families = parse(MODELS);
-    let target = families[1].level("low").unwrap();
+    let target = families[4].level(Some("low")).unwrap();
     let command = "/model gemini-3.8-flash-low";
     let with = |completion: &str| {
         screen(
@@ -218,15 +368,48 @@ fn enter_needs_the_echo_and_the_exact_completion_row() {
     ));
     assert!(
         echoed(
+            &with("> Gemini 3.8 Flash (Low)      gemini-3.8-flash-low"),
+            command,
+            target
+        ),
+        "agy 1.5.13 column-aligned 6-space padding"
+    );
+    assert!(
+        echoed(
             &with("> Gemini 3.8 Flash (Low)  gemini-3.8-fla..."),
             command,
             target
         ),
         "44-column terminal"
     );
+    assert!(
+        echoed(&with("> Gemini 3.8 Flash (Low)"), command, target),
+        "40-column terminal omitting id column"
+    );
+    let orch_carbon = families[2].level(None).unwrap();
+    let orch_cmd = "/model gemini-pro-orchestrator";
+    let multi_row = screen(
+        &[
+            RULE,
+            &format!("> {orch_cmd}"),
+            RULE,
+            "  Orchestrator (Neon)         gemini-pro-orchestrator-neon",
+            "> Orchestrator (Carbon)       gemini-pro-orchestrator",
+            "  Orchestrator (Argon)        gemini-pro-orchestrator-argon",
+            "",
+            "  ↑/↓ Navigate · enter Select · tab Complete",
+            STATUS,
+        ],
+        (1, 32),
+    );
+    assert!(
+        echoed(&multi_row, orch_cmd, orch_carbon),
+        "exact Orchestrator (Carbon) highlighted on second row"
+    );
     for wrong in [
         "> Gemini 3.8 Flash (High)  gemini-3.8-flash-high",
         "> Gemini 3.8 Flash (Low)  gemini-4-arg...",
+        "> Gemini 3.8 Flash (Low) extra",
         "> /model  Set a model, or run a single prompt on another model",
         "",
     ] {
@@ -366,7 +549,7 @@ fn fixture(tag: &str, version: &str, delay: &str) -> io::Result<(PathBuf, Contex
 fn listing_uses_the_session_profile_and_the_home_install() {
     let (root, context) = fixture("fetch", "1.4.12", "0").unwrap();
     let families = fetch(context.config.as_deref(), &context.home).unwrap();
-    assert_eq!(families.len(), 4);
+    assert_eq!(families.len(), 7);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -401,7 +584,7 @@ fn a_poll_never_waits_for_the_listing() {
     assert_eq!(first["reason"], LOADING);
     Agy.settle(&context);
     let ready = Agy.catalog(&context);
-    assert_eq!(ready["items"].as_array().unwrap().len(), 4, "{ready}");
+    assert_eq!(ready["items"].as_array().unwrap().len(), 7, "{ready}");
     assert_eq!(ready["supported"], false, "listing alone grants no control");
     fs::remove_dir_all(root).unwrap();
 }

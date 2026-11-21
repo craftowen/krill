@@ -1656,6 +1656,7 @@ impl Registry {
         // 세션이 끝나면 그 세션의 파일만 지운다(OWE-499). id 재사용은 `next_id`가 막는다.
         let session = self.reserve_session_id(None).map_err(|error| os(&error))?;
         let state = self.state_dir();
+        let mut agy_prewarm = None;
         let Launch { argv, env } = match c.program {
             Program::Login => crate::agent::login_in(state.as_deref()),
             Program::Custom { program, args } => Shell::Custom { program, args }.launch(),
@@ -1679,6 +1680,21 @@ impl Registry {
                 )
                 .map_err(|e| os(&e))?;
                 crate::agent::pre_trust_workspace(&profile, &c.cwd, account.as_ref());
+                if !cfg!(test) && canonical == "agy" {
+                    agy_prewarm = Some(
+                        account
+                            .as_ref()
+                            .filter(|a| !a.dir.is_empty())
+                            .map(|a| PathBuf::from(&a.dir))
+                            .or_else(|| {
+                                profile
+                                    .env
+                                    .get("ANTIGRAVITY_CLI_HOME")
+                                    .filter(|p| !p.is_empty())
+                                    .map(PathBuf::from)
+                            }),
+                    );
+                }
                 let metadata = control::AgentLaunch {
                     profile: canonical.to_owned(),
                     permission: agents.permission,
@@ -1694,6 +1710,11 @@ impl Registry {
         };
         let (session, pid) =
             self.spawn_holder(holder, session, argv, env, c.cwd, c.cols, c.rows)?;
+        if let Some(config) = agy_prewarm
+            && let Some(home) = krill_proto::os::home_dir()
+        {
+            crate::mobile::prewarm_agy_launch(&home, config);
+        }
         Ok(Reply::Created { session, pid })
     }
 

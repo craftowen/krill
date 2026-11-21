@@ -9,6 +9,8 @@ use native::border;
 const BANNER: &str = "Claude Code v";
 const FLOOR: &[u64] = &[2, 1, 311];
 const EFFORT_FLOOR: &[u64] = &[2, 1, 314];
+const CONFIRM: Duration = Duration::from_secs(5);
+const MANUAL_CONFIRM: &str = "Claude asked for confirmation in the terminal. Confirm in Term.";
 const WAIT: &str =
     "Wait for an idle Claude Code 2.1.311 or later chat with an empty native composer";
 
@@ -161,7 +163,7 @@ fn observe_statusline(
 // model's observed id. ponytail: static list; update it when a Claude model family moves.
 const VERSIONS: &[(&str, &str)] = &[
     ("opus", "Opus 5.5"),
-    ("fable", "Fable 5.1"),
+    ("fable", "Fable 5.2"),
     ("sonnet", "Sonnet 5.5"),
     ("haiku", "Haiku 5.5"),
 ];
@@ -174,33 +176,58 @@ const ALIASES: &[(&str, &str)] = &[
     ("haiku", "Haiku"),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScreenSource {
+    Footer,
+    Banner,
+}
+
 pub(super) fn merge_screen_observation(status: &mut Value, screen: &Screen) {
-    let Some((id, label, effort)) = observe_screen(screen) else {
+    let Some((source, id, label, effort)) = observe_screen_with_source(screen) else {
         return;
     };
     let existing = status.get("model").and_then(Value::as_str);
     let matches_existing =
         existing.is_none_or(|cur| cur == id || cur.starts_with(&format!("claude-{id}-")));
-    if existing.is_none() {
-        super::observe_live_model(status, &id);
-    }
-    if matches_existing {
-        if status.get("model_label").and_then(Value::as_str).is_none() {
+    match source {
+        ScreenSource::Footer => {
+            if existing.is_none() || !matches_existing {
+                super::observe_live_model(status, &id);
+            }
             set(status, "model_label", label.into());
+            if let Some(effort) = effort {
+                set(status, "effort", effort.into());
+            }
         }
-        if let Some(effort) =
-            effort.filter(|_| status.get("effort").and_then(Value::as_str).is_none())
-        {
-            set(status, "effort", effort.into());
+        ScreenSource::Banner => {
+            if existing.is_none() {
+                super::observe_live_model(status, &id);
+            }
+            if matches_existing {
+                if status.get("model_label").and_then(Value::as_str).is_none() {
+                    set(status, "model_label", label.into());
+                }
+                if let Some(effort) =
+                    effort.filter(|_| status.get("effort").and_then(Value::as_str).is_none())
+                {
+                    set(status, "effort", effort.into());
+                }
+            }
         }
     }
 }
 
-pub(super) fn observe_screen(screen: &Screen) -> Option<(String, String, Option<String>)> {
-    if let Some(found) = observe_footer(screen) {
-        return Some(found);
+fn observe_screen_with_source(
+    screen: &Screen,
+) -> Option<(ScreenSource, String, String, Option<String>)> {
+    if let Some((id, label, effort)) = observe_footer(screen) {
+        return Some((ScreenSource::Footer, id, label, effort));
     }
-    observe_banner(screen)
+    observe_banner(screen).map(|(id, label, effort)| (ScreenSource::Banner, id, label, effort))
+}
+
+pub(super) fn observe_screen(screen: &Screen) -> Option<(String, String, Option<String>)> {
+    observe_screen_with_source(screen).map(|(_, id, label, effort)| (id, label, effort))
 }
 
 pub(super) fn parse_model_spec(segment: &str) -> Option<(String, String, Option<String>)> {
@@ -588,6 +615,85 @@ fn models(context: &Context, tap: &Tap) -> io::Result<Value> {
     )
 }
 
+#[derive(Clone, Copy)]
+enum CacheDialog<'a> {
+    Model { id: &'a str, label: &'a str },
+    Effort(&'a str),
+}
+
+fn screen_words(screen: &Screen) -> String {
+    let rows: Vec<_> = (0..screen.rows.len())
+        .map(|y| native::row(screen, y))
+        .collect();
+    native::words(&rows)
+}
+
+fn needs_manual_confirm(screen: &Screen) -> bool {
+    let words = screen_words(screen);
+    words.contains("PreModelSwitch")
+        || words.contains("uses usage credits and needs a one-time consent")
+}
+
+fn cache_confirm_dialog(screen: &Screen, target: CacheDialog<'_>) -> bool {
+    let rows: Vec<_> = (0..screen.rows.len())
+        .map(|y| native::row(screen, y))
+        .collect();
+    let words = native::words(&rows);
+    let title = match target {
+        CacheDialog::Model { .. } => "Switch model?",
+        CacheDialog::Effort(_) => "Change effort level?",
+    };
+    if !words.contains(title)
+        || !words.contains("This conversation is cached for the current")
+        || !words.contains("No, go back")
+        || words.contains("PreModelSwitch")
+    {
+        return false;
+    }
+    let dialog_start = rows.iter().rposition(|r| r.contains(title)).unwrap_or(0);
+    let Some(focused) = rows
+        .get(dialog_start..)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, row)| row.trim_start().starts_with('❯'))
+        .map(|(offset, row)| {
+            let idx = dialog_start + offset;
+            let mut parts = vec![row.clone()];
+            if let Some(next) = rows.get(idx + 1)
+                && !next.trim().is_empty()
+                && !next.trim_start().starts_with('❯')
+                && !next.contains("No, go back")
+            {
+                parts.push(next.clone());
+            }
+            native::words(&parts)
+        })
+    else {
+        return false;
+    };
+    if !focused.contains("Yes, switch to ") {
+        return false;
+    }
+    match target {
+        CacheDialog::Effort(effort) => {
+            focused.contains(&format!("Yes, switch to {effort}"))
+                || focused
+                    .to_ascii_lowercase()
+                    .contains(&format!("yes, switch to {}", effort.to_ascii_lowercase()))
+        }
+        CacheDialog::Model { id, label } => {
+            if id == "default" {
+                focused.contains("(default)") || focused.contains("Default")
+            } else {
+                let plain = label.strip_suffix(" (recommended)").unwrap_or(label);
+                focused.contains(&format!("Yes, switch to {plain}"))
+            }
+        }
+    }
+}
+
 fn set_model(context: &Context, tap: &Tap, working: bool, id: &str) -> io::Result<Value> {
     let choices = choices(context);
     let Some((_, label)) = choices.iter().find(|(alias, _)| *alias == id) else {
@@ -600,6 +706,8 @@ fn set_model(context: &Context, tap: &Tap, working: bool, id: &str) -> io::Resul
     if !verified(&before) || !composer(&before, None) {
         return Err(io::Error::other(WAIT));
     }
+    let before_model = observe_footer(&before).map(|(m, _, _)| m);
+    let before_manual = needs_manual_confirm(&before);
     let command = format!("/model {id}");
     super::command(
         tap,
@@ -608,15 +716,36 @@ fn set_model(context: &Context, tap: &Tap, working: bool, id: &str) -> io::Resul
         command.as_bytes(),
         |screen, pasted| verified(screen) && composer(screen, pasted.then_some(command.as_str())),
     )?;
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
+    let mut dialog_confirmed = false;
+    let mut deadline = Instant::now() + CONFIRM;
+    while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
         let (screen, after, _) = tap.capture();
-        if after.0 > revision.0
-            && composer(&screen, None)
-            && confirmed(&native::fresh_text(tap, seq.0), label)
+        if after.0 <= revision.0 {
+            continue;
+        }
+        if !dialog_confirmed
+            && cache_confirm_dialog(&screen, CacheDialog::Model { id, label })
+            && tap.guarded_enter(|s| cache_confirm_dialog(s, CacheDialog::Model { id, label }))?
+        {
+            dialog_confirmed = true;
+            deadline = Instant::now() + CONFIRM;
+            continue;
+        }
+        let fresh = native::fresh_text(tap, seq.0);
+        if composer(&screen, None)
+            && (confirmed(&fresh, id, label)
+                || (id != "default"
+                    && before_model.as_deref() != Some(id)
+                    && observe_footer(&screen).is_some_and(|(m, _, _)| m == id)))
         {
             return Ok(json!({"applied":true,"supported":true,"model":id}));
+        }
+        if (!before_manual && needs_manual_confirm(&screen))
+            || native::contains_phrase(&fresh, "uses usage credits and needs a one-time consent")
+            || native::contains_phrase(&fresh, "PreModelSwitch")
+        {
+            return Ok(json!({"applied":false,"supported":true,"reason":MANUAL_CONFIRM}));
         }
     }
     Ok(
@@ -639,12 +768,14 @@ fn set_effort(tap: &Tap, working: bool, effort: &str) -> io::Result<Value> {
             "Effort is not a verified Claude effort level",
         ));
     }
-    let (before, revision, _) = tap.capture();
+    let (before, revision, seq) = tap.capture();
     if !effort_available(&before) {
         return Err(io::Error::other(
             "Wait for an idle Claude Code chat with an empty native composer",
         ));
     }
+    let before_effort = observe_footer(&before).and_then(|(_, _, e)| e);
+    let before_manual = needs_manual_confirm(&before);
     let command = format!("/effort {effort}");
     super::command(
         tap,
@@ -655,16 +786,80 @@ fn set_effort(tap: &Tap, working: bool, effort: &str) -> io::Result<Value> {
             effort_version(screen) && composer(screen, pasted.then_some(command.as_str()))
         },
     )?;
+    let mut dialog_confirmed = false;
+    let mut deadline = Instant::now() + CONFIRM;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+        let (screen, after, _) = tap.capture();
+        if after.0 <= revision.0 {
+            continue;
+        }
+        if !dialog_confirmed
+            && cache_confirm_dialog(&screen, CacheDialog::Effort(effort))
+            && tap.guarded_enter(|s| cache_confirm_dialog(s, CacheDialog::Effort(effort)))?
+        {
+            dialog_confirmed = true;
+            deadline = Instant::now() + CONFIRM;
+            continue;
+        }
+        let fresh = native::fresh_text(tap, seq.0);
+        if composer(&screen, None) {
+            if let Some(applied_effort) = effort_confirmed(&fresh, effort) {
+                return Ok(json!({"applied":true,"supported":true,"effort":applied_effort}));
+            }
+            if effort_rejected(&fresh) {
+                break;
+            }
+            if before_effort.as_deref() != Some(effort)
+                && observe_footer(&screen).and_then(|(_, _, e)| e).as_deref() == Some(effort)
+            {
+                return Ok(json!({"applied":true,"supported":true,"effort":effort}));
+            }
+        }
+        if (!before_manual && needs_manual_confirm(&screen))
+            || native::contains_phrase(&fresh, "uses usage credits and needs a one-time consent")
+            || native::contains_phrase(&fresh, "PreModelSwitch")
+        {
+            return Ok(json!({"applied":false,"supported":true,"reason":MANUAL_CONFIRM}));
+        }
+    }
     Ok(
-        json!({"applied":false,"requested":true,"supported":true,"effort":effort,"reason":"Claude received the effort command. Its current effort has not been observed; the command will not be resent."}),
+        json!({"applied":false,"requested":true,"supported":true,"effort":effort,"reason":"Claude received the effort command, but its native confirmation was not recognized. It will not be resent."}),
     )
 }
 
 /// Only output since the command counts, so an older confirmation cannot match. Claude draws
 /// this as a transcript row when idle and as a floating note mid-turn.
-fn confirmed(fresh: &str, label: &str) -> bool {
-    let label = label.strip_suffix(" (recommended)").unwrap_or(label);
-    native::contains_phrase(fresh, &format!("Set model to {label}"))
+fn confirmed(fresh: &str, id: &str, label: &str) -> bool {
+    if id == "default" {
+        return native::contains_phrase(fresh, "Set model to Default")
+            || (native::contains_phrase(fresh, "Set model to")
+                && native::contains_phrase(fresh, "(default)"))
+            || native::contains_phrase(fresh, "Model set to Default");
+    }
+    let plain = label.strip_suffix(" (recommended)").unwrap_or(label);
+    native::contains_phrase(fresh, &format!("Set model to {plain}"))
+        || native::contains_phrase(fresh, &format!("Model set to {plain}"))
+        || native::contains_phrase(fresh, &format!("Kept model as {plain}"))
+}
+
+fn effort_confirmed(fresh: &str, requested: &str) -> Option<String> {
+    if native::contains_phrase(fresh, &format!("Set effort level to {requested}")) {
+        return Some(requested.to_owned());
+    }
+    if native::contains_phrase(fresh, &format!("Effort '{requested}' exceeds the cap")) {
+        for actual in ["low", "medium", "high", "xhigh", "max"] {
+            if native::contains_phrase(fresh, &format!("set to '{actual}' instead")) {
+                return Some(actual.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn effort_rejected(fresh: &str) -> bool {
+    native::contains_phrase(fresh, "Couldn't set effort level:")
+        || native::contains_phrase(fresh, "CLAUDE_CODE_EFFORT_LEVEL=")
 }
 
 #[cfg(test)]

@@ -429,9 +429,32 @@ fn confirmations(screen: &Screen, id: &str) -> usize {
 }
 
 pub(super) fn fresh_text(tap: &crate::session::Tap, from: u64) -> String {
-    let crate::session::Read::Bytes(bytes) = tap.read(from, 64 * 1024) else {
-        return String::new();
-    };
+    const CHUNK: usize = 64 * 1024;
+    const MAX_BYTES: usize = 512 * 1024;
+    let mut pos = from;
+    let mut bytes = Vec::new();
+    for _ in 0..16 {
+        match tap.read(pos, CHUNK) {
+            crate::session::Read::Bytes(chunk) => {
+                if chunk.is_empty() {
+                    break;
+                }
+                let take = chunk.len().min(MAX_BYTES.saturating_sub(bytes.len()));
+                bytes.extend_from_slice(chunk.get(..take).unwrap_or_default());
+                pos = pos.saturating_add(u64::try_from(take).unwrap_or(u64::MAX));
+                if bytes.len() >= MAX_BYTES || chunk.len() < CHUNK {
+                    break;
+                }
+            }
+            crate::session::Read::Disk { to } => {
+                if to <= pos {
+                    break;
+                }
+                pos = to;
+            }
+            crate::session::Read::Idle(_) => break,
+        }
+    }
     plain(&bytes)
 }
 

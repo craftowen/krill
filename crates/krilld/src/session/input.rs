@@ -300,6 +300,35 @@ fn write_command(
     ))
 }
 
+/// Atomically checks a live-screen predicate under the input/live locks and sends a single `\r`.
+/// Returns `Ok(true)` if `\r` was written, `Ok(false)` if the predicate or terminal state did not allow it.
+#[cfg(unix)]
+pub(super) fn guarded_enter(
+    tap: &Tap,
+    accepts: impl Fn(&krill_proto::screen::Screen) -> bool,
+) -> io::Result<bool> {
+    let state = tap
+        .0
+        .input
+        .try_lock()
+        .map_err(|_| io::Error::other("Terminal input is busy"))?;
+    let clients = tap
+        .0
+        .clients
+        .lock()
+        .map_err(|_| io::Error::other("Terminal client state unavailable"))?;
+    let mut live = tap.0.live();
+    if clients.sleeping || state.paste || state.matched != 0 || !accepts(&live.engine.screen()) {
+        return Ok(false);
+    }
+    let written = write_once(tap, b"\r")?;
+    if written != 1 {
+        return Err(io::Error::other("Command submission was not confirmed"));
+    }
+    live.last_input_ns = crate::status::now_ns();
+    Ok(true)
+}
+
 #[cfg(windows)]
 pub(super) fn guarded_command(
     _tap: &Tap,
@@ -320,6 +349,17 @@ pub(super) fn streaming_command(
     accepts: impl Fn(&krill_proto::screen::Screen, bool) -> bool,
 ) -> io::Result<()> {
     guarded_command(tap, 0, command, accepts)
+}
+
+#[cfg(windows)]
+pub(super) fn guarded_enter(
+    _tap: &Tap,
+    _accepts: impl Fn(&krill_proto::screen::Screen) -> bool,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Verified atomic model input is unavailable on Windows",
+    ))
 }
 
 pub(super) fn write_input(tap: &Tap, bytes: &[u8], peer: Option<BorrowedFd<'_>>) -> io::Result<()> {

@@ -130,6 +130,26 @@
       "Codex에 모델 변경 명령을 전달했지만 적용은 확인되지 않았습니다. 활동 내역을 확인하세요. 명령을 자동으로 다시 보내지 않습니다.",
     "Claude received the model command, but its native confirmation was not recognized. It will not be resent.":
       "Claude에 모델 변경 명령을 전달했지만 적용은 확인되지 않았습니다. 명령을 자동으로 다시 보내지 않습니다.",
+    "Claude received the effort command, but its native confirmation was not recognized. It will not be resent.":
+      "Claude에 사고 수준 변경 명령을 전달했지만 적용은 확인되지 않았습니다. 명령을 자동으로 다시 보내지 않습니다.",
+    "Claude received the effort command. Its current effort has not been observed; the command will not be resent.":
+      "Claude에 사고 수준 변경 명령을 전달했지만 현재 사고 수준을 확인하지 못했습니다. 명령을 자동으로 다시 보내지 않습니다.",
+    "Claude asked for confirmation in the terminal. Confirm in Term.":
+      "Claude가 터미널에서 확인을 요청했습니다. 터미널에서 확인하세요.",
+    "Wait for an idle Claude Code chat with an empty native composer":
+      "Claude 작업이 끝난 뒤 터미널 입력란을 비워 주세요.",
+    "Wait for an idle terminal with an empty native composer":
+      "터미널 입력란을 비운 뒤 다시 시도하세요.",
+    "Native command echo was not recognized; no Enter was sent":
+      "터미널에 명령 입력이 확인되지 않아 실행하지 않았습니다. 다시 시도하세요.",
+    "Choose Claude effort separately from the model":
+      "Claude는 모델과 사고 수준을 따로 선택하세요.",
+    "Effort is not a verified Claude effort level":
+      "지원하지 않는 Claude 사고 수준입니다.",
+    "Model is not a verified Claude native alias":
+      "지원하지 않는 Claude 모델입니다.",
+    "Wait for an idle chat with an observed current model":
+      "현재 모델이 확인되고 입력을 기다릴 때 바꿀 수 있습니다.",
     "This running Codex session does not expose a verified model control connection. Discovered models are from local configuration/cache; no model was changed.":
       "이 Codex 세션에서는 모델 직접 변경을 지원하지 않습니다. 모델은 변경하지 않았습니다.",
     "This running Claude Code session does not expose verified model control. Configured models are shown for reference; no model was changed.":

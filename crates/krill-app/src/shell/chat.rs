@@ -505,6 +505,7 @@ pub(crate) struct ChatState {
     pub quick_menu: BTreeSet<ChatKey>,
     pub model_picker: BTreeSet<ChatKey>,
     pub model_picker_selected: BTreeMap<ChatKey, usize>,
+    composer_models_in_flight: BTreeSet<ChatKey>,
     pub(super) finds: BTreeMap<ChatKey, ChatFindState>,
     composer_tasks: BTreeMap<ChatKey, Task<()>>,
     earlier_tasks: BTreeMap<ChatKey, Task<()>>,
@@ -926,12 +927,14 @@ pub(crate) fn apply_composer_status_json(raw: &str, meta: &mut ComposerMeta) -> 
     {
         meta.model_label = Some(label.to_owned());
     }
-    if let Some(effort) = data
-        .get("effort")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        meta.effort = Some(effort.to_owned());
+    match data.get("effort") {
+        Some(serde_json::Value::String(effort)) if !effort.is_empty() => {
+            meta.effort = Some(effort.to_owned());
+        }
+        Some(serde_json::Value::Null) => {
+            meta.effort = None;
+        }
+        _ => {}
     }
     if let Some(pct) = data
         .pointer("/context/percent")
@@ -1049,12 +1052,14 @@ pub(crate) fn apply_composer_set_json(raw: &str, meta: &mut ComposerMeta) -> boo
         {
             meta.model_label = Some(label.to_owned());
         }
-        if let Some(effort) = data
-            .get("effort")
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            meta.effort = Some(effort.to_owned());
+        match data.get("effort") {
+            Some(serde_json::Value::String(effort)) if !effort.is_empty() => {
+                meta.effort = Some(effort.to_owned());
+            }
+            Some(serde_json::Value::Null) => {
+                meta.effort = None;
+            }
+            _ => {}
         }
         meta.reason = None;
         true
@@ -1272,6 +1277,7 @@ impl Shell {
         chat.quick_menu.retain(keep);
         chat.model_picker.retain(keep);
         chat.model_picker_selected.retain(|key, _| keep(key));
+        chat.composer_models_in_flight.retain(keep);
         chat.finds.retain(|key, _| keep(key));
         chat.composer_tasks.retain(|key, _| keep(key));
         chat.earlier_tasks.retain(|key, _| keep(key));
@@ -1625,13 +1631,23 @@ impl Shell {
                     } else if let Some(Ok(Reply::AgentHistory(Response::ChatPolled(snapshot)))) =
                         reply
                     {
+                        let composer_interval = if this
+                            .chat
+                            .logs
+                            .get(&key)
+                            .is_none_or(|log| log.meta.model.is_none() || !log.meta.supported)
+                        {
+                            Duration::from_millis(1500)
+                        } else {
+                            Duration::from_secs(5)
+                        };
                         let refresh_composer = snapshot.reset
                             || !snapshot.items.is_empty()
                             || this
                                 .chat
                                 .last_composer_poll
                                 .get(&key)
-                                .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+                                .is_none_or(|t| t.elapsed() >= composer_interval);
                         this.chat.poll_failed.remove(&key);
                         this.apply_chat_poll_for_host_with_state(
                             session,
@@ -1962,7 +1978,9 @@ impl Shell {
         include_models: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.chat.logs.get(key).is_some_and(|log| log.meta.pending) {
+        if self.chat.logs.get(key).is_some_and(|log| log.meta.pending)
+            || (!include_models && self.chat.composer_models_in_flight.contains(key))
+        {
             return;
         }
         let Some(call) = self.workflow_call_for_key(key) else {
@@ -1970,6 +1988,9 @@ impl Shell {
         };
         let task_key = key.clone();
         let session = key.1.0;
+        if include_models {
+            self.chat.composer_models_in_flight.insert(key.clone());
+        }
         self.chat
             .last_composer_poll
             .insert(key.clone(), std::time::Instant::now());
@@ -1994,6 +2015,9 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| {
                 this.chat.composer_tasks.remove(&task_key);
+                if include_models {
+                    this.chat.composer_models_in_flight.remove(&task_key);
+                }
                 let log = this.chat.logs.entry(task_key.clone()).or_default();
                 if let Some(raw) = status_raw
                     && let Some(agent) = apply_composer_status_json(&raw, &mut log.meta)
@@ -2132,6 +2156,7 @@ impl Shell {
                     .cloned()
                     .or_else(|| item.default_effort.clone())
             });
+        self.chat.composer_models_in_flight.remove(key);
         log.meta.pending = true;
         log.meta.reason = None;
         let task_key = key.clone();
@@ -2188,6 +2213,7 @@ impl Shell {
         if log.meta.pending {
             return;
         }
+        self.chat.composer_models_in_flight.remove(key);
         log.meta.pending = true;
         log.meta.reason = None;
         let task_key = key.clone();
