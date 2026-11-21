@@ -116,7 +116,9 @@ impl Adapter for Codex {
                         "reason",
                         "Changes the model in this running Codex chat session only.".into(),
                     );
-                    if let Some(current) = observed_model(models, &screen) {
+                    if let Some(current) = observed_model(models, &screen)
+                        .or_else(|| banner_model(models, &screen).map(|(id, _)| id))
+                    {
                         set(models, "current", current.into());
                     }
                 } else {
@@ -215,10 +217,13 @@ impl Adapter for Codex {
         };
         let (screen, _, _) = tap.capture();
         if idle(&screen) {
-            if let Some(model) = observed_model(catalog, &screen) {
+            let banner = banner_model(catalog, &screen);
+            if let Some(model) = observed_model(catalog, &screen)
+                .or_else(|| banner.as_ref().map(|(id, _)| id.clone()))
+            {
                 observe_live_model(status, &model);
             }
-            if let Some(effort) = effort(&screen) {
+            if let Some(effort) = effort(&screen).or_else(|| banner.and_then(|(_, e)| e)) {
                 set(status, "effort", effort.into());
             }
         }
@@ -229,16 +234,95 @@ fn idle(screen: &Screen) -> bool {
     verified(screen) && composer(screen, None)
 }
 
-fn observed_model(models: &Value, screen: &Screen) -> Option<String> {
-    let footer = row(screen, usize::from(screen.cursor.line) + 2);
+fn row_wraps(screen: &Screen, y: usize) -> bool {
+    screen
+        .rows
+        .get(y)
+        .and_then(|cells| cells.last())
+        .is_some_and(|cell| cell.flags.contains(krill_proto::screen::Flags::WRAPLINE))
+}
+
+fn wrapped_row(screen: &Screen, start_y: usize) -> String {
+    let lines = screen.rows.len();
+    let mut joined = String::new();
+    let mut y = start_y;
+    let max_y = start_y.saturating_add(4).min(lines);
+    while y < max_y {
+        if row_wraps(screen, y) {
+            if let Some(cells) = screen.rows.get(y) {
+                for cell in cells {
+                    if !cell.flags.contains(krill_proto::screen::Flags::SPACER) {
+                        joined.push(cell.ch);
+                        joined.extend(cell.zerowidth.iter().copied());
+                    }
+                }
+            }
+            y += 1;
+        } else {
+            joined.push_str(&row(screen, y));
+            break;
+        }
+    }
+    joined
+}
+
+fn starts_with_token(haystack: &str, token: &str) -> bool {
+    !token.is_empty()
+        && haystack.strip_prefix(token).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('·')
+        })
+}
+
+fn match_model_prefix(models: &Value, text: &str) -> Option<(String, usize)> {
+    let head = text.trim_start().to_ascii_lowercase();
     models
         .get("items")?
         .as_array()?
         .iter()
-        .filter_map(|item| Some((item.get("label")?.as_str()?, item.get("id")?.as_str()?)))
-        .filter(|(label, _)| footer.trim_start().starts_with(&format!("{label} ")))
-        .max_by_key(|(label, _)| label.len())
-        .map(|(_, id)| id.to_owned())
+        .filter_map(|item| {
+            let label = item.get("label")?.as_str()?;
+            let id = item.get("id")?.as_str()?;
+            let label_len =
+                starts_with_token(&head, &label.to_ascii_lowercase()).then_some(label.len());
+            let id_len = starts_with_token(&head, &id.to_ascii_lowercase()).then_some(id.len());
+            label_len.max(id_len).map(|len| (id.to_owned(), len))
+        })
+        .max_by_key(|(_, len)| *len)
+}
+
+fn observed_model(models: &Value, screen: &Screen) -> Option<String> {
+    let footer = wrapped_row(screen, usize::from(screen.cursor.line) + 2);
+    match_model_prefix(models, &footer).map(|(id, _)| id)
+}
+
+fn banner_model(models: &Value, screen: &Screen) -> Option<(String, Option<String>)> {
+    let lines = screen.rows.len();
+    let banner_y = (0..lines).find(|&y| row(screen, y).contains(BANNER))?;
+    for y in (banner_y + 1)..=(banner_y + 6).min(lines.saturating_sub(1)) {
+        let text = wrapped_row(screen, y);
+        let inner = text
+            .trim()
+            .trim_start_matches(['│', '┃'])
+            .trim_end_matches(['│', '┃'])
+            .trim();
+        let Some(prefix) = inner.get(..6).filter(|p| p.eq_ignore_ascii_case("model:")) else {
+            continue;
+        };
+        let Some(rest) = inner.get(prefix.len()..).map(str::trim_start) else {
+            continue;
+        };
+        if let Some((id, matched_len)) = match_model_prefix(models, rest) {
+            let after = rest.get(matched_len..).unwrap_or("").trim_start();
+            let before_slash = after.split('/').next().unwrap_or("");
+            let effort = before_slash
+                .split_whitespace()
+                .next()
+                .map(str::to_ascii_lowercase)
+                .filter(|word| super::valid_effort(word));
+            return Some((id, effort));
+        }
+    }
+    None
 }
 
 pub(super) fn border(screen: &Screen, y: usize) -> bool {
@@ -263,13 +347,13 @@ fn verified(screen: &Screen) -> bool {
 }
 
 fn effort(screen: &Screen) -> Option<String> {
-    let footer = row(screen, usize::from(screen.cursor.line) + 2);
+    let footer = wrapped_row(screen, usize::from(screen.cursor.line) + 2);
     let (model, _) = footer.split_once(" · ")?;
     model
         .split_whitespace()
         .last()
+        .map(str::to_ascii_lowercase)
         .filter(|effort| super::valid_effort(effort))
-        .map(str::to_owned)
 }
 
 fn composer(screen: &Screen, command: Option<&str>) -> bool {
@@ -632,5 +716,61 @@ mod tests {
             })
             .collect();
         assert!(effort(&current).is_none());
+    }
+    #[test]
+    fn observed_model_handles_wrapped_footer_and_case_insensitive_ids() {
+        let catalog = serde_json::json!({
+            "items": [
+                {"id": "gpt-5.4", "label": "GPT-5.4"},
+                {"id": "gpt-5.4-codex", "label": "GPT-5.4-Codex"}
+            ]
+        });
+        let mut s = screen("");
+        s.cursor.line = 1;
+        let to_cells = |text: &str, wraps: bool| -> Vec<Cell> {
+            let mut cells: Vec<Cell> = text
+                .chars()
+                .map(|ch| Cell {
+                    ch,
+                    ..Cell::default()
+                })
+                .collect();
+            if wraps && let Some(last) = cells.last_mut() {
+                last.flags |= krill_proto::screen::Flags::WRAPLINE;
+            }
+            cells
+        };
+        s.rows[3] = to_cells("  gpt-5.4-", true);
+        s.rows[4] = to_cells("codex xhigh · 100% left", false);
+        assert_eq!(
+            observed_model(&catalog, &s).as_deref(),
+            Some("gpt-5.4-codex")
+        );
+        assert_eq!(effort(&s).as_deref(), Some("xhigh"));
+
+        s.rows[3] = to_cells("  GPT-5.4·100% left", false);
+        s.rows[4].clear();
+        assert_eq!(observed_model(&catalog, &s).as_deref(), Some("gpt-5.4"));
+        assert!(effort(&s).is_none());
+    }
+    #[test]
+    fn banner_model_reads_startup_box_and_effort() {
+        let catalog = serde_json::json!({
+            "items": [
+                {"id": "gpt-5.4", "label": "GPT-5.4"}
+            ]
+        });
+        let s = composer_below(&[
+            "╭──────────────────────────────────╮",
+            "│ >_ OpenAI Codex (v0.166.0)       │",
+            "│                                  │",
+            "│ model:     gpt-5.4 high /model   │",
+            "│ directory: ~/repo                │",
+            "╰──────────────────────────────────╯",
+        ]);
+        assert_eq!(
+            banner_model(&catalog, &s),
+            Some(("gpt-5.4".to_owned(), Some("high".to_owned())))
+        );
     }
 }

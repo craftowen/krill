@@ -16,15 +16,16 @@
     }
     return tr(raw);
   }
-  const EFFORT_BARS = new Map([
-    ["none", 0],
-    ["minimal", 1],
-    ["low", 1],
-    ["medium", 2],
-    ["high", 3],
-    ["xhigh", 4],
-    ["max", 5],
-    ["ultra", 5],
+  const EFFORT_SHORT = new Map([
+    ["none", "None"],
+    ["off", "Off"],
+    ["minimal", "Min"],
+    ["low", "Low"],
+    ["medium", "Med"],
+    ["high", "High"],
+    ["xhigh", "XHigh"],
+    ["max", "Max"],
+    ["ultra", "Ultra"],
   ]);
   const EFFORT_ORDER = new Map([
     ["none", 0],
@@ -61,19 +62,26 @@
     ["max", "Max"],
     ["ultra", "Ultra"],
   ]);
-  const fullModel = (text) => {
-    const name = shortModel(text);
-    return name.charAt(0).toUpperCase() + name.slice(1);
-  };
+  const titleWord = (word) =>
+    word ? word.charAt(0).toUpperCase() + word.slice(1) : "";
+  const fullModel = (text) => shortModel(text);
   function shortModel(text) {
-    const name = text
-        .toLowerCase()
+    const raw = String(text || "").trim();
+    if (!raw) return "";
+    const clean = raw
         .replace(/\s*[([].*$/, "")
         .replace(/-\d{8}$/, ""),
       [, family, major, minor] =
-        /^claude-(.+?)-(\d+)(?:-(\d+))?$/.exec(name) || [];
-    if (family) return `${family} ${major}${minor ? `.${minor}` : ""}`;
-    return name.replace(/^claude[- ]/, "");
+        /^claude-(.+?)-(\d+)(?:-(\d+))?$/i.exec(clean) || [];
+    if (family)
+      return `${titleWord(family.toLowerCase())} ${major}${minor ? `.${minor}` : ""}`;
+    const stripped = clean.replace(/^claude[- ]/i, "");
+    if (/[A-Z]/.test(stripped)) return stripped;
+    if (stripped.includes(" "))
+      return stripped.split(/\s+/).map(titleWord).join(" ");
+    if (["default", "opus", "sonnet", "haiku", "fable"].includes(stripped))
+      return titleWord(stripped);
+    return stripped;
   }
   // Build inline formatting with text nodes/elements only; transcript HTML never becomes markup.
   function renderInline(el, parent, text, depth = 0) {
@@ -190,6 +198,7 @@
       },
     ],
     chevronRight: [{ tag: "path", d: "m9 18 6-6-6-6" }],
+    arrowDown: [{ tag: "path", d: "M12 5v14m-7-7 7 7 7-7" }],
     check: [{ tag: "path", d: "M20 6 9 17l-5-5" }],
   };
   function svgIcon(name) {
@@ -734,6 +743,21 @@
     }
     const latestBtn = button(t("Back to latest"), returnToLatest, "ghost small");
     history.append(earlierBtn, latestBtn);
+    const jumpBtn = button(
+      t("Jump to latest"),
+      () => {
+        if (!active()) return;
+        returnToLatest();
+        pinLatestSoon();
+      },
+      "chat-jump-bottom",
+    );
+    jumpBtn.hidden = true;
+    const jumpGlyph = svgIcon("arrowDown");
+    if (jumpGlyph) jumpBtn.replaceChildren(jumpGlyph);
+    function syncJumpButton() {
+      jumpBtn.hidden = !entry.items.length || (following && !entry.live);
+    }
     const pollStatus = el("div", undefined, "chat-actions"),
       pollText = el("span", undefined, "muted");
     pollStatus.setAttribute("role", "status");
@@ -844,6 +868,7 @@
       else if (upward) following = false;
       else if (gap < 60) following = true;
       syncLiveCardVisibility();
+      syncJumpButton();
       const threshold = historyThreshold();
       if (top > threshold) {
         autoBlocked = null;
@@ -879,11 +904,13 @@
       }
       following = true;
       syncLiveCardVisibility();
+      syncJumpButton();
     }
     function pinLatest() {
       if (visible && following && !entry.live)
         feed.scrollTop = feed.scrollHeight || 0;
       syncScroll();
+      syncJumpButton();
     }
     function pinLatestSoon() {
       pinLatest();
@@ -1102,21 +1129,106 @@
     const modelBtn = button(t("Model"), () => chooseModel(), "composer-pill"),
       modelName = el("span", undefined, "composer-model-name"),
       modelEffort = el("span", undefined, "composer-model-effort"),
-      effortBars = Array.from({ length: 5 }, () => el("span")),
-      contextMeter = el("span", undefined, "composer-context");
-    modelEffort.append(...effortBars);
+      contextMeter = button(
+        t("Context"),
+        () => openContextSheet(),
+        "composer-context",
+      ),
+      leading = el("div", undefined, "composer-leading");
     modelBtn.replaceChildren(modelName, modelEffort);
-    contextMeter.setAttribute("role", "img");
+    contextMeter.hidden = true;
+    function setContextRing(host, usage) {
+      const doc = globalThis.document,
+        svg = doc?.createElementNS?.(SVG_NS, "svg");
+      if (!svg) {
+        host.replaceChildren?.();
+        if (host.style)
+          host.style.background = `conic-gradient(var(--foreground) ${usage}%, var(--border) 0)`;
+        return;
+      }
+      svg.setAttribute("viewBox", "0 0 18 18");
+      svg.setAttribute("aria-hidden", "true");
+      const r = 6.5,
+        c = 2 * Math.PI * r,
+        track = doc.createElementNS(SVG_NS, "circle"),
+        arc = doc.createElementNS(SVG_NS, "circle");
+      for (const [node, color, dash, offset] of [
+        [track, "color-mix(in srgb, currentColor 22%, transparent)", null, null],
+        [arc, "currentColor", c.toFixed(2), (c * (1 - usage / 100)).toFixed(2)],
+      ]) {
+        node.setAttribute("cx", "9");
+        node.setAttribute("cy", "9");
+        node.setAttribute("r", String(r));
+        node.setAttribute("fill", "none");
+        node.setAttribute("stroke", color);
+        node.setAttribute("stroke-width", "2");
+        if (dash) {
+          node.setAttribute("stroke-dasharray", dash);
+          node.setAttribute("stroke-dashoffset", offset);
+          node.setAttribute("transform", "rotate(-90 9 9)");
+        }
+      }
+      svg.append(track, arc);
+      if (host.style) host.style.background = "";
+      host.replaceChildren(svg);
+    }
+    function openContextSheet() {
+      const status =
+          entry.composerStatus?.agent === chatAgent()
+            ? entry.composerStatus
+            : null,
+        percent = status?.context?.percent;
+      if (typeof percent !== "number" || !Number.isFinite(percent)) return;
+      const usage = Math.round(Math.max(0, Math.min(100, percent))),
+        currentModel =
+          (entry.model?.agent === chatAgent() && entry.model.scope === scope()
+            ? entry.model.label
+            : null) ||
+          status?.model_label ||
+          status?.model;
+      ctx.sheet?.(t("Context"), [], t("Context used {0}%", usage), (body) => {
+        const group = el("div", undefined, "sheet-group context-sheet-group"),
+          addRow = (label, value) => {
+            const row = el("div", undefined, "context-sheet-row");
+            row.append(
+              el("span", t(label), "muted"),
+              el("strong", String(value)),
+            );
+            group.append(row);
+          };
+        addRow("Model", currentModel ? fullModel(currentModel) : t("Model"));
+        addRow("Context used", `${usage}%`);
+        const used = status.context?.used ?? status.context?.tokens,
+          limit = status.context?.limit ?? status.context?.max;
+        if (Number.isFinite(used) && Number.isFinite(limit) && limit > 0)
+          addRow(
+            "Tokens",
+            `${Number(used).toLocaleString()} / ${Number(limit).toLocaleString()}`,
+          );
+        body.append(group);
+      });
+    }
     const suggestions = el("div", undefined, "chat-composer-suggestions"),
       choiceList = el("div", undefined, "chat-composer-options");
     choiceList.id = `chat-composer-options-${sessionId}`;
     suggestions.hidden = true;
+    suggestions.addEventListener("click", (event) => {
+      if (
+        picker?.kind === "models" &&
+        event.target === suggestions &&
+        !suggestions.dataset.pending
+      ) {
+        closeSuggestions();
+        input.focus?.();
+      }
+    });
     choiceList.setAttribute("role", "listbox");
     choiceList.setAttribute("aria-label", t("Commands, skills and files"));
     const box = el("div", undefined, "chat-composer-box");
-    box.append(suggestions, input, sendBtn);
-    statusRow.append(attachBtn, modelBtn, contextMeter, statusLine);
-    composer.append(attachment, box, statusRow, photoPicker);
+    leading.append(attachBtn, modelBtn, statusLine);
+    statusRow.append(leading, contextMeter, sendBtn);
+    box.append(suggestions, attachment, input, statusRow);
+    composer.append(box, photoPicker);
     // Like Orca, the send tap takes focus so the IME commits the last syllable first.
     for (const row of [attachment, statusRow])
       globalThis.MkKeyboard?.keepFocus(row, ctx.signal);
@@ -1212,6 +1324,7 @@
         entry.composerStatusAt = 0;
         entry.composerProbes = 0;
         statusFlight = null;
+        clearStatusRetry();
         discovery.clear();
         discovering.clear();
         closeSuggestions();
@@ -1234,6 +1347,7 @@
       suggestTimer = null;
       picker = null;
       choices = [];
+      delete suggestions.dataset.kind;
       delete suggestions.dataset.pending;
       suggestions.hidden = true;
       input.setAttribute("aria-expanded", "false");
@@ -1245,48 +1359,66 @@
       suggestions.replaceChildren();
       choiceList.replaceChildren();
       suggestions.hidden = false;
+      const isModels = picker?.kind === "models";
+      if (isModels) suggestions.dataset.kind = "models";
+      else delete suggestions.dataset.kind;
       const head = el("div", undefined, "chat-actions"),
         close = button(
-          t(picker?.kind === "models" ? "Close" : "Close suggestions"),
+          t(isModels ? "Done" : "Close suggestions"),
           () => {
             closeSuggestions();
             input.focus?.();
           },
-          "ghost small",
+          isModels ? "ghost small chat-model-done" : "ghost small",
         );
       close.type = "button";
       head.append(
         el(
           "span",
           t(
-            picker?.kind === "models"
+            isModels
               ? "Model"
               : picker?.kind === "files"
                 ? "Workspace files"
                 : "Commands and skills",
           ),
-          "muted",
+          isModels ? "chat-model-title" : "muted",
         ),
         close,
       );
-      suggestions.append(head);
       input.setAttribute("aria-expanded", "true");
-      if (message) suggestions.append(el("p", message, "muted"));
       let row = null,
         group;
       for (const [index, item] of items.entries()) {
         if (item.group !== group) {
           group = item.group;
-          row = el("div", undefined, "chat-composer-chips");
-          if (group === "efforts")
-            choiceList.append(el("span", t("Effort"), "muted chat-composer-section"));
+          row = el(
+            "div",
+            undefined,
+            group === "models"
+              ? "chat-model-group"
+              : group === "efforts"
+                ? "chat-effort-segment"
+                : "chat-composer-chips",
+          );
+          if (group === "efforts") {
+            row.setAttribute("role", "group");
+            row.setAttribute("aria-label", t("Reasoning Effort"));
+            choiceList.append(
+              el("span", t("Reasoning Effort"), "muted chat-composer-section"),
+            );
+          }
           choiceList.append(row);
         }
-        const node = button(
-          "",
-          () => selectChoice(index),
-          group ? "ghost chat-composer-chip" : "ghost chat-composer-option",
-        );
+        const cls =
+          group === "models"
+            ? "ghost chat-composer-chip chat-model-row"
+            : group === "efforts"
+              ? "ghost chat-composer-chip chat-effort-option"
+              : group
+                ? "ghost chat-composer-chip"
+                : "ghost chat-composer-option";
+        const node = button("", () => selectChoice(index), cls);
         if (item.current) node.setAttribute("aria-current", "true");
         node.type = "button";
         node.tabIndex = -1;
@@ -1294,11 +1426,34 @@
         node.setAttribute("role", "option");
         node.append(el("span", item.label, "chat-composer-option-label"));
         if (item.detail) node.append(el("span", item.detail, "muted"));
+        if (group === "models" && item.current) {
+          const check = el("span", undefined, "chat-model-check");
+          check.setAttribute("aria-hidden", "true");
+          const glyph = svgIcon("check");
+          if (glyph) check.append(glyph);
+          else check.textContent = "✓";
+          node.append(check);
+        }
         node.addEventListener("pointerdown", (event) => event.preventDefault());
         (group ? row : choiceList).append(node);
         item.node = node;
       }
-      suggestions.append(choiceList);
+      if (isModels) {
+        const sheet = el("div", undefined, "chat-model-sheet");
+        sheet.append(el("div", undefined, "sheet-handle"), head);
+        if (items.length) {
+          sheet.append(choiceList);
+          if (message) sheet.append(el("p", message, "muted chat-picker-note"));
+        } else {
+          if (message) sheet.append(el("p", message, "muted chat-picker-note"));
+          sheet.append(choiceList);
+        }
+        suggestions.append(sheet);
+      } else {
+        suggestions.append(head);
+        if (message) suggestions.append(el("p", message, "muted"));
+        suggestions.append(choiceList);
+      }
       markChoice();
     }
     function markChoice() {
@@ -1662,9 +1817,10 @@
           choices.find((item) => item.group === "efforts" && item.id === effort);
         if (chosen?.node) chosen.node.dataset.pending = "true";
         for (const item of choices) if (item.node) item.node.disabled = true;
-        for (const child of Array.from(suggestions.children || []))
+        const container = choiceList.parentElement || suggestions;
+        for (const child of Array.from(container.children || []))
           if (child.tagName === "P" || child.tag === "p") child.remove();
-        suggestions.insertBefore(
+        container.insertBefore(
           el("p", t("Applying…"), "muted chat-picker-status"),
           choiceList,
         );
@@ -1736,13 +1892,19 @@
         }
       }
     }
-    let statusFlight = null;
+    let statusFlight = null,
+      statusRetryTimer = null;
+    function clearStatusRetry() {
+      clearTimeout(statusRetryTimer);
+      statusRetryTimer = null;
+    }
     async function refreshStatus(force = false) {
       if (!active() || !capability("chat_composer") || state.cached || state.connection?.phase !== "ready") return;
       const binding = scope(), generation = entry.generation, owner = ctx.transport, linkEpoch = state.connection?.generation;
       if (statusFlight?.binding === binding) return statusFlight.promise;
-      const hasLiveMeta = Boolean(entry.composerStatus?.model || entry.composerStatus?.supported),
-        ttl = hasLiveMeta || (entry.composerProbes || 0) >= 10 ? 15000 : 1500;
+      const hasLiveMeta = Boolean(entry.composerStatus?.model || (entry.composerStatus?.supported && entry.composerStatus?.model_label)),
+        probes = entry.composerProbes || 0,
+        ttl = hasLiveMeta || probes >= 12 ? 15000 : probes <= 1 ? 700 : 1500;
       if (!force && (!isVisible() || Date.now() - (entry.composerStatusAt || 0) < ttl)) return;
       const flight = {binding};
       const current = () => statusFlight === flight && active() && scope() === binding && entry.generation === generation && owner === ctx.transport && linkEpoch === state.connection?.generation;
@@ -1752,9 +1914,20 @@
           if (!current() || data?.agent !== chatAgent() || data.generation && data.generation !== generation) return;
           if (entry.model && data.model && data.model !== entry.model.statusBefore && !matchesModel(chatAgent(), entry.model.id, data.model)) entry.model = null;
           else if (entry.model && data.effort && data.effort !== entry.model.statusEffortBefore) entry.model.effort = data.effort;
-          entry.composerProbes = data?.model || data?.supported ? 0 : (entry.composerProbes || 0) + 1;
+          const gotModel = Boolean(data?.model || (data?.supported && data?.model_label));
+          entry.composerProbes = gotModel ? 0 : (entry.composerProbes || 0) + 1;
           entry.composerStatus = data; entry.composerStatusAt = Date.now(); syncAgent();
+          clearStatusRetry();
+          if (!gotModel && entry.composerProbes < 12 && isVisible() && state.connection?.phase === "ready") {
+            const delay = entry.composerProbes === 1 ? 700 : 1500;
+            statusRetryTimer = setTimeout(() => {
+              statusRetryTimer = null;
+              if (active() && isVisible()) refreshStatus();
+            }, delay);
+            statusRetryTimer?.unref?.();
+          }
         } catch (error) {
+          clearStatusRetry();
           if (current()) {entry.composerStatus = null; entry.composerStatusAt = Date.now(); syncAgent(); if (force) throw error;}
         } finally {if (statusFlight === flight) statusFlight = null; if (active() && scope() === binding && entry.generation !== generation) refreshStatus();}
       });
@@ -1771,24 +1944,32 @@
         currentModel = currentEntryModel?.label || null,
         observedModel = currentModel || status?.model_label || status?.model,
         observedEffort = currentEntryModel?.effort || status?.effort,
+        effortKey = String(observedEffort || "").toLowerCase(),
+        hasEffort = Boolean(observedEffort && (EFFORT_SHORT.has(effortKey) || EFFORT_LABELS.has(effortKey))),
         hasStatus = capability("chat_composer"),
-        modelText = observedModel || t(hasStatus ? "Model unknown" : "Model"),
-        label = hasStatus ? `${modelText} · ${observedEffort || t("Effort unknown")}` : modelText,
-        filledBars = EFFORT_BARS.get(observedEffort);
+        modelText = observedModel ? shortModel(observedModel) : t("Model"),
+        displayModel = observedModel ? fullModel(observedModel) : t("Model"),
+        effortLong = hasEffort ? t(EFFORT_LABELS.get(effortKey) || observedEffort) : "",
+        effortShort = hasEffort ? t(EFFORT_SHORT.get(effortKey) || EFFORT_LABELS.get(effortKey) || observedEffort) : "",
+        label = hasEffort ? `${displayModel} · ${effortLong}` : displayModel;
       shell.dataset.composerStatus = String(hasStatus);
       if ((modelBtn.getAttribute ? modelBtn.getAttribute("aria-label") : modelBtn.attrs?.["aria-label"]) !== label) modelBtn.setAttribute("aria-label", label);
-      modelName.textContent = observedModel ? shortModel(observedModel) : modelText;
-      modelEffort.hidden = filledBars === undefined;
-      effortBars.forEach((bar, index) => {
-        bar.dataset.on = String(index < filledBars);
-      });
+      modelName.textContent = modelText;
+      modelEffort.hidden = !hasEffort;
+      modelEffort.textContent = effortShort;
+      if (hasEffort) modelEffort.dataset.effort = effortKey;
+      else delete modelEffort.dataset.effort;
       modelBtn.title = label;
       const percent = !entry.model || matchesModel(agent, entry.model.id, status?.model) ? status?.context?.percent : undefined, known = typeof percent === "number" && Number.isFinite(percent);
       contextMeter.hidden = !known;
       if (known) {
         const usage = Math.round(Math.max(0,Math.min(100,percent))), description = t("Context used {0}%", usage);
-        contextMeter.style.background = `conic-gradient(var(--foreground) ${usage}%, var(--border) 0)`;
-        contextMeter.title = description; contextMeter.setAttribute("aria-label",description);
+        contextMeter.dataset.percent = String(usage);
+        contextMeter.title = description;
+        contextMeter.setAttribute("aria-label", description);
+        setContextRing(contextMeter, usage);
+      } else {
+        delete contextMeter.dataset.percent;
       }
       const controllable = ["claude", "codex", "agy"].includes(agent);
       modelBtn.hidden = !agent || !capability("composer_models") || (!controllable && !!status && !status.supported && !status.model && !status.model_label && !currentModel);
@@ -2217,7 +2398,7 @@
       liveTitle,
     );
     liveCard.append(liveCopy, liveOpen);
-    shell.append(history, pollStatus, feed, liveCard, composer);
+    shell.append(history, pollStatus, feed, jumpBtn, liveCard, composer);
     root.replaceChildren(shell);
     // Only a complete live terminal screen supplies an answer target. Historical cards stay inert.
     let liveQuestion = null,
@@ -2599,7 +2780,7 @@
             )
           ) {
             const empty = el("div", undefined, "chat-empty");
-            empty.append(el("p", t("Enter a new message"), "muted"));
+            empty.append(el("p", t("Start a conversation"), "muted"));
             feed.append(empty);
           }
         }
@@ -2954,9 +3135,10 @@
       renderedItems = entry.items;
       if (!entry.items.length && entry.loaded && !optimisticText()) {
         const empty = el("div", undefined, "chat-empty");
-        empty.append(el("p", t("Enter a new message"), "muted"));
+        empty.append(el("p", t("Start a conversation"), "muted"));
         feed.append(empty);
       }
+      syncJumpButton();
       const first = entry.items[0];
       const start = first?._pageStart || 0;
       earlierBtn.hidden =
@@ -3543,7 +3725,7 @@
     }
     function clearTranscript(clearSessionState = true) {
       prefetchedEarlier = null; fillPages = 0;
-      entry.composerStatus = null; entry.composerStatusAt = 0; entry.composerProbes = 0; statusFlight = null;
+      entry.composerStatus = null; entry.composerStatusAt = 0; entry.composerProbes = 0; statusFlight = null; clearStatusRetry();
       entry.items = [];
       entry.retainedBytes = 0;
       if (clearSessionState) entry.disclosures?.clear();
@@ -4037,6 +4219,7 @@
         earlierEpoch++;
         prefetchedEarlier = null;
         earlierQueued = false;
+        clearStatusRetry();
       }
       schedule();
       syncTailRunSummary();
@@ -4106,6 +4289,7 @@
         clearCopiedCode();
         clearTimeout(pollTimer);
         clearTimeout(appliedTimer);
+        clearStatusRetry();
         pollTimer = null;
         if (entry.notifyComposer === updateComposer)
           entry.notifyComposer = null;

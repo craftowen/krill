@@ -103,10 +103,12 @@ impl Adapter for Claude {
         status: &mut Value,
     ) {
         observe_statusline(context, live, snapshot, status);
+        let screen = live.tap().ok().map(|tap| tap.capture().0);
+        if let Some(screen) = screen.as_ref() {
+            merge_screen_observation(status, screen);
+        }
         let effort_supported = status.get("supported").and_then(Value::as_bool) == Some(true)
-            && live
-                .tap()
-                .is_ok_and(|tap| effort_available(&tap.capture().0));
+            && screen.as_ref().is_some_and(effort_available);
         set(status, "effort_supported", effort_supported.into());
         if effort_supported {
             set(
@@ -167,6 +169,336 @@ const ALIASES: &[(&str, &str)] = &[
     ("sonnet", "Sonnet"),
     ("haiku", "Haiku"),
 ];
+
+pub(super) fn merge_screen_observation(status: &mut Value, screen: &Screen) {
+    let Some((id, label, effort)) = observe_screen(screen) else {
+        return;
+    };
+    let existing = status.get("model").and_then(Value::as_str);
+    let matches_existing =
+        existing.is_none_or(|cur| cur == id || cur.starts_with(&format!("claude-{id}-")));
+    if existing.is_none() {
+        super::observe_live_model(status, &id);
+    }
+    if matches_existing {
+        if status.get("model_label").and_then(Value::as_str).is_none() {
+            set(status, "model_label", label.into());
+        }
+        if let Some(effort) =
+            effort.filter(|_| status.get("effort").and_then(Value::as_str).is_none())
+        {
+            set(status, "effort", effort.into());
+        }
+    }
+}
+
+pub(super) fn observe_screen(screen: &Screen) -> Option<(String, String, Option<String>)> {
+    if let Some(found) = observe_footer(screen) {
+        return Some(found);
+    }
+    observe_banner(screen)
+}
+
+pub(super) fn parse_model_spec(segment: &str) -> Option<(String, String, Option<String>)> {
+    let trimmed = segment.trim();
+    let (id, label, rest) = parse_claude_model(trimmed)?;
+    let rest = skip_model_context(rest)?;
+    let TrailingStatus::Valid(effort) = parse_trailing_status(rest) else {
+        return None;
+    };
+    Some((id, label, effort))
+}
+
+fn parse_claude_model(text: &str) -> Option<(String, String, &str)> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(after_claude) = lower.strip_prefix("claude-") {
+        for (alias, _) in VERSIONS {
+            if let Some(after_alias) = after_claude.strip_prefix(alias)
+                && (after_alias.is_empty()
+                    || !after_alias
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric()))
+            {
+                let consumed = "claude-".len() + alias.len();
+                let mut rest = text.get(consumed..)?;
+                let mut version = String::new();
+                while let Some(part) = rest.strip_prefix('-') {
+                    let digits_len = part.chars().take_while(char::is_ascii_digit).count();
+                    if digits_len == 0 {
+                        break;
+                    }
+                    let (token, after_digits) = part.split_at_checked(digits_len)?;
+                    if digits_len == 8 && !version.is_empty() {
+                        rest = after_digits;
+                        break;
+                    }
+                    if !version.is_empty() {
+                        version.push('.');
+                    }
+                    version.push_str(token);
+                    rest = after_digits;
+                }
+                if !rest.is_empty()
+                    && !rest
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_whitespace() || matches!(c, '(' | '·' | '|'))
+                {
+                    return None;
+                }
+                let title = title_case_family(alias);
+                let label = if version.is_empty() {
+                    title
+                } else {
+                    format!("{title} {version}")
+                };
+                return Some(((*alias).to_owned(), label, rest));
+            }
+        }
+        return None;
+    }
+
+    for (alias, _) in VERSIONS {
+        if lower.starts_with(alias) {
+            let Some(after_alias) = text.get(alias.len()..) else {
+                continue;
+            };
+            if after_alias
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_whitespace() && !matches!(c, '(' | '·' | '|'))
+            {
+                continue;
+            }
+            let title = title_case_family(alias);
+            let after_ws = after_alias.trim_start();
+            let ver_len = after_ws
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .count();
+            if ver_len > 0
+                && let Some((candidate, after_ver)) = after_ws.split_at_checked(ver_len)
+                && candidate.chars().any(|c| c.is_ascii_digit())
+                && !candidate.starts_with('.')
+                && !candidate.ends_with('.')
+                && !candidate.contains("..")
+                && after_ver
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || matches!(c, '(' | '·' | '|'))
+            {
+                return Some((
+                    (*alias).to_owned(),
+                    format!("{title} {candidate}"),
+                    after_ver,
+                ));
+            }
+            return Some(((*alias).to_owned(), title, after_alias));
+        }
+    }
+    None
+}
+
+fn title_case_family(alias: &str) -> String {
+    let mut chars = alias.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+fn skip_model_context(mut rest: &str) -> Option<&str> {
+    loop {
+        rest = rest.trim_start();
+        let Some(inside) = rest.strip_prefix('(') else {
+            return Some(rest);
+        };
+        if let Some((body, after_paren)) = inside.split_once(')') {
+            if body.len() > 36 || body.contains(['?', '!']) || body.contains(". ") {
+                return None;
+            }
+            rest = after_paren;
+        } else {
+            if inside.len() <= 24
+                && !inside.contains(['?', '!', ';'])
+                && inside
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '/'))
+            {
+                return Some("");
+            }
+            return None;
+        }
+    }
+}
+
+enum TrailingStatus {
+    Valid(Option<String>),
+    Invalid,
+}
+
+fn parse_trailing_status(rest: &str) -> TrailingStatus {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return TrailingStatus::Valid(None);
+    }
+    if let Some(after_sep) = trimmed
+        .strip_prefix('·')
+        .or_else(|| trimmed.strip_prefix('|'))
+    {
+        let tail = after_sep.trim();
+        if tail.contains(". ") || tail.contains(['?', '!']) || tail.ends_with('.') {
+            return TrailingStatus::Invalid;
+        }
+        let first_seg = tail.split(['·', '|']).next().unwrap_or("").trim();
+        return TrailingStatus::Valid(extract_effort_token(first_seg));
+    }
+    let first_word = trimmed.split([' ', '\t', '·', '|']).next().unwrap_or("");
+    let lower = first_word.to_ascii_lowercase();
+    if super::valid_effort(&lower) {
+        let rem = trimmed.get(first_word.len()..).unwrap_or("").trim_start();
+        if rem.is_empty() || rem.starts_with('·') || rem.starts_with('|') {
+            return TrailingStatus::Valid(Some(lower));
+        }
+    }
+    TrailingStatus::Invalid
+}
+
+fn extract_effort_token(segment: &str) -> Option<String> {
+    let mut words = segment.split_whitespace();
+    let first = words.next()?;
+    let lower = first.to_ascii_lowercase();
+    if !super::valid_effort(&lower) {
+        return None;
+    }
+    match words.next() {
+        None => Some(lower),
+        Some(second) if second.eq_ignore_ascii_case("effort") && words.next().is_none() => {
+            Some(lower)
+        }
+        Some(_) => None,
+    }
+}
+
+fn observe_footer(screen: &Screen) -> Option<(String, String, Option<String>)> {
+    let lines = screen.rows.len();
+    let cursor_y = usize::from(screen.cursor.line);
+    let border_y = if composer(screen, None) {
+        ((cursor_y + 1)..=(cursor_y + 5).min(lines.saturating_sub(1)))
+            .find(|&y| native::border(screen, y))
+    } else {
+        (0..lines).rev().find(|&y| {
+            native::border(screen, y)
+                && (y.saturating_sub(5)..y)
+                    .any(|py| native::row(screen, py).trim_start().starts_with('❯'))
+                && ((y + 1)..lines)
+                    .filter(|&ry| !native::row(screen, ry).trim().is_empty())
+                    .count()
+                    <= 3
+        })
+    }?;
+
+    let mut rows = Vec::new();
+    for y in (border_y + 1)..=(border_y + 3).min(lines.saturating_sub(1)) {
+        if native::border(screen, y) {
+            break;
+        }
+        let text = native::row(screen, y);
+        if !text.trim().is_empty() {
+            rows.push(text);
+        }
+    }
+
+    let mut fallback = None;
+    for (idx, line) in rows.iter().enumerate() {
+        if let Some(next) = rows.get(idx + 1) {
+            let joined = format!("{} {}", line.trim_end(), next.trim_start());
+            if let Some(spec) = scan_statusline_segments(&joined)
+                && spec.2.is_some()
+            {
+                return Some(spec);
+            }
+            if fallback.is_none() {
+                fallback = scan_statusline_segments(&joined);
+            }
+        }
+        if let Some(spec) = scan_statusline_segments(line) {
+            if spec.2.is_some() {
+                return Some(spec);
+            }
+            if fallback.is_none() {
+                fallback = Some(spec);
+            }
+        }
+    }
+    fallback
+}
+
+fn scan_statusline_segments(line: &str) -> Option<(String, String, Option<String>)> {
+    let mut pipe_parts = line.split('|').peekable();
+    while let Some(part) = pipe_parts.next() {
+        let trimmed = part.trim();
+        let mut candidates = vec![trimmed];
+        for (idx, ch) in trimmed.char_indices() {
+            if ch == '·'
+                && let Some(after) = trimmed.get(idx + ch.len_utf8()..)
+            {
+                candidates.push(after.trim_start());
+            }
+        }
+        for candidate in candidates {
+            if let Some((id, label, mut effort)) = parse_model_spec(candidate) {
+                if effort.is_none()
+                    && let Some(next_part) = pipe_parts.peek()
+                {
+                    effort = extract_effort_token(next_part.trim());
+                }
+                return Some((id, label, effort));
+            }
+        }
+    }
+    None
+}
+
+fn strip_banner_frame(row: &str) -> &str {
+    row.trim_start_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(c, '*' | '│' | '┃' | '╭' | '╰' | '├' | '✻' | '✳' | '✶')
+            || ('\u{2580}'..='\u{259F}').contains(&c)
+    })
+    .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '│' | '┃'))
+}
+
+fn observe_banner(screen: &Screen) -> Option<(String, String, Option<String>)> {
+    if !verified(screen) {
+        return None;
+    }
+    let lines = screen.rows.len();
+    let banner_y = (0..lines).find(|&y| native::row(screen, y).contains(BANNER))?;
+    let rows: Vec<String> = ((banner_y + 1)..=(banner_y + 4).min(lines.saturating_sub(1)))
+        .map(|y| strip_banner_frame(&native::row(screen, y)).to_owned())
+        .collect();
+    for (idx, row_text) in rows.iter().enumerate() {
+        if let Some(next) = rows.get(idx + 1)
+            && !next.is_empty()
+            && (row_text.ends_with('(')
+                || row_text
+                    .rsplit_once('(')
+                    .is_some_and(|(_, tail)| !tail.contains(')'))
+                || next.starts_with('·'))
+        {
+            let joined = format!("{row_text} {next}");
+            if let Some(found) = parse_model_spec(&joined) {
+                return Some(found);
+            }
+        }
+        if let Some(found) = parse_model_spec(row_text) {
+            return Some(found);
+        }
+    }
+    None
+}
 
 fn verified(screen: &Screen) -> bool {
     native::banner_meets(screen, BANNER, FLOOR)
@@ -246,8 +578,9 @@ fn models(context: &Context, tap: &Tap) -> io::Result<Value> {
     if !verified(&screen) || !composer(&screen, None) {
         return Err(io::Error::other(WAIT));
     }
+    let current = observe_screen(&screen).map(|(id, _, _)| id);
     Ok(
-        json!({"agent":"claude","supported":true,"current":null,"items":choices(context).iter().map(|(id,label)|json!({"id":id,"label":VERSIONS.iter().find(|(alias,_)|alias==id).map_or(*label,|(_,name)|*name)})).collect::<Vec<_>>(),"truncated":false,"reason":"Changes the model in this running Claude chat. Claude also saves its default for new sessions.","note":"Claude also saves this as the default for new sessions."}),
+        json!({"agent":"claude","supported":true,"current":current,"items":choices(context).iter().map(|(id,label)|json!({"id":id,"label":VERSIONS.iter().find(|(alias,_)|alias==id).map_or(*label,|(_,name)|*name)})).collect::<Vec<_>>(),"truncated":false,"reason":"Changes the model in this running Claude chat. Claude also saves its default for new sessions.","note":"Claude also saves this as the default for new sessions."}),
     )
 }
 
