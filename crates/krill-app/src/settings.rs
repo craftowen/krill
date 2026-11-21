@@ -1528,6 +1528,71 @@ pub fn set_running_session_switch_policy(policy: RunningSessionSwitchPolicy, cx:
     }
 }
 
+type AccountSwitchHandler = std::rc::Rc<
+    dyn Fn(
+        crate::hosts::HostId,
+        krill_proto::usage::ProviderKind,
+        String,
+        &mut App,
+    ) -> Option<bool>,
+>;
+
+#[derive(Default)]
+struct AccountSwitchHosts(Vec<AccountSwitchHandler>);
+impl gpui::Global for AccountSwitchHosts {}
+
+/// 메인 창(`Shell`)을 기본 계정 전환 호스트로 등록한다. 설정의 계정 전환도 상태바와
+/// 같은 실행 중 세션 정책을 따르게 한다. 콜백은 호스트가 해제됐으면 `None`,
+/// 처리했으면 `Some(true)`, 건너뛰면 `Some(false)`.
+pub fn register_account_switch_host(
+    cx: &mut App,
+    handler: impl Fn(
+        crate::hosts::HostId,
+        krill_proto::usage::ProviderKind,
+        String,
+        &mut App,
+    ) -> Option<bool>
+    + 'static,
+) {
+    cx.default_global::<AccountSwitchHosts>()
+        .0
+        .push(std::rc::Rc::new(handler));
+}
+
+fn dispatch_account_switch(
+    host: &crate::hosts::HostId,
+    provider: krill_proto::usage::ProviderKind,
+    account_id: &str,
+    cx: &mut App,
+) -> bool {
+    let handlers = cx
+        .try_global::<AccountSwitchHosts>()
+        .map(|h| h.0.clone())
+        .unwrap_or_default();
+    let mut gone = Vec::new();
+    let mut handled = false;
+    for (i, handler) in handlers.iter().enumerate().rev() {
+        match handler(host.clone(), provider, account_id.to_owned(), cx) {
+            Some(true) => {
+                handled = true;
+                break;
+            }
+            Some(false) => {}
+            None => gone.push(i),
+        }
+    }
+    if !gone.is_empty() && cx.has_global::<AccountSwitchHosts>() {
+        // `gone`은 큰 인덱스부터 쌓이므로 앞 항목 위치가 밀리지 않는다.
+        let list = &mut cx.global_mut::<AccountSwitchHosts>().0;
+        for i in gone {
+            if i < list.len() {
+                list.remove(i);
+            }
+        }
+    }
+    handled
+}
+
 /// 해당 프로바이더를 하단 상태바에 표시할지 여부(기본 true).
 #[must_use]
 pub fn status_provider_visible(provider: krill_proto::usage::ProviderKind, cx: &App) -> bool {
@@ -5597,6 +5662,29 @@ impl SettingsView {
         );
     }
 
+    /// 기본 계정 전환. 메인 창이 등록돼 있으면 실행 중 세션 정책(묻기·재시작·유지)을
+    /// 그쪽에서 적용하고, 없으면 기존 `SwitchAccount`로 바꾼다.
+    fn switch_default_account(
+        &mut self,
+        provider: krill_proto::usage::ProviderKind,
+        account_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.daemon_required(cx) || self.account_rule_pending {
+            return;
+        }
+        if dispatch_account_switch(&self.account_host, provider, &account_id, cx) {
+            return;
+        }
+        self.apply_account_request(
+            krill_proto::usage::UsageRequest::SwitchAccount {
+                provider,
+                account_id,
+            },
+            cx,
+        );
+    }
+
     fn consume_reset_credit(
         &mut self,
         provider: krill_proto::usage::ProviderKind,
@@ -7806,7 +7894,7 @@ impl SettingsView {
     ) -> gpui::Stateful<gpui::Div> {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         use gpui_component::{IconName, Sizable as _};
-        use krill_proto::usage::{ConnectionStatus, ProviderKind, UsageRequest};
+        use krill_proto::usage::{ConnectionStatus, ProviderKind};
 
         let p = crate::ui::palette(cx);
         let provider = acc.provider;
@@ -8175,13 +8263,7 @@ impl SettingsView {
                 )
                 .debug_selector(move || switch_id.clone())
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.apply_account_request(
-                        UsageRequest::SwitchAccount {
-                            provider,
-                            account_id: acc_id.clone(),
-                        },
-                        cx,
-                    );
+                    this.switch_default_account(provider, acc_id.clone(), cx);
                 })),
             );
         }
@@ -8369,13 +8451,7 @@ impl SettingsView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.rename.is_none() && this.removing.is_none() && this.armed.is_none()
                         {
-                            this.apply_account_request(
-                                UsageRequest::SwitchAccount {
-                                    provider,
-                                    account_id: row_acc_id.clone(),
-                                },
-                                cx,
-                            );
+                            this.switch_default_account(provider, row_acc_id.clone(), cx);
                         }
                     }))
             })
@@ -8560,7 +8636,8 @@ impl SettingsView {
                     .id("admin-account-error")
                     .debug_selector(|| "admin-account-error".into())
             }))
-            .child(self.render_auto_switch_strip(cx));
+            .child(self.render_auto_switch_strip(cx))
+            .child(Self::render_switch_policy_row(cx));
 
         let mut host_line = div()
             .w_full()
@@ -9127,6 +9204,47 @@ impl SettingsView {
             text::AUTO_SWITCH_SUMMARY_RULES.format(&[("n", &policy.rules.len().to_string())]),
         );
         parts.join(", ")
+    }
+
+    /// 기본 계정을 바꿀 때 실행 중 세션 처리(묻기·자동 재시작·유지) 선택기.
+    fn render_switch_policy_row(cx: &mut Context<Self>) -> gpui::Div {
+        use crate::i18n::catalog::session_switch as switch_text;
+        let p = crate::ui::palette(cx);
+        let current = running_session_switch_policy(cx);
+        let option = |id: &'static str, label: &'static str, policy: RunningSessionSwitchPolicy| {
+            layout::segment(p, id, label, current == policy)
+                .debug_selector(move || id.into())
+                .on_click(move |_, _, cx| set_running_session_switch_policy(policy, cx))
+        };
+        crate::ui::group(
+            p,
+            [crate::ui::group_row()
+                .child(layout::label(p, switch_text::POLICY_TITLE.get(), None))
+                .child(
+                    layout::controls().child(layout::segmented_control(
+                        p,
+                        [
+                            (
+                                "settings-switch-policy-ask",
+                                switch_text::POLICY_ASK.get(),
+                                RunningSessionSwitchPolicy::Ask,
+                            ),
+                            (
+                                "settings-switch-policy-restart",
+                                switch_text::POLICY_RESTART.get(),
+                                RunningSessionSwitchPolicy::Restart,
+                            ),
+                            (
+                                "settings-switch-policy-keep",
+                                switch_text::POLICY_KEEP.get(),
+                                RunningSessionSwitchPolicy::Keep,
+                            ),
+                        ]
+                        .into_iter()
+                        .map(|(id, label, policy)| option(id, label, policy)),
+                    )),
+                )],
+        )
     }
 
     /// 계정 탭 맨 위의 자동 전환 띠. 접으면 요약과 스위치 한 줄, 펼치면 전역 설정과 계정별 규칙이 한곳에 있다.

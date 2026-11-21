@@ -320,13 +320,8 @@ fn render_cell(
 
 fn switch_account(weak: &WeakEntity<Shell>, account: &AccountInfo, cx: &mut App) {
     weak.update(cx, |shell, cx| {
-        shell.refresh_accounts(
-            UsageRequest::SwitchAccount {
-                provider: account.provider,
-                account_id: account.id.clone(),
-            },
-            cx,
-        );
+        let host = shell.active_account_host();
+        shell.switch_provider_account(host, account.provider, account.id.clone(), cx);
     })
     .ok();
 }
@@ -1235,12 +1230,10 @@ fn render_remote_hosts_tab(
                                             cx.stop_propagation();
                                             switch_weak
                                                 .update(cx, |shell, cx| {
-                                                    shell.refresh_accounts_for_host(
+                                                    shell.switch_provider_account(
                                                         switch_host.clone(),
-                                                        UsageRequest::SwitchAccount {
-                                                            provider,
-                                                            account_id: account_id.clone(),
-                                                        },
+                                                        provider,
+                                                        account_id.clone(),
                                                         cx,
                                                     );
                                                 })
