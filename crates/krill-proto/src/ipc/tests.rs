@@ -323,6 +323,11 @@ fn feature_registry_matches_architecture_and_frozen_values() {
             39,
         ),
         (
+            "FEAT_ACCOUNT_SWITCH_CONTROL",
+            crate::usage::FEAT_ACCOUNT_SWITCH_CONTROL,
+            43,
+        ),
+        (
             "FEAT_SESSION_ACCOUNT_SWITCH",
             crate::usage::FEAT_SESSION_ACCOUNT_SWITCH,
             28,

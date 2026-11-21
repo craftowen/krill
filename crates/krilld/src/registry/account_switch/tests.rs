@@ -656,6 +656,7 @@ fn explicit_cancel_accepts_pending_or_failed_live_original_and_preserves_untrack
             account_id: "selected".into(),
             prepared: true,
             not_before: None,
+            interrupt_busy: false,
         },
     );
     reg.cancel_failed_account_switch(session).unwrap();
@@ -2011,6 +2012,7 @@ fn unbound_session_skips_auto_switch_and_cancelled_opt_out_until_bound_and_prune
             account_id: target.clone(),
             prepared: false,
             not_before: None,
+            interrupt_busy: false,
         },
     );
     reg.process_account_work_in(&home);
@@ -2260,6 +2262,7 @@ fn stale_provider_handoff_is_cancelled_and_rejected_before_reading_transcripts()
             session,
             ProviderKind::Codex,
             &target,
+            false,
             &home
         ),
         Err(Failure::BadRequest)
@@ -2668,6 +2671,7 @@ fn check_retirement_transfer(selection: TransferSelection, during_refresh: bool)
 
                     prepared: true,
                     not_before: None,
+                    interrupt_busy: false,
                 },
             );
             let chosen = match selection {
@@ -3592,6 +3596,7 @@ fn multi_session_straggler_rate_limit_requeues_host_default_and_shared_claude_se
             account_id: healthy_id.clone(),
             prepared: true,
             not_before: Some(Instant::now() + Duration::from_secs(30)),
+            interrupt_busy: false,
         },
     );
 
@@ -3863,6 +3868,7 @@ fn deferred_session_not_before_is_not_dispatched_early_by_provider_scope() {
                 account_id: target.clone(),
                 prepared: true,
                 not_before: Some(Instant::now() + Duration::from_secs(60)),
+                interrupt_busy: false,
             },
         );
         pending.insert(
@@ -3871,6 +3877,7 @@ fn deferred_session_not_before_is_not_dispatched_early_by_provider_scope() {
                 account_id: target,
                 prepared: true,
                 not_before: None,
+                interrupt_busy: false,
             },
         );
     }
@@ -3951,6 +3958,7 @@ fn superseded_handoff_failure_does_not_overwrite_newer_pending_selection() {
             account_id: newer_id.clone(),
             prepared: true,
             not_before: None,
+            interrupt_busy: false,
         },
     );
 
@@ -3960,6 +3968,7 @@ fn superseded_handoff_failure_does_not_overwrite_newer_pending_selection() {
         SessionId(202),
         ProviderKind::Codex,
         "missing-old-account",
+        false,
         &home,
     );
     let saved = load(Some(&state));
@@ -4076,6 +4085,253 @@ fn running_account_resolves_isolated_claude_session_id_without_transcript_path()
         "claude-host"
     );
 
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn switch_control_inspects_switches_only_the_default_and_hands_off_selected_sessions() {
+    use krill_proto::hook::{EventId, HookEvent, Input};
+    use krill_proto::roles::Role;
+    use krill_proto::usage::{
+        CantMoveReason, FEAT_ACCOUNT_SWITCH_CONTROL, SessionSwitchGroup, UsageReply, UsageRequest,
+    };
+    let root = Path::new("/tmp").join(format!("kas-control-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let own = root.join("own");
+    fs::create_dir_all(&own).unwrap();
+    let mut ids = Vec::new();
+    let mut snapshot = AccountsSnapshot::default();
+    for label in ["A", "B", "C"] {
+        let dir = root.join(label);
+        fs::create_dir_all(&dir).unwrap();
+        snapshot = accounts::add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            label,
+            None,
+            dir.to_str().unwrap(),
+        )
+        .unwrap();
+        let id = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.label == label)
+            .unwrap()
+            .id
+            .clone();
+        ids.push((id, dir));
+    }
+    let [(a, a_dir), (b, b_dir), (c, c_dir)] = ids.try_into().unwrap();
+    let sessions: Vec<_> = (1..=9).map(SessionId).collect();
+    let (reg, _processes) = kept_sessions_fixture(&state, &sessions);
+    let launch = |session: u64, conversation: Option<&str>, id: &str, dir: &Path| {
+        reg.agents
+            .remember_session(
+                SessionId(session),
+                &AgentLaunch {
+                    profile: "codex".into(),
+                    permission: Permission::Yolo,
+                },
+                conversation.map(str::to_owned),
+                format!("/w/{session}").into_bytes(),
+                Some(LaunchAccount {
+                    id: id.into(),
+                    env_key: "CODEX_HOME".into(),
+                    dir: dir.display().to_string(),
+                }),
+            )
+            .unwrap();
+    };
+    launch(1, Some("conv-1"), &a, &a_dir);
+    launch(2, Some("conv-2"), &b, &b_dir);
+    launch(3, Some("conv-3"), &c, &c_dir);
+    launch(4, Some("conv-4"), &a, &own);
+    launch(5, Some("conv-5"), "ghost", Path::new(""));
+    launch(6, Some("shared"), &a, &a_dir);
+    launch(7, Some("shared"), &a, &a_dir);
+    launch(8, None, &a, &a_dir);
+    launch(9, Some("conv-9"), &a, &a_dir);
+    lock(&reg.account_handoffs).insert(
+        SessionId(9),
+        SessionHandoff {
+            from: SessionId(9),
+            to: None,
+            account_id: c.clone(),
+            error: None,
+        },
+    );
+    let working = HookEvent {
+        id: EventId {
+            pid: 723,
+            unix_ns: 1,
+        },
+        ppid: 723,
+        agent: "codex".into(),
+        input: Input::Complete,
+        payload: br#"{"hook_event_name":"UserPromptSubmit","session_id":"conv-3","prompt":"go"}"#
+            .to_vec(),
+    };
+    reg.status.hook(&[(SessionId(3), &working)]).unwrap();
+    assert!(reg.account_switch_busy(SessionId(3)));
+
+    let plan = reg
+        .inspect_session_switches_in(
+            &home,
+            ProviderKind::Codex,
+            Some(a.clone()),
+            b.clone(),
+            &snapshot,
+        )
+        .unwrap();
+    let group = |session: u64| {
+        plan.candidates
+            .iter()
+            .find(|c| c.session == SessionId(session))
+            .map(|c| c.group)
+    };
+    assert_eq!(group(1), Some(SessionSwitchGroup::OnPreviousAccount));
+    assert_eq!(group(2), None, "already on the target account");
+    assert_eq!(group(3), Some(SessionSwitchGroup::Elsewhere));
+    let cant = |reason| Some(SessionSwitchGroup::CantMove(reason));
+    assert_eq!(group(4), cant(CantMoveReason::OwnFolder));
+    assert_eq!(group(5), cant(CantMoveReason::UnknownAccount));
+    assert_eq!(group(6), cant(CantMoveReason::SharedSession));
+    assert_eq!(group(7), cant(CantMoveReason::SharedSession));
+    assert_eq!(group(8), cant(CantMoveReason::NoSession));
+    assert_eq!(group(9), cant(CantMoveReason::PendingHandoff));
+    let first = &plan.candidates[0];
+    assert_eq!(
+        (first.cwd.as_str(), first.agent.as_str(), first.busy),
+        ("/w/1", "codex", false)
+    );
+    assert_eq!(first.current_account_label, "A");
+    assert!(
+        plan.candidates
+            .iter()
+            .any(|c| c.session == SessionId(3) && c.busy)
+    );
+    assert_eq!(
+        plan.candidates
+            .iter()
+            .find(|c| c.session == SessionId(5))
+            .unwrap()
+            .current_account_label,
+        "ghost"
+    );
+    assert_eq!(
+        reg.inspect_session_switches_in(
+            &home,
+            ProviderKind::Codex,
+            None,
+            "missing".into(),
+            &snapshot
+        ),
+        Err(Failure::BadRequest)
+    );
+
+    // The default changes while no running session is queued for a handoff.
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let only = UsageRequest::SwitchAccountOnly {
+        provider: ProviderKind::Codex,
+        account_id: b.clone(),
+    };
+    let features = krill_proto::ipc::FEATURES;
+    assert_eq!(
+        reg.on_usage_negotiated_in(
+            &peer,
+            Role::Interactive,
+            only.clone(),
+            features & !FEAT_ACCOUNT_SWITCH_CONTROL,
+            &home
+        ),
+        UsageReply::Failed(Failure::BadRequest)
+    );
+    let handoffs_before = lock(&reg.account_handoffs).len();
+    let UsageReply::Accounts(after) =
+        reg.on_usage_negotiated_in(&peer, Role::Interactive, only, features, &home)
+    else {
+        panic!("expected accounts");
+    };
+    assert!(after.accounts.iter().any(|x| x.id == b && x.active));
+    assert!(lock(&reg.account_work.pending).is_empty());
+    assert_eq!(lock(&reg.account_handoffs).len(), handoffs_before);
+    let config = fs::read(state.join("accounts.toml")).unwrap();
+
+    // Only the chosen sessions are queued, carrying the busy override; the default is untouched.
+    let UsageReply::Accounts(_) = reg.on_usage_negotiated_in(
+        &peer,
+        Role::Interactive,
+        UsageRequest::SwitchSelectedSessions {
+            provider: ProviderKind::Codex,
+            account_id: c.clone(),
+            sessions: vec![SessionId(1), SessionId(1), SessionId(3)],
+            interrupt_busy: true,
+        },
+        features,
+        &home,
+    ) else {
+        panic!("expected accounts");
+    };
+    assert_eq!(fs::read(state.join("accounts.toml")).unwrap(), config);
+    let pending = lock(&reg.account_work.pending);
+    let queued: Vec<_> = pending
+        .iter()
+        .map(|(scope, target)| (*scope, target.account_id.clone(), target.interrupt_busy))
+        .collect();
+    assert_eq!(
+        queued,
+        [
+            (
+                SwitchScope::Session(SessionId(1), ProviderKind::Codex),
+                c.clone(),
+                true
+            ),
+            (
+                SwitchScope::Session(SessionId(3), ProviderKind::Codex),
+                c.clone(),
+                true
+            ),
+        ]
+    );
+    drop(pending);
+    let saved = load(Some(&state));
+    assert!(saved.contains_key(&SessionId(1)) && !saved.contains_key(&SessionId(6)));
+
+    // A working session refuses without the override and passes the busy gate with it.
+    lock(&reg.account_handoffs).insert(
+        SessionId(3),
+        SessionHandoff {
+            from: SessionId(3),
+            to: None,
+            account_id: a.clone(),
+            error: None,
+        },
+    );
+    lock(&reg.account_work.pending).clear();
+    for (interrupt_busy, expected) in [
+        (false, Failure::Os(libc::EBUSY)),
+        (true, Failure::BadRequest),
+    ] {
+        // Claude is the wrong provider, so a passed busy gate stops at the provider recheck.
+        assert_eq!(
+            reg.handoff_account(
+                &peer,
+                SessionId(3),
+                ProviderKind::Claude,
+                &a,
+                interrupt_busy,
+                &home
+            ),
+            Err(expected)
+        );
+    }
     drop(reg);
     fs::remove_dir_all(root).unwrap();
 }

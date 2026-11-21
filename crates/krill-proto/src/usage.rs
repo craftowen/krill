@@ -17,6 +17,12 @@ pub const FEAT_ACCOUNT_CANCEL: u64 = 1 << 22;
 pub const FEAT_ACCOUNT_INPUT_RECOVERY: u64 = 1 << 39;
 /// Resume exactly one session under another account without changing the provider default.
 pub const FEAT_SESSION_ACCOUNT_SWITCH: u64 = 1 << 28;
+/// Switch the default only, inspect running sessions, and hand off a chosen subset.
+pub const FEAT_ACCOUNT_SWITCH_CONTROL: u64 = 1 << 43;
+mod switch_plan;
+pub use switch_plan::{
+    CantMoveReason, SessionSwitchCandidate, SessionSwitchGroup, SessionSwitchPlan,
+};
 mod details;
 pub use details::{
     AccountMeters, HandoffOutcome, ProviderDetails, RESET_CREDITS_EXPIRY_METER_PREFIX,
@@ -836,6 +842,27 @@ pub enum UsageRequest {
         session: crate::SessionId,
         account_id: String,
     },
+    /// Change the provider default only; running sessions keep their account.
+    /// Requires [`FEAT_ACCOUNT_SWITCH_CONTROL`] and [`FEAT_PROVIDER_DETAILS`].
+    SwitchAccountOnly {
+        provider: ProviderKind,
+        account_id: String,
+    },
+    /// Classify live sessions before a switch → [`UsageReply::SessionSwitchPlan`].
+    /// Daemon-only (never answered locally). Requires [`FEAT_ACCOUNT_SWITCH_CONTROL`].
+    InspectSessionSwitches {
+        provider: ProviderKind,
+        previous_account_id: Option<String>,
+        target_account_id: String,
+    },
+    /// Hand off only the listed sessions; the provider default is unchanged.
+    /// `interrupt_busy` skips the busy refusal only. Requires [`FEAT_ACCOUNT_SWITCH_CONTROL`].
+    SwitchSelectedSessions {
+        provider: ProviderKind,
+        account_id: String,
+        sessions: Vec<crate::SessionId>,
+        interrupt_busy: bool,
+    },
 }
 
 impl UsageRequest {
@@ -846,6 +873,9 @@ impl UsageRequest {
         match self {
             Self::SwitchAccount { provider, .. }
             | Self::SwitchSessionAccount { provider, .. }
+            | Self::SwitchAccountOnly { provider, .. }
+            | Self::InspectSessionSwitches { provider, .. }
+            | Self::SwitchSelectedSessions { provider, .. }
             | Self::AddAccount { provider, .. }
             | Self::RemoveAccount { provider, .. }
             | Self::RemoveAutoSwitchRule { provider, .. }
@@ -889,6 +919,12 @@ impl UsageRequest {
         let provider = match self {
             Self::SwitchSessionAccount { provider, .. } => {
                 features |= FEAT_SESSION_ACCOUNT_SWITCH | FEAT_PROVIDER_DETAILS;
+                Some(*provider)
+            }
+            Self::SwitchAccountOnly { provider, .. }
+            | Self::InspectSessionSwitches { provider, .. }
+            | Self::SwitchSelectedSessions { provider, .. } => {
+                features |= FEAT_ACCOUNT_SWITCH_CONTROL | FEAT_PROVIDER_DETAILS;
                 Some(*provider)
             }
             Self::CancelAccountSwitch { .. } => {
@@ -1087,6 +1123,8 @@ pub enum UsageReply {
         outcome: ResetConsumeOutcome,
         windows_reset: u64,
     },
+    /// [`UsageRequest::InspectSessionSwitches`] 응답. [`FEAT_ACCOUNT_SWITCH_CONTROL`].
+    SessionSwitchPlan(SessionSwitchPlan),
 }
 
 /// 등록되지 않은 Krill 관리 프로필 폴더(OWE-704). 이전 버전의 "제거"가 남긴 폴더 등.
@@ -1100,6 +1138,10 @@ impl UsageReply {
     /// Hide extensions that the peer cannot decode; retain the N-1 response prefix.
     #[must_use]
     pub fn for_features(mut self, features: u64) -> Self {
+        if features & FEAT_ACCOUNT_SWITCH_CONTROL == 0 && matches!(self, Self::SessionSwitchPlan(_))
+        {
+            return Self::Failed(crate::control::Failure::BadRequest);
+        }
         if features & FEAT_USAGE_RESET == 0
             && let Self::ResetConsumed { snapshot, .. } = self
         {

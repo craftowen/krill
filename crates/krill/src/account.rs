@@ -498,7 +498,9 @@ fn request(req: &UsageRequest) -> Result<AccountsSnapshot, String> {
         UsageReply::Accounts(snap) => Ok(snap),
         UsageReply::Current(_) | UsageReply::Orphans(_) => Ok(AccountsSnapshot::default()),
         UsageReply::ResetConsumed { snapshot, .. } => Ok(snapshot),
-        UsageReply::Provisioning(_) => Err("unexpected account reply".to_owned()),
+        UsageReply::Provisioning(_) | UsageReply::SessionSwitchPlan(_) => {
+            Err("unexpected account reply".to_owned())
+        }
         UsageReply::Failed(e) => Err(e.to_string()),
     }
 }

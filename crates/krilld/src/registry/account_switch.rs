@@ -3,6 +3,7 @@
 //! src/renderer/src/store/terminals/terminal-restart-state.ts,
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
 
+mod diagnose;
 pub(super) mod identity;
 mod input_recovery;
 pub(crate) mod ledger;
@@ -194,6 +195,10 @@ impl Registry {
             .and_then(ProviderKind::parse)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one queued selection and its locks"
+    )]
     fn queue_session_account_switch_locked(
         &self,
         session: SessionId,
@@ -202,6 +207,7 @@ impl Registry {
         snapshot: &AccountsSnapshot,
         pending: &mut BTreeMap<SwitchScope, accounts::switch_work::SwitchTarget>,
         home: &Path,
+        interrupt_busy: bool,
     ) -> Result<(), Failure> {
         // A sidebar click can still name the original while retirement is being observed.
         // Follow only durable aliases; an unconfirmed replacement is never a valid target.
@@ -277,6 +283,7 @@ impl Registry {
                     account_id: account_id.into(),
                     prepared: true,
                     not_before: None,
+                    interrupt_busy,
                 },
             );
             self.account_work.wake.notify_one();
@@ -311,6 +318,7 @@ impl Registry {
                 account_id: account_id.into(),
                 prepared: true,
                 not_before: None,
+                interrupt_busy,
             },
         );
         drop(handoffs);
@@ -334,6 +342,42 @@ impl Registry {
         )
     }
 
+    /// Queue only the chosen sessions; the provider default and every other session are unchanged.
+    /// Every session is attempted; the first refusal is returned.
+    pub(super) fn queue_selected_account_switches_in(
+        &self,
+        sessions: &[SessionId],
+        provider: ProviderKind,
+        account_id: &str,
+        interrupt_busy: bool,
+        snapshot: &AccountsSnapshot,
+        home: &Path,
+    ) -> Result<(), Failure> {
+        let unique: std::collections::BTreeSet<_> = sessions.iter().copied().collect();
+        let mut first_error = None;
+        for session in unique {
+            let queued = {
+                let mut pending = lock(&self.account_work.pending);
+                self.queue_session_account_switch_locked(
+                    session,
+                    provider,
+                    account_id,
+                    snapshot,
+                    &mut pending,
+                    home,
+                    interrupt_busy,
+                )
+            };
+            match queued {
+                Ok(()) => self.acknowledge_retained_handoff(session),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     pub(super) fn queue_session_account_switch_in(
         &self,
         session: SessionId,
@@ -351,6 +395,7 @@ impl Registry {
                 snapshot,
                 &mut pending,
                 home,
+                false,
             )?;
         }
         self.acknowledge_retained_handoff(session);
@@ -776,6 +821,7 @@ impl Registry {
                 account_id: account_id.into(),
                 prepared: true,
                 not_before: None,
+                interrupt_busy: false,
             },
         );
         self.account_work.wake.notify_one();
@@ -1169,11 +1215,14 @@ impl Registry {
                     }
                     SwitchScope::Session(id, p) => *id == h.from && *p == provider,
                 });
-                matched.then_some((h.from, provider, h.account_id))
+                let interrupt_busy = pending
+                    .get(&SwitchScope::Session(h.from, provider))
+                    .is_some_and(|t| t.interrupt_busy && t.account_id == h.account_id);
+                matched.then_some((h.from, provider, h.account_id, interrupt_busy))
             })
             .collect();
-        run_bounded(&jobs, |(old, provider, account_id)| {
-            self.process_account_handoff(*old, *provider, account_id, home);
+        run_bounded(&jobs, |(old, provider, account_id, interrupt_busy)| {
+            self.process_account_handoff(*old, *provider, account_id, *interrupt_busy, home);
         });
     }
 
@@ -1182,6 +1231,7 @@ impl Registry {
         old: SessionId,
         provider: ProviderKind,
         account_id: &str,
+        interrupt_busy: bool,
         home: &Path,
     ) {
         let peer = Peer {
@@ -1189,7 +1239,7 @@ impl Registry {
             scope: Scope::Full,
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.handoff_account(&peer, old, provider, account_id, home)
+            self.handoff_account(&peer, old, provider, account_id, interrupt_busy, home)
         }))
         .unwrap_or(Err(Failure::BadRequest));
         if result == Err(Failure::Os(libc::EBUSY)) {
@@ -1203,6 +1253,7 @@ impl Registry {
                     account_id: account_id.to_owned(),
                     prepared: true,
                     not_before: Some(Instant::now() + Duration::from_millis(500)),
+                    interrupt_busy,
                 });
             return;
         }
@@ -1394,6 +1445,7 @@ impl Registry {
                         account_id: account.id.clone(),
                         prepared: true,
                         not_before: None,
+                        interrupt_busy: false,
                     });
             } else {
                 handoff.error =
@@ -1573,6 +1625,7 @@ impl Registry {
                 &snapshot,
                 &mut pending,
                 &accounts::default_home(),
+                old_target.as_ref().is_some_and(|t| t.interrupt_busy),
             );
             if result.is_err()
                 && let Some(old_target) = old_target
@@ -1590,6 +1643,7 @@ impl Registry {
         old: SessionId,
         provider: ProviderKind,
         account_id: &str,
+        interrupt_busy: bool,
         home: &Path,
     ) -> Result<SessionId, Failure> {
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
@@ -1602,7 +1656,7 @@ impl Registry {
         ) {
             return Err(Failure::BadRequest);
         }
-        if self.account_switch_busy(old) {
+        if !interrupt_busy && self.account_switch_busy(old) {
             return Err(Failure::Os(libc::EBUSY));
         }
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
@@ -2002,7 +2056,7 @@ impl Registry {
         if !self.account_selection_current(old, provider, account_id, &pending) {
             return Err(Failure::BadRequest);
         }
-        if self.account_switch_busy(old) {
+        if !interrupt_busy && self.account_switch_busy(old) {
             return Err(Failure::Os(libc::EBUSY));
         }
         prepared_transcript
